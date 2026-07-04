@@ -4,23 +4,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use lattice_core::{ActorId, ActorKind, Epoch, InstanceId, ServiceKind};
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::{InstanceRecord, PlacementError};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActorPlacementKey {
     pub actor_kind: ActorKind,
     pub actor_id: ActorId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct LeaseId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct PlacementVersion(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PlacementState {
     Activating,
     Running,
@@ -29,7 +33,7 @@ pub enum PlacementState {
     Stopped,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorPlacementRecord {
     pub actor_kind: ActorKind,
     pub actor_id: ActorId,

@@ -4,10 +4,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use http::Uri;
 use lattice_core::{InstanceCapacity, InstanceId, ServiceKind};
+use serde::{Deserialize, Serialize};
 
 use crate::PlacementError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InstanceState {
     Starting,
     Ready,
@@ -16,16 +18,40 @@ pub enum InstanceState {
     Dead,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceRecord {
     pub service_kind: ServiceKind,
     pub instance_id: InstanceId,
+    #[serde(with = "uri_serde")]
     pub advertised_endpoint: Uri,
+    #[serde(with = "uri_serde")]
     pub control_endpoint: Uri,
     pub version: String,
     pub state: InstanceState,
     pub capacity: InstanceCapacity,
     pub labels: BTreeMap<String, String>,
+}
+
+mod uri_serde {
+    use std::str::FromStr;
+
+    use http::Uri;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Uri, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Uri, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Uri::from_str(&value).map_err(serde::de::Error::custom)
+    }
 }
 
 #[async_trait]

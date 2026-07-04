@@ -22,6 +22,7 @@ repository = "https://github.com/realm-labs/lattice"
 [workspace.dependencies]
 async-trait = "0.1.89"
 axum = "0.8.9"
+etcd-client = "0.19.0"
 http = "1.4.2"
 lattice-config = { path = "crates/lattice-config" }
 lattice-core = { path = "crates/lattice-core" }

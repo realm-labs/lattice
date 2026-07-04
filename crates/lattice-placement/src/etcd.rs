@@ -3,6 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use etcd_client::{
+    Client, Compare, CompareOp, EventType, GetOptions, PutOptions, Txn, TxnOp, WatchOptions,
+};
 use lattice_core::{ActorId, InstanceId, ServiceKind};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -27,10 +30,27 @@ impl<C> EtcdPlacementStore<C> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EtcdPlacementStoreConfig {
     pub key_prefix: String,
+    pub endpoints: Vec<String>,
+    pub activation_lock_ttl_secs: i64,
+}
+
+impl EtcdPlacementStore<RealEtcdClient> {
+    pub async fn connect(config: EtcdPlacementStoreConfig) -> Result<Self, PlacementError> {
+        let client = RealEtcdClient::connect(
+            config.endpoints,
+            ActivationLockTtl::new(config.activation_lock_ttl_secs),
+        )
+        .await?;
+        Ok(Self::new(PlacementPrefix::new(config.key_prefix), client))
+    }
+
+    pub async fn from_config(config: EtcdPlacementStoreConfig) -> Result<Self, PlacementError> {
+        Self::connect(config).await
+    }
 }
 
 impl EtcdPlacementStore<InMemoryEtcdClient> {
-    pub fn from_config(config: EtcdPlacementStoreConfig) -> Self {
+    pub fn in_memory_from_config(config: EtcdPlacementStoreConfig) -> Self {
         Self::new(
             PlacementPrefix::new(config.key_prefix),
             InMemoryEtcdClient::new(),
@@ -207,7 +227,7 @@ pub trait EtcdKv: Clone + Send + Sync + 'static {
     async fn watch_prefix(&self, prefix: &str) -> Result<EtcdWatch, PlacementError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EtcdValue {
     Instance(Box<InstanceRecord>),
     Actor(Box<ActorPlacementRecord>),
@@ -237,6 +257,171 @@ impl EtcdWatch {
                 }
             }
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct RealEtcdClient {
+    client: Client,
+    activation_lock_ttl: ActivationLockTtl,
+}
+
+impl RealEtcdClient {
+    pub async fn connect(
+        endpoints: Vec<String>,
+        activation_lock_ttl: ActivationLockTtl,
+    ) -> Result<Self, PlacementError> {
+        let client = Client::connect(endpoints, None).await.map_err(etcd_error)?;
+        Ok(Self {
+            client,
+            activation_lock_ttl,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ActivationLockTtl(i64);
+
+impl ActivationLockTtl {
+    const DEFAULT_SECS: i64 = 30;
+
+    pub fn new(seconds: i64) -> Self {
+        if seconds > 0 {
+            Self(seconds)
+        } else {
+            Self(Self::DEFAULT_SECS)
+        }
+    }
+
+    fn as_secs(self) -> i64 {
+        self.0
+    }
+}
+
+#[async_trait]
+impl EtcdKv for RealEtcdClient {
+    async fn put(&self, key: String, value: EtcdValue) -> Result<(), PlacementError> {
+        let mut client = self.client.clone();
+        client
+            .put(key, encode_etcd_value(&value)?, put_options_for(&value)?)
+            .await
+            .map_err(etcd_error)?;
+        Ok(())
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+    ) -> Result<Option<(PlacementVersion, EtcdValue)>, PlacementError> {
+        let mut client = self.client.clone();
+        let response = client.get(key, None).await.map_err(etcd_error)?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        Ok(Some((
+            placement_version(kv.version())?,
+            decode_etcd_value(kv.value())?,
+        )))
+    }
+
+    async fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, PlacementVersion, EtcdValue)>, PlacementError> {
+        let mut client = self.client.clone();
+        let response = client
+            .get(prefix, Some(GetOptions::new().with_prefix()))
+            .await
+            .map_err(etcd_error)?;
+        response
+            .kvs()
+            .iter()
+            .map(|kv| {
+                Ok((
+                    String::from_utf8(kv.key().to_vec()).map_err(codec_error)?,
+                    placement_version(kv.version())?,
+                    decode_etcd_value(kv.value())?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn compare_and_put(
+        &self,
+        key: String,
+        expected: Option<PlacementVersion>,
+        value: EtcdValue,
+    ) -> Result<PlacementVersion, PlacementError> {
+        let expected_version = expected.map_or(0, |version| version.0 as i64);
+        let bytes = encode_etcd_value(&value)?;
+        let put_options = put_options_for(&value)?;
+        let txn = Txn::new()
+            .when(vec![Compare::version(
+                key.as_bytes(),
+                CompareOp::Equal,
+                expected_version,
+            )])
+            .and_then(vec![TxnOp::put(key.clone(), bytes, put_options)]);
+        let mut client = self.client.clone();
+        let response = client.txn(txn).await.map_err(etcd_error)?;
+        if !response.succeeded() {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        self.get(&key)
+            .await?
+            .map(|(version, _)| version)
+            .ok_or_else(|| PlacementError::Etcd {
+                message: format!("compare-and-put succeeded but key {key} was not readable"),
+            })
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), PlacementError> {
+        let mut client = self.client.clone();
+        client.delete(key, None).await.map_err(etcd_error)?;
+        Ok(())
+    }
+
+    async fn next_lease_id(&self) -> Result<LeaseId, PlacementError> {
+        let mut client = self.client.clone();
+        let response = client
+            .lease_grant(self.activation_lock_ttl.as_secs(), None)
+            .await
+            .map_err(etcd_error)?;
+        lease_id(response.id())
+    }
+
+    async fn watch_prefix(&self, prefix: &str) -> Result<EtcdWatch, PlacementError> {
+        let mut client = self.client.clone();
+        let mut stream = client
+            .watch(prefix, Some(WatchOptions::new().with_prefix()))
+            .await
+            .map_err(etcd_error)?;
+        let (tx, rx) = broadcast::channel(128);
+        tokio::spawn(async move {
+            while let Ok(Some(response)) = stream.message().await {
+                for event in response.events() {
+                    let Some(kv) = event.kv() else {
+                        continue;
+                    };
+                    let Ok(key) = String::from_utf8(kv.key().to_vec()) else {
+                        continue;
+                    };
+                    let Ok(version) = placement_version(kv.version()) else {
+                        continue;
+                    };
+                    let value = match event.event_type() {
+                        EventType::Put => decode_etcd_value(kv.value()).ok(),
+                        EventType::Delete => None,
+                    };
+                    let _ = tx.send(EtcdWatchEvent {
+                        key,
+                        version,
+                        value,
+                    });
+                }
+            }
+        });
+        Ok(EtcdWatch { rx })
     }
 }
 
@@ -390,6 +575,46 @@ fn clean_prefix(prefix: &PlacementPrefix) -> &str {
     prefix.as_str().trim_end_matches('/')
 }
 
+fn encode_etcd_value(value: &EtcdValue) -> Result<Vec<u8>, PlacementError> {
+    serde_json::to_vec(value).map_err(codec_error)
+}
+
+fn decode_etcd_value(bytes: &[u8]) -> Result<EtcdValue, PlacementError> {
+    serde_json::from_slice(bytes).map_err(codec_error)
+}
+
+fn put_options_for(value: &EtcdValue) -> Result<Option<PutOptions>, PlacementError> {
+    match value {
+        EtcdValue::ActivationLock(lease_id) => {
+            let lease_id = i64::try_from(lease_id.0).map_err(codec_error)?;
+            Ok(Some(PutOptions::new().with_lease(lease_id)))
+        }
+        EtcdValue::Instance(_) | EtcdValue::Actor(_) => Ok(None),
+    }
+}
+
+fn placement_version(version: i64) -> Result<PlacementVersion, PlacementError> {
+    let version = u64::try_from(version).map_err(codec_error)?;
+    Ok(PlacementVersion(version))
+}
+
+fn lease_id(id: i64) -> Result<LeaseId, PlacementError> {
+    let id = u64::try_from(id).map_err(codec_error)?;
+    Ok(LeaseId(id))
+}
+
+fn etcd_error(error: etcd_client::Error) -> PlacementError {
+    PlacementError::Etcd {
+        message: error.to_string(),
+    }
+}
+
+fn codec_error(error: impl std::fmt::Display) -> PlacementError {
+    PlacementError::PlacementCodec {
+        message: error.to_string(),
+    }
+}
+
 fn instance_key(
     prefix: &PlacementPrefix,
     service_kind: &ServiceKind,
@@ -533,11 +758,27 @@ mod tests {
 
     #[test]
     fn etcd_store_builds_from_config() {
-        let store = EtcdPlacementStore::from_config(EtcdPlacementStoreConfig {
+        let store = EtcdPlacementStore::in_memory_from_config(EtcdPlacementStoreConfig {
             key_prefix: "/lattice/test".to_string(),
+            endpoints: vec!["http://127.0.0.1:2379".to_string()],
+            activation_lock_ttl_secs: 30,
         });
 
         assert_eq!(store.prefix().as_str(), "/lattice/test");
+    }
+
+    #[test]
+    fn etcd_value_codec_round_trips_placement_metadata() {
+        let instance =
+            EtcdValue::Instance(Box::new(instance_record("world-a", InstanceState::Ready)));
+        let actor = EtcdValue::Actor(Box::new(actor_record(7, "world-a", 3, LeaseId(5))));
+        let lock = EtcdValue::ActivationLock(LeaseId(42));
+
+        for value in [instance, actor, lock] {
+            let encoded = encode_etcd_value(&value).unwrap();
+            let decoded = decode_etcd_value(&encoded).unwrap();
+            assert_eq!(decoded, value);
+        }
     }
 
     fn actor_key_for(actor_id: u64) -> ActorPlacementKey {

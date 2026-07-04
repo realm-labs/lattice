@@ -526,6 +526,10 @@ pub enum PlacementError {
     SingletonLockHeld,
     #[error("placement watch closed")]
     PlacementWatchClosed,
+    #[error("etcd placement store error: {message}")]
+    Etcd { message: String },
+    #[error("placement codec error: {message}")]
+    PlacementCodec { message: String },
 }
 
 #[cfg(test)]

@@ -7,11 +7,13 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+etcd-client.workspace = true
 http.workspace = true
 lattice-core.workspace = true
 lattice-rpc.workspace = true
 prost.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
