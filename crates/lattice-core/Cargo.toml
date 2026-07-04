@@ -1,0 +1,12 @@
+[package]
+name = "lattice-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+http.workspace = true
+lattice-config.workspace = true
+serde.workspace = true
+thiserror.workspace = true

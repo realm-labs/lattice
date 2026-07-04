@@ -1,6 +1,6 @@
 use tokio::sync::mpsc;
 
-use crate::actor::mailbox::{ActorCommand, MailboxConfig};
+use crate::mailbox::{ActorCommand, MailboxConfig};
 use crate::{Actor, ActorContext, ActorHandle, StopReason};
 
 pub fn spawn_actor<A>(actor: A, mailbox: MailboxConfig) -> ActorHandle<A>

@@ -5,7 +5,7 @@ use tokio::sync::{
     oneshot,
 };
 
-use crate::actor::mailbox::{ActorCommand, EnvelopeMessage, MailboxLane};
+use crate::mailbox::{ActorCommand, EnvelopeMessage, MailboxLane};
 use crate::{Actor, ActorCallError, ActorTellError, Handler, Message, StopReason};
 
 pub struct ActorHandle<A: Actor> {

@@ -1,19 +1,25 @@
-[package]
-name = "lattice"
+[workspace]
+members = [
+    "crates/lattice-actor",
+    "crates/lattice-config",
+    "crates/lattice-core",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/realm-labs/lattice"
 
-[dependencies]
+[workspace.dependencies]
 async-trait = "0.1.89"
 http = "1.4.2"
+lattice-config = { path = "crates/lattice-config" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml = "0.9.34"
-thiserror = "2.0.18"
-tokio = { version = "1.48.0", features = ["macros", "rt", "sync", "time"] }
-toml = "0.9.7"
-
-[dev-dependencies]
 tempfile = "3.23.0"
+thiserror = "2.0.18"
+tokio = { version = "1.48.0", features = ["macros", "rt", "sync"] }
+toml = "0.9.7"

@@ -145,8 +145,8 @@ pub struct InstanceConfig {
 }
 
 impl InstanceConfig {
-    pub fn from_env() -> Result<Self, crate::ConfigError> {
-        crate::ConfigSource::env("LATTICE")
+    pub fn from_env() -> Result<Self, lattice_config::ConfigError> {
+        lattice_config::ConfigSource::env("LATTICE")
             .load()?
             .section("instance")
     }
@@ -182,10 +182,23 @@ mod uri_serde {
     }
 }
 
+#[macro_export]
+macro_rules! actor_kind {
+    ($name:literal) => {
+        $crate::ActorKind::from_static($name)
+    };
+}
+
+#[macro_export]
+macro_rules! service_kind {
+    ($name:literal) => {
+        $crate::ServiceKind::from_static($name)
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{actor_kind, service_kind};
 
     const WORLD_SERVICE: ServiceKind = service_kind!("World");
     const WORLD_ACTOR: ActorKind = actor_kind!("World");
