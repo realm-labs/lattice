@@ -3,6 +3,7 @@ mod error;
 mod handle;
 mod mailbox;
 mod registry;
+mod remote_watch;
 mod runtime;
 mod traits;
 mod watch;
@@ -17,6 +18,7 @@ pub use mailbox::MailboxConfig;
 pub use registry::{
     ActorCreateContext, ActorFactory, ActorLoader, ActorRegistry, ActorRegistryConfig,
 };
+pub use remote_watch::{CrossNodeWatchRegistry, RemoteActorRef, RemoteWatchEvent};
 pub use runtime::{
     ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorScheduler, ActorSpawnOptions,
     PassivationPolicy, spawn_actor,
