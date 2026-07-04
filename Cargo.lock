@@ -420,6 +420,7 @@ dependencies = [
  "async-trait",
  "axum",
  "lattice-core",
+ "lattice-eventbus",
  "lattice-placement",
  "serde",
  "serde_json",

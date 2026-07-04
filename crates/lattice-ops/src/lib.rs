@@ -15,10 +15,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 mod config_store;
+mod shutdown;
 
 pub use config_store::{
     ConfigStore, ConfigWatch, EtcdConfigStore, EtcdConfigStoreConfig, InMemoryEtcdConfigClient,
     LocalConfigStore,
+};
+pub use shutdown::{
+    GracefulShutdown, GracefulShutdownReport, InMemoryShutdownLeaseController, LeaseEvent,
+    ShutdownLeaseController, ShutdownStage, ShutdownTrigger,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -568,9 +573,12 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use lattice_core::{ActorId, Epoch, InstanceCapacity, actor_kind, service_kind};
+    use lattice_eventbus::{
+        EventBus, EventEnvelope, EventId, EventSubscription, LocalEventBus, Subject, SubjectFilter,
+    };
     use lattice_placement::{
-        ActorPlacementRecord, InMemoryPlacementStore, InstanceState, LeaseId, PlacementPrefix,
-        PlacementState, PlacementStore,
+        ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, InstanceState, LeaseId,
+        NoopLogicControl, PlacementCoordinator, PlacementPrefix, PlacementState, PlacementStore,
     };
     use serde_json::json;
 
@@ -597,6 +605,116 @@ mod tests {
 
         assert!(after_shutdown > 0);
         assert_eq!(ticks.load(Ordering::SeqCst), after_shutdown);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_before_releasing_lease_and_cancels_runtime_work() {
+        let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+        store
+            .upsert_instance(instance_record("world-a"))
+            .await
+            .unwrap();
+        store
+            .upsert_instance(instance_record("world-b"))
+            .await
+            .unwrap();
+        let actor_key = ActorPlacementKey {
+            actor_kind: actor_kind!("World"),
+            actor_id: ActorId::U64(7),
+        };
+        store
+            .compare_and_put_actor(
+                actor_key.clone(),
+                None,
+                ActorPlacementRecord {
+                    actor_kind: actor_kind!("World"),
+                    actor_id: ActorId::U64(7),
+                    owner: InstanceId::new("world-a"),
+                    epoch: Epoch(1),
+                    lease_id: LeaseId(1),
+                    state: PlacementState::Running,
+                },
+            )
+            .await
+            .unwrap();
+        let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+        let scheduler = ServiceScheduler::new();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticks_clone = ticks.clone();
+        scheduler
+            .interval(Duration::from_millis(5), move || {
+                let ticks = ticks_clone.clone();
+                async move {
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        let bus = LocalEventBus::new();
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let deliveries_clone = deliveries.clone();
+        let subscription = bus
+            .subscribe(
+                EventSubscription::local(SubjectFilter::new("system.shutdown.*")),
+                move |_event| {
+                    let deliveries = deliveries_clone.clone();
+                    async move {
+                        deliveries.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        let lease_controller = InMemoryShutdownLeaseController::default();
+        let shutdown = GracefulShutdown::new(
+            service_kind!("World"),
+            InstanceId::new("world-a"),
+            coordinator,
+            lease_controller.clone(),
+            scheduler,
+        );
+        shutdown.own_subscription(subscription).await;
+
+        let report = shutdown
+            .shutdown(ShutdownTrigger::KubernetesPreStop)
+            .await
+            .unwrap();
+        let migrated = store.get_actor(&actor_key).await.unwrap().unwrap().1;
+        let drained = store
+            .get_instance(&InstanceId::new("world-a"))
+            .await
+            .unwrap()
+            .unwrap();
+        let ticks_after_shutdown = ticks.load(Ordering::SeqCst);
+        bus.publish(test_event("system.shutdown.done"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(!shutdown.is_ready());
+        assert_eq!(
+            report.stages,
+            vec![
+                ShutdownStage::ReadinessFalse,
+                ShutdownStage::LeaseKeptAlive,
+                ShutdownStage::SubscriptionsCancelled,
+                ShutdownStage::Drained,
+                ShutdownStage::SchedulerStopped,
+                ShutdownStage::LeaseReleased,
+            ]
+        );
+        assert_eq!(report.drain.migrated_actors, 1);
+        assert_eq!(migrated.owner, InstanceId::new("world-b"));
+        assert_eq!(drained.state, InstanceState::Draining);
+        assert_eq!(deliveries.load(Ordering::SeqCst), 0);
+        assert_eq!(ticks.load(Ordering::SeqCst), ticks_after_shutdown);
+        assert_eq!(
+            lease_controller.events().await,
+            vec![
+                LeaseEvent::KeepAlive(InstanceId::new("world-a")),
+                LeaseEvent::Release(InstanceId::new("world-a")),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -739,6 +857,22 @@ mod tests {
             state: InstanceState::Ready,
             capacity: InstanceCapacity::default(),
             labels: BTreeMap::new(),
+        }
+    }
+
+    fn test_event(subject: &str) -> EventEnvelope {
+        EventEnvelope {
+            event_id: EventId::new("event-1"),
+            subject: Subject::new(subject),
+            event_type: "ShutdownEvent".to_string(),
+            source_service: service_kind!("World"),
+            source_instance: InstanceId::new("world-a"),
+            actor_kind: None,
+            actor_id: None,
+            request_id: None,
+            trace: TraceContext::default(),
+            occurred_unix_ms: 1,
+            payload: Vec::new(),
         }
     }
 

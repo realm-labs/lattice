@@ -9,6 +9,7 @@ repository.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 lattice-core.workspace = true
+lattice-eventbus.workspace = true
 lattice-placement.workspace = true
 serde.workspace = true
 serde_json.workspace = true
