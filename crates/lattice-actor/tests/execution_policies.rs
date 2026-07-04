@@ -15,6 +15,12 @@ impl Message for Ping {
     type Reply = String;
 }
 
+struct CurrentThread;
+
+impl Message for CurrentThread {
+    type Reply = String;
+}
+
 struct TestActor {
     events: Arc<Mutex<Vec<&'static str>>>,
 }
@@ -34,6 +40,17 @@ impl Handler<Ping> for TestActor {
     }
 }
 
+#[async_trait]
+impl Handler<CurrentThread> for TestActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _msg: CurrentThread,
+    ) -> Result<String, ActorError> {
+        Ok(format!("{:?}", std::thread::current().id()))
+    }
+}
+
 #[tokio::test]
 async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
     let runtime = ActorRuntime::default();
@@ -46,6 +63,7 @@ async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
                 execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 2 }),
+                scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
             },
         )
@@ -70,6 +88,7 @@ async fn shard_worker_execution_policy_runs_actor_with_same_mailbox_semantics() 
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
                 execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 4 }),
+                scheduler_key: Some(ActorId::U64(42)),
                 passivation: PassivationPolicy::Disabled,
             },
         )
@@ -93,6 +112,7 @@ async fn execution_policies_reject_zero_workers() {
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
                 execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 0 }),
+                scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
             },
         )
@@ -105,6 +125,7 @@ async fn execution_policies_reject_zero_workers() {
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
                 execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 0 }),
+                scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
             },
         )
@@ -118,6 +139,82 @@ async fn execution_policies_reject_zero_workers() {
         dedicated,
         Err(ActorSpawnError::InvalidExecutionPolicy { .. })
     ));
+}
+
+#[tokio::test]
+async fn dedicated_thread_pool_reuses_configured_worker_threads() {
+    let runtime = ActorRuntime::default();
+    let first = runtime
+        .spawn_actor(
+            TestActor {
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            ActorSpawnOptions {
+                mailbox: MailboxConfig::bounded(8),
+                execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
+                scheduler_key: None,
+                passivation: PassivationPolicy::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+    let second = runtime
+        .spawn_actor(
+            TestActor {
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            ActorSpawnOptions {
+                mailbox: MailboxConfig::bounded(8),
+                execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
+                scheduler_key: None,
+                passivation: PassivationPolicy::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        first.call(CurrentThread).await.unwrap(),
+        second.call(CurrentThread).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn shard_worker_uses_scheduler_key_for_worker_affinity() {
+    let runtime = ActorRuntime::default();
+    let first = runtime
+        .spawn_actor(
+            TestActor {
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            ActorSpawnOptions {
+                mailbox: MailboxConfig::bounded(8),
+                execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 2 }),
+                scheduler_key: Some(ActorId::Str("same-key".to_string())),
+                passivation: PassivationPolicy::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+    let second = runtime
+        .spawn_actor(
+            TestActor {
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            ActorSpawnOptions {
+                mailbox: MailboxConfig::bounded(8),
+                execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 2 }),
+                scheduler_key: Some(ActorId::Str("same-key".to_string())),
+                passivation: PassivationPolicy::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        first.call(CurrentThread).await.unwrap(),
+        second.call(CurrentThread).await.unwrap()
+    );
 }
 
 #[test]

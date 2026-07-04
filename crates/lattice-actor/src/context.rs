@@ -1,9 +1,11 @@
+use std::any::type_name;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 use crate::ChildSupervision;
 use crate::{
@@ -47,10 +49,20 @@ impl<A: Actor> ActorContext<A> {
         M: Message<Reply = ()>,
     {
         let handle = self.handle.clone();
-        self.spawn_scoped(async move {
-            tokio::time::sleep(delay).await;
-            let _ = handle.try_tell_internal(msg);
-        });
+        let span = tracing::info_span!(
+            "actor.timer",
+            otel.kind = "internal",
+            actor.type = type_name::<A>(),
+            message.type = type_name::<M>(),
+            timer.kind = "after"
+        );
+        self.spawn_scoped(
+            async move {
+                tokio::time::sleep(delay).await;
+                let _ = handle.try_tell_internal(msg);
+            }
+            .instrument(span),
+        );
     }
 
     pub fn notify_interval<M, F>(&mut self, interval: Duration, mut make_msg: F)
@@ -60,15 +72,25 @@ impl<A: Actor> ActorContext<A> {
         F: FnMut() -> M + Send + 'static,
     {
         let handle = self.handle.clone();
-        self.spawn_scoped(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                if handle.try_tell_internal(make_msg()).is_err() {
-                    break;
+        let span = tracing::info_span!(
+            "actor.timer",
+            otel.kind = "internal",
+            actor.type = type_name::<A>(),
+            message.type = type_name::<M>(),
+            timer.kind = "interval"
+        );
+        self.spawn_scoped(
+            async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    ticker.tick().await;
+                    if handle.try_tell_internal(make_msg()).is_err() {
+                        break;
+                    }
                 }
             }
-        });
+            .instrument(span),
+        );
     }
 
     pub fn spawn_scoped<F>(&mut self, future: F)
@@ -88,11 +110,21 @@ impl<A: Actor> ActorContext<A> {
 
         let mut terminations = target.subscribe_terminated();
         let self_handle = self.handle.clone();
-        let task = tokio::spawn(async move {
-            if let Ok(notification) = terminations.recv().await {
-                let _ = self_handle.try_tell_internal(notification);
+        let span = tracing::info_span!(
+            "actor.watch",
+            otel.kind = "internal",
+            watcher.type = type_name::<A>(),
+            watched.type = type_name::<B>(),
+            watch.id = ?watch_id
+        );
+        let task = tokio::spawn(
+            async move {
+                if let Ok(notification) = terminations.recv().await {
+                    let _ = self_handle.try_tell_internal(notification);
+                }
             }
-        });
+            .instrument(span),
+        );
         self.watches.insert(watch_id, task);
         Ok(watch_id)
     }
@@ -127,6 +159,14 @@ impl<A: Actor> ActorContext<A> {
             )));
         }
 
+        let span = tracing::info_span!(
+            "actor.child.spawn",
+            otel.kind = "internal",
+            parent.type = type_name::<A>(),
+            child.type = type_name::<C>(),
+            child.key = key.as_str()
+        );
+        let _entered = span.enter();
         let handle = spawn_actor(actor, options.mailbox);
         let slot = Arc::new(ChildSlot::new(handle.clone()));
         self.children
@@ -152,6 +192,14 @@ impl<A: Actor> ActorContext<A> {
             )));
         }
 
+        let span = tracing::info_span!(
+            "actor.child.spawn",
+            otel.kind = "internal",
+            parent.type = type_name::<A>(),
+            child.type = type_name::<C>(),
+            child.key = key.as_str()
+        );
+        let _entered = span.enter();
         let handle = spawn_actor(factory(), options.mailbox);
         let slot = Arc::new(ChildSlot::new(handle.clone()));
         self.children
@@ -162,6 +210,13 @@ impl<A: Actor> ActorContext<A> {
 
     pub fn stop_child(&mut self, key: &ChildActorKey) -> bool {
         if let Some(child) = self.children.remove(key) {
+            let span = tracing::info_span!(
+                "actor.child.stop",
+                otel.kind = "internal",
+                parent.type = type_name::<A>(),
+                child.key = key.as_str()
+            );
+            let _entered = span.enter();
             child.stop(StopReason::Requested);
             true
         } else {

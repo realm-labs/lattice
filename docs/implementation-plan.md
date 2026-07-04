@@ -104,7 +104,7 @@ InstanceId / InstanceConfig
 ConfigSource / ConfigFormat / BootstrapConfig
 lattice-actor Actor / Message / Handler<M>
 ActorRuntime / ActorScheduler abstraction
-ActorExecutionPolicy with TaskPerActor as the only Phase 1 implementation
+ActorExecutionPolicy API with TaskPerActor as the Phase 1 default
 ActorRuntimeConfig / ActorSpawnOptions API
 ActorHandle.call/tell
 type-erased Envelope
@@ -131,7 +131,7 @@ BootstrapConfig supports TOML/YAML/JSON/env/composite sources.
 Actor execution is spawned and managed through lattice ActorRuntime, even if the backing executor is the process Tokio runtime.
 Tokio runtime is not exposed as the actor scheduling model.
 TaskPerActor is the default Phase 1 execution policy and is selected through ActorRuntimeConfig / ActorSpawnOptions.
-Unsupported execution policies return explicit errors instead of silently falling back.
+Invalid execution policy configuration returns explicit errors instead of silently falling back.
 ActorHandle does not expose or depend on Tokio JoinHandle.
 Mailbox and Handler<M> semantics are independent from execution policy.
 Local timer can drive WorldTick.
@@ -157,7 +157,7 @@ actor_kind/service_kind const macro tests
 bootstrap config format/merge/env override tests
 ActorRuntime spawn policy test
 ActorExecutionPolicy default TaskPerActor test
-unsupported execution policy returns explicit error test
+invalid execution policy returns explicit error test
 ActorHandle does not expose JoinHandle compile test
 ActorHandle call/tell
 system mailbox priority
@@ -282,7 +282,7 @@ Acceptance:
 ```text
 actor_id routes to a shard owner.
 ShardWorker execution policy can run multiple lightweight actors on a bounded worker set.
-ShardWorker maps actor identity deterministically to a worker.
+ShardWorker maps actor identity deterministically to a worker through ActorSpawnOptions::scheduler_key.
 ShardWorker preserves the same mailbox and Handler<M> semantics as TaskPerActor.
 Target instance lazy-loads actor on registry miss.
 Concurrent lazy activation starts only one local actor.

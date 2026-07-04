@@ -269,6 +269,7 @@ mod tests {
                 ActorSpawnOptions {
                     mailbox: MailboxConfig::bounded(8),
                     execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 2 }),
+                    scheduler_key: None,
                     passivation: PassivationPolicy::Disabled,
                 },
             )
@@ -1097,6 +1098,7 @@ mod tests {
                 ActorSpawnOptions {
                     mailbox: MailboxConfig::bounded(8),
                     execution: None,
+                    scheduler_key: None,
                     passivation: PassivationPolicy::IdleTimeout(std::time::Duration::from_millis(
                         10,
                     )),

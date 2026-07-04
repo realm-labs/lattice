@@ -10,3 +10,4 @@ async-trait.workspace = true
 lattice-core.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true

@@ -166,7 +166,6 @@ impl<A: Actor> ActorHandle<A> {
     ) -> Result<(), ActorCallError> {
         let result = match lane {
             MailboxLane::Normal => self.normal_tx.try_send(command),
-            #[cfg(test)]
             MailboxLane::System => self.system_tx.try_send(command),
         };
 

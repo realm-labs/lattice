@@ -76,4 +76,6 @@ pub enum ActorSpawnError {
     UnsupportedExecutionPolicy { policy: crate::ActorExecutionPolicy },
     #[error("invalid actor execution policy: {reason}")]
     InvalidExecutionPolicy { reason: &'static str },
+    #[error("actor executor failed to start: {reason}")]
+    ExecutorStartFailed { reason: &'static str },
 }

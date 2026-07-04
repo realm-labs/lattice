@@ -1,10 +1,17 @@
+use std::any::type_name;
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, oneshot, watch};
+use tracing::Instrument;
 
-use crate::mailbox::{ActorCommand, MailboxConfig};
+use crate::mailbox::{ActorCommand, MailboxConfig, MailboxLane};
 use crate::{
     Actor, ActorContext, ActorHandle, ActorIncarnation, ActorLifecycleState, ActorTerminated,
     LocalActorRef, PassivationReason, StopReason, TerminatedReason,
@@ -33,10 +40,11 @@ impl Default for ActorRuntimeConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ActorSpawnOptions {
     pub mailbox: MailboxConfig,
     pub execution: Option<ActorExecutionPolicy>,
+    pub scheduler_key: Option<ActorId>,
     pub passivation: PassivationPolicy,
 }
 
@@ -57,7 +65,7 @@ impl ActorRuntime {
     pub fn new(config: ActorRuntimeConfig) -> Self {
         Self {
             config,
-            scheduler: ActorScheduler,
+            scheduler: ActorScheduler::default(),
         }
     }
 
@@ -95,8 +103,30 @@ impl Default for ActorRuntime {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ActorScheduler;
+#[derive(Clone)]
+pub struct ActorScheduler {
+    pools: Arc<SchedulerPools>,
+}
+
+impl std::fmt::Debug for ActorScheduler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorScheduler").finish_non_exhaustive()
+    }
+}
+
+impl Default for ActorScheduler {
+    fn default() -> Self {
+        Self {
+            pools: Arc::new(SchedulerPools::default()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SchedulerPools {
+    shard_workers: Mutex<HashMap<usize, Arc<ActorWorkerPool>>>,
+    dedicated_workers: Mutex<HashMap<usize, Arc<ActorWorkerPool>>>,
+}
 
 impl ActorScheduler {
     pub fn shard_worker_index(
@@ -128,7 +158,7 @@ impl ActorScheduler {
                         reason: "ShardWorker worker_count must be greater than zero",
                     });
                 }
-                Ok(spawn_task_per_actor(actor, options))
+                self.spawn_shard_worker_actor(actor, options, worker_count)
             }
             ActorExecutionPolicy::DedicatedThreadPool { worker_count } => {
                 if worker_count == 0 {
@@ -136,9 +166,176 @@ impl ActorScheduler {
                         reason: "DedicatedThreadPool worker_count must be greater than zero",
                     });
                 }
-                Ok(spawn_dedicated_thread_actor(actor, options))
+                self.spawn_dedicated_pool_actor(actor, options, worker_count)
             }
         }
+    }
+
+    fn spawn_shard_worker_actor<A>(
+        &self,
+        actor: A,
+        options: ActorSpawnOptions,
+        worker_count: usize,
+    ) -> Result<ActorHandle<A>, crate::ActorSpawnError>
+    where
+        A: Actor,
+    {
+        let pool = self.worker_pool(WorkerPoolKind::Shard, worker_count)?;
+        let parts = create_actor_parts(options.mailbox);
+        let scheduler_key = options
+            .scheduler_key
+            .unwrap_or_else(|| ActorId::U64(parts.handle.local_ref().id()));
+        let worker_index = Self::shard_worker_index(&scheduler_key, worker_count)?;
+        Ok(spawn_actor_on_pool(
+            actor,
+            parts,
+            options.passivation,
+            &pool,
+            worker_index,
+            "shard_worker",
+        ))
+    }
+
+    fn spawn_dedicated_pool_actor<A>(
+        &self,
+        actor: A,
+        options: ActorSpawnOptions,
+        worker_count: usize,
+    ) -> Result<ActorHandle<A>, crate::ActorSpawnError>
+    where
+        A: Actor,
+    {
+        let pool = self.worker_pool(WorkerPoolKind::Dedicated, worker_count)?;
+        let worker_index = pool.next_worker_index();
+        Ok(spawn_actor_on_pool(
+            actor,
+            create_actor_parts(options.mailbox),
+            options.passivation,
+            &pool,
+            worker_index,
+            "dedicated_thread_pool",
+        ))
+    }
+
+    fn worker_pool(
+        &self,
+        kind: WorkerPoolKind,
+        worker_count: usize,
+    ) -> Result<Arc<ActorWorkerPool>, crate::ActorSpawnError> {
+        let pools = match kind {
+            WorkerPoolKind::Shard => &self.pools.shard_workers,
+            WorkerPoolKind::Dedicated => &self.pools.dedicated_workers,
+        };
+        let mut pools = pools.lock().expect("actor worker pool mutex poisoned");
+        if let Some(pool) = pools.get(&worker_count) {
+            return Ok(pool.clone());
+        }
+
+        let pool = Arc::new(ActorWorkerPool::start(kind, worker_count)?);
+        pools.insert(worker_count, pool.clone());
+        Ok(pool)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WorkerPoolKind {
+    Shard,
+    Dedicated,
+}
+
+impl WorkerPoolKind {
+    fn thread_name(self) -> &'static str {
+        match self {
+            Self::Shard => "lattice-shard-worker",
+            Self::Dedicated => "lattice-dedicated-worker",
+        }
+    }
+}
+
+struct ActorWorkerPool {
+    workers: Vec<ActorWorker>,
+    next_worker: AtomicU64,
+}
+
+impl ActorWorkerPool {
+    fn start(kind: WorkerPoolKind, worker_count: usize) -> Result<Self, crate::ActorSpawnError> {
+        let mut workers = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            workers.push(ActorWorker::start(kind, worker_index)?);
+        }
+        Ok(Self {
+            workers,
+            next_worker: AtomicU64::new(0),
+        })
+    }
+
+    fn spawn<F>(&self, worker_index: usize, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.workers[worker_index].handle.spawn(future);
+    }
+
+    fn next_worker_index(&self) -> usize {
+        (self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len() as u64) as usize
+    }
+}
+
+impl Drop for ActorWorkerPool {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            if let Some(shutdown_tx) = worker.shutdown_tx.take() {
+                let _ = shutdown_tx.send(());
+            }
+        }
+        for worker in &mut self.workers {
+            if let Some(join_handle) = worker.join_handle.take()
+                && join_handle.thread().id() != std::thread::current().id()
+            {
+                let _ = join_handle.join();
+            }
+        }
+    }
+}
+
+struct ActorWorker {
+    handle: tokio::runtime::Handle,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl ActorWorker {
+    fn start(kind: WorkerPoolKind, worker_index: usize) -> Result<Self, crate::ActorSpawnError> {
+        let (handle_tx, handle_rx) = std_mpsc::sync_channel(1);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let thread_name = format!("{}-{}", kind.thread_name(), worker_index);
+        let join_handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("actor worker runtime should build");
+                let handle = runtime.handle().clone();
+                let _ = handle_tx.send(handle);
+                runtime.block_on(async {
+                    let _ = shutdown_rx.await;
+                });
+            })
+            .map_err(|_| crate::ActorSpawnError::ExecutorStartFailed {
+                reason: "failed to spawn actor worker thread",
+            })?;
+        let handle = handle_rx
+            .recv()
+            .map_err(|_| crate::ActorSpawnError::ExecutorStartFailed {
+                reason: "actor worker runtime stopped before publishing its handle",
+            })?;
+
+        Ok(Self {
+            handle,
+            shutdown_tx: Some(shutdown_tx),
+            join_handle: Some(join_handle),
+        })
     }
 }
 
@@ -182,6 +379,7 @@ where
             ActorSpawnOptions {
                 mailbox,
                 execution: Some(ActorExecutionPolicy::TaskPerActor),
+                scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
             },
         )
@@ -192,7 +390,20 @@ fn spawn_task_per_actor<A>(actor: A, options: ActorSpawnOptions) -> ActorHandle<
 where
     A: Actor,
 {
-    let mailbox = options.mailbox;
+    let parts = create_actor_parts(options.mailbox);
+    spawn_actor_as_tokio_task(actor, parts, options.passivation, "task_per_actor")
+}
+
+struct ActorRuntimeParts<A: Actor> {
+    handle: ActorHandle<A>,
+    normal_rx: mpsc::Receiver<ActorCommand<A>>,
+    system_rx: mpsc::Receiver<ActorCommand<A>>,
+}
+
+fn create_actor_parts<A>(mailbox: MailboxConfig) -> ActorRuntimeParts<A>
+where
+    A: Actor,
+{
     let (normal_tx, normal_rx) = mpsc::channel(mailbox.normal_capacity());
     let (system_tx, system_rx) = mpsc::channel(mailbox.system_capacity());
     let local_ref = LocalActorRef::new(NEXT_LOCAL_ACTOR_ID.fetch_add(1, Ordering::Relaxed));
@@ -200,46 +411,75 @@ where
     let (lifecycle_tx, _lifecycle_rx) = watch::channel(ActorLifecycleState::Empty);
     let handle = ActorHandle::new(local_ref, terminated_tx, lifecycle_tx, normal_tx, system_tx);
 
-    tokio::spawn(run_actor(
-        actor,
-        handle.clone(),
+    ActorRuntimeParts {
+        handle,
         normal_rx,
         system_rx,
-        options.passivation,
-    ));
+    }
+}
+
+fn spawn_actor_as_tokio_task<A>(
+    actor: A,
+    parts: ActorRuntimeParts<A>,
+    passivation: PassivationPolicy,
+    execution_policy: &'static str,
+) -> ActorHandle<A>
+where
+    A: Actor,
+{
+    let handle = parts.handle;
+    let span = tracing::info_span!(
+        "actor.spawn",
+        otel.kind = "internal",
+        actor.type = type_name::<A>(),
+        actor.local_ref = handle.local_ref().id(),
+        execution.policy = execution_policy
+    );
+    tokio::spawn(
+        run_actor(
+            actor,
+            handle.clone(),
+            parts.normal_rx,
+            parts.system_rx,
+            passivation,
+        )
+        .instrument(span),
+    );
 
     handle
 }
 
-fn spawn_dedicated_thread_actor<A>(actor: A, options: ActorSpawnOptions) -> ActorHandle<A>
+fn spawn_actor_on_pool<A>(
+    actor: A,
+    parts: ActorRuntimeParts<A>,
+    passivation: PassivationPolicy,
+    pool: &ActorWorkerPool,
+    worker_index: usize,
+    execution_policy: &'static str,
+) -> ActorHandle<A>
 where
     A: Actor,
 {
-    let mailbox = options.mailbox;
-    let (normal_tx, normal_rx) = mpsc::channel(mailbox.normal_capacity());
-    let (system_tx, system_rx) = mpsc::channel(mailbox.system_capacity());
-    let local_ref = LocalActorRef::new(NEXT_LOCAL_ACTOR_ID.fetch_add(1, Ordering::Relaxed));
-    let (terminated_tx, _terminated_rx) = broadcast::channel(16);
-    let (lifecycle_tx, _lifecycle_rx) = watch::channel(ActorLifecycleState::Empty);
-    let handle = ActorHandle::new(local_ref, terminated_tx, lifecycle_tx, normal_tx, system_tx);
-    let actor_handle = handle.clone();
-
-    std::thread::Builder::new()
-        .name("lattice-dedicated-actor".to_string())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .expect("dedicated actor runtime should build");
-            runtime.block_on(run_actor(
-                actor,
-                actor_handle,
-                normal_rx,
-                system_rx,
-                options.passivation,
-            ));
-        })
-        .expect("dedicated actor thread should spawn");
+    let handle = parts.handle;
+    let span = tracing::info_span!(
+        "actor.spawn",
+        otel.kind = "internal",
+        actor.type = type_name::<A>(),
+        actor.local_ref = handle.local_ref().id(),
+        execution.policy = execution_policy,
+        execution.worker = worker_index
+    );
+    pool.spawn(
+        worker_index,
+        run_actor(
+            actor,
+            handle.clone(),
+            parts.normal_rx,
+            parts.system_rx,
+            passivation,
+        )
+        .instrument(span),
+    );
 
     handle
 }
@@ -255,11 +495,32 @@ async fn run_actor<A>(
 {
     let mut ctx = ActorContext::new(handle.clone());
     let activity_tx = spawn_passivation_monitor(&handle, passivation);
+    let actor_type = type_name::<A>();
+    let local_ref = handle.local_ref().id();
 
-    if actor.started(&mut ctx).await.is_err() {
+    let started_span = tracing::info_span!(
+        "actor.started",
+        otel.kind = "internal",
+        actor.type = actor_type,
+        actor.local_ref = local_ref
+    );
+    if actor
+        .started(&mut ctx)
+        .instrument(started_span)
+        .await
+        .is_err()
+    {
         handle.set_lifecycle_state(ActorLifecycleState::Stopping);
+        let stopping_span = tracing::info_span!(
+            "actor.stopping",
+            otel.kind = "internal",
+            actor.type = actor_type,
+            actor.local_ref = local_ref,
+            stop.reason = ?StopReason::StartFailed
+        );
         if actor
             .stopping(&mut ctx, StopReason::StartFailed)
+            .instrument(stopping_span)
             .await
             .is_err()
         {
@@ -278,6 +539,7 @@ async fn run_actor<A>(
         while let Ok(command) = system_rx.try_recv() {
             if handle_command(
                 command,
+                MailboxLane::System,
                 &mut actor,
                 &mut ctx,
                 &mut stop_reason,
@@ -301,6 +563,7 @@ async fn run_actor<A>(
                     Some(command) => {
                         handle_command(
                             command,
+                            MailboxLane::System,
                             &mut actor,
                             &mut ctx,
                             &mut stop_reason,
@@ -319,6 +582,7 @@ async fn run_actor<A>(
                     Some(command) => {
                         handle_command(
                             command,
+                            MailboxLane::Normal,
                             &mut actor,
                             &mut ctx,
                             &mut stop_reason,
@@ -342,7 +606,19 @@ async fn run_actor<A>(
             ActorLifecycleState::Stopping
         }
     });
-    if actor.stopping(&mut ctx, reason).await.is_err() {
+    let stopping_span = tracing::info_span!(
+        "actor.stopping",
+        otel.kind = "internal",
+        actor.type = actor_type,
+        actor.local_ref = local_ref,
+        stop.reason = ?reason
+    );
+    if actor
+        .stopping(&mut ctx, reason)
+        .instrument(stopping_span)
+        .await
+        .is_err()
+    {
         ctx.cancel_all_tasks();
         ctx.stop_all_children(reason);
         handle.set_lifecycle_state(ActorLifecycleState::StopFailed);
@@ -360,6 +636,7 @@ async fn run_actor<A>(
 
 async fn handle_command<A>(
     command: ActorCommand<A>,
+    lane: MailboxLane,
     actor: &mut A,
     ctx: &mut ActorContext<A>,
     stop_reason: &mut Option<StopReason>,
@@ -370,7 +647,14 @@ where
 {
     match command {
         ActorCommand::Envelope(envelope) => {
-            envelope.handle(actor, ctx).await;
+            let span = tracing::info_span!(
+                "actor.message",
+                otel.kind = "consumer",
+                actor.type = type_name::<A>(),
+                message.type = envelope.message_type(),
+                mailbox.lane = lane.as_str()
+            );
+            envelope.handle(actor, ctx).instrument(span).await;
             record_activity(activity_tx);
             if let Some(requested_reason) = ctx.take_lifecycle_request() {
                 *stop_reason = Some(requested_reason);

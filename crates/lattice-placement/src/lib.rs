@@ -17,6 +17,7 @@ use lattice_rpc::{
     ShardedRpcCore,
 };
 use tonic::{Request, Response};
+use tracing::Instrument;
 
 pub use coordinator::*;
 pub use etcd::*;
@@ -183,43 +184,86 @@ where
     where
         Req: RoutedRequest + RpcRequest,
     {
-        let resolve_request = ResolveRequest {
-            service_kind: self.service_kind.clone(),
-            actor_kind: req.actor_kind(),
-            route_key: req.route_key(),
-        };
-        let key = resolve_request.cache_key();
-        let encoded = req.encode_to_vec();
+        let actor_kind = req.actor_kind();
+        let route_key = req.route_key();
+        let span = tracing::info_span!(
+            "rpc.client",
+            otel.kind = "client",
+            rpc.method = Req::METHOD,
+            service.kind = self.service_kind.as_str(),
+            actor.kind = actor_kind.as_str(),
+            route.key = ?route_key
+        );
 
-        let target = self.resolve_rpc_target(resolve_request.clone()).await?;
-        let ctx = self.context_factory.next_context(target.owner_epoch);
-        match self
-            .send_with_context(target, ctx.clone(), decode_request::<Req>(&encoded)?)
-            .await
-        {
-            Ok(reply) => Ok(reply),
-            Err(RpcError::NotOwner { .. }) => {
-                self.resolver
-                    .invalidate(key, InvalidateReason::NotOwner)
-                    .await;
-                let retry_target = self.resolve_rpc_target(resolve_request).await?;
-                let mut retry_ctx = ctx;
-                retry_ctx.route_epoch = retry_target.owner_epoch;
-                self.send_with_context(retry_target, retry_ctx, decode_request::<Req>(&encoded)?)
+        async {
+            let resolve_request = ResolveRequest {
+                service_kind: self.service_kind.clone(),
+                actor_kind,
+                route_key,
+            };
+            let key = resolve_request.cache_key();
+            let encoded = req.encode_to_vec();
+
+            let target = self.resolve_rpc_target(resolve_request.clone()).await?;
+            let ctx = self.context_factory.next_context(target.owner_epoch);
+            match self
+                .send_with_context(target, ctx.clone(), decode_request::<Req>(&encoded)?)
+                .await
+            {
+                Ok(reply) => Ok(reply),
+                Err(RpcError::NotOwner { .. }) => {
+                    let retry_span = tracing::info_span!(
+                        "rpc.client.retry",
+                        otel.kind = "client",
+                        rpc.method = Req::METHOD,
+                        retry.reason = "not_owner"
+                    );
+                    async {
+                        self.resolver
+                            .invalidate(key, InvalidateReason::NotOwner)
+                            .await;
+                        let retry_target = self.resolve_rpc_target(resolve_request).await?;
+                        let mut retry_ctx = ctx;
+                        retry_ctx.route_epoch = retry_target.owner_epoch;
+                        self.send_with_context(
+                            retry_target,
+                            retry_ctx,
+                            decode_request::<Req>(&encoded)?,
+                        )
+                        .await
+                    }
+                    .instrument(retry_span)
                     .await
-            }
-            Err(RpcError::Fenced { .. }) => {
-                self.resolver
-                    .invalidate(key, InvalidateReason::Fenced)
-                    .await;
-                let retry_target = self.resolve_rpc_target(resolve_request).await?;
-                let mut retry_ctx = ctx;
-                retry_ctx.route_epoch = retry_target.owner_epoch;
-                self.send_with_context(retry_target, retry_ctx, decode_request::<Req>(&encoded)?)
+                }
+                Err(RpcError::Fenced { .. }) => {
+                    let retry_span = tracing::info_span!(
+                        "rpc.client.retry",
+                        otel.kind = "client",
+                        rpc.method = Req::METHOD,
+                        retry.reason = "fenced"
+                    );
+                    async {
+                        self.resolver
+                            .invalidate(key, InvalidateReason::Fenced)
+                            .await;
+                        let retry_target = self.resolve_rpc_target(resolve_request).await?;
+                        let mut retry_ctx = ctx;
+                        retry_ctx.route_epoch = retry_target.owner_epoch;
+                        self.send_with_context(
+                            retry_target,
+                            retry_ctx,
+                            decode_request::<Req>(&encoded)?,
+                        )
+                        .await
+                    }
+                    .instrument(retry_span)
                     .await
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
         }
+        .instrument(span)
+        .await
     }
 }
 
@@ -244,7 +288,16 @@ where
     where
         Req: RoutedRequest + RpcRequest,
     {
-        let endpoint = self.endpoint_pool.get_or_connect(&target);
+        let endpoint = {
+            let span = tracing::info_span!(
+                "endpoint.pool.acquire",
+                otel.kind = "internal",
+                target.instance = target.instance_id.as_str(),
+                target.endpoint = %target.advertised_endpoint
+            );
+            let _entered = span.enter();
+            self.endpoint_pool.get_or_connect(&target)
+        };
         let mut request = Request::new(req);
         ctx.inject_metadata(request.metadata_mut())
             .map_err(|error| RpcError::Business(error.to_string()))?;

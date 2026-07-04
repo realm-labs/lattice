@@ -135,10 +135,11 @@ impl ActorRuntime {
 pub struct ActorSpawnOptions {
     pub mailbox: MailboxConfig,
     pub execution: Option<ActorExecutionPolicy>,
+    pub scheduler_key: Option<ActorId>,
 }
 ```
 
-Phase 1 implements only `TaskPerActor`. The other variants are part of the stable design and may return `UnsupportedExecutionPolicy` only until their planned phase is implemented. A completed lattice implementation must support every `ActorExecutionPolicy` variant listed here.
+All `ActorExecutionPolicy` variants are framework-owned scheduling paths. They must not be aliases for each other.
 
 Final scheduling semantics:
 
@@ -148,12 +149,15 @@ TaskPerActor:
   This is the default for explicit actors, local child actors, and early runtime implementation.
 
 ShardWorker:
-  A fixed worker set owns many actor mailbox loops.
-  Actor identity maps deterministically to a worker.
+  A fixed worker set owns many actor mailbox loops on lattice-managed worker runtimes.
+  Actor identity maps deterministically to a worker through ActorSpawnOptions::scheduler_key.
+  If scheduler_key is not provided, the runtime falls back to the local actor id, which is acceptable only for local helper actors.
   This is intended for virtual-shard actors after Phase 4, where task count and locality matter.
 
 DedicatedThreadPool:
   A named pool for actors that must be isolated from normal Tokio worker threads.
+  A pool worker can run many actor mailbox loops; this is not one OS thread per actor.
+  Actors are assigned across the pool, currently by round-robin.
   This is for blocking-heavy or CPU-heavy actor families only when they cannot offload work elsewhere.
 ```
 
@@ -168,6 +172,7 @@ CPU-heavy or blocking work must not run directly on Tokio worker threads; use a 
 ActorRegistry stores actor ownership independently from the concrete execution policy.
 Mailbox semantics are identical across execution policies.
 Changing execution policy must not change Handler<M> business code.
+Shared/placed actors should pass a stable scheduler_key derived from ActorId when using ShardWorker.
 ```
 
 Forbidden implementation shortcuts:

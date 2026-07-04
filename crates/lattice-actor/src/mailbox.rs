@@ -42,8 +42,16 @@ impl Default for MailboxConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MailboxLane {
     Normal,
-    #[cfg(test)]
     System,
+}
+
+impl MailboxLane {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::System => "system",
+        }
+    }
 }
 
 pub(crate) enum ActorCommand<A: Actor> {
@@ -53,6 +61,8 @@ pub(crate) enum ActorCommand<A: Actor> {
 
 #[async_trait]
 pub(crate) trait ActorEnvelope<A: Actor>: Send {
+    fn message_type(&self) -> &'static str;
+
     async fn handle(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>);
 }
 
@@ -73,6 +83,10 @@ where
     A: Handler<M>,
     M: Message,
 {
+    fn message_type(&self) -> &'static str {
+        std::any::type_name::<M>()
+    }
+
     async fn handle(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>) {
         let result = actor
             .handle(ctx, self.msg)
