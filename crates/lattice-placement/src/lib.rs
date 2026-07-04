@@ -1,5 +1,6 @@
 mod coordinator;
 mod instance;
+mod singleton;
 mod store;
 mod vshard;
 
@@ -18,6 +19,7 @@ use tonic::{Request, Response};
 
 pub use coordinator::*;
 pub use instance::*;
+pub use singleton::*;
 pub use store::*;
 pub use vshard::*;
 
@@ -518,6 +520,8 @@ pub enum PlacementError {
     CompareAndPutFailed,
     #[error("activation lock is already held for actor")]
     ActivationLockHeld,
+    #[error("singleton activation lock is already held")]
+    SingletonLockHeld,
 }
 
 #[cfg(test)]
