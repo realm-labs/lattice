@@ -359,6 +359,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-gateway"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "lattice-core",
+ "lattice-rpc",
+ "prost",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "lattice-rpc"
 version = "0.1.0"
 dependencies = [
