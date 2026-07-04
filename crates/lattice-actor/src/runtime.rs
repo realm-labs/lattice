@@ -11,22 +11,24 @@ where
     let (system_tx, system_rx) = mpsc::channel(mailbox.system_capacity());
     let handle = ActorHandle::new(normal_tx, system_tx);
 
-    tokio::spawn(run_actor(actor, normal_rx, system_rx));
+    tokio::spawn(run_actor(actor, handle.clone(), normal_rx, system_rx));
 
     handle
 }
 
 async fn run_actor<A>(
     mut actor: A,
+    handle: ActorHandle<A>,
     mut normal_rx: mpsc::Receiver<ActorCommand<A>>,
     mut system_rx: mpsc::Receiver<ActorCommand<A>>,
 ) where
     A: Actor,
 {
-    let mut ctx = ActorContext::new();
+    let mut ctx = ActorContext::new(handle);
 
     if actor.started(&mut ctx).await.is_err() {
         let _ = actor.stopping(&mut ctx, StopReason::StartFailed).await;
+        ctx.cancel_all_tasks();
         return;
     }
 
@@ -74,6 +76,7 @@ async fn run_actor<A>(
     let _ = actor
         .stopping(&mut ctx, stop_reason.unwrap_or(StopReason::Requested))
         .await;
+    ctx.cancel_all_tasks();
 }
 
 async fn handle_command<A>(
@@ -88,8 +91,8 @@ where
     match command {
         ActorCommand::Envelope(envelope) => {
             envelope.handle(actor, ctx).await;
-            if ctx.take_stop_requested() {
-                *stop_reason = Some(StopReason::Requested);
+            if let Some(requested_reason) = ctx.take_lifecycle_request() {
+                *stop_reason = Some(requested_reason);
                 return true;
             }
         }

@@ -10,18 +10,18 @@ pub use error::{ActorCallError, ActorError, ActorStopError, ActorTellError};
 pub use handle::ActorHandle;
 pub use mailbox::MailboxConfig;
 pub use runtime::spawn_actor;
-pub use traits::{Actor, Handler, Message, StopReason};
+pub use traits::{Actor, Handler, Message, PassivationReason, StopReason};
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use tokio::sync::{Mutex, Semaphore};
+    use tokio::sync::{Mutex, Semaphore, oneshot};
 
     use crate::{
         Actor, ActorCallError, ActorContext, ActorError, ActorTellError, Handler, MailboxConfig,
-        Message, StopReason, spawn_actor,
+        Message, PassivationReason, StopReason, spawn_actor,
     };
 
     #[derive(Debug)]
@@ -54,6 +54,20 @@ mod tests {
     }
 
     impl Message for Record {
+        type Reply = ();
+    }
+
+    #[derive(Debug)]
+    struct StopAfterReply;
+
+    impl Message for StopAfterReply {
+        type Reply = &'static str;
+    }
+
+    #[derive(Debug)]
+    struct Tick;
+
+    impl Message for Tick {
         type Reply = ();
     }
 
@@ -111,6 +125,31 @@ mod tests {
             if let Some(processed) = msg.processed {
                 processed.add_permits(1);
             }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<StopAfterReply> for TestActor {
+        async fn handle(
+            &mut self,
+            ctx: &mut ActorContext<Self>,
+            _msg: StopAfterReply,
+        ) -> Result<&'static str, ActorError> {
+            self.events.lock().await.push("handled");
+            ctx.request_passivation(PassivationReason::BusinessIdle)?;
+            Ok("reply-before-stop")
+        }
+    }
+
+    #[async_trait]
+    impl Handler<Tick> for TestActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: Tick,
+        ) -> Result<(), ActorError> {
+            self.events.lock().await.push("tick");
             Ok(())
         }
     }
@@ -202,5 +241,107 @@ mod tests {
 
         let result = handle.call(Ping("after-stop")).await;
         assert!(matches!(result, Err(ActorCallError::MailboxClosed)));
+    }
+
+    #[tokio::test]
+    async fn local_timer_delivers_message_to_actor() {
+        struct TimerActor {
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl Actor for TimerActor {
+            async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+                ctx.notify_after(std::time::Duration::from_millis(5), Tick);
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl Handler<Tick> for TimerActor {
+            async fn handle(
+                &mut self,
+                _ctx: &mut ActorContext<Self>,
+                _msg: Tick,
+            ) -> Result<(), ActorError> {
+                self.events.lock().await.push("tick");
+                Ok(())
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let _handle = spawn_actor(
+            TimerActor {
+                events: events.clone(),
+            },
+            MailboxConfig::bounded(8),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(*events.lock().await, vec!["tick"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_task_is_cancelled_when_actor_stops() {
+        struct TaskActor {
+            dropped_tx: Option<oneshot::Sender<()>>,
+        }
+
+        struct DropSignal(Option<oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        #[async_trait]
+        impl Actor for TaskActor {
+            async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+                let signal = DropSignal(self.dropped_tx.take());
+                ctx.spawn_scoped(async move {
+                    let _signal = signal;
+                    std::future::pending::<()>().await;
+                });
+                Ok(())
+            }
+        }
+
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let handle = spawn_actor(
+            TaskActor {
+                dropped_tx: Some(dropped_tx),
+            },
+            MailboxConfig::bounded(8),
+        );
+
+        handle.stop(StopReason::Requested).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn business_passivation_happens_after_handler_reply() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let stopped = Arc::new(Semaphore::new(0));
+        let actor = TestActor {
+            events: events.clone(),
+            start_gate: None,
+            stopped: Some(stopped.clone()),
+        };
+        let handle = spawn_actor(actor, MailboxConfig::bounded(8));
+
+        let reply = handle.call(StopAfterReply).await.unwrap();
+        stopped.acquire().await.unwrap().forget();
+        let after_stop = handle.tell(Record::new("after-stop")).await;
+
+        assert_eq!(reply, "reply-before-stop");
+        assert_eq!(*events.lock().await, vec!["handled"]);
+        assert!(matches!(after_stop, Err(ActorTellError::MailboxClosed)));
     }
 }

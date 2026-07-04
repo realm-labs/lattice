@@ -56,12 +56,12 @@ impl<A: Actor> ActorHandle<A> {
         self.send_system_command(ActorCommand::Stop(reason))
     }
 
-    pub async fn call_system<M>(&self, msg: M) -> Result<M::Reply, ActorCallError>
+    pub(crate) fn try_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
-        M: Message,
+        M: Message<Reply = ()>,
     {
-        self.call_on_lane(msg, MailboxLane::System).await
+        self.try_tell_on_lane(msg, MailboxLane::Normal)
     }
 
     #[cfg(test)]
@@ -70,7 +70,7 @@ impl<A: Actor> ActorHandle<A> {
         A: Handler<M>,
         M: Message<Reply = ()>,
     {
-        self.try_tell_on_lane_for_test(msg, MailboxLane::Normal)
+        self.try_tell_on_lane(msg, MailboxLane::Normal)
     }
 
     #[cfg(test)]
@@ -79,7 +79,7 @@ impl<A: Actor> ActorHandle<A> {
         A: Handler<M>,
         M: Message<Reply = ()>,
     {
-        self.try_tell_on_lane_for_test(msg, MailboxLane::System)
+        self.try_tell_on_lane(msg, MailboxLane::System)
     }
 
     async fn call_on_lane<M>(&self, msg: M, lane: MailboxLane) -> Result<M::Reply, ActorCallError>
@@ -95,8 +95,7 @@ impl<A: Actor> ActorHandle<A> {
             .map_err(|_| ActorCallError::ResponseDropped)?
     }
 
-    #[cfg(test)]
-    fn try_tell_on_lane_for_test<M>(&self, msg: M, lane: MailboxLane) -> Result<(), ActorTellError>
+    fn try_tell_on_lane<M>(&self, msg: M, lane: MailboxLane) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
         M: Message<Reply = ()>,
@@ -123,6 +122,7 @@ impl<A: Actor> ActorHandle<A> {
     ) -> Result<(), ActorCallError> {
         let result = match lane {
             MailboxLane::Normal => self.normal_tx.try_send(command),
+            #[cfg(test)]
             MailboxLane::System => self.system_tx.try_send(command),
         };
 

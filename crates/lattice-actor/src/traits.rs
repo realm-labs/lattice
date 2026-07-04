@@ -36,7 +36,14 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     Requested,
-    Passivated,
+    Passivated(PassivationReason),
     MailboxClosed,
     StartFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassivationReason {
+    BusinessIdle,
+    IdleTimeout,
+    Drain,
 }

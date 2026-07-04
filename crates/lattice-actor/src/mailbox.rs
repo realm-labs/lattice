@@ -42,6 +42,7 @@ impl Default for MailboxConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MailboxLane {
     Normal,
+    #[cfg(test)]
     System,
 }
 
