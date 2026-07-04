@@ -13,6 +13,7 @@ Single-node semantics before distributed semantics.
 Typed actor/RPC programming model before automated placement.
 Static routing before etcd/Coordinator dynamic routing.
 Owner/fencing correctness before migration, drain, and production ops.
+Workspace crate boundaries before feature implementation.
 Every phase must keep the main branch runnable.
 Every phase must include examples and automated tests.
 ```
@@ -96,6 +97,7 @@ Goal: implement the local actor programming model so business code can write `Ac
 Deliverables:
 
 ```text
+Cargo workspace layout
 lattice-core ids, Epoch, RequestId, errors
 ServiceKind / ActorKind / actor_kind! / service_kind!
 InstanceId / InstanceConfig
@@ -118,6 +120,8 @@ actor state-machine example
 Acceptance:
 
 ```text
+Repository is a Cargo workspace with dedicated framework crates, not a single root crate containing all modules.
+The root lattice crate is only a facade/prelude crate if it remains.
 Business code can write WorldActor with Handler<M>.
 Business code can define ActorKind/ServiceKind as reusable constants.
 BootstrapConfig supports TOML/YAML/JSON/env/composite sources.
@@ -138,6 +142,7 @@ No giant framework enum.
 Suggested tests:
 
 ```text
+workspace package graph check
 Handler<M> compile-time bounds
 actor_kind/service_kind const macro tests
 bootstrap config format/merge/env override tests
@@ -613,6 +618,8 @@ async fn main() -> anyhow::Result<()> {
 Pre-implementation checks:
 
 ```text
+[ ] Repository is organized as a Cargo workspace with the planned framework crates.
+[ ] The root lattice crate does not become a dumping ground; it only re-exports deliberate public facade APIs if needed.
 [ ] Actor state has a unique owner.
 [ ] Owner changes increment epoch.
 [ ] State-changing requests carry request_id.
@@ -677,15 +684,16 @@ This section defines how a Codex goal should execute this plan. The standalone p
 1. Read docs/implementation-plan.md and identify the earliest unfinished phase.
 2. Read the docs/architecture/* chapters relevant to that phase.
 3. Build the phase checklist from that phase's deliverables, acceptance items, and suggested tests.
-4. Select a small slice: one checklist item, or a few tightly related checklist items that can be completed end to end.
-5. Inspect the current codebase and classify what is done, missing, or inconsistent with the architecture for that slice.
-6. Implement the missing capability, keeping public APIs aligned with docs/architecture/07-api-examples.md where applicable.
-7. Add tests for the new capability, using this file's test scope.
-8. Run the required verification commands for the slice.
-9. If implementation proves architecture or plan text stale, update both docs and this plan. Do not use doc edits as a substitute for implementation.
-10. Commit the completed slice with an English conventional commit message.
-11. Summarize completed work, remaining work, verification results, and commit id/message.
-12. If the current phase checklist is fully satisfied, move to the next phase. Otherwise choose the next small slice in the same phase.
+4. If the repository is still a single implementation crate, the first slice must convert it to the planned Cargo workspace crate layout before adding more framework features.
+5. Select a small slice: one checklist item, or a few tightly related checklist items that can be completed end to end.
+6. Inspect the current codebase and classify what is done, missing, or inconsistent with the architecture for that slice.
+7. Implement the missing capability, keeping public APIs aligned with docs/architecture/07-api-examples.md where applicable.
+8. Add tests for the new capability, using this file's test scope.
+9. Run the required verification commands for the slice.
+10. If implementation proves architecture or plan text stale, update both docs and this plan. Do not use doc edits as a substitute for implementation.
+11. Commit the completed slice with an English conventional commit message.
+12. Summarize completed work, remaining work, verification results, and commit id/message.
+13. If the current phase checklist is fully satisfied, move to the next phase. Otherwise choose the next small slice in the same phase.
 ```
 
 ### 5.2 Per-Phase Checklist Template
@@ -708,6 +716,11 @@ Tests:
 Examples:
 - [ ] examples/minimal-world reflects this phase where applicable
 - [ ] public API shape matches docs/architecture/07-api-examples.md where applicable
+
+Workspace:
+- [ ] implementation lives in dedicated workspace crates
+- [ ] root crate is only a deliberate facade/prelude if present
+- [ ] no framework area is implemented as a large single-crate internal module tree when it has its own planned crate
 
 Verification:
 - [ ] cargo fmt
@@ -735,6 +748,7 @@ Each phase can exit only when all items are true:
 [ ] All suggested tests in this phase are implemented, or covered by explicit equivalent tests.
 [ ] examples/minimal-world or a matching example demonstrates the key capability.
 [ ] Relevant API sketches in docs/architecture/07-api-examples.md are covered by compile tests, examples, or implementation.
+[ ] The crate split for this phase matches the planned Cargo workspace boundaries.
 [ ] cargo fmt passes.
 [ ] cargo clippy passes.
 [ ] cargo test passes.
@@ -757,6 +771,7 @@ The whole goal can be marked complete only when:
 [ ] architecture/05-gateway-ops.md gateway, rate limit, admin, telemetry, and inspection are implemented and tested.
 [ ] Valid constraints in architecture/06-appendix.md are not violated.
 [ ] API sketches in architecture/07-api-examples.md are covered by examples or compile tests.
+[ ] The implementation uses the planned Cargo workspace crate split; the root crate is not a monolithic implementation crate.
 [ ] examples/minimal-world runs as an end-to-end example.
 [ ] cargo fmt passes.
 [ ] cargo clippy passes.
@@ -769,6 +784,10 @@ The whole goal can be marked complete only when:
 
 ```text
 Work on the earliest unfinished phase first; avoid unrelated refactors.
+Implement the planned Cargo workspace crate split before adding more framework features.
+Do not implement lattice as one root crate with many internal modules.
+Use dedicated crates for framework areas: lattice-core, lattice-actor, lattice-rpc, lattice-codegen, lattice-placement, lattice-coordinator, lattice-eventbus, lattice-scheduler, lattice-config, lattice-gateway, and lattice-ops.
+The root lattice crate may exist as a small facade/prelude crate only.
 Within a phase, progress by one or a few small checklist items at a time.
 Each slice must be implemented, tested, verified, and committed before continuing.
 Use English conventional commit messages, for example "feat(actor): add bounded mailbox" or "test(rpc): cover metadata extraction".

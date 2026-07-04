@@ -175,7 +175,9 @@ Business types are not hardcoded into the framework.
 
 ---
 
-## 5. Suggested Crate Split
+## 5. Required Workspace Crate Split
+
+lattice must be implemented as a Cargo workspace. The root `lattice` crate may exist as a small facade/prelude crate, but framework implementation should live in dedicated crates. Do not implement the framework as one root crate with many internal modules.
 
 ```text
 lattice-core
