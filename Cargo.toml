@@ -3,6 +3,7 @@ members = [
     "crates/lattice-actor",
     "crates/lattice-config",
     "crates/lattice-core",
+    "crates/lattice-codegen",
     "crates/lattice-gateway",
     "crates/lattice-rpc",
     "examples/minimal-world",
@@ -21,6 +22,7 @@ http = "1.4.2"
 lattice-config = { path = "crates/lattice-config" }
 lattice-core = { path = "crates/lattice-core" }
 lattice-actor = { path = "crates/lattice-actor" }
+lattice-codegen = { path = "crates/lattice-codegen" }
 lattice-gateway = { path = "crates/lattice-gateway" }
 lattice-rpc = { path = "crates/lattice-rpc" }
 prost = "0.14.4"

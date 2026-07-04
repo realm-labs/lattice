@@ -337,6 +337,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-codegen"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "lattice-config"
 version = "0.1.0"
 dependencies = [
