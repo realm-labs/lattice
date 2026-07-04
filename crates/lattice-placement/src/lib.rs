@@ -1,4 +1,5 @@
 mod instance;
+mod store;
 mod vshard;
 
 use std::collections::{BTreeMap, HashMap};
@@ -15,6 +16,7 @@ use lattice_rpc::{
 use tonic::{Request, Response};
 
 pub use instance::*;
+pub use store::*;
 pub use vshard::*;
 
 #[derive(Debug, Clone)]
@@ -510,6 +512,10 @@ pub enum PlacementError {
         instance_id: InstanceId,
         state: InstanceState,
     },
+    #[error("placement compare-and-put failed")]
+    CompareAndPutFailed,
+    #[error("activation lock is already held for actor")]
+    ActivationLockHeld,
 }
 
 #[cfg(test)]
@@ -519,7 +525,9 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use lattice_core::{Epoch, InstanceCapacity, InstanceId, RouteKey, actor_kind, service_kind};
+    use lattice_core::{
+        ActorId, Epoch, InstanceCapacity, InstanceId, RouteKey, actor_kind, service_kind,
+    };
     use lattice_rpc::{AuthContext, RpcContext};
 
     use super::*;
@@ -850,6 +858,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_placement_store_compare_and_puts_actor_records() {
+        let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+        let key = actor_key(7);
+        let record = actor_record(7, "world-a", 1, LeaseId(10));
+
+        let version = store
+            .compare_and_put_actor(key.clone(), None, record.clone())
+            .await
+            .unwrap();
+        let stale = store
+            .compare_and_put_actor(key.clone(), None, record.clone())
+            .await;
+        let updated = ActorPlacementRecord {
+            epoch: Epoch(2),
+            ..record
+        };
+        let next = store
+            .compare_and_put_actor(key.clone(), Some(version), updated.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(version, PlacementVersion(1));
+        assert_eq!(stale, Err(PlacementError::CompareAndPutFailed));
+        assert_eq!(next, PlacementVersion(2));
+        assert_eq!(store.get_actor(&key).await.unwrap().unwrap().1, updated);
+    }
+
+    #[tokio::test]
+    async fn in_memory_placement_store_activation_lock_is_exclusive_until_release() {
+        let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+        let key = actor_key(7);
+
+        let first = store.acquire_activation_lock(key.clone()).await.unwrap();
+        let second = store.acquire_activation_lock(key.clone()).await;
+        store.release_activation_lock(&key).await.unwrap();
+        let third = store.acquire_activation_lock(key).await.unwrap();
+
+        assert_eq!(first, LeaseId(1));
+        assert_eq!(second, Err(PlacementError::ActivationLockHeld));
+        assert_eq!(third, LeaseId(2));
+    }
+
+    #[tokio::test]
+    async fn in_memory_placement_store_isolates_records_by_cluster_prefix() {
+        let first = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/cluster-a"));
+        let second = InMemoryPlacementStore::with_shared_inner(
+            PlacementPrefix::new("/lattice/cluster-b"),
+            &first,
+        );
+        let key = actor_key(7);
+
+        first
+            .upsert_instance(instance_record("world-a", InstanceState::Ready))
+            .await
+            .unwrap();
+        first
+            .compare_and_put_actor(
+                key.clone(),
+                None,
+                actor_record(7, "world-a", 1, LeaseId(10)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first
+                .list_instances(&service_kind!("World"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            second
+                .list_instances(&service_kind!("World"))
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(second.get_actor(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn resolving_rpc_core_invalidates_not_owner_and_retries_same_request_id() {
         let resolver = SequencedResolver {
             targets: Arc::new(Mutex::new(VecDeque::from([
@@ -955,6 +1047,29 @@ mod tests {
             state,
             capacity: InstanceCapacity::default(),
             labels: Default::default(),
+        }
+    }
+
+    fn actor_key(actor_id: u64) -> ActorPlacementKey {
+        ActorPlacementKey {
+            actor_kind: actor_kind!("World"),
+            actor_id: ActorId::U64(actor_id),
+        }
+    }
+
+    fn actor_record(
+        actor_id: u64,
+        owner: &str,
+        epoch: u64,
+        lease_id: LeaseId,
+    ) -> ActorPlacementRecord {
+        ActorPlacementRecord {
+            actor_kind: actor_kind!("World"),
+            actor_id: ActorId::U64(actor_id),
+            owner: InstanceId::new(owner),
+            epoch: Epoch(epoch),
+            lease_id,
+            state: PlacementState::Running,
         }
     }
 }
