@@ -397,6 +397,7 @@ dependencies = [
  "lattice-core",
  "lattice-rpc",
  "prost",
+ "serde",
  "thiserror",
  "tokio",
 ]
@@ -437,6 +438,7 @@ dependencies = [
  "lattice-core",
  "lattice-rpc",
  "prost",
+ "serde",
  "thiserror",
  "tokio",
  "tonic",
