@@ -5,8 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::Json;
+use axum::Router;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::routing::get;
 use lattice_core::{ActorKind, InstanceId, ServiceKind};
 use lattice_placement::{ActorPlacementRecord, InstanceRecord, PlacementError, PlacementStore};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 
 #[derive(Debug, Clone)]
@@ -152,17 +158,170 @@ impl ConfigWatch {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClusterSummary {
     pub instance_count: usize,
     pub actor_owner_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NodeSummary {
     pub instance_id: InstanceId,
     pub service_kind: ServiceKind,
     pub actor_kinds: Vec<ActorKind>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminAuth {
+    token: Option<String>,
+}
+
+impl AdminAuth {
+    pub fn disabled() -> Self {
+        Self { token: None }
+    }
+
+    pub fn bearer_token(token: impl Into<String>) -> Self {
+        Self {
+            token: Some(token.into()),
+        }
+    }
+
+    pub fn authorize(&self, headers: &HeaderMap) -> Result<(), AdminApiError> {
+        let Some(expected) = &self.token else {
+            return Ok(());
+        };
+        let actual = headers
+            .get("x-lattice-admin-token")
+            .and_then(|value| value.to_str().ok());
+        if actual == Some(expected.as_str()) {
+            Ok(())
+        } else {
+            Err(AdminApiError::Unauthorized)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct PageRequest {
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_page_limit")]
+    pub limit: usize,
+}
+
+fn default_page_limit() -> usize {
+    100
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub partial: bool,
+}
+
+pub fn paginate<T: Clone>(items: &[T], request: PageRequest) -> Page<T> {
+    let limit = request.limit.clamp(1, 500);
+    let offset = request.offset.min(items.len());
+    let end = (offset + limit).min(items.len());
+    Page {
+        items: items[offset..end].to_vec(),
+        offset,
+        limit,
+        total: items.len(),
+        partial: end < items.len(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InstanceView {
+    pub service_kind: ServiceKind,
+    pub instance_id: InstanceId,
+    pub state: String,
+    pub advertised_endpoint: String,
+    pub control_endpoint: String,
+    pub version: String,
+}
+
+impl From<InstanceRecord> for InstanceView {
+    fn from(record: InstanceRecord) -> Self {
+        Self {
+            service_kind: record.service_kind,
+            instance_id: record.instance_id,
+            state: format!("{:?}", record.state),
+            advertised_endpoint: record.advertised_endpoint.to_string(),
+            control_endpoint: record.control_endpoint.to_string(),
+            version: record.version,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminSnapshot {
+    pub summary: ClusterSummary,
+    pub instances: Vec<InstanceView>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminHttpState {
+    auth: AdminAuth,
+    snapshot: AdminSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminHttpAdapter {
+    state: AdminHttpState,
+}
+
+impl AdminHttpAdapter {
+    pub fn new(auth: AdminAuth, snapshot: AdminSnapshot) -> Self {
+        Self {
+            state: AdminHttpState { auth, snapshot },
+        }
+    }
+
+    pub fn router(self) -> Router {
+        Router::new()
+            .route("/admin/cluster/summary", get(admin_cluster_summary))
+            .route("/admin/instances", get(admin_instances))
+            .with_state(self.state)
+    }
+}
+
+async fn admin_cluster_summary(
+    State(state): State<AdminHttpState>,
+    headers: HeaderMap,
+) -> Result<Json<ClusterSummary>, AdminApiError> {
+    state.auth.authorize(&headers)?;
+    Ok(Json(state.snapshot.summary))
+}
+
+async fn admin_instances(
+    State(state): State<AdminHttpState>,
+    headers: HeaderMap,
+    Query(page): Query<PageRequest>,
+) -> Result<Json<Page<InstanceView>>, AdminApiError> {
+    state.auth.authorize(&headers)?;
+    Ok(Json(paginate(&state.snapshot.instances, page)))
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AdminApiError {
+    #[error("admin request is unauthorized")]
+    Unauthorized,
+}
+
+impl axum::response::IntoResponse for AdminApiError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            AdminApiError::Unauthorized => {
+                (StatusCode::UNAUTHORIZED, self.to_string()).into_response()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -299,6 +458,45 @@ mod tests {
             }
         );
         assert_eq!(node.actor_kinds, vec![actor_kind!("World")]);
+    }
+
+    #[test]
+    fn admin_auth_requires_configured_token() {
+        let auth = AdminAuth::bearer_token("secret");
+        let mut headers = HeaderMap::new();
+
+        assert_eq!(auth.authorize(&headers), Err(AdminApiError::Unauthorized));
+        headers.insert("x-lattice-admin-token", "secret".parse().unwrap());
+
+        assert_eq!(auth.authorize(&headers), Ok(()));
+    }
+
+    #[test]
+    fn admin_pagination_reports_partial_results() {
+        let page = paginate(
+            &[1, 2, 3, 4],
+            PageRequest {
+                offset: 1,
+                limit: 2,
+            },
+        );
+
+        assert_eq!(page.items, vec![2, 3]);
+        assert_eq!(page.total, 4);
+        assert!(page.partial);
+    }
+
+    #[test]
+    fn admin_http_adapter_builds_axum_router() {
+        let snapshot = AdminSnapshot {
+            summary: ClusterSummary {
+                instance_count: 1,
+                actor_owner_count: 0,
+            },
+            instances: vec![InstanceView::from(instance_record("world-a"))],
+        };
+
+        let _router = AdminHttpAdapter::new(AdminAuth::disabled(), snapshot).router();
     }
 
     fn instance_record(instance_id: &str) -> InstanceRecord {
