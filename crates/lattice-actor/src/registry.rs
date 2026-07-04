@@ -3,6 +3,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use lattice_core::{ActorId, ActorKind};
 use tokio::sync::{Mutex, Semaphore, watch};
 
@@ -29,6 +30,28 @@ pub struct ActorRegistry<A: Actor> {
     kind: ActorKind,
     config: ActorRegistryConfig,
     entries: Mutex<HashMap<ActorId, RegistryEntry<A>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorCreateContext {
+    pub actor_kind: ActorKind,
+    pub actor_id: ActorId,
+}
+
+#[async_trait]
+pub trait ActorFactory<A>: Clone + Send + Sync + 'static
+where
+    A: Actor,
+{
+    async fn create(&self, ctx: ActorCreateContext) -> Result<A, ActorError>;
+}
+
+#[async_trait]
+pub trait ActorLoader<A>: Clone + Send + Sync + 'static
+where
+    A: Actor,
+{
+    async fn load(&self, ctx: ActorCreateContext) -> Result<A, ActorError>;
 }
 
 impl<A: Actor> ActorRegistry<A> {
@@ -116,6 +139,38 @@ impl<A: Actor> ActorRegistry<A> {
 
         activation.publish(result.clone());
         result
+    }
+
+    pub async fn get_or_create<F>(
+        &self,
+        actor_id: ActorId,
+        factory: F,
+    ) -> Result<ActorHandle<A>, ActorActivationError>
+    where
+        F: ActorFactory<A>,
+    {
+        let ctx = ActorCreateContext {
+            actor_kind: self.kind.clone(),
+            actor_id: actor_id.clone(),
+        };
+        self.get_or_activate(actor_id, || async move { factory.create(ctx).await })
+            .await
+    }
+
+    pub async fn get_or_load<L>(
+        &self,
+        actor_id: ActorId,
+        loader: L,
+    ) -> Result<ActorHandle<A>, ActorActivationError>
+    where
+        L: ActorLoader<A>,
+    {
+        let ctx = ActorCreateContext {
+            actor_kind: self.kind.clone(),
+            actor_id: actor_id.clone(),
+        };
+        self.get_or_activate(actor_id, || async move { loader.load(ctx).await })
+            .await
     }
 
     async fn wait_for_activation(

@@ -14,7 +14,9 @@ pub use error::{
 };
 pub use handle::ActorHandle;
 pub use mailbox::MailboxConfig;
-pub use registry::{ActorRegistry, ActorRegistryConfig};
+pub use registry::{
+    ActorCreateContext, ActorFactory, ActorLoader, ActorRegistry, ActorRegistryConfig,
+};
 pub use runtime::{
     ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorScheduler, ActorSpawnOptions,
     PassivationPolicy, spawn_actor,
