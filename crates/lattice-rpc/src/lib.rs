@@ -2,8 +2,10 @@ use async_trait::async_trait;
 use http::Uri;
 use lattice_actor::{Actor, ActorCallError, ActorHandle, Handler, Message};
 use lattice_core::{ActorKind, Epoch, InstanceId, RequestId, RouteKey, ServiceKind, TraceContext};
-use std::sync::Arc;
+use prost::Message as ProstMessage;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status};
 
@@ -217,11 +219,7 @@ impl<A: Actor> ActorRpcAdapter<A> {
         Req: RoutedRequest + RpcRequest,
     {
         let ctx = RpcContext::from_metadata(request.metadata()).map_err(metadata_status)?;
-        if let (Some(expected), Some(actual)) = (ctx.route_epoch, self.owner_epoch)
-            && expected != actual
-        {
-            return Err(Status::failed_precondition("route epoch mismatch"));
-        }
+        self.validate_owner_epoch(&ctx)?;
 
         let req = request.into_inner();
         let _actor_kind = req.actor_kind();
@@ -232,6 +230,88 @@ impl<A: Actor> ActorRpcAdapter<A> {
             .await
             .map_err(actor_call_status)?;
         Ok(Response::new(reply))
+    }
+
+    pub async fn unary_dedup<Req>(
+        &self,
+        request: Request<Req>,
+        deduplicator: &RequestDeduplicator,
+    ) -> Result<Response<Req::Reply>, Status>
+    where
+        A: Handler<Rpc<Req>>,
+        Req: RoutedRequest + RpcRequest,
+    {
+        let ctx = RpcContext::from_metadata(request.metadata()).map_err(metadata_status)?;
+        self.validate_owner_epoch(&ctx)?;
+        let key = RequestDedupKey::new(Req::METHOD, &ctx.request_id);
+        if let Some(reply) = deduplicator.get::<Req>(&key)? {
+            return Ok(Response::new(reply));
+        }
+
+        let response = self.unary(request).await?;
+        deduplicator.record(&key, response.get_ref())?;
+        Ok(response)
+    }
+
+    fn validate_owner_epoch(&self, ctx: &RpcContext) -> Result<(), Status> {
+        if let (Some(expected), Some(actual)) = (ctx.route_epoch, self.owner_epoch)
+            && expected != actual
+        {
+            return Err(Status::failed_precondition("route epoch mismatch"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RequestDedupKey {
+    method: &'static str,
+    request_id: RequestId,
+}
+
+impl RequestDedupKey {
+    pub fn new(method: &'static str, request_id: &RequestId) -> Self {
+        Self {
+            method,
+            request_id: request_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct RequestDeduplicator {
+    replies: Arc<Mutex<HashMap<RequestDedupKey, Vec<u8>>>>,
+}
+
+impl RequestDeduplicator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get<Req>(&self, key: &RequestDedupKey) -> Result<Option<Req::Reply>, Status>
+    where
+        Req: RpcRequest,
+    {
+        self.replies
+            .lock()
+            .expect("request deduplicator mutex poisoned")
+            .get(key)
+            .map(|bytes| {
+                Req::Reply::decode(bytes.as_slice())
+                    .map_err(|error| Status::internal(error.to_string()))
+            })
+            .transpose()
+    }
+
+    pub fn record<Reply>(&self, key: &RequestDedupKey, reply: &Reply) -> Result<(), Status>
+    where
+        Reply: prost::Message,
+    {
+        self.replies
+            .lock()
+            .expect("request deduplicator mutex poisoned")
+            .insert(key.clone(), reply.encode_to_vec());
+        Ok(())
     }
 }
 
@@ -403,6 +483,7 @@ fn actor_call_status(error: ActorCallError) -> Status {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -451,6 +532,27 @@ mod tests {
             msg: Rpc<EnterWorldRequest>,
         ) -> Result<EnterWorldReply, ActorError> {
             assert_eq!(msg.ctx.request_id.as_str(), "req-1");
+            Ok(EnterWorldReply {
+                ok: msg.req.world_id == 9,
+            })
+        }
+    }
+
+    struct CountingWorldActor {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Actor for CountingWorldActor {}
+
+    #[async_trait]
+    impl Handler<Rpc<EnterWorldRequest>> for CountingWorldActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            msg: Rpc<EnterWorldRequest>,
+        ) -> Result<EnterWorldReply, ActorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(EnterWorldReply {
                 ok: msg.req.world_id == 9,
             })
@@ -602,6 +704,46 @@ mod tests {
         let status = adapter.unary(request).await.unwrap_err();
 
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn actor_rpc_adapter_replays_duplicate_request_id_without_reentering_handler() {
+        let runtime = ActorRuntime::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handle = runtime
+            .spawn_actor(
+                CountingWorldActor {
+                    calls: calls.clone(),
+                },
+                ActorSpawnOptions::default(),
+            )
+            .await
+            .unwrap();
+        let adapter = ActorRpcAdapter::new(handle).with_owner_epoch(Epoch(7));
+        let deduplicator = RequestDeduplicator::new();
+        let mut first = Request::new(EnterWorldRequest { world_id: 9 });
+        test_context(Some(Epoch(7)))
+            .inject_metadata(first.metadata_mut())
+            .unwrap();
+        let mut duplicate = Request::new(EnterWorldRequest { world_id: 1 });
+        test_context(Some(Epoch(7)))
+            .inject_metadata(duplicate.metadata_mut())
+            .unwrap();
+
+        let first_reply = adapter
+            .unary_dedup(first, &deduplicator)
+            .await
+            .unwrap()
+            .into_inner();
+        let duplicate_reply = adapter
+            .unary_dedup(duplicate, &deduplicator)
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(first_reply.ok);
+        assert!(duplicate_reply.ok);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     fn test_context(route_epoch: Option<Epoch>) -> RpcContext {
