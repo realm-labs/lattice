@@ -1,0 +1,14 @@
+[package]
+name = "minimal-world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+lattice-actor.workspace = true
+lattice-config.workspace = true
+lattice-core.workspace = true
+serde.workspace = true
+tokio.workspace = true

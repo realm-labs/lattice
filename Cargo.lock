@@ -147,6 +147,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "minimal-world"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "lattice-actor",
+ "lattice-config",
+ "lattice-core",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
