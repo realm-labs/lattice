@@ -11,7 +11,119 @@ use crate::{
 
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorExecutionPolicy {
+    TaskPerActor,
+    ShardWorker { worker_count: usize },
+    DedicatedThreadPool { worker_count: usize },
+}
+
+#[derive(Debug, Clone)]
+pub struct ActorRuntimeConfig {
+    pub default_execution: ActorExecutionPolicy,
+}
+
+impl Default for ActorRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            default_execution: ActorExecutionPolicy::TaskPerActor,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ActorSpawnOptions {
+    pub mailbox: MailboxConfig,
+    pub execution: Option<ActorExecutionPolicy>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActorRuntime {
+    config: ActorRuntimeConfig,
+    scheduler: ActorScheduler,
+}
+
+impl ActorRuntime {
+    pub fn new(config: ActorRuntimeConfig) -> Self {
+        Self {
+            config,
+            scheduler: ActorScheduler,
+        }
+    }
+
+    pub fn scheduler(&self) -> &ActorScheduler {
+        &self.scheduler
+    }
+
+    pub async fn spawn_actor<A>(
+        &self,
+        actor: A,
+        options: ActorSpawnOptions,
+    ) -> Result<ActorHandle<A>, crate::ActorSpawnError>
+    where
+        A: Actor,
+    {
+        self.spawn_actor_now(actor, options)
+    }
+
+    pub(crate) fn spawn_actor_now<A>(
+        &self,
+        actor: A,
+        options: ActorSpawnOptions,
+    ) -> Result<ActorHandle<A>, crate::ActorSpawnError>
+    where
+        A: Actor,
+    {
+        let execution = options.execution.unwrap_or(self.config.default_execution);
+        self.scheduler.spawn(actor, options.mailbox, execution)
+    }
+}
+
+impl Default for ActorRuntime {
+    fn default() -> Self {
+        Self::new(ActorRuntimeConfig::default())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ActorScheduler;
+
+impl ActorScheduler {
+    fn spawn<A>(
+        &self,
+        actor: A,
+        mailbox: MailboxConfig,
+        execution: ActorExecutionPolicy,
+    ) -> Result<ActorHandle<A>, crate::ActorSpawnError>
+    where
+        A: Actor,
+    {
+        match execution {
+            ActorExecutionPolicy::TaskPerActor => Ok(spawn_task_per_actor(actor, mailbox)),
+            ActorExecutionPolicy::ShardWorker { .. }
+            | ActorExecutionPolicy::DedicatedThreadPool { .. } => {
+                Err(crate::ActorSpawnError::UnsupportedExecutionPolicy { policy: execution })
+            }
+        }
+    }
+}
+
 pub fn spawn_actor<A>(actor: A, mailbox: MailboxConfig) -> ActorHandle<A>
+where
+    A: Actor,
+{
+    ActorRuntime::default()
+        .spawn_actor_now(
+            actor,
+            ActorSpawnOptions {
+                mailbox,
+                execution: Some(ActorExecutionPolicy::TaskPerActor),
+            },
+        )
+        .expect("TaskPerActor execution is supported")
+}
+
+fn spawn_task_per_actor<A>(actor: A, mailbox: MailboxConfig) -> ActorHandle<A>
 where
     A: Actor,
 {

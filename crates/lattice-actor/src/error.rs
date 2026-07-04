@@ -69,3 +69,9 @@ pub enum ActorActivationError {
     #[error("actor activation failed: {0}")]
     ActivationFailed(ActorError),
 }
+
+#[derive(Debug, Clone, Error)]
+pub enum ActorSpawnError {
+    #[error("unsupported actor execution policy: {policy:?}")]
+    UnsupportedExecutionPolicy { policy: crate::ActorExecutionPolicy },
+}

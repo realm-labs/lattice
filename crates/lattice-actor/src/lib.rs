@@ -8,11 +8,17 @@ mod traits;
 mod watch;
 
 pub use context::ActorContext;
-pub use error::{ActorActivationError, ActorCallError, ActorError, ActorStopError, ActorTellError};
+pub use error::{
+    ActorActivationError, ActorCallError, ActorError, ActorSpawnError, ActorStopError,
+    ActorTellError,
+};
 pub use handle::ActorHandle;
 pub use mailbox::MailboxConfig;
 pub use registry::{ActorRegistry, ActorRegistryConfig};
-pub use runtime::spawn_actor;
+pub use runtime::{
+    ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorScheduler, ActorSpawnOptions,
+    spawn_actor,
+};
 pub use traits::{
     Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, Handler, Message,
     PassivationReason, StopReason,
@@ -28,10 +34,11 @@ mod tests {
     use tokio::sync::{Mutex, Semaphore, oneshot};
 
     use crate::{
-        Actor, ActorActivationError, ActorCallError, ActorContext, ActorError, ActorHandle,
-        ActorLifecycleState, ActorRegistry, ActorRegistryConfig, ActorTellError, ActorTerminated,
-        ChildActorKey, ChildActorOptions, Handler, MailboxConfig, Message, PassivationReason,
-        StopReason, TerminatedReason, spawn_actor,
+        Actor, ActorActivationError, ActorCallError, ActorContext, ActorError,
+        ActorExecutionPolicy, ActorHandle, ActorLifecycleState, ActorRegistry, ActorRegistryConfig,
+        ActorRuntime, ActorRuntimeConfig, ActorSpawnError, ActorSpawnOptions, ActorTellError,
+        ActorTerminated, ChildActorKey, ChildActorOptions, Handler, MailboxConfig, Message,
+        PassivationReason, StopReason, TerminatedReason, spawn_actor,
     };
     use lattice_core::{ActorId, actor_kind};
 
@@ -211,6 +218,64 @@ mod tests {
 
         assert_eq!(reply, "pong:one");
         assert_eq!(*events.lock().await, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn actor_execution_policy_defaults_to_task_per_actor() {
+        assert_eq!(
+            ActorRuntimeConfig::default().default_execution,
+            ActorExecutionPolicy::TaskPerActor
+        );
+        assert_eq!(ActorSpawnOptions::default().execution, None);
+    }
+
+    #[tokio::test]
+    async fn actor_runtime_spawns_task_per_actor() {
+        let runtime = ActorRuntime::new(ActorRuntimeConfig::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let actor = TestActor {
+            events: events.clone(),
+            start_gate: None,
+            stopped: None,
+        };
+
+        let handle = runtime
+            .spawn_actor(actor, ActorSpawnOptions::default())
+            .await
+            .unwrap();
+        let reply = handle.call(Ping("runtime")).await.unwrap();
+
+        assert_eq!(reply, "pong:runtime");
+        assert_eq!(*events.lock().await, vec!["runtime"]);
+    }
+
+    #[tokio::test]
+    async fn unsupported_execution_policy_returns_explicit_error() {
+        let runtime = ActorRuntime::new(ActorRuntimeConfig {
+            default_execution: ActorExecutionPolicy::TaskPerActor,
+        });
+        let actor = TestActor {
+            events: Arc::new(Mutex::new(Vec::new())),
+            start_gate: None,
+            stopped: None,
+        };
+
+        let result = runtime
+            .spawn_actor(
+                actor,
+                ActorSpawnOptions {
+                    mailbox: MailboxConfig::bounded(8),
+                    execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 2 }),
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ActorSpawnError::UnsupportedExecutionPolicy {
+                policy: ActorExecutionPolicy::ShardWorker { worker_count: 2 }
+            })
+        ));
     }
 
     #[tokio::test]
