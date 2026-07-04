@@ -103,6 +103,8 @@ ServiceKind / ActorKind / actor_kind! / service_kind!
 InstanceId / InstanceConfig
 ConfigSource / ConfigFormat / BootstrapConfig
 lattice-actor Actor / Message / Handler<M>
+ActorRuntime / ActorScheduler abstraction
+ActorExecutionPolicy with TaskPerActor as the only Phase 1 implementation
 ActorHandle.call/tell
 type-erased Envelope
 system/normal mailbox
@@ -125,6 +127,8 @@ The root lattice crate is only a facade/prelude crate if it remains.
 Business code can write WorldActor with Handler<M>.
 Business code can define ActorKind/ServiceKind as reusable constants.
 BootstrapConfig supports TOML/YAML/JSON/env/composite sources.
+Actor execution is spawned and managed through lattice ActorRuntime, even if the backing executor is the process Tokio runtime.
+Tokio runtime is not exposed as the actor scheduling model.
 Local timer can drive WorldTick.
 Tasks created by ActorContext are cancelled or isolated on stop/passivation.
 Business handlers can request passivation and return the current response before stop starts.
@@ -146,6 +150,8 @@ workspace package graph check
 Handler<M> compile-time bounds
 actor_kind/service_kind const macro tests
 bootstrap config format/merge/env override tests
+ActorRuntime spawn policy test
+ActorExecutionPolicy default TaskPerActor test
 ActorHandle call/tell
 system mailbox priority
 mailbox full

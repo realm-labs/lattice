@@ -85,7 +85,47 @@ Cross-process calls use generated clients or ActorRef.
 Async tasks are created through ActorContext so they can be cancelled or isolated during stop/passivation.
 ```
 
-### 7.2 Core Traits
+### 7.2 Actor Scheduling Model
+
+The first implementation may run on the service process's existing Tokio runtime, but Tokio itself must not be the actor scheduling abstraction exposed by lattice.
+
+Recommended layering:
+
+```text
+Tokio runtime
+  -> lattice ActorRuntime / ActorScheduler
+    -> actor execution policy
+      -> actor mailbox loop
+```
+
+The default first-version execution policy is one managed Tokio task per actor:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorExecutionPolicy {
+    TaskPerActor,
+    ShardWorker { workers: usize },
+    DedicatedThread,
+    LocalSet,
+}
+```
+
+Phase 1 should implement only `TaskPerActor`, but the API should leave room for later shard workers, dedicated workers, or local sets.
+
+Rules:
+
+```text
+Actor tasks are spawned by lattice ActorRuntime, not directly by business code.
+ActorRuntime owns task naming, lifecycle, cancellation, metrics, tracing, and drain integration.
+ActorContext creates scoped tasks through the actor runtime so they can be cancelled or isolated.
+ServiceContext creates service-scoped tasks through the service runtime.
+CPU-heavy or blocking work must not run directly on Tokio worker threads; use a blocking pool, dedicated worker, or external compute service.
+Virtual-shard actors may later run on shard workers to reduce task count and improve cache locality.
+```
+
+This keeps the first version simple while avoiding a design where every actor is merely an unmanaged `tokio::spawn`.
+
+### 7.3 Core Traits
 
 ```rust
 #[async_trait::async_trait]
@@ -122,7 +162,7 @@ where
 
 `Actor::stopping` is where business code normally persists state. If it fails, the actor enters `StopFailed`; the runtime keeps ownership and blocks unload/release until retry or manual intervention.
 
-### 7.3 Rpc Wrapper
+### 7.4 Rpc Wrapper
 
 RPC metadata is carried by framework metadata, not by business proto request fields.
 
@@ -136,7 +176,7 @@ pub struct Rpc<T> {
 
 `RpcContext` is extracted from gRPC metadata by the generated adapter. Business handlers receive the typed request and context without defining `meta: Option<_>` in every proto message.
 
-### 7.4 Handler Example
+### 7.5 Handler Example
 
 ```rust
 #[async_trait::async_trait]
@@ -154,7 +194,7 @@ impl Handler<Rpc<EnterWorldRequest>> for WorldActor {
 }
 ```
 
-### 7.5 Mailbox
+### 7.6 Mailbox
 
 The mailbox has two lanes:
 
@@ -170,7 +210,7 @@ System messages are prioritized so shutdown, fencing, passivation, and supervisi
 
 Mailbox capacity is explicit. When full, the caller receives a clear backpressure error or timeout. The framework does not expose an unbounded business-visible stash.
 
-### 7.6 ActorHandle
+### 7.7 ActorHandle
 
 `ActorHandle<A>` is a local typed handle to an already running actor. It is used by local runtime internals, local child actors, tests, and local-only helpers.
 
@@ -196,13 +236,13 @@ impl<A: Actor> ActorHandle<A> {
 
 `ActorHandle` must not cross RPC or EventBus boundaries. Cross-process references use `ActorRef`, `GatewaySessionRef`, or generated clients.
 
-### 7.7 Stash and Deferred Messages
+### 7.8 Stash and Deferred Messages
 
 lattice does not expose an arbitrary unbounded stash to business code. During activation/loading, waiters are bounded and have timeouts. If activation fails, all waiters are woken with an error, and a later request may retry activation.
 
 Business state machines should model deferred work explicitly with their own queue or pending operation state.
 
-### 7.8 Slow I/O
+### 7.9 Slow I/O
 
 Actor handlers should not block realtime actor execution with unbounded slow I/O. Use one of these patterns:
 
@@ -215,13 +255,13 @@ Business pending state plus retry/compensation for cross-service workflows.
 
 Raw `tokio::spawn` is discouraged for actor-owned work because it can leak after actor unload. Use `ActorContext` task APIs.
 
-### 7.9 High-Frequency Input
+### 7.10 High-Frequency Input
 
 High-frequency gameplay input should be coalesced, sampled, batched, or pushed through specialized stream handling. It should not create one distributed actor RPC per frame when latency and volume are incompatible with the actor model.
 
 ---
 
-## 7.10 Actor Watch
+## 7.11 Actor Watch
 
 Watch lets one actor observe the termination of another actor's current incarnation.
 
@@ -260,7 +300,7 @@ Notifications are best-effort plus owner/lease semantics; business logic must st
 
 ---
 
-## 7.11 Local Child Actors
+## 7.12 Local Child Actors
 
 A local child actor is spawned by a parent actor inside the same process. It is not placed in etcd and cannot be routed to from other nodes.
 
