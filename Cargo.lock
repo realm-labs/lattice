@@ -436,8 +436,12 @@ dependencies = [
  "lattice-actor",
  "lattice-config",
  "lattice-core",
+ "lattice-gateway",
+ "lattice-rpc",
+ "prost",
  "serde",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
