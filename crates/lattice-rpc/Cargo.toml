@@ -1,0 +1,15 @@
+[package]
+name = "lattice-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+http.workspace = true
+lattice-actor.workspace = true
+lattice-core.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
