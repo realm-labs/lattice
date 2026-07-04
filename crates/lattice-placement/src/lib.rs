@@ -1,3 +1,4 @@
+mod coordinator;
 mod instance;
 mod store;
 mod vshard;
@@ -15,6 +16,7 @@ use lattice_rpc::{
 };
 use tonic::{Request, Response};
 
+pub use coordinator::*;
 pub use instance::*;
 pub use store::*;
 pub use vshard::*;
