@@ -42,6 +42,18 @@ pub enum StopReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorLifecycleState {
+    Empty,
+    Activating,
+    Loading,
+    Running,
+    Passivating,
+    Stopping,
+    StopFailed,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassivationReason {
     BusinessIdle,
     IdleTimeout,

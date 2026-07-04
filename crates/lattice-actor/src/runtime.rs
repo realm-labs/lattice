@@ -1,12 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use tokio::sync::{broadcast, watch};
 
 use crate::mailbox::{ActorCommand, MailboxConfig};
 use crate::{
-    Actor, ActorContext, ActorHandle, ActorIncarnation, ActorTerminated, LocalActorRef, StopReason,
-    TerminatedReason,
+    Actor, ActorContext, ActorHandle, ActorIncarnation, ActorLifecycleState, ActorTerminated,
+    LocalActorRef, StopReason, TerminatedReason,
 };
 
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
@@ -19,7 +19,8 @@ where
     let (system_tx, system_rx) = mpsc::channel(mailbox.system_capacity());
     let local_ref = LocalActorRef::new(NEXT_LOCAL_ACTOR_ID.fetch_add(1, Ordering::Relaxed));
     let (terminated_tx, _terminated_rx) = broadcast::channel(16);
-    let handle = ActorHandle::new(local_ref, terminated_tx, normal_tx, system_tx);
+    let (lifecycle_tx, _lifecycle_rx) = watch::channel(ActorLifecycleState::Empty);
+    let handle = ActorHandle::new(local_ref, terminated_tx, lifecycle_tx, normal_tx, system_tx);
 
     tokio::spawn(run_actor(actor, handle.clone(), normal_rx, system_rx));
 
@@ -37,10 +38,20 @@ async fn run_actor<A>(
     let mut ctx = ActorContext::new(handle.clone());
 
     if actor.started(&mut ctx).await.is_err() {
-        let _ = actor.stopping(&mut ctx, StopReason::StartFailed).await;
+        handle.set_lifecycle_state(ActorLifecycleState::Stopping);
+        if actor
+            .stopping(&mut ctx, StopReason::StartFailed)
+            .await
+            .is_err()
+        {
+            handle.set_lifecycle_state(ActorLifecycleState::StopFailed);
+        } else {
+            handle.set_lifecycle_state(ActorLifecycleState::Stopped);
+        }
         ctx.cancel_all_tasks();
         return;
     }
+    handle.set_lifecycle_state(ActorLifecycleState::Running);
 
     let mut stop_reason = None;
 
@@ -83,12 +94,22 @@ async fn run_actor<A>(
         }
     }
 
-    let _ = actor
-        .stopping(&mut ctx, stop_reason.unwrap_or(StopReason::Requested))
-        .await;
-    ctx.cancel_all_tasks();
     let reason = stop_reason.unwrap_or(StopReason::Requested);
+    handle.set_lifecycle_state(match reason {
+        StopReason::Passivated(_) => ActorLifecycleState::Passivating,
+        StopReason::Requested | StopReason::MailboxClosed | StopReason::StartFailed => {
+            ActorLifecycleState::Stopping
+        }
+    });
+    if actor.stopping(&mut ctx, reason).await.is_err() {
+        ctx.cancel_all_tasks();
+        ctx.stop_all_children(reason);
+        handle.set_lifecycle_state(ActorLifecycleState::StopFailed);
+        return;
+    }
+    ctx.cancel_all_tasks();
     ctx.stop_all_children(reason);
+    handle.set_lifecycle_state(ActorLifecycleState::Stopped);
     handle.publish_terminated(ActorTerminated {
         target: handle.local_ref(),
         incarnation: ActorIncarnation::new(handle.local_ref().id()),

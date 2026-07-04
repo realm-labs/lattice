@@ -3,18 +3,19 @@ use std::marker::PhantomData;
 use tokio::sync::{
     broadcast,
     mpsc::{self, error::TrySendError},
-    oneshot,
+    oneshot, watch,
 };
 
 use crate::mailbox::{ActorCommand, EnvelopeMessage, MailboxLane};
 use crate::{
-    Actor, ActorCallError, ActorTellError, ActorTerminated, Handler, LocalActorRef, Message,
-    StopReason,
+    Actor, ActorCallError, ActorLifecycleState, ActorTellError, ActorTerminated, Handler,
+    LocalActorRef, Message, StopReason,
 };
 
 pub struct ActorHandle<A: Actor> {
     local_ref: LocalActorRef,
     terminated_tx: broadcast::Sender<ActorTerminated>,
+    lifecycle_tx: watch::Sender<ActorLifecycleState>,
     normal_tx: mpsc::Sender<ActorCommand<A>>,
     system_tx: mpsc::Sender<ActorCommand<A>>,
     _marker: PhantomData<A>,
@@ -25,6 +26,7 @@ impl<A: Actor> Clone for ActorHandle<A> {
         Self {
             local_ref: self.local_ref,
             terminated_tx: self.terminated_tx.clone(),
+            lifecycle_tx: self.lifecycle_tx.clone(),
             normal_tx: self.normal_tx.clone(),
             system_tx: self.system_tx.clone(),
             _marker: PhantomData,
@@ -36,12 +38,14 @@ impl<A: Actor> ActorHandle<A> {
     pub(crate) fn new(
         local_ref: LocalActorRef,
         terminated_tx: broadcast::Sender<ActorTerminated>,
+        lifecycle_tx: watch::Sender<ActorLifecycleState>,
         normal_tx: mpsc::Sender<ActorCommand<A>>,
         system_tx: mpsc::Sender<ActorCommand<A>>,
     ) -> Self {
         Self {
             local_ref,
             terminated_tx,
+            lifecycle_tx,
             normal_tx,
             system_tx,
             _marker: PhantomData,
@@ -50,6 +54,10 @@ impl<A: Actor> ActorHandle<A> {
 
     pub fn local_ref(&self) -> LocalActorRef {
         self.local_ref
+    }
+
+    pub fn lifecycle_state(&self) -> ActorLifecycleState {
+        *self.lifecycle_tx.borrow()
     }
 
     pub async fn call<M>(&self, msg: M) -> Result<M::Reply, ActorCallError>
@@ -86,6 +94,14 @@ impl<A: Actor> ActorHandle<A> {
 
     pub(crate) fn subscribe_terminated(&self) -> broadcast::Receiver<ActorTerminated> {
         self.terminated_tx.subscribe()
+    }
+
+    pub fn subscribe_lifecycle(&self) -> watch::Receiver<ActorLifecycleState> {
+        self.lifecycle_tx.subscribe()
+    }
+
+    pub(crate) fn set_lifecycle_state(&self, state: ActorLifecycleState) {
+        self.lifecycle_tx.send_replace(state);
     }
 
     pub(crate) fn publish_terminated(&self, notification: ActorTerminated) {

@@ -14,7 +14,8 @@ pub use mailbox::MailboxConfig;
 pub use registry::{ActorRegistry, ActorRegistryConfig};
 pub use runtime::spawn_actor;
 pub use traits::{
-    Actor, ChildActorKey, ChildActorOptions, Handler, Message, PassivationReason, StopReason,
+    Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, Handler, Message,
+    PassivationReason, StopReason,
 };
 pub use watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason, WatchId};
 
@@ -28,9 +29,9 @@ mod tests {
 
     use crate::{
         Actor, ActorActivationError, ActorCallError, ActorContext, ActorError, ActorHandle,
-        ActorRegistry, ActorRegistryConfig, ActorTellError, ActorTerminated, ChildActorKey,
-        ChildActorOptions, Handler, MailboxConfig, Message, PassivationReason, StopReason,
-        TerminatedReason, spawn_actor,
+        ActorLifecycleState, ActorRegistry, ActorRegistryConfig, ActorTellError, ActorTerminated,
+        ChildActorKey, ChildActorOptions, Handler, MailboxConfig, Message, PassivationReason,
+        StopReason, TerminatedReason, spawn_actor,
     };
     use lattice_core::{ActorId, actor_kind};
 
@@ -85,6 +86,13 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         start_gate: Option<Arc<Semaphore>>,
         stopped: Option<Arc<Semaphore>>,
+    }
+
+    #[derive(Debug)]
+    struct Fail;
+
+    impl Message for Fail {
+        type Reply = ();
     }
 
     #[async_trait]
@@ -161,6 +169,17 @@ mod tests {
         ) -> Result<(), ActorError> {
             self.events.lock().await.push("tick");
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<Fail> for TestActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: Fail,
+        ) -> Result<(), ActorError> {
+            Err(ActorError::new("handler failed"))
         }
     }
 
@@ -762,5 +781,56 @@ mod tests {
         .unwrap()
         .unwrap()
         .forget();
+    }
+
+    #[tokio::test]
+    async fn handler_error_returns_to_caller_and_actor_remains_running() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let actor = TestActor {
+            events: events.clone(),
+            start_gate: None,
+            stopped: None,
+        };
+        let handle = spawn_actor(actor, MailboxConfig::bounded(8));
+
+        let error = handle.call(Fail).await;
+        let reply = handle.call(Ping("after-error")).await.unwrap();
+
+        assert!(matches!(error, Err(ActorCallError::Handler(_))));
+        assert_eq!(reply, "pong:after-error");
+        assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Running);
+    }
+
+    #[tokio::test]
+    async fn stopping_failure_enters_stop_failed_state() {
+        struct FailingStopActor;
+
+        #[async_trait]
+        impl Actor for FailingStopActor {
+            async fn stopping(
+                &mut self,
+                _ctx: &mut ActorContext<Self>,
+                _reason: StopReason,
+            ) -> Result<(), crate::ActorStopError> {
+                Err(crate::ActorStopError::new("save failed"))
+            }
+        }
+
+        let handle = spawn_actor(FailingStopActor, MailboxConfig::bounded(8));
+        let mut lifecycle = handle.subscribe_lifecycle();
+
+        handle.stop(StopReason::Requested).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                lifecycle.changed().await.unwrap();
+                if *lifecycle.borrow() == ActorLifecycleState::StopFailed {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(handle.lifecycle_state(), ActorLifecycleState::StopFailed);
     }
 }
