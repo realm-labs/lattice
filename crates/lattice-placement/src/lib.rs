@@ -1,4 +1,5 @@
 mod coordinator;
+mod etcd;
 mod instance;
 mod singleton;
 mod store;
@@ -18,6 +19,7 @@ use lattice_rpc::{
 use tonic::{Request, Response};
 
 pub use coordinator::*;
+pub use etcd::*;
 pub use instance::*;
 pub use singleton::*;
 pub use store::*;
