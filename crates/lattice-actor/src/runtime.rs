@@ -88,6 +88,7 @@ async fn run_actor<A>(
         .await;
     ctx.cancel_all_tasks();
     let reason = stop_reason.unwrap_or(StopReason::Requested);
+    ctx.stop_all_children(reason);
     handle.publish_terminated(ActorTerminated {
         target: handle.local_ref(),
         incarnation: ActorIncarnation::new(handle.local_ref().id()),

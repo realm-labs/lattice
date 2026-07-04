@@ -5,8 +5,8 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 use crate::{
-    Actor, ActorError, ActorHandle, ActorTerminated, Handler, Message, PassivationReason,
-    StopReason, WatchId,
+    Actor, ActorError, ActorHandle, ActorTerminated, ChildActorKey, ChildActorOptions, Handler,
+    Message, PassivationReason, StopReason, WatchId, spawn_actor,
 };
 
 pub struct ActorContext<A: Actor> {
@@ -14,6 +14,7 @@ pub struct ActorContext<A: Actor> {
     lifecycle_request: Option<StopReason>,
     tasks: Vec<JoinHandle<()>>,
     watches: HashMap<WatchId, JoinHandle<()>>,
+    children: HashMap<ChildActorKey, Box<dyn ChildStop>>,
     next_watch_id: u64,
 }
 
@@ -24,6 +25,7 @@ impl<A: Actor> ActorContext<A> {
             lifecycle_request: None,
             tasks: Vec::new(),
             watches: HashMap::new(),
+            children: HashMap::new(),
             next_watch_id: 0,
         }
     }
@@ -102,12 +104,49 @@ impl<A: Actor> ActorContext<A> {
         }
     }
 
+    pub fn spawn_child<C>(
+        &mut self,
+        key: ChildActorKey,
+        actor: C,
+        options: ChildActorOptions,
+    ) -> Result<ActorHandle<C>, ActorError>
+    where
+        C: Actor,
+    {
+        if self.children.contains_key(&key) {
+            return Err(ActorError::new(format!(
+                "child actor {} already exists",
+                key.as_str()
+            )));
+        }
+
+        let handle = spawn_actor(actor, options.mailbox);
+        self.children
+            .insert(key, Box::new(ChildHandleStopper(handle.clone())));
+        Ok(handle)
+    }
+
+    pub fn stop_child(&mut self, key: &ChildActorKey) -> bool {
+        if let Some(child) = self.children.remove(key) {
+            child.stop(StopReason::Requested);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn cancel_all_tasks(&mut self) {
         for task in self.tasks.drain(..) {
             task.abort();
         }
         for (_watch_id, task) in self.watches.drain() {
             task.abort();
+        }
+    }
+
+    pub(crate) fn stop_all_children(&mut self, reason: StopReason) {
+        for (_key, child) in self.children.drain() {
+            child.stop(reason);
         }
     }
 
@@ -119,5 +158,17 @@ impl<A: Actor> ActorContext<A> {
 impl<A: Actor> Drop for ActorContext<A> {
     fn drop(&mut self) {
         self.cancel_all_tasks();
+    }
+}
+
+trait ChildStop: Send {
+    fn stop(self: Box<Self>, reason: StopReason);
+}
+
+struct ChildHandleStopper<C: Actor>(ActorHandle<C>);
+
+impl<C: Actor> ChildStop for ChildHandleStopper<C> {
+    fn stop(self: Box<Self>, reason: StopReason) {
+        let _ = self.0.try_stop_internal(reason);
     }
 }

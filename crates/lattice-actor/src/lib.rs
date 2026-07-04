@@ -13,7 +13,9 @@ pub use handle::ActorHandle;
 pub use mailbox::MailboxConfig;
 pub use registry::{ActorRegistry, ActorRegistryConfig};
 pub use runtime::spawn_actor;
-pub use traits::{Actor, Handler, Message, PassivationReason, StopReason};
+pub use traits::{
+    Actor, ChildActorKey, ChildActorOptions, Handler, Message, PassivationReason, StopReason,
+};
 pub use watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason, WatchId};
 
 #[cfg(test)]
@@ -26,8 +28,9 @@ mod tests {
 
     use crate::{
         Actor, ActorActivationError, ActorCallError, ActorContext, ActorError, ActorHandle,
-        ActorRegistry, ActorRegistryConfig, ActorTellError, ActorTerminated, Handler,
-        MailboxConfig, Message, PassivationReason, StopReason, TerminatedReason, spawn_actor,
+        ActorRegistry, ActorRegistryConfig, ActorTellError, ActorTerminated, ChildActorKey,
+        ChildActorOptions, Handler, MailboxConfig, Message, PassivationReason, StopReason,
+        TerminatedReason, spawn_actor,
     };
     use lattice_core::{ActorId, actor_kind};
 
@@ -656,5 +659,108 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
         assert!(events.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_child_actor_stops_with_parent_lifecycle() {
+        struct ChildActor {
+            stopped: Option<Arc<Semaphore>>,
+        }
+
+        #[async_trait]
+        impl Actor for ChildActor {
+            async fn stopping(
+                &mut self,
+                _ctx: &mut ActorContext<Self>,
+                _reason: StopReason,
+            ) -> Result<(), crate::ActorStopError> {
+                if let Some(stopped) = self.stopped.take() {
+                    stopped.add_permits(1);
+                }
+                Ok(())
+            }
+        }
+
+        struct ParentActor {
+            child_stopped: Arc<Semaphore>,
+        }
+
+        #[async_trait]
+        impl Actor for ParentActor {
+            async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+                ctx.spawn_child(
+                    ChildActorKey::new("child"),
+                    ChildActor {
+                        stopped: Some(self.child_stopped.clone()),
+                    },
+                    ChildActorOptions::default(),
+                )?;
+                Ok(())
+            }
+        }
+
+        let child_stopped = Arc::new(Semaphore::new(0));
+        let parent = spawn_actor(
+            ParentActor {
+                child_stopped: child_stopped.clone(),
+            },
+            MailboxConfig::bounded(8),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        parent.stop(StopReason::Requested).await.unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            child_stopped.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    }
+
+    #[tokio::test]
+    async fn local_child_actor_duplicate_key_is_rejected() {
+        struct ChildActor;
+
+        #[async_trait]
+        impl Actor for ChildActor {}
+
+        struct ParentActor {
+            duplicate_rejected: Arc<Semaphore>,
+        }
+
+        #[async_trait]
+        impl Actor for ParentActor {
+            async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+                let key = ChildActorKey::new("child");
+                ctx.spawn_child(key.clone(), ChildActor, ChildActorOptions::default())?;
+                if ctx
+                    .spawn_child(key, ChildActor, ChildActorOptions::default())
+                    .is_err()
+                {
+                    self.duplicate_rejected.add_permits(1);
+                }
+                Ok(())
+            }
+        }
+
+        let duplicate_rejected = Arc::new(Semaphore::new(0));
+        let _parent = spawn_actor(
+            ParentActor {
+                duplicate_rejected: duplicate_rejected.clone(),
+            },
+            MailboxConfig::bounded(8),
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            duplicate_rejected.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
     }
 }

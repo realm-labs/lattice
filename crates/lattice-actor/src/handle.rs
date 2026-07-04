@@ -72,6 +72,10 @@ impl<A: Actor> ActorHandle<A> {
         self.send_system_command(ActorCommand::Stop(reason))
     }
 
+    pub(crate) fn try_stop_internal(&self, reason: StopReason) -> Result<(), ActorTellError> {
+        self.send_system_command(ActorCommand::Stop(reason))
+    }
+
     pub(crate) fn try_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,

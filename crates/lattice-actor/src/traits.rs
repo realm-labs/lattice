@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::{ActorContext, ActorError, ActorStopError};
+use crate::{ActorContext, ActorError, ActorStopError, MailboxConfig};
 
 #[async_trait]
 pub trait Actor: Sized + Send + 'static {
@@ -46,4 +46,22 @@ pub enum PassivationReason {
     BusinessIdle,
     IdleTimeout,
     Drain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChildActorKey(String);
+
+impl ChildActorKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChildActorOptions {
+    pub mailbox: MailboxConfig,
 }
