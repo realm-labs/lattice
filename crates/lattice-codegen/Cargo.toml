@@ -6,4 +6,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+prost.workspace = true
+prost-reflect.workspace = true
+prost-types.workspace = true
+serde.workspace = true
 thiserror.workspace = true
+toml.workspace = true
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

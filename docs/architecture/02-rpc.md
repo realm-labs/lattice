@@ -12,13 +12,17 @@
 Business proto messages should not contain framework metadata fields. Framework metadata is carried through gRPC metadata.
 
 ```proto
+syntax = "proto3";
+package world;
+
+import "lattice/options.proto";
+
 service WorldRpc {
-  rpc EnterWorld(EnterWorldRequest) returns (EnterWorldReply) {
-    option (lattice.route_key) = {
-      actor_kind: "World"
-      key_field: "world_id"
-    };
-  }
+  option (lattice.options.service_kind) = "World";
+  option (lattice.options.actor_kind) = "World";
+  option (lattice.options.default_route_key) = "world_id";
+
+  rpc EnterWorld(EnterWorldRequest) returns (EnterWorldReply);
 }
 
 message EnterWorldRequest {
@@ -33,7 +37,103 @@ message EnterWorldReply {
 
 `RpcMeta meta = 1` is intentionally not part of every business request. This keeps business messages clean and prevents callers from having to fill unrelated `None` values.
 
-### 9.2 Rust Binding
+The framework-owned option proto is:
+
+```proto
+syntax = "proto3";
+package lattice.options;
+
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.ServiceOptions {
+  string service_kind = 51001;
+  string actor_kind = 51002;
+  string default_route_key = 51003;
+}
+
+extend google.protobuf.MethodOptions {
+  string route_key = 51003;
+  uint32 gateway_msg_id = 51004;
+}
+```
+
+### 9.2 Build Script Codegen
+
+Proto-driven code generation uses `build.rs`, not a proc macro. `lattice-codegen` wraps `tonic-prost-build`, emits tonic/prost types, parses the descriptor set plus lattice proto options, validates routing metadata, and writes `$OUT_DIR/lattice.generated.rs`.
+
+Business build script shape:
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let includes = vec!["proto".into(), lattice_codegen::proto_include()];
+
+    lattice_codegen::configure()
+        .gateway_route_ids([(100, "world.WorldRpc.EnterWorld")])
+        .compile_protos(&["proto/world.proto"], &includes)?;
+
+    Ok(())
+}
+```
+
+For large projects, gateway message ids should usually come from business-owned protocol tables instead of being embedded in RPC definitions. `gateway_route_ids` is the programmatic path for build scripts that already have an id-to-method table.
+
+File-based route tables are also supported:
+
+```toml
+[[routes]]
+msg_id = 100
+method = "world.WorldRpc.EnterWorld"
+```
+
+```rust
+lattice_codegen::configure()
+    .gateway_routes("proto/gateway-routes.toml")
+    .compile_protos(&["proto/world.proto"], &includes)?;
+```
+
+Business code includes generated bindings explicitly:
+
+```rust
+pub mod world {
+    tonic::include_proto!("world");
+}
+
+pub mod generated {
+    include!(concat!(env!("OUT_DIR"), "/lattice.generated.rs"));
+}
+```
+
+Generated lattice RPC methods must have:
+
+```text
+service_kind on protobuf service
+actor_kind on protobuf service
+default_route_key on protobuf service or route_key override on protobuf method
+request type
+reply type
+```
+
+`default_route_key` and method-level `route_key` must name a non-optional field on the request message. The service-level `default_route_key` is the normal path; method-level `route_key` is only for rare methods that need a different key field. Supported route key field types are `uint64`, `int64`, `string`, and `bytes`.
+
+Allowed route key fields:
+
+```text
+proto3 ordinary scalar field
+proto2 required scalar field
+```
+
+Rejected during codegen:
+
+```text
+proto2 optional route key field
+proto3 optional route key field
+repeated route key field
+oneof route key field
+```
+
+`gateway_msg_id` remains available as a convenience proto option for small projects, but it is not the preferred path for large business protocols. If a method has both a proto `gateway_msg_id` and an external route mapping, the ids must match. Duplicate gateway message ids are rejected during codegen.
+
+### 9.3 Rust Binding
 
 The generated code binds a proto RPC method to:
 
@@ -48,7 +148,7 @@ Generated server adapter method
 
 The framework does not hardcode `World`, `Player`, or `Guild`. Those names come from business proto options, constants, or codegen output.
 
-### 9.3 Endpoint and gRPC Services
+### 9.4 Endpoint and gRPC Services
 
 `RouteTarget.advertised_endpoint` identifies one service process and tonic channel. A single process can host multiple generated gRPC services:
 
@@ -63,7 +163,7 @@ world-service instance:
 
 Connection pooling is keyed by `instance_id` and `advertised_endpoint`, not by actor id.
 
-### 9.4 Generated Artifacts
+### 9.5 Generated Artifacts
 
 Codegen should generate:
 

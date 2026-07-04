@@ -20,3 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+lattice-codegen.workspace = true

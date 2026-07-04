@@ -17,10 +17,7 @@ use lattice_eventbus::{
     EventBus, EventEnvelope, EventPublisher, EventSubscription, LocalEventBus, Subject,
     SubjectFilter,
 };
-use lattice_gateway::{
-    BinaryClientCodec, ClientCodec, ClientFrame, GatewayError, GatewayRouteTable,
-    ProstClientMessageBinding,
-};
+use lattice_gateway::{BinaryClientCodec, ClientCodec, ClientFrame, GatewayRouteTable};
 use lattice_ops::ServiceScheduler;
 use lattice_placement::{
     EndpointLease, EndpointPool, EndpointRpcTransport, ResolvingRpcCore, RouteCacheConfig,
@@ -28,12 +25,25 @@ use lattice_placement::{
 };
 use lattice_rpc::{
     ActorRpcAdapter, RouteTarget, RoutedRequest, Rpc, RpcClientContextFactory, RpcError,
-    RpcRequest, RpcServerBuilder, ShardedRpcCore, TypedRpcClient,
+    RpcRequest, RpcServerBuilder,
 };
 use prost::Message as ProstMessage;
 use serde::Deserialize;
 use serde_json::json;
 use tonic::{Request, Response};
+
+pub mod world {
+    tonic::include_proto!("world");
+}
+
+pub mod generated {
+    include!(concat!(env!("OUT_DIR"), "/lattice.generated.rs"));
+}
+
+use generated::{
+    WorldRpcClient as WorldClient, WorldRpcEnterWorldGatewayBinding, register_gateway_routes,
+};
+use world::{EnterWorldReply, EnterWorldRequest};
 
 pub const WORLD_SERVICE: ServiceKind = service_kind!("World");
 pub const WORLD_ACTOR: ActorKind = actor_kind!("World");
@@ -86,29 +96,6 @@ impl Actor for WorldActor {
     }
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct EnterWorldRequest {
-    #[prost(uint64, tag = "1")]
-    pub world_id: u64,
-    #[prost(uint64, tag = "2")]
-    pub player_id: u64,
-}
-
-impl RoutedRequest for EnterWorldRequest {
-    fn actor_kind(&self) -> ActorKind {
-        WORLD_ACTOR
-    }
-
-    fn route_key(&self) -> RouteKey {
-        RouteKey::U64(self.world_id)
-    }
-}
-
-impl RpcRequest for EnterWorldRequest {
-    type Reply = EnterWorldReply;
-    const METHOD: &'static str = "WorldRpc/EnterWorld";
-}
-
 #[derive(Debug)]
 pub struct EnterWorld {
     pub player_id: u64,
@@ -116,14 +103,6 @@ pub struct EnterWorld {
 
 impl Message for EnterWorld {
     type Reply = EnterWorldReply;
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct EnterWorldReply {
-    #[prost(bool, tag = "1")]
-    pub ok: bool,
-    #[prost(uint64, tag = "2")]
-    pub player_count: u64,
 }
 
 #[derive(Debug)]
@@ -258,47 +237,6 @@ impl EndpointRpcTransport for LocalWorldTransport {
             .map(Response::new)
             .map_err(|error| RpcError::Business(error.to_string()))
     }
-}
-
-struct WorldClient<C> {
-    inner: TypedRpcClient<C>,
-}
-
-impl<C> WorldClient<C>
-where
-    C: ShardedRpcCore,
-{
-    fn new(core: C) -> Self {
-        Self {
-            inner: TypedRpcClient::new(core),
-        }
-    }
-
-    async fn enter_world(
-        &self,
-        world_id: u64,
-        player_id: u64,
-    ) -> Result<EnterWorldReply, RpcError> {
-        self.inner
-            .call(EnterWorldRequest {
-                world_id,
-                player_id,
-            })
-            .await
-    }
-}
-
-struct WorldRpcEnterWorldGatewayBinding;
-
-impl WorldRpcEnterWorldGatewayBinding {
-    fn binding() -> ProstClientMessageBinding<EnterWorldRequest> {
-        ProstClientMessageBinding::new(100)
-    }
-}
-
-fn register_gateway_routes(table: &mut GatewayRouteTable) -> Result<(), GatewayError> {
-    table.register(WorldRpcEnterWorldGatewayBinding::binding().route_spec())?;
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,8 +384,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let direct_reply = world_a.call(EnterWorld { player_id: 1000 }).await?;
-    let rpc_reply = client.enter_world(1, 1001).await?;
-    let range_reply = client.enter_world(75, 2001).await?;
+    let rpc_reply = client
+        .enter_world(EnterWorldRequest {
+            world_id: 1,
+            player_id: 1001,
+        })
+        .await?;
+    let range_reply = client
+        .enter_world(EnterWorldRequest {
+            world_id: 75,
+            player_id: 2001,
+        })
+        .await?;
 
     let mut route_table = GatewayRouteTable::new();
     register_gateway_routes(&mut route_table)?;
@@ -461,7 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         payload: gateway_request.encode_to_vec(),
     })?;
     let decoded = codec.decode(&encoded)?;
-    let gateway_reply_frame = WorldRpcEnterWorldGatewayBinding::binding()
+    let gateway_reply_frame = WorldRpcEnterWorldGatewayBinding::default_binding()
         .decode_and_forward(decoded, core)
         .await?;
     let gateway_reply = EnterWorldReply::decode(gateway_reply_frame.payload.as_slice())?;

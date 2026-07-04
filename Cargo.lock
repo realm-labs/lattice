@@ -604,7 +604,14 @@ dependencies = [
 name = "lattice-codegen"
 version = "0.1.0"
 dependencies = [
+ "prost",
+ "prost-reflect",
+ "prost-types",
+ "serde",
+ "tempfile",
  "thiserror",
+ "toml 0.9.12+spec-1.1.0",
+ "tonic-prost-build",
 ]
 
 [[package]]
@@ -798,6 +805,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "lattice-actor",
+ "lattice-codegen",
  "lattice-config",
  "lattice-core",
  "lattice-eventbus",
@@ -810,6 +818,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tonic",
+ "tonic-prost",
 ]
 
 [[package]]
@@ -1049,6 +1058,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "prost-reflect"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "590aa145fee8f7a26b5a6055365e7c5e89a5c1caae9869de76ec0ee73181a2f9"
+dependencies = [
+ "prost",
+ "prost-types",
 ]
 
 [[package]]

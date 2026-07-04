@@ -34,7 +34,45 @@ lattice runtime:
 
 ---
 
-## 35. Starting a Logic Service
+## 35. Generating RPC Bindings
+
+Business crates generate proto types and lattice RPC glue from `build.rs`:
+
+```rust
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let includes = vec!["proto".into(), lattice_codegen::proto_include()];
+
+    lattice_codegen::configure()
+        .gateway_route_ids([(100, "world.WorldRpc.EnterWorld")])
+        .compile_protos(&["proto/world.proto"], &includes)?;
+
+    Ok(())
+}
+```
+
+Large protocols can generate the `gateway_route_ids` input from a business-owned message table, or load it from a validated file:
+
+```rust
+lattice_codegen::configure()
+    .gateway_routes("proto/gateway-routes.toml")
+    .compile_protos(&["proto/world.proto"], &includes)?;
+```
+
+Runtime code includes both tonic/prost output and lattice bindings:
+
+```rust
+pub mod world {
+    tonic::include_proto!("world");
+}
+
+pub mod generated {
+    include!(concat!(env!("OUT_DIR"), "/lattice.generated.rs"));
+}
+```
+
+---
+
+## 36. Starting a Logic Service
 
 ```rust
 pub const WORLD_SERVICE: ServiceKind = service_kind!("World");
@@ -82,7 +120,7 @@ A process may register multiple actor kinds and multiple generated gRPC services
 
 ---
 
-## 36. InstanceConfig
+## 37. InstanceConfig
 
 ```rust
 let instance = InstanceConfig {
@@ -105,7 +143,7 @@ let instance = InstanceConfig {
 
 ---
 
-## 37. AppDeps
+## 38. AppDeps
 
 `AppDeps` is owned by the business crate. It contains business dependencies, not framework runtime internals.
 
@@ -123,7 +161,7 @@ Framework handles created by runtime, such as generated clients, schedulers, eve
 
 ---
 
-## 38. Actor Factory Registration
+## 39. Actor Factory Registration
 
 ```rust
 pub struct WorldActorFactory {
@@ -162,7 +200,7 @@ Factory input may use the business typed key when codegen has enough information
 
 ---
 
-## 39. Actor and Handler
+## 40. Actor and Handler
 
 ```rust
 pub struct WorldActor {
@@ -211,7 +249,7 @@ If `stopping` fails while saving state, the runtime enters `StopFailed`, keeps o
 
 ---
 
-## 40. Actor State Machine Pattern
+## 41. Actor State Machine Pattern
 
 Business state machines should be explicit:
 
@@ -246,7 +284,7 @@ Avoid relying on a hidden mailbox stash for state-machine transitions.
 
 ---
 
-## 41. RPC Binding and Client
+## 42. RPC Binding and Client
 
 Generated binding shape:
 
@@ -282,7 +320,7 @@ The framework should make the common path short. Business crates can wrap genera
 
 ---
 
-## 42. ServiceContext
+## 43. ServiceContext
 
 ```rust
 #[derive(Clone)]
@@ -308,7 +346,7 @@ impl<A: Actor> ActorContext<A> {
 
 ---
 
-## 43. Gateway Service
+## 44. Gateway Service
 
 ```rust
 #[tokio::main]
@@ -335,7 +373,7 @@ Large businesses should use generated route tables or validated config, not hund
 
 ---
 
-## 44. Placement Coordinator
+## 45. Placement Coordinator
 
 ```rust
 #[tokio::main]
@@ -357,7 +395,7 @@ The Coordinator handles control-plane decisions only.
 
 ---
 
-## 45. EventBus, Config, and Scheduler Usage
+## 46. EventBus, Config, and Scheduler Usage
 
 Typed event publish:
 
@@ -424,7 +462,7 @@ service
 
 ---
 
-## 46. Minimal Business Layout
+## 47. Minimal Business Layout
 
 ```text
 crates/
@@ -457,7 +495,7 @@ config/
 
 ---
 
-## 47. API Decisions to Keep Stable
+## 48. API Decisions to Keep Stable
 
 ```text
 ActorKind and ServiceKind are opaque string newtypes with actor_kind! and service_kind! helpers.

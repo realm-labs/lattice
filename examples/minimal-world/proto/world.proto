@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package world;
+
+import "lattice/options.proto";
+
+service WorldRpc {
+  option (lattice.options.service_kind) = "World";
+  option (lattice.options.actor_kind) = "World";
+  option (lattice.options.default_route_key) = "world_id";
+
+  rpc EnterWorld(EnterWorldRequest) returns (EnterWorldReply);
+}
+
+message EnterWorldRequest {
+  uint64 world_id = 1;
+  uint64 player_id = 2;
+}
+
+message EnterWorldReply {
+  bool ok = 1;
+  uint64 player_count = 2;
+}

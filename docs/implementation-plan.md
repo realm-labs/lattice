@@ -182,7 +182,12 @@ Goal: build the generated glue between proto typed RPC and actor handlers. Place
 Deliverables:
 
 ```text
-proto route_key option
+proto/lattice/options.proto with service-level service_kind/actor_kind/default_route_key and method-level route_key override/gateway_msg_id options
+lattice_codegen::configure() build.rs API
+programmatic gateway_route_ids build.rs API
+file-based gateway_routes build.rs API
+tonic-prost-build descriptor pipeline
+descriptor-backed lattice option parsing and validation
 RoutedRequest generation
 RpcRequest generation
 generated typed client wrapper
@@ -194,11 +199,20 @@ RpcMetadata injection/extraction
 RpcError
 RouteTarget.advertised_endpoint
 multiple gRPC services on one advertised_endpoint
+examples/minimal-world build.rs and proto-driven generated bindings
 ```
 
 Acceptance:
 
 ```text
+Proto-driven codegen uses build.rs only; proc macros are not part of Phase 2 RPC generation.
+Custom proto options are the source of truth; no parallel TOML route config is required for generated RPC.
+Gateway msg_id mapping may come from proto options, gateway_route_ids, or gateway_routes files.
+Large business protocols should prefer business-owned msg_id tables over embedding ids in RPC proto methods.
+Every generated lattice RPC service validates service_kind and actor_kind; every generated method validates default_route_key or route_key override, request type, and reply type.
+Route key fields are validated against request messages and support only uint64, int64, string, and bytes in Phase 2.
+Route key fields must generate non-Option Rust fields: proto3 ordinary scalar fields and proto2 required scalar fields are allowed; optional, repeated, and oneof route keys are rejected during codegen.
+Duplicate gateway_msg_id values and unknown gateway route methods are rejected during codegen.
 PlayerService can call WorldActor through generated WorldClient.
 Missing Handler<Rpc<Request>> fails at compile time.
 Generated adapter converts tonic request into actor.call.
@@ -214,6 +228,14 @@ Suggested tests:
 
 ```text
 generated output snapshot tests
+proto option parsing tests
+missing service_kind, actor_kind, and route_key validation tests
+unsupported route key field type validation tests
+optional/repeated/oneof route key rejection tests
+duplicate gateway_msg_id validation tests
+programmatic gateway_route_ids tests
+file-based gateway_routes tests
+lattice_codegen::configure().compile_protos integration test
 generated client API compile tests
 missing handler compile-fail tests
 fake tonic transport round trip

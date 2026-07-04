@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package lattice.options;
+
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.ServiceOptions {
+  string service_kind = 51001;
+  string actor_kind = 51002;
+  string default_route_key = 51003;
+}
+
+extend google.protobuf.MethodOptions {
+  string route_key = 51003;
+  uint32 gateway_msg_id = 51004;
+}
