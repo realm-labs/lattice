@@ -388,6 +388,7 @@ name = "lattice-placement"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "http",
  "lattice-core",
  "lattice-rpc",
  "prost",

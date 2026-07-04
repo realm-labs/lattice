@@ -1,6 +1,7 @@
+mod instance;
 mod vshard;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -13,7 +14,69 @@ use lattice_rpc::{
 };
 use tonic::{Request, Response};
 
+pub use instance::*;
 pub use vshard::*;
+
+#[derive(Debug, Clone)]
+pub struct VirtualShardRouteTable {
+    service_kind: ServiceKind,
+    actor_kind: ActorKind,
+    mapper: VirtualShardMapper,
+    assignments: BTreeMap<VirtualShardId, VirtualShardAssignment>,
+    instances: InMemoryInstanceRegistry,
+}
+
+impl VirtualShardRouteTable {
+    pub fn new(
+        service_kind: ServiceKind,
+        actor_kind: ActorKind,
+        mapper: VirtualShardMapper,
+        assignments: Vec<VirtualShardAssignment>,
+        instances: InMemoryInstanceRegistry,
+    ) -> Self {
+        Self {
+            service_kind,
+            actor_kind,
+            mapper,
+            assignments: assignments
+                .into_iter()
+                .map(|assignment| (assignment.shard_id, assignment))
+                .collect(),
+            instances,
+        }
+    }
+
+    pub async fn resolve(&self, route_key: &RouteKey) -> Result<RouteTarget, PlacementError> {
+        let shard_id = self.mapper.shard_for_route_key(route_key);
+        let assignment = self
+            .assignments
+            .get(&shard_id)
+            .ok_or(PlacementError::NoRoute)?;
+        let instance = self
+            .instances
+            .get(&assignment.owner)
+            .await?
+            .ok_or_else(|| PlacementError::InstanceNotFound {
+                instance_id: assignment.owner.clone(),
+            })?;
+        if instance.state != InstanceState::Ready {
+            return Err(PlacementError::InstanceNotReady {
+                instance_id: instance.instance_id,
+                state: instance.state,
+            });
+        }
+        Ok(RouteTarget {
+            service_kind: self.service_kind.clone(),
+            instance_id: instance.instance_id,
+            advertised_endpoint: instance.advertised_endpoint,
+            owner_epoch: Some(assignment.epoch),
+        })
+    }
+
+    pub fn actor_kind(&self) -> &ActorKind {
+        &self.actor_kind
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteCacheKey {
@@ -440,6 +503,13 @@ pub enum PlacementError {
     NoReadyInstances,
     #[error("duplicate virtual shard assigner {name}")]
     DuplicateAssigner { name: &'static str },
+    #[error("instance {instance_id} was not found")]
+    InstanceNotFound { instance_id: InstanceId },
+    #[error("instance {instance_id} is not ready: {state:?}")]
+    InstanceNotReady {
+        instance_id: InstanceId,
+        state: InstanceState,
+    },
 }
 
 #[cfg(test)]
@@ -449,7 +519,7 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use lattice_core::{Epoch, InstanceId, RouteKey, actor_kind, service_kind};
+    use lattice_core::{Epoch, InstanceCapacity, InstanceId, RouteKey, actor_kind, service_kind};
     use lattice_rpc::{AuthContext, RpcContext};
 
     use super::*;
@@ -728,6 +798,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_instance_registry_lists_ready_instances_for_service() {
+        let registry = InMemoryInstanceRegistry::new();
+
+        registry
+            .upsert(instance_record("world-a", InstanceState::Ready))
+            .await
+            .unwrap();
+        registry
+            .upsert(instance_record("world-b", InstanceState::Draining))
+            .await
+            .unwrap();
+
+        let ready = registry.list_ready(&service_kind!("World")).await.unwrap();
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].instance_id, InstanceId::new("world-a"));
+    }
+
+    #[tokio::test]
+    async fn virtual_shard_route_table_resolves_actor_key_to_shard_owner() {
+        let registry = InMemoryInstanceRegistry::new();
+        registry
+            .upsert(instance_record("world-a", InstanceState::Ready))
+            .await
+            .unwrap();
+        registry
+            .upsert(instance_record("world-b", InstanceState::Ready))
+            .await
+            .unwrap();
+        let mapper = VirtualShardMapper::new(2).unwrap();
+        let shard = mapper.shard_for_route_key(&RouteKey::U64(7));
+        let owner = if shard.0 == 0 { "world-a" } else { "world-b" };
+        let table = VirtualShardRouteTable::new(
+            service_kind!("World"),
+            actor_kind!("World"),
+            mapper,
+            vec![VirtualShardAssignment {
+                shard_id: shard,
+                owner: InstanceId::new(owner),
+                epoch: Epoch(9),
+            }],
+            registry,
+        );
+
+        let target = table.resolve(&RouteKey::U64(7)).await.unwrap();
+
+        assert_eq!(target.instance_id, InstanceId::new(owner));
+        assert_eq!(target.owner_epoch, Some(Epoch(9)));
+        assert_eq!(table.actor_kind(), &actor_kind!("World"));
+    }
+
+    #[tokio::test]
     async fn resolving_rpc_core_invalidates_not_owner_and_retries_same_request_id() {
         let resolver = SequencedResolver {
             targets: Arc::new(Mutex::new(VecDeque::from([
@@ -820,6 +942,19 @@ mod tests {
             previous,
             eligible_shards,
             max_migrations,
+        }
+    }
+
+    fn instance_record(instance_id: &str, state: InstanceState) -> InstanceRecord {
+        InstanceRecord {
+            service_kind: service_kind!("World"),
+            instance_id: InstanceId::new(instance_id),
+            advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
+            control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),
+            version: "test".to_string(),
+            state,
+            capacity: InstanceCapacity::default(),
+            labels: Default::default(),
         }
     }
 }
