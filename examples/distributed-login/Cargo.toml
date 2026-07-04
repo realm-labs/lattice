@@ -1,5 +1,5 @@
 [package]
-name = "lattice-placement"
+name = "distributed-login"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,17 +7,20 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-dashmap.workspace = true
-etcd-client.workspace = true
 http.workspace = true
+lattice-actor.workspace = true
 lattice-core.workspace = true
+lattice-gateway.workspace = true
+lattice-placement.workspace = true
 lattice-rpc.workspace = true
 prost.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
+tonic-prost.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
 
-[dev-dependencies]
+[build-dependencies]
+lattice-codegen.workspace = true

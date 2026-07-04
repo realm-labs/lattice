@@ -7,6 +7,8 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
+use lattice_core::ActorRef;
+
 use crate::ChildSupervision;
 use crate::{
     Actor, ActorError, ActorHandle, ActorTerminated, ChildActorKey, ChildActorOptions, Handler,
@@ -15,6 +17,7 @@ use crate::{
 
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
+    self_ref: Option<ActorRef>,
     lifecycle_request: Option<StopReason>,
     tasks: Vec<JoinHandle<()>>,
     watches: HashMap<WatchId, JoinHandle<()>>,
@@ -23,15 +26,26 @@ pub struct ActorContext<A: Actor> {
 }
 
 impl<A: Actor> ActorContext<A> {
-    pub(crate) fn new(handle: ActorHandle<A>) -> Self {
+    pub(crate) fn new(handle: ActorHandle<A>, self_ref: Option<ActorRef>) -> Self {
         Self {
             handle,
+            self_ref,
             lifecycle_request: None,
             tasks: Vec::new(),
             watches: HashMap::new(),
             children: HashMap::new(),
             next_watch_id: 0,
         }
+    }
+
+    pub fn self_ref(&self) -> Option<&ActorRef> {
+        self.self_ref.as_ref()
+    }
+
+    pub fn require_self_ref(&self) -> Result<&ActorRef, ActorError> {
+        self.self_ref
+            .as_ref()
+            .ok_or_else(|| ActorError::new("actor self ref is not available"))
     }
 
     pub fn request_stop(&mut self) {

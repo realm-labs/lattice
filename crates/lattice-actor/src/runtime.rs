@@ -16,7 +16,7 @@ use crate::{
     Actor, ActorContext, ActorHandle, ActorIncarnation, ActorLifecycleState, ActorTerminated,
     LocalActorRef, PassivationReason, StopReason, TerminatedReason,
 };
-use lattice_core::ActorId;
+use lattice_core::{ActorId, ActorRef};
 
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -46,6 +46,7 @@ pub struct ActorSpawnOptions {
     pub execution: Option<ActorExecutionPolicy>,
     pub scheduler_key: Option<ActorId>,
     pub passivation: PassivationPolicy,
+    pub self_ref: Option<ActorRef>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -187,15 +188,21 @@ impl ActorScheduler {
         A: Actor,
     {
         let pool = self.keyed_worker_pool(worker_count)?;
-        let parts = create_actor_parts(options.mailbox);
-        let scheduler_key = options
-            .scheduler_key
-            .unwrap_or_else(|| ActorId::U64(parts.handle.local_ref().id()));
+        let ActorSpawnOptions {
+            mailbox,
+            scheduler_key,
+            passivation,
+            self_ref,
+            execution: _,
+        } = options;
+        let parts = create_actor_parts(mailbox, self_ref);
+        let scheduler_key =
+            scheduler_key.unwrap_or_else(|| ActorId::U64(parts.handle.local_ref().id()));
         let worker_index = Self::keyed_worker_index(&scheduler_key, worker_count)?;
         Ok(spawn_actor_on_pool(
             actor,
             parts,
-            options.passivation,
+            passivation,
             &pool,
             worker_index,
             "keyed_worker_pool",
@@ -213,10 +220,17 @@ impl ActorScheduler {
     {
         let pool = self.dedicated_worker_pool::<A>(worker_count)?;
         let worker_index = pool.next_worker_index();
+        let ActorSpawnOptions {
+            mailbox,
+            passivation,
+            self_ref,
+            execution: _,
+            scheduler_key: _,
+        } = options;
         Ok(spawn_actor_on_pool(
             actor,
-            create_actor_parts(options.mailbox),
-            options.passivation,
+            create_actor_parts(mailbox, self_ref),
+            passivation,
             &pool,
             worker_index,
             "dedicated_thread_pool",
@@ -417,6 +431,29 @@ where
                 execution: Some(ActorExecutionPolicy::TaskPerActor),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
+                self_ref: None,
+            },
+        )
+        .expect("TaskPerActor execution is supported")
+}
+
+pub(crate) fn spawn_actor_with_self_ref<A>(
+    actor: A,
+    mailbox: MailboxConfig,
+    self_ref: Option<ActorRef>,
+) -> ActorHandle<A>
+where
+    A: Actor,
+{
+    ActorRuntime::default()
+        .spawn_actor_now(
+            actor,
+            ActorSpawnOptions {
+                mailbox,
+                execution: Some(ActorExecutionPolicy::TaskPerActor),
+                scheduler_key: None,
+                passivation: PassivationPolicy::Disabled,
+                self_ref,
             },
         )
         .expect("TaskPerActor execution is supported")
@@ -426,17 +463,25 @@ fn spawn_task_per_actor<A>(actor: A, options: ActorSpawnOptions) -> ActorHandle<
 where
     A: Actor,
 {
-    let parts = create_actor_parts(options.mailbox);
-    spawn_actor_as_tokio_task(actor, parts, options.passivation, "task_per_actor")
+    let ActorSpawnOptions {
+        mailbox,
+        passivation,
+        self_ref,
+        execution: _,
+        scheduler_key: _,
+    } = options;
+    let parts = create_actor_parts(mailbox, self_ref);
+    spawn_actor_as_tokio_task(actor, parts, passivation, "task_per_actor")
 }
 
 struct ActorRuntimeParts<A: Actor> {
     handle: ActorHandle<A>,
     normal_rx: mpsc::Receiver<ActorCommand<A>>,
     system_rx: mpsc::Receiver<ActorCommand<A>>,
+    self_ref: Option<ActorRef>,
 }
 
-fn create_actor_parts<A>(mailbox: MailboxConfig) -> ActorRuntimeParts<A>
+fn create_actor_parts<A>(mailbox: MailboxConfig, self_ref: Option<ActorRef>) -> ActorRuntimeParts<A>
 where
     A: Actor,
 {
@@ -451,6 +496,7 @@ where
         handle,
         normal_rx,
         system_rx,
+        self_ref,
     }
 }
 
@@ -464,6 +510,7 @@ where
     A: Actor,
 {
     let handle = parts.handle;
+    let self_ref = parts.self_ref;
     let span = tracing::info_span!(
         "actor.spawn",
         otel.kind = "internal",
@@ -478,6 +525,7 @@ where
             parts.normal_rx,
             parts.system_rx,
             passivation,
+            self_ref,
         )
         .instrument(span),
     );
@@ -497,6 +545,7 @@ where
     A: Actor,
 {
     let handle = parts.handle;
+    let self_ref = parts.self_ref;
     let span = tracing::info_span!(
         "actor.spawn",
         otel.kind = "internal",
@@ -513,6 +562,7 @@ where
             parts.normal_rx,
             parts.system_rx,
             passivation,
+            self_ref,
         )
         .instrument(span),
     );
@@ -526,10 +576,11 @@ async fn run_actor<A>(
     mut normal_rx: mpsc::Receiver<ActorCommand<A>>,
     mut system_rx: mpsc::Receiver<ActorCommand<A>>,
     passivation: PassivationPolicy,
+    self_ref: Option<ActorRef>,
 ) where
     A: Actor,
 {
-    let mut ctx = ActorContext::new(handle.clone());
+    let mut ctx = ActorContext::new(handle.clone(), self_ref);
     let activity_tx = spawn_passivation_monitor(&handle, passivation);
     let actor_type = type_name::<A>();
     let local_ref = handle.local_ref().id();

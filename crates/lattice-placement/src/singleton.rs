@@ -187,14 +187,14 @@ where
 #[derive(Debug, Clone)]
 pub struct SingletonRouteResolver<S, C> {
     coordinator: SingletonCoordinator<S, C>,
-    cache: Arc<std::sync::Mutex<LocalRouteCache>>,
+    cache: Arc<LocalRouteCache>,
 }
 
 impl<S, C> SingletonRouteResolver<S, C> {
     pub fn new(coordinator: SingletonCoordinator<S, C>, cache_config: RouteCacheConfig) -> Self {
         Self {
             coordinator,
-            cache: Arc::new(std::sync::Mutex::new(LocalRouteCache::new(cache_config))),
+            cache: Arc::new(LocalRouteCache::new(cache_config)),
         }
     }
 }
@@ -207,14 +207,11 @@ where
 {
     async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
         let cache_key = request.cache_key();
-        {
-            let mut cache = self.cache.lock().unwrap();
-            match cache.get(&cache_key) {
-                crate::CacheLookup::Fresh(target) | crate::CacheLookup::Stale(target) => {
-                    return Ok(target);
-                }
-                crate::CacheLookup::Miss => {}
+        match self.cache.get(&cache_key) {
+            crate::CacheLookup::Fresh(target) | crate::CacheLookup::Stale(target) => {
+                return Ok(target);
             }
+            crate::CacheLookup::Miss => {}
         }
 
         let scope = match request.route_key {
@@ -243,12 +240,12 @@ where
             advertised_endpoint: instance.advertised_endpoint,
             owner_epoch: Some(record.epoch),
         };
-        self.cache.lock().unwrap().insert(cache_key, target.clone());
+        self.cache.insert(cache_key, target.clone());
         Ok(target)
     }
 
     async fn invalidate(&self, key: RouteCacheKey, _reason: crate::InvalidateReason) {
-        self.cache.lock().unwrap().invalidate(&key);
+        self.cache.invalidate(&key);
     }
 }
 

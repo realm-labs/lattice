@@ -339,7 +339,7 @@ pub struct ExplicitRouteResolver<S, L> {
     service_kind: ServiceKind,
     store: S,
     coordinator: PlacementCoordinator<S, L>,
-    cache: Arc<std::sync::Mutex<LocalRouteCache>>,
+    cache: Arc<LocalRouteCache>,
     placement_lookups: Arc<AtomicU64>,
 }
 
@@ -354,7 +354,7 @@ impl<S, L> ExplicitRouteResolver<S, L> {
             service_kind,
             store,
             coordinator,
-            cache: Arc::new(std::sync::Mutex::new(LocalRouteCache::new(cache_config))),
+            cache: Arc::new(LocalRouteCache::new(cache_config)),
             placement_lookups: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -401,14 +401,11 @@ where
 {
     async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
         let key = request.cache_key();
-        {
-            let mut cache = self.cache.lock().expect("route cache mutex poisoned");
-            match cache.get(&key) {
-                crate::CacheLookup::Fresh(target) | crate::CacheLookup::Stale(target) => {
-                    return Ok(target);
-                }
-                crate::CacheLookup::Miss => {}
+        match self.cache.get(&key) {
+            crate::CacheLookup::Fresh(target) | crate::CacheLookup::Stale(target) => {
+                return Ok(target);
             }
+            crate::CacheLookup::Miss => {}
         }
 
         self.placement_lookups.fetch_add(1, Ordering::SeqCst);
@@ -442,18 +439,12 @@ where
             advertised_endpoint: instance.advertised_endpoint,
             owner_epoch: Some(record.epoch),
         };
-        self.cache
-            .lock()
-            .expect("route cache mutex poisoned")
-            .insert(key, target.clone());
+        self.cache.insert(key, target.clone());
         Ok(target)
     }
 
     async fn invalidate(&self, key: RouteCacheKey, _reason: InvalidateReason) {
-        self.cache
-            .lock()
-            .expect("route cache mutex poisoned")
-            .invalidate(&key);
+        self.cache.invalidate(&key);
     }
 }
 
@@ -478,7 +469,7 @@ fn route_key_from_actor_id(actor_id: &ActorId) -> RouteKey {
 async fn refresh_cache_from_watch_event<S>(
     service_kind: &ServiceKind,
     store: &S,
-    cache: &Arc<std::sync::Mutex<LocalRouteCache>>,
+    cache: &Arc<LocalRouteCache>,
     event: PlacementWatchEvent,
 ) where
     S: PlacementStore,
@@ -493,10 +484,7 @@ async fn refresh_cache_from_watch_event<S>(
     );
 
     if record.state != PlacementState::Running {
-        cache
-            .lock()
-            .expect("route cache mutex poisoned")
-            .invalidate(&cache_key);
+        cache.invalidate(&cache_key);
         return;
     }
 
@@ -508,18 +496,12 @@ async fn refresh_cache_from_watch_event<S>(
             owner_epoch: Some(record.epoch),
         },
         _ => {
-            cache
-                .lock()
-                .expect("route cache mutex poisoned")
-                .invalidate(&cache_key);
+            cache.invalidate(&cache_key);
             return;
         }
     };
 
-    cache
-        .lock()
-        .expect("route cache mutex poisoned")
-        .insert(cache_key, target);
+    cache.insert(cache_key, target);
 }
 
 #[cfg(test)]

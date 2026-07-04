@@ -11,6 +11,7 @@ members = [
     "crates/lattice-telemetry-otlp",
     "crates/lattice-ops",
     "crates/lattice-rpc",
+    "examples/distributed-login",
     "examples/minimal-world",
 ]
 resolver = "3"
@@ -24,6 +25,7 @@ repository = "https://github.com/realm-labs/lattice"
 [workspace.dependencies]
 async-trait = "0.1.89"
 axum = "0.8.9"
+dashmap = "6.1.0"
 etcd-client = "0.19.0"
 http = "1.4.2"
 lattice-config = { path = "crates/lattice-config" }
@@ -48,7 +50,8 @@ serde_json = "1.0.150"
 serde_yaml = "0.9.34"
 tempfile = "3.23.0"
 thiserror = "2.0.18"
-tokio = { version = "1.48.0", features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.17", features = ["net"] }
 toml = "0.9.7"
 tonic = "0.14.6"
 tonic-prost = "0.14.6"

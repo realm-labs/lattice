@@ -5,16 +5,20 @@ mod singleton;
 mod store;
 mod vshard;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use lattice_core::{ActorKind, InstanceId, RouteKey, ServiceKind};
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
+use lattice_core::{
+    ActorId, ActorKind, ActorRef, ActorRefTarget, InstanceId, RouteKey, ServiceKind,
+};
 use lattice_rpc::{
-    RouteTarget, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError, RpcRequest,
-    ShardedRpcCore,
+    ActorRefRpcCore, RouteTarget, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError,
+    RpcRequest, ShardedRpcCore,
 };
 use tonic::{Request, Response};
 use tracing::Instrument;
@@ -308,6 +312,140 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvingActorRefRpcCore<R, T> {
+    resolver: R,
+    endpoint_pool: EndpointPool,
+    context_factory: RpcClientContextFactory,
+    transport: T,
+}
+
+impl<R, T> ResolvingActorRefRpcCore<R, T> {
+    pub fn new(
+        resolver: R,
+        endpoint_pool: EndpointPool,
+        context_factory: RpcClientContextFactory,
+        transport: T,
+    ) -> Self {
+        Self {
+            resolver,
+            endpoint_pool,
+            context_factory,
+            transport,
+        }
+    }
+}
+
+#[async_trait]
+impl<R, T> ActorRefRpcCore for ResolvingActorRefRpcCore<R, T>
+where
+    R: RouteResolver,
+    T: EndpointRpcTransport,
+{
+    async fn call_ref<Req>(&self, actor_ref: ActorRef, req: Req) -> Result<Req::Reply, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        validate_actor_ref_request(&actor_ref, &req)?;
+        let encoded = req.encode_to_vec();
+        let target = self.resolve_actor_ref_target(&actor_ref).await?;
+        let ctx = self.context_factory.next_context(target.owner_epoch);
+        self.send_with_context(target, ctx, decode_request::<Req>(&encoded)?)
+            .await
+    }
+}
+
+impl<R, T> ResolvingActorRefRpcCore<R, T>
+where
+    R: RouteResolver,
+    T: EndpointRpcTransport,
+{
+    async fn resolve_actor_ref_target(
+        &self,
+        actor_ref: &ActorRef,
+    ) -> Result<RouteTarget, RpcError> {
+        match &actor_ref.target {
+            ActorRefTarget::Direct {
+                instance_id,
+                endpoint,
+                owner_epoch,
+            } => Ok(RouteTarget {
+                service_kind: actor_ref.service_kind.clone(),
+                instance_id: instance_id.clone(),
+                advertised_endpoint: endpoint.clone(),
+                owner_epoch: *owner_epoch,
+            }),
+            ActorRefTarget::Routed => {
+                let request = ResolveRequest {
+                    service_kind: actor_ref.service_kind.clone(),
+                    actor_kind: actor_ref.actor_kind.clone(),
+                    route_key: actor_ref.actor_id.to_route_key(),
+                };
+                self.resolver
+                    .resolve(request)
+                    .await
+                    .map_err(|error| RpcError::Business(error.to_string()))
+            }
+        }
+    }
+
+    async fn send_with_context<Req>(
+        &self,
+        target: RouteTarget,
+        ctx: RpcContext,
+        req: Req,
+    ) -> Result<Req::Reply, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        let endpoint = self.endpoint_pool.get_or_connect(&target);
+        let mut request = Request::new(req);
+        ctx.inject_metadata(request.metadata_mut())
+            .map_err(|error| RpcError::Business(error.to_string()))?;
+        self.transport
+            .unary(endpoint, target, request)
+            .await
+            .map(Response::into_inner)
+    }
+}
+
+fn validate_actor_ref_request<Req>(actor_ref: &ActorRef, req: &Req) -> Result<(), RpcError>
+where
+    Req: RoutedRequest,
+{
+    if req.actor_kind() != actor_ref.actor_kind {
+        return Err(RpcError::Business(format!(
+            "actor ref kind {} does not match request kind {}",
+            actor_ref.actor_kind.as_str(),
+            req.actor_kind().as_str()
+        )));
+    }
+    if !actor_id_matches_route_key(&actor_ref.actor_id, &req.route_key()) {
+        return Err(RpcError::Business(format!(
+            "actor ref id {:?} does not match request route key {:?}",
+            actor_ref.actor_id,
+            req.route_key()
+        )));
+    }
+    Ok(())
+}
+
+fn actor_id_matches_route_key(actor_id: &ActorId, route_key: &RouteKey) -> bool {
+    matches!(
+        (actor_id, route_key),
+        (ActorId::Str(left), RouteKey::Str(right)) if left == right
+    ) || matches!(
+        (actor_id, route_key),
+        (ActorId::U64(left), RouteKey::U64(right)) if left == right
+    ) || matches!(
+        (actor_id, route_key),
+        (ActorId::I64(left), RouteKey::I64(right)) if left == right
+    ) || matches!(
+        (actor_id, route_key),
+        (ActorId::Bytes(left), RouteKey::Bytes(right)) if left == right
+    )
+}
+
 fn decode_request<Req>(bytes: &[u8]) -> Result<Req, RpcError>
 where
     Req: RpcRequest,
@@ -333,7 +471,7 @@ impl Default for RouteCacheConfig {
 #[derive(Debug, Clone)]
 pub struct LocalRouteCache {
     config: RouteCacheConfig,
-    entries: HashMap<RouteCacheKey, RouteCacheEntry>,
+    entries: DashMap<RouteCacheKey, RouteCacheEntry>,
 }
 
 impl LocalRouteCache {
@@ -344,11 +482,11 @@ impl LocalRouteCache {
         );
         Self {
             config,
-            entries: HashMap::new(),
+            entries: DashMap::new(),
         }
     }
 
-    pub fn insert(&mut self, key: RouteCacheKey, target: RouteTarget) {
+    pub fn insert(&self, key: RouteCacheKey, target: RouteTarget) {
         self.entries.insert(
             key,
             RouteCacheEntry {
@@ -358,7 +496,7 @@ impl LocalRouteCache {
         );
     }
 
-    pub fn get(&mut self, key: &RouteCacheKey) -> CacheLookup {
+    pub fn get(&self, key: &RouteCacheKey) -> CacheLookup {
         let Some(entry) = self.entries.get(key) else {
             return CacheLookup::Miss;
         };
@@ -366,13 +504,14 @@ impl LocalRouteCache {
             CacheEntryState::Fresh => CacheLookup::Fresh(entry.target.clone()),
             CacheEntryState::Stale => CacheLookup::Stale(entry.target.clone()),
             CacheEntryState::Expired => {
+                drop(entry);
                 self.entries.remove(key);
                 CacheLookup::Miss
             }
         }
     }
 
-    pub fn invalidate(&mut self, key: &RouteCacheKey) {
+    pub fn invalidate(&self, key: &RouteCacheKey) {
         self.entries.remove(key);
     }
 }
@@ -433,7 +572,7 @@ pub struct StaticRouteRange {
 #[derive(Debug, Clone)]
 pub struct StaticRouteResolver {
     config: StaticPlacementConfig,
-    cache: Arc<std::sync::Mutex<LocalRouteCache>>,
+    cache: Arc<LocalRouteCache>,
     placement_lookups: Arc<AtomicU64>,
 }
 
@@ -441,7 +580,7 @@ impl StaticRouteResolver {
     pub fn new(config: StaticPlacementConfig, cache_config: RouteCacheConfig) -> Self {
         Self {
             config,
-            cache: Arc::new(std::sync::Mutex::new(LocalRouteCache::new(cache_config))),
+            cache: Arc::new(LocalRouteCache::new(cache_config)),
             placement_lookups: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -485,27 +624,18 @@ impl RouteResolver for StaticRouteResolver {
         );
         let _entered = span.enter();
         let key = request.cache_key();
-        {
-            let mut cache = self.cache.lock().expect("route cache mutex poisoned");
-            match cache.get(&key) {
-                CacheLookup::Fresh(target) | CacheLookup::Stale(target) => return Ok(target),
-                CacheLookup::Miss => {}
-            }
+        match self.cache.get(&key) {
+            CacheLookup::Fresh(target) | CacheLookup::Stale(target) => return Ok(target),
+            CacheLookup::Miss => {}
         }
 
         let target = self.resolve_from_static_config(&request)?;
-        self.cache
-            .lock()
-            .expect("route cache mutex poisoned")
-            .insert(key, target.clone());
+        self.cache.insert(key, target.clone());
         Ok(target)
     }
 
     async fn invalidate(&self, key: RouteCacheKey, _reason: InvalidateReason) {
-        self.cache
-            .lock()
-            .expect("route cache mutex poisoned")
-            .invalidate(&key);
+        self.cache.invalidate(&key);
     }
 }
 
@@ -532,31 +662,29 @@ pub struct EndpointLease {
 
 #[derive(Debug, Default, Clone)]
 pub struct EndpointPool {
-    connections: Arc<std::sync::Mutex<HashMap<EndpointPoolKey, EndpointLease>>>,
+    connections: Arc<DashMap<EndpointPoolKey, EndpointLease>>,
     next_connection_id: Arc<AtomicU64>,
 }
 
 impl EndpointPool {
     pub fn new() -> Self {
         Self {
-            connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            connections: Arc::new(DashMap::new()),
             next_connection_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
     pub fn get_or_connect(&self, target: &RouteTarget) -> EndpointLease {
         let key = EndpointPoolKey::from_target(target);
-        let mut connections = self
-            .connections
-            .lock()
-            .expect("endpoint pool mutex poisoned");
-        connections
-            .entry(key.clone())
-            .or_insert_with(|| EndpointLease {
-                key,
-                connection_id: self.next_connection_id.fetch_add(1, Ordering::SeqCst),
-            })
-            .clone()
+        match self.connections.entry(key.clone()) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => entry
+                .insert(EndpointLease {
+                    key,
+                    connection_id: self.next_connection_id.fetch_add(1, Ordering::SeqCst),
+                })
+                .clone(),
+        }
     }
 }
 
@@ -601,7 +729,7 @@ mod tests {
 
     use async_trait::async_trait;
     use lattice_core::{
-        ActorId, Epoch, InstanceCapacity, InstanceId, RouteKey, actor_kind, service_kind,
+        ActorId, ActorRef, Epoch, InstanceCapacity, InstanceId, RouteKey, actor_kind, service_kind,
     };
     use lattice_rpc::{AuthContext, RpcContext};
 
@@ -670,6 +798,34 @@ mod tests {
         attempts: Arc<Mutex<Vec<Attempt>>>,
     }
 
+    #[derive(Clone, Default)]
+    struct OkTransport {
+        attempts: Arc<Mutex<Vec<Attempt>>>,
+    }
+
+    #[async_trait]
+    impl EndpointRpcTransport for OkTransport {
+        async fn unary<Req>(
+            &self,
+            endpoint: EndpointLease,
+            target: RouteTarget,
+            request: Request<Req>,
+        ) -> Result<Response<Req::Reply>, RpcError>
+        where
+            Req: RoutedRequest + RpcRequest,
+        {
+            let ctx = RpcContext::from_metadata(request.metadata())
+                .map_err(|error| RpcError::Business(error.to_string()))?;
+            self.attempts.lock().unwrap().push(Attempt {
+                request_id: ctx.request_id.as_str().to_string(),
+                route_epoch: ctx.route_epoch,
+                instance_id: target.instance_id,
+                connection_id: endpoint.connection_id,
+            });
+            Ok(Response::new(Req::Reply::default()))
+        }
+    }
+
     #[async_trait]
     impl EndpointRpcTransport for NotOwnerThenOkTransport {
         async fn unary<Req>(
@@ -702,7 +858,7 @@ mod tests {
 
     #[test]
     fn local_route_cache_reports_fresh_stale_and_hard_expired_entries() {
-        let mut cache = LocalRouteCache::new(RouteCacheConfig {
+        let cache = LocalRouteCache::new(RouteCacheConfig {
             soft_ttl: Duration::from_millis(5),
             hard_ttl: Duration::from_millis(25),
         });
@@ -1056,6 +1212,61 @@ mod tests {
         assert_eq!(attempts[1].route_epoch, Some(Epoch(2)));
         assert_eq!(attempts[0].instance_id, InstanceId::new("world-a"));
         assert_eq!(attempts[1].instance_id, InstanceId::new("world-b"));
+    }
+
+    #[tokio::test]
+    async fn actor_ref_core_sends_direct_ref_without_resolving_placement() {
+        let resolver = static_resolver();
+        let transport = OkTransport::default();
+        let attempts = transport.attempts.clone();
+        let core = ResolvingActorRefRpcCore::new(
+            resolver.clone(),
+            EndpointPool::new(),
+            RpcClientContextFactory::new(service_kind!("Player"), InstanceId::new("player-0")),
+            transport,
+        );
+        let actor_ref = ActorRef::direct(
+            service_kind!("World"),
+            actor_kind!("World"),
+            ActorId::U64(7),
+            InstanceId::new("world-direct"),
+            "http://127.0.0.1:19081".parse().unwrap(),
+            Some(Epoch(11)),
+        );
+
+        core.call_ref(actor_ref, EnterWorldRequest { world_id: 7 })
+            .await
+            .unwrap();
+
+        assert_eq!(resolver.placement_lookups(), 0);
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].instance_id, InstanceId::new("world-direct"));
+        assert_eq!(attempts[0].route_epoch, Some(Epoch(11)));
+    }
+
+    #[tokio::test]
+    async fn actor_ref_core_rejects_mismatched_route_key() {
+        let core = ResolvingActorRefRpcCore::new(
+            static_resolver(),
+            EndpointPool::new(),
+            RpcClientContextFactory::new(service_kind!("Player"), InstanceId::new("player-0")),
+            OkTransport::default(),
+        );
+        let actor_ref = ActorRef::routed(
+            service_kind!("World"),
+            actor_kind!("World"),
+            ActorId::U64(8),
+        );
+
+        let error = core
+            .call_ref(actor_ref, EnterWorldRequest { world_id: 7 })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RpcError::Business(message) if message.contains("does not match request route key"))
+        );
     }
 
     fn static_resolver() -> StaticRouteResolver {

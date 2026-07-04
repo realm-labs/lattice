@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use lattice_core::ActorKind;
 use lattice_rpc::{RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 use prost::Message as ProstMessage;
@@ -72,7 +74,7 @@ pub struct RateLimitKey {
 pub struct KeyedRateLimiter {
     limit: u32,
     window: Duration,
-    buckets: HashMap<RateLimitKey, RateBucket>,
+    buckets: DashMap<RateLimitKey, RateBucket>,
 }
 
 impl KeyedRateLimiter {
@@ -80,16 +82,19 @@ impl KeyedRateLimiter {
         Self {
             limit,
             window,
-            buckets: HashMap::new(),
+            buckets: DashMap::new(),
         }
     }
 
-    pub fn check(&mut self, key: RateLimitKey) -> Result<(), GatewayError> {
+    pub fn check(&self, key: RateLimitKey) -> Result<(), GatewayError> {
         let now = Instant::now();
-        let bucket = self.buckets.entry(key).or_insert(RateBucket {
-            window_started: now,
-            used: 0,
-        });
+        let mut bucket = match self.buckets.entry(key) {
+            Entry::Occupied(entry) => entry.into_ref(),
+            Entry::Vacant(entry) => entry.insert(RateBucket {
+                window_started: now,
+                used: 0,
+            }),
+        };
         if now.duration_since(bucket.window_started) >= self.window {
             bucket.window_started = now;
             bucket.used = 0;
@@ -127,7 +132,7 @@ impl From<GatewayRequestContext> for RateLimitKey {
 
 #[derive(Debug)]
 pub struct GatewayTowerPipeline {
-    limiter: std::sync::Mutex<KeyedRateLimiter>,
+    limiter: KeyedRateLimiter,
     max_in_flight: usize,
     in_flight: Arc<AtomicUsize>,
 }
@@ -135,7 +140,7 @@ pub struct GatewayTowerPipeline {
 impl GatewayTowerPipeline {
     pub fn new(limiter: KeyedRateLimiter, max_in_flight: usize) -> Self {
         Self {
-            limiter: std::sync::Mutex::new(limiter),
+            limiter,
             max_in_flight,
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
@@ -145,10 +150,7 @@ impl GatewayTowerPipeline {
         &self,
         ctx: GatewayRequestContext,
     ) -> Result<GatewayConcurrencyPermit, GatewayError> {
-        self.limiter
-            .lock()
-            .expect("gateway limiter mutex poisoned")
-            .check(ctx.into())?;
+        self.limiter.check(ctx.into())?;
         self.acquire_concurrency()
     }
 
@@ -454,7 +456,7 @@ mod tests {
 
     #[test]
     fn keyed_rate_limiter_is_scoped_by_principal_session_and_rate_class() {
-        let mut limiter = KeyedRateLimiter::new(1, Duration::from_secs(60));
+        let limiter = KeyedRateLimiter::new(1, Duration::from_secs(60));
         let key = RateLimitKey {
             principal_id: "player-1".into(),
             session_id: "session-1".into(),

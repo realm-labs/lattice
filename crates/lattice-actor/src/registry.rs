@@ -1,19 +1,33 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lattice_core::{ActorId, ActorKind};
-use tokio::sync::{Mutex, Semaphore, watch};
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
+use http::Uri;
+use lattice_core::{ActorId, ActorKind, ActorRef, Epoch, InstanceId, ServiceKind};
+use tokio::sync::{Semaphore, watch};
 
-use crate::{Actor, ActorActivationError, ActorError, ActorHandle, MailboxConfig, spawn_actor};
+use crate::{
+    Actor, ActorActivationError, ActorError, ActorHandle, MailboxConfig,
+    runtime::spawn_actor_with_self_ref,
+};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ActorRegistryConfig {
     pub mailbox: MailboxConfig,
     pub waiter_capacity: usize,
     pub waiter_timeout: Duration,
+    pub actor_ref: Option<ActorRefConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorRefConfig {
+    pub service_kind: ServiceKind,
+    pub instance_id: InstanceId,
+    pub endpoint: Uri,
+    pub owner_epoch: Option<Epoch>,
 }
 
 impl Default for ActorRegistryConfig {
@@ -22,6 +36,7 @@ impl Default for ActorRegistryConfig {
             mailbox: MailboxConfig::default(),
             waiter_capacity: 1024,
             waiter_timeout: Duration::from_secs(5),
+            actor_ref: None,
         }
     }
 }
@@ -29,7 +44,7 @@ impl Default for ActorRegistryConfig {
 pub struct ActorRegistry<A: Actor> {
     kind: ActorKind,
     config: ActorRegistryConfig,
-    entries: Mutex<HashMap<ActorId, RegistryEntry<A>>>,
+    entries: DashMap<ActorId, RegistryEntry<A>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +74,7 @@ impl<A: Actor> ActorRegistry<A> {
         Self {
             kind,
             config,
-            entries: Mutex::new(HashMap::new()),
+            entries: DashMap::new(),
         }
     }
 
@@ -68,9 +83,22 @@ impl<A: Actor> ActorRegistry<A> {
     }
 
     pub async fn get(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
-        match self.entries.lock().await.get(actor_id) {
+        match self.entries.get(actor_id).as_deref() {
             Some(RegistryEntry::Running(handle)) => Some(handle.clone()),
             Some(RegistryEntry::Activating(_)) | None => None,
+        }
+    }
+
+    pub async fn remove(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
+        match self.entries.remove(actor_id).map(|(_, entry)| entry) {
+            Some(RegistryEntry::Running(handle)) => Some(handle),
+            Some(RegistryEntry::Activating(activation)) => {
+                activation.publish(Err(ActorActivationError::ActivationFailed(
+                    ActorError::new("actor registry entry removed during activation"),
+                )));
+                None
+            }
+            None => None,
         }
     }
 
@@ -79,14 +107,14 @@ impl<A: Actor> ActorRegistry<A> {
         actor_id: ActorId,
         actor: A,
     ) -> Result<ActorHandle<A>, ActorActivationError> {
-        let mut entries = self.entries.lock().await;
-        if entries.contains_key(&actor_id) {
-            return Err(ActorActivationError::AlreadyExists);
+        match self.entries.entry(actor_id.clone()) {
+            Entry::Occupied(_) => Err(ActorActivationError::AlreadyExists),
+            Entry::Vacant(entry) => {
+                let handle = self.spawn_actor(actor_id, actor);
+                entry.insert(RegistryEntry::Running(handle.clone()));
+                Ok(handle)
+            }
         }
-
-        let handle = spawn_actor(actor, self.config.mailbox);
-        entries.insert(actor_id, RegistryEntry::Running(handle.clone()));
-        Ok(handle)
     }
 
     pub async fn get_or_activate<F, Fut>(
@@ -98,21 +126,15 @@ impl<A: Actor> ActorRegistry<A> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<A, ActorError>>,
     {
-        let lookup = {
-            let mut entries = self.entries.lock().await;
-            match entries.get(&actor_id) {
-                Some(RegistryEntry::Running(handle)) => return Ok(handle.clone()),
-                Some(RegistryEntry::Activating(activation)) => {
-                    RegistryLookup::Wait(activation.clone())
-                }
-                None => {
-                    let activation = ActivationState::new(self.config.waiter_capacity);
-                    entries.insert(
-                        actor_id.clone(),
-                        RegistryEntry::Activating(activation.clone()),
-                    );
-                    RegistryLookup::Activate(activation)
-                }
+        let lookup = match self.entries.entry(actor_id.clone()) {
+            Entry::Occupied(entry) => match entry.get() {
+                RegistryEntry::Running(handle) => return Ok(handle.clone()),
+                RegistryEntry::Activating(activation) => RegistryLookup::Wait(activation.clone()),
+            },
+            Entry::Vacant(entry) => {
+                let activation = ActivationState::new(self.config.waiter_capacity);
+                entry.insert(RegistryEntry::Activating(activation.clone()));
+                RegistryLookup::Activate(activation)
             }
         };
 
@@ -125,14 +147,15 @@ impl<A: Actor> ActorRegistry<A> {
 
         let result = match activate().await {
             Ok(actor) => {
-                let handle = spawn_actor(actor, self.config.mailbox);
-                let mut entries = self.entries.lock().await;
-                entries.insert(actor_id, RegistryEntry::Running(handle.clone()));
+                let handle = self.spawn_actor(actor_id.clone(), actor);
+                self.entries
+                    .insert(actor_id, RegistryEntry::Running(handle.clone()));
                 Ok(handle)
             }
             Err(error) => {
-                let mut entries = self.entries.lock().await;
-                entries.remove(&actor_id);
+                self.entries.remove_if(&actor_id, |_, entry| {
+                    matches!(entry, RegistryEntry::Activating(existing) if Arc::ptr_eq(existing, &activation))
+                });
                 Err(ActorActivationError::ActivationFailed(error))
             }
         };
@@ -209,6 +232,23 @@ impl<A: Actor> ActorRegistry<A> {
             })?;
         drop(permit);
         result
+    }
+
+    fn spawn_actor(&self, actor_id: ActorId, actor: A) -> ActorHandle<A> {
+        let self_ref = self.actor_ref_for(actor_id);
+        spawn_actor_with_self_ref(actor, self.config.mailbox, self_ref)
+    }
+
+    fn actor_ref_for(&self, actor_id: ActorId) -> Option<ActorRef> {
+        let config = self.config.actor_ref.as_ref()?;
+        Some(ActorRef::direct(
+            config.service_kind.clone(),
+            self.kind.clone(),
+            actor_id,
+            config.instance_id.clone(),
+            config.endpoint.clone(),
+            config.owner_epoch,
+        ))
     }
 }
 

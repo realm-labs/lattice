@@ -164,6 +164,69 @@ pub enum ActorId {
     Bytes(Vec<u8>),
 }
 
+impl ActorId {
+    pub fn to_route_key(&self) -> RouteKey {
+        match self {
+            Self::Str(value) => RouteKey::Str(value.clone()),
+            Self::U64(value) => RouteKey::U64(*value),
+            Self::I64(value) => RouteKey::I64(*value),
+            Self::Bytes(value) => RouteKey::Bytes(value.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorRef {
+    pub service_kind: ServiceKind,
+    pub actor_kind: ActorKind,
+    pub actor_id: ActorId,
+    pub target: ActorRefTarget,
+}
+
+impl ActorRef {
+    pub fn direct(
+        service_kind: ServiceKind,
+        actor_kind: ActorKind,
+        actor_id: ActorId,
+        instance_id: InstanceId,
+        endpoint: Uri,
+        owner_epoch: Option<Epoch>,
+    ) -> Self {
+        Self {
+            service_kind,
+            actor_kind,
+            actor_id,
+            target: ActorRefTarget::Direct {
+                instance_id,
+                endpoint,
+                owner_epoch,
+            },
+        }
+    }
+
+    pub fn routed(service_kind: ServiceKind, actor_kind: ActorKind, actor_id: ActorId) -> Self {
+        Self {
+            service_kind,
+            actor_kind,
+            actor_id,
+            target: ActorRefTarget::Routed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActorRefTarget {
+    Direct {
+        instance_id: InstanceId,
+        #[serde(with = "uri_serde")]
+        endpoint: Uri,
+        #[serde(default)]
+        owner_epoch: Option<Epoch>,
+    },
+    Routed,
+}
+
 pub trait ActorKey: Clone + Send + Sync + 'static {
     fn to_route_key(&self) -> RouteKey;
     fn to_actor_id(&self) -> ActorId;
@@ -283,8 +346,30 @@ mod tests {
 
         assert_eq!(id.to_route_key(), RouteKey::U64(42));
         assert_eq!(id.to_actor_id(), ActorId::U64(42));
+        assert_eq!(id.to_actor_id().to_route_key(), RouteKey::U64(42));
         assert_eq!(WorldId::try_from_actor_id(&ActorId::U64(42)), Ok(id));
         assert!(WorldId::try_from_actor_id(&ActorId::Str("42".into())).is_err());
+    }
+
+    #[test]
+    fn actor_ref_models_direct_and_routed_targets() {
+        let direct = ActorRef::direct(
+            service_kind!("Gateway"),
+            actor_kind!("GatewaySession"),
+            ActorId::Str("session-1".into()),
+            InstanceId::new("gateway-a"),
+            "http://127.0.0.1:19083".parse().unwrap(),
+            Some(Epoch(7)),
+        );
+        let routed = ActorRef::routed(WORLD_SERVICE, WORLD_ACTOR, ActorId::U64(42));
+
+        assert!(matches!(direct.target, ActorRefTarget::Direct { .. }));
+        assert_eq!(
+            direct.actor_id.to_route_key(),
+            RouteKey::Str("session-1".into())
+        );
+        assert_eq!(routed.actor_id.to_route_key(), RouteKey::U64(42));
+        assert_eq!(routed.target, ActorRefTarget::Routed);
     }
 
     #[test]

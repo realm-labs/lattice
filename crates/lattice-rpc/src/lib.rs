@@ -1,12 +1,16 @@
 use async_trait::async_trait;
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use http::Uri;
 use lattice_actor::{Actor, ActorCallError, ActorHandle, Handler, Message};
-use lattice_core::{ActorKind, Epoch, InstanceId, RequestId, RouteKey, ServiceKind, TraceContext};
+use lattice_core::{
+    ActorKind, ActorRef, Epoch, InstanceId, RequestId, RouteKey, ServiceKind, TraceContext,
+};
 use prost::Message as ProstMessage;
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
@@ -258,6 +262,37 @@ pub struct RouteTarget {
     pub owner_epoch: Option<Epoch>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct TonicEndpointChannelPool {
+    channels: Arc<DashMap<String, Channel>>,
+}
+
+impl TonicEndpointChannelPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn get_or_connect(&self, endpoint: &Uri) -> Result<Channel, RpcError> {
+        let key = endpoint.to_string();
+        if let Some(channel) = self.channels.get(&key).map(|entry| entry.clone()) {
+            return Ok(channel);
+        }
+
+        let channel = Channel::builder(endpoint.clone())
+            .connect()
+            .await
+            .map_err(|error| RpcError::Business(format!("connect {endpoint}: {error}")))?;
+        match self.channels.entry(key) {
+            Entry::Occupied(entry) => Ok(entry.get().clone()),
+            Entry::Vacant(entry) => Ok(entry.insert(channel).clone()),
+        }
+    }
+}
+
+pub fn tonic_status_to_rpc_error(status: Status) -> RpcError {
+    RpcError::Business(status.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredRpcService {
     pub name: String,
@@ -454,7 +489,7 @@ impl RequestDedupKey {
 
 #[derive(Debug, Default, Clone)]
 pub struct RequestDeduplicator {
-    replies: Arc<Mutex<HashMap<RequestDedupKey, Vec<u8>>>>,
+    replies: Arc<DashMap<RequestDedupKey, Vec<u8>>>,
 }
 
 impl RequestDeduplicator {
@@ -467,11 +502,9 @@ impl RequestDeduplicator {
         Req: RpcRequest,
     {
         self.replies
-            .lock()
-            .expect("request deduplicator mutex poisoned")
             .get(key)
-            .map(|bytes| {
-                Req::Reply::decode(bytes.as_slice())
+            .map(|entry| {
+                Req::Reply::decode(entry.value().as_slice())
                     .map_err(|error| Status::internal(error.to_string()))
             })
             .transpose()
@@ -481,10 +514,7 @@ impl RequestDeduplicator {
     where
         Reply: prost::Message,
     {
-        self.replies
-            .lock()
-            .expect("request deduplicator mutex poisoned")
-            .insert(key.clone(), reply.encode_to_vec());
+        self.replies.insert(key.clone(), reply.encode_to_vec());
         Ok(())
     }
 }
@@ -504,6 +534,20 @@ pub trait ShardedRpcCore: Clone + Send + Sync + 'static {
     async fn call<Req>(&self, req: Req) -> Result<Req::Reply, RpcError>
     where
         Req: RoutedRequest + RpcRequest;
+}
+
+#[async_trait]
+pub trait ActorRefRpcCore: Clone + Send + Sync + 'static {
+    async fn call_ref<Req>(&self, actor_ref: ActorRef, req: Req) -> Result<Req::Reply, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest;
+
+    async fn tell_ref<Req>(&self, actor_ref: ActorRef, req: Req) -> Result<(), RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        self.call_ref(actor_ref, req).await.map(|_| ())
+    }
 }
 
 #[async_trait]
@@ -580,6 +624,40 @@ where
         Req: RoutedRequest + RpcRequest,
     {
         self.core.call(req).await
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ActorRefRpcClient<C> {
+    core: C,
+}
+
+impl<C> ActorRefRpcClient<C> {
+    pub fn new(core: C) -> Self {
+        Self { core }
+    }
+
+    pub fn core(&self) -> &C {
+        &self.core
+    }
+}
+
+impl<C> ActorRefRpcClient<C>
+where
+    C: ActorRefRpcCore,
+{
+    pub async fn call_ref<Req>(&self, actor_ref: ActorRef, req: Req) -> Result<Req::Reply, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        self.core.call_ref(actor_ref, req).await
+    }
+
+    pub async fn tell_ref<Req>(&self, actor_ref: ActorRef, req: Req) -> Result<(), RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        self.core.tell_ref(actor_ref, req).await
     }
 }
 

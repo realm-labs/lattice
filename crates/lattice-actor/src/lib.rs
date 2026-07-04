@@ -16,7 +16,8 @@ pub use error::{
 pub use handle::ActorHandle;
 pub use mailbox::MailboxConfig;
 pub use registry::{
-    ActorCreateContext, ActorFactory, ActorLoader, ActorRegistry, ActorRegistryConfig,
+    ActorCreateContext, ActorFactory, ActorLoader, ActorRefConfig, ActorRegistry,
+    ActorRegistryConfig,
 };
 pub use remote_watch::{CrossNodeWatchRegistry, RemoteActorRef, RemoteWatchEvent};
 pub use runtime::{
@@ -271,6 +272,7 @@ mod tests {
                     execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 }),
                     scheduler_key: None,
                     passivation: PassivationPolicy::Disabled,
+                    self_ref: None,
                 },
             )
             .await
@@ -545,6 +547,7 @@ mod tests {
                 mailbox: MailboxConfig::bounded(8),
                 waiter_capacity: 0,
                 waiter_timeout: std::time::Duration::from_millis(20),
+                actor_ref: None,
             },
         ));
         let actor_id = ActorId::U64(3);
@@ -1102,6 +1105,7 @@ mod tests {
                     passivation: PassivationPolicy::IdleTimeout(std::time::Duration::from_millis(
                         10,
                     )),
+                    self_ref: None,
                 },
             )
             .await

@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package game;
+
+import "lattice/options.proto";
+import "lattice/actor_ref.proto";
+
+service WorldRpc {
+  option (lattice.options.service_kind) = "World";
+  option (lattice.options.actor_kind) = "World";
+  option (lattice.options.default_route_key) = "world_id";
+
+  rpc Login(LoginRequest) returns (LoginAcceptedReply);
+  rpc WorldPing(WorldPingRequest) returns (WorldPingReply);
+}
+
+service PlayerRpc {
+  option (lattice.options.service_kind) = "Player";
+  option (lattice.options.actor_kind) = "Player";
+  option (lattice.options.default_route_key) = "player_id";
+
+  rpc InitSession(InitSessionRequest) returns (InitSessionReply);
+  rpc PlayerPing(PlayerPingRequest) returns (PlayerPingReply);
+}
+
+service GatewayPushRpc {
+  option (lattice.options.service_kind) = "Gateway";
+  option (lattice.options.actor_kind) = "GatewaySession";
+  option (lattice.options.default_route_key) = "session_id";
+
+  rpc PushToClient(PushToClientRequest) returns (PushToClientReply);
+}
+
+message LoginRequest {
+  uint64 world_id = 1;
+  uint64 player_id = 2;
+  string token = 3;
+  lattice.actor.ActorRef gateway_session = 4;
+}
+
+message LoginAcceptedReply {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message LoginReply {
+  bool ok = 1;
+  uint64 world_id = 2;
+  uint64 player_id = 3;
+  string session_id = 4;
+  string message = 5;
+}
+
+message WorldPingRequest {
+  uint64 world_id = 1;
+}
+
+message WorldPingReply {
+  bool ok = 1;
+  uint64 world_id = 2;
+  uint64 session_count = 3;
+  string message = 4;
+}
+
+message InitSessionRequest {
+  uint64 player_id = 1;
+  uint64 world_id = 2;
+  string session_id = 3;
+  lattice.actor.ActorRef gateway_session = 4;
+}
+
+message InitSessionReply {
+  bool ok = 1;
+  uint64 player_id = 2;
+  string message = 3;
+}
+
+message PlayerPingRequest {
+  uint64 player_id = 1;
+}
+
+message PlayerPingReply {
+  bool ok = 1;
+  uint64 player_id = 2;
+  uint64 session_count = 3;
+  string message = 4;
+}
+
+message PushToClientRequest {
+  string session_id = 1;
+  uint32 msg_id = 2;
+  bytes payload = 3;
+}
+
+message PushToClientReply {
+  bool ok = 1;
+  string message = 2;
+}

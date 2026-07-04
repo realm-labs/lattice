@@ -6,7 +6,7 @@ use prost_types::FileDescriptorSet;
 use serde::Deserialize;
 
 use crate::descriptor::{methods_from_descriptor, parse_proto_options};
-use crate::render::generate_rpc_bindings;
+use crate::render::{RenderOptions, generate_rpc_bindings_with_options};
 use crate::{CodegenError, GatewayRoute, RpcMethodSpec, proto_include};
 
 #[derive(Debug, Clone)]
@@ -97,7 +97,12 @@ impl LatticeCodegenBuilder {
         let mut methods = methods_from_descriptor(&descriptor, &options)?;
         let gateway_routes = self.load_gateway_routes()?;
         apply_gateway_routes(&mut methods, &gateway_routes)?;
-        let generated = generate_rpc_bindings(&methods)?;
+        let generated = generate_rpc_bindings_with_options(
+            &methods,
+            RenderOptions {
+                actor_ref_proto: descriptor_has_actor_ref_proto(&descriptor),
+            },
+        )?;
         let generated_path = out_dir.join("lattice.generated.rs");
         fs::write(generated_path, generated.rust)
             .map_err(|error| CodegenError::WriteGenerated(error.to_string()))?;
@@ -139,6 +144,13 @@ impl LatticeCodegenBuilder {
         }
         Ok(routes)
     }
+}
+
+fn descriptor_has_actor_ref_proto(descriptor: &FileDescriptorSet) -> bool {
+    descriptor
+        .file
+        .iter()
+        .any(|file| file.package.as_deref() == Some("lattice.actor"))
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package lattice.actor;
+
+message ActorRef {
+  string service_kind = 1;
+  string actor_kind = 2;
+  ActorId actor_id = 3;
+  Target target = 4;
+}
+
+message ActorId {
+  oneof kind {
+    string str = 1;
+    uint64 u64 = 2;
+    int64 i64 = 3;
+    bytes bytes = 4;
+  }
+}
+
+message Target {
+  oneof kind {
+    DirectTarget direct = 1;
+    RoutedTarget routed = 2;
+  }
+}
+
+message DirectTarget {
+  string instance_id = 1;
+  string endpoint = 2;
+  optional uint64 owner_epoch = 3;
+}
+
+message RoutedTarget {}
