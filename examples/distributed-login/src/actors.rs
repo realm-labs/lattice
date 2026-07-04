@@ -14,7 +14,7 @@ use crate::game::{
     PlayerPingReply, PlayerPingRequest, PushToClientReply, PushToClientRequest, WorldPingReply,
     WorldPingRequest,
 };
-use crate::generated::PlayerRpcClient;
+use crate::generated::player_rpc::Client as PlayerRpcClient;
 use crate::placement::{DemoActorRefRpcCore, DemoRpcCore};
 
 pub struct WorldActor {

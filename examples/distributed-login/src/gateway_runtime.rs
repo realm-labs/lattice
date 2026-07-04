@@ -20,14 +20,13 @@ use tracing::{error, info};
 
 use crate::actors::GatewaySessionActor;
 use crate::game::{LoginRequest, gateway_push_rpc_server::GatewayPushRpcServer};
-use crate::generated::{
-    GatewayPushRpcRegistryService, PlayerRpcPlayerPingGatewayBinding, WorldRpcLoginGatewayBinding,
-    WorldRpcWorldPingGatewayBinding, register_gateway_routes,
-};
+use crate::generated::{GatewayDispatcher, gateway_push_rpc, register_gateway_routes};
 use crate::placement::{DemoRpcCore, player_core, world_core};
 use crate::services::ExampleResult;
 use crate::tcp::{read_client_frame, write_client_frame};
 use crate::{GATEWAY_SERVICE, GATEWAY_SESSION_ACTOR};
+
+type DemoGatewayDispatcher = GatewayDispatcher<DemoRpcCore, DemoRpcCore>;
 
 pub async fn run_gateway(
     client_listener: TcpListener,
@@ -43,10 +42,11 @@ pub async fn run_gateway(
 
     let world_core = world_core(world_endpoint, InstanceId::new("gateway-1"));
     let player_core = player_core(player_endpoint, InstanceId::new("gateway-1"));
+    let dispatcher = DemoGatewayDispatcher::new(world_core, player_core);
     let gateway_push_endpoint = format!("http://{push_addr}").parse::<Uri>()?;
     let sessions = GatewaySessions::new(gateway_push_endpoint);
     let push_service =
-        GatewayPushRpcRegistryService::new(sessions.registry(), GatewaySessionLoader);
+        gateway_push_rpc::RegistryService::new(sessions.registry(), GatewaySessionLoader);
     tokio::spawn(async move {
         let result = Server::builder()
             .add_service(GatewayPushRpcServer::new(push_service))
@@ -64,11 +64,10 @@ pub async fn run_gateway(
 
     loop {
         let (socket, peer) = client_listener.accept().await?;
-        let world_core = world_core.clone();
-        let player_core = player_core.clone();
+        let dispatcher = dispatcher.clone();
         let sessions = sessions.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(socket, world_core, player_core, sessions).await {
+            if let Err(error) = handle_connection(socket, dispatcher, sessions).await {
                 error!(%peer, %error, "gateway connection failed");
             }
         });
@@ -149,20 +148,13 @@ impl ActorLoader<GatewaySessionActor> for GatewaySessionLoader {
 
 async fn handle_connection(
     socket: TcpStream,
-    world_core: DemoRpcCore,
-    player_core: DemoRpcCore,
+    dispatcher: DemoGatewayDispatcher,
     sessions: GatewaySessions,
 ) -> ExampleResult<()> {
     let (reader, writer) = socket.into_split();
     let (tx, rx) = mpsc::channel::<ClientFrame>(16);
 
-    let read_task = tokio::spawn(read_client_messages(
-        reader,
-        tx,
-        world_core,
-        player_core,
-        sessions,
-    ));
+    let read_task = tokio::spawn(read_client_messages(reader, tx, dispatcher, sessions));
     let write_task = tokio::spawn(write_client_messages(writer, rx));
 
     let read_result = read_task.await?;
@@ -175,16 +167,14 @@ async fn handle_connection(
 async fn read_client_messages(
     mut reader: OwnedReadHalf,
     tx: mpsc::Sender<ClientFrame>,
-    world_core: DemoRpcCore,
-    player_core: DemoRpcCore,
+    dispatcher: DemoGatewayDispatcher,
     sessions: GatewaySessions,
 ) -> ExampleResult<()> {
     let mut registered_session = None::<String>;
     let result = read_client_messages_inner(
         &mut reader,
         &tx,
-        world_core,
-        player_core,
+        dispatcher,
         sessions.clone(),
         &mut registered_session,
     )
@@ -199,8 +189,7 @@ async fn read_client_messages(
 async fn read_client_messages_inner(
     reader: &mut OwnedReadHalf,
     tx: &mpsc::Sender<ClientFrame>,
-    world_core: DemoRpcCore,
-    player_core: DemoRpcCore,
+    dispatcher: DemoGatewayDispatcher,
     sessions: GatewaySessions,
     registered_session: &mut Option<String>,
 ) -> ExampleResult<()> {
@@ -239,22 +228,10 @@ async fn read_client_messages_inner(
                     msg_id: frame.msg_id,
                     payload: login.encode_to_vec(),
                 };
-                let _ack = WorldRpcLoginGatewayBinding::default_binding()
-                    .decode_and_forward(frame, world_core.clone())
-                    .await?;
+                let _ack = dispatcher.dispatch(frame).await?;
                 continue;
             }
-            crate::WORLD_PING_MSG_ID => {
-                WorldRpcWorldPingGatewayBinding::default_binding()
-                    .decode_and_forward(frame, world_core.clone())
-                    .await?
-            }
-            crate::PLAYER_PING_MSG_ID => {
-                PlayerRpcPlayerPingGatewayBinding::default_binding()
-                    .decode_and_forward(frame, player_core.clone())
-                    .await?
-            }
-            other => return Err(format!("unknown gateway message id {other}").into()),
+            _ => dispatcher.dispatch(frame).await?,
         };
         tx.send(response)
             .await

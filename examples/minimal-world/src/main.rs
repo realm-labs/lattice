@@ -40,9 +40,7 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/lattice.generated.rs"));
 }
 
-use generated::{
-    WorldRpcClient as WorldClient, WorldRpcEnterWorldGatewayBinding, register_gateway_routes,
-};
+use generated::{register_gateway_routes, world_rpc::Client as WorldClient};
 use world::{EnterWorldReply, EnterWorldRequest};
 
 pub const WORLD_SERVICE: ServiceKind = service_kind!("World");
@@ -409,9 +407,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         payload: gateway_request.encode_to_vec(),
     })?;
     let decoded = codec.decode(&encoded)?;
-    let gateway_reply_frame = WorldRpcEnterWorldGatewayBinding::default_binding()
-        .decode_and_forward(decoded, core)
-        .await?;
+    let dispatcher = generated::GatewayDispatcher::new(core);
+    let gateway_reply_frame = dispatcher.dispatch(decoded).await?;
     let gateway_reply = EnterWorldReply::decode(gateway_reply_frame.payload.as_slice())?;
     let event_id = publisher
         .publish_bytes(

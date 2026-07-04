@@ -32,7 +32,7 @@ pub fn generate_rpc_bindings_with_options(
         "#[allow(unused_imports)]\nuse lattice_core::{ActorId, ActorKind, RouteKey, actor_kind};\n",
     );
     rust.push_str(
-        "#[allow(unused_imports)]\nuse lattice_gateway::{GatewayError, GatewayRouteTable, ProstClientMessageBinding};\n",
+        "#[allow(unused_imports)]\nuse lattice_gateway::{ClientFrame, GatewayError, GatewayRouteTable};\n",
     );
     rust.push_str(
         "#[allow(unused_imports)]\nuse lattice_placement::{EndpointLease, EndpointRpcTransport};\n",
@@ -48,18 +48,13 @@ pub fn generate_rpc_bindings_with_options(
     for method in methods {
         push_routed_request(&mut rust, method);
         push_rpc_request(&mut rust, method);
-        push_handler_assertion(&mut rust, method);
     }
     for service_methods in group_by_service(methods).values() {
-        push_typed_client(&mut rust, service_methods);
-        push_server_adapter(&mut rust, service_methods);
-        push_registry_server_adapter(&mut rust, service_methods);
+        push_service_module(&mut rust, service_methods);
     }
     push_tonic_endpoint_transport(&mut rust, methods);
-    for method in methods {
-        push_gateway_binding(&mut rust, method);
-    }
     push_gateway_route_table(&mut rust, methods);
+    push_gateway_dispatcher(&mut rust, methods);
 
     Ok(GeneratedRpcBindings { rust })
 }
@@ -205,140 +200,133 @@ fn push_rpc_request(rust: &mut String, method: &RpcMethodSpec) {
     rust.push_str("}\n\n");
 }
 
-fn push_handler_assertion(rust: &mut String, method: &RpcMethodSpec) {
-    rust.push_str(&format!(
-        "pub fn assert_{snake}_handler<A>()\n",
-        snake = lower_camel_to_snake(&method.method_name)
-    ));
-    rust.push_str("where\n");
-    rust.push_str("    A: Actor + Handler<Rpc<");
-    rust.push_str(&method.request_type);
-    rust.push_str(">>,\n");
-    rust.push_str("{\n");
+fn push_service_module(rust: &mut String, methods: &[&RpcMethodSpec]) {
+    let service = methods[0];
+    let module_name = lower_camel_to_snake(&service.service_name);
+    rust.push_str(&format!("pub mod {module_name} {{\n"));
+    rust.push_str("    use std::sync::Arc;\n");
+    rust.push_str(
+        "    use lattice_actor::{Actor, ActorHandle, ActorLoader, ActorRegistry, Handler};\n",
+    );
+    rust.push_str("    use lattice_core::{ActorId, RouteKey};\n");
+    rust.push_str("    use lattice_rpc::{ActorRpcAdapter, Rpc, RpcRequest, RoutedRequest, ShardedRpcCore, TypedRpcClient};\n\n");
+    push_typed_client(rust, methods);
+    push_server_adapter(rust, methods);
+    push_registry_server_adapter(rust, methods);
+    for method in methods {
+        push_method_module(rust, method);
+    }
+    rust.push_str("    fn actor_id_from_route_key(route_key: RouteKey) -> ActorId {\n");
+    rust.push_str("        match route_key {\n");
+    rust.push_str("            RouteKey::Str(value) => ActorId::Str(value),\n");
+    rust.push_str("            RouteKey::U64(value) => ActorId::U64(value),\n");
+    rust.push_str("            RouteKey::I64(value) => ActorId::I64(value),\n");
+    rust.push_str("            RouteKey::Bytes(value) => ActorId::Bytes(value),\n");
+    rust.push_str("        }\n");
+    rust.push_str("    }\n");
     rust.push_str("}\n\n");
 }
 
 fn push_typed_client(rust: &mut String, methods: &[&RpcMethodSpec]) {
-    let service_name = &methods[0].service_name;
-    let client_name = format!("{service_name}Client");
-    rust.push_str(&format!(
-        "pub struct {client}<C> {{\n    inner: TypedRpcClient<C>,\n}}\n\n",
-        client = client_name
-    ));
-    rust.push_str(&format!("impl<C> {client}<C>\n", client = client_name));
-    rust.push_str("where\n    C: ShardedRpcCore,\n{\n");
-    rust.push_str("    pub fn new(core: C) -> Self {\n        Self { inner: TypedRpcClient::new(core) }\n    }\n\n");
+    rust.push_str("    pub struct Client<C> {\n        inner: TypedRpcClient<C>,\n    }\n\n");
+    rust.push_str("    impl<C> Client<C>\n");
+    rust.push_str("    where\n        C: ShardedRpcCore,\n    {\n");
+    rust.push_str("        pub fn new(core: C) -> Self {\n            Self { inner: TypedRpcClient::new(core) }\n        }\n\n");
     for method in methods {
         rust.push_str(&format!(
-            "    pub async fn {method}(&self, req: {request}) -> Result<{reply}, lattice_rpc::RpcError> {{\n",
+            "        pub async fn {method}(&self, req: {request}) -> Result<{reply}, lattice_rpc::RpcError> {{\n",
             method = lower_camel_to_snake(&method.method_name),
             request = method.request_type,
             reply = method.reply_type
         ));
-        rust.push_str("        self.inner.call(req).await\n");
-        rust.push_str("    }\n");
+        rust.push_str("            self.inner.call(req).await\n");
+        rust.push_str("        }\n");
     }
-    rust.push_str("}\n\n");
+    rust.push_str("    }\n\n");
 }
 
 fn push_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let service = methods[0];
-    let adapter_name = format!("{}ActorService", service.service_name);
     let trait_path = tonic_service_trait_path(service);
-    rust.push_str("#[derive(Clone)]\n");
-    rust.push_str(&format!(
-        "pub struct {adapter}<A: Actor> {{\n    inner: ActorRpcAdapter<A>,\n}}\n\n",
-        adapter = adapter_name
-    ));
-    rust.push_str(&format!(
-        "impl<A: Actor> {adapter}<A> {{\n",
-        adapter = adapter_name
-    ));
-    rust.push_str("    pub fn new(handle: ActorHandle<A>) -> Self {\n");
-    rust.push_str("        Self { inner: ActorRpcAdapter::new(handle) }\n");
-    rust.push_str("    }\n");
-    rust.push_str("}\n\n");
-    rust.push_str("#[tonic::async_trait]\n");
-    rust.push_str(&format!(
-        "impl<A> {trait_path} for {adapter}<A>\n",
-        adapter = adapter_name
-    ));
-    rust.push_str("where\n    A: Actor + Sync");
+    rust.push_str("    #[derive(Clone)]\n");
+    rust.push_str(
+        "    pub struct ActorService<A: Actor> {\n        inner: ActorRpcAdapter<A>,\n    }\n\n",
+    );
+    rust.push_str("    impl<A: Actor> ActorService<A> {\n");
+    rust.push_str("        pub fn new(handle: ActorHandle<A>) -> Self {\n");
+    rust.push_str("            Self { inner: ActorRpcAdapter::new(handle) }\n");
+    rust.push_str("        }\n");
+    rust.push_str("    }\n\n");
+    rust.push_str("    #[tonic::async_trait]\n");
+    rust.push_str(&format!("    impl<A> {trait_path} for ActorService<A>\n"));
+    rust.push_str("    where\n        A: Actor + Sync");
     for method in methods {
         rust.push_str(" + Handler<Rpc<");
         rust.push_str(&method.request_type);
         rust.push_str(">>");
     }
-    rust.push_str(",\n{\n");
+    rust.push_str(",\n    {\n");
     for method in methods {
         rust.push_str(&format!(
-            "    async fn {method}(&self, request: tonic::Request<{request}>) -> Result<tonic::Response<{reply}>, tonic::Status> {{\n",
+            "        async fn {method}(&self, request: tonic::Request<{request}>) -> Result<tonic::Response<{reply}>, tonic::Status> {{\n",
             method = lower_camel_to_snake(&method.method_name),
             request = method.request_type,
             reply = method.reply_type
         ));
-        rust.push_str("        self.inner.unary(request).await\n");
-        rust.push_str("    }\n");
+        rust.push_str("            self.inner.unary(request).await\n");
+        rust.push_str("        }\n");
     }
-    rust.push_str("}\n\n");
+    rust.push_str("    }\n\n");
 }
 
 fn push_registry_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let service = methods[0];
-    let adapter_name = format!("{}RegistryService", service.service_name);
     let trait_path = tonic_service_trait_path(service);
-    rust.push_str("#[derive(Clone)]\n");
-    rust.push_str(&format!(
-        "pub struct {adapter}<A: Actor, L> {{\n    registry: Arc<ActorRegistry<A>>,\n    loader: L,\n}}\n\n",
-        adapter = adapter_name
-    ));
-    rust.push_str(&format!(
-        "impl<A, L> {adapter}<A, L>\nwhere\n    A: Actor,\n    L: ActorLoader<A>,\n{{\n",
-        adapter = adapter_name
-    ));
-    rust.push_str("    pub fn new(registry: Arc<ActorRegistry<A>>, loader: L) -> Self {\n");
-    rust.push_str("        Self { registry, loader }\n");
-    rust.push_str("    }\n\n");
-    rust.push_str("    async fn unary<Req>(&self, request: tonic::Request<Req>) -> Result<tonic::Response<Req::Reply>, tonic::Status>\n");
-    rust.push_str("    where\n        A: Handler<Rpc<Req>>,\n        Req: RoutedRequest + RpcRequest,\n    {\n");
-    rust.push_str("        let metadata = request.metadata().clone();\n");
-    rust.push_str("        let req = request.into_inner();\n");
-    rust.push_str("        let actor_id = actor_id_from_route_key(req.route_key());\n");
-    rust.push_str("        let handle = self\n");
-    rust.push_str("            .registry\n");
-    rust.push_str("            .get_or_load(actor_id, self.loader.clone())\n");
-    rust.push_str("            .await\n");
+    rust.push_str("    #[derive(Clone)]\n");
+    rust.push_str("    pub struct RegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n    }\n\n");
+    rust.push_str("    impl<A, L> RegistryService<A, L>\n    where\n        A: Actor,\n        L: ActorLoader<A>,\n    {\n");
+    rust.push_str("        pub fn new(registry: Arc<ActorRegistry<A>>, loader: L) -> Self {\n");
+    rust.push_str("            Self { registry, loader }\n");
+    rust.push_str("        }\n\n");
+    rust.push_str("        async fn unary<Req>(&self, request: tonic::Request<Req>) -> Result<tonic::Response<Req::Reply>, tonic::Status>\n");
+    rust.push_str("        where\n            A: Handler<Rpc<Req>>,\n            Req: RoutedRequest + RpcRequest,\n        {\n");
+    rust.push_str("            let metadata = request.metadata().clone();\n");
+    rust.push_str("            let req = request.into_inner();\n");
+    rust.push_str("            let actor_id = actor_id_from_route_key(req.route_key());\n");
+    rust.push_str("            let handle = self\n");
+    rust.push_str("                .registry\n");
+    rust.push_str("                .get_or_load(actor_id, self.loader.clone())\n");
+    rust.push_str("                .await\n");
     rust.push_str(
-        "            .map_err(|error| tonic::Status::unavailable(error.to_string()))?;\n",
+        "                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;\n",
     );
-    rust.push_str("        let mut forwarded = tonic::Request::new(req);\n");
-    rust.push_str("        *forwarded.metadata_mut() = metadata;\n");
-    rust.push_str("        ActorRpcAdapter::new(handle).unary(forwarded).await\n");
-    rust.push_str("    }\n");
-    rust.push_str("}\n\n");
-    rust.push_str("#[tonic::async_trait]\n");
+    rust.push_str("            let mut forwarded = tonic::Request::new(req);\n");
+    rust.push_str("            *forwarded.metadata_mut() = metadata;\n");
+    rust.push_str("            ActorRpcAdapter::new(handle).unary(forwarded).await\n");
+    rust.push_str("        }\n");
+    rust.push_str("    }\n\n");
+    rust.push_str("    #[tonic::async_trait]\n");
     rust.push_str(&format!(
-        "impl<A, L> {trait_path} for {adapter}<A, L>\n",
-        adapter = adapter_name
+        "    impl<A, L> {trait_path} for RegistryService<A, L>\n"
     ));
-    rust.push_str("where\n    A: Actor + Sync");
+    rust.push_str("    where\n        A: Actor + Sync");
     for method in methods {
         rust.push_str(" + Handler<Rpc<");
         rust.push_str(&method.request_type);
         rust.push_str(">>");
     }
-    rust.push_str(",\n    L: ActorLoader<A>,\n{\n");
+    rust.push_str(",\n        L: ActorLoader<A>,\n    {\n");
     for method in methods {
         rust.push_str(&format!(
-            "    async fn {method}(&self, request: tonic::Request<{request}>) -> Result<tonic::Response<{reply}>, tonic::Status> {{\n",
+            "        async fn {method}(&self, request: tonic::Request<{request}>) -> Result<tonic::Response<{reply}>, tonic::Status> {{\n",
             method = lower_camel_to_snake(&method.method_name),
             request = method.request_type,
             reply = method.reply_type
         ));
-        rust.push_str("        self.unary(request).await\n");
-        rust.push_str("    }\n");
+        rust.push_str("            self.unary(request).await\n");
+        rust.push_str("        }\n");
     }
-    rust.push_str("}\n\n");
+    rust.push_str("    }\n\n");
 }
 
 fn push_tonic_endpoint_transport(rust: &mut String, methods: &[RpcMethodSpec]) {
@@ -368,14 +356,6 @@ fn push_tonic_endpoint_transport(rust: &mut String, methods: &[RpcMethodSpec]) {
     for method in methods {
         push_tonic_transport_method(rust, method);
     }
-    rust.push_str("}\n\n");
-    rust.push_str("fn actor_id_from_route_key(route_key: RouteKey) -> ActorId {\n");
-    rust.push_str("    match route_key {\n");
-    rust.push_str("        RouteKey::Str(value) => ActorId::Str(value),\n");
-    rust.push_str("        RouteKey::U64(value) => ActorId::U64(value),\n");
-    rust.push_str("        RouteKey::I64(value) => ActorId::I64(value),\n");
-    rust.push_str("        RouteKey::Bytes(value) => ActorId::Bytes(value),\n");
-    rust.push_str("    }\n");
     rust.push_str("}\n\n");
 }
 
@@ -417,30 +397,81 @@ fn push_tonic_transport_method(rust: &mut String, method: &RpcMethodSpec) {
     rust.push_str("    }\n\n");
 }
 
-fn push_gateway_binding(rust: &mut String, method: &RpcMethodSpec) {
-    let binding_name = format!(
-        "{}{}GatewayBinding",
-        method.service_name, method.method_name
-    );
-    rust.push_str(&format!("pub struct {};\n\n", binding_name));
-    rust.push_str(&format!("impl {} {{\n", binding_name));
+fn push_method_module(rust: &mut String, method: &RpcMethodSpec) {
+    let module_name = lower_camel_to_snake(&method.method_name);
+    rust.push_str(&format!("    pub mod {module_name} {{\n"));
+    rust.push_str("        use lattice_actor::{Actor, Handler};\n");
+    rust.push_str("        use lattice_gateway::ProstClientMessageBinding;\n");
+    rust.push_str("        use lattice_rpc::Rpc;\n");
+    if method.gateway_msg_id.is_some() {
+        rust.push_str(
+            "        use lattice_gateway::{ClientFrame, GatewayError, GatewayRouteSpec};\n",
+        );
+        rust.push_str("        use lattice_rpc::{RoutedRequest, RpcRequest, ShardedRpcCore};\n");
+        rust.push_str("        use prost::Message as ProstMessage;\n");
+    }
+    rust.push('\n');
+    rust.push_str("        pub fn assert_handler<A>()\n");
+    rust.push_str("        where\n");
+    rust.push_str("            A: Actor + Handler<Rpc<");
+    rust.push_str(&method.request_type);
+    rust.push_str(">>,\n");
+    rust.push_str("        {\n");
+    rust.push_str("        }\n\n");
+    rust.push_str("        pub struct GatewayBinding;\n\n");
+    rust.push_str("        impl GatewayBinding {\n");
     if let Some(msg_id) = method.gateway_msg_id {
         rust.push_str(&format!(
-            "    pub const DEFAULT_MSG_ID: u32 = {};\n\n",
+            "            pub const DEFAULT_MSG_ID: u32 = {};\n\n",
             msg_id
         ));
-        rust.push_str("    pub fn default_binding() -> ProstClientMessageBinding<");
+        rust.push_str("            pub fn route_spec() -> GatewayRouteSpec {\n");
+        rust.push_str("                let default_req = <");
+        rust.push_str(&method.request_type);
+        rust.push_str(" as Default>::default();\n");
+        rust.push_str("                GatewayRouteSpec {\n");
+        rust.push_str("                    msg_id: Self::DEFAULT_MSG_ID,\n");
+        rust.push_str("                    actor_kind: default_req.actor_kind(),\n");
+        rust.push_str("                    method: <");
+        rust.push_str(&method.request_type);
+        rust.push_str(" as RpcRequest>::METHOD,\n");
+        rust.push_str("                }\n");
+        rust.push_str("            }\n\n");
+        rust.push_str("            pub async fn decode_and_forward<C>(frame: ClientFrame, core: C) -> Result<ClientFrame, GatewayError>\n");
+        rust.push_str("            where\n");
+        rust.push_str("                C: ShardedRpcCore,\n");
+        rust.push_str("            {\n");
+        rust.push_str("                if frame.msg_id != Self::DEFAULT_MSG_ID {\n");
+        rust.push_str("                    return Err(GatewayError::UnexpectedMessageId {\n");
+        rust.push_str("                        expected: Self::DEFAULT_MSG_ID,\n");
+        rust.push_str("                        actual: frame.msg_id,\n");
+        rust.push_str("                    });\n");
+        rust.push_str("                }\n");
+        rust.push_str("                let req = <");
+        rust.push_str(&method.request_type);
+        rust.push_str(" as ProstMessage>::decode(frame.payload.as_slice())\n");
+        rust.push_str("                    .map_err(|source| GatewayError::DecodePayload(source.to_string()))?;\n");
+        rust.push_str(
+            "                let reply = core.call(req).await.map_err(GatewayError::Rpc)?;\n",
+        );
+        rust.push_str("                Ok(ClientFrame {\n");
+        rust.push_str("                    msg_id: Self::DEFAULT_MSG_ID,\n");
+        rust.push_str("                    payload: reply.encode_to_vec(),\n");
+        rust.push_str("                })\n");
+        rust.push_str("            }\n\n");
+        rust.push_str("            pub fn default_binding() -> ProstClientMessageBinding<");
         rust.push_str(&method.request_type);
         rust.push_str("> {\n");
-        rust.push_str("        Self::binding(Self::DEFAULT_MSG_ID)\n");
-        rust.push_str("    }\n\n");
+        rust.push_str("                Self::binding(Self::DEFAULT_MSG_ID)\n");
+        rust.push_str("            }\n\n");
     }
-    rust.push_str("    pub fn binding(msg_id: u32) -> ProstClientMessageBinding<");
+    rust.push_str("            pub fn binding(msg_id: u32) -> ProstClientMessageBinding<");
     rust.push_str(&method.request_type);
     rust.push_str("> {\n");
-    rust.push_str("        ProstClientMessageBinding::new(msg_id)\n");
-    rust.push_str("    }\n");
-    rust.push_str("}\n\n");
+    rust.push_str("                ProstClientMessageBinding::new(msg_id)\n");
+    rust.push_str("            }\n");
+    rust.push_str("        }\n");
+    rust.push_str("    }\n\n");
 }
 
 fn push_gateway_route_table(rust: &mut String, methods: &[RpcMethodSpec]) {
@@ -457,14 +488,116 @@ fn push_gateway_route_table(rust: &mut String, methods: &[RpcMethodSpec]) {
     );
     for method in gateway_methods {
         rust.push_str("    table.register(");
-        rust.push_str(&format!(
-            "{}{}GatewayBinding::default_binding().route_spec()",
-            method.service_name, method.method_name
-        ));
+        rust.push_str(&gateway_binding_path(method));
+        rust.push_str("::route_spec()");
         rust.push_str(")?;\n");
     }
     rust.push_str("    Ok(())\n");
     rust.push_str("}\n\n");
+}
+
+fn push_gateway_dispatcher(rust: &mut String, methods: &[RpcMethodSpec]) {
+    let gateway_methods: Vec<&RpcMethodSpec> = methods
+        .iter()
+        .filter(|method| method.gateway_msg_id.is_some())
+        .collect();
+    if gateway_methods.is_empty() {
+        return;
+    }
+    let service_groups = gateway_service_groups(&gateway_methods);
+    let type_params = service_groups
+        .iter()
+        .map(|methods| gateway_core_type_param(methods[0]))
+        .collect::<Vec<_>>();
+    let type_params_csv = type_params.join(", ");
+
+    rust.push_str("#[derive(Clone)]\n");
+    rust.push_str(&format!(
+        "pub struct GatewayDispatcher<{type_params_csv}> {{\n"
+    ));
+    for methods in &service_groups {
+        rust.push_str(&format!(
+            "    {}: {},\n",
+            lower_camel_to_snake(&methods[0].service_name),
+            gateway_core_type_param(methods[0])
+        ));
+    }
+    rust.push_str("}\n\n");
+
+    rust.push_str(&format!(
+        "impl<{type_params_csv}> GatewayDispatcher<{type_params_csv}>\n"
+    ));
+    rust.push_str("where\n");
+    for type_param in &type_params {
+        rust.push_str(&format!("    {type_param}: ShardedRpcCore + Clone,\n"));
+    }
+    rust.push_str("{\n");
+    rust.push_str(&format!(
+        "    pub fn new({}) -> Self {{\n",
+        gateway_new_args(&service_groups)
+    ));
+    rust.push_str("        Self {\n");
+    for methods in &service_groups {
+        let field = lower_camel_to_snake(&methods[0].service_name);
+        rust.push_str(&format!("            {field},\n"));
+    }
+    rust.push_str("        }\n");
+    rust.push_str("    }\n\n");
+    rust.push_str(
+        "    pub async fn dispatch(&self, frame: ClientFrame) -> Result<ClientFrame, GatewayError> {\n",
+    );
+    rust.push_str("        match frame.msg_id {\n");
+    for method in gateway_methods {
+        let field = lower_camel_to_snake(&method.service_name);
+        let binding_path = gateway_binding_path(method);
+        rust.push_str(&format!(
+            "            {binding_path}::DEFAULT_MSG_ID => {binding_path}::decode_and_forward(frame, self.{field}.clone()).await,\n"
+        ));
+    }
+    rust.push_str("            msg_id => Err(GatewayError::UnknownMessageId { msg_id }),\n");
+    rust.push_str("        }\n");
+    rust.push_str("    }\n");
+    rust.push_str("}\n\n");
+}
+
+fn gateway_service_groups<'a>(methods: &[&'a RpcMethodSpec]) -> Vec<Vec<&'a RpcMethodSpec>> {
+    let mut groups = Vec::<Vec<&RpcMethodSpec>>::new();
+    for method in methods {
+        if let Some(group) = groups.iter_mut().find(|group| {
+            group[0].package == method.package && group[0].service_name == method.service_name
+        }) {
+            group.push(*method);
+        } else {
+            groups.push(vec![*method]);
+        }
+    }
+    groups
+}
+
+fn gateway_core_type_param(method: &RpcMethodSpec) -> String {
+    format!("{}Core", method.service_name)
+}
+
+fn gateway_new_args(service_groups: &[Vec<&RpcMethodSpec>]) -> String {
+    service_groups
+        .iter()
+        .map(|methods| {
+            format!(
+                "{}: {}",
+                lower_camel_to_snake(&methods[0].service_name),
+                gateway_core_type_param(methods[0])
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn gateway_binding_path(method: &RpcMethodSpec) -> String {
+    format!(
+        "{}::{}::GatewayBinding",
+        lower_camel_to_snake(&method.service_name),
+        lower_camel_to_snake(&method.method_name)
+    )
 }
 
 fn group_by_service(methods: &[RpcMethodSpec]) -> BTreeMap<(&str, &str), Vec<&RpcMethodSpec>> {

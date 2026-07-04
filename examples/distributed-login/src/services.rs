@@ -13,7 +13,7 @@ use tonic::transport::Server;
 use crate::actors::{PlayerActor, PlayerLoader, WorldActor};
 use crate::game::player_rpc_server::PlayerRpcServer;
 use crate::game::world_rpc_server::WorldRpcServer;
-use crate::generated::{PlayerRpcClient, PlayerRpcRegistryService, WorldRpcActorService};
+use crate::generated::{player_rpc, world_rpc};
 use crate::placement::{actor_ref_core, player_core};
 use crate::{PLAYER_ACTOR, PLAYER_SERVICE};
 
@@ -30,7 +30,7 @@ pub async fn run_player_service(
     ));
     let actor_ref_client =
         ActorRefRpcClient::new(actor_ref_core(PLAYER_SERVICE, InstanceId::new("player-1")));
-    let service = PlayerRpcRegistryService::new(registry, PlayerLoader::new(actor_ref_client));
+    let service = player_rpc::RegistryService::new(registry, PlayerLoader::new(actor_ref_client));
     if let Some(ready) = ready {
         let _ = ready.send(local_addr);
     }
@@ -48,7 +48,7 @@ pub async fn run_world_service(
 ) -> ExampleResult<()> {
     let local_addr = listener.local_addr()?;
     let player_client =
-        PlayerRpcClient::new(player_core(player_endpoint, InstanceId::new("world-1")));
+        player_rpc::Client::new(player_core(player_endpoint, InstanceId::new("world-1")));
     let runtime = ActorRuntime::default();
     let world = runtime
         .spawn_actor(
@@ -59,7 +59,7 @@ pub async fn run_world_service(
             },
         )
         .await?;
-    let service = WorldRpcActorService::new(world);
+    let service = world_rpc::ActorService::new(world);
     if let Some(ready) = ready {
         let _ = ready.send(local_addr);
     }

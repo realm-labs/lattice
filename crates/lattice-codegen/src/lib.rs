@@ -149,16 +149,13 @@ mod tests {
                 .rust
                 .contains("impl RoutedRequest for crate::world::EnterWorldRequest")
         );
-        assert!(generated.rust.contains("pub struct WorldRpcClient<C>"));
+        assert!(generated.rust.contains("pub mod world_rpc"));
+        assert!(generated.rust.contains("pub struct Client<C>"));
+        assert!(generated.rust.contains("pub struct ActorService<A: Actor>"));
         assert!(
             generated
                 .rust
-                .contains("pub struct WorldRpcActorService<A: Actor>")
-        );
-        assert!(
-            generated
-                .rust
-                .contains("pub struct WorldRpcRegistryService<A: Actor, L>")
+                .contains("pub struct RegistryService<A: Actor, L>")
         );
         assert!(
             generated
@@ -166,12 +163,19 @@ mod tests {
                 .contains("pub struct GeneratedTonicEndpointTransport")
         );
         assert!(generated.rust.contains("\"world.WorldRpc/EnterWorld\" => self.call_world_rpc_enter_world::<Req>(target, request).await"));
+        assert!(generated.rust.contains("pub mod enter_world"));
+        assert!(generated.rust.contains("pub struct GatewayBinding"));
+        assert!(generated.rust.contains("register_gateway_routes"));
         assert!(
             generated
                 .rust
-                .contains("pub struct WorldRpcEnterWorldGatewayBinding")
+                .contains("pub struct GatewayDispatcher<WorldRpcCore>")
         );
-        assert!(generated.rust.contains("register_gateway_routes"));
+        assert!(
+            generated
+                .rust
+                .contains("pub async fn dispatch(&self, frame: ClientFrame)")
+        );
     }
 
     #[test]
@@ -376,12 +380,21 @@ mod tests {
 
         let generated = generate_rpc_bindings(&[first, second]).unwrap();
 
-        assert!(generated.rust.contains(
-            "table.register(WorldRpcEnterWorldGatewayBinding::default_binding().route_spec())?;"
-        ));
-        assert!(generated.rust.contains(
-            "table.register(RoomRpcJoinRoomGatewayBinding::default_binding().route_spec())?;"
-        ));
+        assert!(
+            generated
+                .rust
+                .contains("table.register(world_rpc::enter_world::GatewayBinding::route_spec())?;")
+        );
+        assert!(
+            generated
+                .rust
+                .contains("table.register(room_rpc::join_room::GatewayBinding::route_spec())?;")
+        );
+        assert!(
+            generated
+                .rust
+                .contains("pub struct GatewayDispatcher<WorldRpcCore, RoomRpcCore>")
+        );
     }
 
     #[test]
@@ -391,11 +404,8 @@ mod tests {
 
         let generated = generate_rpc_bindings(&[method]).unwrap();
 
-        assert!(
-            generated
-                .rust
-                .contains("pub struct WorldRpcEnterWorldGatewayBinding;")
-        );
+        assert!(generated.rust.contains("pub mod enter_world"));
+        assert!(generated.rust.contains("pub struct GatewayBinding;"));
         assert!(generated.rust.contains("pub fn binding(msg_id: u32)"));
         assert!(!generated.rust.contains("DEFAULT_MSG_ID"));
         assert!(!generated.rust.contains("register_gateway_routes"));
@@ -534,7 +544,8 @@ message EnterWorldReply {
 
         let generated = std::fs::read_to_string(out_dir.join("lattice.generated.rs")).unwrap();
         assert!(generated.contains("impl RoutedRequest for crate::world::EnterWorldRequest"));
-        assert!(generated.contains("pub struct WorldRpcClient<C>"));
+        assert!(generated.contains("pub mod world_rpc"));
+        assert!(generated.contains("pub struct Client<C>"));
         assert!(generated.contains("pub const DEFAULT_MSG_ID: u32 = 100;"));
         assert!(out_dir.join("world.rs").exists());
         assert!(!out_dir.join("lattice.descriptor.bin").exists());

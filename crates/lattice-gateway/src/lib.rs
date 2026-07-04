@@ -308,6 +308,8 @@ pub enum GatewayError {
     DuplicateRoute { msg_id: u32 },
     #[error("unexpected msg_id: expected {expected}, got {actual}")]
     UnexpectedMessageId { expected: u32, actual: u32 },
+    #[error("unknown gateway msg_id {msg_id}")]
+    UnknownMessageId { msg_id: u32 },
     #[error("failed to decode client payload: {0}")]
     DecodePayload(String),
     #[error("rpc failed: {0}")]
