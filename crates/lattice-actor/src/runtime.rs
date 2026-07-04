@@ -130,8 +130,13 @@ impl ActorScheduler {
                 }
                 Ok(spawn_task_per_actor(actor, options))
             }
-            ActorExecutionPolicy::DedicatedThreadPool { .. } => {
-                Err(crate::ActorSpawnError::UnsupportedExecutionPolicy { policy: execution })
+            ActorExecutionPolicy::DedicatedThreadPool { worker_count } => {
+                if worker_count == 0 {
+                    return Err(crate::ActorSpawnError::InvalidExecutionPolicy {
+                        reason: "DedicatedThreadPool worker_count must be greater than zero",
+                    });
+                }
+                Ok(spawn_dedicated_thread_actor(actor, options))
             }
         }
     }
@@ -202,6 +207,39 @@ where
         system_rx,
         options.passivation,
     ));
+
+    handle
+}
+
+fn spawn_dedicated_thread_actor<A>(actor: A, options: ActorSpawnOptions) -> ActorHandle<A>
+where
+    A: Actor,
+{
+    let mailbox = options.mailbox;
+    let (normal_tx, normal_rx) = mpsc::channel(mailbox.normal_capacity());
+    let (system_tx, system_rx) = mpsc::channel(mailbox.system_capacity());
+    let local_ref = LocalActorRef::new(NEXT_LOCAL_ACTOR_ID.fetch_add(1, Ordering::Relaxed));
+    let (terminated_tx, _terminated_rx) = broadcast::channel(16);
+    let (lifecycle_tx, _lifecycle_rx) = watch::channel(ActorLifecycleState::Empty);
+    let handle = ActorHandle::new(local_ref, terminated_tx, lifecycle_tx, normal_tx, system_tx);
+    let actor_handle = handle.clone();
+
+    std::thread::Builder::new()
+        .name("lattice-dedicated-actor".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("dedicated actor runtime should build");
+            runtime.block_on(run_actor(
+                actor,
+                actor_handle,
+                normal_rx,
+                system_rx,
+                options.passivation,
+            ));
+        })
+        .expect("dedicated actor thread should spawn");
 
     handle
 }

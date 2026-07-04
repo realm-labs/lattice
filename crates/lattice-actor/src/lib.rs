@@ -253,17 +253,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_thread_pool_policy_returns_explicit_error_until_phase_seven() {
+    async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
         let runtime = ActorRuntime::new(ActorRuntimeConfig {
             default_execution: ActorExecutionPolicy::TaskPerActor,
         });
+        let events = Arc::new(Mutex::new(Vec::new()));
         let actor = TestActor {
-            events: Arc::new(Mutex::new(Vec::new())),
+            events: events.clone(),
             start_gate: None,
             stopped: None,
         };
 
-        let result = runtime
+        let handle = runtime
             .spawn_actor(
                 actor,
                 ActorSpawnOptions {
@@ -272,13 +273,54 @@ mod tests {
                     passivation: PassivationPolicy::Disabled,
                 },
             )
+            .await
+            .unwrap();
+
+        let reply = handle.call(Ping("dedicated")).await.unwrap();
+
+        assert_eq!(reply, "pong:dedicated");
+        assert_eq!(*events.lock().await, vec!["dedicated"]);
+    }
+
+    #[tokio::test]
+    async fn execution_policies_reject_zero_workers() {
+        let runtime = ActorRuntime::default();
+        let shard = runtime
+            .spawn_actor(
+                TestActor {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                    start_gate: None,
+                    stopped: None,
+                },
+                ActorSpawnOptions {
+                    mailbox: MailboxConfig::bounded(8),
+                    execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 0 }),
+                    passivation: PassivationPolicy::Disabled,
+                },
+            )
+            .await;
+        let dedicated = runtime
+            .spawn_actor(
+                TestActor {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                    start_gate: None,
+                    stopped: None,
+                },
+                ActorSpawnOptions {
+                    mailbox: MailboxConfig::bounded(8),
+                    execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 0 }),
+                    passivation: PassivationPolicy::Disabled,
+                },
+            )
             .await;
 
         assert!(matches!(
-            result,
-            Err(ActorSpawnError::UnsupportedExecutionPolicy {
-                policy: ActorExecutionPolicy::DedicatedThreadPool { worker_count: 2 }
-            })
+            shard,
+            Err(ActorSpawnError::InvalidExecutionPolicy { .. })
+        ));
+        assert!(matches!(
+            dedicated,
+            Err(ActorSpawnError::InvalidExecutionPolicy { .. })
         ));
     }
 
