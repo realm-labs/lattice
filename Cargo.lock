@@ -390,8 +390,10 @@ dependencies = [
  "async-trait",
  "lattice-core",
  "lattice-rpc",
+ "prost",
  "thiserror",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

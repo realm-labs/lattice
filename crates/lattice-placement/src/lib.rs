@@ -5,7 +5,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use lattice_core::{ActorKind, InstanceId, RouteKey, ServiceKind};
-use lattice_rpc::RouteTarget;
+use lattice_rpc::{
+    RouteTarget, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError, RpcRequest,
+    ShardedRpcCore,
+};
+use tonic::{Request, Response};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteCacheKey {
@@ -53,6 +57,134 @@ pub enum InvalidateReason {
 pub trait RouteResolver: Clone + Send + Sync + 'static {
     async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError>;
     async fn invalidate(&self, key: RouteCacheKey, reason: InvalidateReason);
+}
+
+#[async_trait]
+pub trait EndpointRpcTransport: Clone + Send + Sync + 'static {
+    async fn unary<Req>(
+        &self,
+        endpoint: EndpointLease,
+        target: RouteTarget,
+        request: Request<Req>,
+    ) -> Result<Response<Req::Reply>, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest;
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvingRpcCore<R, T> {
+    service_kind: ServiceKind,
+    resolver: R,
+    endpoint_pool: EndpointPool,
+    context_factory: RpcClientContextFactory,
+    transport: T,
+}
+
+impl<R, T> ResolvingRpcCore<R, T> {
+    pub fn new(
+        service_kind: ServiceKind,
+        resolver: R,
+        endpoint_pool: EndpointPool,
+        context_factory: RpcClientContextFactory,
+        transport: T,
+    ) -> Self {
+        Self {
+            service_kind,
+            resolver,
+            endpoint_pool,
+            context_factory,
+            transport,
+        }
+    }
+}
+
+#[async_trait]
+impl<R, T> ShardedRpcCore for ResolvingRpcCore<R, T>
+where
+    R: RouteResolver,
+    T: EndpointRpcTransport,
+{
+    async fn call<Req>(&self, req: Req) -> Result<Req::Reply, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        let resolve_request = ResolveRequest {
+            service_kind: self.service_kind.clone(),
+            actor_kind: req.actor_kind(),
+            route_key: req.route_key(),
+        };
+        let key = resolve_request.cache_key();
+        let encoded = req.encode_to_vec();
+
+        let target = self.resolve_rpc_target(resolve_request.clone()).await?;
+        let ctx = self.context_factory.next_context(target.owner_epoch);
+        match self
+            .send_with_context(target, ctx.clone(), decode_request::<Req>(&encoded)?)
+            .await
+        {
+            Ok(reply) => Ok(reply),
+            Err(RpcError::NotOwner { .. }) => {
+                self.resolver
+                    .invalidate(key, InvalidateReason::NotOwner)
+                    .await;
+                let retry_target = self.resolve_rpc_target(resolve_request).await?;
+                let mut retry_ctx = ctx;
+                retry_ctx.route_epoch = retry_target.owner_epoch;
+                self.send_with_context(retry_target, retry_ctx, decode_request::<Req>(&encoded)?)
+                    .await
+            }
+            Err(RpcError::Fenced { .. }) => {
+                self.resolver
+                    .invalidate(key, InvalidateReason::Fenced)
+                    .await;
+                let retry_target = self.resolve_rpc_target(resolve_request).await?;
+                let mut retry_ctx = ctx;
+                retry_ctx.route_epoch = retry_target.owner_epoch;
+                self.send_with_context(retry_target, retry_ctx, decode_request::<Req>(&encoded)?)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl<R, T> ResolvingRpcCore<R, T>
+where
+    R: RouteResolver,
+    T: EndpointRpcTransport,
+{
+    async fn resolve_rpc_target(&self, request: ResolveRequest) -> Result<RouteTarget, RpcError> {
+        self.resolver
+            .resolve(request)
+            .await
+            .map_err(|error| RpcError::Business(error.to_string()))
+    }
+
+    async fn send_with_context<Req>(
+        &self,
+        target: RouteTarget,
+        ctx: RpcContext,
+        req: Req,
+    ) -> Result<Req::Reply, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        let endpoint = self.endpoint_pool.get_or_connect(&target);
+        let mut request = Request::new(req);
+        ctx.inject_metadata(request.metadata_mut())
+            .map_err(|error| RpcError::Business(error.to_string()))?;
+        self.transport
+            .unary(endpoint, target, request)
+            .await
+            .map(Response::into_inner)
+    }
+}
+
+fn decode_request<Req>(bytes: &[u8]) -> Result<Req, RpcError>
+where
+    Req: RpcRequest,
+{
+    Req::decode(bytes).map_err(|error| RpcError::Business(error.to_string()))
 }
 
 #[derive(Debug, Clone)]
@@ -302,11 +434,108 @@ pub enum PlacementError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use async_trait::async_trait;
     use lattice_core::{Epoch, InstanceId, RouteKey, actor_kind, service_kind};
+    use lattice_rpc::{AuthContext, RpcContext};
 
     use super::*;
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct EnterWorldRequest {
+        #[prost(uint64, tag = "1")]
+        world_id: u64,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct EnterWorldReply {
+        #[prost(bool, tag = "1")]
+        ok: bool,
+    }
+
+    impl RoutedRequest for EnterWorldRequest {
+        fn actor_kind(&self) -> lattice_core::ActorKind {
+            actor_kind!("World")
+        }
+
+        fn route_key(&self) -> RouteKey {
+            RouteKey::U64(self.world_id)
+        }
+    }
+
+    impl RpcRequest for EnterWorldRequest {
+        type Reply = EnterWorldReply;
+        const METHOD: &'static str = "WorldRpc/EnterWorld";
+    }
+
+    #[derive(Clone)]
+    struct SequencedResolver {
+        targets: Arc<Mutex<VecDeque<RouteTarget>>>,
+        resolves: Arc<AtomicU64>,
+        invalidations: Arc<Mutex<Vec<(RouteCacheKey, InvalidateReason)>>>,
+    }
+
+    #[async_trait]
+    impl RouteResolver for SequencedResolver {
+        async fn resolve(&self, _request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            self.targets
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(PlacementError::NoRoute)
+        }
+
+        async fn invalidate(&self, key: RouteCacheKey, reason: InvalidateReason) {
+            self.invalidations.lock().unwrap().push((key, reason));
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Attempt {
+        request_id: String,
+        route_epoch: Option<Epoch>,
+        instance_id: InstanceId,
+        connection_id: u64,
+    }
+
+    #[derive(Clone, Default)]
+    struct NotOwnerThenOkTransport {
+        attempts: Arc<Mutex<Vec<Attempt>>>,
+    }
+
+    #[async_trait]
+    impl EndpointRpcTransport for NotOwnerThenOkTransport {
+        async fn unary<Req>(
+            &self,
+            endpoint: EndpointLease,
+            target: RouteTarget,
+            request: Request<Req>,
+        ) -> Result<Response<Req::Reply>, RpcError>
+        where
+            Req: RoutedRequest + RpcRequest,
+        {
+            let ctx = RpcContext::from_metadata(request.metadata())
+                .map_err(|error| RpcError::Business(error.to_string()))?;
+            let mut attempts = self.attempts.lock().unwrap();
+            attempts.push(Attempt {
+                request_id: ctx.request_id.as_str().to_string(),
+                route_epoch: ctx.route_epoch,
+                instance_id: target.instance_id,
+                connection_id: endpoint.connection_id,
+            });
+            if attempts.len() == 1 {
+                return Err(RpcError::NotOwner {
+                    expected_epoch: Some(Epoch(2)),
+                });
+            }
+
+            Ok(Response::new(Req::Reply::default()))
+        }
+    }
 
     #[test]
     fn local_route_cache_reports_fresh_stale_and_hard_expired_entries() {
@@ -382,6 +611,48 @@ mod tests {
 
         assert_eq!(first.connection_id, same.connection_id);
         assert_ne!(first.connection_id, other.connection_id);
+    }
+
+    #[tokio::test]
+    async fn resolving_rpc_core_invalidates_not_owner_and_retries_same_request_id() {
+        let resolver = SequencedResolver {
+            targets: Arc::new(Mutex::new(VecDeque::from([
+                route_target("world-a", 1),
+                route_target("world-b", 2),
+            ]))),
+            resolves: Arc::new(AtomicU64::new(0)),
+            invalidations: Arc::new(Mutex::new(Vec::new())),
+        };
+        let transport = NotOwnerThenOkTransport::default();
+        let attempts = transport.attempts.clone();
+        let context_factory =
+            RpcClientContextFactory::new(service_kind!("Player"), InstanceId::new("player-0"))
+                .with_auth(AuthContext {
+                    authorization: "Bearer internal".into(),
+                });
+        let core = ResolvingRpcCore::new(
+            service_kind!("World"),
+            resolver.clone(),
+            EndpointPool::new(),
+            context_factory,
+            transport,
+        );
+
+        let reply = core.call(EnterWorldRequest { world_id: 7 }).await.unwrap();
+
+        assert!(!reply.ok);
+        assert_eq!(resolver.resolves.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            resolver.invalidations.lock().unwrap()[0].1,
+            InvalidateReason::NotOwner
+        );
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].request_id, attempts[1].request_id);
+        assert_eq!(attempts[0].route_epoch, Some(Epoch(1)));
+        assert_eq!(attempts[1].route_epoch, Some(Epoch(2)));
+        assert_eq!(attempts[0].instance_id, InstanceId::new("world-a"));
+        assert_eq!(attempts[1].instance_id, InstanceId::new("world-b"));
     }
 
     fn static_resolver() -> StaticRouteResolver {

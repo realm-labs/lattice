@@ -9,7 +9,9 @@ repository.workspace = true
 async-trait.workspace = true
 lattice-core.workspace = true
 lattice-rpc.workspace = true
+prost.workspace = true
 thiserror.workspace = true
+tonic.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
