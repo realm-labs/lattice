@@ -56,6 +56,12 @@ pub struct DrainReport {
     pub migrated_actors: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailoverReport {
+    pub failed_instance: InstanceId,
+    pub reassigned_actors: usize,
+}
+
 impl<S, L> PlacementCoordinator<S, L> {
     pub fn new(store: S, logic: L) -> Self {
         Self { store, logic }
@@ -167,6 +173,49 @@ where
         Ok(DrainReport {
             drained_instance: instance_id,
             migrated_actors,
+        })
+    }
+
+    pub async fn failover_expired_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+    ) -> Result<FailoverReport, PlacementError> {
+        let replacement = self
+            .store
+            .list_instances(&service_kind)
+            .await?
+            .into_iter()
+            .filter(|candidate| {
+                candidate.state == InstanceState::Ready && candidate.instance_id != instance_id
+            })
+            .min_by_key(|candidate| candidate.instance_id.clone())
+            .ok_or(PlacementError::NoReadyInstances)?;
+        let mut reassigned_actors = 0;
+        for (version, record) in self.store.list_actors().await? {
+            if record.owner != instance_id {
+                continue;
+            }
+            let key = ActorPlacementKey {
+                actor_kind: record.actor_kind.clone(),
+                actor_id: record.actor_id.clone(),
+            };
+            let reassigned = ActorPlacementRecord {
+                owner: replacement.instance_id.clone(),
+                epoch: Epoch(record.epoch.0 + 1),
+                lease_id: LeaseId(record.lease_id.0 + 1),
+                state: PlacementState::Running,
+                ..record
+            };
+            self.store
+                .compare_and_put_actor(key, Some(version), reassigned)
+                .await?;
+            reassigned_actors += 1;
+        }
+
+        Ok(FailoverReport {
+            failed_instance: instance_id,
+            reassigned_actors,
         })
     }
 
