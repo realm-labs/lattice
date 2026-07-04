@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use lattice_core::ActorKind;
@@ -104,6 +106,84 @@ impl KeyedRateLimiter {
 struct RateBucket {
     window_started: Instant,
     used: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayRequestContext {
+    pub principal_id: String,
+    pub session_id: String,
+    pub rate_class: String,
+}
+
+impl From<GatewayRequestContext> for RateLimitKey {
+    fn from(value: GatewayRequestContext) -> Self {
+        Self {
+            principal_id: value.principal_id,
+            session_id: value.session_id,
+            rate_class: value.rate_class,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct GatewayTowerPipeline {
+    limiter: std::sync::Mutex<KeyedRateLimiter>,
+    max_in_flight: usize,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl GatewayTowerPipeline {
+    pub fn new(limiter: KeyedRateLimiter, max_in_flight: usize) -> Self {
+        Self {
+            limiter: std::sync::Mutex::new(limiter),
+            max_in_flight,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn enter(
+        &self,
+        ctx: GatewayRequestContext,
+    ) -> Result<GatewayConcurrencyPermit, GatewayError> {
+        self.limiter
+            .lock()
+            .expect("gateway limiter mutex poisoned")
+            .check(ctx.into())?;
+        self.acquire_concurrency()
+    }
+
+    fn acquire_concurrency(&self) -> Result<GatewayConcurrencyPermit, GatewayError> {
+        let mut current = self.in_flight.load(Ordering::SeqCst);
+        loop {
+            if current >= self.max_in_flight {
+                return Err(GatewayError::LoadShed);
+            }
+            match self.in_flight.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Ok(GatewayConcurrencyPermit {
+                        in_flight: self.in_flight.clone(),
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct GatewayConcurrencyPermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for GatewayConcurrencyPermit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub trait ClientCodec {
@@ -242,6 +322,8 @@ pub enum GatewayError {
     },
     #[error("gateway rate limit exceeded")]
     RateLimited,
+    #[error("gateway load shed: concurrency limit exceeded")]
+    LoadShed,
 }
 
 #[cfg(test)]
@@ -386,5 +468,43 @@ mod tests {
         assert_eq!(limiter.check(key.clone()), Ok(()));
         assert_eq!(limiter.check(key), Err(GatewayError::RateLimited));
         assert_eq!(limiter.check(other_class), Ok(()));
+    }
+
+    #[test]
+    fn gateway_pipeline_load_sheds_when_concurrency_limit_is_full() {
+        let pipeline =
+            GatewayTowerPipeline::new(KeyedRateLimiter::new(10, Duration::from_secs(60)), 1);
+        let ctx = GatewayRequestContext {
+            principal_id: "player-1".into(),
+            session_id: "session-1".into(),
+            rate_class: "move".into(),
+        };
+
+        let permit = pipeline.enter(ctx.clone()).unwrap();
+        assert!(matches!(
+            pipeline.enter(ctx.clone()),
+            Err(GatewayError::LoadShed)
+        ));
+        drop(permit);
+
+        assert!(pipeline.enter(ctx).is_ok());
+    }
+
+    #[test]
+    fn gateway_pipeline_applies_keyed_rate_limit_before_forwarding() {
+        let pipeline =
+            GatewayTowerPipeline::new(KeyedRateLimiter::new(1, Duration::from_secs(60)), 8);
+        let ctx = GatewayRequestContext {
+            principal_id: "player-1".into(),
+            session_id: "session-1".into(),
+            rate_class: "chat".into(),
+        };
+
+        let _permit = pipeline.enter(ctx.clone()).unwrap();
+
+        assert!(matches!(
+            pipeline.enter(ctx),
+            Err(GatewayError::RateLimited)
+        ));
     }
 }
