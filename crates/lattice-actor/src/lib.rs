@@ -36,10 +36,10 @@ mod tests {
     use crate::{
         Actor, ActorActivationError, ActorCallError, ActorContext, ActorError,
         ActorExecutionPolicy, ActorHandle, ActorLifecycleState, ActorRegistry, ActorRegistryConfig,
-        ActorRuntime, ActorRuntimeConfig, ActorSpawnError, ActorSpawnOptions, ActorTellError,
-        ActorTerminated, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
-        MailboxConfig, Message, PassivationPolicy, PassivationReason, StopReason, TerminatedReason,
-        spawn_actor,
+        ActorRuntime, ActorRuntimeConfig, ActorScheduler, ActorSpawnError, ActorSpawnOptions,
+        ActorTellError, ActorTerminated, ChildActorKey, ChildActorOptions, ChildSupervision,
+        Handler, MailboxConfig, Message, PassivationPolicy, PassivationReason, StopReason,
+        TerminatedReason, spawn_actor,
     };
     use lattice_core::{ActorId, actor_kind};
 
@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_execution_policy_returns_explicit_error() {
+    async fn dedicated_thread_pool_policy_returns_explicit_error_until_phase_seven() {
         let runtime = ActorRuntime::new(ActorRuntimeConfig {
             default_execution: ActorExecutionPolicy::TaskPerActor,
         });
@@ -266,7 +266,7 @@ mod tests {
                 actor,
                 ActorSpawnOptions {
                     mailbox: MailboxConfig::bounded(8),
-                    execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 2 }),
+                    execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 2 }),
                     passivation: PassivationPolicy::Disabled,
                 },
             )
@@ -275,9 +275,85 @@ mod tests {
         assert!(matches!(
             result,
             Err(ActorSpawnError::UnsupportedExecutionPolicy {
-                policy: ActorExecutionPolicy::ShardWorker { worker_count: 2 }
+                policy: ActorExecutionPolicy::DedicatedThreadPool { worker_count: 2 }
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn shard_worker_execution_policy_runs_actor_with_same_mailbox_semantics() {
+        let runtime = ActorRuntime::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let handle = runtime
+            .spawn_actor(
+                TestActor {
+                    events: events.clone(),
+                    start_gate: None,
+                    stopped: None,
+                },
+                ActorSpawnOptions {
+                    mailbox: MailboxConfig::bounded(8),
+                    execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 4 }),
+                    passivation: PassivationPolicy::Disabled,
+                },
+            )
+            .await
+            .unwrap();
+
+        let reply = handle.call(Ping("shard-worker")).await.unwrap();
+
+        assert_eq!(reply, "pong:shard-worker");
+        assert_eq!(*events.lock().await, vec!["shard-worker"]);
+    }
+
+    #[test]
+    fn shard_worker_maps_actor_identity_deterministically_to_worker() {
+        let actor_id = ActorId::U64(42);
+
+        let first = ActorScheduler::shard_worker_index(&actor_id, 8).unwrap();
+        let second = ActorScheduler::shard_worker_index(&actor_id, 8).unwrap();
+        let zero = ActorScheduler::shard_worker_index(&actor_id, 0);
+
+        assert_eq!(first, second);
+        assert!(first < 8);
+        assert!(matches!(
+            zero,
+            Err(ActorSpawnError::InvalidExecutionPolicy { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn shard_worker_system_mailbox_keeps_priority_over_normal_mailbox() {
+        let runtime = ActorRuntime::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let start_gate = Arc::new(Semaphore::new(0));
+        let processed = Arc::new(Semaphore::new(0));
+        let handle = runtime
+            .spawn_actor(
+                TestActor {
+                    events: events.clone(),
+                    start_gate: Some(start_gate.clone()),
+                    stopped: None,
+                },
+                ActorSpawnOptions {
+                    mailbox: MailboxConfig::bounded(8),
+                    execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 2 }),
+                    passivation: PassivationPolicy::Disabled,
+                },
+            )
+            .await
+            .unwrap();
+
+        handle
+            .try_tell_for_test(Record::with_processed_signal("normal", processed.clone()))
+            .unwrap();
+        handle
+            .try_tell_system_for_test(Record::with_processed_signal("system", processed.clone()))
+            .unwrap();
+        start_gate.add_permits(1);
+        processed.acquire_many(2).await.unwrap().forget();
+
+        assert_eq!(*events.lock().await, vec!["system", "normal"]);
     }
 
     #[tokio::test]

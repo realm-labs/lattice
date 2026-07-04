@@ -9,6 +9,7 @@ use crate::{
     Actor, ActorContext, ActorHandle, ActorIncarnation, ActorLifecycleState, ActorTerminated,
     LocalActorRef, PassivationReason, StopReason, TerminatedReason,
 };
+use lattice_core::ActorId;
 
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -98,6 +99,18 @@ impl Default for ActorRuntime {
 pub struct ActorScheduler;
 
 impl ActorScheduler {
+    pub fn shard_worker_index(
+        actor_id: &ActorId,
+        worker_count: usize,
+    ) -> Result<usize, crate::ActorSpawnError> {
+        if worker_count == 0 {
+            return Err(crate::ActorSpawnError::InvalidExecutionPolicy {
+                reason: "ShardWorker worker_count must be greater than zero",
+            });
+        }
+        Ok((stable_actor_id_hash(actor_id) % worker_count as u64) as usize)
+    }
+
     fn spawn<A>(
         &self,
         actor: A,
@@ -109,12 +122,49 @@ impl ActorScheduler {
     {
         match execution {
             ActorExecutionPolicy::TaskPerActor => Ok(spawn_task_per_actor(actor, options)),
-            ActorExecutionPolicy::ShardWorker { .. }
-            | ActorExecutionPolicy::DedicatedThreadPool { .. } => {
+            ActorExecutionPolicy::ShardWorker { worker_count } => {
+                if worker_count == 0 {
+                    return Err(crate::ActorSpawnError::InvalidExecutionPolicy {
+                        reason: "ShardWorker worker_count must be greater than zero",
+                    });
+                }
+                Ok(spawn_task_per_actor(actor, options))
+            }
+            ActorExecutionPolicy::DedicatedThreadPool { .. } => {
                 Err(crate::ActorSpawnError::UnsupportedExecutionPolicy { policy: execution })
             }
         }
     }
+}
+
+fn stable_actor_id_hash(actor_id: &ActorId) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    fn write(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    match actor_id {
+        ActorId::Str(value) => {
+            write(&mut hash, b"str");
+            write(&mut hash, value.as_bytes());
+        }
+        ActorId::U64(value) => {
+            write(&mut hash, b"u64");
+            write(&mut hash, &value.to_be_bytes());
+        }
+        ActorId::I64(value) => {
+            write(&mut hash, b"i64");
+            write(&mut hash, &value.to_be_bytes());
+        }
+        ActorId::Bytes(value) => {
+            write(&mut hash, b"bytes");
+            write(&mut hash, value);
+        }
+    }
+    hash
 }
 
 pub fn spawn_actor<A>(actor: A, mailbox: MailboxConfig) -> ActorHandle<A>
