@@ -105,6 +105,7 @@ ConfigSource / ConfigFormat / BootstrapConfig
 lattice-actor Actor / Message / Handler<M>
 ActorRuntime / ActorScheduler abstraction
 ActorExecutionPolicy with TaskPerActor as the only Phase 1 implementation
+ActorRuntimeConfig / ActorSpawnOptions API
 ActorHandle.call/tell
 type-erased Envelope
 system/normal mailbox
@@ -129,6 +130,10 @@ Business code can define ActorKind/ServiceKind as reusable constants.
 BootstrapConfig supports TOML/YAML/JSON/env/composite sources.
 Actor execution is spawned and managed through lattice ActorRuntime, even if the backing executor is the process Tokio runtime.
 Tokio runtime is not exposed as the actor scheduling model.
+TaskPerActor is the default Phase 1 execution policy and is selected through ActorRuntimeConfig / ActorSpawnOptions.
+Unsupported execution policies return explicit errors instead of silently falling back.
+ActorHandle does not expose or depend on Tokio JoinHandle.
+Mailbox and Handler<M> semantics are independent from execution policy.
 Local timer can drive WorldTick.
 Tasks created by ActorContext are cancelled or isolated on stop/passivation.
 Business handlers can request passivation and return the current response before stop starts.
@@ -152,6 +157,8 @@ actor_kind/service_kind const macro tests
 bootstrap config format/merge/env override tests
 ActorRuntime spawn policy test
 ActorExecutionPolicy default TaskPerActor test
+unsupported execution policy returns explicit error test
+ActorHandle does not expose JoinHandle compile test
 ActorHandle call/tell
 system mailbox priority
 mailbox full

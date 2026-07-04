@@ -87,30 +87,80 @@ Async tasks are created through ActorContext so they can be cancelled or isolate
 
 ### 7.2 Actor Scheduling Model
 
-The first implementation may run on the service process's existing Tokio runtime, but Tokio itself must not be the actor scheduling abstraction exposed by lattice.
+The actor scheduling model is part of lattice, not an implementation detail left to each feature. The first implementation runs on the service process's Tokio runtime, but all actor execution must go through `ActorRuntime`.
 
-Recommended layering:
+Required layering:
 
 ```text
 Tokio runtime
-  -> lattice ActorRuntime / ActorScheduler
-    -> actor execution policy
-      -> actor mailbox loop
+  -> lattice ActorRuntime
+    -> ActorExecutor
+      -> ActorExecutionPolicy
+        -> actor mailbox loop
 ```
 
-The default first-version execution policy is one managed Tokio task per actor:
+The public scheduling API shape is:
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorExecutionPolicy {
     TaskPerActor,
-    ShardWorker { workers: usize },
-    DedicatedThread,
+    ShardWorker { worker_count: usize },
+    DedicatedThreadPool { worker_count: usize },
     LocalSet,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActorRuntimeConfig {
+    pub default_execution: ActorExecutionPolicy,
+}
+
+pub struct ActorRuntime {
+    executor: ActorExecutor,
+    registry: ActorRegistry,
+}
+
+impl ActorRuntime {
+    pub fn new(config: ActorRuntimeConfig) -> Self;
+
+    pub async fn spawn_actor<A>(
+        &self,
+        actor: A,
+        options: ActorSpawnOptions,
+    ) -> Result<ActorHandle<A>, ActorSpawnError>
+    where
+        A: Actor;
+}
+
+#[derive(Debug, Clone)]
+pub struct ActorSpawnOptions {
+    pub mailbox: MailboxConfig,
+    pub execution: Option<ActorExecutionPolicy>,
 }
 ```
 
-Phase 1 should implement only `TaskPerActor`, but the API should leave room for later shard workers, dedicated workers, or local sets.
+Phase 1 implements only `TaskPerActor`. The other variants are part of the stable design but may return `UnsupportedExecutionPolicy` until their phase is implemented.
+
+Final scheduling semantics:
+
+```text
+TaskPerActor:
+  One managed Tokio task owns one actor mailbox loop.
+  This is the default for explicit actors, local child actors, and early runtime implementation.
+
+ShardWorker:
+  A fixed worker set owns many actor mailbox loops.
+  Actor identity maps deterministically to a worker.
+  This is intended for virtual-shard actors after Phase 4, where task count and locality matter.
+
+DedicatedThreadPool:
+  A named pool for actors that must be isolated from normal Tokio worker threads.
+  This is for blocking-heavy or CPU-heavy actor families only when they cannot offload work elsewhere.
+
+LocalSet:
+  A single-thread Tokio LocalSet for !Send internal tasks or affinity-sensitive local execution.
+  Public actor messages still remain Send unless a later phase explicitly relaxes that boundary.
+```
 
 Rules:
 
@@ -120,10 +170,22 @@ ActorRuntime owns task naming, lifecycle, cancellation, metrics, tracing, and dr
 ActorContext creates scoped tasks through the actor runtime so they can be cancelled or isolated.
 ServiceContext creates service-scoped tasks through the service runtime.
 CPU-heavy or blocking work must not run directly on Tokio worker threads; use a blocking pool, dedicated worker, or external compute service.
-Virtual-shard actors may later run on shard workers to reduce task count and improve cache locality.
+ActorRegistry stores actor ownership independently from the concrete execution policy.
+Mailbox semantics are identical across execution policies.
+Changing execution policy must not change Handler<M> business code.
 ```
 
-This keeps the first version simple while avoiding a design where every actor is merely an unmanaged `tokio::spawn`.
+Forbidden implementation shortcuts:
+
+```text
+Do not expose tokio::spawn as the actor spawn API.
+Do not make ActorHandle depend on Tokio JoinHandle.
+Do not let each actor kind invent its own scheduling path.
+Do not encode execution policy into business Handler<M> bounds.
+Do not add ShardWorker/DedicatedThreadPool behavior before TaskPerActor semantics are tested.
+```
+
+This keeps the first version simple while fixing the final scheduling boundary: lattice owns actor scheduling; Tokio is only the first backing executor.
 
 ### 7.3 Core Traits
 
