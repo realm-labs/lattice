@@ -16,12 +16,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 mod config_store;
+mod ops_config;
 mod shutdown;
 
 pub use config_store::{
     ConfigStore, ConfigWatch, EtcdConfigStore, EtcdConfigStoreConfig, InMemoryEtcdConfigClient,
     LocalConfigStore,
 };
+pub use ops_config::{AdminHttpConfig, TelemetryConfig};
 pub use shutdown::{
     GracefulShutdown, GracefulShutdownReport, InMemoryShutdownLeaseController, LeaseEvent,
     ShutdownLeaseController, ShutdownStage, ShutdownTrigger,
@@ -1155,12 +1157,12 @@ mod tests {
     async fn opentelemetry_pipeline_exports_resource_spans_metrics_and_links() {
         let telemetry = TelemetryRecorder::default();
         let exporter = InMemoryTelemetryExporter::default();
-        let pipeline = OpenTelemetryPipeline::new(
-            TelemetryResource {
-                service_kind: service_kind!("World"),
-                instance_id: InstanceId::new("world-a"),
-                service_version: "test".to_string(),
-            },
+        let pipeline = TelemetryConfig {
+            service_version: "test".to_string(),
+        }
+        .build_in_memory_pipeline(
+            service_kind!("World"),
+            InstanceId::new("world-a"),
             exporter.clone(),
         );
         let producer = TraceContext {

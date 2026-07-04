@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -13,12 +14,34 @@ use crate::{
 #[derive(Clone)]
 pub struct NatsEventBus {
     client: InMemoryNatsClient,
+    config: Option<NatsEventBusConfig>,
 }
 
 impl NatsEventBus {
     pub fn new(client: InMemoryNatsClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            config: None,
+        }
     }
+
+    pub fn from_config(config: NatsEventBusConfig) -> Self {
+        Self {
+            client: InMemoryNatsClient::new(),
+            config: Some(config),
+        }
+    }
+
+    pub fn config(&self) -> Option<&NatsEventBusConfig> {
+        self.config.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NatsEventBusConfig {
+    pub endpoint: String,
+    pub stream: String,
+    pub durable_prefix: String,
 }
 
 #[derive(Clone)]
@@ -202,6 +225,18 @@ mod tests {
         bus.publish(test_event("event-1")).await.unwrap();
 
         assert_eq!(*seen.lock().await, vec!["event-1"]);
+    }
+
+    #[test]
+    fn nats_event_bus_builds_from_config() {
+        let config = NatsEventBusConfig {
+            endpoint: "nats://nats:4222".to_string(),
+            stream: "lattice-events".to_string(),
+            durable_prefix: "world".to_string(),
+        };
+        let bus = NatsEventBus::from_config(config.clone());
+
+        assert_eq!(bus.config(), Some(&config));
     }
 
     fn test_event(event_id: &str) -> EventEnvelope {

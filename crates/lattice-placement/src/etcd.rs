@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use lattice_core::{ActorId, InstanceId, ServiceKind};
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::{
@@ -20,6 +21,20 @@ pub struct EtcdPlacementStore<C> {
 impl<C> EtcdPlacementStore<C> {
     pub fn new(prefix: PlacementPrefix, client: C) -> Self {
         Self { prefix, client }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EtcdPlacementStoreConfig {
+    pub key_prefix: String,
+}
+
+impl EtcdPlacementStore<InMemoryEtcdClient> {
+    pub fn from_config(config: EtcdPlacementStoreConfig) -> Self {
+        Self::new(
+            PlacementPrefix::new(config.key_prefix),
+            InMemoryEtcdClient::new(),
+        )
     }
 }
 
@@ -514,6 +529,15 @@ mod tests {
         assert_eq!(first, LeaseId(1));
         assert_eq!(second, Err(PlacementError::ActivationLockHeld));
         assert_eq!(third, LeaseId(3));
+    }
+
+    #[test]
+    fn etcd_store_builds_from_config() {
+        let store = EtcdPlacementStore::from_config(EtcdPlacementStoreConfig {
+            key_prefix: "/lattice/test".to_string(),
+        });
+
+        assert_eq!(store.prefix().as_str(), "/lattice/test");
     }
 
     fn actor_key_for(actor_id: u64) -> ActorPlacementKey {

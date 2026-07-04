@@ -10,7 +10,7 @@ use lattice_core::{ActorId, ActorKind, InstanceId, RequestId, ServiceKind, Trace
 use lattice_rpc::{RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 use tokio::sync::Mutex;
 
-pub use nats::{InMemoryNatsClient, NatsEventBus};
+pub use nats::{InMemoryNatsClient, NatsEventBus, NatsEventBusConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subject(String);

@@ -11,6 +11,7 @@ http.workspace = true
 lattice-core.workspace = true
 lattice-rpc.workspace = true
 prost.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
