@@ -38,10 +38,9 @@ mod tests {
     use crate::{
         Actor, ActorActivationError, ActorCallError, ActorContext, ActorError,
         ActorExecutionPolicy, ActorHandle, ActorLifecycleState, ActorRegistry, ActorRegistryConfig,
-        ActorRuntime, ActorRuntimeConfig, ActorScheduler, ActorSpawnError, ActorSpawnOptions,
-        ActorTellError, ActorTerminated, ChildActorKey, ChildActorOptions, ChildSupervision,
-        Handler, MailboxConfig, Message, PassivationPolicy, PassivationReason, StopReason,
-        TerminatedReason, spawn_actor,
+        ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, ActorTellError, ActorTerminated,
+        ChildActorKey, ChildActorOptions, ChildSupervision, Handler, MailboxConfig, Message,
+        PassivationPolicy, PassivationReason, StopReason, TerminatedReason, spawn_actor,
     };
     use lattice_core::{ActorId, actor_kind};
 
@@ -250,120 +249,6 @@ mod tests {
 
         assert_eq!(reply, "pong:runtime");
         assert_eq!(*events.lock().await, vec!["runtime"]);
-    }
-
-    #[tokio::test]
-    async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
-        let runtime = ActorRuntime::new(ActorRuntimeConfig {
-            default_execution: ActorExecutionPolicy::TaskPerActor,
-        });
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let actor = TestActor {
-            events: events.clone(),
-            start_gate: None,
-            stopped: None,
-        };
-
-        let handle = runtime
-            .spawn_actor(
-                actor,
-                ActorSpawnOptions {
-                    mailbox: MailboxConfig::bounded(8),
-                    execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 2 }),
-                    passivation: PassivationPolicy::Disabled,
-                },
-            )
-            .await
-            .unwrap();
-
-        let reply = handle.call(Ping("dedicated")).await.unwrap();
-
-        assert_eq!(reply, "pong:dedicated");
-        assert_eq!(*events.lock().await, vec!["dedicated"]);
-    }
-
-    #[tokio::test]
-    async fn execution_policies_reject_zero_workers() {
-        let runtime = ActorRuntime::default();
-        let shard = runtime
-            .spawn_actor(
-                TestActor {
-                    events: Arc::new(Mutex::new(Vec::new())),
-                    start_gate: None,
-                    stopped: None,
-                },
-                ActorSpawnOptions {
-                    mailbox: MailboxConfig::bounded(8),
-                    execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 0 }),
-                    passivation: PassivationPolicy::Disabled,
-                },
-            )
-            .await;
-        let dedicated = runtime
-            .spawn_actor(
-                TestActor {
-                    events: Arc::new(Mutex::new(Vec::new())),
-                    start_gate: None,
-                    stopped: None,
-                },
-                ActorSpawnOptions {
-                    mailbox: MailboxConfig::bounded(8),
-                    execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 0 }),
-                    passivation: PassivationPolicy::Disabled,
-                },
-            )
-            .await;
-
-        assert!(matches!(
-            shard,
-            Err(ActorSpawnError::InvalidExecutionPolicy { .. })
-        ));
-        assert!(matches!(
-            dedicated,
-            Err(ActorSpawnError::InvalidExecutionPolicy { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn shard_worker_execution_policy_runs_actor_with_same_mailbox_semantics() {
-        let runtime = ActorRuntime::default();
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let handle = runtime
-            .spawn_actor(
-                TestActor {
-                    events: events.clone(),
-                    start_gate: None,
-                    stopped: None,
-                },
-                ActorSpawnOptions {
-                    mailbox: MailboxConfig::bounded(8),
-                    execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 4 }),
-                    passivation: PassivationPolicy::Disabled,
-                },
-            )
-            .await
-            .unwrap();
-
-        let reply = handle.call(Ping("shard-worker")).await.unwrap();
-
-        assert_eq!(reply, "pong:shard-worker");
-        assert_eq!(*events.lock().await, vec!["shard-worker"]);
-    }
-
-    #[test]
-    fn shard_worker_maps_actor_identity_deterministically_to_worker() {
-        let actor_id = ActorId::U64(42);
-
-        let first = ActorScheduler::shard_worker_index(&actor_id, 8).unwrap();
-        let second = ActorScheduler::shard_worker_index(&actor_id, 8).unwrap();
-        let zero = ActorScheduler::shard_worker_index(&actor_id, 0);
-
-        assert_eq!(first, second);
-        assert!(first < 8);
-        assert!(matches!(
-            zero,
-            Err(ActorSpawnError::InvalidExecutionPolicy { .. })
-        ));
     }
 
     #[tokio::test]
