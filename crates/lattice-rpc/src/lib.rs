@@ -155,6 +155,33 @@ pub trait ShardedRpcCore: Clone + Send + Sync + 'static {
         Req: RoutedRequest + RpcRequest;
 }
 
+#[derive(Debug, Clone)]
+pub struct TypedRpcClient<C> {
+    core: C,
+}
+
+impl<C> TypedRpcClient<C> {
+    pub fn new(core: C) -> Self {
+        Self { core }
+    }
+
+    pub fn core(&self) -> &C {
+        &self.core
+    }
+}
+
+impl<C> TypedRpcClient<C>
+where
+    C: ShardedRpcCore,
+{
+    pub async fn call<Req>(&self, req: Req) -> Result<Req::Reply, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        self.core.call(req).await
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RpcError {
     #[error("target owner not found")]
@@ -229,6 +256,8 @@ fn actor_call_status(error: ActorCallError) -> Status {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use async_trait::async_trait;
     use lattice_actor::{ActorContext, ActorError, ActorRuntime, ActorSpawnOptions};
     use lattice_core::{actor_kind, service_kind};
@@ -325,6 +354,53 @@ mod tests {
     #[test]
     fn rpc_wrapper_is_actor_message_for_rpc_request() {
         assert_actor_message::<Rpc<EnterWorldRequest>>();
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeRpcCore {
+        methods: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl ShardedRpcCore for FakeRpcCore {
+        async fn call<Req>(&self, _req: Req) -> Result<Req::Reply, RpcError>
+        where
+            Req: RoutedRequest + RpcRequest,
+        {
+            self.methods.lock().unwrap().push(Req::METHOD);
+            Ok(Req::Reply::default())
+        }
+    }
+
+    struct WorldClient<C> {
+        inner: TypedRpcClient<C>,
+    }
+
+    impl<C> WorldClient<C>
+    where
+        C: ShardedRpcCore,
+    {
+        fn new(core: C) -> Self {
+            Self {
+                inner: TypedRpcClient::new(core),
+            }
+        }
+
+        async fn enter_world(&self, world_id: u64) -> Result<EnterWorldReply, RpcError> {
+            self.inner.call(EnterWorldRequest { world_id }).await
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_typed_client_wrapper_delegates_to_rpc_core() {
+        let core = FakeRpcCore::default();
+        let observed = core.methods.clone();
+        let client = WorldClient::new(core);
+
+        let reply = client.enter_world(5).await.unwrap();
+
+        assert!(!reply.ok);
+        assert_eq!(*observed.lock().unwrap(), vec!["world.WorldRpc/EnterWorld"]);
     }
 
     #[tokio::test]
