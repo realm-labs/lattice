@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 lattice-core.workspace = true
+lattice-rpc.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

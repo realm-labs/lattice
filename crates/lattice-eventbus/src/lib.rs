@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use lattice_core::{ActorId, ActorKind, InstanceId, RequestId, ServiceKind, TraceContext};
+use lattice_rpc::{RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -209,6 +210,45 @@ pub struct EventPublisher<B> {
     next_id: Arc<AtomicU64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ServiceEvents<B> {
+    bus: B,
+}
+
+impl<B> ServiceEvents<B>
+where
+    B: EventBus,
+{
+    pub fn new(bus: B) -> Self {
+        Self { bus }
+    }
+
+    pub async fn subscribe_actor<C, F, Req>(
+        &self,
+        subscription: EventSubscription,
+        core: C,
+        map: F,
+    ) -> Result<EventSubscriptionHandle, EventBusError>
+    where
+        C: ShardedRpcCore,
+        F: Fn(EventEnvelope) -> Req + Send + Sync + 'static,
+        Req: RoutedRequest + RpcRequest,
+    {
+        self.bus
+            .subscribe(subscription, move |event: EventEnvelope| {
+                let core = core.clone();
+                let req = map(event);
+                async move {
+                    core.call(req)
+                        .await
+                        .map(|_| ())
+                        .map_err(EventBusError::from_rpc)
+                }
+            })
+            .await
+    }
+}
+
 impl<B> EventPublisher<B>
 where
     B: EventBus,
@@ -265,13 +305,23 @@ fn now_unix_ms() -> u64 {
 pub enum EventBusError {
     #[error("event handler failed: {0}")]
     Handler(String),
+    #[error("event actor delivery failed: {0}")]
+    ActorDelivery(String),
+}
+
+impl EventBusError {
+    fn from_rpc(error: RpcError) -> Self {
+        Self::ActorDelivery(error.to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use lattice_core::{ActorKind, RouteKey, actor_kind};
     use lattice_core::{InstanceId, service_kind};
+    use lattice_rpc::{RpcRequest, ShardedRpcCore};
     use tokio::sync::Mutex;
 
     use super::*;
@@ -382,5 +432,67 @@ mod tests {
             occurred_unix_ms: 1,
             payload: Vec::new(),
         }
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct EventToActorRequest {
+        #[prost(uint64, tag = "1")]
+        world_id: u64,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct EventToActorReply {}
+
+    impl RoutedRequest for EventToActorRequest {
+        fn actor_kind(&self) -> ActorKind {
+            actor_kind!("World")
+        }
+
+        fn route_key(&self) -> RouteKey {
+            RouteKey::U64(self.world_id)
+        }
+    }
+
+    impl RpcRequest for EventToActorRequest {
+        type Reply = EventToActorReply;
+        const METHOD: &'static str = "WorldRpc/Event";
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingCore {
+        routed: Arc<Mutex<Vec<RouteKey>>>,
+    }
+
+    #[async_trait]
+    impl ShardedRpcCore for RecordingCore {
+        async fn call<Req>(&self, req: Req) -> Result<Req::Reply, lattice_rpc::RpcError>
+        where
+            Req: RoutedRequest + RpcRequest,
+        {
+            self.routed.lock().await.push(req.route_key());
+            Ok(Req::Reply::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn service_events_subscribe_actor_routes_through_rpc_core() {
+        let bus = LocalEventBus::new();
+        let events = ServiceEvents::new(bus.clone());
+        let core = RecordingCore::default();
+        let routed = core.routed.clone();
+        events
+            .subscribe_actor(
+                EventSubscription::local(SubjectFilter::new("game.world.*")),
+                core,
+                |_event| EventToActorRequest { world_id: 42 },
+            )
+            .await
+            .unwrap();
+
+        bus.publish(test_event("game.world.player_entered", "PlayerEntered"))
+            .await
+            .unwrap();
+
+        assert_eq!(*routed.lock().await, vec![RouteKey::U64(42)]);
     }
 }
