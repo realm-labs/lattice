@@ -8,8 +8,8 @@ use lattice_rpc::RouteTarget;
 
 use crate::{
     ActorPlacementKey, ActorPlacementRecord, InstanceRecord, InstanceState, InvalidateReason,
-    LeaseId, LocalRouteCache, PlacementError, PlacementState, PlacementStore, ResolveRequest,
-    RouteCacheConfig, RouteCacheKey, RouteResolver,
+    LeaseId, LocalRouteCache, PlacementError, PlacementState, PlacementStore, PlacementWatchEvent,
+    ResolveRequest, RouteCacheConfig, RouteCacheKey, RouteResolver,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +249,35 @@ impl<S, L> ExplicitRouteResolver<S, L> {
     }
 }
 
+impl<S, L> ExplicitRouteResolver<S, L>
+where
+    S: PlacementStore,
+{
+    pub async fn watch_cache_updates(&self) -> Result<PlacementWatchTask, PlacementError> {
+        let mut watch = self.store.watch(self.store.prefix().clone()).await?;
+        let store = self.store.clone();
+        let cache = self.cache.clone();
+        let service_kind = self.service_kind.clone();
+        let handle = tokio::spawn(async move {
+            while let Ok(event) = watch.next().await {
+                refresh_cache_from_watch_event(&service_kind, &store, &cache, event).await;
+            }
+        });
+        Ok(PlacementWatchTask { handle })
+    }
+}
+
+#[derive(Debug)]
+pub struct PlacementWatchTask {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl PlacementWatchTask {
+    pub fn cancel(&self) {
+        self.handle.abort();
+    }
+}
+
 #[async_trait]
 impl<S, L> RouteResolver for ExplicitRouteResolver<S, L>
 where
@@ -320,6 +349,62 @@ fn actor_id_from_route_key(route_key: RouteKey) -> ActorId {
         RouteKey::I64(value) => ActorId::I64(value),
         RouteKey::Bytes(value) => ActorId::Bytes(value),
     }
+}
+
+fn route_key_from_actor_id(actor_id: &ActorId) -> RouteKey {
+    match actor_id {
+        ActorId::Str(value) => RouteKey::Str(value.clone()),
+        ActorId::U64(value) => RouteKey::U64(*value),
+        ActorId::I64(value) => RouteKey::I64(*value),
+        ActorId::Bytes(value) => RouteKey::Bytes(value.clone()),
+    }
+}
+
+async fn refresh_cache_from_watch_event<S>(
+    service_kind: &ServiceKind,
+    store: &S,
+    cache: &Arc<std::sync::Mutex<LocalRouteCache>>,
+    event: PlacementWatchEvent,
+) where
+    S: PlacementStore,
+{
+    let PlacementWatchEvent::ActorUpdated { record, .. } = event else {
+        return;
+    };
+    let cache_key = RouteCacheKey::new(
+        service_kind.clone(),
+        record.actor_kind.clone(),
+        route_key_from_actor_id(&record.actor_id),
+    );
+
+    if record.state != PlacementState::Running {
+        cache
+            .lock()
+            .expect("route cache mutex poisoned")
+            .invalidate(&cache_key);
+        return;
+    }
+
+    let target = match store.get_instance(&record.owner).await {
+        Ok(Some(instance)) if instance.state == InstanceState::Ready => RouteTarget {
+            service_kind: service_kind.clone(),
+            instance_id: instance.instance_id,
+            advertised_endpoint: instance.advertised_endpoint,
+            owner_epoch: Some(record.epoch),
+        },
+        _ => {
+            cache
+                .lock()
+                .expect("route cache mutex poisoned")
+                .invalidate(&cache_key);
+            return;
+        }
+    };
+
+    cache
+        .lock()
+        .expect("route cache mutex poisoned")
+        .insert(cache_key, target);
 }
 
 #[cfg(test)]
@@ -458,6 +543,54 @@ mod tests {
 
         assert_eq!(moved.owner, InstanceId::new("world-b"));
         assert_eq!(moved.epoch, Epoch(2));
+    }
+
+    #[tokio::test]
+    async fn explicit_route_resolver_refreshes_cache_from_placement_watch() {
+        let store = ready_store().await;
+        store
+            .upsert_instance(instance_record("world-b", InstanceState::Ready))
+            .await
+            .unwrap();
+        let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+        let resolver = ExplicitRouteResolver::new(
+            service_kind!("World"),
+            store,
+            coordinator.clone(),
+            RouteCacheConfig::default(),
+        );
+        let watch_task = resolver.watch_cache_updates().await.unwrap();
+        let request = ResolveRequest {
+            service_kind: service_kind!("World"),
+            actor_kind: actor_kind!("World"),
+            route_key: RouteKey::U64(7),
+        };
+        let key = ActorPlacementKey {
+            actor_kind: actor_kind!("World"),
+            actor_id: ActorId::U64(7),
+        };
+
+        let first = resolver.resolve(request.clone()).await.unwrap();
+        let lookups_after_first_resolve = resolver.placement_lookups();
+        coordinator
+            .move_actor(key, InstanceId::new("world-b"))
+            .await
+            .unwrap();
+
+        for _ in 0..50 {
+            let refreshed = resolver.resolve(request.clone()).await.unwrap();
+            if refreshed.instance_id == InstanceId::new("world-b") {
+                assert_eq!(first.instance_id, InstanceId::new("world-a"));
+                assert_eq!(refreshed.owner_epoch, Some(Epoch(2)));
+                assert_eq!(resolver.placement_lookups(), lookups_after_first_resolve);
+                watch_task.cancel();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        watch_task.cancel();
+        panic!("placement watch did not refresh route cache");
     }
 
     #[tokio::test]

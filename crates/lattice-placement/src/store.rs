@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use lattice_core::{ActorId, ActorKind, Epoch, InstanceId, ServiceKind};
+use tokio::sync::broadcast;
 
 use crate::{InstanceRecord, PlacementError};
 
@@ -36,6 +37,41 @@ pub struct ActorPlacementRecord {
     pub epoch: Epoch,
     pub lease_id: LeaseId,
     pub state: PlacementState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementWatchEvent {
+    InstanceUpdated {
+        record: InstanceRecord,
+    },
+    ActorUpdated {
+        key: ActorPlacementKey,
+        version: PlacementVersion,
+        record: ActorPlacementRecord,
+    },
+}
+
+#[derive(Debug)]
+pub struct PlacementWatch {
+    rx: broadcast::Receiver<PlacementWatchEvent>,
+}
+
+impl PlacementWatch {
+    pub async fn next(&mut self) -> Result<PlacementWatchEvent, PlacementError> {
+        loop {
+            match self.rx.recv().await {
+                Ok(event) => return Ok(event),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(PlacementError::PlacementWatchClosed);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn new(rx: broadcast::Receiver<PlacementWatchEvent>) -> Self {
+        Self { rx }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -80,6 +116,7 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
         key: ActorPlacementKey,
     ) -> Result<LeaseId, PlacementError>;
     async fn release_activation_lock(&self, key: &ActorPlacementKey) -> Result<(), PlacementError>;
+    async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError>;
     fn prefix(&self) -> &PlacementPrefix;
 }
 
@@ -125,11 +162,15 @@ impl InMemoryPlacementStore {
 #[async_trait]
 impl PlacementStore for InMemoryPlacementStore {
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError> {
-        self.inner
-            .lock()
-            .expect("placement store mutex poisoned")
-            .instances
-            .insert(self.prefixed_instance_key(&record.instance_id), record);
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        inner.instances.insert(
+            self.prefixed_instance_key(&record.instance_id),
+            record.clone(),
+        );
+        inner.notify(
+            &self.prefix,
+            PlacementWatchEvent::InstanceUpdated { record },
+        );
         Ok(())
     }
 
@@ -203,7 +244,16 @@ impl PlacementStore for InMemoryPlacementStore {
             return Err(PlacementError::CompareAndPutFailed);
         }
         let next = PlacementVersion(current.map_or(1, |version| version.0 + 1));
-        inner.actors.insert(key, (next, value));
+        let watch_key = key.key.clone();
+        inner.actors.insert(key, (next, value.clone()));
+        inner.notify(
+            &self.prefix,
+            PlacementWatchEvent::ActorUpdated {
+                key: watch_key,
+                version: next,
+                record: value,
+            },
+        );
         Ok(next)
     }
 
@@ -230,6 +280,19 @@ impl PlacementStore for InMemoryPlacementStore {
         Ok(())
     }
 
+    async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let rx = inner
+            .watchers
+            .entry(prefix)
+            .or_insert_with(|| {
+                let (tx, _rx) = broadcast::channel(128);
+                tx
+            })
+            .subscribe();
+        Ok(PlacementWatch::new(rx))
+    }
+
     fn prefix(&self) -> &PlacementPrefix {
         &self.prefix
     }
@@ -240,6 +303,15 @@ struct PlacementStoreInner {
     instances: HashMap<PrefixedInstanceKey, InstanceRecord>,
     actors: HashMap<PrefixedActorKey, (PlacementVersion, ActorPlacementRecord)>,
     activation_locks: HashMap<PrefixedActorKey, LeaseId>,
+    watchers: HashMap<PlacementPrefix, broadcast::Sender<PlacementWatchEvent>>,
+}
+
+impl PlacementStoreInner {
+    fn notify(&self, prefix: &PlacementPrefix, event: PlacementWatchEvent) {
+        if let Some(tx) = self.watchers.get(prefix) {
+            let _ = tx.send(event);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

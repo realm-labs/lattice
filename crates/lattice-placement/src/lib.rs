@@ -524,6 +524,8 @@ pub enum PlacementError {
     ActivationLockHeld,
     #[error("singleton activation lock is already held")]
     SingletonLockHeld,
+    #[error("placement watch closed")]
+    PlacementWatchClosed,
 }
 
 #[cfg(test)]

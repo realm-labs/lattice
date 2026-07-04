@@ -4,10 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use lattice_core::{ActorId, InstanceId, ServiceKind};
+use tokio::sync::broadcast;
 
 use crate::{
     ActorPlacementKey, ActorPlacementRecord, InstanceRecord, LeaseId, PlacementError,
-    PlacementPrefix, PlacementStore, PlacementVersion,
+    PlacementPrefix, PlacementStore, PlacementVersion, PlacementWatch, PlacementWatchEvent,
 };
 
 #[derive(Debug, Clone)]
@@ -142,6 +143,30 @@ where
             .await
     }
 
+    async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError> {
+        let actor_prefix = format!("{}/logic/actors/", clean_prefix(&prefix));
+        let mut etcd_watch = self.client.watch_prefix(&actor_prefix).await?;
+        let (tx, rx) = broadcast::channel(128);
+        tokio::spawn(async move {
+            while let Ok(event) = etcd_watch.next().await {
+                let Some(EtcdValue::Actor(record)) = event.value else {
+                    continue;
+                };
+                let record = *record;
+                let key = ActorPlacementKey {
+                    actor_kind: record.actor_kind.clone(),
+                    actor_id: record.actor_id.clone(),
+                };
+                let _ = tx.send(PlacementWatchEvent::ActorUpdated {
+                    key,
+                    version: event.version,
+                    record,
+                });
+            }
+        });
+        Ok(PlacementWatch::new(rx))
+    }
+
     fn prefix(&self) -> &PlacementPrefix {
         &self.prefix
     }
@@ -164,6 +189,7 @@ pub trait EtcdKv: Clone + Send + Sync + 'static {
     ) -> Result<PlacementVersion, PlacementError>;
     async fn delete(&self, key: &str) -> Result<(), PlacementError>;
     async fn next_lease_id(&self) -> Result<LeaseId, PlacementError>;
+    async fn watch_prefix(&self, prefix: &str) -> Result<EtcdWatch, PlacementError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,9 +199,36 @@ pub enum EtcdValue {
     ActivationLock(LeaseId),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EtcdWatchEvent {
+    pub key: String,
+    pub version: PlacementVersion,
+    pub value: Option<EtcdValue>,
+}
+
+#[derive(Debug)]
+pub struct EtcdWatch {
+    rx: broadcast::Receiver<EtcdWatchEvent>,
+}
+
+impl EtcdWatch {
+    pub async fn next(&mut self) -> Result<EtcdWatchEvent, PlacementError> {
+        loop {
+            match self.rx.recv().await {
+                Ok(event) => return Ok(event),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(PlacementError::PlacementWatchClosed);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryEtcdClient {
     inner: Arc<std::sync::Mutex<HashMap<String, (PlacementVersion, EtcdValue)>>>,
+    watchers: Arc<std::sync::Mutex<HashMap<String, broadcast::Sender<EtcdWatchEvent>>>>,
     next_lease_id: Arc<AtomicU64>,
 }
 
@@ -183,6 +236,7 @@ impl InMemoryEtcdClient {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            watchers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_lease_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -207,7 +261,13 @@ impl EtcdKv for InMemoryEtcdClient {
         let version = inner.get(&key).map_or(PlacementVersion(1), |(version, _)| {
             PlacementVersion(version.0 + 1)
         });
-        inner.insert(key, (version, value));
+        inner.insert(key.clone(), (version, value.clone()));
+        drop(inner);
+        self.notify_watchers(EtcdWatchEvent {
+            key,
+            version,
+            value: Some(value),
+        });
         Ok(())
     }
 
@@ -249,20 +309,65 @@ impl EtcdKv for InMemoryEtcdClient {
             return Err(PlacementError::CompareAndPutFailed);
         }
         let next = PlacementVersion(current.map_or(1, |version| version.0 + 1));
-        inner.insert(key, (next, value));
+        inner.insert(key.clone(), (next, value.clone()));
+        drop(inner);
+        self.notify_watchers(EtcdWatchEvent {
+            key,
+            version: next,
+            value: Some(value),
+        });
         Ok(next)
     }
 
     async fn delete(&self, key: &str) -> Result<(), PlacementError> {
-        self.inner
+        let removed = self
+            .inner
             .lock()
             .expect("in-memory etcd mutex poisoned")
             .remove(key);
+        if let Some((version, _)) = removed {
+            self.notify_watchers(EtcdWatchEvent {
+                key: key.to_string(),
+                version,
+                value: None,
+            });
+        }
         Ok(())
     }
 
     async fn next_lease_id(&self) -> Result<LeaseId, PlacementError> {
         Ok(LeaseId(self.next_lease_id.fetch_add(1, Ordering::SeqCst)))
+    }
+
+    async fn watch_prefix(&self, prefix: &str) -> Result<EtcdWatch, PlacementError> {
+        let mut watchers = self
+            .watchers
+            .lock()
+            .expect("in-memory etcd watchers mutex poisoned");
+        let rx = watchers
+            .entry(prefix.to_string())
+            .or_insert_with(|| {
+                let (tx, _rx) = broadcast::channel(128);
+                tx
+            })
+            .subscribe();
+        Ok(EtcdWatch { rx })
+    }
+}
+
+impl InMemoryEtcdClient {
+    fn notify_watchers(&self, event: EtcdWatchEvent) {
+        let watchers = self
+            .watchers
+            .lock()
+            .expect("in-memory etcd watchers mutex poisoned")
+            .iter()
+            .filter(|(prefix, _)| event.key.starts_with(prefix.as_str()))
+            .map(|(_, tx)| tx.clone())
+            .collect::<Vec<_>>();
+        for tx in watchers {
+            let _ = tx.send(event.clone());
+        }
     }
 }
 
