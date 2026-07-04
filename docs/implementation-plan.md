@@ -271,6 +271,7 @@ virtual shard assignment
 VirtualShardAssigner trait + default assigners
 VirtualShardAssignerRegistry by stable name
 virtual shard gradual rebalance
+ActorExecutionPolicy::ShardWorker implementation
 lightweight actor lazy activation
 ActorFactory/ActorLoader lifecycle
 in-memory/static instance registry until etcd phase
@@ -280,6 +281,9 @@ Acceptance:
 
 ```text
 actor_id routes to a shard owner.
+ShardWorker execution policy can run multiple lightweight actors on a bounded worker set.
+ShardWorker maps actor identity deterministically to a worker.
+ShardWorker preserves the same mailbox and Handler<M> semantics as TaskPerActor.
 Target instance lazy-loads actor on registry miss.
 Concurrent lazy activation starts only one local actor.
 Business ActorLoader failure has explicit error behavior.
@@ -295,6 +299,8 @@ virtual shard owner lookup
 virtual shard assigner trait/default implementation
 assigner deterministic plan
 virtual shard gradual rebalance
+ShardWorker deterministic actor-to-worker mapping test
+ShardWorker mailbox ordering and system priority test
 local lazy activation race
 business actor loader/saver lifecycle
 stop/save failure enters StopFailed and blocks passivation/drain
@@ -411,6 +417,7 @@ EventBus subscribe_actor to owner mailbox API
 ConfigStore abstraction + local/etcd adapter
 actor scheduler + service scheduler
 cross-node actor watch/unwatch
+ActorExecutionPolicy::DedicatedThreadPool implementation
 business saga / pending operation example
 transactional outbox guidance example
 security/mTLS integration
@@ -445,6 +452,8 @@ Actors can watch remote actor incarnations and receive notifications for stop/pa
 ConfigStore supports low-frequency watch/reload.
 Actor scheduler is bound to actor lifecycle and cancelled on stop/passivation.
 Service scheduler is bound to service instance lifecycle and lost after restart.
+DedicatedThreadPool execution policy isolates configured actor families from normal Tokio worker threads.
+All ActorExecutionPolicy variants are implemented by the end of Phase 7; none remain stub-only or unsupported in the completed framework.
 ```
 
 Suggested tests:
@@ -472,6 +481,7 @@ config store watch/reload
 bootstrap config format/composite/from_config
 actor scheduler cancellation
 service scheduler shutdown
+DedicatedThreadPool isolation and shutdown test
 metrics labels smoke
 trace fields smoke
 trace context propagation across rpc/eventbus/scheduler
@@ -778,6 +788,8 @@ The whole goal can be marked complete only when:
 [ ] This file's global acceptance checklist is fully satisfied.
 [ ] architecture/00-overview.md system boundaries and module responsibilities are implemented.
 [ ] architecture/01-actor-runtime.md actor runtime capabilities are implemented and tested.
+[ ] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, ShardWorker, and DedicatedThreadPool.
+[ ] UnsupportedExecutionPolicy is used only for invalid configuration, not for planned policies in the completed framework.
 [ ] architecture/02-rpc.md typed RPC, metadata, codegen, and gateway decode/forward are implemented and tested.
 [ ] architecture/03-placement.md placement, scale, drain, shutdown, crash, and watch are implemented and tested.
 [ ] architecture/04-eventbus-scheduler-config.md event bus, scheduler, and config are implemented and tested.

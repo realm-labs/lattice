@@ -138,7 +138,7 @@ pub struct ActorSpawnOptions {
 }
 ```
 
-Phase 1 implements only `TaskPerActor`. The other variants are part of the stable design but may return `UnsupportedExecutionPolicy` until their phase is implemented.
+Phase 1 implements only `TaskPerActor`. The other variants are part of the stable design and may return `UnsupportedExecutionPolicy` only until their planned phase is implemented. A completed lattice implementation must support every `ActorExecutionPolicy` variant listed here.
 
 Final scheduling semantics:
 
