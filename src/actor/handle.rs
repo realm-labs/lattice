@@ -64,6 +64,24 @@ impl<A: Actor> ActorHandle<A> {
         self.call_on_lane(msg, MailboxLane::System).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn try_tell_for_test<M>(&self, msg: M) -> Result<(), ActorTellError>
+    where
+        A: Handler<M>,
+        M: Message<Reply = ()>,
+    {
+        self.try_tell_on_lane_for_test(msg, MailboxLane::Normal)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_tell_system_for_test<M>(&self, msg: M) -> Result<(), ActorTellError>
+    where
+        A: Handler<M>,
+        M: Message<Reply = ()>,
+    {
+        self.try_tell_on_lane_for_test(msg, MailboxLane::System)
+    }
+
     async fn call_on_lane<M>(&self, msg: M, lane: MailboxLane) -> Result<M::Reply, ActorCallError>
     where
         A: Handler<M>,
@@ -75,6 +93,18 @@ impl<A: Actor> ActorHandle<A> {
         reply_rx
             .await
             .map_err(|_| ActorCallError::ResponseDropped)?
+    }
+
+    #[cfg(test)]
+    fn try_tell_on_lane_for_test<M>(&self, msg: M, lane: MailboxLane) -> Result<(), ActorTellError>
+    where
+        A: Handler<M>,
+        M: Message<Reply = ()>,
+    {
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let command = ActorCommand::Envelope(Box::new(EnvelopeMessage::new(msg, reply_tx)));
+        self.send_command(command, lane)
+            .map_err(ActorTellError::from)
     }
 
     fn send_system_command(&self, command: ActorCommand<A>) -> Result<(), ActorTellError> {
