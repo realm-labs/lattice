@@ -17,7 +17,7 @@ pub use mailbox::MailboxConfig;
 pub use registry::{ActorRegistry, ActorRegistryConfig};
 pub use runtime::{
     ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorScheduler, ActorSpawnOptions,
-    spawn_actor,
+    PassivationPolicy, spawn_actor,
 };
 pub use traits::{
     Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, Handler, Message,
@@ -38,7 +38,7 @@ mod tests {
         ActorExecutionPolicy, ActorHandle, ActorLifecycleState, ActorRegistry, ActorRegistryConfig,
         ActorRuntime, ActorRuntimeConfig, ActorSpawnError, ActorSpawnOptions, ActorTellError,
         ActorTerminated, ChildActorKey, ChildActorOptions, Handler, MailboxConfig, Message,
-        PassivationReason, StopReason, TerminatedReason, spawn_actor,
+        PassivationPolicy, PassivationReason, StopReason, TerminatedReason, spawn_actor,
     };
     use lattice_core::{ActorId, actor_kind};
 
@@ -266,6 +266,7 @@ mod tests {
                 ActorSpawnOptions {
                     mailbox: MailboxConfig::bounded(8),
                     execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 2 }),
+                    passivation: PassivationPolicy::Disabled,
                 },
             )
             .await;
@@ -897,5 +898,56 @@ mod tests {
         .unwrap();
 
         assert_eq!(handle.lifecycle_state(), ActorLifecycleState::StopFailed);
+    }
+
+    #[tokio::test]
+    async fn passivation_policy_idle_timeout_stops_idle_actor() {
+        struct IdleActor {
+            stopped: Option<Arc<Semaphore>>,
+        }
+
+        #[async_trait]
+        impl Actor for IdleActor {
+            async fn stopping(
+                &mut self,
+                _ctx: &mut ActorContext<Self>,
+                reason: StopReason,
+            ) -> Result<(), crate::ActorStopError> {
+                assert_eq!(
+                    reason,
+                    StopReason::Passivated(PassivationReason::IdleTimeout)
+                );
+                if let Some(stopped) = self.stopped.take() {
+                    stopped.add_permits(1);
+                }
+                Ok(())
+            }
+        }
+
+        let runtime = ActorRuntime::default();
+        let stopped = Arc::new(Semaphore::new(0));
+        let handle = runtime
+            .spawn_actor(
+                IdleActor {
+                    stopped: Some(stopped.clone()),
+                },
+                ActorSpawnOptions {
+                    mailbox: MailboxConfig::bounded(8),
+                    execution: None,
+                    passivation: PassivationPolicy::IdleTimeout(std::time::Duration::from_millis(
+                        10,
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), stopped.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+
+        assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopped);
     }
 }
