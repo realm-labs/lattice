@@ -2,6 +2,8 @@ use async_trait::async_trait;
 use http::Uri;
 use lattice_actor::{Actor, ActorCallError, ActorHandle, Handler, Message};
 use lattice_core::{ActorKind, Epoch, InstanceId, RequestId, RouteKey, ServiceKind, TraceContext};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status};
 
@@ -85,6 +87,53 @@ impl RpcContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthContext {
     pub authorization: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RpcClientContextFactory {
+    source_service: ServiceKind,
+    source_instance: InstanceId,
+    trace: TraceContext,
+    auth: Option<AuthContext>,
+    request_seq: Arc<AtomicU64>,
+}
+
+impl RpcClientContextFactory {
+    pub fn new(source_service: ServiceKind, source_instance: InstanceId) -> Self {
+        Self {
+            source_service,
+            source_instance,
+            trace: TraceContext::default(),
+            auth: None,
+            request_seq: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub fn with_trace(mut self, trace: TraceContext) -> Self {
+        self.trace = trace;
+        self
+    }
+
+    pub fn with_auth(mut self, auth: AuthContext) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    pub fn next_context(&self, route_epoch: Option<Epoch>) -> RpcContext {
+        let seq = self.request_seq.fetch_add(1, Ordering::Relaxed);
+        RpcContext {
+            request_id: RequestId::new(format!(
+                "{}:{}:{seq}",
+                self.source_service.as_str(),
+                self.source_instance.as_str()
+            )),
+            route_epoch,
+            source_service: self.source_service.clone(),
+            source_instance: self.source_instance.clone(),
+            trace: self.trace.clone(),
+            auth: self.auth.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +250,56 @@ pub trait ShardedRpcCore: Clone + Send + Sync + 'static {
     async fn call<Req>(&self, req: Req) -> Result<Req::Reply, RpcError>
     where
         Req: RoutedRequest + RpcRequest;
+}
+
+#[async_trait]
+pub trait UnaryRpcTransport: Clone + Send + Sync + 'static {
+    async fn unary<Req>(&self, request: Request<Req>) -> Result<Response<Req::Reply>, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest;
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataInjectingRpcCore<T> {
+    transport: T,
+    context_factory: RpcClientContextFactory,
+    route_epoch: Option<Epoch>,
+}
+
+impl<T> MetadataInjectingRpcCore<T> {
+    pub fn new(transport: T, context_factory: RpcClientContextFactory) -> Self {
+        Self {
+            transport,
+            context_factory,
+            route_epoch: None,
+        }
+    }
+
+    pub fn with_route_epoch(mut self, route_epoch: Epoch) -> Self {
+        self.route_epoch = Some(route_epoch);
+        self
+    }
+}
+
+#[async_trait]
+impl<T> ShardedRpcCore for MetadataInjectingRpcCore<T>
+where
+    T: UnaryRpcTransport,
+{
+    async fn call<Req>(&self, req: Req) -> Result<Req::Reply, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        let mut request = Request::new(req);
+        self.context_factory
+            .next_context(self.route_epoch)
+            .inject_metadata(request.metadata_mut())
+            .map_err(|error| RpcError::Business(error.to_string()))?;
+        self.transport
+            .unary(request)
+            .await
+            .map(Response::into_inner)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +501,24 @@ mod tests {
     #[test]
     fn rpc_wrapper_is_actor_message_for_rpc_request() {
         assert_actor_message::<Rpc<EnterWorldRequest>>();
+    }
+
+    #[test]
+    fn client_context_factory_generates_metadata_contexts() {
+        let factory = RpcClientContextFactory::new(service_kind!("Player"), InstanceId::new("p0"))
+            .with_trace(TraceContext {
+                traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00".into()),
+                tracestate: None,
+            });
+
+        let first = factory.next_context(Some(Epoch(1)));
+        let second = factory.next_context(Some(Epoch(1)));
+
+        assert_eq!(first.source_service, service_kind!("Player"));
+        assert_eq!(first.source_instance, InstanceId::new("p0"));
+        assert_eq!(first.route_epoch, Some(Epoch(1)));
+        assert_ne!(first.request_id, second.request_id);
+        assert!(first.trace.traceparent.is_some());
     }
 
     #[derive(Clone, Default)]
