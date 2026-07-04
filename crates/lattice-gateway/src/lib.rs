@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::time::{Duration, Instant};
 
 use lattice_core::ActorKind;
 use lattice_rpc::{RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
@@ -9,6 +10,100 @@ use prost::Message as ProstMessage;
 pub struct ClientFrame {
     pub msg_id: u32,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GatewaySessionRef {
+    pub session_id: String,
+    pub connection_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayPush {
+    pub session: GatewaySessionRef,
+    pub frame: ClientFrame,
+}
+
+#[derive(Debug, Default)]
+pub struct GatewaySessionRegistry {
+    sessions: HashMap<String, u64>,
+}
+
+impl GatewaySessionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn connect(&mut self, session_id: impl Into<String>) -> GatewaySessionRef {
+        let session_id = session_id.into();
+        let epoch = self.sessions.get(&session_id).copied().unwrap_or(0) + 1;
+        self.sessions.insert(session_id.clone(), epoch);
+        GatewaySessionRef {
+            session_id,
+            connection_epoch: epoch,
+        }
+    }
+
+    pub fn validate_push(&self, push: &GatewayPush) -> Result<(), GatewayError> {
+        match self.sessions.get(&push.session.session_id) {
+            Some(epoch) if *epoch == push.session.connection_epoch => Ok(()),
+            Some(current_epoch) => Err(GatewayError::StaleSession {
+                session_id: push.session.session_id.clone(),
+                expected_epoch: *current_epoch,
+                actual_epoch: push.session.connection_epoch,
+            }),
+            None => Err(GatewayError::UnknownSession {
+                session_id: push.session.session_id.clone(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RateLimitKey {
+    pub principal_id: String,
+    pub session_id: String,
+    pub rate_class: String,
+}
+
+#[derive(Debug)]
+pub struct KeyedRateLimiter {
+    limit: u32,
+    window: Duration,
+    buckets: HashMap<RateLimitKey, RateBucket>,
+}
+
+impl KeyedRateLimiter {
+    pub fn new(limit: u32, window: Duration) -> Self {
+        Self {
+            limit,
+            window,
+            buckets: HashMap::new(),
+        }
+    }
+
+    pub fn check(&mut self, key: RateLimitKey) -> Result<(), GatewayError> {
+        let now = Instant::now();
+        let bucket = self.buckets.entry(key).or_insert(RateBucket {
+            window_started: now,
+            used: 0,
+        });
+        if now.duration_since(bucket.window_started) >= self.window {
+            bucket.window_started = now;
+            bucket.used = 0;
+        }
+        if bucket.used >= self.limit {
+            return Err(GatewayError::RateLimited);
+        }
+        bucket.used += 1;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct RateBucket {
+    window_started: Instant,
+    used: u32,
 }
 
 pub trait ClientCodec {
@@ -135,6 +230,18 @@ pub enum GatewayError {
     DecodePayload(String),
     #[error("rpc failed: {0}")]
     Rpc(RpcError),
+    #[error("unknown gateway session {session_id}")]
+    UnknownSession { session_id: String },
+    #[error(
+        "stale gateway session {session_id}: expected epoch {expected_epoch}, got {actual_epoch}"
+    )]
+    StaleSession {
+        session_id: String,
+        expected_epoch: u64,
+        actual_epoch: u64,
+    },
+    #[error("gateway rate limit exceeded")]
+    RateLimited,
 }
 
 #[cfg(test)]
@@ -234,5 +341,50 @@ mod tests {
         assert_eq!(*routed.lock().unwrap(), vec![RouteKey::U64(42)]);
         let reply = EnterWorldReply::decode(reply_frame.payload.as_slice()).unwrap();
         assert!(!reply.ok);
+    }
+
+    #[test]
+    fn gateway_push_validates_session_id_and_connection_epoch() {
+        let mut sessions = GatewaySessionRegistry::new();
+        let first = sessions.connect("session-1");
+        let second = sessions.connect("session-1");
+        let push = GatewayPush {
+            session: second.clone(),
+            frame: ClientFrame {
+                msg_id: 9,
+                payload: Vec::new(),
+            },
+        };
+        let stale = GatewayPush {
+            session: first,
+            frame: ClientFrame {
+                msg_id: 9,
+                payload: Vec::new(),
+            },
+        };
+
+        assert_eq!(sessions.validate_push(&push), Ok(()));
+        assert!(matches!(
+            sessions.validate_push(&stale),
+            Err(GatewayError::StaleSession { .. })
+        ));
+    }
+
+    #[test]
+    fn keyed_rate_limiter_is_scoped_by_principal_session_and_rate_class() {
+        let mut limiter = KeyedRateLimiter::new(1, Duration::from_secs(60));
+        let key = RateLimitKey {
+            principal_id: "player-1".into(),
+            session_id: "session-1".into(),
+            rate_class: "move".into(),
+        };
+        let other_class = RateLimitKey {
+            rate_class: "chat".into(),
+            ..key.clone()
+        };
+
+        assert_eq!(limiter.check(key.clone()), Ok(()));
+        assert_eq!(limiter.check(key), Err(GatewayError::RateLimited));
+        assert_eq!(limiter.check(other_class), Ok(()));
     }
 }
