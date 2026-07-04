@@ -7,6 +7,7 @@ members = [
     "crates/lattice-gateway",
     "crates/lattice-eventbus",
     "crates/lattice-placement",
+    "crates/lattice-ops",
     "crates/lattice-rpc",
     "examples/minimal-world",
 ]
@@ -27,6 +28,7 @@ lattice-actor = { path = "crates/lattice-actor" }
 lattice-codegen = { path = "crates/lattice-codegen" }
 lattice-eventbus = { path = "crates/lattice-eventbus" }
 lattice-gateway = { path = "crates/lattice-gateway" }
+lattice-ops = { path = "crates/lattice-ops" }
 lattice-placement = { path = "crates/lattice-placement" }
 lattice-rpc = { path = "crates/lattice-rpc" }
 prost = "0.14.4"

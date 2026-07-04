@@ -395,6 +395,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-ops"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "lattice-core",
+ "lattice-placement",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "lattice-placement"
 version = "0.1.0"
 dependencies = [
