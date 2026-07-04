@@ -503,10 +503,49 @@ impl From<InstanceRecord> for InstanceView {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeInspectView {
+    pub instance_id: InstanceId,
+    pub reachable: bool,
+    pub summary: Option<NodeSummary>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InspectionView {
+    pub name: String,
+    pub owner: Option<InstanceId>,
+    pub state: String,
+    pub details: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AdminSnapshot {
     pub summary: ClusterSummary,
     pub instances: Vec<InstanceView>,
+    pub nodes: Vec<NodeInspectView>,
+    pub placements: Vec<InspectionView>,
+    pub virtual_shards: Vec<InspectionView>,
+    pub singletons: Vec<InspectionView>,
+    pub mailboxes: Vec<InspectionView>,
+    pub schedulers: Vec<InspectionView>,
+    pub event_subscriptions: Vec<InspectionView>,
+}
+
+impl AdminSnapshot {
+    pub fn new(summary: ClusterSummary, instances: Vec<InstanceView>) -> Self {
+        Self {
+            summary,
+            instances,
+            nodes: Vec::new(),
+            placements: Vec::new(),
+            virtual_shards: Vec::new(),
+            singletons: Vec::new(),
+            mailboxes: Vec::new(),
+            schedulers: Vec::new(),
+            event_subscriptions: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -531,6 +570,13 @@ impl AdminHttpAdapter {
         Router::new()
             .route("/admin/cluster/summary", get(admin_cluster_summary))
             .route("/admin/instances", get(admin_instances))
+            .route("/admin/nodes", get(admin_nodes))
+            .route("/admin/placements", get(admin_placements))
+            .route("/admin/vshards", get(admin_virtual_shards))
+            .route("/admin/singletons", get(admin_singletons))
+            .route("/admin/mailboxes", get(admin_mailboxes))
+            .route("/admin/schedulers", get(admin_schedulers))
+            .route("/admin/event-subscriptions", get(admin_event_subscriptions))
             .with_state(self.state)
     }
 }
@@ -551,6 +597,35 @@ async fn admin_instances(
     state.auth.authorize(&headers)?;
     Ok(Json(paginate(&state.snapshot.instances, page)))
 }
+
+async fn admin_nodes(
+    State(state): State<AdminHttpState>,
+    headers: HeaderMap,
+    Query(page): Query<PageRequest>,
+) -> Result<Json<Page<NodeInspectView>>, AdminApiError> {
+    state.auth.authorize(&headers)?;
+    Ok(Json(paginate(&state.snapshot.nodes, page)))
+}
+
+macro_rules! admin_inspection_handler {
+    ($name:ident, $field:ident) => {
+        async fn $name(
+            State(state): State<AdminHttpState>,
+            headers: HeaderMap,
+            Query(page): Query<PageRequest>,
+        ) -> Result<Json<Page<InspectionView>>, AdminApiError> {
+            state.auth.authorize(&headers)?;
+            Ok(Json(paginate(&state.snapshot.$field, page)))
+        }
+    };
+}
+
+admin_inspection_handler!(admin_placements, placements);
+admin_inspection_handler!(admin_virtual_shards, virtual_shards);
+admin_inspection_handler!(admin_singletons, singletons);
+admin_inspection_handler!(admin_mailboxes, mailboxes);
+admin_inspection_handler!(admin_schedulers, schedulers);
+admin_inspection_handler!(admin_event_subscriptions, event_subscriptions);
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AdminApiError {
@@ -900,14 +975,46 @@ mod tests {
 
     #[test]
     fn admin_http_adapter_builds_axum_router() {
-        let snapshot = AdminSnapshot {
-            summary: ClusterSummary {
+        let mut snapshot = AdminSnapshot::new(
+            ClusterSummary {
                 instance_count: 1,
                 actor_owner_count: 0,
             },
-            instances: vec![InstanceView::from(instance_record("world-a"))],
-        };
+            vec![InstanceView::from(instance_record("world-a"))],
+        );
+        snapshot.nodes.push(NodeInspectView {
+            instance_id: InstanceId::new("world-a"),
+            reachable: false,
+            summary: None,
+            error: Some("timeout".to_string()),
+        });
+        snapshot.nodes.push(NodeInspectView {
+            instance_id: InstanceId::new("world-b"),
+            reachable: true,
+            summary: None,
+            error: None,
+        });
+        snapshot.placements.push(inspection("World/7", "Running"));
+        snapshot.virtual_shards.push(inspection("World#0", "Ready"));
+        snapshot
+            .singletons
+            .push(inspection("Season/default", "Running"));
+        snapshot.mailboxes.push(inspection("World/7", "Depth=0"));
+        snapshot.schedulers.push(inspection("service", "Running"));
+        snapshot
+            .event_subscriptions
+            .push(inspection("system.shutdown.*", "Active"));
 
+        assert!(
+            paginate(
+                &snapshot.nodes,
+                PageRequest {
+                    offset: 0,
+                    limit: 1
+                }
+            )
+            .partial
+        );
         let _router = AdminHttpAdapter::new(AdminAuth::disabled(), snapshot).router();
     }
 
@@ -937,6 +1044,15 @@ mod tests {
             trace: TraceContext::default(),
             occurred_unix_ms: 1,
             payload: Vec::new(),
+        }
+    }
+
+    fn inspection(name: &str, state: &str) -> InspectionView {
+        InspectionView {
+            name: name.to_string(),
+            owner: Some(InstanceId::new("world-a")),
+            state: state.to_string(),
+            details: HashMap::new(),
         }
     }
 
