@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         .placement_store(EtcdPlacementStore::from_config())
         .event_bus(NatsEventBus::from_config())
         .local_event_bus(LocalEventBus::default())
-        .config_store(EtcdConfigStore::from_config())
+        .config_store(lattice_config_etcd::EtcdConfigStore::from_config())
         .telemetry(TelemetryConfig::from_config())
         .admin_http(AdminHttpConfig::from_config())
         .register_actor(
@@ -460,6 +460,7 @@ ActorHandle is local-only.
 GatewaySessionRef is the cross-process handle for client push.
 Virtual shard assignment is a trait with default implementations.
 ConfigSource supports file, explicit format, env, inline, and composite sources.
+ConfigStore is a trait in lattice-config; etcd and Nacos-style backends are adapter crates or business implementations.
 from_config() reads component config during builder build.
 EventBus has both local and cluster implementations.
 subscribe_actor routes through owner resolution and actor mailbox.

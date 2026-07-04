@@ -7,6 +7,10 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+mod store;
+
+pub use store::{ConfigStore, ConfigStoreError, ConfigWatch, LocalConfigStore};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFormat {
     Toml,
@@ -291,6 +295,109 @@ pub enum ConfigError {
     },
     #[error("environment config separator cannot be empty")]
     EmptyEnvSeparator,
+}
+
+#[cfg(test)]
+mod store_tests {
+    use async_trait::async_trait;
+    use serde_json::json;
+    use tokio::sync::watch;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn local_config_store_supports_watch_reload() {
+        let store = LocalConfigStore::default();
+        let mut watch = store.watch("world.tick_ms").await.unwrap();
+
+        store
+            .put("world.tick_ms".to_string(), json!(50))
+            .await
+            .unwrap();
+        let value = watch.changed().await.unwrap();
+
+        assert_eq!(value, Some(json!(50)));
+        assert_eq!(store.get("world.tick_ms").await.unwrap(), Some(json!(50)));
+    }
+
+    #[tokio::test]
+    async fn custom_store_can_build_config_watch_from_channel() {
+        #[derive(Clone)]
+        struct CustomStore {
+            tx: watch::Sender<Option<serde_json::Value>>,
+        }
+
+        #[async_trait]
+        impl ConfigStore for CustomStore {
+            async fn get(&self, _key: &str) -> Result<Option<serde_json::Value>, ConfigStoreError> {
+                Ok(self.tx.borrow().clone())
+            }
+
+            async fn put(
+                &self,
+                _key: String,
+                value: serde_json::Value,
+            ) -> Result<(), ConfigStoreError> {
+                self.tx.send_replace(Some(value));
+                Ok(())
+            }
+
+            async fn watch(&self, _key: &str) -> Result<ConfigWatch, ConfigStoreError> {
+                Ok(ConfigWatch::from_receiver(self.tx.subscribe()))
+            }
+        }
+
+        let (tx, mut watch) = ConfigWatch::channel(Some(json!(10)));
+        let store = CustomStore { tx };
+
+        store
+            .put("world.tick_ms".to_string(), json!(20))
+            .await
+            .unwrap();
+
+        assert_eq!(watch.changed().await.unwrap(), Some(json!(20)));
+        assert_eq!(store.get("world.tick_ms").await.unwrap(), Some(json!(20)));
+    }
+
+    #[tokio::test]
+    async fn unsupported_writes_are_explicit() {
+        #[derive(Clone)]
+        struct ReadOnlyStore;
+
+        #[async_trait]
+        impl ConfigStore for ReadOnlyStore {
+            async fn get(&self, _key: &str) -> Result<Option<serde_json::Value>, ConfigStoreError> {
+                Ok(None)
+            }
+
+            async fn put(
+                &self,
+                _key: String,
+                _value: serde_json::Value,
+            ) -> Result<(), ConfigStoreError> {
+                Err(ConfigStoreError::UnsupportedOperation {
+                    operation: "put",
+                    backend: "readonly",
+                })
+            }
+
+            async fn watch(&self, _key: &str) -> Result<ConfigWatch, ConfigStoreError> {
+                Ok(ConfigWatch::channel(None).1)
+            }
+        }
+
+        let error = ReadOnlyStore
+            .put("feature.foo".to_string(), json!(true))
+            .await;
+
+        assert!(matches!(
+            error,
+            Err(ConfigStoreError::UnsupportedOperation {
+                operation: "put",
+                backend: "readonly"
+            })
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -414,7 +414,8 @@ EventBus abstraction + NATS adapter
 LocalEventBus / NodeEvents in-memory adapter
 typed EventPublisher / ServiceEvents subscriber API
 EventBus subscribe_actor to owner mailbox API
-ConfigStore abstraction + local/etcd adapter
+ConfigStore abstraction in lattice-config + LocalConfigStore
+optional lattice-config-etcd adapter crate
 actor scheduler + service scheduler
 cross-node actor watch/unwatch
 ActorExecutionPolicy::DedicatedThreadPool implementation
@@ -449,7 +450,7 @@ NATS JetStream subscribers can consume idempotently by event_id.
 Service stop/drain/shutdown cancels runtime-managed event subscriptions.
 subscribe_actor delivers events to actor handlers through owner routing/fencing.
 Actors can watch remote actor incarnations and receive notifications for stop/passivation/migrate/fence/node down.
-ConfigStore supports low-frequency watch/reload.
+ConfigStore supports low-frequency watch/reload and custom backend implementations.
 Actor scheduler is bound to actor lifecycle and cancelled on stop/passivation.
 Service scheduler is bound to service instance lifecycle and lost after restart.
 DedicatedThreadPool execution policy isolates configured actor families from normal Tokio worker threads.

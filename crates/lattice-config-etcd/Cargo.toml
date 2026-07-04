@@ -1,5 +1,5 @@
 [package]
-name = "lattice-config"
+name = "lattice-config-etcd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,12 +7,8 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+etcd-client.workspace = true
+lattice-config.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
-toml.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

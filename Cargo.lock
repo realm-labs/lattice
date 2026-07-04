@@ -425,12 +425,26 @@ dependencies = [
 name = "lattice-config"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
  "thiserror",
+ "tokio",
  "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "lattice-config-etcd"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "etcd-client",
+ "lattice-config",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -474,6 +488,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "lattice-config",
  "lattice-core",
  "lattice-eventbus",
  "lattice-placement",

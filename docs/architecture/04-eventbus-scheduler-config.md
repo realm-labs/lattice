@@ -319,18 +319,17 @@ Explicit config must also be supported for tests and non-file deployments:
 ConfigStore is the runtime configuration-center abstraction for low-frequency watch/reload:
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ConfigKey(String);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ConfigVersion(String);
-
 #[async_trait::async_trait]
 pub trait ConfigStore: Clone + Send + Sync + 'static {
-    async fn get(&self, key: ConfigKey) -> Result<Option<ConfigValue>, ConfigError>;
-    async fn watch(&self, key: ConfigKey) -> Result<ConfigWatchStream, ConfigError>;
+    async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, ConfigStoreError>;
+    async fn put(&self, key: String, value: serde_json::Value) -> Result<(), ConfigStoreError>;
+    async fn watch(&self, key: &str) -> Result<ConfigWatch, ConfigStoreError>;
 }
 ```
+
+`ConfigStore` lives in `lattice-config`, not in `lattice-ops`. `LocalConfigStore` is the only backend in the core config crate. Real configuration centers are adapter crates, for example `lattice-config-etcd`; a business project can implement the same trait for Nacos or an internal configuration center without changing lattice.
+
+Read-only configuration centers are valid. They return `ConfigStoreError::UnsupportedOperation` from `put`.
 
 Suitable for:
 
@@ -353,15 +352,20 @@ high-frequency player state
 business data requiring complex queries or transactional consistency
 ```
 
-First-version adapters:
+Adapter boundary:
 
 ```text
-local file
-etcd
-in-memory test store
+core crate: lattice-config
+  ConfigStore, ConfigWatch, LocalConfigStore
+
+official adapter crate: lattice-config-etcd
+  EtcdConfigStore, EtcdConfigStoreConfig
+
+future or business adapter crate:
+  NacosConfigStore or internal ConfigStore implementation
 ```
 
-Nacos and Consul can be added later. Kubernetes ConfigMap is useful for deployment config but not for high-frequency watch.
+Kubernetes ConfigMap is useful for deployment config but not for high-frequency watch.
 
 ### 22.4 Config Change Rules
 

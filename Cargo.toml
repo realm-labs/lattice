@@ -2,6 +2,7 @@
 members = [
     "crates/lattice-actor",
     "crates/lattice-config",
+    "crates/lattice-config-etcd",
     "crates/lattice-core",
     "crates/lattice-codegen",
     "crates/lattice-gateway",
@@ -25,6 +26,7 @@ axum = "0.8.9"
 etcd-client = "0.19.0"
 http = "1.4.2"
 lattice-config = { path = "crates/lattice-config" }
+lattice-config-etcd = { path = "crates/lattice-config-etcd" }
 lattice-core = { path = "crates/lattice-core" }
 lattice-actor = { path = "crates/lattice-actor" }
 lattice-codegen = { path = "crates/lattice-codegen" }

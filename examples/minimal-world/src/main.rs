@@ -8,7 +8,7 @@ use lattice_actor::{
     Actor, ActorContext, ActorError, ActorRuntime, ActorSpawnOptions, Handler, MailboxConfig,
     Message,
 };
-use lattice_config::ConfigSource;
+use lattice_config::{ConfigSource, ConfigStore, LocalConfigStore};
 use lattice_core::{
     ActorId, ActorKey, ActorKeyDecodeError, ActorKind, Epoch, InstanceId, RouteKey, ServiceKind,
     TraceContext, actor_kind, service_kind,
@@ -21,7 +21,7 @@ use lattice_gateway::{
     BinaryClientCodec, ClientCodec, ClientFrame, GatewayError, GatewayRouteTable,
     ProstClientMessageBinding,
 };
-use lattice_ops::{ConfigStore, LocalConfigStore, ServiceScheduler};
+use lattice_ops::ServiceScheduler;
 use lattice_placement::{
     EndpointLease, EndpointPool, EndpointRpcTransport, ResolvingRpcCore, RouteCacheConfig,
     StaticPlacementConfig, StaticRouteRange, StaticRouteResolver,

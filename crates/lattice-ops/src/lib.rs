@@ -15,14 +15,10 @@ use lattice_placement::{ActorPlacementRecord, InstanceRecord, PlacementError, Pl
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-mod config_store;
 mod ops_config;
 mod shutdown;
 
-pub use config_store::{
-    ConfigStore, ConfigWatch, EtcdConfigStore, EtcdConfigStoreConfig, InMemoryEtcdConfigClient,
-    LocalConfigStore,
-};
+pub use lattice_config::{ConfigStore, ConfigWatch, LocalConfigStore};
 pub use ops_config::{AdminHttpConfig, TelemetryConfig};
 pub use shutdown::{
     GracefulShutdown, GracefulShutdownReport, InMemoryShutdownLeaseController, LeaseEvent,
@@ -692,8 +688,6 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
-    #[error("config watch closed")]
-    ConfigWatchClosed,
     #[error("placement failed: {0}")]
     Placement(#[from] PlacementError),
     #[error("duplicate operation {operation_id}")]
@@ -855,66 +849,6 @@ mod tests {
                 LeaseEvent::KeepAlive(InstanceId::new("world-a")),
                 LeaseEvent::Release(InstanceId::new("world-a")),
             ]
-        );
-    }
-
-    #[tokio::test]
-    async fn local_config_store_supports_watch_reload() {
-        let store = LocalConfigStore::default();
-        let mut watch = store.watch("world.tick_ms").await.unwrap();
-
-        store
-            .put("world.tick_ms".to_string(), json!(50))
-            .await
-            .unwrap();
-        let value = watch.changed().await.unwrap();
-
-        assert_eq!(value, Some(json!(50)));
-        assert_eq!(store.get("world.tick_ms").await.unwrap(), Some(json!(50)));
-    }
-
-    #[tokio::test]
-    async fn etcd_config_store_supports_watch_reload() {
-        let store = EtcdConfigStore::new(InMemoryEtcdConfigClient::new(), "/lattice/test/config");
-        let mut watch = store.watch("gateway.rate_limit").await.unwrap();
-
-        store
-            .put(
-                "gateway.rate_limit".to_string(),
-                json!({ "per_second": 100 }),
-            )
-            .await
-            .unwrap();
-        let value = watch.changed().await.unwrap();
-
-        assert_eq!(value, Some(json!({ "per_second": 100 })));
-        assert_eq!(
-            store.get("gateway.rate_limit").await.unwrap(),
-            Some(json!({ "per_second": 100 }))
-        );
-    }
-
-    #[tokio::test]
-    async fn etcd_config_store_isolates_cluster_prefixes() {
-        let client = InMemoryEtcdConfigClient::new();
-        let prod = EtcdConfigStore::new(client.clone(), "/lattice/prod/config");
-        let staging = EtcdConfigStore::new(client, "/lattice/staging/config");
-
-        prod.put("feature.matchmaking".to_string(), json!(true))
-            .await
-            .unwrap();
-        staging
-            .put("feature.matchmaking".to_string(), json!(false))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            prod.get("feature.matchmaking").await.unwrap(),
-            Some(json!(true))
-        );
-        assert_eq!(
-            staging.get("feature.matchmaking").await.unwrap(),
-            Some(json!(false))
         );
     }
 
