@@ -50,6 +50,12 @@ pub struct PlacementCoordinator<S, L> {
     logic: L,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainReport {
+    pub drained_instance: InstanceId,
+    pub migrated_actors: usize,
+}
+
 impl<S, L> PlacementCoordinator<S, L> {
     pub fn new(store: S, logic: L) -> Self {
         Self { store, logic }
@@ -109,6 +115,59 @@ where
             .compare_and_put_actor(key, Some(version), record.clone())
             .await?;
         Ok(record)
+    }
+
+    pub async fn drain_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+    ) -> Result<DrainReport, PlacementError> {
+        let mut instance = self
+            .store
+            .get_instance(&instance_id)
+            .await?
+            .ok_or_else(|| PlacementError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            })?;
+        instance.state = InstanceState::Draining;
+        self.store.upsert_instance(instance).await?;
+
+        let replacement = self
+            .store
+            .list_instances(&service_kind)
+            .await?
+            .into_iter()
+            .filter(|candidate| {
+                candidate.state == InstanceState::Ready && candidate.instance_id != instance_id
+            })
+            .min_by_key(|candidate| candidate.instance_id.clone())
+            .ok_or(PlacementError::NoReadyInstances)?;
+        let mut migrated_actors = 0;
+        for (version, record) in self.store.list_actors().await? {
+            if record.owner != instance_id {
+                continue;
+            }
+            let key = ActorPlacementKey {
+                actor_kind: record.actor_kind.clone(),
+                actor_id: record.actor_id.clone(),
+            };
+            let migrated = ActorPlacementRecord {
+                owner: replacement.instance_id.clone(),
+                epoch: Epoch(record.epoch.0 + 1),
+                lease_id: LeaseId(record.lease_id.0 + 1),
+                state: PlacementState::Running,
+                ..record
+            };
+            self.store
+                .compare_and_put_actor(key, Some(version), migrated)
+                .await?;
+            migrated_actors += 1;
+        }
+
+        Ok(DrainReport {
+            drained_instance: instance_id,
+            migrated_actors,
+        })
     }
 
     async fn activate_actor_with_lock(
@@ -399,6 +458,50 @@ mod tests {
 
         assert_eq!(moved.owner, InstanceId::new("world-b"));
         assert_eq!(moved.epoch, Epoch(2));
+    }
+
+    #[tokio::test]
+    async fn coordinator_drain_marks_instance_draining_and_migrates_owned_actors() {
+        let store = ready_store().await;
+        store
+            .upsert_instance(instance_record("world-b", InstanceState::Ready))
+            .await
+            .unwrap();
+        let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+        let key = ActorPlacementKey {
+            actor_kind: actor_kind!("World"),
+            actor_id: ActorId::U64(7),
+        };
+        coordinator
+            .activate_actor(ActivateActorRequest {
+                service_kind: service_kind!("World"),
+                actor_kind: actor_kind!("World"),
+                actor_id: ActorId::U64(7),
+            })
+            .await
+            .unwrap();
+
+        let report = coordinator
+            .drain_instance(service_kind!("World"), InstanceId::new("world-a"))
+            .await
+            .unwrap();
+        let drained = store
+            .get_instance(&InstanceId::new("world-a"))
+            .await
+            .unwrap()
+            .unwrap();
+        let migrated = store.get_actor(&key).await.unwrap().unwrap().1;
+
+        assert_eq!(
+            report,
+            DrainReport {
+                drained_instance: InstanceId::new("world-a"),
+                migrated_actors: 1
+            }
+        );
+        assert_eq!(drained.state, InstanceState::Draining);
+        assert_eq!(migrated.owner, InstanceId::new("world-b"));
+        assert_eq!(migrated.epoch, Epoch(2));
     }
 
     async fn ready_store() -> InMemoryPlacementStore {

@@ -66,6 +66,9 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
         &self,
         key: &ActorPlacementKey,
     ) -> Result<Option<(PlacementVersion, ActorPlacementRecord)>, PlacementError>;
+    async fn list_actors(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, ActorPlacementRecord)>, PlacementError>;
     async fn compare_and_put_actor(
         &self,
         key: ActorPlacementKey,
@@ -171,6 +174,20 @@ impl PlacementStore for InMemoryPlacementStore {
             .actors
             .get(&self.prefixed_actor_key(key))
             .cloned())
+    }
+
+    async fn list_actors(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .actors
+            .iter()
+            .filter(|(key, _)| key.prefix == self.prefix)
+            .map(|(_, value)| value.clone())
+            .collect())
     }
 
     async fn compare_and_put_actor(
