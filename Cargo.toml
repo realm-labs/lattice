@@ -5,6 +5,7 @@ members = [
     "crates/lattice-core",
     "crates/lattice-codegen",
     "crates/lattice-gateway",
+    "crates/lattice-eventbus",
     "crates/lattice-placement",
     "crates/lattice-rpc",
     "examples/minimal-world",
@@ -24,6 +25,7 @@ lattice-config = { path = "crates/lattice-config" }
 lattice-core = { path = "crates/lattice-core" }
 lattice-actor = { path = "crates/lattice-actor" }
 lattice-codegen = { path = "crates/lattice-codegen" }
+lattice-eventbus = { path = "crates/lattice-eventbus" }
 lattice-gateway = { path = "crates/lattice-gateway" }
 lattice-placement = { path = "crates/lattice-placement" }
 lattice-rpc = { path = "crates/lattice-rpc" }
