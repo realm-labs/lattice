@@ -95,6 +95,46 @@ pub struct RouteTarget {
     pub owner_epoch: Option<Epoch>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredRpcService {
+    pub name: String,
+    pub target: RouteTarget,
+}
+
+#[derive(Debug, Default)]
+pub struct RpcServerBuilder {
+    services: Vec<RegisteredRpcService>,
+}
+
+impl RpcServerBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_service(
+        &mut self,
+        name: impl Into<String>,
+        target: RouteTarget,
+    ) -> Result<(), RpcServerBuildError> {
+        let name = name.into();
+        if self.services.iter().any(|service| service.name == name) {
+            return Err(RpcServerBuildError::DuplicateService { name });
+        }
+        self.services.push(RegisteredRpcService { name, target });
+        Ok(())
+    }
+
+    pub fn services(&self) -> &[RegisteredRpcService] {
+        &self.services
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RpcServerBuildError {
+    #[error("duplicate rpc service registration {name}")]
+    DuplicateService { name: String },
+}
+
 #[derive(Clone)]
 pub struct ActorRpcAdapter<A: Actor> {
     handle: ActorHandle<A>,
@@ -448,5 +488,49 @@ mod tests {
             trace: TraceContext::default(),
             auth: None,
         }
+    }
+
+    #[test]
+    fn rpc_server_builder_allows_multiple_services_on_one_endpoint() {
+        let endpoint: Uri = "http://world-0.world:18080".parse().unwrap();
+        let target = RouteTarget {
+            service_kind: service_kind!("World"),
+            instance_id: InstanceId::new("world-0"),
+            advertised_endpoint: endpoint.clone(),
+            owner_epoch: Some(Epoch(1)),
+        };
+        let mut builder = RpcServerBuilder::new();
+
+        builder.add_service("WorldRpc", target.clone()).unwrap();
+        builder.add_service("RoomRpc", target).unwrap();
+
+        assert_eq!(builder.services().len(), 2);
+        assert!(
+            builder
+                .services()
+                .iter()
+                .all(|service| service.target.advertised_endpoint == endpoint)
+        );
+    }
+
+    #[test]
+    fn rpc_server_builder_rejects_duplicate_service_names() {
+        let target = RouteTarget {
+            service_kind: service_kind!("World"),
+            instance_id: InstanceId::new("world-0"),
+            advertised_endpoint: "http://world-0.world:18080".parse().unwrap(),
+            owner_epoch: None,
+        };
+        let mut builder = RpcServerBuilder::new();
+
+        builder.add_service("WorldRpc", target.clone()).unwrap();
+        let duplicate = builder.add_service("WorldRpc", target);
+
+        assert_eq!(
+            duplicate,
+            Err(RpcServerBuildError::DuplicateService {
+                name: "WorldRpc".to_string()
+            })
+        );
     }
 }
