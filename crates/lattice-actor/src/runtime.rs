@@ -1,7 +1,15 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
 use crate::mailbox::{ActorCommand, MailboxConfig};
-use crate::{Actor, ActorContext, ActorHandle, StopReason};
+use crate::{
+    Actor, ActorContext, ActorHandle, ActorIncarnation, ActorTerminated, LocalActorRef, StopReason,
+    TerminatedReason,
+};
+
+static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn spawn_actor<A>(actor: A, mailbox: MailboxConfig) -> ActorHandle<A>
 where
@@ -9,7 +17,9 @@ where
 {
     let (normal_tx, normal_rx) = mpsc::channel(mailbox.normal_capacity());
     let (system_tx, system_rx) = mpsc::channel(mailbox.system_capacity());
-    let handle = ActorHandle::new(normal_tx, system_tx);
+    let local_ref = LocalActorRef::new(NEXT_LOCAL_ACTOR_ID.fetch_add(1, Ordering::Relaxed));
+    let (terminated_tx, _terminated_rx) = broadcast::channel(16);
+    let handle = ActorHandle::new(local_ref, terminated_tx, normal_tx, system_tx);
 
     tokio::spawn(run_actor(actor, handle.clone(), normal_rx, system_rx));
 
@@ -24,7 +34,7 @@ async fn run_actor<A>(
 ) where
     A: Actor,
 {
-    let mut ctx = ActorContext::new(handle);
+    let mut ctx = ActorContext::new(handle.clone());
 
     if actor.started(&mut ctx).await.is_err() {
         let _ = actor.stopping(&mut ctx, StopReason::StartFailed).await;
@@ -77,6 +87,12 @@ async fn run_actor<A>(
         .stopping(&mut ctx, stop_reason.unwrap_or(StopReason::Requested))
         .await;
     ctx.cancel_all_tasks();
+    let reason = stop_reason.unwrap_or(StopReason::Requested);
+    handle.publish_terminated(ActorTerminated {
+        target: handle.local_ref(),
+        incarnation: ActorIncarnation::new(handle.local_ref().id()),
+        reason: TerminatedReason::from(reason),
+    });
 }
 
 async fn handle_command<A>(

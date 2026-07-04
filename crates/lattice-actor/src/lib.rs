@@ -5,6 +5,7 @@ mod mailbox;
 mod registry;
 mod runtime;
 mod traits;
+mod watch;
 
 pub use context::ActorContext;
 pub use error::{ActorActivationError, ActorCallError, ActorError, ActorStopError, ActorTellError};
@@ -13,6 +14,7 @@ pub use mailbox::MailboxConfig;
 pub use registry::{ActorRegistry, ActorRegistryConfig};
 pub use runtime::spawn_actor;
 pub use traits::{Actor, Handler, Message, PassivationReason, StopReason};
+pub use watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason, WatchId};
 
 #[cfg(test)]
 mod tests {
@@ -23,9 +25,9 @@ mod tests {
     use tokio::sync::{Mutex, Semaphore, oneshot};
 
     use crate::{
-        Actor, ActorActivationError, ActorCallError, ActorContext, ActorError, ActorRegistry,
-        ActorRegistryConfig, ActorTellError, Handler, MailboxConfig, Message, PassivationReason,
-        StopReason, spawn_actor,
+        Actor, ActorActivationError, ActorCallError, ActorContext, ActorError, ActorHandle,
+        ActorRegistry, ActorRegistryConfig, ActorTellError, ActorTerminated, Handler,
+        MailboxConfig, Message, PassivationReason, StopReason, TerminatedReason, spawn_actor,
     };
     use lattice_core::{ActorId, actor_kind};
 
@@ -550,5 +552,109 @@ mod tests {
             .await;
 
         assert!(retry.is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_actor_watch_sends_typed_termination_notification() {
+        struct TargetActor;
+
+        #[async_trait]
+        impl Actor for TargetActor {}
+
+        struct WatcherActor {
+            target: ActorHandle<TargetActor>,
+            events: Arc<Mutex<Vec<TerminatedReason>>>,
+            notified: Arc<Semaphore>,
+        }
+
+        #[async_trait]
+        impl Actor for WatcherActor {
+            async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+                ctx.watch(&self.target)?;
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl Handler<ActorTerminated> for WatcherActor {
+            async fn handle(
+                &mut self,
+                _ctx: &mut ActorContext<Self>,
+                msg: ActorTerminated,
+            ) -> Result<(), ActorError> {
+                self.events.lock().await.push(msg.reason);
+                self.notified.add_permits(1);
+                Ok(())
+            }
+        }
+
+        let target = spawn_actor(TargetActor, MailboxConfig::bounded(8));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let notified = Arc::new(Semaphore::new(0));
+        let _watcher = spawn_actor(
+            WatcherActor {
+                target: target.clone(),
+                events: events.clone(),
+                notified: notified.clone(),
+            },
+            MailboxConfig::bounded(8),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        target.stop(StopReason::Requested).await.unwrap();
+        notified.acquire().await.unwrap().forget();
+
+        assert_eq!(*events.lock().await, vec![TerminatedReason::Stopped]);
+    }
+
+    #[tokio::test]
+    async fn watcher_stop_auto_unwatches_local_target() {
+        struct TargetActor;
+
+        #[async_trait]
+        impl Actor for TargetActor {}
+
+        struct WatcherActor {
+            target: ActorHandle<TargetActor>,
+            events: Arc<Mutex<Vec<TerminatedReason>>>,
+        }
+
+        #[async_trait]
+        impl Actor for WatcherActor {
+            async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+                ctx.watch(&self.target)?;
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl Handler<ActorTerminated> for WatcherActor {
+            async fn handle(
+                &mut self,
+                _ctx: &mut ActorContext<Self>,
+                msg: ActorTerminated,
+            ) -> Result<(), ActorError> {
+                self.events.lock().await.push(msg.reason);
+                Ok(())
+            }
+        }
+
+        let target = spawn_actor(TargetActor, MailboxConfig::bounded(8));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let watcher = spawn_actor(
+            WatcherActor {
+                target: target.clone(),
+                events: events.clone(),
+            },
+            MailboxConfig::bounded(8),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        watcher.stop(StopReason::Requested).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        target.stop(StopReason::Requested).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        assert!(events.lock().await.is_empty());
     }
 }

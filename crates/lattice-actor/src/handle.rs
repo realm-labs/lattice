@@ -1,14 +1,20 @@
 use std::marker::PhantomData;
 
 use tokio::sync::{
+    broadcast,
     mpsc::{self, error::TrySendError},
     oneshot,
 };
 
 use crate::mailbox::{ActorCommand, EnvelopeMessage, MailboxLane};
-use crate::{Actor, ActorCallError, ActorTellError, Handler, Message, StopReason};
+use crate::{
+    Actor, ActorCallError, ActorTellError, ActorTerminated, Handler, LocalActorRef, Message,
+    StopReason,
+};
 
 pub struct ActorHandle<A: Actor> {
+    local_ref: LocalActorRef,
+    terminated_tx: broadcast::Sender<ActorTerminated>,
     normal_tx: mpsc::Sender<ActorCommand<A>>,
     system_tx: mpsc::Sender<ActorCommand<A>>,
     _marker: PhantomData<A>,
@@ -17,6 +23,8 @@ pub struct ActorHandle<A: Actor> {
 impl<A: Actor> Clone for ActorHandle<A> {
     fn clone(&self) -> Self {
         Self {
+            local_ref: self.local_ref,
+            terminated_tx: self.terminated_tx.clone(),
             normal_tx: self.normal_tx.clone(),
             system_tx: self.system_tx.clone(),
             _marker: PhantomData,
@@ -26,14 +34,22 @@ impl<A: Actor> Clone for ActorHandle<A> {
 
 impl<A: Actor> ActorHandle<A> {
     pub(crate) fn new(
+        local_ref: LocalActorRef,
+        terminated_tx: broadcast::Sender<ActorTerminated>,
         normal_tx: mpsc::Sender<ActorCommand<A>>,
         system_tx: mpsc::Sender<ActorCommand<A>>,
     ) -> Self {
         Self {
+            local_ref,
+            terminated_tx,
             normal_tx,
             system_tx,
             _marker: PhantomData,
         }
+    }
+
+    pub fn local_ref(&self) -> LocalActorRef {
+        self.local_ref
     }
 
     pub async fn call<M>(&self, msg: M) -> Result<M::Reply, ActorCallError>
@@ -62,6 +78,14 @@ impl<A: Actor> ActorHandle<A> {
         M: Message<Reply = ()>,
     {
         self.try_tell_on_lane(msg, MailboxLane::Normal)
+    }
+
+    pub(crate) fn subscribe_terminated(&self) -> broadcast::Receiver<ActorTerminated> {
+        self.terminated_tx.subscribe()
+    }
+
+    pub(crate) fn publish_terminated(&self, notification: ActorTerminated) {
+        let _ = self.terminated_tx.send(notification);
     }
 
     #[cfg(test)]

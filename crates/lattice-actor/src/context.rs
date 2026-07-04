@@ -1,14 +1,20 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
-use crate::{Actor, ActorError, ActorHandle, Handler, Message, PassivationReason, StopReason};
+use crate::{
+    Actor, ActorError, ActorHandle, ActorTerminated, Handler, Message, PassivationReason,
+    StopReason, WatchId,
+};
 
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
     lifecycle_request: Option<StopReason>,
     tasks: Vec<JoinHandle<()>>,
+    watches: HashMap<WatchId, JoinHandle<()>>,
+    next_watch_id: u64,
 }
 
 impl<A: Actor> ActorContext<A> {
@@ -17,6 +23,8 @@ impl<A: Actor> ActorContext<A> {
             handle,
             lifecycle_request: None,
             tasks: Vec::new(),
+            watches: HashMap::new(),
+            next_watch_id: 0,
         }
     }
 
@@ -66,8 +74,39 @@ impl<A: Actor> ActorContext<A> {
         self.tasks.push(tokio::spawn(future));
     }
 
+    pub fn watch<B>(&mut self, target: &ActorHandle<B>) -> Result<WatchId, ActorError>
+    where
+        A: Handler<ActorTerminated>,
+        B: Actor,
+    {
+        let watch_id = WatchId::new(self.next_watch_id);
+        self.next_watch_id += 1;
+
+        let mut terminations = target.subscribe_terminated();
+        let self_handle = self.handle.clone();
+        let task = tokio::spawn(async move {
+            if let Ok(notification) = terminations.recv().await {
+                let _ = self_handle.try_tell_internal(notification);
+            }
+        });
+        self.watches.insert(watch_id, task);
+        Ok(watch_id)
+    }
+
+    pub fn unwatch(&mut self, watch_id: &WatchId) -> bool {
+        if let Some(task) = self.watches.remove(watch_id) {
+            task.abort();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn cancel_all_tasks(&mut self) {
         for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        for (_watch_id, task) in self.watches.drain() {
             task.abort();
         }
     }
