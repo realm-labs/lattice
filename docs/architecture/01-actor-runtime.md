@@ -107,7 +107,6 @@ pub enum ActorExecutionPolicy {
     TaskPerActor,
     ShardWorker { worker_count: usize },
     DedicatedThreadPool { worker_count: usize },
-    LocalSet,
 }
 
 #[derive(Debug, Clone)]
@@ -156,10 +155,6 @@ ShardWorker:
 DedicatedThreadPool:
   A named pool for actors that must be isolated from normal Tokio worker threads.
   This is for blocking-heavy or CPU-heavy actor families only when they cannot offload work elsewhere.
-
-LocalSet:
-  A single-thread Tokio LocalSet for !Send internal tasks or affinity-sensitive local execution.
-  Public actor messages still remain Send unless a later phase explicitly relaxes that boundary.
 ```
 
 Rules:
