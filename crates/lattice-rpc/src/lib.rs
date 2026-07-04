@@ -135,10 +135,18 @@ pub enum RpcServerBuildError {
     DuplicateService { name: String },
 }
 
-#[derive(Clone)]
 pub struct ActorRpcAdapter<A: Actor> {
     handle: ActorHandle<A>,
     owner_epoch: Option<Epoch>,
+}
+
+impl<A: Actor> Clone for ActorRpcAdapter<A> {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            owner_epoch: self.owner_epoch,
+        }
+    }
 }
 
 impl<A: Actor> ActorRpcAdapter<A> {
