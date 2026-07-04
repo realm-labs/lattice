@@ -1091,10 +1091,7 @@ mod tests {
     async fn opentelemetry_pipeline_exports_resource_spans_metrics_and_links() {
         let telemetry = TelemetryRecorder::default();
         let exporter = InMemoryTelemetryExporter::default();
-        let pipeline = TelemetryConfig {
-            service_version: "test".to_string(),
-        }
-        .build_in_memory_pipeline(
+        let pipeline = TelemetryConfig::new("test").build_in_memory_pipeline(
             service_kind!("World"),
             InstanceId::new("world-a"),
             exporter.clone(),

@@ -43,9 +43,16 @@ pub const WORLD_ACTOR: ActorKind = actor_kind!("World");
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let app = AppDeps::from_env().await?;
+    let instance = InstanceConfig::from_env()?;
+    let _telemetry = lattice_telemetry_otlp::LatticeTelemetry::from_config(
+        WORLD_SERVICE,
+        instance.instance_id.clone(),
+        lattice_telemetry_otlp::TelemetryConfig::fmt_only(instance.version.clone()),
+    )
+    .install()?;
 
     let service = LatticeService::builder(WORLD_SERVICE)
-        .instance(InstanceConfig::from_env()?)
+        .instance(instance)
         .config(ConfigSource::file("config/world-service.toml"))
         .placement_store(EtcdPlacementStore::from_config())
         .event_bus(NatsEventBus::from_config())

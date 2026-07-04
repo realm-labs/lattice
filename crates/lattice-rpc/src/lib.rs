@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
 
 const REQUEST_ID: &str = "lattice-request-id";
 const ROUTE_EPOCH: &str = "lattice-route-epoch";
@@ -381,14 +382,28 @@ impl<A: Actor> ActorRpcAdapter<A> {
         A: Handler<Rpc<Req>>,
         Req: RoutedRequest + RpcRequest,
     {
-        let _actor_kind = req.actor_kind();
-        let _route_key = req.route_key();
-        let reply = self
-            .handle
-            .call(Rpc { req, ctx })
-            .await
-            .map_err(actor_call_status)?;
-        Ok(Response::new(reply))
+        let actor_kind = req.actor_kind();
+        let route_key = req.route_key();
+        let span = tracing::info_span!(
+            "rpc.server",
+            otel.kind = "server",
+            rpc.method = Req::METHOD,
+            actor.kind = actor_kind.as_str(),
+            route.key = ?route_key,
+            request.id = ctx.request_id.as_str(),
+            source.service = ctx.source_service.as_str(),
+            source.instance = ctx.source_instance.as_str()
+        );
+        async {
+            let reply = self
+                .handle
+                .call(Rpc { req, ctx })
+                .await
+                .map_err(actor_call_status)?;
+            Ok(Response::new(reply))
+        }
+        .instrument(span)
+        .await
     }
 
     pub async fn unary_dedup<Req>(

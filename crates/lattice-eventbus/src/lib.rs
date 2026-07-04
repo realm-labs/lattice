@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use lattice_core::{ActorId, ActorKind, InstanceId, RequestId, ServiceKind, TraceContext};
 use lattice_rpc::{RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 pub use nats::{InMemoryNatsClient, NatsEventBus, NatsEventBusConfig};
 
@@ -179,16 +180,43 @@ struct LocalSubscriber {
 #[async_trait]
 impl EventBus for LocalEventBus {
     async fn publish(&self, event: EventEnvelope) -> Result<(), EventBusError> {
-        let subscribers = self.inner.subscribers.lock().await;
-        for subscriber in subscribers.values() {
-            if subscriber.cancelled.load(Ordering::SeqCst) {
-                continue;
+        let span = tracing::info_span!(
+            "eventbus.publish",
+            otel.kind = "producer",
+            event.subject = event.subject.as_str(),
+            event.type = event.event_type.as_str(),
+            source.service = event.source_service.as_str(),
+            source.instance = event.source_instance.as_str()
+        );
+        async {
+            let handlers = {
+                let subscribers = self.inner.subscribers.lock().await;
+                subscribers
+                    .values()
+                    .filter(|subscriber| {
+                        !subscriber.cancelled.load(Ordering::SeqCst)
+                            && subscriber.subscription.filter.matches(&event.subject)
+                    })
+                    .map(|subscriber| subscriber.handler.clone())
+                    .collect::<Vec<_>>()
+            };
+
+            for handler in handlers {
+                let consumer_span = tracing::info_span!(
+                    "eventbus.consume",
+                    otel.kind = "consumer",
+                    event.subject = event.subject.as_str(),
+                    event.type = event.event_type.as_str()
+                );
+                handler
+                    .handle(event.clone())
+                    .instrument(consumer_span)
+                    .await?;
             }
-            if subscriber.subscription.filter.matches(&event.subject) {
-                subscriber.handler.handle(event.clone()).await?;
-            }
+            Ok(())
         }
-        Ok(())
+        .instrument(span)
+        .await
     }
 
     async fn subscribe<H>(

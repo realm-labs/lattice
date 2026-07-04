@@ -236,7 +236,19 @@ Avoid high-cardinality labels such as actor_id, request_id, event_id, or session
 
 ### 25.3 Telemetry and Async Tracing
 
-OpenTelemetry is the default tracing model.
+OpenTelemetry is the default export model. Framework code emits spans and events through `tracing`; `lattice-telemetry-otlp` installs the `tracing-subscriber` stack and optional OTLP exporter.
+
+Startup shape:
+
+```rust
+let _telemetry = lattice_telemetry_otlp::LatticeTelemetry::from_config(
+    service_kind!("World"),
+    InstanceId::new("world-a"),
+    lattice_telemetry_otlp::TelemetryConfig::fmt_only("1.2.3")
+        .with_otlp_endpoint("http://otel-collector:4317"),
+)
+.install()?;
+```
 
 TraceContext propagates through:
 
@@ -262,6 +274,8 @@ admin operation span
 ```
 
 EventBus fan-out should use span links rather than pretending all consumers are a single child chain.
+
+`TelemetryRecorder` in `lattice-ops` is for tests, admin snapshots, and manually aggregated framework metrics. It is not the production tracing path.
 
 ### 25.4 Trace Fields
 

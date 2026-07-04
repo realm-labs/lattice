@@ -406,6 +406,7 @@ from_config component builders
 ConfigSource file/env/inline/composite adapters
 metrics/tracing
 OpenTelemetry exporter integration
+tracing-subscriber + lattice-telemetry-otlp adapter crate
 TraceContext propagation across RPC/EventBus/scheduler/actor mailbox
 GatewaySessionRef + GatewayPush RPC
 Gateway tower pipeline + Governor keyed rate limiter
@@ -676,6 +677,8 @@ Pre-implementation checks:
 [ ] NodeInspect list APIs are paginated and support partial result/unreachable instance.
 [ ] Actor business state inspect is optional, read-only, redacted, and timeout bounded.
 [ ] TraceContext propagates through gRPC metadata, EventBus headers, actor mailbox envelope, and scheduler envelope.
+[ ] Framework emits tracing spans for RPC server, EventBus publish/consume, and placement resolve.
+[ ] lattice-telemetry-otlp can install fmt-only telemetry and optional OTLP tracing export.
 [ ] EventBus fan-out uses span links rather than a fake single parent-child chain.
 [ ] metrics labels avoid actor_id/request_id/event_id/session_id high-cardinality fields.
 [ ] actor activation has a distributed lock.

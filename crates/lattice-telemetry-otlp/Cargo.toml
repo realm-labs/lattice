@@ -1,18 +1,17 @@
 [package]
-name = "lattice-eventbus"
+name = "lattice-telemetry-otlp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-async-trait.workspace = true
 lattice-core.workspace = true
-lattice-rpc.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-prost.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true

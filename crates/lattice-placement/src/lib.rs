@@ -423,6 +423,14 @@ impl StaticRouteResolver {
 #[async_trait]
 impl RouteResolver for StaticRouteResolver {
     async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
+        let span = tracing::info_span!(
+            "placement.resolve",
+            otel.kind = "internal",
+            service.kind = request.service_kind.as_str(),
+            actor.kind = request.actor_kind.as_str(),
+            route.key = ?request.route_key
+        );
+        let _entered = span.enter();
         let key = request.cache_key();
         {
             let mut cache = self.cache.lock().expect("route cache mutex poisoned");

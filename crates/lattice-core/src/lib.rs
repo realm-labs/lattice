@@ -108,6 +108,44 @@ pub struct TraceContext {
     pub tracestate: Option<String>,
 }
 
+impl TraceContext {
+    pub fn is_empty(&self) -> bool {
+        self.traceparent.is_none() && self.tracestate.is_none()
+    }
+
+    pub fn span(&self, name: &'static str, kind: TraceSpanKind) -> tracing::Span {
+        tracing::info_span!(
+            "lattice.trace_context",
+            otel.name = name,
+            otel.kind = kind.as_str(),
+            traceparent = self.traceparent.as_deref().unwrap_or(""),
+            tracestate = self.tracestate.as_deref().unwrap_or("")
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSpanKind {
+    Internal,
+    Client,
+    Server,
+    Producer,
+    Consumer,
+}
+
+impl TraceSpanKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::Client => "client",
+            Self::Server => "server",
+            Self::Producer => "producer",
+            Self::Consumer => "consumer",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum RouteKey {
@@ -247,5 +285,20 @@ mod tests {
         assert_eq!(id.to_actor_id(), ActorId::U64(42));
         assert_eq!(WorldId::try_from_actor_id(&ActorId::U64(42)), Ok(id));
         assert!(WorldId::try_from_actor_id(&ActorId::Str("42".into())).is_err());
+    }
+
+    #[test]
+    fn trace_context_reports_empty_and_span_kind_names() {
+        let empty = TraceContext::default();
+        let trace = TraceContext {
+            traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00".into()),
+            tracestate: None,
+        };
+
+        assert!(empty.is_empty());
+        assert!(!trace.is_empty());
+        assert_eq!(TraceSpanKind::Client.as_str(), "client");
+        assert_eq!(TraceSpanKind::Consumer.as_str(), "consumer");
+        let _span = trace.span("rpc.client", TraceSpanKind::Client);
     }
 }
