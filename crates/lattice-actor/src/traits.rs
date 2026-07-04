@@ -76,4 +76,13 @@ impl ChildActorKey {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ChildActorOptions {
     pub mailbox: MailboxConfig,
+    pub supervision: ChildSupervision,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChildSupervision {
+    #[default]
+    StopChild,
+    StopParent,
+    RestartChild,
 }

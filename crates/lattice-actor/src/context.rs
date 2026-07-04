@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
+use crate::ChildSupervision;
 use crate::{
     Actor, ActorError, ActorHandle, ActorTerminated, ChildActorKey, ChildActorOptions, Handler,
     Message, PassivationReason, StopReason, WatchId, spawn_actor,
@@ -113,6 +115,11 @@ impl<A: Actor> ActorContext<A> {
     where
         C: Actor,
     {
+        if options.supervision == ChildSupervision::RestartChild {
+            return Err(ActorError::new(
+                "RestartChild supervision requires spawn_child_with_factory",
+            ));
+        }
         if self.children.contains_key(&key) {
             return Err(ActorError::new(format!(
                 "child actor {} already exists",
@@ -121,8 +128,35 @@ impl<A: Actor> ActorContext<A> {
         }
 
         let handle = spawn_actor(actor, options.mailbox);
+        let slot = Arc::new(ChildSlot::new(handle.clone()));
         self.children
-            .insert(key, Box::new(ChildHandleStopper(handle.clone())));
+            .insert(key, Box::new(ChildSlotStopper(slot.clone())));
+        self.spawn_supervision_task(slot, options, None::<fn() -> C>);
+        Ok(handle)
+    }
+
+    pub fn spawn_child_with_factory<C, F>(
+        &mut self,
+        key: ChildActorKey,
+        mut factory: F,
+        options: ChildActorOptions,
+    ) -> Result<ActorHandle<C>, ActorError>
+    where
+        C: Actor,
+        F: FnMut() -> C + Send + 'static,
+    {
+        if self.children.contains_key(&key) {
+            return Err(ActorError::new(format!(
+                "child actor {} already exists",
+                key.as_str()
+            )));
+        }
+
+        let handle = spawn_actor(factory(), options.mailbox);
+        let slot = Arc::new(ChildSlot::new(handle.clone()));
+        self.children
+            .insert(key, Box::new(ChildSlotStopper(slot.clone())));
+        self.spawn_supervision_task(slot, options, Some(factory));
         Ok(handle)
     }
 
@@ -153,6 +187,47 @@ impl<A: Actor> ActorContext<A> {
     pub(crate) fn take_lifecycle_request(&mut self) -> Option<StopReason> {
         self.lifecycle_request.take()
     }
+
+    fn spawn_supervision_task<C, F>(
+        &mut self,
+        slot: Arc<ChildSlot<C>>,
+        options: ChildActorOptions,
+        mut factory: Option<F>,
+    ) where
+        C: Actor,
+        F: FnMut() -> C + Send + 'static,
+    {
+        match options.supervision {
+            ChildSupervision::StopChild => {}
+            ChildSupervision::StopParent => {
+                let parent = self.handle.clone();
+                if let Some(child) = slot.current() {
+                    let mut terminations = child.subscribe_terminated();
+                    self.spawn_scoped(async move {
+                        if terminations.recv().await.is_ok() {
+                            let _ = parent.try_stop_internal(StopReason::Requested);
+                        }
+                    });
+                }
+            }
+            ChildSupervision::RestartChild => {
+                let (Some(mut factory), Some(child)) = (factory.take(), slot.current()) else {
+                    return;
+                };
+                let mut terminations = child.subscribe_terminated();
+                self.spawn_scoped(async move {
+                    loop {
+                        if terminations.recv().await.is_err() {
+                            break;
+                        }
+                        let replacement = spawn_actor(factory(), options.mailbox);
+                        terminations = replacement.subscribe_terminated();
+                        slot.replace(replacement);
+                    }
+                });
+            }
+        }
+    }
 }
 
 impl<A: Actor> Drop for ActorContext<A> {
@@ -165,10 +240,32 @@ trait ChildStop: Send {
     fn stop(self: Box<Self>, reason: StopReason);
 }
 
-struct ChildHandleStopper<C: Actor>(ActorHandle<C>);
+struct ChildSlot<C: Actor> {
+    current: Mutex<Option<ActorHandle<C>>>,
+}
 
-impl<C: Actor> ChildStop for ChildHandleStopper<C> {
+impl<C: Actor> ChildSlot<C> {
+    fn new(handle: ActorHandle<C>) -> Self {
+        Self {
+            current: Mutex::new(Some(handle)),
+        }
+    }
+
+    fn current(&self) -> Option<ActorHandle<C>> {
+        self.current.lock().expect("child slot poisoned").clone()
+    }
+
+    fn replace(&self, handle: ActorHandle<C>) {
+        *self.current.lock().expect("child slot poisoned") = Some(handle);
+    }
+}
+
+struct ChildSlotStopper<C: Actor>(Arc<ChildSlot<C>>);
+
+impl<C: Actor> ChildStop for ChildSlotStopper<C> {
     fn stop(self: Box<Self>, reason: StopReason) {
-        let _ = self.0.try_stop_internal(reason);
+        if let Some(handle) = self.0.current.lock().expect("child slot poisoned").take() {
+            let _ = handle.try_stop_internal(reason);
+        }
     }
 }

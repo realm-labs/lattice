@@ -20,8 +20,8 @@ pub use runtime::{
     PassivationPolicy, spawn_actor,
 };
 pub use traits::{
-    Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, Handler, Message,
-    PassivationReason, StopReason,
+    Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
+    Message, PassivationReason, StopReason,
 };
 pub use watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason, WatchId};
 
@@ -37,8 +37,9 @@ mod tests {
         Actor, ActorActivationError, ActorCallError, ActorContext, ActorError,
         ActorExecutionPolicy, ActorHandle, ActorLifecycleState, ActorRegistry, ActorRegistryConfig,
         ActorRuntime, ActorRuntimeConfig, ActorSpawnError, ActorSpawnOptions, ActorTellError,
-        ActorTerminated, ChildActorKey, ChildActorOptions, Handler, MailboxConfig, Message,
-        PassivationPolicy, PassivationReason, StopReason, TerminatedReason, spawn_actor,
+        ActorTerminated, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
+        MailboxConfig, Message, PassivationPolicy, PassivationReason, StopReason, TerminatedReason,
+        spawn_actor,
     };
     use lattice_core::{ActorId, actor_kind};
 
@@ -842,6 +843,161 @@ mod tests {
         tokio::time::timeout(
             std::time::Duration::from_millis(100),
             duplicate_rejected.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    }
+
+    #[tokio::test]
+    async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
+        struct ChildActor;
+
+        #[async_trait]
+        impl Actor for ChildActor {}
+
+        #[derive(Debug)]
+        struct StopChild;
+
+        impl Message for StopChild {
+            type Reply = ();
+        }
+
+        struct ParentActor {
+            child: Option<ActorHandle<ChildActor>>,
+            stopped: Option<Arc<Semaphore>>,
+        }
+
+        #[async_trait]
+        impl Actor for ParentActor {
+            async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+                self.child = Some(ctx.spawn_child(
+                    ChildActorKey::new("child"),
+                    ChildActor,
+                    ChildActorOptions {
+                        mailbox: MailboxConfig::bounded(8),
+                        supervision: ChildSupervision::StopParent,
+                    },
+                )?);
+                Ok(())
+            }
+
+            async fn stopping(
+                &mut self,
+                _ctx: &mut ActorContext<Self>,
+                _reason: StopReason,
+            ) -> Result<(), crate::ActorStopError> {
+                if let Some(stopped) = self.stopped.take() {
+                    stopped.add_permits(1);
+                }
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl Handler<StopChild> for ParentActor {
+            async fn handle(
+                &mut self,
+                _ctx: &mut ActorContext<Self>,
+                _msg: StopChild,
+            ) -> Result<(), ActorError> {
+                self.child
+                    .as_ref()
+                    .expect("child should be available")
+                    .stop(StopReason::Requested)
+                    .await
+                    .map_err(|error| ActorError::new(error.to_string()))?;
+                Ok(())
+            }
+        }
+
+        let stopped = Arc::new(Semaphore::new(0));
+        let parent = spawn_actor(
+            ParentActor {
+                child: None,
+                stopped: Some(stopped.clone()),
+            },
+            MailboxConfig::bounded(8),
+        );
+
+        parent.tell(StopChild).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(100), stopped.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+    }
+
+    #[tokio::test]
+    async fn child_supervision_restart_child_recreates_child_from_factory() {
+        struct ChildActor;
+
+        #[async_trait]
+        impl Actor for ChildActor {}
+
+        #[derive(Debug)]
+        struct StopChild;
+
+        impl Message for StopChild {
+            type Reply = ();
+        }
+
+        struct ParentActor {
+            child: Option<ActorHandle<ChildActor>>,
+            child_started: Arc<Semaphore>,
+        }
+
+        #[async_trait]
+        impl Actor for ParentActor {
+            async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+                let child_started = self.child_started.clone();
+                self.child = Some(ctx.spawn_child_with_factory(
+                    ChildActorKey::new("child"),
+                    move || {
+                        child_started.add_permits(1);
+                        ChildActor
+                    },
+                    ChildActorOptions {
+                        mailbox: MailboxConfig::bounded(8),
+                        supervision: ChildSupervision::RestartChild,
+                    },
+                )?);
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl Handler<StopChild> for ParentActor {
+            async fn handle(
+                &mut self,
+                _ctx: &mut ActorContext<Self>,
+                _msg: StopChild,
+            ) -> Result<(), ActorError> {
+                self.child
+                    .as_ref()
+                    .expect("child should be available")
+                    .stop(StopReason::Requested)
+                    .await
+                    .map_err(|error| ActorError::new(error.to_string()))?;
+                Ok(())
+            }
+        }
+
+        let child_started = Arc::new(Semaphore::new(0));
+        let parent = spawn_actor(
+            ParentActor {
+                child: None,
+                child_started: child_started.clone(),
+            },
+            MailboxConfig::bounded(8),
+        );
+
+        child_started.acquire().await.unwrap().forget();
+        parent.tell(StopChild).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            child_started.acquire(),
         )
         .await
         .unwrap()
