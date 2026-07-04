@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Query, State};
@@ -183,6 +184,69 @@ pub struct MetricSample {
     pub name: String,
     pub value: u64,
     pub labels: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TelemetryResource {
+    pub service_kind: ServiceKind,
+    pub instance_id: InstanceId,
+    pub service_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TelemetryBatch {
+    pub resource: TelemetryResource,
+    pub spans: Vec<TraceSpan>,
+    pub metrics: Vec<MetricSample>,
+}
+
+#[async_trait]
+pub trait TelemetryExporter: Clone + Send + Sync + 'static {
+    async fn export(&self, batch: TelemetryBatch) -> Result<(), OpsError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenTelemetryPipeline<E> {
+    resource: TelemetryResource,
+    exporter: E,
+}
+
+impl<E> OpenTelemetryPipeline<E>
+where
+    E: TelemetryExporter,
+{
+    pub fn new(resource: TelemetryResource, exporter: E) -> Self {
+        Self { resource, exporter }
+    }
+
+    pub async fn export_from(&self, recorder: &TelemetryRecorder) -> Result<(), OpsError> {
+        self.exporter
+            .export(TelemetryBatch {
+                resource: self.resource.clone(),
+                spans: recorder.spans().await,
+                metrics: recorder.metrics().await,
+            })
+            .await
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryTelemetryExporter {
+    batches: Arc<Mutex<Vec<TelemetryBatch>>>,
+}
+
+impl InMemoryTelemetryExporter {
+    pub async fn batches(&self) -> Vec<TelemetryBatch> {
+        self.batches.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl TelemetryExporter for InMemoryTelemetryExporter {
+    async fn export(&self, batch: TelemetryBatch) -> Result<(), OpsError> {
+        self.batches.lock().await.push(batch);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -969,5 +1033,50 @@ mod tests {
             bad_metric,
             Err(OpsError::HighCardinalityMetricLabel { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn opentelemetry_pipeline_exports_resource_spans_metrics_and_links() {
+        let telemetry = TelemetryRecorder::default();
+        let exporter = InMemoryTelemetryExporter::default();
+        let pipeline = OpenTelemetryPipeline::new(
+            TelemetryResource {
+                service_kind: service_kind!("World"),
+                instance_id: InstanceId::new("world-a"),
+                service_version: "test".to_string(),
+            },
+            exporter.clone(),
+        );
+        let producer = TraceContext {
+            traceparent: Some("producer-trace".to_string()),
+            tracestate: None,
+        };
+        telemetry
+            .record_span(TraceSpan {
+                name: "event consumer".to_string(),
+                kind: TraceSpanKind::EventBus,
+                context: TraceContext {
+                    traceparent: Some("consumer-trace".to_string()),
+                    tracestate: None,
+                },
+                links: vec![producer.clone()],
+            })
+            .await;
+        telemetry
+            .record_metric(MetricSample {
+                name: "eventbus_deliveries".to_string(),
+                value: 1,
+                labels: HashMap::from([("event_type".to_string(), "PlayerEntered".to_string())]),
+            })
+            .await
+            .unwrap();
+
+        pipeline.export_from(&telemetry).await.unwrap();
+        let batches = exporter.batches().await;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].resource.service_kind, service_kind!("World"));
+        assert_eq!(batches[0].spans[0].links, vec![producer]);
+        assert_eq!(batches[0].metrics[0].name, "eventbus_deliveries");
     }
 }
