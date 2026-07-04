@@ -384,6 +384,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-placement"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "lattice-core",
+ "lattice-rpc",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "lattice-rpc"
 version = "0.1.0"
 dependencies = [
