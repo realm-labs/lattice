@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -54,4 +56,16 @@ pub enum ActorTellError {
     ResponseDropped,
     #[error("actor handler failed: {0}")]
     Handler(ActorError),
+}
+
+#[derive(Debug, Clone, Error)]
+pub enum ActorActivationError {
+    #[error("actor is already running or activating")]
+    AlreadyExists,
+    #[error("activation waiter capacity exceeded")]
+    WaiterCapacityExceeded,
+    #[error("timed out waiting {timeout:?} for actor activation")]
+    WaiterTimeout { timeout: Duration },
+    #[error("actor activation failed: {0}")]
+    ActivationFailed(ActorError),
 }
