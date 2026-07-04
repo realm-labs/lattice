@@ -15,6 +15,171 @@ use lattice_placement::{ActorPlacementRecord, InstanceRecord, PlacementError, Pl
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct OperationId(String);
+
+impl OperationId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum OperationStatus {
+    Pending,
+    Retrying { attempts: u32 },
+    Completed,
+    CompensationRequired { reason: String },
+    ManualRequired { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingOperation {
+    pub operation_id: OperationId,
+    pub status: OperationStatus,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct OperationTracker {
+    operations: Arc<Mutex<HashMap<OperationId, PendingOperation>>>,
+}
+
+impl OperationTracker {
+    pub async fn start(&self, operation_id: OperationId) -> Result<(), OpsError> {
+        let mut operations = self.operations.lock().await;
+        if operations.contains_key(&operation_id) {
+            return Err(OpsError::DuplicateOperation {
+                operation_id: operation_id.as_str().to_string(),
+            });
+        }
+        operations.insert(
+            operation_id.clone(),
+            PendingOperation {
+                operation_id,
+                status: OperationStatus::Pending,
+            },
+        );
+        Ok(())
+    }
+
+    pub async fn mark_retrying(
+        &self,
+        operation_id: &OperationId,
+        attempts: u32,
+    ) -> Result<(), OpsError> {
+        self.update(operation_id, OperationStatus::Retrying { attempts })
+            .await
+    }
+
+    pub async fn mark_compensation_required(
+        &self,
+        operation_id: &OperationId,
+        reason: impl Into<String>,
+    ) -> Result<(), OpsError> {
+        self.update(
+            operation_id,
+            OperationStatus::CompensationRequired {
+                reason: reason.into(),
+            },
+        )
+        .await
+    }
+
+    pub async fn mark_manual_required(
+        &self,
+        operation_id: &OperationId,
+        reason: impl Into<String>,
+    ) -> Result<(), OpsError> {
+        self.update(
+            operation_id,
+            OperationStatus::ManualRequired {
+                reason: reason.into(),
+            },
+        )
+        .await
+    }
+
+    pub async fn complete(&self, operation_id: &OperationId) -> Result<(), OpsError> {
+        self.update(operation_id, OperationStatus::Completed).await
+    }
+
+    pub async fn get(&self, operation_id: &OperationId) -> Option<PendingOperation> {
+        self.operations.lock().await.get(operation_id).cloned()
+    }
+
+    async fn update(
+        &self,
+        operation_id: &OperationId,
+        status: OperationStatus,
+    ) -> Result<(), OpsError> {
+        let mut operations = self.operations.lock().await;
+        let operation =
+            operations
+                .get_mut(operation_id)
+                .ok_or_else(|| OpsError::UnknownOperation {
+                    operation_id: operation_id.as_str().to_string(),
+                })?;
+        operation.status = status;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct OutboxEventId(String);
+
+impl OutboxEventId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutboxEvent {
+    pub event_id: OutboxEventId,
+    pub topic: String,
+    pub payload: serde_json::Value,
+    pub published: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TransactionalOutbox {
+    events: Arc<Mutex<HashMap<OutboxEventId, OutboxEvent>>>,
+}
+
+impl TransactionalOutbox {
+    pub async fn enqueue(&self, event: OutboxEvent) -> Result<(), OpsError> {
+        let mut events = self.events.lock().await;
+        if events.contains_key(&event.event_id) {
+            return Err(OpsError::DuplicateOutboxEvent);
+        }
+        events.insert(event.event_id.clone(), event);
+        Ok(())
+    }
+
+    pub async fn unpublished(&self) -> Vec<OutboxEvent> {
+        self.events
+            .lock()
+            .await
+            .values()
+            .filter(|event| !event.published)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn mark_published(&self, event_id: &OutboxEventId) -> Result<(), OpsError> {
+        let mut events = self.events.lock().await;
+        let event = events
+            .get_mut(event_id)
+            .ok_or(OpsError::UnknownOutboxEvent)?;
+        event.published = true;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceScheduler {
     inner: Arc<ServiceSchedulerInner>,
@@ -375,6 +540,14 @@ pub enum OpsError {
     ConfigWatchClosed,
     #[error("placement failed: {0}")]
     Placement(#[from] PlacementError),
+    #[error("duplicate operation {operation_id}")]
+    DuplicateOperation { operation_id: String },
+    #[error("unknown operation {operation_id}")]
+    UnknownOperation { operation_id: String },
+    #[error("duplicate outbox event")]
+    DuplicateOutboxEvent,
+    #[error("unknown outbox event")]
+    UnknownOutboxEvent,
 }
 
 #[cfg(test)]
@@ -510,5 +683,56 @@ mod tests {
             capacity: InstanceCapacity::default(),
             labels: BTreeMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn operation_tracker_models_retry_compensation_and_manual_repair() {
+        let tracker = OperationTracker::default();
+        let operation_id = OperationId::new("trade-1");
+
+        tracker.start(operation_id.clone()).await.unwrap();
+        tracker.mark_retrying(&operation_id, 1).await.unwrap();
+        assert_eq!(
+            tracker.get(&operation_id).await.unwrap().status,
+            OperationStatus::Retrying { attempts: 1 }
+        );
+
+        tracker
+            .mark_compensation_required(&operation_id, "debit applied but credit unknown")
+            .await
+            .unwrap();
+        assert!(matches!(
+            tracker.get(&operation_id).await.unwrap().status,
+            OperationStatus::CompensationRequired { .. }
+        ));
+
+        tracker
+            .mark_manual_required(&operation_id, "operator review")
+            .await
+            .unwrap();
+        assert!(matches!(
+            tracker.get(&operation_id).await.unwrap().status,
+            OperationStatus::ManualRequired { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn transactional_outbox_tracks_unpublished_events_idempotently() {
+        let outbox = TransactionalOutbox::default();
+        let event_id = OutboxEventId::new("event-1");
+        let event = OutboxEvent {
+            event_id: event_id.clone(),
+            topic: "game.world.player_entered".to_string(),
+            payload: json!({ "world_id": 1, "player_id": 1001 }),
+            published: false,
+        };
+
+        outbox.enqueue(event.clone()).await.unwrap();
+        let duplicate = outbox.enqueue(event).await;
+        assert!(matches!(duplicate, Err(OpsError::DuplicateOutboxEvent)));
+        assert_eq!(outbox.unpublished().await.len(), 1);
+
+        outbox.mark_published(&event_id).await.unwrap();
+        assert!(outbox.unpublished().await.is_empty());
     }
 }
