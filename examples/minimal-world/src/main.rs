@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,10 +13,15 @@ use lattice_core::{
     ActorId, ActorKey, ActorKeyDecodeError, ActorKind, Epoch, InstanceId, RouteKey, ServiceKind,
     TraceContext, actor_kind, service_kind,
 };
+use lattice_eventbus::{
+    EventBus, EventEnvelope, EventPublisher, EventSubscription, LocalEventBus, Subject,
+    SubjectFilter,
+};
 use lattice_gateway::{
     BinaryClientCodec, ClientCodec, ClientFrame, GatewayError, GatewayRouteTable,
     ProstClientMessageBinding,
 };
+use lattice_ops::{ConfigStore, LocalConfigStore, ServiceScheduler};
 use lattice_placement::{
     EndpointLease, EndpointPool, EndpointRpcTransport, ResolvingRpcCore, RouteCacheConfig,
     StaticPlacementConfig, StaticRouteRange, StaticRouteResolver,
@@ -25,6 +32,7 @@ use lattice_rpc::{
 };
 use prost::Message as ProstMessage;
 use serde::Deserialize;
+use serde_json::json;
 use tonic::{Request, Response};
 
 pub const WORLD_SERVICE: ServiceKind = service_kind!("World");
@@ -399,6 +407,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let client = WorldClient::new(core.clone());
 
+    let trace = TraceContext {
+        traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00".into()),
+        tracestate: None,
+    };
+    let events = LocalEventBus::new();
+    let event_count = Arc::new(AtomicUsize::new(0));
+    let event_count_clone = event_count.clone();
+    events
+        .subscribe(
+            EventSubscription::local(SubjectFilter::new("game.world.*")),
+            move |_event: EventEnvelope| {
+                let event_count = event_count_clone.clone();
+                async move {
+                    event_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        )
+        .await?;
+    let publisher = EventPublisher::new(events, WORLD_SERVICE, InstanceId::new("world-a"));
+
+    let scheduler = ServiceScheduler::new();
+    let scheduled_ticks = Arc::new(AtomicUsize::new(0));
+    let scheduled_ticks_clone = scheduled_ticks.clone();
+    scheduler
+        .interval(Duration::from_millis(config.tick_ms), move || {
+            let scheduled_ticks = scheduled_ticks_clone.clone();
+            async move {
+                scheduled_ticks.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+
+    let config_store = LocalConfigStore::default();
+    config_store
+        .put("world.tick_ms".to_string(), json!(config.tick_ms))
+        .await?;
+
     let direct_reply = world_a.call(EnterWorld { player_id: 1000 }).await?;
     let rpc_reply = client.enter_world(1, 1001).await?;
     let range_reply = client.enter_world(75, 2001).await?;
@@ -419,13 +465,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .decode_and_forward(decoded, core)
         .await?;
     let gateway_reply = EnterWorldReply::decode(gateway_reply_frame.payload.as_slice())?;
+    let event_id = publisher
+        .publish_bytes(
+            Subject::new("game.world.player_entered"),
+            "PlayerEntered",
+            vec![1, 100],
+            trace.clone(),
+        )
+        .await?;
 
     tokio::time::sleep(Duration::from_millis(config.tick_ms * 2)).await;
+    scheduler.shutdown().await;
     let snapshot_a = world_a.call(InspectWorld).await?;
     let snapshot_b = world_b.call(InspectWorld).await?;
+    let configured_tick = config_store.get("world.tick_ms").await?;
 
     println!(
-        "{}:{} direct_ok={} rpc_ok={} range_ok={} gateway_ok={} services={} routes={} placement_lookups={} players_a={} players_b={} ticks_a={} ticks_b={} last_rpc_request_id={}",
+        "{}:{} direct_ok={} rpc_ok={} range_ok={} gateway_ok={} services={} routes={} placement_lookups={} players_a={} players_b={} ticks_a={} ticks_b={} events={} scheduled={} config_tick={} trace={} event_id={} last_rpc_request_id={}",
         WORLD_SERVICE.as_str(),
         WORLD_ACTOR.as_str(),
         direct_reply.ok,
@@ -439,6 +495,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot_b.player_count,
         snapshot_a.total_ticks,
         snapshot_b.total_ticks,
+        event_count.load(Ordering::SeqCst),
+        scheduled_ticks.load(Ordering::SeqCst),
+        configured_tick.unwrap_or_default(),
+        trace.traceparent.as_deref().unwrap_or("<missing>"),
+        event_id.as_str(),
         snapshot_a
             .last_rpc_request_id
             .as_deref()
