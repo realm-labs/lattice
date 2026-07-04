@@ -11,6 +11,7 @@ lattice-actor.workspace = true
 lattice-config.workspace = true
 lattice-core.workspace = true
 lattice-gateway.workspace = true
+lattice-placement.workspace = true
 lattice-rpc.workspace = true
 prost.workspace = true
 serde.workspace = true

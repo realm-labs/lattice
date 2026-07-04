@@ -450,6 +450,7 @@ dependencies = [
  "lattice-config",
  "lattice-core",
  "lattice-gateway",
+ "lattice-placement",
  "lattice-rpc",
  "prost",
  "serde",

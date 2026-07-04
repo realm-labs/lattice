@@ -15,10 +15,13 @@ use lattice_gateway::{
     BinaryClientCodec, ClientCodec, ClientFrame, GatewayError, GatewayRouteTable,
     ProstClientMessageBinding,
 };
+use lattice_placement::{
+    EndpointLease, EndpointPool, EndpointRpcTransport, ResolvingRpcCore, RouteCacheConfig,
+    StaticPlacementConfig, StaticRouteRange, StaticRouteResolver,
+};
 use lattice_rpc::{
-    ActorRpcAdapter, MetadataInjectingRpcCore, RouteTarget, RoutedRequest, Rpc,
-    RpcClientContextFactory, RpcError, RpcRequest, RpcServerBuilder, ShardedRpcCore,
-    TypedRpcClient, UnaryRpcTransport,
+    ActorRpcAdapter, RouteTarget, RoutedRequest, Rpc, RpcClientContextFactory, RpcError,
+    RpcRequest, RpcServerBuilder, ShardedRpcCore, TypedRpcClient,
 };
 use prost::Message as ProstMessage;
 use serde::Deserialize;
@@ -212,15 +215,24 @@ impl Handler<InspectWorld> for WorldActor {
 
 #[derive(Clone)]
 struct LocalWorldTransport {
-    adapter: ActorRpcAdapter<WorldActor>,
+    adapters: HashMap<InstanceId, ActorRpcAdapter<WorldActor>>,
 }
 
 #[async_trait]
-impl UnaryRpcTransport for LocalWorldTransport {
-    async fn unary<Req>(&self, request: Request<Req>) -> Result<Response<Req::Reply>, RpcError>
+impl EndpointRpcTransport for LocalWorldTransport {
+    async fn unary<Req>(
+        &self,
+        _endpoint: EndpointLease,
+        target: RouteTarget,
+        request: Request<Req>,
+    ) -> Result<Response<Req::Reply>, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
     {
+        let adapter = self
+            .adapters
+            .get(&target.instance_id)
+            .ok_or_else(|| RpcError::Business("missing local adapter".to_string()))?;
         let metadata = request.metadata().clone();
         let request_bytes = request.into_inner().encode_to_vec();
         let mut actor_request = Request::new(
@@ -229,8 +241,7 @@ impl UnaryRpcTransport for LocalWorldTransport {
         );
         *actor_request.metadata_mut() = metadata;
 
-        let reply = self
-            .adapter
+        let reply = adapter
             .unary(actor_request)
             .await
             .map(Response::into_inner)
@@ -295,7 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .load()?
             .section("world")?;
     let runtime = ActorRuntime::default();
-    let world = runtime
+    let world_a = runtime
         .spawn_actor(
             WorldActor {
                 world_id: WorldId(1),
@@ -309,20 +320,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
+    let world_b = runtime
+        .spawn_actor(
+            WorldActor {
+                world_id: WorldId(75),
+                tick_ms: config.tick_ms,
+                players: HashMap::new(),
+                last_rpc_request_id: None,
+            },
+            ActorSpawnOptions {
+                mailbox: MailboxConfig::bounded(config.mailbox_capacity),
+                ..ActorSpawnOptions::default()
+            },
+        )
+        .await?;
 
-    let endpoint = "http://world-0.world:18080".parse()?;
-    let target = RouteTarget {
+    let target_a = RouteTarget {
         service_kind: WORLD_SERVICE,
-        instance_id: InstanceId::new("world-0"),
-        advertised_endpoint: endpoint,
+        instance_id: InstanceId::new("world-a"),
+        advertised_endpoint: "http://world-a.world:18080".parse()?,
+        owner_epoch: Some(Epoch(1)),
+    };
+    let target_b = RouteTarget {
+        service_kind: WORLD_SERVICE,
+        instance_id: InstanceId::new("world-b"),
+        advertised_endpoint: "http://world-b.world:18080".parse()?,
         owner_epoch: Some(Epoch(1)),
     };
     let mut rpc_server = RpcServerBuilder::new();
-    rpc_server.add_service("WorldRpc", target.clone())?;
-    rpc_server.add_service("WorldAdminRpc", target)?;
+    rpc_server.add_service("WorldRpc", target_a.clone())?;
+    rpc_server.add_service("WorldAdminRpc", target_a.clone())?;
 
+    let resolver = StaticRouteResolver::new(
+        StaticPlacementConfig {
+            ranges: vec![
+                StaticRouteRange {
+                    service_kind: WORLD_SERVICE,
+                    actor_kind: WORLD_ACTOR,
+                    start_inclusive: 0,
+                    end_exclusive: 50,
+                    target: target_a,
+                },
+                StaticRouteRange {
+                    service_kind: WORLD_SERVICE,
+                    actor_kind: WORLD_ACTOR,
+                    start_inclusive: 50,
+                    end_exclusive: 100,
+                    target: target_b,
+                },
+            ],
+        },
+        RouteCacheConfig::default(),
+    );
     let transport = LocalWorldTransport {
-        adapter: ActorRpcAdapter::new(world.clone()).with_owner_epoch(Epoch(1)),
+        adapters: HashMap::from([
+            (
+                InstanceId::new("world-a"),
+                ActorRpcAdapter::new(world_a.clone()).with_owner_epoch(Epoch(1)),
+            ),
+            (
+                InstanceId::new("world-b"),
+                ActorRpcAdapter::new(world_b.clone()).with_owner_epoch(Epoch(1)),
+            ),
+        ]),
     };
     let context_factory =
         RpcClientContextFactory::new(service_kind!("Player"), InstanceId::new("player-0"))
@@ -330,11 +390,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00".into()),
                 tracestate: None,
             });
-    let core = MetadataInjectingRpcCore::new(transport, context_factory).with_route_epoch(Epoch(1));
+    let core = ResolvingRpcCore::new(
+        WORLD_SERVICE,
+        resolver.clone(),
+        EndpointPool::new(),
+        context_factory,
+        transport,
+    );
     let client = WorldClient::new(core.clone());
 
-    let direct_reply = world.call(EnterWorld { player_id: 1000 }).await?;
+    let direct_reply = world_a.call(EnterWorld { player_id: 1000 }).await?;
     let rpc_reply = client.enter_world(1, 1001).await?;
+    let range_reply = client.enter_world(75, 2001).await?;
 
     let mut route_table = GatewayRouteTable::new();
     register_gateway_routes(&mut route_table)?;
@@ -354,20 +421,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gateway_reply = EnterWorldReply::decode(gateway_reply_frame.payload.as_slice())?;
 
     tokio::time::sleep(Duration::from_millis(config.tick_ms * 2)).await;
-    let snapshot = world.call(InspectWorld).await?;
+    let snapshot_a = world_a.call(InspectWorld).await?;
+    let snapshot_b = world_b.call(InspectWorld).await?;
 
     println!(
-        "{}:{} direct_ok={} rpc_ok={} gateway_ok={} services={} routes={} players={} ticks={} last_rpc_request_id={}",
+        "{}:{} direct_ok={} rpc_ok={} range_ok={} gateway_ok={} services={} routes={} placement_lookups={} players_a={} players_b={} ticks_a={} ticks_b={} last_rpc_request_id={}",
         WORLD_SERVICE.as_str(),
         WORLD_ACTOR.as_str(),
         direct_reply.ok,
         rpc_reply.ok,
+        range_reply.ok,
         gateway_reply.ok,
         rpc_server.services().len(),
         usize::from(route_table.get(100).is_some()),
-        snapshot.player_count,
-        snapshot.total_ticks,
-        snapshot
+        resolver.placement_lookups(),
+        snapshot_a.player_count,
+        snapshot_b.player_count,
+        snapshot_a.total_ticks,
+        snapshot_b.total_ticks,
+        snapshot_a
             .last_rpc_request_id
             .as_deref()
             .unwrap_or("<missing>")
