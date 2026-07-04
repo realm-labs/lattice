@@ -10,7 +10,7 @@ use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
-use lattice_core::{ActorKind, InstanceId, ServiceKind};
+use lattice_core::{ActorKind, InstanceId, ServiceKind, TraceContext};
 use lattice_placement::{ActorPlacementRecord, InstanceRecord, PlacementError, PlacementStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
@@ -148,6 +148,68 @@ pub struct OutboxEvent {
 #[derive(Debug, Default, Clone)]
 pub struct TransactionalOutbox {
     events: Arc<Mutex<HashMap<OutboxEventId, OutboxEvent>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum TraceSpanKind {
+    Rpc,
+    EventBus,
+    Scheduler,
+    ActorHandler,
+    Admin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TraceSpan {
+    pub name: String,
+    pub kind: TraceSpanKind,
+    pub context: TraceContext,
+    pub links: Vec<TraceContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MetricSample {
+    pub name: String,
+    pub value: u64,
+    pub labels: HashMap<String, String>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TelemetryRecorder {
+    spans: Arc<Mutex<Vec<TraceSpan>>>,
+    metrics: Arc<Mutex<Vec<MetricSample>>>,
+}
+
+impl TelemetryRecorder {
+    pub async fn record_span(&self, span: TraceSpan) {
+        self.spans.lock().await.push(span);
+    }
+
+    pub async fn record_metric(&self, sample: MetricSample) -> Result<(), OpsError> {
+        validate_metric_labels(&sample.labels)?;
+        self.metrics.lock().await.push(sample);
+        Ok(())
+    }
+
+    pub async fn spans(&self) -> Vec<TraceSpan> {
+        self.spans.lock().await.clone()
+    }
+
+    pub async fn metrics(&self) -> Vec<MetricSample> {
+        self.metrics.lock().await.clone()
+    }
+}
+
+fn validate_metric_labels(labels: &HashMap<String, String>) -> Result<(), OpsError> {
+    const DISALLOWED: &[&str] = &["actor_id", "request_id", "event_id", "session_id"];
+    for label in DISALLOWED {
+        if labels.contains_key(*label) {
+            return Err(OpsError::HighCardinalityMetricLabel {
+                label: (*label).to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl TransactionalOutbox {
@@ -548,6 +610,8 @@ pub enum OpsError {
     DuplicateOutboxEvent,
     #[error("unknown outbox event")]
     UnknownOutboxEvent,
+    #[error("metric label {label} is too high-cardinality")]
+    HighCardinalityMetricLabel { label: String },
 }
 
 #[cfg(test)]
@@ -734,5 +798,49 @@ mod tests {
 
         outbox.mark_published(&event_id).await.unwrap();
         assert!(outbox.unpublished().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn telemetry_records_span_links_and_rejects_high_cardinality_metric_labels() {
+        let telemetry = TelemetryRecorder::default();
+        let trace = TraceContext {
+            traceparent: Some("trace-a".to_string()),
+            tracestate: None,
+        };
+        let linked = TraceContext {
+            traceparent: Some("trace-b".to_string()),
+            tracestate: None,
+        };
+
+        telemetry
+            .record_span(TraceSpan {
+                name: "event fanout".to_string(),
+                kind: TraceSpanKind::EventBus,
+                context: trace.clone(),
+                links: vec![linked.clone()],
+            })
+            .await;
+        telemetry
+            .record_metric(MetricSample {
+                name: "actor_mailbox_depth".to_string(),
+                value: 4,
+                labels: HashMap::from([("actor_kind".to_string(), "World".to_string())]),
+            })
+            .await
+            .unwrap();
+        let bad_metric = telemetry
+            .record_metric(MetricSample {
+                name: "rpc_latency".to_string(),
+                value: 10,
+                labels: HashMap::from([("request_id".to_string(), "req-1".to_string())]),
+            })
+            .await;
+
+        assert_eq!(telemetry.spans().await[0].links, vec![linked]);
+        assert_eq!(telemetry.metrics().await.len(), 1);
+        assert!(matches!(
+            bad_metric,
+            Err(OpsError::HighCardinalityMetricLabel { .. })
+        ));
     }
 }
