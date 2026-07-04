@@ -368,6 +368,7 @@ dependencies = [
  "lattice-core",
  "prost",
  "thiserror",
+ "tokio",
  "tonic",
 ]
 

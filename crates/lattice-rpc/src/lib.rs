@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use http::Uri;
-use lattice_actor::Message;
+use lattice_actor::{Actor, ActorCallError, ActorHandle, Handler, Message};
 use lattice_core::{ActorKind, Epoch, InstanceId, RequestId, RouteKey, ServiceKind, TraceContext};
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
+use tonic::{Request, Response, Status};
 
 const REQUEST_ID: &str = "lattice-request-id";
 const ROUTE_EPOCH: &str = "lattice-route-epoch";
@@ -94,6 +95,49 @@ pub struct RouteTarget {
     pub owner_epoch: Option<Epoch>,
 }
 
+#[derive(Clone)]
+pub struct ActorRpcAdapter<A: Actor> {
+    handle: ActorHandle<A>,
+    owner_epoch: Option<Epoch>,
+}
+
+impl<A: Actor> ActorRpcAdapter<A> {
+    pub fn new(handle: ActorHandle<A>) -> Self {
+        Self {
+            handle,
+            owner_epoch: None,
+        }
+    }
+
+    pub fn with_owner_epoch(mut self, owner_epoch: Epoch) -> Self {
+        self.owner_epoch = Some(owner_epoch);
+        self
+    }
+
+    pub async fn unary<Req>(&self, request: Request<Req>) -> Result<Response<Req::Reply>, Status>
+    where
+        A: Handler<Rpc<Req>>,
+        Req: RoutedRequest + RpcRequest,
+    {
+        let ctx = RpcContext::from_metadata(request.metadata()).map_err(metadata_status)?;
+        if let (Some(expected), Some(actual)) = (ctx.route_epoch, self.owner_epoch)
+            && expected != actual
+        {
+            return Err(Status::failed_precondition("route epoch mismatch"));
+        }
+
+        let req = request.into_inner();
+        let _actor_kind = req.actor_kind();
+        let _route_key = req.route_key();
+        let reply = self
+            .handle
+            .call(Rpc { req, ctx })
+            .await
+            .map_err(actor_call_status)?;
+        Ok(Response::new(reply))
+    }
+}
+
 pub trait RoutedRequest {
     fn actor_kind(&self) -> ActorKind;
     fn route_key(&self) -> RouteKey;
@@ -169,8 +213,24 @@ fn optional_ascii(
         .transpose()
 }
 
+fn metadata_status(error: RpcMetadataError) -> Status {
+    Status::invalid_argument(error.to_string())
+}
+
+fn actor_call_status(error: ActorCallError) -> Status {
+    match error {
+        ActorCallError::MailboxFull => Status::resource_exhausted(error.to_string()),
+        ActorCallError::MailboxClosed | ActorCallError::ResponseDropped => {
+            Status::unavailable(error.to_string())
+        }
+        ActorCallError::Handler(_) => Status::internal(error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use lattice_actor::{ActorContext, ActorError, ActorRuntime, ActorSpawnOptions};
     use lattice_core::{actor_kind, service_kind};
 
     use super::*;
@@ -200,6 +260,25 @@ mod tests {
     impl RpcRequest for EnterWorldRequest {
         type Reply = EnterWorldReply;
         const METHOD: &'static str = "world.WorldRpc/EnterWorld";
+    }
+
+    struct WorldActor;
+
+    #[async_trait]
+    impl Actor for WorldActor {}
+
+    #[async_trait]
+    impl Handler<Rpc<EnterWorldRequest>> for WorldActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            msg: Rpc<EnterWorldRequest>,
+        ) -> Result<EnterWorldReply, ActorError> {
+            assert_eq!(msg.ctx.request_id.as_str(), "req-1");
+            Ok(EnterWorldReply {
+                ok: msg.req.world_id == 9,
+            })
+        }
     }
 
     #[test]
@@ -246,5 +325,52 @@ mod tests {
     #[test]
     fn rpc_wrapper_is_actor_message_for_rpc_request() {
         assert_actor_message::<Rpc<EnterWorldRequest>>();
+    }
+
+    #[tokio::test]
+    async fn actor_rpc_adapter_converts_tonic_request_into_actor_call() {
+        let runtime = ActorRuntime::default();
+        let handle = runtime
+            .spawn_actor(WorldActor, ActorSpawnOptions::default())
+            .await
+            .unwrap();
+        let adapter = ActorRpcAdapter::new(handle).with_owner_epoch(Epoch(7));
+        let mut request = Request::new(EnterWorldRequest { world_id: 9 });
+        test_context(Some(Epoch(7)))
+            .inject_metadata(request.metadata_mut())
+            .unwrap();
+
+        let response = adapter.unary(request).await.unwrap().into_inner();
+
+        assert!(response.ok);
+    }
+
+    #[tokio::test]
+    async fn actor_rpc_adapter_rejects_stale_route_epoch_before_handler() {
+        let runtime = ActorRuntime::default();
+        let handle = runtime
+            .spawn_actor(WorldActor, ActorSpawnOptions::default())
+            .await
+            .unwrap();
+        let adapter = ActorRpcAdapter::new(handle).with_owner_epoch(Epoch(8));
+        let mut request = Request::new(EnterWorldRequest { world_id: 9 });
+        test_context(Some(Epoch(7)))
+            .inject_metadata(request.metadata_mut())
+            .unwrap();
+
+        let status = adapter.unary(request).await.unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    fn test_context(route_epoch: Option<Epoch>) -> RpcContext {
+        RpcContext {
+            request_id: RequestId::new("req-1"),
+            route_epoch,
+            source_service: service_kind!("World"),
+            source_instance: InstanceId::new("world-0"),
+            trace: TraceContext::default(),
+            auth: None,
+        }
     }
 }

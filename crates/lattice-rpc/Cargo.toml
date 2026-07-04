@@ -13,3 +13,6 @@ lattice-core.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 tonic.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
