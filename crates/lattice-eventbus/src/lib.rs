@@ -1,3 +1,5 @@
+mod nats;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -7,6 +9,8 @@ use async_trait::async_trait;
 use lattice_core::{ActorId, ActorKind, InstanceId, RequestId, ServiceKind, TraceContext};
 use lattice_rpc::{RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 use tokio::sync::Mutex;
+
+pub use nats::{InMemoryNatsClient, NatsEventBus};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subject(String);
@@ -62,6 +66,13 @@ impl EventSubscription {
             durable_name: None,
         }
     }
+
+    pub fn durable(filter: SubjectFilter, durable_name: impl Into<String>) -> Self {
+        Self {
+            filter,
+            durable_name: Some(durable_name.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +83,7 @@ impl SubjectFilter {
         Self(value.into())
     }
 
-    fn matches(&self, subject: &Subject) -> bool {
+    pub(crate) fn matches(&self, subject: &Subject) -> bool {
         if self.0 == subject.0 {
             return true;
         }
