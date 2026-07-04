@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shard_worker_system_mailbox_keeps_priority_over_normal_mailbox() {
+    async fn keyed_worker_pool_system_mailbox_keeps_priority_over_normal_mailbox() {
         let runtime = ActorRuntime::default();
         let events = Arc::new(Mutex::new(Vec::new()));
         let start_gate = Arc::new(Semaphore::new(0));
@@ -268,7 +268,7 @@ mod tests {
                 },
                 ActorSpawnOptions {
                     mailbox: MailboxConfig::bounded(8),
-                    execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 2 }),
+                    execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 }),
                     scheduler_key: None,
                     passivation: PassivationPolicy::Disabled,
                 },

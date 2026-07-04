@@ -1,4 +1,4 @@
-use std::any::type_name;
+use std::any::{TypeId, type_name};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +23,7 @@ static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorExecutionPolicy {
     TaskPerActor,
-    ShardWorker { worker_count: usize },
+    KeyedWorkerPool { worker_count: usize },
     DedicatedThreadPool { worker_count: usize },
 }
 
@@ -124,18 +124,24 @@ impl Default for ActorScheduler {
 
 #[derive(Default)]
 struct SchedulerPools {
-    shard_workers: Mutex<HashMap<usize, Arc<ActorWorkerPool>>>,
-    dedicated_workers: Mutex<HashMap<usize, Arc<ActorWorkerPool>>>,
+    keyed_workers: Mutex<HashMap<usize, Arc<ActorWorkerPool>>>,
+    dedicated_workers: Mutex<HashMap<DedicatedPoolKey, Arc<ActorWorkerPool>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DedicatedPoolKey {
+    actor_type: TypeId,
+    worker_count: usize,
 }
 
 impl ActorScheduler {
-    pub fn shard_worker_index(
+    pub fn keyed_worker_index(
         actor_id: &ActorId,
         worker_count: usize,
     ) -> Result<usize, crate::ActorSpawnError> {
         if worker_count == 0 {
             return Err(crate::ActorSpawnError::InvalidExecutionPolicy {
-                reason: "ShardWorker worker_count must be greater than zero",
+                reason: "KeyedWorkerPool worker_count must be greater than zero",
             });
         }
         Ok((stable_actor_id_hash(actor_id) % worker_count as u64) as usize)
@@ -152,13 +158,13 @@ impl ActorScheduler {
     {
         match execution {
             ActorExecutionPolicy::TaskPerActor => Ok(spawn_task_per_actor(actor, options)),
-            ActorExecutionPolicy::ShardWorker { worker_count } => {
+            ActorExecutionPolicy::KeyedWorkerPool { worker_count } => {
                 if worker_count == 0 {
                     return Err(crate::ActorSpawnError::InvalidExecutionPolicy {
-                        reason: "ShardWorker worker_count must be greater than zero",
+                        reason: "KeyedWorkerPool worker_count must be greater than zero",
                     });
                 }
-                self.spawn_shard_worker_actor(actor, options, worker_count)
+                self.spawn_keyed_worker_pool_actor(actor, options, worker_count)
             }
             ActorExecutionPolicy::DedicatedThreadPool { worker_count } => {
                 if worker_count == 0 {
@@ -171,7 +177,7 @@ impl ActorScheduler {
         }
     }
 
-    fn spawn_shard_worker_actor<A>(
+    fn spawn_keyed_worker_pool_actor<A>(
         &self,
         actor: A,
         options: ActorSpawnOptions,
@@ -180,19 +186,19 @@ impl ActorScheduler {
     where
         A: Actor,
     {
-        let pool = self.worker_pool(WorkerPoolKind::Shard, worker_count)?;
+        let pool = self.keyed_worker_pool(worker_count)?;
         let parts = create_actor_parts(options.mailbox);
         let scheduler_key = options
             .scheduler_key
             .unwrap_or_else(|| ActorId::U64(parts.handle.local_ref().id()));
-        let worker_index = Self::shard_worker_index(&scheduler_key, worker_count)?;
+        let worker_index = Self::keyed_worker_index(&scheduler_key, worker_count)?;
         Ok(spawn_actor_on_pool(
             actor,
             parts,
             options.passivation,
             &pool,
             worker_index,
-            "shard_worker",
+            "keyed_worker_pool",
         ))
     }
 
@@ -205,7 +211,7 @@ impl ActorScheduler {
     where
         A: Actor,
     {
-        let pool = self.worker_pool(WorkerPoolKind::Dedicated, worker_count)?;
+        let pool = self.dedicated_worker_pool::<A>(worker_count)?;
         let worker_index = pool.next_worker_index();
         Ok(spawn_actor_on_pool(
             actor,
@@ -217,37 +223,68 @@ impl ActorScheduler {
         ))
     }
 
-    fn worker_pool(
+    fn keyed_worker_pool(
         &self,
-        kind: WorkerPoolKind,
         worker_count: usize,
     ) -> Result<Arc<ActorWorkerPool>, crate::ActorSpawnError> {
-        let pools = match kind {
-            WorkerPoolKind::Shard => &self.pools.shard_workers,
-            WorkerPoolKind::Dedicated => &self.pools.dedicated_workers,
-        };
-        let mut pools = pools.lock().expect("actor worker pool mutex poisoned");
+        let mut pools = self
+            .pools
+            .keyed_workers
+            .lock()
+            .expect("actor worker pool mutex poisoned");
         if let Some(pool) = pools.get(&worker_count) {
             return Ok(pool.clone());
         }
 
-        let pool = Arc::new(ActorWorkerPool::start(kind, worker_count)?);
+        let pool = Arc::new(ActorWorkerPool::start(WorkerPoolKind::Keyed, worker_count)?);
         pools.insert(worker_count, pool.clone());
+        Ok(pool)
+    }
+
+    fn dedicated_worker_pool<A>(
+        &self,
+        worker_count: usize,
+    ) -> Result<Arc<ActorWorkerPool>, crate::ActorSpawnError>
+    where
+        A: Actor,
+    {
+        let key = DedicatedPoolKey {
+            actor_type: TypeId::of::<A>(),
+            worker_count,
+        };
+        let mut pools = self
+            .pools
+            .dedicated_workers
+            .lock()
+            .expect("actor worker pool mutex poisoned");
+        if let Some(pool) = pools.get(&key) {
+            return Ok(pool.clone());
+        }
+
+        let pool = Arc::new(ActorWorkerPool::start(
+            WorkerPoolKind::Dedicated {
+                actor_type: type_name::<A>(),
+            },
+            worker_count,
+        )?);
+        pools.insert(key, pool.clone());
         Ok(pool)
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum WorkerPoolKind {
-    Shard,
-    Dedicated,
+    Keyed,
+    Dedicated { actor_type: &'static str },
 }
 
 impl WorkerPoolKind {
-    fn thread_name(self) -> &'static str {
+    fn thread_name(self, worker_index: usize) -> String {
         match self {
-            Self::Shard => "lattice-shard-worker",
-            Self::Dedicated => "lattice-dedicated-worker",
+            Self::Keyed => format!("lattice-keyed-worker-{worker_index}"),
+            Self::Dedicated { actor_type } => {
+                format!("lattice-dedicated-worker-{worker_index}-{actor_type}")
+            }
         }
     }
 }
@@ -308,9 +345,8 @@ impl ActorWorker {
     fn start(kind: WorkerPoolKind, worker_index: usize) -> Result<Self, crate::ActorSpawnError> {
         let (handle_tx, handle_rx) = std_mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let thread_name = format!("{}-{}", kind.thread_name(), worker_index);
         let join_handle = std::thread::Builder::new()
-            .name(thread_name)
+            .name(kind.thread_name(worker_index))
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()

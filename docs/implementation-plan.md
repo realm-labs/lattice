@@ -271,7 +271,7 @@ virtual shard assignment
 VirtualShardAssigner trait + default assigners
 VirtualShardAssignerRegistry by stable name
 virtual shard gradual rebalance
-ActorExecutionPolicy::ShardWorker implementation
+ActorExecutionPolicy::KeyedWorkerPool implementation
 lightweight actor lazy activation
 ActorFactory/ActorLoader lifecycle
 in-memory/static instance registry until etcd phase
@@ -281,9 +281,9 @@ Acceptance:
 
 ```text
 actor_id routes to a shard owner.
-ShardWorker execution policy can run multiple lightweight actors on a bounded worker set.
-ShardWorker maps actor identity deterministically to a worker through ActorSpawnOptions::scheduler_key.
-ShardWorker preserves the same mailbox and Handler<M> semantics as TaskPerActor.
+KeyedWorkerPool execution policy can run multiple lightweight actors on a bounded worker set.
+KeyedWorkerPool maps scheduler_key deterministically to a worker.
+KeyedWorkerPool preserves the same mailbox and Handler<M> semantics as TaskPerActor.
 Target instance lazy-loads actor on registry miss.
 Concurrent lazy activation starts only one local actor.
 Business ActorLoader failure has explicit error behavior.
@@ -299,8 +299,8 @@ virtual shard owner lookup
 virtual shard assigner trait/default implementation
 assigner deterministic plan
 virtual shard gradual rebalance
-ShardWorker deterministic actor-to-worker mapping test
-ShardWorker mailbox ordering and system priority test
+KeyedWorkerPool deterministic actor-to-worker mapping test
+KeyedWorkerPool mailbox ordering and system priority test
 local lazy activation race
 business actor loader/saver lifecycle
 stop/save failure enters StopFailed and blocks passivation/drain
@@ -792,7 +792,7 @@ The whole goal can be marked complete only when:
 [ ] This file's global acceptance checklist is fully satisfied.
 [ ] architecture/00-overview.md system boundaries and module responsibilities are implemented.
 [ ] architecture/01-actor-runtime.md actor runtime capabilities are implemented and tested.
-[ ] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, ShardWorker, and DedicatedThreadPool.
+[ ] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, KeyedWorkerPool, and DedicatedThreadPool.
 [ ] UnsupportedExecutionPolicy is used only for invalid configuration, not for planned policies in the completed framework.
 [ ] architecture/02-rpc.md typed RPC, metadata, codegen, and gateway decode/forward are implemented and tested.
 [ ] architecture/03-placement.md placement, scale, drain, shutdown, crash, and watch are implemented and tested.

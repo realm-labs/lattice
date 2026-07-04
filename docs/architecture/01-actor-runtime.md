@@ -105,7 +105,7 @@ The public scheduling API shape is:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorExecutionPolicy {
     TaskPerActor,
-    ShardWorker { worker_count: usize },
+    KeyedWorkerPool { worker_count: usize },
     DedicatedThreadPool { worker_count: usize },
 }
 
@@ -148,16 +148,19 @@ TaskPerActor:
   One managed Tokio task owns one actor mailbox loop.
   This is the default for explicit actors, local child actors, and early runtime implementation.
 
-ShardWorker:
+KeyedWorkerPool:
   A fixed worker set owns many actor mailbox loops on lattice-managed worker runtimes.
-  Actor identity maps deterministically to a worker through ActorSpawnOptions::scheduler_key.
+  The scheduler_key maps deterministically to a worker.
   If scheduler_key is not provided, the runtime falls back to the local actor id, which is acceptable only for local helper actors.
-  This is intended for virtual-shard actors after Phase 4, where task count and locality matter.
+  This is useful for stable affinity, cache locality, and predictable distribution without claiming to be a full shard scheduler.
 
 DedicatedThreadPool:
   A named pool for actors that must be isolated from normal Tokio worker threads.
+  The pool is scoped by actor Rust type and worker_count.
+  Actors of the same type reuse that type's dedicated worker pool.
+  Different actor types do not share a dedicated worker pool unless a future explicit named-pool API is added.
   A pool worker can run many actor mailbox loops; this is not one OS thread per actor.
-  Actors are assigned across the pool, currently by round-robin.
+  Actors of the same type are assigned across the pool, currently by round-robin.
   This is for blocking-heavy or CPU-heavy actor families only when they cannot offload work elsewhere.
 ```
 
@@ -172,7 +175,7 @@ CPU-heavy or blocking work must not run directly on Tokio worker threads; use a 
 ActorRegistry stores actor ownership independently from the concrete execution policy.
 Mailbox semantics are identical across execution policies.
 Changing execution policy must not change Handler<M> business code.
-Shared/placed actors should pass a stable scheduler_key derived from ActorId when using ShardWorker.
+Shared/placed actors should pass a stable scheduler_key derived from ActorId when using KeyedWorkerPool.
 ```
 
 Forbidden implementation shortcuts:
@@ -182,7 +185,7 @@ Do not expose tokio::spawn as the actor spawn API.
 Do not make ActorHandle depend on Tokio JoinHandle.
 Do not let each actor kind invent its own scheduling path.
 Do not encode execution policy into business Handler<M> bounds.
-Do not add ShardWorker/DedicatedThreadPool behavior before TaskPerActor semantics are tested.
+Do not add KeyedWorkerPool/DedicatedThreadPool behavior before TaskPerActor semantics are tested.
 ```
 
 This keeps the first version simple while fixing the final scheduling boundary: lattice owns actor scheduling; Tokio is only the first backing executor.

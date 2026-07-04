@@ -25,8 +25,13 @@ struct TestActor {
     events: Arc<Mutex<Vec<&'static str>>>,
 }
 
+struct OtherActor;
+
 #[async_trait]
 impl Actor for TestActor {}
+
+#[async_trait]
+impl Actor for OtherActor {}
 
 #[async_trait]
 impl Handler<Ping> for TestActor {
@@ -42,6 +47,17 @@ impl Handler<Ping> for TestActor {
 
 #[async_trait]
 impl Handler<CurrentThread> for TestActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _msg: CurrentThread,
+    ) -> Result<String, ActorError> {
+        Ok(format!("{:?}", std::thread::current().id()))
+    }
+}
+
+#[async_trait]
+impl Handler<CurrentThread> for OtherActor {
     async fn handle(
         &mut self,
         _ctx: &mut ActorContext<Self>,
@@ -77,7 +93,7 @@ async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
 }
 
 #[tokio::test]
-async fn shard_worker_execution_policy_runs_actor_with_same_mailbox_semantics() {
+async fn keyed_worker_pool_execution_policy_runs_actor_with_same_mailbox_semantics() {
     let runtime = ActorRuntime::default();
     let events = Arc::new(Mutex::new(Vec::new()));
     let handle = runtime
@@ -87,7 +103,7 @@ async fn shard_worker_execution_policy_runs_actor_with_same_mailbox_semantics() 
             },
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 4 }),
+                execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 4 }),
                 scheduler_key: Some(ActorId::U64(42)),
                 passivation: PassivationPolicy::Disabled,
             },
@@ -111,7 +127,7 @@ async fn execution_policies_reject_zero_workers() {
             },
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 0 }),
+                execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 0 }),
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
             },
@@ -180,7 +196,7 @@ async fn dedicated_thread_pool_reuses_configured_worker_threads() {
 }
 
 #[tokio::test]
-async fn shard_worker_uses_scheduler_key_for_worker_affinity() {
+async fn dedicated_thread_pool_is_scoped_by_actor_type() {
     let runtime = ActorRuntime::default();
     let first = runtime
         .spawn_actor(
@@ -189,7 +205,43 @@ async fn shard_worker_uses_scheduler_key_for_worker_affinity() {
             },
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 2 }),
+                execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
+                scheduler_key: None,
+                passivation: PassivationPolicy::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+    let second = runtime
+        .spawn_actor(
+            OtherActor,
+            ActorSpawnOptions {
+                mailbox: MailboxConfig::bounded(8),
+                execution: Some(ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 }),
+                scheduler_key: None,
+                passivation: PassivationPolicy::Disabled,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        first.call(CurrentThread).await.unwrap(),
+        second.call(CurrentThread).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
+    let runtime = ActorRuntime::default();
+    let first = runtime
+        .spawn_actor(
+            TestActor {
+                events: Arc::new(Mutex::new(Vec::new())),
+            },
+            ActorSpawnOptions {
+                mailbox: MailboxConfig::bounded(8),
+                execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 }),
                 scheduler_key: Some(ActorId::Str("same-key".to_string())),
                 passivation: PassivationPolicy::Disabled,
             },
@@ -203,7 +255,7 @@ async fn shard_worker_uses_scheduler_key_for_worker_affinity() {
             },
             ActorSpawnOptions {
                 mailbox: MailboxConfig::bounded(8),
-                execution: Some(ActorExecutionPolicy::ShardWorker { worker_count: 2 }),
+                execution: Some(ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 }),
                 scheduler_key: Some(ActorId::Str("same-key".to_string())),
                 passivation: PassivationPolicy::Disabled,
             },
@@ -218,12 +270,12 @@ async fn shard_worker_uses_scheduler_key_for_worker_affinity() {
 }
 
 #[test]
-fn shard_worker_maps_actor_identity_deterministically_to_worker() {
+fn keyed_worker_pool_maps_actor_identity_deterministically_to_worker() {
     let actor_id = ActorId::U64(42);
 
-    let first = ActorScheduler::shard_worker_index(&actor_id, 8).unwrap();
-    let second = ActorScheduler::shard_worker_index(&actor_id, 8).unwrap();
-    let zero = ActorScheduler::shard_worker_index(&actor_id, 0);
+    let first = ActorScheduler::keyed_worker_index(&actor_id, 8).unwrap();
+    let second = ActorScheduler::keyed_worker_index(&actor_id, 8).unwrap();
+    let zero = ActorScheduler::keyed_worker_index(&actor_id, 0);
 
     assert_eq!(first, second);
     assert!(first < 8);
