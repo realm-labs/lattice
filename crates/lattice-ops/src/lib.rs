@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Query, State};
@@ -13,7 +12,14 @@ use axum::routing::get;
 use lattice_core::{ActorKind, InstanceId, ServiceKind, TraceContext};
 use lattice_placement::{ActorPlacementRecord, InstanceRecord, PlacementError, PlacementStore};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
+
+mod config_store;
+
+pub use config_store::{
+    ConfigStore, ConfigWatch, EtcdConfigStore, EtcdConfigStoreConfig, InMemoryEtcdConfigClient,
+    LocalConfigStore,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct OperationId(String);
@@ -327,64 +333,6 @@ impl ServiceTaskHandle {
     }
 }
 
-#[async_trait]
-pub trait ConfigStore: Clone + Send + Sync + 'static {
-    async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, OpsError>;
-    async fn put(&self, key: String, value: serde_json::Value) -> Result<(), OpsError>;
-    async fn watch(&self, key: &str) -> Result<ConfigWatch, OpsError>;
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct LocalConfigStore {
-    values: Arc<Mutex<HashMap<String, serde_json::Value>>>,
-    watches: Arc<Mutex<HashMap<String, watch::Sender<Option<serde_json::Value>>>>>,
-}
-
-#[async_trait]
-impl ConfigStore for LocalConfigStore {
-    async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, OpsError> {
-        Ok(self.values.lock().await.get(key).cloned())
-    }
-
-    async fn put(&self, key: String, value: serde_json::Value) -> Result<(), OpsError> {
-        self.values.lock().await.insert(key.clone(), value.clone());
-        let mut watches = self.watches.lock().await;
-        let tx = watches.entry(key).or_insert_with(|| {
-            let (tx, _rx) = watch::channel(None);
-            tx
-        });
-        tx.send_replace(Some(value));
-        Ok(())
-    }
-
-    async fn watch(&self, key: &str) -> Result<ConfigWatch, OpsError> {
-        let current = self.values.lock().await.get(key).cloned();
-        let mut watches = self.watches.lock().await;
-        let rx = watches
-            .entry(key.to_string())
-            .or_insert_with(|| {
-                let (tx, _rx) = watch::channel(current.clone());
-                tx
-            })
-            .subscribe();
-        Ok(ConfigWatch { rx })
-    }
-}
-
-pub struct ConfigWatch {
-    rx: watch::Receiver<Option<serde_json::Value>>,
-}
-
-impl ConfigWatch {
-    pub async fn changed(&mut self) -> Result<Option<serde_json::Value>, OpsError> {
-        self.rx
-            .changed()
-            .await
-            .map_err(|_| OpsError::ConfigWatchClosed)?;
-        Ok(self.rx.borrow().clone())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClusterSummary {
     pub instance_count: usize,
@@ -664,6 +612,51 @@ mod tests {
 
         assert_eq!(value, Some(json!(50)));
         assert_eq!(store.get("world.tick_ms").await.unwrap(), Some(json!(50)));
+    }
+
+    #[tokio::test]
+    async fn etcd_config_store_supports_watch_reload() {
+        let store = EtcdConfigStore::new(InMemoryEtcdConfigClient::new(), "/lattice/test/config");
+        let mut watch = store.watch("gateway.rate_limit").await.unwrap();
+
+        store
+            .put(
+                "gateway.rate_limit".to_string(),
+                json!({ "per_second": 100 }),
+            )
+            .await
+            .unwrap();
+        let value = watch.changed().await.unwrap();
+
+        assert_eq!(value, Some(json!({ "per_second": 100 })));
+        assert_eq!(
+            store.get("gateway.rate_limit").await.unwrap(),
+            Some(json!({ "per_second": 100 }))
+        );
+    }
+
+    #[tokio::test]
+    async fn etcd_config_store_isolates_cluster_prefixes() {
+        let client = InMemoryEtcdConfigClient::new();
+        let prod = EtcdConfigStore::new(client.clone(), "/lattice/prod/config");
+        let staging = EtcdConfigStore::new(client, "/lattice/staging/config");
+
+        prod.put("feature.matchmaking".to_string(), json!(true))
+            .await
+            .unwrap();
+        staging
+            .put("feature.matchmaking".to_string(), json!(false))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prod.get("feature.matchmaking").await.unwrap(),
+            Some(json!(true))
+        );
+        assert_eq!(
+            staging.get("feature.matchmaking").await.unwrap(),
+            Some(json!(false))
+        );
     }
 
     #[tokio::test]
