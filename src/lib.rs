@@ -1,14 +1,24 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+//! Core lattice framework APIs.
+
+pub mod config;
+pub mod core;
+
+pub use config::{BootstrapConfig, ConfigError, ConfigFormat, ConfigSource};
+pub use core::{
+    ActorId, ActorKey, ActorKeyDecodeError, ActorKind, Epoch, InstanceCapacity, InstanceConfig,
+    InstanceId, RequestId, RouteKey, ServiceKind,
+};
+
+#[macro_export]
+macro_rules! actor_kind {
+    ($name:literal) => {
+        $crate::ActorKind::from_static($name)
+    };
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+#[macro_export]
+macro_rules! service_kind {
+    ($name:literal) => {
+        $crate::ServiceKind::from_static($name)
+    };
 }
