@@ -16,3 +16,4 @@ tonic.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+trybuild.workspace = true

@@ -1,0 +1,19 @@
+error[E0277]: the trait bound `WorldActor: lattice_actor::Handler<Rpc<EnterWorldRequest>>` is not satisfied
+  --> tests/ui/missing_rpc_handler.rs:45:38
+   |
+45 |     assert_generated_adapter_bound::<WorldActor>();
+   |                                      ^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `lattice_actor::Handler<Rpc<EnterWorldRequest>>` is not implemented for `WorldActor`
+  --> tests/ui/missing_rpc_handler.rs:33:1
+   |
+33 | struct WorldActor;
+   | ^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_generated_adapter_bound`
+  --> tests/ui/missing_rpc_handler.rs:40:16
+   |
+38 | fn assert_generated_adapter_bound<A>()
+   |    ------------------------------ required by a bound in this function
+39 | where
+40 |     A: Actor + Handler<Rpc<EnterWorldRequest>>,
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `assert_generated_adapter_bound`
