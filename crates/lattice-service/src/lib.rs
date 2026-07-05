@@ -20,6 +20,7 @@ pub use framework::{
 };
 pub use lattice_core::ServiceContext;
 pub use lattice_ops::{AdminHttpConfig, ServiceScheduler};
+pub use lattice_rpc::{MtlsConfig, PeerIdentity, RpcSecurityPolicy, RpcServerSecurity};
 pub use rpc::{RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
 pub use service::LatticeService;
 

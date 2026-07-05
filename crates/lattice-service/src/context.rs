@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use lattice_actor::Actor;
 use lattice_core::{ActorKind, ServiceContext};
+use lattice_rpc::RpcServerSecurity;
 use tonic::body::Body;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
@@ -16,6 +17,7 @@ use crate::actor::{ErasedLogicActor, RegisteredActor};
 
 pub struct ServiceBuildContext {
     service: ServiceContext,
+    rpc_security: RpcServerSecurity,
     pub(crate) actors: HashMap<ActorKind, Box<dyn Any + Send>>,
     pub(crate) logic_actors: HashMap<ActorKind, Arc<dyn ErasedLogicActor>>,
     pub(crate) router: Option<Router>,
@@ -26,6 +28,7 @@ impl std::fmt::Debug for ServiceBuildContext {
         formatter
             .debug_struct("ServiceBuildContext")
             .field("service", &self.service)
+            .field("rpc_security", &self.rpc_security)
             .field("actor_count", &self.actors.len())
             .field("logic_actor_count", &self.logic_actors.len())
             .field("has_router", &self.router.is_some())
@@ -34,9 +37,17 @@ impl std::fmt::Debug for ServiceBuildContext {
 }
 
 impl ServiceBuildContext {
-    pub(crate) fn new(service: ServiceContext) -> Self {
+    pub fn new(service: ServiceContext) -> Self {
+        Self::with_rpc_security(service, RpcServerSecurity::disabled())
+    }
+
+    pub(crate) fn with_rpc_security(
+        service: ServiceContext,
+        rpc_security: RpcServerSecurity,
+    ) -> Self {
         Self {
             service,
+            rpc_security,
             actors: HashMap::new(),
             logic_actors: HashMap::new(),
             router: None,
@@ -45,6 +56,10 @@ impl ServiceBuildContext {
 
     pub fn service_context(&self) -> ServiceContext {
         self.service.clone()
+    }
+
+    pub fn rpc_security(&self) -> RpcServerSecurity {
+        self.rpc_security.clone()
     }
 
     pub fn add_rpc_service<S>(&mut self, service: S)

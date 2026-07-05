@@ -1,6 +1,8 @@
 use crate::dedup::RequestDeduplicator;
 use crate::metadata::RpcMetadataError;
-use crate::security::{MtlsConfig, PeerIdentity, RpcSecurityError, RpcSecurityPolicy};
+use crate::security::{
+    MtlsConfig, PeerIdentity, RpcSecurityError, RpcSecurityPolicy, RpcServerSecurity,
+};
 use crate::server::{RpcServerBuildError, RpcServerBuilder};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -163,6 +165,23 @@ fn rpc_security_policy_validates_mtls_peer_identity_against_metadata() {
             peer: service_kind!("Gateway"),
         })
     );
+}
+
+#[test]
+fn rpc_server_security_reads_peer_identity_from_request_extensions() {
+    let security = RpcServerSecurity::new(RpcSecurityPolicy::require_mtls(mtls_config()));
+    let peer = PeerIdentity::new(
+        service_kind!("Player"),
+        InstanceId::new("player-0"),
+        "spiffe://lattice.test/ns/default/sa/player",
+    );
+    let mut request = Request::new(EnterWorldRequest { world_id: 9 });
+
+    assert_eq!(security.peer_identity(&request), None);
+
+    request.extensions_mut().insert(peer.clone());
+
+    assert_eq!(security.peer_identity(&request), Some(peer));
 }
 
 #[test]

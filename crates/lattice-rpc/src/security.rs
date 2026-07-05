@@ -1,5 +1,5 @@
 use lattice_core::{InstanceId, ServiceKind};
-use tonic::Status;
+use tonic::{Request, Status};
 
 use crate::RpcContext;
 
@@ -111,6 +111,31 @@ impl RpcSecurityPolicy {
             });
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcServerSecurity {
+    policy: RpcSecurityPolicy,
+}
+
+impl RpcServerSecurity {
+    pub fn disabled() -> Self {
+        Self {
+            policy: RpcSecurityPolicy::disabled(),
+        }
+    }
+
+    pub fn new(policy: RpcSecurityPolicy) -> Self {
+        Self { policy }
+    }
+
+    pub fn policy(&self) -> &RpcSecurityPolicy {
+        &self.policy
+    }
+
+    pub fn peer_identity<T>(&self, request: &Request<T>) -> Option<PeerIdentity> {
+        request.extensions().get::<PeerIdentity>().cloned()
     }
 }
 

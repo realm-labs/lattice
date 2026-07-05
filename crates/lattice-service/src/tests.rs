@@ -15,8 +15,8 @@ use lattice_actor::{
 };
 use lattice_config::{ConfigFormat, ConfigSource};
 use lattice_core::{
-    ActorId, ActorKind, ConfiguredComponent, Epoch, InstanceId, RouteKey, TraceContext, actor_kind,
-    service_kind,
+    ActorId, ActorKind, ConfiguredComponent, Epoch, InstanceId, RequestId, RouteKey, TraceContext,
+    actor_kind, service_kind,
 };
 use lattice_eventbus::{
     EventBus, EventEnvelope, EventId, EventSubscription, LocalEventBus, Subject, SubjectFilter,
@@ -35,7 +35,10 @@ use lattice_placement::{
     BoxRouteResolver, EndpointLease, EndpointPool, EndpointRpcTransport, ResolveRequest,
     ResolvingRpcCore, RouteResolver,
 };
-use lattice_rpc::{RoutedRequest, RpcClientContextFactory, RpcError, RpcRequest, ShardedRpcCore};
+use lattice_rpc::{
+    AuthContext, MtlsConfig, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError,
+    RpcRequest, RpcSecurityError, RpcSecurityPolicy, ShardedRpcCore,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -184,6 +187,37 @@ where
         context: &mut ServiceBuildContext,
     ) -> Result<(), LatticeServiceError> {
         let _ = context.actor::<A>(&self.actor_kind)?;
+        context.add_rpc_service(EmptyRpcService);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct SecurityProbeBinding;
+
+impl RpcServiceBinding for SecurityProbeBinding {
+    fn service_name(&self) -> &'static str {
+        "SecurityProbeRpc"
+    }
+
+    fn register(
+        self: Box<Self>,
+        context: &mut ServiceBuildContext,
+    ) -> Result<(), LatticeServiceError> {
+        let rpc_context = RpcContext {
+            request_id: RequestId::new("req-1"),
+            route_epoch: None,
+            source_service: service_kind!("Player"),
+            source_instance: InstanceId::new("player-1"),
+            trace: TraceContext::default(),
+            auth: Some(AuthContext {
+                authorization: "Bearer internal".to_string(),
+            }),
+        };
+        let result = context.rpc_security().policy().validate(&rpc_context, None);
+
+        assert_eq!(result, Err(RpcSecurityError::MissingPeerIdentity));
+
         context.add_rpc_service(EmptyRpcService);
         Ok(())
     }
@@ -520,6 +554,24 @@ async fn duplicate_rpc_service_registration_fails() {
         result,
         Err(LatticeServiceError::DuplicateRpcService { .. })
     ));
+}
+
+#[tokio::test]
+async fn builder_propagates_rpc_security_to_service_bindings() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let _service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .rpc_security(
+            RpcSecurityPolicy::require_mtls(test_mtls_config())
+                .allow_service(service_kind!("Player"))
+                .require_authorization(),
+        )
+        .register_sharded_rpc(SecurityProbeBinding)
+        .build()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1471,5 +1523,14 @@ fn placement_actor_record(
         epoch: Epoch(epoch),
         lease_id: LeaseId(lease_id),
         state: PlacementState::Running,
+    }
+}
+
+fn test_mtls_config() -> MtlsConfig {
+    MtlsConfig {
+        trust_domain: "lattice.test".to_string(),
+        ca_cert_path: "/etc/lattice/ca.pem".to_string(),
+        cert_chain_path: "/etc/lattice/tls.crt".to_string(),
+        private_key_path: "/etc/lattice/tls.key".to_string(),
     }
 }

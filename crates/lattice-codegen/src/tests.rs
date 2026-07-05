@@ -68,6 +68,18 @@ fn generated_output_matches_phase_two_shape() {
             .rust
             .contains("pub struct RegistryService<A: Actor, L>")
     );
+    assert!(generated.rust.contains("RpcServerSecurity"));
+    assert!(generated.rust.contains("context.rpc_security()"));
+    assert!(
+        generated
+            .rust
+            .contains("self.security.peer_identity(&request)")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("unary_secure(forwarded, self.security.policy(), peer.as_ref())")
+    );
     assert!(
         generated
             .rust

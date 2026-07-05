@@ -40,7 +40,7 @@ pub fn generate_rpc_bindings_with_options(
         "#[allow(unused_imports)]\nuse lattice_placement::{EndpointLease, EndpointRpcTransport};\n",
     );
     rust.push_str(
-        "#[allow(unused_imports)]\nuse lattice_rpc::{ActorRpcAdapter, Rpc, RpcError, RpcRequest, RoutedRequest, ShardedRpcCore, TonicEndpointChannelPool, TypedRpcClient};\n",
+        "#[allow(unused_imports)]\nuse lattice_rpc::{ActorRpcAdapter, Rpc, RpcError, RpcRequest, RpcServerSecurity, RoutedRequest, ShardedRpcCore, TonicEndpointChannelPool, TypedRpcClient};\n",
     );
     rust.push_str("#[allow(unused_imports)]\nuse prost::Message as ProstMessage;\n\n");
 
@@ -214,7 +214,7 @@ fn push_service_module(rust: &mut String, methods: &[&RpcMethodSpec]) {
     rust.push_str(
         "    use lattice_core::{ActorId, ActorKind, InstanceId, RouteKey, ServiceKind};\n",
     );
-    rust.push_str("    use lattice_rpc::{ActorRpcAdapter, Rpc, RpcContext, RpcRequest, RoutedRequest, ShardedRpcCore, TypedRpcClient};\n\n");
+    rust.push_str("    use lattice_rpc::{ActorRpcAdapter, Rpc, RpcContext, RpcRequest, RpcServerSecurity, RoutedRequest, ShardedRpcCore, TypedRpcClient};\n\n");
     rust.push_str(
         "    use lattice_service::{LatticeServiceError, RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
     use lattice_service::ServiceContextExt;
@@ -302,7 +302,7 @@ fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     rust.push_str("        fn register(self: Box<Self>, context: &mut ServiceBuildContext) -> Result<(), LatticeServiceError> {\n");
     rust.push_str("            let actor = context.actor::<A>(&self.actor_kind)?;\n");
     rust.push_str(&format!(
-        "            context.add_rpc_service({server_path}::new(RegistryService::new(actor.registry(), actor.loader())));\n"
+        "            context.add_rpc_service({server_path}::new(RegistryService::with_security(actor.registry(), actor.loader(), context.rpc_security())));\n"
     ));
     rust.push_str("            Ok(())\n");
     rust.push_str("        }\n");
@@ -357,7 +357,7 @@ fn push_singleton_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     rust.push_str("            let placement_store = service.placement_store();\n");
     rust.push_str("            let instance_id = service.instance_id().clone();\n");
     rust.push_str(&format!(
-        "            context.add_rpc_service({server_path}::new(SingletonRegistryService::new(actor.registry(), actor.loader(), placement_store, instance_id)));\n"
+        "            context.add_rpc_service({server_path}::new(SingletonRegistryService::with_security(actor.registry(), actor.loader(), placement_store, instance_id, context.rpc_security())));\n"
     ));
     rust.push_str("            Ok(())\n");
     rust.push_str("        }\n");
@@ -369,11 +369,14 @@ fn push_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let trait_path = tonic_service_trait_path(service);
     rust.push_str("    #[derive(Debug, Clone)]\n");
     rust.push_str(
-        "    pub struct ActorService<A: Actor> {\n        inner: ActorRpcAdapter<A>,\n    }\n\n",
+        "    pub struct ActorService<A: Actor> {\n        inner: ActorRpcAdapter<A>,\n        security: RpcServerSecurity,\n    }\n\n",
     );
     rust.push_str("    impl<A: Actor> ActorService<A> {\n");
     rust.push_str("        pub fn new(handle: ActorHandle<A>) -> Self {\n");
-    rust.push_str("            Self { inner: ActorRpcAdapter::new(handle) }\n");
+    rust.push_str("            Self { inner: ActorRpcAdapter::new(handle), security: RpcServerSecurity::disabled() }\n");
+    rust.push_str("        }\n\n");
+    rust.push_str("        pub fn with_security(handle: ActorHandle<A>, security: RpcServerSecurity) -> Self {\n");
+    rust.push_str("            Self { inner: ActorRpcAdapter::new(handle), security }\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
     rust.push_str("    #[tonic::async_trait]\n");
@@ -392,7 +395,8 @@ fn push_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
             request = method.request_type,
             reply = method.reply_type
         ));
-        rust.push_str("            self.inner.unary(request).await\n");
+        rust.push_str("            let peer = self.security.peer_identity(&request);\n");
+        rust.push_str("            self.inner.unary_secure(request, self.security.policy(), peer.as_ref()).await\n");
         rust.push_str("        }\n");
     }
     rust.push_str("    }\n\n");
@@ -402,14 +406,20 @@ fn push_registry_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let service = methods[0];
     let trait_path = tonic_service_trait_path(service);
     rust.push_str("    #[derive(Debug, Clone)]\n");
-    rust.push_str("    pub struct RegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n    }\n\n");
+    rust.push_str("    pub struct RegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n        security: RpcServerSecurity,\n    }\n\n");
     rust.push_str("    impl<A, L> RegistryService<A, L>\n    where\n        A: Actor,\n        L: ActorLoader<A>,\n    {\n");
     rust.push_str("        pub fn new(registry: Arc<ActorRegistry<A>>, loader: L) -> Self {\n");
-    rust.push_str("            Self { registry, loader }\n");
+    rust.push_str(
+        "            Self { registry, loader, security: RpcServerSecurity::disabled() }\n",
+    );
+    rust.push_str("        }\n\n");
+    rust.push_str("        pub fn with_security(registry: Arc<ActorRegistry<A>>, loader: L, security: RpcServerSecurity) -> Self {\n");
+    rust.push_str("            Self { registry, loader, security }\n");
     rust.push_str("        }\n\n");
     rust.push_str("        async fn unary<Req>(&self, request: tonic::Request<Req>) -> Result<tonic::Response<Req::Reply>, tonic::Status>\n");
     rust.push_str("        where\n            A: Handler<Rpc<Req>>,\n            Req: RoutedRequest + RpcRequest,\n        {\n");
     rust.push_str("            let metadata = request.metadata().clone();\n");
+    rust.push_str("            let peer = self.security.peer_identity(&request);\n");
     rust.push_str("            let req = request.into_inner();\n");
     rust.push_str("            let actor_id = actor_id_from_route_key(req.route_key());\n");
     rust.push_str("            let handle = self\n");
@@ -421,7 +431,7 @@ fn push_registry_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     );
     rust.push_str("            let mut forwarded = tonic::Request::new(req);\n");
     rust.push_str("            *forwarded.metadata_mut() = metadata;\n");
-    rust.push_str("            ActorRpcAdapter::new(handle).unary(forwarded).await\n");
+    rust.push_str("            ActorRpcAdapter::new(handle).unary_secure(forwarded, self.security.policy(), peer.as_ref()).await\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
     rust.push_str("    #[tonic::async_trait]\n");
@@ -452,7 +462,7 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
     let service = methods[0];
     let trait_path = tonic_service_trait_path(service);
     rust.push_str("    #[derive(Clone)]\n");
-    rust.push_str("    pub struct SingletonRegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n        placement_store: Arc<dyn lattice_service::DynPlacementStore>,\n        instance_id: InstanceId,\n    }\n\n");
+    rust.push_str("    pub struct SingletonRegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n        placement_store: Arc<dyn lattice_service::DynPlacementStore>,\n        instance_id: InstanceId,\n        security: RpcServerSecurity,\n    }\n\n");
     rust.push_str("    impl<A, L> std::fmt::Debug for SingletonRegistryService<A, L>\n");
     rust.push_str("    where\n        A: Actor,\n    {\n");
     rust.push_str(
@@ -463,11 +473,17 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
     rust.push_str("    }\n\n");
     rust.push_str("    impl<A, L> SingletonRegistryService<A, L>\n    where\n        A: Actor,\n        L: ActorLoader<A>,\n    {\n");
     rust.push_str("        pub fn new(registry: Arc<ActorRegistry<A>>, loader: L, placement_store: Arc<dyn lattice_service::DynPlacementStore>, instance_id: InstanceId) -> Self {\n");
-    rust.push_str("            Self { registry, loader, placement_store, instance_id }\n");
+    rust.push_str("            Self { registry, loader, placement_store, instance_id, security: RpcServerSecurity::disabled() }\n");
+    rust.push_str("        }\n\n");
+    rust.push_str("        pub fn with_security(registry: Arc<ActorRegistry<A>>, loader: L, placement_store: Arc<dyn lattice_service::DynPlacementStore>, instance_id: InstanceId, security: RpcServerSecurity) -> Self {\n");
+    rust.push_str(
+        "            Self { registry, loader, placement_store, instance_id, security }\n",
+    );
     rust.push_str("        }\n\n");
     rust.push_str("        async fn unary<Req>(&self, request: tonic::Request<Req>) -> Result<tonic::Response<Req::Reply>, tonic::Status>\n");
     rust.push_str("        where\n            A: Handler<Rpc<Req>>,\n            Req: RoutedRequest + RpcRequest,\n        {\n");
     rust.push_str("            let metadata = request.metadata().clone();\n");
+    rust.push_str("            let peer = self.security.peer_identity(&request);\n");
     rust.push_str("            let ctx = RpcContext::from_metadata(&metadata).map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;\n");
     rust.push_str("            let req = request.into_inner();\n");
     rust.push_str("            let route_key = req.route_key();\n");
@@ -505,7 +521,7 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
     );
     rust.push_str("            let mut forwarded = tonic::Request::new(req);\n");
     rust.push_str("            *forwarded.metadata_mut() = metadata;\n");
-    rust.push_str("            ActorRpcAdapter::new(handle).with_owner_epoch(record.epoch).unary(forwarded).await\n");
+    rust.push_str("            ActorRpcAdapter::new(handle).with_owner_epoch(record.epoch).unary_secure(forwarded, self.security.policy(), peer.as_ref()).await\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
     rust.push_str("    #[tonic::async_trait]\n");
