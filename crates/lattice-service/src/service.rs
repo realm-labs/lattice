@@ -4,9 +4,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router as AxumRouter;
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::{ServiceContext, ServiceKind};
+use lattice_core::{ActorKind, ServiceContext, ServiceKind};
+use lattice_ops::admin::{AdminAuth, AdminHttpAdapter, AdminSnapshot};
 use lattice_placement::PlacementError;
 use lattice_placement::coordinator::PlacementWatchTask;
 use lattice_placement::instance::{InstanceRecord, InstanceState};
@@ -133,7 +133,13 @@ impl LatticeService {
         );
 
         let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel::<()>();
-        let (admin_shutdown_tx, admin_task) = start_admin_http_server(admin_http);
+        let (admin_shutdown_tx, admin_task) = start_admin_http_server(
+            admin_http,
+            placement_store.as_ref(),
+            &service_kind,
+            &instance.instance_id,
+        )
+        .await?;
         let keepalive = async {
             loop {
                 tokio::time::sleep(instance_lease_keepalive_interval).await;
@@ -312,26 +318,73 @@ where
 type AdminShutdownSignal = oneshot::Sender<()>;
 type AdminHttpTask = tokio::task::JoinHandle<Result<(), LatticeServiceError>>;
 
-fn start_admin_http_server(
+async fn start_admin_http_server(
     admin_http: Option<AdminHttpServer>,
-) -> (Option<AdminShutdownSignal>, Option<AdminHttpTask>) {
+    placement_store: &dyn ErasedPlacementStore,
+    service_kind: &ServiceKind,
+    instance_id: &lattice_core::InstanceId,
+) -> Result<(Option<AdminShutdownSignal>, Option<AdminHttpTask>), LatticeServiceError> {
     let Some(admin_http) = admin_http else {
-        return (None, None);
+        return Ok((None, None));
     };
+    let snapshot = build_admin_snapshot(
+        placement_store,
+        service_kind,
+        instance_id,
+        admin_http.actor_kinds,
+    )
+    .await?;
+    let router = AdminHttpAdapter::new(admin_http.auth, snapshot).router();
     let local_addr = admin_http.listener.local_addr().ok();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {
         if let Some(local_addr) = local_addr {
             info!(%local_addr, "lattice admin http listening");
         }
-        axum::serve(admin_http.listener, admin_http.router)
+        axum::serve(admin_http.listener, router)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             })
             .await
             .map_err(LatticeServiceError::from)
     });
-    (Some(shutdown_tx), Some(task))
+    Ok((Some(shutdown_tx), Some(task)))
+}
+
+async fn build_admin_snapshot(
+    placement_store: &dyn ErasedPlacementStore,
+    service_kind: &ServiceKind,
+    instance_id: &lattice_core::InstanceId,
+    actor_kinds: Vec<ActorKind>,
+) -> Result<AdminSnapshot, LatticeServiceError> {
+    let instances = placement_store.list_instances(service_kind).await?;
+    let actors = placement_store
+        .list_actors()
+        .await?
+        .into_iter()
+        .map(|(_version, record)| record)
+        .collect();
+    let virtual_shards = placement_store
+        .list_virtual_shards_for_service(service_kind)
+        .await?
+        .into_iter()
+        .map(|(_version, record)| record)
+        .collect();
+    let singletons = placement_store
+        .list_singletons()
+        .await?
+        .into_iter()
+        .map(|(_version, record)| record)
+        .collect();
+    Ok(AdminSnapshot::from_placement_records(
+        service_kind.clone(),
+        instance_id.clone(),
+        actor_kinds,
+        instances,
+        actors,
+        virtual_shards,
+        singletons,
+    ))
 }
 
 async fn cancel_event_subscriptions(service_context: &ServiceContext) -> usize {
@@ -434,7 +487,8 @@ pub(crate) struct LatticeServiceParts {
 #[derive(Debug)]
 pub(crate) struct AdminHttpServer {
     pub listener: TcpListener,
-    pub router: AxumRouter,
+    pub auth: AdminAuth,
+    pub actor_kinds: Vec<ActorKind>,
 }
 
 fn socket_addr_to_uri(addr: SocketAddr) -> http::Uri {

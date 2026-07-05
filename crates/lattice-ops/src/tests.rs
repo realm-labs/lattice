@@ -15,8 +15,9 @@ use lattice_placement::coordinator::{NoopLogicControl, PlacementCoordinator};
 use lattice_placement::instance::{InstanceRecord, InstanceState};
 use lattice_placement::store::{
     ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
-    PlacementState, PlacementStore,
+    PlacementState, PlacementStore, SingletonPlacementRecord, VirtualShardPlacementRecord,
 };
+use lattice_placement::vshard::VirtualShardId;
 use serde_json::json;
 
 use super::*;
@@ -194,6 +195,56 @@ async fn cluster_inspector_summarizes_instances_and_actor_owners() {
         }
     );
     assert_eq!(node.actor_kinds, vec![actor_kind!("World")]);
+}
+
+#[test]
+fn admin_snapshot_builds_views_from_live_placement_records() {
+    let instance = instance_record("world-a");
+    let snapshot = AdminSnapshot::from_placement_records(
+        service_kind!("World"),
+        InstanceId::new("world-a"),
+        vec![actor_kind!("World")],
+        vec![instance],
+        vec![ActorPlacementRecord {
+            actor_kind: actor_kind!("World"),
+            actor_id: ActorId::U64(7),
+            owner: InstanceId::new("world-a"),
+            epoch: Epoch(2),
+            lease_id: LeaseId(3),
+            state: PlacementState::Running,
+        }],
+        vec![VirtualShardPlacementRecord {
+            service_kind: service_kind!("World"),
+            actor_kind: actor_kind!("World"),
+            shard_id: VirtualShardId(4),
+            owner: InstanceId::new("world-a"),
+            epoch: Epoch(5),
+        }],
+        vec![SingletonPlacementRecord {
+            service_kind: service_kind!("World"),
+            singleton_kind: actor_kind!("SeasonManager"),
+            scope: "default".to_string(),
+            owner: InstanceId::new("world-a"),
+            epoch: Epoch(6),
+            lease_id: LeaseId(7),
+            state: PlacementState::Running,
+        }],
+    );
+
+    assert_eq!(
+        snapshot.summary,
+        ClusterSummary {
+            instance_count: 1,
+            actor_owner_count: 1,
+        }
+    );
+    assert_eq!(
+        snapshot.node_summary.unwrap().actor_kinds,
+        vec![actor_kind!("World")]
+    );
+    assert_eq!(snapshot.placements[0].name, "World/U64(7)");
+    assert_eq!(snapshot.virtual_shards[0].name, "World/#4");
+    assert_eq!(snapshot.singletons[0].name, "SeasonManager/default");
 }
 
 #[derive(Clone)]

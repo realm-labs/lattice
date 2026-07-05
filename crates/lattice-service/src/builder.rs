@@ -9,7 +9,6 @@ use lattice_config::{BootstrapConfig, ConfigSource};
 use lattice_config::{ConfigStore, LocalConfigStore};
 use lattice_core::{ActorKind, InstanceId, ServiceContext, ServiceKind};
 use lattice_eventbus::{EventBus, LocalEventBus};
-use lattice_ops::admin::{AdminHttpAdapter, AdminSnapshot, ClusterSummary};
 use lattice_ops::{AdminHttpConfig, ServiceScheduler};
 use lattice_placement::coordinator::{PlacementWatchStarter, PlacementWatchTask};
 use lattice_placement::route::RpcRetryPolicy;
@@ -313,7 +312,12 @@ impl LatticeServiceBuilder {
         }
         let mut service_context =
             ServiceContext::builder(self.service_kind.clone(), instance.instance_id.clone());
-        let admin_http = build_admin_http(self.admin_http).await?;
+        let admin_actor_kinds = self
+            .actor_registrations
+            .iter()
+            .map(|registration| registration.actor_kind().clone())
+            .collect();
+        let admin_http = build_admin_http(self.admin_http, admin_actor_kinds).await?;
         let placement_watchers = self.placement_watchers;
         let placement_store = build_placement_store_or_default(
             self.placement_store,
@@ -494,6 +498,7 @@ impl LatticeServiceBuilder {
 
 async fn build_admin_http(
     config: Option<AdminHttpConfig>,
+    actor_kinds: Vec<ActorKind>,
 ) -> Result<Option<AdminHttpServer>, LatticeServiceError> {
     let Some(config) = config else {
         return Ok(None);
@@ -502,15 +507,11 @@ async fn build_admin_http(
         .bind
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
     let listener = TcpListener::bind(bind).await?;
-    let snapshot = AdminSnapshot::new(
-        ClusterSummary {
-            instance_count: 0,
-            actor_owner_count: 0,
-        },
-        Vec::new(),
-    );
-    let router = AdminHttpAdapter::new(config.build_auth(), snapshot).router();
-    Ok(Some(AdminHttpServer { listener, router }))
+    Ok(Some(AdminHttpServer {
+        listener,
+        auth: config.build_auth(),
+        actor_kinds,
+    }))
 }
 
 #[async_trait::async_trait]

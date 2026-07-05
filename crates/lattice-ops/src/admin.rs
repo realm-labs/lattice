@@ -8,7 +8,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use lattice_core::{ActorKind, InstanceId, ServiceKind};
 use lattice_placement::instance::InstanceRecord;
-use lattice_placement::store::{ActorPlacementRecord, PlacementStore};
+use lattice_placement::store::{
+    ActorPlacementRecord, PlacementStore, SingletonPlacementRecord, VirtualShardPlacementRecord,
+};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -160,6 +162,79 @@ impl AdminSnapshot {
             schedulers: Vec::new(),
             event_subscriptions: Vec::new(),
         }
+    }
+
+    pub fn from_placement_records(
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        mut actor_kinds: Vec<ActorKind>,
+        instances: Vec<InstanceRecord>,
+        actors: Vec<ActorPlacementRecord>,
+        virtual_shards: Vec<VirtualShardPlacementRecord>,
+        singletons: Vec<SingletonPlacementRecord>,
+    ) -> Self {
+        actor_kinds.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        actor_kinds.dedup();
+        let actor_kind_set = actor_kinds
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let actors = actors
+            .into_iter()
+            .filter(|record| actor_kind_set.contains(&record.actor_kind))
+            .collect::<Vec<_>>();
+        let service_kind_filter = service_kind.clone();
+        let mut snapshot = Self::new(
+            ClusterSummary {
+                instance_count: instances.len(),
+                actor_owner_count: actors.len(),
+            },
+            instances.into_iter().map(InstanceView::from).collect(),
+        );
+        snapshot.node_summary = Some(NodeSummary {
+            instance_id,
+            service_kind,
+            actor_kinds,
+        });
+        snapshot.placements = actors
+            .into_iter()
+            .map(|record| InspectionView {
+                name: format!("{}/{:?}", record.actor_kind.as_str(), record.actor_id),
+                owner: Some(record.owner),
+                state: format!("{:?}", record.state),
+                details: HashMap::from([
+                    ("epoch".to_string(), record.epoch.0.to_string()),
+                    ("lease_id".to_string(), record.lease_id.0.to_string()),
+                ]),
+            })
+            .collect();
+        snapshot.virtual_shards = virtual_shards
+            .into_iter()
+            .map(|record| InspectionView {
+                name: format!("{}/#{}", record.actor_kind.as_str(), record.shard_id.0),
+                owner: Some(record.owner),
+                state: "Assigned".to_string(),
+                details: HashMap::from([
+                    ("service_kind".to_string(), record.service_kind.to_string()),
+                    ("epoch".to_string(), record.epoch.0.to_string()),
+                ]),
+            })
+            .collect();
+        snapshot.singletons = singletons
+            .into_iter()
+            .filter(|record| record.service_kind == service_kind_filter)
+            .map(|record| InspectionView {
+                name: format!("{}/{}", record.singleton_kind.as_str(), record.scope),
+                owner: Some(record.owner),
+                state: format!("{:?}", record.state),
+                details: HashMap::from([
+                    ("service_kind".to_string(), record.service_kind.to_string()),
+                    ("epoch".to_string(), record.epoch.0.to_string()),
+                    ("lease_id".to_string(), record.lease_id.0.to_string()),
+                ]),
+            })
+            .collect();
+        snapshot
     }
 }
 

@@ -224,7 +224,7 @@ Status: `[ ]` incomplete.
 - [x] Service drain invokes coordinator-driven placement migration for owned actors before final stop.
 - [x] RPC readiness/drain behavior for new requests during shutdown is explicit: `LatticeService` publishes `Draining`, stops accepting RPC before placement/runtime drain, keeps lifecycle drain running after the listener closes, and tests cover listener closure while actor drain is blocked.
 - [x] Gateway startup is represented as a framework service API: `GatewayService` owns the TCP accept loop, supports custom connection handlers, manages background tasks such as push RPC listeners, and distributed-login starts through it with gateway crate coverage.
-- [ ] Cluster/node inspection does not query live services through LogicControl/Admin APIs.
+- [x] Cluster/node inspection queries live services through Admin APIs: services now build admin snapshots from Ready placement records and registered actor kinds at startup, expose node summaries over managed Admin HTTP, and `ClusterInspector`/`HttpNodeInspectorClient` coverage verifies live-node aggregation and partial failures.
 - [ ] Security/mTLS integration is partial and not connected to service builders by default.
 - [ ] Full chaos test suite is not implemented.
   - [x] Stale owner recovers after lease expiry and is fenced; route cache invalidates and retries with the same request id.

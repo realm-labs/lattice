@@ -11,7 +11,10 @@ use lattice_placement::coordinator::{
 };
 use lattice_placement::instance::InstanceRecord;
 use lattice_placement::singleton::SingletonRouteResolver;
-use lattice_placement::store::{LeaseId, PlacementStore};
+use lattice_placement::store::{
+    ActorPlacementRecord, LeaseId, PlacementStore, PlacementVersion, SingletonPlacementRecord,
+    VirtualShardPlacementRecord,
+};
 
 use crate::LatticeServiceError;
 use crate::framework::{
@@ -143,6 +146,20 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
     async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError>;
+    async fn list_instances(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<InstanceRecord>, PlacementError>;
+    async fn list_actors(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, ActorPlacementRecord)>, PlacementError>;
+    async fn list_virtual_shards_for_service(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
+    async fn list_singletons(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, SingletonPlacementRecord)>, PlacementError>;
     async fn keepalive_singleton_owner_leases(
         &self,
         service_kind: &ServiceKind,
@@ -217,6 +234,34 @@ where
 
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError> {
         self.store.upsert_instance(record).await
+    }
+
+    async fn list_instances(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<InstanceRecord>, PlacementError> {
+        self.store.list_instances(service_kind).await
+    }
+
+    async fn list_actors(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
+        self.store.list_actors().await
+    }
+
+    async fn list_virtual_shards_for_service(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        self.store
+            .list_virtual_shards_for_service(service_kind)
+            .await
+    }
+
+    async fn list_singletons(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        self.store.list_singletons().await
     }
 
     async fn keepalive_singleton_owner_leases(

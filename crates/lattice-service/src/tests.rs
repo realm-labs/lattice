@@ -938,20 +938,31 @@ async fn service_starts_admin_http_as_managed_listener() {
     }));
     ready_rx.await.unwrap();
 
+    let response = read_admin_http(admin_addr, "/admin/cluster/summary").await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("\"instance_count\":1"));
+
+    let response = read_admin_http(admin_addr, "/admin/node/summary").await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("\"instance_id\":\"world-1\""));
+    assert!(response.contains("\"actor_kinds\":[\"World\"]"));
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+async fn read_admin_http(admin_addr: std::net::SocketAddr, path: &str) -> String {
     let mut stream = TcpStream::connect(admin_addr).await.unwrap();
     stream
         .write_all(
-            b"GET /admin/cluster/summary HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
         )
         .await
         .unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).await.unwrap();
-    assert!(response.starts_with("HTTP/1.1 200 OK"));
-    assert!(response.contains("\"instance_count\":0"));
-
-    shutdown_tx.send(()).unwrap();
-    task.await.unwrap().unwrap();
+    response
 }
 
 #[tokio::test]
