@@ -225,7 +225,7 @@ Status: `[ ]` incomplete.
   - [x] Target service succeeds but response is lost/unknown-result handling is covered.
   - [x] Timeout followed by retry/reconciliation is covered.
   - [x] Coordinator leader switch is covered.
-  - [ ] Temporary etcd outage is covered.
+  - [x] Temporary etcd outage is covered.
   - [ ] Partial placement write failure is covered.
   - [ ] New request arriving while an actor is passivating is covered.
   - [ ] Singleton failover while a long business job is running is covered.

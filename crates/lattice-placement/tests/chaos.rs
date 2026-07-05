@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -8,10 +9,13 @@ use lattice_placement::coordinator::{
     ActivateActorRequest, ExplicitRouteResolver, FailoverReport, NoopLogicControl,
     PlacementCoordinator,
 };
+use lattice_placement::etcd::{
+    EtcdKv, EtcdPlacementStore, EtcdValue, EtcdWatch, InMemoryEtcdClient,
+};
 use lattice_placement::instance::{InstanceRecord, InstanceState};
 use lattice_placement::store::{
     ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
-    PlacementState, PlacementStore, SingletonKey, SingletonPlacementRecord,
+    PlacementState, PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
 };
 use lattice_placement::{
     EndpointLease, EndpointPool, EndpointRpcTransport, PlacementError, ResolveRequest,
@@ -221,6 +225,123 @@ async fn coordinator_leader_switch_rejects_stale_keepalive_and_continues_placeme
     assert_eq!(first.owner, InstanceId::new("world-a"));
     assert_eq!(second.owner, InstanceId::new("world-a"));
     assert_eq!(store.list_actors().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn temporary_etcd_outage_during_activation_is_retryable_without_partial_owner() {
+    let client = FlakyEtcdClient::new(InMemoryEtcdClient::new());
+    let store =
+        EtcdPlacementStore::new(PlacementPrefix::new("/lattice/chaos-etcd"), client.clone());
+    store
+        .upsert_instance(instance_record("world-a", InstanceState::Ready))
+        .await
+        .unwrap();
+    client.fail_next_compare_and_put();
+    let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+    let key = ActorPlacementKey {
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(7),
+    };
+
+    let failed = coordinator.activate_actor(activate_request(7)).await;
+    let retry = coordinator
+        .activate_actor(activate_request(7))
+        .await
+        .unwrap();
+
+    assert!(matches!(failed, Err(PlacementError::Etcd { .. })));
+    assert!(store.get_actor(&key).await.unwrap().is_some());
+    assert_eq!(store.list_actors().await.unwrap().len(), 1);
+    assert_eq!(retry.owner, InstanceId::new("world-a"));
+    assert_eq!(retry.epoch, Epoch(1));
+}
+
+#[derive(Debug, Clone)]
+struct FlakyEtcdClient {
+    inner: InMemoryEtcdClient,
+    fail_compare_and_puts: Arc<AtomicUsize>,
+}
+
+impl FlakyEtcdClient {
+    fn new(inner: InMemoryEtcdClient) -> Self {
+        Self {
+            inner,
+            fail_compare_and_puts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn fail_next_compare_and_put(&self) {
+        self.fail_compare_and_puts.store(1, Ordering::SeqCst);
+    }
+
+    fn check_compare_and_put(&self) -> Result<(), PlacementError> {
+        if self.fail_compare_and_puts.load(Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+        if self
+            .fail_compare_and_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(PlacementError::Etcd {
+                message: "temporary etcd outage".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EtcdKv for FlakyEtcdClient {
+    async fn put(&self, key: String, value: EtcdValue) -> Result<(), PlacementError> {
+        self.inner.put(key, value).await
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+    ) -> Result<Option<(PlacementVersion, EtcdValue)>, PlacementError> {
+        self.inner.get(key).await
+    }
+
+    async fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, PlacementVersion, EtcdValue)>, PlacementError> {
+        self.inner.list_prefix(prefix).await
+    }
+
+    async fn compare_and_put(
+        &self,
+        key: String,
+        expected: Option<PlacementVersion>,
+        value: EtcdValue,
+    ) -> Result<PlacementVersion, PlacementError> {
+        self.check_compare_and_put()?;
+        self.inner.compare_and_put(key, expected, value).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), PlacementError> {
+        self.inner.delete(key).await
+    }
+
+    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
+        self.inner.grant_instance_lease().await
+    }
+
+    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
+        self.inner.keepalive_instance_lease(lease_id).await
+    }
+
+    async fn next_lease_id(&self) -> Result<LeaseId, PlacementError> {
+        self.inner.next_lease_id().await
+    }
+
+    async fn watch_prefix(&self, prefix: &str) -> Result<EtcdWatch, PlacementError> {
+        self.inner.watch_prefix(prefix).await
+    }
 }
 
 #[derive(Clone)]
