@@ -8,7 +8,7 @@ use lattice_placement::store::PlacementStore;
 
 use crate::LatticeServiceError;
 use crate::framework::{
-    ConfigStoreComponent, EventBusComponent, LocalEventBusComponent, PlacementStoreComponent,
+    ClusterEventBusComponent, ConfigStoreComponent, LocalEventBusComponent, PlacementStoreComponent,
 };
 
 #[derive(Debug)]
@@ -248,14 +248,14 @@ impl<T> ServiceComponentRegistration<T>
 where
     T: Send + Sync + 'static,
 {
-    pub(crate) fn event_bus<C>(component: C) -> Self
+    pub(crate) fn cluster_event_bus<C>(component: C) -> Self
     where
         T: lattice_eventbus::EventBus,
         C: IntoServiceComponent<T>,
     {
         Self {
-            target_name: "event_bus",
-            insert: insert_event_bus_component::<T>,
+            target_name: "cluster_event_bus",
+            insert: insert_cluster_event_bus_component::<T>,
             component: Box::new(component.into_service_component()),
         }
     }
@@ -296,14 +296,14 @@ where
     }
 }
 
-fn insert_event_bus_component<T>(
+fn insert_cluster_event_bus_component<T>(
     service: &mut ServiceContextBuilder,
     event_bus: T,
 ) -> Result<(), &'static str>
 where
     T: lattice_eventbus::EventBus,
 {
-    service.insert_extension(EventBusComponent::new(event_bus))
+    service.insert_extension(ClusterEventBusComponent::new(event_bus))
 }
 
 fn insert_local_event_bus_component<T>(

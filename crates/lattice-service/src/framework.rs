@@ -5,7 +5,7 @@ use lattice_config::{ConfigStore, ConfigStoreError, ConfigWatch};
 use lattice_core::{InstanceId, ServiceContext, ServiceKind};
 use lattice_eventbus::{
     EventBus, EventBusError, EventEnvelope, EventHandler, EventSubscription,
-    EventSubscriptionHandle,
+    EventSubscriptionHandle, ServiceEvents,
 };
 use lattice_placement::PlacementError;
 use lattice_placement::instance::InstanceRecord;
@@ -198,11 +198,50 @@ impl std::fmt::Debug for PlacementStoreComponent {
 }
 
 #[derive(Clone)]
-pub struct EventBusComponent {
+pub struct ServiceEventBus {
     inner: Arc<dyn DynEventBus>,
 }
 
-impl EventBusComponent {
+impl ServiceEventBus {
+    fn new(inner: Arc<dyn DynEventBus>) -> Self {
+        Self { inner }
+    }
+}
+
+impl std::fmt::Debug for ServiceEventBus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceEventBus")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl EventBus for ServiceEventBus {
+    async fn publish(&self, event: EventEnvelope) -> Result<(), EventBusError> {
+        self.inner.publish(event).await
+    }
+
+    async fn subscribe<H>(
+        &self,
+        subscription: EventSubscription,
+        handler: H,
+    ) -> Result<EventSubscriptionHandle, EventBusError>
+    where
+        H: EventHandler,
+    {
+        self.inner
+            .subscribe_boxed(subscription, Arc::new(handler))
+            .await
+    }
+}
+
+#[derive(Clone)]
+pub struct ClusterEventBusComponent {
+    inner: Arc<dyn DynEventBus>,
+}
+
+impl ClusterEventBusComponent {
     pub fn new<T>(event_bus: T) -> Self
     where
         T: EventBus,
@@ -212,15 +251,15 @@ impl EventBusComponent {
         }
     }
 
-    pub fn inner(&self) -> Arc<dyn DynEventBus> {
-        self.inner.clone()
+    pub fn bus(&self) -> ServiceEventBus {
+        ServiceEventBus::new(self.inner.clone())
     }
 }
 
-impl std::fmt::Debug for EventBusComponent {
+impl std::fmt::Debug for ClusterEventBusComponent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("EventBusComponent")
+            .debug_struct("ClusterEventBusComponent")
             .finish_non_exhaustive()
     }
 }
@@ -240,8 +279,8 @@ impl LocalEventBusComponent {
         }
     }
 
-    pub fn inner(&self) -> Arc<dyn DynEventBus> {
-        self.inner.clone()
+    pub fn bus(&self) -> ServiceEventBus {
+        ServiceEventBus::new(self.inner.clone())
     }
 }
 
@@ -283,8 +322,10 @@ impl std::fmt::Debug for ConfigStoreComponent {
 
 pub trait ServiceContextExt {
     fn placement_store(&self) -> Arc<dyn DynPlacementStore>;
-    fn event_bus(&self) -> Arc<dyn DynEventBus>;
-    fn local_event_bus(&self) -> Arc<dyn DynEventBus>;
+    fn cluster_event_bus(&self) -> ServiceEventBus;
+    fn local_event_bus(&self) -> ServiceEventBus;
+    fn cluster_events(&self) -> ServiceEvents<ServiceEventBus>;
+    fn local_events(&self) -> ServiceEvents<ServiceEventBus>;
     fn config_store(&self) -> Arc<dyn DynConfigStore>;
 }
 
@@ -295,20 +336,28 @@ impl ServiceContextExt for ServiceContext {
             .expect("placement_store should be registered in ServiceContext")
     }
 
-    fn event_bus(&self) -> Arc<dyn DynEventBus> {
-        self.extension::<EventBusComponent>()
-            .map(|component| component.inner())
-            .expect("event_bus should be registered in ServiceContext")
+    fn cluster_event_bus(&self) -> ServiceEventBus {
+        self.extension::<ClusterEventBusComponent>()
+            .map(|component| component.bus())
+            .expect("cluster_event_bus should be registered in ServiceContext")
     }
 
-    fn local_event_bus(&self) -> Arc<dyn DynEventBus> {
+    fn local_event_bus(&self) -> ServiceEventBus {
         self.extension::<LocalEventBusComponent>()
-            .map(|component| component.inner())
+            .map(|component| component.bus())
             .or_else(|| {
-                self.extension::<EventBusComponent>()
-                    .map(|component| component.inner())
+                self.extension::<ClusterEventBusComponent>()
+                    .map(|component| component.bus())
             })
             .expect("local_event_bus should be registered in ServiceContext")
+    }
+
+    fn cluster_events(&self) -> ServiceEvents<ServiceEventBus> {
+        ServiceEvents::new(self.cluster_event_bus())
+    }
+
+    fn local_events(&self) -> ServiceEvents<ServiceEventBus> {
+        ServiceEvents::new(self.local_event_bus())
     }
 
     fn config_store(&self) -> Arc<dyn DynConfigStore> {

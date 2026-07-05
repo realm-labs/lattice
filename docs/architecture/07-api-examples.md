@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         .instance(instance)
         .config(ConfigSource::file("config/world-service.toml"))
         .placement_store(EtcdPlacementStore::from_config())
-        .event_bus(NatsEventBus::from_config())
+        .cluster_event_bus(NatsEventBus::from_config())
         .local_event_bus(LocalEventBus::default())
         .config_store(lattice_config_etcd::EtcdConfigStore::from_config())
         .telemetry(TelemetryConfig::from_config())
@@ -327,7 +327,8 @@ The framework should make the common path short. Business crates can wrap genera
 pub struct ServiceContext {
     pub instance_id: InstanceId,
     pub clients: ServiceClients,
-    pub events: ServiceEvents,
+    pub cluster_events: ServiceEvents,
+    pub local_events: ServiceEvents,
     pub config: ConfigStoreHandle,
     pub scheduler: ServiceScheduler,
 }
@@ -338,7 +339,8 @@ Actor context may expose a narrowed view:
 ```rust
 impl<A: Actor> ActorContext<A> {
     pub fn clients(&self) -> &ServiceClients;
-    pub fn events(&self) -> &ActorEvents;
+    pub fn cluster_events(&self) -> &ActorEvents;
+    pub fn local_events(&self) -> &ActorEvents;
     pub fn config(&self) -> &ConfigStoreHandle;
     pub fn scheduler(&self) -> &ActorScheduler;
 }
@@ -359,7 +361,7 @@ async fn main() -> anyhow::Result<()> {
         .register_binding(WorldGatewayBinding)
         .register_binding(GuildGatewayBinding)
         .rate_limiter(GovernorGatewayRateLimiter::from_config())
-        .event_bus(NatsEventBus::from_config())
+        .cluster_event_bus(NatsEventBus::from_config())
         .telemetry(TelemetryConfig::from_config())
         .admin_http(AdminHttpConfig::from_config())
         .build()
@@ -400,7 +402,8 @@ The Coordinator handles control-plane decisions only.
 Typed event publish:
 
 ```rust
-ctx.events()
+ctx.service()
+    .cluster_events()
     .publish(WorldEvents::player_entered(PlayerEnteredWorld {
         world_id: self.world_id.0,
         player_id: player_id.0,
@@ -412,7 +415,7 @@ Typed service subscription:
 
 ```rust
 service
-    .events()
+    .cluster_events()
     .subscribe_typed(
         SubjectFilter::new("game.guild.*"),
         ConsumerGroup::new("world-cache"),
@@ -425,7 +428,7 @@ Actor subscription:
 
 ```rust
 service
-    .events()
+    .cluster_events()
     .subscribe_actor(
         SubjectFilter::new("game.guild.created"),
         EventActorRoute::by_key(|event: &GuildCreated| WorldId(event.world_id)),

@@ -34,7 +34,7 @@ pub struct LatticeServiceBuilder {
     client_bindings: Vec<String>,
     config: Option<ConfigSource>,
     placement_store: Option<Box<dyn ErasedPlacementStoreComponent>>,
-    event_bus: Option<Box<dyn ErasedServiceComponent>>,
+    cluster_event_bus: Option<Box<dyn ErasedServiceComponent>>,
     local_event_bus: Option<Box<dyn ErasedServiceComponent>>,
     config_store: Option<Box<dyn ErasedServiceComponent>>,
     duplicate_framework_component: Option<&'static str>,
@@ -58,7 +58,7 @@ impl fmt::Debug for LatticeServiceBuilder {
             .field("client_bindings", &self.client_bindings)
             .field("has_config", &self.config.is_some())
             .field("has_placement_store", &self.placement_store.is_some())
-            .field("has_event_bus", &self.event_bus.is_some())
+            .field("has_cluster_event_bus", &self.cluster_event_bus.is_some())
             .field("has_local_event_bus", &self.local_event_bus.is_some())
             .field("has_config_store", &self.config_store.is_some())
             .field("extension_count", &self.extensions.len())
@@ -78,7 +78,7 @@ impl LatticeServiceBuilder {
             client_bindings: Vec::new(),
             config: None,
             placement_store: None,
-            event_bus: None,
+            cluster_event_bus: None,
             local_event_bus: None,
             config_store: None,
             duplicate_framework_component: None,
@@ -133,18 +133,18 @@ impl LatticeServiceBuilder {
         self
     }
 
-    pub fn event_bus<T, C>(mut self, event_bus: C) -> Self
+    pub fn cluster_event_bus<T, C>(mut self, event_bus: C) -> Self
     where
         T: EventBus,
         C: IntoServiceComponent<T>,
     {
-        if self.event_bus.is_some() {
+        if self.cluster_event_bus.is_some() {
             self.duplicate_framework_component
-                .get_or_insert("event_bus");
+                .get_or_insert("cluster_event_bus");
         } else {
-            self.event_bus = Some(Box::new(ServiceComponentRegistration::<T>::event_bus(
-                event_bus,
-            )));
+            self.cluster_event_bus = Some(Box::new(
+                ServiceComponentRegistration::<T>::cluster_event_bus(event_bus),
+            ));
         }
         self
     }
@@ -268,24 +268,28 @@ impl LatticeServiceBuilder {
             self.service_kind.as_str(),
         )
         .await?;
-        match (self.event_bus, self.local_event_bus) {
+        match (self.cluster_event_bus, self.local_event_bus) {
             (None, None) => {
                 build_service_component(
-                    Box::new(ServiceComponentRegistration::<LocalEventBus>::event_bus(
-                        LocalEventBus::default(),
-                    )),
+                    Box::new(
+                        ServiceComponentRegistration::<LocalEventBus>::cluster_event_bus(
+                            LocalEventBus::default(),
+                        ),
+                    ),
                     &component_context,
                     &mut service_context,
                     self.service_kind.as_str(),
                 )
                 .await?;
             }
-            (event_bus, local_event_bus) => {
+            (cluster_event_bus, local_event_bus) => {
                 build_framework_component_or_default(
-                    event_bus,
-                    Box::new(ServiceComponentRegistration::<LocalEventBus>::event_bus(
-                        LocalEventBus::default(),
-                    )),
+                    cluster_event_bus,
+                    Box::new(
+                        ServiceComponentRegistration::<LocalEventBus>::cluster_event_bus(
+                            LocalEventBus::default(),
+                        ),
+                    ),
                     &component_context,
                     &mut service_context,
                     self.service_kind.as_str(),

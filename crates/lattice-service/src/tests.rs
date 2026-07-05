@@ -378,8 +378,10 @@ async fn build_loads_config_and_stores_components_in_service_context() {
         Some(&serde_json::Value::String("from-config".to_string()))
     );
     let _placement_store = service.context().placement_store();
-    let _event_bus = service.context().event_bus();
+    let _cluster_event_bus = service.context().cluster_event_bus();
     let _local_event_bus = service.context().local_event_bus();
+    let _cluster_events = service.context().cluster_events();
+    let _local_events = service.context().local_events();
     let _config_store = service.context().config_store();
     assert!(service.context().extension::<LocalEventBus>().is_none());
 }
@@ -412,7 +414,7 @@ async fn framework_accessors_are_trait_based_even_with_same_concrete_type() {
     let service = LatticeService::builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
-        .event_bus::<LocalEventBus, _>(LocalEventBus::default())
+        .cluster_event_bus::<LocalEventBus, _>(LocalEventBus::default())
         .local_event_bus::<LocalEventBus, _>(LocalEventBus::default())
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
@@ -427,8 +429,10 @@ async fn framework_accessors_are_trait_based_even_with_same_concrete_type() {
         .await
         .unwrap();
 
-    let _event_bus = service.context().event_bus();
+    let _cluster_event_bus = service.context().cluster_event_bus();
     let _local_event_bus = service.context().local_event_bus();
+    let _cluster_events = service.context().cluster_events();
+    let _local_events = service.context().local_events();
     assert!(service.context().extension::<LocalEventBus>().is_none());
 }
 

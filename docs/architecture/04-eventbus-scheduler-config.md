@@ -152,7 +152,8 @@ pub trait EventBus: Clone + Send + Sync + 'static {
 Business code should prefer typed event publishers so metadata is filled by the framework:
 
 ```rust
-ctx.events()
+ctx.service()
+    .cluster_events()
     .publish(WorldEvents::player_entered(PlayerEnteredWorld {
         world_id: self.world_id.0,
         player_id: player_id.0,
@@ -168,7 +169,7 @@ Events may be delivered directly into an actor message handler:
 
 ```rust
 service
-    .events()
+    .cluster_events()
     .subscribe_actor(
         SubjectFilter::new("game.guild.*"),
         EventActorRoute::by_key(|event: &GuildCreated| WorldId(event.world_id)),
@@ -296,7 +297,7 @@ let service = LatticeService::builder(WORLD_SERVICE)
     .instance(InstanceConfig::from_env()?)
     .config(ConfigSource::file("config/world-service.toml"))
     .placement_store(EtcdPlacementStore::from_config())
-    .event_bus(NatsEventBus::from_config())
+    .cluster_event_bus(NatsEventBus::from_config())
     .telemetry(TelemetryConfig::from_config())
     .admin_http(AdminHttpConfig::from_config())
     .build()

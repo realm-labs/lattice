@@ -13,8 +13,8 @@ pub use builder::LatticeServiceBuilder;
 pub use component::{IntoServiceComponent, ReadyComponent, ServiceComponent};
 pub use error::LatticeServiceError;
 pub use framework::{
-    ConfigStoreComponent, DynConfigStore, DynEventBus, DynPlacementStore, EventBusComponent,
-    LocalEventBusComponent, PlacementStoreComponent, ServiceContextExt,
+    ClusterEventBusComponent, ConfigStoreComponent, DynConfigStore, DynEventBus, DynPlacementStore,
+    LocalEventBusComponent, PlacementStoreComponent, ServiceContextExt, ServiceEventBus,
 };
 pub use lattice_core::ServiceContext;
 pub use rpc::{RpcClientBinding, RpcServiceBinding};
