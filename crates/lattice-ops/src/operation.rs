@@ -23,6 +23,7 @@ impl OperationId {
 pub enum OperationStatus {
     Pending,
     Retrying { attempts: u32 },
+    TimeoutRetrying { attempts: u32 },
     UnknownResult { reason: String },
     Completed,
     CompensationRequired { reason: String },
@@ -64,6 +65,15 @@ impl OperationTracker {
         attempts: u32,
     ) -> Result<(), OpsError> {
         self.update(operation_id, OperationStatus::Retrying { attempts })
+            .await
+    }
+
+    pub async fn mark_timeout_retrying(
+        &self,
+        operation_id: &OperationId,
+        attempts: u32,
+    ) -> Result<(), OpsError> {
+        self.update(operation_id, OperationStatus::TimeoutRetrying { attempts })
             .await
     }
 

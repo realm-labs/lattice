@@ -469,6 +469,37 @@ async fn operation_tracker_models_lost_response_unknown_result_reconciliation() 
 }
 
 #[tokio::test]
+async fn operation_tracker_models_timeout_retry_and_reconciliation() {
+    let tracker = OperationTracker::default();
+    let operation_id = OperationId::new("matchmaking-timeout");
+
+    tracker.start(operation_id.clone()).await.unwrap();
+    tracker
+        .mark_timeout_retrying(&operation_id, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        tracker.get(&operation_id).await.unwrap().status,
+        OperationStatus::TimeoutRetrying { attempts: 1 }
+    );
+
+    tracker
+        .mark_unknown_result(&operation_id, "retry timed out; querying target state")
+        .await
+        .unwrap();
+    assert!(matches!(
+        tracker.get(&operation_id).await.unwrap().status,
+        OperationStatus::UnknownResult { .. }
+    ));
+
+    tracker.complete(&operation_id).await.unwrap();
+    assert_eq!(
+        tracker.get(&operation_id).await.unwrap().status,
+        OperationStatus::Completed
+    );
+}
+
+#[tokio::test]
 async fn transactional_outbox_tracks_unpublished_events_idempotently() {
     let outbox = TransactionalOutbox::default();
     let event_id = OutboxEventId::new("event-1");

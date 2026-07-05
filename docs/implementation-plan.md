@@ -223,7 +223,7 @@ Status: `[ ]` incomplete.
 - [ ] Full chaos test suite is not implemented.
   - [x] Stale owner recovers after lease expiry and is fenced; route cache invalidates and retries with the same request id.
   - [x] Target service succeeds but response is lost/unknown-result handling is covered.
-  - [ ] Timeout followed by retry/reconciliation is covered.
+  - [x] Timeout followed by retry/reconciliation is covered.
   - [ ] Coordinator leader switch is covered.
   - [ ] Temporary etcd outage is covered.
   - [ ] Partial placement write failure is covered.
