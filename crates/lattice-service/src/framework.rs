@@ -11,7 +11,7 @@ use lattice_placement::PlacementError;
 use lattice_placement::instance::InstanceRecord;
 use lattice_placement::store::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementStore,
-    PlacementVersion, PlacementWatch,
+    PlacementVersion, PlacementWatch, VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
 #[async_trait]
@@ -37,6 +37,21 @@ pub trait DynPlacementStore: Send + Sync + 'static {
         key: ActorPlacementKey,
         expected: Option<PlacementVersion>,
         value: ActorPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError>;
+    async fn get_virtual_shard(
+        &self,
+        key: &VirtualShardPlacementKey,
+    ) -> Result<Option<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
+    async fn list_virtual_shards(
+        &self,
+        service_kind: &ServiceKind,
+        actor_kind: &lattice_core::ActorKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
+    async fn compare_and_put_virtual_shard(
+        &self,
+        key: VirtualShardPlacementKey,
+        expected: Option<PlacementVersion>,
+        value: VirtualShardPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError>;
     async fn acquire_activation_lock(
         &self,
@@ -90,6 +105,30 @@ where
         value: ActorPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError> {
         PlacementStore::compare_and_put_actor(self, key, expected, value).await
+    }
+
+    async fn get_virtual_shard(
+        &self,
+        key: &VirtualShardPlacementKey,
+    ) -> Result<Option<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        PlacementStore::get_virtual_shard(self, key).await
+    }
+
+    async fn list_virtual_shards(
+        &self,
+        service_kind: &ServiceKind,
+        actor_kind: &lattice_core::ActorKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        PlacementStore::list_virtual_shards(self, service_kind, actor_kind).await
+    }
+
+    async fn compare_and_put_virtual_shard(
+        &self,
+        key: VirtualShardPlacementKey,
+        expected: Option<PlacementVersion>,
+        value: VirtualShardPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        PlacementStore::compare_and_put_virtual_shard(self, key, expected, value).await
     }
 
     async fn acquire_activation_lock(

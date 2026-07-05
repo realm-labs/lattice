@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use etcd_client::{
     Client, Compare, CompareOp, EventType, GetOptions, PutOptions, Txn, TxnOp, WatchOptions,
 };
-use lattice_core::{ActorId, ConfiguredComponent, InstanceId, ServiceKind};
+use lattice_core::{ActorId, ActorKind, ConfiguredComponent, InstanceId, ServiceKind};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -15,7 +15,8 @@ use crate::error::PlacementError;
 use crate::instance::InstanceRecord;
 use crate::store::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementStore,
-    PlacementVersion, PlacementWatch, PlacementWatchEvent,
+    PlacementVersion, PlacementWatch, PlacementWatchEvent, VirtualShardPlacementKey,
+    VirtualShardPlacementRecord,
 };
 
 #[derive(Debug, Clone)]
@@ -159,6 +160,57 @@ where
             .await
     }
 
+    async fn get_virtual_shard(
+        &self,
+        key: &VirtualShardPlacementKey,
+    ) -> Result<Option<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        let Some((version, value)) = self.client.get(&vshard_key(&self.prefix, key)).await? else {
+            return Ok(None);
+        };
+        match value {
+            EtcdValue::VirtualShard(record) => Ok(Some((version, *record))),
+            _ => Ok(None),
+        }
+    }
+
+    async fn list_virtual_shards(
+        &self,
+        service_kind: &ServiceKind,
+        actor_kind: &ActorKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        let prefix = format!(
+            "{}/logic/vshards/{}/{}/",
+            clean_prefix(&self.prefix),
+            service_kind.as_str(),
+            actor_kind.as_str()
+        );
+        Ok(self
+            .client
+            .list_prefix(&prefix)
+            .await?
+            .into_iter()
+            .filter_map(|(_key, version, value)| match value {
+                EtcdValue::VirtualShard(record) => Some((version, *record)),
+                _ => None,
+            })
+            .collect())
+    }
+
+    async fn compare_and_put_virtual_shard(
+        &self,
+        key: VirtualShardPlacementKey,
+        expected: Option<PlacementVersion>,
+        value: VirtualShardPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        self.client
+            .compare_and_put(
+                vshard_key(&self.prefix, &key),
+                expected,
+                EtcdValue::VirtualShard(Box::new(value)),
+            )
+            .await
+    }
+
     async fn acquire_activation_lock(
         &self,
         key: ActorPlacementKey,
@@ -186,24 +238,39 @@ where
     }
 
     async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError> {
-        let actor_prefix = format!("{}/logic/actors/", clean_prefix(&prefix));
-        let mut etcd_watch = self.client.watch_prefix(&actor_prefix).await?;
+        let logic_prefix = format!("{}/logic/", clean_prefix(&prefix));
+        let mut etcd_watch = self.client.watch_prefix(&logic_prefix).await?;
         let (tx, rx) = broadcast::channel(128);
         tokio::spawn(async move {
             while let Ok(event) = etcd_watch.next().await {
-                let Some(EtcdValue::Actor(record)) = event.value else {
-                    continue;
-                };
-                let record = *record;
-                let key = ActorPlacementKey {
-                    actor_kind: record.actor_kind.clone(),
-                    actor_id: record.actor_id.clone(),
-                };
-                let _ = tx.send(PlacementWatchEvent::ActorUpdated {
-                    key,
-                    version: event.version,
-                    record,
-                });
+                match event.value {
+                    Some(EtcdValue::Actor(record)) => {
+                        let record = *record;
+                        let key = ActorPlacementKey {
+                            actor_kind: record.actor_kind.clone(),
+                            actor_id: record.actor_id.clone(),
+                        };
+                        let _ = tx.send(PlacementWatchEvent::ActorUpdated {
+                            key,
+                            version: event.version,
+                            record,
+                        });
+                    }
+                    Some(EtcdValue::VirtualShard(record)) => {
+                        let record = *record;
+                        let key = VirtualShardPlacementKey {
+                            service_kind: record.service_kind.clone(),
+                            actor_kind: record.actor_kind.clone(),
+                            shard_id: record.shard_id,
+                        };
+                        let _ = tx.send(PlacementWatchEvent::VirtualShardUpdated {
+                            key,
+                            version: event.version,
+                            record,
+                        });
+                    }
+                    _ => {}
+                }
             }
         });
         Ok(PlacementWatch::new(rx))
@@ -238,6 +305,7 @@ pub trait EtcdKv: Clone + Send + Sync + 'static {
 pub enum EtcdValue {
     Instance(Box<InstanceRecord>),
     Actor(Box<ActorPlacementRecord>),
+    VirtualShard(Box<VirtualShardPlacementRecord>),
     ActivationLock(LeaseId),
 }
 
@@ -605,7 +673,7 @@ fn put_options_for(value: &EtcdValue) -> Result<Option<PutOptions>, PlacementErr
             let lease_id = i64::try_from(lease_id.0).map_err(codec_error)?;
             Ok(Some(PutOptions::new().with_lease(lease_id)))
         }
-        EtcdValue::Instance(_) | EtcdValue::Actor(_) => Ok(None),
+        EtcdValue::Instance(_) | EtcdValue::Actor(_) | EtcdValue::VirtualShard(_) => Ok(None),
     }
 }
 
@@ -650,6 +718,16 @@ fn actor_key(prefix: &PlacementPrefix, key: &ActorPlacementKey) -> String {
         clean_prefix(prefix),
         key.actor_kind.as_str(),
         actor_id_segment(&key.actor_id)
+    )
+}
+
+fn vshard_key(prefix: &PlacementPrefix, key: &VirtualShardPlacementKey) -> String {
+    format!(
+        "{}/logic/vshards/{}/{}/{}",
+        clean_prefix(prefix),
+        key.service_kind.as_str(),
+        key.actor_kind.as_str(),
+        key.shard_id.0
     )
 }
 
@@ -707,15 +785,27 @@ mod tests {
             .compare_and_put_actor(key.clone(), None, actor_record(7, "world-a", 1, LeaseId(1)))
             .await
             .unwrap();
+        first
+            .compare_and_put_virtual_shard(vshard_key_for(3), None, vshard_record(3, "world-a", 1))
+            .await
+            .unwrap();
 
         assert_eq!(
             client.keys(),
             vec![
                 "/lattice/cluster-a/logic/actors/World/u64:7".to_string(),
                 "/lattice/cluster-a/logic/instances/World/world-a".to_string(),
+                "/lattice/cluster-a/logic/vshards/World/World/3".to_string(),
             ]
         );
         assert!(second.get_actor(&key).await.unwrap().is_none());
+        assert!(
+            second
+                .get_virtual_shard(&vshard_key_for(3))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             second
                 .list_instances(&service_kind!("World"))
@@ -754,6 +844,74 @@ mod tests {
         assert_eq!(stale, Err(PlacementError::CompareAndPutFailed));
         assert_eq!(next, PlacementVersion(2));
         assert_eq!(store.get_actor(&key).await.unwrap().unwrap().1, updated);
+    }
+
+    #[tokio::test]
+    async fn etcd_store_persists_virtual_shards_with_versions() {
+        let store = EtcdPlacementStore::new(
+            PlacementPrefix::new("/lattice/test"),
+            InMemoryEtcdClient::new(),
+        );
+        let key = vshard_key_for(9);
+        let record = vshard_record(9, "world-a", 1);
+
+        let version = store
+            .compare_and_put_virtual_shard(key.clone(), None, record.clone())
+            .await
+            .unwrap();
+        let stale = store
+            .compare_and_put_virtual_shard(key.clone(), None, record.clone())
+            .await;
+        let updated = VirtualShardPlacementRecord {
+            owner: InstanceId::new("world-b"),
+            epoch: Epoch(2),
+            ..record
+        };
+        let next = store
+            .compare_and_put_virtual_shard(key.clone(), Some(version), updated.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(version, PlacementVersion(1));
+        assert_eq!(stale, Err(PlacementError::CompareAndPutFailed));
+        assert_eq!(next, PlacementVersion(2));
+        assert_eq!(
+            store.get_virtual_shard(&key).await.unwrap().unwrap().1,
+            updated
+        );
+        assert_eq!(
+            store
+                .list_virtual_shards(&service_kind!("World"), &actor_kind!("World"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn etcd_watch_reports_virtual_shard_updates() {
+        let store = EtcdPlacementStore::new(
+            PlacementPrefix::new("/lattice/test"),
+            InMemoryEtcdClient::new(),
+        );
+        let mut watch = store.watch(store.prefix().clone()).await.unwrap();
+        let key = vshard_key_for(5);
+        let record = vshard_record(5, "world-a", 1);
+        let version = store
+            .compare_and_put_virtual_shard(key.clone(), None, record.clone())
+            .await
+            .unwrap();
+
+        let event = watch.next().await.unwrap();
+        assert_eq!(
+            event,
+            PlacementWatchEvent::VirtualShardUpdated {
+                key,
+                version,
+                record,
+            }
+        );
     }
 
     #[tokio::test]
@@ -810,6 +968,14 @@ mod tests {
         }
     }
 
+    fn vshard_key_for(shard_id: u32) -> VirtualShardPlacementKey {
+        VirtualShardPlacementKey {
+            service_kind: service_kind!("World"),
+            actor_kind: actor_kind!("World"),
+            shard_id: crate::vshard::VirtualShardId(shard_id),
+        }
+    }
+
     fn instance_record(instance_id: &str, state: InstanceState) -> InstanceRecord {
         InstanceRecord {
             service_kind: service_kind!("World"),
@@ -836,6 +1002,16 @@ mod tests {
             epoch: Epoch(epoch),
             lease_id,
             state: PlacementState::Running,
+        }
+    }
+
+    fn vshard_record(shard_id: u32, owner: &str, epoch: u64) -> VirtualShardPlacementRecord {
+        VirtualShardPlacementRecord {
+            service_kind: service_kind!("World"),
+            actor_kind: actor_kind!("World"),
+            shard_id: crate::vshard::VirtualShardId(shard_id),
+            owner: InstanceId::new(owner),
+            epoch: Epoch(epoch),
         }
     }
 }

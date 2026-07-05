@@ -9,6 +9,7 @@ use tokio::sync::broadcast;
 
 use crate::error::PlacementError;
 use crate::instance::InstanceRecord;
+use crate::vshard::VirtualShardId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActorPlacementKey {
@@ -44,6 +45,22 @@ pub struct ActorPlacementRecord {
     pub state: PlacementState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VirtualShardPlacementKey {
+    pub service_kind: ServiceKind,
+    pub actor_kind: ActorKind,
+    pub shard_id: VirtualShardId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualShardPlacementRecord {
+    pub service_kind: ServiceKind,
+    pub actor_kind: ActorKind,
+    pub shard_id: VirtualShardId,
+    pub owner: InstanceId,
+    pub epoch: Epoch,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlacementWatchEvent {
     InstanceUpdated {
@@ -53,6 +70,11 @@ pub enum PlacementWatchEvent {
         key: ActorPlacementKey,
         version: PlacementVersion,
         record: ActorPlacementRecord,
+    },
+    VirtualShardUpdated {
+        key: VirtualShardPlacementKey,
+        version: PlacementVersion,
+        record: VirtualShardPlacementRecord,
     },
 }
 
@@ -116,6 +138,21 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
         expected: Option<PlacementVersion>,
         value: ActorPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError>;
+    async fn get_virtual_shard(
+        &self,
+        key: &VirtualShardPlacementKey,
+    ) -> Result<Option<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
+    async fn list_virtual_shards(
+        &self,
+        service_kind: &ServiceKind,
+        actor_kind: &ActorKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
+    async fn compare_and_put_virtual_shard(
+        &self,
+        key: VirtualShardPlacementKey,
+        expected: Option<PlacementVersion>,
+        value: VirtualShardPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError>;
     async fn acquire_activation_lock(
         &self,
         key: ActorPlacementKey,
@@ -151,6 +188,13 @@ impl InMemoryPlacementStore {
 
     fn prefixed_actor_key(&self, key: &ActorPlacementKey) -> PrefixedActorKey {
         PrefixedActorKey {
+            prefix: self.prefix.clone(),
+            key: key.clone(),
+        }
+    }
+
+    fn prefixed_vshard_key(&self, key: &VirtualShardPlacementKey) -> PrefixedVShardKey {
+        PrefixedVShardKey {
             prefix: self.prefix.clone(),
             key: key.clone(),
         }
@@ -262,6 +306,65 @@ impl PlacementStore for InMemoryPlacementStore {
         Ok(next)
     }
 
+    async fn get_virtual_shard(
+        &self,
+        key: &VirtualShardPlacementKey,
+    ) -> Result<Option<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .vshards
+            .get(&self.prefixed_vshard_key(key))
+            .cloned())
+    }
+
+    async fn list_virtual_shards(
+        &self,
+        service_kind: &ServiceKind,
+        actor_kind: &ActorKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .vshards
+            .iter()
+            .filter(|(key, _)| {
+                key.prefix == self.prefix
+                    && &key.key.service_kind == service_kind
+                    && &key.key.actor_kind == actor_kind
+            })
+            .map(|(_, value)| value.clone())
+            .collect())
+    }
+
+    async fn compare_and_put_virtual_shard(
+        &self,
+        key: VirtualShardPlacementKey,
+        expected: Option<PlacementVersion>,
+        value: VirtualShardPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let key = self.prefixed_vshard_key(&key);
+        let current = inner.vshards.get(&key).map(|(version, _)| *version);
+        if current != expected {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let next = PlacementVersion(current.map_or(1, |version| version.0 + 1));
+        let watch_key = key.key.clone();
+        inner.vshards.insert(key, (next, value.clone()));
+        inner.notify(
+            &self.prefix,
+            PlacementWatchEvent::VirtualShardUpdated {
+                key: watch_key,
+                version: next,
+                record: value,
+            },
+        );
+        Ok(next)
+    }
+
     async fn acquire_activation_lock(
         &self,
         key: ActorPlacementKey,
@@ -307,6 +410,7 @@ impl PlacementStore for InMemoryPlacementStore {
 struct PlacementStoreInner {
     instances: HashMap<PrefixedInstanceKey, InstanceRecord>,
     actors: HashMap<PrefixedActorKey, (PlacementVersion, ActorPlacementRecord)>,
+    vshards: HashMap<PrefixedVShardKey, (PlacementVersion, VirtualShardPlacementRecord)>,
     activation_locks: HashMap<PrefixedActorKey, LeaseId>,
     watchers: HashMap<PlacementPrefix, broadcast::Sender<PlacementWatchEvent>>,
 }
@@ -329,4 +433,10 @@ struct PrefixedInstanceKey {
 struct PrefixedActorKey {
     prefix: PlacementPrefix,
     key: ActorPlacementKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PrefixedVShardKey {
+    prefix: PlacementPrefix,
+    key: VirtualShardPlacementKey,
 }

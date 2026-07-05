@@ -23,7 +23,8 @@ use crate::route::{
 use crate::static_resolver::{StaticPlacementConfig, StaticRouteRange, StaticRouteResolver};
 use crate::store::{
     ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
-    PlacementState, PlacementStore, PlacementVersion,
+    PlacementState, PlacementStore, PlacementVersion, PlacementWatchEvent,
+    VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 use crate::vshard::{
     GradualRebalanceShardAssigner, RoundRobinShardAssigner, VirtualShardAssignInput,
@@ -415,6 +416,69 @@ async fn in_memory_placement_store_compare_and_puts_actor_records() {
 }
 
 #[tokio::test]
+async fn in_memory_placement_store_persists_virtual_shard_records() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let key = vshard_key(3);
+    let record = vshard_record(3, "world-a", 1);
+
+    let version = store
+        .compare_and_put_virtual_shard(key.clone(), None, record.clone())
+        .await
+        .unwrap();
+    let stale = store
+        .compare_and_put_virtual_shard(key.clone(), None, record.clone())
+        .await;
+    let updated = VirtualShardPlacementRecord {
+        owner: InstanceId::new("world-b"),
+        epoch: Epoch(2),
+        ..record
+    };
+    let next = store
+        .compare_and_put_virtual_shard(key.clone(), Some(version), updated.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(version, PlacementVersion(1));
+    assert_eq!(stale, Err(PlacementError::CompareAndPutFailed));
+    assert_eq!(next, PlacementVersion(2));
+    assert_eq!(
+        store.get_virtual_shard(&key).await.unwrap().unwrap().1,
+        updated
+    );
+    assert_eq!(
+        store
+            .list_virtual_shards(&service_kind!("World"), &actor_kind!("World"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn placement_watch_reports_virtual_shard_updates() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let mut watch = store.watch(store.prefix().clone()).await.unwrap();
+    let key = vshard_key(4);
+    let record = vshard_record(4, "world-a", 1);
+
+    let version = store
+        .compare_and_put_virtual_shard(key.clone(), None, record.clone())
+        .await
+        .unwrap();
+
+    let event = watch.next().await.unwrap();
+    assert_eq!(
+        event,
+        PlacementWatchEvent::VirtualShardUpdated {
+            key,
+            version,
+            record,
+        }
+    );
+}
+
+#[tokio::test]
 async fn in_memory_placement_store_activation_lock_is_exclusive_until_release() {
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
     let key = actor_key(7);
@@ -450,6 +514,10 @@ async fn in_memory_placement_store_isolates_records_by_cluster_prefix() {
         )
         .await
         .unwrap();
+    first
+        .compare_and_put_virtual_shard(vshard_key(1), None, vshard_record(1, "world-a", 1))
+        .await
+        .unwrap();
 
     assert_eq!(
         first
@@ -468,6 +536,13 @@ async fn in_memory_placement_store_isolates_records_by_cluster_prefix() {
         0
     );
     assert!(second.get_actor(&key).await.unwrap().is_none());
+    assert!(
+        second
+            .get_virtual_shard(&vshard_key(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -649,5 +724,23 @@ fn actor_record(actor_id: u64, owner: &str, epoch: u64, lease_id: LeaseId) -> Ac
         epoch: Epoch(epoch),
         lease_id,
         state: PlacementState::Running,
+    }
+}
+
+fn vshard_key(shard_id: u32) -> VirtualShardPlacementKey {
+    VirtualShardPlacementKey {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        shard_id: VirtualShardId(shard_id),
+    }
+}
+
+fn vshard_record(shard_id: u32, owner: &str, epoch: u64) -> VirtualShardPlacementRecord {
+    VirtualShardPlacementRecord {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        shard_id: VirtualShardId(shard_id),
+        owner: InstanceId::new(owner),
+        epoch: Epoch(epoch),
     }
 }

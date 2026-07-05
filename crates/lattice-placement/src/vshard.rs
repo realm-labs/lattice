@@ -4,10 +4,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lattice_core::{ActorKind, Epoch, InstanceId, RouteKey, ServiceKind};
+use serde::{Deserialize, Serialize};
 
 use crate::PlacementError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct VirtualShardId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

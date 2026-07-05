@@ -17,7 +17,10 @@ pub use route::{
     ResolvingRpcCore, RouteCacheKey, RouteResolver,
 };
 pub use static_resolver::{StaticPlacementConfig, StaticRouteRange, StaticRouteResolver};
-pub use store::{InMemoryPlacementStore, PlacementPrefix, PlacementStore};
+pub use store::{
+    InMemoryPlacementStore, PlacementPrefix, PlacementStore, VirtualShardPlacementKey,
+    VirtualShardPlacementRecord,
+};
 
 #[cfg(test)]
 mod tests;

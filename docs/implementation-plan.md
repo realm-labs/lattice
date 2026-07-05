@@ -153,7 +153,7 @@ Status: `[ ]` incomplete.
 - [x] Registry-backed lazy actor activation exists.
 - [x] Concurrent local lazy activation starts one actor and shares waiters.
 - [x] Loader/factory failure wakes waiters and remains retryable.
-- [ ] Virtual shard ownership is not yet persisted through a production `PlacementStore` keyspace.
+- [x] Virtual shard ownership is not yet persisted through a production `PlacementStore` keyspace.
 - [ ] `LatticeService` does not yet start a placement watch to refresh local shard/owner caches.
 - [ ] Scale-out does not yet make new service instances automatically participate in shard assignment.
 - [ ] Scale-in does not yet drain/rebalance shard ownership before termination.
