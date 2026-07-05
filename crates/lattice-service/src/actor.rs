@@ -12,11 +12,12 @@ use lattice_actor::registry::{
 };
 use lattice_actor::runtime::{PassivationPolicy, ShardMigrationPolicy};
 use lattice_actor::traits::{Actor, PassivationReason};
-use lattice_core::{ActorId, ActorKind, RouteKey};
+use lattice_core::{ActorId, ActorKind, LinkCloseReason, RouteKey};
 use lattice_placement::vshard::{VirtualShardId, VirtualShardMapper};
 
 use crate::LatticeServiceError;
 use crate::context::ServiceBuildContext;
+use crate::direct_link::DirectLinkServiceRuntime;
 
 type ActorCreateFuture<A> = Pin<Box<dyn Future<Output = Result<A, <A as Actor>::Error>> + Send>>;
 type ActorCreateFn<A> = dyn Fn(ActorCreateContext) -> ActorCreateFuture<A> + Send + Sync;
@@ -219,6 +220,7 @@ pub(crate) trait ErasedLogicActor: Send + Sync + fmt::Debug {
         &self,
         shard_id: VirtualShardId,
         shard_count: u32,
+        direct_links: Option<DirectLinkServiceRuntime>,
     ) -> VirtualShardPreparation;
 }
 
@@ -249,6 +251,7 @@ where
         &self,
         shard_id: VirtualShardId,
         shard_count: u32,
+        direct_links: Option<DirectLinkServiceRuntime>,
     ) -> VirtualShardPreparation {
         let mapper = match VirtualShardMapper::new(shard_count) {
             Ok(mapper) => mapper,
@@ -284,6 +287,12 @@ where
                 passivated_actors: 0,
             },
             ShardMigrationPolicy::PassivateRunningActors => {
+                close_direct_links_for_actor_ids(
+                    direct_links.as_ref(),
+                    self.registry.kind(),
+                    &running_actor_ids,
+                    LinkCloseReason::TargetMigrating,
+                );
                 let passivated = self
                     .registry
                     .passivate_actor_ids(running_actor_ids, PassivationReason::Migrate)
@@ -296,6 +305,26 @@ where
             }
         }
     }
+}
+
+fn close_direct_links_for_actor_ids(
+    runtime: Option<&DirectLinkServiceRuntime>,
+    actor_kind: &ActorKind,
+    actor_ids: &[ActorId],
+    reason: LinkCloseReason,
+) -> usize {
+    let Some(runtime) = runtime else {
+        return 0;
+    };
+    actor_ids
+        .iter()
+        .filter_map(|actor_id| {
+            runtime
+                .inbound_router()
+                .close_active_links_for_actor(actor_kind, actor_id, reason.clone())
+                .ok()
+        })
+        .sum()
 }
 
 fn route_key_from_actor_id(actor_id: &ActorId) -> RouteKey {

@@ -288,7 +288,8 @@ Status: `[ ]` in progress.
   - [x] Managed TCP heartbeat send task writes heartbeat frames on open direct-link connections.
   - [x] Protocol-error frame handling and invalid post-open frames close links with `ProtocolError`.
   - [x] Service node-drain hook closes active links with `NodeDraining` during shutdown before actor registry drain.
-  - [ ] Actor passivation and actor migration hooks close affected links with `TargetPassivated` or `TargetMigrating`.
+  - [x] Actor migration hook closes affected links with `TargetMigrating` before migration passivation.
+  - [ ] Actor passivation hook closes affected links with `TargetPassivated`.
 - [ ] Security hooks cover internal bind policy, peer identity/auth, source service/actor authorization, max frame size, connection limit, link limit, and rate limit.
 - [ ] Observability emits link open/close/send/receive/drop/coalesce/backpressure/decode-error metrics and sampled tracing without per-message spans by default.
 - [ ] Direct Link benchmark exists for TCP single-process, local multi-process, and payload/backpressure matrices.

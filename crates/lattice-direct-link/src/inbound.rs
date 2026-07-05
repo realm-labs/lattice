@@ -10,8 +10,9 @@ use std::time::Instant;
 
 use lattice_actor::{Actor, ActorHandle, ActorTellError, Handler};
 use lattice_core::{
-    ActorKind, ActorRef, DirectLinkMessageId, LinkBackpressure, LinkCloseReason, LinkClosed,
-    LinkDirection, LinkDirectionClosed, LinkId, LinkMessageContext, LinkMessageFlags, LinkOpened,
+    ActorId, ActorKind, ActorRef, DirectLinkMessageId, LinkBackpressure, LinkCloseReason,
+    LinkClosed, LinkDirection, LinkDirectionClosed, LinkId, LinkMessageContext, LinkMessageFlags,
+    LinkOpened,
 };
 use thiserror::Error;
 
@@ -256,6 +257,27 @@ impl DirectLinkInboundRouter {
         for snapshot in snapshots {
             self.close_all(&snapshot.link_id, reason.clone())?;
             closed += 1;
+        }
+        Ok(closed)
+    }
+
+    pub fn close_active_links_for_actor(
+        &self,
+        actor_kind: &ActorKind,
+        actor_id: &ActorId,
+        reason: LinkCloseReason,
+    ) -> Result<usize, InboundDeliveryError> {
+        let snapshots = self.session_manager.active_link_snapshots();
+        let mut closed = 0;
+        for snapshot in snapshots {
+            let matches_source =
+                snapshot.source.actor_kind == *actor_kind && snapshot.source.actor_id == *actor_id;
+            let matches_target =
+                snapshot.target.actor_kind == *actor_kind && snapshot.target.actor_id == *actor_id;
+            if matches_source || matches_target {
+                self.close_all(&snapshot.link_id, reason.clone())?;
+                closed += 1;
+            }
         }
         Ok(closed)
     }

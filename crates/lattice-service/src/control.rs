@@ -11,16 +11,22 @@ use lattice_placement::coordinator::{
 use lattice_placement::store::{ActorPlacementKey, SingletonKey};
 
 use crate::actor::ErasedLogicActor;
+use crate::direct_link::DirectLinkServiceRuntime;
 
 #[derive(Clone)]
 pub(crate) struct ServiceLogicControlHandler {
     actors: Arc<HashMap<ActorKind, Arc<dyn ErasedLogicActor>>>,
+    direct_links: Option<DirectLinkServiceRuntime>,
 }
 
 impl ServiceLogicControlHandler {
-    pub(crate) fn new(actors: HashMap<ActorKind, Arc<dyn ErasedLogicActor>>) -> Self {
+    pub(crate) fn new(
+        actors: HashMap<ActorKind, Arc<dyn ErasedLogicActor>>,
+        direct_links: Option<DirectLinkServiceRuntime>,
+    ) -> Self {
         Self {
             actors: Arc::new(actors),
+            direct_links,
         }
     }
 }
@@ -73,7 +79,11 @@ impl LogicControlHandler for ServiceLogicControlHandler {
             });
         };
         let preparation = actor
-            .prepare_virtual_shard_migration(request.shard_id, request.shard_count)
+            .prepare_virtual_shard_migration(
+                request.shard_id,
+                request.shard_count,
+                self.direct_links.clone(),
+            )
             .await;
         Ok(VirtualShardMigrationOutcome {
             shard_id: request.shard_id,

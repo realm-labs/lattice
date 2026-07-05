@@ -2057,6 +2057,110 @@ async fn logic_control_prepares_virtual_shard_migration_from_registry_policy() {
 }
 
 #[tokio::test]
+async fn logic_control_closes_direct_links_for_migrating_actors() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store =
+        InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test-direct-link-migrate"));
+    let closed = Arc::new(Mutex::new(Vec::new()));
+    let stream = DirectLinkStream::new("movement").message::<DirectLinkTestPayload>();
+    let descriptor = stream.descriptor();
+    let link_id = LinkId::new("service-link-target-migrating");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .shard_migration(ShardMigrationPolicy::PassivateRunningActors)
+                .factory(DirectLinkLifecycleFactory {
+                    closed: closed.clone(),
+                })
+                .build(),
+        )
+        .register_direct_link(stream.for_actor::<DirectLinkLifecycleActor>(actor_kind!("World")))
+        .build()
+        .await
+        .unwrap();
+    let direct_link_runtime = service.direct_link_runtime().unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let addr = ready_rx.await.unwrap();
+    let mut client = LogicControlClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    client
+        .activate_actor(proto::ActivateActorRequest {
+            service_kind: "World".to_string(),
+            actor_kind: "World".to_string(),
+            actor_id: Some(actor_id_to_proto(&ActorId::U64(7))),
+            epoch: 1,
+        })
+        .await
+        .unwrap();
+
+    direct_link_runtime
+        .session_manager()
+        .open_link(OpenLinkRequest {
+            protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+            link_id: link_id.clone(),
+            source: direct_actor_ref(
+                service_kind!("Gateway"),
+                actor_kind!("GatewaySession"),
+                ActorId::U64(99),
+                "tcp://127.0.0.1:1".parse().unwrap(),
+            ),
+            target: direct_actor_ref(
+                service_kind!("World"),
+                actor_kind!("World"),
+                ActorId::U64(7),
+                "tcp://127.0.0.1:2".parse().unwrap(),
+            ),
+            mode: DirectLinkMode::Unidirectional,
+            source_to_target: OpenLinkDirection::from_stream(link_id.clone(), &descriptor),
+            target_to_source: None,
+            options: DirectLinkOptions::unidirectional(),
+        })
+        .unwrap();
+
+    let shard_id = VirtualShardMapper::new(8)
+        .unwrap()
+        .shard_for_route_key(&RouteKey::U64(7));
+    let response = client
+        .prepare_virtual_shard_migration(proto::PrepareVirtualShardMigrationRequest {
+            service_kind: "World".to_string(),
+            actor_kind: "World".to_string(),
+            shard_id: shard_id.0,
+            shard_count: 8,
+            owner_epoch: 1,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.eligible);
+    assert_eq!(response.running_actors, 1);
+    assert_eq!(response.passivated_actors, 1);
+
+    let snapshot = direct_link_runtime
+        .session_manager()
+        .link_snapshot(&link_id)
+        .unwrap();
+    assert!(snapshot.closed);
+    assert_eq!(
+        snapshot.close_reason,
+        Some(LinkCloseReason::TargetMigrating)
+    );
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn service_shutdown_migrates_owned_placement_records() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));

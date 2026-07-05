@@ -517,7 +517,10 @@ impl LatticeServiceBuilder {
         }
         let direct_link_runtime = build_direct_link_runtime(self.direct_link_bindings, &context)?;
         if !context.logic_actors.is_empty() {
-            let handler = ServiceLogicControlHandler::new(context.logic_actors.clone());
+            let handler = ServiceLogicControlHandler::new(
+                context.logic_actors.clone(),
+                direct_link_runtime.clone(),
+            );
             context.add_rpc_service(lattice_placement::control::LogicControlServer::new(
                 lattice_placement::control::LogicControlService::new(handler),
             ));
