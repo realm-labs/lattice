@@ -11,6 +11,7 @@ pub mod static_resolver;
 pub mod store;
 pub mod vshard;
 
+pub use coordinator::PlacementRouteResolver;
 pub use endpoint::{EndpointLease, EndpointPool};
 pub use error::PlacementError;
 pub use route::{

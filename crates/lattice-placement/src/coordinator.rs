@@ -516,6 +516,8 @@ pub struct ExplicitRouteResolver<S, L> {
     placement_lookups: Arc<AtomicU64>,
 }
 
+pub type PlacementRouteResolver<S, L> = ExplicitRouteResolver<S, L>;
+
 impl<S, L> ExplicitRouteResolver<S, L> {
     pub fn new(
         service_kind: ServiceKind,
@@ -808,6 +810,52 @@ mod tests {
         assert_eq!(first.owner_epoch, Some(Epoch(1)));
         assert_eq!(resolver.placement_lookups(), 1);
         assert_eq!(logic.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn placement_route_resolver_reads_existing_store_record_without_activation() {
+        let store = ready_store().await;
+        let key = ActorPlacementKey {
+            actor_kind: actor_kind!("World"),
+            actor_id: ActorId::U64(7),
+        };
+        store
+            .compare_and_put_actor(
+                key,
+                None,
+                ActorPlacementRecord {
+                    actor_kind: actor_kind!("World"),
+                    actor_id: ActorId::U64(7),
+                    owner: InstanceId::new("world-a"),
+                    epoch: Epoch(3),
+                    lease_id: LeaseId(10),
+                    state: PlacementState::Running,
+                },
+            )
+            .await
+            .unwrap();
+        let logic = CountingLogicControl::default();
+        let coordinator = PlacementCoordinator::new(store.clone(), logic.clone());
+        let resolver = PlacementRouteResolver::new(
+            service_kind!("World"),
+            store,
+            coordinator,
+            RouteCacheConfig::default(),
+        );
+
+        let target = resolver
+            .resolve(ResolveRequest {
+                service_kind: service_kind!("World"),
+                actor_kind: actor_kind!("World"),
+                route_key: RouteKey::U64(7),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(target.instance_id, InstanceId::new("world-a"));
+        assert_eq!(target.owner_epoch, Some(Epoch(3)));
+        assert_eq!(resolver.placement_lookups(), 1);
+        assert_eq!(logic.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
