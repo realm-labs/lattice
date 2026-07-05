@@ -7,10 +7,10 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+http.workspace = true
 lattice-actor.workspace = true
 lattice-core.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
