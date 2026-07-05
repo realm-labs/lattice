@@ -2033,6 +2033,7 @@ name = "rpc-benchmark"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clap",
  "criterion",
  "lattice-actor",
  "lattice-codegen",

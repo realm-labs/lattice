@@ -6,6 +6,7 @@ use tokio::task::JoinSet;
 use crate::bench::{ChainPingRequest, PingRequest};
 use crate::error::{BenchmarkError, BenchmarkResult};
 use crate::metrics::WorkloadReport;
+use crate::topology::BenchClient;
 use crate::topology::{BenchmarkConfig, BenchmarkTopology};
 
 #[derive(Debug, Clone)]
@@ -43,7 +44,19 @@ pub async fn run_routed_rpc_fanout(
     topology: &BenchmarkTopology,
     config: &WorkloadConfig,
 ) -> BenchmarkResult<WorkloadReport> {
-    let client = topology.bench_client();
+    run_routed_rpc_fanout_with_client(
+        "routed_rpc_fanout_warm_cache",
+        topology.bench_client(),
+        config,
+    )
+    .await
+}
+
+pub async fn run_routed_rpc_fanout_with_client(
+    name: &'static str,
+    client: std::sync::Arc<BenchClient>,
+    config: &WorkloadConfig,
+) -> BenchmarkResult<WorkloadReport> {
     let mut tasks = JoinSet::new();
     let started = Instant::now();
     let worker_count = worker_count(config);
@@ -79,13 +92,7 @@ pub async fn run_routed_rpc_fanout(
         });
     }
 
-    collect_report(
-        "routed_rpc_fanout_warm_cache",
-        config.requests,
-        started,
-        tasks,
-    )
-    .await
+    collect_report(name, config.requests, started, tasks).await
 }
 
 pub async fn run_cross_service_chain(

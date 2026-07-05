@@ -1,6 +1,7 @@
 pub mod actors;
 pub mod error;
 pub mod metrics;
+pub mod multiprocess;
 pub mod topology;
 pub mod workload;
 

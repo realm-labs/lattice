@@ -62,5 +62,32 @@ Set `LATTICE_BENCH_RPC_RETRY=false` to measure the hot path without
 route-correction retry buffering, and `LATTICE_BENCH_REQUEST_DEDUP=false` to
 measure without server-side request id reservation.
 
-This benchmark is intentionally single-process multi-node. A true multi-process
-driver can be added later after this baseline is stable.
+The Criterion benchmark is intentionally single-process multi-node for stable
+framework measurements. Use the local multi-process driver below when you need
+process-boundary data.
+
+## Local Multi-Process Benchmark
+
+Use the multi-process driver to compare against the in-process Criterion
+baseline. It starts multiple `rpc-benchmark-node` child processes on
+`127.0.0.1:0`, uses etcd as the shared placement store, then runs the same
+single-hop routed RPC workload from the driver process.
+
+Start etcd locally, then build and run:
+
+```bash
+cargo build -p rpc-benchmark --bins --release
+
+target/release/rpc-benchmark-driver \
+  --etcd-endpoints http://127.0.0.1:2379 \
+  --nodes 2 \
+  --actors 256 \
+  --concurrency 64 \
+  --requests 10000 \
+  --channel-stripes 4
+```
+
+The driver uses a unique placement key prefix by default. Override it with
+`--key-prefix` when you want stable keys for inspection. The current
+multi-process driver covers the single-hop `BenchRpc.Ping` path; the in-process
+Criterion target still covers both single-hop and chained RPC scenarios.

@@ -63,7 +63,7 @@ impl BenchmarkConfig {
             .expect("benchmark channel stripe count is clamped to at least one")
     }
 
-    fn rpc_retry_policy(&self) -> RpcRetryPolicy {
+    pub fn rpc_retry_policy(&self) -> RpcRetryPolicy {
         if self.rpc_retry {
             RpcRetryPolicy::RouteCorrection
         } else {
