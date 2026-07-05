@@ -6,6 +6,10 @@ service LogicControl {
   rpc ActivateActor(ActivateActorRequest) returns (ActivateActorReply);
 }
 
+service PlacementCoordinator {
+  rpc ActivateActor(ActivateActorRequest) returns (ActorPlacementReply);
+}
+
 message ActivateActorRequest {
   string service_kind = 1;
   string actor_kind = 2;
@@ -23,3 +27,12 @@ message ActorId {
 }
 
 message ActivateActorReply {}
+
+message ActorPlacementReply {
+  string actor_kind = 1;
+  ActorId actor_id = 2;
+  string owner_instance_id = 3;
+  uint64 epoch = 4;
+  uint64 lease_id = 5;
+  string state = 6;
+}
