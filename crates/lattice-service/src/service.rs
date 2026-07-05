@@ -154,6 +154,7 @@ impl LatticeService {
                 lease_id,
             )
             .await;
+            let _ = server_shutdown_tx.send(());
             let placement_drain =
                 drain_placement(placement_store.as_ref(), &service_kind, &instance).await;
             let cancelled_subscriptions = cancel_event_subscriptions(&service_context).await;
@@ -171,7 +172,6 @@ impl LatticeService {
                 actor.registries.drained = drained_actors,
                 "drained runtime actor registries"
             );
-            let _ = server_shutdown_tx.send(());
             if let Some(admin_shutdown_tx) = admin_shutdown_tx {
                 let _ = admin_shutdown_tx.send(());
             }
@@ -187,6 +187,7 @@ impl LatticeService {
         tokio::pin!(serve);
         let mut lifecycle_done = false;
         let mut lifecycle_error = None;
+        let mut serve_result = None;
         let service_exit = loop {
             tokio::select! {
                 result = &mut lifecycle_shutdown, if !lifecycle_done => {
@@ -194,11 +195,19 @@ impl LatticeService {
                     if let Err(error) = result {
                         lifecycle_error = Some(error);
                     }
+                    if let Some(result) = serve_result.take() {
+                        break ServiceExit::Server(result);
+                    }
                 }
                 result = &mut keepalive => {
                     break ServiceExit::Keepalive(result);
                 }
-                result = &mut serve => break ServiceExit::Server(result),
+                result = &mut serve, if serve_result.is_none() => {
+                    if lifecycle_done {
+                        break ServiceExit::Server(result);
+                    }
+                    serve_result = Some(result);
+                }
             }
         };
         if let Some(error) = lifecycle_error {

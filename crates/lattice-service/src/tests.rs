@@ -448,6 +448,42 @@ impl ActorFactory<DrainRecordingActor> for DrainRecordingFactory {
     }
 }
 
+struct BlockingStopActor {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl Actor for BlockingStopActor {
+    type Error = ActorError;
+
+    async fn stopping(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _reason: StopReason,
+    ) -> Result<(), ActorStopError> {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct BlockingStopFactory {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl ActorFactory<BlockingStopActor> for BlockingStopFactory {
+    async fn create(&self, _ctx: ActorCreateContext) -> Result<BlockingStopActor, ActorError> {
+        Ok(BlockingStopActor {
+            entered: self.entered.clone(),
+            release: self.release.clone(),
+        })
+    }
+}
+
 #[derive(Debug)]
 struct ReadServiceContext;
 
@@ -1067,6 +1103,62 @@ async fn service_shutdown_drains_runtime_actor_registries() {
         *reasons.lock().await,
         vec![StopReason::Passivated(PassivationReason::Drain)]
     );
+}
+
+#[tokio::test]
+async fn service_shutdown_stops_accepting_rpc_before_actor_drain_finishes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-drain-rpc"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(BlockingStopFactory {
+                    entered: entered.clone(),
+                    release: release.clone(),
+                })
+                .build(),
+        )
+        .build()
+        .await
+        .unwrap();
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let addr = ready_rx.await.unwrap();
+    let mut client = LogicControlClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    client
+        .activate_actor(proto::ActivateActorRequest {
+            service_kind: "World".to_string(),
+            actor_kind: "World".to_string(),
+            actor_id: Some(actor_id_to_proto(&ActorId::U64(7))),
+            epoch: 1,
+        })
+        .await
+        .unwrap();
+
+    shutdown_tx.send(()).unwrap();
+    entered.acquire().await.unwrap().forget();
+
+    let mut stopped_accepting = false;
+    for _ in 0..50 {
+        if TcpStream::connect(addr).await.is_err() {
+            stopped_accepting = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(stopped_accepting, "service kept accepting RPC during drain");
+
+    release.add_permits(1);
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
