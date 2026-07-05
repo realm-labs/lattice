@@ -136,11 +136,28 @@ impl DirectLinkInboundRouter {
         now: Instant,
     ) -> Result<(), InboundDeliveryError> {
         match frame.kind {
-            DirectLinkFrameKind::Message => self.deliver_frame(frame),
+            DirectLinkFrameKind::Message => {
+                let link_id = frame.link_id.clone();
+                match self.deliver_frame(frame) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        if let Some(reason) = protocol_error_close_reason(&error) {
+                            let _ =
+                                self.close_all(&link_id, LinkCloseReason::ProtocolError(reason));
+                        }
+                        Err(error)
+                    }
+                }
+            }
             DirectLinkFrameKind::Heartbeat | DirectLinkFrameKind::HeartbeatAck => self
                 .session_manager
                 .record_heartbeat_at(&frame.link_id, now)
                 .map_err(Into::into),
+            DirectLinkFrameKind::ProtocolError => {
+                let reason = String::from_utf8(frame.payload)
+                    .unwrap_or_else(|_| "remote protocol error".to_string());
+                self.close_all(&frame.link_id, LinkCloseReason::ProtocolError(reason))
+            }
             _ => Err(InboundDeliveryError::NotMessageFrame),
         }
     }
@@ -558,6 +575,39 @@ fn is_mailbox_full(error: &InboundDeliveryError) -> bool {
             ActorTellError::MailboxFull
         ))
     )
+}
+
+fn protocol_error_close_reason(error: &InboundDeliveryError) -> Option<String> {
+    match error {
+        InboundDeliveryError::Frame(MessageFrameError::UnknownLink) => {
+            Some("unknown link".to_string())
+        }
+        InboundDeliveryError::Frame(MessageFrameError::WrongDirection) => {
+            Some("wrong direction".to_string())
+        }
+        InboundDeliveryError::Frame(MessageFrameError::Closed) => Some("link closed".to_string()),
+        InboundDeliveryError::Frame(MessageFrameError::UnsupportedMessageType) => {
+            Some("unsupported message type".to_string())
+        }
+        InboundDeliveryError::Frame(MessageFrameError::NonActivatableTarget) => {
+            Some("non-activatable target".to_string())
+        }
+        InboundDeliveryError::Frame(MessageFrameError::DecodeError(error)) => {
+            Some(format!("decode error: {error}"))
+        }
+        InboundDeliveryError::Frame(MessageFrameError::InvalidSequence { expected, actual }) => {
+            Some(format!(
+                "invalid sequence: expected {expected:?}, actual {actual:?}"
+            ))
+        }
+        InboundDeliveryError::Delivery(DirectLinkDeliveryError::UnsupportedMessageType) => {
+            Some("unsupported message type".to_string())
+        }
+        InboundDeliveryError::Delivery(DirectLinkDeliveryError::Decode(error)) => {
+            Some(format!("decode error: {error}"))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1725,6 +1775,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_frame_closes_invalid_message_frames_with_protocol_error() {
+        for (name, frame) in [
+            ("wrong direction", ProtocolErrorFrame::WrongDirection),
+            (
+                "unsupported message type",
+                ProtocolErrorFrame::UnsupportedMessageType,
+            ),
+            ("decode error", ProtocolErrorFrame::DecodeError),
+        ] {
+            let link_id = LinkId::new(format!("link-protocol-error-{name}"));
+            let (router, descriptor, received, link_closed) =
+                protocol_error_test_router(link_id.clone()).await;
+            let message_id = descriptor.message_id_for::<InputCommand>().unwrap();
+            let frame = match frame {
+                ProtocolErrorFrame::WrongDirection => DirectLinkFrame::directed_message(
+                    link_id.clone(),
+                    LinkDirection::TargetToSource,
+                    LinkSequence(1),
+                    message_id,
+                    InputCommand { command_id: 11 }.encode_to_vec(),
+                ),
+                ProtocolErrorFrame::UnsupportedMessageType => DirectLinkFrame::message(
+                    link_id.clone(),
+                    LinkSequence(1),
+                    DirectLinkMessageId(999),
+                    InputCommand { command_id: 11 }.encode_to_vec(),
+                ),
+                ProtocolErrorFrame::DecodeError => DirectLinkFrame::message(
+                    link_id.clone(),
+                    LinkSequence(1),
+                    message_id,
+                    b"not protobuf".to_vec(),
+                ),
+            };
+
+            assert!(router.process_frame(frame).is_err());
+            wait_for_len(&link_closed, 1).await;
+            assert!(received.lock().expect("received mutex poisoned").is_empty());
+            let event = link_closed.lock().expect("link closed mutex poisoned")[0].clone();
+            assert_eq!(event.link_id, link_id);
+            assert!(matches!(
+                event.reason,
+                LinkCloseReason::ProtocolError(ref reason) if reason.contains(name)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn process_frame_closes_remote_protocol_error_frame() {
+        let link_id = LinkId::new("link-remote-protocol-error");
+        let (router, _descriptor, _received, link_closed) =
+            protocol_error_test_router(link_id.clone()).await;
+        let frame = DirectLinkFrame {
+            kind: DirectLinkFrameKind::ProtocolError,
+            link_id: link_id.clone(),
+            sequence: LinkSequence(0),
+            message_id: None,
+            flags: LinkMessageFlags::EMPTY,
+            header: Vec::new(),
+            payload: b"remote invalid sequence".to_vec(),
+        };
+
+        router.process_frame(frame).unwrap();
+        wait_for_len(&link_closed, 1).await;
+        let event = link_closed.lock().expect("link closed mutex poisoned")[0].clone();
+        assert_eq!(event.link_id, link_id);
+        assert_eq!(
+            event.reason,
+            LinkCloseReason::ProtocolError("remote invalid sequence".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn inbound_backpressure_drop_newest_emits_event_without_mailbox_delivery() {
         let received = Arc::new(Mutex::new(Vec::new()));
         let backpressure = Arc::new(Mutex::new(Vec::new()));
@@ -1907,6 +2030,64 @@ mod tests {
             router.deliver_frame(frame),
             Err(InboundDeliveryError::UnboundActorKind { .. })
         ));
+    }
+
+    enum ProtocolErrorFrame {
+        WrongDirection,
+        UnsupportedMessageType,
+        DecodeError,
+    }
+
+    async fn protocol_error_test_router(
+        link_id: LinkId,
+    ) -> (
+        DirectLinkInboundRouter,
+        DirectLinkStreamDescriptor,
+        Arc<Mutex<Vec<u64>>>,
+        Arc<Mutex<Vec<LinkClosed>>>,
+    ) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let backpressure = Arc::new(Mutex::new(Vec::new()));
+        let direction_closed = Arc::new(Mutex::new(Vec::new()));
+        let link_closed = Arc::new(Mutex::new(Vec::new()));
+        let handle = ActorRuntime::default()
+            .spawn_actor(
+                BackpressureActor {
+                    received: received.clone(),
+                    backpressure,
+                    direction_closed,
+                    link_closed: link_closed.clone(),
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let manager = Arc::new(DirectLinkSessionManager::new());
+        let input_stream = DirectLinkStream::new("gateway-input").message::<InputCommand>();
+        let input_descriptor = input_stream.descriptor();
+        manager
+            .register_binding(actor_kind!("Battle"), input_descriptor.clone())
+            .unwrap();
+        manager
+            .open_link(OpenLinkRequest {
+                protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                link_id: link_id.clone(),
+                source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+                target: actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9),
+                mode: DirectLinkMode::Unidirectional,
+                source_to_target: OpenLinkDirection::from_stream(link_id, &input_descriptor),
+                target_to_source: None,
+                options: DirectLinkOptions::unidirectional(),
+            })
+            .unwrap();
+        let router = DirectLinkInboundRouter::builder(manager)
+            .bind_actor(
+                input_stream.for_actor::<BackpressureActor>(actor_kind!("Battle")),
+                move |_| Some(handle.clone()),
+            )
+            .build();
+
+        (router, input_descriptor, received, link_closed)
     }
 
     fn actor_ref(service_kind: ServiceKind, actor_kind: ActorKind, id: u64) -> ActorRef {

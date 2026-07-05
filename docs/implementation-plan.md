@@ -286,7 +286,7 @@ Status: `[ ]` in progress.
   - [x] Heartbeat / heartbeat-ack frame processing refreshes liveness, and idle-timeout scans close stale links with `HeartbeatTimeout`.
   - [x] Managed TCP idle-timeout background task drives liveness scans during service runtime.
   - [x] Managed TCP heartbeat send task writes heartbeat frames on open direct-link connections.
-  - [ ] Protocol-error frame handling and invalid post-open frames close links with `ProtocolError`.
+  - [x] Protocol-error frame handling and invalid post-open frames close links with `ProtocolError`.
   - [ ] Service node-drain, actor passivation, and actor migration hooks close affected links with `NodeDraining`, `TargetPassivated`, or `TargetMigrating`.
 - [ ] Security hooks cover internal bind policy, peer identity/auth, source service/actor authorization, max frame size, connection limit, link limit, and rate limit.
 - [ ] Observability emits link open/close/send/receive/drop/coalesce/backpressure/decode-error metrics and sampled tracing without per-message spans by default.
