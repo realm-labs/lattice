@@ -6,12 +6,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lattice_actor::registry::ActorCreateContext;
 use lattice_actor::{
-    Actor, ActorContext, ActorError, ActorFactory, ActorRuntime, ActorSpawnOptions, Handler,
-    MailboxConfig, Message,
+    Actor, ActorContext, ActorError, ActorFactory, Handler, MailboxConfig, Message,
 };
 use lattice_config::{ConfigSource, ConfigStore, LocalConfigStore};
 use lattice_core::{
-    ActorId, ActorKey, ActorKeyDecodeError, ActorKind, Epoch, InstanceId, RouteKey, ServiceKind,
+    ActorId, ActorKey, ActorKeyDecodeError, ActorKind, InstanceId, RouteKey, ServiceKind,
     TraceContext, actor_kind, service_kind,
 };
 use lattice_eventbus::{
@@ -20,21 +19,13 @@ use lattice_eventbus::{
 };
 use lattice_gateway::{BinaryClientCodec, ClientCodec, ClientFrame, GatewayRouteTable};
 use lattice_ops::ServiceScheduler;
-use lattice_placement::cache::RouteCacheConfig;
-use lattice_placement::static_resolver::{
-    StaticPlacementConfig, StaticRouteRange, StaticRouteResolver,
-};
-use lattice_placement::{EndpointLease, EndpointPool, EndpointRpcTransport, ResolvingRpcCore};
-use lattice_rpc::server::RpcServerBuilder;
-use lattice_rpc::{
-    ActorRpcAdapter, RouteTarget, RoutedRequest, Rpc, RpcClientContextFactory, RpcError, RpcRequest,
-};
+use lattice_placement::{InMemoryPlacementStore, PlacementPrefix};
+use lattice_rpc::Rpc;
 use lattice_service::{ActorRegistration, LatticeService};
 use prost::Message as ProstMessage;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
-use tonic::{Request, Response};
 
 pub mod world {
     tonic::include_proto!("world");
@@ -101,52 +92,12 @@ impl Actor for WorldActor {
 }
 
 #[derive(Debug)]
-pub struct EnterWorld {
-    pub player_id: u64,
-}
-
-impl Message for EnterWorld {
-    type Reply = EnterWorldReply;
-}
-
-#[derive(Debug)]
 pub struct WorldTick {
     pub delta_ms: u64,
 }
 
 impl Message for WorldTick {
     type Reply = ();
-}
-
-#[derive(Debug)]
-pub struct InspectWorld;
-
-impl Message for InspectWorld {
-    type Reply = WorldSnapshot;
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct WorldSnapshot {
-    pub world_id: WorldId,
-    pub player_count: usize,
-    pub total_ticks: u64,
-    pub last_rpc_request_id: Option<String>,
-}
-
-#[async_trait]
-impl Handler<EnterWorld> for WorldActor {
-    async fn handle(
-        &mut self,
-        _ctx: &mut ActorContext<Self>,
-        msg: EnterWorld,
-    ) -> Result<EnterWorldReply, ActorError> {
-        let player_id = PlayerId(msg.player_id);
-        self.players.entry(player_id).or_default();
-        Ok(EnterWorldReply {
-            ok: true,
-            player_count: self.players.len() as u64,
-        })
-    }
 }
 
 #[async_trait]
@@ -188,29 +139,7 @@ impl Handler<WorldTick> for WorldActor {
     }
 }
 
-#[async_trait]
-impl Handler<InspectWorld> for WorldActor {
-    async fn handle(
-        &mut self,
-        _ctx: &mut ActorContext<Self>,
-        _msg: InspectWorld,
-    ) -> Result<WorldSnapshot, ActorError> {
-        Ok(WorldSnapshot {
-            world_id: self.world_id,
-            player_count: self.players.len(),
-            total_ticks: self.players.values().map(|state| state.ticks_seen).sum(),
-            last_rpc_request_id: self.last_rpc_request_id.clone(),
-        })
-    }
-}
-
-#[derive(Clone)]
-struct LocalWorldTransport {
-    adapters: HashMap<InstanceId, ActorRpcAdapter<WorldActor>>,
-}
-
-type LocalWorldCore = ResolvingRpcCore<StaticRouteResolver, LocalWorldTransport>;
-type LocalWorldClient = WorldClient<LocalWorldCore>;
+type GeneratedWorldClient = WorldClient<generated::world_rpc::DefaultClientCore>;
 
 #[derive(Clone)]
 struct WorldActorFactory {
@@ -238,40 +167,6 @@ impl ActorFactory<WorldActor> for WorldActorFactory {
     }
 }
 
-#[async_trait]
-impl EndpointRpcTransport for LocalWorldTransport {
-    async fn unary<Req>(
-        &self,
-        _endpoint: EndpointLease,
-        target: RouteTarget,
-        metadata: tonic::metadata::MetadataMap,
-        request: &Req,
-    ) -> Result<Response<Req::Reply>, RpcError>
-    where
-        Req: RoutedRequest + RpcRequest,
-    {
-        let adapter = self
-            .adapters
-            .get(&target.instance_id)
-            .ok_or_else(|| RpcError::Business("missing local adapter".to_string()))?;
-        let request_bytes = request.encode_to_vec();
-        let mut actor_request = Request::new(
-            EnterWorldRequest::decode(request_bytes.as_slice())
-                .map_err(|error| RpcError::Business(error.to_string()))?,
-        );
-        *actor_request.metadata_mut() = metadata;
-
-        let reply = adapter
-            .unary(actor_request)
-            .await
-            .map(Response::into_inner)
-            .map_err(|status| RpcError::Business(status.to_string()))?;
-        Req::Reply::decode(reply.encode_to_vec().as_slice())
-            .map(Response::new)
-            .map_err(|error| RpcError::Business(error.to_string()))
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct WorldConfig {
     tick_ms: u64,
@@ -284,104 +179,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ConfigSource::file("examples/minimal-world/config/world-service.toml")
             .load()?
             .section("world")?;
-    let runtime = ActorRuntime::default();
-    let world_a = runtime
-        .spawn_actor(
-            WorldActor {
-                world_id: WorldId(1),
-                tick_ms: config.tick_ms,
-                players: HashMap::new(),
-                last_rpc_request_id: None,
-            },
-            ActorSpawnOptions {
-                mailbox: MailboxConfig::bounded(config.mailbox_capacity),
-                ..ActorSpawnOptions::default()
-            },
-        )
-        .await?;
-    let world_b = runtime
-        .spawn_actor(
-            WorldActor {
-                world_id: WorldId(75),
-                tick_ms: config.tick_ms,
-                players: HashMap::new(),
-                last_rpc_request_id: None,
-            },
-            ActorSpawnOptions {
-                mailbox: MailboxConfig::bounded(config.mailbox_capacity),
-                ..ActorSpawnOptions::default()
-            },
-        )
-        .await?;
-
-    let target_a = RouteTarget {
-        service_kind: WORLD_SERVICE,
-        instance_id: InstanceId::new("world-a"),
-        advertised_endpoint: "http://world-a.world:18080".parse()?,
-        owner_epoch: Some(Epoch(1)),
-    };
-    let target_b = RouteTarget {
-        service_kind: WORLD_SERVICE,
-        instance_id: InstanceId::new("world-b"),
-        advertised_endpoint: "http://world-b.world:18080".parse()?,
-        owner_epoch: Some(Epoch(1)),
-    };
-    let mut rpc_server = RpcServerBuilder::new();
-    rpc_server.add_service("WorldRpc", target_a.clone())?;
-    rpc_server.add_service("WorldAdminRpc", target_a.clone())?;
-
-    let resolver = StaticRouteResolver::new(
-        StaticPlacementConfig {
-            ranges: vec![
-                StaticRouteRange {
-                    service_kind: WORLD_SERVICE,
-                    actor_kind: WORLD_ACTOR,
-                    start_inclusive: 0,
-                    end_exclusive: 50,
-                    target: target_a,
-                },
-                StaticRouteRange {
-                    service_kind: WORLD_SERVICE,
-                    actor_kind: WORLD_ACTOR,
-                    start_inclusive: 50,
-                    end_exclusive: 100,
-                    target: target_b,
-                },
-            ],
-        },
-        RouteCacheConfig::default(),
-    );
-    let transport = LocalWorldTransport {
-        adapters: HashMap::from([
-            (
-                InstanceId::new("world-a"),
-                ActorRpcAdapter::new(world_a.clone()).with_owner_epoch(Epoch(1)),
-            ),
-            (
-                InstanceId::new("world-b"),
-                ActorRpcAdapter::new(world_b.clone()).with_owner_epoch(Epoch(1)),
-            ),
-        ]),
-    };
-    let context_factory =
-        RpcClientContextFactory::new(service_kind!("Player"), InstanceId::new("player-0"))
-            .with_trace(TraceContext {
-                traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00".into()),
-                tracestate: None,
-            });
-    let core = ResolvingRpcCore::new(
-        WORLD_SERVICE,
-        resolver.clone(),
-        EndpointPool::new(),
-        context_factory,
-        transport,
-    );
+    let placement_store =
+        InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/minimal-world"));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let service = LatticeService::builder(service_kind!("Player"))
-        .instance_id(InstanceId::new("player-0"))
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(WORLD_SERVICE)
+        .instance_id(InstanceId::new("world-a"))
         .listen(listener)
-        .extension::<LocalWorldCore, _>(core.clone())
-        .register_client::<generated::world_rpc::Binding<(), LocalWorldCore>>()
+        .ready_signal(ready_tx)
+        .placement_store::<InMemoryPlacementStore, _>(placement_store)
+        .register_client::<generated::world_rpc::Binding>()
         .register_actor(
             ActorRegistration::builder(WORLD_ACTOR)
                 .factory(WorldActorFactory {
@@ -395,9 +203,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .build()
         .await?;
-    let client = service
-        .context()
-        .extension::<LocalWorldClient>()
+    let service_context = service.context().clone();
+    let service_task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let _service_addr = ready_rx.await?;
+    let client = service_context
+        .extension::<GeneratedWorldClient>()
         .ok_or_else(|| {
             std::io::Error::other("generated World client was not registered in ServiceContext")
         })?;
@@ -440,14 +252,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .put("world.tick_ms".to_string(), json!(config.tick_ms))
         .await?;
 
-    let direct_reply = world_a.call(EnterWorld { player_id: 1000 }).await?;
     let rpc_reply = client
         .enter_world(EnterWorldRequest {
             world_id: 1,
             player_id: 1001,
         })
         .await?;
-    let range_reply = client
+    let second_actor_reply = client
         .enter_world(EnterWorldRequest {
             world_id: 75,
             player_id: 2001,
@@ -466,9 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         payload: gateway_request.encode_to_vec(),
     })?;
     let decoded = codec.decode(&encoded)?;
-    let dispatcher = generated::GatewayDispatcher::new(core);
-    let gateway_reply_frame = dispatcher.dispatch(decoded).await?;
-    let gateway_reply = EnterWorldReply::decode(gateway_reply_frame.payload.as_slice())?;
+    let gateway_decoded = EnterWorldRequest::decode(decoded.payload.as_slice())?;
     let event_id = publisher
         .publish_bytes(
             Subject::new("game.world.player_entered"),
@@ -480,34 +289,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::time::sleep(Duration::from_millis(config.tick_ms * 2)).await;
     scheduler.shutdown().await;
-    let snapshot_a = world_a.call(InspectWorld).await?;
-    let snapshot_b = world_b.call(InspectWorld).await?;
     let configured_tick = config_store.get("world.tick_ms").await?;
+    shutdown_tx.send(()).map_err(|_| {
+        std::io::Error::other("minimal world service shutdown receiver was dropped")
+    })?;
+    service_task.await??;
 
     println!(
-        "{}:{} direct_ok={} rpc_ok={} range_ok={} gateway_ok={} services={} routes={} placement_lookups={} players_a={} players_b={} ticks_a={} ticks_b={} events={} scheduled={} config_tick={} trace={} event_id={} last_rpc_request_id={}",
+        "{}:{} rpc_ok={} second_actor_ok={} gateway_msg_id={} gateway_world_id={} routes={} events={} scheduled={} config_tick={} trace={} event_id={}",
         WORLD_SERVICE.as_str(),
         WORLD_ACTOR.as_str(),
-        direct_reply.ok,
         rpc_reply.ok,
-        range_reply.ok,
-        gateway_reply.ok,
-        rpc_server.services().len(),
+        second_actor_reply.ok,
+        decoded.msg_id,
+        gateway_decoded.world_id,
         usize::from(route_table.get(100).is_some()),
-        resolver.placement_lookups(),
-        snapshot_a.player_count,
-        snapshot_b.player_count,
-        snapshot_a.total_ticks,
-        snapshot_b.total_ticks,
         event_count.load(Ordering::SeqCst),
         scheduled_ticks.load(Ordering::SeqCst),
         configured_tick.unwrap_or_default(),
         trace.traceparent.as_deref().unwrap_or("<missing>"),
-        event_id.as_str(),
-        snapshot_a
-            .last_rpc_request_id
-            .as_deref()
-            .unwrap_or("<missing>")
+        event_id.as_str()
     );
     Ok(())
 }
