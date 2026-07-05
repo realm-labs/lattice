@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package bench;
+
+import "lattice/options.proto";
+
+service BenchRpc {
+  option (lattice.options.service_kind) = "Bench";
+  option (lattice.options.actor_kind) = "Bench";
+  option (lattice.options.default_route_key) = "actor_id";
+
+  rpc Ping(PingRequest) returns (PingReply);
+}
+
+service ChainRpc {
+  option (lattice.options.service_kind) = "Chain";
+  option (lattice.options.actor_kind) = "Chain";
+  option (lattice.options.default_route_key) = "actor_id";
+
+  rpc ChainPing(ChainPingRequest) returns (ChainPingReply);
+}
+
+service WorkerRpc {
+  option (lattice.options.service_kind) = "Worker";
+  option (lattice.options.actor_kind) = "Worker";
+  option (lattice.options.default_route_key) = "worker_actor_id";
+
+  rpc Work(WorkRequest) returns (WorkReply);
+}
+
+message PingRequest {
+  uint64 actor_id = 1;
+  uint64 sequence = 2;
+  bytes payload = 3;
+}
+
+message PingReply {
+  uint64 actor_id = 1;
+  uint64 sequence = 2;
+  uint64 actor_seen = 3;
+}
+
+message ChainPingRequest {
+  uint64 actor_id = 1;
+  uint64 worker_actor_id = 2;
+  uint64 sequence = 3;
+}
+
+message ChainPingReply {
+  uint64 actor_id = 1;
+  uint64 worker_actor_id = 2;
+  uint64 sequence = 3;
+  uint64 chain_seen = 4;
+  uint64 worker_seen = 5;
+}
+
+message WorkRequest {
+  uint64 worker_actor_id = 1;
+  uint64 sequence = 2;
+}
+
+message WorkReply {
+  uint64 worker_actor_id = 1;
+  uint64 sequence = 2;
+  uint64 worker_seen = 3;
+}

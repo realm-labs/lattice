@@ -1,0 +1,30 @@
+[package]
+name = "rpc-benchmark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+lattice-actor.workspace = true
+lattice-core.workspace = true
+lattice-gateway.workspace = true
+lattice-placement.workspace = true
+lattice-rpc.workspace = true
+lattice-service.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[build-dependencies]
+lattice-codegen.workspace = true
+
+[[bench]]
+name = "rpc_benchmark"
+harness = false
