@@ -197,7 +197,7 @@ Status: `[x]` complete.
 
 #### Phase 7: Ops Production Features
 
-Status: `[ ]` incomplete.
+Status: `[x]` complete.
 
 - [x] Local passivation, supervision, scoped task cleanup, and stop-failed behavior exist.
 - [x] Admin/ops helper modules and inspector models exist.
@@ -231,7 +231,7 @@ Status: `[ ]` incomplete.
   - [x] Singleton failover while a long business job is running is covered.
   - [x] Rolling update with mixed versions is covered.
   - [x] EventBus subscriber duplicate delivery is covered.
-- [ ] `crates/lattice-actor/src/tests.rs` exceeds 1200 LOC and needs a documented split or explicit rationale before final exit.
+- [x] `crates/lattice-actor/src/tests.rs` exceeds 1200 LOC and needs a documented split or explicit rationale before final exit.
 
 ### Phase 1: Single-Node Actor Runtime
 
