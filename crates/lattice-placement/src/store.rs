@@ -168,6 +168,7 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
         &self,
         service_kind: &ServiceKind,
     ) -> Result<Vec<InstanceRecord>, PlacementError>;
+    async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError>;
     async fn get_actor(
         &self,
         key: &ActorPlacementKey,
@@ -263,6 +264,18 @@ impl InMemoryPlacementStore {
             .expect("placement store mutex poisoned")
             .coordinator_leader
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_instance_for_test(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Option<InstanceRecord> {
+        self.inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .instances
+            .remove(&self.prefixed_instance_key(instance_id))
     }
 
     fn prefixed_actor_key(&self, key: &ActorPlacementKey) -> PrefixedActorKey {
@@ -397,6 +410,18 @@ impl PlacementStore for InMemoryPlacementStore {
             .filter(|(key, record)| {
                 key.prefix == self.prefix && &record.service_kind == service_kind
             })
+            .map(|(_, record)| record.clone())
+            .collect())
+    }
+
+    async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .instances
+            .iter()
+            .filter(|(key, _)| key.prefix == self.prefix)
             .map(|(_, record)| record.clone())
             .collect())
     }

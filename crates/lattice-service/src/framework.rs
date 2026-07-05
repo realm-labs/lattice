@@ -30,6 +30,7 @@ pub trait DynPlacementStore: Send + Sync + 'static {
         &self,
         service_kind: &ServiceKind,
     ) -> Result<Vec<InstanceRecord>, PlacementError>;
+    async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError>;
     async fn get_actor(
         &self,
         key: &ActorPlacementKey,
@@ -104,6 +105,10 @@ where
         service_kind: &ServiceKind,
     ) -> Result<Vec<InstanceRecord>, PlacementError> {
         PlacementStore::list_instances(self, service_kind).await
+    }
+
+    async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError> {
+        PlacementStore::list_all_instances(self).await
     }
 
     async fn get_actor(

@@ -183,7 +183,7 @@ Status: `[ ]` incomplete.
 - [x] Explicit actor activation is wired into generated clients through placement-backed client cores.
 - [x] `register_client` builds resolver/core from the configured placement store by default.
 - [x] Placement watch is wired into route cache invalidation in running services.
-- [ ] Crash handling still needs a full lease-expiry reconciliation loop that observes expired instances and invokes coordinator failover automatically.
+- [x] Crash handling has a lease-expiry reconciliation loop that observes missing/dead instance records and invokes coordinator failover automatically for actors and singletons.
 - [ ] The runnable coordinator currently exits when leadership is held; it does not yet wait/re-campaign as a long-running standby.
 - [ ] Examples still include static-resolver/demo-specific paths and should be moved to placement-backed defaults where appropriate.
 

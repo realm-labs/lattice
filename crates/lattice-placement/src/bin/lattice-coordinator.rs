@@ -39,6 +39,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keepalive_store = store.clone();
     let keepalive_leadership = leadership.clone();
     let coordinator = PlacementCoordinator::new(store.clone(), TonicLogicControl);
+    let reconciler = coordinator.start_all_service_lease_expiry_reconciler(Duration::from_secs(
+        env_u64("LATTICE_LEASE_RECONCILE_INTERVAL_SECS", 5),
+    ));
     let keepalive = keepalive_loop(keepalive_store, keepalive_leadership);
 
     let server = Server::builder()
@@ -52,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result = server => result?,
         result = keepalive => result?,
     }
+    reconciler.cancel();
     store.resign_coordinator_leader(&leadership).await?;
     Ok(())
 }
@@ -74,6 +78,13 @@ fn env_value(name: &str, default: &str) -> String {
 }
 
 fn env_i64(name: &str, default: i64) -> i64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
     env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())

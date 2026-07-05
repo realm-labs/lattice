@@ -587,6 +587,80 @@ async fn coordinator_drain_marks_instance_draining_and_migrates_owned_actors() {
     assert_eq!(migrated_shard.epoch, Epoch(2));
 }
 
+#[tokio::test]
+async fn lease_expiry_reconciler_observes_missing_instance_and_fails_over() {
+    let store = ready_store().await;
+    store
+        .upsert_instance(instance_record("world-b", InstanceState::Ready))
+        .await
+        .unwrap();
+    let actor_key = ActorPlacementKey {
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(7),
+    };
+    store
+        .compare_and_put_actor(
+            actor_key.clone(),
+            None,
+            ActorPlacementRecord {
+                actor_kind: actor_kind!("World"),
+                actor_id: ActorId::U64(7),
+                owner: InstanceId::new("world-a"),
+                epoch: Epoch(3),
+                lease_id: LeaseId(9),
+                state: PlacementState::Running,
+            },
+        )
+        .await
+        .unwrap();
+    let singleton_key = SingletonKey {
+        service_kind: service_kind!("World"),
+        singleton_kind: actor_kind!("SeasonManager"),
+        scope: "global".to_string(),
+    };
+    store
+        .compare_and_put_singleton(
+            singleton_key.clone(),
+            None,
+            SingletonPlacementRecord {
+                service_kind: service_kind!("World"),
+                singleton_kind: actor_kind!("SeasonManager"),
+                scope: "global".to_string(),
+                owner: InstanceId::new("world-a"),
+                epoch: Epoch(5),
+                lease_id: LeaseId(11),
+                state: PlacementState::Running,
+            },
+        )
+        .await
+        .unwrap();
+    store.remove_instance_for_test(&InstanceId::new("world-a"));
+    let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+    let task = coordinator.start_all_service_lease_expiry_reconciler(Duration::from_millis(5));
+
+    for _ in 0..50 {
+        let actor = store.get_actor(&actor_key).await.unwrap().unwrap().1;
+        let singleton = store
+            .get_singleton(&singleton_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        if actor.owner == InstanceId::new("world-b")
+            && singleton.owner == InstanceId::new("world-b")
+        {
+            task.cancel();
+            assert_eq!(actor.epoch, Epoch(4));
+            assert_eq!(singleton.epoch, Epoch(6));
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    task.cancel();
+    panic!("lease-expiry reconciler did not fail over expired owner");
+}
+
 async fn ready_store() -> InMemoryPlacementStore {
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
     store

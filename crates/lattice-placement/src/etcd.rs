@@ -189,6 +189,20 @@ where
             .collect())
     }
 
+    async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError> {
+        let prefix = format!("{}/logic/instances/", clean_prefix(&self.prefix));
+        Ok(self
+            .client
+            .list_prefix(&prefix)
+            .await?
+            .into_iter()
+            .filter_map(|(_key, _version, value)| match value {
+                EtcdValue::Instance(record) => Some(*record),
+                _ => None,
+            })
+            .collect())
+    }
+
     async fn get_actor(
         &self,
         key: &ActorPlacementKey,
