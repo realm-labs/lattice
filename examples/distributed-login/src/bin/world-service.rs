@@ -1,26 +1,23 @@
-use distributed_login::services::run_world_service;
+use clap::Parser;
+use distributed_login::world::run_world_service;
 use http::Uri;
 use tokio::net::TcpListener;
+
+#[derive(Debug, Parser)]
+#[command(about = "World logic service for the distributed login example")]
+struct Args {
+    #[arg(long, default_value = "127.0.0.1:19081")]
+    addr: String,
+    #[arg(long, default_value = "http://127.0.0.1:19082")]
+    player_endpoint: Uri,
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_tracing();
-    let addr = arg_value("--addr").unwrap_or_else(|| "127.0.0.1:19081".to_string());
-    let player_endpoint = arg_value("--player-endpoint")
-        .unwrap_or_else(|| "http://127.0.0.1:19082".to_string())
-        .parse::<Uri>()?;
-    let listener = TcpListener::bind(&addr).await?;
-    run_world_service(listener, player_endpoint, None).await
-}
-
-fn arg_value(name: &str) -> Option<String> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == name {
-            return args.next();
-        }
-    }
-    None
+    let args = Args::parse();
+    let listener = TcpListener::bind(&args.addr).await?;
+    run_world_service(listener, args.player_endpoint, None).await
 }
 
 fn init_tracing() {

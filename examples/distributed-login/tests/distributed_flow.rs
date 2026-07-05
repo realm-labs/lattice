@@ -1,10 +1,11 @@
 use distributed_login::game::{
     LoginReply, LoginRequest, PlayerPingReply, PlayerPingRequest, WorldPingReply, WorldPingRequest,
 };
-use distributed_login::gateway_runtime::run_gateway;
+use distributed_login::gateway::run_gateway;
 use distributed_login::lattice::actor::{ActorId, ActorRef, actor_id};
-use distributed_login::services::{run_player_service, run_world_service};
+use distributed_login::player::run_player_service;
 use distributed_login::tcp::{decode_reply, read_client_frame, request_frame, write_client_frame};
+use distributed_login::world::run_world_service;
 use distributed_login::{
     GATEWAY_SERVICE, GATEWAY_SESSION_ACTOR, LOGIN_MSG_ID, PLAYER_PING_MSG_ID, WORLD_PING_MSG_ID,
 };

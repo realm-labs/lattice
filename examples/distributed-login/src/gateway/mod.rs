@@ -1,3 +1,5 @@
+mod session_actor;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -12,19 +14,17 @@ use lattice_gateway::{ClientFrame, GatewayRouteTable};
 use prost::Message as ProstMessage;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tracing::{error, info};
 
-use crate::actors::GatewaySessionActor;
 use crate::game::{LoginRequest, gateway_push_rpc_server::GatewayPushRpcServer};
+use crate::gateway::session_actor::GatewaySessionActor;
 use crate::generated::{GatewayDispatcher, gateway_push_rpc, register_gateway_routes};
 use crate::placement::{DemoRpcCore, player_core, world_core};
-use crate::services::ExampleResult;
 use crate::tcp::{read_client_frame, write_client_frame};
-use crate::{GATEWAY_SERVICE, GATEWAY_SESSION_ACTOR};
+use crate::{ExampleResult, GATEWAY_SERVICE, GATEWAY_SESSION_ACTOR};
 
 type DemoGatewayDispatcher = GatewayDispatcher<DemoRpcCore, DemoRpcCore>;
 

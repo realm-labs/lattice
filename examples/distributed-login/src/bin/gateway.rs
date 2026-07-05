@@ -1,38 +1,35 @@
-use distributed_login::gateway_runtime::run_gateway;
+use clap::Parser;
+use distributed_login::gateway::run_gateway;
 use http::Uri;
 use tokio::net::TcpListener;
+
+#[derive(Debug, Parser)]
+#[command(about = "Gateway process for the distributed login example")]
+struct Args {
+    #[arg(long, default_value = "127.0.0.1:19080")]
+    addr: String,
+    #[arg(long, default_value = "127.0.0.1:19083")]
+    push_addr: String,
+    #[arg(long, default_value = "http://127.0.0.1:19081")]
+    world_endpoint: Uri,
+    #[arg(long, default_value = "http://127.0.0.1:19082")]
+    player_endpoint: Uri,
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_tracing();
-    let addr = arg_value("--addr").unwrap_or_else(|| "127.0.0.1:19080".to_string());
-    let push_addr = arg_value("--push-addr").unwrap_or_else(|| "127.0.0.1:19083".to_string());
-    let world_endpoint = arg_value("--world-endpoint")
-        .unwrap_or_else(|| "http://127.0.0.1:19081".to_string())
-        .parse::<Uri>()?;
-    let player_endpoint = arg_value("--player-endpoint")
-        .unwrap_or_else(|| "http://127.0.0.1:19082".to_string())
-        .parse::<Uri>()?;
-    let listener = TcpListener::bind(&addr).await?;
-    let push_listener = TcpListener::bind(&push_addr).await?;
+    let args = Args::parse();
+    let listener = TcpListener::bind(&args.addr).await?;
+    let push_listener = TcpListener::bind(&args.push_addr).await?;
     run_gateway(
         listener,
         push_listener,
-        world_endpoint,
-        player_endpoint,
+        args.world_endpoint,
+        args.player_endpoint,
         None,
     )
     .await
-}
-
-fn arg_value(name: &str) -> Option<String> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == name {
-            return args.next();
-        }
-    }
-    None
 }
 
 fn init_tracing() {

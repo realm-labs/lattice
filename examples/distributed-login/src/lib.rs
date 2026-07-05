@@ -1,8 +1,12 @@
-pub mod actors;
-pub mod gateway_runtime;
+mod error;
+
+pub mod gateway;
 pub mod placement;
-pub mod services;
+pub mod player;
 pub mod tcp;
+pub mod world;
+
+pub use error::ExampleResult;
 
 use lattice_core::{ActorKind, ServiceKind, actor_kind, service_kind};
 
