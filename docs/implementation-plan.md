@@ -226,14 +226,14 @@ Status: `[ ]` incomplete.
 - [x] Gateway startup is represented as a framework service API: `GatewayService` owns the TCP accept loop, supports custom connection handlers, manages background tasks such as push RPC listeners, and distributed-login starts through it with gateway crate coverage.
 - [x] Cluster/node inspection queries live services through Admin APIs: services now build admin snapshots from Ready placement records and registered actor kinds at startup, expose node summaries over managed Admin HTTP, and `ClusterInspector`/`HttpNodeInspectorClient` coverage verifies live-node aggregation and partial failures.
 - [x] Security/mTLS-equivalent service identity is connected to service builders by default: `RpcSecurityPolicy` derives client auth and SPIFFE-shaped peer identity metadata, generated placement-backed clients receive it through `RpcClientContextFactory`, and servers validate identity from either transport extensions or framework metadata.
-- [ ] Full chaos test suite is not implemented.
+- [x] Full chaos test suite is implemented across placement, ops, and actor chaos tests.
   - [x] Stale owner recovers after lease expiry and is fenced; route cache invalidates and retries with the same request id.
-  - [ ] Target service succeeds but response is lost/unknown-result handling is covered.
-  - [ ] Timeout followed by retry/reconciliation is covered.
+  - [x] Target service succeeds but response is lost/unknown-result handling is covered by `operation_tracker_models_lost_response_unknown_result_reconciliation`.
+  - [x] Timeout followed by retry/reconciliation is covered by `operation_tracker_models_timeout_retry_and_reconciliation`.
   - [x] Coordinator leader switch is covered.
   - [x] Temporary etcd outage is covered.
   - [x] Partial placement write failure is covered.
-  - [ ] New request arriving while an actor is passivating is covered.
+  - [x] New request arriving while an actor is passivating is covered by `request_arriving_while_actor_is_passivating_is_not_processed_by_old_incarnation`.
   - [x] Singleton failover while a long business job is running is covered.
   - [x] Rolling update with mixed versions is covered.
 - [ ] EventBus subscriber duplicate delivery is covered.
