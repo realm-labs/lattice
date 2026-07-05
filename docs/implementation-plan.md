@@ -251,7 +251,7 @@ Status: `[x]` complete.
 
 #### Phase 8: Direct Actor Link
 
-Status: `[ ]` in progress.
+Status: `[x]` complete.
 
 - [x] Direct Link public API exists: `DirectLinkStream`, `DirectLinkMode::{Unidirectional, Bidirectional}`, `ActorContext::links()`, `connect`, `connect_bidirectional`, `get::<S>`, `close_all`, `tell`, `try_tell`, and directional `close`.
 - [x] `lattice-codegen` emits `DirectLinkMessage` metadata for generated protobuf messages without requiring per-message proto options.
