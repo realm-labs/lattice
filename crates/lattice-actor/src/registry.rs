@@ -117,6 +117,10 @@ impl<A: Actor> ActorRegistry<A> {
     }
 
     pub async fn get(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
+        self.get_running(actor_id)
+    }
+
+    pub fn get_running(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
         match self.entries.get(actor_id).as_deref() {
             Some(RegistryEntry::Running(handle)) => Some(handle.clone()),
             Some(RegistryEntry::Activating(_)) | None => None,

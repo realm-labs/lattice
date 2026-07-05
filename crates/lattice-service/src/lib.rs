@@ -4,6 +4,7 @@ pub mod component;
 pub mod config;
 pub mod context;
 mod control;
+pub mod direct_link;
 pub mod error;
 pub mod framework;
 pub mod rpc;
@@ -13,6 +14,7 @@ pub use actor::{ActorRegistration, ActorRegistrationBuilder};
 pub use builder::LatticeServiceBuilder;
 pub use component::{IntoServiceComponent, ReadyComponent, ServiceComponent};
 pub use config::DirectLinkConfig;
+pub use direct_link::DirectLinkServiceRuntime;
 pub use error::LatticeServiceError;
 pub use framework::{
     ClusterEventBusComponent, ConfigStoreComponent, DynConfigStore, DynEventBus, DynPlacementStore,

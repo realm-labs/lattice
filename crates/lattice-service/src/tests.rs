@@ -10,6 +10,7 @@ use std::convert::Infallible;
 use std::future::pending;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -23,8 +24,13 @@ use lattice_actor::{
 };
 use lattice_config::{ConfigFormat, ConfigSource};
 use lattice_core::{
-    ActorId, ActorKind, ConfiguredComponent, Epoch, InstanceId, RequestId, RouteKey, TraceContext,
-    actor_kind, service_kind,
+    ActorId, ActorKind, ActorRef, ConfiguredComponent, DirectLinkEndpoint, DirectLinkMessage,
+    DirectLinkMode, DirectLinkOptions, Epoch, InstanceId, LinkId, LinkSequence, Linked, RequestId,
+    RouteKey, TraceContext, actor_kind, service_kind,
+};
+use lattice_direct_link::{
+    DIRECT_LINK_PROTOCOL_VERSION, DirectLinkConnection, DirectLinkFrame, DirectLinkStream,
+    DirectLinkTransport, OpenLinkDirection, OpenLinkRequest, TcpDirectLinkTransport,
 };
 use lattice_eventbus::{
     EventBus, EventEnvelope, EventId, EventSubscription, LocalEventBus, Subject, SubjectFilter,
@@ -49,6 +55,7 @@ use lattice_rpc::{
     RpcSecurityError, RpcSecurityPolicy, ServiceIdentityConfig, ShardedRpcCore,
     TonicEndpointChannelPoolConfig,
 };
+use prost::Message as ProstMessage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -143,6 +150,54 @@ impl Handler<TestMessage> for TestActor {
         _ctx: &mut ActorContext<Self>,
         _msg: TestMessage,
     ) -> Result<(), ActorError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct DirectLinkTestPayload {
+    #[prost(uint64, tag = "1")]
+    tick: u64,
+}
+
+impl DirectLinkMessage for DirectLinkTestPayload {
+    const PROTO_FULL_NAME: &'static str = "test.DirectLinkPayload";
+}
+
+#[derive(Clone)]
+struct DirectLinkTestFactory {
+    received: Arc<Mutex<Vec<u64>>>,
+}
+
+struct DirectLinkTestActor {
+    received: Arc<Mutex<Vec<u64>>>,
+}
+
+#[async_trait]
+impl Actor for DirectLinkTestActor {
+    type Error = ActorError;
+}
+
+#[async_trait]
+impl ActorFactory<DirectLinkTestActor> for DirectLinkTestFactory {
+    async fn create(&self, _ctx: ActorCreateContext) -> Result<DirectLinkTestActor, ActorError> {
+        Ok(DirectLinkTestActor {
+            received: self.received.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl Handler<Linked<DirectLinkTestPayload>> for DirectLinkTestActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        msg: Linked<DirectLinkTestPayload>,
+    ) -> Result<(), ActorError> {
+        self.received
+            .lock()
+            .expect("received direct-link payloads mutex poisoned")
+            .push(msg.payload.tick);
         Ok(())
     }
 }
@@ -928,6 +983,158 @@ async fn direct_link_listener_publishes_endpoint_and_stops_with_service() {
 
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn direct_link_listener_routes_message_frames_to_registered_actor() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store =
+        InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test-direct-link-route"));
+    let mut watch = store.watch(store.prefix().clone()).await.unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let stream = DirectLinkStream::new("movement").message::<DirectLinkTestPayload>();
+    let descriptor = stream.descriptor();
+    let link_id = LinkId::new("service-link-inbound");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(DirectLinkTestFactory {
+                    received: received.clone(),
+                })
+                .build(),
+        )
+        .register_direct_link(stream.for_actor::<DirectLinkTestActor>(actor_kind!("World")))
+        .register_sharded_rpc(FakeRpcBinding::<DirectLinkTestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+    let direct_link_runtime = service.direct_link_runtime().unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let addr = ready_rx.await.unwrap();
+    let mut client = LogicControlClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    client
+        .activate_actor(proto::ActivateActorRequest {
+            service_kind: "World".to_string(),
+            actor_kind: "World".to_string(),
+            actor_id: Some(actor_id_to_proto(&ActorId::U64(7))),
+            epoch: 1,
+        })
+        .await
+        .unwrap();
+
+    let ready_record = loop {
+        let event = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .unwrap()
+            .unwrap();
+        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+            && record.state == InstanceState::Ready
+        {
+            break record;
+        }
+    };
+    let direct_link_endpoint: http::Uri = ready_record
+        .labels
+        .get("direct_link_endpoint")
+        .expect("direct-link endpoint label")
+        .parse()
+        .unwrap();
+    let target_ref = direct_actor_ref(
+        service_kind!("World"),
+        actor_kind!("World"),
+        ActorId::U64(7),
+        direct_link_endpoint.clone(),
+    );
+    direct_link_runtime
+        .session_manager()
+        .open_link(OpenLinkRequest {
+            protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+            link_id: link_id.clone(),
+            source: direct_actor_ref(
+                service_kind!("Gateway"),
+                actor_kind!("GatewaySession"),
+                ActorId::U64(99),
+                "tcp://127.0.0.1:1".parse().unwrap(),
+            ),
+            target: target_ref,
+            mode: DirectLinkMode::Unidirectional,
+            source_to_target: OpenLinkDirection::from_stream(link_id.clone(), &descriptor),
+            target_to_source: None,
+            options: DirectLinkOptions::default(),
+        })
+        .unwrap();
+
+    let mut connection = TcpDirectLinkTransport::new()
+        .connect(DirectLinkEndpoint::new(direct_link_endpoint))
+        .await
+        .unwrap();
+    connection
+        .write_frame(DirectLinkFrame::message(
+            link_id,
+            LinkSequence(1),
+            descriptor
+                .message_id_for::<DirectLinkTestPayload>()
+                .unwrap(),
+            DirectLinkTestPayload { tick: 42 }.encode_to_vec(),
+        ))
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if !received
+                .lock()
+                .expect("received direct-link payloads mutex poisoned")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        *received
+            .lock()
+            .expect("received direct-link payloads mutex poisoned"),
+        vec![42]
+    );
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+fn direct_actor_ref(
+    service_kind: lattice_core::ServiceKind,
+    actor_kind: ActorKind,
+    actor_id: ActorId,
+    endpoint: http::Uri,
+) -> ActorRef {
+    ActorRef::direct(
+        service_kind,
+        actor_kind,
+        actor_id,
+        InstanceId::new("direct-link-test"),
+        endpoint,
+        None,
+    )
 }
 
 #[tokio::test]

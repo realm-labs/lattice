@@ -7,7 +7,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lattice_core::instance::InstanceCapacity;
 use lattice_core::{ActorKind, DirectLinkEndpoint, ServiceContext, ServiceKind};
-use lattice_direct_link::{DirectLinkConnection, DirectLinkTransport, TcpDirectLinkTransport};
+use lattice_direct_link::{
+    DirectLinkConnection, DirectLinkInboundRouter, DirectLinkTransport, TcpDirectLinkConnection,
+    TcpDirectLinkTransport,
+};
 use lattice_ops::admin::{
     AdminActorTarget, AdminApiError, AdminAuth, AdminHttpAdapter, AdminMutationHandler,
     AdminMutationReply, AdminSnapshot,
@@ -26,6 +29,7 @@ use tracing::{debug, error, info, warn};
 use crate::actor::ErasedLogicActor;
 use crate::component::ErasedPlacementStore;
 use crate::config::{DirectLinkConfig, InstanceConfig};
+use crate::direct_link::DirectLinkServiceRuntime;
 use crate::framework::{
     ClusterEventBusComponent, DynPlacementStore, LocalEventBusComponent, ServiceContextExt,
     ServiceSchedulerComponent,
@@ -45,6 +49,7 @@ pub struct LatticeService {
     admin_http: Option<AdminHttpServer>,
     instance_lease_keepalive_interval: Duration,
     direct_link: Option<DirectLinkConfig>,
+    direct_link_runtime: Option<DirectLinkServiceRuntime>,
     ready: Option<oneshot::Sender<SocketAddr>>,
 }
 
@@ -66,6 +71,7 @@ impl LatticeService {
             admin_http: parts.admin_http,
             instance_lease_keepalive_interval: parts.instance_lease_keepalive_interval,
             direct_link: parts.direct_link,
+            direct_link_runtime: parts.direct_link_runtime,
             ready: parts.ready,
         }
     }
@@ -84,6 +90,10 @@ impl LatticeService {
 
     pub fn placement_watch_count(&self) -> usize {
         self.placement_watch_tasks.len()
+    }
+
+    pub fn direct_link_runtime(&self) -> Option<DirectLinkServiceRuntime> {
+        self.direct_link_runtime.clone()
     }
 
     pub async fn run_until_shutdown(self) -> Result<(), LatticeServiceError> {
@@ -107,10 +117,12 @@ impl LatticeService {
             admin_http,
             instance_lease_keepalive_interval,
             direct_link,
+            direct_link_runtime,
             ready,
         } = self;
         let local_addr = listener.local_addr()?;
-        let direct_link_listener = start_direct_link_listener(direct_link).await?;
+        let direct_link_listener =
+            start_direct_link_listener(direct_link, direct_link_runtime).await?;
         let direct_link_endpoint = direct_link_listener
             .as_ref()
             .map(ManagedDirectLinkListener::endpoint);
@@ -532,6 +544,7 @@ impl ManagedDirectLinkListener {
 
 async fn start_direct_link_listener(
     config: Option<DirectLinkConfig>,
+    runtime: Option<DirectLinkServiceRuntime>,
 ) -> Result<Option<ManagedDirectLinkListener>, LatticeServiceError> {
     let Some(config) = config else {
         return Ok(None);
@@ -551,6 +564,7 @@ async fn start_direct_link_listener(
         }
     })?;
     let endpoint = listener.local_endpoint();
+    let inbound_router = runtime.map(|runtime| runtime.inbound_router());
     let (shutdown, mut shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         loop {
@@ -561,9 +575,10 @@ async fn start_direct_link_listener(
                 }
                 accepted = listener.accept() => {
                     match accepted {
-                        Ok(mut connection) => {
+                        Ok(connection) => {
+                            let inbound_router = inbound_router.clone();
                             tokio::spawn(async move {
-                                let _ = connection.close().await;
+                                handle_direct_link_connection(connection, inbound_router).await;
                             });
                         }
                         Err(error) => {
@@ -582,6 +597,32 @@ async fn start_direct_link_listener(
         shutdown,
         task,
     }))
+}
+
+async fn handle_direct_link_connection(
+    mut connection: TcpDirectLinkConnection,
+    inbound_router: Option<Arc<DirectLinkInboundRouter>>,
+) {
+    let Some(inbound_router) = inbound_router else {
+        let _ = connection.close().await;
+        return;
+    };
+
+    loop {
+        let frame = match connection.read_frame().await {
+            Ok(frame) => frame,
+            Err(error) => {
+                debug!(%error, "closing direct-link connection after read failure");
+                let _ = connection.close().await;
+                return;
+            }
+        };
+        if let Err(error) = inbound_router.deliver_frame(frame) {
+            warn!(%error, "closing direct-link connection after inbound delivery failure");
+            let _ = connection.close().await;
+            return;
+        }
+    }
 }
 
 async fn drain_placement(
@@ -661,6 +702,7 @@ pub(crate) struct LatticeServiceParts {
     pub admin_http: Option<AdminHttpServer>,
     pub instance_lease_keepalive_interval: Duration,
     pub direct_link: Option<DirectLinkConfig>,
+    pub direct_link_runtime: Option<DirectLinkServiceRuntime>,
     pub ready: Option<oneshot::Sender<SocketAddr>>,
 }
 

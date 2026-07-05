@@ -8,6 +8,7 @@ use lattice_actor::Actor;
 use lattice_config::{BootstrapConfig, ConfigSource};
 use lattice_config::{ConfigStore, LocalConfigStore};
 use lattice_core::{ActorKind, InstanceId, ServiceContext, ServiceKind};
+use lattice_direct_link::{DirectLinkActorBinding, DirectLinkDispatch};
 use lattice_eventbus::{EventBus, LocalEventBus};
 use lattice_ops::{AdminHttpConfig, ServiceScheduler};
 use lattice_placement::coordinator::{PlacementWatchStarter, PlacementWatchTask};
@@ -30,6 +31,9 @@ use crate::component::{
 use crate::config::{DirectLinkConfig, InstanceConfig};
 use crate::context::ServiceBuildContext;
 use crate::control::ServiceLogicControlHandler;
+use crate::direct_link::{
+    DirectLinkBindingRegistration, ErasedDirectLinkBinding, build_direct_link_runtime,
+};
 use crate::framework::ServiceSchedulerComponent;
 use crate::rpc::{ErasedRpcClientBinding, RpcClientPlacement, RpcClientRegistration};
 use crate::service::AdminHttpServer;
@@ -45,6 +49,7 @@ pub struct LatticeServiceBuilder {
     actor_registrations: Vec<Box<dyn ErasedActorRegistration>>,
     rpc_services: Vec<Box<dyn RpcServiceBinding>>,
     client_bindings: Vec<Box<dyn ErasedRpcClientBinding>>,
+    direct_link_bindings: Vec<Box<dyn ErasedDirectLinkBinding>>,
     config: Option<ConfigSource>,
     placement_store: Option<Box<dyn ErasedPlacementStoreComponent>>,
     cluster_event_bus: Option<Box<dyn ErasedServiceComponent>>,
@@ -80,6 +85,10 @@ impl fmt::Debug for LatticeServiceBuilder {
             .field("actor_registration_count", &self.actor_registrations.len())
             .field("rpc_service_count", &self.rpc_services.len())
             .field("client_binding_count", &self.client_bindings.len())
+            .field(
+                "direct_link_binding_count",
+                &self.direct_link_bindings.len(),
+            )
             .field("has_config", &self.config.is_some())
             .field("has_placement_store", &self.placement_store.is_some())
             .field("has_cluster_event_bus", &self.cluster_event_bus.is_some())
@@ -108,6 +117,7 @@ impl LatticeServiceBuilder {
             actor_registrations: Vec::new(),
             rpc_services: Vec::new(),
             client_bindings: Vec::new(),
+            direct_link_bindings: Vec::new(),
             config: None,
             placement_store: None,
             cluster_event_bus: None,
@@ -254,6 +264,19 @@ impl LatticeServiceBuilder {
 
     pub fn direct_links(mut self, config: DirectLinkConfig) -> Self {
         self.direct_link = Some(config);
+        self
+    }
+
+    pub fn register_direct_link<A, Messages>(
+        mut self,
+        binding: DirectLinkActorBinding<A, Messages>,
+    ) -> Self
+    where
+        A: Actor + Sync,
+        Messages: DirectLinkDispatch<A>,
+    {
+        self.direct_link_bindings
+            .push(Box::new(DirectLinkBindingRegistration::new(binding)));
         self
     }
 
@@ -485,6 +508,7 @@ impl LatticeServiceBuilder {
             );
             registration.register(&mut context)?;
         }
+        let direct_link_runtime = build_direct_link_runtime(self.direct_link_bindings, &context)?;
         if !context.logic_actors.is_empty() {
             let handler = ServiceLogicControlHandler::new(context.logic_actors.clone());
             context.add_rpc_service(lattice_placement::control::LogicControlServer::new(
@@ -522,6 +546,7 @@ impl LatticeServiceBuilder {
             admin_http,
             instance_lease_keepalive_interval: self.instance_lease_keepalive_interval,
             direct_link: self.direct_link,
+            direct_link_runtime,
             ready: self.ready,
         }))
     }
