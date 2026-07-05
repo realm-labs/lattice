@@ -125,8 +125,8 @@ Status: `[x]` complete.
 - [x] Multiple generated gRPC services can be registered on one endpoint.
 - [x] `LatticeService::register_client::<Binding>()` constructs and exposes generated typed clients through service/actor context.
 - [x] `examples/minimal-world` uses the final generated client access path, not ad hoc client/core construction.
-- [x] Generated transport should avoid unnecessary encode/decode when the concrete request type is already known, or document why that cost is acceptable.
-  - Documented tradeoff: the generated endpoint transport currently crosses the object-safe `EndpointRpcTransport::unary<Req>` boundary and dispatches by `Req::METHOD`, so it re-encodes the generic request into the concrete generated tonic request and decodes the concrete reply back into `Req::Reply`. This keeps one generated transport usable by `ResolvingRpcCore`, gateway dispatch, and fake transports while Phase 5 placement-backed client construction is still pending. The extra encode/decode happens only on the client transport boundary, after gateway payload decode and before tonic encode, and is acceptable for the Phase 2 MVP. A later specialized typed transport can remove it without changing business handlers or generated client APIs.
+- [x] Generated transport avoids unnecessary encode/decode when the concrete request type is already known.
+  - The generated endpoint transport now dispatches by `Req::METHOD`, verifies the concrete generated request/reply types with `Any` downcasts, and calls the generated tonic client directly. This keeps the object-safe `EndpointRpcTransport::unary<Req>` boundary while removing the previous protobuf re-encode/re-decode on the client transport boundary.
 
 #### Phase 3: Route Cache + Static Placement
 

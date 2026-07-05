@@ -86,6 +86,22 @@ fn generated_output_matches_phase_two_shape() {
             .contains("pub struct GeneratedTonicEndpointTransport")
     );
     assert!(generated.rust.contains("\"world.WorldRpc/EnterWorld\" => self.call_world_rpc_enter_world::<Req>(target, metadata, request).await"));
+    assert!(
+        generated
+            .rust
+            .contains("downcast_ref::<crate::world::EnterWorldRequest>()")
+    );
+    assert!(generated.rust.contains("downcast::<Req::Reply>()"));
+    assert!(
+        !generated
+            .rust
+            .contains("let request_bytes = request.encode_to_vec();")
+    );
+    assert!(
+        !generated
+            .rust
+            .contains("let reply_bytes = typed_reply.encode_to_vec();")
+    );
     assert!(generated.rust.contains("pub mod enter_world"));
     assert!(generated.rust.contains("pub struct GatewayBinding"));
     assert!(generated.rust.contains("register_gateway_routes"));

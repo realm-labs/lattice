@@ -586,11 +586,12 @@ fn push_tonic_transport_method(rust: &mut String, method: &RpcMethodSpec) {
         "    async fn call_{suffix}<Req>(&self, target: lattice_rpc::RouteTarget, metadata: tonic::metadata::MetadataMap, request: &Req) -> Result<tonic::Response<Req::Reply>, RpcError>\n",
     ));
     rust.push_str("    where\n        Req: RoutedRequest + RpcRequest,\n    {\n");
-    rust.push_str("        let request_bytes = request.encode_to_vec();\n");
-    rust.push_str("        let typed_request = <");
+    rust.push_str("        let typed_request = (request as &dyn std::any::Any)\n");
+    rust.push_str("            .downcast_ref::<");
     rust.push_str(&method.request_type);
-    rust.push_str(" as ProstMessage>::decode(request_bytes.as_slice())\n");
-    rust.push_str("            .map_err(|error| RpcError::Business(error.to_string()))?;\n");
+    rust.push_str(">()\n");
+    rust.push_str("            .ok_or_else(|| RpcError::Business(format!(\"generated rpc method {} received unexpected request type {}\", Req::METHOD, std::any::type_name::<Req>())))?\n");
+    rust.push_str("            .clone();\n");
     rust.push_str(
         "        let channel = self.channels.get_or_connect(&target.advertised_endpoint).await?;\n",
     );
@@ -606,12 +607,12 @@ fn push_tonic_transport_method(rust: &mut String, method: &RpcMethodSpec) {
     ));
     rust.push_str("            .map_err(lattice_rpc::client::tonic_status_to_rpc_error)?\n");
     rust.push_str("            .into_inner();\n");
-    rust.push_str("        let reply_bytes = typed_reply.encode_to_vec();\n");
     rust.push_str(
-        "        let reply = <Req::Reply as ProstMessage>::decode(reply_bytes.as_slice())\n",
+        "        let reply = (Box::new(typed_reply) as Box<dyn std::any::Any + Send + Sync>)\n",
     );
-    rust.push_str("            .map_err(|error| RpcError::Business(error.to_string()))?;\n");
-    rust.push_str("        Ok(tonic::Response::new(reply))\n");
+    rust.push_str("            .downcast::<Req::Reply>()\n");
+    rust.push_str("            .map_err(|_| RpcError::Business(format!(\"generated rpc method {} returned unexpected reply type {}\", Req::METHOD, std::any::type_name::<Req::Reply>())))?;\n");
+    rust.push_str("        Ok(tonic::Response::new(*reply))\n");
     rust.push_str("    }\n\n");
 }
 
