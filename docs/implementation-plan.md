@@ -143,7 +143,7 @@ Status: `[x]` complete for static placement.
 
 #### Phase 4: Virtual Shard + Lazy Activation
 
-Status: `[ ]` incomplete.
+Status: `[x]` complete.
 
 - [x] Virtual shard id mapping exists.
 - [x] Virtual shard assignment model exists.
@@ -157,7 +157,7 @@ Status: `[ ]` incomplete.
 - [x] `LatticeService` does not yet start a placement watch to refresh local shard/owner caches.
 - [x] Scale-out does not yet make new service instances automatically participate in shard assignment.
 - [x] Scale-in does not yet drain/rebalance shard ownership before termination.
-- [ ] Running actor migration/passivation policy is not yet connected to shard rebalance decisions.
+- [x] Running actor migration/passivation policy is not yet connected to shard rebalance decisions.
 
 #### Phase 5: Explicit Placement + Coordinator
 

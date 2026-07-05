@@ -78,6 +78,7 @@ pub struct RebalanceVirtualShardsRequest {
     pub shard_count: u32,
     pub eligible_shards: BTreeSet<VirtualShardId>,
     pub max_migrations: usize,
+    pub movement_policy: VirtualShardMovementPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +86,12 @@ pub struct RebalanceVirtualShardsReport {
     pub ready_instances: usize,
     pub assignments_written: usize,
     pub moved_shards: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualShardMovementPolicy {
+    EligibleOnly,
+    AllowRunningMigration,
 }
 
 impl<S, L> PlacementCoordinator<S, L> {
@@ -387,8 +394,18 @@ where
                     shard_count: request.shard_count,
                     instances,
                     previous,
-                    eligible_shards: request.eligible_shards,
-                    max_migrations: request.max_migrations,
+                    eligible_shards: match request.movement_policy {
+                        VirtualShardMovementPolicy::EligibleOnly => request.eligible_shards.clone(),
+                        VirtualShardMovementPolicy::AllowRunningMigration => BTreeSet::new(),
+                    },
+                    max_migrations: match request.movement_policy {
+                        VirtualShardMovementPolicy::EligibleOnly
+                            if request.eligible_shards.is_empty() =>
+                        {
+                            0
+                        }
+                        _ => request.max_migrations,
+                    },
                 })
                 .await?;
 
@@ -881,6 +898,7 @@ mod tests {
             shard_count: 4,
             eligible_shards: BTreeSet::new(),
             max_migrations: usize::MAX,
+            movement_policy: VirtualShardMovementPolicy::EligibleOnly,
         };
 
         let initial = coordinator
@@ -905,6 +923,7 @@ mod tests {
                 RebalanceVirtualShardsRequest {
                     eligible_shards: BTreeSet::from([VirtualShardId(1), VirtualShardId(3)]),
                     max_migrations: 2,
+                    movement_policy: VirtualShardMovementPolicy::EligibleOnly,
                     ..request
                 },
                 &GradualRebalanceShardAssigner,
@@ -935,6 +954,60 @@ mod tests {
             assignments.get(&VirtualShardId(3)),
             Some(&(InstanceId::new("world-b"), Epoch(2)))
         );
+    }
+
+    #[tokio::test]
+    async fn virtual_shard_rebalance_respects_running_actor_movement_policy() {
+        let store = ready_store().await;
+        let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+        let initial = RebalanceVirtualShardsRequest {
+            service_kind: service_kind!("World"),
+            actor_kind: actor_kind!("World"),
+            shard_count: 4,
+            eligible_shards: BTreeSet::new(),
+            max_migrations: usize::MAX,
+            movement_policy: VirtualShardMovementPolicy::AllowRunningMigration,
+        };
+        coordinator
+            .rebalance_virtual_shards(initial, &RoundRobinShardAssigner)
+            .await
+            .unwrap();
+        store
+            .upsert_instance(instance_record("world-b", InstanceState::Ready))
+            .await
+            .unwrap();
+
+        let running_guarded = coordinator
+            .rebalance_virtual_shards(
+                RebalanceVirtualShardsRequest {
+                    service_kind: service_kind!("World"),
+                    actor_kind: actor_kind!("World"),
+                    shard_count: 4,
+                    eligible_shards: BTreeSet::new(),
+                    max_migrations: usize::MAX,
+                    movement_policy: VirtualShardMovementPolicy::EligibleOnly,
+                },
+                &GradualRebalanceShardAssigner,
+            )
+            .await
+            .unwrap();
+        let running_allowed = coordinator
+            .rebalance_virtual_shards(
+                RebalanceVirtualShardsRequest {
+                    service_kind: service_kind!("World"),
+                    actor_kind: actor_kind!("World"),
+                    shard_count: 4,
+                    eligible_shards: BTreeSet::new(),
+                    max_migrations: usize::MAX,
+                    movement_policy: VirtualShardMovementPolicy::AllowRunningMigration,
+                },
+                &GradualRebalanceShardAssigner,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(running_guarded.moved_shards, 0);
+        assert_eq!(running_allowed.moved_shards, 2);
     }
 
     #[tokio::test]
