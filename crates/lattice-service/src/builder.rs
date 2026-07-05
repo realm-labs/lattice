@@ -4,10 +4,10 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use lattice_actor::Actor;
+use lattice_actor::{Actor, Handler};
 use lattice_config::{BootstrapConfig, ConfigSource};
 use lattice_config::{ConfigStore, LocalConfigStore};
-use lattice_core::{ActorKind, InstanceId, ServiceContext, ServiceKind};
+use lattice_core::{ActorKind, InstanceId, LinkOpened, ServiceContext, ServiceKind};
 use lattice_direct_link::{DirectLinkActorBinding, DirectLinkDispatch};
 use lattice_eventbus::{EventBus, LocalEventBus};
 use lattice_ops::{AdminHttpConfig, ServiceScheduler};
@@ -273,6 +273,7 @@ impl LatticeServiceBuilder {
     ) -> Self
     where
         A: Actor + Sync,
+        A: Handler<LinkOpened>,
         Messages: DirectLinkDispatch<A>,
     {
         self.direct_link_bindings

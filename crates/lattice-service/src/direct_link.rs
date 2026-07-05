@@ -2,7 +2,8 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use lattice_actor::Actor;
+use lattice_actor::{Actor, Handler};
+use lattice_core::LinkOpened;
 use lattice_direct_link::{
     DirectLinkActorBinding, DirectLinkDispatch, DirectLinkInboundRouter,
     DirectLinkInboundRouterBuilder, DirectLinkSessionManager,
@@ -69,6 +70,7 @@ where
 impl<A, Messages> ErasedDirectLinkBinding for DirectLinkBindingRegistration<A, Messages>
 where
     A: Actor + Sync,
+    A: Handler<LinkOpened>,
     Messages: DirectLinkDispatch<A>,
 {
     fn register(

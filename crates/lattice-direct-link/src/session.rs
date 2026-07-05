@@ -9,7 +9,7 @@ use lattice_core::{
     ActorKind, ActorRef, ActorRefTarget, BackpressurePolicy, DirectLinkMessage,
     DirectLinkMessageId, DirectLinkMode, DirectLinkOptions, DirectLinkSession,
     DirectLinkStreamDescriptor, Epoch, LinkCloseReason, LinkDirection, LinkError, LinkId,
-    LinkSequence, ServiceKind,
+    LinkOpened, LinkSequence, ServiceKind,
 };
 use thiserror::Error;
 
@@ -408,6 +408,18 @@ impl DirectLinkSessionManager {
             .expect("direct link managed links poisoned")
             .get(link_id)
             .map(ManagedLinkSnapshot::from)
+    }
+
+    pub fn link_opened_for_actor(
+        &self,
+        link_id: &LinkId,
+        actor_ref: &ActorRef,
+    ) -> Option<LinkOpened> {
+        self.links
+            .lock()
+            .expect("direct link managed links poisoned")
+            .get(link_id)?
+            .opened_for_actor(actor_ref)
     }
 
     pub fn close(&self, link_id: &LinkId, _reason: LinkCloseReason) -> bool {
@@ -853,6 +865,46 @@ impl From<&ManagedLink> for ManagedLinkSnapshot {
             directions: value.directions.keys().copied().collect(),
             closed: value.closed,
         }
+    }
+}
+
+impl ManagedLink {
+    fn opened_for_actor(&self, actor_ref: &ActorRef) -> Option<LinkOpened> {
+        if *actor_ref == self.target {
+            let inbound = self.directions.get(&LinkDirection::SourceToTarget)?;
+            let outbound = self.directions.get(&LinkDirection::TargetToSource);
+            return Some(LinkOpened {
+                link_id: self.link_id.clone(),
+                source: self.source.clone(),
+                target: self.target.clone(),
+                mode: self.mode,
+                inbound_stream: inbound.stream_name.clone(),
+                inbound_accepted_message_types: inbound.accepted_message_type_ids.clone(),
+                outbound_stream: outbound.map(|direction| direction.stream_name.clone()),
+                outbound_accepted_message_types: outbound
+                    .map(|direction| direction.accepted_message_type_ids.clone())
+                    .unwrap_or_default(),
+            });
+        }
+
+        if *actor_ref == self.source {
+            let inbound = self.directions.get(&LinkDirection::TargetToSource)?;
+            let outbound = self.directions.get(&LinkDirection::SourceToTarget);
+            return Some(LinkOpened {
+                link_id: self.link_id.clone(),
+                source: self.source.clone(),
+                target: self.target.clone(),
+                mode: self.mode,
+                inbound_stream: inbound.stream_name.clone(),
+                inbound_accepted_message_types: inbound.accepted_message_type_ids.clone(),
+                outbound_stream: outbound.map(|direction| direction.stream_name.clone()),
+                outbound_accepted_message_types: outbound
+                    .map(|direction| direction.accepted_message_type_ids.clone())
+                    .unwrap_or_default(),
+            });
+        }
+
+        None
     }
 }
 

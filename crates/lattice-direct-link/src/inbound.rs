@@ -3,9 +3,10 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use lattice_actor::{Actor, ActorHandle};
+use lattice_actor::{Actor, ActorHandle, Handler};
 use lattice_core::{
-    ActorKind, ActorRef, DirectLinkMessageId, LinkDirection, LinkMessageContext, LinkMessageFlags,
+    ActorKind, ActorRef, DirectLinkMessageId, LinkDirection, LinkId, LinkMessageContext,
+    LinkMessageFlags, LinkOpened,
 };
 use thiserror::Error;
 
@@ -24,6 +25,8 @@ pub enum InboundDeliveryError {
     UnboundActorKind { actor_kind: ActorKind },
     #[error("direct-link target actor is unavailable")]
     ActorUnavailable,
+    #[error("direct-link open event is unavailable")]
+    LinkOpenUnavailable,
     #[error(transparent)]
     Frame(#[from] MessageFrameError),
     #[error(transparent)]
@@ -88,6 +91,27 @@ impl DirectLinkInboundRouter {
         };
         binding.deliver(&actor_ref, message_id, &frame.payload, context)
     }
+
+    pub fn deliver_link_opened_to_target(
+        &self,
+        link_id: &LinkId,
+    ) -> Result<(), InboundDeliveryError> {
+        let snapshot = self
+            .session_manager
+            .link_snapshot(link_id)
+            .ok_or(InboundDeliveryError::LinkOpenUnavailable)?;
+        let opened = self
+            .session_manager
+            .link_opened_for_actor(link_id, &snapshot.target)
+            .ok_or(InboundDeliveryError::LinkOpenUnavailable)?;
+        let binding = self
+            .bindings
+            .get(&snapshot.target.actor_kind)
+            .ok_or_else(|| InboundDeliveryError::UnboundActorKind {
+                actor_kind: snapshot.target.actor_kind.clone(),
+            })?;
+        binding.deliver_link_opened(&snapshot.target, opened)
+    }
 }
 
 pub struct DirectLinkInboundRouterBuilder {
@@ -104,6 +128,7 @@ impl DirectLinkInboundRouterBuilder {
     where
         A: Actor,
         Messages: DirectLinkDispatch<A>,
+        A: Handler<LinkOpened>,
         F: Fn(&ActorRef) -> Option<ActorHandle<A>> + Send + Sync + 'static,
     {
         self.bindings.insert(
@@ -133,6 +158,12 @@ trait ErasedInboundBinding: Send + Sync + 'static {
         payload: &[u8],
         context: LinkMessageContext,
     ) -> Result<(), InboundDeliveryError>;
+
+    fn deliver_link_opened(
+        &self,
+        actor_ref: &ActorRef,
+        opened: LinkOpened,
+    ) -> Result<(), InboundDeliveryError>;
 }
 
 type ActorResolver<A> = dyn Fn(&ActorRef) -> Option<ActorHandle<A>> + Send + Sync;
@@ -148,7 +179,7 @@ where
 
 impl<A, Messages> ErasedInboundBinding for TypedInboundBinding<A, Messages>
 where
-    A: Actor,
+    A: Actor + Handler<LinkOpened>,
     Messages: DirectLinkDispatch<A>,
 {
     fn deliver(
@@ -161,6 +192,18 @@ where
         let handle = (self.resolver)(actor_ref).ok_or(InboundDeliveryError::ActorUnavailable)?;
         self.binding
             .try_deliver(&handle, message_id, payload, context)
+            .map_err(Into::into)
+    }
+
+    fn deliver_link_opened(
+        &self,
+        actor_ref: &ActorRef,
+        opened: LinkOpened,
+    ) -> Result<(), InboundDeliveryError> {
+        let handle = (self.resolver)(actor_ref).ok_or(InboundDeliveryError::ActorUnavailable)?;
+        handle
+            .try_tell(opened)
+            .map_err(DirectLinkDeliveryError::from)
             .map_err(Into::into)
     }
 }
@@ -178,11 +221,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use lattice_actor::{ActorContext, ActorRuntime, Handler};
+    use lattice_actor::{ActorContext, ActorRuntime, ActorSpawnOptions, Handler};
     use lattice_core::{
         ActorId, ActorKind, ActorRef, DirectLinkMessage, DirectLinkMode, DirectLinkOptions,
-        InstanceId, LinkDirection, LinkId, LinkSequence, Linked, ServiceKind, actor_kind,
-        service_kind,
+        DirectLinkRuntime, DirectLinkRuntimeHandle, DirectLinkSender, DirectLinkSession,
+        DirectLinkStreamDescriptor, DirectLinkStreamType, InstanceId, LinkDirection, LinkError,
+        LinkId, LinkOpened, LinkSendError, LinkSequence, Linked, OutboundDirectLinkMessage,
+        ServiceContext, ServiceKind, actor_kind, service_kind,
     };
     use prost::Message as _;
     use tokio::time::{Duration, timeout};
@@ -251,6 +296,17 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Handler<LinkOpened> for BattleActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkOpened,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     struct GatewayActor {
         received: Arc<Mutex<Vec<u64>>>,
     }
@@ -271,6 +327,142 @@ mod tests {
                 .lock()
                 .expect("received mutex poisoned")
                 .push(msg.payload.tick);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkOpened> for GatewayActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkOpened,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingLinkRuntime {
+        outbound_requests: Mutex<Vec<(LinkId, DirectLinkStreamDescriptor)>>,
+        sender: Arc<RecordingLinkSender>,
+    }
+
+    #[async_trait]
+    impl DirectLinkRuntime for RecordingLinkRuntime {
+        async fn open_link(
+            &self,
+            _request: lattice_core::DirectLinkOpenRequest,
+        ) -> Result<DirectLinkSession, LinkError> {
+            Err(LinkError::Protocol(
+                "open_link is not used by this test".to_string(),
+            ))
+        }
+
+        async fn get_outbound(
+            &self,
+            link_id: LinkId,
+            stream: DirectLinkStreamDescriptor,
+        ) -> Result<DirectLinkSession, LinkError> {
+            self.outbound_requests
+                .lock()
+                .expect("outbound requests mutex poisoned")
+                .push((link_id.clone(), stream.clone()));
+            Ok(DirectLinkSession {
+                link_id,
+                direction: LinkDirection::TargetToSource,
+                accepted_message_ids: stream.accepted_message_ids(),
+                stream,
+                sender: self.sender.clone(),
+            })
+        }
+
+        async fn close_all(
+            &self,
+            _link_id: LinkId,
+            _reason: lattice_core::LinkCloseReason,
+        ) -> Result<(), LinkError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingLinkSender {
+        sent: Mutex<Vec<OutboundDirectLinkMessage>>,
+    }
+
+    #[async_trait]
+    impl DirectLinkSender for RecordingLinkSender {
+        async fn tell(&self, message: OutboundDirectLinkMessage) -> Result<(), LinkSendError> {
+            self.try_tell(message)
+        }
+
+        fn try_tell(&self, message: OutboundDirectLinkMessage) -> Result<(), LinkSendError> {
+            self.sent
+                .lock()
+                .expect("sent messages mutex poisoned")
+                .push(message);
+            Ok(())
+        }
+
+        async fn close(&self, _reason: lattice_core::LinkCloseReason) -> Result<(), LinkSendError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct BattleUpdateStream;
+
+    impl DirectLinkStreamType for BattleUpdateStream {
+        fn descriptor() -> DirectLinkStreamDescriptor {
+            DirectLinkStream::new("battle-update")
+                .message::<PositionUpdate>()
+                .descriptor()
+        }
+    }
+
+    struct OpeningBattleActor {
+        opened: Arc<Mutex<Vec<LinkOpened>>>,
+        outbound: Arc<Mutex<Option<(LinkDirection, String)>>>,
+    }
+
+    #[async_trait]
+    impl lattice_actor::Actor for OpeningBattleActor {
+        type Error = Infallible;
+    }
+
+    #[async_trait]
+    impl Handler<Linked<InputCommand>> for OpeningBattleActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: Linked<InputCommand>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkOpened> for OpeningBattleActor {
+        async fn handle(
+            &mut self,
+            ctx: &mut ActorContext<Self>,
+            msg: LinkOpened,
+        ) -> Result<(), Self::Error> {
+            let outbound = ctx
+                .links()
+                .get::<BattleUpdateStream>(msg.link_id.clone())
+                .await
+                .expect("target-to-source link should be available");
+            *self
+                .outbound
+                .lock()
+                .expect("outbound handle mutex poisoned") =
+                Some((outbound.direction(), outbound.stream().stream_name.clone()));
+            self.opened
+                .lock()
+                .expect("opened messages mutex poisoned")
+                .push(msg);
             Ok(())
         }
     }
@@ -448,6 +640,104 @@ mod tests {
             [LinkDirection::SourceToTarget, LinkDirection::TargetToSource]
                 .into_iter()
                 .collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_router_delivers_link_opened_and_actor_gets_target_to_source_handle() {
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let outbound = Arc::new(Mutex::new(None));
+        let runtime = Arc::new(RecordingLinkRuntime::default());
+        let mut service =
+            ServiceContext::builder(service_kind!("Battle"), InstanceId::new("battle-1"));
+        service
+            .insert_extension(DirectLinkRuntimeHandle::new(runtime.clone()))
+            .unwrap();
+        let link_id = LinkId::new("link-opened");
+        let target_ref = actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9);
+        let handle = ActorRuntime::default()
+            .spawn_actor(
+                OpeningBattleActor {
+                    opened: opened.clone(),
+                    outbound: outbound.clone(),
+                },
+                ActorSpawnOptions {
+                    self_ref: Some(target_ref.clone()),
+                    service: service.build(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let manager = Arc::new(DirectLinkSessionManager::new());
+        let input_stream = DirectLinkStream::new("gateway-input").message::<InputCommand>();
+        let update_stream = DirectLinkStream::new("battle-update").message::<PositionUpdate>();
+        let input_descriptor = input_stream.descriptor();
+        let update_descriptor = update_stream.descriptor();
+        manager
+            .register_binding(actor_kind!("Battle"), input_descriptor.clone())
+            .unwrap();
+        manager
+            .register_binding(actor_kind!("GatewaySession"), update_descriptor.clone())
+            .unwrap();
+        manager
+            .open_link(OpenLinkRequest {
+                protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                link_id: link_id.clone(),
+                source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+                target: target_ref,
+                mode: DirectLinkMode::Bidirectional,
+                source_to_target: OpenLinkDirection::from_stream(
+                    link_id.clone(),
+                    &input_descriptor,
+                ),
+                target_to_source: Some(OpenLinkDirection::from_stream(
+                    link_id.clone(),
+                    &update_descriptor,
+                )),
+                options: DirectLinkOptions::bidirectional(),
+            })
+            .unwrap();
+        let router = DirectLinkInboundRouter::builder(manager)
+            .bind_actor(
+                input_stream.for_actor::<OpeningBattleActor>(actor_kind!("Battle")),
+                move |_| Some(handle.clone()),
+            )
+            .build();
+
+        router.deliver_link_opened_to_target(&link_id).unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if outbound
+                    .lock()
+                    .expect("outbound handle mutex poisoned")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let opened = opened.lock().expect("opened messages mutex poisoned");
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].mode, DirectLinkMode::Bidirectional);
+        assert_eq!(opened[0].inbound_stream, "gateway-input");
+        assert_eq!(opened[0].outbound_stream.as_deref(), Some("battle-update"));
+        assert_eq!(
+            *outbound.lock().expect("outbound handle mutex poisoned"),
+            Some((LinkDirection::TargetToSource, "battle-update".to_string()))
+        );
+        assert_eq!(
+            runtime
+                .outbound_requests
+                .lock()
+                .expect("outbound requests mutex poisoned")
+                .as_slice(),
+            &[(link_id, BattleUpdateStream::descriptor())]
         );
     }
 

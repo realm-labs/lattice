@@ -25,8 +25,8 @@ use lattice_actor::{
 use lattice_config::{ConfigFormat, ConfigSource};
 use lattice_core::{
     ActorId, ActorKind, ActorRef, ConfiguredComponent, DirectLinkEndpoint, DirectLinkMessage,
-    DirectLinkMode, DirectLinkOptions, Epoch, InstanceId, LinkId, LinkSequence, Linked, RequestId,
-    RouteKey, TraceContext, actor_kind, service_kind,
+    DirectLinkMode, DirectLinkOptions, Epoch, InstanceId, LinkId, LinkOpened, LinkSequence, Linked,
+    RequestId, RouteKey, TraceContext, actor_kind, service_kind,
 };
 use lattice_direct_link::{
     DIRECT_LINK_PROTOCOL_VERSION, DirectLinkConnection, DirectLinkFrame, DirectLinkStream,
@@ -198,6 +198,17 @@ impl Handler<Linked<DirectLinkTestPayload>> for DirectLinkTestActor {
             .lock()
             .expect("received direct-link payloads mutex poisoned")
             .push(msg.payload.tick);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<LinkOpened> for DirectLinkTestActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _msg: LinkOpened,
+    ) -> Result<(), ActorError> {
         Ok(())
     }
 }
