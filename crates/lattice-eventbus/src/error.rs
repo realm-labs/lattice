@@ -9,6 +9,8 @@ pub enum EventBusError {
         message_type: &'static str,
         reason: String,
     },
+    #[error("event is missing actor routing field {field}")]
+    MissingActorTarget { field: &'static str },
     #[error("event actor delivery failed: {0}")]
     ActorDelivery(String),
 }

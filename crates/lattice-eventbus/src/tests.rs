@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_core::{ActorKind, RouteKey, actor_kind};
+use lattice_core::{ActorId, ActorKind, ActorRef, ActorRefTarget, RouteKey, actor_kind};
 use lattice_core::{InstanceId, TraceContext, service_kind};
-use lattice_rpc::{RoutedRequest, RpcRequest, ShardedRpcCore};
+use lattice_rpc::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpcCore};
 use prost::Message as ProstMessage;
 use tokio::sync::Mutex;
 
@@ -156,6 +156,26 @@ impl ShardedRpcCore for RecordingCore {
     }
 }
 
+#[derive(Clone, Default)]
+struct RecordingActorRefCore {
+    refs: Arc<Mutex<Vec<ActorRef>>>,
+}
+
+#[async_trait]
+impl ActorRefRpcCore for RecordingActorRefCore {
+    async fn call_ref<Req>(
+        &self,
+        actor_ref: ActorRef,
+        _req: Req,
+    ) -> Result<Req::Reply, lattice_rpc::RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        self.refs.lock().await.push(actor_ref);
+        Ok(Req::Reply::default())
+    }
+}
+
 #[tokio::test]
 async fn service_events_subscribe_actor_routes_through_rpc_core() {
     let bus = LocalEventBus::new();
@@ -201,6 +221,36 @@ async fn service_events_subscribe_actor_decodes_typed_rpc_request() {
 }
 
 #[tokio::test]
+async fn service_events_subscribe_actor_routed_uses_envelope_actor_ref() {
+    let bus = LocalEventBus::new();
+    let events = ServiceEvents::new(bus.clone());
+    let core = RecordingActorRefCore::default();
+    let refs = core.refs.clone();
+    events
+        .subscribe_actor_routed::<EventToActorRequest, _>(
+            EventSubscription::local(SubjectFilter::new("game.world.*")),
+            service_kind!("World"),
+            core,
+            DeliveryOptions::at_least_once(),
+        )
+        .await
+        .unwrap();
+
+    let mut event = test_event("game.world.player_entered", "PlayerEntered");
+    event.actor_kind = Some(actor_kind!("World"));
+    event.actor_id = Some(ActorId::U64(77));
+    event.payload = EventToActorRequest { world_id: 77 }.encode_to_vec();
+    bus.publish(event).await.unwrap();
+
+    let refs = refs.lock().await;
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].service_kind, service_kind!("World"));
+    assert_eq!(refs[0].actor_kind, actor_kind!("World"));
+    assert_eq!(refs[0].actor_id, ActorId::U64(77));
+    assert_eq!(refs[0].target, ActorRefTarget::Routed);
+}
+
+#[tokio::test]
 async fn service_events_subscribe_actor_rejects_invalid_typed_payload() {
     let bus = LocalEventBus::new();
     let events = ServiceEvents::new(bus.clone());
@@ -219,4 +269,30 @@ async fn service_events_subscribe_actor_rejects_invalid_typed_payload() {
     let error = bus.publish(event).await.unwrap_err();
 
     assert!(matches!(error, EventBusError::Decode { .. }));
+}
+
+#[tokio::test]
+async fn service_events_subscribe_actor_routed_requires_actor_target() {
+    let bus = LocalEventBus::new();
+    let events = ServiceEvents::new(bus.clone());
+    events
+        .subscribe_actor_routed::<EventToActorRequest, _>(
+            EventSubscription::local(SubjectFilter::new("game.world.*")),
+            service_kind!("World"),
+            RecordingActorRefCore::default(),
+            DeliveryOptions::at_least_once(),
+        )
+        .await
+        .unwrap();
+
+    let mut event = test_event("game.world.player_entered", "PlayerEntered");
+    event.payload = EventToActorRequest { world_id: 77 }.encode_to_vec();
+    let error = bus.publish(event).await.unwrap_err();
+
+    assert_eq!(
+        error,
+        EventBusError::MissingActorTarget {
+            field: "actor_kind"
+        }
+    );
 }

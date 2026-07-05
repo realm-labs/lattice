@@ -215,7 +215,7 @@ Status: `[ ]` incomplete.
 - [x] Direct/routed `ActorRef` messaging exists.
 - [x] Cross-node remote watch model exists in framework code/tests.
 - [x] `ctx.service().cluster_event_bus()/local_event_bus()` and `cluster_events()/local_events()` accessors exist.
-- [ ] `subscribe_actor` still needs final typed owner-routed actor delivery semantics beyond the current bridge.
+- [x] `subscribe_actor` has typed owner-routed actor delivery semantics through `subscribe_actor_routed`, which builds routed `ActorRef`s from event actor metadata and delivers through `ActorRefRpcCore`.
 - [x] Event subscriptions owned by service event buses are cancelled by `LatticeService` shutdown/drain.
 - [x] Service scheduler is exposed through `ServiceContext`.
 - [x] Admin HTTP is wired into `LatticeService` startup as a managed listener.

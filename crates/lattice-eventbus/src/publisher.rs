@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lattice_core::{InstanceId, ServiceKind, TraceContext};
-use lattice_rpc::{RoutedRequest, RpcRequest, ShardedRpcCore};
+use lattice_core::{ActorRef, InstanceId, ServiceKind, TraceContext};
+use lattice_rpc::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpcCore};
 use prost::Message as ProstMessage;
 
 use crate::{
@@ -100,6 +100,53 @@ where
                 let req = map(event);
                 async move {
                     core.call(req)
+                        .await
+                        .map(|_| ())
+                        .map_err(EventBusError::from_rpc)
+                }
+            })
+            .await
+    }
+
+    pub async fn subscribe_actor_routed<Req, C>(
+        &self,
+        subscription: EventSubscription,
+        target_service: ServiceKind,
+        core: C,
+        options: DeliveryOptions,
+    ) -> Result<EventSubscriptionHandle, EventBusError>
+    where
+        Req: RoutedRequest + RpcRequest,
+        C: ActorRefRpcCore,
+    {
+        match options.guarantee {
+            DeliveryGuarantee::AtLeastOnce => {}
+        }
+
+        self.bus
+            .subscribe(subscription, move |event: EventEnvelope| {
+                let target_service = target_service.clone();
+                let core = core.clone();
+                async move {
+                    let actor_kind =
+                        event
+                            .actor_kind
+                            .clone()
+                            .ok_or(EventBusError::MissingActorTarget {
+                                field: "actor_kind",
+                            })?;
+                    let actor_id = event
+                        .actor_id
+                        .clone()
+                        .ok_or(EventBusError::MissingActorTarget { field: "actor_id" })?;
+                    let req = <Req as ProstMessage>::decode(event.payload.as_slice()).map_err(
+                        |error| EventBusError::Decode {
+                            message_type: std::any::type_name::<Req>(),
+                            reason: error.to_string(),
+                        },
+                    )?;
+                    let actor_ref = ActorRef::routed(target_service, actor_kind, actor_id);
+                    core.call_ref(actor_ref, req)
                         .await
                         .map(|_| ())
                         .map_err(EventBusError::from_rpc)
