@@ -189,7 +189,7 @@ Status: `[x]` complete.
 
 #### Phase 6: Cluster Singleton
 
-Status: `[ ]` incomplete.
+Status: `[x]` complete.
 
 - [x] In-memory singleton placement model and activation race tests exist.
 - [x] Singleton owner record has owner, epoch, lease id, and state in the current model.
@@ -198,7 +198,7 @@ Status: `[ ]` incomplete.
 - [x] Generated singleton client/adapter exists through `SingletonBinding`, singleton placement client cores, and `SingletonRegistryService` with executable codegen/service coverage.
 - [x] Singleton owner lease/keepalive is connected to service lifecycle for owners held by the running instance.
 - [x] Automatic singleton failover after owner crash is covered by the lease-expiry reconciliation loop and failover test coverage.
-- [ ] Old singleton owner fencing is not enforced in the runtime path.
+- [x] Old singleton owner fencing is enforced in the generated singleton runtime path through owner/epoch checks before actor dispatch and FENCED retry status normalization.
 
 #### Phase 7: Ops Production Features
 
