@@ -1039,10 +1039,10 @@ Pre-implementation checks:
 [x] local child actor does not write placement and stops with parent lifecycle.
 [x] actor/service scheduler is explicitly non-durable and lost on restart.
 [x] metrics/trace/admin APIs are sufficient for production diagnosis.
-[ ] Direct Actor Link is implemented as a separate high-throughput actor stream capability, not as a gRPC transport replacement.
-[ ] Direct Actor Link supports TCP unidirectional and bidirectional streams with typed `Linked<T>` actor handlers.
-[ ] Direct Actor Link stream binding uses real Rust message types and compile-time handler checks.
-[ ] Direct Actor Link lifecycle, close semantics, backpressure, validation, security, and observability match architecture/02-rpc.md.
+[x] Direct Actor Link is implemented as a separate high-throughput actor stream capability, not as a gRPC transport replacement.
+[x] Direct Actor Link supports TCP unidirectional and bidirectional streams with typed `Linked<T>` actor handlers.
+[x] Direct Actor Link stream binding uses real Rust message types and compile-time handler checks.
+[x] Direct Actor Link lifecycle, close semantics, backpressure, validation, security, and observability match architecture/02-rpc.md.
 ```
 
 ---
