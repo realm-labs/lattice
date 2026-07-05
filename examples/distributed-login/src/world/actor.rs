@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use lattice_actor::{Actor, ActorContext, ActorError, Handler};
+use lattice_actor::{Actor, ActorContext, ActorCreateContext, ActorError, ActorLoader, Handler};
+use lattice_core::ActorId;
 use lattice_rpc::Rpc;
 
 use crate::game::{
@@ -17,7 +18,7 @@ pub struct WorldActor {
 }
 
 impl WorldActor {
-    pub fn new(world_id: u64, player_client: PlayerRpcClient<DemoRpcCore>) -> Self {
+    fn new(world_id: u64, player_client: PlayerRpcClient<DemoRpcCore>) -> Self {
         Self {
             world_id,
             sessions: HashMap::new(),
@@ -68,6 +69,32 @@ impl Handler<Rpc<LoginRequest>> for WorldActor {
             }
             .to_string(),
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct WorldLoader {
+    player_core: DemoRpcCore,
+}
+
+impl WorldLoader {
+    pub fn new(player_core: DemoRpcCore) -> Self {
+        Self { player_core }
+    }
+}
+
+#[async_trait]
+impl ActorLoader<WorldActor> for WorldLoader {
+    async fn load(&self, ctx: ActorCreateContext) -> Result<WorldActor, ActorError> {
+        match ctx.actor_id {
+            ActorId::U64(world_id) => Ok(WorldActor::new(
+                world_id,
+                PlayerRpcClient::new(self.player_core.clone()),
+            )),
+            other => Err(ActorError::new(format!(
+                "unsupported world actor id {other:?}"
+            ))),
+        }
     }
 }
 
