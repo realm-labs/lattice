@@ -30,6 +30,7 @@ pub struct DirectLinkConfig {
     max_frame_size: usize,
     maintenance_interval: Duration,
     bind_policy: DirectLinkBindPolicy,
+    max_connections: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +46,7 @@ impl DirectLinkConfig {
             max_frame_size: 256 * 1024,
             maintenance_interval: Duration::from_secs(1),
             bind_policy: DirectLinkBindPolicy::LoopbackOnly,
+            max_connections: None,
         }
     }
 
@@ -67,8 +69,19 @@ impl DirectLinkConfig {
         self
     }
 
+    pub fn max_connections(mut self, max_connections: usize) -> Self {
+        if max_connections > 0 {
+            self.max_connections = Some(max_connections);
+        }
+        self
+    }
+
     pub(crate) fn maintenance_interval_config(&self) -> Duration {
         self.maintenance_interval
+    }
+
+    pub(crate) fn max_connections_config(&self) -> Option<usize> {
+        self.max_connections
     }
 
     pub(crate) fn listen_config(&self) -> Result<DirectLinkListenConfig, String> {
@@ -148,6 +161,22 @@ mod tests {
                 .bind_policy(DirectLinkBindPolicy::External)
                 .listen_config()
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn direct_link_connection_limit_ignores_zero_and_records_positive_values() {
+        assert_eq!(
+            DirectLinkConfig::enabled("127.0.0.1:0")
+                .max_connections(0)
+                .max_connections_config(),
+            None
+        );
+        assert_eq!(
+            DirectLinkConfig::enabled("127.0.0.1:0")
+                .max_connections(8)
+                .max_connections_config(),
+            Some(8)
         );
     }
 }

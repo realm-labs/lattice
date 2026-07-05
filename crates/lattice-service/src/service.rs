@@ -23,7 +23,7 @@ use lattice_placement::coordinator::PlacementWatchTask;
 use lattice_placement::instance::{InstanceRecord, InstanceState};
 use lattice_placement::store::LeaseId;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::server::Router;
@@ -568,6 +568,7 @@ async fn start_direct_link_listener(
                 message,
             })?;
     let maintenance_interval = config.maintenance_interval_config();
+    let connection_limit = config.max_connections_config();
     let transport = TcpDirectLinkTransport::new();
     let listener = transport.bind(listen_config).await.map_err(|error| {
         LatticeServiceError::ComponentBuild {
@@ -577,6 +578,7 @@ async fn start_direct_link_listener(
     })?;
     let endpoint = listener.local_endpoint();
     let inbound_router = runtime.map(|runtime| runtime.inbound_router());
+    let connection_permits = connection_limit.map(|limit| Arc::new(Semaphore::new(limit)));
     let (shutdown, mut shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         let mut maintenance = tokio::time::interval(maintenance_interval);
@@ -595,10 +597,23 @@ async fn start_direct_link_listener(
                 }
                 accepted = listener.accept() => {
                     match accepted {
-                        Ok(connection) => {
+                        Ok(mut connection) => {
+                            let permit = if let Some(connection_permits) = &connection_permits {
+                                match connection_permits.clone().try_acquire_owned() {
+                                    Ok(permit) => Some(permit),
+                                    Err(error) => {
+                                        warn!(%error, "rejecting direct-link connection after connection limit reached");
+                                        let _ = connection.close().await;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                             let inbound_router = inbound_router.clone();
                             let maintenance_interval = maintenance_interval;
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 handle_direct_link_connection(
                                     connection,
                                     inbound_router,

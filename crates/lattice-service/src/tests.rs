@@ -1461,6 +1461,78 @@ async fn direct_link_connection_writes_open_link_reject_frames() {
 }
 
 #[tokio::test]
+async fn direct_link_listener_enforces_connection_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store =
+        InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test-direct-link-conn-limit"));
+    let mut watch = store.watch(store.prefix().clone()).await.unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let stream = DirectLinkStream::new("movement").message::<DirectLinkTestPayload>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .direct_links(DirectLinkConfig::enabled("127.0.0.1:0").max_connections(1))
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(DirectLinkTestFactory {
+                    received: received.clone(),
+                })
+                .build(),
+        )
+        .register_direct_link(stream.for_actor::<DirectLinkTestActor>(actor_kind!("World")))
+        .build()
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+    let ready_record = loop {
+        let event = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .unwrap()
+            .unwrap();
+        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+            && record.state == InstanceState::Ready
+        {
+            break record;
+        }
+    };
+    let direct_link_endpoint: http::Uri = ready_record
+        .labels
+        .get("direct_link_endpoint")
+        .expect("direct-link endpoint label")
+        .parse()
+        .unwrap();
+    let transport = TcpDirectLinkTransport::new();
+    let mut first = transport
+        .connect(DirectLinkEndpoint::new(direct_link_endpoint.clone()))
+        .await
+        .unwrap();
+    let mut second = transport
+        .connect(DirectLinkEndpoint::new(direct_link_endpoint))
+        .await
+        .unwrap();
+
+    let rejected = timeout(Duration::from_secs(1), second.read_frame())
+        .await
+        .unwrap();
+    assert!(
+        rejected.is_err(),
+        "second direct-link connection stayed open"
+    );
+
+    first.close().await.unwrap();
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn direct_link_listener_idle_maintenance_closes_stale_links() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test-direct-link-idle"));

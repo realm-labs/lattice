@@ -296,7 +296,7 @@ Status: `[ ]` in progress.
   - [x] OpenLink peer identity/auth hook rejects missing, trust-domain-mismatched, service-mismatched, or source-instance-mismatched peer identity before creating sessions.
   - [x] Managed TCP OpenLink frames are decoded, validated through the session manager, answered with OpenLinkAck/OpenLinkReject frames, and deliver LinkOpened to the target actor before message delivery.
   - [x] Managed TCP handshake supplies authenticated peer identity to OpenLink validation instead of trusting only declared source metadata.
-  - [ ] Managed TCP listener enforces a configured connection limit.
+  - [x] Managed TCP listener enforces a configured connection limit.
   - [ ] Session manager enforces a configured active link limit.
   - [ ] Direct Link open/data path enforces configured rate limits.
 - [ ] Observability emits link open/close/send/receive/drop/coalesce/backpressure/decode-error metrics and sampled tracing without per-message spans by default.
