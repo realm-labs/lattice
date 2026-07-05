@@ -1,6 +1,4 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use lattice_core::{ActorKind, Epoch, InstanceId, RouteKey, ServiceKind};
@@ -10,22 +8,9 @@ use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::error::PlacementError;
 use crate::instance::{InstanceRecord, InstanceState};
 use crate::route::{ResolveRequest, RouteCacheKey, RouteResolver};
-use crate::store::{LeaseId, PlacementStore};
+use crate::store::{LeaseId, PlacementState, PlacementStore, SingletonKey};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SingletonKey {
-    pub singleton_kind: ActorKind,
-    pub scope: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SingletonPlacementRecord {
-    pub singleton_kind: ActorKind,
-    pub scope: String,
-    pub owner: InstanceId,
-    pub epoch: Epoch,
-    pub lease_id: LeaseId,
-}
+pub use crate::store::SingletonPlacementRecord;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivateSingletonRequest {
@@ -64,9 +49,6 @@ pub struct SingletonCoordinator<S, C> {
     service_kind: ServiceKind,
     store: S,
     control: C,
-    records: Arc<std::sync::Mutex<HashMap<SingletonKey, SingletonPlacementRecord>>>,
-    locks: Arc<std::sync::Mutex<HashMap<SingletonKey, LeaseId>>>,
-    next_lease_id: Arc<AtomicU64>,
 }
 
 impl<S, C> SingletonCoordinator<S, C> {
@@ -75,9 +57,6 @@ impl<S, C> SingletonCoordinator<S, C> {
             service_kind,
             store,
             control,
-            records: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            next_lease_id: Arc::new(AtomicU64::new(1)),
         }
     }
 }
@@ -92,13 +71,14 @@ where
         request: ActivateSingletonRequest,
     ) -> Result<SingletonPlacementRecord, PlacementError> {
         let key = SingletonKey {
+            service_kind: request.service_kind,
             singleton_kind: request.singleton_kind,
             scope: request.scope,
         };
-        if let Some(record) = self.records.lock().unwrap().get(&key).cloned() {
+        if let Some((_version, record)) = self.store.get_singleton(&key).await? {
             return Ok(record);
         }
-        let lease_id = match self.acquire_lock(key.clone()) {
+        let lease_id = match self.store.acquire_singleton_lock(key.clone()).await {
             Ok(lease_id) => lease_id,
             Err(PlacementError::SingletonLockHeld) => {
                 return self.wait_for_existing_owner(&key).await;
@@ -106,7 +86,7 @@ where
             Err(error) => return Err(error),
         };
         let result = self.activate_with_lock(key.clone(), lease_id).await;
-        self.locks.lock().unwrap().remove(&key);
+        self.store.release_singleton_lock(&key).await?;
         result
     }
 
@@ -115,20 +95,45 @@ where
         key: &SingletonKey,
         new_owner: InstanceId,
     ) -> Result<SingletonPlacementRecord, PlacementError> {
-        let mut records = self.records.lock().unwrap();
-        let current = records.get(key).cloned().ok_or(PlacementError::NoRoute)?;
+        let lease_id = self.store.acquire_singleton_lock(key.clone()).await?;
+        let result = self.failover_with_lock(key, new_owner, lease_id).await;
+        self.store.release_singleton_lock(key).await?;
+        result
+    }
+
+    pub async fn get(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<SingletonPlacementRecord>, PlacementError> {
+        Ok(self
+            .store
+            .get_singleton(key)
+            .await?
+            .map(|(_version, record)| record))
+    }
+
+    async fn failover_with_lock(
+        &self,
+        key: &SingletonKey,
+        new_owner: InstanceId,
+        lease_id: LeaseId,
+    ) -> Result<SingletonPlacementRecord, PlacementError> {
+        let (version, current) = self
+            .store
+            .get_singleton(key)
+            .await?
+            .ok_or(PlacementError::NoRoute)?;
         let record = SingletonPlacementRecord {
             owner: new_owner,
             epoch: Epoch(current.epoch.0 + 1),
-            lease_id: LeaseId(current.lease_id.0 + 1),
+            lease_id,
+            state: PlacementState::Running,
             ..current
         };
-        records.insert(key.clone(), record.clone());
+        self.store
+            .compare_and_put_singleton(key.clone(), Some(version), record.clone())
+            .await?;
         Ok(record)
-    }
-
-    pub fn get(&self, key: &SingletonKey) -> Option<SingletonPlacementRecord> {
-        self.records.lock().unwrap().get(key).cloned()
     }
 
     async fn activate_with_lock(
@@ -136,7 +141,7 @@ where
         key: SingletonKey,
         lease_id: LeaseId,
     ) -> Result<SingletonPlacementRecord, PlacementError> {
-        if let Some(record) = self.records.lock().unwrap().get(&key).cloned() {
+        if let Some((_version, record)) = self.store.get_singleton(&key).await? {
             return Ok(record);
         }
         let instance = self
@@ -148,27 +153,21 @@ where
             .min_by_key(|instance| instance.instance_id.clone())
             .ok_or(PlacementError::NoReadyInstances)?;
         let record = SingletonPlacementRecord {
+            service_kind: key.service_kind.clone(),
             singleton_kind: key.singleton_kind.clone(),
             scope: key.scope.clone(),
             owner: instance.instance_id.clone(),
             epoch: Epoch(1),
             lease_id,
+            state: PlacementState::Running,
         };
         self.control
             .activate_singleton(&instance, &key, record.epoch)
             .await?;
-        self.records.lock().unwrap().insert(key, record.clone());
+        self.store
+            .compare_and_put_singleton(key, None, record.clone())
+            .await?;
         Ok(record)
-    }
-
-    fn acquire_lock(&self, key: SingletonKey) -> Result<LeaseId, PlacementError> {
-        let mut locks = self.locks.lock().unwrap();
-        if locks.contains_key(&key) {
-            return Err(PlacementError::SingletonLockHeld);
-        }
-        let lease_id = LeaseId(self.next_lease_id.fetch_add(1, Ordering::SeqCst));
-        locks.insert(key, lease_id);
-        Ok(lease_id)
     }
 
     async fn wait_for_existing_owner(
@@ -176,7 +175,7 @@ where
         key: &SingletonKey,
     ) -> Result<SingletonPlacementRecord, PlacementError> {
         for _ in 0..50 {
-            if let Some(record) = self.records.lock().unwrap().get(key).cloned() {
+            if let Some((_version, record)) = self.store.get_singleton(key).await? {
                 return Ok(record);
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -253,6 +252,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use lattice_core::instance::InstanceCapacity;
@@ -260,6 +260,7 @@ mod tests {
 
     use super::*;
     use crate::instance::InstanceState;
+    use crate::store::PlacementVersion;
     use crate::{InMemoryPlacementStore, PlacementPrefix};
 
     #[derive(Debug, Clone, Default)]
@@ -328,6 +329,7 @@ mod tests {
         let coordinator =
             SingletonCoordinator::new(service_kind!("Control"), store, NoopSingletonControl);
         let key = SingletonKey {
+            service_kind: service_kind!("Control"),
             singleton_kind: actor_kind!("SeasonManager"),
             scope: "global".to_string(),
         };
@@ -347,6 +349,39 @@ mod tests {
 
         assert_eq!(failed_over.owner, InstanceId::new("control-b"));
         assert_eq!(failed_over.epoch, Epoch(2));
+    }
+
+    #[tokio::test]
+    async fn singleton_owner_record_is_persisted_in_store() {
+        let store = ready_store().await;
+        let coordinator = SingletonCoordinator::new(
+            service_kind!("Control"),
+            store.clone(),
+            NoopSingletonControl,
+        );
+        let key = SingletonKey {
+            service_kind: service_kind!("Control"),
+            singleton_kind: actor_kind!("SeasonManager"),
+            scope: "global".to_string(),
+        };
+
+        let record = coordinator
+            .activate_singleton(ActivateSingletonRequest {
+                service_kind: service_kind!("Control"),
+                singleton_kind: key.singleton_kind.clone(),
+                scope: key.scope.clone(),
+            })
+            .await
+            .unwrap();
+        let stored = store.get_singleton(&key).await.unwrap().unwrap().1;
+
+        assert_eq!(stored, record);
+        assert_eq!(stored.state, PlacementState::Running);
+        assert_eq!(stored.service_kind, service_kind!("Control"));
+        assert_eq!(
+            store.list_singletons().await.unwrap(),
+            vec![(PlacementVersion(1), stored)]
+        );
     }
 
     #[tokio::test]

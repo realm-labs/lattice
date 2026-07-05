@@ -189,7 +189,7 @@ Status: `[ ]` incomplete.
 
 - [x] In-memory singleton placement model and activation race tests exist.
 - [x] Singleton owner record has owner, epoch, lease id, and state in the current model.
-- [ ] Singleton ownership is not stored through the production `PlacementStore`/etcd keyspace.
+- [x] Singleton ownership is not stored through the production `PlacementStore`/etcd keyspace.
 - [ ] `ActivateSingleton` control-plane API is not implemented as a service endpoint.
 - [ ] Generated singleton client/adapter is missing.
 - [ ] Singleton owner lease/keepalive/failover is not connected to service lifecycle.
@@ -219,6 +219,7 @@ Status: `[ ]` incomplete.
 - [ ] Cluster/node inspection does not query live services through LogicControl/Admin APIs.
 - [ ] Security/mTLS integration is partial and not connected to service builders by default.
 - [ ] Full chaos test suite is not implemented.
+- [ ] `crates/lattice-actor/src/tests.rs` exceeds 1200 LOC and needs a documented split or explicit rationale before final exit.
 
 ### Phase 1: Single-Node Actor Runtime
 

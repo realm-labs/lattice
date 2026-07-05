@@ -15,8 +15,8 @@ use crate::error::PlacementError;
 use crate::instance::InstanceRecord;
 use crate::store::{
     ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, LeaseId, PlacementPrefix,
-    PlacementStore, PlacementVersion, PlacementWatch, PlacementWatchEvent,
-    VirtualShardPlacementKey, VirtualShardPlacementRecord,
+    PlacementStore, PlacementVersion, PlacementWatch, PlacementWatchEvent, SingletonKey,
+    SingletonPlacementRecord, VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
 #[derive(Debug, Clone)]
@@ -305,6 +305,74 @@ where
             .await
     }
 
+    async fn get_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        let Some((version, value)) = self.client.get(&singleton_key(&self.prefix, key)).await?
+        else {
+            return Ok(None);
+        };
+        match value {
+            EtcdValue::Singleton(record) => Ok(Some((version, *record))),
+            _ => Ok(None),
+        }
+    }
+
+    async fn list_singletons(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        let prefix = format!("{}/logic/singletons/", clean_prefix(&self.prefix));
+        Ok(self
+            .client
+            .list_prefix(&prefix)
+            .await?
+            .into_iter()
+            .filter_map(|(_key, version, value)| match value {
+                EtcdValue::Singleton(record) => Some((version, *record)),
+                _ => None,
+            })
+            .collect())
+    }
+
+    async fn compare_and_put_singleton(
+        &self,
+        key: SingletonKey,
+        expected: Option<PlacementVersion>,
+        value: SingletonPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        self.client
+            .compare_and_put(
+                singleton_key(&self.prefix, &key),
+                expected,
+                EtcdValue::Singleton(Box::new(value)),
+            )
+            .await
+    }
+
+    async fn acquire_singleton_lock(&self, key: SingletonKey) -> Result<LeaseId, PlacementError> {
+        let lease_id = self.client.next_lease_id().await?;
+        match self
+            .client
+            .compare_and_put(
+                singleton_lock_key(&self.prefix, &key),
+                None,
+                EtcdValue::SingletonLock(lease_id),
+            )
+            .await
+        {
+            Ok(_) => Ok(lease_id),
+            Err(PlacementError::CompareAndPutFailed) => Err(PlacementError::SingletonLockHeld),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn release_singleton_lock(&self, key: &SingletonKey) -> Result<(), PlacementError> {
+        self.client
+            .delete(&singleton_lock_key(&self.prefix, key))
+            .await
+    }
+
     async fn acquire_activation_lock(
         &self,
         key: ActorPlacementKey,
@@ -363,6 +431,19 @@ where
                             record,
                         });
                     }
+                    Some(EtcdValue::Singleton(record)) => {
+                        let record = *record;
+                        let key = SingletonKey {
+                            service_kind: record.service_kind.clone(),
+                            singleton_kind: record.singleton_kind.clone(),
+                            scope: record.scope.clone(),
+                        };
+                        let _ = tx.send(PlacementWatchEvent::SingletonUpdated {
+                            key,
+                            version: event.version,
+                            record,
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -402,8 +483,10 @@ pub enum EtcdValue {
     Instance(Box<InstanceRecord>),
     Actor(Box<ActorPlacementRecord>),
     VirtualShard(Box<VirtualShardPlacementRecord>),
+    Singleton(Box<SingletonPlacementRecord>),
     CoordinatorLeader(Box<CoordinatorLeadership>),
     ActivationLock(LeaseId),
+    SingletonLock(LeaseId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -841,11 +924,11 @@ fn put_options_for(value: &EtcdValue) -> Result<Option<PutOptions>, PlacementErr
             let lease_id = i64::try_from(leadership.lease_id.0).map_err(codec_error)?;
             Ok(Some(PutOptions::new().with_lease(lease_id)))
         }
-        EtcdValue::ActivationLock(lease_id) => {
+        EtcdValue::ActivationLock(lease_id) | EtcdValue::SingletonLock(lease_id) => {
             let lease_id = i64::try_from(lease_id.0).map_err(codec_error)?;
             Ok(Some(PutOptions::new().with_lease(lease_id)))
         }
-        EtcdValue::Actor(_) | EtcdValue::VirtualShard(_) => Ok(None),
+        EtcdValue::Actor(_) | EtcdValue::VirtualShard(_) | EtcdValue::Singleton(_) => Ok(None),
     }
 }
 
@@ -907,6 +990,16 @@ fn vshard_key(prefix: &PlacementPrefix, key: &VirtualShardPlacementKey) -> Strin
     )
 }
 
+fn singleton_key(prefix: &PlacementPrefix, key: &SingletonKey) -> String {
+    format!(
+        "{}/logic/singletons/{}/{}/{}",
+        clean_prefix(prefix),
+        key.service_kind.as_str(),
+        key.singleton_kind.as_str(),
+        scope_segment(&key.scope)
+    )
+}
+
 fn activation_lock_key(prefix: &PlacementPrefix, key: &ActorPlacementKey) -> String {
     format!(
         "{}/logic/activation_locks/{}/{}",
@@ -916,8 +1009,22 @@ fn activation_lock_key(prefix: &PlacementPrefix, key: &ActorPlacementKey) -> Str
     )
 }
 
+fn singleton_lock_key(prefix: &PlacementPrefix, key: &SingletonKey) -> String {
+    format!(
+        "{}/logic/singleton_locks/{}/{}/{}",
+        clean_prefix(prefix),
+        key.service_kind.as_str(),
+        key.singleton_kind.as_str(),
+        scope_segment(&key.scope)
+    )
+}
+
 fn coordinator_leader_key(prefix: &PlacementPrefix) -> String {
     format!("{}/coordinator/leader", clean_prefix(prefix))
+}
+
+fn scope_segment(scope: &str) -> String {
+    hex_encode(scope.as_bytes())
 }
 
 fn actor_id_segment(actor_id: &ActorId) -> String {
@@ -938,325 +1045,4 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use lattice_core::instance::InstanceCapacity;
-    use lattice_core::{ActorId, Epoch, actor_kind, service_kind};
-
-    use super::*;
-    use crate::instance::InstanceState;
-    use crate::store::PlacementState;
-
-    #[tokio::test]
-    async fn etcd_store_writes_under_cluster_prefix_and_isolates_reads() {
-        let client = InMemoryEtcdClient::new();
-        let first =
-            EtcdPlacementStore::new(PlacementPrefix::new("/lattice/cluster-a"), client.clone());
-        let second =
-            EtcdPlacementStore::new(PlacementPrefix::new("/lattice/cluster-b"), client.clone());
-        let key = actor_key_for(7);
-
-        first
-            .upsert_instance(instance_record("world-a", InstanceState::Ready))
-            .await
-            .unwrap();
-        first
-            .compare_and_put_actor(key.clone(), None, actor_record(7, "world-a", 1, LeaseId(1)))
-            .await
-            .unwrap();
-        first
-            .compare_and_put_virtual_shard(vshard_key_for(3), None, vshard_record(3, "world-a", 1))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            client.keys(),
-            vec![
-                "/lattice/cluster-a/logic/actors/World/u64:7".to_string(),
-                "/lattice/cluster-a/logic/instances/World/world-a".to_string(),
-                "/lattice/cluster-a/logic/vshards/World/World/3".to_string(),
-            ]
-        );
-        assert!(second.get_actor(&key).await.unwrap().is_none());
-        assert!(
-            second
-                .get_virtual_shard(&vshard_key_for(3))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            second
-                .list_instances(&service_kind!("World"))
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn etcd_store_compare_and_put_uses_versions() {
-        let store = EtcdPlacementStore::new(
-            PlacementPrefix::new("/lattice/test"),
-            InMemoryEtcdClient::new(),
-        );
-        let key = actor_key_for(7);
-        let record = actor_record(7, "world-a", 1, LeaseId(1));
-
-        let version = store
-            .compare_and_put_actor(key.clone(), None, record.clone())
-            .await
-            .unwrap();
-        let stale = store
-            .compare_and_put_actor(key.clone(), None, record.clone())
-            .await;
-        let updated = ActorPlacementRecord {
-            epoch: Epoch(2),
-            ..record
-        };
-        let next = store
-            .compare_and_put_actor(key.clone(), Some(version), updated.clone())
-            .await
-            .unwrap();
-
-        assert_eq!(version, PlacementVersion(1));
-        assert_eq!(stale, Err(PlacementError::CompareAndPutFailed));
-        assert_eq!(next, PlacementVersion(2));
-        assert_eq!(store.get_actor(&key).await.unwrap().unwrap().1, updated);
-    }
-
-    #[tokio::test]
-    async fn etcd_store_persists_virtual_shards_with_versions() {
-        let store = EtcdPlacementStore::new(
-            PlacementPrefix::new("/lattice/test"),
-            InMemoryEtcdClient::new(),
-        );
-        let key = vshard_key_for(9);
-        let record = vshard_record(9, "world-a", 1);
-
-        let version = store
-            .compare_and_put_virtual_shard(key.clone(), None, record.clone())
-            .await
-            .unwrap();
-        let stale = store
-            .compare_and_put_virtual_shard(key.clone(), None, record.clone())
-            .await;
-        let updated = VirtualShardPlacementRecord {
-            owner: InstanceId::new("world-b"),
-            epoch: Epoch(2),
-            ..record
-        };
-        let next = store
-            .compare_and_put_virtual_shard(key.clone(), Some(version), updated.clone())
-            .await
-            .unwrap();
-
-        assert_eq!(version, PlacementVersion(1));
-        assert_eq!(stale, Err(PlacementError::CompareAndPutFailed));
-        assert_eq!(next, PlacementVersion(2));
-        assert_eq!(
-            store.get_virtual_shard(&key).await.unwrap().unwrap().1,
-            updated
-        );
-        assert_eq!(
-            store
-                .list_virtual_shards(&service_kind!("World"), &actor_kind!("World"))
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn etcd_watch_reports_virtual_shard_updates() {
-        let store = EtcdPlacementStore::new(
-            PlacementPrefix::new("/lattice/test"),
-            InMemoryEtcdClient::new(),
-        );
-        let mut watch = store.watch(store.prefix().clone()).await.unwrap();
-        let key = vshard_key_for(5);
-        let record = vshard_record(5, "world-a", 1);
-        let version = store
-            .compare_and_put_virtual_shard(key.clone(), None, record.clone())
-            .await
-            .unwrap();
-
-        let event = watch.next().await.unwrap();
-        assert_eq!(
-            event,
-            PlacementWatchEvent::VirtualShardUpdated {
-                key,
-                version,
-                record,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn etcd_store_grants_and_keeps_instance_leases_alive() {
-        let store = EtcdPlacementStore::new(
-            PlacementPrefix::new("/lattice/test"),
-            InMemoryEtcdClient::new(),
-        );
-
-        let lease_id = store.grant_instance_lease().await.unwrap();
-        store.keepalive_instance_lease(lease_id).await.unwrap();
-        let missing = store.keepalive_instance_lease(LeaseId(999)).await;
-
-        assert_eq!(lease_id, LeaseId(1));
-        assert_eq!(
-            missing,
-            Err(PlacementError::InstanceLeaseNotFound {
-                lease_id: LeaseId(999)
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn etcd_store_elects_one_coordinator_leader_until_resign() {
-        let store = EtcdPlacementStore::new(
-            PlacementPrefix::new("/lattice/test"),
-            InMemoryEtcdClient::new(),
-        );
-
-        let first = store
-            .campaign_coordinator_leader(InstanceId::new("coordinator-a"))
-            .await
-            .unwrap()
-            .unwrap();
-        let second = store
-            .campaign_coordinator_leader(InstanceId::new("coordinator-b"))
-            .await
-            .unwrap();
-        store.keepalive_coordinator_leader(&first).await.unwrap();
-        store.resign_coordinator_leader(&first).await.unwrap();
-        let third = store
-            .campaign_coordinator_leader(InstanceId::new("coordinator-b"))
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(first.candidate_id, InstanceId::new("coordinator-a"));
-        assert_eq!(second, None);
-        assert_eq!(third.candidate_id, InstanceId::new("coordinator-b"));
-    }
-
-    #[tokio::test]
-    async fn etcd_store_activation_lock_is_exclusive_until_release() {
-        let store = EtcdPlacementStore::new(
-            PlacementPrefix::new("/lattice/test"),
-            InMemoryEtcdClient::new(),
-        );
-        let key = actor_key_for(7);
-
-        let first = store.acquire_activation_lock(key.clone()).await.unwrap();
-        let second = store.acquire_activation_lock(key.clone()).await;
-        store.release_activation_lock(&key).await.unwrap();
-        let third = store.acquire_activation_lock(key).await.unwrap();
-
-        assert_eq!(first, LeaseId(1));
-        assert_eq!(second, Err(PlacementError::ActivationLockHeld));
-        assert_eq!(third, LeaseId(3));
-    }
-
-    #[test]
-    fn etcd_store_builds_from_config() {
-        let store = EtcdPlacementStore::in_memory_from_config(EtcdPlacementStoreConfig {
-            key_prefix: "/lattice/test".to_string(),
-            endpoints: vec!["http://127.0.0.1:2379".to_string()],
-            instance_lease_ttl_secs: 30,
-            activation_lock_ttl_secs: 30,
-        });
-
-        assert_eq!(store.prefix().as_str(), "/lattice/test");
-        assert_eq!(
-            EtcdPlacementStore::from_config().section(),
-            "placement_store"
-        );
-    }
-
-    #[test]
-    fn etcd_value_codec_round_trips_placement_metadata() {
-        let instance =
-            EtcdValue::Instance(Box::new(instance_record("world-a", InstanceState::Ready)));
-        let actor = EtcdValue::Actor(Box::new(actor_record(7, "world-a", 3, LeaseId(5))));
-        let leader = EtcdValue::CoordinatorLeader(Box::new(CoordinatorLeadership {
-            candidate_id: InstanceId::new("coordinator-a"),
-            lease_id: LeaseId(99),
-        }));
-        let lock = EtcdValue::ActivationLock(LeaseId(42));
-
-        for value in [instance, actor, leader, lock] {
-            let encoded = encode_etcd_value(&value).unwrap();
-            let decoded = decode_etcd_value(&encoded).unwrap();
-            assert_eq!(decoded, value);
-        }
-    }
-
-    #[test]
-    fn etcd_instance_records_are_written_with_their_instance_lease() {
-        let instance =
-            EtcdValue::Instance(Box::new(instance_record("world-a", InstanceState::Ready)));
-
-        let options = put_options_for(&instance).unwrap();
-
-        assert!(options.is_some());
-    }
-
-    fn actor_key_for(actor_id: u64) -> ActorPlacementKey {
-        ActorPlacementKey {
-            actor_kind: actor_kind!("World"),
-            actor_id: ActorId::U64(actor_id),
-        }
-    }
-
-    fn vshard_key_for(shard_id: u32) -> VirtualShardPlacementKey {
-        VirtualShardPlacementKey {
-            service_kind: service_kind!("World"),
-            actor_kind: actor_kind!("World"),
-            shard_id: crate::vshard::VirtualShardId(shard_id),
-        }
-    }
-
-    fn instance_record(instance_id: &str, state: InstanceState) -> InstanceRecord {
-        InstanceRecord {
-            service_kind: service_kind!("World"),
-            instance_id: InstanceId::new(instance_id),
-            lease_id: LeaseId(1),
-            advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
-            control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),
-            version: "test".to_string(),
-            state,
-            capacity: InstanceCapacity::default(),
-            labels: BTreeMap::new(),
-        }
-    }
-
-    fn actor_record(
-        actor_id: u64,
-        owner: &str,
-        epoch: u64,
-        lease_id: LeaseId,
-    ) -> ActorPlacementRecord {
-        ActorPlacementRecord {
-            actor_kind: actor_kind!("World"),
-            actor_id: ActorId::U64(actor_id),
-            owner: InstanceId::new(owner),
-            epoch: Epoch(epoch),
-            lease_id,
-            state: PlacementState::Running,
-        }
-    }
-
-    fn vshard_record(shard_id: u32, owner: &str, epoch: u64) -> VirtualShardPlacementRecord {
-        VirtualShardPlacementRecord {
-            service_kind: service_kind!("World"),
-            actor_kind: actor_kind!("World"),
-            shard_id: crate::vshard::VirtualShardId(shard_id),
-            owner: InstanceId::new(owner),
-            epoch: Epoch(epoch),
-        }
-    }
-}
+mod tests;

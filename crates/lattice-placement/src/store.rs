@@ -61,6 +61,24 @@ pub struct VirtualShardPlacementRecord {
     pub epoch: Epoch,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SingletonKey {
+    pub service_kind: ServiceKind,
+    pub singleton_kind: ActorKind,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SingletonPlacementRecord {
+    pub service_kind: ServiceKind,
+    pub singleton_kind: ActorKind,
+    pub scope: String,
+    pub owner: InstanceId,
+    pub epoch: Epoch,
+    pub lease_id: LeaseId,
+    pub state: PlacementState,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordinatorLeadership {
     pub candidate_id: InstanceId,
@@ -81,6 +99,11 @@ pub enum PlacementWatchEvent {
         key: VirtualShardPlacementKey,
         version: PlacementVersion,
         record: VirtualShardPlacementRecord,
+    },
+    SingletonUpdated {
+        key: SingletonKey,
+        version: PlacementVersion,
+        record: SingletonPlacementRecord,
     },
 }
 
@@ -177,6 +200,21 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
         expected: Option<PlacementVersion>,
         value: VirtualShardPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError>;
+    async fn get_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError>;
+    async fn list_singletons(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, SingletonPlacementRecord)>, PlacementError>;
+    async fn compare_and_put_singleton(
+        &self,
+        key: SingletonKey,
+        expected: Option<PlacementVersion>,
+        value: SingletonPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError>;
+    async fn acquire_singleton_lock(&self, key: SingletonKey) -> Result<LeaseId, PlacementError>;
+    async fn release_singleton_lock(&self, key: &SingletonKey) -> Result<(), PlacementError>;
     async fn acquire_activation_lock(
         &self,
         key: ActorPlacementKey,
@@ -236,6 +274,13 @@ impl InMemoryPlacementStore {
 
     fn prefixed_vshard_key(&self, key: &VirtualShardPlacementKey) -> PrefixedVShardKey {
         PrefixedVShardKey {
+            prefix: self.prefix.clone(),
+            key: key.clone(),
+        }
+    }
+
+    fn prefixed_singleton_key(&self, key: &SingletonKey) -> PrefixedSingletonKey {
+        PrefixedSingletonKey {
             prefix: self.prefix.clone(),
             key: key.clone(),
         }
@@ -483,6 +528,79 @@ impl PlacementStore for InMemoryPlacementStore {
         Ok(next)
     }
 
+    async fn get_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .singletons
+            .get(&self.prefixed_singleton_key(key))
+            .cloned())
+    }
+
+    async fn list_singletons(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .singletons
+            .iter()
+            .filter(|(key, _)| key.prefix == self.prefix)
+            .map(|(_, value)| value.clone())
+            .collect())
+    }
+
+    async fn compare_and_put_singleton(
+        &self,
+        key: SingletonKey,
+        expected: Option<PlacementVersion>,
+        value: SingletonPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let key = self.prefixed_singleton_key(&key);
+        let current = inner.singletons.get(&key).map(|(version, _)| *version);
+        if current != expected {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let next = PlacementVersion(current.map_or(1, |version| version.0 + 1));
+        let watch_key = key.key.clone();
+        inner.singletons.insert(key, (next, value.clone()));
+        inner.notify(
+            &self.prefix,
+            PlacementWatchEvent::SingletonUpdated {
+                key: watch_key,
+                version: next,
+                record: value,
+            },
+        );
+        Ok(next)
+    }
+
+    async fn acquire_singleton_lock(&self, key: SingletonKey) -> Result<LeaseId, PlacementError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let key = self.prefixed_singleton_key(&key);
+        if inner.singleton_locks.contains_key(&key) {
+            return Err(PlacementError::SingletonLockHeld);
+        }
+        let lease = LeaseId(self.next_lease_id.fetch_add(1, Ordering::SeqCst));
+        inner.singleton_locks.insert(key, lease);
+        Ok(lease)
+    }
+
+    async fn release_singleton_lock(&self, key: &SingletonKey) -> Result<(), PlacementError> {
+        self.inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .singleton_locks
+            .remove(&self.prefixed_singleton_key(key));
+        Ok(())
+    }
+
     async fn acquire_activation_lock(
         &self,
         key: ActorPlacementKey,
@@ -531,7 +649,9 @@ struct PlacementStoreInner {
     instances: HashMap<PrefixedInstanceKey, InstanceRecord>,
     actors: HashMap<PrefixedActorKey, (PlacementVersion, ActorPlacementRecord)>,
     vshards: HashMap<PrefixedVShardKey, (PlacementVersion, VirtualShardPlacementRecord)>,
+    singletons: HashMap<PrefixedSingletonKey, (PlacementVersion, SingletonPlacementRecord)>,
     activation_locks: HashMap<PrefixedActorKey, LeaseId>,
+    singleton_locks: HashMap<PrefixedSingletonKey, LeaseId>,
     watchers: HashMap<PlacementPrefix, broadcast::Sender<PlacementWatchEvent>>,
 }
 
@@ -559,4 +679,10 @@ struct PrefixedActorKey {
 struct PrefixedVShardKey {
     prefix: PlacementPrefix,
     key: VirtualShardPlacementKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PrefixedSingletonKey {
+    prefix: PlacementPrefix,
+    key: SingletonKey,
 }
