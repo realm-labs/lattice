@@ -290,7 +290,7 @@ fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
         service.service_kind
     ));
     rust.push_str("\n        fn build_client(core: Self::Core) -> Self::Client {\n            Client::new(core)\n        }\n\n");
-    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::BoxRouteResolver,\n            context_factory: lattice_rpc::RpcClientContextFactory,\n            retry_policy: lattice_placement::RpcRetryPolicy,\n            transport_security: lattice_rpc::RpcTransportSecurity,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::ResolvingRpcCore::new(\n                lattice_core::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::with_transport_security(transport_security),\n            ).with_retry_policy(retry_policy);\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
+    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::BoxRouteResolver,\n            context_factory: lattice_rpc::RpcClientContextFactory,\n            retry_policy: lattice_placement::RpcRetryPolicy,\n            transport_security: lattice_rpc::RpcTransportSecurity,\n            transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::ResolvingRpcCore::new(\n                lattice_core::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::with_transport_config(transport_security, transport_config),\n            ).with_retry_policy(retry_policy);\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
     rust.push_str("    }\n\n");
     rust.push_str(
         "    impl<A, C> RpcServiceBinding for Binding<A, C>\n    where\n        A: Actor + Sync,\n        C: Send + Sync + 'static",
@@ -348,7 +348,7 @@ fn push_singleton_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     ));
     rust.push_str("\n        fn placement() -> RpcClientPlacement {\n            RpcClientPlacement::Singleton\n        }\n\n");
     rust.push_str("        fn build_client(core: Self::Core) -> Self::Client {\n            Client::new(core)\n        }\n\n");
-    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::BoxRouteResolver,\n            context_factory: lattice_rpc::RpcClientContextFactory,\n            retry_policy: lattice_placement::RpcRetryPolicy,\n            transport_security: lattice_rpc::RpcTransportSecurity,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::ResolvingRpcCore::new(\n                lattice_core::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::with_transport_security(transport_security),\n            ).with_retry_policy(retry_policy);\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
+    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::BoxRouteResolver,\n            context_factory: lattice_rpc::RpcClientContextFactory,\n            retry_policy: lattice_placement::RpcRetryPolicy,\n            transport_security: lattice_rpc::RpcTransportSecurity,\n            transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::ResolvingRpcCore::new(\n                lattice_core::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::with_transport_config(transport_security, transport_config),\n            ).with_retry_policy(retry_policy);\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
     rust.push_str("    }\n\n");
     rust.push_str(
         "    impl<A, C> RpcServiceBinding for SingletonBinding<A, C>\n    where\n        A: Actor + Sync,\n        C: Send + Sync + 'static",
@@ -594,6 +594,7 @@ fn push_tonic_endpoint_transport(rust: &mut String, methods: &[RpcMethodSpec]) {
     rust.push_str("impl GeneratedTonicEndpointTransport {\n");
     rust.push_str("    pub fn new() -> Self {\n        Self { channels: TonicEndpointChannelPool::new() }\n    }\n\n");
     rust.push_str("    pub fn with_transport_security(transport_security: lattice_rpc::RpcTransportSecurity) -> Self {\n        Self { channels: TonicEndpointChannelPool::with_transport_security(transport_security) }\n    }\n\n");
+    rust.push_str("    pub fn with_transport_config(transport_security: lattice_rpc::RpcTransportSecurity, transport_config: lattice_rpc::TonicEndpointChannelPoolConfig) -> Self {\n        Self { channels: TonicEndpointChannelPool::with_transport_config(transport_security, transport_config) }\n    }\n\n");
     rust.push_str("    pub fn with_channels(channels: TonicEndpointChannelPool) -> Self {\n        Self { channels }\n    }\n");
     rust.push_str("}\n\n");
     rust.push_str("#[tonic::async_trait]\n");
@@ -627,6 +628,7 @@ fn push_tonic_transport_method(rust: &mut String, method: &RpcMethodSpec) {
         "    async fn call_{suffix}<Req>(&self, target: lattice_rpc::RouteTarget, metadata: tonic::metadata::MetadataMap, request: Req) -> Result<tonic::Response<Req::Reply>, RpcError>\n",
     ));
     rust.push_str("    where\n        Req: RoutedRequest + RpcRequest,\n    {\n");
+    rust.push_str("        let route_key = request.route_key();\n");
     rust.push_str(
         "        let typed_request = (Box::new(request) as Box<dyn std::any::Any + Send + Sync>)\n",
     );
@@ -641,7 +643,7 @@ fn push_tonic_transport_method(rust: &mut String, method: &RpcMethodSpec) {
         "            .unwrap_or_else(|_| lattice_core::RequestId::new(\"<missing>\"));\n",
     );
     rust.push_str(
-        "        let channel = self.channels.get_or_connect(&target.advertised_endpoint).await?;\n",
+        "        let channel = self.channels.get_or_connect_for_route_key(&target.advertised_endpoint, &route_key).await?;\n",
     );
     rust.push_str(&format!(
         "        let mut client = {client_path}::new(channel);\n",

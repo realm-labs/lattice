@@ -32,6 +32,7 @@ pub trait RpcClientBinding: Send + Sync + 'static {
         _context_factory: lattice_rpc::RpcClientContextFactory,
         _retry_policy: lattice_placement::RpcRetryPolicy,
         _transport_security: lattice_rpc::RpcTransportSecurity,
+        _transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
         None
     }
@@ -49,6 +50,7 @@ pub(crate) trait ErasedRpcClientBinding: Send + Sync + 'static {
         context_factory: lattice_rpc::RpcClientContextFactory,
         retry_policy: lattice_placement::RpcRetryPolicy,
         transport_security: lattice_rpc::RpcTransportSecurity,
+        transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
     ) -> Result<(), LatticeServiceError>;
 }
 
@@ -87,6 +89,7 @@ where
         context_factory: lattice_rpc::RpcClientContextFactory,
         retry_policy: lattice_placement::RpcRetryPolicy,
         transport_security: lattice_rpc::RpcTransportSecurity,
+        transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
     ) -> Result<(), LatticeServiceError> {
         let service_kind = self.service_kind();
         let core = service_context
@@ -100,6 +103,7 @@ where
                             context_factory,
                             retry_policy,
                             transport_security,
+                            transport_config,
                         )
                     })
                     .unwrap_or(None)

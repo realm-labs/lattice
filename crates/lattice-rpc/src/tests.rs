@@ -266,6 +266,60 @@ fn rpc_transport_security_server_tls_requires_identity() {
 }
 
 #[test]
+fn tonic_channel_pool_config_defaults_to_four_stripes() {
+    assert_eq!(
+        TonicEndpointChannelPoolConfig::default()
+            .channels_per_endpoint()
+            .get(),
+        4
+    );
+}
+
+#[test]
+fn tonic_channel_pool_config_rejects_zero_stripes() {
+    assert!(TonicEndpointChannelPoolConfig::try_new(0).is_none());
+}
+
+#[test]
+fn tonic_channel_pool_uses_stable_route_key_stripes() {
+    let pool = TonicEndpointChannelPool::with_transport_config(
+        RpcTransportSecurity::plaintext(),
+        TonicEndpointChannelPoolConfig::try_new(8).unwrap(),
+    );
+    let route_key = RouteKey::U64(42);
+
+    assert_eq!(
+        pool.stripe_index_for(&route_key),
+        pool.stripe_index_for(&route_key)
+    );
+}
+
+#[test]
+fn tonic_channel_pool_distributes_route_keys_over_stripes() {
+    let pool = TonicEndpointChannelPool::with_transport_config(
+        RpcTransportSecurity::plaintext(),
+        TonicEndpointChannelPoolConfig::try_new(8).unwrap(),
+    );
+    let mut stripes = std::collections::BTreeSet::new();
+
+    for actor_id in 1..=64 {
+        stripes.insert(pool.stripe_index_for(&RouteKey::U64(actor_id)));
+    }
+
+    assert!(stripes.len() > 1);
+}
+
+#[test]
+fn tonic_channel_pool_can_select_stripe_from_request_id() {
+    let pool = TonicEndpointChannelPool::with_transport_config(
+        RpcTransportSecurity::plaintext(),
+        TonicEndpointChannelPoolConfig::try_new(4).unwrap(),
+    );
+
+    assert!(pool.stripe_index_for(&RequestId::new("req-1")) < 4);
+}
+
+#[test]
 fn routed_request_exposes_actor_kind_and_route_key() {
     let request = EnterWorldRequest { world_id: 9 };
 

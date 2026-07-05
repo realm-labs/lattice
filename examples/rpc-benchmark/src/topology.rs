@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lattice_core::{InstanceId, ServiceContext};
 use lattice_placement::{InMemoryPlacementStore, PlacementPrefix};
+use lattice_rpc::TonicEndpointChannelPoolConfig;
 use lattice_service::{ActorRegistration, LatticeService};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
@@ -24,6 +25,7 @@ pub struct BenchmarkConfig {
     pub actors: u64,
     pub concurrency: usize,
     pub requests: usize,
+    pub channel_stripes: usize,
 }
 
 impl BenchmarkConfig {
@@ -33,6 +35,7 @@ impl BenchmarkConfig {
             actors: env_u64("LATTICE_BENCH_ACTORS", 256).max(1),
             concurrency: env_usize("LATTICE_BENCH_CONCURRENCY", 64).max(1),
             requests: env_usize("LATTICE_BENCH_REQUESTS", 10_000).max(1),
+            channel_stripes: env_usize("LATTICE_BENCH_CHANNEL_STRIPES", 4).max(1),
         }
     }
 
@@ -42,7 +45,13 @@ impl BenchmarkConfig {
             actors: 8,
             concurrency: 4,
             requests: 32,
+            channel_stripes: 4,
         }
+    }
+
+    fn rpc_client_transport(&self) -> TonicEndpointChannelPoolConfig {
+        TonicEndpointChannelPoolConfig::try_new(self.channel_stripes)
+            .expect("benchmark channel stripe count is clamped to at least one")
     }
 }
 
@@ -71,12 +80,12 @@ impl BenchmarkTopology {
         let mut chain_context = None;
 
         for index in 0..config.nodes {
-            let node = start_worker_node(index, placement_store.clone()).await?;
+            let node = start_worker_node(index, placement_store.clone(), config).await?;
             shutdowns.push(node.shutdown);
             tasks.push(node.task);
         }
         for index in 0..config.nodes {
-            let node = start_chain_node(index, placement_store.clone()).await?;
+            let node = start_chain_node(index, placement_store.clone(), config).await?;
             if chain_context.is_none() {
                 chain_context = Some(node.context.clone());
             }
@@ -84,7 +93,7 @@ impl BenchmarkTopology {
             tasks.push(node.task);
         }
         for index in 0..config.nodes {
-            let node = start_bench_node(index, placement_store.clone()).await?;
+            let node = start_bench_node(index, placement_store.clone(), config).await?;
             if bench_context.is_none() {
                 bench_context = Some(node.context.clone());
             }
@@ -141,6 +150,7 @@ struct StartedNode {
 async fn start_bench_node(
     index: usize,
     placement_store: InMemoryPlacementStore,
+    config: &BenchmarkConfig,
 ) -> BenchmarkResult<StartedNode> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -149,6 +159,7 @@ async fn start_bench_node(
         .instance_id(InstanceId::new(format!("bench-{index}")))
         .listen(listener)
         .ready_signal(ready_tx)
+        .rpc_client_transport(config.rpc_client_transport())
         .placement_store::<InMemoryPlacementStore, _>(placement_store)
         .register_client::<bench_rpc::Binding>()
         .register_actor(
@@ -165,6 +176,7 @@ async fn start_bench_node(
 async fn start_chain_node(
     index: usize,
     placement_store: InMemoryPlacementStore,
+    config: &BenchmarkConfig,
 ) -> BenchmarkResult<StartedNode> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -173,6 +185,7 @@ async fn start_chain_node(
         .instance_id(InstanceId::new(format!("chain-{index}")))
         .listen(listener)
         .ready_signal(ready_tx)
+        .rpc_client_transport(config.rpc_client_transport())
         .placement_store::<InMemoryPlacementStore, _>(placement_store)
         .register_client::<chain_rpc::Binding>()
         .register_client::<worker_rpc::Binding>()
@@ -190,6 +203,7 @@ async fn start_chain_node(
 async fn start_worker_node(
     index: usize,
     placement_store: InMemoryPlacementStore,
+    config: &BenchmarkConfig,
 ) -> BenchmarkResult<StartedNode> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -198,6 +212,7 @@ async fn start_worker_node(
         .instance_id(InstanceId::new(format!("worker-{index}")))
         .listen(listener)
         .ready_signal(ready_tx)
+        .rpc_client_transport(config.rpc_client_transport())
         .placement_store::<InMemoryPlacementStore, _>(placement_store)
         .register_actor(
             ActorRegistration::builder(WORKER_ACTOR)

@@ -70,7 +70,12 @@ fn generated_output_matches_phase_two_shape() {
     assert!(
         generated
             .rust
-            .contains("super::GeneratedTonicEndpointTransport::with_transport_security")
+            .contains("transport_config: lattice_rpc::TonicEndpointChannelPoolConfig")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("super::GeneratedTonicEndpointTransport::with_transport_config")
     );
     assert!(generated.rust.contains(".with_retry_policy(retry_policy)"));
     assert!(
@@ -118,7 +123,18 @@ fn generated_output_matches_phase_two_shape() {
             .contains("pub struct GeneratedTonicEndpointTransport")
     );
     assert!(generated.rust.contains("pub fn with_transport_security"));
+    assert!(generated.rust.contains("pub fn with_transport_config"));
     assert!(generated.rust.contains("\"world.WorldRpc/EnterWorld\" => self.call_world_rpc_enter_world::<Req>(target, metadata, request).await"));
+    assert!(
+        generated
+            .rust
+            .contains("let route_key = request.route_key();")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("get_or_connect_for_route_key(&target.advertised_endpoint, &route_key)")
+    );
     assert!(
         generated
             .rust

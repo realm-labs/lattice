@@ -1,10 +1,13 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use http::Uri;
-use lattice_core::{ActorRef, Epoch, RequestId};
+use lattice_core::{ActorRef, Epoch, RequestId, RouteKey};
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 use tracing::{debug, warn};
@@ -14,10 +17,53 @@ use crate::security::RpcTransportSecurity;
 use crate::traits::UnaryRpcTransport;
 use crate::{ActorRefRpcCore, RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 
-#[derive(Debug, Default, Clone)]
+const DEFAULT_CHANNELS_PER_ENDPOINT: NonZeroUsize =
+    NonZeroUsize::new(4).expect("default tonic channel stripe count is non-zero");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TonicEndpointChannelPoolConfig {
+    channels_per_endpoint: NonZeroUsize,
+}
+
+impl TonicEndpointChannelPoolConfig {
+    pub const fn new(channels_per_endpoint: NonZeroUsize) -> Self {
+        Self {
+            channels_per_endpoint,
+        }
+    }
+
+    pub fn try_new(channels_per_endpoint: usize) -> Option<Self> {
+        NonZeroUsize::new(channels_per_endpoint).map(Self::new)
+    }
+
+    pub fn channels_per_endpoint(self) -> NonZeroUsize {
+        self.channels_per_endpoint
+    }
+}
+
+impl Default for TonicEndpointChannelPoolConfig {
+    fn default() -> Self {
+        Self {
+            channels_per_endpoint: DEFAULT_CHANNELS_PER_ENDPOINT,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct TonicEndpointChannelPool {
     channels: Arc<DashMap<String, Channel>>,
     transport_security: RpcTransportSecurity,
+    config: TonicEndpointChannelPoolConfig,
+}
+
+impl Default for TonicEndpointChannelPool {
+    fn default() -> Self {
+        Self {
+            channels: Arc::new(DashMap::new()),
+            transport_security: RpcTransportSecurity::default(),
+            config: TonicEndpointChannelPoolConfig::default(),
+        }
+    }
 }
 
 impl TonicEndpointChannelPool {
@@ -26,20 +72,68 @@ impl TonicEndpointChannelPool {
     }
 
     pub fn with_transport_security(transport_security: RpcTransportSecurity) -> Self {
+        Self::with_transport_config(
+            transport_security,
+            TonicEndpointChannelPoolConfig::default(),
+        )
+    }
+
+    pub fn with_transport_config(
+        transport_security: RpcTransportSecurity,
+        config: TonicEndpointChannelPoolConfig,
+    ) -> Self {
         Self {
             channels: Arc::new(DashMap::new()),
             transport_security,
+            config,
         }
     }
 
+    pub fn config(&self) -> TonicEndpointChannelPoolConfig {
+        self.config
+    }
+
     pub async fn get_or_connect(&self, endpoint: &Uri) -> Result<Channel, RpcError> {
-        let key = endpoint.to_string();
+        self.get_or_connect_stripe(endpoint, 0).await
+    }
+
+    pub async fn get_or_connect_for_route_key(
+        &self,
+        endpoint: &Uri,
+        route_key: &RouteKey,
+    ) -> Result<Channel, RpcError> {
+        let stripe = self.stripe_index_for(route_key);
+        self.get_or_connect_stripe(endpoint, stripe).await
+    }
+
+    pub async fn get_or_connect_for_request_id(
+        &self,
+        endpoint: &Uri,
+        request_id: &RequestId,
+    ) -> Result<Channel, RpcError> {
+        let stripe = self.stripe_index_for(request_id);
+        self.get_or_connect_stripe(endpoint, stripe).await
+    }
+
+    pub fn stripe_index_for<T>(&self, key: &T) -> usize
+    where
+        T: Hash + ?Sized,
+    {
+        stripe_index_for_hash(key, self.config.channels_per_endpoint)
+    }
+
+    async fn get_or_connect_stripe(
+        &self,
+        endpoint: &Uri,
+        stripe: usize,
+    ) -> Result<Channel, RpcError> {
+        let key = channel_key(endpoint, stripe);
         if let Some(channel) = self.channels.get(&key).map(|entry| entry.clone()) {
-            debug!(%endpoint, "reusing tonic endpoint channel");
+            debug!(%endpoint, channel.stripe = stripe, "reusing tonic endpoint channel");
             return Ok(channel);
         }
 
-        debug!(%endpoint, "connecting tonic endpoint channel");
+        debug!(%endpoint, channel.stripe = stripe, "connecting tonic endpoint channel");
         let mut builder = Channel::builder(endpoint.clone());
         if let Some(tls) = self
             .transport_security
@@ -56,15 +150,32 @@ impl TonicEndpointChannelPool {
         })?;
         match self.channels.entry(key) {
             Entry::Occupied(entry) => {
-                debug!(%endpoint, "using concurrently established tonic endpoint channel");
+                debug!(
+                    %endpoint,
+                    channel.stripe = stripe,
+                    "using concurrently established tonic endpoint channel"
+                );
                 Ok(entry.get().clone())
             }
             Entry::Vacant(entry) => {
-                debug!(%endpoint, "tonic endpoint channel connected");
+                debug!(%endpoint, channel.stripe = stripe, "tonic endpoint channel connected");
                 Ok(entry.insert(channel).clone())
             }
         }
     }
+}
+
+fn channel_key(endpoint: &Uri, stripe: usize) -> String {
+    format!("{endpoint}#{stripe}")
+}
+
+fn stripe_index_for_hash<T>(key: &T, stripe_count: NonZeroUsize) -> usize
+where
+    T: Hash + ?Sized,
+{
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % stripe_count.get()
 }
 
 pub fn tonic_status_to_rpc_error_for_request(

@@ -9,7 +9,9 @@ pub mod traits;
 pub mod types;
 
 pub use adapter::ActorRpcAdapter;
-pub use client::{ActorRefRpcClient, TonicEndpointChannelPool, TypedRpcClient};
+pub use client::{
+    ActorRefRpcClient, TonicEndpointChannelPool, TonicEndpointChannelPoolConfig, TypedRpcClient,
+};
 pub use error::RpcError;
 pub use metadata::{AuthContext, RpcClientContextFactory, RpcContext};
 pub use security::{

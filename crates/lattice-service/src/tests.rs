@@ -47,6 +47,7 @@ use lattice_placement::{
 use lattice_rpc::{
     AuthContext, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError, RpcRequest,
     RpcSecurityError, RpcSecurityPolicy, ServiceIdentityConfig, ShardedRpcCore,
+    TonicEndpointChannelPoolConfig,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -268,6 +269,7 @@ impl RpcClientBinding for SecurityClientProbeBinding {
         context_factory: RpcClientContextFactory,
         _retry_policy: lattice_placement::RpcRetryPolicy,
         _transport_security: lattice_rpc::RpcTransportSecurity,
+        _transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
         let ctx = context_factory.next_context(None);
         assert!(ctx.auth.is_some());
@@ -348,6 +350,53 @@ impl RpcClientBinding for FakeRpcClientBinding {
     }
 }
 
+static OBSERVED_RPC_CLIENT_STRIPES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone)]
+struct TransportConfigProbeCore;
+
+#[async_trait]
+impl ShardedRpcCore for TransportConfigProbeCore {
+    async fn call<Req>(&self, _req: Req) -> Result<Req::Reply, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        Err(RpcError::Business(
+            "transport config probe core is not called".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TransportConfigProbeClient;
+
+struct TransportConfigProbeBinding;
+
+impl RpcClientBinding for TransportConfigProbeBinding {
+    type Core = TransportConfigProbeCore;
+    type Client = TransportConfigProbeClient;
+
+    const SERVICE_KIND: &'static str = "World";
+
+    fn build_client(_core: Self::Core) -> Self::Client {
+        TransportConfigProbeClient
+    }
+
+    fn build_default_core(
+        _resolver: BoxRouteResolver,
+        _context_factory: RpcClientContextFactory,
+        _retry_policy: lattice_placement::RpcRetryPolicy,
+        _transport_security: lattice_rpc::RpcTransportSecurity,
+        transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
+    ) -> Option<Self::Core> {
+        OBSERVED_RPC_CLIENT_STRIPES.store(
+            transport_config.channels_per_endpoint().get(),
+            Ordering::SeqCst,
+        );
+        Some(TransportConfigProbeCore)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FakeEndpointTransport;
 
@@ -393,6 +442,7 @@ impl RpcClientBinding for FakePlacementClientBinding {
         context_factory: RpcClientContextFactory,
         retry_policy: lattice_placement::RpcRetryPolicy,
         _transport_security: lattice_rpc::RpcTransportSecurity,
+        _transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
         Some(
             ResolvingRpcCore::new(
@@ -428,6 +478,7 @@ impl RpcClientBinding for FakeSingletonClientBinding {
         context_factory: RpcClientContextFactory,
         retry_policy: lattice_placement::RpcRetryPolicy,
         _transport_security: lattice_rpc::RpcTransportSecurity,
+        _transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
         Some(
             ResolvingRpcCore::new(
@@ -1463,6 +1514,37 @@ async fn register_client_builds_default_placement_core_from_store() {
         std::mem::size_of::<FakePlacementCore>()
     );
     assert_eq!(service.placement_watch_count(), 1);
+}
+
+#[tokio::test]
+async fn register_client_passes_rpc_client_transport_config() {
+    OBSERVED_RPC_CLIENT_STRIPES.store(0, Ordering::SeqCst);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service = LatticeService::builder(service_kind!("Player"))
+        .instance_id(InstanceId::new("player-1"))
+        .listen(listener)
+        .rpc_client_transport(TonicEndpointChannelPoolConfig::try_new(8).unwrap())
+        .register_client::<TransportConfigProbeBinding>()
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    assert!(
+        service
+            .context()
+            .extension::<TransportConfigProbeClient>()
+            .is_some()
+    );
+    assert_eq!(OBSERVED_RPC_CLIENT_STRIPES.load(Ordering::SeqCst), 8);
 }
 
 #[tokio::test]

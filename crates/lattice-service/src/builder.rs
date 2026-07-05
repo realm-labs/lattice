@@ -13,7 +13,9 @@ use lattice_ops::{AdminHttpConfig, ServiceScheduler};
 use lattice_placement::coordinator::{PlacementWatchStarter, PlacementWatchTask};
 use lattice_placement::route::RpcRetryPolicy;
 use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix, PlacementStore};
-use lattice_rpc::{RpcSecurityPolicy, RpcServerSecurity, RpcTransportSecurity};
+use lattice_rpc::{
+    RpcSecurityPolicy, RpcServerSecurity, RpcTransportSecurity, TonicEndpointChannelPoolConfig,
+};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::{debug, info};
@@ -51,6 +53,7 @@ pub struct LatticeServiceBuilder {
     admin_http: Option<AdminHttpConfig>,
     rpc_security: RpcServerSecurity,
     rpc_transport_security: RpcTransportSecurity,
+    rpc_client_transport: TonicEndpointChannelPoolConfig,
     rpc_retry_policy: RpcRetryPolicy,
     placement_watchers: Vec<Box<dyn ErasedPlacementWatchStarter>>,
     duplicate_framework_component: Option<&'static str>,
@@ -84,6 +87,7 @@ impl fmt::Debug for LatticeServiceBuilder {
             .field("has_admin_http", &self.admin_http.is_some())
             .field("rpc_security", &self.rpc_security)
             .field("rpc_transport_security", &self.rpc_transport_security)
+            .field("rpc_client_transport", &self.rpc_client_transport)
             .field("rpc_retry_policy", &self.rpc_retry_policy)
             .field("placement_watch_count", &self.placement_watchers.len())
             .field("extension_count", &self.extensions.len())
@@ -110,6 +114,7 @@ impl LatticeServiceBuilder {
             admin_http: None,
             rpc_security: RpcServerSecurity::disabled(),
             rpc_transport_security: RpcTransportSecurity::plaintext(),
+            rpc_client_transport: TonicEndpointChannelPoolConfig::default(),
             rpc_retry_policy: RpcRetryPolicy::default(),
             placement_watchers: Vec::new(),
             duplicate_framework_component: None,
@@ -231,6 +236,11 @@ impl LatticeServiceBuilder {
 
     pub fn rpc_transport_security(mut self, security: RpcTransportSecurity) -> Self {
         self.rpc_transport_security = security;
+        self
+    }
+
+    pub fn rpc_client_transport(mut self, config: TonicEndpointChannelPoolConfig) -> Self {
+        self.rpc_client_transport = config;
         self
     }
 
@@ -433,6 +443,7 @@ impl LatticeServiceBuilder {
                 context_factory,
                 self.rpc_retry_policy,
                 self.rpc_transport_security.clone(),
+                self.rpc_client_transport,
             )?;
         }
         let service_context = service_context.build();
