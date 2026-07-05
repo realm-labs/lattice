@@ -1,3 +1,11 @@
+//! Consolidated service test module.
+//!
+//! These tests intentionally share one crate-private module because they assert
+//! service builder, lifecycle, readiness, lease, admin, RPC binding, and shutdown
+//! behavior through internal seams that are not stable public test fixtures.
+//! Split this module when those fixtures become public or when a subdomain can
+//! move to integration tests without weakening coverage of service internals.
+
 use std::convert::Infallible;
 use std::future::pending;
 use std::marker::PhantomData;

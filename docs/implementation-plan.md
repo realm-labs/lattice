@@ -230,8 +230,9 @@ Status: `[x]` complete.
   - [x] New request arriving while an actor is passivating is covered.
   - [x] Singleton failover while a long business job is running is covered.
   - [x] Rolling update with mixed versions is covered.
-  - [x] EventBus subscriber duplicate delivery is covered.
+- [x] EventBus subscriber duplicate delivery is covered.
 - [x] `crates/lattice-actor/src/tests.rs` exceeds 1200 LOC and needs a documented split or explicit rationale before final exit.
+- [x] `crates/lattice-service/src/tests.rs` exceeds 1200 LOC and has a module-level rationale for its crate-private service lifecycle coverage.
 
 ### Phase 1: Single-Node Actor Runtime
 
@@ -808,60 +809,60 @@ async fn main() -> anyhow::Result<()> {
 Pre-implementation checks:
 
 ```text
-[ ] Repository is organized as a Cargo workspace with the planned framework crates.
-[ ] The root lattice crate does not become a dumping ground; it only re-exports deliberate public facade APIs if needed.
-[ ] Actor state has a unique owner.
-[ ] Owner changes increment epoch.
-[ ] State-changing requests carry request_id.
-[ ] Cross-service workflows have operation_id, pending state, retry/query for unknown results, compensation, or manual repair path.
-[ ] Generated adapter/runtime checks route_epoch before entering Handler.
-[ ] RPC client encapsulates route/cache/retry.
-[ ] One advertised_endpoint can register multiple generated gRPC services and reuse connections by instance_id.
-[ ] Business code does not use raw tonic clients directly.
-[ ] Gateway uses codegen binding to decode payload into typed proto request instead of forwarding opaque bytes to Logic.
-[ ] Cross-process references use ActorRef/GatewaySessionRef, not ActorHandle.
-[ ] Gateway push validates session_id and connection_epoch.
-[ ] Gateway per-principal/session rate limit uses keyed limiter, not only instance-wide RateLimit.
-[ ] EventBus is not used to replace typed RPC that needs owner/fencing/return value.
-[ ] Same-node events prefer LocalEventBus to avoid unnecessary cluster EventBus dependency.
-[ ] Business event publishing defaults to typed EventPublisher instead of hand-filled EventEnvelope.
-[ ] Subscribers are idempotent by event_id.
-[ ] Event subscriptions are owned by service runtime and cancelled on shutdown.
-[ ] subscribe_actor routes through ActorRef/ActorKey to owner mailbox and never holds cross-process ActorHandle.
-[ ] Framework layer depends only on ConfigStore/EventBus/PlacementStore, not business databases.
-[ ] BootstrapConfig / from_config parse and validate only during build and support TOML/YAML/JSON/env override.
-[ ] Coordinator is not on the business hot path.
-[ ] etcd deployment prewrites only cluster prefix/auth/config, not /logic placement keys.
-[ ] route cache has NOT_OWNER invalidation.
-[ ] New Ready instances participate in activation/shard assignment after scale-out.
-[ ] scale-out rebalance does not force-migrate Running actors by default.
-[ ] scale-in drains before pod termination.
-[ ] node shutdown sets readiness=false, drains, and keeps instance lease until drain finishes.
-[ ] node crash recovery does not depend on Actor::stopping and uses lease expiry + reload.
-[ ] Cluster state is queried through Admin/Ops API, not direct etcd scans.
-[ ] NodeInspect list APIs are paginated and support partial result/unreachable instance.
-[ ] Actor business state inspect is optional, read-only, redacted, and timeout bounded.
-[ ] TraceContext propagates through gRPC metadata, EventBus headers, actor mailbox envelope, and scheduler envelope.
-[ ] Framework emits tracing spans for RPC server, EventBus publish/consume, and placement resolve.
-[ ] lattice-telemetry-otlp can install fmt-only telemetry and optional OTLP tracing export.
-[ ] EventBus fan-out uses span links rather than a fake single parent-child chain.
-[ ] metrics labels avoid actor_id/request_id/event_id/session_id high-cardinality fields.
-[ ] actor activation has a distributed lock.
-[ ] actor registry prevents duplicate local activation.
+[x] Repository is organized as a Cargo workspace with the planned framework crates.
+[x] The root lattice crate does not become a dumping ground; it only re-exports deliberate public facade APIs if needed.
+[x] Actor state has a unique owner.
+[x] Owner changes increment epoch.
+[x] State-changing requests carry request_id.
+[x] Cross-service workflows have operation_id, pending state, retry/query for unknown results, compensation, or manual repair path.
+[x] Generated adapter/runtime checks route_epoch before entering Handler.
+[x] RPC client encapsulates route/cache/retry.
+[x] One advertised_endpoint can register multiple generated gRPC services and reuse connections by instance_id.
+[x] Business code does not use raw tonic clients directly.
+[x] Gateway uses codegen binding to decode payload into typed proto request instead of forwarding opaque bytes to Logic.
+[x] Cross-process references use ActorRef/GatewaySessionRef, not ActorHandle.
+[x] Gateway push validates session_id and connection_epoch.
+[x] Gateway per-principal/session rate limit uses keyed limiter, not only instance-wide RateLimit.
+[x] EventBus is not used to replace typed RPC that needs owner/fencing/return value.
+[x] Same-node events prefer LocalEventBus to avoid unnecessary cluster EventBus dependency.
+[x] Business event publishing defaults to typed EventPublisher instead of hand-filled EventEnvelope.
+[x] Subscribers are idempotent by event_id.
+[x] Event subscriptions are owned by service runtime and cancelled on shutdown.
+[x] subscribe_actor routes through ActorRef/ActorKey to owner mailbox and never holds cross-process ActorHandle.
+[x] Framework layer depends only on ConfigStore/EventBus/PlacementStore, not business databases.
+[x] BootstrapConfig / from_config parse and validate only during build and support TOML/YAML/JSON/env override.
+[x] Coordinator is not on the business hot path.
+[x] etcd deployment prewrites only cluster prefix/auth/config, not /logic placement keys.
+[x] route cache has NOT_OWNER invalidation.
+[x] New Ready instances participate in activation/shard assignment after scale-out.
+[x] scale-out rebalance does not force-migrate Running actors by default.
+[x] scale-in drains before pod termination.
+[x] node shutdown sets readiness=false, drains, and keeps instance lease until drain finishes.
+[x] node crash recovery does not depend on Actor::stopping and uses lease expiry + reload.
+[x] Cluster state is queried through Admin/Ops API, not direct etcd scans.
+[x] NodeInspect list APIs are paginated and support partial result/unreachable instance.
+[x] Actor business state inspect is optional, read-only, redacted, and timeout bounded.
+[x] TraceContext propagates through gRPC metadata, EventBus headers, actor mailbox envelope, and scheduler envelope.
+[x] Framework emits tracing spans for RPC server, EventBus publish/consume, and placement resolve.
+[x] lattice-telemetry-otlp can install fmt-only telemetry and optional OTLP tracing export.
+[x] EventBus fan-out uses span links rather than a fake single parent-child chain.
+[x] metrics labels avoid actor_id/request_id/event_id/session_id high-cardinality fields.
+[x] actor activation has a distributed lock.
+[x] actor registry prevents duplicate local activation.
 [x] singleton has lease + epoch + durable owner record.
-[ ] passivation calls business stop/save hook and cleans mailbox/tasks.
-[ ] business request_passivation/request_stop takes effect after the current handler returns.
-[ ] stop/save failure enters StopFailed, blocks unload and owner release, and waits for retry/operator intervention.
-[ ] mailbox has capacity and priority.
-[ ] there is no business-visible unbounded stash; activation waiters have capacity and timeout.
-[ ] slow I/O does not block realtime actors.
-[ ] Handler does not use raw tokio::spawn for actor-owned tasks; it uses ActorContext.
-[ ] actor stop/passivation/lost ownership cancels or isolates managed tasks.
-[ ] actor watch is bound to current owner epoch and auto-unwatches when watcher stops/passivates.
-[ ] cross-node watch uses ActorRef/LogicControl and does not hold remote ActorHandle.
-[ ] local child actor does not write placement and stops with parent lifecycle.
-[ ] actor/service scheduler is explicitly non-durable and lost on restart.
-[ ] metrics/trace/admin APIs are sufficient for production diagnosis.
+[x] passivation calls business stop/save hook and cleans mailbox/tasks.
+[x] business request_passivation/request_stop takes effect after the current handler returns.
+[x] stop/save failure enters StopFailed, blocks unload and owner release, and waits for retry/operator intervention.
+[x] mailbox has capacity and priority.
+[x] there is no business-visible unbounded stash; activation waiters have capacity and timeout.
+[x] slow I/O does not block realtime actors.
+[x] Handler does not use raw tokio::spawn for actor-owned tasks; it uses ActorContext.
+[x] actor stop/passivation/lost ownership cancels or isolates managed tasks.
+[x] actor watch is bound to current owner epoch and auto-unwatches when watcher stops/passivates.
+[x] cross-node watch uses ActorRef/LogicControl and does not hold remote ActorHandle.
+[x] local child actor does not write placement and stops with parent lifecycle.
+[x] actor/service scheduler is explicitly non-durable and lost on restart.
+[x] metrics/trace/admin APIs are sufficient for production diagnosis.
 ```
 
 ---
@@ -958,25 +959,25 @@ Each phase can exit only when all items are true:
 The whole goal can be marked complete only when:
 
 ```text
-[ ] Phase 1 through Phase 7 are complete.
-[ ] This file's global acceptance checklist is fully satisfied.
-[ ] architecture/00-overview.md system boundaries and module responsibilities are implemented.
-[ ] architecture/01-actor-runtime.md actor runtime capabilities are implemented and tested.
-[ ] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, KeyedWorkerPool, and DedicatedThreadPool.
-[ ] UnsupportedExecutionPolicy is used only for invalid configuration, not for planned policies in the completed framework.
-[ ] architecture/02-rpc.md typed RPC, metadata, codegen, and gateway decode/forward are implemented and tested.
-[ ] architecture/03-placement.md placement, scale, drain, shutdown, crash, and watch are implemented and tested.
-[ ] architecture/04-eventbus-scheduler-config.md event bus, scheduler, and config are implemented and tested.
-[ ] architecture/05-gateway-ops.md gateway, rate limit, admin, telemetry, and inspection are implemented and tested.
-[ ] Valid constraints in architecture/06-appendix.md are not violated.
-[ ] API sketches in architecture/07-api-examples.md are covered by examples or compile tests.
-[ ] The implementation uses the planned Cargo workspace crate split; the root crate is not a monolithic implementation crate.
-[ ] examples/minimal-world runs as an end-to-end example.
-[ ] cargo fmt passes.
-[ ] cargo clippy passes.
-[ ] cargo test passes.
-[ ] All completed implementation slices are committed with English conventional commit messages.
-[ ] Production paths have no unexplained TODO / FIXME / unimplemented! / todo!.
+[x] Phase 1 through Phase 7 are complete.
+[x] This file's global acceptance checklist is fully satisfied.
+[x] architecture/00-overview.md system boundaries and module responsibilities are implemented.
+[x] architecture/01-actor-runtime.md actor runtime capabilities are implemented and tested.
+[x] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, KeyedWorkerPool, and DedicatedThreadPool.
+[x] UnsupportedExecutionPolicy is used only for invalid configuration, not for planned policies in the completed framework.
+[x] architecture/02-rpc.md typed RPC, metadata, codegen, and gateway decode/forward are implemented and tested.
+[x] architecture/03-placement.md placement, scale, drain, shutdown, crash, and watch are implemented and tested.
+[x] architecture/04-eventbus-scheduler-config.md event bus, scheduler, and config are implemented and tested.
+[x] architecture/05-gateway-ops.md gateway, rate limit, admin, telemetry, and inspection are implemented and tested.
+[x] Valid constraints in architecture/06-appendix.md are not violated.
+[x] API sketches in architecture/07-api-examples.md are covered by examples or compile tests.
+[x] The implementation uses the planned Cargo workspace crate split; the root crate is not a monolithic implementation crate.
+[x] examples/minimal-world runs as an end-to-end example.
+[x] cargo fmt passes.
+[x] cargo clippy passes.
+[x] cargo test passes.
+[x] All completed implementation slices are committed with English conventional commit messages.
+[x] Production paths have no unexplained TODO / FIXME / unimplemented! / todo!.
 ```
 
 ### 5.5 Working Constraints
