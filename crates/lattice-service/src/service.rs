@@ -11,8 +11,8 @@ use lattice_core::{
 };
 use lattice_direct_link::transport::TcpDirectLinkWriter;
 use lattice_direct_link::{
-    DirectLinkConnection, DirectLinkInboundRouter, DirectLinkTransport, TcpDirectLinkConnection,
-    TcpDirectLinkTransport,
+    DirectLinkConnection, DirectLinkFrameKind, DirectLinkInboundRouter, DirectLinkTransport,
+    TcpDirectLinkConnection, TcpDirectLinkTransport,
 };
 use lattice_ops::admin::{
     AdminActorTarget, AdminApiError, AdminAuth, AdminHttpAdapter, AdminMutationHandler,
@@ -625,7 +625,7 @@ async fn start_direct_link_listener(
     }))
 }
 
-async fn handle_direct_link_connection(
+pub(crate) async fn handle_direct_link_connection(
     connection: TcpDirectLinkConnection,
     inbound_router: Option<Arc<DirectLinkInboundRouter>>,
     maintenance_interval: Duration,
@@ -656,7 +656,22 @@ async fn handle_direct_link_connection(
                         return;
                     }
                 };
-                if let Err(error) = inbound_router.process_frame(frame) {
+                if frame.kind == DirectLinkFrameKind::OpenLink {
+                    match inbound_router.process_open_link_frame(frame, None) {
+                        Ok(response) => {
+                            if let Err(error) = writer.write_frame(response).await {
+                                warn!(%error, "closing direct-link connection after open-link response write failure");
+                                let _ = writer.close().await;
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, "closing direct-link connection after open-link handling failure");
+                            let _ = writer.close().await;
+                            return;
+                        }
+                    }
+                } else if let Err(error) = inbound_router.process_frame(frame) {
                     warn!(%error, "closing direct-link connection after inbound delivery failure");
                     let _ = writer.close().await;
                     return;

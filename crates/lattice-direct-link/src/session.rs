@@ -12,6 +12,7 @@ use lattice_core::{
     DirectLinkStreamDescriptor, Epoch, InstanceId, LinkCloseReason, LinkClosed, LinkDirection,
     LinkDirectionClosed, LinkError, LinkId, LinkOpened, LinkSequence, ServiceKind,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Default, Clone)]
@@ -806,7 +807,7 @@ impl DirectLinkSessionManager {
 
 pub const DIRECT_LINK_PROTOCOL_VERSION: u16 = 1;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenLinkRequest {
     pub protocol_version: u16,
     pub link_id: LinkId,
@@ -906,13 +907,13 @@ impl Default for OpenLinkValidationPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectLinkPeerIdentityPolicy {
     Disabled,
     Require { trust_domain: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectLinkPeerIdentity {
     pub service_kind: ServiceKind,
     pub instance_id: InstanceId,
@@ -1018,7 +1019,7 @@ impl Default for DirectLinkActorPolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenLinkDirection {
     pub link_id: LinkId,
     pub stream_name: String,
@@ -1035,14 +1036,14 @@ impl OpenLinkDirection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenLinkAck {
     pub link_id: LinkId,
     pub source_to_target: NegotiatedDirection,
     pub target_to_source: Option<NegotiatedDirection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenLinkReject {
     pub link_id: LinkId,
     pub reason: OpenLinkRejectReason,
@@ -1059,7 +1060,7 @@ impl OpenLinkReject {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpenLinkRejectReason {
     NotOwner,
     Fenced,
@@ -1071,7 +1072,7 @@ pub enum OpenLinkRejectReason {
     ProtocolVersionMismatch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NegotiatedDirection {
     pub direction: LinkDirection,
     pub stream_name: String,

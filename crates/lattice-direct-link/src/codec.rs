@@ -1,6 +1,8 @@
 use lattice_core::{DirectLinkMessageId, LinkDirection, LinkId, LinkMessageFlags, LinkSequence};
 use thiserror::Error;
 
+use crate::session::{OpenLinkAck, OpenLinkReject, OpenLinkRequest};
+
 const MAGIC: u32 = 0x4c44_4c4b;
 const VERSION: u16 = 1;
 const FIXED_HEADER_LEN: usize = 4 + 2 + 1 + 4 + 2 + 8 + 8 + 4 + 4;
@@ -91,6 +93,57 @@ impl DirectLinkFrame {
         Self::control(DirectLinkFrameKind::HeartbeatAck, link_id)
     }
 
+    pub fn open_link(request: &OpenLinkRequest) -> Result<Self, FrameCodecError> {
+        Ok(Self {
+            kind: DirectLinkFrameKind::OpenLink,
+            link_id: request.link_id.clone(),
+            sequence: LinkSequence(0),
+            message_id: None,
+            flags: LinkMessageFlags::EMPTY,
+            header: Vec::new(),
+            payload: serde_json::to_vec(request)
+                .map_err(|error| FrameCodecError::HandshakePayload(error.to_string()))?,
+        })
+    }
+
+    pub fn decode_open_link(&self) -> Result<OpenLinkRequest, FrameCodecError> {
+        self.decode_handshake_payload(DirectLinkFrameKind::OpenLink)
+    }
+
+    pub fn open_link_ack(ack: &OpenLinkAck) -> Result<Self, FrameCodecError> {
+        Ok(Self {
+            kind: DirectLinkFrameKind::OpenLinkAck,
+            link_id: ack.link_id.clone(),
+            sequence: LinkSequence(0),
+            message_id: None,
+            flags: LinkMessageFlags::EMPTY,
+            header: Vec::new(),
+            payload: serde_json::to_vec(ack)
+                .map_err(|error| FrameCodecError::HandshakePayload(error.to_string()))?,
+        })
+    }
+
+    pub fn decode_open_link_ack(&self) -> Result<OpenLinkAck, FrameCodecError> {
+        self.decode_handshake_payload(DirectLinkFrameKind::OpenLinkAck)
+    }
+
+    pub fn open_link_reject(reject: &OpenLinkReject) -> Result<Self, FrameCodecError> {
+        Ok(Self {
+            kind: DirectLinkFrameKind::OpenLinkReject,
+            link_id: reject.link_id.clone(),
+            sequence: LinkSequence(0),
+            message_id: None,
+            flags: LinkMessageFlags::EMPTY,
+            header: Vec::new(),
+            payload: serde_json::to_vec(reject)
+                .map_err(|error| FrameCodecError::HandshakePayload(error.to_string()))?,
+        })
+    }
+
+    pub fn decode_open_link_reject(&self) -> Result<OpenLinkReject, FrameCodecError> {
+        self.decode_handshake_payload(DirectLinkFrameKind::OpenLinkReject)
+    }
+
     fn control(kind: DirectLinkFrameKind, link_id: LinkId) -> Self {
         Self {
             kind,
@@ -105,6 +158,23 @@ impl DirectLinkFrame {
 
     pub fn direction(&self) -> LinkDirection {
         direction_from_flags(&self.flags)
+    }
+
+    fn decode_handshake_payload<T>(
+        &self,
+        expected_kind: DirectLinkFrameKind,
+    ) -> Result<T, FrameCodecError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        if self.kind != expected_kind {
+            return Err(FrameCodecError::UnexpectedFrameKind {
+                expected: expected_kind,
+                actual: self.kind,
+            });
+        }
+        serde_json::from_slice(&self.payload)
+            .map_err(|error| FrameCodecError::HandshakePayload(error.to_string()))
     }
 }
 
@@ -239,6 +309,13 @@ pub enum FrameCodecError {
     LengthMismatch { expected: usize, actual: usize },
     #[error("direct link frame contains an invalid link id")]
     InvalidLinkId,
+    #[error("unexpected direct link frame kind: expected {expected:?}, actual {actual:?}")]
+    UnexpectedFrameKind {
+        expected: DirectLinkFrameKind,
+        actual: DirectLinkFrameKind,
+    },
+    #[error("direct link handshake payload error: {0}")]
+    HandshakePayload(String),
 }
 
 struct Cursor<'a> {
@@ -296,6 +373,16 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    use lattice_core::{
+        ActorId, ActorKind, ActorRef, BackpressurePolicy, DirectLinkMode, DirectLinkOptions,
+        InstanceId, ServiceKind,
+    };
+
+    use crate::session::{
+        DIRECT_LINK_PROTOCOL_VERSION, NegotiatedDirection, OpenLinkDirection, OpenLinkRejectReason,
+    };
 
     #[test]
     fn frame_codec_round_trips_message_frame() {
@@ -342,5 +429,72 @@ mod tests {
         );
 
         assert_eq!(codec.encode(&frame), Err(FrameCodecError::FrameTooLarge));
+    }
+
+    #[test]
+    fn frame_codec_round_trips_open_link_handshake_frames() {
+        let codec = DirectLinkFrameCodec::new(4096);
+        let link_id = LinkId::new("link-open");
+        let message_id = DirectLinkMessageId(11);
+        let request = OpenLinkRequest {
+            protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+            link_id: link_id.clone(),
+            source: test_actor_ref("Gateway", "GatewaySession", 99),
+            target: test_actor_ref("World", "World", 7),
+            mode: DirectLinkMode::Unidirectional,
+            source_to_target: OpenLinkDirection {
+                link_id: link_id.clone(),
+                stream_name: "movement".to_string(),
+                supported_message_type_ids: BTreeSet::from([message_id]),
+            },
+            target_to_source: None,
+            options: DirectLinkOptions::default(),
+        };
+
+        let open_frame = DirectLinkFrame::open_link(&request).unwrap();
+        let decoded_open_frame = codec.decode(&codec.encode(&open_frame).unwrap()).unwrap();
+        let decoded_request = decoded_open_frame.decode_open_link().unwrap();
+        assert_eq!(decoded_request.link_id, request.link_id);
+        assert_eq!(decoded_request.source, request.source);
+        assert_eq!(decoded_request.target, request.target);
+        assert_eq!(
+            decoded_request.source_to_target.supported_message_type_ids,
+            BTreeSet::from([message_id])
+        );
+
+        let ack = OpenLinkAck {
+            link_id: link_id.clone(),
+            source_to_target: NegotiatedDirection {
+                direction: LinkDirection::SourceToTarget,
+                stream_name: "movement".to_string(),
+                accepted_message_type_ids: BTreeSet::from([message_id]),
+                next_receive_sequence: LinkSequence(1),
+                backpressure: BackpressurePolicy::FailFast { max_pending: 8 },
+                closed: false,
+            },
+            target_to_source: None,
+        };
+        let ack_frame = DirectLinkFrame::open_link_ack(&ack).unwrap();
+        let decoded_ack_frame = codec.decode(&codec.encode(&ack_frame).unwrap()).unwrap();
+        assert_eq!(decoded_ack_frame.decode_open_link_ack().unwrap(), ack);
+
+        let reject = OpenLinkReject::new(link_id, OpenLinkRejectReason::Unauthorized);
+        let reject_frame = DirectLinkFrame::open_link_reject(&reject).unwrap();
+        let decoded_reject_frame = codec.decode(&codec.encode(&reject_frame).unwrap()).unwrap();
+        assert_eq!(
+            decoded_reject_frame.decode_open_link_reject().unwrap(),
+            reject
+        );
+    }
+
+    fn test_actor_ref(service: &str, actor: &str, id: u64) -> ActorRef {
+        ActorRef::direct(
+            ServiceKind::new(service),
+            ActorKind::new(actor),
+            ActorId::U64(id),
+            InstanceId::new("codec-test"),
+            "tcp://127.0.0.1:1".parse().unwrap(),
+            None,
+        )
     }
 }

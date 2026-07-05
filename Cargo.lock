@@ -1220,6 +1220,8 @@ dependencies = [
  "lattice-actor",
  "lattice-core",
  "prost",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

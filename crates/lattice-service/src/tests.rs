@@ -31,7 +31,8 @@ use lattice_core::{
 };
 use lattice_direct_link::{
     DIRECT_LINK_PROTOCOL_VERSION, DirectLinkConnection, DirectLinkFrame, DirectLinkFrameKind,
-    DirectLinkStream, DirectLinkTransport, OpenLinkDirection, OpenLinkRequest,
+    DirectLinkInboundRouter, DirectLinkListenConfig, DirectLinkSessionManager, DirectLinkStream,
+    DirectLinkTransport, OpenLinkDirection, OpenLinkRejectReason, OpenLinkRequest,
     TcpDirectLinkTransport,
 };
 use lattice_eventbus::{
@@ -1207,7 +1208,6 @@ async fn direct_link_listener_publishes_endpoint_and_stops_with_service() {
         .build()
         .await
         .unwrap();
-
     let task = tokio::spawn(service.run_until_shutdown_signal(async {
         let _ = shutdown_rx.await;
     }));
@@ -1329,7 +1329,6 @@ async fn direct_link_listener_routes_message_frames_to_registered_actor() {
             options: DirectLinkOptions::default(),
         })
         .unwrap();
-
     let mut connection = TcpDirectLinkTransport::new()
         .connect(DirectLinkEndpoint::new(direct_link_endpoint))
         .await
@@ -1370,6 +1369,84 @@ async fn direct_link_listener_routes_message_frames_to_registered_actor() {
 
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn direct_link_connection_writes_open_link_reject_frames() {
+    let transport = TcpDirectLinkTransport::new();
+    let listener = transport
+        .bind(DirectLinkListenConfig {
+            endpoint: DirectLinkEndpoint::new("tcp://127.0.0.1:0".parse().unwrap()),
+            max_frame_size: 4096,
+        })
+        .await
+        .unwrap();
+    let endpoint = listener.local_endpoint();
+    let router = Arc::new(
+        DirectLinkInboundRouter::builder(Arc::new(DirectLinkSessionManager::new())).build(),
+    );
+    let server = tokio::spawn(async move {
+        let connection = listener.accept().await.unwrap();
+        crate::service::handle_direct_link_connection(
+            connection,
+            Some(router),
+            Duration::from_secs(1),
+        )
+        .await;
+    });
+
+    let link_id = LinkId::new("service-link-open-reject");
+    let mut connection = TcpDirectLinkTransport::new()
+        .connect(endpoint)
+        .await
+        .unwrap();
+    connection
+        .write_frame(
+            DirectLinkFrame::open_link(&OpenLinkRequest {
+                protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                link_id: link_id.clone(),
+                source: direct_actor_ref(
+                    service_kind!("Gateway"),
+                    actor_kind!("GatewaySession"),
+                    ActorId::U64(99),
+                    "tcp://127.0.0.1:1".parse().unwrap(),
+                ),
+                target: direct_actor_ref(
+                    service_kind!("World"),
+                    actor_kind!("World"),
+                    ActorId::U64(7),
+                    "tcp://127.0.0.1:2".parse().unwrap(),
+                ),
+                mode: DirectLinkMode::Unidirectional,
+                source_to_target: OpenLinkDirection {
+                    link_id: link_id.clone(),
+                    stream_name: "unregistered".to_string(),
+                    supported_message_type_ids: [lattice_core::DirectLinkMessageId(1)]
+                        .into_iter()
+                        .collect(),
+                },
+                target_to_source: None,
+                options: DirectLinkOptions::default(),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let response = timeout(Duration::from_secs(1), connection.read_frame())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.kind, DirectLinkFrameKind::OpenLinkReject);
+    let reject = response.decode_open_link_reject().unwrap();
+    assert_eq!(reject.link_id, link_id);
+    assert_eq!(reject.reason, OpenLinkRejectReason::ActorUnavailable);
+
+    connection.close().await.unwrap();
+    timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

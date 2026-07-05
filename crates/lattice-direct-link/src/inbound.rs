@@ -20,8 +20,8 @@ use crate::backpressure::{BackpressureOutcome, BackpressureQueue, BackpressureSn
 use crate::codec::{DirectLinkFrame, DirectLinkFrameKind};
 use crate::delivery::{DirectLinkDeliveryError, DirectLinkDispatch};
 use crate::session::{
-    CloseAllTransition, CloseTransition, DirectLinkSessionManager, ManagedLinkSnapshot,
-    MessageFrameError, SessionManagerError,
+    CloseAllTransition, CloseTransition, DirectLinkPeerIdentity, DirectLinkSessionManager,
+    ManagedLinkSnapshot, MessageFrameError, SessionManagerError,
 };
 use crate::stream::DirectLinkActorBinding;
 
@@ -41,6 +41,8 @@ pub enum InboundDeliveryError {
     BackpressureFull,
     #[error("direct-link inbound backpressure closed the link")]
     BackpressureExceeded,
+    #[error("direct-link handshake failed: {0}")]
+    Handshake(String),
     #[error(transparent)]
     Frame(#[from] MessageFrameError),
     #[error(transparent)]
@@ -160,6 +162,28 @@ impl DirectLinkInboundRouter {
                 self.close_all(&frame.link_id, LinkCloseReason::ProtocolError(reason))
             }
             _ => Err(InboundDeliveryError::NotMessageFrame),
+        }
+    }
+
+    pub fn process_open_link_frame(
+        &self,
+        frame: DirectLinkFrame,
+        peer_identity: Option<DirectLinkPeerIdentity>,
+    ) -> Result<DirectLinkFrame, InboundDeliveryError> {
+        let request = frame
+            .decode_open_link()
+            .map_err(|error| InboundDeliveryError::Handshake(error.to_string()))?;
+        match self
+            .session_manager
+            .open_link_from_peer(request, peer_identity)
+        {
+            Ok(ack) => {
+                self.deliver_link_opened_to_target(&ack.link_id)?;
+                DirectLinkFrame::open_link_ack(&ack)
+                    .map_err(|error| InboundDeliveryError::Handshake(error.to_string()))
+            }
+            Err(reject) => DirectLinkFrame::open_link_reject(&reject)
+                .map_err(|error| InboundDeliveryError::Handshake(error.to_string())),
         }
     }
 
@@ -1437,6 +1461,96 @@ mod tests {
                 .expect("outbound requests mutex poisoned")
                 .as_slice(),
             &[(link_id, BattleUpdateStream::descriptor())]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_open_link_frame_returns_ack_and_delivers_link_opened() {
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let outbound = Arc::new(Mutex::new(None));
+        let runtime = Arc::new(RecordingLinkRuntime::default());
+        let mut service =
+            ServiceContext::builder(service_kind!("Battle"), InstanceId::new("battle-1"));
+        service
+            .insert_extension(DirectLinkRuntimeHandle::new(runtime.clone()))
+            .unwrap();
+        let link_id = LinkId::new("link-open-frame");
+        let target_ref = actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9);
+        let handle = ActorRuntime::default()
+            .spawn_actor(
+                OpeningBattleActor {
+                    opened: opened.clone(),
+                    outbound: outbound.clone(),
+                },
+                ActorSpawnOptions {
+                    self_ref: Some(target_ref.clone()),
+                    service: service.build(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let manager = Arc::new(DirectLinkSessionManager::new());
+        let input_stream = DirectLinkStream::new("gateway-input").message::<InputCommand>();
+        let update_stream = DirectLinkStream::new("battle-update").message::<PositionUpdate>();
+        let input_descriptor = input_stream.descriptor();
+        let update_descriptor = update_stream.descriptor();
+        manager
+            .register_binding(actor_kind!("Battle"), input_descriptor.clone())
+            .unwrap();
+        manager
+            .register_binding(actor_kind!("GatewaySession"), update_descriptor.clone())
+            .unwrap();
+        let router = DirectLinkInboundRouter::builder(manager)
+            .bind_actor(
+                input_stream.for_actor::<OpeningBattleActor>(actor_kind!("Battle")),
+                move |_| Some(handle.clone()),
+            )
+            .build();
+
+        let response = router
+            .process_open_link_frame(
+                DirectLinkFrame::open_link(&OpenLinkRequest {
+                    protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                    link_id: link_id.clone(),
+                    source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+                    target: target_ref,
+                    mode: DirectLinkMode::Bidirectional,
+                    source_to_target: OpenLinkDirection::from_stream(
+                        link_id.clone(),
+                        &input_descriptor,
+                    ),
+                    target_to_source: Some(OpenLinkDirection::from_stream(
+                        link_id.clone(),
+                        &update_descriptor,
+                    )),
+                    options: DirectLinkOptions::bidirectional(),
+                })
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(response.kind, DirectLinkFrameKind::OpenLinkAck);
+        let ack = response.decode_open_link_ack().unwrap();
+        assert_eq!(ack.link_id, link_id);
+        assert_eq!(ack.source_to_target.stream_name, "gateway-input");
+        assert_eq!(
+            ack.target_to_source
+                .as_ref()
+                .expect("target-to-source negotiation")
+                .stream_name,
+            "battle-update"
+        );
+        wait_for_len(&opened, 1).await;
+        let opened = opened.lock().expect("opened messages mutex poisoned");
+        assert_eq!(opened[0].link_id, link_id);
+        assert_eq!(opened[0].mode, DirectLinkMode::Bidirectional);
+        assert_eq!(opened[0].inbound_stream, "gateway-input");
+        assert_eq!(opened[0].outbound_stream.as_deref(), Some("battle-update"));
+        assert_eq!(
+            *outbound.lock().expect("outbound handle mutex poisoned"),
+            Some((LinkDirection::TargetToSource, "battle-update".to_string()))
         );
     }
 
