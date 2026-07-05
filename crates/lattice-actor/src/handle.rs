@@ -86,6 +86,14 @@ impl<A: Actor> ActorHandle<A> {
         self.call(msg).await.map_err(ActorTellError::from)
     }
 
+    pub fn try_tell<M>(&self, msg: M) -> Result<(), ActorTellError>
+    where
+        A: Handler<M>,
+        M: Message<Reply = ()>,
+    {
+        self.try_tell_on_lane(msg, MailboxLane::Normal)
+    }
+
     pub async fn stop(&self, reason: StopReason) -> Result<(), ActorTellError> {
         self.send_system_command(ActorCommand::Stop(reason))
     }
