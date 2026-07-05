@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use lattice_core::{
     ActorKind, ActorRef, ActorRefTarget, BackpressurePolicy, DirectLinkMessage,
     DirectLinkMessageId, DirectLinkMode, DirectLinkOptions, DirectLinkSession,
-    DirectLinkStreamDescriptor, Epoch, LinkCloseReason, LinkClosed, LinkDirection,
+    DirectLinkStreamDescriptor, Epoch, InstanceId, LinkCloseReason, LinkClosed, LinkDirection,
     LinkDirectionClosed, LinkError, LinkId, LinkOpened, LinkSequence, ServiceKind,
 };
 use thiserror::Error;
@@ -205,13 +205,21 @@ impl DirectLinkSessionManager {
     }
 
     pub fn open_link(&self, request: OpenLinkRequest) -> Result<OpenLinkAck, OpenLinkReject> {
+        self.open_link_from_peer(request, None)
+    }
+
+    pub fn open_link_from_peer(
+        &self,
+        request: OpenLinkRequest,
+        peer_identity: Option<DirectLinkPeerIdentity>,
+    ) -> Result<OpenLinkAck, OpenLinkReject> {
         if request.protocol_version != DIRECT_LINK_PROTOCOL_VERSION {
             return Err(OpenLinkReject::new(
                 request.link_id,
                 OpenLinkRejectReason::ProtocolVersionMismatch,
             ));
         }
-        self.validate_open_request(&request)?;
+        self.validate_open_request(&request, peer_identity.as_ref())?;
         let source_to_target = self.negotiate_direction(
             &request.target.actor_kind,
             request.source_to_target.clone(),
@@ -714,7 +722,11 @@ impl DirectLinkSessionManager {
         })
     }
 
-    fn validate_open_request(&self, request: &OpenLinkRequest) -> Result<(), OpenLinkReject> {
+    fn validate_open_request(
+        &self,
+        request: &OpenLinkRequest,
+        peer_identity: Option<&DirectLinkPeerIdentity>,
+    ) -> Result<(), OpenLinkReject> {
         let validation = self
             .validation
             .lock()
@@ -743,6 +755,7 @@ impl DirectLinkSessionManager {
                 OpenLinkRejectReason::Unauthorized,
             ));
         }
+        validation.validate_peer_identity(request, peer_identity)?;
         if validation
             .max_frame_size
             .is_some_and(|max| request.options.max_frame_size > max)
@@ -810,6 +823,7 @@ pub struct OpenLinkValidationPolicy {
     pub hosted_service: Option<ServiceKind>,
     pub accepting_links: bool,
     pub auth_policy: DirectLinkAuthPolicy,
+    pub peer_identity_policy: DirectLinkPeerIdentityPolicy,
     pub max_frame_size: Option<usize>,
     pub max_pending: Option<usize>,
 }
@@ -827,6 +841,13 @@ impl OpenLinkValidationPolicy {
         self
     }
 
+    pub fn require_peer_identity(mut self, trust_domain: impl Into<String>) -> Self {
+        self.peer_identity_policy = DirectLinkPeerIdentityPolicy::Require {
+            trust_domain: trust_domain.into(),
+        };
+        self
+    }
+
     pub fn accepting_links(mut self, accepting_links: bool) -> Self {
         self.accepting_links = accepting_links;
         self
@@ -841,6 +862,35 @@ impl OpenLinkValidationPolicy {
         self.max_pending = Some(max_pending);
         self
     }
+
+    fn validate_peer_identity(
+        &self,
+        request: &OpenLinkRequest,
+        peer_identity: Option<&DirectLinkPeerIdentity>,
+    ) -> Result<(), OpenLinkReject> {
+        let DirectLinkPeerIdentityPolicy::Require { trust_domain } = &self.peer_identity_policy
+        else {
+            return Ok(());
+        };
+        let Some(peer_identity) = peer_identity else {
+            return Err(OpenLinkReject::new(
+                request.link_id.clone(),
+                OpenLinkRejectReason::Unauthorized,
+            ));
+        };
+        let expected_prefix = format!("spiffe://{trust_domain}/");
+        if peer_identity.service_kind != request.source.service_kind
+            || !peer_identity.spiffe_id.starts_with(&expected_prefix)
+            || source_instance_id(&request.source)
+                .is_some_and(|instance_id| instance_id != &peer_identity.instance_id)
+        {
+            return Err(OpenLinkReject::new(
+                request.link_id.clone(),
+                OpenLinkRejectReason::Unauthorized,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for OpenLinkValidationPolicy {
@@ -849,8 +899,36 @@ impl Default for OpenLinkValidationPolicy {
             hosted_service: None,
             accepting_links: true,
             auth_policy: DirectLinkAuthPolicy::AllowAll,
+            peer_identity_policy: DirectLinkPeerIdentityPolicy::Disabled,
             max_frame_size: None,
             max_pending: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectLinkPeerIdentityPolicy {
+    Disabled,
+    Require { trust_domain: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectLinkPeerIdentity {
+    pub service_kind: ServiceKind,
+    pub instance_id: InstanceId,
+    pub spiffe_id: String,
+}
+
+impl DirectLinkPeerIdentity {
+    pub fn new(
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        spiffe_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            service_kind,
+            instance_id,
+            spiffe_id: spiffe_id.into(),
         }
     }
 }
@@ -867,6 +945,13 @@ impl DirectLinkAuthPolicy {
             Self::AllowAll => true,
             Self::AllowServices(allowed) => allowed.contains(source),
         }
+    }
+}
+
+fn source_instance_id(source: &ActorRef) -> Option<&InstanceId> {
+    match &source.target {
+        ActorRefTarget::Direct { instance_id, .. } => Some(instance_id),
+        ActorRefTarget::Routed => None,
     }
 }
 
@@ -1464,6 +1549,64 @@ mod tests {
         let lazy = configured_manager(&stream);
         lazy.register_actor(actor_kind!("Battle"), DirectLinkActorPolicy::lazy(None));
         assert!(lazy.open_link(open_request(&stream)).is_ok());
+    }
+
+    #[test]
+    fn open_link_binds_required_peer_identity_to_source_metadata() {
+        let stream = stream("movement", &[1]);
+        let manager = configured_manager(&stream);
+        manager.set_validation_policy(
+            OpenLinkValidationPolicy::hosted(service_kind!("Battle"))
+                .authorize_sources([service_kind!("Gateway")])
+                .require_peer_identity("lattice.test"),
+        );
+
+        let reject = manager.open_link(open_request(&stream)).unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::Unauthorized);
+
+        let wrong_service = DirectLinkPeerIdentity::new(
+            service_kind!("Intruder"),
+            InstanceId::new("instance-7"),
+            "spiffe://lattice.test/svc/intruder/instance/instance-7",
+        );
+        let reject = manager
+            .open_link_from_peer(open_request(&stream), Some(wrong_service))
+            .unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::Unauthorized);
+
+        let wrong_instance = DirectLinkPeerIdentity::new(
+            service_kind!("Gateway"),
+            InstanceId::new("instance-8"),
+            "spiffe://lattice.test/svc/gateway/instance/instance-8",
+        );
+        let reject = manager
+            .open_link_from_peer(open_request(&stream), Some(wrong_instance))
+            .unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::Unauthorized);
+
+        let wrong_trust_domain = DirectLinkPeerIdentity::new(
+            service_kind!("Gateway"),
+            InstanceId::new("instance-7"),
+            "spiffe://other.test/svc/gateway/instance/instance-7",
+        );
+        let reject = manager
+            .open_link_from_peer(open_request(&stream), Some(wrong_trust_domain))
+            .unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::Unauthorized);
+
+        let accepted = DirectLinkPeerIdentity::new(
+            service_kind!("Gateway"),
+            InstanceId::new("instance-7"),
+            "spiffe://lattice.test/svc/gateway/instance/instance-7",
+        );
+        assert!(
+            manager
+                .open_link_from_peer(
+                    open_request_with_id(&stream, LinkId::new("link-peer-ok")),
+                    Some(accepted)
+                )
+                .is_ok()
+        );
     }
 
     #[test]

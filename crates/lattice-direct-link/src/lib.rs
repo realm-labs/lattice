@@ -15,9 +15,10 @@ pub use outbound::{OutboundDirectLinkQueue, OutboundQueueEvent};
 pub use session::{
     CloseAllTransition, CloseTransition, DIRECT_LINK_PROTOCOL_VERSION, DirectLinkActivationPolicy,
     DirectLinkActorPolicy, DirectLinkAuthPolicy, DirectLinkMetrics, DirectLinkMetricsSnapshot,
-    DirectLinkSessionManager, ManagedLinkSnapshot, MessageFrameError, NegotiatedDirection,
-    OpenLinkAck, OpenLinkDirection, OpenLinkReject, OpenLinkRejectReason, OpenLinkRequest,
-    OpenLinkValidationPolicy, SessionManagerError,
+    DirectLinkPeerIdentity, DirectLinkPeerIdentityPolicy, DirectLinkSessionManager,
+    ManagedLinkSnapshot, MessageFrameError, NegotiatedDirection, OpenLinkAck, OpenLinkDirection,
+    OpenLinkReject, OpenLinkRejectReason, OpenLinkRequest, OpenLinkValidationPolicy,
+    SessionManagerError,
 };
 pub use stream::{DirectLinkActorBinding, DirectLinkHandlers, DirectLinkStream};
 pub use transport::{

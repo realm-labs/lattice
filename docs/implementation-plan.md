@@ -293,7 +293,8 @@ Status: `[ ]` in progress.
 - [ ] Security hooks cover internal bind policy, peer identity/auth, source service/actor authorization, max frame size, connection limit, link limit, and rate limit.
   - [x] Service direct-link bind policy defaults to loopback-only binds and requires explicit `DirectLinkBindPolicy::External` opt-in for wildcard or non-loopback listener endpoints.
   - [x] OpenLink validation covers source service authorization, max frame size, and backpressure pending-limit policy with `Unauthorized` or `Overloaded` rejects.
-  - [ ] Peer identity/auth hook binds authenticated peer identity to source service/actor instead of trusting only declared source metadata.
+  - [x] OpenLink peer identity/auth hook rejects missing, trust-domain-mismatched, service-mismatched, or source-instance-mismatched peer identity before creating sessions.
+  - [ ] Managed TCP handshake supplies authenticated peer identity to OpenLink validation instead of trusting only declared source metadata.
   - [ ] Managed TCP listener enforces a configured connection limit.
   - [ ] Session manager enforces a configured active link limit.
   - [ ] Direct Link open/data path enforces configured rate limits.
