@@ -266,7 +266,7 @@ Status: `[ ]` not started.
 - [x] Direct Link listener is managed by `LatticeService`, publishes direct-link endpoint metadata, and shuts down/drains with the service lifecycle.
 - [x] OpenLink handshake validates service/actor identity, stream binding, accepted message ids, activation policy, owner epoch, auth, and backpressure policy before creating sessions.
 - [x] Invalid OpenLink requests reject with explicit reasons: `NotOwner`, `Fenced`, `ActorUnavailable`, `UnsupportedStream`, `UnsupportedMessageType`, `Unauthorized`, `Overloaded`, or `ProtocolVersionMismatch`.
-- [ ] Message frame validation rejects unknown link ids, wrong direction, unsupported message ids, decode errors, invalid sequence, and non-activatable target actors before mailbox delivery.
+- [x] Message frame validation rejects unknown link ids, wrong direction, unsupported message ids, decode errors, invalid sequence, and non-activatable target actors before mailbox delivery.
 - [ ] Unidirectional links deliver fire-and-forget `Linked<T>` messages through actor mailbox without executing handlers on socket tasks.
 - [ ] Bidirectional links are modeled as two logical unidirectional sessions over one underlying connection, with separate streams, message ids, sequence numbers, and backpressure state.
 - [ ] The initiator receives the source-to-target send handle from `connect_bidirectional`.

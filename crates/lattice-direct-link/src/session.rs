@@ -1,10 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+// This module currently keeps Direct Link session state and its white-box tests
+// together because the Phase 8 runtime surface is still being assembled. Split
+// the tests into integration fixtures once mailbox delivery and service wiring
+// expose stable public seams.
 use lattice_core::{
-    ActorKind, ActorRef, ActorRefTarget, BackpressurePolicy, DirectLinkMessageId, DirectLinkMode,
-    DirectLinkOptions, DirectLinkSession, DirectLinkStreamDescriptor, Epoch, LinkCloseReason,
-    LinkDirection, LinkError, LinkId, LinkSequence, ServiceKind,
+    ActorKind, ActorRef, ActorRefTarget, BackpressurePolicy, DirectLinkMessage,
+    DirectLinkMessageId, DirectLinkMode, DirectLinkOptions, DirectLinkSession,
+    DirectLinkStreamDescriptor, Epoch, LinkCloseReason, LinkDirection, LinkError, LinkId,
+    LinkSequence, ServiceKind,
 };
 use thiserror::Error;
 
@@ -281,6 +286,7 @@ impl DirectLinkSessionManager {
         if link.closed {
             return self.message_frame_error(link_id, MessageFrameError::Closed);
         }
+        self.validate_frame_target(link_id, link)?;
         let Some(direction_state) = link.directions.get_mut(&direction) else {
             return self.message_frame_error(link_id, MessageFrameError::WrongDirection);
         };
@@ -313,6 +319,30 @@ impl DirectLinkSessionManager {
             "direct link message frame accepted"
         );
         Ok(())
+    }
+
+    pub fn validate_and_decode_message<T>(
+        &self,
+        link_id: &LinkId,
+        direction: LinkDirection,
+        message_id: DirectLinkMessageId,
+        sequence: LinkSequence,
+        payload: &[u8],
+    ) -> Result<T, MessageFrameError>
+    where
+        T: DirectLinkMessage,
+    {
+        self.validate_message_frame(link_id, direction, message_id, sequence)?;
+        T::decode(payload).map_err(|error| {
+            self.metrics.record_decode_error();
+            tracing::warn!(
+                link.id = link_id.as_str(),
+                message.id = message_id.0,
+                error = %error,
+                "direct link message decode failed"
+            );
+            MessageFrameError::DecodeError(error.to_string())
+        })
     }
 
     pub fn close_direction(
@@ -454,6 +484,24 @@ impl DirectLinkSessionManager {
             "direct link message frame rejected"
         );
         Err(error)
+    }
+
+    fn validate_frame_target(
+        &self,
+        link_id: &LinkId,
+        link: &ManagedLink,
+    ) -> Result<(), MessageFrameError> {
+        let actors = self
+            .actors
+            .lock()
+            .expect("direct link actor policies poisoned");
+        let Some(policy) = actors.get(&link.target.actor_kind) else {
+            return self.message_frame_error(link_id, MessageFrameError::NonActivatableTarget);
+        };
+        if !policy.active && policy.activation == DirectLinkActivationPolicy::ExistingOnly {
+            return self.message_frame_error(link_id, MessageFrameError::NonActivatableTarget);
+        }
+        Ok(())
     }
 
     fn negotiate_direction(
@@ -849,6 +897,10 @@ pub enum MessageFrameError {
     Closed,
     #[error("direct-link message type is not negotiated")]
     UnsupportedMessageType,
+    #[error("direct-link target actor is not active or activatable")]
+    NonActivatableTarget,
+    #[error("direct-link message payload failed to decode: {0}")]
+    DecodeError(String),
     #[error("direct-link sequence is invalid: expected {expected:?}, actual {actual:?}")]
     InvalidSequence {
         expected: LinkSequence,
@@ -866,6 +918,16 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct TestPayload {
+        #[prost(uint64, tag = "1")]
+        value: u64,
+    }
+
+    impl DirectLinkMessage for TestPayload {
+        const PROTO_FULL_NAME: &'static str = "game.TestPayload";
+    }
 
     #[test]
     fn open_link_negotiates_unidirectional_session_and_sequence() {
@@ -924,6 +986,83 @@ mod tests {
         assert_eq!(metrics.opened, 1);
         assert_eq!(metrics.received, 1);
         assert_eq!(metrics.protocol_errors, 1);
+    }
+
+    #[test]
+    fn message_frame_validation_rejects_invalid_frames_before_delivery() {
+        let manager = DirectLinkSessionManager::new();
+        let stream = stream("movement", &[1]);
+        manager
+            .register_binding(actor_kind!("Battle"), stream.clone())
+            .unwrap();
+        let link_id = LinkId::new("link-frames");
+        manager
+            .open_link(open_request_with_id(&stream, link_id.clone()))
+            .unwrap();
+
+        assert_eq!(
+            manager.validate_message_frame(
+                &LinkId::new("missing"),
+                LinkDirection::SourceToTarget,
+                DirectLinkMessageId(1),
+                LinkSequence(1),
+            ),
+            Err(MessageFrameError::UnknownLink)
+        );
+        assert_eq!(
+            manager.validate_message_frame(
+                &link_id,
+                LinkDirection::TargetToSource,
+                DirectLinkMessageId(1),
+                LinkSequence(1),
+            ),
+            Err(MessageFrameError::WrongDirection)
+        );
+        assert_eq!(
+            manager.validate_message_frame(
+                &link_id,
+                LinkDirection::SourceToTarget,
+                DirectLinkMessageId(2),
+                LinkSequence(1),
+            ),
+            Err(MessageFrameError::UnsupportedMessageType)
+        );
+        assert!(matches!(
+            manager.validate_and_decode_message::<TestPayload>(
+                &link_id,
+                LinkDirection::SourceToTarget,
+                DirectLinkMessageId(1),
+                LinkSequence(1),
+                b"not protobuf",
+            ),
+            Err(MessageFrameError::DecodeError(_))
+        ));
+
+        let inactive = DirectLinkSessionManager::new();
+        inactive
+            .register_binding(actor_kind!("Battle"), stream.clone())
+            .unwrap();
+        let inactive_id = LinkId::new("link-inactive");
+        inactive
+            .open_link(open_request_with_id(&stream, inactive_id.clone()))
+            .unwrap();
+        inactive.register_actor(
+            actor_kind!("Battle"),
+            DirectLinkActorPolicy {
+                activation: DirectLinkActivationPolicy::ExistingOnly,
+                active: false,
+                owner_epoch: None,
+            },
+        );
+        assert_eq!(
+            inactive.validate_message_frame(
+                &inactive_id,
+                LinkDirection::SourceToTarget,
+                DirectLinkMessageId(1),
+                LinkSequence(1),
+            ),
+            Err(MessageFrameError::NonActivatableTarget)
+        );
     }
 
     #[test]
@@ -1165,7 +1304,13 @@ mod tests {
     }
 
     fn open_request(stream: &DirectLinkStreamDescriptor) -> OpenLinkRequest {
-        let link_id = LinkId::new("link-policy");
+        open_request_with_id(stream, LinkId::new("link-policy"))
+    }
+
+    fn open_request_with_id(
+        stream: &DirectLinkStreamDescriptor,
+        link_id: LinkId,
+    ) -> OpenLinkRequest {
         OpenLinkRequest {
             protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
             link_id: link_id.clone(),
