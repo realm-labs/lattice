@@ -96,6 +96,7 @@ Phase 1 Actor Runtime
   -> Phase 6 Cluster Singleton
   -> Phase 7 Ops Production Features
   -> Phase 8 Direct Actor Link
+  -> Phase 9 Direct Link Multiplexed Transport Runtime
 ```
 
 ### 2.1 Current Progress Tracker
@@ -306,6 +307,31 @@ Status: `[x]` complete.
   - [x] `crates/lattice-direct-link/benches/direct_link_benchmark.rs` covers TCP single-process loopback, local multi-process-shaped independent transport loopback, frame payload sizes, and backpressure policy enqueue matrices.
 - [x] Architecture/API examples document when to use gRPC RPC versus Direct Actor Link and show unidirectional and bidirectional flows.
   - [x] `docs/architecture/07-api-examples.md` shows generated RPC, unidirectional direct-link, bidirectional direct-link, target `Linked<T>` / `LinkOpened` handlers, and direct-link service registration. This item is documentation/API guidance only; the referenced APIs are implemented and covered by the preceding Phase 8 code/test items.
+
+#### Phase 9: Direct Link Multiplexed Transport Runtime
+
+Status: `[ ]` not started.
+
+This phase intentionally breaks the current Direct Link transport/runtime shape. Do not preserve compatibility with the one-connection-per-open path or the low-level `DirectLinkTransport::connect(endpoint) -> Connection` API if it blocks endpoint pooling.
+
+- [ ] Replace per-link TCP connection assumptions with an instance-to-instance `DirectLinkEndpointPool`.
+- [ ] Add `DirectLinkEndpointPoolConfig` with `connections_per_endpoint`, `max_links_per_connection`, `max_links_per_endpoint`, idle timeout, connect timeout, and reconnect/backoff settings.
+- [ ] Replace or narrow `DirectLinkTransport` so business/runtime code opens logical link sessions through the endpoint pool, not raw TCP connections.
+- [ ] Add pooled connection stripes keyed by target direct-link endpoint and stable link/session hash.
+- [ ] Multiplex many `link_id` logical sessions over each TCP connection.
+- [ ] OpenLink frames are routed over a selected endpoint stripe and do not create a dedicated TCP connection per actor pair.
+- [ ] Outbound `DirectLinkSender` writes frames through a pooled connection writer task.
+- [ ] Inbound connection task demultiplexes frames by `link_id` and routes them through `DirectLinkInboundRouter`.
+- [ ] Production `DirectLinkRuntimeHandle` is installed into `ServiceContext` by `LatticeService` so `ctx.links().connect(...)` works without test-only runtime injection.
+- [ ] Direct Link endpoint resolution uses `ActorRef` / placement instance metadata to find the target instance `direct_link_endpoint`.
+- [ ] `LinkTarget::Endpoint` remains available for explicit business endpoints, but it also goes through the endpoint pool.
+- [ ] Endpoint pool enforces connection count, per-connection link count, and per-endpoint link count before OpenLink.
+- [ ] Node drain closes logical sessions before closing pooled TCP connections.
+- [ ] Peer connection loss closes all sessions multiplexed on that TCP connection with `ConnectionLost`.
+- [ ] Connection-level protocol fatal error closes the connection and every multiplexed session.
+- [ ] Link-level protocol error closes only the affected logical link unless the frame corrupts connection state.
+- [ ] Metrics distinguish physical connections from logical links: connection open/close, active connections, links per connection, frames per connection, reconnects, and pool queue/backpressure.
+- [ ] Direct Link benchmark compares one connection per link versus pooled striped connections and documents the fd/port/throughput impact.
 
 ### Phase 1: Single-Node Actor Runtime
 
@@ -835,6 +861,98 @@ TCP transport round trip
 direct-link benchmark smoke
 ```
 
+### Phase 9: Direct Link Multiplexed Transport Runtime
+
+Goal: turn Direct Link from a functional link/session implementation into a production transport runtime that reuses a bounded number of instance-to-instance TCP connections and multiplexes many actor links over them.
+
+This phase is a breaking refactor. Remove or replace APIs that expose raw transport connections to the service/runtime hot path. The target runtime shape is endpoint-pooled logical sessions, not one TCP connection per actor pair or per OpenLink.
+
+Current implementation audit:
+
+```text
+DirectLinkStream, typed handler validation, session negotiation, frame codec, inbound routing, TCP listener, service-managed listener, lifecycle events, security checks, backpressure, and benchmarks exist.
+TcpDirectLinkTransport::connect(endpoint) returns one physical connection.
+LatticeService listener accepts physical TCP connections and handles frames on that connection.
+Service-side DirectLinkRuntimeHandle is not a production outbound runtime backed by placement resolution and a connection pool.
+The implementation does not yet define an endpoint connection pool that multiplexes many link_id sessions over bounded per-endpoint TCP stripes.
+```
+
+Deliverables:
+
+```text
+DirectLinkEndpointPool
+DirectLinkEndpointPoolConfig
+DirectLinkEndpointKey
+DirectLinkConnectionStripe
+DirectLinkConnectionId
+pooled TCP connection manager
+pooled writer task per physical connection
+pooled reader task per physical connection
+logical link session table keyed by link_id
+link_id to connection stripe mapping
+endpoint-level connection limit
+endpoint-level logical link limit
+per-connection logical link limit
+connection idle timeout
+connection reconnect/backoff policy
+production DirectLinkRuntime implementation
+placement-backed target endpoint resolution for ActorRef targets
+ServiceContext installs DirectLinkRuntimeHandle from LatticeService build
+LinkTarget::Actor opens through placement endpoint resolution and endpoint pool
+LinkTarget::Endpoint opens through endpoint pool
+OpenLink handshake over pooled connections
+CloseDirection / Close frame routing over pooled connections
+connection-loss fanout to every logical session on the connection
+connection-level and link-level protocol error separation
+connection/link metrics separation
+benchmark for pooled versus one-connection-per-link behavior
+```
+
+Acceptance:
+
+```text
+No production path opens one TCP connection per actor pair.
+Every outbound Direct Link goes through DirectLinkEndpointPool.
+Connections are keyed by target direct_link_endpoint, not actor id.
+Default connections_per_endpoint is bounded and configurable.
+Multiple logical link_id sessions can share one TCP connection.
+Different links distribute across connection stripes using stable hash of link_id or source/target actor ids.
+Pool rejects OpenLink before transport connect when max_links_per_endpoint or max_links_per_connection would be exceeded.
+Peer connection loss closes all logical sessions on that physical connection with ConnectionLost.
+Link-level protocol errors close only the affected link unless connection state is corrupted.
+Node draining closes logical sessions before closing physical connections.
+Actor passivation closes only links for that actor, not the whole endpoint connection.
+Service startup installs a real DirectLinkRuntimeHandle, so ctx.links().connect(...) works in a normal service without test-only extension injection.
+ActorRef target resolution reads target direct_link_endpoint from placement instance metadata.
+Explicit endpoint target still uses pooling and does not bypass connection limits.
+The old raw connect/open path is removed or hidden behind tests; no compatibility shim is required.
+Metrics expose physical connection counts separately from logical link counts.
+Benchmark demonstrates reduced fd/port usage and documents throughput/latency tradeoffs.
+```
+
+Suggested tests:
+
+```text
+endpoint pool reuses one TCP connection for multiple links to the same endpoint
+endpoint pool honors connections_per_endpoint
+endpoint pool stripes links across multiple connections
+same link id maps to stable stripe
+max_links_per_connection rejects additional OpenLink
+max_links_per_endpoint rejects additional OpenLink
+connection idle timeout closes unused physical connection
+logical link close does not close pooled connection when other links remain
+connection loss closes every multiplexed link with ConnectionLost
+link-level protocol error closes only that link
+connection-level protocol error closes all links on that connection
+service build installs DirectLinkRuntimeHandle
+ctx.links().connect ActorRef resolves placement direct_link_endpoint and opens through endpoint pool
+ctx.links().connect explicit endpoint opens through endpoint pool
+node drain closes logical links before physical connections
+actor passivation closes only matching actor links
+pooled benchmark smoke
+fd/connection count regression test with many actor links to one endpoint
+```
+
 ---
 
 ## 3. Minimal Runnable Example Shape
@@ -1043,6 +1161,8 @@ Pre-implementation checks:
 [x] Direct Actor Link supports TCP unidirectional and bidirectional streams with typed `Linked<T>` actor handlers.
 [x] Direct Actor Link stream binding uses real Rust message types and compile-time handler checks.
 [x] Direct Actor Link lifecycle, close semantics, backpressure, validation, security, and observability match architecture/02-rpc.md.
+[ ] Direct Actor Link production transport multiplexes many logical actor links over bounded instance-to-instance TCP connection pools.
+[ ] `ctx.links().connect(...)` works through a production `DirectLinkRuntimeHandle` installed by `LatticeService`, not only through test/runtime injection.
 ```
 
 ---
@@ -1146,13 +1266,13 @@ Each phase can exit only when all items are true:
 The whole goal can be marked complete only when:
 
 ```text
-[x] Phase 1 through Phase 8 are complete.
-[x] This file's global acceptance checklist is fully satisfied.
+[ ] Phase 1 through Phase 9 are complete.
+[ ] This file's global acceptance checklist is fully satisfied.
 [x] architecture/00-overview.md system boundaries and module responsibilities are implemented.
 [x] architecture/01-actor-runtime.md actor runtime capabilities are implemented and tested.
 [x] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, KeyedWorkerPool, and DedicatedThreadPool.
 [x] UnsupportedExecutionPolicy is used only for invalid configuration, not for planned policies in the completed framework.
-[x] architecture/02-rpc.md typed RPC, metadata, codegen, gateway decode/forward, and Direct Actor Link are implemented and tested.
+[ ] architecture/02-rpc.md typed RPC, metadata, codegen, gateway decode/forward, Direct Actor Link, and Direct Link endpoint pooling are implemented and tested.
 [x] architecture/03-placement.md placement, scale, drain, shutdown, crash, and watch are implemented and tested.
 [x] architecture/04-eventbus-scheduler-config.md event bus, scheduler, and config are implemented and tested.
 [x] architecture/05-gateway-ops.md gateway, rate limit, admin, telemetry, and inspection are implemented and tested.
@@ -1206,6 +1326,7 @@ v0.4: Phase 5, etcd PlacementStore and Coordinator
 v0.5: Phase 6, Cluster Singleton
 v0.6: Phase 7, production ops features
 v0.7: Phase 8, Direct Actor Link
+v0.8: Phase 9, Direct Link multiplexed transport runtime
 ```
 
 Before every version release, update:

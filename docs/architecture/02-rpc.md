@@ -1002,26 +1002,66 @@ The transport may support batching later, but the first complete design should k
 
 The Direct Link protocol must be transport-agnostic above the frame layer. Actor APIs, stream binding, message ids, lifecycle events, and backpressure semantics must not depend on TCP.
 
-Required transport abstraction:
+Direct Link must not open one TCP connection per actor pair. Physical connections are instance-to-instance and are pooled by target direct-link endpoint. Logical actor links are multiplexed over those pooled connections by `link_id`.
+
+Required endpoint pool abstraction:
+
+```rust
+pub struct DirectLinkEndpointPoolConfig {
+    pub connections_per_endpoint: NonZeroUsize,
+    pub max_links_per_connection: usize,
+    pub max_links_per_endpoint: usize,
+    pub connect_timeout: Duration,
+    pub idle_timeout: Duration,
+}
+
+pub trait DirectLinkEndpointPool: Clone + Send + Sync + 'static {
+    async fn open_link(
+        &self,
+        endpoint: DirectLinkEndpoint,
+        request: OpenLinkRequest,
+    ) -> Result<PooledDirectLinkSession, LinkError>;
+
+    async fn write_frame(
+        &self,
+        connection_id: DirectLinkConnectionId,
+        frame: DirectLinkFrame,
+    ) -> Result<(), LinkError>;
+}
+```
+
+The low-level transport remains responsible for binding/listening and creating physical connections, but normal runtime code should go through the endpoint pool rather than directly opening raw connections:
 
 ```rust
 pub trait DirectLinkTransport: Clone + Send + Sync + 'static {
     type Listener;
-    type Connection;
+    type Connection: DirectLinkConnection;
 
     async fn bind(&self, config: DirectLinkListenConfig) -> Result<Self::Listener, LinkError>;
-    async fn connect(&self, endpoint: DirectLinkEndpoint) -> Result<Self::Connection, LinkError>;
+    async fn connect_physical(
+        &self,
+        endpoint: DirectLinkEndpoint,
+    ) -> Result<Self::Connection, LinkError>;
 }
-```
 
-The connection abstraction must provide ordered frame read/write for reliable transports:
-
-```rust
 pub trait DirectLinkConnection: Send + Sync + 'static {
     async fn read_frame(&mut self) -> Result<DirectLinkFrame, LinkError>;
     async fn write_frame(&mut self, frame: DirectLinkFrame) -> Result<(), LinkError>;
     async fn close(&mut self) -> Result<(), LinkError>;
 }
+```
+
+Connection pool behavior:
+
+```text
+pool key: target direct_link_endpoint
+physical connection count: bounded by connections_per_endpoint
+stripe selection: stable hash of link_id or source_actor_id + target_actor_id
+logical session key: link_id
+one physical connection may carry many link_id sessions
+OpenLink creates a logical session on a pooled connection
+CloseDirection / Close release logical sessions, not necessarily the physical connection
+peer disconnect closes every logical session multiplexed on that physical connection
 ```
 
 TCP transport:
@@ -1031,6 +1071,7 @@ default implementation
 ordered reliable byte stream
 length-delimited frames
 one read task and one write task per connection
+many logical links per connection
 suitable for all Direct Link modes
 ```
 
@@ -1607,6 +1648,11 @@ service integration:
   build-time validation of actor/message bindings
 
 transport:
+  DirectLinkEndpointPool trait
+  DirectLinkEndpointPoolConfig
+  instance-to-instance connection pooling
+  per-endpoint connection striping
+  link_id multiplexing over pooled TCP connections
   DirectLinkTransport trait
   DirectLinkConnection trait
   TCP transport implementation
@@ -1624,8 +1670,10 @@ wire protocol:
   protocol error
 
 runtime:
-  one read task per connection
-  one write task per connection or connection stripe
+  one read task per physical pooled connection
+  one write task per physical pooled connection
+  many logical link sessions per physical connection
+  no actor-pair dedicated TCP connections
   bounded outbound queues
   bounded inbound delivery queues
   mailbox delivery only through actor runtime
