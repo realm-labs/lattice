@@ -58,7 +58,7 @@ impl DirectLinkInboundRouter {
         if frame.kind != DirectLinkFrameKind::Message {
             return Err(InboundDeliveryError::NotMessageFrame);
         }
-        let direction = frame_direction(&frame);
+        let direction = frame.direction();
         let message_id = frame
             .message_id
             .ok_or(InboundDeliveryError::MissingMessageId)?;
@@ -165,14 +165,6 @@ where
     }
 }
 
-fn frame_direction(frame: &DirectLinkFrame) -> LinkDirection {
-    if frame.flags.bits() & 0b1 == 0 {
-        LinkDirection::SourceToTarget
-    } else {
-        LinkDirection::TargetToSource
-    }
-}
-
 fn actor_for_direction(snapshot: &ManagedLinkSnapshot, direction: LinkDirection) -> &ActorRef {
     match direction {
         LinkDirection::SourceToTarget => &snapshot.target,
@@ -189,7 +181,8 @@ mod tests {
     use lattice_actor::{ActorContext, ActorRuntime, Handler};
     use lattice_core::{
         ActorId, ActorKind, ActorRef, DirectLinkMessage, DirectLinkMode, DirectLinkOptions,
-        InstanceId, LinkId, LinkSequence, Linked, ServiceKind, actor_kind, service_kind,
+        InstanceId, LinkDirection, LinkId, LinkSequence, Linked, ServiceKind, actor_kind,
+        service_kind,
     };
     use prost::Message as _;
     use tokio::time::{Duration, timeout};
@@ -209,6 +202,16 @@ mod tests {
         const PROTO_FULL_NAME: &'static str = "game.PositionUpdate";
     }
 
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct InputCommand {
+        #[prost(uint64, tag = "1")]
+        command_id: u64,
+    }
+
+    impl DirectLinkMessage for InputCommand {
+        const PROTO_FULL_NAME: &'static str = "game.InputCommand";
+    }
+
     struct BattleActor {
         received: Arc<Mutex<Vec<u64>>>,
     }
@@ -220,6 +223,45 @@ mod tests {
 
     #[async_trait]
     impl Handler<Linked<PositionUpdate>> for BattleActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            msg: Linked<PositionUpdate>,
+        ) -> Result<(), Self::Error> {
+            self.received
+                .lock()
+                .expect("received mutex poisoned")
+                .push(msg.payload.tick);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<Linked<InputCommand>> for BattleActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            msg: Linked<InputCommand>,
+        ) -> Result<(), Self::Error> {
+            self.received
+                .lock()
+                .expect("received mutex poisoned")
+                .push(msg.payload.command_id);
+            Ok(())
+        }
+    }
+
+    struct GatewayActor {
+        received: Arc<Mutex<Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl lattice_actor::Actor for GatewayActor {
+        type Error = Infallible;
+    }
+
+    #[async_trait]
+    impl Handler<Linked<PositionUpdate>> for GatewayActor {
         async fn handle(
             &mut self,
             _ctx: &mut ActorContext<Self>,
@@ -289,6 +331,124 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(*received.lock().expect("received mutex poisoned"), vec![99]);
+    }
+
+    #[tokio::test]
+    async fn inbound_router_delivers_bidirectional_frames_to_each_direction_actor() {
+        let battle_received = Arc::new(Mutex::new(Vec::new()));
+        let gateway_received = Arc::new(Mutex::new(Vec::new()));
+        let runtime = ActorRuntime::default();
+        let battle_handle = runtime
+            .spawn_actor(
+                BattleActor {
+                    received: battle_received.clone(),
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let gateway_handle = runtime
+            .spawn_actor(
+                GatewayActor {
+                    received: gateway_received.clone(),
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let manager = Arc::new(DirectLinkSessionManager::new());
+        let input_stream = DirectLinkStream::new("gateway-input").message::<InputCommand>();
+        let update_stream = DirectLinkStream::new("battle-update").message::<PositionUpdate>();
+        let input_descriptor = input_stream.descriptor();
+        let update_descriptor = update_stream.descriptor();
+        manager
+            .register_binding(actor_kind!("Battle"), input_descriptor.clone())
+            .unwrap();
+        manager
+            .register_binding(actor_kind!("GatewaySession"), update_descriptor.clone())
+            .unwrap();
+        let link_id = LinkId::new("link-bidirectional");
+        manager
+            .open_link(OpenLinkRequest {
+                protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                link_id: link_id.clone(),
+                source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+                target: actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9),
+                mode: DirectLinkMode::Bidirectional,
+                source_to_target: OpenLinkDirection::from_stream(
+                    link_id.clone(),
+                    &input_descriptor,
+                ),
+                target_to_source: Some(OpenLinkDirection::from_stream(
+                    link_id.clone(),
+                    &update_descriptor,
+                )),
+                options: DirectLinkOptions::bidirectional(),
+            })
+            .unwrap();
+        let router = DirectLinkInboundRouter::builder(manager.clone())
+            .bind_actor(
+                input_stream.for_actor::<BattleActor>(actor_kind!("Battle")),
+                move |_| Some(battle_handle.clone()),
+            )
+            .bind_actor(
+                update_stream.for_actor::<GatewayActor>(actor_kind!("GatewaySession")),
+                move |_| Some(gateway_handle.clone()),
+            )
+            .build();
+
+        router
+            .deliver_frame(DirectLinkFrame::message(
+                link_id.clone(),
+                LinkSequence(1),
+                input_descriptor.message_id_for::<InputCommand>().unwrap(),
+                InputCommand { command_id: 11 }.encode_to_vec(),
+            ))
+            .unwrap();
+        router
+            .deliver_frame(DirectLinkFrame::directed_message(
+                link_id.clone(),
+                LinkDirection::TargetToSource,
+                LinkSequence(1),
+                update_descriptor
+                    .message_id_for::<PositionUpdate>()
+                    .unwrap(),
+                PositionUpdate { tick: 22 }.encode_to_vec(),
+            ))
+            .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let battle_done = !battle_received
+                    .lock()
+                    .expect("received mutex poisoned")
+                    .is_empty();
+                let gateway_done = !gateway_received
+                    .lock()
+                    .expect("received mutex poisoned")
+                    .is_empty();
+                if battle_done && gateway_done {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *battle_received.lock().expect("received mutex poisoned"),
+            vec![11]
+        );
+        assert_eq!(
+            *gateway_received.lock().expect("received mutex poisoned"),
+            vec![22]
+        );
+        assert_eq!(
+            manager.link_snapshot(&link_id).unwrap().directions,
+            [LinkDirection::SourceToTarget, LinkDirection::TargetToSource]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]

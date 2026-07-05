@@ -1,4 +1,4 @@
-use lattice_core::{DirectLinkMessageId, LinkId, LinkMessageFlags, LinkSequence};
+use lattice_core::{DirectLinkMessageId, LinkDirection, LinkId, LinkMessageFlags, LinkSequence};
 use thiserror::Error;
 
 const MAGIC: u32 = 0x4c44_4c4b;
@@ -56,15 +56,50 @@ impl DirectLinkFrame {
         message_id: DirectLinkMessageId,
         payload: Vec<u8>,
     ) -> Self {
+        Self::directed_message(
+            link_id,
+            LinkDirection::SourceToTarget,
+            sequence,
+            message_id,
+            payload,
+        )
+    }
+
+    pub fn directed_message(
+        link_id: LinkId,
+        direction: LinkDirection,
+        sequence: LinkSequence,
+        message_id: DirectLinkMessageId,
+        payload: Vec<u8>,
+    ) -> Self {
         Self {
             kind: DirectLinkFrameKind::Message,
             link_id,
             sequence,
             message_id: Some(message_id),
-            flags: LinkMessageFlags::EMPTY,
+            flags: flags_for_direction(direction),
             header: Vec::new(),
             payload,
         }
+    }
+
+    pub fn direction(&self) -> LinkDirection {
+        direction_from_flags(&self.flags)
+    }
+}
+
+fn flags_for_direction(direction: LinkDirection) -> LinkMessageFlags {
+    match direction {
+        LinkDirection::SourceToTarget => LinkMessageFlags::EMPTY,
+        LinkDirection::TargetToSource => LinkMessageFlags::from_bits(0b1),
+    }
+}
+
+fn direction_from_flags(flags: &LinkMessageFlags) -> LinkDirection {
+    if flags.bits() & 0b1 == 0 {
+        LinkDirection::SourceToTarget
+    } else {
+        LinkDirection::TargetToSource
     }
 }
 
@@ -256,6 +291,24 @@ mod tests {
         let decoded = codec.decode(&encoded).unwrap();
 
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn frame_codec_round_trips_target_to_source_message_frame() {
+        let codec = DirectLinkFrameCodec::new(1024);
+        let frame = DirectLinkFrame::directed_message(
+            LinkId::new("link-1"),
+            LinkDirection::TargetToSource,
+            LinkSequence(7),
+            DirectLinkMessageId(42),
+            b"payload".to_vec(),
+        );
+
+        let encoded = codec.encode(&frame).unwrap();
+        let decoded = codec.decode(&encoded).unwrap();
+
+        assert_eq!(decoded, frame);
+        assert_eq!(decoded.direction(), LinkDirection::TargetToSource);
     }
 
     #[test]
