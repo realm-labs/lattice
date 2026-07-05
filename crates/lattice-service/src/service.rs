@@ -1,3 +1,4 @@
+use std::future::{Future, pending};
 use std::net::SocketAddr;
 use std::str::FromStr;
 
@@ -59,42 +60,116 @@ impl LatticeService {
     }
 
     pub async fn run_until_shutdown(self) -> Result<(), LatticeServiceError> {
-        let local_addr = self.listener.local_addr()?;
-        let lease_id = self.placement_store.grant_instance_lease().await?;
-        self.placement_store
-            .keepalive_instance_lease(lease_id)
-            .await?;
-        self.publish_instance(local_addr, InstanceState::Ready, lease_id)
-            .await?;
-        if let Some(ready) = self.ready {
+        self.run_until_shutdown_signal(pending::<()>()).await
+    }
+
+    pub async fn run_until_shutdown_signal<F>(self, shutdown: F) -> Result<(), LatticeServiceError>
+    where
+        F: Future<Output = ()>,
+    {
+        let LatticeService {
+            service_kind,
+            instance,
+            listener,
+            router,
+            service_context: _service_context,
+            placement_store,
+            placement_watch_tasks,
+            ready,
+        } = self;
+        let local_addr = listener.local_addr()?;
+        let lease_id = placement_store.grant_instance_lease().await?;
+        placement_store.keepalive_instance_lease(lease_id).await?;
+        publish_instance_record(
+            placement_store.as_ref(),
+            &service_kind,
+            &instance,
+            local_addr,
+            InstanceState::Starting,
+            lease_id,
+        )
+        .await?;
+        publish_instance_record(
+            placement_store.as_ref(),
+            &service_kind,
+            &instance,
+            local_addr,
+            InstanceState::Ready,
+            lease_id,
+        )
+        .await?;
+        if let Some(ready) = ready {
             let _ = ready.send(local_addr);
         }
 
         info!(
-            service.kind = self.service_kind.as_str(),
-            instance.id = self.instance.instance_id.as_str(),
-            placement.watches = self.placement_watch_tasks.len(),
+            service.kind = service_kind.as_str(),
+            instance.id = instance.instance_id.as_str(),
+            placement.watches = placement_watch_tasks.len(),
             %local_addr,
             "lattice service listening"
         );
 
-        match self
-            .router
-            .serve_with_incoming(TcpListenerStream::new(self.listener))
-            .await
-        {
+        let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel::<()>();
+        let lifecycle_shutdown = async {
+            shutdown.await;
+            let result = publish_instance_record(
+                placement_store.as_ref(),
+                &service_kind,
+                &instance,
+                local_addr,
+                InstanceState::Draining,
+                lease_id,
+            )
+            .await;
+            let _ = server_shutdown_tx.send(());
+            result
+        };
+        tokio::pin!(lifecycle_shutdown);
+        let serve =
+            router.serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _ = server_shutdown_rx.await;
+            });
+        tokio::pin!(serve);
+        let mut lifecycle_done = false;
+        let mut lifecycle_error = None;
+        let serve_result = loop {
+            tokio::select! {
+                result = &mut lifecycle_shutdown, if !lifecycle_done => {
+                    lifecycle_done = true;
+                    if let Err(error) = result {
+                        lifecycle_error = Some(error);
+                    }
+                }
+                result = &mut serve => break result,
+            }
+        };
+        if let Some(error) = lifecycle_error {
+            return Err(error);
+        }
+
+        match serve_result {
             Ok(()) => {
+                publish_instance_record(
+                    placement_store.as_ref(),
+                    &service_kind,
+                    &instance,
+                    local_addr,
+                    InstanceState::Stopping,
+                    lease_id,
+                )
+                .await?;
                 info!(
-                    service.kind = self.service_kind.as_str(),
-                    instance.id = self.instance.instance_id.as_str(),
+                    service.kind = service_kind.as_str(),
+                    instance.id = instance.instance_id.as_str(),
                     "lattice service stopped"
                 );
                 Ok(())
             }
             Err(error) => {
                 error!(
-                    service.kind = self.service_kind.as_str(),
-                    instance.id = self.instance.instance_id.as_str(),
+                    service.kind = service_kind.as_str(),
+                    instance.id = instance.instance_id.as_str(),
                     %error,
                     "lattice service failed"
                 );
@@ -102,32 +177,33 @@ impl LatticeService {
             }
         }
     }
+}
 
-    pub(crate) async fn publish_instance(
-        &self,
-        local_addr: SocketAddr,
-        state: InstanceState,
-        lease_id: LeaseId,
-    ) -> Result<(), LatticeServiceError> {
-        let endpoint = self
-            .instance
-            .advertised_endpoint
-            .clone()
-            .unwrap_or_else(|| socket_addr_to_uri(local_addr));
-        let record = InstanceRecord {
-            service_kind: self.service_kind.clone(),
-            instance_id: self.instance.instance_id.clone(),
-            lease_id,
-            advertised_endpoint: endpoint.clone(),
-            control_endpoint: endpoint,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            state,
-            capacity: InstanceCapacity::default(),
-            labels: Default::default(),
-        };
-        self.placement_store.upsert_instance(record).await?;
-        Ok(())
-    }
+async fn publish_instance_record(
+    placement_store: &dyn ErasedPlacementStore,
+    service_kind: &ServiceKind,
+    instance: &InstanceConfig,
+    local_addr: SocketAddr,
+    state: InstanceState,
+    lease_id: LeaseId,
+) -> Result<(), LatticeServiceError> {
+    let endpoint = instance
+        .advertised_endpoint
+        .clone()
+        .unwrap_or_else(|| socket_addr_to_uri(local_addr));
+    let record = InstanceRecord {
+        service_kind: service_kind.clone(),
+        instance_id: instance.instance_id.clone(),
+        lease_id,
+        advertised_endpoint: endpoint.clone(),
+        control_endpoint: endpoint,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        state,
+        capacity: InstanceCapacity::default(),
+        labels: Default::default(),
+    };
+    placement_store.upsert_instance(record).await?;
+    Ok(())
 }
 
 pub(crate) struct LatticeServiceParts {

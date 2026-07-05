@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use http::{Request, Response};
@@ -25,6 +26,7 @@ use lattice_placement::store::{
 use lattice_placement::{ResolveRequest, RouteResolver};
 use lattice_rpc::{RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 use tokio::net::TcpListener;
+use tokio::time::timeout;
 use tonic::body::Body;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
@@ -422,6 +424,60 @@ async fn build_loads_config_and_stores_components_in_service_context() {
     let _local_events = service.context().local_events();
     let _config_store = service.context().config_store();
     assert!(service.context().extension::<LocalEventBus>().is_none());
+}
+
+#[tokio::test]
+async fn service_lifecycle_writes_starting_ready_draining_stopping() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let mut watch = store.watch(store.prefix().clone()).await.unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+    shutdown_tx.send(()).unwrap();
+
+    let mut states = Vec::new();
+    while states.len() < 4 {
+        let event = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .unwrap()
+            .unwrap();
+        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event {
+            states.push(record.state);
+        }
+    }
+    task.await.unwrap().unwrap();
+
+    assert_eq!(
+        states,
+        vec![
+            InstanceState::Starting,
+            InstanceState::Ready,
+            InstanceState::Draining,
+            InstanceState::Stopping,
+        ]
+    );
 }
 
 #[tokio::test]
