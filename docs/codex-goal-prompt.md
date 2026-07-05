@@ -18,15 +18,21 @@ Architecture acceptance sources:
 - docs/architecture/07-api-examples.md
 
 First, read docs/implementation-plan.md completely, including the "Codex Goal Execution Protocol" section.
-Then execute the plan in order from Phase 1 through Phase 7.
+Then execute the plan through the "Current Progress Tracker" in docs/implementation-plan.md.
 
 Do not skip phases. Do not stop at documentation. Do not stop at API sketches.
 The implementation must use the Cargo workspace crate split defined in docs/architecture/00-overview.md and docs/implementation-plan.md. Do not implement lattice as one root crate with many internal modules.
 For each phase, complete the code implementation, examples, tests, and acceptance checklist before moving to the next phase.
+Always choose the earliest unchecked item in the Current Progress Tracker unless it is explicitly blocked by an earlier missing dependency.
 Within a phase, work in small slices: choose one or a few checklist items, implement them end to end, verify them, then commit that slice before continuing.
+After each completed slice, update docs/implementation-plan.md:
+- mark completed tracker items with `[x]`;
+- add newly discovered missing work as `[ ]` items;
+- mark a phase status `[x]` only after every required checklist item in that phase is checked and phase acceptance tests pass.
 After each completed slice, create an English conventional commit message, such as "feat(actor): add bounded mailbox" or "test(rpc): cover metadata extraction".
 
 Final exit criteria:
+- Every phase status in the Current Progress Tracker is `[x]`.
 - Every deliverable, acceptance item, and suggested test in docs/implementation-plan.md is complete or covered by an explicit equivalent test.
 - Every item in the global acceptance checklist in docs/implementation-plan.md is satisfied.
 - Every architecture design under docs/architecture/ has a corresponding code implementation, example API, or executable test coverage.

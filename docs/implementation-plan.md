@@ -90,6 +90,135 @@ Phase 1 Actor Runtime
   -> Phase 7 Ops Production Features
 ```
 
+### 2.1 Current Progress Tracker
+
+This tracker is the source of truth for goal progress. When a slice is implemented, tested, and committed, update the matching item from `[ ]` to `[x]`. Mark a phase `[x]` only after every required item in that phase is checked and the phase acceptance tests pass.
+
+#### Phase 1: Single-Node Actor Runtime
+
+Status: `[x]` complete.
+
+- [x] Workspace crate split exists and framework code is not concentrated in one root crate.
+- [x] Core ids, `ActorKind`, `ServiceKind`, `ActorId`, `RouteKey`, `Epoch`, `RequestId`, and const helper macros exist.
+- [x] `ConfigSource`, `ConfigFormat`, and `BootstrapConfig` support TOML/YAML/JSON/env/inline/composite configuration.
+- [x] `Actor`, `Message`, `Handler<M>`, `ActorContext`, `ActorRuntime`, `ActorHandle.call/tell`, and typed replies exist.
+- [x] Mailbox has normal/system lanes, bounded capacity behavior, and system priority tests.
+- [x] Actor timers, scoped tasks, stop/passivation requests, and lifecycle cleanup exist.
+- [x] Actor registry prevents duplicate local activation and handles activation waiters, timeout, failure, and retry.
+- [x] Local actor watch/unwatch and local child actor lifecycle exist.
+- [x] `ActorExecutionPolicy::TaskPerActor`, `KeyedWorkerPool`, and `DedicatedThreadPool` have real implementations and tests.
+- [x] Business error propagation and actor error hook exist.
+
+#### Phase 2: Typed RPC + Codegen MVP
+
+Status: `[ ]` incomplete.
+
+- [x] `lattice_codegen::configure()` build script API exists.
+- [x] `proto/lattice/options.proto` exists with service and method options.
+- [x] Descriptor-backed proto option parsing and validation exist.
+- [x] Generated `RoutedRequest` and `RpcRequest` implementations exist.
+- [x] Generated typed client wrapper exists.
+- [x] Generated actor server adapter and registry-backed server adapter exist.
+- [x] Generated gateway route bindings and dispatcher exist.
+- [x] gRPC metadata carries framework RPC context instead of business request fields.
+- [x] Codegen rejects missing service/actor/route metadata, unsupported route key types, optional/repeated route keys, and duplicate gateway ids.
+- [x] Multiple generated gRPC services can be registered on one endpoint.
+- [ ] `LatticeService::register_client::<Binding>()` must construct and expose generated typed clients through service/actor context instead of only recording the service kind.
+- [ ] `examples/minimal-world` should use the final generated client access path, not ad hoc client/core construction.
+- [ ] Generated transport should avoid unnecessary encode/decode when the concrete request type is already known, or document why that cost is acceptable.
+
+#### Phase 3: Route Cache + Static Placement
+
+Status: `[x]` complete for static placement.
+
+- [x] `RouteResolver` abstraction exists.
+- [x] `EndpointPool` and tonic endpoint channel reuse exist.
+- [x] Local route cache exists with stale/hard-expiry behavior.
+- [x] Static route resolver exists.
+- [x] `ResolvingRpcCore` performs owner resolution and direct owner calls.
+- [x] NOT_OWNER/FENCED invalidation and retry exist.
+- [x] Retry preserves the request id.
+- [x] Static multi-instance routing is covered by tests/example code.
+
+#### Phase 4: Virtual Shard + Lazy Activation
+
+Status: `[ ]` incomplete.
+
+- [x] Virtual shard id mapping exists.
+- [x] Virtual shard assignment model exists.
+- [x] `VirtualShardAssigner` trait and default assignment strategies exist.
+- [x] `VirtualShardAssignerRegistry` exists.
+- [x] Gradual rebalance logic exists and increments epochs in tests.
+- [x] Registry-backed lazy actor activation exists.
+- [x] Concurrent local lazy activation starts one actor and shares waiters.
+- [x] Loader/factory failure wakes waiters and remains retryable.
+- [ ] Virtual shard ownership is not yet persisted through a production `PlacementStore` keyspace.
+- [ ] `LatticeService` does not yet start a placement watch to refresh local shard/owner caches.
+- [ ] Scale-out does not yet make new service instances automatically participate in shard assignment.
+- [ ] Scale-in does not yet drain/rebalance shard ownership before termination.
+- [ ] Running actor migration/passivation policy is not yet connected to shard rebalance decisions.
+
+#### Phase 5: Explicit Placement + Coordinator
+
+Status: `[ ]` incomplete and currently the highest-priority gap.
+
+- [x] `PlacementStore` trait exists.
+- [x] In-memory placement store exists.
+- [x] etcd placement store adapter exists and uses a cluster key prefix.
+- [x] Actor activation lock exists.
+- [x] Actor placement records include owner, epoch, lease id, and state.
+- [x] `PlacementCoordinator` library type can activate/move/drain/fail over actors in tests.
+- [x] `LatticeService` writes an `InstanceRecord` at startup.
+- [ ] `InstanceRecord` does not yet include a real liveness lease/keepalive contract.
+- [ ] `LatticeService` does not write `Starting -> Ready -> Draining -> Stopping` state transitions as a lifecycle.
+- [ ] `LatticeService` does not keep an instance lease alive or remove/expire records on crash.
+- [ ] etcd instance registration is ordinary KV, not lease-backed liveness.
+- [ ] `LogicControl` is only a Rust trait; no tonic control-plane RPC service is exposed by logic services.
+- [ ] Coordinator is only an in-process library type; there is no runnable coordinator service/binary.
+- [ ] Coordinator leader election is not implemented.
+- [ ] Store-backed `PlacementRouteResolver` is missing: cache miss should read placement, call Coordinator activation if absent, and cache the target.
+- [ ] Explicit actor activation is not wired into generated clients or `LatticeService`.
+- [ ] `register_client` does not build a resolver/core from the configured placement store.
+- [ ] Placement watch is not wired into route cache invalidation in running services.
+- [ ] Deployment still requires examples to hand-build static resolvers for real RPC calls.
+
+#### Phase 6: Cluster Singleton
+
+Status: `[ ]` incomplete.
+
+- [x] In-memory singleton placement model and activation race tests exist.
+- [x] Singleton owner record has owner, epoch, lease id, and state in the current model.
+- [ ] Singleton ownership is not stored through the production `PlacementStore`/etcd keyspace.
+- [ ] `ActivateSingleton` control-plane API is not implemented as a service endpoint.
+- [ ] Generated singleton client/adapter is missing.
+- [ ] Singleton owner lease/keepalive/failover is not connected to service lifecycle.
+- [ ] Old singleton owner fencing is not enforced in the runtime path.
+
+#### Phase 7: Ops Production Features
+
+Status: `[ ]` incomplete.
+
+- [x] Local passivation, supervision, scoped task cleanup, and stop-failed behavior exist.
+- [x] Admin/ops helper modules and inspector models exist.
+- [x] Config source and config store abstractions exist, including local and etcd config adapters.
+- [x] LocalEventBus and NATS event bus adapters exist.
+- [x] Typed event publisher and current `ServiceEvents::subscribe_actor` bridge exist.
+- [x] Gateway binary frame codec, generated gateway binding, push validation, keyed Governor rate limiter, and tower-style pipeline tests exist.
+- [x] OpenTelemetry/fmt telemetry setup exists.
+- [x] Actor scheduler and service scheduler exist as non-durable lifecycle-bound schedulers.
+- [x] Direct/routed `ActorRef` messaging exists.
+- [x] Cross-node remote watch model exists in framework code/tests.
+- [ ] `subscribe_actor` is not yet the final typed API from `ctx.service().cluster_events()/local_events()` to actor handlers; it still requires manual event-to-RPC mapping.
+- [ ] Event subscriptions are not yet owned and cancelled by `LatticeService` shutdown/drain.
+- [ ] Service scheduler is not yet exposed through `ServiceContext`.
+- [ ] Admin HTTP is not wired into `LatticeService` startup as a managed listener.
+- [ ] Node graceful shutdown is not wired into `LatticeService::run_until_shutdown`.
+- [ ] Drain/migration are not connected to runtime actor registries, placement leases, or RPC readiness.
+- [ ] Gateway startup is still mostly example-specific and not represented as a framework service API.
+- [ ] Cluster/node inspection does not query live services through LogicControl/Admin APIs.
+- [ ] Security/mTLS integration is partial and not connected to service builders by default.
+- [ ] Full chaos test suite is not implemented.
+
 ### Phase 1: Single-Node Actor Runtime
 
 Goal: implement the local actor programming model so business code can write `Actor + Handler<M>` and verify mailbox, timers, and registry semantics.
@@ -730,19 +859,24 @@ This section defines how a Codex goal should execute this plan. The standalone p
 ### 5.1 Execution Loop
 
 ```text
-1. Read docs/implementation-plan.md and identify the earliest unfinished phase.
-2. Read the docs/architecture/* chapters relevant to that phase.
-3. Build the phase checklist from that phase's deliverables, acceptance items, and suggested tests.
-4. If the repository is still a single implementation crate, the first slice must convert it to the planned Cargo workspace crate layout before adding more framework features.
-5. Select a small slice: one checklist item, or a few tightly related checklist items that can be completed end to end.
-6. Inspect the current codebase and classify what is done, missing, or inconsistent with the architecture for that slice.
-7. Implement the missing capability, keeping public APIs aligned with docs/architecture/07-api-examples.md where applicable.
-8. Add tests for the new capability, using this file's test scope.
-9. Run the required verification commands for the slice.
-10. If implementation proves architecture or plan text stale, update both docs and this plan. Do not use doc edits as a substitute for implementation.
-11. Commit the completed slice with an English conventional commit message.
-12. Summarize completed work, remaining work, verification results, and commit id/message.
-13. If the current phase checklist is fully satisfied, move to the next phase. Otherwise choose the next small slice in the same phase.
+1. Read docs/implementation-plan.md and start from "2.1 Current Progress Tracker".
+2. Identify the earliest phase whose phase status is still [ ].
+3. Within that phase, identify the earliest unchecked checklist item that is not blocked by a later-phase dependency.
+4. Read the detailed phase deliverables, acceptance items, and suggested tests below the tracker.
+5. Read the docs/architecture/* chapters relevant to that unchecked item.
+6. Select a small slice: one checklist item, or a few tightly related checklist items that can be completed end to end.
+7. Inspect the current codebase and classify what is done, missing, or inconsistent with the architecture for that slice.
+8. Implement the missing capability, keeping public APIs aligned with docs/architecture/07-api-examples.md where applicable.
+9. Add tests for the new capability, using this file's test scope.
+10. Run the required verification commands for the slice.
+11. Update "2.1 Current Progress Tracker":
+    - mark completed checklist items [x];
+    - add newly discovered missing work as [ ] items;
+    - mark the phase status [x] only when all required items in that phase are [x].
+12. If implementation proves architecture or plan text stale, update both docs and this plan. Do not use doc edits as a substitute for implementation.
+13. Commit the completed slice with an English conventional commit message.
+14. Summarize completed work, remaining work, verification results, and commit id/message.
+15. If the current phase checklist is fully satisfied, move to the next phase. Otherwise choose the next small slice in the same phase.
 ```
 
 ### 5.2 Per-Phase Checklist Template
