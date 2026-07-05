@@ -572,6 +572,7 @@ async fn build_loads_config_and_stores_components_in_service_context() {
     let _local_event_bus = service.context().local_event_bus();
     let _cluster_events = service.context().cluster_events();
     let _local_events = service.context().local_events();
+    let _scheduler = service.context().scheduler();
     let _config_store = service.context().config_store();
     assert!(service.context().extension::<LocalEventBus>().is_none());
 }
@@ -686,6 +687,57 @@ async fn service_shutdown_cancels_context_event_subscriptions() {
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn service_context_scheduler_stops_on_shutdown() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let scheduled_ticks = ticks.clone();
+    service
+        .context()
+        .scheduler()
+        .interval(Duration::from_millis(5), move || {
+            let scheduled_ticks = scheduled_ticks.clone();
+            async move {
+                scheduled_ticks.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(ticks.load(Ordering::SeqCst) > 0);
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let ticks_after_shutdown = ticks.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    assert_eq!(ticks.load(Ordering::SeqCst), ticks_after_shutdown);
 }
 
 #[tokio::test]

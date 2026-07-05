@@ -7,6 +7,7 @@ use lattice_eventbus::{
     EventBus, EventBusError, EventEnvelope, EventHandler, EventSubscription,
     EventSubscriptionHandle, ServiceEvents,
 };
+use lattice_ops::ServiceScheduler;
 use lattice_placement::PlacementError;
 use lattice_placement::instance::InstanceRecord;
 use lattice_placement::store::{
@@ -432,12 +433,28 @@ impl std::fmt::Debug for ConfigStoreComponent {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ServiceSchedulerComponent {
+    scheduler: ServiceScheduler,
+}
+
+impl ServiceSchedulerComponent {
+    pub fn new(scheduler: ServiceScheduler) -> Self {
+        Self { scheduler }
+    }
+
+    pub fn scheduler(&self) -> ServiceScheduler {
+        self.scheduler.clone()
+    }
+}
+
 pub trait ServiceContextExt {
     fn placement_store(&self) -> Arc<dyn DynPlacementStore>;
     fn cluster_event_bus(&self) -> ServiceEventBus;
     fn local_event_bus(&self) -> ServiceEventBus;
     fn cluster_events(&self) -> ServiceEvents<ServiceEventBus>;
     fn local_events(&self) -> ServiceEvents<ServiceEventBus>;
+    fn scheduler(&self) -> ServiceScheduler;
     fn config_store(&self) -> Arc<dyn DynConfigStore>;
 }
 
@@ -470,6 +487,12 @@ impl ServiceContextExt for ServiceContext {
 
     fn local_events(&self) -> ServiceEvents<ServiceEventBus> {
         ServiceEvents::new(self.local_event_bus())
+    }
+
+    fn scheduler(&self) -> ServiceScheduler {
+        self.extension::<ServiceSchedulerComponent>()
+            .map(|component| component.scheduler())
+            .expect("service scheduler should be registered in ServiceContext")
     }
 
     fn config_store(&self) -> Arc<dyn DynConfigStore> {

@@ -9,6 +9,7 @@ use lattice_config::{BootstrapConfig, ConfigSource};
 use lattice_config::{ConfigStore, LocalConfigStore};
 use lattice_core::{ActorKind, InstanceId, ServiceContext, ServiceKind};
 use lattice_eventbus::{EventBus, LocalEventBus};
+use lattice_ops::ServiceScheduler;
 use lattice_placement::coordinator::{PlacementWatchStarter, PlacementWatchTask};
 use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix, PlacementStore};
 use lattice_rpc::RpcClientContextFactory;
@@ -26,6 +27,7 @@ use crate::component::{
 use crate::config::InstanceConfig;
 use crate::context::ServiceBuildContext;
 use crate::control::ServiceLogicControlHandler;
+use crate::framework::ServiceSchedulerComponent;
 use crate::rpc::{ErasedRpcClientBinding, RpcClientPlacement, RpcClientRegistration};
 use crate::service::LatticeServiceParts;
 use crate::{LatticeService, LatticeServiceError, RpcClientBinding, RpcServiceBinding};
@@ -348,6 +350,11 @@ impl LatticeServiceBuilder {
             self.service_kind.as_str(),
         )
         .await?;
+        service_context
+            .insert_extension(ServiceSchedulerComponent::new(ServiceScheduler::new()))
+            .map_err(|component| LatticeServiceError::DuplicateServiceComponent {
+                component: component.to_string(),
+            })?;
         for extension in self.extensions.into_values() {
             build_service_component(
                 extension,

@@ -900,6 +900,7 @@ dependencies = [
  "lattice-config",
  "lattice-core",
  "lattice-eventbus",
+ "lattice-ops",
  "lattice-placement",
  "lattice-rpc",
  "prost",

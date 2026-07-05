@@ -16,7 +16,9 @@ use tracing::{debug, error, info};
 
 use crate::component::ErasedPlacementStore;
 use crate::config::InstanceConfig;
-use crate::framework::{ClusterEventBusComponent, LocalEventBusComponent};
+use crate::framework::{
+    ClusterEventBusComponent, LocalEventBusComponent, ServiceSchedulerComponent,
+};
 use crate::{LatticeServiceBuilder, LatticeServiceError};
 
 #[derive(Debug)]
@@ -147,6 +149,7 @@ impl LatticeService {
                 event.subscriptions.cancelled = cancelled_subscriptions,
                 "cancelled runtime-owned event subscriptions"
             );
+            shutdown_service_scheduler(&service_context).await;
             let _ = server_shutdown_tx.send(());
             result
         };
@@ -227,6 +230,12 @@ async fn cancel_event_subscriptions(service_context: &ServiceContext) -> usize {
         cancelled += component.cancel_owned_subscriptions().await;
     }
     cancelled
+}
+
+async fn shutdown_service_scheduler(service_context: &ServiceContext) {
+    if let Some(component) = service_context.extension::<ServiceSchedulerComponent>() {
+        component.scheduler().shutdown().await;
+    }
 }
 
 async fn publish_instance_record(

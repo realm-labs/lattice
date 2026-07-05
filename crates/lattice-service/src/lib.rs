@@ -16,8 +16,10 @@ pub use error::LatticeServiceError;
 pub use framework::{
     ClusterEventBusComponent, ConfigStoreComponent, DynConfigStore, DynEventBus, DynPlacementStore,
     LocalEventBusComponent, PlacementStoreComponent, ServiceContextExt, ServiceEventBus,
+    ServiceSchedulerComponent,
 };
 pub use lattice_core::ServiceContext;
+pub use lattice_ops::ServiceScheduler;
 pub use rpc::{RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
 pub use service::LatticeService;
 
