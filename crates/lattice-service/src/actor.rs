@@ -5,13 +5,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lattice_actor::error::ActorActivationError;
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::registry::{
     ActorCreateContext, ActorFactory, ActorLoader, ActorRegistry, ActorRegistryConfig,
 };
 use lattice_actor::runtime::PassivationPolicy;
 use lattice_actor::traits::Actor;
-use lattice_core::ActorKind;
+use lattice_core::{ActorId, ActorKind};
 
 use crate::LatticeServiceError;
 use crate::context::ServiceBuildContext;
@@ -193,6 +194,24 @@ where
     }
 }
 
+#[async_trait]
+pub(crate) trait ErasedLogicActor: Send + Sync {
+    async fn activate(&self, actor_id: ActorId) -> Result<(), ActorActivationError>;
+}
+
+#[async_trait]
+impl<A> ErasedLogicActor for RegisteredActor<A>
+where
+    A: Actor + Sync,
+{
+    async fn activate(&self, actor_id: ActorId) -> Result<(), ActorActivationError> {
+        self.registry
+            .get_or_load(actor_id, self.loader.clone())
+            .await?;
+        Ok(())
+    }
+}
+
 pub(crate) trait ErasedActorRegistration: Send + Sync {
     fn actor_kind(&self) -> &ActorKind;
     fn register(
@@ -220,6 +239,9 @@ where
             registry,
             loader: self.loader,
         };
+        context
+            .logic_actors
+            .insert(self.actor_kind.clone(), Arc::new(registered.clone()));
         context
             .actors
             .insert(self.actor_kind.clone(), Box::new(registered));

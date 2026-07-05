@@ -36,4 +36,6 @@ pub enum PlacementError {
     Etcd { message: String },
     #[error("placement codec error: {message}")]
     PlacementCodec { message: String },
+    #[error("logic control error: {message}")]
+    LogicControl { message: String },
 }

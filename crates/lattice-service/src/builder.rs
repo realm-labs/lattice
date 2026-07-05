@@ -24,6 +24,7 @@ use crate::component::{
 };
 use crate::config::InstanceConfig;
 use crate::context::ServiceBuildContext;
+use crate::control::ServiceLogicControlHandler;
 use crate::rpc::{ErasedRpcClientBinding, RpcClientRegistration};
 use crate::service::LatticeServiceParts;
 use crate::{LatticeService, LatticeServiceError, RpcClientBinding, RpcServiceBinding};
@@ -393,6 +394,12 @@ impl LatticeServiceBuilder {
                 "registering actor"
             );
             registration.register(&mut context)?;
+        }
+        if !context.logic_actors.is_empty() {
+            let handler = ServiceLogicControlHandler::new(context.logic_actors.clone());
+            context.add_rpc_service(lattice_placement::control::LogicControlServer::new(
+                lattice_placement::control::LogicControlService::new(handler),
+            ));
         }
 
         let mut rpc_services = HashSet::<String>::new();

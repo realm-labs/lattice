@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use lattice_actor::Actor;
 use lattice_core::{ActorKind, ServiceContext};
@@ -11,13 +12,25 @@ use tonic::transport::Server;
 use tonic::transport::server::Router;
 
 use crate::LatticeServiceError;
-use crate::actor::RegisteredActor;
+use crate::actor::{ErasedLogicActor, RegisteredActor};
 
-#[derive(Debug)]
 pub struct ServiceBuildContext {
     service: ServiceContext,
     pub(crate) actors: HashMap<ActorKind, Box<dyn Any + Send>>,
+    pub(crate) logic_actors: HashMap<ActorKind, Arc<dyn ErasedLogicActor>>,
     pub(crate) router: Option<Router>,
+}
+
+impl std::fmt::Debug for ServiceBuildContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceBuildContext")
+            .field("service", &self.service)
+            .field("actor_count", &self.actors.len())
+            .field("logic_actor_count", &self.logic_actors.len())
+            .field("has_router", &self.router.is_some())
+            .finish()
+    }
 }
 
 impl ServiceBuildContext {
@@ -25,6 +38,7 @@ impl ServiceBuildContext {
         Self {
             service,
             actors: HashMap::new(),
+            logic_actors: HashMap::new(),
             router: None,
         }
     }

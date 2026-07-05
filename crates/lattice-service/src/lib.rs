@@ -3,6 +3,7 @@ pub mod builder;
 pub mod component;
 pub mod config;
 pub mod context;
+mod control;
 pub mod error;
 pub mod framework;
 pub mod rpc;

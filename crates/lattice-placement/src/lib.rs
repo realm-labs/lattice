@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod control;
 pub mod coordinator;
 pub mod endpoint;
 pub mod error;

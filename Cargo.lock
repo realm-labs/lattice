@@ -866,6 +866,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
  "tracing",
 ]
 

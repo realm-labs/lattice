@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package lattice.placement.control;
+
+service LogicControl {
+  rpc ActivateActor(ActivateActorRequest) returns (ActivateActorReply);
+}
+
+message ActivateActorRequest {
+  string service_kind = 1;
+  string actor_kind = 2;
+  ActorId actor_id = 3;
+  uint64 epoch = 4;
+}
+
+message ActorId {
+  oneof value {
+    string str_value = 1;
+    uint64 u64_value = 2;
+    int64 i64_value = 3;
+    bytes bytes_value = 4;
+  }
+}
+
+message ActivateActorReply {}

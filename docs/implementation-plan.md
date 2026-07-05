@@ -174,7 +174,7 @@ Status: `[ ]` incomplete and currently the highest-priority gap.
 - [x] `LatticeService` does not write `Starting -> Ready -> Draining -> Stopping` state transitions as a lifecycle.
 - [x] `LatticeService` does not keep an instance lease alive or remove/expire records on crash.
 - [x] etcd instance registration is ordinary KV, not lease-backed liveness.
-- [ ] `LogicControl` is only a Rust trait; no tonic control-plane RPC service is exposed by logic services.
+- [x] `LogicControl` is only a Rust trait; no tonic control-plane RPC service is exposed by logic services.
 - [ ] Coordinator is only an in-process library type; there is no runnable coordinator service/binary.
 - [ ] Coordinator leader election is not implemented.
 - [ ] Store-backed `PlacementRouteResolver` is missing: cache miss should read placement, call Coordinator activation if absent, and cache the target.
