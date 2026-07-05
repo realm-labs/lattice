@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -13,7 +14,10 @@ use crate::instance::{InstanceRecord, InstanceState};
 use crate::route::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
 use crate::store::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementState, PlacementStore,
-    PlacementWatchEvent,
+    PlacementWatchEvent, VirtualShardPlacementKey, VirtualShardPlacementRecord,
+};
+use crate::vshard::{
+    VirtualShardAssignInput, VirtualShardAssigner, VirtualShardAssignment, VirtualShardId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +68,22 @@ pub struct DrainReport {
 pub struct FailoverReport {
     pub failed_instance: InstanceId,
     pub reassigned_actors: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebalanceVirtualShardsRequest {
+    pub service_kind: ServiceKind,
+    pub actor_kind: ActorKind,
+    pub shard_count: u32,
+    pub eligible_shards: BTreeSet<VirtualShardId>,
+    pub max_migrations: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebalanceVirtualShardsReport {
+    pub ready_instances: usize,
+    pub assignments_written: usize,
+    pub moved_shards: usize,
 }
 
 impl<S, L> PlacementCoordinator<S, L> {
@@ -282,6 +302,113 @@ where
             Ok(FailoverReport {
                 failed_instance: instance_id,
                 reassigned_actors,
+            })
+        }
+        .instrument(span)
+        .await
+    }
+
+    pub async fn rebalance_virtual_shards<A>(
+        &self,
+        request: RebalanceVirtualShardsRequest,
+        assigner: &A,
+    ) -> Result<RebalanceVirtualShardsReport, PlacementError>
+    where
+        A: VirtualShardAssigner,
+    {
+        let span = tracing::info_span!(
+            "placement.vshards.rebalance",
+            otel.kind = "internal",
+            service.kind = request.service_kind.as_str(),
+            actor.kind = request.actor_kind.as_str(),
+            shard.count = request.shard_count
+        );
+        async {
+            let mut instances = self
+                .store
+                .list_instances(&request.service_kind)
+                .await?
+                .into_iter()
+                .filter(|instance| instance.state == InstanceState::Ready)
+                .map(|instance| instance.instance_id)
+                .collect::<Vec<_>>();
+            instances.sort();
+            if instances.is_empty() {
+                return Err(PlacementError::NoReadyInstances);
+            }
+            let ready_instances = instances.len();
+
+            let existing = self
+                .store
+                .list_virtual_shards(&request.service_kind, &request.actor_kind)
+                .await?;
+            let previous = existing
+                .iter()
+                .map(|(_, record)| VirtualShardAssignment {
+                    shard_id: record.shard_id,
+                    owner: record.owner.clone(),
+                    epoch: record.epoch,
+                })
+                .collect::<Vec<_>>();
+            let current_by_shard = existing
+                .into_iter()
+                .map(|(version, record)| (record.shard_id, (version, record)))
+                .collect::<BTreeMap<_, _>>();
+            let plan = assigner
+                .plan(VirtualShardAssignInput {
+                    service_kind: request.service_kind.clone(),
+                    actor_kind: request.actor_kind.clone(),
+                    shard_count: request.shard_count,
+                    instances,
+                    previous,
+                    eligible_shards: request.eligible_shards,
+                    max_migrations: request.max_migrations,
+                })
+                .await?;
+
+            let mut assignments_written = 0;
+            let mut moved_shards = 0;
+            for assignment in plan.assignments {
+                let key = VirtualShardPlacementKey {
+                    service_kind: request.service_kind.clone(),
+                    actor_kind: request.actor_kind.clone(),
+                    shard_id: assignment.shard_id,
+                };
+                let current = current_by_shard.get(&assignment.shard_id);
+                if let Some((_, record)) = current
+                    && record.owner == assignment.owner
+                    && record.epoch == assignment.epoch
+                {
+                    continue;
+                }
+                let moved = current
+                    .map(|(_, current)| current.owner != assignment.owner)
+                    .unwrap_or(false);
+
+                let record = VirtualShardPlacementRecord {
+                    service_kind: request.service_kind.clone(),
+                    actor_kind: request.actor_kind.clone(),
+                    shard_id: assignment.shard_id,
+                    owner: assignment.owner,
+                    epoch: assignment.epoch,
+                };
+                self.store
+                    .compare_and_put_virtual_shard(
+                        key,
+                        current.map(|(version, _)| *version),
+                        record,
+                    )
+                    .await?;
+                assignments_written += 1;
+                if moved {
+                    moved_shards += 1;
+                }
+            }
+
+            Ok(RebalanceVirtualShardsReport {
+                ready_instances,
+                assignments_written,
+                moved_shards,
             })
         }
         .instrument(span)
@@ -531,13 +658,14 @@ async fn refresh_cache_from_watch_event<S>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use lattice_core::instance::InstanceCapacity;
     use lattice_core::{actor_kind, service_kind};
 
     use super::*;
     use crate::instance::InstanceState;
+    use crate::vshard::{GradualRebalanceShardAssigner, RoundRobinShardAssigner, VirtualShardId};
     use crate::{InMemoryPlacementStore, PlacementPrefix};
 
     #[derive(Debug, Clone, Default)]
@@ -715,6 +843,72 @@ mod tests {
 
         watch_task.cancel();
         panic!("placement watch did not refresh route cache");
+    }
+
+    #[tokio::test]
+    async fn scale_out_ready_instance_participates_in_virtual_shard_assignment() {
+        let store = ready_store().await;
+        let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+        let request = RebalanceVirtualShardsRequest {
+            service_kind: service_kind!("World"),
+            actor_kind: actor_kind!("World"),
+            shard_count: 4,
+            eligible_shards: BTreeSet::new(),
+            max_migrations: usize::MAX,
+        };
+
+        let initial = coordinator
+            .rebalance_virtual_shards(request.clone(), &RoundRobinShardAssigner)
+            .await
+            .unwrap();
+        assert_eq!(
+            initial,
+            RebalanceVirtualShardsReport {
+                ready_instances: 1,
+                assignments_written: 4,
+                moved_shards: 0,
+            }
+        );
+
+        store
+            .upsert_instance(instance_record("world-b", InstanceState::Ready))
+            .await
+            .unwrap();
+        let after_scale_out = coordinator
+            .rebalance_virtual_shards(
+                RebalanceVirtualShardsRequest {
+                    eligible_shards: BTreeSet::from([VirtualShardId(1), VirtualShardId(3)]),
+                    max_migrations: 2,
+                    ..request
+                },
+                &GradualRebalanceShardAssigner,
+            )
+            .await
+            .unwrap();
+        let assignments = store
+            .list_virtual_shards(&service_kind!("World"), &actor_kind!("World"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, record)| (record.shard_id, (record.owner, record.epoch)))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            after_scale_out,
+            RebalanceVirtualShardsReport {
+                ready_instances: 2,
+                assignments_written: 2,
+                moved_shards: 2,
+            }
+        );
+        assert_eq!(
+            assignments.get(&VirtualShardId(1)),
+            Some(&(InstanceId::new("world-b"), Epoch(2)))
+        );
+        assert_eq!(
+            assignments.get(&VirtualShardId(3)),
+            Some(&(InstanceId::new("world-b"), Epoch(2)))
+        );
     }
 
     #[tokio::test]
