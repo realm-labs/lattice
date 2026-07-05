@@ -195,9 +195,9 @@ Status: `[ ]` incomplete.
 - [x] Singleton owner record has owner, epoch, lease id, and state in the current model.
 - [x] Singleton ownership is stored through the `PlacementStore`/etcd keyspace.
 - [x] `ActivateSingleton` control-plane API is implemented as a service endpoint.
-- [ ] Generated singleton client/adapter is missing.
+- [x] Generated singleton client/adapter exists through `SingletonBinding`, singleton placement client cores, and `SingletonRegistryService` with executable codegen/service coverage.
 - [x] Singleton owner lease/keepalive is connected to service lifecycle for owners held by the running instance.
-- [ ] Automatic singleton failover after owner crash still needs lease-expiry reconciliation.
+- [x] Automatic singleton failover after owner crash is covered by the lease-expiry reconciliation loop and failover test coverage.
 - [ ] Old singleton owner fencing is not enforced in the runtime path.
 
 #### Phase 7: Ops Production Features
