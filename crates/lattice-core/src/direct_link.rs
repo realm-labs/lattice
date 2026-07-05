@@ -361,7 +361,7 @@ pub struct LinkProtocolError {
     pub close_action: LinkCloseReason,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundDirectLinkMessage {
     pub link_id: LinkId,
     pub direction: LinkDirection,
@@ -463,7 +463,7 @@ where
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum LinkSendError {
     #[error("direct link is closed: {reason:?}")]
     Closed { reason: LinkCloseReason },
