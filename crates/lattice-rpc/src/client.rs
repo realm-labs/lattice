@@ -8,6 +8,7 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use http::Uri;
 use lattice_core::{ActorRef, Epoch, RequestId, RouteKey};
+use tokio::sync::OnceCell;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 use tracing::{debug, warn};
@@ -51,9 +52,24 @@ impl Default for TonicEndpointChannelPoolConfig {
 
 #[derive(Debug, Clone)]
 pub struct TonicEndpointChannelPool {
-    channels: Arc<DashMap<String, Channel>>,
+    channels: Arc<DashMap<Uri, Arc<EndpointChannelStripes>>>,
     transport_security: RpcTransportSecurity,
     config: TonicEndpointChannelPoolConfig,
+}
+
+#[derive(Debug)]
+struct EndpointChannelStripes {
+    endpoint: Uri,
+    channels: Vec<OnceCell<Channel>>,
+}
+
+impl EndpointChannelStripes {
+    fn new(endpoint: Uri, config: TonicEndpointChannelPoolConfig) -> Self {
+        let channels = (0..config.channels_per_endpoint().get())
+            .map(|_| OnceCell::new())
+            .collect();
+        Self { endpoint, channels }
+    }
 }
 
 impl Default for TonicEndpointChannelPool {
@@ -127,12 +143,32 @@ impl TonicEndpointChannelPool {
         endpoint: &Uri,
         stripe: usize,
     ) -> Result<Channel, RpcError> {
-        let key = channel_key(endpoint, stripe);
-        if let Some(channel) = self.channels.get(&key).map(|entry| entry.clone()) {
-            debug!(%endpoint, channel.stripe = stripe, "reusing tonic endpoint channel");
-            return Ok(channel);
+        let stripes = self.endpoint_stripes(endpoint);
+        let stripe = stripe % stripes.channels.len();
+        let channel = stripes.channels[stripe]
+            .get_or_try_init(|| async { self.connect_channel(&stripes.endpoint, stripe).await })
+            .await?;
+        debug!(%endpoint, channel.stripe = stripe, "reusing tonic endpoint channel");
+        Ok(channel.clone())
+    }
+
+    fn endpoint_stripes(&self, endpoint: &Uri) -> Arc<EndpointChannelStripes> {
+        if let Some(stripes) = self.channels.get(endpoint).map(|entry| entry.clone()) {
+            return stripes;
         }
 
+        match self.channels.entry(endpoint.clone()) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => entry
+                .insert(Arc::new(EndpointChannelStripes::new(
+                    endpoint.clone(),
+                    self.config,
+                )))
+                .clone(),
+        }
+    }
+
+    async fn connect_channel(&self, endpoint: &Uri, stripe: usize) -> Result<Channel, RpcError> {
         debug!(%endpoint, channel.stripe = stripe, "connecting tonic endpoint channel");
         let mut builder = Channel::builder(endpoint.clone());
         if let Some(tls) = self
@@ -144,29 +180,11 @@ impl TonicEndpointChannelPool {
                 RpcError::Business(format!("configure TLS for {endpoint}: {error}"))
             })?;
         }
-        let channel = builder.connect().await.map_err(|error| {
+        builder.connect().await.map_err(|error| {
             warn!(%endpoint, %error, "failed to connect tonic endpoint channel");
             RpcError::Business(format!("connect {endpoint}: {error}"))
-        })?;
-        match self.channels.entry(key) {
-            Entry::Occupied(entry) => {
-                debug!(
-                    %endpoint,
-                    channel.stripe = stripe,
-                    "using concurrently established tonic endpoint channel"
-                );
-                Ok(entry.get().clone())
-            }
-            Entry::Vacant(entry) => {
-                debug!(%endpoint, channel.stripe = stripe, "tonic endpoint channel connected");
-                Ok(entry.insert(channel).clone())
-            }
-        }
+        })
     }
-}
-
-fn channel_key(endpoint: &Uri, stripe: usize) -> String {
-    format!("{endpoint}#{stripe}")
 }
 
 fn stripe_index_for_hash<T>(key: &T, stripe_count: NonZeroUsize) -> usize

@@ -21,6 +21,9 @@ Default topology:
 64 concurrent requests
 10,000 requests per Criterion iteration
 4 tonic channels per endpoint
+0-byte single-hop payload
+RPC route-correction retry enabled
+server request dedup enabled
 ```
 
 Environment overrides:
@@ -31,6 +34,9 @@ LATTICE_BENCH_ACTORS=1024 \
 LATTICE_BENCH_CONCURRENCY=128 \
 LATTICE_BENCH_REQUESTS=50000 \
 LATTICE_BENCH_CHANNEL_STRIPES=4 \
+LATTICE_BENCH_PAYLOAD_BYTES=0 \
+LATTICE_BENCH_RPC_RETRY=true \
+LATTICE_BENCH_REQUEST_DEDUP=true \
 cargo bench -p rpc-benchmark --bench rpc_benchmark
 ```
 
@@ -48,6 +54,13 @@ and route caches before Criterion measures the workload.
 Generated clients use per-endpoint tonic channel striping by default. Set
 `LATTICE_BENCH_CHANNEL_STRIPES=1` to compare against the previous
 single-channel-per-endpoint behavior.
+
+Set `LATTICE_BENCH_PAYLOAD_BYTES` to a larger value, for example `16384`, to
+make request body copy/encode costs visible in the single-hop benchmark.
+
+Set `LATTICE_BENCH_RPC_RETRY=false` to measure the hot path without
+route-correction retry buffering, and `LATTICE_BENCH_REQUEST_DEDUP=false` to
+measure without server-side request id reservation.
 
 This benchmark is intentionally single-process multi-node. A true multi-process
 driver can be added later after this baseline is stable.

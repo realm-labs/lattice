@@ -13,9 +13,9 @@ lattice-actor.workspace = true
 lattice-core.workspace = true
 prost.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
 trybuild.workspace = true

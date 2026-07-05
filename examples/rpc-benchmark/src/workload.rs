@@ -13,6 +13,7 @@ pub struct WorkloadConfig {
     pub actors: u64,
     pub concurrency: usize,
     pub requests: usize,
+    pub payload_bytes: usize,
 }
 
 impl From<&BenchmarkConfig> for WorkloadConfig {
@@ -21,6 +22,7 @@ impl From<&BenchmarkConfig> for WorkloadConfig {
             actors: config.actors,
             concurrency: config.concurrency,
             requests: config.requests,
+            payload_bytes: config.payload_bytes,
         }
     }
 }
@@ -30,6 +32,7 @@ pub async fn warm_up(topology: &BenchmarkTopology, config: &WorkloadConfig) -> B
         actors: config.actors.clamp(1, 32),
         concurrency: config.concurrency.clamp(1, 16),
         requests: (config.actors.min(32) as usize).max(1),
+        payload_bytes: config.payload_bytes,
     };
     run_routed_rpc_fanout(topology, &warmup).await?;
     run_cross_service_chain(topology, &warmup).await?;
@@ -54,6 +57,7 @@ pub async fn run_routed_rpc_fanout(
                 worker_count,
                 config.requests,
             ));
+            let payload = vec![0_u8; config.payload_bytes];
             let mut sequence = worker_id;
             while sequence < config.requests {
                 let actor_id = actor_id_for(sequence, config.actors);
@@ -62,7 +66,7 @@ pub async fn run_routed_rpc_fanout(
                     .ping(PingRequest {
                         actor_id,
                         sequence: sequence as u64,
-                        payload: Vec::new(),
+                        payload: payload.clone(),
                     })
                     .await
                 {

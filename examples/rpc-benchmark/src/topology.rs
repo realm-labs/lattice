@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lattice_core::{InstanceId, ServiceContext};
-use lattice_placement::{InMemoryPlacementStore, PlacementPrefix};
+use lattice_placement::{InMemoryPlacementStore, PlacementPrefix, RpcRetryPolicy};
 use lattice_rpc::TonicEndpointChannelPoolConfig;
 use lattice_service::{ActorRegistration, LatticeService};
 use tokio::net::TcpListener;
@@ -26,6 +26,9 @@ pub struct BenchmarkConfig {
     pub concurrency: usize,
     pub requests: usize,
     pub channel_stripes: usize,
+    pub rpc_retry: bool,
+    pub request_dedup: bool,
+    pub payload_bytes: usize,
 }
 
 impl BenchmarkConfig {
@@ -36,6 +39,9 @@ impl BenchmarkConfig {
             concurrency: env_usize("LATTICE_BENCH_CONCURRENCY", 64).max(1),
             requests: env_usize("LATTICE_BENCH_REQUESTS", 10_000).max(1),
             channel_stripes: env_usize("LATTICE_BENCH_CHANNEL_STRIPES", 4).max(1),
+            rpc_retry: env_bool("LATTICE_BENCH_RPC_RETRY", true),
+            request_dedup: env_bool("LATTICE_BENCH_REQUEST_DEDUP", true),
+            payload_bytes: env_usize("LATTICE_BENCH_PAYLOAD_BYTES", 0),
         }
     }
 
@@ -46,12 +52,23 @@ impl BenchmarkConfig {
             concurrency: 4,
             requests: 32,
             channel_stripes: 4,
+            rpc_retry: true,
+            request_dedup: true,
+            payload_bytes: 0,
         }
     }
 
     fn rpc_client_transport(&self) -> TonicEndpointChannelPoolConfig {
         TonicEndpointChannelPoolConfig::try_new(self.channel_stripes)
             .expect("benchmark channel stripe count is clamped to at least one")
+    }
+
+    fn rpc_retry_policy(&self) -> RpcRetryPolicy {
+        if self.rpc_retry {
+            RpcRetryPolicy::RouteCorrection
+        } else {
+            RpcRetryPolicy::Disabled
+        }
     }
 }
 
@@ -160,6 +177,7 @@ async fn start_bench_node(
         .listen(listener)
         .ready_signal(ready_tx)
         .rpc_client_transport(config.rpc_client_transport())
+        .rpc_retry_policy(config.rpc_retry_policy())
         .placement_store::<InMemoryPlacementStore, _>(placement_store)
         .register_client::<bench_rpc::Binding>()
         .register_actor(
@@ -167,7 +185,10 @@ async fn start_bench_node(
                 .factory(BenchActorFactory)
                 .build(),
         )
-        .register_sharded_rpc(bench_rpc::Binding::for_actor::<BenchActor>(BENCH_ACTOR))
+        .register_sharded_rpc(
+            bench_rpc::Binding::for_actor::<BenchActor>(BENCH_ACTOR)
+                .request_dedup(config.request_dedup),
+        )
         .build()
         .await?;
     start_service(service, ready_rx, shutdown_tx, shutdown_rx).await
@@ -186,6 +207,7 @@ async fn start_chain_node(
         .listen(listener)
         .ready_signal(ready_tx)
         .rpc_client_transport(config.rpc_client_transport())
+        .rpc_retry_policy(config.rpc_retry_policy())
         .placement_store::<InMemoryPlacementStore, _>(placement_store)
         .register_client::<chain_rpc::Binding>()
         .register_client::<worker_rpc::Binding>()
@@ -194,7 +216,10 @@ async fn start_chain_node(
                 .factory(ChainActorFactory)
                 .build(),
         )
-        .register_sharded_rpc(chain_rpc::Binding::for_actor::<ChainActor>(CHAIN_ACTOR))
+        .register_sharded_rpc(
+            chain_rpc::Binding::for_actor::<ChainActor>(CHAIN_ACTOR)
+                .request_dedup(config.request_dedup),
+        )
         .build()
         .await?;
     start_service(service, ready_rx, shutdown_tx, shutdown_rx).await
@@ -213,13 +238,17 @@ async fn start_worker_node(
         .listen(listener)
         .ready_signal(ready_tx)
         .rpc_client_transport(config.rpc_client_transport())
+        .rpc_retry_policy(config.rpc_retry_policy())
         .placement_store::<InMemoryPlacementStore, _>(placement_store)
         .register_actor(
             ActorRegistration::builder(WORKER_ACTOR)
                 .factory(WorkerActorFactory)
                 .build(),
         )
-        .register_sharded_rpc(worker_rpc::Binding::for_actor::<WorkerActor>(WORKER_ACTOR))
+        .register_sharded_rpc(
+            worker_rpc::Binding::for_actor::<WorkerActor>(WORKER_ACTOR)
+                .request_dedup(config.request_dedup),
+        )
         .build()
         .await?;
     start_service(service, ready_rx, shutdown_tx, shutdown_rx).await
@@ -266,6 +295,17 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
 }
 
 fn run_id() -> u128 {
