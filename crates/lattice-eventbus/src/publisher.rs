@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lattice_core::{InstanceId, ServiceKind, TraceContext};
 use lattice_rpc::{RoutedRequest, RpcRequest, ShardedRpcCore};
+use prost::Message as ProstMessage;
 
 use crate::{
     EventBus, EventBusError, EventEnvelope, EventId, EventSubscription, EventSubscriptionHandle,
@@ -23,6 +24,24 @@ pub struct ServiceEvents<B> {
     bus: B,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryOptions {
+    guarantee: DeliveryGuarantee,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryGuarantee {
+    AtLeastOnce,
+}
+
+impl DeliveryOptions {
+    pub fn at_least_once() -> Self {
+        Self {
+            guarantee: DeliveryGuarantee::AtLeastOnce,
+        }
+    }
+}
+
 impl<B> ServiceEvents<B>
 where
     B: EventBus,
@@ -31,7 +50,40 @@ where
         Self { bus }
     }
 
-    pub async fn subscribe_actor<C, F, Req>(
+    pub async fn subscribe_actor<Req, C>(
+        &self,
+        subscription: EventSubscription,
+        core: C,
+        options: DeliveryOptions,
+    ) -> Result<EventSubscriptionHandle, EventBusError>
+    where
+        Req: RoutedRequest + RpcRequest,
+        C: ShardedRpcCore,
+    {
+        match options.guarantee {
+            DeliveryGuarantee::AtLeastOnce => {}
+        }
+
+        self.bus
+            .subscribe(subscription, move |event: EventEnvelope| {
+                let core = core.clone();
+                async move {
+                    let req = <Req as ProstMessage>::decode(event.payload.as_slice()).map_err(
+                        |error| EventBusError::Decode {
+                            message_type: std::any::type_name::<Req>(),
+                            reason: error.to_string(),
+                        },
+                    )?;
+                    core.call(req)
+                        .await
+                        .map(|_| ())
+                        .map_err(EventBusError::from_rpc)
+                }
+            })
+            .await
+    }
+
+    pub async fn subscribe_actor_mapped<C, F, Req>(
         &self,
         subscription: EventSubscription,
         core: C,

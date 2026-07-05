@@ -9,6 +9,7 @@ repository.workspace = true
 async-trait.workspace = true
 lattice-core.workspace = true
 lattice-rpc.workspace = true
+prost.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -16,4 +17,3 @@ tracing.workspace = true
 
 [dev-dependencies]
 lattice-config.workspace = true
-prost.workspace = true

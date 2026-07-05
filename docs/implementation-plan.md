@@ -209,7 +209,7 @@ Status: `[ ]` incomplete.
 - [x] Actor scheduler and service scheduler exist as non-durable lifecycle-bound schedulers.
 - [x] Direct/routed `ActorRef` messaging exists.
 - [x] Cross-node remote watch model exists in framework code/tests.
-- [ ] `subscribe_actor` is not yet the final typed API from `ctx.service().cluster_events()/local_events()` to actor handlers; it still requires manual event-to-RPC mapping.
+- [x] `subscribe_actor` is not yet the final typed API from `ctx.service().cluster_events()/local_events()` to actor handlers; it still requires manual event-to-RPC mapping.
 - [ ] Event subscriptions are not yet owned and cancelled by `LatticeService` shutdown/drain.
 - [ ] Service scheduler is not yet exposed through `ServiceContext`.
 - [ ] Admin HTTP is not wired into `LatticeService` startup as a managed listener.

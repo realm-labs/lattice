@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use lattice_core::{ActorKind, RouteKey, actor_kind};
 use lattice_core::{InstanceId, TraceContext, service_kind};
 use lattice_rpc::{RoutedRequest, RpcRequest, ShardedRpcCore};
+use prost::Message as ProstMessage;
 use tokio::sync::Mutex;
 
 use crate::*;
@@ -162,7 +163,7 @@ async fn service_events_subscribe_actor_routes_through_rpc_core() {
     let core = RecordingCore::default();
     let routed = core.routed.clone();
     events
-        .subscribe_actor(
+        .subscribe_actor_mapped(
             EventSubscription::local(SubjectFilter::new("game.world.*")),
             core,
             |_event| EventToActorRequest { world_id: 42 },
@@ -175,4 +176,47 @@ async fn service_events_subscribe_actor_routes_through_rpc_core() {
         .unwrap();
 
     assert_eq!(*routed.lock().await, vec![RouteKey::U64(42)]);
+}
+
+#[tokio::test]
+async fn service_events_subscribe_actor_decodes_typed_rpc_request() {
+    let bus = LocalEventBus::new();
+    let events = ServiceEvents::new(bus.clone());
+    let core = RecordingCore::default();
+    let routed = core.routed.clone();
+    events
+        .subscribe_actor::<EventToActorRequest, _>(
+            EventSubscription::local(SubjectFilter::new("game.world.*")),
+            core,
+            DeliveryOptions::at_least_once(),
+        )
+        .await
+        .unwrap();
+
+    let mut event = test_event("game.world.player_entered", "PlayerEntered");
+    event.payload = EventToActorRequest { world_id: 99 }.encode_to_vec();
+    bus.publish(event).await.unwrap();
+
+    assert_eq!(*routed.lock().await, vec![RouteKey::U64(99)]);
+}
+
+#[tokio::test]
+async fn service_events_subscribe_actor_rejects_invalid_typed_payload() {
+    let bus = LocalEventBus::new();
+    let events = ServiceEvents::new(bus.clone());
+    let core = RecordingCore::default();
+    events
+        .subscribe_actor::<EventToActorRequest, _>(
+            EventSubscription::local(SubjectFilter::new("game.world.*")),
+            core,
+            DeliveryOptions::at_least_once(),
+        )
+        .await
+        .unwrap();
+
+    let mut event = test_event("game.world.player_entered", "PlayerEntered");
+    event.payload = vec![0xff];
+    let error = bus.publish(event).await.unwrap_err();
+
+    assert!(matches!(error, EventBusError::Decode { .. }));
 }

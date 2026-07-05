@@ -4,6 +4,11 @@ use lattice_rpc::RpcError;
 pub enum EventBusError {
     #[error("event handler failed: {0}")]
     Handler(String),
+    #[error("failed to decode event payload as {message_type}: {reason}")]
+    Decode {
+        message_type: &'static str,
+        reason: String,
+    },
     #[error("event actor delivery failed: {0}")]
     ActorDelivery(String),
 }
