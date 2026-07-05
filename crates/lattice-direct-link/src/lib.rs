@@ -11,4 +11,7 @@ pub use session::{
     SessionManagerError,
 };
 pub use stream::{DirectLinkActorBinding, DirectLinkHandlers, DirectLinkStream};
-pub use transport::{DirectLinkConnection, DirectLinkListenConfig, DirectLinkTransport};
+pub use transport::{
+    DirectLinkConnection, DirectLinkListenConfig, DirectLinkTransport, TcpDirectLinkConnection,
+    TcpDirectLinkListener, TcpDirectLinkTransport,
+};

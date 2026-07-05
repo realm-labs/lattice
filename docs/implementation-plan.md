@@ -257,12 +257,12 @@ Status: `[ ]` not started.
 - [x] `lattice-codegen` emits `DirectLinkMessage` metadata for generated protobuf messages without requiring per-message proto options.
 - [x] Typed stream binding validates at compile time that the target actor implements `Handler<Linked<T>>` for every message in the stream.
 - [x] Direct-link message ids are generated deterministically from stream name plus protobuf full name, with explicit Rust-side manual id override for compatibility.
-- [ ] `lattice-direct-link` crate exists with transport-independent frame codec, message catalog, stream binding, session manager, and metrics/tracing hooks.
+- [x] `lattice-direct-link` crate exists with transport-independent frame codec, message catalog, stream binding, session manager, and metrics/tracing hooks.
   - [x] Initial `lattice-direct-link` crate, stream message catalog, frame codec, handler-bound actor binding, session registry, and metrics scaffolding exist with focused tests.
   - [x] Concrete session manager drives OpenLink state, negotiated directions, send/receive sequencing, and close transitions instead of only storing sessions.
   - [x] Session-manager metrics/tracing hooks cover open, close, receive validation, protocol errors, drop, coalesce, backpressure, and decode-error surfaces with focused tests.
-  - [ ] Transport/runtime send and receive task metrics/tracing hooks are emitted from concrete TCP/runtime paths.
-- [ ] TCP direct-link transport exists as the default implementation behind `DirectLinkTransport` / `DirectLinkConnection`.
+  - [x] Transport/runtime send and receive task metrics/tracing hooks are emitted from concrete TCP/runtime paths.
+- [x] TCP direct-link transport exists as the default implementation behind `DirectLinkTransport` / `DirectLinkConnection`.
 - [ ] Direct Link listener is managed by `LatticeService`, publishes direct-link endpoint metadata, and shuts down/drains with the service lifecycle.
 - [ ] OpenLink handshake validates service/actor identity, stream binding, accepted message ids, activation policy, owner epoch, auth, and backpressure policy before creating sessions.
 - [ ] Invalid OpenLink requests reject with explicit reasons: `NotOwner`, `Fenced`, `ActorUnavailable`, `UnsupportedStream`, `UnsupportedMessageType`, `Unauthorized`, `Overloaded`, or `ProtocolVersionMismatch`.

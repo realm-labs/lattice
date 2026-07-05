@@ -17,6 +17,7 @@ pub struct DirectLinkMetrics {
 pub struct DirectLinkMetricsSnapshot {
     pub opened: u64,
     pub closed: u64,
+    pub sent: u64,
     pub received: u64,
     pub protocol_errors: u64,
     pub dropped: u64,
@@ -61,6 +62,14 @@ impl DirectLinkMetrics {
             .expect("direct link metrics poisoned")
             .snapshot
             .received += 1;
+    }
+
+    pub fn record_send(&self) {
+        self.inner
+            .lock()
+            .expect("direct link metrics poisoned")
+            .snapshot
+            .sent += 1;
     }
 
     pub fn record_protocol_error(&self) {
