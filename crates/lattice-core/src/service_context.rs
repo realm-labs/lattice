@@ -148,7 +148,6 @@ pub struct ServiceContext {
 struct ServiceContextInner {
     service_kind: ServiceKind,
     instance_id: InstanceId,
-    bootstrap_config: BootstrapConfig,
     extensions: HashMap<TypeId, StoredComponent>,
 }
 
@@ -191,37 +190,23 @@ impl fmt::Debug for StoredComponent {
 
 impl ServiceContext {
     pub fn empty() -> Self {
-        Self::new(
-            ServiceKind::from_static("local"),
-            InstanceId::new("local"),
-            BootstrapConfig::default(),
-        )
+        Self::new(ServiceKind::from_static("local"), InstanceId::new("local"))
     }
 
-    pub fn new(
-        service_kind: ServiceKind,
-        instance_id: InstanceId,
-        bootstrap_config: BootstrapConfig,
-    ) -> Self {
+    pub fn new(service_kind: ServiceKind, instance_id: InstanceId) -> Self {
         Self {
             inner: Arc::new(ServiceContextInner {
                 service_kind,
                 instance_id,
-                bootstrap_config,
                 extensions: HashMap::new(),
             }),
         }
     }
 
-    pub fn builder(
-        service_kind: ServiceKind,
-        instance_id: InstanceId,
-        bootstrap_config: BootstrapConfig,
-    ) -> ServiceContextBuilder {
+    pub fn builder(service_kind: ServiceKind, instance_id: InstanceId) -> ServiceContextBuilder {
         ServiceContextBuilder {
             service_kind,
             instance_id,
-            bootstrap_config,
             extensions: HashMap::new(),
         }
     }
@@ -232,10 +217,6 @@ impl ServiceContext {
 
     pub fn instance_id(&self) -> &InstanceId {
         &self.inner.instance_id
-    }
-
-    pub fn bootstrap_config(&self) -> &BootstrapConfig {
-        &self.inner.bootstrap_config
     }
 
     pub fn extension<T>(&self) -> Option<Arc<T>>
@@ -263,7 +244,6 @@ impl Default for ServiceContext {
 pub struct ServiceContextBuilder {
     service_kind: ServiceKind,
     instance_id: InstanceId,
-    bootstrap_config: BootstrapConfig,
     extensions: HashMap<TypeId, StoredComponent>,
 }
 
@@ -291,7 +271,6 @@ impl ServiceContextBuilder {
             inner: Arc::new(ServiceContextInner {
                 service_kind: self.service_kind,
                 instance_id: self.instance_id,
-                bootstrap_config: self.bootstrap_config,
                 extensions: self.extensions,
             }),
         }

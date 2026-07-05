@@ -287,11 +287,8 @@ async fn registered_factory_activates_actor_once_and_can_retry_failures() {
     let registration = ActorRegistration::builder(actor_kind!("World"))
         .factory(TestFactory)
         .build();
-    let context_service = lattice_core::ServiceContext::new(
-        service_kind!("World"),
-        InstanceId::new("world-1"),
-        lattice_config::BootstrapConfig::default(),
-    );
+    let context_service =
+        lattice_core::ServiceContext::new(service_kind!("World"), InstanceId::new("world-1"));
     let mut context = ServiceBuildContext::new(context_service);
     Box::new(registration).register(&mut context).unwrap();
     let registered = context.actor::<TestActor>(&actor_kind!("World")).unwrap();
@@ -312,11 +309,8 @@ async fn factory_activation_failure_does_not_leave_zombie_actor() {
             attempts: attempts.clone(),
         })
         .build();
-    let context_service = lattice_core::ServiceContext::new(
-        service_kind!("World"),
-        InstanceId::new("world-1"),
-        lattice_config::BootstrapConfig::default(),
-    );
+    let context_service =
+        lattice_core::ServiceContext::new(service_kind!("World"), InstanceId::new("world-1"));
     let mut context = ServiceBuildContext::new(context_service);
     Box::new(registration).register(&mut context).unwrap();
     let registered = context.actor::<TestActor>(&actor_kind!("World")).unwrap();
@@ -370,13 +364,6 @@ async fn build_loads_config_and_stores_components_in_service_context() {
 
     let component = service.context().extension::<ExampleComponent>().unwrap();
     assert_eq!(component.value, "from-config");
-    assert_eq!(
-        service
-            .context()
-            .bootstrap_config()
-            .get_path("example.value"),
-        Some(&serde_json::Value::String("from-config".to_string()))
-    );
     let _placement_store = service.context().placement_store();
     let _cluster_event_bus = service.context().cluster_event_bus();
     let _local_event_bus = service.context().local_event_bus();

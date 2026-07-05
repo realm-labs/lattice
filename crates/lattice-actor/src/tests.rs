@@ -412,11 +412,7 @@ async fn standalone_actor_receives_empty_service_context() {
 #[tokio::test]
 async fn actor_spawn_options_pass_service_context_to_handler_and_child() {
     let runtime = ActorRuntime::default();
-    let service = ServiceContext::new(
-        service_kind!("World"),
-        InstanceId::new("world-service"),
-        lattice_core::BootstrapConfig::default(),
-    );
+    let service = ServiceContext::new(service_kind!("World"), InstanceId::new("world-service"));
     let handle = runtime
         .spawn_actor(
             TestActor {

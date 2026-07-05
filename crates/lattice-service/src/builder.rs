@@ -250,11 +250,8 @@ impl LatticeServiceBuilder {
                 type_name: type_name.to_string(),
             });
         }
-        let mut service_context = ServiceContext::builder(
-            self.service_kind.clone(),
-            instance.instance_id.clone(),
-            bootstrap_config,
-        );
+        let mut service_context =
+            ServiceContext::builder(self.service_kind.clone(), instance.instance_id.clone());
         let placement_store = build_placement_store_or_default(
             self.placement_store,
             Box::new(PlacementStoreRegistration::<InMemoryPlacementStore>::new(
