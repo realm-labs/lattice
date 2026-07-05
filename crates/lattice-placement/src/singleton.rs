@@ -46,18 +46,17 @@ impl SingletonControl for NoopSingletonControl {
 
 #[derive(Debug, Clone)]
 pub struct SingletonCoordinator<S, C> {
-    service_kind: ServiceKind,
     store: S,
     control: C,
 }
 
 impl<S, C> SingletonCoordinator<S, C> {
-    pub fn new(service_kind: ServiceKind, store: S, control: C) -> Self {
-        Self {
-            service_kind,
-            store,
-            control,
-        }
+    pub fn new(_service_kind: ServiceKind, store: S, control: C) -> Self {
+        Self::from_store(store, control)
+    }
+
+    pub fn from_store(store: S, control: C) -> Self {
+        Self { store, control }
     }
 }
 
@@ -146,7 +145,7 @@ where
         }
         let instance = self
             .store
-            .list_instances(&self.service_kind)
+            .list_instances(&key.service_kind)
             .await?
             .into_iter()
             .filter(|instance| instance.state == InstanceState::Ready)

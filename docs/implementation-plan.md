@@ -190,7 +190,7 @@ Status: `[ ]` incomplete.
 - [x] In-memory singleton placement model and activation race tests exist.
 - [x] Singleton owner record has owner, epoch, lease id, and state in the current model.
 - [x] Singleton ownership is not stored through the production `PlacementStore`/etcd keyspace.
-- [ ] `ActivateSingleton` control-plane API is not implemented as a service endpoint.
+- [x] `ActivateSingleton` control-plane API is not implemented as a service endpoint.
 - [ ] Generated singleton client/adapter is missing.
 - [ ] Singleton owner lease/keepalive/failover is not connected to service lifecycle.
 - [ ] Old singleton owner fencing is not enforced in the runtime path.

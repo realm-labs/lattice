@@ -643,6 +643,52 @@ async fn service_exposes_tonic_logic_control_activation() {
 }
 
 #[tokio::test]
+async fn service_exposes_tonic_logic_control_singleton_activation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let observed_instance = Arc::new(tokio::sync::Mutex::new(None));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-control"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("SeasonManager"))
+                .factory(ContextRecordingFactory {
+                    observed_instance: observed_instance.clone(),
+                })
+                .build(),
+        )
+        .build()
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let addr = ready_rx.await.unwrap();
+    let mut client = LogicControlClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    client
+        .activate_singleton(proto::ActivateSingletonRequest {
+            service_kind: "World".to_string(),
+            singleton_kind: "SeasonManager".to_string(),
+            scope: "global".to_string(),
+            epoch: 1,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *observed_instance.lock().await,
+        Some(InstanceId::new("world-control"))
+    );
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn register_client_builds_typed_client_from_context_core() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let service = LatticeService::builder(service_kind!("Player"))

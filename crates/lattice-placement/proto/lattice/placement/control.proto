@@ -4,10 +4,12 @@ package lattice.placement.control;
 
 service LogicControl {
   rpc ActivateActor(ActivateActorRequest) returns (ActivateActorReply);
+  rpc ActivateSingleton(ActivateSingletonRequest) returns (ActivateSingletonReply);
 }
 
 service PlacementCoordinator {
   rpc ActivateActor(ActivateActorRequest) returns (ActorPlacementReply);
+  rpc ActivateSingleton(ActivateSingletonRequest) returns (SingletonPlacementReply);
 }
 
 message ActivateActorRequest {
@@ -28,6 +30,15 @@ message ActorId {
 
 message ActivateActorReply {}
 
+message ActivateSingletonRequest {
+  string service_kind = 1;
+  string singleton_kind = 2;
+  string scope = 3;
+  uint64 epoch = 4;
+}
+
+message ActivateSingletonReply {}
+
 message ActorPlacementReply {
   string actor_kind = 1;
   ActorId actor_id = 2;
@@ -35,4 +46,14 @@ message ActorPlacementReply {
   uint64 epoch = 4;
   uint64 lease_id = 5;
   string state = 6;
+}
+
+message SingletonPlacementReply {
+  string service_kind = 1;
+  string singleton_kind = 2;
+  string scope = 3;
+  string owner_instance_id = 4;
+  uint64 epoch = 5;
+  uint64 lease_id = 6;
+  string state = 7;
 }

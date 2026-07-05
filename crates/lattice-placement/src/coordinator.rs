@@ -12,9 +12,10 @@ use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::error::PlacementError;
 use crate::instance::{InstanceRecord, InstanceState};
 use crate::route::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
+use crate::singleton::SingletonControl;
 use crate::store::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementState, PlacementStore,
-    PlacementWatchEvent, VirtualShardPlacementKey, VirtualShardPlacementRecord,
+    PlacementWatchEvent, SingletonKey, VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 use crate::vshard::{
     VirtualShardAssignInput, VirtualShardAssigner, VirtualShardAssignment, VirtualShardId,
@@ -46,6 +47,18 @@ impl LogicControl for NoopLogicControl {
         &self,
         _instance: &InstanceRecord,
         _key: &ActorPlacementKey,
+        _epoch: Epoch,
+    ) -> Result<(), PlacementError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SingletonControl for NoopLogicControl {
+    async fn activate_singleton(
+        &self,
+        _instance: &InstanceRecord,
+        _key: &SingletonKey,
         _epoch: Epoch,
     ) -> Result<(), PlacementError> {
         Ok(())
@@ -97,6 +110,16 @@ pub enum VirtualShardMovementPolicy {
 impl<S, L> PlacementCoordinator<S, L> {
     pub fn new(store: S, logic: L) -> Self {
         Self { store, logic }
+    }
+}
+
+impl<S, L> PlacementCoordinator<S, L>
+where
+    S: Clone,
+    L: Clone,
+{
+    pub(crate) fn parts(&self) -> (S, L) {
+        (self.store.clone(), self.logic.clone())
     }
 }
 

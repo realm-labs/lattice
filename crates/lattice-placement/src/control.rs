@@ -8,7 +8,14 @@ use crate::coordinator::{
 };
 use crate::error::PlacementError;
 use crate::instance::InstanceRecord;
-use crate::store::{ActorPlacementKey, ActorPlacementRecord, PlacementState, PlacementStore};
+use crate::singleton::{
+    ActivateSingletonRequest as CoordinatorActivateSingletonRequest, SingletonControl,
+    SingletonCoordinator,
+};
+use crate::store::{
+    ActorPlacementKey, ActorPlacementRecord, PlacementState, PlacementStore, SingletonKey,
+    SingletonPlacementRecord,
+};
 
 pub mod proto {
     tonic::include_proto!("lattice.placement.control");
@@ -26,6 +33,11 @@ pub trait LogicControlHandler: Clone + Send + Sync + 'static {
         key: ActorPlacementKey,
         epoch: Epoch,
     ) -> Result<(), PlacementError>;
+    async fn activate_singleton(
+        &self,
+        key: SingletonKey,
+        epoch: Epoch,
+    ) -> Result<(), PlacementError>;
 }
 
 #[derive(Debug, Clone)]
@@ -36,11 +48,30 @@ pub struct LogicControlService<H> {
 #[derive(Debug, Clone)]
 pub struct PlacementCoordinatorService<S, L> {
     coordinator: PlacementCoordinator<S, L>,
+    singleton_coordinator: SingletonCoordinator<S, L>,
 }
 
 impl<S, L> PlacementCoordinatorService<S, L> {
-    pub fn new(coordinator: PlacementCoordinator<S, L>) -> Self {
-        Self { coordinator }
+    pub fn new(coordinator: PlacementCoordinator<S, L>) -> Self
+    where
+        S: Clone,
+        L: Clone,
+    {
+        let (store, logic) = coordinator.parts();
+        Self {
+            coordinator,
+            singleton_coordinator: SingletonCoordinator::from_store(store, logic),
+        }
+    }
+
+    pub fn with_singleton_coordinator(
+        coordinator: PlacementCoordinator<S, L>,
+        singleton_coordinator: SingletonCoordinator<S, L>,
+    ) -> Self {
+        Self {
+            coordinator,
+            singleton_coordinator,
+        }
     }
 }
 
@@ -49,7 +80,7 @@ impl<S, L> proto::placement_coordinator_server::PlacementCoordinator
     for PlacementCoordinatorService<S, L>
 where
     S: PlacementStore,
-    L: CoordinatorLogicControl,
+    L: CoordinatorLogicControl + SingletonControl,
 {
     async fn activate_actor(
         &self,
@@ -70,6 +101,23 @@ where
             .await
             .map_err(status_from_placement)?;
         Ok(Response::new(actor_placement_to_proto(record)))
+    }
+
+    async fn activate_singleton(
+        &self,
+        request: Request<proto::ActivateSingletonRequest>,
+    ) -> Result<Response<proto::SingletonPlacementReply>, Status> {
+        let request = request.into_inner();
+        let record = self
+            .singleton_coordinator
+            .activate_singleton(CoordinatorActivateSingletonRequest {
+                service_kind: ServiceKind::new(request.service_kind),
+                singleton_kind: ActorKind::new(request.singleton_kind),
+                scope: request.scope,
+            })
+            .await
+            .map_err(status_from_placement)?;
+        Ok(Response::new(singleton_placement_to_proto(record)))
     }
 }
 
@@ -103,6 +151,23 @@ where
             .map_err(status_from_placement)?;
         Ok(Response::new(proto::ActivateActorReply {}))
     }
+
+    async fn activate_singleton(
+        &self,
+        request: Request<proto::ActivateSingletonRequest>,
+    ) -> Result<Response<proto::ActivateSingletonReply>, Status> {
+        let request = request.into_inner();
+        let key = SingletonKey {
+            service_kind: ServiceKind::new(request.service_kind),
+            singleton_kind: ActorKind::new(request.singleton_kind),
+            scope: request.scope,
+        };
+        self.handler
+            .activate_singleton(key, Epoch(request.epoch))
+            .await
+            .map_err(status_from_placement)?;
+        Ok(Response::new(proto::ActivateSingletonReply {}))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -124,6 +189,30 @@ impl CoordinatorLogicControl for TonicLogicControl {
                 service_kind: instance.service_kind.as_str().to_string(),
                 actor_kind: key.actor_kind.as_str().to_string(),
                 actor_id: Some(actor_id_to_proto(&key.actor_id)),
+                epoch: epoch.0,
+            })
+            .await
+            .map_err(logic_error)?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SingletonControl for TonicLogicControl {
+    async fn activate_singleton(
+        &self,
+        instance: &InstanceRecord,
+        key: &SingletonKey,
+        epoch: Epoch,
+    ) -> Result<(), PlacementError> {
+        let mut client = LogicControlClient::connect(instance.control_endpoint.to_string())
+            .await
+            .map_err(logic_error)?;
+        client
+            .activate_singleton(proto::ActivateSingletonRequest {
+                service_kind: key.service_kind.as_str().to_string(),
+                singleton_kind: key.singleton_kind.as_str().to_string(),
+                scope: key.scope.clone(),
                 epoch: epoch.0,
             })
             .await
@@ -164,6 +253,20 @@ fn actor_placement_to_proto(record: ActorPlacementRecord) -> proto::ActorPlaceme
     proto::ActorPlacementReply {
         actor_kind: record.actor_kind.as_str().to_string(),
         actor_id: Some(actor_id_to_proto(&record.actor_id)),
+        owner_instance_id: record.owner.as_str().to_string(),
+        epoch: record.epoch.0,
+        lease_id: record.lease_id.0,
+        state: placement_state_name(record.state).to_string(),
+    }
+}
+
+fn singleton_placement_to_proto(
+    record: SingletonPlacementRecord,
+) -> proto::SingletonPlacementReply {
+    proto::SingletonPlacementReply {
+        service_kind: record.service_kind.as_str().to_string(),
+        singleton_kind: record.singleton_kind.as_str().to_string(),
+        scope: record.scope,
         owner_instance_id: record.owner.as_str().to_string(),
         epoch: record.epoch.0,
         lease_id: record.lease_id.0,
@@ -267,6 +370,51 @@ mod tests {
             actor_id_from_proto(response.actor_id.unwrap()).unwrap(),
             ActorId::U64(7)
         );
+        shutdown_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn coordinator_rpc_activates_singleton_and_returns_owner_record() {
+        let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+        store
+            .upsert_instance(instance_record("world-a", InstanceState::Ready))
+            .await
+            .unwrap();
+        let coordinator = PlacementCoordinator::new(store, NoopLogicControl);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = Server::builder()
+            .add_service(PlacementCoordinatorServer::new(
+                PlacementCoordinatorService::new(coordinator),
+            ))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let task = tokio::spawn(server);
+
+        let mut client = PlacementCoordinatorClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        let response = client
+            .activate_singleton(proto::ActivateSingletonRequest {
+                service_kind: "World".to_string(),
+                singleton_kind: "SeasonManager".to_string(),
+                scope: "global".to_string(),
+                epoch: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.service_kind, "World");
+        assert_eq!(response.singleton_kind, "SeasonManager");
+        assert_eq!(response.scope, "global");
+        assert_eq!(response.owner_instance_id, "world-a");
+        assert_eq!(response.epoch, 1);
+        assert_eq!(response.lease_id, 1);
+        assert_eq!(response.state, "running");
         shutdown_tx.send(()).unwrap();
         task.await.unwrap().unwrap();
     }

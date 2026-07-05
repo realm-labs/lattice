@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_core::{ActorKind, Epoch};
+use lattice_core::{ActorId, ActorKind, Epoch};
 use lattice_placement::PlacementError;
 use lattice_placement::control::LogicControlHandler;
-use lattice_placement::store::ActorPlacementKey;
+use lattice_placement::store::{ActorPlacementKey, SingletonKey};
 
 use crate::actor::ErasedLogicActor;
 
@@ -36,6 +36,24 @@ impl LogicControlHandler for ServiceLogicControlHandler {
         };
         actor
             .activate(key.actor_id)
+            .await
+            .map_err(|error| PlacementError::LogicControl {
+                message: error.to_string(),
+            })
+    }
+
+    async fn activate_singleton(
+        &self,
+        key: SingletonKey,
+        _epoch: Epoch,
+    ) -> Result<(), PlacementError> {
+        let Some(actor) = self.actors.get(&key.singleton_kind) else {
+            return Err(PlacementError::LogicControl {
+                message: format!("missing singleton registration for {}", key.singleton_kind),
+            });
+        };
+        actor
+            .activate(ActorId::Str(key.scope))
             .await
             .map_err(|error| PlacementError::LogicControl {
                 message: error.to_string(),
