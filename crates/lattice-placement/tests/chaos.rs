@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use lattice_core::instance::InstanceCapacity;
 use lattice_core::{ActorId, ActorKind, Epoch, InstanceId, RouteKey, actor_kind, service_kind};
 use lattice_placement::coordinator::{
-    ExplicitRouteResolver, FailoverReport, NoopLogicControl, PlacementCoordinator,
+    ActivateActorRequest, ExplicitRouteResolver, FailoverReport, NoopLogicControl,
+    PlacementCoordinator,
 };
 use lattice_placement::instance::{InstanceRecord, InstanceState};
 use lattice_placement::store::{
@@ -13,8 +14,8 @@ use lattice_placement::store::{
     PlacementState, PlacementStore, SingletonKey, SingletonPlacementRecord,
 };
 use lattice_placement::{
-    EndpointLease, EndpointPool, EndpointRpcTransport, ResolveRequest, ResolvingRpcCore,
-    RouteResolver,
+    EndpointLease, EndpointPool, EndpointRpcTransport, PlacementError, ResolveRequest,
+    ResolvingRpcCore, RouteResolver,
 };
 use lattice_rpc::{
     RouteTarget, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError, RpcRequest,
@@ -176,6 +177,52 @@ async fn stale_owner_recovery_after_lease_expiry_is_fenced_and_retried() {
     assert_eq!(calls[0].request_id, calls[1].request_id);
 }
 
+#[tokio::test]
+async fn coordinator_leader_switch_rejects_stale_keepalive_and_continues_placement() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/chaos-leader"));
+    store
+        .upsert_instance(instance_record("world-a", InstanceState::Ready))
+        .await
+        .unwrap();
+    store
+        .upsert_instance(instance_record("world-b", InstanceState::Ready))
+        .await
+        .unwrap();
+    let leader_a = store
+        .campaign_coordinator_leader(InstanceId::new("coordinator-a"))
+        .await
+        .unwrap()
+        .unwrap();
+    let coordinator_a = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+
+    let first = coordinator_a
+        .activate_actor(activate_request(7))
+        .await
+        .unwrap();
+    store.resign_coordinator_leader(&leader_a).await.unwrap();
+    let leader_b = store
+        .campaign_coordinator_leader(InstanceId::new("coordinator-b"))
+        .await
+        .unwrap()
+        .unwrap();
+    let stale_keepalive = store.keepalive_coordinator_leader(&leader_a).await;
+    store.keepalive_coordinator_leader(&leader_b).await.unwrap();
+    let coordinator_b = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+    let second = coordinator_b
+        .activate_actor(activate_request(8))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        stale_keepalive,
+        Err(PlacementError::CoordinatorLeadershipLost)
+    );
+    assert_eq!(store.coordinator_leader(), Some(leader_b));
+    assert_eq!(first.owner, InstanceId::new("world-a"));
+    assert_eq!(second.owner, InstanceId::new("world-a"));
+    assert_eq!(store.list_actors().await.unwrap().len(), 2);
+}
+
 #[derive(Clone)]
 struct FencingStoreTransport {
     store: InMemoryPlacementStore,
@@ -257,6 +304,14 @@ fn actor_record(actor_id: u64, owner: &str, epoch: u64, lease_id: LeaseId) -> Ac
         epoch: Epoch(epoch),
         lease_id,
         state: PlacementState::Running,
+    }
+}
+
+fn activate_request(actor_id: u64) -> ActivateActorRequest {
+    ActivateActorRequest {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(actor_id),
     }
 }
 
