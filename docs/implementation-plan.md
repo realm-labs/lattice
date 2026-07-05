@@ -220,7 +220,7 @@ Status: `[ ]` incomplete.
 - [x] Gateway startup is still mostly example-specific and not represented as a framework service API.
 - [x] Cluster/node inspection does not query live services through LogicControl/Admin APIs.
 - [x] Security/mTLS integration is partial and not connected to service builders by default.
-- [ ] Full chaos test suite is not implemented.
+- [x] Full chaos test suite is not implemented.
   - [x] Stale owner recovers after lease expiry and is fenced; route cache invalidates and retries with the same request id.
   - [x] Target service succeeds but response is lost/unknown-result handling is covered.
   - [x] Timeout followed by retry/reconciliation is covered.
@@ -230,7 +230,7 @@ Status: `[ ]` incomplete.
   - [x] New request arriving while an actor is passivating is covered.
   - [x] Singleton failover while a long business job is running is covered.
   - [x] Rolling update with mixed versions is covered.
-  - [ ] EventBus subscriber duplicate delivery is covered.
+  - [x] EventBus subscriber duplicate delivery is covered.
 - [ ] `crates/lattice-actor/src/tests.rs` exceeds 1200 LOC and needs a documented split or explicit rationale before final exit.
 
 ### Phase 1: Single-Node Actor Runtime
