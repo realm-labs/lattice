@@ -1,3 +1,4 @@
+pub mod backpressure;
 pub mod codec;
 pub mod delivery;
 pub mod inbound;
@@ -5,6 +6,7 @@ pub mod session;
 pub mod stream;
 pub mod transport;
 
+pub use backpressure::{BackpressureOutcome, BackpressureQueue, BackpressureSnapshot};
 pub use codec::{DirectLinkFrame, DirectLinkFrameCodec, DirectLinkFrameKind, FrameCodecError};
 pub use delivery::{DirectLinkDeliveryError, DirectLinkDispatch, try_deliver_linked};
 pub use inbound::{DirectLinkInboundRouter, DirectLinkInboundRouterBuilder, InboundDeliveryError};
