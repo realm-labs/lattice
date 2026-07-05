@@ -13,7 +13,7 @@ use lattice_ops::{AdminHttpConfig, ServiceScheduler};
 use lattice_placement::coordinator::{PlacementWatchStarter, PlacementWatchTask};
 use lattice_placement::route::RpcRetryPolicy;
 use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix, PlacementStore};
-use lattice_rpc::{RpcClientContextFactory, RpcSecurityPolicy, RpcServerSecurity};
+use lattice_rpc::{RpcSecurityPolicy, RpcServerSecurity};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::{debug, info};
@@ -416,10 +416,9 @@ impl LatticeServiceBuilder {
                 RpcClientPlacement::Singleton => placement_store.singleton_route_resolver().await?,
             };
             placement_watch_tasks.push(watch_task);
-            let context_factory = RpcClientContextFactory::new(
-                self.service_kind.clone(),
-                instance.instance_id.clone(),
-            );
+            let context_factory = self
+                .rpc_security
+                .client_context_factory(self.service_kind.clone(), instance.instance_id.clone());
             binding.register(
                 &mut service_context,
                 Some(default_resolver),

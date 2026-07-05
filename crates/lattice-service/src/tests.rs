@@ -222,6 +222,7 @@ impl RpcServiceBinding for SecurityProbeBinding {
             auth: Some(AuthContext {
                 authorization: "Bearer internal".to_string(),
             }),
+            peer_identity: None,
         };
         let result = context.rpc_security().policy().validate(&rpc_context, None);
 
@@ -229,6 +230,51 @@ impl RpcServiceBinding for SecurityProbeBinding {
 
         context.add_rpc_service(EmptyRpcService);
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SecurityClientProbeCore;
+
+#[async_trait]
+impl ShardedRpcCore for SecurityClientProbeCore {
+    async fn call<Req>(&self, _req: Req) -> Result<Req::Reply, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        Err(RpcError::Business(
+            "security probe core is not called".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SecurityClientProbe;
+
+struct SecurityClientProbeBinding;
+
+impl RpcClientBinding for SecurityClientProbeBinding {
+    type Core = SecurityClientProbeCore;
+    type Client = SecurityClientProbe;
+
+    const SERVICE_KIND: &'static str = "World";
+
+    fn build_client(_core: Self::Core) -> Self::Client {
+        SecurityClientProbe
+    }
+
+    fn build_default_core(
+        _resolver: BoxRouteResolver,
+        context_factory: RpcClientContextFactory,
+        _retry_policy: lattice_placement::RpcRetryPolicy,
+    ) -> Option<Self::Core> {
+        let ctx = context_factory.next_context(None);
+        assert!(ctx.auth.is_some());
+        let peer = ctx.peer_identity.as_ref().expect("peer identity");
+        assert_eq!(peer.service_kind, service_kind!("World"));
+        assert_eq!(peer.instance_id, InstanceId::new("world-1"));
+        assert!(peer.spiffe_id.starts_with("spiffe://lattice.test/"));
+        Some(SecurityClientProbeCore)
     }
 }
 
@@ -622,6 +668,7 @@ async fn builder_propagates_rpc_security_to_service_bindings() {
                 .require_authorization(),
         )
         .register_sharded_rpc(SecurityProbeBinding)
+        .register_client::<SecurityClientProbeBinding>()
         .build()
         .await
         .unwrap();

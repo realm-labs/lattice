@@ -107,6 +107,7 @@ fn rpc_context_injects_and_extracts_grpc_metadata() {
         auth: Some(AuthContext {
             authorization: "Bearer test".into(),
         }),
+        peer_identity: None,
     };
     let mut metadata = MetadataMap::new();
 
@@ -134,6 +135,7 @@ fn rpc_security_policy_validates_mtls_peer_identity_against_metadata() {
         auth: Some(AuthContext {
             authorization: "Bearer internal".to_string(),
         }),
+        peer_identity: None,
     };
     let mut metadata = MetadataMap::new();
     ctx.inject_metadata(&mut metadata).unwrap();
@@ -183,6 +185,43 @@ fn rpc_server_security_reads_peer_identity_from_request_extensions() {
     request.extensions_mut().insert(peer.clone());
 
     assert_eq!(security.peer_identity(&request), Some(peer));
+}
+
+#[test]
+fn rpc_server_security_reads_peer_identity_from_metadata() {
+    let security = RpcServerSecurity::new(RpcSecurityPolicy::require_mtls(mtls_config()));
+    let peer = PeerIdentity::new(
+        service_kind!("Player"),
+        InstanceId::new("player-0"),
+        "spiffe://lattice.test/ns/default/sa/player",
+    );
+    let ctx = RpcClientContextFactory::new(service_kind!("Player"), InstanceId::new("player-0"))
+        .with_peer_identity(peer.clone())
+        .next_context(None);
+    let mut request = Request::new(EnterWorldRequest { world_id: 9 });
+    ctx.inject_metadata(request.metadata_mut()).unwrap();
+
+    assert_eq!(security.peer_identity(&request), Some(peer));
+}
+
+#[test]
+fn rpc_security_policy_builds_default_client_context() {
+    let security = RpcServerSecurity::new(
+        RpcSecurityPolicy::require_mtls(mtls_config()).require_authorization(),
+    );
+    let ctx = security
+        .client_context_factory(service_kind!("Player"), InstanceId::new("player-0"))
+        .next_context(None);
+    let mut metadata = MetadataMap::new();
+    ctx.inject_metadata(&mut metadata).unwrap();
+    let extracted = RpcContext::from_metadata(&metadata).unwrap();
+    let peer = extracted.peer_identity.as_ref().unwrap();
+
+    assert!(extracted.auth.is_some());
+    assert_eq!(peer.service_kind, service_kind!("Player"));
+    assert_eq!(peer.instance_id, InstanceId::new("player-0"));
+    assert!(peer.spiffe_id.starts_with("spiffe://lattice.test/"));
+    assert_eq!(security.policy().validate(&extracted, Some(peer)), Ok(()));
 }
 
 #[test]
@@ -479,6 +518,7 @@ fn test_context(route_epoch: Option<Epoch>) -> RpcContext {
         source_instance: InstanceId::new("world-0"),
         trace: TraceContext::default(),
         auth: None,
+        peer_identity: None,
     }
 }
 

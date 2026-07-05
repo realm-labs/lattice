@@ -5,10 +5,15 @@ use lattice_core::{Epoch, InstanceId, RequestId, ServiceKind, TraceContext};
 use tonic::Status;
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 
+use crate::security::PeerIdentity;
+
 pub(crate) const REQUEST_ID: &str = "lattice-request-id";
 pub(crate) const ROUTE_EPOCH: &str = "lattice-route-epoch";
 pub(crate) const SOURCE_SERVICE: &str = "lattice-source-service";
 pub(crate) const SOURCE_INSTANCE: &str = "lattice-source-instance";
+pub(crate) const PEER_SERVICE: &str = "lattice-peer-service";
+pub(crate) const PEER_INSTANCE: &str = "lattice-peer-instance";
+pub(crate) const PEER_SPIFFE_ID: &str = "lattice-peer-spiffe-id";
 pub(crate) const TRACEPARENT: &str = "traceparent";
 pub(crate) const TRACESTATE: &str = "tracestate";
 pub(crate) const AUTHORIZATION: &str = "authorization";
@@ -21,6 +26,7 @@ pub struct RpcContext {
     pub source_instance: InstanceId,
     pub trace: TraceContext,
     pub auth: Option<AuthContext>,
+    pub peer_identity: Option<PeerIdentity>,
 }
 
 impl RpcContext {
@@ -39,6 +45,11 @@ impl RpcContext {
         }
         if let Some(auth) = &self.auth {
             insert_ascii(metadata, AUTHORIZATION, &auth.authorization)?;
+        }
+        if let Some(peer) = &self.peer_identity {
+            insert_ascii(metadata, PEER_SERVICE, peer.service_kind.as_str())?;
+            insert_ascii(metadata, PEER_INSTANCE, peer.instance_id.as_str())?;
+            insert_ascii(metadata, PEER_SPIFFE_ID, &peer.spiffe_id)?;
         }
         Ok(())
     }
@@ -65,6 +76,7 @@ impl RpcContext {
             },
             auth: optional_ascii(metadata, AUTHORIZATION)?
                 .map(|authorization| AuthContext { authorization }),
+            peer_identity: peer_identity_from_metadata(metadata)?,
         })
     }
 }
@@ -80,6 +92,7 @@ pub struct RpcClientContextFactory {
     source_instance: InstanceId,
     trace: TraceContext,
     auth: Option<AuthContext>,
+    peer_identity: Option<PeerIdentity>,
     request_seq: Arc<AtomicU64>,
 }
 
@@ -90,6 +103,7 @@ impl RpcClientContextFactory {
             source_instance,
             trace: TraceContext::default(),
             auth: None,
+            peer_identity: None,
             request_seq: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -101,6 +115,11 @@ impl RpcClientContextFactory {
 
     pub fn with_auth(mut self, auth: AuthContext) -> Self {
         self.auth = Some(auth);
+        self
+    }
+
+    pub fn with_peer_identity(mut self, peer_identity: PeerIdentity) -> Self {
+        self.peer_identity = Some(peer_identity);
         self
     }
 
@@ -117,6 +136,7 @@ impl RpcClientContextFactory {
             source_instance: self.source_instance.clone(),
             trace: self.trace.clone(),
             auth: self.auth.clone(),
+            peer_identity: self.peer_identity.clone(),
         }
     }
 }
@@ -159,6 +179,32 @@ fn optional_ascii(
                 .map_err(|_| RpcMetadataError::InvalidAscii { key })
         })
         .transpose()
+}
+
+pub(crate) fn peer_identity_from_metadata(
+    metadata: &MetadataMap,
+) -> Result<Option<PeerIdentity>, RpcMetadataError> {
+    let service_kind = optional_ascii(metadata, PEER_SERVICE)?;
+    let instance_id = optional_ascii(metadata, PEER_INSTANCE)?;
+    let spiffe_id = optional_ascii(metadata, PEER_SPIFFE_ID)?;
+    match (service_kind, instance_id, spiffe_id) {
+        (None, None, None) => Ok(None),
+        (Some(service_kind), Some(instance_id), Some(spiffe_id)) => Ok(Some(PeerIdentity::new(
+            ServiceKind::new(service_kind),
+            InstanceId::new(instance_id),
+            spiffe_id,
+        ))),
+        (service_kind, instance_id, _spiffe_id) => {
+            let missing = if service_kind.is_none() {
+                PEER_SERVICE
+            } else if instance_id.is_none() {
+                PEER_INSTANCE
+            } else {
+                PEER_SPIFFE_ID
+            };
+            Err(RpcMetadataError::Missing { key: missing })
+        }
+    }
 }
 
 pub(crate) fn metadata_status(error: RpcMetadataError) -> Status {

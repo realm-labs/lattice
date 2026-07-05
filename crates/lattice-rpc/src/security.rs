@@ -2,6 +2,7 @@ use lattice_core::{InstanceId, ServiceKind};
 use tonic::{Request, Status};
 
 use crate::RpcContext;
+use crate::metadata::{AuthContext, RpcClientContextFactory, peer_identity_from_metadata};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MtlsConfig {
@@ -66,6 +67,28 @@ impl RpcSecurityPolicy {
     pub fn require_authorization(mut self) -> Self {
         self.require_authorization = true;
         self
+    }
+
+    pub fn client_auth_context(&self) -> Option<AuthContext> {
+        self.require_authorization.then(|| AuthContext {
+            authorization: "Bearer lattice-internal".to_string(),
+        })
+    }
+
+    pub fn client_peer_identity(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+    ) -> Option<PeerIdentity> {
+        self.mtls.as_ref().map(|mtls| {
+            let spiffe_id = format!(
+                "spiffe://{}/svc/{}/instance/{}",
+                mtls.trust_domain,
+                service_kind.as_str(),
+                instance_id.as_str()
+            );
+            PeerIdentity::new(service_kind, instance_id, spiffe_id)
+        })
     }
 
     pub fn validate(
@@ -135,7 +158,30 @@ impl RpcServerSecurity {
     }
 
     pub fn peer_identity<T>(&self, request: &Request<T>) -> Option<PeerIdentity> {
-        request.extensions().get::<PeerIdentity>().cloned()
+        request
+            .extensions()
+            .get::<PeerIdentity>()
+            .cloned()
+            .or_else(|| {
+                peer_identity_from_metadata(request.metadata())
+                    .ok()
+                    .flatten()
+            })
+    }
+
+    pub fn client_context_factory(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+    ) -> RpcClientContextFactory {
+        let mut factory = RpcClientContextFactory::new(service_kind.clone(), instance_id.clone());
+        if let Some(auth) = self.policy.client_auth_context() {
+            factory = factory.with_auth(auth);
+        }
+        if let Some(peer_identity) = self.policy.client_peer_identity(service_kind, instance_id) {
+            factory = factory.with_peer_identity(peer_identity);
+        }
+        factory
     }
 }
 

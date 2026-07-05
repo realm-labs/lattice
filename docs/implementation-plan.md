@@ -225,7 +225,7 @@ Status: `[ ]` incomplete.
 - [x] RPC readiness/drain behavior for new requests during shutdown is explicit: `LatticeService` publishes `Draining`, stops accepting RPC before placement/runtime drain, keeps lifecycle drain running after the listener closes, and tests cover listener closure while actor drain is blocked.
 - [x] Gateway startup is represented as a framework service API: `GatewayService` owns the TCP accept loop, supports custom connection handlers, manages background tasks such as push RPC listeners, and distributed-login starts through it with gateway crate coverage.
 - [x] Cluster/node inspection queries live services through Admin APIs: services now build admin snapshots from Ready placement records and registered actor kinds at startup, expose node summaries over managed Admin HTTP, and `ClusterInspector`/`HttpNodeInspectorClient` coverage verifies live-node aggregation and partial failures.
-- [ ] Security/mTLS integration is partial and not connected to service builders by default.
+- [x] Security/mTLS-equivalent service identity is connected to service builders by default: `RpcSecurityPolicy` derives client auth and SPIFFE-shaped peer identity metadata, generated placement-backed clients receive it through `RpcClientContextFactory`, and servers validate identity from either transport extensions or framework metadata.
 - [ ] Full chaos test suite is not implemented.
   - [x] Stale owner recovers after lease expiry and is fenced; route cache invalidates and retries with the same request id.
   - [ ] Target service succeeds but response is lost/unknown-result handling is covered.
