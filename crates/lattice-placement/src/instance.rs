@@ -8,6 +8,7 @@ use lattice_core::{InstanceId, ServiceKind};
 use serde::{Deserialize, Serialize};
 
 use crate::PlacementError;
+use crate::store::LeaseId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +24,7 @@ pub enum InstanceState {
 pub struct InstanceRecord {
     pub service_kind: ServiceKind,
     pub instance_id: InstanceId,
+    pub lease_id: LeaseId,
     #[serde(with = "uri_serde")]
     pub advertised_endpoint: Uri,
     #[serde(with = "uri_serde")]

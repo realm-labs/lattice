@@ -16,6 +16,8 @@ use lattice_placement::store::{
 
 #[async_trait]
 pub trait DynPlacementStore: Send + Sync + 'static {
+    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
+    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError>;
     async fn get_instance(
         &self,
@@ -71,6 +73,14 @@ impl<T> DynPlacementStore for T
 where
     T: PlacementStore,
 {
+    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
+        PlacementStore::grant_instance_lease(self).await
+    }
+
+    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
+        PlacementStore::keepalive_instance_lease(self, lease_id).await
+    }
+
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError> {
         PlacementStore::upsert_instance(self, record).await
     }

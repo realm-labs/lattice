@@ -4,7 +4,7 @@ use lattice_core::service_context::ConfiguredComponentBuilder;
 use lattice_core::{ConfiguredComponent, InstanceId, ServiceContextBuilder, ServiceKind};
 use lattice_placement::PlacementError;
 use lattice_placement::instance::InstanceRecord;
-use lattice_placement::store::PlacementStore;
+use lattice_placement::store::{LeaseId, PlacementStore};
 
 use crate::LatticeServiceError;
 use crate::framework::{
@@ -133,6 +133,8 @@ pub(crate) trait ErasedServiceComponent: Send + Sync {
 
 #[async_trait]
 pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
+    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
+    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError>;
 }
 
@@ -181,6 +183,14 @@ impl<T> ErasedPlacementStore for PlacementStoreHandle<T>
 where
     T: PlacementStore,
 {
+    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
+        self.store.grant_instance_lease().await
+    }
+
+    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
+        self.store.keepalive_instance_lease(lease_id).await
+    }
+
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError> {
         self.store.upsert_instance(record).await
     }

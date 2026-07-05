@@ -5,6 +5,7 @@ use lattice_core::instance::InstanceCapacity;
 use lattice_core::{ServiceContext, ServiceKind};
 use lattice_placement::coordinator::PlacementWatchTask;
 use lattice_placement::instance::{InstanceRecord, InstanceState};
+use lattice_placement::store::LeaseId;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -59,7 +60,11 @@ impl LatticeService {
 
     pub async fn run_until_shutdown(self) -> Result<(), LatticeServiceError> {
         let local_addr = self.listener.local_addr()?;
-        self.publish_instance(local_addr, InstanceState::Ready)
+        let lease_id = self.placement_store.grant_instance_lease().await?;
+        self.placement_store
+            .keepalive_instance_lease(lease_id)
+            .await?;
+        self.publish_instance(local_addr, InstanceState::Ready, lease_id)
             .await?;
         if let Some(ready) = self.ready {
             let _ = ready.send(local_addr);
@@ -102,6 +107,7 @@ impl LatticeService {
         &self,
         local_addr: SocketAddr,
         state: InstanceState,
+        lease_id: LeaseId,
     ) -> Result<(), LatticeServiceError> {
         let endpoint = self
             .instance
@@ -111,6 +117,7 @@ impl LatticeService {
         let record = InstanceRecord {
             service_kind: self.service_kind.clone(),
             instance_id: self.instance.instance_id.clone(),
+            lease_id,
             advertised_endpoint: endpoint.clone(),
             control_endpoint: endpoint,
             version: env!("CARGO_PKG_VERSION").to_string(),

@@ -382,6 +382,7 @@ mod tests {
         InstanceRecord {
             service_kind: service_kind!("Control"),
             instance_id: InstanceId::new(instance_id),
+            lease_id: LeaseId(1),
             advertised_endpoint: format!("http://{instance_id}.control:18080")
                 .parse()
                 .unwrap(),

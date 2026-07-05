@@ -52,6 +52,7 @@ fn instance_record(instance_id: &str, state: InstanceState) -> InstanceRecord {
     InstanceRecord {
         service_kind: service_kind!("World"),
         instance_id: InstanceId::new(instance_id),
+        lease_id: LeaseId(1),
         advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
         control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),
         version: "test".to_string(),

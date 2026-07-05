@@ -170,10 +170,10 @@ Status: `[ ]` incomplete and currently the highest-priority gap.
 - [x] Actor placement records include owner, epoch, lease id, and state.
 - [x] `PlacementCoordinator` library type can activate/move/drain/fail over actors in tests.
 - [x] `LatticeService` writes an `InstanceRecord` at startup.
-- [ ] `InstanceRecord` does not yet include a real liveness lease/keepalive contract.
+- [x] `InstanceRecord` does not yet include a real liveness lease/keepalive contract.
 - [ ] `LatticeService` does not write `Starting -> Ready -> Draining -> Stopping` state transitions as a lifecycle.
 - [ ] `LatticeService` does not keep an instance lease alive or remove/expire records on crash.
-- [ ] etcd instance registration is ordinary KV, not lease-backed liveness.
+- [x] etcd instance registration is ordinary KV, not lease-backed liveness.
 - [ ] `LogicControl` is only a Rust trait; no tonic control-plane RPC service is exposed by logic services.
 - [ ] Coordinator is only an in-process library type; there is no runnable coordinator service/binary.
 - [ ] Coordinator leader election is not implemented.

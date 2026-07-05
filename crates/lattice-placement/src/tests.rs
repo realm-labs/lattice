@@ -479,6 +479,23 @@ async fn placement_watch_reports_virtual_shard_updates() {
 }
 
 #[tokio::test]
+async fn in_memory_placement_store_grants_and_keeps_instance_leases_alive() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+
+    let lease_id = store.grant_instance_lease().await.unwrap();
+    store.keepalive_instance_lease(lease_id).await.unwrap();
+    let missing = store.keepalive_instance_lease(LeaseId(999)).await;
+
+    assert_eq!(lease_id, LeaseId(1));
+    assert_eq!(
+        missing,
+        Err(PlacementError::InstanceLeaseNotFound {
+            lease_id: LeaseId(999)
+        })
+    );
+}
+
+#[tokio::test]
 async fn in_memory_placement_store_activation_lock_is_exclusive_until_release() {
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
     let key = actor_key(7);
@@ -700,6 +717,7 @@ fn instance_record(instance_id: &str, state: InstanceState) -> InstanceRecord {
     InstanceRecord {
         service_kind: service_kind!("World"),
         instance_id: InstanceId::new(instance_id),
+        lease_id: LeaseId(1),
         advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
         control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),
         version: "test".to_string(),

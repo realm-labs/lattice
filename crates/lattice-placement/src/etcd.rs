@@ -35,6 +35,8 @@ impl<C> EtcdPlacementStore<C> {
 pub struct EtcdPlacementStoreConfig {
     pub key_prefix: String,
     pub endpoints: Vec<String>,
+    #[serde(default = "default_instance_lease_ttl_secs")]
+    pub instance_lease_ttl_secs: i64,
     pub activation_lock_ttl_secs: i64,
 }
 
@@ -46,6 +48,7 @@ impl EtcdPlacementStore<RealEtcdClient> {
     pub async fn connect(config: EtcdPlacementStoreConfig) -> Result<Self, PlacementError> {
         let client = RealEtcdClient::connect(
             config.endpoints,
+            InstanceLeaseTtl::new(config.instance_lease_ttl_secs),
             ActivationLockTtl::new(config.activation_lock_ttl_secs),
         )
         .await?;
@@ -71,6 +74,14 @@ impl<C> PlacementStore for EtcdPlacementStore<C>
 where
     C: EtcdKv,
 {
+    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
+        self.client.grant_instance_lease().await
+    }
+
+    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
+        self.client.keepalive_instance_lease(lease_id).await
+    }
+
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError> {
         self.client
             .put(
@@ -318,6 +329,8 @@ pub trait EtcdKv: Clone + Send + Sync + 'static {
         value: EtcdValue,
     ) -> Result<PlacementVersion, PlacementError>;
     async fn delete(&self, key: &str) -> Result<(), PlacementError>;
+    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
+    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
     async fn next_lease_id(&self) -> Result<LeaseId, PlacementError>;
     async fn watch_prefix(&self, prefix: &str) -> Result<EtcdWatch, PlacementError>;
 }
@@ -359,6 +372,7 @@ impl EtcdWatch {
 #[derive(Clone)]
 pub struct RealEtcdClient {
     client: Client,
+    instance_lease_ttl: InstanceLeaseTtl,
     activation_lock_ttl: ActivationLockTtl,
 }
 
@@ -366,6 +380,7 @@ impl fmt::Debug for RealEtcdClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RealEtcdClient")
+            .field("instance_lease_ttl", &self.instance_lease_ttl)
             .field("activation_lock_ttl", &self.activation_lock_ttl)
             .finish_non_exhaustive()
     }
@@ -374,13 +389,34 @@ impl fmt::Debug for RealEtcdClient {
 impl RealEtcdClient {
     pub async fn connect(
         endpoints: Vec<String>,
+        instance_lease_ttl: InstanceLeaseTtl,
         activation_lock_ttl: ActivationLockTtl,
     ) -> Result<Self, PlacementError> {
         let client = Client::connect(endpoints, None).await.map_err(etcd_error)?;
         Ok(Self {
             client,
+            instance_lease_ttl,
             activation_lock_ttl,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InstanceLeaseTtl(i64);
+
+impl InstanceLeaseTtl {
+    const DEFAULT_SECS: i64 = 30;
+
+    pub fn new(seconds: i64) -> Self {
+        if seconds > 0 {
+            Self(seconds)
+        } else {
+            Self(Self::DEFAULT_SECS)
+        }
+    }
+
+    fn as_secs(self) -> i64 {
+        self.0
     }
 }
 
@@ -486,6 +522,27 @@ impl EtcdKv for RealEtcdClient {
         Ok(())
     }
 
+    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
+        let mut client = self.client.clone();
+        let response = client
+            .lease_grant(self.instance_lease_ttl.as_secs(), None)
+            .await
+            .map_err(etcd_error)?;
+        lease_id(response.id())
+    }
+
+    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
+        let lease_id = i64::try_from(lease_id.0).map_err(codec_error)?;
+        let mut client = self.client.clone();
+        let (mut keeper, mut stream) = client
+            .lease_keep_alive(lease_id)
+            .await
+            .map_err(etcd_error)?;
+        keeper.keep_alive().await.map_err(etcd_error)?;
+        stream.message().await.map_err(etcd_error)?;
+        Ok(())
+    }
+
     async fn next_lease_id(&self) -> Result<LeaseId, PlacementError> {
         let mut client = self.client.clone();
         let response = client
@@ -534,6 +591,7 @@ impl EtcdKv for RealEtcdClient {
 pub struct InMemoryEtcdClient {
     inner: Arc<std::sync::Mutex<HashMap<String, (PlacementVersion, EtcdValue)>>>,
     watchers: Arc<std::sync::Mutex<HashMap<String, broadcast::Sender<EtcdWatchEvent>>>>,
+    instance_leases: Arc<std::sync::Mutex<HashMap<LeaseId, u64>>>,
     next_lease_id: Arc<AtomicU64>,
 }
 
@@ -542,6 +600,7 @@ impl InMemoryEtcdClient {
         Self {
             inner: Arc::new(std::sync::Mutex::new(HashMap::new())),
             watchers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            instance_leases: Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_lease_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -640,6 +699,27 @@ impl EtcdKv for InMemoryEtcdClient {
         Ok(())
     }
 
+    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
+        let lease_id = LeaseId(self.next_lease_id.fetch_add(1, Ordering::SeqCst));
+        self.instance_leases
+            .lock()
+            .expect("in-memory etcd leases mutex poisoned")
+            .insert(lease_id, 0);
+        Ok(lease_id)
+    }
+
+    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
+        let mut leases = self
+            .instance_leases
+            .lock()
+            .expect("in-memory etcd leases mutex poisoned");
+        let Some(keepalives) = leases.get_mut(&lease_id) else {
+            return Err(PlacementError::InstanceLeaseNotFound { lease_id });
+        };
+        *keepalives += 1;
+        Ok(())
+    }
+
     async fn next_lease_id(&self) -> Result<LeaseId, PlacementError> {
         Ok(LeaseId(self.next_lease_id.fetch_add(1, Ordering::SeqCst)))
     }
@@ -690,12 +770,20 @@ fn decode_etcd_value(bytes: &[u8]) -> Result<EtcdValue, PlacementError> {
 
 fn put_options_for(value: &EtcdValue) -> Result<Option<PutOptions>, PlacementError> {
     match value {
+        EtcdValue::Instance(record) => {
+            let lease_id = i64::try_from(record.lease_id.0).map_err(codec_error)?;
+            Ok(Some(PutOptions::new().with_lease(lease_id)))
+        }
         EtcdValue::ActivationLock(lease_id) => {
             let lease_id = i64::try_from(lease_id.0).map_err(codec_error)?;
             Ok(Some(PutOptions::new().with_lease(lease_id)))
         }
-        EtcdValue::Instance(_) | EtcdValue::Actor(_) | EtcdValue::VirtualShard(_) => Ok(None),
+        EtcdValue::Actor(_) | EtcdValue::VirtualShard(_) => Ok(None),
     }
+}
+
+fn default_instance_lease_ttl_secs() -> i64 {
+    InstanceLeaseTtl::DEFAULT_SECS
 }
 
 fn placement_version(version: i64) -> Result<PlacementVersion, PlacementError> {
@@ -936,6 +1024,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn etcd_store_grants_and_keeps_instance_leases_alive() {
+        let store = EtcdPlacementStore::new(
+            PlacementPrefix::new("/lattice/test"),
+            InMemoryEtcdClient::new(),
+        );
+
+        let lease_id = store.grant_instance_lease().await.unwrap();
+        store.keepalive_instance_lease(lease_id).await.unwrap();
+        let missing = store.keepalive_instance_lease(LeaseId(999)).await;
+
+        assert_eq!(lease_id, LeaseId(1));
+        assert_eq!(
+            missing,
+            Err(PlacementError::InstanceLeaseNotFound {
+                lease_id: LeaseId(999)
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn etcd_store_activation_lock_is_exclusive_until_release() {
         let store = EtcdPlacementStore::new(
             PlacementPrefix::new("/lattice/test"),
@@ -958,6 +1066,7 @@ mod tests {
         let store = EtcdPlacementStore::in_memory_from_config(EtcdPlacementStoreConfig {
             key_prefix: "/lattice/test".to_string(),
             endpoints: vec!["http://127.0.0.1:2379".to_string()],
+            instance_lease_ttl_secs: 30,
             activation_lock_ttl_secs: 30,
         });
 
@@ -982,6 +1091,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn etcd_instance_records_are_written_with_their_instance_lease() {
+        let instance =
+            EtcdValue::Instance(Box::new(instance_record("world-a", InstanceState::Ready)));
+
+        let options = put_options_for(&instance).unwrap();
+
+        assert!(options.is_some());
+    }
+
     fn actor_key_for(actor_id: u64) -> ActorPlacementKey {
         ActorPlacementKey {
             actor_kind: actor_kind!("World"),
@@ -1001,6 +1120,7 @@ mod tests {
         InstanceRecord {
             service_kind: service_kind!("World"),
             instance_id: InstanceId::new(instance_id),
+            lease_id: LeaseId(1),
             advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
             control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),
             version: "test".to_string(),

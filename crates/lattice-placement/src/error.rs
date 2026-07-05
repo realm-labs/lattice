@@ -1,6 +1,7 @@
 use lattice_core::InstanceId;
 
 use crate::instance::InstanceState;
+use crate::store::LeaseId;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PlacementError {
@@ -25,6 +26,8 @@ pub enum PlacementError {
     CompareAndPutFailed,
     #[error("activation lock is already held for actor")]
     ActivationLockHeld,
+    #[error("instance lease {lease_id:?} was not found")]
+    InstanceLeaseNotFound { lease_id: LeaseId },
     #[error("singleton activation lock is already held")]
     SingletonLockHeld,
     #[error("placement watch closed")]

@@ -116,6 +116,8 @@ impl PlacementPrefix {
 
 #[async_trait]
 pub trait PlacementStore: Clone + Send + Sync + 'static {
+    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
+    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError>;
     async fn get_instance(
         &self,
@@ -214,6 +216,22 @@ impl InMemoryPlacementStore {
 
 #[async_trait]
 impl PlacementStore for InMemoryPlacementStore {
+    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let lease_id = LeaseId(self.next_lease_id.fetch_add(1, Ordering::SeqCst));
+        inner.instance_leases.insert(lease_id, 0);
+        Ok(lease_id)
+    }
+
+    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let Some(keepalives) = inner.instance_leases.get_mut(&lease_id) else {
+            return Err(PlacementError::InstanceLeaseNotFound { lease_id });
+        };
+        *keepalives += 1;
+        Ok(())
+    }
+
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError> {
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
         inner.instances.insert(
@@ -427,6 +445,7 @@ impl PlacementStore for InMemoryPlacementStore {
 
 #[derive(Debug, Default)]
 struct PlacementStoreInner {
+    instance_leases: HashMap<LeaseId, u64>,
     instances: HashMap<PrefixedInstanceKey, InstanceRecord>,
     actors: HashMap<PrefixedActorKey, (PlacementVersion, ActorPlacementRecord)>,
     vshards: HashMap<PrefixedVShardKey, (PlacementVersion, VirtualShardPlacementRecord)>,
