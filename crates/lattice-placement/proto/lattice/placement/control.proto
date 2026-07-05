@@ -5,6 +5,7 @@ package lattice.placement.control;
 service LogicControl {
   rpc ActivateActor(ActivateActorRequest) returns (ActivateActorReply);
   rpc ActivateSingleton(ActivateSingletonRequest) returns (ActivateSingletonReply);
+  rpc PrepareVirtualShardMigration(PrepareVirtualShardMigrationRequest) returns (PrepareVirtualShardMigrationReply);
 }
 
 service PlacementCoordinator {
@@ -38,6 +39,20 @@ message ActivateSingletonRequest {
 }
 
 message ActivateSingletonReply {}
+
+message PrepareVirtualShardMigrationRequest {
+  string service_kind = 1;
+  string actor_kind = 2;
+  uint32 shard_id = 3;
+  uint32 shard_count = 4;
+  uint64 owner_epoch = 5;
+}
+
+message PrepareVirtualShardMigrationReply {
+  bool eligible = 1;
+  uint64 running_actors = 2;
+  uint64 passivated_actors = 3;
+}
 
 message ActorPlacementReply {
   string actor_kind = 1;

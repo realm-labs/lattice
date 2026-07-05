@@ -30,6 +30,49 @@ impl LogicControl for CountingLogicControl {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct SelectiveShardMigrationControl {
+    eligible: Arc<std::sync::Mutex<BTreeSet<VirtualShardId>>>,
+    prepared: Arc<std::sync::Mutex<Vec<VirtualShardId>>>,
+}
+
+#[async_trait]
+impl LogicControl for SelectiveShardMigrationControl {
+    async fn activate_actor(
+        &self,
+        _instance: &InstanceRecord,
+        _key: &ActorPlacementKey,
+        _epoch: Epoch,
+    ) -> Result<(), PlacementError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl VirtualShardMigrationControl for SelectiveShardMigrationControl {
+    async fn prepare_virtual_shard_migration(
+        &self,
+        _instance: &InstanceRecord,
+        request: PrepareVirtualShardMigrationRequest,
+    ) -> Result<VirtualShardMigrationOutcome, PlacementError> {
+        self.prepared
+            .lock()
+            .expect("prepared shard mutex poisoned")
+            .push(request.shard_id);
+        let eligible = self
+            .eligible
+            .lock()
+            .expect("eligible shard mutex poisoned")
+            .contains(&request.shard_id);
+        Ok(VirtualShardMigrationOutcome {
+            shard_id: request.shard_id,
+            eligible,
+            running_actors: usize::from(!eligible),
+            passivated_actors: usize::from(eligible),
+        })
+    }
+}
+
 #[tokio::test]
 async fn coordinator_activates_missing_actor_owner_without_prewritten_logic_key() {
     let store = ready_store().await;
@@ -397,6 +440,76 @@ async fn virtual_shard_rebalance_respects_running_actor_movement_policy() {
 
     assert_eq!(running_guarded.moved_shards, 0);
     assert_eq!(running_allowed.moved_shards, 2);
+}
+
+#[tokio::test]
+async fn prepared_virtual_shard_rebalance_moves_only_policy_eligible_shards() {
+    let store = ready_store().await;
+    let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+    coordinator
+        .rebalance_virtual_shards(
+            RebalanceVirtualShardsRequest {
+                service_kind: service_kind!("World"),
+                actor_kind: actor_kind!("World"),
+                shard_count: 4,
+                eligible_shards: BTreeSet::new(),
+                max_migrations: usize::MAX,
+                movement_policy: VirtualShardMovementPolicy::AllowRunningMigration,
+            },
+            &RoundRobinShardAssigner,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_instance(instance_record("world-b", InstanceState::Ready))
+        .await
+        .unwrap();
+    let logic = SelectiveShardMigrationControl::default();
+    logic
+        .eligible
+        .lock()
+        .expect("eligible shard mutex poisoned")
+        .insert(VirtualShardId(1));
+    let coordinator = PlacementCoordinator::new(store.clone(), logic.clone());
+
+    let report = coordinator
+        .prepare_and_rebalance_virtual_shards(
+            RebalanceVirtualShardsRequest {
+                service_kind: service_kind!("World"),
+                actor_kind: actor_kind!("World"),
+                shard_count: 4,
+                eligible_shards: BTreeSet::new(),
+                max_migrations: usize::MAX,
+                movement_policy: VirtualShardMovementPolicy::EligibleOnly,
+            },
+            &GradualRebalanceShardAssigner,
+        )
+        .await
+        .unwrap();
+    let assignments = store
+        .list_virtual_shards(&service_kind!("World"), &actor_kind!("World"))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, record)| (record.shard_id, (record.owner, record.epoch)))
+        .collect::<BTreeMap<_, _>>();
+
+    assert_eq!(report.moved_shards, 1);
+    assert_eq!(
+        *logic
+            .prepared
+            .lock()
+            .expect("prepared shard mutex poisoned"),
+        vec![VirtualShardId(1), VirtualShardId(3)]
+    );
+    assert_eq!(
+        assignments.get(&VirtualShardId(1)),
+        Some(&(InstanceId::new("world-b"), Epoch(2)))
+    );
+    assert_eq!(
+        assignments.get(&VirtualShardId(3)),
+        Some(&(InstanceId::new("world-a"), Epoch(1)))
+    );
 }
 
 #[tokio::test]

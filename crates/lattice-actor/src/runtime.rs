@@ -57,6 +57,13 @@ pub enum PassivationPolicy {
     IdleTimeout(Duration),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShardMigrationPolicy {
+    #[default]
+    BlockRunningActors,
+    PassivateRunningActors,
+}
+
 #[derive(Debug, Clone)]
 pub struct ActorRuntime {
     config: ActorRuntimeConfig,

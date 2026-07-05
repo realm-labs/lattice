@@ -5,6 +5,8 @@ use tonic::{Request, Response, Status};
 use crate::coordinator::{
     ActivateActorRequest as CoordinatorActivateActorRequest,
     LogicControl as CoordinatorLogicControl, PlacementCoordinator,
+    PrepareVirtualShardMigrationRequest, VirtualShardMigrationControl,
+    VirtualShardMigrationOutcome,
 };
 use crate::error::PlacementError;
 use crate::instance::InstanceRecord;
@@ -16,6 +18,7 @@ use crate::store::{
     ActorPlacementKey, ActorPlacementRecord, PlacementState, PlacementStore, SingletonKey,
     SingletonPlacementRecord,
 };
+use crate::vshard::VirtualShardId;
 
 pub mod proto {
     tonic::include_proto!("lattice.placement.control");
@@ -38,6 +41,10 @@ pub trait LogicControlHandler: Clone + Send + Sync + 'static {
         key: SingletonKey,
         epoch: Epoch,
     ) -> Result<(), PlacementError>;
+    async fn prepare_virtual_shard_migration(
+        &self,
+        request: PrepareVirtualShardMigrationRequest,
+    ) -> Result<VirtualShardMigrationOutcome, PlacementError>;
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +175,29 @@ where
             .map_err(status_from_placement)?;
         Ok(Response::new(proto::ActivateSingletonReply {}))
     }
+
+    async fn prepare_virtual_shard_migration(
+        &self,
+        request: Request<proto::PrepareVirtualShardMigrationRequest>,
+    ) -> Result<Response<proto::PrepareVirtualShardMigrationReply>, Status> {
+        let request = request.into_inner();
+        let outcome = self
+            .handler
+            .prepare_virtual_shard_migration(PrepareVirtualShardMigrationRequest {
+                service_kind: ServiceKind::new(request.service_kind),
+                actor_kind: ActorKind::new(request.actor_kind),
+                shard_id: VirtualShardId(request.shard_id),
+                shard_count: request.shard_count,
+                owner_epoch: Epoch(request.owner_epoch),
+            })
+            .await
+            .map_err(status_from_placement)?;
+        Ok(Response::new(proto::PrepareVirtualShardMigrationReply {
+            eligible: outcome.eligible,
+            running_actors: outcome.running_actors as u64,
+            passivated_actors: outcome.passivated_actors as u64,
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -218,6 +248,36 @@ impl SingletonControl for TonicLogicControl {
             .await
             .map_err(logic_error)?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl VirtualShardMigrationControl for TonicLogicControl {
+    async fn prepare_virtual_shard_migration(
+        &self,
+        instance: &InstanceRecord,
+        request: PrepareVirtualShardMigrationRequest,
+    ) -> Result<VirtualShardMigrationOutcome, PlacementError> {
+        let mut client = LogicControlClient::connect(instance.control_endpoint.to_string())
+            .await
+            .map_err(logic_error)?;
+        let response = client
+            .prepare_virtual_shard_migration(proto::PrepareVirtualShardMigrationRequest {
+                service_kind: request.service_kind.as_str().to_string(),
+                actor_kind: request.actor_kind.as_str().to_string(),
+                shard_id: request.shard_id.0,
+                shard_count: request.shard_count,
+                owner_epoch: request.owner_epoch.0,
+            })
+            .await
+            .map_err(logic_error)?
+            .into_inner();
+        Ok(VirtualShardMigrationOutcome {
+            shard_id: request.shard_id,
+            eligible: response.eligible,
+            running_actors: response.running_actors as usize,
+            passivated_actors: response.passivated_actors as usize,
+        })
     }
 }
 

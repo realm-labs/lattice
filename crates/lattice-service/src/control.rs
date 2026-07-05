@@ -5,6 +5,9 @@ use async_trait::async_trait;
 use lattice_core::{ActorId, ActorKind, Epoch};
 use lattice_placement::PlacementError;
 use lattice_placement::control::LogicControlHandler;
+use lattice_placement::coordinator::{
+    PrepareVirtualShardMigrationRequest, VirtualShardMigrationOutcome,
+};
 use lattice_placement::store::{ActorPlacementKey, SingletonKey};
 
 use crate::actor::ErasedLogicActor;
@@ -58,5 +61,25 @@ impl LogicControlHandler for ServiceLogicControlHandler {
             .map_err(|error| PlacementError::LogicControl {
                 message: error.to_string(),
             })
+    }
+
+    async fn prepare_virtual_shard_migration(
+        &self,
+        request: PrepareVirtualShardMigrationRequest,
+    ) -> Result<VirtualShardMigrationOutcome, PlacementError> {
+        let Some(actor) = self.actors.get(&request.actor_kind) else {
+            return Err(PlacementError::LogicControl {
+                message: format!("missing actor registration for {}", request.actor_kind),
+            });
+        };
+        let preparation = actor
+            .prepare_virtual_shard_migration(request.shard_id, request.shard_count)
+            .await;
+        Ok(VirtualShardMigrationOutcome {
+            shard_id: request.shard_id,
+            eligible: preparation.eligible,
+            running_actors: preparation.running_actors,
+            passivated_actors: preparation.passivated_actors,
+        })
     }
 }

@@ -27,6 +27,7 @@ async fn activation_waiter_times_out_while_activation_is_loading() {
         ActorRegistryConfig {
             mailbox: MailboxConfig::bounded(8),
             passivation: Default::default(),
+            shard_migration: Default::default(),
             waiter_capacity: 1,
             waiter_timeout: Duration::from_millis(10),
             actor_ref: None,

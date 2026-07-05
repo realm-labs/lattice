@@ -19,7 +19,7 @@ use http::{Request, Response};
 use lattice_actor::registry::ActorCreateContext;
 use lattice_actor::{
     Actor, ActorContext, ActorError, ActorFactory, ActorStopError, Handler, Message,
-    PassivationReason, StopReason,
+    PassivationReason, ShardMigrationPolicy, StopReason,
 };
 use lattice_config::{ConfigFormat, ConfigSource};
 use lattice_core::{
@@ -39,6 +39,7 @@ use lattice_placement::store::{
     ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
     PlacementState, PlacementStore, SingletonKey,
 };
+use lattice_placement::vshard::VirtualShardMapper;
 use lattice_placement::{
     BoxRouteResolver, EndpointLease, EndpointPool, EndpointRpcTransport, ResolveRequest,
     ResolvingRpcCore, RouteResolver,
@@ -1069,6 +1070,40 @@ async fn service_shutdown_drains_runtime_actor_registries() {
 }
 
 #[tokio::test]
+async fn logic_control_prepares_virtual_shard_migration_from_registry_policy() {
+    let blocked = prepare_virtual_shard_migration_with_policy(
+        ShardMigrationPolicy::BlockRunningActors,
+        Arc::new(tokio::sync::Mutex::new(Vec::new())),
+    )
+    .await;
+    assert!(!blocked.0.eligible);
+    assert_eq!(blocked.0.running_actors, 1);
+    assert_eq!(blocked.0.passivated_actors, 0);
+
+    let reasons = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let passivated = prepare_virtual_shard_migration_with_policy(
+        ShardMigrationPolicy::PassivateRunningActors,
+        reasons.clone(),
+    )
+    .await;
+    assert!(passivated.0.eligible);
+    assert_eq!(passivated.0.running_actors, 1);
+    assert_eq!(passivated.0.passivated_actors, 1);
+
+    for _ in 0..50 {
+        if reasons
+            .lock()
+            .await
+            .contains(&StopReason::Passivated(PassivationReason::Migrate))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("migration passivation reason was not recorded");
+}
+
+#[tokio::test]
 async fn service_shutdown_migrates_owned_placement_records() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
@@ -1517,6 +1552,65 @@ fn placement_instance(instance_id: &str) -> InstanceRecord {
         capacity: Default::default(),
         labels: Default::default(),
     }
+}
+
+async fn prepare_virtual_shard_migration_with_policy(
+    policy: ShardMigrationPolicy,
+    reasons: Arc<tokio::sync::Mutex<Vec<StopReason>>>,
+) -> (proto::PrepareVirtualShardMigrationReply,) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-migration"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .shard_migration(policy)
+                .factory(DrainRecordingFactory {
+                    reasons: reasons.clone(),
+                })
+                .build(),
+        )
+        .build()
+        .await
+        .unwrap();
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let addr = ready_rx.await.unwrap();
+    let mut client = LogicControlClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    client
+        .activate_actor(proto::ActivateActorRequest {
+            service_kind: "World".to_string(),
+            actor_kind: "World".to_string(),
+            actor_id: Some(actor_id_to_proto(&ActorId::U64(7))),
+            epoch: 1,
+        })
+        .await
+        .unwrap();
+
+    let shard_id = VirtualShardMapper::new(8)
+        .unwrap()
+        .shard_for_route_key(&RouteKey::U64(7));
+    let response = client
+        .prepare_virtual_shard_migration(proto::PrepareVirtualShardMigrationRequest {
+            service_kind: "World".to_string(),
+            actor_kind: "World".to_string(),
+            shard_id: shard_id.0,
+            shard_count: 8,
+            owner_epoch: 1,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    (response,)
 }
 
 fn placement_actor_key(actor_id: u64) -> ActorPlacementKey {

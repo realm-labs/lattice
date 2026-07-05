@@ -10,9 +10,10 @@ use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::registry::{
     ActorCreateContext, ActorFactory, ActorLoader, ActorRegistry, ActorRegistryConfig,
 };
-use lattice_actor::runtime::PassivationPolicy;
-use lattice_actor::traits::Actor;
-use lattice_core::{ActorId, ActorKind};
+use lattice_actor::runtime::{PassivationPolicy, ShardMigrationPolicy};
+use lattice_actor::traits::{Actor, PassivationReason};
+use lattice_core::{ActorId, ActorKind, RouteKey};
+use lattice_placement::vshard::{VirtualShardId, VirtualShardMapper};
 
 use crate::LatticeServiceError;
 use crate::context::ServiceBuildContext;
@@ -66,6 +67,11 @@ where
 
     pub fn passivation(mut self, passivation: PassivationPolicy) -> Self {
         self.config.passivation = passivation;
+        self
+    }
+
+    pub fn shard_migration(mut self, policy: ShardMigrationPolicy) -> Self {
+        self.config.shard_migration = policy;
         self
     }
 
@@ -209,6 +215,18 @@ where
 pub(crate) trait ErasedLogicActor: Send + Sync + fmt::Debug {
     async fn activate(&self, actor_id: ActorId) -> Result<(), ActorActivationError>;
     async fn drain(&self) -> usize;
+    async fn prepare_virtual_shard_migration(
+        &self,
+        shard_id: VirtualShardId,
+        shard_count: u32,
+    ) -> VirtualShardPreparation;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VirtualShardPreparation {
+    pub eligible: bool,
+    pub running_actors: usize,
+    pub passivated_actors: usize,
 }
 
 #[async_trait]
@@ -225,6 +243,67 @@ where
 
     async fn drain(&self) -> usize {
         self.registry.drain().await
+    }
+
+    async fn prepare_virtual_shard_migration(
+        &self,
+        shard_id: VirtualShardId,
+        shard_count: u32,
+    ) -> VirtualShardPreparation {
+        let mapper = match VirtualShardMapper::new(shard_count) {
+            Ok(mapper) => mapper,
+            Err(_) => {
+                return VirtualShardPreparation {
+                    eligible: false,
+                    running_actors: 0,
+                    passivated_actors: 0,
+                };
+            }
+        };
+        let running_actor_ids = self
+            .registry
+            .running_actor_ids()
+            .into_iter()
+            .filter(|actor_id| {
+                mapper.shard_for_route_key(&route_key_from_actor_id(actor_id)) == shard_id
+            })
+            .collect::<Vec<_>>();
+        let running_actors = running_actor_ids.len();
+        if running_actors == 0 {
+            return VirtualShardPreparation {
+                eligible: true,
+                running_actors,
+                passivated_actors: 0,
+            };
+        }
+
+        match self.registry.shard_migration_policy() {
+            ShardMigrationPolicy::BlockRunningActors => VirtualShardPreparation {
+                eligible: false,
+                running_actors,
+                passivated_actors: 0,
+            },
+            ShardMigrationPolicy::PassivateRunningActors => {
+                let passivated = self
+                    .registry
+                    .passivate_actor_ids(running_actor_ids, PassivationReason::Migrate)
+                    .await;
+                VirtualShardPreparation {
+                    eligible: true,
+                    running_actors,
+                    passivated_actors: passivated,
+                }
+            }
+        }
+    }
+}
+
+fn route_key_from_actor_id(actor_id: &ActorId) -> RouteKey {
+    match actor_id {
+        ActorId::Str(value) => RouteKey::Str(value.clone()),
+        ActorId::U64(value) => RouteKey::U64(*value),
+        ActorId::I64(value) => RouteKey::I64(*value),
+        ActorId::Bytes(value) => RouteKey::Bytes(value.clone()),
     }
 }
 

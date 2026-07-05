@@ -13,13 +13,14 @@ use tokio::sync::{Semaphore, watch};
 use crate::error::{ActorActivationError, ActorError};
 use crate::handle::ActorHandle;
 use crate::mailbox::MailboxConfig;
-use crate::runtime::{PassivationPolicy, spawn_actor_with_self_ref};
+use crate::runtime::{PassivationPolicy, ShardMigrationPolicy, spawn_actor_with_self_ref};
 use crate::traits::{Actor, PassivationReason, StopReason};
 
 #[derive(Debug, Clone)]
 pub struct ActorRegistryConfig {
     pub mailbox: MailboxConfig,
     pub passivation: PassivationPolicy,
+    pub shard_migration: ShardMigrationPolicy,
     pub waiter_capacity: usize,
     pub waiter_timeout: Duration,
     pub actor_ref: Option<ActorRefConfig>,
@@ -39,6 +40,7 @@ impl Default for ActorRegistryConfig {
         Self {
             mailbox: MailboxConfig::default(),
             passivation: PassivationPolicy::Disabled,
+            shard_migration: ShardMigrationPolicy::BlockRunningActors,
             waiter_capacity: 1024,
             waiter_timeout: Duration::from_secs(5),
             actor_ref: None,
@@ -100,6 +102,20 @@ impl<A: Actor> ActorRegistry<A> {
         &self.kind
     }
 
+    pub fn shard_migration_policy(&self) -> ShardMigrationPolicy {
+        self.config.shard_migration
+    }
+
+    pub fn running_actor_ids(&self) -> Vec<ActorId> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                RegistryEntry::Running(_) => Some(entry.key().clone()),
+                RegistryEntry::Activating(_) => None,
+            })
+            .collect()
+    }
+
     pub async fn get(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
         match self.entries.get(actor_id).as_deref() {
             Some(RegistryEntry::Running(handle)) => Some(handle.clone()),
@@ -136,6 +152,20 @@ impl<A: Actor> ActorRegistry<A> {
             }
         }
         drained
+    }
+
+    pub async fn passivate_actor_ids<I>(&self, actor_ids: I, reason: PassivationReason) -> usize
+    where
+        I: IntoIterator<Item = ActorId>,
+    {
+        let mut passivated = 0;
+        for actor_id in actor_ids {
+            if let Some(handle) = self.remove(&actor_id).await {
+                let _ = handle.stop(StopReason::Passivated(reason)).await;
+                passivated += 1;
+            }
+        }
+        passivated
     }
 
     pub async fn start(

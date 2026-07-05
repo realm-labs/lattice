@@ -14,7 +14,8 @@ pub use handle::ActorHandle;
 pub use mailbox::MailboxConfig;
 pub use registry::{ActorFactory, ActorLoader, ActorRegistry};
 pub use runtime::{
-    ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, PassivationPolicy, spawn_actor,
+    ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, PassivationPolicy, ShardMigrationPolicy,
+    spawn_actor,
 };
 pub use traits::{Actor, Handler, HandlerErrorAction, Message, PassivationReason, StopReason};
 

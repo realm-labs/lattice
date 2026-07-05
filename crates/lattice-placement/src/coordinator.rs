@@ -39,6 +39,15 @@ pub trait LogicControl: Clone + Send + Sync + 'static {
     ) -> Result<(), PlacementError>;
 }
 
+#[async_trait]
+pub trait VirtualShardMigrationControl: LogicControl {
+    async fn prepare_virtual_shard_migration(
+        &self,
+        instance: &InstanceRecord,
+        request: PrepareVirtualShardMigrationRequest,
+    ) -> Result<VirtualShardMigrationOutcome, PlacementError>;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NoopLogicControl;
 
@@ -63,6 +72,22 @@ impl SingletonControl for NoopLogicControl {
         _epoch: Epoch,
     ) -> Result<(), PlacementError> {
         Ok(())
+    }
+}
+
+#[async_trait]
+impl VirtualShardMigrationControl for NoopLogicControl {
+    async fn prepare_virtual_shard_migration(
+        &self,
+        _instance: &InstanceRecord,
+        request: PrepareVirtualShardMigrationRequest,
+    ) -> Result<VirtualShardMigrationOutcome, PlacementError> {
+        Ok(VirtualShardMigrationOutcome {
+            shard_id: request.shard_id,
+            eligible: true,
+            running_actors: 0,
+            passivated_actors: 0,
+        })
     }
 }
 
@@ -101,6 +126,23 @@ pub struct RebalanceVirtualShardsReport {
     pub ready_instances: usize,
     pub assignments_written: usize,
     pub moved_shards: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareVirtualShardMigrationRequest {
+    pub service_kind: ServiceKind,
+    pub actor_kind: ActorKind,
+    pub shard_id: VirtualShardId,
+    pub shard_count: u32,
+    pub owner_epoch: Epoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualShardMigrationOutcome {
+    pub shard_id: VirtualShardId,
+    pub eligible: bool,
+    pub running_actors: usize,
+    pub passivated_actors: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -514,6 +556,60 @@ where
         .await
     }
 
+    pub async fn prepare_and_rebalance_virtual_shards<A>(
+        &self,
+        request: RebalanceVirtualShardsRequest,
+        assigner: &A,
+    ) -> Result<RebalanceVirtualShardsReport, PlacementError>
+    where
+        A: VirtualShardAssigner + ?Sized,
+        L: VirtualShardMigrationControl,
+    {
+        if request.movement_policy == VirtualShardMovementPolicy::AllowRunningMigration {
+            return self.rebalance_virtual_shards(request, assigner).await;
+        }
+
+        let candidates = self
+            .planned_virtual_shard_moves(request.clone(), assigner)
+            .await?;
+        let mut eligible_shards = request.eligible_shards.clone();
+        for record in candidates {
+            let Some(instance) = self.store.get_instance(&record.owner).await? else {
+                continue;
+            };
+            if instance.state != InstanceState::Ready {
+                continue;
+            }
+
+            let outcome = self
+                .logic
+                .prepare_virtual_shard_migration(
+                    &instance,
+                    PrepareVirtualShardMigrationRequest {
+                        service_kind: record.service_kind.clone(),
+                        actor_kind: record.actor_kind.clone(),
+                        shard_id: record.shard_id,
+                        shard_count: request.shard_count,
+                        owner_epoch: record.epoch,
+                    },
+                )
+                .await?;
+            if outcome.eligible {
+                eligible_shards.insert(record.shard_id);
+            }
+        }
+
+        self.rebalance_virtual_shards(
+            RebalanceVirtualShardsRequest {
+                eligible_shards,
+                movement_policy: VirtualShardMovementPolicy::EligibleOnly,
+                ..request
+            },
+            assigner,
+        )
+        .await
+    }
+
     pub async fn start_virtual_shard_scale_out_watch<A>(
         &self,
         requests: Vec<RebalanceVirtualShardsRequest>,
@@ -521,6 +617,7 @@ where
     ) -> Result<PlacementWatchTask, PlacementError>
     where
         A: VirtualShardAssigner,
+        L: VirtualShardMigrationControl,
     {
         let mut watch = self.store.watch(self.store.prefix().clone()).await?;
         let coordinator = self.clone();
@@ -539,7 +636,7 @@ where
                     .filter(|request| request.service_kind == record.service_kind)
                 {
                     if let Err(error) = coordinator
-                        .rebalance_virtual_shards(request.clone(), assigner.as_ref())
+                        .prepare_and_rebalance_virtual_shards(request.clone(), assigner.as_ref())
                         .await
                     {
                         warn!(
@@ -555,6 +652,65 @@ where
         });
 
         Ok(PlacementWatchTask { handle })
+    }
+
+    async fn planned_virtual_shard_moves<A>(
+        &self,
+        request: RebalanceVirtualShardsRequest,
+        assigner: &A,
+    ) -> Result<Vec<VirtualShardPlacementRecord>, PlacementError>
+    where
+        A: VirtualShardAssigner + ?Sized,
+    {
+        let mut instances = self
+            .store
+            .list_instances(&request.service_kind)
+            .await?
+            .into_iter()
+            .filter(|instance| instance.state == InstanceState::Ready)
+            .map(|instance| instance.instance_id)
+            .collect::<Vec<_>>();
+        instances.sort();
+        if instances.is_empty() {
+            return Err(PlacementError::NoReadyInstances);
+        }
+
+        let existing = self
+            .store
+            .list_virtual_shards(&request.service_kind, &request.actor_kind)
+            .await?;
+        let previous = existing
+            .iter()
+            .map(|(_, record)| VirtualShardAssignment {
+                shard_id: record.shard_id,
+                owner: record.owner.clone(),
+                epoch: record.epoch,
+            })
+            .collect::<Vec<_>>();
+        let current_by_shard = existing
+            .into_iter()
+            .map(|(_, record)| (record.shard_id, record))
+            .collect::<BTreeMap<_, _>>();
+        let plan = assigner
+            .plan(VirtualShardAssignInput {
+                service_kind: request.service_kind,
+                actor_kind: request.actor_kind,
+                shard_count: request.shard_count,
+                instances,
+                previous,
+                eligible_shards: BTreeSet::new(),
+                max_migrations: request.max_migrations,
+            })
+            .await?;
+
+        Ok(plan
+            .assignments
+            .into_iter()
+            .filter_map(|assignment| {
+                let current = current_by_shard.get(&assignment.shard_id)?;
+                (current.owner != assignment.owner).then(|| current.clone())
+            })
+            .collect())
     }
 
     async fn activate_actor_with_lock(

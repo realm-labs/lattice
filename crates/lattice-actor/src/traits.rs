@@ -81,6 +81,7 @@ pub enum PassivationReason {
     BusinessIdle,
     IdleTimeout,
     Drain,
+    Migrate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

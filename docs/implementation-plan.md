@@ -145,7 +145,7 @@ Status: `[x]` complete for static placement.
 
 #### Phase 4: Virtual Shard + Lazy Activation
 
-Status: `[ ]` incomplete.
+Status: `[x]` complete.
 
 - [x] Virtual shard id mapping exists.
 - [x] Virtual shard assignment model exists.
@@ -159,7 +159,7 @@ Status: `[ ]` incomplete.
 - [x] `LatticeService` can start placement watches for service-owned route caches.
 - [x] Scale-out makes new Ready service instances automatically participate in shard assignment through a coordinator placement watch that triggers configured virtual-shard rebalance plans without changing the existing running-actor movement policy.
 - [x] Scale-in service shutdown drains placement ownership and migrates owned actors/virtual shards when a replacement instance exists.
-- [ ] Running actor migration/passivation policy is not yet connected to shard rebalance decisions.
+- [x] Running actor migration/passivation policy is connected to shard rebalance decisions through LogicControl shard-preparation RPC, registry-backed `ShardMigrationPolicy`, and coordinator `prepare_and_rebalance_virtual_shards` coverage.
 
 #### Phase 5: Explicit Placement + Coordinator
 

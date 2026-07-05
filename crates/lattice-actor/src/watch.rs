@@ -63,6 +63,7 @@ impl From<StopReason> for TerminatedReason {
             StopReason::Passivated(PassivationReason::BusinessIdle)
             | StopReason::Passivated(PassivationReason::IdleTimeout)
             | StopReason::Passivated(PassivationReason::Drain) => Self::Passivated,
+            StopReason::Passivated(PassivationReason::Migrate) => Self::Migrated,
             StopReason::Requested | StopReason::MailboxClosed | StopReason::StartFailed => {
                 Self::Stopped
             }

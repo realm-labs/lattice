@@ -731,6 +731,7 @@ async fn actor_registry_bounds_and_times_out_activation_waiters() {
         ActorRegistryConfig {
             mailbox: MailboxConfig::bounded(8),
             passivation: Default::default(),
+            shard_migration: Default::default(),
             waiter_capacity: 0,
             waiter_timeout: std::time::Duration::from_millis(20),
             actor_ref: None,
