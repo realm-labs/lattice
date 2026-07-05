@@ -275,7 +275,7 @@ Status: `[ ]` in progress.
 - [x] Bidirectional links are modeled as two logical unidirectional sessions over one underlying connection, with separate streams, message ids, sequence numbers, and backpressure state.
 - [x] The initiator receives the source-to-target send handle from `connect_bidirectional`.
 - [x] The target actor receives `LinkOpened` and can obtain the target-to-source send handle through `ctx.links().get::<S>(link_id)`.
-- [ ] Directional close and whole-link close are implemented and emit `LinkDirectionClosed` / `LinkClosed` exactly once per observed transition.
+- [x] Directional close and whole-link close are implemented and emit `LinkDirectionClosed` / `LinkClosed` exactly once per observed transition.
 - [ ] Backpressure policies are implemented: `Block`, `FailFast`, `DropNewest`, `DropOldest`, `Coalesce`, and `Disconnect`.
 - [ ] Heartbeat, heartbeat timeout, protocol error, node draining, target passivation/migration, and backpressure disconnect close links with structured reasons.
 - [ ] Security hooks cover internal bind policy, peer identity/auth, source service/actor authorization, max frame size, connection limit, link limit, and rate limit.

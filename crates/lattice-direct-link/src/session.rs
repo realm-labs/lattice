@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use lattice_core::{
     ActorKind, ActorRef, ActorRefTarget, BackpressurePolicy, DirectLinkMessage,
     DirectLinkMessageId, DirectLinkMode, DirectLinkOptions, DirectLinkSession,
-    DirectLinkStreamDescriptor, Epoch, LinkCloseReason, LinkDirection, LinkError, LinkId,
-    LinkOpened, LinkSequence, ServiceKind,
+    DirectLinkStreamDescriptor, Epoch, LinkCloseReason, LinkClosed, LinkDirection,
+    LinkDirectionClosed, LinkError, LinkId, LinkOpened, LinkSequence, ServiceKind,
 };
 use thiserror::Error;
 
@@ -362,6 +362,12 @@ impl DirectLinkSessionManager {
             .directions
             .get_mut(&direction)
             .ok_or(SessionManagerError::WrongDirection)?;
+        let stream = direction_state.stream_name.clone();
+        let last_sequence_seen = direction_state
+            .next_receive_sequence
+            .0
+            .checked_sub(1)
+            .map(LinkSequence);
         if direction_state.closed {
             return Ok(CloseTransition::AlreadyClosed);
         }
@@ -371,6 +377,13 @@ impl DirectLinkSessionManager {
             .iter()
             .filter_map(|(direction, state)| state.closed.then_some(*direction))
             .collect::<BTreeSet<_>>();
+        let direction_closed = LinkDirectionClosed {
+            link_id: link_id.clone(),
+            direction,
+            stream,
+            reason: reason.clone(),
+            last_sequence_seen,
+        };
         if link.directions.values().all(|state| state.closed) {
             link.closed = true;
             self.metrics.record_close();
@@ -380,8 +393,13 @@ impl DirectLinkSessionManager {
                 "direct link closed"
             );
             Ok(CloseTransition::LinkClosed {
-                reason,
-                closed_directions,
+                direction_closed,
+                link_closed: LinkClosed {
+                    link_id: link_id.clone(),
+                    reason,
+                    closed_directions,
+                    last_sequence_seen,
+                },
             })
         } else {
             tracing::debug!(
@@ -390,7 +408,7 @@ impl DirectLinkSessionManager {
                 link.reason = ?reason,
                 "direct link direction closed"
             );
-            Ok(CloseTransition::DirectionClosed { reason, direction })
+            Ok(CloseTransition::DirectionClosed(direction_closed))
         }
     }
 
@@ -910,13 +928,10 @@ impl ManagedLink {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseTransition {
-    DirectionClosed {
-        reason: LinkCloseReason,
-        direction: LinkDirection,
-    },
+    DirectionClosed(LinkDirectionClosed),
     LinkClosed {
-        reason: LinkCloseReason,
-        closed_directions: BTreeSet<LinkDirection>,
+        direction_closed: LinkDirectionClosed,
+        link_closed: LinkClosed,
     },
     AlreadyClosed,
 }
@@ -1271,19 +1286,21 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(
-            manager
-                .close_direction(
-                    &link_id,
-                    LinkDirection::SourceToTarget,
-                    LinkCloseReason::Done
-                )
-                .unwrap(),
-            CloseTransition::DirectionClosed {
-                reason: LinkCloseReason::Done,
-                direction: LinkDirection::SourceToTarget,
+        match manager
+            .close_direction(
+                &link_id,
+                LinkDirection::SourceToTarget,
+                LinkCloseReason::Done,
+            )
+            .unwrap()
+        {
+            CloseTransition::DirectionClosed(event) => {
+                assert_eq!(event.reason, LinkCloseReason::Done);
+                assert_eq!(event.direction, LinkDirection::SourceToTarget);
+                assert_eq!(event.stream, "input");
             }
-        );
+            other => panic!("expected direction close, got {other:?}"),
+        }
         manager
             .validate_message_frame(
                 &link_id,
@@ -1292,16 +1309,29 @@ mod tests {
                 LinkSequence(1),
             )
             .unwrap();
-        assert!(matches!(
-            manager
-                .close_direction(
-                    &link_id,
-                    LinkDirection::TargetToSource,
-                    LinkCloseReason::Done
-                )
-                .unwrap(),
-            CloseTransition::LinkClosed { .. }
-        ));
+        match manager
+            .close_direction(
+                &link_id,
+                LinkDirection::TargetToSource,
+                LinkCloseReason::Done,
+            )
+            .unwrap()
+        {
+            CloseTransition::LinkClosed {
+                direction_closed,
+                link_closed,
+            } => {
+                assert_eq!(direction_closed.direction, LinkDirection::TargetToSource);
+                assert_eq!(direction_closed.stream, "updates");
+                assert_eq!(
+                    link_closed.closed_directions,
+                    [LinkDirection::SourceToTarget, LinkDirection::TargetToSource]
+                        .into_iter()
+                        .collect()
+                );
+            }
+            other => panic!("expected link close, got {other:?}"),
+        }
         assert_eq!(manager.metrics().snapshot().closed, 1);
     }
 

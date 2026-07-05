@@ -328,7 +328,7 @@ pub struct LinkOpened {
     pub outbound_accepted_message_types: BTreeSet<DirectLinkMessageId>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkDirectionClosed {
     pub link_id: LinkId,
     pub direction: LinkDirection,
@@ -337,7 +337,7 @@ pub struct LinkDirectionClosed {
     pub last_sequence_seen: Option<LinkSequence>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkClosed {
     pub link_id: LinkId,
     pub reason: LinkCloseReason,

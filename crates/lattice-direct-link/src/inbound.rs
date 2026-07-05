@@ -5,14 +5,17 @@ use std::sync::Arc;
 
 use lattice_actor::{Actor, ActorHandle, Handler};
 use lattice_core::{
-    ActorKind, ActorRef, DirectLinkMessageId, LinkDirection, LinkId, LinkMessageContext,
-    LinkMessageFlags, LinkOpened,
+    ActorKind, ActorRef, DirectLinkMessageId, LinkCloseReason, LinkClosed, LinkDirection,
+    LinkDirectionClosed, LinkId, LinkMessageContext, LinkMessageFlags, LinkOpened,
 };
 use thiserror::Error;
 
 use crate::codec::{DirectLinkFrame, DirectLinkFrameKind};
 use crate::delivery::{DirectLinkDeliveryError, DirectLinkDispatch};
-use crate::session::{DirectLinkSessionManager, ManagedLinkSnapshot, MessageFrameError};
+use crate::session::{
+    CloseTransition, DirectLinkSessionManager, ManagedLinkSnapshot, MessageFrameError,
+    SessionManagerError,
+};
 use crate::stream::DirectLinkActorBinding;
 
 #[derive(Debug, Error)]
@@ -29,6 +32,8 @@ pub enum InboundDeliveryError {
     LinkOpenUnavailable,
     #[error(transparent)]
     Frame(#[from] MessageFrameError),
+    #[error(transparent)]
+    Session(#[from] SessionManagerError),
     #[error(transparent)]
     Delivery(#[from] DirectLinkDeliveryError),
 }
@@ -112,6 +117,62 @@ impl DirectLinkInboundRouter {
             })?;
         binding.deliver_link_opened(&snapshot.target, opened)
     }
+
+    pub fn close_direction(
+        &self,
+        link_id: &LinkId,
+        direction: LinkDirection,
+        reason: LinkCloseReason,
+    ) -> Result<(), InboundDeliveryError> {
+        let snapshot = self
+            .session_manager
+            .link_snapshot(link_id)
+            .ok_or(InboundDeliveryError::LinkOpenUnavailable)?;
+        match self
+            .session_manager
+            .close_direction(link_id, direction, reason)?
+        {
+            CloseTransition::AlreadyClosed => Ok(()),
+            CloseTransition::DirectionClosed(event) => {
+                let actor_ref = actor_for_direction(&snapshot, event.direction);
+                self.deliver_direction_closed(actor_ref, event)
+            }
+            CloseTransition::LinkClosed {
+                direction_closed,
+                link_closed,
+            } => {
+                let actor_ref = actor_for_direction(&snapshot, direction_closed.direction);
+                self.deliver_direction_closed(actor_ref, direction_closed)?;
+                self.deliver_link_closed_to_bound_actors(&snapshot, link_closed)
+            }
+        }
+    }
+
+    fn deliver_direction_closed(
+        &self,
+        actor_ref: &ActorRef,
+        event: LinkDirectionClosed,
+    ) -> Result<(), InboundDeliveryError> {
+        let binding = self.bindings.get(&actor_ref.actor_kind).ok_or_else(|| {
+            InboundDeliveryError::UnboundActorKind {
+                actor_kind: actor_ref.actor_kind.clone(),
+            }
+        })?;
+        binding.deliver_direction_closed(actor_ref, event)
+    }
+
+    fn deliver_link_closed_to_bound_actors(
+        &self,
+        snapshot: &ManagedLinkSnapshot,
+        event: LinkClosed,
+    ) -> Result<(), InboundDeliveryError> {
+        for actor_ref in [&snapshot.source, &snapshot.target] {
+            if let Some(binding) = self.bindings.get(&actor_ref.actor_kind) {
+                binding.deliver_link_closed(actor_ref, event.clone())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct DirectLinkInboundRouterBuilder {
@@ -128,7 +189,7 @@ impl DirectLinkInboundRouterBuilder {
     where
         A: Actor,
         Messages: DirectLinkDispatch<A>,
-        A: Handler<LinkOpened>,
+        A: Handler<LinkOpened> + Handler<LinkDirectionClosed> + Handler<LinkClosed>,
         F: Fn(&ActorRef) -> Option<ActorHandle<A>> + Send + Sync + 'static,
     {
         self.bindings.insert(
@@ -164,6 +225,18 @@ trait ErasedInboundBinding: Send + Sync + 'static {
         actor_ref: &ActorRef,
         opened: LinkOpened,
     ) -> Result<(), InboundDeliveryError>;
+
+    fn deliver_direction_closed(
+        &self,
+        actor_ref: &ActorRef,
+        event: LinkDirectionClosed,
+    ) -> Result<(), InboundDeliveryError>;
+
+    fn deliver_link_closed(
+        &self,
+        actor_ref: &ActorRef,
+        event: LinkClosed,
+    ) -> Result<(), InboundDeliveryError>;
 }
 
 type ActorResolver<A> = dyn Fn(&ActorRef) -> Option<ActorHandle<A>> + Send + Sync;
@@ -179,7 +252,7 @@ where
 
 impl<A, Messages> ErasedInboundBinding for TypedInboundBinding<A, Messages>
 where
-    A: Actor + Handler<LinkOpened>,
+    A: Actor + Handler<LinkOpened> + Handler<LinkDirectionClosed> + Handler<LinkClosed>,
     Messages: DirectLinkDispatch<A>,
 {
     fn deliver(
@@ -206,6 +279,30 @@ where
             .map_err(DirectLinkDeliveryError::from)
             .map_err(Into::into)
     }
+
+    fn deliver_direction_closed(
+        &self,
+        actor_ref: &ActorRef,
+        event: LinkDirectionClosed,
+    ) -> Result<(), InboundDeliveryError> {
+        let handle = (self.resolver)(actor_ref).ok_or(InboundDeliveryError::ActorUnavailable)?;
+        handle
+            .try_tell(event)
+            .map_err(DirectLinkDeliveryError::from)
+            .map_err(Into::into)
+    }
+
+    fn deliver_link_closed(
+        &self,
+        actor_ref: &ActorRef,
+        event: LinkClosed,
+    ) -> Result<(), InboundDeliveryError> {
+        let handle = (self.resolver)(actor_ref).ok_or(InboundDeliveryError::ActorUnavailable)?;
+        handle
+            .try_tell(event)
+            .map_err(DirectLinkDeliveryError::from)
+            .map_err(Into::into)
+    }
 }
 
 fn actor_for_direction(snapshot: &ManagedLinkSnapshot, direction: LinkDirection) -> &ActorRef {
@@ -225,9 +322,10 @@ mod tests {
     use lattice_core::{
         ActorId, ActorKind, ActorRef, DirectLinkMessage, DirectLinkMode, DirectLinkOptions,
         DirectLinkRuntime, DirectLinkRuntimeHandle, DirectLinkSender, DirectLinkSession,
-        DirectLinkStreamDescriptor, DirectLinkStreamType, InstanceId, LinkDirection, LinkError,
-        LinkId, LinkOpened, LinkSendError, LinkSequence, Linked, OutboundDirectLinkMessage,
-        ServiceContext, ServiceKind, actor_kind, service_kind,
+        DirectLinkStreamDescriptor, DirectLinkStreamType, InstanceId, LinkCloseReason, LinkClosed,
+        LinkDirection, LinkDirectionClosed, LinkError, LinkId, LinkOpened, LinkSendError,
+        LinkSequence, Linked, OutboundDirectLinkMessage, ServiceContext, ServiceKind, actor_kind,
+        service_kind,
     };
     use prost::Message as _;
     use tokio::time::{Duration, timeout};
@@ -307,6 +405,28 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Handler<LinkDirectionClosed> for BattleActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkDirectionClosed,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkClosed> for BattleActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkClosed,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     struct GatewayActor {
         received: Arc<Mutex<Vec<u64>>>,
     }
@@ -337,6 +457,28 @@ mod tests {
             &mut self,
             _ctx: &mut ActorContext<Self>,
             _msg: LinkOpened,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkDirectionClosed> for GatewayActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkDirectionClosed,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkClosed> for GatewayActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkClosed,
         ) -> Result<(), Self::Error> {
             Ok(())
         }
@@ -462,6 +604,101 @@ mod tests {
             self.opened
                 .lock()
                 .expect("opened messages mutex poisoned")
+                .push(msg);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkDirectionClosed> for OpeningBattleActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkDirectionClosed,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkClosed> for OpeningBattleActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkClosed,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    struct ClosingActor {
+        direction_closed: Arc<Mutex<Vec<LinkDirectionClosed>>>,
+        link_closed: Arc<Mutex<Vec<LinkClosed>>>,
+    }
+
+    #[async_trait]
+    impl lattice_actor::Actor for ClosingActor {
+        type Error = Infallible;
+    }
+
+    #[async_trait]
+    impl Handler<Linked<InputCommand>> for ClosingActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: Linked<InputCommand>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<Linked<PositionUpdate>> for ClosingActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: Linked<PositionUpdate>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkOpened> for ClosingActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkOpened,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkDirectionClosed> for ClosingActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            msg: LinkDirectionClosed,
+        ) -> Result<(), Self::Error> {
+            self.direction_closed
+                .lock()
+                .expect("direction closed mutex poisoned")
+                .push(msg);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkClosed> for ClosingActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            msg: LinkClosed,
+        ) -> Result<(), Self::Error> {
+            self.link_closed
+                .lock()
+                .expect("link closed mutex poisoned")
                 .push(msg);
             Ok(())
         }
@@ -741,6 +978,152 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn inbound_router_emits_direction_and_link_closed_once_per_transition() {
+        let target_direction_closed = Arc::new(Mutex::new(Vec::new()));
+        let source_direction_closed = Arc::new(Mutex::new(Vec::new()));
+        let target_link_closed = Arc::new(Mutex::new(Vec::new()));
+        let source_link_closed = Arc::new(Mutex::new(Vec::new()));
+        let runtime = ActorRuntime::default();
+        let target_handle = runtime
+            .spawn_actor(
+                ClosingActor {
+                    direction_closed: target_direction_closed.clone(),
+                    link_closed: target_link_closed.clone(),
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let source_handle = runtime
+            .spawn_actor(
+                ClosingActor {
+                    direction_closed: source_direction_closed.clone(),
+                    link_closed: source_link_closed.clone(),
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let manager = Arc::new(DirectLinkSessionManager::new());
+        let input_stream = DirectLinkStream::new("gateway-input").message::<InputCommand>();
+        let update_stream = DirectLinkStream::new("battle-update").message::<PositionUpdate>();
+        let input_descriptor = input_stream.descriptor();
+        let update_descriptor = update_stream.descriptor();
+        manager
+            .register_binding(actor_kind!("Battle"), input_descriptor.clone())
+            .unwrap();
+        manager
+            .register_binding(actor_kind!("GatewaySession"), update_descriptor.clone())
+            .unwrap();
+        let link_id = LinkId::new("link-close-events");
+        manager
+            .open_link(OpenLinkRequest {
+                protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                link_id: link_id.clone(),
+                source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+                target: actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9),
+                mode: DirectLinkMode::Bidirectional,
+                source_to_target: OpenLinkDirection::from_stream(
+                    link_id.clone(),
+                    &input_descriptor,
+                ),
+                target_to_source: Some(OpenLinkDirection::from_stream(
+                    link_id.clone(),
+                    &update_descriptor,
+                )),
+                options: DirectLinkOptions::bidirectional(),
+            })
+            .unwrap();
+        let router = DirectLinkInboundRouter::builder(manager)
+            .bind_actor(
+                input_stream.for_actor::<ClosingActor>(actor_kind!("Battle")),
+                move |_| Some(target_handle.clone()),
+            )
+            .bind_actor(
+                update_stream.for_actor::<ClosingActor>(actor_kind!("GatewaySession")),
+                move |_| Some(source_handle.clone()),
+            )
+            .build();
+
+        router
+            .close_direction(
+                &link_id,
+                LinkDirection::SourceToTarget,
+                LinkCloseReason::Done,
+            )
+            .unwrap();
+        router
+            .close_direction(
+                &link_id,
+                LinkDirection::SourceToTarget,
+                LinkCloseReason::Done,
+            )
+            .unwrap();
+        wait_for_len(&target_direction_closed, 1).await;
+        assert_eq!(
+            target_direction_closed
+                .lock()
+                .expect("direction closed mutex poisoned")
+                .len(),
+            1
+        );
+
+        router
+            .close_direction(
+                &link_id,
+                LinkDirection::TargetToSource,
+                LinkCloseReason::Done,
+            )
+            .unwrap();
+        router
+            .close_direction(
+                &link_id,
+                LinkDirection::TargetToSource,
+                LinkCloseReason::Done,
+            )
+            .unwrap();
+        wait_for_len(&source_direction_closed, 1).await;
+        wait_for_len(&target_link_closed, 1).await;
+        wait_for_len(&source_link_closed, 1).await;
+
+        assert_eq!(
+            source_direction_closed
+                .lock()
+                .expect("direction closed mutex poisoned")
+                .len(),
+            1
+        );
+        assert_eq!(
+            target_link_closed
+                .lock()
+                .expect("link closed mutex poisoned")
+                .len(),
+            1
+        );
+        assert_eq!(
+            source_link_closed
+                .lock()
+                .expect("link closed mutex poisoned")
+                .len(),
+            1
+        );
+        assert_eq!(
+            target_direction_closed
+                .lock()
+                .expect("direction closed mutex poisoned")[0]
+                .stream,
+            "gateway-input"
+        );
+        assert_eq!(
+            source_direction_closed
+                .lock()
+                .expect("direction closed mutex poisoned")[0]
+                .stream,
+            "battle-update"
+        );
+    }
+
     #[test]
     fn inbound_router_rejects_unbound_actor_kind() {
         let manager = Arc::new(DirectLinkSessionManager::new());
@@ -785,5 +1168,18 @@ mod tests {
             "http://127.0.0.1:10000".parse().unwrap(),
             None,
         )
+    }
+
+    async fn wait_for_len<T>(items: &Arc<Mutex<Vec<T>>>, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if items.lock().expect("items mutex poisoned").len() >= expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }
