@@ -236,7 +236,7 @@ Status: `[ ]` incomplete.
   - [x] New request arriving while an actor is passivating is covered by `request_arriving_while_actor_is_passivating_is_not_processed_by_old_incarnation`.
   - [x] Singleton failover while a long business job is running is covered.
   - [x] Rolling update with mixed versions is covered.
-- [ ] EventBus subscriber duplicate delivery is covered.
+- [x] EventBus subscriber duplicate delivery is covered by `durable_subscriber_deduplicates_duplicate_event_delivery_by_event_id`.
 - [ ] `crates/lattice-actor/src/tests.rs` exceeds 1200 LOC and needs a documented split or explicit rationale before final exit.
 - [x] `crates/lattice-service/src/tests.rs` exceeds 1200 LOC and has a module-level rationale for its crate-private service lifecycle coverage.
 
