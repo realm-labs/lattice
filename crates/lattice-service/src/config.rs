@@ -32,6 +32,8 @@ pub struct DirectLinkConfig {
     bind_policy: DirectLinkBindPolicy,
     max_connections: Option<usize>,
     max_active_links: Option<usize>,
+    max_open_links_per_second: Option<usize>,
+    max_messages_per_second: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,8 @@ impl DirectLinkConfig {
             bind_policy: DirectLinkBindPolicy::LoopbackOnly,
             max_connections: None,
             max_active_links: None,
+            max_open_links_per_second: None,
+            max_messages_per_second: None,
         }
     }
 
@@ -85,6 +89,20 @@ impl DirectLinkConfig {
         self
     }
 
+    pub fn max_open_links_per_second(mut self, max_open_links: usize) -> Self {
+        if max_open_links > 0 {
+            self.max_open_links_per_second = Some(max_open_links);
+        }
+        self
+    }
+
+    pub fn max_messages_per_second(mut self, max_messages: usize) -> Self {
+        if max_messages > 0 {
+            self.max_messages_per_second = Some(max_messages);
+        }
+        self
+    }
+
     pub(crate) fn maintenance_interval_config(&self) -> Duration {
         self.maintenance_interval
     }
@@ -95,6 +113,14 @@ impl DirectLinkConfig {
 
     pub(crate) fn max_active_links_config(&self) -> Option<usize> {
         self.max_active_links
+    }
+
+    pub(crate) fn max_open_links_per_second_config(&self) -> Option<usize> {
+        self.max_open_links_per_second
+    }
+
+    pub(crate) fn max_messages_per_second_config(&self) -> Option<usize> {
+        self.max_messages_per_second
     }
 
     pub(crate) fn listen_config(&self) -> Result<DirectLinkListenConfig, String> {
@@ -207,5 +233,20 @@ mod tests {
                 .max_active_links_config(),
             Some(4)
         );
+    }
+
+    #[test]
+    fn direct_link_rate_limits_ignore_zero_and_record_positive_values() {
+        let disabled = DirectLinkConfig::enabled("127.0.0.1:0")
+            .max_open_links_per_second(0)
+            .max_messages_per_second(0);
+        assert_eq!(disabled.max_open_links_per_second_config(), None);
+        assert_eq!(disabled.max_messages_per_second_config(), None);
+
+        let enabled = DirectLinkConfig::enabled("127.0.0.1:0")
+            .max_open_links_per_second(2)
+            .max_messages_per_second(64);
+        assert_eq!(enabled.max_open_links_per_second_config(), Some(2));
+        assert_eq!(enabled.max_messages_per_second_config(), Some(64));
     }
 }

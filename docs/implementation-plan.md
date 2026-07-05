@@ -290,7 +290,7 @@ Status: `[ ]` in progress.
   - [x] Service node-drain hook closes active links with `NodeDraining` during shutdown before actor registry drain.
   - [x] Actor migration hook closes affected links with `TargetMigrating` before migration passivation.
   - [x] Actor passivation hook closes affected links with `TargetPassivated`.
-- [ ] Security hooks cover internal bind policy, peer identity/auth, source service/actor authorization, max frame size, connection limit, link limit, and rate limit.
+- [x] Security hooks cover internal bind policy, peer identity/auth, source service/actor authorization, max frame size, connection limit, link limit, and rate limit.
   - [x] Service direct-link bind policy defaults to loopback-only binds and requires explicit `DirectLinkBindPolicy::External` opt-in for wildcard or non-loopback listener endpoints.
   - [x] OpenLink validation covers source service authorization, max frame size, and backpressure pending-limit policy with `Unauthorized` or `Overloaded` rejects.
   - [x] OpenLink peer identity/auth hook rejects missing, trust-domain-mismatched, service-mismatched, or source-instance-mismatched peer identity before creating sessions.
@@ -298,7 +298,7 @@ Status: `[ ]` in progress.
   - [x] Managed TCP handshake supplies authenticated peer identity to OpenLink validation instead of trusting only declared source metadata.
   - [x] Managed TCP listener enforces a configured connection limit.
   - [x] Session manager enforces a configured active link limit.
-  - [ ] Direct Link open/data path enforces configured rate limits.
+  - [x] Direct Link open/data path enforces configured rate limits.
 - [ ] Observability emits link open/close/send/receive/drop/coalesce/backpressure/decode-error metrics and sampled tracing without per-message spans by default.
 - [ ] Direct Link benchmark exists for TCP single-process, local multi-process, and payload/backpressure matrices.
 - [ ] Architecture/API examples document when to use gRPC RPC versus Direct Actor Link and show unidirectional and bidirectional flows.

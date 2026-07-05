@@ -127,6 +127,7 @@ pub struct DirectLinkSessionManager {
     bindings: Mutex<HashMap<(ActorKind, String), DirectLinkStreamDescriptor>>,
     actors: Mutex<HashMap<ActorKind, DirectLinkActorPolicy>>,
     validation: Mutex<OpenLinkValidationPolicy>,
+    rate_limits: Mutex<DirectLinkRateLimitState>,
     metrics: DirectLinkMetrics,
 }
 
@@ -303,6 +304,11 @@ impl DirectLinkSessionManager {
         message_id: DirectLinkMessageId,
         sequence: LinkSequence,
     ) -> Result<(), MessageFrameError> {
+        let message_rate_limit = self
+            .validation
+            .lock()
+            .expect("direct link validation policy poisoned")
+            .message_rate_limit;
         let mut links = self
             .links
             .lock()
@@ -335,6 +341,9 @@ impl DirectLinkSessionManager {
                     actual: sequence,
                 },
             );
+        }
+        if !self.consume_message_rate_limit(link_id, message_rate_limit, Instant::now()) {
+            return self.message_frame_error(link_id, MessageFrameError::RateLimited);
         }
         direction_state.next_receive_sequence = LinkSequence(expected.0 + 1);
         self.metrics.record_receive();
@@ -593,6 +602,35 @@ impl DirectLinkSessionManager {
             .count()
     }
 
+    fn consume_open_rate_limit(&self, policy: Option<DirectLinkRateLimit>, now: Instant) -> bool {
+        let Some(policy) = policy else {
+            return true;
+        };
+        self.rate_limits
+            .lock()
+            .expect("direct link rate limits poisoned")
+            .open_links
+            .consume(policy, now)
+    }
+
+    fn consume_message_rate_limit(
+        &self,
+        link_id: &LinkId,
+        policy: Option<DirectLinkRateLimit>,
+        now: Instant,
+    ) -> bool {
+        let Some(policy) = policy else {
+            return true;
+        };
+        self.rate_limits
+            .lock()
+            .expect("direct link rate limits poisoned")
+            .messages
+            .entry(link_id.clone())
+            .or_default()
+            .consume(policy, now)
+    }
+
     pub fn heartbeat_due_link_ids_at(&self, now: Instant) -> Vec<LinkId> {
         self.links
             .lock()
@@ -804,6 +842,12 @@ impl DirectLinkSessionManager {
                 OpenLinkRejectReason::Overloaded,
             ));
         }
+        if !self.consume_open_rate_limit(validation.open_rate_limit, Instant::now()) {
+            return Err(OpenLinkReject::new(
+                request.link_id.clone(),
+                OpenLinkRejectReason::Overloaded,
+            ));
+        }
 
         let actors = self
             .actors
@@ -831,6 +875,35 @@ impl DirectLinkSessionManager {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct DirectLinkRateLimitState {
+    open_links: DirectLinkRateWindow,
+    messages: HashMap<LinkId, DirectLinkRateWindow>,
+}
+
+#[derive(Debug, Default)]
+struct DirectLinkRateWindow {
+    started_at: Option<Instant>,
+    count: usize,
+}
+
+impl DirectLinkRateWindow {
+    fn consume(&mut self, policy: DirectLinkRateLimit, now: Instant) -> bool {
+        let reset = self
+            .started_at
+            .is_none_or(|started_at| now.saturating_duration_since(started_at) >= policy.window);
+        if reset {
+            self.started_at = Some(now);
+            self.count = 0;
+        }
+        if self.count >= policy.max_events {
+            return false;
+        }
+        self.count += 1;
+        true
     }
 }
 
@@ -882,6 +955,8 @@ pub struct OpenLinkValidationPolicy {
     pub max_frame_size: Option<usize>,
     pub max_pending: Option<usize>,
     pub max_active_links: Option<usize>,
+    pub open_rate_limit: Option<DirectLinkRateLimit>,
+    pub message_rate_limit: Option<DirectLinkRateLimit>,
 }
 
 impl OpenLinkValidationPolicy {
@@ -921,6 +996,20 @@ impl OpenLinkValidationPolicy {
 
     pub fn max_active_links(mut self, max_active_links: usize) -> Self {
         self.max_active_links = Some(max_active_links);
+        self
+    }
+
+    pub fn open_rate_limit(mut self, max_events: usize, window: Duration) -> Self {
+        if max_events > 0 && !window.is_zero() {
+            self.open_rate_limit = Some(DirectLinkRateLimit { max_events, window });
+        }
+        self
+    }
+
+    pub fn message_rate_limit(mut self, max_events: usize, window: Duration) -> Self {
+        if max_events > 0 && !window.is_zero() {
+            self.message_rate_limit = Some(DirectLinkRateLimit { max_events, window });
+        }
         self
     }
 
@@ -964,8 +1053,16 @@ impl Default for OpenLinkValidationPolicy {
             max_frame_size: None,
             max_pending: None,
             max_active_links: None,
+            open_rate_limit: None,
+            message_rate_limit: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectLinkRateLimit {
+    pub max_events: usize,
+    pub window: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1276,6 +1373,8 @@ pub enum MessageFrameError {
     UnsupportedMessageType,
     #[error("direct-link target actor is not active or activatable")]
     NonActivatableTarget,
+    #[error("direct-link message rate limit exceeded")]
+    RateLimited,
     #[error("direct-link message payload failed to decode: {0}")]
     DecodeError(String),
     #[error("direct-link sequence is invalid: expected {expected:?}, actual {actual:?}")]
@@ -1590,6 +1689,43 @@ mod tests {
             .open_link(open_request_with_id(&stream, LinkId::new("link-active-2")))
             .unwrap_err();
         assert_eq!(reject.reason, OpenLinkRejectReason::Overloaded);
+
+        let open_rate_limited = configured_manager(&stream);
+        open_rate_limited
+            .update_validation_policy(|policy| policy.open_rate_limit(1, Duration::from_secs(60)));
+        open_rate_limited
+            .open_link(open_request_with_id(&stream, LinkId::new("link-rate-1")))
+            .unwrap();
+        let reject = open_rate_limited
+            .open_link(open_request_with_id(&stream, LinkId::new("link-rate-2")))
+            .unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::Overloaded);
+
+        let message_rate_limited = configured_manager(&stream);
+        message_rate_limited.update_validation_policy(|policy| {
+            policy.message_rate_limit(1, Duration::from_secs(60))
+        });
+        let link_id = LinkId::new("link-message-rate");
+        message_rate_limited
+            .open_link(open_request_with_id(&stream, link_id.clone()))
+            .unwrap();
+        message_rate_limited
+            .validate_message_frame(
+                &link_id,
+                LinkDirection::SourceToTarget,
+                DirectLinkMessageId(1),
+                LinkSequence(1),
+            )
+            .unwrap();
+        assert_eq!(
+            message_rate_limited.validate_message_frame(
+                &link_id,
+                LinkDirection::SourceToTarget,
+                DirectLinkMessageId(1),
+                LinkSequence(2),
+            ),
+            Err(MessageFrameError::RateLimited)
+        );
 
         let fenced = configured_manager(&stream);
         fenced.register_actor(

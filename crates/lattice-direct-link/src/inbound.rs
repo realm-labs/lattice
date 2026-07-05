@@ -653,6 +653,9 @@ fn protocol_error_close_reason(error: &InboundDeliveryError) -> Option<String> {
         InboundDeliveryError::Frame(MessageFrameError::NonActivatableTarget) => {
             Some("non-activatable target".to_string())
         }
+        InboundDeliveryError::Frame(MessageFrameError::RateLimited) => {
+            Some("message rate limit exceeded".to_string())
+        }
         InboundDeliveryError::Frame(MessageFrameError::DecodeError(error)) => {
             Some(format!("decode error: {error}"))
         }
