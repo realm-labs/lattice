@@ -111,7 +111,7 @@ Status: `[x]` complete.
 
 #### Phase 2: Typed RPC + Codegen MVP
 
-Status: `[ ]` incomplete.
+Status: `[x]` complete.
 
 - [x] `lattice_codegen::configure()` build script API exists.
 - [x] `proto/lattice/options.proto` exists with service and method options.
@@ -123,9 +123,10 @@ Status: `[ ]` incomplete.
 - [x] gRPC metadata carries framework RPC context instead of business request fields.
 - [x] Codegen rejects missing service/actor/route metadata, unsupported route key types, optional/repeated route keys, and duplicate gateway ids.
 - [x] Multiple generated gRPC services can be registered on one endpoint.
-- [ ] `LatticeService::register_client::<Binding>()` must construct and expose generated typed clients through service/actor context instead of only recording the service kind.
-- [ ] `examples/minimal-world` should use the final generated client access path, not ad hoc client/core construction.
-- [ ] Generated transport should avoid unnecessary encode/decode when the concrete request type is already known, or document why that cost is acceptable.
+- [x] `LatticeService::register_client::<Binding>()` must construct and expose generated typed clients through service/actor context instead of only recording the service kind.
+- [x] `examples/minimal-world` should use the final generated client access path, not ad hoc client/core construction.
+- [x] Generated transport should avoid unnecessary encode/decode when the concrete request type is already known, or document why that cost is acceptable.
+  - Documented tradeoff: the generated endpoint transport currently crosses the object-safe `EndpointRpcTransport::unary<Req>` boundary and dispatches by `Req::METHOD`, so it re-encodes the generic request into the concrete generated tonic request and decodes the concrete reply back into `Req::Reply`. This keeps one generated transport usable by `ResolvingRpcCore`, gateway dispatch, and fake transports while Phase 5 placement-backed client construction is still pending. The extra encode/decode happens only on the client transport boundary, after gateway payload decode and before tonic encode, and is acceptable for the Phase 2 MVP. A later specialized typed transport can remove it without changing business handlers or generated client APIs.
 
 #### Phase 3: Route Cache + Static Placement
 

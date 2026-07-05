@@ -248,6 +248,15 @@ pub struct ServiceContextBuilder {
 }
 
 impl ServiceContextBuilder {
+    pub fn extension<T>(&self) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.extensions
+            .get(&TypeId::of::<T>())
+            .and_then(|extension| extension.value.clone().downcast::<T>().ok())
+    }
+
     pub fn insert_extension<T>(&mut self, extension: T) -> Result<(), &'static str>
     where
         T: Send + Sync + 'static,

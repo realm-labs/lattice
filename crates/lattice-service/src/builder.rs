@@ -22,6 +22,7 @@ use crate::component::{
 };
 use crate::config::InstanceConfig;
 use crate::context::ServiceBuildContext;
+use crate::rpc::{ErasedRpcClientBinding, RpcClientRegistration};
 use crate::{LatticeService, LatticeServiceError, RpcClientBinding, RpcServiceBinding};
 
 pub struct LatticeServiceBuilder {
@@ -31,7 +32,7 @@ pub struct LatticeServiceBuilder {
     ready: Option<oneshot::Sender<SocketAddr>>,
     actor_registrations: Vec<Box<dyn ErasedActorRegistration>>,
     rpc_services: Vec<Box<dyn RpcServiceBinding>>,
-    client_bindings: Vec<String>,
+    client_bindings: Vec<Box<dyn ErasedRpcClientBinding>>,
     config: Option<ConfigSource>,
     placement_store: Option<Box<dyn ErasedPlacementStoreComponent>>,
     cluster_event_bus: Option<Box<dyn ErasedServiceComponent>>,
@@ -55,7 +56,7 @@ impl fmt::Debug for LatticeServiceBuilder {
             .field("has_ready_signal", &self.ready.is_some())
             .field("actor_registration_count", &self.actor_registrations.len())
             .field("rpc_service_count", &self.rpc_services.len())
-            .field("client_bindings", &self.client_bindings)
+            .field("client_binding_count", &self.client_bindings.len())
             .field("has_config", &self.config.is_some())
             .field("has_placement_store", &self.placement_store.is_some())
             .field("has_cluster_event_bus", &self.cluster_event_bus.is_some())
@@ -220,7 +221,8 @@ impl LatticeServiceBuilder {
     where
         B: RpcClientBinding,
     {
-        self.client_bindings.push(B::SERVICE_KIND.to_string());
+        self.client_bindings
+            .push(Box::new(RpcClientRegistration::<B>::new()));
         self
     }
 
@@ -324,6 +326,16 @@ impl LatticeServiceBuilder {
             )
             .await?;
         }
+        let rpc_client_count = self.client_bindings.len();
+        for binding in self.client_bindings {
+            debug!(
+                service.kind = self.service_kind.as_str(),
+                rpc.client.service = binding.service_kind().as_str(),
+                rpc.client.core = binding.core_type(),
+                "registering rpc client binding"
+            );
+            binding.register(&mut service_context)?;
+        }
         let service_context = service_context.build();
 
         info!(
@@ -331,7 +343,7 @@ impl LatticeServiceBuilder {
             instance.id = instance.instance_id.as_str(),
             actor.registrations = self.actor_registrations.len(),
             rpc.services = self.rpc_services.len(),
-            rpc.clients = self.client_bindings.len(),
+            rpc.clients = rpc_client_count,
             service.extensions = service_context.extension_count(),
             "building lattice service"
         );
@@ -365,14 +377,6 @@ impl LatticeServiceBuilder {
                 "registering rpc service"
             );
             binding.register(&mut context)?;
-        }
-
-        for service_kind in &self.client_bindings {
-            debug!(
-                service.kind = self.service_kind.as_str(),
-                rpc.client.service = service_kind,
-                "registered rpc client binding"
-            );
         }
 
         let router = context.router.ok_or(LatticeServiceError::NoRpcServices)?;

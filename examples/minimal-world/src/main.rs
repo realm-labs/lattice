@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lattice_actor::registry::ActorCreateContext;
 use lattice_actor::{
-    Actor, ActorContext, ActorError, ActorRuntime, ActorSpawnOptions, Handler, MailboxConfig,
-    Message,
+    Actor, ActorContext, ActorError, ActorFactory, ActorRuntime, ActorSpawnOptions, Handler,
+    MailboxConfig, Message,
 };
 use lattice_config::{ConfigSource, ConfigStore, LocalConfigStore};
 use lattice_core::{
@@ -28,9 +29,11 @@ use lattice_rpc::server::RpcServerBuilder;
 use lattice_rpc::{
     ActorRpcAdapter, RouteTarget, RoutedRequest, Rpc, RpcClientContextFactory, RpcError, RpcRequest,
 };
+use lattice_service::{ActorRegistration, LatticeService};
 use prost::Message as ProstMessage;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::net::TcpListener;
 use tonic::{Request, Response};
 
 pub mod world {
@@ -206,6 +209,35 @@ struct LocalWorldTransport {
     adapters: HashMap<InstanceId, ActorRpcAdapter<WorldActor>>,
 }
 
+type LocalWorldCore = ResolvingRpcCore<StaticRouteResolver, LocalWorldTransport>;
+type LocalWorldClient = WorldClient<LocalWorldCore>;
+
+#[derive(Clone)]
+struct WorldActorFactory {
+    tick_ms: u64,
+}
+
+#[async_trait]
+impl ActorFactory<WorldActor> for WorldActorFactory {
+    async fn create(&self, ctx: ActorCreateContext) -> Result<WorldActor, ActorError> {
+        let world_id = match ctx.actor_id {
+            ActorId::U64(value) => WorldId(value),
+            other => {
+                return Err(ActorError::new(format!(
+                    "expected u64 world actor id, got {other:?}"
+                )));
+            }
+        };
+
+        Ok(WorldActor {
+            world_id,
+            tick_ms: self.tick_ms,
+            players: HashMap::new(),
+            last_rpc_request_id: None,
+        })
+    }
+}
+
 #[async_trait]
 impl EndpointRpcTransport for LocalWorldTransport {
     async fn unary<Req>(
@@ -344,7 +376,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         context_factory,
         transport,
     );
-    let client = WorldClient::new(core.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let service = LatticeService::builder(service_kind!("Player"))
+        .instance_id(InstanceId::new("player-0"))
+        .listen(listener)
+        .extension::<LocalWorldCore, _>(core.clone())
+        .register_client::<generated::world_rpc::Binding<(), LocalWorldCore>>()
+        .register_actor(
+            ActorRegistration::builder(WORLD_ACTOR)
+                .factory(WorldActorFactory {
+                    tick_ms: config.tick_ms,
+                })
+                .mailbox(MailboxConfig::bounded(config.mailbox_capacity))
+                .build(),
+        )
+        .register_sharded_rpc(generated::world_rpc::Binding::for_actor::<WorldActor>(
+            WORLD_ACTOR,
+        ))
+        .build()
+        .await?;
+    let client = service
+        .context()
+        .extension::<LocalWorldClient>()
+        .ok_or_else(|| {
+            std::io::Error::other("generated World client was not registered in ServiceContext")
+        })?;
 
     let trace = TraceContext {
         traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00".into()),

@@ -77,24 +77,23 @@ impl Handler<Rpc<LoginRequest>> for WorldActor {
 }
 
 #[derive(Debug, Clone)]
-pub struct WorldActorFactory {
-    player_core: DemoRpcCore,
-}
+pub struct WorldActorFactory;
 
 impl WorldActorFactory {
-    pub fn new(player_core: DemoRpcCore) -> Self {
-        Self { player_core }
+    pub fn new() -> Self {
+        Self
     }
 }
 
 #[async_trait]
 impl ActorFactory<WorldActor> for WorldActorFactory {
     async fn create(&self, ctx: ActorCreateContext) -> Result<WorldActor, ActorError> {
+        let player_client = ctx
+            .service
+            .extension::<PlayerRpcClient<DemoRpcCore>>()
+            .ok_or_else(|| ActorError::new("missing generated Player RPC client"))?;
         match ctx.actor_id {
-            ActorId::U64(world_id) => Ok(WorldActor::new(
-                world_id,
-                PlayerRpcClient::new(self.player_core.clone()),
-            )),
+            ActorId::U64(world_id) => Ok(WorldActor::new(world_id, (*player_client).clone())),
             other => Err(ActorError::new(format!(
                 "unsupported world actor id {other:?}"
             ))),

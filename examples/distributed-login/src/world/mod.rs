@@ -27,13 +27,14 @@ pub async fn run_world_service(
     let player_core = player_core(player_endpoint, InstanceId::new("world-1"));
 
     builder
+        .extension::<crate::placement::DemoRpcCore, _>(player_core)
+        .register_client::<player_rpc::Binding>()
         .register_actor(
             ActorRegistration::builder(WORLD_ACTOR)
-                .factory(WorldActorFactory::new(player_core))
+                .factory(WorldActorFactory::new())
                 .build(),
         )
         .register_sharded_rpc(world_rpc::Binding::for_actor::<WorldActor>(WORLD_ACTOR))
-        .register_client::<player_rpc::Binding>()
         .build()
         .await?
         .run_until_shutdown()

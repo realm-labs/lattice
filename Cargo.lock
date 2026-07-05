@@ -898,6 +898,7 @@ dependencies = [
  "lattice-core",
  "lattice-eventbus",
  "lattice-placement",
+ "lattice-rpc",
  "serde",
  "serde_json",
  "thiserror",

@@ -236,7 +236,7 @@ fn push_service_module(rust: &mut String, methods: &[&RpcMethodSpec]) {
 }
 
 fn push_typed_client(rust: &mut String, methods: &[&RpcMethodSpec]) {
-    rust.push_str("    #[derive(Debug)]\n");
+    rust.push_str("    #[derive(Debug, Clone)]\n");
     rust.push_str("    pub struct Client<C> {\n        inner: TypedRpcClient<C>,\n    }\n\n");
     rust.push_str("    impl<C> Client<C>\n");
     rust.push_str("    where\n        C: ShardedRpcCore,\n    {\n");
@@ -257,24 +257,28 @@ fn push_typed_client(rust: &mut String, methods: &[&RpcMethodSpec]) {
 fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let service = methods[0];
     let server_path = tonic_server_path(service);
+    rust.push_str("    pub type DefaultClientCore = lattice_placement::ResolvingRpcCore<lattice_placement::StaticRouteResolver, super::GeneratedTonicEndpointTransport>;\n\n");
     rust.push_str("    #[derive(Debug)]\n");
-    rust.push_str("    pub struct Binding<A = ()> {\n        actor_kind: ActorKind,\n        _actor: PhantomData<fn() -> A>,\n    }\n\n");
+    rust.push_str("    pub struct Binding<A = (), C = DefaultClientCore> {\n        actor_kind: ActorKind,\n        _actor: PhantomData<fn() -> A>,\n        _core: PhantomData<fn() -> C>,\n    }\n\n");
     rust.push_str("    impl Binding<()> {\n");
     rust.push_str("        pub fn for_actor<A>(actor_kind: ActorKind) -> Binding<A>\n        where\n            A: Actor,\n        {\n");
-    rust.push_str("            Binding { actor_kind, _actor: PhantomData }\n");
+    rust.push_str("            Binding { actor_kind, _actor: PhantomData, _core: PhantomData }\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
-    rust.push_str("    impl<A> RpcClientBinding for Binding<A>\n    where\n        A: Send + Sync + 'static,\n    {\n");
+    rust.push_str("    impl<A, C> RpcClientBinding for Binding<A, C>\n    where\n        A: Send + Sync + 'static,\n        C: ShardedRpcCore + Clone,\n    {\n");
+    rust.push_str("        type Core = C;\n");
+    rust.push_str("        type Client = Client<C>;\n\n");
     rust.push_str(&format!(
         "        const SERVICE_KIND: &'static str = \"{}\";\n",
         service.service_kind
     ));
+    rust.push_str("\n        fn build_client(core: Self::Core) -> Self::Client {\n            Client::new(core)\n        }\n");
     rust.push_str("    }\n\n");
     rust.push_str(
-        "    impl<A> RpcServiceBinding for Binding<A>\n    where\n        A: Actor + Sync",
+        "    impl<A, C> RpcServiceBinding for Binding<A, C>\n    where\n        A: Actor + Sync,\n        C: Send + Sync + 'static",
     );
     for method in methods {
-        rust.push_str(" + Handler<Rpc<");
+        rust.push_str(",\n        A: Handler<Rpc<");
         rust.push_str(&method.request_type);
         rust.push_str(">>");
     }

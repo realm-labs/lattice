@@ -10,5 +10,63 @@ pub trait RpcServiceBinding: Send + Sync + 'static {
 }
 
 pub trait RpcClientBinding: Send + Sync + 'static {
+    type Core: lattice_rpc::ShardedRpcCore + Clone + Send + Sync + 'static;
+    type Client: Send + Sync + 'static;
+
     const SERVICE_KIND: &'static str;
+
+    fn build_client(core: Self::Core) -> Self::Client;
+}
+
+pub(crate) trait ErasedRpcClientBinding: Send + Sync + 'static {
+    fn service_kind(&self) -> lattice_core::ServiceKind;
+    fn core_type(&self) -> &'static str;
+
+    fn register(
+        self: Box<Self>,
+        service_context: &mut lattice_core::ServiceContextBuilder,
+    ) -> Result<(), LatticeServiceError>;
+}
+
+pub(crate) struct RpcClientRegistration<B> {
+    _binding: std::marker::PhantomData<fn() -> B>,
+}
+
+impl<B> RpcClientRegistration<B> {
+    pub(crate) fn new() -> Self {
+        Self {
+            _binding: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<B> ErasedRpcClientBinding for RpcClientRegistration<B>
+where
+    B: RpcClientBinding,
+{
+    fn service_kind(&self) -> lattice_core::ServiceKind {
+        lattice_core::ServiceKind::from_static(B::SERVICE_KIND)
+    }
+
+    fn core_type(&self) -> &'static str {
+        std::any::type_name::<B::Core>()
+    }
+
+    fn register(
+        self: Box<Self>,
+        service_context: &mut lattice_core::ServiceContextBuilder,
+    ) -> Result<(), LatticeServiceError> {
+        let service_kind = self.service_kind();
+        let core = service_context.extension::<B::Core>().ok_or(
+            LatticeServiceError::MissingRpcClientCore {
+                service_kind,
+                core_type: self.core_type(),
+            },
+        )?;
+        service_context
+            .insert_extension(B::build_client((*core).clone()))
+            .map_err(|type_name| LatticeServiceError::DuplicateServiceExtension {
+                type_name: type_name.to_string(),
+            })
+    }
 }

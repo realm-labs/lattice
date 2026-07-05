@@ -8,7 +8,7 @@ use lattice_service::{ActorRegistration, LatticeService};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use crate::generated::{gateway_push_rpc, player_rpc};
+use crate::generated::player_rpc;
 use crate::placement::actor_ref_core;
 use crate::player::actor::{PlayerActor, PlayerActorFactory};
 use crate::{ExampleResult, PLAYER_ACTOR, PLAYER_SERVICE};
@@ -33,7 +33,6 @@ pub async fn run_player_service(
                 .build(),
         )
         .register_sharded_rpc(player_rpc::Binding::for_actor::<PlayerActor>(PLAYER_ACTOR))
-        .register_client::<gateway_push_rpc::Binding>()
         .build()
         .await?
         .run_until_shutdown()

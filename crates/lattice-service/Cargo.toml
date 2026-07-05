@@ -14,6 +14,7 @@ lattice-actor.workspace = true
 lattice-core.workspace = true
 lattice-eventbus.workspace = true
 lattice-placement.workspace = true
+lattice-rpc.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

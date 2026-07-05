@@ -1,4 +1,4 @@
-use lattice_core::ActorKind;
+use lattice_core::{ActorKind, ServiceKind};
 use lattice_placement::PlacementError;
 use thiserror::Error;
 use tonic::transport::Error as TransportError;
@@ -15,6 +15,11 @@ pub enum LatticeServiceError {
     DuplicateActorRegistration { actor_kind: ActorKind },
     #[error("duplicate RPC service registration for {service_name}")]
     DuplicateRpcService { service_name: String },
+    #[error("missing RPC client core {core_type} for service {service_kind}")]
+    MissingRpcClientCore {
+        service_kind: ServiceKind,
+        core_type: &'static str,
+    },
     #[error("missing actor registration for {actor_kind}")]
     MissingActorRegistration { actor_kind: ActorKind },
     #[error("actor registration for {actor_kind} does not match expected type {expected_type}")]

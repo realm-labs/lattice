@@ -11,6 +11,7 @@ use lattice_actor::{Actor, ActorContext, ActorError, ActorFactory, Handler, Mess
 use lattice_config::{ConfigFormat, ConfigSource};
 use lattice_core::{ActorId, ActorKind, ConfiguredComponent, InstanceId, actor_kind, service_kind};
 use lattice_eventbus::LocalEventBus;
+use lattice_rpc::{RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 use tokio::net::TcpListener;
 use tonic::body::Body;
 use tonic::codegen::Service;
@@ -19,7 +20,8 @@ use tonic::server::NamedService;
 use crate::actor::ErasedActorRegistration;
 use crate::context::ServiceBuildContext;
 use crate::{
-    ActorRegistration, LatticeService, LatticeServiceError, RpcServiceBinding, ServiceContextExt,
+    ActorRegistration, LatticeService, LatticeServiceError, RpcClientBinding, RpcServiceBinding,
+    ServiceContextExt,
 };
 
 #[derive(Clone)]
@@ -131,6 +133,43 @@ where
         let _ = context.actor::<A>(&self.actor_kind)?;
         context.add_rpc_service(EmptyRpcService);
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FakeRpcCore;
+
+#[async_trait]
+impl ShardedRpcCore for FakeRpcCore {
+    async fn call<Req>(&self, _req: Req) -> Result<Req::Reply, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        Err(RpcError::Business(
+            "fake core is only used for client construction".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FakeRpcClient {
+    service_kind: &'static str,
+    core: FakeRpcCore,
+}
+
+struct FakeRpcClientBinding;
+
+impl RpcClientBinding for FakeRpcClientBinding {
+    type Core = FakeRpcCore;
+    type Client = FakeRpcClient;
+
+    const SERVICE_KIND: &'static str = "World";
+
+    fn build_client(core: Self::Core) -> Self::Client {
+        FakeRpcClient {
+            service_kind: Self::SERVICE_KIND,
+            core,
+        }
     }
 }
 
@@ -371,6 +410,57 @@ async fn build_loads_config_and_stores_components_in_service_context() {
     let _local_events = service.context().local_events();
     let _config_store = service.context().config_store();
     assert!(service.context().extension::<LocalEventBus>().is_none());
+}
+
+#[tokio::test]
+async fn register_client_builds_typed_client_from_context_core() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service = LatticeService::builder(service_kind!("Player"))
+        .instance_id(InstanceId::new("player-1"))
+        .listen(listener)
+        .extension::<FakeRpcCore, _>(FakeRpcCore)
+        .register_client::<FakeRpcClientBinding>()
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    let client = service.context().extension::<FakeRpcClient>().unwrap();
+    assert_eq!(client.service_kind, "World");
+    assert_eq!(std::mem::size_of_val(&client.core), 0);
+}
+
+#[tokio::test]
+async fn register_client_fails_when_core_is_missing() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let result = LatticeService::builder(service_kind!("Player"))
+        .instance_id(InstanceId::new("player-1"))
+        .listen(listener)
+        .register_client::<FakeRpcClientBinding>()
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LatticeServiceError::MissingRpcClientCore { .. })
+    ));
 }
 
 #[tokio::test]

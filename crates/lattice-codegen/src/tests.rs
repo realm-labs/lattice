@@ -21,11 +21,17 @@ fn generated_output_matches_phase_two_shape() {
     );
     assert!(generated.rust.contains("pub mod world_rpc"));
     assert!(generated.rust.contains("pub struct Client<C>"));
-    assert!(generated.rust.contains("pub struct Binding<A = ()>"));
     assert!(
         generated
             .rust
-            .contains("impl<A> RpcServiceBinding for Binding<A>")
+            .contains("pub struct Binding<A = (), C = DefaultClientCore>")
+    );
+    assert!(generated.rust.contains("type Core = C;"));
+    assert!(generated.rust.contains("type Client = Client<C>;"));
+    assert!(
+        generated
+            .rust
+            .contains("impl<A, C> RpcServiceBinding for Binding<A, C>")
     );
     assert!(generated.rust.contains("pub struct ActorService<A: Actor>"));
     assert!(
