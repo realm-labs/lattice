@@ -2,6 +2,7 @@ use std::any::{TypeId, type_name};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use lattice_actor::Actor;
 use lattice_config::{BootstrapConfig, ConfigSource};
@@ -32,6 +33,7 @@ pub struct LatticeServiceBuilder {
     instance: Option<InstanceConfig>,
     listener: Option<TcpListener>,
     ready: Option<oneshot::Sender<SocketAddr>>,
+    instance_lease_keepalive_interval: Duration,
     actor_registrations: Vec<Box<dyn ErasedActorRegistration>>,
     rpc_services: Vec<Box<dyn RpcServiceBinding>>,
     client_bindings: Vec<Box<dyn ErasedRpcClientBinding>>,
@@ -57,6 +59,10 @@ impl fmt::Debug for LatticeServiceBuilder {
                 &self.listener.as_ref().map(TcpListener::local_addr),
             )
             .field("has_ready_signal", &self.ready.is_some())
+            .field(
+                "instance_lease_keepalive_interval",
+                &self.instance_lease_keepalive_interval,
+            )
             .field("actor_registration_count", &self.actor_registrations.len())
             .field("rpc_service_count", &self.rpc_services.len())
             .field("client_binding_count", &self.client_bindings.len())
@@ -78,6 +84,7 @@ impl LatticeServiceBuilder {
             instance: None,
             listener: None,
             ready: None,
+            instance_lease_keepalive_interval: Duration::from_secs(10),
             actor_registrations: Vec::new(),
             rpc_services: Vec::new(),
             client_bindings: Vec::new(),
@@ -117,6 +124,13 @@ impl LatticeServiceBuilder {
 
     pub fn ready_signal(mut self, ready: oneshot::Sender<SocketAddr>) -> Self {
         self.ready = Some(ready);
+        self
+    }
+
+    pub fn instance_lease_keepalive_interval(mut self, interval: Duration) -> Self {
+        if !interval.is_zero() {
+            self.instance_lease_keepalive_interval = interval;
+        }
         self
     }
 
@@ -406,6 +420,7 @@ impl LatticeServiceBuilder {
             service_context,
             placement_store,
             placement_watch_tasks,
+            instance_lease_keepalive_interval: self.instance_lease_keepalive_interval,
             ready: self.ready,
         }))
     }

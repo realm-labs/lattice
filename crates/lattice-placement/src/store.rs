@@ -192,6 +192,15 @@ impl InMemoryPlacementStore {
         }
     }
 
+    pub fn instance_lease_keepalive_count(&self, lease_id: LeaseId) -> Option<u64> {
+        self.inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .instance_leases
+            .get(&lease_id)
+            .copied()
+    }
+
     fn prefixed_actor_key(&self, key: &ActorPlacementKey) -> PrefixedActorKey {
         PrefixedActorKey {
             prefix: self.prefix.clone(),

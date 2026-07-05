@@ -1,6 +1,7 @@
 use std::future::{Future, pending};
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::Duration;
 
 use lattice_core::instance::InstanceCapacity;
 use lattice_core::{ServiceContext, ServiceKind};
@@ -26,6 +27,7 @@ pub struct LatticeService {
     service_context: ServiceContext,
     placement_store: Box<dyn ErasedPlacementStore>,
     placement_watch_tasks: Vec<PlacementWatchTask>,
+    instance_lease_keepalive_interval: Duration,
     ready: Option<oneshot::Sender<SocketAddr>>,
 }
 
@@ -43,6 +45,7 @@ impl LatticeService {
             service_context: parts.service_context,
             placement_store: parts.placement_store,
             placement_watch_tasks: parts.placement_watch_tasks,
+            instance_lease_keepalive_interval: parts.instance_lease_keepalive_interval,
             ready: parts.ready,
         }
     }
@@ -75,6 +78,7 @@ impl LatticeService {
             service_context: _service_context,
             placement_store,
             placement_watch_tasks,
+            instance_lease_keepalive_interval,
             ready,
         } = self;
         let local_addr = listener.local_addr()?;
@@ -111,6 +115,12 @@ impl LatticeService {
         );
 
         let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel::<()>();
+        let keepalive = async {
+            loop {
+                tokio::time::sleep(instance_lease_keepalive_interval).await;
+                placement_store.keepalive_instance_lease(lease_id).await?;
+            }
+        };
         let lifecycle_shutdown = async {
             shutdown.await;
             let result = publish_instance_record(
@@ -125,6 +135,7 @@ impl LatticeService {
             let _ = server_shutdown_tx.send(());
             result
         };
+        tokio::pin!(keepalive);
         tokio::pin!(lifecycle_shutdown);
         let serve =
             router.serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
@@ -133,7 +144,7 @@ impl LatticeService {
         tokio::pin!(serve);
         let mut lifecycle_done = false;
         let mut lifecycle_error = None;
-        let serve_result = loop {
+        let service_exit = loop {
             tokio::select! {
                 result = &mut lifecycle_shutdown, if !lifecycle_done => {
                     lifecycle_done = true;
@@ -141,12 +152,20 @@ impl LatticeService {
                         lifecycle_error = Some(error);
                     }
                 }
-                result = &mut serve => break result,
+                result = &mut keepalive => {
+                    break ServiceExit::Keepalive(result);
+                }
+                result = &mut serve => break ServiceExit::Server(result),
             }
         };
         if let Some(error) = lifecycle_error {
             return Err(error);
         }
+
+        let serve_result = match service_exit {
+            ServiceExit::Server(result) => result,
+            ServiceExit::Keepalive(result) => return result,
+        };
 
         match serve_result {
             Ok(()) => {
@@ -177,6 +196,11 @@ impl LatticeService {
             }
         }
     }
+}
+
+enum ServiceExit {
+    Server(Result<(), tonic::transport::Error>),
+    Keepalive(Result<(), LatticeServiceError>),
 }
 
 async fn publish_instance_record(
@@ -214,6 +238,7 @@ pub(crate) struct LatticeServiceParts {
     pub service_context: ServiceContext,
     pub placement_store: Box<dyn ErasedPlacementStore>,
     pub placement_watch_tasks: Vec<PlacementWatchTask>,
+    pub instance_lease_keepalive_interval: Duration,
     pub ready: Option<oneshot::Sender<SocketAddr>>,
 }
 
