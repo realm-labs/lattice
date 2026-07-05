@@ -8,15 +8,16 @@ use http::Uri;
 use lattice_actor::registry::{ActorCreateContext, ActorRefConfig, ActorRegistryConfig};
 use lattice_actor::{ActorError, ActorLoader, ActorRegistry, StopReason};
 use lattice_core::{ActorId, ActorRef, InstanceId};
-use lattice_gateway::{ClientFrame, GatewayRouteTable};
+use lattice_gateway::{
+    ClientFrame, GatewayConnectionHandler, GatewayError, GatewayRouteTable, GatewayService,
+};
 use lattice_placement::InMemoryPlacementStore;
 use prost::Message as ProstMessage;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::game::{LoginRequest, gateway_push_rpc_server::GatewayPushRpcServer};
 use crate::gateway::session_actor::GatewaySessionActor;
@@ -45,31 +46,32 @@ pub async fn run_gateway(
     let sessions = GatewaySessions::new(gateway_push_endpoint);
     let push_service =
         gateway_push_rpc::RegistryService::new(sessions.registry(), GatewaySessionLoader);
-    tokio::spawn(async move {
-        let result = Server::builder()
+    let push_task = async move {
+        Server::builder()
             .add_service(GatewayPushRpcServer::new(push_service))
-            .serve_with_incoming(TcpListenerStream::new(push_listener))
-            .await;
-        if let Err(error) = result {
-            error!(%error, "gateway push rpc failed");
-        }
-    });
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                push_listener,
+            ))
+            .await
+            .map_err(|error| GatewayError::Io(error.to_string()))
+    };
+    let service = GatewayService::new(
+        client_listener,
+        DemoGatewayConnectionHandler {
+            dispatcher,
+            sessions,
+        },
+    )
+    .background_task("gateway-push-rpc", push_task);
+    let service = if let Some(ready) = ready {
+        service.ready_signal(ready)
+    } else {
+        service
+    };
 
-    if let Some(ready) = ready {
-        let _ = ready.send(local_addr);
-    }
     info!(%local_addr, %push_addr, "gateway listening");
-
-    loop {
-        let (socket, peer) = client_listener.accept().await?;
-        let dispatcher = dispatcher.clone();
-        let sessions = sessions.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_connection(socket, dispatcher, sessions).await {
-                error!(%peer, %error, "gateway connection failed");
-            }
-        });
-    }
+    service.run().await?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -141,6 +143,25 @@ impl ActorLoader<GatewaySessionActor> for GatewaySessionLoader {
             "gateway session actor {:?} is not running on this gateway",
             ctx.actor_id
         )))
+    }
+}
+
+#[derive(Clone)]
+struct DemoGatewayConnectionHandler {
+    dispatcher: DemoGatewayDispatcher,
+    sessions: GatewaySessions,
+}
+
+#[async_trait]
+impl GatewayConnectionHandler for DemoGatewayConnectionHandler {
+    async fn handle_connection(
+        &self,
+        socket: TcpStream,
+        _peer: SocketAddr,
+    ) -> Result<(), GatewayError> {
+        handle_connection(socket, self.dispatcher.clone(), self.sessions.clone())
+            .await
+            .map_err(|error| GatewayError::Io(error.to_string()))
     }
 }
 

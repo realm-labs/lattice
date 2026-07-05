@@ -10,7 +10,10 @@ pub use binding::ProstClientMessageBinding;
 pub use error::GatewayError;
 pub use frame::{BinaryClientCodec, ClientCodec, ClientFrame};
 pub use route::{GatewayRouteSpec, GatewayRouteTable};
-pub use server::{GatewayFrameHandler, GatewayTcpServer, read_client_frame, write_client_frame};
+pub use server::{
+    GatewayConnectionHandler, GatewayFrameConnectionHandler, GatewayFrameHandler, GatewayService,
+    GatewayTcpServer, read_client_frame, write_client_frame,
+};
 
 #[cfg(test)]
 mod tests;

@@ -30,4 +30,8 @@ pub enum GatewayError {
     LoadShed,
     #[error("gateway io error: {0}")]
     Io(String),
+    #[error("gateway background task {task} exited unexpectedly")]
+    BackgroundTaskExited { task: String },
+    #[error("gateway background task {task} failed: {error}")]
+    BackgroundTaskFailed { task: String, error: String },
 }

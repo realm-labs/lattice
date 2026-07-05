@@ -1,12 +1,17 @@
+use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 
 use crate::{BinaryClientCodec, ClientCodec, ClientFrame, GatewayError};
+
+type GatewayTaskFuture = Pin<Box<dyn Future<Output = Result<(), GatewayError>> + Send + 'static>>;
 
 #[async_trait]
 pub trait GatewayFrameHandler: Clone + Send + Sync + 'static {
@@ -24,22 +29,86 @@ where
     }
 }
 
-#[derive(Debug)]
-pub struct GatewayTcpServer<H> {
-    listener: TcpListener,
-    handler: H,
-    ready: Option<oneshot::Sender<SocketAddr>>,
+#[async_trait]
+pub trait GatewayConnectionHandler: Clone + Send + Sync + 'static {
+    async fn handle_connection(
+        &self,
+        socket: TcpStream,
+        peer: SocketAddr,
+    ) -> Result<(), GatewayError>;
 }
 
-impl<H> GatewayTcpServer<H>
+#[async_trait]
+impl<F, Fut> GatewayConnectionHandler for F
+where
+    F: Fn(TcpStream, SocketAddr) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), GatewayError>> + Send,
+{
+    async fn handle_connection(
+        &self,
+        socket: TcpStream,
+        peer: SocketAddr,
+    ) -> Result<(), GatewayError> {
+        self(socket, peer).await
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewayFrameConnectionHandler<H> {
+    frame_handler: H,
+}
+
+impl<H> GatewayFrameConnectionHandler<H> {
+    pub fn new(frame_handler: H) -> Self {
+        Self { frame_handler }
+    }
+}
+
+#[async_trait]
+impl<H> GatewayConnectionHandler for GatewayFrameConnectionHandler<H>
 where
     H: GatewayFrameHandler,
 {
-    pub fn new(listener: TcpListener, handler: H) -> Self {
+    async fn handle_connection(
+        &self,
+        socket: TcpStream,
+        _peer: SocketAddr,
+    ) -> Result<(), GatewayError> {
+        handle_framed_connection(socket, self.frame_handler.clone()).await
+    }
+}
+
+struct GatewayBackgroundTask {
+    name: String,
+    future: GatewayTaskFuture,
+}
+
+impl fmt::Debug for GatewayBackgroundTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GatewayBackgroundTask")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub struct GatewayService<H> {
+    listener: TcpListener,
+    connection_handler: H,
+    ready: Option<oneshot::Sender<SocketAddr>>,
+    background_tasks: Vec<GatewayBackgroundTask>,
+}
+
+impl<H> GatewayService<H>
+where
+    H: GatewayConnectionHandler,
+{
+    pub fn new(listener: TcpListener, connection_handler: H) -> Self {
         Self {
             listener,
-            handler,
+            connection_handler,
             ready: None,
+            background_tasks: Vec::new(),
         }
     }
 
@@ -48,14 +117,31 @@ where
         self
     }
 
+    pub fn background_task<F>(mut self, name: impl Into<String>, future: F) -> Self
+    where
+        F: Future<Output = Result<(), GatewayError>> + Send + 'static,
+    {
+        self.background_tasks.push(GatewayBackgroundTask {
+            name: name.into(),
+            future: Box::pin(future),
+        });
+        self
+    }
+
+    pub async fn run(self) -> Result<(), GatewayError> {
+        self.run_until_shutdown_signal(std::future::pending::<()>())
+            .await
+    }
+
     pub async fn run_until_shutdown_signal<F>(self, shutdown: F) -> Result<(), GatewayError>
     where
         F: Future<Output = ()>,
     {
         let Self {
             listener,
-            handler,
+            connection_handler,
             ready,
+            background_tasks,
         } = self;
         let local_addr = listener
             .local_addr()
@@ -63,16 +149,46 @@ where
         if let Some(ready) = ready {
             let _ = ready.send(local_addr);
         }
+
+        let mut tasks = JoinSet::new();
+        for task in background_tasks {
+            tasks.spawn(async move {
+                let name = task.name;
+                let result = task.future.await;
+                (name, result)
+            });
+        }
+
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
                 () = &mut shutdown => return Ok(()),
+                joined = tasks.join_next(), if !tasks.is_empty() => {
+                    match joined {
+                        Some(Ok((name, Ok(())))) => {
+                            return Err(GatewayError::BackgroundTaskExited { task: name });
+                        }
+                        Some(Ok((name, Err(error)))) => {
+                            return Err(GatewayError::BackgroundTaskFailed {
+                                task: name,
+                                error: error.to_string(),
+                            });
+                        }
+                        Some(Err(error)) => {
+                            return Err(GatewayError::BackgroundTaskFailed {
+                                task: "unknown".to_string(),
+                                error: error.to_string(),
+                            });
+                        }
+                        None => {}
+                    }
+                }
                 accepted = listener.accept() => {
-                    let (socket, _peer) = accepted
+                    let (socket, peer) = accepted
                         .map_err(|error| GatewayError::Io(error.to_string()))?;
-                    let handler = handler.clone();
+                    let connection_handler = connection_handler.clone();
                     tokio::spawn(async move {
-                        let _ = handle_connection(socket, handler).await;
+                        let _ = connection_handler.handle_connection(socket, peer).await;
                     });
                 }
             }
@@ -80,7 +196,35 @@ where
     }
 }
 
-async fn handle_connection<H>(mut socket: TcpStream, handler: H) -> Result<(), GatewayError>
+#[derive(Debug)]
+pub struct GatewayTcpServer<H> {
+    service: GatewayService<GatewayFrameConnectionHandler<H>>,
+}
+
+impl<H> GatewayTcpServer<H>
+where
+    H: GatewayFrameHandler,
+{
+    pub fn new(listener: TcpListener, handler: H) -> Self {
+        Self {
+            service: GatewayService::new(listener, GatewayFrameConnectionHandler::new(handler)),
+        }
+    }
+
+    pub fn ready_signal(mut self, ready: oneshot::Sender<SocketAddr>) -> Self {
+        self.service = self.service.ready_signal(ready);
+        self
+    }
+
+    pub async fn run_until_shutdown_signal<F>(self, shutdown: F) -> Result<(), GatewayError>
+    where
+        F: Future<Output = ()>,
+    {
+        self.service.run_until_shutdown_signal(shutdown).await
+    }
+}
+
+async fn handle_framed_connection<H>(mut socket: TcpStream, handler: H) -> Result<(), GatewayError>
 where
     H: GatewayFrameHandler,
 {

@@ -112,6 +112,79 @@ async fn gateway_tcp_server_serves_framed_client_requests_until_shutdown() {
     task.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn gateway_service_runs_connection_handler_and_background_task() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let background_started = Arc::new(tokio::sync::Semaphore::new(0));
+    let background_started_task = background_started.clone();
+    let server = GatewayService::new(listener, |mut socket: TcpStream, _peer| async move {
+        let frame = read_client_frame(&mut socket).await?;
+        write_client_frame(
+            &mut socket,
+            ClientFrame {
+                msg_id: frame.msg_id + 10,
+                payload: frame.payload,
+            },
+        )
+        .await
+    })
+    .background_task("gateway-push-rpc", async move {
+        background_started_task.add_permits(1);
+        std::future::pending::<()>().await;
+        Ok(())
+    })
+    .ready_signal(ready_tx);
+
+    let task = tokio::spawn(server.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let addr = ready_rx.await.unwrap();
+    background_started.acquire().await.unwrap().forget();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    write_client_frame(
+        &mut stream,
+        ClientFrame {
+            msg_id: 30,
+            payload: vec![4, 5],
+        },
+    )
+    .await
+    .unwrap();
+    let reply = read_client_frame(&mut stream).await.unwrap();
+
+    assert_eq!(
+        reply,
+        ClientFrame {
+            msg_id: 40,
+            payload: vec![4, 5],
+        }
+    );
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn gateway_service_reports_background_task_failure() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let result = GatewayService::new(listener, |_socket: TcpStream, _peer| async { Ok(()) })
+        .background_task("gateway-push-rpc", async {
+            Err(GatewayError::Io("push listener closed".to_string()))
+        })
+        .run_until_shutdown_signal(std::future::pending::<()>())
+        .await;
+
+    assert_eq!(
+        result,
+        Err(GatewayError::BackgroundTaskFailed {
+            task: "gateway-push-rpc".to_string(),
+            error: "gateway io error: push listener closed".to_string(),
+        })
+    );
+}
+
 #[test]
 fn gateway_route_table_rejects_duplicate_msg_id() {
     let binding = ProstClientMessageBinding::<EnterWorldRequest>::new(100);
