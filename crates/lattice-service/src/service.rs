@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router as AxumRouter;
@@ -15,6 +16,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::server::Router;
 use tracing::{debug, error, info, warn};
 
+use crate::actor::ErasedLogicActor;
 use crate::component::ErasedPlacementStore;
 use crate::config::InstanceConfig;
 use crate::framework::{
@@ -29,6 +31,7 @@ pub struct LatticeService {
     listener: TcpListener,
     router: Router,
     service_context: ServiceContext,
+    logic_actors: Vec<Arc<dyn ErasedLogicActor>>,
     placement_store: Box<dyn ErasedPlacementStore>,
     placement_watch_tasks: Vec<PlacementWatchTask>,
     admin_http: Option<AdminHttpServer>,
@@ -48,6 +51,7 @@ impl LatticeService {
             listener: parts.listener,
             router: parts.router,
             service_context: parts.service_context,
+            logic_actors: parts.logic_actors,
             placement_store: parts.placement_store,
             placement_watch_tasks: parts.placement_watch_tasks,
             admin_http: parts.admin_http,
@@ -87,6 +91,7 @@ impl LatticeService {
             listener,
             router,
             service_context,
+            logic_actors,
             placement_store,
             placement_watch_tasks,
             admin_http,
@@ -156,6 +161,13 @@ impl LatticeService {
                 "cancelled runtime-owned event subscriptions"
             );
             shutdown_service_scheduler(&service_context).await;
+            let drained_actors = drain_runtime_actors(&logic_actors).await;
+            debug!(
+                service.kind = service_kind.as_str(),
+                instance.id = instance.instance_id.as_str(),
+                actor.registries.drained = drained_actors,
+                "drained runtime actor registries"
+            );
             let _ = server_shutdown_tx.send(());
             if let Some(admin_shutdown_tx) = admin_shutdown_tx {
                 let _ = admin_shutdown_tx.send(());
@@ -326,6 +338,14 @@ async fn shutdown_service_scheduler(service_context: &ServiceContext) {
     }
 }
 
+async fn drain_runtime_actors(logic_actors: &[Arc<dyn ErasedLogicActor>]) -> usize {
+    let mut drained = 0;
+    for actor in logic_actors {
+        drained += actor.drain().await;
+    }
+    drained
+}
+
 async fn publish_instance_record(
     placement_store: &dyn ErasedPlacementStore,
     service_kind: &ServiceKind,
@@ -359,6 +379,7 @@ pub(crate) struct LatticeServiceParts {
     pub listener: TcpListener,
     pub router: Router,
     pub service_context: ServiceContext,
+    pub logic_actors: Vec<Arc<dyn ErasedLogicActor>>,
     pub placement_store: Box<dyn ErasedPlacementStore>,
     pub placement_watch_tasks: Vec<PlacementWatchTask>,
     pub admin_http: Option<AdminHttpServer>,

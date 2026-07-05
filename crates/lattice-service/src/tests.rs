@@ -9,7 +9,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use http::{Request, Response};
 use lattice_actor::registry::ActorCreateContext;
-use lattice_actor::{Actor, ActorContext, ActorError, ActorFactory, Handler, Message};
+use lattice_actor::{
+    Actor, ActorContext, ActorError, ActorFactory, ActorStopError, Handler, Message,
+    PassivationReason, StopReason,
+};
 use lattice_config::{ConfigFormat, ConfigSource};
 use lattice_core::{
     ActorId, ActorKind, ConfiguredComponent, Epoch, InstanceId, RouteKey, TraceContext, actor_kind,
@@ -359,6 +362,38 @@ impl ActorFactory<TestActor> for ContextRecordingFactory {
     async fn create(&self, ctx: ActorCreateContext) -> Result<TestActor, ActorError> {
         *self.observed_instance.lock().await = Some(ctx.service.instance_id().clone());
         Ok(TestActor)
+    }
+}
+
+struct DrainRecordingActor {
+    reasons: Arc<tokio::sync::Mutex<Vec<StopReason>>>,
+}
+
+#[async_trait]
+impl Actor for DrainRecordingActor {
+    type Error = ActorError;
+
+    async fn stopping(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        reason: StopReason,
+    ) -> Result<(), ActorStopError> {
+        self.reasons.lock().await.push(reason);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct DrainRecordingFactory {
+    reasons: Arc<tokio::sync::Mutex<Vec<StopReason>>>,
+}
+
+#[async_trait]
+impl ActorFactory<DrainRecordingActor> for DrainRecordingFactory {
+    async fn create(&self, _ctx: ActorCreateContext) -> Result<DrainRecordingActor, ActorError> {
+        Ok(DrainRecordingActor {
+            reasons: self.reasons.clone(),
+        })
     }
 }
 
@@ -914,6 +949,53 @@ async fn service_exposes_tonic_logic_control_activation() {
     );
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn service_shutdown_drains_runtime_actor_registries() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let reasons = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-control"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(DrainRecordingFactory {
+                    reasons: reasons.clone(),
+                })
+                .build(),
+        )
+        .build()
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let addr = ready_rx.await.unwrap();
+    let mut client = LogicControlClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    client
+        .activate_actor(proto::ActivateActorRequest {
+            service_kind: "World".to_string(),
+            actor_kind: "World".to_string(),
+            actor_id: Some(actor_id_to_proto(&ActorId::U64(7))),
+            epoch: 1,
+        })
+        .await
+        .unwrap();
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+
+    assert_eq!(
+        *reasons.lock().await,
+        vec![StopReason::Passivated(PassivationReason::Drain)]
+    );
 }
 
 #[tokio::test]

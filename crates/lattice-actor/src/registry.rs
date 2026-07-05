@@ -14,7 +14,7 @@ use crate::error::{ActorActivationError, ActorError};
 use crate::handle::ActorHandle;
 use crate::mailbox::MailboxConfig;
 use crate::runtime::{PassivationPolicy, spawn_actor_with_self_ref};
-use crate::traits::Actor;
+use crate::traits::{Actor, PassivationReason, StopReason};
 
 #[derive(Debug, Clone)]
 pub struct ActorRegistryConfig {
@@ -118,6 +118,24 @@ impl<A: Actor> ActorRegistry<A> {
             }
             None => None,
         }
+    }
+
+    pub async fn drain(&self) -> usize {
+        let actor_ids = self
+            .entries
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        let mut drained = 0;
+        for actor_id in actor_ids {
+            if let Some(handle) = self.remove(&actor_id).await {
+                let _ = handle
+                    .stop(StopReason::Passivated(PassivationReason::Drain))
+                    .await;
+                drained += 1;
+            }
+        }
+        drained
     }
 
     pub async fn start(

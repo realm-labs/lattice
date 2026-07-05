@@ -160,13 +160,24 @@ where
     }
 }
 
-#[derive(Debug)]
 pub struct RegisteredActor<A>
 where
     A: Actor,
 {
     registry: Arc<ActorRegistry<A>>,
     loader: ServiceActorLoader<A>,
+}
+
+impl<A> fmt::Debug for RegisteredActor<A>
+where
+    A: Actor,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredActor")
+            .field("actor_kind", self.registry.kind())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<A> Clone for RegisteredActor<A>
@@ -195,8 +206,9 @@ where
 }
 
 #[async_trait]
-pub(crate) trait ErasedLogicActor: Send + Sync {
+pub(crate) trait ErasedLogicActor: Send + Sync + fmt::Debug {
     async fn activate(&self, actor_id: ActorId) -> Result<(), ActorActivationError>;
+    async fn drain(&self) -> usize;
 }
 
 #[async_trait]
@@ -209,6 +221,10 @@ where
             .get_or_load(actor_id, self.loader.clone())
             .await?;
         Ok(())
+    }
+
+    async fn drain(&self) -> usize {
+        self.registry.drain().await
     }
 }
 

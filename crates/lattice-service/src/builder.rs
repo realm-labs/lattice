@@ -455,6 +455,7 @@ impl LatticeServiceBuilder {
             binding.register(&mut context)?;
         }
 
+        let logic_actors = context.logic_actors.values().cloned().collect();
         let router = context.router.ok_or(LatticeServiceError::NoRpcServices)?;
         Ok(LatticeService::new(LatticeServiceParts {
             service_kind: self.service_kind,
@@ -462,6 +463,7 @@ impl LatticeServiceBuilder {
             listener,
             router,
             service_context,
+            logic_actors,
             placement_store,
             placement_watch_tasks,
             admin_http,
