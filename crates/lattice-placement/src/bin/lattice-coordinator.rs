@@ -32,10 +32,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         activation_lock_ttl_secs: env_i64("LATTICE_ACTIVATION_LOCK_TTL_SECS", 30),
     })
     .await?;
-    let leadership = store
-        .campaign_coordinator_leader(candidate_id.clone())
-        .await?
-        .ok_or_else(|| format!("coordinator leader already exists for prefix {key_prefix}"))?;
+    let leadership = campaign_until_leader(
+        store.clone(),
+        candidate_id.clone(),
+        Duration::from_secs(env_u64("LATTICE_COORDINATOR_CAMPAIGN_RETRY_SECS", 5)),
+    )
+    .await?;
     let keepalive_store = store.clone();
     let keepalive_leadership = leadership.clone();
     let coordinator = PlacementCoordinator::new(store.clone(), TonicLogicControl);
@@ -58,6 +60,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     reconciler.cancel();
     store.resign_coordinator_leader(&leadership).await?;
     Ok(())
+}
+
+async fn campaign_until_leader<S>(
+    store: S,
+    candidate_id: InstanceId,
+    retry_interval: Duration,
+) -> Result<CoordinatorLeadership, lattice_placement::PlacementError>
+where
+    S: PlacementStore,
+{
+    loop {
+        if let Some(leadership) = store
+            .campaign_coordinator_leader(candidate_id.clone())
+            .await?
+        {
+            return Ok(leadership);
+        }
+        tokio::time::sleep(retry_interval).await;
+    }
 }
 
 async fn keepalive_loop<S>(
@@ -89,4 +110,42 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix};
+
+    #[tokio::test]
+    async fn campaign_until_leader_waits_and_recampaigns_as_standby() {
+        let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/coordinator-bin"));
+        let first = store
+            .campaign_coordinator_leader(InstanceId::new("coordinator-a"))
+            .await
+            .unwrap()
+            .unwrap();
+        let release_store = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            release_store
+                .resign_coordinator_leader(&first)
+                .await
+                .unwrap();
+        });
+
+        let leadership = tokio::time::timeout(
+            Duration::from_secs(1),
+            campaign_until_leader(
+                store,
+                InstanceId::new("coordinator-b"),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(leadership.candidate_id, InstanceId::new("coordinator-b"));
+    }
 }

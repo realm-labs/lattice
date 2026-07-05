@@ -184,7 +184,7 @@ Status: `[ ]` incomplete.
 - [x] `register_client` builds resolver/core from the configured placement store by default.
 - [x] Placement watch is wired into route cache invalidation in running services.
 - [x] Crash handling has a lease-expiry reconciliation loop that observes missing/dead instance records and invokes coordinator failover automatically for actors and singletons.
-- [ ] The runnable coordinator currently exits when leadership is held; it does not yet wait/re-campaign as a long-running standby.
+- [x] The runnable coordinator waits and re-campaigns as a standby when leadership is held instead of exiting immediately.
 - [ ] Examples still include static-resolver/demo-specific paths and should be moved to placement-backed defaults where appropriate.
 
 #### Phase 6: Cluster Singleton
