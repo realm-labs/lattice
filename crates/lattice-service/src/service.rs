@@ -12,10 +12,11 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::server::Router;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::component::ErasedPlacementStore;
 use crate::config::InstanceConfig;
+use crate::framework::{ClusterEventBusComponent, LocalEventBusComponent};
 use crate::{LatticeServiceBuilder, LatticeServiceError};
 
 #[derive(Debug)]
@@ -79,7 +80,7 @@ impl LatticeService {
             instance,
             listener,
             router,
-            service_context: _service_context,
+            service_context,
             placement_store,
             placement_watch_tasks,
             instance_lease_keepalive_interval,
@@ -139,6 +140,13 @@ impl LatticeService {
                 lease_id,
             )
             .await;
+            let cancelled_subscriptions = cancel_event_subscriptions(&service_context).await;
+            debug!(
+                service.kind = service_kind.as_str(),
+                instance.id = instance.instance_id.as_str(),
+                event.subscriptions.cancelled = cancelled_subscriptions,
+                "cancelled runtime-owned event subscriptions"
+            );
             let _ = server_shutdown_tx.send(());
             result
         };
@@ -208,6 +216,17 @@ impl LatticeService {
 enum ServiceExit {
     Server(Result<(), tonic::transport::Error>),
     Keepalive(Result<(), LatticeServiceError>),
+}
+
+async fn cancel_event_subscriptions(service_context: &ServiceContext) -> usize {
+    let mut cancelled = 0;
+    if let Some(component) = service_context.extension::<ClusterEventBusComponent>() {
+        cancelled += component.cancel_owned_subscriptions().await;
+    }
+    if let Some(component) = service_context.extension::<LocalEventBusComponent>() {
+        cancelled += component.cancel_owned_subscriptions().await;
+    }
+    cancelled
 }
 
 async fn publish_instance_record(

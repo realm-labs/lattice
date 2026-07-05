@@ -11,9 +11,12 @@ use lattice_actor::registry::ActorCreateContext;
 use lattice_actor::{Actor, ActorContext, ActorError, ActorFactory, Handler, Message};
 use lattice_config::{ConfigFormat, ConfigSource};
 use lattice_core::{
-    ActorId, ActorKind, ConfiguredComponent, Epoch, InstanceId, RouteKey, actor_kind, service_kind,
+    ActorId, ActorKind, ConfiguredComponent, Epoch, InstanceId, RouteKey, TraceContext, actor_kind,
+    service_kind,
 };
-use lattice_eventbus::LocalEventBus;
+use lattice_eventbus::{
+    EventBus, EventEnvelope, EventId, EventSubscription, LocalEventBus, Subject, SubjectFilter,
+};
 use lattice_placement::cache::RouteCacheConfig;
 use lattice_placement::control::{LogicControlClient, actor_id_to_proto, proto};
 use lattice_placement::coordinator::{
@@ -196,10 +199,42 @@ impl ShardedRpcCore for FakeRpcCore {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct RecordingRpcCore {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ShardedRpcCore for RecordingRpcCore {
+    async fn call<Req>(&self, _req: Req) -> Result<Req::Reply, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Req::Reply::default())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FakeRpcClient {
     service_kind: &'static str,
     core: FakeRpcCore,
+}
+
+fn test_event(subject: &str, event_type: &str) -> EventEnvelope {
+    EventEnvelope {
+        event_id: EventId::new("event-1"),
+        subject: Subject::new(subject),
+        event_type: event_type.to_string(),
+        source_service: service_kind!("World"),
+        source_instance: InstanceId::new("world-1"),
+        actor_kind: None,
+        actor_id: None,
+        request_id: None,
+        trace: TraceContext::default(),
+        occurred_unix_ms: 1,
+        payload: Vec::new(),
+    }
 }
 
 struct FakeRpcClientBinding;
@@ -593,6 +628,64 @@ async fn service_lifecycle_writes_starting_ready_draining_stopping() {
             InstanceState::Stopping,
         ]
     );
+}
+
+#[tokio::test]
+async fn service_shutdown_cancels_context_event_subscriptions() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let bus = LocalEventBus::new();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .cluster_event_bus::<LocalEventBus, _>(bus.clone())
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+    let core = RecordingRpcCore::default();
+    let calls = core.calls.clone();
+    service
+        .context()
+        .cluster_events()
+        .subscribe_actor_mapped(
+            EventSubscription::local(SubjectFilter::new("system.shutdown.*")),
+            core,
+            |_event| SingletonScopeRequest {
+                scope: "season-1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    bus.publish(test_event("system.shutdown.before", "BeforeShutdown"))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+
+    bus.publish(test_event("system.shutdown.after", "AfterShutdown"))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

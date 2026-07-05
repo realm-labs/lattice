@@ -14,6 +14,7 @@ use lattice_placement::store::{
     PlacementVersion, PlacementWatch, SingletonKey, SingletonPlacementRecord,
     VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
+use tokio::sync::Mutex;
 
 #[async_trait]
 pub trait DynPlacementStore: Send + Sync + 'static {
@@ -272,11 +273,15 @@ impl std::fmt::Debug for PlacementStoreComponent {
 #[derive(Clone)]
 pub struct ServiceEventBus {
     inner: Arc<dyn DynEventBus>,
+    subscriptions: EventSubscriptionRegistry,
 }
 
 impl ServiceEventBus {
-    fn new(inner: Arc<dyn DynEventBus>) -> Self {
-        Self { inner }
+    fn new(inner: Arc<dyn DynEventBus>, subscriptions: EventSubscriptionRegistry) -> Self {
+        Self {
+            inner,
+            subscriptions,
+        }
     }
 }
 
@@ -302,15 +307,39 @@ impl EventBus for ServiceEventBus {
     where
         H: EventHandler,
     {
-        self.inner
+        let handle = self
+            .inner
             .subscribe_boxed(subscription, Arc::new(handler))
-            .await
+            .await?;
+        self.subscriptions.own(handle.clone()).await;
+        Ok(handle)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct EventSubscriptionRegistry {
+    handles: Arc<Mutex<Vec<EventSubscriptionHandle>>>,
+}
+
+impl EventSubscriptionRegistry {
+    async fn own(&self, handle: EventSubscriptionHandle) {
+        self.handles.lock().await.push(handle);
+    }
+
+    pub(crate) async fn cancel_all(&self) -> usize {
+        let mut handles = self.handles.lock().await;
+        let count = handles.len();
+        for handle in handles.drain(..) {
+            handle.cancel();
+        }
+        count
     }
 }
 
 #[derive(Clone)]
 pub struct ClusterEventBusComponent {
     inner: Arc<dyn DynEventBus>,
+    subscriptions: EventSubscriptionRegistry,
 }
 
 impl ClusterEventBusComponent {
@@ -320,11 +349,16 @@ impl ClusterEventBusComponent {
     {
         Self {
             inner: Arc::new(event_bus),
+            subscriptions: EventSubscriptionRegistry::default(),
         }
     }
 
     pub fn bus(&self) -> ServiceEventBus {
-        ServiceEventBus::new(self.inner.clone())
+        ServiceEventBus::new(self.inner.clone(), self.subscriptions.clone())
+    }
+
+    pub(crate) async fn cancel_owned_subscriptions(&self) -> usize {
+        self.subscriptions.cancel_all().await
     }
 }
 
@@ -339,6 +373,7 @@ impl std::fmt::Debug for ClusterEventBusComponent {
 #[derive(Clone)]
 pub struct LocalEventBusComponent {
     inner: Arc<dyn DynEventBus>,
+    subscriptions: EventSubscriptionRegistry,
 }
 
 impl LocalEventBusComponent {
@@ -348,11 +383,16 @@ impl LocalEventBusComponent {
     {
         Self {
             inner: Arc::new(event_bus),
+            subscriptions: EventSubscriptionRegistry::default(),
         }
     }
 
     pub fn bus(&self) -> ServiceEventBus {
-        ServiceEventBus::new(self.inner.clone())
+        ServiceEventBus::new(self.inner.clone(), self.subscriptions.clone())
+    }
+
+    pub(crate) async fn cancel_owned_subscriptions(&self) -> usize {
+        self.subscriptions.cancel_all().await
     }
 }
 
