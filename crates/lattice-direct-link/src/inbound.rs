@@ -247,6 +247,19 @@ impl DirectLinkInboundRouter {
         Ok(closed)
     }
 
+    pub fn close_active_links(
+        &self,
+        reason: LinkCloseReason,
+    ) -> Result<usize, InboundDeliveryError> {
+        let snapshots = self.session_manager.active_link_snapshots();
+        let mut closed = 0;
+        for snapshot in snapshots {
+            self.close_all(&snapshot.link_id, reason.clone())?;
+            closed += 1;
+        }
+        Ok(closed)
+    }
+
     pub fn heartbeat_frames_due_at(&self, now: Instant) -> Vec<DirectLinkFrame> {
         self.session_manager
             .heartbeat_due_link_ids_at(now)

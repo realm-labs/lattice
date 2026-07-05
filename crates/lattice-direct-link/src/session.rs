@@ -254,6 +254,7 @@ impl DirectLinkSessionManager {
                 .map(|direction| (direction.direction, direction))
                 .collect(),
             closed: false,
+            close_reason: None,
         };
         self.links
             .lock()
@@ -392,6 +393,7 @@ impl DirectLinkSessionManager {
         };
         if link.directions.values().all(|state| state.closed) {
             link.closed = true;
+            link.close_reason = Some(reason.clone());
             self.metrics.record_close();
             tracing::debug!(
                 link.id = link_id.as_str(),
@@ -456,11 +458,13 @@ impl DirectLinkSessionManager {
 
         if direction_closed.is_empty() {
             link.closed = true;
+            link.close_reason = Some(reason);
             return Ok(CloseAllTransition::AlreadyClosed);
         }
 
         let closed_directions = link.directions.keys().copied().collect::<BTreeSet<_>>();
         link.closed = true;
+        link.close_reason = Some(reason.clone());
         self.metrics.record_close();
         tracing::debug!(
             link.id = link_id.as_str(),
@@ -546,6 +550,16 @@ impl DirectLinkSessionManager {
                 !link.closed
                     && now.saturating_duration_since(link.last_heartbeat_at) >= link.idle_timeout
             })
+            .map(ManagedLinkSnapshot::from)
+            .collect()
+    }
+
+    pub fn active_link_snapshots(&self) -> Vec<ManagedLinkSnapshot> {
+        self.links
+            .lock()
+            .expect("direct link managed links poisoned")
+            .values()
+            .filter(|link| !link.closed)
             .map(ManagedLinkSnapshot::from)
             .collect()
     }
@@ -994,6 +1008,7 @@ struct ManagedLink {
     last_heartbeat_sent_at: Instant,
     directions: BTreeMap<LinkDirection, NegotiatedDirection>,
     closed: bool,
+    close_reason: Option<LinkCloseReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1006,6 +1021,7 @@ pub struct ManagedLinkSnapshot {
     pub idle_timeout: Duration,
     pub directions: BTreeSet<LinkDirection>,
     pub closed: bool,
+    pub close_reason: Option<LinkCloseReason>,
 }
 
 impl From<&ManagedLink> for ManagedLinkSnapshot {
@@ -1019,6 +1035,7 @@ impl From<&ManagedLink> for ManagedLinkSnapshot {
             idle_timeout: value.idle_timeout,
             directions: value.directions.keys().copied().collect(),
             closed: value.closed,
+            close_reason: value.close_reason.clone(),
         }
     }
 }

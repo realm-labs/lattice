@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::{ActorKind, DirectLinkEndpoint, LinkError, ServiceContext, ServiceKind};
+use lattice_core::{
+    ActorKind, DirectLinkEndpoint, LinkCloseReason, LinkError, ServiceContext, ServiceKind,
+};
 use lattice_direct_link::transport::TcpDirectLinkWriter;
 use lattice_direct_link::{
     DirectLinkConnection, DirectLinkInboundRouter, DirectLinkTransport, TcpDirectLinkConnection,
@@ -122,6 +124,7 @@ impl LatticeService {
             ready,
         } = self;
         let local_addr = listener.local_addr()?;
+        let direct_link_runtime_for_drain = direct_link_runtime.clone();
         let direct_link_listener =
             start_direct_link_listener(direct_link, direct_link_runtime).await?;
         let direct_link_endpoint = direct_link_listener
@@ -199,6 +202,13 @@ impl LatticeService {
             if let Some(direct_link_shutdown_tx) = direct_link_shutdown_tx {
                 let _ = direct_link_shutdown_tx.send(());
             }
+            let drained_direct_links = drain_direct_links(direct_link_runtime_for_drain.as_ref())?;
+            debug!(
+                service.kind = service_kind.as_str(),
+                instance.id = instance.instance_id.as_str(),
+                direct_links.drained = drained_direct_links,
+                "drained direct links"
+            );
             let placement_drain =
                 drain_placement(placement_store.as_ref(), &service_kind, &instance).await;
             let cancelled_subscriptions = cancel_event_subscriptions(&service_context).await;
@@ -695,6 +705,21 @@ async fn drain_placement(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn drain_direct_links(
+    runtime: Option<&DirectLinkServiceRuntime>,
+) -> Result<usize, LatticeServiceError> {
+    let Some(runtime) = runtime else {
+        return Ok(0);
+    };
+    runtime
+        .inbound_router()
+        .close_active_links(LinkCloseReason::NodeDraining)
+        .map_err(|error| LatticeServiceError::ComponentBuild {
+            slot: "direct_links".to_string(),
+            message: error.to_string(),
+        })
 }
 
 async fn publish_instance_record(
