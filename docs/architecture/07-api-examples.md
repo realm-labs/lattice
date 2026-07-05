@@ -105,8 +105,8 @@ async fn main() -> anyhow::Result<()> {
                 .passivation(PassivationPolicy::IdleTimeout(Duration::from_secs(300)))
                 .build(),
         )
-        .register_sharded_rpc(WorldRpcBinding::for_actor(WORLD_ACTOR))
-        .register_client::<PlayerRpcBinding>()
+        .register_sharded_rpc(generated::world_rpc::Binding::for_actor::<WorldActor>(WORLD_ACTOR))
+        .register_client::<generated::player_rpc::Binding>()
         .build()
         .await?;
 

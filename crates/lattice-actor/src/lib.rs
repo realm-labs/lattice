@@ -545,6 +545,7 @@ mod tests {
             actor_kind!("Test"),
             ActorRegistryConfig {
                 mailbox: MailboxConfig::bounded(8),
+                passivation: Default::default(),
                 waiter_capacity: 0,
                 waiter_timeout: std::time::Duration::from_millis(20),
                 actor_ref: None,

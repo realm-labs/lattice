@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use lattice_actor::{Actor, ActorContext, ActorCreateContext, ActorError, ActorLoader, Handler};
+use lattice_actor::{Actor, ActorContext, ActorCreateContext, ActorError, ActorFactory, Handler};
 use lattice_core::{ActorId, ActorRef};
 use lattice_rpc::{ActorRefRpcClient, Rpc};
 use prost::Message as ProstMessage;
@@ -130,19 +130,19 @@ impl Handler<Rpc<PlayerPingRequest>> for PlayerActor {
 }
 
 #[derive(Clone)]
-pub struct PlayerLoader {
+pub struct PlayerActorFactory {
     actor_ref_client: ActorRefRpcClient<DemoActorRefRpcCore>,
 }
 
-impl PlayerLoader {
+impl PlayerActorFactory {
     pub fn new(actor_ref_client: ActorRefRpcClient<DemoActorRefRpcCore>) -> Self {
         Self { actor_ref_client }
     }
 }
 
 #[async_trait]
-impl ActorLoader<PlayerActor> for PlayerLoader {
-    async fn load(&self, ctx: ActorCreateContext) -> Result<PlayerActor, ActorError> {
+impl ActorFactory<PlayerActor> for PlayerActorFactory {
+    async fn create(&self, ctx: ActorCreateContext) -> Result<PlayerActor, ActorError> {
         match ctx.actor_id {
             ActorId::U64(player_id) => {
                 Ok(PlayerActor::new(player_id, self.actor_ref_client.clone()))

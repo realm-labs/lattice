@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use lattice_actor::{Actor, ActorContext, ActorCreateContext, ActorError, ActorLoader, Handler};
+use lattice_actor::{Actor, ActorContext, ActorCreateContext, ActorError, ActorFactory, Handler};
 use lattice_core::ActorId;
 use lattice_rpc::Rpc;
 
@@ -73,19 +73,19 @@ impl Handler<Rpc<LoginRequest>> for WorldActor {
 }
 
 #[derive(Clone)]
-pub struct WorldLoader {
+pub struct WorldActorFactory {
     player_core: DemoRpcCore,
 }
 
-impl WorldLoader {
+impl WorldActorFactory {
     pub fn new(player_core: DemoRpcCore) -> Self {
         Self { player_core }
     }
 }
 
 #[async_trait]
-impl ActorLoader<WorldActor> for WorldLoader {
-    async fn load(&self, ctx: ActorCreateContext) -> Result<WorldActor, ActorError> {
+impl ActorFactory<WorldActor> for WorldActorFactory {
+    async fn create(&self, ctx: ActorCreateContext) -> Result<WorldActor, ActorError> {
         match ctx.actor_id {
             ActorId::U64(world_id) => Ok(WorldActor::new(
                 world_id,

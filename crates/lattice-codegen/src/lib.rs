@@ -151,6 +151,12 @@ mod tests {
         );
         assert!(generated.rust.contains("pub mod world_rpc"));
         assert!(generated.rust.contains("pub struct Client<C>"));
+        assert!(generated.rust.contains("pub struct Binding<A = ()>"));
+        assert!(
+            generated
+                .rust
+                .contains("impl<A> RpcServiceBinding for Binding<A>")
+        );
         assert!(generated.rust.contains("pub struct ActorService<A: Actor>"));
         assert!(
             generated

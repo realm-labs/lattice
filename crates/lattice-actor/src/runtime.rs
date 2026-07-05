@@ -440,6 +440,7 @@ where
 pub(crate) fn spawn_actor_with_self_ref<A>(
     actor: A,
     mailbox: MailboxConfig,
+    passivation: PassivationPolicy,
     self_ref: Option<ActorRef>,
 ) -> ActorHandle<A>
 where
@@ -452,7 +453,7 @@ where
                 mailbox,
                 execution: Some(ActorExecutionPolicy::TaskPerActor),
                 scheduler_key: None,
-                passivation: PassivationPolicy::Disabled,
+                passivation,
                 self_ref,
             },
         )

@@ -10,13 +10,14 @@ use lattice_core::{ActorId, ActorKind, ActorRef, Epoch, InstanceId, ServiceKind}
 use tokio::sync::{Semaphore, watch};
 
 use crate::{
-    Actor, ActorActivationError, ActorError, ActorHandle, MailboxConfig,
+    Actor, ActorActivationError, ActorError, ActorHandle, MailboxConfig, PassivationPolicy,
     runtime::spawn_actor_with_self_ref,
 };
 
 #[derive(Debug, Clone)]
 pub struct ActorRegistryConfig {
     pub mailbox: MailboxConfig,
+    pub passivation: PassivationPolicy,
     pub waiter_capacity: usize,
     pub waiter_timeout: Duration,
     pub actor_ref: Option<ActorRefConfig>,
@@ -34,6 +35,7 @@ impl Default for ActorRegistryConfig {
     fn default() -> Self {
         Self {
             mailbox: MailboxConfig::default(),
+            passivation: PassivationPolicy::Disabled,
             waiter_capacity: 1024,
             waiter_timeout: Duration::from_secs(5),
             actor_ref: None,
@@ -236,7 +238,12 @@ impl<A: Actor> ActorRegistry<A> {
 
     fn spawn_actor(&self, actor_id: ActorId, actor: A) -> ActorHandle<A> {
         let self_ref = self.actor_ref_for(actor_id);
-        spawn_actor_with_self_ref(actor, self.config.mailbox, self_ref)
+        spawn_actor_with_self_ref(
+            actor,
+            self.config.mailbox,
+            self.config.passivation,
+            self_ref,
+        )
     }
 
     fn actor_ref_for(&self, actor_id: ActorId) -> Option<ActorRef> {

@@ -1,0 +1,17 @@
+[package]
+name = "lattice-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+http.workspace = true
+lattice-actor.workspace = true
+lattice-core.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true

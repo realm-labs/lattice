@@ -11,6 +11,7 @@ members = [
     "crates/lattice-telemetry-otlp",
     "crates/lattice-ops",
     "crates/lattice-rpc",
+    "crates/lattice-service",
     "examples/distributed-login",
     "examples/minimal-world",
 ]
@@ -40,6 +41,7 @@ lattice-ops = { path = "crates/lattice-ops" }
 lattice-placement = { path = "crates/lattice-placement" }
 lattice-telemetry-otlp = { path = "crates/lattice-telemetry-otlp" }
 lattice-rpc = { path = "crates/lattice-rpc" }
+lattice-service = { path = "crates/lattice-service" }
 opentelemetry = { version = "0.32.0", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["trace", "rt-tokio"] }

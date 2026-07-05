@@ -1,40 +1,42 @@
 mod actor;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use http::Uri;
-use lattice_actor::{ActorRegistry, ActorRegistryConfig};
 use lattice_core::InstanceId;
+use lattice_service::{ActorRegistration, LatticeService};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
 
-use crate::game::world_rpc_server::WorldRpcServer;
-use crate::generated::world_rpc;
+use crate::generated::{player_rpc, world_rpc};
 use crate::placement::player_core;
-use crate::world::actor::{WorldActor, WorldLoader};
-use crate::{ExampleResult, WORLD_ACTOR};
+use crate::world::actor::{WorldActor, WorldActorFactory};
+use crate::{ExampleResult, WORLD_ACTOR, WORLD_SERVICE};
 
 pub async fn run_world_service(
     listener: TcpListener,
     player_endpoint: Uri,
     ready: Option<oneshot::Sender<SocketAddr>>,
 ) -> ExampleResult<()> {
-    let local_addr = listener.local_addr()?;
-    let player_core = player_core(player_endpoint, InstanceId::new("world-1"));
-    let registry = Arc::new(ActorRegistry::<WorldActor>::new(
-        WORLD_ACTOR,
-        ActorRegistryConfig::default(),
-    ));
-    let service = world_rpc::RegistryService::new(registry, WorldLoader::new(player_core));
+    let mut builder = LatticeService::builder(WORLD_SERVICE)
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener);
     if let Some(ready) = ready {
-        let _ = ready.send(local_addr);
+        builder = builder.ready_signal(ready);
     }
-    Server::builder()
-        .add_service(WorldRpcServer::new(service))
-        .serve_with_incoming(TcpListenerStream::new(listener))
+    let player_core = player_core(player_endpoint, InstanceId::new("world-1"));
+
+    builder
+        .register_actor(
+            ActorRegistration::builder(WORLD_ACTOR)
+                .factory(WorldActorFactory::new(player_core))
+                .build(),
+        )
+        .register_sharded_rpc(world_rpc::Binding::for_actor::<WorldActor>(WORLD_ACTOR))
+        .register_client::<player_rpc::Binding>()
+        .build()
+        .await?
+        .run_until_shutdown()
         .await?;
     Ok(())
 }

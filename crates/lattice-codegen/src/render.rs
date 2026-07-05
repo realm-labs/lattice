@@ -205,12 +205,15 @@ fn push_service_module(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let module_name = lower_camel_to_snake(&service.service_name);
     rust.push_str(&format!("pub mod {module_name} {{\n"));
     rust.push_str("    use std::sync::Arc;\n");
+    rust.push_str("    use std::marker::PhantomData;\n");
     rust.push_str(
         "    use lattice_actor::{Actor, ActorHandle, ActorLoader, ActorRegistry, Handler};\n",
     );
-    rust.push_str("    use lattice_core::{ActorId, RouteKey};\n");
+    rust.push_str("    use lattice_core::{ActorId, ActorKind, RouteKey};\n");
     rust.push_str("    use lattice_rpc::{ActorRpcAdapter, Rpc, RpcRequest, RoutedRequest, ShardedRpcCore, TypedRpcClient};\n\n");
+    rust.push_str("    use lattice_service::{LatticeServiceError, RpcClientBinding, RpcServiceBinding, ServiceBuildContext};\n\n");
     push_typed_client(rust, methods);
+    push_service_binding(rust, methods);
     push_server_adapter(rust, methods);
     push_registry_server_adapter(rust, methods);
     for method in methods {
@@ -242,6 +245,44 @@ fn push_typed_client(rust: &mut String, methods: &[&RpcMethodSpec]) {
         rust.push_str("            self.inner.call(req).await\n");
         rust.push_str("        }\n");
     }
+    rust.push_str("    }\n\n");
+}
+
+fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
+    let service = methods[0];
+    let server_path = tonic_server_path(service);
+    rust.push_str("    pub struct Binding<A = ()> {\n        actor_kind: ActorKind,\n        _actor: PhantomData<fn() -> A>,\n    }\n\n");
+    rust.push_str("    impl Binding<()> {\n");
+    rust.push_str("        pub fn for_actor<A>(actor_kind: ActorKind) -> Binding<A>\n        where\n            A: Actor,\n        {\n");
+    rust.push_str("            Binding { actor_kind, _actor: PhantomData }\n");
+    rust.push_str("        }\n");
+    rust.push_str("    }\n\n");
+    rust.push_str("    impl<A> RpcClientBinding for Binding<A>\n    where\n        A: Send + Sync + 'static,\n    {\n");
+    rust.push_str(&format!(
+        "        const SERVICE_KIND: &'static str = \"{}\";\n",
+        service.service_kind
+    ));
+    rust.push_str("    }\n\n");
+    rust.push_str(
+        "    impl<A> RpcServiceBinding for Binding<A>\n    where\n        A: Actor + Sync",
+    );
+    for method in methods {
+        rust.push_str(" + Handler<Rpc<");
+        rust.push_str(&method.request_type);
+        rust.push_str(">>");
+    }
+    rust.push_str(",\n    {\n");
+    rust.push_str(&format!(
+        "        fn service_name(&self) -> &'static str {{ \"{}\" }}\n\n",
+        service.service_name
+    ));
+    rust.push_str("        fn register(self: Box<Self>, context: &mut ServiceBuildContext) -> Result<(), LatticeServiceError> {\n");
+    rust.push_str("            let actor = context.actor::<A>(&self.actor_kind)?;\n");
+    rust.push_str(&format!(
+        "            context.add_rpc_service({server_path}::new(RegistryService::new(actor.registry(), actor.loader())));\n"
+    ));
+    rust.push_str("            Ok(())\n");
+    rust.push_str("        }\n");
     rust.push_str("    }\n\n");
 }
 
@@ -627,6 +668,19 @@ fn tonic_service_trait_path(method: &RpcMethodSpec) -> String {
         format!("crate::{server_module}::{}", method.service_name)
     } else {
         format!("crate::{module}::{server_module}::{}", method.service_name)
+    }
+}
+
+fn tonic_server_path(method: &RpcMethodSpec) -> String {
+    let module = package_module(&method.package);
+    let server_module = format!("{}_server", lower_camel_to_snake(&method.service_name));
+    if module.is_empty() {
+        format!("crate::{server_module}::{}Server", method.service_name)
+    } else {
+        format!(
+            "crate::{module}::{server_module}::{}Server",
+            method.service_name
+        )
     }
 }
 

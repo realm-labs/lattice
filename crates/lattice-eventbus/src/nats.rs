@@ -129,7 +129,7 @@ impl EventBus for NatsEventBus {
             deliver_if_needed(&self.client, &subscriber, event).await?;
         }
 
-        Ok(EventSubscriptionHandle { id, cancelled })
+        Ok(EventSubscriptionHandle::new(id, cancelled))
     }
 }
 
