@@ -12,6 +12,6 @@ lattice-core.workspace = true
 lattice-rpc.workspace = true
 prost.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true

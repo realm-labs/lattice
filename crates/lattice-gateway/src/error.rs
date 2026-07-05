@@ -28,4 +28,6 @@ pub enum GatewayError {
     RateLimited,
     #[error("gateway load shed: concurrency limit exceeded")]
     LoadShed,
+    #[error("gateway io error: {0}")]
+    Io(String),
 }

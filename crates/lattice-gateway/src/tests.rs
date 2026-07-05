@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use lattice_core::{ActorKind, RouteKey, actor_kind};
 use lattice_rpc::{RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 use prost::Message as ProstMessage;
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::*;
 
@@ -68,6 +69,47 @@ fn binary_client_codec_decodes_and_encodes_frame() {
         }
     );
     assert_eq!(codec.encode(frame).unwrap(), vec![0, 0, 0, 9, 1, 2, 3]);
+}
+
+#[tokio::test]
+async fn gateway_tcp_server_serves_framed_client_requests_until_shutdown() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = GatewayTcpServer::new(listener, |frame: ClientFrame| async move {
+        Ok(Some(ClientFrame {
+            msg_id: frame.msg_id + 1,
+            payload: frame.payload,
+        }))
+    })
+    .ready_signal(ready_tx);
+
+    let task = tokio::spawn(server.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let addr = ready_rx.await.unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    write_client_frame(
+        &mut stream,
+        ClientFrame {
+            msg_id: 41,
+            payload: vec![1, 2, 3],
+        },
+    )
+    .await
+    .unwrap();
+    let reply = read_client_frame(&mut stream).await.unwrap();
+
+    assert_eq!(
+        reply,
+        ClientFrame {
+            msg_id: 42,
+            payload: vec![1, 2, 3],
+        }
+    );
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[test]

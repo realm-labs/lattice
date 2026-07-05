@@ -217,7 +217,7 @@ Status: `[ ]` incomplete.
 - [x] Drain/migration are not connected to runtime actor registries, placement leases, or RPC readiness.
   - [x] `LatticeService` shutdown does not drain runtime actor registries with `PassivationReason::Drain`.
   - [x] Service drain does not yet invoke coordinator-driven placement migration for owned actors before releasing readiness.
-- [ ] Gateway startup is still mostly example-specific and not represented as a framework service API.
+- [x] Gateway startup is still mostly example-specific and not represented as a framework service API.
 - [ ] Cluster/node inspection does not query live services through LogicControl/Admin APIs.
 - [ ] Security/mTLS integration is partial and not connected to service builders by default.
 - [ ] Full chaos test suite is not implemented.
