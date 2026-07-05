@@ -157,7 +157,7 @@ Status: `[ ]` incomplete.
 - [x] Loader/factory failure wakes waiters and remains retryable.
 - [x] Virtual shard ownership is persisted through the `PlacementStore` keyspace, including the etcd adapter.
 - [x] `LatticeService` can start placement watches for service-owned route caches.
-- [ ] Scale-out does not yet make new service instances automatically participate in shard assignment.
+- [x] Scale-out makes new Ready service instances automatically participate in shard assignment through a coordinator placement watch that triggers configured virtual-shard rebalance plans without changing the existing running-actor movement policy.
 - [x] Scale-in service shutdown drains placement ownership and migrates owned actors/virtual shards when a replacement instance exists.
 - [ ] Running actor migration/passivation policy is not yet connected to shard rebalance decisions.
 

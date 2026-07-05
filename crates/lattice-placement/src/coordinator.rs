@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lattice_core::{ActorId, ActorKind, Epoch, InstanceId, RouteKey, ServiceKind};
 use lattice_rpc::RouteTarget;
-use tracing::Instrument;
+use tracing::{Instrument, warn};
 
 use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::error::PlacementError;
@@ -403,7 +403,7 @@ where
         assigner: &A,
     ) -> Result<RebalanceVirtualShardsReport, PlacementError>
     where
-        A: VirtualShardAssigner,
+        A: VirtualShardAssigner + ?Sized,
     {
         let span = tracing::info_span!(
             "placement.vshards.rebalance",
@@ -512,6 +512,49 @@ where
         }
         .instrument(span)
         .await
+    }
+
+    pub async fn start_virtual_shard_scale_out_watch<A>(
+        &self,
+        requests: Vec<RebalanceVirtualShardsRequest>,
+        assigner: A,
+    ) -> Result<PlacementWatchTask, PlacementError>
+    where
+        A: VirtualShardAssigner,
+    {
+        let mut watch = self.store.watch(self.store.prefix().clone()).await?;
+        let coordinator = self.clone();
+        let assigner: Arc<dyn VirtualShardAssigner> = Arc::new(assigner);
+        let handle = tokio::spawn(async move {
+            while let Ok(event) = watch.next().await {
+                let PlacementWatchEvent::InstanceUpdated { record } = event else {
+                    continue;
+                };
+                if record.state != InstanceState::Ready {
+                    continue;
+                }
+
+                for request in requests
+                    .iter()
+                    .filter(|request| request.service_kind == record.service_kind)
+                {
+                    if let Err(error) = coordinator
+                        .rebalance_virtual_shards(request.clone(), assigner.as_ref())
+                        .await
+                    {
+                        warn!(
+                            service.kind = request.service_kind.as_str(),
+                            actor.kind = request.actor_kind.as_str(),
+                            instance.id = record.instance_id.as_str(),
+                            error = %error,
+                            "automatic virtual shard scale-out rebalance failed"
+                        );
+                    }
+                }
+            }
+        });
+
+        Ok(PlacementWatchTask { handle })
     }
 
     async fn activate_actor_with_lock(

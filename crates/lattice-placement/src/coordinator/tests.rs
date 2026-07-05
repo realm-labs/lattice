@@ -300,6 +300,52 @@ async fn scale_out_ready_instance_participates_in_virtual_shard_assignment() {
 }
 
 #[tokio::test]
+async fn ready_instance_watch_triggers_virtual_shard_assignment() {
+    let store = ready_store().await;
+    let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+    let watch_task = coordinator
+        .start_virtual_shard_scale_out_watch(
+            vec![RebalanceVirtualShardsRequest {
+                service_kind: service_kind!("World"),
+                actor_kind: actor_kind!("World"),
+                shard_count: 4,
+                eligible_shards: BTreeSet::new(),
+                max_migrations: usize::MAX,
+                movement_policy: VirtualShardMovementPolicy::EligibleOnly,
+            }],
+            GradualRebalanceShardAssigner,
+        )
+        .await
+        .unwrap();
+
+    store
+        .upsert_instance(instance_record("world-b", InstanceState::Ready))
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        let assignments = store
+            .list_virtual_shards(&service_kind!("World"), &actor_kind!("World"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, record)| (record.shard_id, (record.owner, record.epoch)))
+            .collect::<BTreeMap<_, _>>();
+        if assignments.len() == 4
+            && assignments.get(&VirtualShardId(1)) == Some(&(InstanceId::new("world-b"), Epoch(1)))
+            && assignments.get(&VirtualShardId(3)) == Some(&(InstanceId::new("world-b"), Epoch(1)))
+        {
+            watch_task.cancel();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    watch_task.cancel();
+    panic!("ready instance watch did not assign virtual shards");
+}
+
+#[tokio::test]
 async fn virtual_shard_rebalance_respects_running_actor_movement_policy() {
     let store = ready_store().await;
     let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
