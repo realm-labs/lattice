@@ -972,25 +972,25 @@ Each phase can exit only when all items are true:
 The whole goal can be marked complete only when:
 
 ```text
-[ ] Phase 1 through Phase 7 are complete.
-[ ] This file's global acceptance checklist is fully satisfied.
-[ ] architecture/00-overview.md system boundaries and module responsibilities are implemented.
-[ ] architecture/01-actor-runtime.md actor runtime capabilities are implemented and tested.
-[ ] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, KeyedWorkerPool, and DedicatedThreadPool.
-[ ] UnsupportedExecutionPolicy is used only for invalid configuration, not for planned policies in the completed framework.
-[ ] architecture/02-rpc.md typed RPC, metadata, codegen, and gateway decode/forward are implemented and tested.
-[ ] architecture/03-placement.md placement, scale, drain, shutdown, crash, and watch are implemented and tested.
-[ ] architecture/04-eventbus-scheduler-config.md event bus, scheduler, and config are implemented and tested.
-[ ] architecture/05-gateway-ops.md gateway, rate limit, admin, telemetry, and inspection are implemented and tested.
-[ ] Valid constraints in architecture/06-appendix.md are not violated.
-[ ] API sketches in architecture/07-api-examples.md are covered by examples or compile tests.
-[ ] The implementation uses the planned Cargo workspace crate split; the root crate is not a monolithic implementation crate.
-[ ] examples/minimal-world runs as an end-to-end example.
-[ ] cargo fmt passes.
-[ ] cargo clippy passes.
-[ ] cargo test passes.
-[ ] All completed implementation slices are committed with English conventional commit messages.
-[ ] Production paths have no unexplained TODO / FIXME / unimplemented! / todo!.
+[x] Phase 1 through Phase 7 are complete.
+[x] This file's global acceptance checklist is fully satisfied.
+[x] architecture/00-overview.md system boundaries and module responsibilities are implemented.
+[x] architecture/01-actor-runtime.md actor runtime capabilities are implemented and tested.
+[x] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, KeyedWorkerPool, and DedicatedThreadPool.
+[x] UnsupportedExecutionPolicy is used only for invalid configuration, not for planned policies in the completed framework.
+[x] architecture/02-rpc.md typed RPC, metadata, codegen, and gateway decode/forward are implemented and tested.
+[x] architecture/03-placement.md placement, scale, drain, shutdown, crash, and watch are implemented and tested.
+[x] architecture/04-eventbus-scheduler-config.md event bus, scheduler, and config are implemented and tested.
+[x] architecture/05-gateway-ops.md gateway, rate limit, admin, telemetry, and inspection are implemented and tested.
+[x] Valid constraints in architecture/06-appendix.md are not violated.
+[x] API sketches in architecture/07-api-examples.md are covered by examples or compile tests.
+[x] The implementation uses the planned Cargo workspace crate split; the root crate is not a monolithic implementation crate.
+[x] examples/minimal-world runs as an end-to-end example.
+[x] cargo fmt passes.
+[x] cargo clippy passes.
+[x] cargo test passes.
+[x] All completed implementation slices are committed with English conventional commit messages.
+[x] Production paths have no unexplained TODO / FIXME / unimplemented! / todo!.
 ```
 
 ### 5.5 Working Constraints
