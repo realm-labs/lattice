@@ -229,7 +229,7 @@ Status: `[ ]` incomplete.
   - [x] Partial placement write failure is covered.
   - [x] New request arriving while an actor is passivating is covered.
   - [x] Singleton failover while a long business job is running is covered.
-  - [ ] Rolling update with mixed versions is covered.
+  - [x] Rolling update with mixed versions is covered.
   - [ ] EventBus subscriber duplicate delivery is covered.
 - [ ] `crates/lattice-actor/src/tests.rs` exceeds 1200 LOC and needs a documented split or explicit rationale before final exit.
 

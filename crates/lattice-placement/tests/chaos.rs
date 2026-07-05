@@ -430,6 +430,76 @@ async fn singleton_failover_during_long_job_fences_old_owner_and_retries() {
     assert_eq!(calls[0].request_id, calls[1].request_id);
 }
 
+#[tokio::test]
+async fn rolling_update_with_mixed_versions_drains_old_owner_to_ready_new_version() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/chaos-rolling"));
+    store
+        .upsert_instance(instance_record_with_version(
+            "world-a",
+            InstanceState::Ready,
+            "1.0.0",
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_instance(instance_record_with_version(
+            "world-b",
+            InstanceState::Ready,
+            "2.0.0",
+        ))
+        .await
+        .unwrap();
+    let key = ActorPlacementKey {
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(7),
+    };
+    store
+        .compare_and_put_actor(key.clone(), None, actor_record(7, "world-a", 3, LeaseId(9)))
+        .await
+        .unwrap();
+    let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+    let resolver = ExplicitRouteResolver::new(
+        service_kind!("World"),
+        store.clone(),
+        coordinator.clone(),
+        Default::default(),
+    );
+
+    let report = coordinator
+        .drain_instance(service_kind!("World"), InstanceId::new("world-a"))
+        .await
+        .unwrap();
+    let old_instance = store
+        .get_instance(&InstanceId::new("world-a"))
+        .await
+        .unwrap()
+        .unwrap();
+    let new_instance = store
+        .get_instance(&InstanceId::new("world-b"))
+        .await
+        .unwrap()
+        .unwrap();
+    let migrated = store.get_actor(&key).await.unwrap().unwrap().1;
+    let target = resolver
+        .resolve(ResolveRequest {
+            service_kind: service_kind!("World"),
+            actor_kind: actor_kind!("World"),
+            route_key: RouteKey::U64(7),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(report.migrated_actors, 1);
+    assert_eq!(old_instance.state, InstanceState::Draining);
+    assert_eq!(old_instance.version, "1.0.0");
+    assert_eq!(new_instance.state, InstanceState::Ready);
+    assert_eq!(new_instance.version, "2.0.0");
+    assert_eq!(migrated.owner, InstanceId::new("world-b"));
+    assert_eq!(migrated.epoch, Epoch(4));
+    assert_eq!(target.instance_id, InstanceId::new("world-b"));
+    assert_eq!(target.owner_epoch, Some(Epoch(4)));
+}
+
 #[derive(Debug, Clone)]
 struct FlakyEtcdClient {
     inner: InMemoryEtcdClient,
@@ -644,13 +714,21 @@ impl EndpointRpcTransport for FencingStoreTransport {
 }
 
 fn instance_record(instance_id: &str, state: InstanceState) -> InstanceRecord {
+    instance_record_with_version(instance_id, state, "test")
+}
+
+fn instance_record_with_version(
+    instance_id: &str,
+    state: InstanceState,
+    version: &str,
+) -> InstanceRecord {
     InstanceRecord {
         service_kind: service_kind!("World"),
         instance_id: InstanceId::new(instance_id),
         lease_id: LeaseId(1),
         advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
         control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),
-        version: "test".to_string(),
+        version: version.to_string(),
         state,
         capacity: InstanceCapacity::default(),
         labels: BTreeMap::new(),
