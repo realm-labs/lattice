@@ -1,37 +1,35 @@
-use http::Uri;
 use lattice_core::InstanceId;
 use lattice_placement::cache::RouteCacheConfig;
-use lattice_placement::static_resolver::{
-    StaticPlacementConfig, StaticRouteRange, StaticRouteResolver,
+use lattice_placement::control::TonicLogicControl;
+use lattice_placement::coordinator::{PlacementCoordinator, PlacementRouteResolver};
+use lattice_placement::static_resolver::{StaticPlacementConfig, StaticRouteResolver};
+use lattice_placement::{
+    EndpointPool, InMemoryPlacementStore, ResolvingActorRefRpcCore, ResolvingRpcCore,
 };
-use lattice_placement::{EndpointPool, ResolvingActorRefRpcCore, ResolvingRpcCore};
-use lattice_rpc::{RouteTarget, RpcClientContextFactory};
+use lattice_rpc::RpcClientContextFactory;
 
 use crate::generated::GeneratedTonicEndpointTransport;
-use crate::{PLAYER_ACTOR, PLAYER_SERVICE, WORLD_ACTOR, WORLD_SERVICE};
+use crate::{GATEWAY_SERVICE, PLAYER_SERVICE, WORLD_SERVICE};
 
-pub type DemoRpcCore = ResolvingRpcCore<StaticRouteResolver, GeneratedTonicEndpointTransport>;
+pub type DemoRpcCore = ResolvingRpcCore<
+    PlacementRouteResolver<InMemoryPlacementStore, TonicLogicControl>,
+    GeneratedTonicEndpointTransport,
+>;
 pub type DemoActorRefRpcCore =
     ResolvingActorRefRpcCore<StaticRouteResolver, GeneratedTonicEndpointTransport>;
 
-pub fn world_core(world_endpoint: Uri, source_instance: InstanceId) -> DemoRpcCore {
-    DemoRpcCore::new(
-        WORLD_SERVICE,
-        resolver(WORLD_SERVICE, WORLD_ACTOR, "world-1", world_endpoint),
-        EndpointPool::new(),
-        RpcClientContextFactory::new(crate::WORLD_SERVICE, source_instance),
-        GeneratedTonicEndpointTransport::new(),
-    )
+pub fn local_placement_store() -> InMemoryPlacementStore {
+    InMemoryPlacementStore::new(lattice_placement::PlacementPrefix::new(
+        "/lattice/distributed-login",
+    ))
 }
 
-pub fn player_core(player_endpoint: Uri, source_instance: InstanceId) -> DemoRpcCore {
-    DemoRpcCore::new(
-        PLAYER_SERVICE,
-        resolver(PLAYER_SERVICE, PLAYER_ACTOR, "player-1", player_endpoint),
-        EndpointPool::new(),
-        RpcClientContextFactory::new(crate::WORLD_SERVICE, source_instance),
-        GeneratedTonicEndpointTransport::new(),
-    )
+pub fn world_core(store: InMemoryPlacementStore, source_instance: InstanceId) -> DemoRpcCore {
+    rpc_core(WORLD_SERVICE, GATEWAY_SERVICE, source_instance, store)
+}
+
+pub fn player_core(store: InMemoryPlacementStore, source_instance: InstanceId) -> DemoRpcCore {
+    rpc_core(PLAYER_SERVICE, GATEWAY_SERVICE, source_instance, store)
 }
 
 pub fn actor_ref_core(
@@ -49,27 +47,24 @@ pub fn actor_ref_core(
     )
 }
 
-fn resolver(
+fn rpc_core(
     service_kind: lattice_core::ServiceKind,
-    actor_kind: lattice_core::ActorKind,
-    instance: &str,
-    endpoint: Uri,
-) -> StaticRouteResolver {
-    StaticRouteResolver::new(
-        StaticPlacementConfig {
-            ranges: vec![StaticRouteRange {
-                service_kind: service_kind.clone(),
-                actor_kind: actor_kind.clone(),
-                start_inclusive: 0,
-                end_exclusive: u64::MAX,
-                target: RouteTarget {
-                    service_kind,
-                    instance_id: InstanceId::new(instance),
-                    advertised_endpoint: endpoint,
-                    owner_epoch: None,
-                },
-            }],
-        },
+    source_service: lattice_core::ServiceKind,
+    source_instance: InstanceId,
+    store: InMemoryPlacementStore,
+) -> DemoRpcCore {
+    let coordinator = PlacementCoordinator::new(store.clone(), TonicLogicControl);
+    let resolver = PlacementRouteResolver::new(
+        service_kind.clone(),
+        store,
+        coordinator,
         RouteCacheConfig::default(),
+    );
+    DemoRpcCore::new(
+        service_kind,
+        resolver,
+        EndpointPool::new(),
+        RpcClientContextFactory::new(source_service, source_instance),
+        GeneratedTonicEndpointTransport::new(),
     )
 }

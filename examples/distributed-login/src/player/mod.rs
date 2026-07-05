@@ -3,6 +3,7 @@ mod actor;
 use std::net::SocketAddr;
 
 use lattice_core::InstanceId;
+use lattice_placement::InMemoryPlacementStore;
 use lattice_rpc::ActorRefRpcClient;
 use lattice_service::{ActorRegistration, LatticeService};
 use tokio::net::TcpListener;
@@ -15,6 +16,7 @@ use crate::{ExampleResult, PLAYER_ACTOR, PLAYER_SERVICE};
 
 pub async fn run_player_service(
     listener: TcpListener,
+    placement_store: InMemoryPlacementStore,
     ready: Option<oneshot::Sender<SocketAddr>>,
 ) -> ExampleResult<()> {
     let mut builder = LatticeService::builder(PLAYER_SERVICE)
@@ -27,6 +29,7 @@ pub async fn run_player_service(
         ActorRefRpcClient::new(actor_ref_core(PLAYER_SERVICE, InstanceId::new("player-1")));
 
     builder
+        .placement_store::<InMemoryPlacementStore, _>(placement_store)
         .register_actor(
             ActorRegistration::builder(PLAYER_ACTOR)
                 .factory(PlayerActorFactory::new(actor_ref_client))

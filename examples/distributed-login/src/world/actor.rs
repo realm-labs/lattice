@@ -9,18 +9,17 @@ use lattice_rpc::Rpc;
 use crate::game::{
     InitSessionRequest, LoginAcceptedReply, LoginRequest, WorldPingReply, WorldPingRequest,
 };
-use crate::generated::player_rpc::Client as PlayerRpcClient;
-use crate::placement::DemoRpcCore;
+use crate::generated::player_rpc::{Client as PlayerRpcClient, DefaultClientCore as PlayerRpcCore};
 
 #[derive(Debug)]
 pub struct WorldActor {
     world_id: u64,
     sessions: HashMap<u64, String>,
-    player_client: PlayerRpcClient<DemoRpcCore>,
+    player_client: PlayerRpcClient<PlayerRpcCore>,
 }
 
 impl WorldActor {
-    fn new(world_id: u64, player_client: PlayerRpcClient<DemoRpcCore>) -> Self {
+    fn new(world_id: u64, player_client: PlayerRpcClient<PlayerRpcCore>) -> Self {
         Self {
             world_id,
             sessions: HashMap::new(),
@@ -90,7 +89,7 @@ impl ActorFactory<WorldActor> for WorldActorFactory {
     async fn create(&self, ctx: ActorCreateContext) -> Result<WorldActor, ActorError> {
         let player_client = ctx
             .service
-            .extension::<PlayerRpcClient<DemoRpcCore>>()
+            .extension::<PlayerRpcClient<PlayerRpcCore>>()
             .ok_or_else(|| ActorError::new("missing generated Player RPC client"))?;
         match ctx.actor_id {
             ActorId::U64(world_id) => Ok(WorldActor::new(world_id, (*player_client).clone())),

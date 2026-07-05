@@ -1,4 +1,5 @@
 use clap::Parser;
+use distributed_login::placement::local_placement_store;
 use distributed_login::player::run_player_service;
 use tokio::net::TcpListener;
 
@@ -14,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_tracing();
     let args = Args::parse();
     let listener = TcpListener::bind(&args.addr).await?;
-    run_player_service(listener, None).await
+    run_player_service(listener, local_placement_store(), None).await
 }
 
 fn init_tracing() {

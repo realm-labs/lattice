@@ -10,11 +10,14 @@ use distributed_login::{
     GATEWAY_SERVICE, GATEWAY_SESSION_ACTOR, LOGIN_MSG_ID, PLAYER_PING_MSG_ID, WORLD_PING_MSG_ID,
 };
 use lattice_core::{ActorId as CoreActorId, ActorRef as CoreActorRef, ActorRefTarget, InstanceId};
+use lattice_placement::{InMemoryPlacementStore, PlacementPrefix};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn raw_tcp_gateway_drives_world_and_player_login_flow() {
+    let placement_store =
+        InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/distributed-login-test"));
     let gateway_a_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_a_push_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_b_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -22,30 +25,28 @@ async fn raw_tcp_gateway_drives_world_and_player_login_flow() {
     let gateway_b_push_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
     let player_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let player_addr = player_listener.local_addr().unwrap();
     let (player_ready_tx, player_ready_rx) = oneshot::channel();
-    let player_task = tokio::spawn(run_player_service(player_listener, Some(player_ready_tx)));
+    let player_task = tokio::spawn(run_player_service(
+        player_listener,
+        placement_store.clone(),
+        Some(player_ready_tx),
+    ));
     player_ready_rx.await.unwrap();
 
     let world_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let world_addr = world_listener.local_addr().unwrap();
-    let player_endpoint = format!("http://{player_addr}").parse().unwrap();
     let (world_ready_tx, world_ready_rx) = oneshot::channel();
     let world_task = tokio::spawn(run_world_service(
         world_listener,
-        player_endpoint,
+        placement_store.clone(),
         Some(world_ready_tx),
     ));
     world_ready_rx.await.unwrap();
 
-    let world_endpoint: http::Uri = format!("http://{world_addr}").parse().unwrap();
-    let player_endpoint: http::Uri = format!("http://{player_addr}").parse().unwrap();
     let (gateway_a_ready_tx, gateway_a_ready_rx) = oneshot::channel();
     let gateway_a_task = tokio::spawn(run_gateway(
         gateway_a_listener,
         gateway_a_push_listener,
-        world_endpoint.clone(),
-        player_endpoint.clone(),
+        placement_store.clone(),
         Some(gateway_a_ready_tx),
     ));
     gateway_a_ready_rx.await.unwrap();
@@ -54,8 +55,7 @@ async fn raw_tcp_gateway_drives_world_and_player_login_flow() {
     let gateway_b_task = tokio::spawn(run_gateway(
         gateway_b_listener,
         gateway_b_push_listener,
-        world_endpoint,
-        player_endpoint,
+        placement_store,
         Some(gateway_b_ready_tx),
     ));
     gateway_b_ready_rx.await.unwrap();

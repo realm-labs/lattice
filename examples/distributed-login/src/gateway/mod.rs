@@ -9,6 +9,7 @@ use lattice_actor::registry::{ActorCreateContext, ActorRefConfig, ActorRegistryC
 use lattice_actor::{ActorError, ActorLoader, ActorRegistry, StopReason};
 use lattice_core::{ActorId, ActorRef, InstanceId};
 use lattice_gateway::{ClientFrame, GatewayRouteTable};
+use lattice_placement::InMemoryPlacementStore;
 use prost::Message as ProstMessage;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
@@ -29,8 +30,7 @@ type DemoGatewayDispatcher = GatewayDispatcher<DemoRpcCore, DemoRpcCore>;
 pub async fn run_gateway(
     client_listener: TcpListener,
     push_listener: TcpListener,
-    world_endpoint: Uri,
-    player_endpoint: Uri,
+    placement_store: InMemoryPlacementStore,
     ready: Option<oneshot::Sender<SocketAddr>>,
 ) -> ExampleResult<()> {
     let local_addr = client_listener.local_addr()?;
@@ -38,8 +38,8 @@ pub async fn run_gateway(
     let mut route_table = GatewayRouteTable::new();
     register_gateway_routes(&mut route_table)?;
 
-    let world_core = world_core(world_endpoint, InstanceId::new("gateway-1"));
-    let player_core = player_core(player_endpoint, InstanceId::new("gateway-1"));
+    let world_core = world_core(placement_store.clone(), InstanceId::new("gateway-1"));
+    let player_core = player_core(placement_store, InstanceId::new("gateway-1"));
     let dispatcher = DemoGatewayDispatcher::new(world_core, player_core);
     let gateway_push_endpoint = format!("http://{push_addr}").parse::<Uri>()?;
     let sessions = GatewaySessions::new(gateway_push_endpoint);

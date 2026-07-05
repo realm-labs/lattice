@@ -1,6 +1,6 @@
 use clap::Parser;
 use distributed_login::gateway::run_gateway;
-use http::Uri;
+use distributed_login::placement::local_placement_store;
 use tokio::net::TcpListener;
 
 #[derive(Debug, Parser)]
@@ -10,10 +10,6 @@ struct Args {
     addr: String,
     #[arg(long, default_value = "127.0.0.1:19083")]
     push_addr: String,
-    #[arg(long, default_value = "http://127.0.0.1:19081")]
-    world_endpoint: Uri,
-    #[arg(long, default_value = "http://127.0.0.1:19082")]
-    player_endpoint: Uri,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -22,14 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
     let listener = TcpListener::bind(&args.addr).await?;
     let push_listener = TcpListener::bind(&args.push_addr).await?;
-    run_gateway(
-        listener,
-        push_listener,
-        args.world_endpoint,
-        args.player_endpoint,
-        None,
-    )
-    .await
+    run_gateway(listener, push_listener, local_placement_store(), None).await
 }
 
 fn init_tracing() {

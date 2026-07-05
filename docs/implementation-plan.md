@@ -161,7 +161,7 @@ Status: `[x]` complete.
 
 #### Phase 5: Explicit Placement + Coordinator
 
-Status: `[ ]` incomplete and currently the highest-priority gap.
+Status: `[x]` complete.
 
 - [x] `PlacementStore` trait exists.
 - [x] In-memory placement store exists.
@@ -181,7 +181,7 @@ Status: `[ ]` incomplete and currently the highest-priority gap.
 - [x] Explicit actor activation is not wired into generated clients or `LatticeService`.
 - [x] `register_client` does not build a resolver/core from the configured placement store.
 - [x] Placement watch is not wired into route cache invalidation in running services.
-- [ ] Deployment still requires examples to hand-build static resolvers for real RPC calls.
+- [x] Deployment still requires examples to hand-build static resolvers for real RPC calls.
 
 #### Phase 6: Cluster Singleton
 
