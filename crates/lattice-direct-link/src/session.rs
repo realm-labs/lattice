@@ -238,6 +238,7 @@ impl DirectLinkSessionManager {
 
         let source_actor_kind = request.source.actor_kind.as_str().to_string();
         let target_actor_kind = request.target.actor_kind.as_str().to_string();
+        let now = Instant::now();
         let link = ManagedLink {
             link_id: request.link_id.clone(),
             source: request.source,
@@ -245,7 +246,8 @@ impl DirectLinkSessionManager {
             mode: request.mode,
             heartbeat_interval: request.options.heartbeat_interval,
             idle_timeout: request.options.idle_timeout,
-            last_heartbeat_at: Instant::now(),
+            last_heartbeat_at: now,
+            last_heartbeat_sent_at: now,
             directions: [Some(source_to_target.clone()), target_to_source.clone()]
                 .into_iter()
                 .flatten()
@@ -545,6 +547,25 @@ impl DirectLinkSessionManager {
                     && now.saturating_duration_since(link.last_heartbeat_at) >= link.idle_timeout
             })
             .map(ManagedLinkSnapshot::from)
+            .collect()
+    }
+
+    pub fn heartbeat_due_link_ids_at(&self, now: Instant) -> Vec<LinkId> {
+        self.links
+            .lock()
+            .expect("direct link managed links poisoned")
+            .values_mut()
+            .filter_map(|link| {
+                if link.closed
+                    || link.heartbeat_interval.is_zero()
+                    || now.saturating_duration_since(link.last_heartbeat_sent_at)
+                        < link.heartbeat_interval
+                {
+                    return None;
+                }
+                link.last_heartbeat_sent_at = now;
+                Some(link.link_id.clone())
+            })
             .collect()
     }
 
@@ -970,6 +991,7 @@ struct ManagedLink {
     heartbeat_interval: Duration,
     idle_timeout: Duration,
     last_heartbeat_at: Instant,
+    last_heartbeat_sent_at: Instant,
     directions: BTreeMap<LinkDirection, NegotiatedDirection>,
     closed: bool,
 }
@@ -1253,6 +1275,48 @@ mod tests {
                 LinkSequence(1),
             ),
             Err(MessageFrameError::NonActivatableTarget)
+        );
+    }
+
+    #[test]
+    fn heartbeat_due_tracking_emits_once_per_interval_and_stops_after_close() {
+        let manager = DirectLinkSessionManager::new();
+        let stream = stream("movement", &[1]);
+        manager
+            .register_binding(actor_kind!("Battle"), stream.clone())
+            .unwrap();
+        let link_id = LinkId::new("link-heartbeat-due");
+        let mut request = open_request_with_id(&stream, link_id.clone());
+        request.options.heartbeat_interval = Duration::from_secs(10);
+        manager.open_link(request).unwrap();
+
+        let opened_at = Instant::now();
+        assert!(
+            manager
+                .heartbeat_due_link_ids_at(opened_at + Duration::from_secs(1))
+                .is_empty()
+        );
+        assert_eq!(
+            manager.heartbeat_due_link_ids_at(opened_at + Duration::from_secs(10)),
+            vec![link_id.clone()]
+        );
+        assert!(
+            manager
+                .heartbeat_due_link_ids_at(opened_at + Duration::from_secs(19))
+                .is_empty()
+        );
+        assert_eq!(
+            manager.heartbeat_due_link_ids_at(opened_at + Duration::from_secs(20)),
+            vec![link_id.clone()]
+        );
+
+        manager
+            .close_all(&link_id, LinkCloseReason::Done)
+            .expect("close link");
+        assert!(
+            manager
+                .heartbeat_due_link_ids_at(opened_at + Duration::from_secs(30))
+                .is_empty()
         );
     }
 

@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::{ActorKind, DirectLinkEndpoint, ServiceContext, ServiceKind};
+use lattice_core::{ActorKind, DirectLinkEndpoint, LinkError, ServiceContext, ServiceKind};
+use lattice_direct_link::transport::TcpDirectLinkWriter;
 use lattice_direct_link::{
     DirectLinkConnection, DirectLinkInboundRouter, DirectLinkTransport, TcpDirectLinkConnection,
     TcpDirectLinkTransport,
@@ -586,8 +587,14 @@ async fn start_direct_link_listener(
                     match accepted {
                         Ok(connection) => {
                             let inbound_router = inbound_router.clone();
+                            let maintenance_interval = maintenance_interval;
                             tokio::spawn(async move {
-                                handle_direct_link_connection(connection, inbound_router).await;
+                                handle_direct_link_connection(
+                                    connection,
+                                    inbound_router,
+                                    maintenance_interval,
+                                )
+                                .await;
                             });
                         }
                         Err(error) => {
@@ -609,29 +616,54 @@ async fn start_direct_link_listener(
 }
 
 async fn handle_direct_link_connection(
-    mut connection: TcpDirectLinkConnection,
+    connection: TcpDirectLinkConnection,
     inbound_router: Option<Arc<DirectLinkInboundRouter>>,
+    maintenance_interval: Duration,
 ) {
     let Some(inbound_router) = inbound_router else {
+        let mut connection = connection;
         let _ = connection.close().await;
         return;
     };
 
+    let (mut reader, mut writer) = connection.split();
+    let mut heartbeat = tokio::time::interval(maintenance_interval);
     loop {
-        let frame = match connection.read_frame().await {
-            Ok(frame) => frame,
-            Err(error) => {
-                debug!(%error, "closing direct-link connection after read failure");
-                let _ = connection.close().await;
-                return;
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                if let Err(error) = write_due_direct_link_heartbeats(&mut writer, &inbound_router).await {
+                    debug!(%error, "closing direct-link connection after heartbeat write failure");
+                    let _ = writer.close().await;
+                    return;
+                }
             }
-        };
-        if let Err(error) = inbound_router.process_frame(frame) {
-            warn!(%error, "closing direct-link connection after inbound delivery failure");
-            let _ = connection.close().await;
-            return;
+            frame = reader.read_frame() => {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        debug!(%error, "closing direct-link connection after read failure");
+                        let _ = writer.close().await;
+                        return;
+                    }
+                };
+                if let Err(error) = inbound_router.process_frame(frame) {
+                    warn!(%error, "closing direct-link connection after inbound delivery failure");
+                    let _ = writer.close().await;
+                    return;
+                }
+            }
         }
     }
+}
+
+async fn write_due_direct_link_heartbeats(
+    writer: &mut TcpDirectLinkWriter,
+    inbound_router: &DirectLinkInboundRouter,
+) -> Result<(), LinkError> {
+    for frame in inbound_router.heartbeat_frames_due_at(Instant::now()) {
+        writer.write_frame(frame).await?;
+    }
+    Ok(())
 }
 
 async fn drain_placement(

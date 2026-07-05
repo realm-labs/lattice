@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use lattice_core::{DirectLinkEndpoint, LinkError};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 
 use crate::codec::{DirectLinkFrame, DirectLinkFrameCodec};
@@ -111,87 +112,147 @@ impl TcpDirectLinkListener {
 
 #[derive(Debug)]
 pub struct TcpDirectLinkConnection {
-    stream: TcpStream,
+    reader: TcpDirectLinkReader,
+    writer: TcpDirectLinkWriter,
+}
+
+#[derive(Debug)]
+pub struct TcpDirectLinkReader {
+    reader: OwnedReadHalf,
+    codec: DirectLinkFrameCodec,
+    metrics: DirectLinkMetrics,
+}
+
+#[derive(Debug)]
+pub struct TcpDirectLinkWriter {
+    writer: OwnedWriteHalf,
     codec: DirectLinkFrameCodec,
     metrics: DirectLinkMetrics,
 }
 
 impl TcpDirectLinkConnection {
     pub fn new(stream: TcpStream, max_frame_size: usize, metrics: DirectLinkMetrics) -> Self {
+        let codec = DirectLinkFrameCodec::new(max_frame_size);
+        let (reader, writer) = stream.into_split();
         Self {
-            stream,
-            codec: DirectLinkFrameCodec::new(max_frame_size),
-            metrics,
+            reader: TcpDirectLinkReader {
+                reader,
+                codec,
+                metrics: metrics.clone(),
+            },
+            writer: TcpDirectLinkWriter {
+                writer,
+                codec,
+                metrics,
+            },
         }
+    }
+
+    pub fn split(self) -> (TcpDirectLinkReader, TcpDirectLinkWriter) {
+        (self.reader, self.writer)
+    }
+}
+
+impl TcpDirectLinkReader {
+    pub async fn read_frame(&mut self) -> Result<DirectLinkFrame, LinkError> {
+        read_tcp_frame(&mut self.reader, self.codec, &self.metrics).await
+    }
+}
+
+impl TcpDirectLinkWriter {
+    pub async fn write_frame(&mut self, frame: DirectLinkFrame) -> Result<(), LinkError> {
+        write_tcp_frame(&mut self.writer, self.codec, &self.metrics, frame).await
+    }
+
+    pub async fn close(&mut self) -> Result<(), LinkError> {
+        self.writer.shutdown().await.map_err(|error| {
+            LinkError::Protocol(format!("failed to close TCP direct link: {error}"))
+        })
     }
 }
 
 #[async_trait]
 impl DirectLinkConnection for TcpDirectLinkConnection {
     async fn read_frame(&mut self) -> Result<DirectLinkFrame, LinkError> {
-        let len = self.stream.read_u32().await.map_err(|error| {
-            LinkError::Protocol(format!(
-                "failed to read TCP direct link frame length: {error}"
-            ))
-        })?;
-        let len = usize::try_from(len).map_err(|_| {
-            LinkError::Protocol("TCP direct link frame length overflow".to_string())
-        })?;
-        let mut payload = vec![0; len];
-        self.stream
-            .read_exact(&mut payload)
-            .await
-            .map_err(|error| {
-                LinkError::Protocol(format!("failed to read TCP direct link frame: {error}"))
-            })?;
-        self.codec
-            .decode(&payload)
-            .inspect(|frame| {
-                self.metrics.record_receive();
-                tracing::trace!(
-                    link.id = frame.link_id.as_str(),
-                    frame.kind = ?frame.kind,
-                    "read TCP direct link frame"
-                );
-            })
-            .map_err(|error| {
-                self.metrics.record_decode_error();
-                LinkError::Protocol(error.to_string())
-            })
+        self.reader.read_frame().await
     }
 
     async fn write_frame(&mut self, frame: DirectLinkFrame) -> Result<(), LinkError> {
-        let payload = self
-            .codec
-            .encode(&frame)
-            .map_err(|error| LinkError::Protocol(error.to_string()))?;
-        let len = u32::try_from(payload.len())
-            .map_err(|_| LinkError::Protocol("TCP direct link frame is too large".to_string()))?;
-        self.stream.write_u32(len).await.map_err(|error| {
-            LinkError::Protocol(format!(
-                "failed to write TCP direct link frame length: {error}"
-            ))
-        })?;
-        self.stream.write_all(&payload).await.map_err(|error| {
-            LinkError::Protocol(format!("failed to write TCP direct link frame: {error}"))
-        })?;
-        self.stream.flush().await.map_err(|error| {
-            LinkError::Protocol(format!("failed to flush TCP direct link frame: {error}"))
-        })?;
-        self.metrics.record_send();
-        tracing::trace!(
-            link.id = frame.link_id.as_str(),
-            frame.kind = ?frame.kind,
-            "wrote TCP direct link frame"
-        );
-        Ok(())
+        self.writer.write_frame(frame).await
     }
 
     async fn close(&mut self) -> Result<(), LinkError> {
-        self.stream.shutdown().await.map_err(|error| {
-            LinkError::Protocol(format!("failed to close TCP direct link: {error}"))
-        })
+        self.writer.close().await
     }
+}
+
+async fn read_tcp_frame<R>(
+    reader: &mut R,
+    codec: DirectLinkFrameCodec,
+    metrics: &DirectLinkMetrics,
+) -> Result<DirectLinkFrame, LinkError>
+where
+    R: AsyncRead + Unpin,
+{
+    let len = reader.read_u32().await.map_err(|error| {
+        LinkError::Protocol(format!(
+            "failed to read TCP direct link frame length: {error}"
+        ))
+    })?;
+    let len = usize::try_from(len)
+        .map_err(|_| LinkError::Protocol("TCP direct link frame length overflow".to_string()))?;
+    let mut payload = vec![0; len];
+    reader.read_exact(&mut payload).await.map_err(|error| {
+        LinkError::Protocol(format!("failed to read TCP direct link frame: {error}"))
+    })?;
+    codec
+        .decode(&payload)
+        .inspect(|frame| {
+            metrics.record_receive();
+            tracing::trace!(
+                link.id = frame.link_id.as_str(),
+                frame.kind = ?frame.kind,
+                "read TCP direct link frame"
+            );
+        })
+        .map_err(|error| {
+            metrics.record_decode_error();
+            LinkError::Protocol(error.to_string())
+        })
+}
+
+async fn write_tcp_frame<W>(
+    writer: &mut W,
+    codec: DirectLinkFrameCodec,
+    metrics: &DirectLinkMetrics,
+    frame: DirectLinkFrame,
+) -> Result<(), LinkError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let payload = codec
+        .encode(&frame)
+        .map_err(|error| LinkError::Protocol(error.to_string()))?;
+    let len = u32::try_from(payload.len())
+        .map_err(|_| LinkError::Protocol("TCP direct link frame is too large".to_string()))?;
+    writer.write_u32(len).await.map_err(|error| {
+        LinkError::Protocol(format!(
+            "failed to write TCP direct link frame length: {error}"
+        ))
+    })?;
+    writer.write_all(&payload).await.map_err(|error| {
+        LinkError::Protocol(format!("failed to write TCP direct link frame: {error}"))
+    })?;
+    writer.flush().await.map_err(|error| {
+        LinkError::Protocol(format!("failed to flush TCP direct link frame: {error}"))
+    })?;
+    metrics.record_send();
+    tracing::trace!(
+        link.id = frame.link_id.as_str(),
+        frame.kind = ?frame.kind,
+        "wrote TCP direct link frame"
+    );
+    Ok(())
 }
 
 async fn endpoint_socket_address(

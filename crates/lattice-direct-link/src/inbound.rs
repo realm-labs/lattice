@@ -230,6 +230,14 @@ impl DirectLinkInboundRouter {
         Ok(closed)
     }
 
+    pub fn heartbeat_frames_due_at(&self, now: Instant) -> Vec<DirectLinkFrame> {
+        self.session_manager
+            .heartbeat_due_link_ids_at(now)
+            .into_iter()
+            .map(DirectLinkFrame::heartbeat)
+            .collect()
+    }
+
     fn deliver_direction_closed(
         &self,
         actor_ref: &ActorRef,

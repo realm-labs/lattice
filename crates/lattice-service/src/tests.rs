@@ -30,8 +30,9 @@ use lattice_core::{
     TraceContext, actor_kind, service_kind,
 };
 use lattice_direct_link::{
-    DIRECT_LINK_PROTOCOL_VERSION, DirectLinkConnection, DirectLinkFrame, DirectLinkStream,
-    DirectLinkTransport, OpenLinkDirection, OpenLinkRequest, TcpDirectLinkTransport,
+    DIRECT_LINK_PROTOCOL_VERSION, DirectLinkConnection, DirectLinkFrame, DirectLinkFrameKind,
+    DirectLinkStream, DirectLinkTransport, OpenLinkDirection, OpenLinkRequest,
+    TcpDirectLinkTransport,
 };
 use lattice_eventbus::{
     EventBus, EventEnvelope, EventId, EventSubscription, LocalEventBus, Subject, SubjectFilter,
@@ -1344,6 +1345,121 @@ async fn direct_link_listener_idle_maintenance_closes_stale_links() {
     })
     .await
     .unwrap();
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn direct_link_listener_writes_heartbeat_frames_for_open_links() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store =
+        InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test-direct-link-heartbeat"));
+    let mut watch = store.watch(store.prefix().clone()).await.unwrap();
+    let closed = Arc::new(Mutex::new(Vec::new()));
+    let stream = DirectLinkStream::new("movement").message::<DirectLinkTestPayload>();
+    let descriptor = stream.descriptor();
+    let link_id = LinkId::new("service-link-heartbeat");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .direct_links(
+            DirectLinkConfig::enabled("127.0.0.1:0").maintenance_interval(Duration::from_millis(5)),
+        )
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(DirectLinkLifecycleFactory {
+                    closed: closed.clone(),
+                })
+                .build(),
+        )
+        .register_direct_link(stream.for_actor::<DirectLinkLifecycleActor>(actor_kind!("World")))
+        .register_sharded_rpc(FakeRpcBinding::<DirectLinkLifecycleActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+    let direct_link_runtime = service.direct_link_runtime().unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let addr = ready_rx.await.unwrap();
+    let mut client = LogicControlClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    client
+        .activate_actor(proto::ActivateActorRequest {
+            service_kind: "World".to_string(),
+            actor_kind: "World".to_string(),
+            actor_id: Some(actor_id_to_proto(&ActorId::U64(7))),
+            epoch: 1,
+        })
+        .await
+        .unwrap();
+
+    let ready_record = loop {
+        let event = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .unwrap()
+            .unwrap();
+        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+            && record.state == InstanceState::Ready
+        {
+            break record;
+        }
+    };
+    let direct_link_endpoint: http::Uri = ready_record
+        .labels
+        .get("direct_link_endpoint")
+        .expect("direct-link endpoint label")
+        .parse()
+        .unwrap();
+
+    let mut options = DirectLinkOptions::unidirectional();
+    options.heartbeat_interval = Duration::from_millis(10);
+    options.idle_timeout = Duration::from_secs(1);
+    direct_link_runtime
+        .session_manager()
+        .open_link(OpenLinkRequest {
+            protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+            link_id: link_id.clone(),
+            source: direct_actor_ref(
+                service_kind!("Gateway"),
+                actor_kind!("GatewaySession"),
+                ActorId::U64(99),
+                "tcp://127.0.0.1:1".parse().unwrap(),
+            ),
+            target: direct_actor_ref(
+                service_kind!("World"),
+                actor_kind!("World"),
+                ActorId::U64(7),
+                "tcp://127.0.0.1:2".parse().unwrap(),
+            ),
+            mode: DirectLinkMode::Unidirectional,
+            source_to_target: OpenLinkDirection::from_stream(link_id.clone(), &descriptor),
+            target_to_source: None,
+            options,
+        })
+        .unwrap();
+
+    let mut connection = TcpDirectLinkTransport::new()
+        .connect(DirectLinkEndpoint::new(direct_link_endpoint))
+        .await
+        .unwrap();
+    let frame = timeout(Duration::from_secs(1), connection.read_frame())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame.kind, DirectLinkFrameKind::Heartbeat);
+    assert_eq!(frame.link_id, link_id);
+    connection.close().await.unwrap();
 
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();
