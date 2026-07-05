@@ -7,7 +7,7 @@ use serde_json::json;
 use tokio::sync::{Mutex, watch};
 
 use crate::client::EtcdConfigClient;
-use crate::store::EtcdConfigStoreInner;
+use crate::store::{EtcdConfigStore, EtcdConfigStoreInner};
 
 #[tokio::test]
 async fn etcd_config_store_supports_watch_reload() {
@@ -80,6 +80,7 @@ fn config_builds_from_normalized_prefix() {
         store.storage_key("/feature/foo"),
         "/lattice/test/config/feature/foo"
     );
+    assert_eq!(EtcdConfigStore::from_config().section(), "config_store");
 }
 
 fn test_store(prefix: &str) -> EtcdConfigStoreInner<InMemoryEtcdConfigClient> {

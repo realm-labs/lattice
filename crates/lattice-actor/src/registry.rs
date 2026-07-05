@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use http::Uri;
-use lattice_core::{ActorId, ActorKind, ActorRef, Epoch, InstanceId, ServiceKind};
+use lattice_core::{ActorId, ActorKind, ActorRef, Epoch, InstanceId, ServiceContext, ServiceKind};
 use tokio::sync::{Semaphore, watch};
 
 use crate::error::{ActorActivationError, ActorError};
@@ -23,6 +23,7 @@ pub struct ActorRegistryConfig {
     pub waiter_capacity: usize,
     pub waiter_timeout: Duration,
     pub actor_ref: Option<ActorRefConfig>,
+    pub service: ServiceContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,7 @@ impl Default for ActorRegistryConfig {
             waiter_capacity: 1024,
             waiter_timeout: Duration::from_secs(5),
             actor_ref: None,
+            service: ServiceContext::empty(),
         }
     }
 }
@@ -62,10 +64,11 @@ impl<A: Actor> fmt::Debug for ActorRegistry<A> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ActorCreateContext {
     pub actor_kind: ActorKind,
     pub actor_id: ActorId,
+    pub service: ServiceContext,
 }
 
 #[async_trait]
@@ -192,6 +195,7 @@ impl<A: Actor> ActorRegistry<A> {
         let ctx = ActorCreateContext {
             actor_kind: self.kind.clone(),
             actor_id: actor_id.clone(),
+            service: self.config.service.clone(),
         };
         self.get_or_activate(actor_id, || async move { factory.create(ctx).await })
             .await
@@ -208,6 +212,7 @@ impl<A: Actor> ActorRegistry<A> {
         let ctx = ActorCreateContext {
             actor_kind: self.kind.clone(),
             actor_id: actor_id.clone(),
+            service: self.config.service.clone(),
         };
         self.get_or_activate(actor_id, || async move { loader.load(ctx).await })
             .await
@@ -258,6 +263,7 @@ impl<A: Actor> ActorRegistry<A> {
             self.config.mailbox,
             self.config.passivation,
             self_ref,
+            self.config.service.clone(),
         )
     }
 

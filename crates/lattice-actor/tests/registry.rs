@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use lattice_actor::error::ActorActivationError;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistryConfig};
 use lattice_actor::{Actor, ActorContext, ActorError, ActorRegistry, MailboxConfig};
-use lattice_core::{ActorId, ActorRef, ActorRefTarget, InstanceId, actor_kind, service_kind};
+use lattice_core::{
+    ActorId, ActorRef, ActorRefTarget, InstanceId, ServiceContext, actor_kind, service_kind,
+};
 use tokio::sync::{Semaphore, oneshot};
 
 struct SlowActor;
@@ -28,6 +30,7 @@ async fn activation_waiter_times_out_while_activation_is_loading() {
             waiter_capacity: 1,
             waiter_timeout: Duration::from_millis(10),
             actor_ref: None,
+            service: ServiceContext::empty(),
         },
     ));
     let actor_id = ActorId::U64(7);

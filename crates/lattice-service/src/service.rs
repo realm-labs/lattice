@@ -1,12 +1,16 @@
 use std::net::SocketAddr;
+use std::str::FromStr;
 
-use lattice_core::ServiceKind;
+use lattice_core::instance::InstanceCapacity;
+use lattice_core::{ServiceContext, ServiceKind};
+use lattice_placement::instance::{InstanceRecord, InstanceState};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::server::Router;
 use tracing::{error, info};
 
+use crate::component::ErasedPlacementStore;
 use crate::config::InstanceConfig;
 use crate::{LatticeServiceBuilder, LatticeServiceError};
 
@@ -16,6 +20,8 @@ pub struct LatticeService {
     instance: InstanceConfig,
     listener: TcpListener,
     router: Router,
+    service_context: ServiceContext,
+    placement_store: Box<dyn ErasedPlacementStore>,
     ready: Option<oneshot::Sender<SocketAddr>>,
 }
 
@@ -29,6 +35,8 @@ impl LatticeService {
         instance: InstanceConfig,
         listener: TcpListener,
         router: Router,
+        service_context: ServiceContext,
+        placement_store: Box<dyn ErasedPlacementStore>,
         ready: Option<oneshot::Sender<SocketAddr>>,
     ) -> Self {
         Self {
@@ -36,6 +44,8 @@ impl LatticeService {
             instance,
             listener,
             router,
+            service_context,
+            placement_store,
             ready,
         }
     }
@@ -48,8 +58,14 @@ impl LatticeService {
         &self.instance
     }
 
+    pub fn context(&self) -> &ServiceContext {
+        &self.service_context
+    }
+
     pub async fn run_until_shutdown(self) -> Result<(), LatticeServiceError> {
         let local_addr = self.listener.local_addr()?;
+        self.publish_instance(local_addr, InstanceState::Ready)
+            .await?;
         if let Some(ready) = self.ready {
             let _ = ready.send(local_addr);
         }
@@ -85,4 +101,32 @@ impl LatticeService {
             }
         }
     }
+
+    pub(crate) async fn publish_instance(
+        &self,
+        local_addr: SocketAddr,
+        state: InstanceState,
+    ) -> Result<(), LatticeServiceError> {
+        let endpoint = self
+            .instance
+            .advertised_endpoint
+            .clone()
+            .unwrap_or_else(|| socket_addr_to_uri(local_addr));
+        let record = InstanceRecord {
+            service_kind: self.service_kind.clone(),
+            instance_id: self.instance.instance_id.clone(),
+            advertised_endpoint: endpoint.clone(),
+            control_endpoint: endpoint,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            state,
+            capacity: InstanceCapacity::default(),
+            labels: Default::default(),
+        };
+        self.placement_store.upsert_instance(record).await?;
+        Ok(())
+    }
+}
+
+fn socket_addr_to_uri(addr: SocketAddr) -> http::Uri {
+    http::Uri::from_str(&format!("http://{addr}")).expect("socket address URI should be valid")
 }

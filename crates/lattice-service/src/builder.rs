@@ -1,15 +1,25 @@
-use std::collections::HashSet;
+use std::any::{TypeId, type_name};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 
 use lattice_actor::Actor;
-use lattice_core::{ActorKind, InstanceId, ServiceKind};
+use lattice_config::{BootstrapConfig, ConfigSource};
+use lattice_config::{ConfigStore, LocalConfigStore};
+use lattice_core::{ActorKind, InstanceId, ServiceContext, ServiceKind};
+use lattice_eventbus::{EventBus, LocalEventBus};
+use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix, PlacementStore};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::{debug, info};
 
 use crate::actor::ActorRegistration;
 use crate::actor::ErasedActorRegistration;
+use crate::component::{
+    ErasedPlacementStore, ErasedPlacementStoreComponent, ErasedServiceComponent,
+    IntoServiceComponent, PlacementStoreRegistration, ServiceComponentContext,
+    ServiceComponentRegistration,
+};
 use crate::config::InstanceConfig;
 use crate::context::ServiceBuildContext;
 use crate::{LatticeService, LatticeServiceError, RpcClientBinding, RpcServiceBinding};
@@ -22,7 +32,14 @@ pub struct LatticeServiceBuilder {
     actor_registrations: Vec<Box<dyn ErasedActorRegistration>>,
     rpc_services: Vec<Box<dyn RpcServiceBinding>>,
     client_bindings: Vec<String>,
-    component_labels: Vec<&'static str>,
+    config: Option<ConfigSource>,
+    placement_store: Option<Box<dyn ErasedPlacementStoreComponent>>,
+    event_bus: Option<Box<dyn ErasedServiceComponent>>,
+    local_event_bus: Option<Box<dyn ErasedServiceComponent>>,
+    config_store: Option<Box<dyn ErasedServiceComponent>>,
+    duplicate_framework_component: Option<&'static str>,
+    duplicate_extension: Option<&'static str>,
+    extensions: HashMap<TypeId, Box<dyn ErasedServiceComponent>>,
 }
 
 impl fmt::Debug for LatticeServiceBuilder {
@@ -39,7 +56,12 @@ impl fmt::Debug for LatticeServiceBuilder {
             .field("actor_registration_count", &self.actor_registrations.len())
             .field("rpc_service_count", &self.rpc_services.len())
             .field("client_bindings", &self.client_bindings)
-            .field("component_labels", &self.component_labels)
+            .field("has_config", &self.config.is_some())
+            .field("has_placement_store", &self.placement_store.is_some())
+            .field("has_event_bus", &self.event_bus.is_some())
+            .field("has_local_event_bus", &self.local_event_bus.is_some())
+            .field("has_config_store", &self.config_store.is_some())
+            .field("extension_count", &self.extensions.len())
             .finish()
     }
 }
@@ -54,7 +76,14 @@ impl LatticeServiceBuilder {
             actor_registrations: Vec::new(),
             rpc_services: Vec::new(),
             client_bindings: Vec::new(),
-            component_labels: Vec::new(),
+            config: None,
+            placement_store: None,
+            event_bus: None,
+            local_event_bus: None,
+            config_store: None,
+            duplicate_framework_component: None,
+            duplicate_extension: None,
+            extensions: HashMap::new(),
         }
     }
 
@@ -85,59 +114,89 @@ impl LatticeServiceBuilder {
         self
     }
 
-    pub fn config<T>(mut self, _config: T) -> Self
-    where
-        T: Send + Sync + 'static,
-    {
-        self.component_labels.push("config");
+    pub fn config(mut self, config: ConfigSource) -> Self {
+        self.config = Some(config);
         self
     }
 
-    pub fn placement_store<T>(mut self, _store: T) -> Self
+    pub fn placement_store<T, C>(mut self, store: C) -> Self
     where
-        T: Send + Sync + 'static,
+        T: PlacementStore,
+        C: IntoServiceComponent<T>,
     {
-        self.component_labels.push("placement_store");
+        if self.placement_store.is_some() {
+            self.duplicate_framework_component
+                .get_or_insert("placement_store");
+        } else {
+            self.placement_store = Some(Box::new(PlacementStoreRegistration::<T>::new(store)));
+        }
         self
     }
 
-    pub fn event_bus<T>(mut self, _event_bus: T) -> Self
+    pub fn event_bus<T, C>(mut self, event_bus: C) -> Self
     where
-        T: Send + Sync + 'static,
+        T: EventBus,
+        C: IntoServiceComponent<T>,
     {
-        self.component_labels.push("event_bus");
+        if self.event_bus.is_some() {
+            self.duplicate_framework_component
+                .get_or_insert("event_bus");
+        } else {
+            self.event_bus = Some(Box::new(ServiceComponentRegistration::<T>::event_bus(
+                event_bus,
+            )));
+        }
         self
     }
 
-    pub fn local_event_bus<T>(mut self, _event_bus: T) -> Self
+    pub fn local_event_bus<T, C>(mut self, event_bus: C) -> Self
     where
-        T: Send + Sync + 'static,
+        T: EventBus,
+        C: IntoServiceComponent<T>,
     {
-        self.component_labels.push("local_event_bus");
+        if self.local_event_bus.is_some() {
+            self.duplicate_framework_component
+                .get_or_insert("local_event_bus");
+        } else {
+            self.local_event_bus = Some(Box::new(
+                ServiceComponentRegistration::<T>::local_event_bus(event_bus),
+            ));
+        }
         self
     }
 
-    pub fn config_store<T>(mut self, _store: T) -> Self
+    pub fn config_store<T, C>(mut self, store: C) -> Self
     where
-        T: Send + Sync + 'static,
+        T: ConfigStore,
+        C: IntoServiceComponent<T>,
     {
-        self.component_labels.push("config_store");
+        if self.config_store.is_some() {
+            self.duplicate_framework_component
+                .get_or_insert("config_store");
+        } else {
+            self.config_store = Some(Box::new(ServiceComponentRegistration::<T>::config_store(
+                store,
+            )));
+        }
         self
     }
 
-    pub fn telemetry<T>(mut self, _telemetry: T) -> Self
+    pub fn extension<T, C>(mut self, extension: C) -> Self
     where
         T: Send + Sync + 'static,
+        C: IntoServiceComponent<T>,
     {
-        self.component_labels.push("telemetry");
-        self
-    }
-
-    pub fn admin_http<T>(mut self, _admin_http: T) -> Self
-    where
-        T: Send + Sync + 'static,
-    {
-        self.component_labels.push("admin_http");
+        let type_id = TypeId::of::<T>();
+        match self.extensions.entry(type_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Box::new(ServiceComponentRegistration::<T>::extension(
+                    extension,
+                )));
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                self.duplicate_extension.get_or_insert(type_name::<T>());
+            }
+        }
         self
     }
 
@@ -170,15 +229,112 @@ impl LatticeServiceBuilder {
         let instance = self
             .instance
             .ok_or(LatticeServiceError::MissingInstanceConfig)?;
+        let bootstrap_config = match self.config {
+            Some(source) => source.load().map_err(|error| LatticeServiceError::Config {
+                message: error.to_string(),
+            })?,
+            None => BootstrapConfig::default(),
+        };
+        let component_context = ServiceComponentContext {
+            service_kind: self.service_kind.clone(),
+            instance_id: instance.instance_id.clone(),
+            bootstrap_config: bootstrap_config.clone(),
+        };
+        if let Some(component) = self.duplicate_framework_component {
+            return Err(LatticeServiceError::DuplicateServiceComponent {
+                component: component.to_string(),
+            });
+        }
+        if let Some(type_name) = self.duplicate_extension {
+            return Err(LatticeServiceError::DuplicateServiceExtension {
+                type_name: type_name.to_string(),
+            });
+        }
+        let mut service_context = ServiceContext::builder(
+            self.service_kind.clone(),
+            instance.instance_id.clone(),
+            bootstrap_config,
+        );
+        let placement_store = build_placement_store_or_default(
+            self.placement_store,
+            Box::new(PlacementStoreRegistration::<InMemoryPlacementStore>::new(
+                InMemoryPlacementStore::new(PlacementPrefix::new(format!(
+                    "/lattice/{}/placement",
+                    self.service_kind.as_str()
+                ))),
+            )),
+            &component_context,
+            &mut service_context,
+            self.service_kind.as_str(),
+        )
+        .await?;
+        match (self.event_bus, self.local_event_bus) {
+            (None, None) => {
+                build_service_component(
+                    Box::new(ServiceComponentRegistration::<LocalEventBus>::event_bus(
+                        LocalEventBus::default(),
+                    )),
+                    &component_context,
+                    &mut service_context,
+                    self.service_kind.as_str(),
+                )
+                .await?;
+            }
+            (event_bus, local_event_bus) => {
+                build_framework_component_or_default(
+                    event_bus,
+                    Box::new(ServiceComponentRegistration::<LocalEventBus>::event_bus(
+                        LocalEventBus::default(),
+                    )),
+                    &component_context,
+                    &mut service_context,
+                    self.service_kind.as_str(),
+                )
+                .await?;
+                if let Some(local_event_bus) = local_event_bus {
+                    build_service_component(
+                        local_event_bus,
+                        &component_context,
+                        &mut service_context,
+                        self.service_kind.as_str(),
+                    )
+                    .await?;
+                }
+            }
+        }
+        build_framework_component_or_default(
+            self.config_store,
+            Box::new(
+                ServiceComponentRegistration::<LocalConfigStore>::config_store(
+                    LocalConfigStore::default(),
+                ),
+            ),
+            &component_context,
+            &mut service_context,
+            self.service_kind.as_str(),
+        )
+        .await?;
+        for extension in self.extensions.into_values() {
+            build_service_component(
+                extension,
+                &component_context,
+                &mut service_context,
+                self.service_kind.as_str(),
+            )
+            .await?;
+        }
+        let service_context = service_context.build();
+
         info!(
             service.kind = self.service_kind.as_str(),
             instance.id = instance.instance_id.as_str(),
             actor.registrations = self.actor_registrations.len(),
             rpc.services = self.rpc_services.len(),
             rpc.clients = self.client_bindings.len(),
+            service.extensions = service_context.extension_count(),
             "building lattice service"
         );
-        let mut context = ServiceBuildContext::new(self.service_kind.clone());
+        let mut context = ServiceBuildContext::new(service_context.clone());
         let mut actor_kinds = HashSet::<ActorKind>::new();
 
         for registration in self.actor_registrations {
@@ -224,7 +380,57 @@ impl LatticeServiceBuilder {
             instance,
             listener,
             router,
+            service_context,
+            placement_store,
             self.ready,
         ))
     }
+}
+
+async fn build_placement_store_or_default(
+    configured: Option<Box<dyn ErasedPlacementStoreComponent>>,
+    default: Box<dyn ErasedPlacementStoreComponent>,
+    component_context: &ServiceComponentContext,
+    service_context: &mut lattice_core::ServiceContextBuilder,
+    service_kind: &str,
+) -> Result<Box<dyn ErasedPlacementStore>, LatticeServiceError> {
+    let component = configured.unwrap_or(default);
+    debug!(
+        service.kind = service_kind,
+        component.target = component.target_name(),
+        component.type = component.type_name(),
+        "building service component"
+    );
+    component.build(component_context, service_context).await
+}
+
+async fn build_framework_component_or_default(
+    configured: Option<Box<dyn ErasedServiceComponent>>,
+    default: Box<dyn ErasedServiceComponent>,
+    component_context: &ServiceComponentContext,
+    service_context: &mut lattice_core::ServiceContextBuilder,
+    service_kind: &str,
+) -> Result<(), LatticeServiceError> {
+    build_service_component(
+        configured.unwrap_or(default),
+        component_context,
+        service_context,
+        service_kind,
+    )
+    .await
+}
+
+async fn build_service_component(
+    component: Box<dyn ErasedServiceComponent>,
+    component_context: &ServiceComponentContext,
+    service_context: &mut lattice_core::ServiceContextBuilder,
+    service_kind: &str,
+) -> Result<(), LatticeServiceError> {
+    debug!(
+        service.kind = service_kind,
+        component.target = component.target_name(),
+        component.type = component.type_name(),
+        "building service component"
+    );
+    component.build(component_context, service_context).await
 }

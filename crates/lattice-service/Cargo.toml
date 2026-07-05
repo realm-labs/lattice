@@ -9,10 +9,18 @@ repository.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 http.workspace = true
+lattice-config.workspace = true
 lattice-actor.workspace = true
 lattice-core.workspace = true
+lattice-eventbus.workspace = true
+lattice-placement.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -213,7 +213,9 @@ where
         self: Box<Self>,
         context: &mut ServiceBuildContext,
     ) -> Result<(), LatticeServiceError> {
-        let registry = Arc::new(ActorRegistry::new(self.actor_kind.clone(), self.config));
+        let mut config = self.config;
+        config.service = context.service_context();
+        let registry = Arc::new(ActorRegistry::new(self.actor_kind.clone(), config));
         let registered = RegisteredActor {
             registry,
             loader: self.loader,

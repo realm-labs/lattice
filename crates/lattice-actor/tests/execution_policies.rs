@@ -6,7 +6,7 @@ use lattice_actor::{
     Actor, ActorContext, ActorError, ActorRuntime, ActorSpawnError, ActorSpawnOptions, Handler,
     MailboxConfig, Message, PassivationPolicy,
 };
-use lattice_core::ActorId;
+use lattice_core::{ActorId, ServiceContext};
 use tokio::sync::Mutex;
 
 #[derive(Debug)]
@@ -87,6 +87,7 @@ async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
                 self_ref: None,
+                service: ServiceContext::empty(),
             },
         )
         .await
@@ -113,6 +114,7 @@ async fn keyed_worker_pool_execution_policy_runs_actor_with_same_mailbox_semanti
                 scheduler_key: Some(ActorId::U64(42)),
                 passivation: PassivationPolicy::Disabled,
                 self_ref: None,
+                service: ServiceContext::empty(),
             },
         )
         .await
@@ -138,6 +140,7 @@ async fn execution_policies_reject_zero_workers() {
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
                 self_ref: None,
+                service: ServiceContext::empty(),
             },
         )
         .await;
@@ -152,6 +155,7 @@ async fn execution_policies_reject_zero_workers() {
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
                 self_ref: None,
+                service: ServiceContext::empty(),
             },
         )
         .await;
@@ -180,6 +184,7 @@ async fn dedicated_thread_pool_reuses_configured_worker_threads() {
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
                 self_ref: None,
+                service: ServiceContext::empty(),
             },
         )
         .await
@@ -195,6 +200,7 @@ async fn dedicated_thread_pool_reuses_configured_worker_threads() {
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
                 self_ref: None,
+                service: ServiceContext::empty(),
             },
         )
         .await
@@ -220,6 +226,7 @@ async fn dedicated_thread_pool_is_scoped_by_actor_type() {
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
                 self_ref: None,
+                service: ServiceContext::empty(),
             },
         )
         .await
@@ -233,6 +240,7 @@ async fn dedicated_thread_pool_is_scoped_by_actor_type() {
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
                 self_ref: None,
+                service: ServiceContext::empty(),
             },
         )
         .await
@@ -258,6 +266,7 @@ async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
                 scheduler_key: Some(ActorId::Str("same-key".to_string())),
                 passivation: PassivationPolicy::Disabled,
                 self_ref: None,
+                service: ServiceContext::empty(),
             },
         )
         .await
@@ -273,6 +282,7 @@ async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
                 scheduler_key: Some(ActorId::Str("same-key".to_string())),
                 passivation: PassivationPolicy::Disabled,
                 self_ref: None,
+                service: ServiceContext::empty(),
             },
         )
         .await

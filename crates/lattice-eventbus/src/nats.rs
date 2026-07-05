@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use lattice_core::ConfiguredComponent;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -26,7 +27,13 @@ impl NatsEventBus {
         }
     }
 
-    pub fn from_config(config: NatsEventBusConfig) -> Self {
+    pub fn from_config() -> ConfiguredComponent<Self> {
+        ConfiguredComponent::from_section("event_bus", |config| async move {
+            Ok::<_, EventBusError>(Self::from_options(config))
+        })
+    }
+
+    pub fn from_options(config: NatsEventBusConfig) -> Self {
         Self {
             client: InMemoryNatsClient::new(),
             config: Some(config),
@@ -237,16 +244,30 @@ mod tests {
         assert_eq!(*seen.lock().await, vec!["event-1"]);
     }
 
-    #[test]
-    fn nats_event_bus_builds_from_config() {
+    #[tokio::test]
+    async fn nats_event_bus_builds_from_config() {
         let config = NatsEventBusConfig {
             endpoint: "nats://nats:4222".to_string(),
             stream: "lattice-events".to_string(),
             durable_prefix: "world".to_string(),
         };
-        let bus = NatsEventBus::from_config(config.clone());
+        let bus = NatsEventBus::from_options(config.clone());
 
         assert_eq!(bus.config(), Some(&config));
+
+        let bootstrap = lattice_config::BootstrapConfig::parse(
+            r#"
+            [event_bus]
+            endpoint = "nats://nats:4222"
+            stream = "lattice-events"
+            durable_prefix = "world"
+            "#,
+            lattice_config::ConfigFormat::Toml,
+        )
+        .unwrap();
+        let configured = NatsEventBus::from_config().build(&bootstrap).await.unwrap();
+
+        assert_eq!(configured.config(), Some(&config));
     }
 
     fn test_event(event_id: &str) -> EventEnvelope {

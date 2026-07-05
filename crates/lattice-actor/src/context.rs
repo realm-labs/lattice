@@ -8,11 +8,10 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
-use lattice_core::ActorRef;
+use lattice_core::{ActorRef, ServiceContext};
 
 use crate::ActorError;
 use crate::handle::ActorHandle;
-use crate::runtime::spawn_actor;
 use crate::traits::{
     Actor, ChildActorKey, ChildActorOptions, ChildSupervision, Handler, Message, PassivationReason,
     StopReason,
@@ -22,6 +21,7 @@ use crate::watch::{ActorTerminated, WatchId};
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
     self_ref: Option<ActorRef>,
+    service: ServiceContext,
     lifecycle_request: Option<StopReason>,
     tasks: Vec<JoinHandle<()>>,
     watches: HashMap<WatchId, JoinHandle<()>>,
@@ -35,6 +35,7 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
             .debug_struct("ActorContext")
             .field("handle", &self.handle)
             .field("self_ref", &self.self_ref)
+            .field("service", &self.service)
             .field("lifecycle_request", &self.lifecycle_request)
             .field("task_count", &self.tasks.len())
             .field("watch_count", &self.watches.len())
@@ -45,10 +46,15 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
 }
 
 impl<A: Actor> ActorContext<A> {
-    pub(crate) fn new(handle: ActorHandle<A>, self_ref: Option<ActorRef>) -> Self {
+    pub(crate) fn new(
+        handle: ActorHandle<A>,
+        self_ref: Option<ActorRef>,
+        service: ServiceContext,
+    ) -> Self {
         Self {
             handle,
             self_ref,
+            service,
             lifecycle_request: None,
             tasks: Vec::new(),
             watches: HashMap::new(),
@@ -59,6 +65,10 @@ impl<A: Actor> ActorContext<A> {
 
     pub fn self_ref(&self) -> Option<&ActorRef> {
         self.self_ref.as_ref()
+    }
+
+    pub fn service(&self) -> &ServiceContext {
+        &self.service
     }
 
     pub fn require_self_ref(&self) -> Result<&ActorRef, ActorError> {
@@ -200,7 +210,8 @@ impl<A: Actor> ActorContext<A> {
             child.key = key.as_str()
         );
         let _entered = span.enter();
-        let handle = spawn_actor(actor, options.mailbox);
+        let handle =
+            crate::runtime::spawn_actor_with_context(actor, options.mailbox, self.service.clone());
         let slot = Arc::new(ChildSlot::new(handle.clone()));
         self.children
             .insert(key, Box::new(ChildSlotStopper(slot.clone())));
@@ -233,7 +244,11 @@ impl<A: Actor> ActorContext<A> {
             child.key = key.as_str()
         );
         let _entered = span.enter();
-        let handle = spawn_actor(factory(), options.mailbox);
+        let handle = crate::runtime::spawn_actor_with_context(
+            factory(),
+            options.mailbox,
+            self.service.clone(),
+        );
         let slot = Arc::new(ChildSlot::new(handle.clone()));
         self.children
             .insert(key, Box::new(ChildSlotStopper(slot.clone())));
@@ -303,12 +318,17 @@ impl<A: Actor> ActorContext<A> {
                     return;
                 };
                 let mut terminations = child.subscribe_terminated();
+                let service = self.service.clone();
                 self.spawn_scoped(async move {
                     loop {
                         if terminations.recv().await.is_err() {
                             break;
                         }
-                        let replacement = spawn_actor(factory(), options.mailbox);
+                        let replacement = crate::runtime::spawn_actor_with_context(
+                            factory(),
+                            options.mailbox,
+                            service.clone(),
+                        );
                         terminations = replacement.subscribe_terminated();
                         slot.replace(replacement);
                     }

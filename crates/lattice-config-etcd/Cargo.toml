@@ -9,6 +9,7 @@ repository.workspace = true
 async-trait.workspace = true
 etcd-client.workspace = true
 lattice-config.workspace = true
+lattice-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -19,7 +19,7 @@ use crate::traits::{
     HandlerErrorAction, Message, PassivationReason, StopReason,
 };
 use crate::watch::{ActorTerminated, TerminatedReason};
-use lattice_core::{ActorId, actor_kind};
+use lattice_core::{ActorId, InstanceId, ServiceContext, actor_kind, service_kind};
 
 #[derive(Debug)]
 struct Ping(&'static str);
@@ -66,6 +66,20 @@ struct Tick;
 
 impl Message for Tick {
     type Reply = ();
+}
+
+#[derive(Debug)]
+struct ReadContextInstance;
+
+impl Message for ReadContextInstance {
+    type Reply = InstanceId;
+}
+
+#[derive(Debug)]
+struct SpawnContextChild;
+
+impl Message for SpawnContextChild {
+    type Reply = InstanceId;
 }
 
 struct TestActor {
@@ -156,6 +170,41 @@ impl Handler<Tick> for TestActor {
     ) -> Result<(), ActorError> {
         self.events.lock().await.push("tick");
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<ReadContextInstance> for TestActor {
+    async fn handle(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        _msg: ReadContextInstance,
+    ) -> Result<InstanceId, ActorError> {
+        Ok(ctx.service().instance_id().clone())
+    }
+}
+
+#[async_trait]
+impl Handler<SpawnContextChild> for TestActor {
+    async fn handle(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        _msg: SpawnContextChild,
+    ) -> Result<InstanceId, ActorError> {
+        let child = TestActor {
+            events: Arc::new(Mutex::new(Vec::new())),
+            start_gate: None,
+            stopped: None,
+        };
+        let handle = ctx.spawn_child(
+            ChildActorKey::new("context-child"),
+            child,
+            ChildActorOptions::default(),
+        )?;
+        handle
+            .call(ReadContextInstance)
+            .await
+            .map_err(|error| ActorError::new(error.to_string()))
     }
 }
 
@@ -345,6 +394,55 @@ async fn actor_runtime_spawns_task_per_actor() {
 }
 
 #[tokio::test]
+async fn standalone_actor_receives_empty_service_context() {
+    let handle = spawn_actor(
+        TestActor {
+            events: Arc::new(Mutex::new(Vec::new())),
+            start_gate: None,
+            stopped: None,
+        },
+        MailboxConfig::default(),
+    );
+
+    let instance = handle.call(ReadContextInstance).await.unwrap();
+
+    assert_eq!(instance, InstanceId::new("local"));
+}
+
+#[tokio::test]
+async fn actor_spawn_options_pass_service_context_to_handler_and_child() {
+    let runtime = ActorRuntime::default();
+    let service = ServiceContext::new(
+        service_kind!("World"),
+        InstanceId::new("world-service"),
+        lattice_core::BootstrapConfig::default(),
+    );
+    let handle = runtime
+        .spawn_actor(
+            TestActor {
+                events: Arc::new(Mutex::new(Vec::new())),
+                start_gate: None,
+                stopped: None,
+            },
+            ActorSpawnOptions {
+                service: service.clone(),
+                ..ActorSpawnOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        handle.call(ReadContextInstance).await.unwrap(),
+        InstanceId::new("world-service")
+    );
+    assert_eq!(
+        handle.call(SpawnContextChild).await.unwrap(),
+        InstanceId::new("world-service")
+    );
+}
+
+#[tokio::test]
 async fn keyed_worker_pool_system_mailbox_keeps_priority_over_normal_mailbox() {
     let runtime = ActorRuntime::default();
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -363,6 +461,7 @@ async fn keyed_worker_pool_system_mailbox_keeps_priority_over_normal_mailbox() {
                 scheduler_key: None,
                 passivation: PassivationPolicy::Disabled,
                 self_ref: None,
+                service: ServiceContext::empty(),
             },
         )
         .await
@@ -641,6 +740,7 @@ async fn actor_registry_bounds_and_times_out_activation_waiters() {
             waiter_capacity: 0,
             waiter_timeout: std::time::Duration::from_millis(20),
             actor_ref: None,
+            service: ServiceContext::empty(),
         },
     ));
     let actor_id = ActorId::U64(3);
@@ -1216,6 +1316,7 @@ async fn passivation_policy_idle_timeout_stops_idle_actor() {
                 scheduler_key: None,
                 passivation: PassivationPolicy::IdleTimeout(std::time::Duration::from_millis(10)),
                 self_ref: None,
+                service: ServiceContext::empty(),
             },
         )
         .await

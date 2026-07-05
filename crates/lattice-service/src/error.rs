@@ -1,4 +1,5 @@
 use lattice_core::ActorKind;
+use lattice_placement::PlacementError;
 use thiserror::Error;
 use tonic::transport::Error as TransportError;
 
@@ -21,6 +22,18 @@ pub enum LatticeServiceError {
         actor_kind: ActorKind,
         expected_type: &'static str,
     },
+    #[error("duplicate service component {component}")]
+    DuplicateServiceComponent { component: String },
+    #[error("missing service component {component}")]
+    MissingServiceComponent { component: String },
+    #[error("duplicate service extension for type {type_name}")]
+    DuplicateServiceExtension { type_name: String },
+    #[error("failed to load service config: {message}")]
+    Config { message: String },
+    #[error("failed to build service component {slot}: {message}")]
+    ComponentBuild { slot: String, message: String },
+    #[error(transparent)]
+    Placement(#[from] PlacementError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

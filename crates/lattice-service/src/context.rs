@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 
 use lattice_actor::Actor;
-use lattice_core::{ActorKind, ServiceKind};
+use lattice_core::{ActorKind, ServiceContext};
 use tonic::body::Body;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
@@ -14,36 +14,23 @@ use crate::LatticeServiceError;
 use crate::actor::RegisteredActor;
 
 #[derive(Debug)]
-pub struct ServiceContext {
-    service_kind: ServiceKind,
-}
-
-impl ServiceContext {
-    pub fn service_kind(&self) -> &ServiceKind {
-        &self.service_kind
-    }
-}
-
-#[derive(Debug)]
 pub struct ServiceBuildContext {
-    service_kind: ServiceKind,
+    service: ServiceContext,
     pub(crate) actors: HashMap<ActorKind, Box<dyn Any + Send>>,
     pub(crate) router: Option<Router>,
 }
 
 impl ServiceBuildContext {
-    pub(crate) fn new(service_kind: ServiceKind) -> Self {
+    pub(crate) fn new(service: ServiceContext) -> Self {
         Self {
-            service_kind,
+            service,
             actors: HashMap::new(),
             router: None,
         }
     }
 
     pub fn service_context(&self) -> ServiceContext {
-        ServiceContext {
-            service_kind: self.service_kind.clone(),
-        }
+        self.service.clone()
     }
 
     pub fn add_rpc_service<S>(&mut self, service: S)

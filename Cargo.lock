@@ -789,6 +789,7 @@ dependencies = [
  "async-trait",
  "etcd-client",
  "lattice-config",
+ "lattice-core",
  "serde",
  "serde_json",
  "tokio",
@@ -810,6 +811,7 @@ name = "lattice-eventbus"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "lattice-config",
  "lattice-core",
  "lattice-rpc",
  "prost",
@@ -892,7 +894,12 @@ dependencies = [
  "axum",
  "http",
  "lattice-actor",
+ "lattice-config",
  "lattice-core",
+ "lattice-eventbus",
+ "lattice-placement",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-stream",

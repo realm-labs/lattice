@@ -15,4 +15,5 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+lattice-config.workspace = true
 prost.workspace = true

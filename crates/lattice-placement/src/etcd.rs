@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use etcd_client::{
     Client, Compare, CompareOp, EventType, GetOptions, PutOptions, Txn, TxnOp, WatchOptions,
 };
-use lattice_core::{ActorId, InstanceId, ServiceKind};
+use lattice_core::{ActorId, ConfiguredComponent, InstanceId, ServiceKind};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -38,6 +38,10 @@ pub struct EtcdPlacementStoreConfig {
 }
 
 impl EtcdPlacementStore<RealEtcdClient> {
+    pub fn from_config() -> ConfiguredComponent<Self> {
+        ConfiguredComponent::from_section("placement_store", Self::connect)
+    }
+
     pub async fn connect(config: EtcdPlacementStoreConfig) -> Result<Self, PlacementError> {
         let client = RealEtcdClient::connect(
             config.endpoints,
@@ -47,7 +51,7 @@ impl EtcdPlacementStore<RealEtcdClient> {
         Ok(Self::new(PlacementPrefix::new(config.key_prefix), client))
     }
 
-    pub async fn from_config(config: EtcdPlacementStoreConfig) -> Result<Self, PlacementError> {
+    pub async fn from_options(config: EtcdPlacementStoreConfig) -> Result<Self, PlacementError> {
         Self::connect(config).await
     }
 }
@@ -779,6 +783,10 @@ mod tests {
         });
 
         assert_eq!(store.prefix().as_str(), "/lattice/test");
+        assert_eq!(
+            EtcdPlacementStore::from_config().section(),
+            "placement_store"
+        );
     }
 
     #[test]
