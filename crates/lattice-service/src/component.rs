@@ -3,6 +3,9 @@ use lattice_config::BootstrapConfig;
 use lattice_core::service_context::ConfiguredComponentBuilder;
 use lattice_core::{ConfiguredComponent, InstanceId, ServiceContextBuilder, ServiceKind};
 use lattice_placement::PlacementError;
+use lattice_placement::cache::RouteCacheConfig;
+use lattice_placement::control::TonicLogicControl;
+use lattice_placement::coordinator::{PlacementCoordinator, PlacementRouteResolver};
 use lattice_placement::instance::InstanceRecord;
 use lattice_placement::store::{LeaseId, PlacementStore};
 
@@ -136,6 +139,10 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
     async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError>;
+    fn placement_route_resolver(
+        &self,
+        service_kind: ServiceKind,
+    ) -> lattice_placement::BoxRouteResolver;
 }
 
 #[async_trait]
@@ -193,6 +200,19 @@ where
 
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError> {
         self.store.upsert_instance(record).await
+    }
+
+    fn placement_route_resolver(
+        &self,
+        service_kind: ServiceKind,
+    ) -> lattice_placement::BoxRouteResolver {
+        let coordinator = PlacementCoordinator::new(self.store.clone(), TonicLogicControl);
+        lattice_placement::BoxRouteResolver::new(PlacementRouteResolver::new(
+            service_kind,
+            self.store.clone(),
+            coordinator,
+            RouteCacheConfig::default(),
+        ))
     }
 }
 

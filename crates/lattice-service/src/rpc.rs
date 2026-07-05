@@ -16,6 +16,13 @@ pub trait RpcClientBinding: Send + Sync + 'static {
     const SERVICE_KIND: &'static str;
 
     fn build_client(core: Self::Core) -> Self::Client;
+
+    fn build_default_core(
+        _resolver: lattice_placement::BoxRouteResolver,
+        _context_factory: lattice_rpc::RpcClientContextFactory,
+    ) -> Option<Self::Core> {
+        None
+    }
 }
 
 pub(crate) trait ErasedRpcClientBinding: Send + Sync + 'static {
@@ -25,6 +32,8 @@ pub(crate) trait ErasedRpcClientBinding: Send + Sync + 'static {
     fn register(
         self: Box<Self>,
         service_context: &mut lattice_core::ServiceContextBuilder,
+        default_resolver: Option<lattice_placement::BoxRouteResolver>,
+        context_factory: lattice_rpc::RpcClientContextFactory,
     ) -> Result<(), LatticeServiceError>;
 }
 
@@ -55,16 +64,24 @@ where
     fn register(
         self: Box<Self>,
         service_context: &mut lattice_core::ServiceContextBuilder,
+        default_resolver: Option<lattice_placement::BoxRouteResolver>,
+        context_factory: lattice_rpc::RpcClientContextFactory,
     ) -> Result<(), LatticeServiceError> {
         let service_kind = self.service_kind();
-        let core = service_context.extension::<B::Core>().ok_or(
-            LatticeServiceError::MissingRpcClientCore {
+        let core = service_context
+            .extension::<B::Core>()
+            .map(|core| (*core).clone())
+            .or_else(|| {
+                default_resolver
+                    .map(|resolver| B::build_default_core(resolver, context_factory))
+                    .unwrap_or(None)
+            })
+            .ok_or(LatticeServiceError::MissingRpcClientCore {
                 service_kind,
                 core_type: self.core_type(),
-            },
-        )?;
+            })?;
         service_context
-            .insert_extension(B::build_client((*core).clone()))
+            .insert_extension(B::build_client(core))
             .map_err(|type_name| LatticeServiceError::DuplicateServiceExtension {
                 type_name: type_name.to_string(),
             })

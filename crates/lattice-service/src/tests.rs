@@ -24,8 +24,11 @@ use lattice_placement::store::{
     ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
     PlacementState, PlacementStore,
 };
-use lattice_placement::{ResolveRequest, RouteResolver};
-use lattice_rpc::{RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
+use lattice_placement::{
+    BoxRouteResolver, EndpointLease, EndpointPool, EndpointRpcTransport, ResolveRequest,
+    ResolvingRpcCore, RouteResolver,
+};
+use lattice_rpc::{RoutedRequest, RpcClientContextFactory, RpcError, RpcRequest, ShardedRpcCore};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 use tonic::body::Body;
@@ -185,6 +188,60 @@ impl RpcClientBinding for FakeRpcClientBinding {
             service_kind: Self::SERVICE_KIND,
             core,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FakeEndpointTransport;
+
+#[async_trait]
+impl EndpointRpcTransport for FakeEndpointTransport {
+    async fn unary<Req>(
+        &self,
+        _endpoint: EndpointLease,
+        _target: lattice_rpc::RouteTarget,
+        _metadata: tonic::metadata::MetadataMap,
+        _request: &Req,
+    ) -> Result<tonic::Response<Req::Reply>, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        Err(RpcError::Business(
+            "fake endpoint transport is not used by service build tests".to_string(),
+        ))
+    }
+}
+
+type FakePlacementCore = ResolvingRpcCore<BoxRouteResolver, FakeEndpointTransport>;
+
+#[derive(Debug, Clone)]
+struct FakePlacementClient {
+    core: FakePlacementCore,
+}
+
+struct FakePlacementClientBinding;
+
+impl RpcClientBinding for FakePlacementClientBinding {
+    type Core = FakePlacementCore;
+    type Client = FakePlacementClient;
+
+    const SERVICE_KIND: &'static str = "World";
+
+    fn build_client(core: Self::Core) -> Self::Client {
+        FakePlacementClient { core }
+    }
+
+    fn build_default_core(
+        resolver: BoxRouteResolver,
+        context_factory: RpcClientContextFactory,
+    ) -> Option<Self::Core> {
+        Some(ResolvingRpcCore::new(
+            service_kind!("World"),
+            resolver,
+            EndpointPool::new(),
+            context_factory,
+            FakeEndpointTransport,
+        ))
     }
 }
 
@@ -609,6 +666,36 @@ async fn register_client_builds_typed_client_from_context_core() {
     let client = service.context().extension::<FakeRpcClient>().unwrap();
     assert_eq!(client.service_kind, "World");
     assert_eq!(std::mem::size_of_val(&client.core), 0);
+}
+
+#[tokio::test]
+async fn register_client_builds_default_placement_core_from_store() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service = LatticeService::builder(service_kind!("Player"))
+        .instance_id(InstanceId::new("player-1"))
+        .listen(listener)
+        .register_client::<FakePlacementClientBinding>()
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    let client = service
+        .context()
+        .extension::<FakePlacementClient>()
+        .unwrap();
+    assert_eq!(
+        std::mem::size_of_val(&client.core),
+        std::mem::size_of::<FakePlacementCore>()
+    );
 }
 
 #[tokio::test]

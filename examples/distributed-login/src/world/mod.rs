@@ -28,7 +28,7 @@ pub async fn run_world_service(
 
     builder
         .extension::<crate::placement::DemoRpcCore, _>(player_core)
-        .register_client::<player_rpc::Binding>()
+        .register_client::<player_rpc::Binding<(), crate::placement::DemoRpcCore>>()
         .register_actor(
             ActorRegistration::builder(WORLD_ACTOR)
                 .factory(WorldActorFactory::new())

@@ -124,6 +124,61 @@ pub trait RouteResolver: Clone + Send + Sync + 'static {
 }
 
 #[async_trait]
+pub trait DynRouteResolver: Send + Sync + 'static {
+    async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError>;
+    async fn invalidate(&self, key: RouteCacheKey, reason: InvalidateReason);
+}
+
+#[async_trait]
+impl<T> DynRouteResolver for T
+where
+    T: RouteResolver,
+{
+    async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
+        RouteResolver::resolve(self, request).await
+    }
+
+    async fn invalidate(&self, key: RouteCacheKey, reason: InvalidateReason) {
+        RouteResolver::invalidate(self, key, reason).await;
+    }
+}
+
+#[derive(Clone)]
+pub struct BoxRouteResolver {
+    inner: std::sync::Arc<dyn DynRouteResolver>,
+}
+
+impl std::fmt::Debug for BoxRouteResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoxRouteResolver")
+            .finish_non_exhaustive()
+    }
+}
+
+impl BoxRouteResolver {
+    pub fn new<R>(resolver: R) -> Self
+    where
+        R: RouteResolver,
+    {
+        Self {
+            inner: std::sync::Arc::new(resolver),
+        }
+    }
+}
+
+#[async_trait]
+impl RouteResolver for BoxRouteResolver {
+    async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
+        self.inner.resolve(request).await
+    }
+
+    async fn invalidate(&self, key: RouteCacheKey, reason: InvalidateReason) {
+        self.inner.invalidate(key, reason).await;
+    }
+}
+
+#[async_trait]
 pub trait EndpointRpcTransport: Clone + Send + Sync + 'static {
     async fn unary<Req>(
         &self,

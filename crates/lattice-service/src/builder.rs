@@ -11,6 +11,7 @@ use lattice_core::{ActorKind, InstanceId, ServiceContext, ServiceKind};
 use lattice_eventbus::{EventBus, LocalEventBus};
 use lattice_placement::coordinator::{PlacementWatchStarter, PlacementWatchTask};
 use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix, PlacementStore};
+use lattice_rpc::RpcClientContextFactory;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::{debug, info};
@@ -358,13 +359,20 @@ impl LatticeServiceBuilder {
         }
         let rpc_client_count = self.client_bindings.len();
         for binding in self.client_bindings {
+            let client_service_kind = binding.service_kind();
             debug!(
                 service.kind = self.service_kind.as_str(),
-                rpc.client.service = binding.service_kind().as_str(),
+                rpc.client.service = client_service_kind.as_str(),
                 rpc.client.core = binding.core_type(),
                 "registering rpc client binding"
             );
-            binding.register(&mut service_context)?;
+            let default_resolver =
+                Some(placement_store.placement_route_resolver(client_service_kind));
+            let context_factory = RpcClientContextFactory::new(
+                self.service_kind.clone(),
+                instance.instance_id.clone(),
+            );
+            binding.register(&mut service_context, default_resolver, context_factory)?;
         }
         let service_context = service_context.build();
         let placement_watch_tasks =

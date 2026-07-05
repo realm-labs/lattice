@@ -15,8 +15,8 @@ pub use coordinator::PlacementRouteResolver;
 pub use endpoint::{EndpointLease, EndpointPool};
 pub use error::PlacementError;
 pub use route::{
-    EndpointRpcTransport, InvalidateReason, ResolveRequest, ResolvingActorRefRpcCore,
-    ResolvingRpcCore, RouteCacheKey, RouteResolver,
+    BoxRouteResolver, DynRouteResolver, EndpointRpcTransport, InvalidateReason, ResolveRequest,
+    ResolvingActorRefRpcCore, ResolvingRpcCore, RouteCacheKey, RouteResolver,
 };
 pub use static_resolver::{StaticPlacementConfig, StaticRouteRange, StaticRouteResolver};
 pub use store::{

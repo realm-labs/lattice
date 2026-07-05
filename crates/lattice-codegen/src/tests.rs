@@ -31,6 +31,12 @@ fn generated_output_matches_phase_two_shape() {
     assert!(
         generated
             .rust
+            .contains("lattice_placement::ResolvingRpcCore<lattice_placement::BoxRouteResolver")
+    );
+    assert!(generated.rust.contains("fn build_default_core("));
+    assert!(
+        generated
+            .rust
             .contains("impl<A, C> RpcServiceBinding for Binding<A, C>")
     );
     assert!(generated.rust.contains("pub struct ActorService<A: Actor>"));
