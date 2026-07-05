@@ -147,6 +147,10 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
         service_kind: &ServiceKind,
         actor_kind: &ActorKind,
     ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
+    async fn list_virtual_shards_for_service(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
     async fn compare_and_put_virtual_shard(
         &self,
         key: VirtualShardPlacementKey,
@@ -335,6 +339,21 @@ impl PlacementStore for InMemoryPlacementStore {
                     && &key.key.service_kind == service_kind
                     && &key.key.actor_kind == actor_kind
             })
+            .map(|(_, value)| value.clone())
+            .collect())
+    }
+
+    async fn list_virtual_shards_for_service(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .vshards
+            .iter()
+            .filter(|(key, _)| key.prefix == self.prefix && &key.key.service_kind == service_kind)
             .map(|(_, value)| value.clone())
             .collect())
     }

@@ -47,6 +47,10 @@ pub trait DynPlacementStore: Send + Sync + 'static {
         service_kind: &ServiceKind,
         actor_kind: &lattice_core::ActorKind,
     ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
+    async fn list_virtual_shards_for_service(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
     async fn compare_and_put_virtual_shard(
         &self,
         key: VirtualShardPlacementKey,
@@ -120,6 +124,13 @@ where
         actor_kind: &lattice_core::ActorKind,
     ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
         PlacementStore::list_virtual_shards(self, service_kind, actor_kind).await
+    }
+
+    async fn list_virtual_shards_for_service(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        PlacementStore::list_virtual_shards_for_service(self, service_kind).await
     }
 
     async fn compare_and_put_virtual_shard(

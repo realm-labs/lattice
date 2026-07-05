@@ -196,6 +196,27 @@ where
             .collect())
     }
 
+    async fn list_virtual_shards_for_service(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        let prefix = format!(
+            "{}/logic/vshards/{}/",
+            clean_prefix(&self.prefix),
+            service_kind.as_str()
+        );
+        Ok(self
+            .client
+            .list_prefix(&prefix)
+            .await?
+            .into_iter()
+            .filter_map(|(_key, version, value)| match value {
+                EtcdValue::VirtualShard(record) => Some((version, *record)),
+                _ => None,
+            })
+            .collect())
+    }
+
     async fn compare_and_put_virtual_shard(
         &self,
         key: VirtualShardPlacementKey,

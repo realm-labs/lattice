@@ -62,6 +62,7 @@ pub struct PlacementCoordinator<S, L> {
 pub struct DrainReport {
     pub drained_instance: InstanceId,
     pub migrated_actors: usize,
+    pub migrated_virtual_shards: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,10 +246,35 @@ where
                     .await?;
                 migrated_actors += 1;
             }
+            let mut migrated_virtual_shards = 0;
+            for (version, record) in self
+                .store
+                .list_virtual_shards_for_service(&service_kind)
+                .await?
+            {
+                if record.owner != instance_id {
+                    continue;
+                }
+                let key = VirtualShardPlacementKey {
+                    service_kind: record.service_kind.clone(),
+                    actor_kind: record.actor_kind.clone(),
+                    shard_id: record.shard_id,
+                };
+                let migrated = VirtualShardPlacementRecord {
+                    owner: replacement.instance_id.clone(),
+                    epoch: Epoch(record.epoch.0 + 1),
+                    ..record
+                };
+                self.store
+                    .compare_and_put_virtual_shard(key, Some(version), migrated)
+                    .await?;
+                migrated_virtual_shards += 1;
+            }
 
             Ok(DrainReport {
                 drained_instance: instance_id,
                 migrated_actors,
+                migrated_virtual_shards,
             })
         }
         .instrument(span)
@@ -931,6 +957,24 @@ mod tests {
             })
             .await
             .unwrap();
+        store
+            .compare_and_put_virtual_shard(
+                VirtualShardPlacementKey {
+                    service_kind: service_kind!("World"),
+                    actor_kind: actor_kind!("World"),
+                    shard_id: VirtualShardId(3),
+                },
+                None,
+                VirtualShardPlacementRecord {
+                    service_kind: service_kind!("World"),
+                    actor_kind: actor_kind!("World"),
+                    shard_id: VirtualShardId(3),
+                    owner: InstanceId::new("world-a"),
+                    epoch: Epoch(1),
+                },
+            )
+            .await
+            .unwrap();
 
         let report = coordinator
             .drain_instance(service_kind!("World"), InstanceId::new("world-a"))
@@ -942,17 +986,30 @@ mod tests {
             .unwrap()
             .unwrap();
         let migrated = store.get_actor(&key).await.unwrap().unwrap().1;
+        let migrated_shard = store
+            .get_virtual_shard(&VirtualShardPlacementKey {
+                service_kind: service_kind!("World"),
+                actor_kind: actor_kind!("World"),
+                shard_id: VirtualShardId(3),
+            })
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
 
         assert_eq!(
             report,
             DrainReport {
                 drained_instance: InstanceId::new("world-a"),
-                migrated_actors: 1
+                migrated_actors: 1,
+                migrated_virtual_shards: 1,
             }
         );
         assert_eq!(drained.state, InstanceState::Draining);
         assert_eq!(migrated.owner, InstanceId::new("world-b"));
         assert_eq!(migrated.epoch, Epoch(2));
+        assert_eq!(migrated_shard.owner, InstanceId::new("world-b"));
+        assert_eq!(migrated_shard.epoch, Epoch(2));
     }
 
     async fn ready_store() -> InMemoryPlacementStore {
