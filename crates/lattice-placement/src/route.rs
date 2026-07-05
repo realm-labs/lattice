@@ -6,7 +6,7 @@ use lattice_rpc::{
     ActorRefRpcCore, RouteTarget, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError,
     RpcRequest, ShardedRpcCore,
 };
-use tonic::{Request, Response};
+use tonic::Response;
 use tracing::Instrument;
 
 use crate::endpoint::{EndpointLease, EndpointPool};
@@ -129,7 +129,8 @@ pub trait EndpointRpcTransport: Clone + Send + Sync + 'static {
         &self,
         endpoint: EndpointLease,
         target: RouteTarget,
-        request: Request<Req>,
+        metadata: tonic::metadata::MetadataMap,
+        request: &Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
         Req: RoutedRequest + RpcRequest;
@@ -190,14 +191,10 @@ where
                 route_key,
             };
             let key = resolve_request.cache_key();
-            let encoded = req.encode_to_vec();
 
             let target = self.resolve_rpc_target(resolve_request.clone()).await?;
             let ctx = self.context_factory.next_context(target.owner_epoch);
-            match self
-                .send_with_context(target, ctx.clone(), decode_request::<Req>(&encoded)?)
-                .await
-            {
+            match self.send_with_context(target, ctx.clone(), &req).await {
                 Ok(reply) => Ok(reply),
                 Err(RpcError::NotOwner { .. }) => {
                     let retry_span = tracing::info_span!(
@@ -213,12 +210,7 @@ where
                         let retry_target = self.resolve_rpc_target(resolve_request).await?;
                         let mut retry_ctx = ctx;
                         retry_ctx.route_epoch = retry_target.owner_epoch;
-                        self.send_with_context(
-                            retry_target,
-                            retry_ctx,
-                            decode_request::<Req>(&encoded)?,
-                        )
-                        .await
+                        self.send_with_context(retry_target, retry_ctx, &req).await
                     }
                     .instrument(retry_span)
                     .await
@@ -237,12 +229,7 @@ where
                         let retry_target = self.resolve_rpc_target(resolve_request).await?;
                         let mut retry_ctx = ctx;
                         retry_ctx.route_epoch = retry_target.owner_epoch;
-                        self.send_with_context(
-                            retry_target,
-                            retry_ctx,
-                            decode_request::<Req>(&encoded)?,
-                        )
-                        .await
+                        self.send_with_context(retry_target, retry_ctx, &req).await
                     }
                     .instrument(retry_span)
                     .await
@@ -271,7 +258,7 @@ where
         &self,
         target: RouteTarget,
         ctx: RpcContext,
-        req: Req,
+        req: &Req,
     ) -> Result<Req::Reply, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
@@ -286,11 +273,11 @@ where
             let _entered = span.enter();
             self.endpoint_pool.get_or_connect(&target)
         };
-        let mut request = Request::new(req);
-        ctx.inject_metadata(request.metadata_mut())
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        ctx.inject_metadata(&mut metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;
         self.transport
-            .unary(endpoint, target, request)
+            .unary(endpoint, target, metadata, req)
             .await
             .map(Response::into_inner)
     }
@@ -331,11 +318,9 @@ where
         Req: RoutedRequest + RpcRequest,
     {
         validate_actor_ref_request(&actor_ref, &req)?;
-        let encoded = req.encode_to_vec();
         let target = self.resolve_actor_ref_target(&actor_ref).await?;
         let ctx = self.context_factory.next_context(target.owner_epoch);
-        self.send_with_context(target, ctx, decode_request::<Req>(&encoded)?)
-            .await
+        self.send_with_context(target, ctx, &req).await
     }
 }
 
@@ -377,17 +362,17 @@ where
         &self,
         target: RouteTarget,
         ctx: RpcContext,
-        req: Req,
+        req: &Req,
     ) -> Result<Req::Reply, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
     {
         let endpoint = self.endpoint_pool.get_or_connect(&target);
-        let mut request = Request::new(req);
-        ctx.inject_metadata(request.metadata_mut())
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        ctx.inject_metadata(&mut metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;
         self.transport
-            .unary(endpoint, target, request)
+            .unary(endpoint, target, metadata, req)
             .await
             .map(Response::into_inner)
     }
@@ -428,11 +413,4 @@ fn actor_id_matches_route_key(actor_id: &ActorId, route_key: &RouteKey) -> bool 
         (actor_id, route_key),
         (ActorId::Bytes(left), RouteKey::Bytes(right)) if left == right
     )
-}
-
-fn decode_request<Req>(bytes: &[u8]) -> Result<Req, RpcError>
-where
-    Req: RpcRequest,
-{
-    Req::decode(bytes).map_err(|error| RpcError::Business(error.to_string()))
 }

@@ -10,7 +10,7 @@ use lattice_rpc::{
     ActorRefRpcCore, AuthContext, RouteTarget, RoutedRequest, RpcClientContextFactory, RpcContext,
     RpcError, RpcRequest, ShardedRpcCore,
 };
-use tonic::{Request, Response};
+use tonic::Response;
 
 use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::endpoint::{EndpointLease, EndpointPool};
@@ -105,12 +105,13 @@ impl EndpointRpcTransport for OkTransport {
         &self,
         endpoint: EndpointLease,
         target: RouteTarget,
-        request: Request<Req>,
+        metadata: tonic::metadata::MetadataMap,
+        _request: &Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
     {
-        let ctx = RpcContext::from_metadata(request.metadata())
+        let ctx = RpcContext::from_metadata(&metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;
         self.attempts.lock().unwrap().push(Attempt {
             request_id: ctx.request_id.as_str().to_string(),
@@ -128,12 +129,13 @@ impl EndpointRpcTransport for NotOwnerThenOkTransport {
         &self,
         endpoint: EndpointLease,
         target: RouteTarget,
-        request: Request<Req>,
+        metadata: tonic::metadata::MetadataMap,
+        _request: &Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
     {
-        let ctx = RpcContext::from_metadata(request.metadata())
+        let ctx = RpcContext::from_metadata(&metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;
         let mut attempts = self.attempts.lock().unwrap();
         attempts.push(Attempt {

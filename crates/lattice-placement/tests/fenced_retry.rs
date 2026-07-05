@@ -11,7 +11,7 @@ use lattice_rpc::{
     RouteTarget, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError, RpcRequest,
     ShardedRpcCore,
 };
-use tonic::{Request, Response};
+use tonic::Response;
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct EnterWorldRequest {
@@ -72,12 +72,13 @@ impl EndpointRpcTransport for FencedThenOkTransport {
         &self,
         _endpoint: EndpointLease,
         _target: RouteTarget,
-        request: Request<Req>,
+        metadata: tonic::metadata::MetadataMap,
+        _request: &Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
     {
-        let ctx = RpcContext::from_metadata(request.metadata())
+        let ctx = RpcContext::from_metadata(&metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;
         let mut request_ids = self.request_ids.lock().unwrap();
         request_ids.push(ctx.request_id.as_str().to_string());

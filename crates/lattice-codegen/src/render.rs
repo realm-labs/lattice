@@ -384,12 +384,12 @@ fn push_tonic_endpoint_transport(rust: &mut String, methods: &[RpcMethodSpec]) {
     rust.push_str("}\n\n");
     rust.push_str("#[tonic::async_trait]\n");
     rust.push_str("impl EndpointRpcTransport for GeneratedTonicEndpointTransport {\n");
-    rust.push_str("    async fn unary<Req>(&self, _endpoint: EndpointLease, target: lattice_rpc::RouteTarget, request: tonic::Request<Req>) -> Result<tonic::Response<Req::Reply>, RpcError>\n");
+    rust.push_str("    async fn unary<Req>(&self, _endpoint: EndpointLease, target: lattice_rpc::RouteTarget, metadata: tonic::metadata::MetadataMap, request: &Req) -> Result<tonic::Response<Req::Reply>, RpcError>\n");
     rust.push_str("    where\n        Req: RoutedRequest + RpcRequest,\n    {\n");
     rust.push_str("        match Req::METHOD {\n");
     for method in methods {
         rust.push_str(&format!(
-            "            \"{}\" => self.call_{}::<Req>(target, request).await,\n",
+            "            \"{}\" => self.call_{}::<Req>(target, metadata, request).await,\n",
             method.method_path(),
             method_fn_suffix(method)
         ));
@@ -410,11 +410,10 @@ fn push_tonic_transport_method(rust: &mut String, method: &RpcMethodSpec) {
     let client_path = tonic_client_path(method);
     let suffix = method_fn_suffix(method);
     rust.push_str(&format!(
-        "    async fn call_{suffix}<Req>(&self, target: lattice_rpc::RouteTarget, request: tonic::Request<Req>) -> Result<tonic::Response<Req::Reply>, RpcError>\n",
+        "    async fn call_{suffix}<Req>(&self, target: lattice_rpc::RouteTarget, metadata: tonic::metadata::MetadataMap, request: &Req) -> Result<tonic::Response<Req::Reply>, RpcError>\n",
     ));
     rust.push_str("    where\n        Req: RoutedRequest + RpcRequest,\n    {\n");
-    rust.push_str("        let metadata = request.metadata().clone();\n");
-    rust.push_str("        let request_bytes = request.into_inner().encode_to_vec();\n");
+    rust.push_str("        let request_bytes = request.encode_to_vec();\n");
     rust.push_str("        let typed_request = <");
     rust.push_str(&method.request_type);
     rust.push_str(" as ProstMessage>::decode(request_bytes.as_slice())\n");

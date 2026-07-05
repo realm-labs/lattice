@@ -210,7 +210,8 @@ impl EndpointRpcTransport for LocalWorldTransport {
         &self,
         _endpoint: EndpointLease,
         target: RouteTarget,
-        request: Request<Req>,
+        metadata: tonic::metadata::MetadataMap,
+        request: &Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
@@ -219,8 +220,7 @@ impl EndpointRpcTransport for LocalWorldTransport {
             .adapters
             .get(&target.instance_id)
             .ok_or_else(|| RpcError::Business("missing local adapter".to_string()))?;
-        let metadata = request.metadata().clone();
-        let request_bytes = request.into_inner().encode_to_vec();
+        let request_bytes = request.encode_to_vec();
         let mut actor_request = Request::new(
             EnterWorldRequest::decode(request_bytes.as_slice())
                 .map_err(|error| RpcError::Business(error.to_string()))?,
