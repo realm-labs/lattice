@@ -13,7 +13,7 @@ pub use delivery::{DirectLinkDeliveryError, DirectLinkDispatch, try_deliver_link
 pub use inbound::{DirectLinkInboundRouter, DirectLinkInboundRouterBuilder, InboundDeliveryError};
 pub use outbound::{OutboundDirectLinkQueue, OutboundQueueEvent};
 pub use session::{
-    CloseTransition, DIRECT_LINK_PROTOCOL_VERSION, DirectLinkActivationPolicy,
+    CloseAllTransition, CloseTransition, DIRECT_LINK_PROTOCOL_VERSION, DirectLinkActivationPolicy,
     DirectLinkActorPolicy, DirectLinkAuthPolicy, DirectLinkMetrics, DirectLinkMetricsSnapshot,
     DirectLinkSessionManager, ManagedLinkSnapshot, MessageFrameError, NegotiatedDirection,
     OpenLinkAck, OpenLinkDirection, OpenLinkReject, OpenLinkRejectReason, OpenLinkRequest,

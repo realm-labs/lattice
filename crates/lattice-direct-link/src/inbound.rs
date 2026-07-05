@@ -18,8 +18,8 @@ use crate::backpressure::{BackpressureOutcome, BackpressureQueue, BackpressureSn
 use crate::codec::{DirectLinkFrame, DirectLinkFrameKind};
 use crate::delivery::{DirectLinkDeliveryError, DirectLinkDispatch};
 use crate::session::{
-    CloseTransition, DirectLinkSessionManager, ManagedLinkSnapshot, MessageFrameError,
-    SessionManagerError,
+    CloseAllTransition, CloseTransition, DirectLinkSessionManager, ManagedLinkSnapshot,
+    MessageFrameError, SessionManagerError,
 };
 use crate::stream::DirectLinkActorBinding;
 
@@ -171,6 +171,30 @@ impl DirectLinkInboundRouter {
             } => {
                 let actor_ref = actor_for_direction(&snapshot, direction_closed.direction);
                 self.deliver_direction_closed(actor_ref, direction_closed)?;
+                self.deliver_link_closed_to_bound_actors(&snapshot, link_closed)
+            }
+        }
+    }
+
+    pub fn close_all(
+        &self,
+        link_id: &LinkId,
+        reason: LinkCloseReason,
+    ) -> Result<(), InboundDeliveryError> {
+        let snapshot = self
+            .session_manager
+            .link_snapshot(link_id)
+            .ok_or(InboundDeliveryError::LinkOpenUnavailable)?;
+        match self.session_manager.close_all(link_id, reason)? {
+            CloseAllTransition::AlreadyClosed => Ok(()),
+            CloseAllTransition::Closed {
+                direction_closed,
+                link_closed,
+            } => {
+                for event in direction_closed {
+                    let actor_ref = actor_for_direction(&snapshot, event.direction);
+                    self.deliver_direction_closed(actor_ref, event)?;
+                }
                 self.deliver_link_closed_to_bound_actors(&snapshot, link_closed)
             }
         }
@@ -1435,6 +1459,140 @@ mod tests {
                 .stream,
             "battle-update"
         );
+    }
+
+    #[tokio::test]
+    async fn inbound_router_close_all_emits_structured_reasons_once() {
+        for reason in [
+            LinkCloseReason::HeartbeatTimeout,
+            LinkCloseReason::ProtocolError("invalid sequence".to_string()),
+            LinkCloseReason::TargetPassivated,
+            LinkCloseReason::TargetMigrating,
+            LinkCloseReason::NodeDraining,
+            LinkCloseReason::ConnectionLost,
+        ] {
+            let target_direction_closed = Arc::new(Mutex::new(Vec::new()));
+            let source_direction_closed = Arc::new(Mutex::new(Vec::new()));
+            let target_link_closed = Arc::new(Mutex::new(Vec::new()));
+            let source_link_closed = Arc::new(Mutex::new(Vec::new()));
+            let runtime = ActorRuntime::default();
+            let target_handle = runtime
+                .spawn_actor(
+                    ClosingActor {
+                        direction_closed: target_direction_closed.clone(),
+                        link_closed: target_link_closed.clone(),
+                    },
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+            let source_handle = runtime
+                .spawn_actor(
+                    ClosingActor {
+                        direction_closed: source_direction_closed.clone(),
+                        link_closed: source_link_closed.clone(),
+                    },
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+            let manager = Arc::new(DirectLinkSessionManager::new());
+            let input_stream = DirectLinkStream::new("gateway-input").message::<InputCommand>();
+            let update_stream = DirectLinkStream::new("battle-update").message::<PositionUpdate>();
+            let input_descriptor = input_stream.descriptor();
+            let update_descriptor = update_stream.descriptor();
+            manager
+                .register_binding(actor_kind!("Battle"), input_descriptor.clone())
+                .unwrap();
+            manager
+                .register_binding(actor_kind!("GatewaySession"), update_descriptor.clone())
+                .unwrap();
+            let link_id = LinkId::new(format!("link-close-all-{reason:?}"));
+            manager
+                .open_link(OpenLinkRequest {
+                    protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                    link_id: link_id.clone(),
+                    source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+                    target: actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9),
+                    mode: DirectLinkMode::Bidirectional,
+                    source_to_target: OpenLinkDirection::from_stream(
+                        link_id.clone(),
+                        &input_descriptor,
+                    ),
+                    target_to_source: Some(OpenLinkDirection::from_stream(
+                        link_id.clone(),
+                        &update_descriptor,
+                    )),
+                    options: DirectLinkOptions::bidirectional(),
+                })
+                .unwrap();
+            let router = DirectLinkInboundRouter::builder(manager)
+                .bind_actor(
+                    input_stream.for_actor::<ClosingActor>(actor_kind!("Battle")),
+                    move |_| Some(target_handle.clone()),
+                )
+                .bind_actor(
+                    update_stream.for_actor::<ClosingActor>(actor_kind!("GatewaySession")),
+                    move |_| Some(source_handle.clone()),
+                )
+                .build();
+
+            router.close_all(&link_id, reason.clone()).unwrap();
+            router.close_all(&link_id, reason.clone()).unwrap();
+
+            wait_for_len(&target_direction_closed, 1).await;
+            wait_for_len(&source_direction_closed, 1).await;
+            wait_for_len(&target_link_closed, 1).await;
+            wait_for_len(&source_link_closed, 1).await;
+            assert_eq!(
+                target_direction_closed
+                    .lock()
+                    .expect("direction closed mutex poisoned")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                source_direction_closed
+                    .lock()
+                    .expect("direction closed mutex poisoned")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                target_link_closed
+                    .lock()
+                    .expect("link closed mutex poisoned")
+                    .as_slice(),
+                &[LinkClosed {
+                    link_id: link_id.clone(),
+                    reason: reason.clone(),
+                    closed_directions: [
+                        LinkDirection::SourceToTarget,
+                        LinkDirection::TargetToSource
+                    ]
+                    .into_iter()
+                    .collect(),
+                    last_sequence_seen: None,
+                }]
+            );
+            assert_eq!(
+                source_link_closed
+                    .lock()
+                    .expect("link closed mutex poisoned")
+                    .as_slice(),
+                &[LinkClosed {
+                    link_id,
+                    reason,
+                    closed_directions: [
+                        LinkDirection::SourceToTarget,
+                        LinkDirection::TargetToSource
+                    ]
+                    .into_iter()
+                    .collect(),
+                    last_sequence_seen: None,
+                }]
+            );
+        }
     }
 
     #[tokio::test]

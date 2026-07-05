@@ -412,6 +412,66 @@ impl DirectLinkSessionManager {
         }
     }
 
+    pub fn close_all(
+        &self,
+        link_id: &LinkId,
+        reason: LinkCloseReason,
+    ) -> Result<CloseAllTransition, SessionManagerError> {
+        let mut links = self
+            .links
+            .lock()
+            .expect("direct link managed links poisoned");
+        let link = links
+            .get_mut(link_id)
+            .ok_or(SessionManagerError::UnknownLink)?;
+        if link.closed {
+            return Ok(CloseAllTransition::AlreadyClosed);
+        }
+
+        let mut direction_closed = Vec::new();
+        for (direction, state) in &mut link.directions {
+            if state.closed {
+                continue;
+            }
+            let last_sequence_seen = state
+                .next_receive_sequence
+                .0
+                .checked_sub(1)
+                .map(LinkSequence);
+            state.closed = true;
+            direction_closed.push(LinkDirectionClosed {
+                link_id: link_id.clone(),
+                direction: *direction,
+                stream: state.stream_name.clone(),
+                reason: reason.clone(),
+                last_sequence_seen,
+            });
+        }
+
+        if direction_closed.is_empty() {
+            link.closed = true;
+            return Ok(CloseAllTransition::AlreadyClosed);
+        }
+
+        let closed_directions = link.directions.keys().copied().collect::<BTreeSet<_>>();
+        link.closed = true;
+        self.metrics.record_close();
+        tracing::debug!(
+            link.id = link_id.as_str(),
+            link.reason = ?reason,
+            "direct link closed"
+        );
+        Ok(CloseAllTransition::Closed {
+            direction_closed,
+            link_closed: LinkClosed {
+                link_id: link_id.clone(),
+                reason,
+                closed_directions,
+                last_sequence_seen: None,
+            },
+        })
+    }
+
     pub fn accepted_message_ids(&self, link_id: &LinkId) -> Option<BTreeSet<DirectLinkMessageId>> {
         self.sessions
             .lock()
@@ -945,6 +1005,15 @@ pub enum CloseTransition {
     DirectionClosed(LinkDirectionClosed),
     LinkClosed {
         direction_closed: LinkDirectionClosed,
+        link_closed: LinkClosed,
+    },
+    AlreadyClosed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseAllTransition {
+    Closed {
+        direction_closed: Vec<LinkDirectionClosed>,
         link_closed: LinkClosed,
     },
     AlreadyClosed,
