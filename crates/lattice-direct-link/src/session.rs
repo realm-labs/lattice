@@ -17,6 +17,8 @@ pub struct DirectLinkMetrics {
 pub struct DirectLinkMetricsSnapshot {
     pub opened: u64,
     pub closed: u64,
+    pub received: u64,
+    pub protocol_errors: u64,
     pub dropped: u64,
     pub coalesced: u64,
     pub decode_errors: u64,
@@ -51,6 +53,54 @@ impl DirectLinkMetrics {
             .expect("direct link metrics poisoned")
             .snapshot
             .closed += 1;
+    }
+
+    pub fn record_receive(&self) {
+        self.inner
+            .lock()
+            .expect("direct link metrics poisoned")
+            .snapshot
+            .received += 1;
+    }
+
+    pub fn record_protocol_error(&self) {
+        self.inner
+            .lock()
+            .expect("direct link metrics poisoned")
+            .snapshot
+            .protocol_errors += 1;
+    }
+
+    pub fn record_drop(&self) {
+        self.inner
+            .lock()
+            .expect("direct link metrics poisoned")
+            .snapshot
+            .dropped += 1;
+    }
+
+    pub fn record_coalesce(&self) {
+        self.inner
+            .lock()
+            .expect("direct link metrics poisoned")
+            .snapshot
+            .coalesced += 1;
+    }
+
+    pub fn record_decode_error(&self) {
+        self.inner
+            .lock()
+            .expect("direct link metrics poisoned")
+            .snapshot
+            .decode_errors += 1;
+    }
+
+    pub fn record_backpressure(&self) {
+        self.inner
+            .lock()
+            .expect("direct link metrics poisoned")
+            .snapshot
+            .backpressure_events += 1;
     }
 }
 
@@ -149,6 +199,8 @@ impl DirectLinkSessionManager {
             }
         };
 
+        let source_actor_kind = request.source.actor_kind.as_str().to_string();
+        let target_actor_kind = request.target.actor_kind.as_str().to_string();
         let link = ManagedLink {
             link_id: request.link_id.clone(),
             source: request.source,
@@ -166,6 +218,13 @@ impl DirectLinkSessionManager {
             .expect("direct link managed links poisoned")
             .insert(request.link_id.clone(), link);
         self.metrics.record_open();
+        tracing::debug!(
+            link.id = request.link_id.as_str(),
+            link.mode = ?request.mode,
+            source.actor_kind = source_actor_kind.as_str(),
+            target.actor_kind = target_actor_kind.as_str(),
+            "direct link opened"
+        );
 
         Ok(OpenLinkAck {
             link_id: request.link_id,
@@ -185,33 +244,43 @@ impl DirectLinkSessionManager {
             .links
             .lock()
             .expect("direct link managed links poisoned");
-        let link = links
-            .get_mut(link_id)
-            .ok_or(MessageFrameError::UnknownLink)?;
+        let Some(link) = links.get_mut(link_id) else {
+            return self.message_frame_error(link_id, MessageFrameError::UnknownLink);
+        };
         if link.closed {
-            return Err(MessageFrameError::Closed);
+            return self.message_frame_error(link_id, MessageFrameError::Closed);
         }
-        let direction_state = link
-            .directions
-            .get_mut(&direction)
-            .ok_or(MessageFrameError::WrongDirection)?;
+        let Some(direction_state) = link.directions.get_mut(&direction) else {
+            return self.message_frame_error(link_id, MessageFrameError::WrongDirection);
+        };
         if direction_state.closed {
-            return Err(MessageFrameError::Closed);
+            return self.message_frame_error(link_id, MessageFrameError::Closed);
         }
         if !direction_state
             .accepted_message_type_ids
             .contains(&message_id)
         {
-            return Err(MessageFrameError::UnsupportedMessageType);
+            return self.message_frame_error(link_id, MessageFrameError::UnsupportedMessageType);
         }
         let expected = direction_state.next_receive_sequence;
         if sequence != expected {
-            return Err(MessageFrameError::InvalidSequence {
-                expected,
-                actual: sequence,
-            });
+            return self.message_frame_error(
+                link_id,
+                MessageFrameError::InvalidSequence {
+                    expected,
+                    actual: sequence,
+                },
+            );
         }
         direction_state.next_receive_sequence = LinkSequence(expected.0 + 1);
+        self.metrics.record_receive();
+        tracing::trace!(
+            link.id = link_id.as_str(),
+            link.direction = ?direction,
+            link.sequence = sequence.0,
+            message.id = message_id.0,
+            "direct link message frame accepted"
+        );
         Ok(())
     }
 
@@ -244,11 +313,22 @@ impl DirectLinkSessionManager {
         if link.directions.values().all(|state| state.closed) {
             link.closed = true;
             self.metrics.record_close();
+            tracing::debug!(
+                link.id = link_id.as_str(),
+                link.reason = ?reason,
+                "direct link closed"
+            );
             Ok(CloseTransition::LinkClosed {
                 reason,
                 closed_directions,
             })
         } else {
+            tracing::debug!(
+                link.id = link_id.as_str(),
+                link.direction = ?direction,
+                link.reason = ?reason,
+                "direct link direction closed"
+            );
             Ok(CloseTransition::DirectionClosed { reason, direction })
         }
     }
@@ -284,8 +364,65 @@ impl DirectLinkSessionManager {
             .is_some();
         if removed_session || removed_link {
             self.metrics.record_close();
+            tracing::debug!(link.id = link_id.as_str(), "direct link session removed");
         }
         removed_session || removed_link
+    }
+
+    pub fn record_decode_error(&self, link_id: Option<&LinkId>, details: &str) {
+        self.metrics.record_decode_error();
+        tracing::warn!(
+            link.id = link_id.map(LinkId::as_str).unwrap_or(""),
+            error = details,
+            "direct link decode error"
+        );
+    }
+
+    pub fn record_backpressure(
+        &self,
+        link_id: &LinkId,
+        policy: &BackpressurePolicy,
+        pending: usize,
+    ) {
+        self.metrics.record_backpressure();
+        tracing::debug!(
+            link.id = link_id.as_str(),
+            policy = ?policy,
+            pending,
+            "direct link backpressure"
+        );
+    }
+
+    pub fn record_drop(&self, link_id: &LinkId, message_id: DirectLinkMessageId) {
+        self.metrics.record_drop();
+        tracing::debug!(
+            link.id = link_id.as_str(),
+            message.id = message_id.0,
+            "direct link message dropped"
+        );
+    }
+
+    pub fn record_coalesce(&self, link_id: &LinkId, message_id: DirectLinkMessageId) {
+        self.metrics.record_coalesce();
+        tracing::trace!(
+            link.id = link_id.as_str(),
+            message.id = message_id.0,
+            "direct link message coalesced"
+        );
+    }
+
+    fn message_frame_error<T>(
+        &self,
+        link_id: &LinkId,
+        error: MessageFrameError,
+    ) -> Result<T, MessageFrameError> {
+        self.metrics.record_protocol_error();
+        tracing::warn!(
+            link.id = link_id.as_str(),
+            error = ?error,
+            "direct link message frame rejected"
+        );
+        Err(error)
     }
 
     fn negotiate_direction(
@@ -549,6 +686,10 @@ mod tests {
                 actual: LinkSequence(1)
             })
         );
+        let metrics = manager.metrics().snapshot();
+        assert_eq!(metrics.opened, 1);
+        assert_eq!(metrics.received, 1);
+        assert_eq!(metrics.protocol_errors, 1);
     }
 
     #[test]
@@ -652,6 +793,28 @@ mod tests {
                 .unwrap(),
             CloseTransition::LinkClosed { .. }
         ));
+        assert_eq!(manager.metrics().snapshot().closed, 1);
+    }
+
+    #[test]
+    fn observability_hooks_increment_metrics() {
+        let manager = DirectLinkSessionManager::new();
+        let link_id = LinkId::new("link-1");
+
+        manager.record_decode_error(Some(&link_id), "bad payload");
+        manager.record_backpressure(
+            &link_id,
+            &BackpressurePolicy::DropOldest { max_pending: 1 },
+            1,
+        );
+        manager.record_drop(&link_id, DirectLinkMessageId(10));
+        manager.record_coalesce(&link_id, DirectLinkMessageId(10));
+
+        let metrics = manager.metrics().snapshot();
+        assert_eq!(metrics.decode_errors, 1);
+        assert_eq!(metrics.backpressure_events, 1);
+        assert_eq!(metrics.dropped, 1);
+        assert_eq!(metrics.coalesced, 1);
     }
 
     fn stream(name: &str, ids: &[u64]) -> DirectLinkStreamDescriptor {
