@@ -18,7 +18,7 @@ pub use framework::{
     LocalEventBusComponent, PlacementStoreComponent, ServiceContextExt, ServiceEventBus,
 };
 pub use lattice_core::ServiceContext;
-pub use rpc::{RpcClientBinding, RpcServiceBinding};
+pub use rpc::{RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
 pub use service::LatticeService;
 
 #[cfg(test)]

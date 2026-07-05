@@ -214,11 +214,12 @@ fn push_service_module(rust: &mut String, methods: &[&RpcMethodSpec]) {
     rust.push_str("    use lattice_core::{ActorId, ActorKind, RouteKey};\n");
     rust.push_str("    use lattice_rpc::{ActorRpcAdapter, Rpc, RpcRequest, RoutedRequest, ShardedRpcCore, TypedRpcClient};\n\n");
     rust.push_str(
-        "    use lattice_service::{LatticeServiceError, RpcClientBinding, RpcServiceBinding};
+        "    use lattice_service::{LatticeServiceError, RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
     use lattice_service::context::ServiceBuildContext;\n\n",
     );
     push_typed_client(rust, methods);
     push_service_binding(rust, methods);
+    push_singleton_binding(rust, methods);
     push_server_adapter(rust, methods);
     push_registry_server_adapter(rust, methods);
     for method in methods {
@@ -277,6 +278,58 @@ fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     rust.push_str("    }\n\n");
     rust.push_str(
         "    impl<A, C> RpcServiceBinding for Binding<A, C>\n    where\n        A: Actor + Sync,\n        C: Send + Sync + 'static",
+    );
+    for method in methods {
+        rust.push_str(",\n        A: Handler<Rpc<");
+        rust.push_str(&method.request_type);
+        rust.push_str(">>");
+    }
+    rust.push_str(",\n    {\n");
+    rust.push_str(&format!(
+        "        fn service_name(&self) -> &'static str {{ \"{}\" }}\n\n",
+        service.service_name
+    ));
+    rust.push_str("        fn register(self: Box<Self>, context: &mut ServiceBuildContext) -> Result<(), LatticeServiceError> {\n");
+    rust.push_str("            let actor = context.actor::<A>(&self.actor_kind)?;\n");
+    rust.push_str(&format!(
+        "            context.add_rpc_service({server_path}::new(RegistryService::new(actor.registry(), actor.loader())));\n"
+    ));
+    rust.push_str("            Ok(())\n");
+    rust.push_str("        }\n");
+    rust.push_str("    }\n\n");
+}
+
+fn push_singleton_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
+    let service = methods[0];
+    let server_path = tonic_server_path(service);
+    rust.push_str("    #[derive(Debug)]\n");
+    rust.push_str("    pub struct SingletonBinding<A = (), C = DefaultClientCore> {\n        actor_kind: ActorKind,\n        _actor: PhantomData<fn() -> A>,\n        _core: PhantomData<fn() -> C>,\n    }\n\n");
+    rust.push_str("    impl SingletonBinding<()> {\n");
+    rust.push_str("        pub fn for_actor<A>() -> SingletonBinding<A>\n        where\n            A: Actor,\n        {\n");
+    rust.push_str(&format!(
+        "            SingletonBinding {{ actor_kind: ActorKind::from_static(\"{}\"), _actor: PhantomData, _core: PhantomData }}\n",
+        service.route_key.actor_kind
+    ));
+    rust.push_str("        }\n\n");
+    rust.push_str("        pub fn for_actor_kind<A>(actor_kind: ActorKind) -> SingletonBinding<A>\n        where\n            A: Actor,\n        {\n");
+    rust.push_str(
+        "            SingletonBinding { actor_kind, _actor: PhantomData, _core: PhantomData }\n",
+    );
+    rust.push_str("        }\n");
+    rust.push_str("    }\n\n");
+    rust.push_str("    impl<A, C> RpcClientBinding for SingletonBinding<A, C>\n    where\n        A: Send + Sync + 'static,\n        C: ShardedRpcCore + Clone,\n    {\n");
+    rust.push_str("        type Core = C;\n");
+    rust.push_str("        type Client = Client<C>;\n\n");
+    rust.push_str(&format!(
+        "        const SERVICE_KIND: &'static str = \"{}\";\n",
+        service.service_kind
+    ));
+    rust.push_str("\n        fn placement() -> RpcClientPlacement {\n            RpcClientPlacement::Singleton\n        }\n\n");
+    rust.push_str("        fn build_client(core: Self::Core) -> Self::Client {\n            Client::new(core)\n        }\n\n");
+    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::BoxRouteResolver,\n            context_factory: lattice_rpc::RpcClientContextFactory,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::ResolvingRpcCore::new(\n                lattice_core::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::new(),\n            );\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
+    rust.push_str("    }\n\n");
+    rust.push_str(
+        "    impl<A, C> RpcServiceBinding for SingletonBinding<A, C>\n    where\n        A: Actor + Sync,\n        C: Send + Sync + 'static",
     );
     for method in methods {
         rust.push_str(",\n        A: Handler<Rpc<");

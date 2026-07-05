@@ -902,6 +902,7 @@ dependencies = [
  "lattice-eventbus",
  "lattice-placement",
  "lattice-rpc",
+ "prost",
  "serde",
  "serde_json",
  "thiserror",

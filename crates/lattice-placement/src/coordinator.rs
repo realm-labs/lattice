@@ -602,6 +602,12 @@ pub struct PlacementWatchTask {
 }
 
 impl PlacementWatchTask {
+    pub fn noop() -> Self {
+        Self {
+            handle: tokio::spawn(async {}),
+        }
+    }
+
     pub fn cancel(&self) {
         self.handle.abort();
     }

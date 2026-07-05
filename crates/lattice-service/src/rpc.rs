@@ -9,6 +9,12 @@ pub trait RpcServiceBinding: Send + Sync + 'static {
     ) -> Result<(), LatticeServiceError>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcClientPlacement {
+    Actor,
+    Singleton,
+}
+
 pub trait RpcClientBinding: Send + Sync + 'static {
     type Core: lattice_rpc::ShardedRpcCore + Clone + Send + Sync + 'static;
     type Client: Send + Sync + 'static;
@@ -16,6 +22,10 @@ pub trait RpcClientBinding: Send + Sync + 'static {
     const SERVICE_KIND: &'static str;
 
     fn build_client(core: Self::Core) -> Self::Client;
+
+    fn placement() -> RpcClientPlacement {
+        RpcClientPlacement::Actor
+    }
 
     fn build_default_core(
         _resolver: lattice_placement::BoxRouteResolver,
@@ -28,6 +38,7 @@ pub trait RpcClientBinding: Send + Sync + 'static {
 pub(crate) trait ErasedRpcClientBinding: Send + Sync + 'static {
     fn service_kind(&self) -> lattice_core::ServiceKind;
     fn core_type(&self) -> &'static str;
+    fn placement(&self) -> RpcClientPlacement;
 
     fn register(
         self: Box<Self>,
@@ -59,6 +70,10 @@ where
 
     fn core_type(&self) -> &'static str {
         std::any::type_name::<B::Core>()
+    }
+
+    fn placement(&self) -> RpcClientPlacement {
+        B::placement()
     }
 
     fn register(

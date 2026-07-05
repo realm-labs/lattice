@@ -26,6 +26,22 @@ fn generated_output_matches_phase_two_shape() {
             .rust
             .contains("pub struct Binding<A = (), C = DefaultClientCore>")
     );
+    assert!(
+        generated
+            .rust
+            .contains("pub struct SingletonBinding<A = (), C = DefaultClientCore>")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("fn placement() -> RpcClientPlacement")
+    );
+    assert!(generated.rust.contains("RpcClientPlacement::Singleton"));
+    assert!(
+        generated
+            .rust
+            .contains("pub fn for_actor<A>() -> SingletonBinding<A>")
+    );
     assert!(generated.rust.contains("type Core = C;"));
     assert!(generated.rust.contains("type Client = Client<C>;"));
     assert!(

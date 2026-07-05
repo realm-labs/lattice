@@ -9,6 +9,7 @@ use lattice_placement::coordinator::{
     PlacementCoordinator, PlacementRouteResolver, PlacementWatchStarter, PlacementWatchTask,
 };
 use lattice_placement::instance::InstanceRecord;
+use lattice_placement::singleton::SingletonRouteResolver;
 use lattice_placement::store::{LeaseId, PlacementStore};
 
 use crate::LatticeServiceError;
@@ -145,6 +146,9 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
         &self,
         service_kind: ServiceKind,
     ) -> Result<(lattice_placement::BoxRouteResolver, PlacementWatchTask), PlacementError>;
+    async fn singleton_route_resolver(
+        &self,
+    ) -> Result<(lattice_placement::BoxRouteResolver, PlacementWatchTask), PlacementError>;
 }
 
 #[async_trait]
@@ -217,6 +221,20 @@ where
         );
         let watch = resolver.start_placement_watch().await?;
         Ok((lattice_placement::BoxRouteResolver::new(resolver), watch))
+    }
+
+    async fn singleton_route_resolver(
+        &self,
+    ) -> Result<(lattice_placement::BoxRouteResolver, PlacementWatchTask), PlacementError> {
+        let coordinator = lattice_placement::singleton::SingletonCoordinator::from_store(
+            self.store.clone(),
+            TonicLogicControl,
+        );
+        let resolver = SingletonRouteResolver::new(coordinator, RouteCacheConfig::default());
+        Ok((
+            lattice_placement::BoxRouteResolver::new(resolver),
+            PlacementWatchTask::noop(),
+        ))
     }
 }
 

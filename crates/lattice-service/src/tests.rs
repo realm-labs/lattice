@@ -22,7 +22,7 @@ use lattice_placement::coordinator::{
 use lattice_placement::instance::{InstanceRecord, InstanceState};
 use lattice_placement::store::{
     ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
-    PlacementState, PlacementStore,
+    PlacementState, PlacementStore, SingletonKey,
 };
 use lattice_placement::{
     BoxRouteResolver, EndpointLease, EndpointPool, EndpointRpcTransport, ResolveRequest,
@@ -38,8 +38,8 @@ use tonic::server::NamedService;
 use crate::actor::ErasedActorRegistration;
 use crate::context::ServiceBuildContext;
 use crate::{
-    ActorRegistration, LatticeService, LatticeServiceError, RpcClientBinding, RpcServiceBinding,
-    ServiceContextExt,
+    ActorRegistration, LatticeService, LatticeServiceError, RpcClientBinding, RpcClientPlacement,
+    RpcServiceBinding, ServiceContextExt,
 };
 
 #[derive(Clone)]
@@ -64,6 +64,33 @@ impl ActorFactory<TestActor> for TestFactory {
     async fn create(&self, _ctx: ActorCreateContext) -> Result<TestActor, ActorError> {
         Ok(TestActor)
     }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct SingletonScopeRequest {
+    #[prost(string, tag = "1")]
+    scope: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct SingletonScopeReply {
+    #[prost(bool, tag = "1")]
+    ok: bool,
+}
+
+impl RoutedRequest for SingletonScopeRequest {
+    fn actor_kind(&self) -> ActorKind {
+        actor_kind!("SeasonManager")
+    }
+
+    fn route_key(&self) -> RouteKey {
+        RouteKey::Str(self.scope.clone())
+    }
+}
+
+impl RpcRequest for SingletonScopeRequest {
+    type Reply = SingletonScopeReply;
+    const METHOD: &'static str = "test.SeasonRpc/Tick";
 }
 
 #[derive(Clone)]
@@ -226,6 +253,36 @@ impl RpcClientBinding for FakePlacementClientBinding {
     type Client = FakePlacementClient;
 
     const SERVICE_KIND: &'static str = "World";
+
+    fn build_client(core: Self::Core) -> Self::Client {
+        FakePlacementClient { core }
+    }
+
+    fn build_default_core(
+        resolver: BoxRouteResolver,
+        context_factory: RpcClientContextFactory,
+    ) -> Option<Self::Core> {
+        Some(ResolvingRpcCore::new(
+            service_kind!("World"),
+            resolver,
+            EndpointPool::new(),
+            context_factory,
+            FakeEndpointTransport,
+        ))
+    }
+}
+
+struct FakeSingletonClientBinding;
+
+impl RpcClientBinding for FakeSingletonClientBinding {
+    type Core = FakePlacementCore;
+    type Client = FakePlacementClient;
+
+    const SERVICE_KIND: &'static str = "World";
+
+    fn placement() -> RpcClientPlacement {
+        RpcClientPlacement::Singleton
+    }
 
     fn build_client(core: Self::Core) -> Self::Client {
         FakePlacementClient { core }
@@ -743,6 +800,74 @@ async fn register_client_builds_default_placement_core_from_store() {
         std::mem::size_of::<FakePlacementCore>()
     );
     assert_eq!(service.placement_watch_count(), 1);
+}
+
+#[tokio::test]
+async fn register_client_builds_default_singleton_core_from_store() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/singleton-client"));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-a"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .placement_store::<InMemoryPlacementStore, _>(store.clone())
+        .register_client::<FakeSingletonClientBinding>()
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("SeasonManager"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    let client = service
+        .context()
+        .extension::<FakePlacementClient>()
+        .unwrap()
+        .as_ref()
+        .clone();
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+    let result = client
+        .core
+        .call(SingletonScopeRequest {
+            scope: "global".to_string(),
+        })
+        .await;
+
+    assert!(matches!(result, Err(RpcError::Business(_))));
+    let singleton_key = SingletonKey {
+        service_kind: service_kind!("World"),
+        singleton_kind: actor_kind!("SeasonManager"),
+        scope: "global".to_string(),
+    };
+    assert!(store.get_singleton(&singleton_key).await.unwrap().is_some());
+    assert!(
+        store
+            .get_actor(&ActorPlacementKey {
+                actor_kind: actor_kind!("SeasonManager"),
+                actor_id: ActorId::Str("global".to_string()),
+            })
+            .await
+            .unwrap()
+            .is_none()
+    );
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

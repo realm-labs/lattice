@@ -26,7 +26,7 @@ use crate::component::{
 use crate::config::InstanceConfig;
 use crate::context::ServiceBuildContext;
 use crate::control::ServiceLogicControlHandler;
-use crate::rpc::{ErasedRpcClientBinding, RpcClientRegistration};
+use crate::rpc::{ErasedRpcClientBinding, RpcClientPlacement, RpcClientRegistration};
 use crate::service::LatticeServiceParts;
 use crate::{LatticeService, LatticeServiceError, RpcClientBinding, RpcServiceBinding};
 
@@ -368,9 +368,14 @@ impl LatticeServiceBuilder {
                 rpc.client.core = binding.core_type(),
                 "registering rpc client binding"
             );
-            let (default_resolver, watch_task) = placement_store
-                .placement_route_resolver(client_service_kind)
-                .await?;
+            let (default_resolver, watch_task) = match binding.placement() {
+                RpcClientPlacement::Actor => {
+                    placement_store
+                        .placement_route_resolver(client_service_kind)
+                        .await?
+                }
+                RpcClientPlacement::Singleton => placement_store.singleton_route_resolver().await?,
+            };
             placement_watch_tasks.push(watch_task);
             let context_factory = RpcClientContextFactory::new(
                 self.service_kind.clone(),
