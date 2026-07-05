@@ -292,8 +292,12 @@ pub enum RpcError {
     #[error("mailbox is full")]
     MailboxFull,
 
-    #[error("rpc timed out; result may be unknown")]
-    TimeoutUnknown,
+    #[error("rpc result is unknown for {method} request {request_id}: {message}")]
+    UnknownResult {
+        method: &'static str,
+        request_id: RequestId,
+        message: String,
+    },
 
     #[error("business error: {0}")]
     Business(String),
@@ -311,10 +315,12 @@ NOT_OWNER:
   invalidate route cache, resolve again, retry once with the same request_id.
 
 FENCED:
-  old owner must not continue; client may resolve and retry if the operation is idempotent.
+  invalidate route cache, resolve again, retry once with the same request_id.
 
-TimeoutUnknown:
-  the request may have been applied. Retry only with the same request_id and idempotency key.
+UnknownResult:
+  the request may have been applied, but the client did not receive a definitive response.
+  do not transparently retry. The caller should query state, reconcile an operation_id, or
+  retry only through an explicit idempotent business flow.
 
 MailboxFull / overload:
   apply caller backoff or fail fast according to policy.
@@ -323,7 +329,45 @@ Business error:
   do not retry unless business code marks it retryable.
 ```
 
-### 14.1 RPC Failure and Business Consistency
+Route-correction retry is configurable. It is enabled by default for generated placement-backed clients. Disable it when the caller wants the lowest possible client-side overhead and prefers to handle `NotOwner` / `Fenced` explicitly:
+
+```rust
+LatticeService::builder(WORLD_SERVICE)
+    .rpc_retry_policy(RpcRetryPolicy::Disabled);
+```
+
+When retry is disabled, the placement-backed client sends the request once and moves the request body into the transport. It does not keep an encoded retry copy of the request.
+
+### 14.1 Request ID Duplicate Guard
+
+The framework-level request-id deduplicator is intentionally lightweight:
+
+```text
+same RPC method + same request_id reaches the same live service process:
+  the first request reserves the key and enters the actor handler.
+  later duplicate requests are rejected with duplicate request id.
+
+successful handler result:
+  the key remains recorded in memory, but the reply is not cached.
+
+mailbox full or closed before business handling:
+  the key is released so the caller may retry according to overload policy.
+```
+
+This avoids replay-cache memory growth and avoids treating framework dedup as a durability layer. If the first request succeeded but the response was lost, a retry with the same request_id should receive `UnknownResult`; business code should query state or reconcile an `operation_id`.
+
+Generated `ActorService`, `RegistryService`, and `SingletonRegistryService` adapters enable this duplicate guard by default. Business code can disable it for a generated service binding when needed:
+
+```rust
+service.register_sharded_rpc(
+    generated::world_rpc::Binding::for_actor::<WorldActor>(WORLD_ACTOR)
+        .request_dedup(false),
+);
+```
+
+Low-level hand-written `ActorRpcAdapter::unary(...)` calls do not enable it unless they explicitly use the dedup variant.
+
+### 14.2 RPC Failure and Business Consistency
 
 lattice does not provide distributed transactions across actors, services, EventBus, and business databases.
 

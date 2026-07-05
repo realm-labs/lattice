@@ -270,10 +270,16 @@ fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let server_path = tonic_server_path(service);
     rust.push_str("    pub type DefaultClientCore = lattice_placement::ResolvingRpcCore<lattice_placement::BoxRouteResolver, super::GeneratedTonicEndpointTransport>;\n\n");
     rust.push_str("    #[derive(Debug)]\n");
-    rust.push_str("    pub struct Binding<A = (), C = DefaultClientCore> {\n        actor_kind: ActorKind,\n        _actor: PhantomData<fn() -> A>,\n        _core: PhantomData<fn() -> C>,\n    }\n\n");
+    rust.push_str("    pub struct Binding<A = (), C = DefaultClientCore> {\n        actor_kind: ActorKind,\n        request_dedup: bool,\n        _actor: PhantomData<fn() -> A>,\n        _core: PhantomData<fn() -> C>,\n    }\n\n");
+    rust.push_str("    impl<A, C> Binding<A, C> {\n");
+    rust.push_str("        pub fn request_dedup(mut self, enabled: bool) -> Self {\n");
+    rust.push_str("            self.request_dedup = enabled;\n");
+    rust.push_str("            self\n");
+    rust.push_str("        }\n");
+    rust.push_str("    }\n\n");
     rust.push_str("    impl Binding<()> {\n");
     rust.push_str("        pub fn for_actor<A>(actor_kind: ActorKind) -> Binding<A>\n        where\n            A: Actor,\n        {\n");
-    rust.push_str("            Binding { actor_kind, _actor: PhantomData, _core: PhantomData }\n");
+    rust.push_str("            Binding { actor_kind, request_dedup: true, _actor: PhantomData, _core: PhantomData }\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
     rust.push_str("    impl<A, C> RpcClientBinding for Binding<A, C>\n    where\n        A: Send + Sync + 'static,\n        C: ShardedRpcCore + Clone,\n    {\n");
@@ -284,7 +290,7 @@ fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
         service.service_kind
     ));
     rust.push_str("\n        fn build_client(core: Self::Core) -> Self::Client {\n            Client::new(core)\n        }\n\n");
-    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::BoxRouteResolver,\n            context_factory: lattice_rpc::RpcClientContextFactory,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::ResolvingRpcCore::new(\n                lattice_core::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::new(),\n            );\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
+    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::BoxRouteResolver,\n            context_factory: lattice_rpc::RpcClientContextFactory,\n            retry_policy: lattice_placement::RpcRetryPolicy,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::ResolvingRpcCore::new(\n                lattice_core::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::new(),\n            ).with_retry_policy(retry_policy);\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
     rust.push_str("    }\n\n");
     rust.push_str(
         "    impl<A, C> RpcServiceBinding for Binding<A, C>\n    where\n        A: Actor + Sync,\n        C: Send + Sync + 'static",
@@ -302,7 +308,7 @@ fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     rust.push_str("        fn register(self: Box<Self>, context: &mut ServiceBuildContext) -> Result<(), LatticeServiceError> {\n");
     rust.push_str("            let actor = context.actor::<A>(&self.actor_kind)?;\n");
     rust.push_str(&format!(
-        "            context.add_rpc_service({server_path}::new(RegistryService::with_security(actor.registry(), actor.loader(), context.rpc_security())));\n"
+        "            context.add_rpc_service({server_path}::new(RegistryService::with_security(actor.registry(), actor.loader(), context.rpc_security()).with_request_dedup(self.request_dedup)));\n"
     ));
     rust.push_str("            Ok(())\n");
     rust.push_str("        }\n");
@@ -313,17 +319,23 @@ fn push_singleton_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let service = methods[0];
     let server_path = tonic_server_path(service);
     rust.push_str("    #[derive(Debug)]\n");
-    rust.push_str("    pub struct SingletonBinding<A = (), C = DefaultClientCore> {\n        actor_kind: ActorKind,\n        _actor: PhantomData<fn() -> A>,\n        _core: PhantomData<fn() -> C>,\n    }\n\n");
+    rust.push_str("    pub struct SingletonBinding<A = (), C = DefaultClientCore> {\n        actor_kind: ActorKind,\n        request_dedup: bool,\n        _actor: PhantomData<fn() -> A>,\n        _core: PhantomData<fn() -> C>,\n    }\n\n");
+    rust.push_str("    impl<A, C> SingletonBinding<A, C> {\n");
+    rust.push_str("        pub fn request_dedup(mut self, enabled: bool) -> Self {\n");
+    rust.push_str("            self.request_dedup = enabled;\n");
+    rust.push_str("            self\n");
+    rust.push_str("        }\n");
+    rust.push_str("    }\n\n");
     rust.push_str("    impl SingletonBinding<()> {\n");
     rust.push_str("        pub fn for_actor<A>() -> SingletonBinding<A>\n        where\n            A: Actor,\n        {\n");
     rust.push_str(&format!(
-        "            SingletonBinding {{ actor_kind: ActorKind::from_static(\"{}\"), _actor: PhantomData, _core: PhantomData }}\n",
+        "            SingletonBinding {{ actor_kind: ActorKind::from_static(\"{}\"), request_dedup: true, _actor: PhantomData, _core: PhantomData }}\n",
         service.route_key.actor_kind
     ));
     rust.push_str("        }\n\n");
     rust.push_str("        pub fn for_actor_kind<A>(actor_kind: ActorKind) -> SingletonBinding<A>\n        where\n            A: Actor,\n        {\n");
     rust.push_str(
-        "            SingletonBinding { actor_kind, _actor: PhantomData, _core: PhantomData }\n",
+        "            SingletonBinding { actor_kind, request_dedup: true, _actor: PhantomData, _core: PhantomData }\n",
     );
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
@@ -336,7 +348,7 @@ fn push_singleton_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     ));
     rust.push_str("\n        fn placement() -> RpcClientPlacement {\n            RpcClientPlacement::Singleton\n        }\n\n");
     rust.push_str("        fn build_client(core: Self::Core) -> Self::Client {\n            Client::new(core)\n        }\n\n");
-    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::BoxRouteResolver,\n            context_factory: lattice_rpc::RpcClientContextFactory,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::ResolvingRpcCore::new(\n                lattice_core::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::new(),\n            );\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
+    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::BoxRouteResolver,\n            context_factory: lattice_rpc::RpcClientContextFactory,\n            retry_policy: lattice_placement::RpcRetryPolicy,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::ResolvingRpcCore::new(\n                lattice_core::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::new(),\n            ).with_retry_policy(retry_policy);\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
     rust.push_str("    }\n\n");
     rust.push_str(
         "    impl<A, C> RpcServiceBinding for SingletonBinding<A, C>\n    where\n        A: Actor + Sync,\n        C: Send + Sync + 'static",
@@ -357,7 +369,7 @@ fn push_singleton_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     rust.push_str("            let placement_store = service.placement_store();\n");
     rust.push_str("            let instance_id = service.instance_id().clone();\n");
     rust.push_str(&format!(
-        "            context.add_rpc_service({server_path}::new(SingletonRegistryService::with_security(actor.registry(), actor.loader(), placement_store, instance_id, context.rpc_security())));\n"
+        "            context.add_rpc_service({server_path}::new(SingletonRegistryService::with_security(actor.registry(), actor.loader(), placement_store, instance_id, context.rpc_security()).with_request_dedup(self.request_dedup)));\n"
     ));
     rust.push_str("            Ok(())\n");
     rust.push_str("        }\n");
@@ -369,14 +381,18 @@ fn push_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let trait_path = tonic_service_trait_path(service);
     rust.push_str("    #[derive(Debug, Clone)]\n");
     rust.push_str(
-        "    pub struct ActorService<A: Actor> {\n        inner: ActorRpcAdapter<A>,\n        security: RpcServerSecurity,\n    }\n\n",
+        "    pub struct ActorService<A: Actor> {\n        inner: ActorRpcAdapter<A>,\n        security: RpcServerSecurity,\n        request_dedup: bool,\n        deduplicator: lattice_rpc::dedup::RequestDeduplicator,\n    }\n\n",
     );
     rust.push_str("    impl<A: Actor> ActorService<A> {\n");
     rust.push_str("        pub fn new(handle: ActorHandle<A>) -> Self {\n");
-    rust.push_str("            Self { inner: ActorRpcAdapter::new(handle), security: RpcServerSecurity::disabled() }\n");
+    rust.push_str("            Self { inner: ActorRpcAdapter::new(handle), security: RpcServerSecurity::disabled(), request_dedup: true, deduplicator: lattice_rpc::dedup::RequestDeduplicator::new() }\n");
     rust.push_str("        }\n\n");
     rust.push_str("        pub fn with_security(handle: ActorHandle<A>, security: RpcServerSecurity) -> Self {\n");
-    rust.push_str("            Self { inner: ActorRpcAdapter::new(handle), security }\n");
+    rust.push_str("            Self { inner: ActorRpcAdapter::new(handle), security, request_dedup: true, deduplicator: lattice_rpc::dedup::RequestDeduplicator::new() }\n");
+    rust.push_str("        }\n");
+    rust.push_str("\n        pub fn with_request_dedup(mut self, enabled: bool) -> Self {\n");
+    rust.push_str("            self.request_dedup = enabled;\n");
+    rust.push_str("            self\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
     rust.push_str("    #[tonic::async_trait]\n");
@@ -396,7 +412,11 @@ fn push_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
             reply = method.reply_type
         ));
         rust.push_str("            let peer = self.security.peer_identity(&request);\n");
-        rust.push_str("            self.inner.unary_secure(request, self.security.policy(), peer.as_ref()).await\n");
+        rust.push_str("            if self.request_dedup {\n");
+        rust.push_str("                self.inner.unary_dedup_secure(request, self.security.policy(), peer.as_ref(), &self.deduplicator).await\n");
+        rust.push_str("            } else {\n");
+        rust.push_str("                self.inner.unary_secure(request, self.security.policy(), peer.as_ref()).await\n");
+        rust.push_str("            }\n");
         rust.push_str("        }\n");
     }
     rust.push_str("    }\n\n");
@@ -406,15 +426,19 @@ fn push_registry_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let service = methods[0];
     let trait_path = tonic_service_trait_path(service);
     rust.push_str("    #[derive(Debug, Clone)]\n");
-    rust.push_str("    pub struct RegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n        security: RpcServerSecurity,\n    }\n\n");
+    rust.push_str("    pub struct RegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n        security: RpcServerSecurity,\n        request_dedup: bool,\n        deduplicator: lattice_rpc::dedup::RequestDeduplicator,\n    }\n\n");
     rust.push_str("    impl<A, L> RegistryService<A, L>\n    where\n        A: Actor,\n        L: ActorLoader<A>,\n    {\n");
     rust.push_str("        pub fn new(registry: Arc<ActorRegistry<A>>, loader: L) -> Self {\n");
     rust.push_str(
-        "            Self { registry, loader, security: RpcServerSecurity::disabled() }\n",
+        "            Self { registry, loader, security: RpcServerSecurity::disabled(), request_dedup: true, deduplicator: lattice_rpc::dedup::RequestDeduplicator::new() }\n",
     );
     rust.push_str("        }\n\n");
     rust.push_str("        pub fn with_security(registry: Arc<ActorRegistry<A>>, loader: L, security: RpcServerSecurity) -> Self {\n");
-    rust.push_str("            Self { registry, loader, security }\n");
+    rust.push_str("            Self { registry, loader, security, request_dedup: true, deduplicator: lattice_rpc::dedup::RequestDeduplicator::new() }\n");
+    rust.push_str("        }\n\n");
+    rust.push_str("        pub fn with_request_dedup(mut self, enabled: bool) -> Self {\n");
+    rust.push_str("            self.request_dedup = enabled;\n");
+    rust.push_str("            self\n");
     rust.push_str("        }\n\n");
     rust.push_str("        async fn unary<Req>(&self, request: tonic::Request<Req>) -> Result<tonic::Response<Req::Reply>, tonic::Status>\n");
     rust.push_str("        where\n            A: Handler<Rpc<Req>>,\n            Req: RoutedRequest + RpcRequest,\n        {\n");
@@ -431,7 +455,12 @@ fn push_registry_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     );
     rust.push_str("            let mut forwarded = tonic::Request::new(req);\n");
     rust.push_str("            *forwarded.metadata_mut() = metadata;\n");
-    rust.push_str("            ActorRpcAdapter::new(handle).unary_secure(forwarded, self.security.policy(), peer.as_ref()).await\n");
+    rust.push_str("            let adapter = ActorRpcAdapter::new(handle);\n");
+    rust.push_str("            if self.request_dedup {\n");
+    rust.push_str("                adapter.unary_dedup_secure(forwarded, self.security.policy(), peer.as_ref(), &self.deduplicator).await\n");
+    rust.push_str("            } else {\n");
+    rust.push_str("                adapter.unary_secure(forwarded, self.security.policy(), peer.as_ref()).await\n");
+    rust.push_str("            }\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
     rust.push_str("    #[tonic::async_trait]\n");
@@ -462,7 +491,7 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
     let service = methods[0];
     let trait_path = tonic_service_trait_path(service);
     rust.push_str("    #[derive(Clone)]\n");
-    rust.push_str("    pub struct SingletonRegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n        placement_store: Arc<dyn lattice_service::DynPlacementStore>,\n        instance_id: InstanceId,\n        security: RpcServerSecurity,\n    }\n\n");
+    rust.push_str("    pub struct SingletonRegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n        placement_store: Arc<dyn lattice_service::DynPlacementStore>,\n        instance_id: InstanceId,\n        security: RpcServerSecurity,\n        request_dedup: bool,\n        deduplicator: lattice_rpc::dedup::RequestDeduplicator,\n    }\n\n");
     rust.push_str("    impl<A, L> std::fmt::Debug for SingletonRegistryService<A, L>\n");
     rust.push_str("    where\n        A: Actor,\n    {\n");
     rust.push_str(
@@ -473,12 +502,16 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
     rust.push_str("    }\n\n");
     rust.push_str("    impl<A, L> SingletonRegistryService<A, L>\n    where\n        A: Actor,\n        L: ActorLoader<A>,\n    {\n");
     rust.push_str("        pub fn new(registry: Arc<ActorRegistry<A>>, loader: L, placement_store: Arc<dyn lattice_service::DynPlacementStore>, instance_id: InstanceId) -> Self {\n");
-    rust.push_str("            Self { registry, loader, placement_store, instance_id, security: RpcServerSecurity::disabled() }\n");
+    rust.push_str("            Self { registry, loader, placement_store, instance_id, security: RpcServerSecurity::disabled(), request_dedup: true, deduplicator: lattice_rpc::dedup::RequestDeduplicator::new() }\n");
     rust.push_str("        }\n\n");
     rust.push_str("        pub fn with_security(registry: Arc<ActorRegistry<A>>, loader: L, placement_store: Arc<dyn lattice_service::DynPlacementStore>, instance_id: InstanceId, security: RpcServerSecurity) -> Self {\n");
     rust.push_str(
-        "            Self { registry, loader, placement_store, instance_id, security }\n",
+        "            Self { registry, loader, placement_store, instance_id, security, request_dedup: true, deduplicator: lattice_rpc::dedup::RequestDeduplicator::new() }\n",
     );
+    rust.push_str("        }\n\n");
+    rust.push_str("        pub fn with_request_dedup(mut self, enabled: bool) -> Self {\n");
+    rust.push_str("            self.request_dedup = enabled;\n");
+    rust.push_str("            self\n");
     rust.push_str("        }\n\n");
     rust.push_str("        async fn unary<Req>(&self, request: tonic::Request<Req>) -> Result<tonic::Response<Req::Reply>, tonic::Status>\n");
     rust.push_str("        where\n            A: Handler<Rpc<Req>>,\n            Req: RoutedRequest + RpcRequest,\n        {\n");
@@ -521,7 +554,14 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
     );
     rust.push_str("            let mut forwarded = tonic::Request::new(req);\n");
     rust.push_str("            *forwarded.metadata_mut() = metadata;\n");
-    rust.push_str("            ActorRpcAdapter::new(handle).with_owner_epoch(record.epoch).unary_secure(forwarded, self.security.policy(), peer.as_ref()).await\n");
+    rust.push_str(
+        "            let adapter = ActorRpcAdapter::new(handle).with_owner_epoch(record.epoch);\n",
+    );
+    rust.push_str("            if self.request_dedup {\n");
+    rust.push_str("                adapter.unary_dedup_secure(forwarded, self.security.policy(), peer.as_ref(), &self.deduplicator).await\n");
+    rust.push_str("            } else {\n");
+    rust.push_str("                adapter.unary_secure(forwarded, self.security.policy(), peer.as_ref()).await\n");
+    rust.push_str("            }\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
     rust.push_str("    #[tonic::async_trait]\n");
@@ -557,7 +597,7 @@ fn push_tonic_endpoint_transport(rust: &mut String, methods: &[RpcMethodSpec]) {
     rust.push_str("}\n\n");
     rust.push_str("#[tonic::async_trait]\n");
     rust.push_str("impl EndpointRpcTransport for GeneratedTonicEndpointTransport {\n");
-    rust.push_str("    async fn unary<Req>(&self, _endpoint: EndpointLease, target: lattice_rpc::RouteTarget, metadata: tonic::metadata::MetadataMap, request: &Req) -> Result<tonic::Response<Req::Reply>, RpcError>\n");
+    rust.push_str("    async fn unary<Req>(&self, _endpoint: EndpointLease, target: lattice_rpc::RouteTarget, metadata: tonic::metadata::MetadataMap, request: Req) -> Result<tonic::Response<Req::Reply>, RpcError>\n");
     rust.push_str("    where\n        Req: RoutedRequest + RpcRequest,\n    {\n");
     rust.push_str("        match Req::METHOD {\n");
     for method in methods {
@@ -583,15 +623,22 @@ fn push_tonic_transport_method(rust: &mut String, method: &RpcMethodSpec) {
     let client_path = tonic_client_path(method);
     let suffix = method_fn_suffix(method);
     rust.push_str(&format!(
-        "    async fn call_{suffix}<Req>(&self, target: lattice_rpc::RouteTarget, metadata: tonic::metadata::MetadataMap, request: &Req) -> Result<tonic::Response<Req::Reply>, RpcError>\n",
+        "    async fn call_{suffix}<Req>(&self, target: lattice_rpc::RouteTarget, metadata: tonic::metadata::MetadataMap, request: Req) -> Result<tonic::Response<Req::Reply>, RpcError>\n",
     ));
     rust.push_str("    where\n        Req: RoutedRequest + RpcRequest,\n    {\n");
-    rust.push_str("        let typed_request = (request as &dyn std::any::Any)\n");
-    rust.push_str("            .downcast_ref::<");
+    rust.push_str(
+        "        let typed_request = (Box::new(request) as Box<dyn std::any::Any + Send + Sync>)\n",
+    );
+    rust.push_str("            .downcast::<");
     rust.push_str(&method.request_type);
     rust.push_str(">()\n");
-    rust.push_str("            .ok_or_else(|| RpcError::Business(format!(\"generated rpc method {} received unexpected request type {}\", Req::METHOD, std::any::type_name::<Req>())))?\n");
-    rust.push_str("            .clone();\n");
+    rust.push_str("            .map_err(|_| RpcError::Business(format!(\"generated rpc method {} received unexpected request type {}\", Req::METHOD, std::any::type_name::<Req>())))?;\n");
+    rust.push_str("        let typed_request = *typed_request;\n");
+    rust.push_str("        let request_id = lattice_rpc::RpcContext::from_metadata(&metadata)\n");
+    rust.push_str("            .map(|ctx| ctx.request_id)\n");
+    rust.push_str(
+        "            .unwrap_or_else(|_| lattice_core::RequestId::new(\"<missing>\"));\n",
+    );
     rust.push_str(
         "        let channel = self.channels.get_or_connect(&target.advertised_endpoint).await?;\n",
     );
@@ -605,7 +652,7 @@ fn push_tonic_transport_method(rust: &mut String, method: &RpcMethodSpec) {
         "        let typed_reply = client.{method_name}(typed_tonic_request).await\n",
         method_name = method_name
     ));
-    rust.push_str("            .map_err(lattice_rpc::client::tonic_status_to_rpc_error)?\n");
+    rust.push_str("            .map_err(|status| lattice_rpc::client::tonic_status_to_rpc_error_for_request(status, Req::METHOD, request_id))?\n");
     rust.push_str("            .into_inner();\n");
     rust.push_str(
         "        let reply = (Box::new(typed_reply) as Box<dyn std::any::Any + Send + Sync>)\n",

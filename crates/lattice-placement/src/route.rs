@@ -185,10 +185,17 @@ pub trait EndpointRpcTransport: Clone + Send + Sync + 'static {
         endpoint: EndpointLease,
         target: RouteTarget,
         metadata: tonic::metadata::MetadataMap,
-        request: &Req,
+        request: Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
         Req: RoutedRequest + RpcRequest;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RpcRetryPolicy {
+    Disabled,
+    #[default]
+    RouteCorrection,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +205,7 @@ pub struct ResolvingRpcCore<R, T> {
     endpoint_pool: EndpointPool,
     context_factory: RpcClientContextFactory,
     transport: T,
+    retry_policy: RpcRetryPolicy,
 }
 
 impl<R, T> ResolvingRpcCore<R, T> {
@@ -214,7 +222,13 @@ impl<R, T> ResolvingRpcCore<R, T> {
             endpoint_pool,
             context_factory,
             transport,
+            retry_policy: RpcRetryPolicy::default(),
         }
+    }
+
+    pub fn with_retry_policy(mut self, retry_policy: RpcRetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
     }
 }
 
@@ -255,7 +269,12 @@ where
                 "resolved rpc target"
             );
             let ctx = self.context_factory.next_context(target.owner_epoch);
-            match self.send_with_context(target, ctx.clone(), &req).await {
+            if self.retry_policy == RpcRetryPolicy::Disabled {
+                return self.send_with_context(target, ctx, req).await;
+            }
+
+            let retry_request = <Req as prost::Message>::encode_to_vec(&req);
+            match self.send_with_context(target, ctx.clone(), req).await {
                 Ok(reply) => Ok(reply),
                 Err(RpcError::NotOwner { .. }) => {
                     warn!(
@@ -283,7 +302,10 @@ where
                         );
                         let mut retry_ctx = ctx;
                         retry_ctx.route_epoch = retry_target.owner_epoch;
-                        self.send_with_context(retry_target, retry_ctx, &req).await
+                        let retry_req = <Req as prost::Message>::decode(retry_request.as_slice())
+                            .map_err(|error| RpcError::Business(error.to_string()))?;
+                        self.send_with_context(retry_target, retry_ctx, retry_req)
+                            .await
                     }
                     .instrument(retry_span)
                     .await
@@ -314,7 +336,10 @@ where
                         );
                         let mut retry_ctx = ctx;
                         retry_ctx.route_epoch = retry_target.owner_epoch;
-                        self.send_with_context(retry_target, retry_ctx, &req).await
+                        let retry_req = <Req as prost::Message>::decode(retry_request.as_slice())
+                            .map_err(|error| RpcError::Business(error.to_string()))?;
+                        self.send_with_context(retry_target, retry_ctx, retry_req)
+                            .await
                     }
                     .instrument(retry_span)
                     .await
@@ -350,7 +375,7 @@ where
         &self,
         target: RouteTarget,
         ctx: RpcContext,
-        req: &Req,
+        req: Req,
     ) -> Result<Req::Reply, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
@@ -456,7 +481,7 @@ where
         );
         let target = self.resolve_actor_ref_target(&actor_ref).await?;
         let ctx = self.context_factory.next_context(target.owner_epoch);
-        self.send_with_context(target, ctx, &req).await
+        self.send_with_context(target, ctx, req).await
     }
 }
 
@@ -498,7 +523,7 @@ where
         &self,
         target: RouteTarget,
         ctx: RpcContext,
-        req: &Req,
+        req: Req,
     ) -> Result<Req::Reply, RpcError>
     where
         Req: RoutedRequest + RpcRequest,

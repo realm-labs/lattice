@@ -60,6 +60,12 @@ fn generated_output_matches_phase_two_shape() {
     assert!(
         generated
             .rust
+            .contains("retry_policy: lattice_placement::RpcRetryPolicy")
+    );
+    assert!(generated.rust.contains(".with_retry_policy(retry_policy)"));
+    assert!(
+        generated
+            .rust
             .contains("impl<A, C> RpcServiceBinding for Binding<A, C>")
     );
     assert!(generated.rust.contains("pub struct ActorService<A: Actor>"));
@@ -75,6 +81,22 @@ fn generated_output_matches_phase_two_shape() {
             .rust
             .contains("self.security.peer_identity(&request)")
     );
+    assert!(generated.rust.contains("RequestDeduplicator"));
+    assert!(generated.rust.contains("request_dedup: true"));
+    assert!(
+        generated
+            .rust
+            .contains("pub fn request_dedup(mut self, enabled: bool) -> Self")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("pub fn with_request_dedup(mut self, enabled: bool) -> Self")
+    );
+    assert!(generated.rust.contains("if self.request_dedup"));
+    assert!(generated.rust.contains(
+        "unary_dedup_secure(forwarded, self.security.policy(), peer.as_ref(), &self.deduplicator)"
+    ));
     assert!(
         generated
             .rust
@@ -89,9 +111,25 @@ fn generated_output_matches_phase_two_shape() {
     assert!(
         generated
             .rust
-            .contains("downcast_ref::<crate::world::EnterWorldRequest>()")
+            .contains("downcast::<crate::world::EnterWorldRequest>()")
     );
     assert!(generated.rust.contains("downcast::<Req::Reply>()"));
+    assert!(!generated.rust.contains("#[allow(clippy::clone_on_copy)]"));
+    assert!(
+        !generated
+            .rust
+            .contains("downcast_ref::<crate::world::EnterWorldRequest>()")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("let request_id = lattice_rpc::RpcContext::from_metadata(&metadata)")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("tonic_status_to_rpc_error_for_request(status, Req::METHOD, request_id)")
+    );
     assert!(
         !generated
             .rust

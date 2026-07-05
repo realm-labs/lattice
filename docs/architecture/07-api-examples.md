@@ -98,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         .config_store(lattice_config_etcd::EtcdConfigStore::from_config())
         .telemetry(TelemetryConfig::from_config())
         .admin_http(AdminHttpConfig::from_config())
+        .rpc_retry_policy(RpcRetryPolicy::RouteCorrection)
         .register_actor(
             ActorRegistration::builder(WORLD_ACTOR)
                 .factory(WorldActorFactory::new(app.clone()))
@@ -117,6 +118,15 @@ async fn main() -> anyhow::Result<()> {
 `from_config()` reads the component section from the `BootstrapConfig` already loaded by `.config(...)` during `build()`. It does not read global static state.
 
 A process may register multiple actor kinds and multiple generated gRPC services while sharing one `advertised_endpoint`.
+
+Generated RPC service bindings enable the lightweight request-id duplicate guard by default. Disable it explicitly only for endpoints where duplicate delivery is acceptable or handled elsewhere:
+
+```rust
+.register_sharded_rpc(
+    generated::world_rpc::Binding::for_actor::<WorldActor>(WORLD_ACTOR)
+        .request_dedup(false),
+)
+```
 
 ---
 

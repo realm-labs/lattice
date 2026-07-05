@@ -310,7 +310,7 @@ impl EndpointRpcTransport for FakeEndpointTransport {
         _endpoint: EndpointLease,
         _target: lattice_rpc::RouteTarget,
         _metadata: tonic::metadata::MetadataMap,
-        _request: &Req,
+        _request: Req,
     ) -> Result<tonic::Response<Req::Reply>, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
@@ -343,14 +343,18 @@ impl RpcClientBinding for FakePlacementClientBinding {
     fn build_default_core(
         resolver: BoxRouteResolver,
         context_factory: RpcClientContextFactory,
+        retry_policy: lattice_placement::RpcRetryPolicy,
     ) -> Option<Self::Core> {
-        Some(ResolvingRpcCore::new(
-            service_kind!("World"),
-            resolver,
-            EndpointPool::new(),
-            context_factory,
-            FakeEndpointTransport,
-        ))
+        Some(
+            ResolvingRpcCore::new(
+                service_kind!("World"),
+                resolver,
+                EndpointPool::new(),
+                context_factory,
+                FakeEndpointTransport,
+            )
+            .with_retry_policy(retry_policy),
+        )
     }
 }
 
@@ -373,14 +377,18 @@ impl RpcClientBinding for FakeSingletonClientBinding {
     fn build_default_core(
         resolver: BoxRouteResolver,
         context_factory: RpcClientContextFactory,
+        retry_policy: lattice_placement::RpcRetryPolicy,
     ) -> Option<Self::Core> {
-        Some(ResolvingRpcCore::new(
-            service_kind!("World"),
-            resolver,
-            EndpointPool::new(),
-            context_factory,
-            FakeEndpointTransport,
-        ))
+        Some(
+            ResolvingRpcCore::new(
+                service_kind!("World"),
+                resolver,
+                EndpointPool::new(),
+                context_factory,
+                FakeEndpointTransport,
+            )
+            .with_retry_policy(retry_policy),
+        )
     }
 }
 

@@ -347,7 +347,7 @@ Not suitable for:
 
 ```text
 actor business state
-request_id dedup records
+request_id duplicate-guard records
 business event transaction logs
 high-frequency player state
 business data requiring complex queries or transactional consistency

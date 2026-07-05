@@ -48,7 +48,7 @@ fake tonic transport
 actor activation race
 NOT_OWNER retry
 FENCED retry
-request_id dedup
+request_id duplicate guard
 virtual shard routing
 explicit actor activation
 singleton failover
@@ -139,6 +139,8 @@ Status: `[x]` complete for static placement.
 - [x] `ResolvingRpcCore` performs owner resolution and direct owner calls.
 - [x] NOT_OWNER/FENCED invalidation and retry exist.
 - [x] Retry preserves the request id.
+- [x] Placement-backed RPC retry is configurable; disabled retry sends once without retaining a retry copy of the request body.
+- [x] Ambiguous transport/status failures are normalized to `RpcError::UnknownResult` and are not transparently retried.
 - [x] Static multi-instance routing is covered by tests/example code.
 
 #### Phase 4: Virtual Shard + Lazy Activation
@@ -613,7 +615,7 @@ NOT_OWNER, activation, and timeout issues are diagnosable.
 Actors can push to current client connections through GatewaySessionRef.
 Gateway push validates session_id and connection_epoch.
 Gateway supports per-principal/session rate limit by rate_class.
-State-changing RPCs have request_id dedup.
+Generated service adapters enable configurable lightweight request_id duplicate guards without reply replay caches.
 Cross actor/service workflows model pending/operation_id/retry/compensation/manual_required.
 Typed EventPublisher fills metadata automatically.
 LocalEventBus/NodeEvents handle same-node events in memory.
@@ -640,7 +642,7 @@ actor migration protocol
 scale out new instance assignment
 scale in drain before pod termination
 virtual shard rebalance throttling
-request_id dedup
+lightweight request_id duplicate guard
 business saga partial failure/idempotent retry example
 transactional outbox guidance example
 gateway session reconnect fencing

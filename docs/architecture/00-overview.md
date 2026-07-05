@@ -42,7 +42,7 @@ HA:
 
 Correctness:
   owner epoch and fencing prevent old owners from coming back.
-  request_id and dedup support idempotent retry.
+  request_id and lightweight duplicate guards prevent common duplicate delivery.
   NOT_OWNER repairs stale route caches.
 ```
 
@@ -164,6 +164,7 @@ EventBus carries asynchronous domain events, cross-service integration events, c
 Each mutable actor state has exactly one authoritative owner.
 Every owner change increments epoch.
 Every state-changing RPC carries a request_id.
+Request-id dedup is a lightweight in-memory duplicate guard; it does not store or replay replies.
 Route cache is an optimization only; NOT_OWNER always invalidates stale entries.
 Coordinator handles control plane only.
 Data-plane RPC connects directly to the owner.

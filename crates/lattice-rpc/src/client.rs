@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use http::Uri;
-use lattice_core::{ActorRef, Epoch};
+use lattice_core::{ActorRef, Epoch, RequestId};
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 use tracing::{debug, warn};
@@ -51,7 +51,11 @@ impl TonicEndpointChannelPool {
     }
 }
 
-pub fn tonic_status_to_rpc_error(status: Status) -> RpcError {
+pub fn tonic_status_to_rpc_error_for_request(
+    status: Status,
+    method: &'static str,
+    request_id: RequestId,
+) -> RpcError {
     if status.code() == tonic::Code::FailedPrecondition
         && (status.message().contains("owner") || status.message().contains("epoch"))
     {
@@ -59,6 +63,31 @@ pub fn tonic_status_to_rpc_error(status: Status) -> RpcError {
             current_epoch: Epoch(0),
         };
     }
+
+    if matches!(
+        status.code(),
+        tonic::Code::Cancelled
+            | tonic::Code::Unknown
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Unavailable
+    ) {
+        return RpcError::UnknownResult {
+            method,
+            request_id,
+            message: status.to_string(),
+        };
+    }
+
+    if status.code() == tonic::Code::AlreadyExists
+        && status.message().contains("duplicate request id")
+    {
+        return RpcError::UnknownResult {
+            method,
+            request_id,
+            message: status.to_string(),
+        };
+    }
+
     RpcError::Business(status.to_string())
 }
 

@@ -1,11 +1,13 @@
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use lattice_core::RequestId;
-use prost::Message as ProstMessage;
-use tonic::Status;
 
-use crate::RpcRequest;
+const DEFAULT_REQUEST_DEDUP_TTL: Duration = Duration::from_secs(120);
+const DEFAULT_REQUEST_DEDUP_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RequestDedupKey {
@@ -22,9 +24,23 @@ impl RequestDedupKey {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct RequestDeduplicator {
-    replies: Arc<DashMap<RequestDedupKey, Vec<u8>>>,
+    seen: Arc<DashMap<RequestDedupKey, Instant>>,
+    ttl: Duration,
+    sweep_interval: Duration,
+    last_sweep: Arc<Mutex<Instant>>,
+}
+
+impl Default for RequestDeduplicator {
+    fn default() -> Self {
+        Self {
+            seen: Arc::new(DashMap::new()),
+            ttl: DEFAULT_REQUEST_DEDUP_TTL,
+            sweep_interval: DEFAULT_REQUEST_DEDUP_SWEEP_INTERVAL,
+            last_sweep: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
 }
 
 impl RequestDeduplicator {
@@ -32,24 +48,55 @@ impl RequestDeduplicator {
         Self::default()
     }
 
-    pub fn get<Req>(&self, key: &RequestDedupKey) -> Result<Option<Req::Reply>, Status>
-    where
-        Req: RpcRequest,
-    {
-        self.replies
-            .get(key)
-            .map(|entry| {
-                Req::Reply::decode(entry.value().as_slice())
-                    .map_err(|error| Status::internal(error.to_string()))
-            })
-            .transpose()
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            sweep_interval: ttl.min(DEFAULT_REQUEST_DEDUP_SWEEP_INTERVAL),
+            ..Self::default()
+        }
     }
 
-    pub fn record<Reply>(&self, key: &RequestDedupKey, reply: &Reply) -> Result<(), Status>
-    where
-        Reply: prost::Message,
-    {
-        self.replies.insert(key.clone(), reply.encode_to_vec());
-        Ok(())
+    /// Reserves a request key for lightweight duplicate protection.
+    ///
+    /// This intentionally stores only the key. It does not cache or replay
+    /// business replies; duplicate callers must reconcile an unknown result.
+    pub fn begin(&self, key: &RequestDedupKey) -> bool {
+        let now = Instant::now();
+        self.sweep_expired(now);
+        match self.seen.entry(key.clone()) {
+            Entry::Occupied(mut entry) => {
+                if *entry.get() <= now {
+                    entry.insert(now + self.ttl);
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(now + self.ttl);
+                true
+            }
+        }
+    }
+
+    pub fn forget(&self, key: &RequestDedupKey) {
+        self.seen.remove(key);
+    }
+
+    pub fn contains(&self, key: &RequestDedupKey) -> bool {
+        self.seen
+            .get(key)
+            .is_some_and(|expires_at| *expires_at > Instant::now())
+    }
+
+    fn sweep_expired(&self, now: Instant) {
+        let Ok(mut last_sweep) = self.last_sweep.try_lock() else {
+            return;
+        };
+        if now.duration_since(*last_sweep) < self.sweep_interval {
+            return;
+        }
+        self.seen.retain(|_, expires_at| *expires_at > now);
+        *last_sweep = now;
     }
 }

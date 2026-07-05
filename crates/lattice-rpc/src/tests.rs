@@ -1,4 +1,4 @@
-use crate::dedup::RequestDeduplicator;
+use crate::dedup::{RequestDedupKey, RequestDeduplicator};
 use crate::metadata::RpcMetadataError;
 use crate::security::{
     MtlsConfig, PeerIdentity, RpcSecurityError, RpcSecurityPolicy, RpcServerSecurity,
@@ -6,6 +6,7 @@ use crate::security::{
 use crate::server::{RpcServerBuildError, RpcServerBuilder};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use http::Uri;
@@ -269,7 +270,11 @@ async fn generated_typed_client_wrapper_delegates_to_rpc_core() {
 fn tonic_failed_precondition_owner_epoch_maps_to_fenced_retry() {
     let status = tonic::Status::failed_precondition("singleton route epoch mismatch");
 
-    let error = client::tonic_status_to_rpc_error(status);
+    let error = client::tonic_status_to_rpc_error_for_request(
+        status,
+        EnterWorldRequest::METHOD,
+        RequestId::new("req-1"),
+    );
 
     assert_eq!(
         error,
@@ -277,6 +282,90 @@ fn tonic_failed_precondition_owner_epoch_maps_to_fenced_retry() {
             current_epoch: Epoch(0)
         }
     );
+}
+
+#[test]
+fn tonic_unavailable_maps_to_unknown_result_with_request_id() {
+    let status = tonic::Status::unavailable("connection closed before response");
+
+    let error = client::tonic_status_to_rpc_error_for_request(
+        status,
+        EnterWorldRequest::METHOD,
+        RequestId::new("req-2"),
+    );
+
+    match error {
+        RpcError::UnknownResult {
+            method,
+            request_id,
+            message,
+        } => {
+            assert_eq!(method, EnterWorldRequest::METHOD);
+            assert_eq!(request_id, RequestId::new("req-2"));
+            assert!(message.contains("connection closed before response"));
+        }
+        other => panic!("expected unknown result, got {other:?}"),
+    }
+}
+
+#[test]
+fn tonic_deadline_exceeded_maps_to_unknown_result() {
+    let status = tonic::Status::deadline_exceeded("deadline elapsed");
+
+    let error = client::tonic_status_to_rpc_error_for_request(
+        status,
+        EnterWorldRequest::METHOD,
+        RequestId::new("req-3"),
+    );
+
+    assert!(matches!(
+        error,
+        RpcError::UnknownResult {
+            method: EnterWorldRequest::METHOD,
+            request_id,
+            ..
+        } if request_id == RequestId::new("req-3")
+    ));
+}
+
+#[test]
+fn duplicate_request_id_status_maps_to_unknown_result() {
+    let status = tonic::Status::already_exists("duplicate request id");
+
+    let error = client::tonic_status_to_rpc_error_for_request(
+        status,
+        EnterWorldRequest::METHOD,
+        RequestId::new("req-4"),
+    );
+
+    assert!(matches!(
+        error,
+        RpcError::UnknownResult {
+            method: EnterWorldRequest::METHOD,
+            request_id,
+            ..
+        } if request_id == RequestId::new("req-4")
+    ));
+}
+
+#[test]
+fn request_deduplicator_rejects_duplicate_key() {
+    let deduplicator = RequestDeduplicator::new();
+    let key = RequestDedupKey::new(EnterWorldRequest::METHOD, &RequestId::new("req-dedup"));
+
+    assert!(deduplicator.begin(&key));
+    assert!(!deduplicator.begin(&key));
+    assert!(deduplicator.contains(&key));
+}
+
+#[test]
+fn request_deduplicator_ttl_expiry_allows_reuse_without_sleep() {
+    let deduplicator = RequestDeduplicator::with_ttl(Duration::ZERO);
+    let key = RequestDedupKey::new(EnterWorldRequest::METHOD, &RequestId::new("req-expired"));
+
+    assert!(deduplicator.begin(&key));
+    assert!(!deduplicator.contains(&key));
+    assert!(deduplicator.begin(&key));
 }
 
 #[tokio::test]
@@ -344,7 +433,7 @@ async fn actor_rpc_adapter_rejects_stale_route_epoch_before_handler() {
 }
 
 #[tokio::test]
-async fn actor_rpc_adapter_replays_duplicate_request_id_without_reentering_handler() {
+async fn actor_rpc_adapter_rejects_duplicate_request_id_without_reentering_handler() {
     let runtime = ActorRuntime::default();
     let calls = Arc::new(AtomicUsize::new(0));
     let handle = runtime
@@ -372,14 +461,13 @@ async fn actor_rpc_adapter_replays_duplicate_request_id_without_reentering_handl
         .await
         .unwrap()
         .into_inner();
-    let duplicate_reply = adapter
+    let duplicate_status = adapter
         .unary_dedup(duplicate, &deduplicator)
         .await
-        .unwrap()
-        .into_inner();
+        .unwrap_err();
 
     assert!(first_reply.ok);
-    assert!(duplicate_reply.ok);
+    assert_eq!(duplicate_status.code(), tonic::Code::AlreadyExists);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 

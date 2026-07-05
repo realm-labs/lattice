@@ -1,4 +1,4 @@
-use lattice_core::Epoch;
+use lattice_core::{Epoch, RequestId};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RpcError {
@@ -12,8 +12,12 @@ pub enum RpcError {
     ActorUnavailable,
     #[error("mailbox is full")]
     MailboxFull,
-    #[error("rpc timed out; result may be unknown")]
-    TimeoutUnknown,
+    #[error("rpc result is unknown for {method} request {request_id}: {message}")]
+    UnknownResult {
+        method: &'static str,
+        request_id: RequestId,
+        message: String,
+    },
     #[error("business error: {0}")]
     Business(String),
 }

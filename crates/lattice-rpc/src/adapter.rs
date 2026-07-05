@@ -72,6 +72,18 @@ impl<A: Actor> ActorRpcAdapter<A> {
         A: Handler<Rpc<Req>>,
         Req: RoutedRequest + RpcRequest,
     {
+        self.dispatch_raw(req, ctx).await.map_err(actor_call_status)
+    }
+
+    async fn dispatch_raw<Req>(
+        &self,
+        req: Req,
+        ctx: RpcContext,
+    ) -> Result<Response<Req::Reply>, ActorCallError>
+    where
+        A: Handler<Rpc<Req>>,
+        Req: RoutedRequest + RpcRequest,
+    {
         let actor_kind = req.actor_kind();
         let route_key = req.route_key();
         let span = tracing::info_span!(
@@ -101,7 +113,7 @@ impl<A: Actor> ActorRpcAdapter<A> {
                         %error,
                         "actor failed to handle rpc request"
                     );
-                    Err(actor_call_status(error))
+                    Err(error)
                 }
             }
         }
@@ -120,14 +132,51 @@ impl<A: Actor> ActorRpcAdapter<A> {
     {
         let ctx = RpcContext::from_metadata(request.metadata()).map_err(metadata_status)?;
         self.validate_owner_epoch(&ctx)?;
+        self.dispatch_dedup(request, ctx, deduplicator).await
+    }
+
+    pub async fn unary_dedup_secure<Req>(
+        &self,
+        request: Request<Req>,
+        policy: &RpcSecurityPolicy,
+        peer: Option<&PeerIdentity>,
+        deduplicator: &RequestDeduplicator,
+    ) -> Result<Response<Req::Reply>, Status>
+    where
+        A: Handler<Rpc<Req>>,
+        Req: RoutedRequest + RpcRequest,
+    {
+        let ctx = RpcContext::from_metadata(request.metadata()).map_err(metadata_status)?;
+        self.validate_owner_epoch(&ctx)?;
+        policy.validate(&ctx, peer).map_err(security_status)?;
+        self.dispatch_dedup(request, ctx, deduplicator).await
+    }
+
+    async fn dispatch_dedup<Req>(
+        &self,
+        request: Request<Req>,
+        ctx: RpcContext,
+        deduplicator: &RequestDeduplicator,
+    ) -> Result<Response<Req::Reply>, Status>
+    where
+        A: Handler<Rpc<Req>>,
+        Req: RoutedRequest + RpcRequest,
+    {
         let key = RequestDedupKey::new(Req::METHOD, &ctx.request_id);
-        if let Some(reply) = deduplicator.get::<Req>(&key)? {
-            return Ok(Response::new(reply));
+        if !deduplicator.begin(&key) {
+            return Err(Status::already_exists("duplicate request id"));
         }
 
-        let response = self.unary(request).await?;
-        deduplicator.record(&key, response.get_ref())?;
-        Ok(response)
+        let req = request.into_inner();
+        match self.dispatch_raw(req, ctx).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                if should_release_dedup_key(&error) {
+                    deduplicator.forget(&key);
+                }
+                Err(actor_call_status(error))
+            }
+        }
     }
 
     fn validate_owner_epoch(&self, ctx: &RpcContext) -> Result<(), Status> {
@@ -138,6 +187,13 @@ impl<A: Actor> ActorRpcAdapter<A> {
         }
         Ok(())
     }
+}
+
+fn should_release_dedup_key(error: &ActorCallError) -> bool {
+    matches!(
+        error,
+        ActorCallError::MailboxFull | ActorCallError::MailboxClosed
+    )
 }
 
 fn actor_call_status(error: ActorCallError) -> Status {

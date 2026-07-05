@@ -12,6 +12,7 @@ use lattice_eventbus::{EventBus, LocalEventBus};
 use lattice_ops::admin::{AdminHttpAdapter, AdminSnapshot, ClusterSummary};
 use lattice_ops::{AdminHttpConfig, ServiceScheduler};
 use lattice_placement::coordinator::{PlacementWatchStarter, PlacementWatchTask};
+use lattice_placement::route::RpcRetryPolicy;
 use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix, PlacementStore};
 use lattice_rpc::{RpcClientContextFactory, RpcSecurityPolicy, RpcServerSecurity};
 use tokio::net::TcpListener;
@@ -50,6 +51,7 @@ pub struct LatticeServiceBuilder {
     config_store: Option<Box<dyn ErasedServiceComponent>>,
     admin_http: Option<AdminHttpConfig>,
     rpc_security: RpcServerSecurity,
+    rpc_retry_policy: RpcRetryPolicy,
     placement_watchers: Vec<Box<dyn ErasedPlacementWatchStarter>>,
     duplicate_framework_component: Option<&'static str>,
     duplicate_extension: Option<&'static str>,
@@ -81,6 +83,7 @@ impl fmt::Debug for LatticeServiceBuilder {
             .field("has_config_store", &self.config_store.is_some())
             .field("has_admin_http", &self.admin_http.is_some())
             .field("rpc_security", &self.rpc_security)
+            .field("rpc_retry_policy", &self.rpc_retry_policy)
             .field("placement_watch_count", &self.placement_watchers.len())
             .field("extension_count", &self.extensions.len())
             .finish()
@@ -105,6 +108,7 @@ impl LatticeServiceBuilder {
             config_store: None,
             admin_http: None,
             rpc_security: RpcServerSecurity::disabled(),
+            rpc_retry_policy: RpcRetryPolicy::default(),
             placement_watchers: Vec::new(),
             duplicate_framework_component: None,
             duplicate_extension: None,
@@ -220,6 +224,11 @@ impl LatticeServiceBuilder {
 
     pub fn rpc_security(mut self, policy: RpcSecurityPolicy) -> Self {
         self.rpc_security = RpcServerSecurity::new(policy);
+        self
+    }
+
+    pub fn rpc_retry_policy(mut self, policy: RpcRetryPolicy) -> Self {
+        self.rpc_retry_policy = policy;
         self
     }
 
@@ -411,6 +420,7 @@ impl LatticeServiceBuilder {
                 &mut service_context,
                 Some(default_resolver),
                 context_factory,
+                self.rpc_retry_policy,
             )?;
         }
         let service_context = service_context.build();

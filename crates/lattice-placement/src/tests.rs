@@ -18,7 +18,7 @@ use crate::error::PlacementError;
 use crate::instance::{InMemoryInstanceRegistry, InstanceRecord, InstanceRegistry, InstanceState};
 use crate::route::{
     EndpointRpcTransport, InvalidateReason, ResolveRequest, ResolvingActorRefRpcCore,
-    ResolvingRpcCore, RouteCacheKey, RouteResolver, VirtualShardRouteTable,
+    ResolvingRpcCore, RouteCacheKey, RouteResolver, RpcRetryPolicy, VirtualShardRouteTable,
 };
 use crate::static_resolver::{StaticPlacementConfig, StaticRouteRange, StaticRouteResolver};
 use crate::store::{
@@ -107,7 +107,7 @@ impl EndpointRpcTransport for OkTransport {
         endpoint: EndpointLease,
         target: RouteTarget,
         metadata: tonic::metadata::MetadataMap,
-        _request: &Req,
+        _request: Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
@@ -131,7 +131,7 @@ impl EndpointRpcTransport for NotOwnerThenOkTransport {
         endpoint: EndpointLease,
         target: RouteTarget,
         metadata: tonic::metadata::MetadataMap,
-        _request: &Req,
+        _request: Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
@@ -629,6 +629,38 @@ async fn resolving_rpc_core_invalidates_not_owner_and_retries_same_request_id() 
     assert_eq!(attempts[1].route_epoch, Some(Epoch(2)));
     assert_eq!(attempts[0].instance_id, InstanceId::new("world-a"));
     assert_eq!(attempts[1].instance_id, InstanceId::new("world-b"));
+}
+
+#[tokio::test]
+async fn resolving_rpc_core_can_disable_not_owner_retry() {
+    let resolver = SequencedResolver {
+        targets: Arc::new(Mutex::new(VecDeque::from([
+            route_target("world-a", 1),
+            route_target("world-b", 2),
+        ]))),
+        resolves: Arc::new(AtomicU64::new(0)),
+        invalidations: Arc::new(Mutex::new(Vec::new())),
+    };
+    let transport = NotOwnerThenOkTransport::default();
+    let attempts = transport.attempts.clone();
+    let core = ResolvingRpcCore::new(
+        service_kind!("World"),
+        resolver.clone(),
+        EndpointPool::new(),
+        RpcClientContextFactory::new(service_kind!("Player"), InstanceId::new("player-0")),
+        transport,
+    )
+    .with_retry_policy(RpcRetryPolicy::Disabled);
+
+    let error = core
+        .call(EnterWorldRequest { world_id: 7 })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, RpcError::NotOwner { .. }));
+    assert_eq!(resolver.resolves.load(Ordering::SeqCst), 1);
+    assert!(resolver.invalidations.lock().unwrap().is_empty());
+    assert_eq!(attempts.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

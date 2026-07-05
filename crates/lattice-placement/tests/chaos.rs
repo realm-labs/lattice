@@ -625,7 +625,7 @@ impl EndpointRpcTransport for LongSingletonJobTransport {
         _endpoint: EndpointLease,
         target: RouteTarget,
         metadata: tonic::metadata::MetadataMap,
-        _request: &Req,
+        _request: Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
@@ -685,7 +685,7 @@ impl EndpointRpcTransport for FencingStoreTransport {
         _endpoint: EndpointLease,
         target: RouteTarget,
         metadata: tonic::metadata::MetadataMap,
-        _request: &Req,
+        _request: Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
