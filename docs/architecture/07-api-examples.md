@@ -119,6 +119,31 @@ async fn main() -> anyhow::Result<()> {
 
 A process may register multiple actor kinds and multiple generated gRPC services while sharing one `advertised_endpoint`.
 
+The default command path is generated gRPC RPC. High-frequency transient data should use an explicit direct actor link instead of pretending to be normal RPC:
+
+```rust
+let link = ctx
+    .links()
+    .connect(
+        battle_actor_ref,
+        DirectLinkOptions {
+            reconnect: ReconnectPolicy::BusinessOwned,
+            backpressure: BackpressurePolicy::DropOldest { max_pending: 1024 },
+        },
+    )
+    .await?;
+
+link.tell(PositionUpdate {
+    entity_id,
+    x,
+    y,
+    tick,
+})
+.await?;
+```
+
+Direct actor links are for high-rate data streams with weaker semantics. Commands that need owner routing, fencing, retry, dedup, or a definitive reply should stay on generated RPC clients.
+
 Generated RPC service bindings enable the lightweight request-id duplicate guard by default. Disable it explicitly only for endpoints where duplicate delivery is acceptable or handled elsewhere:
 
 ```rust

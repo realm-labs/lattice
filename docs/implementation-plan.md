@@ -57,6 +57,10 @@ migration
 gateway rate limit
 eventbus local/cluster publish subscribe
 node graceful shutdown
+direct-link open/close
+direct-link unidirectional delivery
+direct-link bidirectional delivery
+direct-link backpressure
 ```
 
 ### 1.3 Chaos Tests
@@ -74,6 +78,9 @@ rolling update with mixed versions
 route cache hits stale owner
 EventBus subscriber duplicate delivery
 NodeInspect partial result
+Direct Link peer disconnect during send
+Direct Link unsupported message after open
+Direct Link target actor passivation during stream
 ```
 
 ---
@@ -88,6 +95,7 @@ Phase 1 Actor Runtime
   -> Phase 5 Explicit Placement + Coordinator
   -> Phase 6 Cluster Singleton
   -> Phase 7 Ops Production Features
+  -> Phase 8 Direct Actor Link
 ```
 
 ### 2.1 Current Progress Tracker
@@ -240,6 +248,32 @@ Status: `[x]` complete.
 - [x] EventBus subscriber duplicate delivery is covered by `durable_subscriber_deduplicates_duplicate_event_delivery_by_event_id`.
 - [x] `crates/lattice-actor/src/tests.rs` no longer exceeds 1200 LOC (843 lines at audit) and actor coverage is split across focused integration tests for execution policies, lifecycle, lazy activation, registry, passivation chaos, timers, and state machines.
 - [x] `crates/lattice-service/src/tests.rs` exceeds 1200 LOC and has a module-level rationale for its crate-private service lifecycle coverage.
+
+#### Phase 8: Direct Actor Link
+
+Status: `[ ]` not started.
+
+- [ ] Direct Link public API exists: `DirectLinkStream`, `DirectLinkMode::{Unidirectional, Bidirectional}`, `ActorContext::links()`, `connect`, `connect_bidirectional`, `get::<S>`, `close_all`, `tell`, `try_tell`, and directional `close`.
+- [ ] `lattice-codegen` emits `DirectLinkMessage` metadata for generated protobuf messages without requiring per-message proto options.
+- [ ] Typed stream binding validates at compile time that the target actor implements `Handler<Linked<T>>` for every message in the stream.
+- [ ] Direct-link message ids are generated deterministically from stream name plus protobuf full name, with explicit Rust-side manual id override for compatibility.
+- [ ] `lattice-direct-link` crate exists with transport-independent frame codec, message catalog, stream binding, session manager, and metrics/tracing hooks.
+- [ ] TCP direct-link transport exists as the default implementation behind `DirectLinkTransport` / `DirectLinkConnection`.
+- [ ] Direct Link listener is managed by `LatticeService`, publishes direct-link endpoint metadata, and shuts down/drains with the service lifecycle.
+- [ ] OpenLink handshake validates service/actor identity, stream binding, accepted message ids, activation policy, owner epoch, auth, and backpressure policy before creating sessions.
+- [ ] Invalid OpenLink requests reject with explicit reasons: `NotOwner`, `Fenced`, `ActorUnavailable`, `UnsupportedStream`, `UnsupportedMessageType`, `Unauthorized`, `Overloaded`, or `ProtocolVersionMismatch`.
+- [ ] Message frame validation rejects unknown link ids, wrong direction, unsupported message ids, decode errors, invalid sequence, and non-activatable target actors before mailbox delivery.
+- [ ] Unidirectional links deliver fire-and-forget `Linked<T>` messages through actor mailbox without executing handlers on socket tasks.
+- [ ] Bidirectional links are modeled as two logical unidirectional sessions over one underlying connection, with separate streams, message ids, sequence numbers, and backpressure state.
+- [ ] The initiator receives the source-to-target send handle from `connect_bidirectional`.
+- [ ] The target actor receives `LinkOpened` and can obtain the target-to-source send handle through `ctx.links().get::<S>(link_id)`.
+- [ ] Directional close and whole-link close are implemented and emit `LinkDirectionClosed` / `LinkClosed` exactly once per observed transition.
+- [ ] Backpressure policies are implemented: `Block`, `FailFast`, `DropNewest`, `DropOldest`, `Coalesce`, and `Disconnect`.
+- [ ] Heartbeat, heartbeat timeout, protocol error, node draining, target passivation/migration, and backpressure disconnect close links with structured reasons.
+- [ ] Security hooks cover internal bind policy, peer identity/auth, source service/actor authorization, max frame size, connection limit, link limit, and rate limit.
+- [ ] Observability emits link open/close/send/receive/drop/coalesce/backpressure/decode-error metrics and sampled tracing without per-message spans by default.
+- [ ] Direct Link benchmark exists for TCP single-process, local multi-process, and payload/backpressure matrices.
+- [ ] Architecture/API examples document when to use gRPC RPC versus Direct Actor Link and show unidirectional and bidirectional flows.
 
 ### Phase 1: Single-Node Actor Runtime
 
@@ -666,6 +700,109 @@ watch target owner crash synthesized notification
 chaos test suite
 ```
 
+### Phase 8: Direct Actor Link
+
+Goal: add a high-throughput actor-to-actor stream capability for fire-and-forget traffic that does not need owner-routed gRPC command semantics.
+
+Direct Actor Link complements gRPC RPC. It does not replace generated gRPC clients, placement-backed routing, request/reply, request_id dedup, route epoch fencing, or UnknownResult handling.
+
+Deliverables:
+
+```text
+lattice-core direct-link ids, modes, options, close reasons, lifecycle messages, Linked<T>, and DirectLinkMessage metadata trait
+lattice-codegen DirectLinkMessage metadata generation for protobuf messages
+lattice-direct-link crate with frame codec, message descriptors, stream binding, session manager, and transport abstraction
+DirectLinkTransport and DirectLinkConnection traits
+TCP DirectLinkTransport implementation
+DirectLinkStream typed builder using real Rust message types
+DirectLinkActorBinding and service registration API
+ActorContext::links() manager API
+connect for unidirectional links
+connect_bidirectional for two directional sessions over one connection
+ctx.links().get::<S>(link_id) for target-side reverse handles
+DirectLink::tell / try_tell / close
+ctx.links().close_all(link_id, reason)
+OpenLink / OpenLinkAck / OpenLinkReject handshake
+source_to_target and target_to_source directional session negotiation
+stream/message validation before session creation
+message frame validation before mailbox delivery
+LinkOpened / LinkDirectionClosed / LinkClosed / LinkBackpressure / LinkProtocolError handlers
+backpressure policies: Block, FailFast, DropNewest, DropOldest, Coalesce, Disconnect
+heartbeat and heartbeat timeout
+structured close reasons
+security policy hooks
+metrics and sampled tracing
+Direct Link benchmark cases
+```
+
+Acceptance:
+
+```text
+Business protobuf messages remain ordinary messages and do not need direct-link proto options.
+build.rs remains normal proto compilation and does not require string-based direct-link message lists.
+DirectLinkStream is composed in application Rust code with real generated Rust message types.
+Default direct-link ids are stable across nodes compiled from the same protobuf schema.
+Manual Rust-side id override exists for compatibility and cross-language protocols.
+Binding a stream to an actor fails to compile if the actor lacks Handler<Linked<T>> for any stream message.
+Service build rejects duplicate stream names, duplicate message ids, duplicate actor stream bindings, missing actor registrations, and unsupported message types.
+OpenLink rejects wrong actor kind/id, unsupported stream, unsupported message id, unauthorized source, overloaded target, and stale/not-owner targets before creating sessions.
+Invalid message frames never reach actor mailboxes and never fall back to dynamic handlers.
+Unidirectional link close produces LinkDirectionClosed and then LinkClosed when no direction remains.
+Bidirectional link close of one direction keeps the opposite direction usable.
+Whole-link close closes every direction and invalidates all send handles.
+Target actor can obtain the reverse send handle after LinkOpened for bidirectional links.
+Actor passivation, node drain, heartbeat timeout, auth failure, protocol error, and backpressure disconnect close links with clear reasons.
+Socket tasks never execute business handlers directly.
+Actor stop/passivation cleans up owned direct-link handles and sessions.
+TCP is the only required first transport.
+Transport adapter boundary is explicit so QUIC/UDP profiles can be added later without changing actor handlers.
+UDP-based future profiles must explicitly declare weaker reliability/ordering semantics and cannot silently weaken TCP semantics.
+Metrics and tracing provide enough visibility for throughput, close reasons, drops, coalescing, decode errors, and backpressure.
+gRPC remains the standard logic-service command path.
+```
+
+Suggested tests:
+
+```text
+DirectLinkMessage metadata generated for prost messages
+DirectLinkStream stable id generation
+manual id override
+duplicate id rejection
+duplicate stream binding rejection
+actor missing Handler<Linked<T>> compile-fail test
+service build fails for binding without registered actor kind
+OpenLink success
+OpenLink reject wrong actor kind/id
+OpenLink reject UnsupportedStream
+OpenLink reject UnsupportedMessageType
+OpenLink reject Unauthorized
+OpenLink reject Overloaded
+unidirectional fire-and-forget delivery to Handler<Linked<T>>
+bidirectional connect returns source-to-target handle
+target actor obtains target-to-source handle from LinkOpened
+same stream bound to two actor types requires both actors to handle all messages
+different streams per direction deliver only direction-specific messages
+message frame wrong direction closes link with ProtocolError
+unknown message id after open closes link with ProtocolError
+decode error closes link with ProtocolError
+ordering for one directional session
+Block backpressure waits
+FailFast backpressure returns error
+DropNewest drops current message and increments metrics
+DropOldest drops old pending message and increments metrics
+Coalesce replaces pending message by key
+Disconnect closes link on overflow
+heartbeat timeout closes whole link
+directional close keeps opposite direction open
+whole-link close closes both directions
+LinkDirectionClosed delivered once
+LinkClosed delivered once
+actor passivation closes links
+service drain closes links before shutdown completes
+TCP transport round trip
+direct-link benchmark smoke
+```
+
 ---
 
 ## 3. Minimal Runnable Example Shape
@@ -870,6 +1007,10 @@ Pre-implementation checks:
 [x] local child actor does not write placement and stops with parent lifecycle.
 [x] actor/service scheduler is explicitly non-durable and lost on restart.
 [x] metrics/trace/admin APIs are sufficient for production diagnosis.
+[ ] Direct Actor Link is implemented as a separate high-throughput actor stream capability, not as a gRPC transport replacement.
+[ ] Direct Actor Link supports TCP unidirectional and bidirectional streams with typed `Linked<T>` actor handlers.
+[ ] Direct Actor Link stream binding uses real Rust message types and compile-time handler checks.
+[ ] Direct Actor Link lifecycle, close semantics, backpressure, validation, security, and observability match architecture/02-rpc.md.
 ```
 
 ---
@@ -973,13 +1114,13 @@ Each phase can exit only when all items are true:
 The whole goal can be marked complete only when:
 
 ```text
-[x] Phase 1 through Phase 7 are complete.
-[x] This file's global acceptance checklist is fully satisfied.
+[ ] Phase 1 through Phase 8 are complete.
+[ ] This file's global acceptance checklist is fully satisfied.
 [x] architecture/00-overview.md system boundaries and module responsibilities are implemented.
 [x] architecture/01-actor-runtime.md actor runtime capabilities are implemented and tested.
 [x] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, KeyedWorkerPool, and DedicatedThreadPool.
 [x] UnsupportedExecutionPolicy is used only for invalid configuration, not for planned policies in the completed framework.
-[x] architecture/02-rpc.md typed RPC, metadata, codegen, and gateway decode/forward are implemented and tested.
+[ ] architecture/02-rpc.md typed RPC, metadata, codegen, gateway decode/forward, and Direct Actor Link are implemented and tested.
 [x] architecture/03-placement.md placement, scale, drain, shutdown, crash, and watch are implemented and tested.
 [x] architecture/04-eventbus-scheduler-config.md event bus, scheduler, and config are implemented and tested.
 [x] architecture/05-gateway-ops.md gateway, rate limit, admin, telemetry, and inspection are implemented and tested.
@@ -1031,6 +1172,7 @@ v0.3: Phase 4, virtual shard and lazy activation
 v0.4: Phase 5, etcd PlacementStore and Coordinator
 v0.5: Phase 6, Cluster Singleton
 v0.6: Phase 7, production ops features
+v0.7: Phase 8, Direct Actor Link
 ```
 
 Before every version release, update:
