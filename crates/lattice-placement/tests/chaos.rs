@@ -13,6 +13,7 @@ use lattice_placement::etcd::{
     EtcdKv, EtcdPlacementStore, EtcdValue, EtcdWatch, InMemoryEtcdClient,
 };
 use lattice_placement::instance::{InstanceRecord, InstanceState};
+use lattice_placement::singleton::{SingletonCoordinator, SingletonRouteResolver};
 use lattice_placement::store::{
     ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
     PlacementState, PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
@@ -25,6 +26,7 @@ use lattice_rpc::{
     RouteTarget, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError, RpcRequest,
     ShardedRpcCore,
 };
+use tokio::sync::Semaphore;
 use tonic::Response;
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -52,6 +54,33 @@ impl RoutedRequest for EnterWorldRequest {
 impl RpcRequest for EnterWorldRequest {
     type Reply = EnterWorldReply;
     const METHOD: &'static str = "world.WorldRpc/EnterWorld";
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct SingletonTickRequest {
+    #[prost(string, tag = "1")]
+    scope: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct SingletonTickReply {
+    #[prost(bool, tag = "1")]
+    ok: bool,
+}
+
+impl RoutedRequest for SingletonTickRequest {
+    fn actor_kind(&self) -> ActorKind {
+        actor_kind!("SeasonManager")
+    }
+
+    fn route_key(&self) -> RouteKey {
+        RouteKey::Str(self.scope.clone())
+    }
+}
+
+impl RpcRequest for SingletonTickRequest {
+    type Reply = SingletonTickReply;
+    const METHOD: &'static str = "world.SeasonRpc/Tick";
 }
 
 #[tokio::test]
@@ -336,6 +365,71 @@ async fn partial_placement_write_failure_can_be_retried_to_complete_failover() {
     assert_eq!(second_after_retry.epoch, Epoch(2));
 }
 
+#[tokio::test]
+async fn singleton_failover_during_long_job_fences_old_owner_and_retries() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/chaos-singleton-job"));
+    store
+        .upsert_instance(instance_record("world-a", InstanceState::Ready))
+        .await
+        .unwrap();
+    store
+        .upsert_instance(instance_record("world-b", InstanceState::Ready))
+        .await
+        .unwrap();
+    let singleton_key = SingletonKey {
+        service_kind: service_kind!("World"),
+        singleton_kind: actor_kind!("SeasonManager"),
+        scope: "global".to_string(),
+    };
+    store
+        .compare_and_put_singleton(
+            singleton_key.clone(),
+            None,
+            singleton_record("global", "world-a", 5, LeaseId(11)),
+        )
+        .await
+        .unwrap();
+    let singleton_coordinator =
+        SingletonCoordinator::new(service_kind!("World"), store.clone(), NoopLogicControl);
+    let resolver = SingletonRouteResolver::new(singleton_coordinator, Default::default());
+    let transport = LongSingletonJobTransport::new(store.clone(), singleton_key);
+    let calls = transport.calls.clone();
+    let core = ResolvingRpcCore::new(
+        service_kind!("World"),
+        resolver,
+        EndpointPool::new(),
+        RpcClientContextFactory::new(service_kind!("Player"), InstanceId::new("player-0")),
+        transport.clone(),
+    );
+    let call = tokio::spawn(async move {
+        core.call(SingletonTickRequest {
+            scope: "global".to_string(),
+        })
+        .await
+    });
+
+    transport
+        .first_call_entered
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
+    PlacementCoordinator::new(store.clone(), NoopLogicControl)
+        .failover_expired_instance(service_kind!("World"), InstanceId::new("world-a"))
+        .await
+        .unwrap();
+    transport.release_first_call.add_permits(1);
+    call.await.unwrap().unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].target_instance, InstanceId::new("world-a"));
+    assert_eq!(calls[0].route_epoch, Some(Epoch(5)));
+    assert_eq!(calls[1].target_instance, InstanceId::new("world-b"));
+    assert_eq!(calls[1].route_epoch, Some(Epoch(6)));
+    assert_eq!(calls[0].request_id, calls[1].request_id);
+}
+
 #[derive(Debug, Clone)]
 struct FlakyEtcdClient {
     inner: InMemoryEtcdClient,
@@ -431,6 +525,70 @@ struct FencingStoreTransport {
     store: InMemoryPlacementStore,
     key: ActorPlacementKey,
     calls: Arc<Mutex<Vec<ObservedCall>>>,
+}
+
+#[derive(Clone)]
+struct LongSingletonJobTransport {
+    store: InMemoryPlacementStore,
+    key: SingletonKey,
+    first_call_entered: Arc<Semaphore>,
+    release_first_call: Arc<Semaphore>,
+    calls: Arc<Mutex<Vec<ObservedCall>>>,
+}
+
+impl LongSingletonJobTransport {
+    fn new(store: InMemoryPlacementStore, key: SingletonKey) -> Self {
+        Self {
+            store,
+            key,
+            first_call_entered: Arc::new(Semaphore::new(0)),
+            release_first_call: Arc::new(Semaphore::new(0)),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl EndpointRpcTransport for LongSingletonJobTransport {
+    async fn unary<Req>(
+        &self,
+        _endpoint: EndpointLease,
+        target: RouteTarget,
+        metadata: tonic::metadata::MetadataMap,
+        _request: &Req,
+    ) -> Result<Response<Req::Reply>, RpcError>
+    where
+        Req: RoutedRequest + RpcRequest,
+    {
+        let ctx = RpcContext::from_metadata(&metadata)
+            .map_err(|error| RpcError::Business(error.to_string()))?;
+        let call_index = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(ObservedCall {
+                target_instance: target.instance_id.clone(),
+                route_epoch: ctx.route_epoch,
+                request_id: ctx.request_id.as_str().to_string(),
+            });
+            calls.len()
+        };
+        if call_index == 1 {
+            self.first_call_entered.add_permits(1);
+            self.release_first_call.acquire().await.unwrap().forget();
+        }
+        let current = self
+            .store
+            .get_singleton(&self.key)
+            .await
+            .map_err(|error| RpcError::Business(error.to_string()))?
+            .map(|(_, record)| record)
+            .ok_or_else(|| RpcError::Business("missing singleton owner".to_string()))?;
+        if target.instance_id != current.owner || ctx.route_epoch != Some(current.epoch) {
+            return Err(RpcError::Fenced {
+                current_epoch: current.epoch,
+            });
+        }
+        Ok(Response::new(Req::Reply::default()))
+    }
 }
 
 impl FencingStoreTransport {
