@@ -25,8 +25,11 @@ pub async fn run_player_service(
     if let Some(ready) = ready {
         builder = builder.ready_signal(ready);
     }
-    let actor_ref_client =
-        ActorRefRpcClient::new(actor_ref_core(PLAYER_SERVICE, InstanceId::new("player-1")));
+    let actor_ref_client = ActorRefRpcClient::new(actor_ref_core(
+        PLAYER_SERVICE,
+        InstanceId::new("player-1"),
+        placement_store.clone(),
+    ));
 
     builder
         .placement_store::<InMemoryPlacementStore, _>(placement_store)

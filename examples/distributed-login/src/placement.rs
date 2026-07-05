@@ -2,7 +2,6 @@ use lattice_core::InstanceId;
 use lattice_placement::cache::RouteCacheConfig;
 use lattice_placement::control::TonicLogicControl;
 use lattice_placement::coordinator::{PlacementCoordinator, PlacementRouteResolver};
-use lattice_placement::static_resolver::{StaticPlacementConfig, StaticRouteResolver};
 use lattice_placement::{
     EndpointPool, InMemoryPlacementStore, ResolvingActorRefRpcCore, ResolvingRpcCore,
 };
@@ -15,8 +14,10 @@ pub type DemoRpcCore = ResolvingRpcCore<
     PlacementRouteResolver<InMemoryPlacementStore, TonicLogicControl>,
     GeneratedTonicEndpointTransport,
 >;
-pub type DemoActorRefRpcCore =
-    ResolvingActorRefRpcCore<StaticRouteResolver, GeneratedTonicEndpointTransport>;
+pub type DemoActorRefRpcCore = ResolvingActorRefRpcCore<
+    PlacementRouteResolver<InMemoryPlacementStore, TonicLogicControl>,
+    GeneratedTonicEndpointTransport,
+>;
 
 pub fn local_placement_store() -> InMemoryPlacementStore {
     InMemoryPlacementStore::new(lattice_placement::PlacementPrefix::new(
@@ -35,10 +36,14 @@ pub fn player_core(store: InMemoryPlacementStore, source_instance: InstanceId) -
 pub fn actor_ref_core(
     source_service: lattice_core::ServiceKind,
     source_instance: InstanceId,
+    store: InMemoryPlacementStore,
 ) -> DemoActorRefRpcCore {
+    let coordinator = PlacementCoordinator::new(store.clone(), TonicLogicControl);
     DemoActorRefRpcCore::new(
-        StaticRouteResolver::new(
-            StaticPlacementConfig { ranges: Vec::new() },
+        PlacementRouteResolver::new(
+            GATEWAY_SERVICE,
+            store,
+            coordinator,
             RouteCacheConfig::default(),
         ),
         EndpointPool::new(),

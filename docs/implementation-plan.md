@@ -163,7 +163,7 @@ Status: `[x]` complete.
 
 #### Phase 5: Explicit Placement + Coordinator
 
-Status: `[ ]` incomplete.
+Status: `[x]` complete.
 
 - [x] `PlacementStore` trait exists.
 - [x] In-memory placement store exists.
@@ -185,7 +185,7 @@ Status: `[ ]` incomplete.
 - [x] Placement watch is wired into route cache invalidation in running services.
 - [x] Crash handling has a lease-expiry reconciliation loop that observes missing/dead instance records and invokes coordinator failover automatically for actors and singletons.
 - [x] The runnable coordinator waits and re-campaigns as a standby when leadership is held instead of exiting immediately.
-- [ ] Examples still include static-resolver/demo-specific paths and should be moved to placement-backed defaults where appropriate.
+- [x] Examples use placement-backed defaults where appropriate; distributed-login actor-ref messaging no longer constructs an empty static resolver, and minimal-world runs through placement-backed generated clients.
 
 #### Phase 6: Cluster Singleton
 
