@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use lattice_core::{
-    ActorKind, ActorRef, BackpressurePolicy, DirectLinkMessageId, DirectLinkMode,
-    DirectLinkOptions, DirectLinkSession, DirectLinkStreamDescriptor, LinkCloseReason,
-    LinkDirection, LinkError, LinkId, LinkSequence,
+    ActorKind, ActorRef, ActorRefTarget, BackpressurePolicy, DirectLinkMessageId, DirectLinkMode,
+    DirectLinkOptions, DirectLinkSession, DirectLinkStreamDescriptor, Epoch, LinkCloseReason,
+    LinkDirection, LinkError, LinkId, LinkSequence, ServiceKind,
 };
 use thiserror::Error;
 
@@ -118,6 +118,8 @@ pub struct DirectLinkSessionManager {
     sessions: Mutex<BTreeMap<LinkId, DirectLinkSession>>,
     links: Mutex<BTreeMap<LinkId, ManagedLink>>,
     bindings: Mutex<HashMap<(ActorKind, String), DirectLinkStreamDescriptor>>,
+    actors: Mutex<HashMap<ActorKind, DirectLinkActorPolicy>>,
+    validation: Mutex<OpenLinkValidationPolicy>,
     metrics: DirectLinkMetrics,
 }
 
@@ -162,6 +164,11 @@ impl DirectLinkSessionManager {
             });
         }
         let key = (actor_kind, stream.stream_name.clone());
+        self.actors
+            .lock()
+            .expect("direct link actor policies poisoned")
+            .entry(key.0.clone())
+            .or_default();
         let replaced = self
             .bindings
             .lock()
@@ -177,6 +184,20 @@ impl DirectLinkSessionManager {
         Ok(())
     }
 
+    pub fn register_actor(&self, actor_kind: ActorKind, policy: DirectLinkActorPolicy) {
+        self.actors
+            .lock()
+            .expect("direct link actor policies poisoned")
+            .insert(actor_kind, policy);
+    }
+
+    pub fn set_validation_policy(&self, policy: OpenLinkValidationPolicy) {
+        *self
+            .validation
+            .lock()
+            .expect("direct link validation policy poisoned") = policy;
+    }
+
     pub fn open_link(&self, request: OpenLinkRequest) -> Result<OpenLinkAck, OpenLinkReject> {
         if request.protocol_version != DIRECT_LINK_PROTOCOL_VERSION {
             return Err(OpenLinkReject::new(
@@ -184,6 +205,7 @@ impl DirectLinkSessionManager {
                 OpenLinkRejectReason::ProtocolVersionMismatch,
             ));
         }
+        self.validate_open_request(&request)?;
         let source_to_target = self.negotiate_direction(
             &request.target.actor_kind,
             request.source_to_target.clone(),
@@ -470,6 +492,82 @@ impl DirectLinkSessionManager {
             closed: false,
         })
     }
+
+    fn validate_open_request(&self, request: &OpenLinkRequest) -> Result<(), OpenLinkReject> {
+        let validation = self
+            .validation
+            .lock()
+            .expect("direct link validation policy poisoned")
+            .clone();
+        if let Some(hosted_service) = &validation.hosted_service
+            && &request.target.service_kind != hosted_service
+        {
+            return Err(OpenLinkReject::new(
+                request.link_id.clone(),
+                OpenLinkRejectReason::NotOwner,
+            ));
+        }
+        if !validation.accepting_links {
+            return Err(OpenLinkReject::new(
+                request.link_id.clone(),
+                OpenLinkRejectReason::Overloaded,
+            ));
+        }
+        if !validation
+            .auth_policy
+            .authorizes(&request.source.service_kind)
+        {
+            return Err(OpenLinkReject::new(
+                request.link_id.clone(),
+                OpenLinkRejectReason::Unauthorized,
+            ));
+        }
+        if validation
+            .max_frame_size
+            .is_some_and(|max| request.options.max_frame_size > max)
+        {
+            return Err(OpenLinkReject::new(
+                request.link_id.clone(),
+                OpenLinkRejectReason::Overloaded,
+            ));
+        }
+        if validation
+            .max_pending
+            .is_some_and(|max| request.options.backpressure.max_pending() > max)
+        {
+            return Err(OpenLinkReject::new(
+                request.link_id.clone(),
+                OpenLinkRejectReason::Overloaded,
+            ));
+        }
+
+        let actors = self
+            .actors
+            .lock()
+            .expect("direct link actor policies poisoned");
+        let target_policy = actors.get(&request.target.actor_kind).ok_or_else(|| {
+            OpenLinkReject::new(
+                request.link_id.clone(),
+                OpenLinkRejectReason::ActorUnavailable,
+            )
+        })?;
+        target_policy.validate_target(request)?;
+        if matches!(request.mode, DirectLinkMode::Bidirectional) {
+            let source_policy = actors.get(&request.source.actor_kind).ok_or_else(|| {
+                OpenLinkReject::new(
+                    request.link_id.clone(),
+                    OpenLinkRejectReason::ActorUnavailable,
+                )
+            })?;
+            if !source_policy.active {
+                return Err(OpenLinkReject::new(
+                    request.link_id.clone(),
+                    OpenLinkRejectReason::ActorUnavailable,
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub const DIRECT_LINK_PROTOCOL_VERSION: u16 = 1;
@@ -484,6 +582,134 @@ pub struct OpenLinkRequest {
     pub source_to_target: OpenLinkDirection,
     pub target_to_source: Option<OpenLinkDirection>,
     pub options: DirectLinkOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenLinkValidationPolicy {
+    pub hosted_service: Option<ServiceKind>,
+    pub accepting_links: bool,
+    pub auth_policy: DirectLinkAuthPolicy,
+    pub max_frame_size: Option<usize>,
+    pub max_pending: Option<usize>,
+}
+
+impl OpenLinkValidationPolicy {
+    pub fn hosted(service_kind: ServiceKind) -> Self {
+        Self {
+            hosted_service: Some(service_kind),
+            ..Self::default()
+        }
+    }
+
+    pub fn authorize_sources(mut self, sources: impl IntoIterator<Item = ServiceKind>) -> Self {
+        self.auth_policy = DirectLinkAuthPolicy::AllowServices(sources.into_iter().collect());
+        self
+    }
+
+    pub fn accepting_links(mut self, accepting_links: bool) -> Self {
+        self.accepting_links = accepting_links;
+        self
+    }
+
+    pub fn max_frame_size(mut self, max_frame_size: usize) -> Self {
+        self.max_frame_size = Some(max_frame_size);
+        self
+    }
+
+    pub fn max_pending(mut self, max_pending: usize) -> Self {
+        self.max_pending = Some(max_pending);
+        self
+    }
+}
+
+impl Default for OpenLinkValidationPolicy {
+    fn default() -> Self {
+        Self {
+            hosted_service: None,
+            accepting_links: true,
+            auth_policy: DirectLinkAuthPolicy::AllowAll,
+            max_frame_size: None,
+            max_pending: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectLinkAuthPolicy {
+    AllowAll,
+    AllowServices(HashSet<ServiceKind>),
+}
+
+impl DirectLinkAuthPolicy {
+    fn authorizes(&self, source: &ServiceKind) -> bool {
+        match self {
+            Self::AllowAll => true,
+            Self::AllowServices(allowed) => allowed.contains(source),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectLinkActivationPolicy {
+    ExistingOnly,
+    AllowLazyActivation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectLinkActorPolicy {
+    pub activation: DirectLinkActivationPolicy,
+    pub active: bool,
+    pub owner_epoch: Option<Epoch>,
+}
+
+impl DirectLinkActorPolicy {
+    pub fn active(owner_epoch: Option<Epoch>) -> Self {
+        Self {
+            activation: DirectLinkActivationPolicy::ExistingOnly,
+            active: true,
+            owner_epoch,
+        }
+    }
+
+    pub fn lazy(owner_epoch: Option<Epoch>) -> Self {
+        Self {
+            activation: DirectLinkActivationPolicy::AllowLazyActivation,
+            active: false,
+            owner_epoch,
+        }
+    }
+
+    fn validate_target(&self, request: &OpenLinkRequest) -> Result<(), OpenLinkReject> {
+        if !self.active && self.activation == DirectLinkActivationPolicy::ExistingOnly {
+            return Err(OpenLinkReject::new(
+                request.link_id.clone(),
+                OpenLinkRejectReason::ActorUnavailable,
+            ));
+        }
+        if let Some(current_epoch) = self.owner_epoch
+            && let ActorRefTarget::Direct {
+                owner_epoch: Some(request_epoch),
+                ..
+            } = &request.target.target
+            && *request_epoch != current_epoch
+        {
+            return Err(OpenLinkReject::new(
+                request.link_id.clone(),
+                OpenLinkRejectReason::Fenced,
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for DirectLinkActorPolicy {
+    fn default() -> Self {
+        Self {
+            activation: DirectLinkActivationPolicy::AllowLazyActivation,
+            active: true,
+            owner_epoch: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -629,14 +855,13 @@ pub enum MessageFrameError {
         actual: LinkSequence,
     },
 }
-
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
     use http::Uri;
     use lattice_core::{
-        ActorId, DirectLinkMessageDescriptor, DirectLinkMessageId, InstanceId, ServiceKind,
+        ActorId, DirectLinkMessageDescriptor, DirectLinkMessageId, Epoch, InstanceId, ServiceKind,
         actor_kind, service_kind,
     };
 
@@ -702,11 +927,29 @@ mod tests {
     }
 
     #[test]
-    fn open_link_rejects_unsupported_stream_and_message() {
+    fn open_link_rejects_unavailable_actor_unsupported_stream_and_message() {
         let manager = DirectLinkSessionManager::new();
         let requested_stream = stream("movement", &[1]);
         let link_id = LinkId::new("link-1");
 
+        let reject = manager
+            .open_link(OpenLinkRequest {
+                protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                link_id: link_id.clone(),
+                source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+                target: actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9),
+                mode: DirectLinkMode::Unidirectional,
+                source_to_target: OpenLinkDirection::from_stream(
+                    link_id.clone(),
+                    &requested_stream,
+                ),
+                target_to_source: None,
+                options: DirectLinkOptions::default(),
+            })
+            .unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::ActorUnavailable);
+
+        manager.register_actor(actor_kind!("Battle"), DirectLinkActorPolicy::default());
         let reject = manager
             .open_link(OpenLinkRequest {
                 protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
@@ -744,6 +987,72 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(reject.reason, OpenLinkRejectReason::UnsupportedMessageType);
+    }
+
+    #[test]
+    fn open_link_validates_service_auth_epoch_activation_and_backpressure() {
+        let stream = stream("movement", &[1]);
+
+        let protocol = configured_manager(&stream);
+        let mut request = open_request(&stream);
+        request.protocol_version = DIRECT_LINK_PROTOCOL_VERSION + 1;
+        let reject = protocol.open_link(request).unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::ProtocolVersionMismatch);
+
+        let wrong_service = configured_manager(&stream);
+        let mut request = open_request(&stream);
+        request.target.service_kind = service_kind!("Wrong");
+        let reject = wrong_service.open_link(request).unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::NotOwner);
+
+        let unauthorized = configured_manager(&stream);
+        let mut request = open_request(&stream);
+        request.source.service_kind = service_kind!("Intruder");
+        let reject = unauthorized.open_link(request).unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::Unauthorized);
+
+        let overloaded = configured_manager(&stream);
+        overloaded.set_validation_policy(
+            OpenLinkValidationPolicy::hosted(service_kind!("Battle"))
+                .authorize_sources([service_kind!("Gateway")])
+                .max_pending(4)
+                .max_frame_size(128),
+        );
+        let mut request = open_request(&stream);
+        request.options.backpressure = BackpressurePolicy::DropOldest { max_pending: 8 };
+        let reject = overloaded.open_link(request).unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::Overloaded);
+
+        let fenced = configured_manager(&stream);
+        fenced.register_actor(
+            actor_kind!("Battle"),
+            DirectLinkActorPolicy::active(Some(Epoch(2))),
+        );
+        let mut request = open_request(&stream);
+        request.target = actor_ref_with_epoch(
+            service_kind!("Battle"),
+            actor_kind!("Battle"),
+            9,
+            Some(Epoch(1)),
+        );
+        let reject = fenced.open_link(request).unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::Fenced);
+
+        let inactive = configured_manager(&stream);
+        inactive.register_actor(
+            actor_kind!("Battle"),
+            DirectLinkActorPolicy {
+                activation: DirectLinkActivationPolicy::ExistingOnly,
+                active: false,
+                owner_epoch: None,
+            },
+        );
+        let reject = inactive.open_link(open_request(&stream)).unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::ActorUnavailable);
+
+        let lazy = configured_manager(&stream);
+        lazy.register_actor(actor_kind!("Battle"), DirectLinkActorPolicy::lazy(None));
+        assert!(lazy.open_link(open_request(&stream)).is_ok());
     }
 
     #[test]
@@ -840,14 +1149,52 @@ mod tests {
         }
     }
 
+    fn configured_manager(stream: &DirectLinkStreamDescriptor) -> DirectLinkSessionManager {
+        let manager = DirectLinkSessionManager::new();
+        manager.set_validation_policy(
+            OpenLinkValidationPolicy::hosted(service_kind!("Battle"))
+                .authorize_sources([service_kind!("Gateway")])
+                .max_pending(1024)
+                .max_frame_size(256 * 1024),
+        );
+        manager.register_actor(actor_kind!("Battle"), DirectLinkActorPolicy::active(None));
+        manager
+            .register_binding(actor_kind!("Battle"), stream.clone())
+            .unwrap();
+        manager
+    }
+
+    fn open_request(stream: &DirectLinkStreamDescriptor) -> OpenLinkRequest {
+        let link_id = LinkId::new("link-policy");
+        OpenLinkRequest {
+            protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+            link_id: link_id.clone(),
+            source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+            target: actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9),
+            mode: DirectLinkMode::Unidirectional,
+            source_to_target: OpenLinkDirection::from_stream(link_id, stream),
+            target_to_source: None,
+            options: DirectLinkOptions::default(),
+        }
+    }
+
     fn actor_ref(service_kind: ServiceKind, actor_kind: ActorKind, id: u64) -> ActorRef {
+        actor_ref_with_epoch(service_kind, actor_kind, id, None)
+    }
+
+    fn actor_ref_with_epoch(
+        service_kind: ServiceKind,
+        actor_kind: ActorKind,
+        id: u64,
+        owner_epoch: Option<Epoch>,
+    ) -> ActorRef {
         ActorRef::direct(
             service_kind,
             actor_kind,
             ActorId::U64(id),
             InstanceId::new(format!("instance-{id}")),
             Uri::from_str("http://127.0.0.1:10000").unwrap(),
-            None,
+            owner_epoch,
         )
     }
 }
