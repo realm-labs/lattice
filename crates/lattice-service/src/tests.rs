@@ -32,7 +32,8 @@ use lattice_placement::{
     ResolvingRpcCore, RouteResolver,
 };
 use lattice_rpc::{RoutedRequest, RpcClientContextFactory, RpcError, RpcRequest, ShardedRpcCore};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tonic::body::Body;
 use tonic::codegen::Service;
@@ -41,8 +42,8 @@ use tonic::server::NamedService;
 use crate::actor::ErasedActorRegistration;
 use crate::context::ServiceBuildContext;
 use crate::{
-    ActorRegistration, LatticeService, LatticeServiceError, RpcClientBinding, RpcClientPlacement,
-    RpcServiceBinding, ServiceContextExt,
+    ActorRegistration, AdminHttpConfig, LatticeService, LatticeServiceError, RpcClientBinding,
+    RpcClientPlacement, RpcServiceBinding, ServiceContextExt,
 };
 
 #[derive(Clone)]
@@ -738,6 +739,58 @@ async fn service_context_scheduler_stops_on_shutdown() {
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     assert_eq!(ticks.load(Ordering::SeqCst), ticks_after_shutdown);
+}
+
+#[tokio::test]
+async fn service_starts_admin_http_as_managed_listener() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = admin_probe.local_addr().unwrap();
+    drop(admin_probe);
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .admin_http(AdminHttpConfig {
+            bind: Some(admin_addr),
+            bearer_token: None,
+        })
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+
+    let mut stream = TcpStream::connect(admin_addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET /admin/cluster/summary HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("\"instance_count\":0"));
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

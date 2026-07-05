@@ -9,7 +9,8 @@ use lattice_config::{BootstrapConfig, ConfigSource};
 use lattice_config::{ConfigStore, LocalConfigStore};
 use lattice_core::{ActorKind, InstanceId, ServiceContext, ServiceKind};
 use lattice_eventbus::{EventBus, LocalEventBus};
-use lattice_ops::ServiceScheduler;
+use lattice_ops::admin::{AdminHttpAdapter, AdminSnapshot, ClusterSummary};
+use lattice_ops::{AdminHttpConfig, ServiceScheduler};
 use lattice_placement::coordinator::{PlacementWatchStarter, PlacementWatchTask};
 use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix, PlacementStore};
 use lattice_rpc::RpcClientContextFactory;
@@ -29,6 +30,7 @@ use crate::context::ServiceBuildContext;
 use crate::control::ServiceLogicControlHandler;
 use crate::framework::ServiceSchedulerComponent;
 use crate::rpc::{ErasedRpcClientBinding, RpcClientPlacement, RpcClientRegistration};
+use crate::service::AdminHttpServer;
 use crate::service::LatticeServiceParts;
 use crate::{LatticeService, LatticeServiceError, RpcClientBinding, RpcServiceBinding};
 
@@ -46,6 +48,7 @@ pub struct LatticeServiceBuilder {
     cluster_event_bus: Option<Box<dyn ErasedServiceComponent>>,
     local_event_bus: Option<Box<dyn ErasedServiceComponent>>,
     config_store: Option<Box<dyn ErasedServiceComponent>>,
+    admin_http: Option<AdminHttpConfig>,
     placement_watchers: Vec<Box<dyn ErasedPlacementWatchStarter>>,
     duplicate_framework_component: Option<&'static str>,
     duplicate_extension: Option<&'static str>,
@@ -75,6 +78,7 @@ impl fmt::Debug for LatticeServiceBuilder {
             .field("has_cluster_event_bus", &self.cluster_event_bus.is_some())
             .field("has_local_event_bus", &self.local_event_bus.is_some())
             .field("has_config_store", &self.config_store.is_some())
+            .field("has_admin_http", &self.admin_http.is_some())
             .field("placement_watch_count", &self.placement_watchers.len())
             .field("extension_count", &self.extensions.len())
             .finish()
@@ -97,6 +101,7 @@ impl LatticeServiceBuilder {
             cluster_event_bus: None,
             local_event_bus: None,
             config_store: None,
+            admin_http: None,
             placement_watchers: Vec::new(),
             duplicate_framework_component: None,
             duplicate_extension: None,
@@ -205,6 +210,11 @@ impl LatticeServiceBuilder {
         self
     }
 
+    pub fn admin_http(mut self, config: AdminHttpConfig) -> Self {
+        self.admin_http = Some(config);
+        self
+    }
+
     pub fn extension<T, C>(mut self, extension: C) -> Self
     where
         T: Send + Sync + 'static,
@@ -286,6 +296,7 @@ impl LatticeServiceBuilder {
         }
         let mut service_context =
             ServiceContext::builder(self.service_kind.clone(), instance.instance_id.clone());
+        let admin_http = build_admin_http(self.admin_http).await?;
         let placement_watchers = self.placement_watchers;
         let placement_store = build_placement_store_or_default(
             self.placement_store,
@@ -453,10 +464,32 @@ impl LatticeServiceBuilder {
             service_context,
             placement_store,
             placement_watch_tasks,
+            admin_http,
             instance_lease_keepalive_interval: self.instance_lease_keepalive_interval,
             ready: self.ready,
         }))
     }
+}
+
+async fn build_admin_http(
+    config: Option<AdminHttpConfig>,
+) -> Result<Option<AdminHttpServer>, LatticeServiceError> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let bind = config
+        .bind
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+    let listener = TcpListener::bind(bind).await?;
+    let snapshot = AdminSnapshot::new(
+        ClusterSummary {
+            instance_count: 0,
+            actor_owner_count: 0,
+        },
+        Vec::new(),
+    );
+    let router = AdminHttpAdapter::new(config.build_auth(), snapshot).router();
+    Ok(Some(AdminHttpServer { listener, router }))
 }
 
 #[async_trait::async_trait]

@@ -19,7 +19,7 @@ pub use framework::{
     ServiceSchedulerComponent,
 };
 pub use lattice_core::ServiceContext;
-pub use lattice_ops::ServiceScheduler;
+pub use lattice_ops::{AdminHttpConfig, ServiceScheduler};
 pub use rpc::{RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
 pub use service::LatticeService;
 

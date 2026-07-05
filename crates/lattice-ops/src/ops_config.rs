@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use lattice_core::{InstanceId, ServiceKind};
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +70,8 @@ fn default_otlp_timeout_millis() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminHttpConfig {
     #[serde(default)]
+    pub bind: Option<SocketAddr>,
+    #[serde(default)]
     pub bearer_token: Option<String>,
 }
 
@@ -90,6 +94,7 @@ mod tests {
     #[test]
     fn admin_http_config_builds_auth_policy() {
         let auth = AdminHttpConfig {
+            bind: None,
             bearer_token: Some("secret".to_string()),
         }
         .build_auth();

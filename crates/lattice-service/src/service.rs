@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
+use axum::Router as AxumRouter;
 use lattice_core::instance::InstanceCapacity;
 use lattice_core::{ServiceContext, ServiceKind};
 use lattice_placement::coordinator::PlacementWatchTask;
@@ -30,6 +31,7 @@ pub struct LatticeService {
     service_context: ServiceContext,
     placement_store: Box<dyn ErasedPlacementStore>,
     placement_watch_tasks: Vec<PlacementWatchTask>,
+    admin_http: Option<AdminHttpServer>,
     instance_lease_keepalive_interval: Duration,
     ready: Option<oneshot::Sender<SocketAddr>>,
 }
@@ -48,6 +50,7 @@ impl LatticeService {
             service_context: parts.service_context,
             placement_store: parts.placement_store,
             placement_watch_tasks: parts.placement_watch_tasks,
+            admin_http: parts.admin_http,
             instance_lease_keepalive_interval: parts.instance_lease_keepalive_interval,
             ready: parts.ready,
         }
@@ -85,6 +88,7 @@ impl LatticeService {
             service_context,
             placement_store,
             placement_watch_tasks,
+            admin_http,
             instance_lease_keepalive_interval,
             ready,
         } = self;
@@ -122,6 +126,7 @@ impl LatticeService {
         );
 
         let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel::<()>();
+        let (admin_shutdown_tx, admin_task) = start_admin_http_server(admin_http);
         let keepalive = async {
             loop {
                 tokio::time::sleep(instance_lease_keepalive_interval).await;
@@ -151,6 +156,9 @@ impl LatticeService {
             );
             shutdown_service_scheduler(&service_context).await;
             let _ = server_shutdown_tx.send(());
+            if let Some(admin_shutdown_tx) = admin_shutdown_tx {
+                let _ = admin_shutdown_tx.send(());
+            }
             result
         };
         tokio::pin!(keepalive);
@@ -187,6 +195,17 @@ impl LatticeService {
 
         match serve_result {
             Ok(()) => {
+                if let Some(admin_task) = admin_task {
+                    match admin_task.await {
+                        Ok(result) => result?,
+                        Err(error) => {
+                            return Err(LatticeServiceError::ComponentBuild {
+                                slot: "admin_http".to_string(),
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                }
                 publish_instance_record(
                     placement_store.as_ref(),
                     &service_kind,
@@ -219,6 +238,31 @@ impl LatticeService {
 enum ServiceExit {
     Server(Result<(), tonic::transport::Error>),
     Keepalive(Result<(), LatticeServiceError>),
+}
+
+type AdminShutdownSignal = oneshot::Sender<()>;
+type AdminHttpTask = tokio::task::JoinHandle<Result<(), LatticeServiceError>>;
+
+fn start_admin_http_server(
+    admin_http: Option<AdminHttpServer>,
+) -> (Option<AdminShutdownSignal>, Option<AdminHttpTask>) {
+    let Some(admin_http) = admin_http else {
+        return (None, None);
+    };
+    let local_addr = admin_http.listener.local_addr().ok();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        if let Some(local_addr) = local_addr {
+            info!(%local_addr, "lattice admin http listening");
+        }
+        axum::serve(admin_http.listener, admin_http.router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .map_err(LatticeServiceError::from)
+    });
+    (Some(shutdown_tx), Some(task))
 }
 
 async fn cancel_event_subscriptions(service_context: &ServiceContext) -> usize {
@@ -273,8 +317,15 @@ pub(crate) struct LatticeServiceParts {
     pub service_context: ServiceContext,
     pub placement_store: Box<dyn ErasedPlacementStore>,
     pub placement_watch_tasks: Vec<PlacementWatchTask>,
+    pub admin_http: Option<AdminHttpServer>,
     pub instance_lease_keepalive_interval: Duration,
     pub ready: Option<oneshot::Sender<SocketAddr>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AdminHttpServer {
+    pub listener: TcpListener,
+    pub router: AxumRouter,
 }
 
 fn socket_addr_to_uri(addr: SocketAddr) -> http::Uri {
