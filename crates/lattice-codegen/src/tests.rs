@@ -110,12 +110,22 @@ fn generated_output_matches_phase_two_shape() {
     );
     assert!(generated.rust.contains("if self.request_dedup"));
     assert!(generated.rust.contains(
-        "unary_dedup_secure(forwarded, self.security.policy(), peer.as_ref(), &self.deduplicator)"
+        "lattice_rpc::adapter::dispatch_actor_rpc_dedup(handle, req, ctx, &self.deduplicator)"
     ));
     assert!(
         generated
             .rust
-            .contains("unary_secure(forwarded, self.security.policy(), peer.as_ref())")
+            .contains("lattice_rpc::adapter::dispatch_actor_rpc(handle, req, ctx)")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("self.security.validate_context(&ctx, peer.as_ref())?")
+    );
+    assert!(
+        !generated
+            .rust
+            .contains("let mut forwarded = tonic::Request::new(req);")
     );
     assert!(
         generated

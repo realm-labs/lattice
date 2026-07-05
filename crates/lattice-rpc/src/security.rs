@@ -294,6 +294,14 @@ impl RpcServerSecurity {
         &self.policy
     }
 
+    pub fn validate_context(
+        &self,
+        ctx: &RpcContext,
+        peer: Option<&PeerIdentity>,
+    ) -> Result<(), Status> {
+        self.policy.validate(ctx, peer).map_err(security_status)
+    }
+
     pub fn peer_identity<T>(&self, request: &Request<T>) -> Option<PeerIdentity> {
         request
             .extensions()

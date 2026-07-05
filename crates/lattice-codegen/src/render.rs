@@ -442,8 +442,9 @@ fn push_registry_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     rust.push_str("        }\n\n");
     rust.push_str("        async fn unary<Req>(&self, request: tonic::Request<Req>) -> Result<tonic::Response<Req::Reply>, tonic::Status>\n");
     rust.push_str("        where\n            A: Handler<Rpc<Req>>,\n            Req: RoutedRequest + RpcRequest,\n        {\n");
-    rust.push_str("            let metadata = request.metadata().clone();\n");
     rust.push_str("            let peer = self.security.peer_identity(&request);\n");
+    rust.push_str("            let ctx = RpcContext::from_metadata(request.metadata()).map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;\n");
+    rust.push_str("            self.security.validate_context(&ctx, peer.as_ref())?;\n");
     rust.push_str("            let req = request.into_inner();\n");
     rust.push_str("            let actor_id = actor_id_from_route_key(req.route_key());\n");
     rust.push_str("            let handle = self\n");
@@ -453,13 +454,12 @@ fn push_registry_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     rust.push_str(
         "                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;\n",
     );
-    rust.push_str("            let mut forwarded = tonic::Request::new(req);\n");
-    rust.push_str("            *forwarded.metadata_mut() = metadata;\n");
-    rust.push_str("            let adapter = ActorRpcAdapter::new(handle);\n");
     rust.push_str("            if self.request_dedup {\n");
-    rust.push_str("                adapter.unary_dedup_secure(forwarded, self.security.policy(), peer.as_ref(), &self.deduplicator).await\n");
+    rust.push_str("                lattice_rpc::adapter::dispatch_actor_rpc_dedup(handle, req, ctx, &self.deduplicator).await\n");
     rust.push_str("            } else {\n");
-    rust.push_str("                adapter.unary_secure(forwarded, self.security.policy(), peer.as_ref()).await\n");
+    rust.push_str(
+        "                lattice_rpc::adapter::dispatch_actor_rpc(handle, req, ctx).await\n",
+    );
     rust.push_str("            }\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
@@ -515,9 +515,9 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
     rust.push_str("        }\n\n");
     rust.push_str("        async fn unary<Req>(&self, request: tonic::Request<Req>) -> Result<tonic::Response<Req::Reply>, tonic::Status>\n");
     rust.push_str("        where\n            A: Handler<Rpc<Req>>,\n            Req: RoutedRequest + RpcRequest,\n        {\n");
-    rust.push_str("            let metadata = request.metadata().clone();\n");
     rust.push_str("            let peer = self.security.peer_identity(&request);\n");
-    rust.push_str("            let ctx = RpcContext::from_metadata(&metadata).map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;\n");
+    rust.push_str("            let ctx = RpcContext::from_metadata(request.metadata()).map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;\n");
+    rust.push_str("            self.security.validate_context(&ctx, peer.as_ref())?;\n");
     rust.push_str("            let req = request.into_inner();\n");
     rust.push_str("            let route_key = req.route_key();\n");
     rust.push_str("            let actor_id = actor_id_from_route_key(route_key.clone());\n");
@@ -552,15 +552,12 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
     rust.push_str(
         "                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;\n",
     );
-    rust.push_str("            let mut forwarded = tonic::Request::new(req);\n");
-    rust.push_str("            *forwarded.metadata_mut() = metadata;\n");
-    rust.push_str(
-        "            let adapter = ActorRpcAdapter::new(handle).with_owner_epoch(record.epoch);\n",
-    );
     rust.push_str("            if self.request_dedup {\n");
-    rust.push_str("                adapter.unary_dedup_secure(forwarded, self.security.policy(), peer.as_ref(), &self.deduplicator).await\n");
+    rust.push_str("                lattice_rpc::adapter::dispatch_actor_rpc_dedup(handle, req, ctx, &self.deduplicator).await\n");
     rust.push_str("            } else {\n");
-    rust.push_str("                adapter.unary_secure(forwarded, self.security.policy(), peer.as_ref()).await\n");
+    rust.push_str(
+        "                lattice_rpc::adapter::dispatch_actor_rpc(handle, req, ctx).await\n",
+    );
     rust.push_str("            }\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
