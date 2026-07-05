@@ -5,7 +5,7 @@ pub mod stream;
 pub mod transport;
 
 pub use codec::{DirectLinkFrame, DirectLinkFrameCodec, DirectLinkFrameKind, FrameCodecError};
-pub use delivery::try_deliver_linked;
+pub use delivery::{DirectLinkDeliveryError, DirectLinkDispatch, try_deliver_linked};
 pub use session::{
     CloseTransition, DIRECT_LINK_PROTOCOL_VERSION, DirectLinkActivationPolicy,
     DirectLinkActorPolicy, DirectLinkAuthPolicy, DirectLinkMetrics, DirectLinkMetricsSnapshot,

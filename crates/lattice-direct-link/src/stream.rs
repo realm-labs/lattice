@@ -2,11 +2,13 @@ use std::any::type_name;
 use std::fmt;
 use std::marker::PhantomData;
 
-use lattice_actor::{Actor, Handler};
+use lattice_actor::{Actor, ActorHandle, Handler};
 use lattice_core::{
     ActorKind, DirectLinkMessage, DirectLinkMessageDescriptor, DirectLinkMessageId,
-    DirectLinkStreamDescriptor, DirectLinkStreamSpec, Linked,
+    DirectLinkStreamDescriptor, DirectLinkStreamSpec, LinkMessageContext, Linked,
 };
+
+use crate::delivery::{DirectLinkDeliveryError, DirectLinkDispatch};
 
 pub struct DirectLinkStream<Messages = ()> {
     descriptor: DirectLinkStreamDescriptor,
@@ -116,6 +118,22 @@ impl<A, Messages> DirectLinkActorBinding<A, Messages> {
 
     pub fn stream(&self) -> &DirectLinkStreamDescriptor {
         &self.stream
+    }
+}
+
+impl<A, Messages> DirectLinkActorBinding<A, Messages>
+where
+    A: Actor,
+    Messages: DirectLinkDispatch<A>,
+{
+    pub fn try_deliver(
+        &self,
+        handle: &ActorHandle<A>,
+        message_id: DirectLinkMessageId,
+        payload: &[u8],
+        context: LinkMessageContext,
+    ) -> Result<(), DirectLinkDeliveryError> {
+        Messages::try_dispatch(handle, &self.stream, message_id, payload, context)
     }
 }
 

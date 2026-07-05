@@ -269,6 +269,7 @@ Status: `[ ]` not started.
 - [x] Message frame validation rejects unknown link ids, wrong direction, unsupported message ids, decode errors, invalid sequence, and non-activatable target actors before mailbox delivery.
 - [ ] Unidirectional links deliver fire-and-forget `Linked<T>` messages through actor mailbox without executing handlers on socket tasks.
   - [x] `try_deliver_linked` wraps decoded payloads as `Linked<T>` and uses non-blocking `ActorHandle::try_tell` mailbox enqueue with actor-runtime coverage proving delivery does not wait for handler completion.
+  - [x] `DirectLinkActorBinding::try_deliver` dispatches by negotiated message id, decodes the concrete protobuf message type, and enqueues typed `Linked<T>` through the actor mailbox.
   - [ ] TCP/session receive runtime resolves target actor registries, decodes negotiated message types, and calls the typed mailbox delivery path.
 - [ ] Bidirectional links are modeled as two logical unidirectional sessions over one underlying connection, with separate streams, message ids, sequence numbers, and backpressure state.
 - [ ] The initiator receives the source-to-target send handle from `connect_bidirectional`.
