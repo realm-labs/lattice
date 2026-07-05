@@ -276,10 +276,10 @@ Status: `[ ]` in progress.
 - [x] The initiator receives the source-to-target send handle from `connect_bidirectional`.
 - [x] The target actor receives `LinkOpened` and can obtain the target-to-source send handle through `ctx.links().get::<S>(link_id)`.
 - [x] Directional close and whole-link close are implemented and emit `LinkDirectionClosed` / `LinkClosed` exactly once per observed transition.
-- [ ] Backpressure policies are implemented: `Block`, `FailFast`, `DropNewest`, `DropOldest`, `Coalesce`, and `Disconnect`.
+- [x] Backpressure policies are implemented: `Block`, `FailFast`, `DropNewest`, `DropOldest`, `Coalesce`, and `Disconnect`.
   - [x] Reusable `BackpressureQueue` policy engine implements and tests all six policy decisions with pending/drop/coalesce counters.
   - [x] Outbound direct-link send queues use `BackpressureQueue` and map decisions to send results, drops/coalesces, or disconnect close reasons.
-  - [ ] Inbound remote mailbox delivery applies negotiated backpressure state before actor mailbox enqueue and emits `LinkBackpressure`.
+  - [x] Inbound remote mailbox delivery applies negotiated backpressure state before actor mailbox enqueue and emits `LinkBackpressure`.
 - [ ] Heartbeat, heartbeat timeout, protocol error, node draining, target passivation/migration, and backpressure disconnect close links with structured reasons.
 - [ ] Security hooks cover internal bind policy, peer identity/auth, source service/actor authorization, max frame size, connection limit, link limit, and rate limit.
 - [ ] Observability emits link open/close/send/receive/drop/coalesce/backpressure/decode-error metrics and sampled tracing without per-message spans by default.

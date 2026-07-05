@@ -8,7 +8,8 @@ use lattice_actor::{Actor, Handler};
 use lattice_config::{BootstrapConfig, ConfigSource};
 use lattice_config::{ConfigStore, LocalConfigStore};
 use lattice_core::{
-    ActorKind, InstanceId, LinkClosed, LinkDirectionClosed, LinkOpened, ServiceContext, ServiceKind,
+    ActorKind, InstanceId, LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened,
+    ServiceContext, ServiceKind,
 };
 use lattice_direct_link::{DirectLinkActorBinding, DirectLinkDispatch};
 use lattice_eventbus::{EventBus, LocalEventBus};
@@ -275,7 +276,10 @@ impl LatticeServiceBuilder {
     ) -> Self
     where
         A: Actor + Sync,
-        A: Handler<LinkOpened> + Handler<LinkDirectionClosed> + Handler<LinkClosed>,
+        A: Handler<LinkOpened>
+            + Handler<LinkDirectionClosed>
+            + Handler<LinkClosed>
+            + Handler<LinkBackpressure>,
         Messages: DirectLinkDispatch<A>,
     {
         self.direct_link_bindings

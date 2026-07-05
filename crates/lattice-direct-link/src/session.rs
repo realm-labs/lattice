@@ -440,6 +440,20 @@ impl DirectLinkSessionManager {
             .opened_for_actor(actor_ref)
     }
 
+    pub fn backpressure_policy(
+        &self,
+        link_id: &LinkId,
+        direction: LinkDirection,
+    ) -> Option<BackpressurePolicy> {
+        self.links
+            .lock()
+            .expect("direct link managed links poisoned")
+            .get(link_id)?
+            .directions
+            .get(&direction)
+            .map(|direction| direction.backpressure.clone())
+    }
+
     pub fn close(&self, link_id: &LinkId, _reason: LinkCloseReason) -> bool {
         let removed_session = self
             .sessions
