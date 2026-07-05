@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::{ActorKind, ServiceContext, ServiceKind};
+use lattice_core::{ActorKind, DirectLinkEndpoint, ServiceContext, ServiceKind};
+use lattice_direct_link::{DirectLinkConnection, DirectLinkTransport, TcpDirectLinkTransport};
 use lattice_ops::admin::{
     AdminActorTarget, AdminApiError, AdminAuth, AdminHttpAdapter, AdminMutationHandler,
     AdminMutationReply, AdminSnapshot,
@@ -17,13 +18,14 @@ use lattice_placement::instance::{InstanceRecord, InstanceState};
 use lattice_placement::store::LeaseId;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::server::Router;
 use tracing::{debug, error, info, warn};
 
 use crate::actor::ErasedLogicActor;
 use crate::component::ErasedPlacementStore;
-use crate::config::InstanceConfig;
+use crate::config::{DirectLinkConfig, InstanceConfig};
 use crate::framework::{
     ClusterEventBusComponent, DynPlacementStore, LocalEventBusComponent, ServiceContextExt,
     ServiceSchedulerComponent,
@@ -42,6 +44,7 @@ pub struct LatticeService {
     placement_watch_tasks: Vec<PlacementWatchTask>,
     admin_http: Option<AdminHttpServer>,
     instance_lease_keepalive_interval: Duration,
+    direct_link: Option<DirectLinkConfig>,
     ready: Option<oneshot::Sender<SocketAddr>>,
 }
 
@@ -62,6 +65,7 @@ impl LatticeService {
             placement_watch_tasks: parts.placement_watch_tasks,
             admin_http: parts.admin_http,
             instance_lease_keepalive_interval: parts.instance_lease_keepalive_interval,
+            direct_link: parts.direct_link,
             ready: parts.ready,
         }
     }
@@ -102,9 +106,14 @@ impl LatticeService {
             placement_watch_tasks,
             admin_http,
             instance_lease_keepalive_interval,
+            direct_link,
             ready,
         } = self;
         let local_addr = listener.local_addr()?;
+        let direct_link_listener = start_direct_link_listener(direct_link).await?;
+        let direct_link_endpoint = direct_link_listener
+            .as_ref()
+            .map(ManagedDirectLinkListener::endpoint);
         let lease_id = placement_store.grant_instance_lease().await?;
         placement_store.keepalive_instance_lease(lease_id).await?;
         publish_instance_record(
@@ -112,6 +121,7 @@ impl LatticeService {
             &service_kind,
             &instance,
             local_addr,
+            direct_link_endpoint.as_ref(),
             InstanceState::Starting,
             lease_id,
         )
@@ -121,6 +131,7 @@ impl LatticeService {
             &service_kind,
             &instance,
             local_addr,
+            direct_link_endpoint.as_ref(),
             InstanceState::Ready,
             lease_id,
         )
@@ -138,6 +149,10 @@ impl LatticeService {
         );
 
         let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel::<()>();
+        let (direct_link_shutdown_tx, direct_link_task) = match direct_link_listener {
+            Some(listener) => (Some(listener.shutdown), Some(listener.task)),
+            None => (None, None),
+        };
         let (admin_shutdown_tx, admin_task) = start_admin_http_server(
             admin_http,
             &service_context,
@@ -162,11 +177,15 @@ impl LatticeService {
                 &service_kind,
                 &instance,
                 local_addr,
+                direct_link_endpoint.as_ref(),
                 InstanceState::Draining,
                 lease_id,
             )
             .await;
             let _ = server_shutdown_tx.send(());
+            if let Some(direct_link_shutdown_tx) = direct_link_shutdown_tx {
+                let _ = direct_link_shutdown_tx.send(());
+            }
             let placement_drain =
                 drain_placement(placement_store.as_ref(), &service_kind, &instance).await;
             let cancelled_subscriptions = cancel_event_subscriptions(&service_context).await;
@@ -244,11 +263,23 @@ impl LatticeService {
                         }
                     }
                 }
+                if let Some(direct_link_task) = direct_link_task {
+                    match direct_link_task.await {
+                        Ok(result) => result?,
+                        Err(error) => {
+                            return Err(LatticeServiceError::ComponentBuild {
+                                slot: "direct_links".to_string(),
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                }
                 publish_instance_record(
                     placement_store.as_ref(),
                     &service_kind,
                     &instance,
                     local_addr,
+                    direct_link_endpoint.as_ref(),
                     InstanceState::Stopping,
                     lease_id,
                 )
@@ -486,6 +517,73 @@ async fn drain_runtime_actors(logic_actors: &[Arc<dyn ErasedLogicActor>]) -> usi
     drained
 }
 
+#[derive(Debug)]
+struct ManagedDirectLinkListener {
+    endpoint: DirectLinkEndpoint,
+    shutdown: oneshot::Sender<()>,
+    task: JoinHandle<Result<(), LatticeServiceError>>,
+}
+
+impl ManagedDirectLinkListener {
+    fn endpoint(&self) -> DirectLinkEndpoint {
+        self.endpoint.clone()
+    }
+}
+
+async fn start_direct_link_listener(
+    config: Option<DirectLinkConfig>,
+) -> Result<Option<ManagedDirectLinkListener>, LatticeServiceError> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let listen_config =
+        config
+            .listen_config()
+            .map_err(|message| LatticeServiceError::ComponentBuild {
+                slot: "direct_links".to_string(),
+                message,
+            })?;
+    let transport = TcpDirectLinkTransport::new();
+    let listener = transport.bind(listen_config).await.map_err(|error| {
+        LatticeServiceError::ComponentBuild {
+            slot: "direct_links".to_string(),
+            message: error.to_string(),
+        }
+    })?;
+    let endpoint = listener.local_endpoint();
+    let (shutdown, mut shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    debug!("direct-link listener shutting down");
+                    return Ok(());
+                }
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok(mut connection) => {
+                            tokio::spawn(async move {
+                                let _ = connection.close().await;
+                            });
+                        }
+                        Err(error) => {
+                            return Err(LatticeServiceError::ComponentBuild {
+                                slot: "direct_links".to_string(),
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Ok(Some(ManagedDirectLinkListener {
+        endpoint,
+        shutdown,
+        task,
+    }))
+}
+
 async fn drain_placement(
     placement_store: &dyn ErasedPlacementStore,
     service_kind: &ServiceKind,
@@ -522,6 +620,7 @@ async fn publish_instance_record(
     service_kind: &ServiceKind,
     instance: &InstanceConfig,
     local_addr: SocketAddr,
+    direct_link_endpoint: Option<&DirectLinkEndpoint>,
     state: InstanceState,
     lease_id: LeaseId,
 ) -> Result<(), LatticeServiceError> {
@@ -538,7 +637,13 @@ async fn publish_instance_record(
         version: env!("CARGO_PKG_VERSION").to_string(),
         state,
         capacity: InstanceCapacity::default(),
-        labels: Default::default(),
+        labels: direct_link_endpoint
+            .map(|endpoint| {
+                [("direct_link_endpoint".to_string(), endpoint.uri.to_string())]
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
     placement_store.upsert_instance(record).await?;
     Ok(())
@@ -555,6 +660,7 @@ pub(crate) struct LatticeServiceParts {
     pub placement_watch_tasks: Vec<PlacementWatchTask>,
     pub admin_http: Option<AdminHttpServer>,
     pub instance_lease_keepalive_interval: Duration,
+    pub direct_link: Option<DirectLinkConfig>,
     pub ready: Option<oneshot::Sender<SocketAddr>>,
 }
 

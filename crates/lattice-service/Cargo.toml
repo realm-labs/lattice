@@ -12,6 +12,7 @@ http.workspace = true
 lattice-config.workspace = true
 lattice-actor.workspace = true
 lattice-core.workspace = true
+lattice-direct-link.workspace = true
 lattice-eventbus.workspace = true
 lattice-ops.workspace = true
 lattice-placement.workspace = true

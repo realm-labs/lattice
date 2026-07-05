@@ -27,7 +27,7 @@ use crate::component::{
     IntoServiceComponent, PlacementStoreRegistration, ServiceComponentContext,
     ServiceComponentRegistration,
 };
-use crate::config::InstanceConfig;
+use crate::config::{DirectLinkConfig, InstanceConfig};
 use crate::context::ServiceBuildContext;
 use crate::control::ServiceLogicControlHandler;
 use crate::framework::ServiceSchedulerComponent;
@@ -55,6 +55,7 @@ pub struct LatticeServiceBuilder {
     rpc_transport_security: RpcTransportSecurity,
     rpc_client_transport: TonicEndpointChannelPoolConfig,
     rpc_retry_policy: RpcRetryPolicy,
+    direct_link: Option<DirectLinkConfig>,
     placement_watchers: Vec<Box<dyn ErasedPlacementWatchStarter>>,
     duplicate_framework_component: Option<&'static str>,
     duplicate_extension: Option<&'static str>,
@@ -89,6 +90,7 @@ impl fmt::Debug for LatticeServiceBuilder {
             .field("rpc_transport_security", &self.rpc_transport_security)
             .field("rpc_client_transport", &self.rpc_client_transport)
             .field("rpc_retry_policy", &self.rpc_retry_policy)
+            .field("direct_link", &self.direct_link)
             .field("placement_watch_count", &self.placement_watchers.len())
             .field("extension_count", &self.extensions.len())
             .finish()
@@ -116,6 +118,7 @@ impl LatticeServiceBuilder {
             rpc_transport_security: RpcTransportSecurity::plaintext(),
             rpc_client_transport: TonicEndpointChannelPoolConfig::default(),
             rpc_retry_policy: RpcRetryPolicy::default(),
+            direct_link: None,
             placement_watchers: Vec::new(),
             duplicate_framework_component: None,
             duplicate_extension: None,
@@ -246,6 +249,11 @@ impl LatticeServiceBuilder {
 
     pub fn rpc_retry_policy(mut self, policy: RpcRetryPolicy) -> Self {
         self.rpc_retry_policy = policy;
+        self
+    }
+
+    pub fn direct_links(mut self, config: DirectLinkConfig) -> Self {
+        self.direct_link = Some(config);
         self
     }
 
@@ -513,6 +521,7 @@ impl LatticeServiceBuilder {
             placement_watch_tasks,
             admin_http,
             instance_lease_keepalive_interval: self.instance_lease_keepalive_interval,
+            direct_link: self.direct_link,
             ready: self.ready,
         }))
     }

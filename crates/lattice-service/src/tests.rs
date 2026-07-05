@@ -59,8 +59,8 @@ use tonic::server::NamedService;
 use crate::actor::ErasedActorRegistration;
 use crate::context::ServiceBuildContext;
 use crate::{
-    ActorRegistration, AdminHttpConfig, LatticeService, LatticeServiceError, RpcClientBinding,
-    RpcClientPlacement, RpcServiceBinding, ServiceContextExt,
+    ActorRegistration, AdminHttpConfig, DirectLinkConfig, LatticeService, LatticeServiceError,
+    RpcClientBinding, RpcClientPlacement, RpcServiceBinding, ServiceContextExt,
 };
 
 #[derive(Clone)]
@@ -874,6 +874,60 @@ async fn service_lifecycle_writes_starting_ready_draining_stopping() {
             InstanceState::Stopping,
         ]
     );
+}
+
+#[tokio::test]
+async fn direct_link_listener_publishes_endpoint_and_stops_with_service() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test-direct-link"));
+    let mut watch = store.watch(store.prefix().clone()).await.unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+
+    let ready_record = loop {
+        let event = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .unwrap()
+            .unwrap();
+        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+            && record.state == InstanceState::Ready
+        {
+            break record;
+        }
+    };
+    let endpoint = ready_record
+        .labels
+        .get("direct_link_endpoint")
+        .expect("direct-link endpoint label");
+    let endpoint: http::Uri = endpoint.parse().unwrap();
+    let socket = endpoint.authority().unwrap().as_str();
+    let _stream = TcpStream::connect(socket).await.unwrap();
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

@@ -12,6 +12,7 @@ pub mod service;
 pub use actor::{ActorRegistration, ActorRegistrationBuilder};
 pub use builder::LatticeServiceBuilder;
 pub use component::{IntoServiceComponent, ReadyComponent, ServiceComponent};
+pub use config::DirectLinkConfig;
 pub use error::LatticeServiceError;
 pub use framework::{
     ClusterEventBusComponent, ConfigStoreComponent, DynConfigStore, DynEventBus, DynPlacementStore,

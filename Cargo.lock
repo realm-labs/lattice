@@ -1325,6 +1325,7 @@ dependencies = [
  "lattice-actor",
  "lattice-config",
  "lattice-core",
+ "lattice-direct-link",
  "lattice-eventbus",
  "lattice-ops",
  "lattice-placement",

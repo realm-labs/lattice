@@ -263,7 +263,7 @@ Status: `[ ]` not started.
   - [x] Session-manager metrics/tracing hooks cover open, close, receive validation, protocol errors, drop, coalesce, backpressure, and decode-error surfaces with focused tests.
   - [x] Transport/runtime send and receive task metrics/tracing hooks are emitted from concrete TCP/runtime paths.
 - [x] TCP direct-link transport exists as the default implementation behind `DirectLinkTransport` / `DirectLinkConnection`.
-- [ ] Direct Link listener is managed by `LatticeService`, publishes direct-link endpoint metadata, and shuts down/drains with the service lifecycle.
+- [x] Direct Link listener is managed by `LatticeService`, publishes direct-link endpoint metadata, and shuts down/drains with the service lifecycle.
 - [ ] OpenLink handshake validates service/actor identity, stream binding, accepted message ids, activation policy, owner epoch, auth, and backpressure policy before creating sessions.
 - [ ] Invalid OpenLink requests reject with explicit reasons: `NotOwner`, `Fenced`, `ActorUnavailable`, `UnsupportedStream`, `UnsupportedMessageType`, `Unauthorized`, `Overloaded`, or `ProtocolVersionMismatch`.
 - [ ] Message frame validation rejects unknown link ids, wrong direction, unsupported message ids, decode errors, invalid sequence, and non-activatable target actors before mailbox delivery.
