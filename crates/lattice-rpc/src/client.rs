@@ -6,7 +6,8 @@ use dashmap::mapref::entry::Entry;
 use http::Uri;
 use lattice_core::{ActorRef, Epoch};
 use tonic::transport::Channel;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Status};
+use tracing::{debug, warn};
 
 use crate::metadata::RpcClientContextFactory;
 use crate::traits::UnaryRpcTransport;
@@ -25,16 +26,27 @@ impl TonicEndpointChannelPool {
     pub async fn get_or_connect(&self, endpoint: &Uri) -> Result<Channel, RpcError> {
         let key = endpoint.to_string();
         if let Some(channel) = self.channels.get(&key).map(|entry| entry.clone()) {
+            debug!(%endpoint, "reusing tonic endpoint channel");
             return Ok(channel);
         }
 
+        debug!(%endpoint, "connecting tonic endpoint channel");
         let channel = Channel::builder(endpoint.clone())
             .connect()
             .await
-            .map_err(|error| RpcError::Business(format!("connect {endpoint}: {error}")))?;
+            .map_err(|error| {
+                warn!(%endpoint, %error, "failed to connect tonic endpoint channel");
+                RpcError::Business(format!("connect {endpoint}: {error}"))
+            })?;
         match self.channels.entry(key) {
-            Entry::Occupied(entry) => Ok(entry.get().clone()),
-            Entry::Vacant(entry) => Ok(entry.insert(channel).clone()),
+            Entry::Occupied(entry) => {
+                debug!(%endpoint, "using concurrently established tonic endpoint channel");
+                Ok(entry.get().clone())
+            }
+            Entry::Vacant(entry) => {
+                debug!(%endpoint, "tonic endpoint channel connected");
+                Ok(entry.insert(channel).clone())
+            }
         }
     }
 }
@@ -74,15 +86,38 @@ where
     where
         Req: RoutedRequest + RpcRequest,
     {
+        let actor_kind = req.actor_kind();
+        let route_key = req.route_key();
         let mut request = Request::new(req);
-        self.context_factory
-            .next_context(self.route_epoch)
-            .inject_metadata(request.metadata_mut())
+        let ctx = self.context_factory.next_context(self.route_epoch);
+        debug!(
+            rpc.method = Req::METHOD,
+            actor.kind = actor_kind.as_str(),
+            route.key = ?route_key,
+            request.id = ctx.request_id.as_str(),
+            "sending rpc request"
+        );
+        ctx.inject_metadata(request.metadata_mut())
             .map_err(|error| RpcError::Business(error.to_string()))?;
-        self.transport
-            .unary(request)
-            .await
-            .map(Response::into_inner)
+        match self.transport.unary(request).await {
+            Ok(response) => {
+                debug!(
+                    rpc.method = Req::METHOD,
+                    request.id = ctx.request_id.as_str(),
+                    "rpc request completed"
+                );
+                Ok(response.into_inner())
+            }
+            Err(error) => {
+                warn!(
+                    rpc.method = Req::METHOD,
+                    request.id = ctx.request_id.as_str(),
+                    %error,
+                    "rpc request failed"
+                );
+                Err(error)
+            }
+        }
     }
 }
 

@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::server::Router;
+use tracing::{error, info};
 
 use crate::config::InstanceConfig;
 use crate::{LatticeServiceBuilder, LatticeServiceError};
@@ -53,9 +54,35 @@ impl LatticeService {
             let _ = ready.send(local_addr);
         }
 
-        self.router
+        info!(
+            service.kind = self.service_kind.as_str(),
+            instance.id = self.instance.instance_id.as_str(),
+            %local_addr,
+            "lattice service listening"
+        );
+
+        match self
+            .router
             .serve_with_incoming(TcpListenerStream::new(self.listener))
-            .await?;
-        Ok(())
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    service.kind = self.service_kind.as_str(),
+                    instance.id = self.instance.instance_id.as_str(),
+                    "lattice service stopped"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                error!(
+                    service.kind = self.service_kind.as_str(),
+                    instance.id = self.instance.instance_id.as_str(),
+                    %error,
+                    "lattice service failed"
+                );
+                Err(error.into())
+            }
+        }
     }
 }

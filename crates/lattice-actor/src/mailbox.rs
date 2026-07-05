@@ -1,5 +1,8 @@
+use std::any::type_name;
+
 use async_trait::async_trait;
 use tokio::sync::oneshot;
+use tracing::{debug, warn};
 
 use crate::traits::HandlerErrorAction;
 use crate::{Actor, ActorCallError, ActorContext, ActorError, Handler, Message, StopReason};
@@ -85,17 +88,33 @@ where
     M: Message,
 {
     fn message_type(&self) -> &'static str {
-        std::any::type_name::<M>()
+        type_name::<M>()
     }
 
     async fn handle(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>) {
         let result = match actor.handle(ctx, self.msg).await {
             Ok(reply) => Ok(reply),
             Err(error) => {
+                warn!(
+                    message.type = type_name::<M>(),
+                    %error,
+                    "actor handler returned error"
+                );
                 actor.on_error::<M>(ctx, &error).await;
                 match actor.handle_error(ctx, error).await {
-                    HandlerErrorAction::Reply(reply) => Ok(reply),
+                    HandlerErrorAction::Reply(reply) => {
+                        debug!(
+                            message.type = type_name::<M>(),
+                            "actor handler error recovered"
+                        );
+                        Ok(reply)
+                    }
                     HandlerErrorAction::Propagate(error) => {
+                        warn!(
+                            message.type = type_name::<M>(),
+                            %error,
+                            "actor handler error propagated"
+                        );
                         Err(ActorCallError::Handler(ActorError::from_error(error)))
                     }
                 }

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::sync::{broadcast, oneshot, watch};
-use tracing::Instrument;
+use tracing::{Instrument, debug, error, info};
 
 use crate::context::ActorContext;
 use crate::handle::ActorHandle;
@@ -592,12 +592,13 @@ async fn run_actor<A>(
         actor.type = actor_type,
         actor.local_ref = local_ref
     );
-    if actor
-        .started(&mut ctx)
-        .instrument(started_span)
-        .await
-        .is_err()
-    {
+    if let Err(error) = actor.started(&mut ctx).instrument(started_span).await {
+        error!(
+            actor.type = actor_type,
+            actor.local_ref = local_ref,
+            %error,
+            "actor failed to start"
+        );
         handle.set_lifecycle_state(ActorLifecycleState::Stopping);
         let stopping_span = tracing::info_span!(
             "actor.stopping",
@@ -606,12 +607,17 @@ async fn run_actor<A>(
             actor.local_ref = local_ref,
             stop.reason = ?StopReason::StartFailed
         );
-        if actor
+        if let Err(error) = actor
             .stopping(&mut ctx, StopReason::StartFailed)
             .instrument(stopping_span)
             .await
-            .is_err()
         {
+            error!(
+                actor.type = actor_type,
+                actor.local_ref = local_ref,
+                %error,
+                "actor failed to stop after start failure"
+            );
             handle.set_lifecycle_state(ActorLifecycleState::StopFailed);
         } else {
             handle.set_lifecycle_state(ActorLifecycleState::Stopped);
@@ -620,6 +626,11 @@ async fn run_actor<A>(
         return;
     }
     handle.set_lifecycle_state(ActorLifecycleState::Running);
+    info!(
+        actor.type = actor_type,
+        actor.local_ref = local_ref,
+        "actor started"
+    );
 
     let mut stop_reason = None;
 
@@ -701,12 +712,18 @@ async fn run_actor<A>(
         actor.local_ref = local_ref,
         stop.reason = ?reason
     );
-    if actor
+    if let Err(error) = actor
         .stopping(&mut ctx, reason)
         .instrument(stopping_span)
         .await
-        .is_err()
     {
+        error!(
+            actor.type = actor_type,
+            actor.local_ref = local_ref,
+            stop.reason = ?reason,
+            %error,
+            "actor failed to stop"
+        );
         ctx.cancel_all_tasks();
         ctx.stop_all_children(reason);
         handle.set_lifecycle_state(ActorLifecycleState::StopFailed);
@@ -720,6 +737,12 @@ async fn run_actor<A>(
         incarnation: ActorIncarnation::new(handle.local_ref().id()),
         reason: TerminatedReason::from(reason),
     });
+    info!(
+        actor.type = actor_type,
+        actor.local_ref = local_ref,
+        stop.reason = ?reason,
+        "actor stopped"
+    );
 }
 
 async fn handle_command<A>(
@@ -735,14 +758,27 @@ where
 {
     match command {
         ActorCommand::Envelope(envelope) => {
+            let message_type = envelope.message_type();
             let span = tracing::info_span!(
                 "actor.message",
                 otel.kind = "consumer",
                 actor.type = type_name::<A>(),
-                message.type = envelope.message_type(),
+                message.type = message_type,
                 mailbox.lane = lane.as_str()
             );
+            debug!(
+                actor.type = type_name::<A>(),
+                message.type = message_type,
+                mailbox.lane = lane.as_str(),
+                "handling actor message"
+            );
             envelope.handle(actor, ctx).instrument(span).await;
+            debug!(
+                actor.type = type_name::<A>(),
+                message.type = message_type,
+                mailbox.lane = lane.as_str(),
+                "actor message handled"
+            );
             record_activity(activity_tx);
             if let Some(requested_reason) = ctx.take_lifecycle_request() {
                 *stop_reason = Some(requested_reason);
@@ -750,6 +786,12 @@ where
             }
         }
         ActorCommand::Stop(reason) => {
+            debug!(
+                actor.type = type_name::<A>(),
+                mailbox.lane = lane.as_str(),
+                stop.reason = ?reason,
+                "actor stop requested"
+            );
             *stop_reason = Some(reason);
             return true;
         }

@@ -1,7 +1,7 @@
 use lattice_actor::{Actor, ActorCallError, ActorHandle, Handler};
 use lattice_core::Epoch;
 use tonic::{Request, Response, Status};
-use tracing::Instrument;
+use tracing::{Instrument, debug, warn};
 
 use crate::dedup::{RequestDedupKey, RequestDeduplicator};
 use crate::metadata::metadata_status;
@@ -85,12 +85,25 @@ impl<A: Actor> ActorRpcAdapter<A> {
             source.instance = ctx.source_instance.as_str()
         );
         async {
-            let reply = self
-                .handle
-                .call(Rpc { req, ctx })
-                .await
-                .map_err(actor_call_status)?;
-            Ok(Response::new(reply))
+            debug!(
+                rpc.method = Req::METHOD,
+                request.id = ctx.request_id.as_str(),
+                "dispatching rpc request to actor"
+            );
+            match self.handle.call(Rpc { req, ctx }).await {
+                Ok(reply) => {
+                    debug!(rpc.method = Req::METHOD, "rpc request handled by actor");
+                    Ok(Response::new(reply))
+                }
+                Err(error) => {
+                    warn!(
+                        rpc.method = Req::METHOD,
+                        %error,
+                        "actor failed to handle rpc request"
+                    );
+                    Err(actor_call_status(error))
+                }
+            }
         }
         .instrument(span)
         .await

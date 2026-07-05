@@ -7,7 +7,7 @@ use lattice_rpc::{
     RpcRequest, ShardedRpcCore,
 };
 use tonic::Response;
-use tracing::Instrument;
+use tracing::{Instrument, debug, warn};
 
 use crate::endpoint::{EndpointLease, EndpointPool};
 use crate::error::PlacementError;
@@ -193,10 +193,21 @@ where
             let key = resolve_request.cache_key();
 
             let target = self.resolve_rpc_target(resolve_request.clone()).await?;
+            debug!(
+                rpc.method = Req::METHOD,
+                target.instance = target.instance_id.as_str(),
+                target.endpoint = %target.advertised_endpoint,
+                "resolved rpc target"
+            );
             let ctx = self.context_factory.next_context(target.owner_epoch);
             match self.send_with_context(target, ctx.clone(), &req).await {
                 Ok(reply) => Ok(reply),
                 Err(RpcError::NotOwner { .. }) => {
+                    warn!(
+                        rpc.method = Req::METHOD,
+                        retry.reason = "not_owner",
+                        "rpc target rejected ownership; retrying"
+                    );
                     let retry_span = tracing::info_span!(
                         "rpc.client.retry",
                         otel.kind = "client",
@@ -208,6 +219,13 @@ where
                             .invalidate(key, InvalidateReason::NotOwner)
                             .await;
                         let retry_target = self.resolve_rpc_target(resolve_request).await?;
+                        debug!(
+                            rpc.method = Req::METHOD,
+                            target.instance = retry_target.instance_id.as_str(),
+                            target.endpoint = %retry_target.advertised_endpoint,
+                            retry.reason = "not_owner",
+                            "resolved retry rpc target"
+                        );
                         let mut retry_ctx = ctx;
                         retry_ctx.route_epoch = retry_target.owner_epoch;
                         self.send_with_context(retry_target, retry_ctx, &req).await
@@ -216,6 +234,11 @@ where
                     .await
                 }
                 Err(RpcError::Fenced { .. }) => {
+                    warn!(
+                        rpc.method = Req::METHOD,
+                        retry.reason = "fenced",
+                        "rpc target rejected route epoch; retrying"
+                    );
                     let retry_span = tracing::info_span!(
                         "rpc.client.retry",
                         otel.kind = "client",
@@ -227,6 +250,13 @@ where
                             .invalidate(key, InvalidateReason::Fenced)
                             .await;
                         let retry_target = self.resolve_rpc_target(resolve_request).await?;
+                        debug!(
+                            rpc.method = Req::METHOD,
+                            target.instance = retry_target.instance_id.as_str(),
+                            target.endpoint = %retry_target.advertised_endpoint,
+                            retry.reason = "fenced",
+                            "resolved retry rpc target"
+                        );
                         let mut retry_ctx = ctx;
                         retry_ctx.route_epoch = retry_target.owner_epoch;
                         self.send_with_context(retry_target, retry_ctx, &req).await
@@ -234,7 +264,14 @@ where
                     .instrument(retry_span)
                     .await
                 }
-                Err(error) => Err(error),
+                Err(error) => {
+                    warn!(
+                        rpc.method = Req::METHOD,
+                        %error,
+                        "rpc request failed without retry"
+                    );
+                    Err(error)
+                }
             }
         }
         .instrument(span)
@@ -263,6 +300,8 @@ where
     where
         Req: RoutedRequest + RpcRequest,
     {
+        let target_instance = target.instance_id.as_str().to_owned();
+        let target_endpoint = target.advertised_endpoint.to_string();
         let endpoint = {
             let span = tracing::info_span!(
                 "endpoint.pool.acquire",
@@ -276,10 +315,44 @@ where
         let mut metadata = tonic::metadata::MetadataMap::new();
         ctx.inject_metadata(&mut metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;
-        self.transport
-            .unary(endpoint, target, metadata, req)
-            .await
-            .map(Response::into_inner)
+        debug!(
+            rpc.method = Req::METHOD,
+            request.id = ctx.request_id.as_str(),
+            target.instance = target_instance.as_str(),
+            target.endpoint = target_endpoint.as_str(),
+            "sending routed rpc request"
+        );
+        match self.transport.unary(endpoint, target, metadata, req).await {
+            Ok(response) => {
+                debug!(
+                    rpc.method = Req::METHOD,
+                    request.id = ctx.request_id.as_str(),
+                    target.instance = target_instance.as_str(),
+                    "routed rpc request completed"
+                );
+                Ok(response.into_inner())
+            }
+            Err(error) => {
+                if matches!(&error, RpcError::NotOwner { .. } | RpcError::Fenced { .. }) {
+                    debug!(
+                        rpc.method = Req::METHOD,
+                        request.id = ctx.request_id.as_str(),
+                        target.instance = target_instance.as_str(),
+                        %error,
+                        "routed rpc request returned retryable error"
+                    );
+                } else {
+                    warn!(
+                        rpc.method = Req::METHOD,
+                        request.id = ctx.request_id.as_str(),
+                        target.instance = target_instance.as_str(),
+                        %error,
+                        "routed rpc request failed"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -318,6 +391,14 @@ where
         Req: RoutedRequest + RpcRequest,
     {
         validate_actor_ref_request(&actor_ref, &req)?;
+        debug!(
+            rpc.method = Req::METHOD,
+            service.kind = actor_ref.service_kind.as_str(),
+            actor.kind = actor_ref.actor_kind.as_str(),
+            actor.id = ?actor_ref.actor_id,
+            actor.ref.target = ?actor_ref.target,
+            "calling actor ref"
+        );
         let target = self.resolve_actor_ref_target(&actor_ref).await?;
         let ctx = self.context_factory.next_context(target.owner_epoch);
         self.send_with_context(target, ctx, &req).await
@@ -367,14 +448,40 @@ where
     where
         Req: RoutedRequest + RpcRequest,
     {
+        let target_instance = target.instance_id.as_str().to_owned();
+        let target_endpoint = target.advertised_endpoint.to_string();
         let endpoint = self.endpoint_pool.get_or_connect(&target);
         let mut metadata = tonic::metadata::MetadataMap::new();
         ctx.inject_metadata(&mut metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;
-        self.transport
-            .unary(endpoint, target, metadata, req)
-            .await
-            .map(Response::into_inner)
+        debug!(
+            rpc.method = Req::METHOD,
+            request.id = ctx.request_id.as_str(),
+            target.instance = target_instance.as_str(),
+            target.endpoint = target_endpoint.as_str(),
+            "sending actor-ref rpc request"
+        );
+        match self.transport.unary(endpoint, target, metadata, req).await {
+            Ok(response) => {
+                debug!(
+                    rpc.method = Req::METHOD,
+                    request.id = ctx.request_id.as_str(),
+                    target.instance = target_instance.as_str(),
+                    "actor-ref rpc request completed"
+                );
+                Ok(response.into_inner())
+            }
+            Err(error) => {
+                warn!(
+                    rpc.method = Req::METHOD,
+                    request.id = ctx.request_id.as_str(),
+                    target.instance = target_instance.as_str(),
+                    %error,
+                    "actor-ref rpc request failed"
+                );
+                Err(error)
+            }
+        }
     }
 }
 

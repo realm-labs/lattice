@@ -6,6 +6,7 @@ use lattice_actor::Actor;
 use lattice_core::{ActorKind, InstanceId, ServiceKind};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tracing::{debug, info};
 
 use crate::actor::ActorRegistration;
 use crate::actor::ErasedActorRegistration;
@@ -169,6 +170,14 @@ impl LatticeServiceBuilder {
         let instance = self
             .instance
             .ok_or(LatticeServiceError::MissingInstanceConfig)?;
+        info!(
+            service.kind = self.service_kind.as_str(),
+            instance.id = instance.instance_id.as_str(),
+            actor.registrations = self.actor_registrations.len(),
+            rpc.services = self.rpc_services.len(),
+            rpc.clients = self.client_bindings.len(),
+            "building lattice service"
+        );
         let mut context = ServiceBuildContext::new(self.service_kind.clone());
         let mut actor_kinds = HashSet::<ActorKind>::new();
 
@@ -177,6 +186,11 @@ impl LatticeServiceBuilder {
             if !actor_kinds.insert(actor_kind.clone()) {
                 return Err(LatticeServiceError::DuplicateActorRegistration { actor_kind });
             }
+            debug!(
+                service.kind = self.service_kind.as_str(),
+                actor.kind = actor_kind.as_str(),
+                "registering actor"
+            );
             registration.register(&mut context)?;
         }
 
@@ -188,7 +202,20 @@ impl LatticeServiceBuilder {
                     service_name: service_name.to_string(),
                 });
             }
+            debug!(
+                service.kind = self.service_kind.as_str(),
+                rpc.service = service_name,
+                "registering rpc service"
+            );
             binding.register(&mut context)?;
+        }
+
+        for service_kind in &self.client_bindings {
+            debug!(
+                service.kind = self.service_kind.as_str(),
+                rpc.client.service = service_kind,
+                "registered rpc client binding"
+            );
         }
 
         let router = context.router.ok_or(LatticeServiceError::NoRpcServices)?;
