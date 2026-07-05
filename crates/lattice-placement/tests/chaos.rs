@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 
-use lattice_core::{ActorId, Epoch, InstanceCapacity, InstanceId, actor_kind, service_kind};
-use lattice_placement::{
-    ActorPlacementKey, ActorPlacementRecord, FailoverReport, InMemoryPlacementStore,
-    InstanceRecord, InstanceState, LeaseId, NoopLogicControl, PlacementCoordinator,
-    PlacementPrefix, PlacementState, PlacementStore,
+use lattice_core::instance::InstanceCapacity;
+use lattice_core::{ActorId, Epoch, InstanceId, actor_kind, service_kind};
+use lattice_placement::coordinator::{FailoverReport, NoopLogicControl, PlacementCoordinator};
+use lattice_placement::instance::{InstanceRecord, InstanceState};
+use lattice_placement::store::{
+    ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
+    PlacementState, PlacementStore,
 };
 
 #[tokio::test]

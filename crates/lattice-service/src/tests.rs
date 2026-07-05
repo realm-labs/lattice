@@ -3,16 +3,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use lattice_actor::{
-    Actor, ActorContext, ActorCreateContext, ActorError, ActorFactory, Handler, Message,
-};
+use lattice_actor::registry::ActorCreateContext;
+use lattice_actor::{Actor, ActorContext, ActorError, ActorFactory, Handler, Message};
 use lattice_core::{ActorId, ActorKind, InstanceId, actor_kind, service_kind};
 use tokio::net::TcpListener;
 
 use crate::actor::ErasedActorRegistration;
-use crate::{
-    ActorRegistration, LatticeService, LatticeServiceError, RpcServiceBinding, ServiceBuildContext,
-};
+use crate::context::ServiceBuildContext;
+use crate::{ActorRegistration, LatticeService, LatticeServiceError, RpcServiceBinding};
 
 #[derive(Clone)]
 struct TestFactory;

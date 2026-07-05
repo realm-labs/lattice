@@ -1,5 +1,8 @@
 use super::*;
 use crate::descriptor::methods_from_descriptor;
+use crate::render::generate_rpc_bindings;
+use crate::route_key::{ProtoRouteKeyOption, RouteKeyType};
+use crate::spec::RpcMethodSpec;
 use prost::Message;
 use prost_types::{
     DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,

@@ -6,11 +6,10 @@ use tokio::sync::{
     oneshot, watch,
 };
 
+use crate::error::{ActorCallError, ActorTellError};
 use crate::mailbox::{ActorCommand, EnvelopeMessage, MailboxLane};
-use crate::{
-    Actor, ActorCallError, ActorLifecycleState, ActorTellError, ActorTerminated, Handler,
-    LocalActorRef, Message, StopReason,
-};
+use crate::traits::{Actor, ActorLifecycleState, Handler, Message, StopReason};
+use crate::watch::{ActorTerminated, LocalActorRef};
 
 pub struct ActorHandle<A: Actor> {
     local_ref: LocalActorRef,

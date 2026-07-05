@@ -1,26 +1,23 @@
-mod cache;
-mod coordinator;
-mod endpoint;
-mod error;
-mod etcd;
-mod instance;
-mod route;
-mod singleton;
-mod static_resolver;
-mod store;
-mod vshard;
+pub mod cache;
+pub mod coordinator;
+pub mod endpoint;
+pub mod error;
+pub mod etcd;
+pub mod instance;
+pub mod route;
+pub mod singleton;
+pub mod static_resolver;
+pub mod store;
+pub mod vshard;
 
-pub use cache::*;
-pub use coordinator::*;
-pub use endpoint::*;
-pub use error::*;
-pub use etcd::*;
-pub use instance::*;
-pub use route::*;
-pub use singleton::*;
-pub use static_resolver::*;
-pub use store::*;
-pub use vshard::*;
+pub use endpoint::{EndpointLease, EndpointPool};
+pub use error::PlacementError;
+pub use route::{
+    EndpointRpcTransport, InvalidateReason, ResolveRequest, ResolvingActorRefRpcCore,
+    ResolvingRpcCore, RouteCacheKey, RouteResolver,
+};
+pub use static_resolver::{StaticPlacementConfig, StaticRouteRange, StaticRouteResolver};
+pub use store::{InMemoryPlacementStore, PlacementPrefix, PlacementStore};
 
 #[cfg(test)]
 mod tests;

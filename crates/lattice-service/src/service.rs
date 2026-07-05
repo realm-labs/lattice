@@ -6,7 +6,8 @@ use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::server::Router;
 
-use crate::{InstanceConfig, LatticeServiceBuilder, LatticeServiceError};
+use crate::config::InstanceConfig;
+use crate::{LatticeServiceBuilder, LatticeServiceError};
 
 pub struct LatticeService {
     service_kind: ServiceKind,

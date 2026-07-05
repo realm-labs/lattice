@@ -10,9 +10,11 @@ use lattice_core::{ActorId, InstanceId, ServiceKind};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::{
-    ActorPlacementKey, ActorPlacementRecord, InstanceRecord, LeaseId, PlacementError,
-    PlacementPrefix, PlacementStore, PlacementVersion, PlacementWatch, PlacementWatchEvent,
+use crate::error::PlacementError;
+use crate::instance::InstanceRecord;
+use crate::store::{
+    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementStore,
+    PlacementVersion, PlacementWatch, PlacementWatchEvent,
 };
 
 #[derive(Debug, Clone)]
@@ -667,10 +669,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use lattice_core::{ActorId, Epoch, InstanceCapacity, actor_kind, service_kind};
+    use lattice_core::instance::InstanceCapacity;
+    use lattice_core::{ActorId, Epoch, actor_kind, service_kind};
 
     use super::*;
-    use crate::{InstanceState, PlacementState};
+    use crate::instance::InstanceState;
+    use crate::store::PlacementState;
 
     #[tokio::test]
     async fn etcd_store_writes_under_cluster_prefix_and_isolates_reads() {

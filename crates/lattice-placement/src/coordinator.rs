@@ -7,10 +7,13 @@ use lattice_core::{ActorId, ActorKind, Epoch, InstanceId, RouteKey, ServiceKind}
 use lattice_rpc::RouteTarget;
 use tracing::Instrument;
 
-use crate::{
-    ActorPlacementKey, ActorPlacementRecord, InstanceRecord, InstanceState, InvalidateReason,
-    LeaseId, LocalRouteCache, PlacementError, PlacementState, PlacementStore, PlacementWatchEvent,
-    ResolveRequest, RouteCacheConfig, RouteCacheKey, RouteResolver,
+use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
+use crate::error::PlacementError;
+use crate::instance::{InstanceRecord, InstanceState};
+use crate::route::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
+use crate::store::{
+    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementState, PlacementStore,
+    PlacementWatchEvent,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,10 +405,10 @@ where
     async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
         let key = request.cache_key();
         match self.cache.get(&key) {
-            crate::CacheLookup::Fresh(target) | crate::CacheLookup::Stale(target) => {
+            CacheLookup::Fresh(target) | CacheLookup::Stale(target) => {
                 return Ok(target);
             }
-            crate::CacheLookup::Miss => {}
+            CacheLookup::Miss => {}
         }
 
         self.placement_lookups.fetch_add(1, Ordering::SeqCst);
@@ -508,10 +511,12 @@ async fn refresh_cache_from_watch_event<S>(
 mod tests {
     use std::collections::BTreeMap;
 
-    use lattice_core::{InstanceCapacity, actor_kind, service_kind};
+    use lattice_core::instance::InstanceCapacity;
+    use lattice_core::{actor_kind, service_kind};
 
     use super::*;
-    use crate::{InMemoryPlacementStore, InstanceState, PlacementPrefix};
+    use crate::instance::InstanceState;
+    use crate::{InMemoryPlacementStore, PlacementPrefix};
 
     #[derive(Debug, Clone, Default)]
     struct CountingLogicControl {

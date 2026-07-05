@@ -9,9 +9,8 @@ use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 use crate::metadata::RpcClientContextFactory;
-use crate::{
-    ActorRefRpcCore, RoutedRequest, RpcError, RpcRequest, ShardedRpcCore, UnaryRpcTransport,
-};
+use crate::traits::UnaryRpcTransport;
+use crate::{ActorRefRpcCore, RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 
 #[derive(Debug, Default, Clone)]
 pub struct TonicEndpointChannelPool {

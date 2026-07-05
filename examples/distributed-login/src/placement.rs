@@ -1,9 +1,10 @@
 use http::Uri;
 use lattice_core::InstanceId;
-use lattice_placement::{
-    EndpointPool, ResolvingActorRefRpcCore, ResolvingRpcCore, RouteCacheConfig,
+use lattice_placement::cache::RouteCacheConfig;
+use lattice_placement::static_resolver::{
     StaticPlacementConfig, StaticRouteRange, StaticRouteResolver,
 };
+use lattice_placement::{EndpointPool, ResolvingActorRefRpcCore, ResolvingRpcCore};
 use lattice_rpc::{RouteTarget, RpcClientContextFactory};
 
 use crate::generated::GeneratedTonicEndpointTransport;

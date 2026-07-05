@@ -7,7 +7,8 @@ use lattice_core::{ActorId, ActorKind, Epoch, InstanceId, ServiceKind};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::{InstanceRecord, PlacementError};
+use crate::error::PlacementError;
+use crate::instance::InstanceRecord;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActorPlacementKey {

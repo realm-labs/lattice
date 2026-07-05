@@ -4,13 +4,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Semaphore, oneshot};
 
-use crate::{
-    Actor, ActorActivationError, ActorCallError, ActorContext, ActorError, ActorExecutionPolicy,
-    ActorHandle, ActorLifecycleState, ActorRegistry, ActorRegistryConfig, ActorRuntime,
-    ActorRuntimeConfig, ActorSpawnOptions, ActorTellError, ActorTerminated, ChildActorKey,
-    ChildActorOptions, ChildSupervision, Handler, MailboxConfig, Message, PassivationPolicy,
-    PassivationReason, StopReason, TerminatedReason, spawn_actor,
+use crate::context::ActorContext;
+use crate::error::{ActorActivationError, ActorCallError, ActorError, ActorTellError};
+use crate::handle::ActorHandle;
+use crate::mailbox::MailboxConfig;
+use crate::registry::{ActorRegistry, ActorRegistryConfig};
+use crate::runtime::{
+    ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, PassivationPolicy,
+    spawn_actor,
 };
+use crate::traits::{
+    Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
+    Message, PassivationReason, StopReason,
+};
+use crate::watch::{ActorTerminated, TerminatedReason};
 use lattice_core::{ActorId, actor_kind};
 
 #[derive(Debug)]

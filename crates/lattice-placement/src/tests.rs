@@ -4,16 +4,32 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lattice_core::{
-    ActorId, ActorRef, Epoch, InstanceCapacity, InstanceId, RouteKey, actor_kind, service_kind,
-};
+use lattice_core::instance::InstanceCapacity;
+use lattice_core::{ActorId, ActorRef, Epoch, InstanceId, RouteKey, actor_kind, service_kind};
 use lattice_rpc::{
     ActorRefRpcCore, AuthContext, RouteTarget, RoutedRequest, RpcClientContextFactory, RpcContext,
     RpcError, RpcRequest, ShardedRpcCore,
 };
 use tonic::{Request, Response};
 
-use super::*;
+use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
+use crate::endpoint::{EndpointLease, EndpointPool};
+use crate::error::PlacementError;
+use crate::instance::{InMemoryInstanceRegistry, InstanceRecord, InstanceRegistry, InstanceState};
+use crate::route::{
+    EndpointRpcTransport, InvalidateReason, ResolveRequest, ResolvingActorRefRpcCore,
+    ResolvingRpcCore, RouteCacheKey, RouteResolver, VirtualShardRouteTable,
+};
+use crate::static_resolver::{StaticPlacementConfig, StaticRouteRange, StaticRouteResolver};
+use crate::store::{
+    ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
+    PlacementState, PlacementStore, PlacementVersion,
+};
+use crate::vshard::{
+    GradualRebalanceShardAssigner, RoundRobinShardAssigner, VirtualShardAssignInput,
+    VirtualShardAssigner, VirtualShardAssignerRegistry, VirtualShardAssignment, VirtualShardId,
+    VirtualShardMapper,
+};
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct EnterWorldRequest {

@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use http::Uri;
-use lattice_core::{InstanceCapacity, InstanceId, ServiceKind};
+use lattice_core::instance::InstanceCapacity;
+use lattice_core::{InstanceId, ServiceKind};
 use serde::{Deserialize, Serialize};
 
 use crate::PlacementError;

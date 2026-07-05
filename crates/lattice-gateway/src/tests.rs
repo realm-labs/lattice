@@ -1,3 +1,7 @@
+use crate::rate_limit::{
+    GatewayRequestContext, GatewayTowerPipeline, KeyedRateLimiter, RateLimitKey,
+};
+use crate::session::{GatewayPush, GatewaySessionRegistry};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

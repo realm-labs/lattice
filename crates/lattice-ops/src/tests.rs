@@ -5,20 +5,30 @@ use std::time::Duration;
 
 use axum::http::HeaderMap;
 
-use lattice_core::{
-    ActorId, Epoch, InstanceCapacity, InstanceId, TraceContext, actor_kind, service_kind,
-};
+use lattice_core::instance::InstanceCapacity;
+use lattice_core::{ActorId, Epoch, InstanceId, TraceContext, actor_kind, service_kind};
 use lattice_eventbus::{
     EventBus, EventEnvelope, EventId, EventSubscription, LocalEventBus, Subject, SubjectFilter,
 };
-use lattice_placement::{
-    ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, InstanceRecord, InstanceState,
-    LeaseId, NoopLogicControl, PlacementCoordinator, PlacementPrefix, PlacementState,
-    PlacementStore,
+use lattice_placement::coordinator::{NoopLogicControl, PlacementCoordinator};
+use lattice_placement::instance::{InstanceRecord, InstanceState};
+use lattice_placement::store::{
+    ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
+    PlacementState, PlacementStore,
 };
 use serde_json::json;
 
 use super::*;
+use crate::admin::{
+    AdminApiError, AdminAuth, AdminHttpAdapter, AdminSnapshot, ClusterInspector, ClusterSummary,
+    InspectionView, InstanceView, NodeInspectView, PageRequest, paginate,
+};
+use crate::operation::{OperationId, OperationStatus, OperationTracker};
+use crate::outbox::{OutboxEvent, OutboxEventId, TransactionalOutbox};
+use crate::shutdown::{InMemoryShutdownLeaseController, LeaseEvent, ShutdownStage};
+use crate::telemetry::{
+    InMemoryTelemetryExporter, MetricSample, TelemetryRecorder, TraceSpan, TraceSpanKind,
+};
 
 #[tokio::test]
 async fn service_scheduler_cancels_interval_on_shutdown() {

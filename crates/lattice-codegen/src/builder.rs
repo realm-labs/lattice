@@ -6,8 +6,10 @@ use prost_types::FileDescriptorSet;
 use serde::Deserialize;
 
 use crate::descriptor::{methods_from_descriptor, parse_proto_options};
+use crate::gateway::GatewayRoute;
 use crate::render::{RenderOptions, generate_rpc_bindings_with_options};
-use crate::{CodegenError, GatewayRoute, RpcMethodSpec, proto_include};
+use crate::spec::RpcMethodSpec;
+use crate::{CodegenError, proto_include};
 
 #[derive(Debug, Clone)]
 pub struct LatticeCodegenBuilder {

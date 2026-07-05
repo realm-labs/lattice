@@ -1,4 +1,5 @@
-use crate::{LatticeServiceError, ServiceBuildContext};
+use crate::LatticeServiceError;
+use crate::context::ServiceBuildContext;
 
 pub trait RpcServiceBinding: Send + Sync + 'static {
     fn service_name(&self) -> &'static str;

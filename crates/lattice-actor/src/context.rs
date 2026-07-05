@@ -9,11 +9,14 @@ use tracing::Instrument;
 
 use lattice_core::ActorRef;
 
-use crate::ChildSupervision;
-use crate::{
-    Actor, ActorError, ActorHandle, ActorTerminated, ChildActorKey, ChildActorOptions, Handler,
-    Message, PassivationReason, StopReason, WatchId, spawn_actor,
+use crate::ActorError;
+use crate::handle::ActorHandle;
+use crate::runtime::spawn_actor;
+use crate::traits::{
+    Actor, ChildActorKey, ChildActorOptions, ChildSupervision, Handler, Message, PassivationReason,
+    StopReason,
 };
+use crate::watch::{ActorTerminated, WatchId};
 
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,

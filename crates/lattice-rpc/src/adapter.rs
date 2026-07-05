@@ -6,7 +6,8 @@ use tracing::Instrument;
 use crate::dedup::{RequestDedupKey, RequestDeduplicator};
 use crate::metadata::metadata_status;
 use crate::security::security_status;
-use crate::{PeerIdentity, RoutedRequest, Rpc, RpcContext, RpcRequest, RpcSecurityPolicy};
+use crate::security::{PeerIdentity, RpcSecurityPolicy};
+use crate::{RoutedRequest, Rpc, RpcContext, RpcRequest};
 
 pub struct ActorRpcAdapter<A: Actor> {
     handle: ActorHandle<A>,

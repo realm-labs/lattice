@@ -1,7 +1,7 @@
-mod client;
-mod codec;
-mod config;
-mod store;
+pub mod client;
+pub mod codec;
+pub mod config;
+pub mod store;
 
 pub use config::EtcdConfigStoreConfig;
 pub use store::EtcdConfigStore;

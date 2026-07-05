@@ -1,10 +1,9 @@
-mod bootstrap;
-mod error;
-mod format;
-mod source;
-mod store;
+pub mod bootstrap;
+pub mod error;
+pub mod format;
+pub mod source;
+pub mod store;
 
-pub use bootstrap::BootstrapConfig;
 pub use error::ConfigError;
 pub use format::ConfigFormat;
 pub use source::ConfigSource;

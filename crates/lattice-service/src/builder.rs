@@ -6,11 +6,11 @@ use lattice_core::{ActorKind, InstanceId, ServiceKind};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+use crate::actor::ActorRegistration;
 use crate::actor::ErasedActorRegistration;
-use crate::{
-    ActorRegistration, InstanceConfig, LatticeService, LatticeServiceError, RpcClientBinding,
-    RpcServiceBinding, ServiceBuildContext,
-};
+use crate::config::InstanceConfig;
+use crate::context::ServiceBuildContext;
+use crate::{LatticeService, LatticeServiceError, RpcClientBinding, RpcServiceBinding};
 
 pub struct LatticeServiceBuilder {
     service_kind: ServiceKind,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::trace::TraceSpanKind;
 
 const WORLD_SERVICE: ServiceKind = service_kind!("World");
 const WORLD_ACTOR: ActorKind = actor_kind!("World");

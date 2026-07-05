@@ -6,7 +6,8 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use lattice_core::{ActorKind, InstanceId, ServiceKind};
-use lattice_placement::{ActorPlacementRecord, InstanceRecord, PlacementStore};
+use lattice_placement::instance::InstanceRecord;
+use lattice_placement::store::{ActorPlacementRecord, PlacementStore};
 use serde::{Deserialize, Serialize};
 
 use crate::OpsError;

@@ -1,7 +1,8 @@
 use lattice_core::{InstanceId, ServiceKind};
 use serde::{Deserialize, Serialize};
 
-use crate::{AdminAuth, InMemoryTelemetryExporter, OpenTelemetryPipeline, TelemetryResource};
+use crate::admin::AdminAuth;
+use crate::telemetry::{InMemoryTelemetryExporter, OpenTelemetryPipeline, TelemetryResource};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TelemetryConfig {
@@ -84,7 +85,7 @@ mod tests {
     use axum::http::HeaderMap;
 
     use super::*;
-    use crate::AdminApiError;
+    use crate::admin::AdminApiError;
 
     #[test]
     fn admin_http_config_builds_auth_policy() {

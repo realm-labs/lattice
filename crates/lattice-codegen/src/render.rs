@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{CodegenError, ProtoRouteKeyOption, RouteKeyType, RpcMethodSpec};
+use crate::CodegenError;
+use crate::route_key::{ProtoRouteKeyOption, RouteKeyType};
+use crate::spec::RpcMethodSpec;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedRpcBindings {
@@ -211,7 +213,10 @@ fn push_service_module(rust: &mut String, methods: &[&RpcMethodSpec]) {
     );
     rust.push_str("    use lattice_core::{ActorId, ActorKind, RouteKey};\n");
     rust.push_str("    use lattice_rpc::{ActorRpcAdapter, Rpc, RpcRequest, RoutedRequest, ShardedRpcCore, TypedRpcClient};\n\n");
-    rust.push_str("    use lattice_service::{LatticeServiceError, RpcClientBinding, RpcServiceBinding, ServiceBuildContext};\n\n");
+    rust.push_str(
+        "    use lattice_service::{LatticeServiceError, RpcClientBinding, RpcServiceBinding};
+    use lattice_service::context::ServiceBuildContext;\n\n",
+    );
     push_typed_client(rust, methods);
     push_service_binding(rust, methods);
     push_server_adapter(rust, methods);
@@ -427,7 +432,7 @@ fn push_tonic_transport_method(rust: &mut String, method: &RpcMethodSpec) {
         "        let typed_reply = client.{method_name}(typed_tonic_request).await\n",
         method_name = method_name
     ));
-    rust.push_str("            .map_err(lattice_rpc::tonic_status_to_rpc_error)?\n");
+    rust.push_str("            .map_err(lattice_rpc::client::tonic_status_to_rpc_error)?\n");
     rust.push_str("            .into_inner();\n");
     rust.push_str("        let reply_bytes = typed_reply.encode_to_vec();\n");
     rust.push_str(

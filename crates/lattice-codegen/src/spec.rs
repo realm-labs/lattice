@@ -1,4 +1,4 @@
-use crate::ProtoRouteKeyOption;
+use crate::route_key::ProtoRouteKeyOption;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcMethodSpec {

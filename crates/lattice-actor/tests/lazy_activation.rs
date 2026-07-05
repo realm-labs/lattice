@@ -2,9 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use lattice_actor::error::ActorActivationError;
+use lattice_actor::registry::{ActorCreateContext, ActorRegistryConfig};
 use lattice_actor::{
-    Actor, ActorActivationError, ActorContext, ActorCreateContext, ActorError, ActorLoader,
-    ActorRegistry, ActorRegistryConfig, Handler, MailboxConfig, Message,
+    Actor, ActorContext, ActorError, ActorLoader, ActorRegistry, Handler, MailboxConfig, Message,
 };
 use lattice_core::{ActorId, actor_kind};
 use tokio::sync::Semaphore;

@@ -5,7 +5,9 @@ use prost_types::{
     DescriptorProto, FieldDescriptorProto, FileDescriptorSet, field_descriptor_proto::Label,
 };
 
-use crate::{CodegenError, ProtoRouteKeyOption, RouteKeyType, RpcMethodSpec};
+use crate::CodegenError;
+use crate::route_key::{ProtoRouteKeyOption, RouteKeyType};
+use crate::spec::RpcMethodSpec;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedOptions {

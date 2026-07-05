@@ -3,9 +3,11 @@ use lattice_actor::{Actor, ActorContext, ActorError, ActorRuntime, ActorSpawnOpt
 use lattice_core::{
     ActorKind, Epoch, InstanceId, RouteKey, TraceContext, actor_kind, service_kind,
 };
+use lattice_rpc::client::MetadataInjectingRpcCore;
+use lattice_rpc::traits::UnaryRpcTransport;
 use lattice_rpc::{
-    ActorRpcAdapter, MetadataInjectingRpcCore, RoutedRequest, Rpc, RpcClientContextFactory,
-    RpcContext, RpcError, RpcRequest, ShardedRpcCore, TypedRpcClient, UnaryRpcTransport,
+    ActorRpcAdapter, RoutedRequest, Rpc, RpcClientContextFactory, RpcContext, RpcError, RpcRequest,
+    ShardedRpcCore, TypedRpcClient,
 };
 use prost::Message as ProstMessage;
 use std::sync::{Arc, Mutex};

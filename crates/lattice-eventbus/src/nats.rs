@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::local::EventHandler;
 use crate::{
-    EventBus, EventBusError, EventEnvelope, EventHandler, EventId, EventSubscription,
-    EventSubscriptionHandle,
+    EventBus, EventBusError, EventEnvelope, EventId, EventSubscription, EventSubscriptionHandle,
 };
 
 #[derive(Clone)]

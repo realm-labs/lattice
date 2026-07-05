@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use lattice_core::{InstanceId, ServiceKind};
 use lattice_eventbus::EventSubscriptionHandle;
-use lattice_placement::{DrainReport, LogicControl, PlacementCoordinator, PlacementStore};
+use lattice_placement::coordinator::{DrainReport, LogicControl, PlacementCoordinator};
+use lattice_placement::store::PlacementStore;
 use tokio::sync::Mutex;
 
 use crate::{OpsError, ServiceScheduler};

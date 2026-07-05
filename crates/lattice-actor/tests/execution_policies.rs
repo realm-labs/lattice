@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lattice_actor::runtime::{ActorExecutionPolicy, ActorScheduler};
 use lattice_actor::{
-    Actor, ActorContext, ActorError, ActorExecutionPolicy, ActorRuntime, ActorScheduler,
-    ActorSpawnError, ActorSpawnOptions, Handler, MailboxConfig, Message, PassivationPolicy,
+    Actor, ActorContext, ActorError, ActorRuntime, ActorSpawnError, ActorSpawnOptions, Handler,
+    MailboxConfig, Message, PassivationPolicy,
 };
 use lattice_core::ActorId;
 use tokio::sync::Mutex;

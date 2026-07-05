@@ -10,7 +10,8 @@ use tonic::server::NamedService;
 use tonic::transport::Server;
 use tonic::transport::server::Router;
 
-use crate::{LatticeServiceError, RegisteredActor};
+use crate::LatticeServiceError;
+use crate::actor::RegisteredActor;
 
 pub struct ServiceContext {
     service_kind: ServiceKind,

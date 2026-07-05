@@ -11,11 +11,11 @@ use tokio::sync::mpsc;
 use tokio::sync::{broadcast, oneshot, watch};
 use tracing::Instrument;
 
+use crate::context::ActorContext;
+use crate::handle::ActorHandle;
 use crate::mailbox::{ActorCommand, MailboxConfig, MailboxLane};
-use crate::{
-    Actor, ActorContext, ActorHandle, ActorIncarnation, ActorLifecycleState, ActorTerminated,
-    LocalActorRef, PassivationReason, StopReason, TerminatedReason,
-};
+use crate::traits::{Actor, ActorLifecycleState, PassivationReason, StopReason};
+use crate::watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason};
 use lattice_core::{ActorId, ActorRef};
 
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);

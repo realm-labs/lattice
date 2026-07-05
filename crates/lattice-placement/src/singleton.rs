@@ -6,10 +6,11 @@ use async_trait::async_trait;
 use lattice_core::{ActorKind, Epoch, InstanceId, RouteKey, ServiceKind};
 use lattice_rpc::RouteTarget;
 
-use crate::{
-    InstanceRecord, InstanceState, LeaseId, LocalRouteCache, PlacementError, PlacementStore,
-    ResolveRequest, RouteCacheConfig, RouteCacheKey, RouteResolver,
-};
+use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
+use crate::error::PlacementError;
+use crate::instance::{InstanceRecord, InstanceState};
+use crate::route::{ResolveRequest, RouteCacheKey, RouteResolver};
+use crate::store::{LeaseId, PlacementStore};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SingletonKey {
@@ -208,10 +209,10 @@ where
     async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
         let cache_key = request.cache_key();
         match self.cache.get(&cache_key) {
-            crate::CacheLookup::Fresh(target) | crate::CacheLookup::Stale(target) => {
+            CacheLookup::Fresh(target) | CacheLookup::Stale(target) => {
                 return Ok(target);
             }
-            crate::CacheLookup::Miss => {}
+            CacheLookup::Miss => {}
         }
 
         let scope = match request.route_key {
@@ -254,10 +255,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use lattice_core::{InstanceCapacity, actor_kind, service_kind};
+    use lattice_core::instance::InstanceCapacity;
+    use lattice_core::{actor_kind, service_kind};
 
     use super::*;
-    use crate::{InMemoryPlacementStore, InstanceState, PlacementPrefix};
+    use crate::instance::InstanceState;
+    use crate::{InMemoryPlacementStore, PlacementPrefix};
 
     #[derive(Debug, Clone, Default)]
     struct CountingSingletonControl {

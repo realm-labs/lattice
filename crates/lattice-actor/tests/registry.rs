@@ -2,10 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lattice_actor::{
-    Actor, ActorActivationError, ActorContext, ActorError, ActorRefConfig, ActorRegistry,
-    ActorRegistryConfig, MailboxConfig,
-};
+use lattice_actor::error::ActorActivationError;
+use lattice_actor::registry::{ActorRefConfig, ActorRegistryConfig};
+use lattice_actor::{Actor, ActorContext, ActorError, ActorRegistry, MailboxConfig};
 use lattice_core::{ActorId, ActorRef, ActorRefTarget, InstanceId, actor_kind, service_kind};
 use tokio::sync::{Semaphore, oneshot};
 

@@ -9,10 +9,11 @@ use http::Uri;
 use lattice_core::{ActorId, ActorKind, ActorRef, Epoch, InstanceId, ServiceKind};
 use tokio::sync::{Semaphore, watch};
 
-use crate::{
-    Actor, ActorActivationError, ActorError, ActorHandle, MailboxConfig, PassivationPolicy,
-    runtime::spawn_actor_with_self_ref,
-};
+use crate::error::{ActorActivationError, ActorError};
+use crate::handle::ActorHandle;
+use crate::mailbox::MailboxConfig;
+use crate::runtime::{PassivationPolicy, spawn_actor_with_self_ref};
+use crate::traits::Actor;
 
 #[derive(Debug, Clone)]
 pub struct ActorRegistryConfig {

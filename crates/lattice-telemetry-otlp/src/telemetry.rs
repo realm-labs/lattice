@@ -8,9 +8,10 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::{
-    OtlpTraceConfig, TelemetryConfig, TelemetryGuard, TelemetryInitError, TelemetryResource,
-};
+use crate::config::{OtlpTraceConfig, TelemetryConfig};
+use crate::error::TelemetryInitError;
+use crate::guard::TelemetryGuard;
+use crate::resource::TelemetryResource;
 
 #[derive(Debug, Clone)]
 pub struct LatticeTelemetry {

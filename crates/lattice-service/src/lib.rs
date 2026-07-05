@@ -1,17 +1,13 @@
-mod actor;
-mod builder;
-mod config;
-mod context;
-mod error;
-mod rpc;
-mod service;
+pub mod actor;
+pub mod builder;
+pub mod config;
+pub mod context;
+pub mod error;
+pub mod rpc;
+pub mod service;
 
-pub use actor::{
-    ActorRegistration, ActorRegistrationBuilder, NoFactory, RegisteredActor, ServiceActorLoader,
-};
+pub use actor::{ActorRegistration, ActorRegistrationBuilder};
 pub use builder::LatticeServiceBuilder;
-pub use config::InstanceConfig;
-pub use context::{ServiceBuildContext, ServiceContext};
 pub use error::LatticeServiceError;
 pub use rpc::{RpcClientBinding, RpcServiceBinding};
 pub use service::LatticeService;

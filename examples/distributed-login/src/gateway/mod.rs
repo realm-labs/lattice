@@ -5,10 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use http::Uri;
-use lattice_actor::{
-    ActorCreateContext, ActorError, ActorLoader, ActorRefConfig, ActorRegistry,
-    ActorRegistryConfig, StopReason,
-};
+use lattice_actor::registry::{ActorCreateContext, ActorRefConfig, ActorRegistryConfig};
+use lattice_actor::{ActorError, ActorLoader, ActorRegistry, StopReason};
 use lattice_core::{ActorId, ActorRef, InstanceId};
 use lattice_gateway::{ClientFrame, GatewayRouteTable};
 use prost::Message as ProstMessage;

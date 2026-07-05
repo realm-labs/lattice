@@ -19,13 +19,14 @@ use lattice_eventbus::{
 };
 use lattice_gateway::{BinaryClientCodec, ClientCodec, ClientFrame, GatewayRouteTable};
 use lattice_ops::ServiceScheduler;
-use lattice_placement::{
-    EndpointLease, EndpointPool, EndpointRpcTransport, ResolvingRpcCore, RouteCacheConfig,
+use lattice_placement::cache::RouteCacheConfig;
+use lattice_placement::static_resolver::{
     StaticPlacementConfig, StaticRouteRange, StaticRouteResolver,
 };
+use lattice_placement::{EndpointLease, EndpointPool, EndpointRpcTransport, ResolvingRpcCore};
+use lattice_rpc::server::RpcServerBuilder;
 use lattice_rpc::{
-    ActorRpcAdapter, RouteTarget, RoutedRequest, Rpc, RpcClientContextFactory, RpcError,
-    RpcRequest, RpcServerBuilder,
+    ActorRpcAdapter, RouteTarget, RoutedRequest, Rpc, RpcClientContextFactory, RpcError, RpcRequest,
 };
 use prost::Message as ProstMessage;
 use serde::Deserialize;

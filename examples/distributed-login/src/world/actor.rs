@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use lattice_actor::{Actor, ActorContext, ActorCreateContext, ActorError, ActorFactory, Handler};
+use lattice_actor::registry::ActorCreateContext;
+use lattice_actor::{Actor, ActorContext, ActorError, ActorFactory, Handler};
 use lattice_core::ActorId;
 use lattice_rpc::Rpc;
 

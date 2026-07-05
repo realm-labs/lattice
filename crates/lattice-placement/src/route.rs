@@ -9,10 +9,10 @@ use lattice_rpc::{
 use tonic::{Request, Response};
 use tracing::Instrument;
 
-use crate::{
-    EndpointLease, EndpointPool, InMemoryInstanceRegistry, InstanceRegistry, InstanceState,
-    PlacementError, VirtualShardAssignment, VirtualShardId, VirtualShardMapper,
-};
+use crate::endpoint::{EndpointLease, EndpointPool};
+use crate::error::PlacementError;
+use crate::instance::{InMemoryInstanceRegistry, InstanceRegistry, InstanceState};
+use crate::vshard::{VirtualShardAssignment, VirtualShardId, VirtualShardMapper};
 
 #[derive(Debug, Clone)]
 pub struct VirtualShardRouteTable {

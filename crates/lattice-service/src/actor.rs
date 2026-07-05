@@ -4,13 +4,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_actor::{
-    Actor, ActorCreateContext, ActorError, ActorFactory, ActorLoader, ActorRegistry,
-    ActorRegistryConfig, MailboxConfig, PassivationPolicy,
+use lattice_actor::error::ActorError;
+use lattice_actor::mailbox::MailboxConfig;
+use lattice_actor::registry::{
+    ActorCreateContext, ActorFactory, ActorLoader, ActorRegistry, ActorRegistryConfig,
 };
+use lattice_actor::runtime::PassivationPolicy;
+use lattice_actor::traits::Actor;
 use lattice_core::ActorKind;
 
-use crate::{LatticeServiceError, ServiceBuildContext};
+use crate::LatticeServiceError;
+use crate::context::ServiceBuildContext;
 
 type ActorCreateFuture<A> = Pin<Box<dyn Future<Output = Result<A, ActorError>> + Send>>;
 type ActorCreateFn<A> = dyn Fn(ActorCreateContext) -> ActorCreateFuture<A> + Send + Sync;

@@ -5,10 +5,9 @@ use async_trait::async_trait;
 use lattice_core::{ActorKind, RouteKey, ServiceKind};
 use lattice_rpc::RouteTarget;
 
-use crate::{
-    CacheLookup, InvalidateReason, LocalRouteCache, PlacementError, ResolveRequest,
-    RouteCacheConfig, RouteCacheKey, RouteResolver,
-};
+use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
+use crate::error::PlacementError;
+use crate::route::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
 
 #[derive(Debug, Clone)]
 pub struct StaticPlacementConfig {

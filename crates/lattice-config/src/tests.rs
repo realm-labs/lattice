@@ -1,3 +1,4 @@
+use crate::bootstrap::BootstrapConfig;
 use std::fs;
 
 use async_trait::async_trait;
