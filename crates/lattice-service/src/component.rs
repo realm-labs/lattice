@@ -142,6 +142,11 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
     async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError>;
+    async fn keepalive_singleton_owner_leases(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+    ) -> Result<usize, PlacementError>;
     async fn placement_route_resolver(
         &self,
         service_kind: ServiceKind,
@@ -206,6 +211,21 @@ where
 
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError> {
         self.store.upsert_instance(record).await
+    }
+
+    async fn keepalive_singleton_owner_leases(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+    ) -> Result<usize, PlacementError> {
+        let mut kept_alive = 0;
+        for (_version, record) in self.store.list_singletons().await? {
+            if &record.service_kind == service_kind && &record.owner == instance_id {
+                self.store.keepalive_instance_lease(record.lease_id).await?;
+                kept_alive += 1;
+            }
+        }
+        Ok(kept_alive)
     }
 
     async fn placement_route_resolver(

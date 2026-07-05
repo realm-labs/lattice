@@ -361,6 +361,20 @@ fn etcd_instance_records_are_written_with_their_instance_lease() {
     assert!(options.is_some());
 }
 
+#[test]
+fn etcd_singleton_records_are_written_with_their_owner_lease() {
+    let singleton = EtcdValue::Singleton(Box::new(singleton_record(
+        "global",
+        "world-a",
+        1,
+        LeaseId(7),
+    )));
+
+    let options = put_options_for(&singleton).unwrap();
+
+    assert!(options.is_some());
+}
+
 fn actor_key_for(actor_id: u64) -> ActorPlacementKey {
     ActorPlacementKey {
         actor_kind: actor_kind!("World"),

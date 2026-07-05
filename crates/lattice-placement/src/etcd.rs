@@ -928,7 +928,11 @@ fn put_options_for(value: &EtcdValue) -> Result<Option<PutOptions>, PlacementErr
             let lease_id = i64::try_from(lease_id.0).map_err(codec_error)?;
             Ok(Some(PutOptions::new().with_lease(lease_id)))
         }
-        EtcdValue::Actor(_) | EtcdValue::VirtualShard(_) | EtcdValue::Singleton(_) => Ok(None),
+        EtcdValue::Singleton(record) => {
+            let lease_id = i64::try_from(record.lease_id.0).map_err(codec_error)?;
+            Ok(Some(PutOptions::new().with_lease(lease_id)))
+        }
+        EtcdValue::Actor(_) | EtcdValue::VirtualShard(_) => Ok(None),
     }
 }
 

@@ -123,6 +123,9 @@ impl LatticeService {
             loop {
                 tokio::time::sleep(instance_lease_keepalive_interval).await;
                 placement_store.keepalive_instance_lease(lease_id).await?;
+                placement_store
+                    .keepalive_singleton_owner_leases(&service_kind, &instance.instance_id)
+                    .await?;
             }
         };
         let lifecycle_shutdown = async {

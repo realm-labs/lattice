@@ -812,6 +812,7 @@ async fn register_client_builds_default_singleton_core_from_store() {
         .instance_id(InstanceId::new("world-a"))
         .listen(listener)
         .ready_signal(ready_tx)
+        .instance_lease_keepalive_interval(Duration::from_millis(10))
         .placement_store::<InMemoryPlacementStore, _>(store.clone())
         .register_client::<FakeSingletonClientBinding>()
         .register_actor(
@@ -855,7 +856,13 @@ async fn register_client_builds_default_singleton_core_from_store() {
         singleton_kind: actor_kind!("SeasonManager"),
         scope: "global".to_string(),
     };
-    assert!(store.get_singleton(&singleton_key).await.unwrap().is_some());
+    let singleton_lease_id = store
+        .get_singleton(&singleton_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+        .lease_id;
     assert!(
         store
             .get_actor(&ActorPlacementKey {
@@ -866,6 +873,20 @@ async fn register_client_builds_default_singleton_core_from_store() {
             .unwrap()
             .is_none()
     );
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if store
+                .instance_lease_keepalive_count(singleton_lease_id)
+                .unwrap_or(0)
+                >= 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();
 }

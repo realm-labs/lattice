@@ -192,7 +192,7 @@ Status: `[ ]` incomplete.
 - [x] Singleton ownership is not stored through the production `PlacementStore`/etcd keyspace.
 - [x] `ActivateSingleton` control-plane API is not implemented as a service endpoint.
 - [x] Generated singleton client/adapter is missing.
-- [ ] Singleton owner lease/keepalive/failover is not connected to service lifecycle.
+- [x] Singleton owner lease/keepalive/failover is not connected to service lifecycle.
 - [ ] Old singleton owner fencing is not enforced in the runtime path.
 
 #### Phase 7: Ops Production Features
@@ -836,7 +836,7 @@ Pre-implementation checks:
 [ ] metrics labels avoid actor_id/request_id/event_id/session_id high-cardinality fields.
 [ ] actor activation has a distributed lock.
 [ ] actor registry prevents duplicate local activation.
-[ ] singleton has lease + epoch + durable owner record.
+[x] singleton has lease + epoch + durable owner record.
 [ ] passivation calls business stop/save hook and cleans mailbox/tasks.
 [ ] business request_passivation/request_stop takes effect after the current handler returns.
 [ ] stop/save failure enters StopFailed, blocks unload and owner release, and waits for retry/operator intervention.

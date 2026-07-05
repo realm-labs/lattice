@@ -8,7 +8,7 @@ use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::error::PlacementError;
 use crate::instance::{InstanceRecord, InstanceState};
 use crate::route::{ResolveRequest, RouteCacheKey, RouteResolver};
-use crate::store::{LeaseId, PlacementState, PlacementStore, SingletonKey};
+use crate::store::{PlacementState, PlacementStore, SingletonKey};
 
 pub use crate::store::SingletonPlacementRecord;
 
@@ -77,14 +77,14 @@ where
         if let Some((_version, record)) = self.store.get_singleton(&key).await? {
             return Ok(record);
         }
-        let lease_id = match self.store.acquire_singleton_lock(key.clone()).await {
+        let _lock_lease_id = match self.store.acquire_singleton_lock(key.clone()).await {
             Ok(lease_id) => lease_id,
             Err(PlacementError::SingletonLockHeld) => {
                 return self.wait_for_existing_owner(&key).await;
             }
             Err(error) => return Err(error),
         };
-        let result = self.activate_with_lock(key.clone(), lease_id).await;
+        let result = self.activate_with_lock(key.clone()).await;
         self.store.release_singleton_lock(&key).await?;
         result
     }
@@ -94,8 +94,8 @@ where
         key: &SingletonKey,
         new_owner: InstanceId,
     ) -> Result<SingletonPlacementRecord, PlacementError> {
-        let lease_id = self.store.acquire_singleton_lock(key.clone()).await?;
-        let result = self.failover_with_lock(key, new_owner, lease_id).await;
+        let _lock_lease_id = self.store.acquire_singleton_lock(key.clone()).await?;
+        let result = self.failover_with_lock(key, new_owner).await;
         self.store.release_singleton_lock(key).await?;
         result
     }
@@ -115,13 +115,13 @@ where
         &self,
         key: &SingletonKey,
         new_owner: InstanceId,
-        lease_id: LeaseId,
     ) -> Result<SingletonPlacementRecord, PlacementError> {
         let (version, current) = self
             .store
             .get_singleton(key)
             .await?
             .ok_or(PlacementError::NoRoute)?;
+        let lease_id = self.store.grant_instance_lease().await?;
         let record = SingletonPlacementRecord {
             owner: new_owner,
             epoch: Epoch(current.epoch.0 + 1),
@@ -138,7 +138,6 @@ where
     async fn activate_with_lock(
         &self,
         key: SingletonKey,
-        lease_id: LeaseId,
     ) -> Result<SingletonPlacementRecord, PlacementError> {
         if let Some((_version, record)) = self.store.get_singleton(&key).await? {
             return Ok(record);
@@ -151,6 +150,7 @@ where
             .filter(|instance| instance.state == InstanceState::Ready)
             .min_by_key(|instance| instance.instance_id.clone())
             .ok_or(PlacementError::NoReadyInstances)?;
+        let lease_id = self.store.grant_instance_lease().await?;
         let record = SingletonPlacementRecord {
             service_kind: key.service_kind.clone(),
             singleton_kind: key.singleton_kind.clone(),
@@ -259,7 +259,7 @@ mod tests {
 
     use super::*;
     use crate::instance::InstanceState;
-    use crate::store::PlacementVersion;
+    use crate::store::{LeaseId, PlacementVersion};
     use crate::{InMemoryPlacementStore, PlacementPrefix};
 
     #[derive(Debug, Clone, Default)]

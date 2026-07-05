@@ -413,7 +413,7 @@ mod tests {
         assert_eq!(response.scope, "global");
         assert_eq!(response.owner_instance_id, "world-a");
         assert_eq!(response.epoch, 1);
-        assert_eq!(response.lease_id, 1);
+        assert_eq!(response.lease_id, 2);
         assert_eq!(response.state, "running");
         shutdown_tx.send(()).unwrap();
         task.await.unwrap().unwrap();
