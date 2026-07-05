@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Query, State};
@@ -9,16 +10,18 @@ use lattice_core::{ActorKind, InstanceId, ServiceKind};
 use lattice_placement::instance::InstanceRecord;
 use lattice_placement::store::{ActorPlacementRecord, PlacementStore};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 use crate::OpsError;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterSummary {
     pub instance_count: usize,
     pub actor_owner_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeSummary {
     pub instance_id: InstanceId,
     pub service_kind: ServiceKind,
@@ -132,6 +135,7 @@ pub struct InspectionView {
 #[derive(Debug, Clone)]
 pub struct AdminSnapshot {
     pub summary: ClusterSummary,
+    pub node_summary: Option<NodeSummary>,
     pub instances: Vec<InstanceView>,
     pub nodes: Vec<NodeInspectView>,
     pub placements: Vec<InspectionView>,
@@ -146,6 +150,7 @@ impl AdminSnapshot {
     pub fn new(summary: ClusterSummary, instances: Vec<InstanceView>) -> Self {
         Self {
             summary,
+            node_summary: None,
             instances,
             nodes: Vec::new(),
             placements: Vec::new(),
@@ -179,6 +184,7 @@ impl AdminHttpAdapter {
     pub fn router(self) -> Router {
         Router::new()
             .route("/admin/cluster/summary", get(admin_cluster_summary))
+            .route("/admin/node/summary", get(admin_node_summary))
             .route("/admin/instances", get(admin_instances))
             .route("/admin/nodes", get(admin_nodes))
             .route("/admin/placements", get(admin_placements))
@@ -197,6 +203,18 @@ async fn admin_cluster_summary(
 ) -> Result<Json<ClusterSummary>, AdminApiError> {
     state.auth.authorize(&headers)?;
     Ok(Json(state.snapshot.summary))
+}
+
+async fn admin_node_summary(
+    State(state): State<AdminHttpState>,
+    headers: HeaderMap,
+) -> Result<Json<NodeSummary>, AdminApiError> {
+    state.auth.authorize(&headers)?;
+    state
+        .snapshot
+        .node_summary
+        .ok_or(AdminApiError::NotFound)
+        .map(Json)
 }
 
 async fn admin_instances(
@@ -241,6 +259,8 @@ admin_inspection_handler!(admin_event_subscriptions, event_subscriptions);
 pub enum AdminApiError {
     #[error("admin request is unauthorized")]
     Unauthorized,
+    #[error("admin resource was not found")]
+    NotFound,
 }
 
 impl axum::response::IntoResponse for AdminApiError {
@@ -249,7 +269,81 @@ impl axum::response::IntoResponse for AdminApiError {
             AdminApiError::Unauthorized => {
                 (StatusCode::UNAUTHORIZED, self.to_string()).into_response()
             }
+            AdminApiError::NotFound => (StatusCode::NOT_FOUND, self.to_string()).into_response(),
         }
+    }
+}
+
+#[async_trait]
+pub trait NodeInspectorClient: Clone + Send + Sync + 'static {
+    async fn inspect_node(&self, instance: InstanceRecord) -> Result<NodeSummary, OpsError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HttpNodeInspectorClient {
+    admin_token: Option<String>,
+}
+
+impl HttpNodeInspectorClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_admin_token(token: impl Into<String>) -> Self {
+        Self {
+            admin_token: Some(token.into()),
+        }
+    }
+}
+
+#[async_trait]
+impl NodeInspectorClient for HttpNodeInspectorClient {
+    async fn inspect_node(&self, instance: InstanceRecord) -> Result<NodeSummary, OpsError> {
+        let endpoint = instance.control_endpoint;
+        let host = endpoint.host().ok_or_else(|| OpsError::Admin {
+            message: format!("control endpoint {endpoint} has no host"),
+        })?;
+        let port = endpoint.port_u16().unwrap_or(80);
+        let mut stream =
+            TcpStream::connect((host, port))
+                .await
+                .map_err(|error| OpsError::Admin {
+                    message: error.to_string(),
+                })?;
+        let token_header = self
+            .admin_token
+            .as_ref()
+            .map(|token| format!("x-lattice-admin-token: {token}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "GET /admin/node/summary HTTP/1.1\r\nHost: {host}\r\n{token_header}Connection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|error| OpsError::Admin {
+                message: error.to_string(),
+            })?;
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .map_err(|error| OpsError::Admin {
+                message: error.to_string(),
+            })?;
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| OpsError::Admin {
+                message: "admin response is missing headers".to_string(),
+            })?;
+        if !head.starts_with("HTTP/1.1 200") {
+            return Err(OpsError::Admin {
+                message: head.lines().next().unwrap_or("HTTP error").to_string(),
+            });
+        }
+        serde_json::from_str(body).map_err(|error| OpsError::Admin {
+            message: error.to_string(),
+        })
     }
 }
 
@@ -295,5 +389,35 @@ where
             service_kind: instance.service_kind.clone(),
             actor_kinds,
         }
+    }
+
+    pub async fn inspect_nodes<C>(
+        &self,
+        service_kind: &ServiceKind,
+        client: C,
+    ) -> Result<Vec<NodeInspectView>, OpsError>
+    where
+        C: NodeInspectorClient,
+    {
+        let instances = self.store.list_instances(service_kind).await?;
+        let mut views = Vec::with_capacity(instances.len());
+        for instance in instances {
+            let instance_id = instance.instance_id.clone();
+            match client.clone().inspect_node(instance).await {
+                Ok(summary) => views.push(NodeInspectView {
+                    instance_id,
+                    reachable: true,
+                    summary: Some(summary),
+                    error: None,
+                }),
+                Err(error) => views.push(NodeInspectView {
+                    instance_id,
+                    reachable: false,
+                    summary: None,
+                    error: Some(error.to_string()),
+                }),
+            }
+        }
+        Ok(views)
     }
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::http::HeaderMap;
 
 use lattice_core::instance::InstanceCapacity;
@@ -21,7 +22,8 @@ use serde_json::json;
 use super::*;
 use crate::admin::{
     AdminApiError, AdminAuth, AdminHttpAdapter, AdminSnapshot, ClusterInspector, ClusterSummary,
-    InspectionView, InstanceView, NodeInspectView, PageRequest, paginate,
+    HttpNodeInspectorClient, InspectionView, InstanceView, NodeInspectView, NodeInspectorClient,
+    NodeSummary, PageRequest, paginate,
 };
 use crate::operation::{OperationId, OperationStatus, OperationTracker};
 use crate::outbox::{OutboxEvent, OutboxEventId, TransactionalOutbox};
@@ -192,6 +194,107 @@ async fn cluster_inspector_summarizes_instances_and_actor_owners() {
         }
     );
     assert_eq!(node.actor_kinds, vec![actor_kind!("World")]);
+}
+
+#[derive(Clone)]
+struct FakeNodeInspectorClient {
+    summaries: Arc<HashMap<InstanceId, Result<NodeSummary, String>>>,
+}
+
+#[async_trait]
+impl NodeInspectorClient for FakeNodeInspectorClient {
+    async fn inspect_node(&self, instance: InstanceRecord) -> Result<NodeSummary, OpsError> {
+        self.summaries
+            .get(&instance.instance_id)
+            .cloned()
+            .unwrap_or_else(|| Err("missing fake node".to_string()))
+            .map_err(|message| OpsError::Admin { message })
+    }
+}
+
+#[tokio::test]
+async fn cluster_inspector_queries_live_nodes_with_partial_failures() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    store
+        .upsert_instance(instance_record("world-a"))
+        .await
+        .unwrap();
+    store
+        .upsert_instance(instance_record("world-b"))
+        .await
+        .unwrap();
+    let summary = NodeSummary {
+        instance_id: InstanceId::new("world-a"),
+        service_kind: service_kind!("World"),
+        actor_kinds: vec![actor_kind!("World")],
+    };
+    let client = FakeNodeInspectorClient {
+        summaries: Arc::new(HashMap::from([
+            (InstanceId::new("world-a"), Ok(summary.clone())),
+            (
+                InstanceId::new("world-b"),
+                Err("admin endpoint timeout".to_string()),
+            ),
+        ])),
+    };
+
+    let mut nodes = ClusterInspector::new(store)
+        .inspect_nodes(&service_kind!("World"), client)
+        .await
+        .unwrap();
+    nodes.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0].summary, Some(summary));
+    assert!(nodes[0].reachable);
+    assert!(!nodes[1].reachable);
+    assert!(
+        nodes[1]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("admin endpoint timeout")
+    );
+}
+
+#[tokio::test]
+async fn http_node_inspector_client_reads_admin_node_summary() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let expected = NodeSummary {
+        instance_id: InstanceId::new("world-a"),
+        service_kind: service_kind!("World"),
+        actor_kinds: vec![actor_kind!("World")],
+    };
+    let mut snapshot = AdminSnapshot::new(
+        ClusterSummary {
+            instance_count: 1,
+            actor_owner_count: 1,
+        },
+        vec![InstanceView::from(instance_record("world-a"))],
+    );
+    snapshot.node_summary = Some(expected.clone());
+    let router = AdminHttpAdapter::new(AdminAuth::disabled(), snapshot).router();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    let mut instance = instance_record("world-a");
+    instance.control_endpoint = format!("http://{addr}").parse().unwrap();
+
+    let actual = HttpNodeInspectorClient::new()
+        .inspect_node(instance)
+        .await
+        .unwrap();
+
+    assert_eq!(actual, expected);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap();
 }
 
 #[test]

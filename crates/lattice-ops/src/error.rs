@@ -14,4 +14,6 @@ pub enum OpsError {
     UnknownOutboxEvent,
     #[error("metric label {label} is too high-cardinality")]
     HighCardinalityMetricLabel { label: String },
+    #[error("admin query failed: {message}")]
+    Admin { message: String },
 }

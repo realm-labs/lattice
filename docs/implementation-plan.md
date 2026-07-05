@@ -218,7 +218,7 @@ Status: `[ ]` incomplete.
   - [x] `LatticeService` shutdown does not drain runtime actor registries with `PassivationReason::Drain`.
   - [x] Service drain does not yet invoke coordinator-driven placement migration for owned actors before releasing readiness.
 - [x] Gateway startup is still mostly example-specific and not represented as a framework service API.
-- [ ] Cluster/node inspection does not query live services through LogicControl/Admin APIs.
+- [x] Cluster/node inspection does not query live services through LogicControl/Admin APIs.
 - [ ] Security/mTLS integration is partial and not connected to service builders by default.
 - [ ] Full chaos test suite is not implemented.
 - [ ] `crates/lattice-actor/src/tests.rs` exceeds 1200 LOC and needs a documented split or explicit rationale before final exit.
