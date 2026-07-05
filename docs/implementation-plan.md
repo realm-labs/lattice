@@ -304,7 +304,8 @@ Status: `[ ]` in progress.
   - [x] TCP transport send/receive metrics and trace-level frame events are covered by transport tests; direct-link tracing uses lifecycle/frame events and does not create per-message spans by default.
 - [x] Direct Link benchmark exists for TCP single-process, local multi-process, and payload/backpressure matrices.
   - [x] `crates/lattice-direct-link/benches/direct_link_benchmark.rs` covers TCP single-process loopback, local multi-process-shaped independent transport loopback, frame payload sizes, and backpressure policy enqueue matrices.
-- [ ] Architecture/API examples document when to use gRPC RPC versus Direct Actor Link and show unidirectional and bidirectional flows.
+- [x] Architecture/API examples document when to use gRPC RPC versus Direct Actor Link and show unidirectional and bidirectional flows.
+  - [x] `docs/architecture/07-api-examples.md` shows generated RPC, unidirectional direct-link, bidirectional direct-link, target `Linked<T>` / `LinkOpened` handlers, and direct-link service registration. This item is documentation/API guidance only; the referenced APIs are implemented and covered by the preceding Phase 8 code/test items.
 
 ### Phase 1: Single-Node Actor Runtime
 

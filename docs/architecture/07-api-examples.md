@@ -119,16 +119,35 @@ async fn main() -> anyhow::Result<()> {
 
 A process may register multiple actor kinds and multiple generated gRPC services while sharing one `advertised_endpoint`.
 
-The default command path is generated gRPC RPC. High-frequency transient data should use an explicit direct actor link instead of pretending to be normal RPC:
+The default command path is generated gRPC RPC. Use it for actor commands that need owner routing, fencing, retries, request-id duplicate guards, route correction, or a definitive reply:
 
 ```rust
-let link = ctx
-    .links()
+let accepted = ctx
+    .clients()
+    .get::<generated::world_rpc::Client>()?
+    .enter_world(generated::world_rpc::EnterWorld {
+        world_id,
+        player_id,
+    })
+    .await?;
+```
+
+Use Direct Actor Link only for explicit high-rate actor-to-actor streams where the business protocol accepts weaker semantics: fire-and-forget messages, no request/reply result, no request-id dedup, and reconnect decisions owned by business code.
+
+Unidirectional Direct Link flow:
+
+```rust
+let movement_stream = DirectLinkStream::new("movement")
+    .message::<game::PositionUpdate>()
+    .message::<game::StateDelta>();
+
+let link = ctx.links()
     .connect(
         battle_actor_ref,
+        movement_stream.clone(),
         DirectLinkOptions {
-            reconnect: ReconnectPolicy::BusinessOwned,
             backpressure: BackpressurePolicy::DropOldest { max_pending: 1024 },
+            ..DirectLinkOptions::unidirectional()
         },
     )
     .await?;
@@ -142,7 +161,88 @@ link.tell(PositionUpdate {
 .await?;
 ```
 
-Direct actor links are for high-rate data streams with weaker semantics. Commands that need owner routing, fencing, retry, dedup, or a definitive reply should stay on generated RPC clients.
+The target actor receives linked payloads through normal actor handlers:
+
+```rust
+impl Handler<Linked<game::PositionUpdate>> for BattleActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        msg: Linked<game::PositionUpdate>,
+    ) -> Result<(), ActorError> {
+        self.apply_position(msg.payload, msg.context.sequence);
+        Ok(())
+    }
+}
+```
+
+Bidirectional Direct Link flow uses two logical streams over the same underlying link: one source-to-target stream and one target-to-source stream.
+
+```rust
+let input_stream = DirectLinkStream::new("gateway-input")
+    .message::<game::InputCommand>();
+let update_stream = DirectLinkStream::new("battle-update")
+    .message::<game::BattleUpdate>();
+
+let input_link = ctx.links()
+    .connect_bidirectional(
+        battle_actor_ref,
+        input_stream.clone(),
+        update_stream.clone(),
+        DirectLinkOptions {
+            backpressure: BackpressurePolicy::FailFast { max_pending: 512 },
+            ..DirectLinkOptions::bidirectional()
+        },
+    )
+    .await?;
+
+input_link.tell(game::InputCommand { command_id, tick }).await?;
+```
+
+On the target actor, `LinkOpened` tells the actor which link is available. The target can obtain its target-to-source sender by link id and a named stream type:
+
+```rust
+impl Handler<LinkOpened> for BattleActor {
+    async fn handle(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        opened: LinkOpened,
+    ) -> Result<(), ActorError> {
+        let updates = ctx.links()
+            .get::<BattleUpdateStream>(opened.link_id.clone())
+            .await?;
+
+        updates.tell(game::BattleUpdate {
+            tick: self.tick,
+            snapshot_id: self.snapshot_id,
+        }).await?;
+
+        Ok(())
+    }
+}
+```
+
+Services that accept direct links must register both the actor and the stream binding. This lets the framework validate message ids and handler coverage before startup:
+
+```rust
+LatticeService::builder(BATTLE_SERVICE)
+    .direct_links(
+        DirectLinkConfig::enabled("0.0.0.0:9001")
+            .max_frame_size(256 * 1024)
+            .max_connections(4096)
+            .max_active_links(128_000)
+            .max_open_links_per_second(10_000)
+            .max_messages_per_second(250_000),
+    )
+    .register_actor(
+        ActorRegistration::builder(BATTLE_ACTOR)
+            .factory(BattleActorFactory::new(app.clone()))
+            .build(),
+    )
+    .register_direct_link(movement_stream.for_actor::<BattleActor>(BATTLE_ACTOR))
+    .register_direct_link(input_stream.for_actor::<BattleActor>(BATTLE_ACTOR))
+    .register_sharded_rpc(generated::battle_rpc::Binding::for_actor::<BattleActor>(BATTLE_ACTOR));
+```
 
 Generated RPC service bindings enable the lightweight request-id duplicate guard by default. Disable it explicitly only for endpoints where duplicate delivery is acceptable or handled elsewhere:
 
