@@ -185,7 +185,7 @@ Status: `[x]` complete.
 
 #### Phase 6: Cluster Singleton
 
-Status: `[ ]` incomplete.
+Status: `[x]` complete.
 
 - [x] In-memory singleton placement model and activation race tests exist.
 - [x] Singleton owner record has owner, epoch, lease id, and state in the current model.
@@ -193,7 +193,7 @@ Status: `[ ]` incomplete.
 - [x] `ActivateSingleton` control-plane API is not implemented as a service endpoint.
 - [x] Generated singleton client/adapter is missing.
 - [x] Singleton owner lease/keepalive/failover is not connected to service lifecycle.
-- [ ] Old singleton owner fencing is not enforced in the runtime path.
+- [x] Old singleton owner fencing is not enforced in the runtime path.
 
 #### Phase 7: Ops Production Features
 

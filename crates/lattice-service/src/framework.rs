@@ -11,7 +11,8 @@ use lattice_placement::PlacementError;
 use lattice_placement::instance::InstanceRecord;
 use lattice_placement::store::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementStore,
-    PlacementVersion, PlacementWatch, VirtualShardPlacementKey, VirtualShardPlacementRecord,
+    PlacementVersion, PlacementWatch, SingletonKey, SingletonPlacementRecord,
+    VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
 #[async_trait]
@@ -59,6 +60,10 @@ pub trait DynPlacementStore: Send + Sync + 'static {
         expected: Option<PlacementVersion>,
         value: VirtualShardPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError>;
+    async fn get_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError>;
     async fn acquire_activation_lock(
         &self,
         key: ActorPlacementKey,
@@ -150,6 +155,13 @@ where
         value: VirtualShardPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError> {
         PlacementStore::compare_and_put_virtual_shard(self, key, expected, value).await
+    }
+
+    async fn get_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        PlacementStore::get_singleton(self, key).await
     }
 
     async fn acquire_activation_lock(

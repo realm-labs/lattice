@@ -246,6 +246,20 @@ async fn generated_typed_client_wrapper_delegates_to_rpc_core() {
     assert_eq!(*observed.lock().unwrap(), vec!["world.WorldRpc/EnterWorld"]);
 }
 
+#[test]
+fn tonic_failed_precondition_owner_epoch_maps_to_fenced_retry() {
+    let status = tonic::Status::failed_precondition("singleton route epoch mismatch");
+
+    let error = client::tonic_status_to_rpc_error(status);
+
+    assert_eq!(
+        error,
+        RpcError::Fenced {
+            current_epoch: Epoch(0)
+        }
+    );
+}
+
 #[tokio::test]
 async fn actor_rpc_adapter_converts_tonic_request_into_actor_call() {
     let runtime = ActorRuntime::default();

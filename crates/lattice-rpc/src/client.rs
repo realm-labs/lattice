@@ -52,6 +52,13 @@ impl TonicEndpointChannelPool {
 }
 
 pub fn tonic_status_to_rpc_error(status: Status) -> RpcError {
+    if status.code() == tonic::Code::FailedPrecondition
+        && (status.message().contains("owner") || status.message().contains("epoch"))
+    {
+        return RpcError::Fenced {
+            current_epoch: Epoch(0),
+        };
+    }
     RpcError::Business(status.to_string())
 }
 
