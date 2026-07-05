@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::time::Duration;
 
 use lattice_core::{DirectLinkEndpoint, InstanceId};
@@ -28,6 +29,13 @@ pub struct DirectLinkConfig {
     bind_endpoint: String,
     max_frame_size: usize,
     maintenance_interval: Duration,
+    bind_policy: DirectLinkBindPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectLinkBindPolicy {
+    LoopbackOnly,
+    External,
 }
 
 impl DirectLinkConfig {
@@ -36,6 +44,7 @@ impl DirectLinkConfig {
             bind_endpoint: bind_endpoint.into(),
             max_frame_size: 256 * 1024,
             maintenance_interval: Duration::from_secs(1),
+            bind_policy: DirectLinkBindPolicy::LoopbackOnly,
         }
     }
 
@@ -53,6 +62,11 @@ impl DirectLinkConfig {
         self
     }
 
+    pub fn bind_policy(mut self, policy: DirectLinkBindPolicy) -> Self {
+        self.bind_policy = policy;
+        self
+    }
+
     pub(crate) fn maintenance_interval_config(&self) -> Duration {
         self.maintenance_interval
     }
@@ -66,9 +80,74 @@ impl DirectLinkConfig {
         let uri = endpoint
             .parse()
             .map_err(|error| format!("invalid direct-link bind endpoint {endpoint}: {error}"))?;
+        validate_bind_policy(&uri, self.bind_policy)?;
         Ok(DirectLinkListenConfig {
             endpoint: DirectLinkEndpoint::new(uri),
             max_frame_size: self.max_frame_size,
         })
+    }
+}
+
+fn validate_bind_policy(uri: &http::Uri, policy: DirectLinkBindPolicy) -> Result<(), String> {
+    if policy == DirectLinkBindPolicy::External {
+        return Ok(());
+    }
+
+    let host = uri
+        .host()
+        .ok_or_else(|| format!("direct-link bind endpoint {uri} has no host"))?;
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(());
+    }
+    let host = host.trim_matches(['[', ']']);
+    let address: IpAddr = host.parse().map_err(|_| {
+        format!(
+            "direct-link bind endpoint {uri} is not loopback; call bind_policy(DirectLinkBindPolicy::External) to allow external binds"
+        )
+    })?;
+    if address.is_loopback() {
+        Ok(())
+    } else {
+        Err(format!(
+            "direct-link bind endpoint {uri} is not loopback; call bind_policy(DirectLinkBindPolicy::External) to allow external binds"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_link_bind_policy_allows_loopback_by_default() {
+        for endpoint in ["127.0.0.1:0", "tcp://localhost:0", "tcp://[::1]:0"] {
+            assert!(
+                DirectLinkConfig::enabled(endpoint).listen_config().is_ok(),
+                "{endpoint} should be accepted by loopback policy"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_link_bind_policy_rejects_external_binds_without_opt_in() {
+        for endpoint in ["0.0.0.0:0", "192.0.2.10:9000", "tcp://[::]:0"] {
+            let error = DirectLinkConfig::enabled(endpoint)
+                .listen_config()
+                .unwrap_err();
+            assert!(
+                error.contains("DirectLinkBindPolicy::External"),
+                "{endpoint} produced unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_link_bind_policy_allows_external_binds_with_explicit_opt_in() {
+        assert!(
+            DirectLinkConfig::enabled("0.0.0.0:0")
+                .bind_policy(DirectLinkBindPolicy::External)
+                .listen_config()
+                .is_ok()
+        );
     }
 }

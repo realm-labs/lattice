@@ -13,7 +13,7 @@ pub mod service;
 pub use actor::{ActorRegistration, ActorRegistrationBuilder};
 pub use builder::LatticeServiceBuilder;
 pub use component::{IntoServiceComponent, ReadyComponent, ServiceComponent};
-pub use config::DirectLinkConfig;
+pub use config::{DirectLinkBindPolicy, DirectLinkConfig};
 pub use direct_link::DirectLinkServiceRuntime;
 pub use error::LatticeServiceError;
 pub use framework::{
