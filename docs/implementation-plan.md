@@ -1146,13 +1146,13 @@ Each phase can exit only when all items are true:
 The whole goal can be marked complete only when:
 
 ```text
-[ ] Phase 1 through Phase 8 are complete.
-[ ] This file's global acceptance checklist is fully satisfied.
+[x] Phase 1 through Phase 8 are complete.
+[x] This file's global acceptance checklist is fully satisfied.
 [x] architecture/00-overview.md system boundaries and module responsibilities are implemented.
 [x] architecture/01-actor-runtime.md actor runtime capabilities are implemented and tested.
 [x] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, KeyedWorkerPool, and DedicatedThreadPool.
 [x] UnsupportedExecutionPolicy is used only for invalid configuration, not for planned policies in the completed framework.
-[ ] architecture/02-rpc.md typed RPC, metadata, codegen, gateway decode/forward, and Direct Actor Link are implemented and tested.
+[x] architecture/02-rpc.md typed RPC, metadata, codegen, gateway decode/forward, and Direct Actor Link are implemented and tested.
 [x] architecture/03-placement.md placement, scale, drain, shutdown, crash, and watch are implemented and tested.
 [x] architecture/04-eventbus-scheduler-config.md event bus, scheduler, and config are implemented and tested.
 [x] architecture/05-gateway-ops.md gateway, rate limit, admin, telemetry, and inspection are implemented and tested.
