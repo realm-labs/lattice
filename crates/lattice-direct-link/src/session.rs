@@ -205,6 +205,17 @@ impl DirectLinkSessionManager {
             .expect("direct link validation policy poisoned") = policy;
     }
 
+    pub fn update_validation_policy(
+        &self,
+        update: impl FnOnce(OpenLinkValidationPolicy) -> OpenLinkValidationPolicy,
+    ) {
+        let mut validation = self
+            .validation
+            .lock()
+            .expect("direct link validation policy poisoned");
+        *validation = update(validation.clone());
+    }
+
     pub fn open_link(&self, request: OpenLinkRequest) -> Result<OpenLinkAck, OpenLinkReject> {
         self.open_link_from_peer(request, None)
     }
@@ -573,6 +584,15 @@ impl DirectLinkSessionManager {
             .collect()
     }
 
+    pub fn active_link_count(&self) -> usize {
+        self.links
+            .lock()
+            .expect("direct link managed links poisoned")
+            .values()
+            .filter(|link| !link.closed)
+            .count()
+    }
+
     pub fn heartbeat_due_link_ids_at(&self, now: Instant) -> Vec<LinkId> {
         self.links
             .lock()
@@ -775,6 +795,15 @@ impl DirectLinkSessionManager {
                 OpenLinkRejectReason::Overloaded,
             ));
         }
+        if validation
+            .max_active_links
+            .is_some_and(|max| self.active_link_count() >= max)
+        {
+            return Err(OpenLinkReject::new(
+                request.link_id.clone(),
+                OpenLinkRejectReason::Overloaded,
+            ));
+        }
 
         let actors = self
             .actors
@@ -852,6 +881,7 @@ pub struct OpenLinkValidationPolicy {
     pub peer_identity_policy: DirectLinkPeerIdentityPolicy,
     pub max_frame_size: Option<usize>,
     pub max_pending: Option<usize>,
+    pub max_active_links: Option<usize>,
 }
 
 impl OpenLinkValidationPolicy {
@@ -886,6 +916,11 @@ impl OpenLinkValidationPolicy {
 
     pub fn max_pending(mut self, max_pending: usize) -> Self {
         self.max_pending = Some(max_pending);
+        self
+    }
+
+    pub fn max_active_links(mut self, max_active_links: usize) -> Self {
+        self.max_active_links = Some(max_active_links);
         self
     }
 
@@ -928,6 +963,7 @@ impl Default for OpenLinkValidationPolicy {
             peer_identity_policy: DirectLinkPeerIdentityPolicy::Disabled,
             max_frame_size: None,
             max_pending: None,
+            max_active_links: None,
         }
     }
 }
@@ -1543,6 +1579,16 @@ mod tests {
         let mut request = open_request(&stream);
         request.options.backpressure = BackpressurePolicy::DropOldest { max_pending: 8 };
         let reject = overloaded.open_link(request).unwrap_err();
+        assert_eq!(reject.reason, OpenLinkRejectReason::Overloaded);
+
+        let link_limited = configured_manager(&stream);
+        link_limited.update_validation_policy(|policy| policy.max_active_links(1));
+        link_limited
+            .open_link(open_request_with_id(&stream, LinkId::new("link-active-1")))
+            .unwrap();
+        let reject = link_limited
+            .open_link(open_request_with_id(&stream, LinkId::new("link-active-2")))
+            .unwrap_err();
         assert_eq!(reject.reason, OpenLinkRejectReason::Overloaded);
 
         let fenced = configured_manager(&stream);

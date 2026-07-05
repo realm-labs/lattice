@@ -536,6 +536,16 @@ impl LatticeServiceBuilder {
             registration.register(&mut context)?;
         }
         let direct_link_runtime = build_direct_link_runtime(self.direct_link_bindings, &context)?;
+        if let (Some(runtime), Some(max_active_links)) = (
+            direct_link_runtime.as_ref(),
+            self.direct_link
+                .as_ref()
+                .and_then(DirectLinkConfig::max_active_links_config),
+        ) {
+            runtime
+                .session_manager()
+                .update_validation_policy(|policy| policy.max_active_links(max_active_links));
+        }
         if let (Some(deferred), Some(runtime)) = (
             direct_link_lifecycle_runtime.as_ref(),
             direct_link_runtime.clone(),

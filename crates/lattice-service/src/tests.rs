@@ -1533,6 +1533,65 @@ async fn direct_link_listener_enforces_connection_limit() {
 }
 
 #[tokio::test]
+async fn direct_link_config_applies_active_link_limit_to_session_manager() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new(
+        "/lattice/test-direct-link-active-limit",
+    ));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let stream = DirectLinkStream::new("movement").message::<DirectLinkTestPayload>();
+    let descriptor = stream.descriptor();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .direct_links(DirectLinkConfig::enabled("127.0.0.1:0").max_active_links(1))
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(DirectLinkTestFactory {
+                    received: received.clone(),
+                })
+                .build(),
+        )
+        .register_direct_link(stream.for_actor::<DirectLinkTestActor>(actor_kind!("World")))
+        .build()
+        .await
+        .unwrap();
+    let direct_link_runtime = service.direct_link_runtime().unwrap();
+    let target_ref = direct_actor_ref(
+        service_kind!("World"),
+        actor_kind!("World"),
+        ActorId::U64(7),
+        "tcp://127.0.0.1:2".parse().unwrap(),
+    );
+    let open_request = |link_id: LinkId| OpenLinkRequest {
+        protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+        link_id: link_id.clone(),
+        source: direct_actor_ref(
+            service_kind!("Gateway"),
+            actor_kind!("GatewaySession"),
+            ActorId::U64(99),
+            "tcp://127.0.0.1:1".parse().unwrap(),
+        ),
+        target: target_ref.clone(),
+        mode: DirectLinkMode::Unidirectional,
+        source_to_target: OpenLinkDirection::from_stream(link_id, &descriptor),
+        target_to_source: None,
+        options: DirectLinkOptions::default(),
+    };
+
+    direct_link_runtime
+        .session_manager()
+        .open_link(open_request(LinkId::new("service-link-active-1")))
+        .unwrap();
+    let reject = direct_link_runtime
+        .session_manager()
+        .open_link(open_request(LinkId::new("service-link-active-2")))
+        .unwrap_err();
+    assert_eq!(reject.reason, OpenLinkRejectReason::Overloaded);
+}
+
+#[tokio::test]
 async fn direct_link_listener_idle_maintenance_closes_stale_links() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test-direct-link-idle"));
