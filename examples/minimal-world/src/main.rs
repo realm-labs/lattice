@@ -19,6 +19,11 @@ use lattice_eventbus::{
 };
 use lattice_gateway::{BinaryClientCodec, ClientCodec, ClientFrame, GatewayRouteTable};
 use lattice_ops::ServiceScheduler;
+use lattice_ops::admin::{AdminSnapshot, ClusterSummary, NodeSummary};
+use lattice_ops::telemetry::{
+    InMemoryTelemetryExporter, MetricSample, OpenTelemetryPipeline, TelemetryRecorder,
+    TelemetryResource, TraceSpan, TraceSpanKind,
+};
 use lattice_placement::{InMemoryPlacementStore, PlacementPrefix};
 use lattice_rpc::Rpc;
 use lattice_service::{ActorRegistration, LatticeService};
@@ -251,6 +256,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config_store
         .put("world.tick_ms".to_string(), json!(config.tick_ms))
         .await?;
+    let mut admin_snapshot = AdminSnapshot::new(
+        ClusterSummary {
+            instance_count: 1,
+            actor_owner_count: 0,
+        },
+        Vec::new(),
+    );
+    admin_snapshot.node_summary = Some(NodeSummary {
+        instance_id: InstanceId::new("world-a"),
+        service_kind: WORLD_SERVICE,
+        actor_kinds: vec![WORLD_ACTOR],
+    });
+
+    let telemetry = TelemetryRecorder::default();
+    telemetry
+        .record_span(TraceSpan {
+            name: "minimal_world.enter_world".to_string(),
+            kind: TraceSpanKind::Rpc,
+            context: trace.clone(),
+            links: Vec::new(),
+        })
+        .await;
 
     let rpc_reply = client
         .enter_world(EnterWorldRequest {
@@ -290,13 +317,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(config.tick_ms * 2)).await;
     scheduler.shutdown().await;
     let configured_tick = config_store.get("world.tick_ms").await?;
+    telemetry
+        .record_metric(MetricSample {
+            name: "minimal_world.events".to_string(),
+            value: event_count.load(Ordering::SeqCst) as u64,
+            labels: HashMap::from([("service".to_string(), WORLD_SERVICE.to_string())]),
+        })
+        .await?;
+    let telemetry_exporter = InMemoryTelemetryExporter::default();
+    let telemetry_pipeline = OpenTelemetryPipeline::new(
+        TelemetryResource {
+            service_kind: WORLD_SERVICE,
+            instance_id: InstanceId::new("world-a"),
+            service_version: "minimal-world".to_string(),
+        },
+        telemetry_exporter.clone(),
+    );
+    telemetry_pipeline.export_from(&telemetry).await?;
+    let telemetry_batches = telemetry_exporter.batches().await;
+    let telemetry_batch = telemetry_batches.first().ok_or_else(|| {
+        std::io::Error::other("minimal world telemetry exporter produced no batches")
+    })?;
+    let ops_actor_kinds = admin_snapshot
+        .node_summary
+        .as_ref()
+        .map(|summary| summary.actor_kinds.len())
+        .unwrap_or_default();
     shutdown_tx.send(()).map_err(|_| {
         std::io::Error::other("minimal world service shutdown receiver was dropped")
     })?;
     service_task.await??;
 
     println!(
-        "{}:{} rpc_ok={} second_actor_ok={} gateway_msg_id={} gateway_world_id={} routes={} events={} scheduled={} config_tick={} trace={} event_id={}",
+        "{}:{} rpc_ok={} second_actor_ok={} gateway_msg_id={} gateway_world_id={} routes={} events={} scheduled={} config_tick={} trace={} event_id={} ops_actor_kinds={} telemetry_spans={} telemetry_metrics={}",
         WORLD_SERVICE.as_str(),
         WORLD_ACTOR.as_str(),
         rpc_reply.ok,
@@ -308,7 +361,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scheduled_ticks.load(Ordering::SeqCst),
         configured_tick.unwrap_or_default(),
         trace.traceparent.as_deref().unwrap_or("<missing>"),
-        event_id.as_str()
+        event_id.as_str(),
+        ops_actor_kinds,
+        telemetry_batch.spans.len(),
+        telemetry_batch.metrics.len()
     );
     Ok(())
 }

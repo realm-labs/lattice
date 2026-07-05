@@ -1,6 +1,8 @@
 use super::*;
-use crate::descriptor::messages_from_descriptor;
+use std::collections::BTreeSet;
+
 use crate::descriptor::methods_from_descriptor;
+use crate::descriptor::{messages_from_descriptor, messages_from_descriptor_for_files};
 use crate::render::generate_rpc_bindings;
 use crate::route_key::{ProtoRouteKeyOption, RouteKeyType};
 use crate::spec::RpcMethodSpec;
@@ -218,6 +220,36 @@ fn descriptor_messages_generate_direct_link_message_metadata() {
             .rust
             .contains("impl lattice_core::DirectLinkMessage for crate::world::EnterWorldReply")
     );
+}
+
+#[test]
+fn direct_link_message_metadata_ignores_descriptor_dependencies_not_compiled_into_crate() {
+    let mut descriptor = world_descriptor();
+    descriptor.file.push(FileDescriptorProto {
+        name: Some("google/protobuf/descriptor.proto".into()),
+        package: Some("google.protobuf".into()),
+        message_type: vec![DescriptorProto {
+            name: Some("FileDescriptorSet".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    let messages =
+        messages_from_descriptor_for_files(&descriptor, &BTreeSet::from(["world.proto".into()]));
+    let generated = crate::render::generate_rpc_bindings_with_options(
+        &[world_enter_method()],
+        &messages,
+        crate::render::RenderOptions::default(),
+    )
+    .unwrap();
+
+    assert!(
+        generated
+            .rust
+            .contains("impl lattice_core::DirectLinkMessage for crate::world::EnterWorldRequest")
+    );
+    assert!(!generated.rust.contains("crate::google::protobuf"));
 }
 
 #[test]

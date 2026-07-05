@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -5,7 +6,9 @@ use prost::Message;
 use prost_types::FileDescriptorSet;
 use serde::Deserialize;
 
-use crate::descriptor::{messages_from_descriptor, methods_from_descriptor, parse_proto_options};
+use crate::descriptor::{
+    messages_from_descriptor_for_files, methods_from_descriptor, parse_proto_options,
+};
 use crate::gateway::GatewayRoute;
 use crate::render::{RenderOptions, generate_rpc_bindings_with_options};
 use crate::spec::RpcMethodSpec;
@@ -97,7 +100,10 @@ impl LatticeCodegenBuilder {
             .map_err(|error| CodegenError::DescriptorRead(error.to_string()))?;
         let options = parse_proto_options(&descriptor, &descriptor_bytes)?;
         let mut methods = methods_from_descriptor(&descriptor, &options)?;
-        let messages = messages_from_descriptor(&descriptor);
+        let messages = messages_from_descriptor_for_files(
+            &descriptor,
+            &descriptor_input_file_names(&proto_paths, &include_paths),
+        );
         let gateway_routes = self.load_gateway_routes()?;
         apply_gateway_routes(&mut methods, &gateway_routes)?;
         let generated = generate_rpc_bindings_with_options(
@@ -148,6 +154,32 @@ impl LatticeCodegenBuilder {
         }
         Ok(routes)
     }
+}
+
+fn descriptor_input_file_names(
+    proto_paths: &[PathBuf],
+    include_paths: &[PathBuf],
+) -> BTreeSet<String> {
+    let mut file_names = BTreeSet::new();
+    for proto_path in proto_paths {
+        file_names.insert(normalize_proto_path(proto_path));
+        if let Some(name) = proto_path.file_name() {
+            file_names.insert(name.to_string_lossy().replace('\\', "/"));
+        }
+        for include_path in include_paths {
+            if let Ok(stripped) = proto_path.strip_prefix(include_path) {
+                file_names.insert(normalize_proto_path(stripped));
+            }
+        }
+    }
+    file_names
+}
+
+fn normalize_proto_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
 }
 
 fn descriptor_has_actor_ref_proto(descriptor: &FileDescriptorSet) -> bool {

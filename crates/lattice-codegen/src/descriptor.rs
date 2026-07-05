@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use prost_reflect::{DescriptorPool, DynamicMessage, ExtensionDescriptor, Value};
 use prost_types::{
@@ -167,14 +167,38 @@ pub fn methods_from_descriptor(
 }
 
 pub fn messages_from_descriptor(descriptor: &FileDescriptorSet) -> Vec<ProtoMessageSpec> {
+    messages_from_descriptor_files(descriptor, None)
+}
+
+pub fn messages_from_descriptor_for_files(
+    descriptor: &FileDescriptorSet,
+    file_names: &BTreeSet<String>,
+) -> Vec<ProtoMessageSpec> {
+    messages_from_descriptor_files(descriptor, Some(file_names))
+}
+
+fn messages_from_descriptor_files(
+    descriptor: &FileDescriptorSet,
+    file_names: Option<&BTreeSet<String>>,
+) -> Vec<ProtoMessageSpec> {
     let mut messages = Vec::new();
     for file in &descriptor.file {
+        if let Some(file_names) = file_names {
+            let file_name = file.name.as_deref().unwrap_or_default();
+            if !file_names.contains(&normalize_proto_file_name(file_name)) {
+                continue;
+            }
+        }
         let package = file.package.clone().unwrap_or_default();
         for message in &file.message_type {
             collect_message_specs(&mut messages, &package, Vec::new(), message);
         }
     }
     messages
+}
+
+fn normalize_proto_file_name(path: &str) -> String {
+    path.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
 fn collect_message_specs(

@@ -1160,6 +1160,7 @@ The whole goal can be marked complete only when:
 [x] API sketches in architecture/07-api-examples.md are covered by examples or compile tests.
 [x] The implementation uses the planned Cargo workspace crate split; the root crate is not a monolithic implementation crate.
 [x] examples/minimal-world runs as an end-to-end example.
+    It exercises service bootstrap, actor registration, generated RPC, placement-backed client routing, EventBus publishing/subscription, scheduler/config, gateway frame decode/route registration, admin snapshot shape, and telemetry recording/export shape.
 [x] cargo fmt passes.
 [x] cargo clippy passes.
 [x] cargo test passes.
