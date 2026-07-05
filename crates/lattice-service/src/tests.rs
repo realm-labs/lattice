@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::future::pending;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -630,6 +631,24 @@ async fn service_lifecycle_writes_starting_ready_draining_stopping() {
             InstanceState::Stopping,
         ]
     );
+}
+
+#[tokio::test]
+async fn shutdown_signal_helper_returns_on_first_trigger() {
+    let (trigger_tx, trigger_rx) = tokio::sync::oneshot::channel();
+    trigger_tx.send(()).unwrap();
+
+    timeout(
+        Duration::from_millis(50),
+        crate::service::first_shutdown_signal(
+            async {
+                let _ = trigger_rx.await;
+            },
+            pending::<()>(),
+        ),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use std::future::{Future, pending};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
@@ -13,7 +13,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::server::Router;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::component::ErasedPlacementStore;
 use crate::config::InstanceConfig;
@@ -73,7 +73,8 @@ impl LatticeService {
     }
 
     pub async fn run_until_shutdown(self) -> Result<(), LatticeServiceError> {
-        self.run_until_shutdown_signal(pending::<()>()).await
+        self.run_until_shutdown_signal(default_shutdown_signal())
+            .await
     }
 
     pub async fn run_until_shutdown_signal<F>(self, shutdown: F) -> Result<(), LatticeServiceError>
@@ -238,6 +239,49 @@ impl LatticeService {
 enum ServiceExit {
     Server(Result<(), tonic::transport::Error>),
     Keepalive(Result<(), LatticeServiceError>),
+}
+
+async fn default_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let ctrl_c = async {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                warn!(%error, "failed to listen for ctrl-c shutdown signal");
+            }
+        };
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                first_shutdown_signal(ctrl_c, async move {
+                    let _ = sigterm.recv().await;
+                })
+                .await;
+            }
+            Err(error) => {
+                warn!(%error, "failed to listen for sigterm shutdown signal");
+                ctrl_c.await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            warn!(%error, "failed to listen for ctrl-c shutdown signal");
+        }
+    }
+}
+
+pub(crate) async fn first_shutdown_signal<C, T>(ctrl_c: C, terminate: T)
+where
+    C: Future<Output = ()>,
+    T: Future<Output = ()>,
+{
+    tokio::pin!(ctrl_c);
+    tokio::pin!(terminate);
+    tokio::select! {
+        () = &mut ctrl_c => {}
+        () = &mut terminate => {}
+    }
 }
 
 type AdminShutdownSignal = oneshot::Sender<()>;
