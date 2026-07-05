@@ -1,3 +1,4 @@
+use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -18,6 +19,7 @@ use crate::context::ServiceBuildContext;
 type ActorCreateFuture<A> = Pin<Box<dyn Future<Output = Result<A, <A as Actor>::Error>> + Send>>;
 type ActorCreateFn<A> = dyn Fn(ActorCreateContext) -> ActorCreateFuture<A> + Send + Sync;
 
+#[derive(Debug)]
 pub struct ActorRegistration<A>
 where
     A: Actor,
@@ -41,6 +43,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct ActorRegistrationBuilder<A, F>
 where
     A: Actor,
@@ -97,6 +100,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct NoFactory;
 
 pub struct ServiceActorLoader<A>
@@ -104,6 +108,17 @@ where
     A: Actor,
 {
     create: Arc<ActorCreateFn<A>>,
+}
+
+impl<A> fmt::Debug for ServiceActorLoader<A>
+where
+    A: Actor,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServiceActorLoader")
+            .finish_non_exhaustive()
+    }
 }
 
 impl<A> Clone for ServiceActorLoader<A>
@@ -144,6 +159,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct RegisteredActor<A>
 where
     A: Actor,

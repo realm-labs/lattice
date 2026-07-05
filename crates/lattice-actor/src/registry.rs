@@ -1,3 +1,4 @@
+use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +49,17 @@ pub struct ActorRegistry<A: Actor> {
     kind: ActorKind,
     config: ActorRegistryConfig,
     entries: DashMap<ActorId, RegistryEntry<A>>,
+}
+
+impl<A: Actor> fmt::Debug for ActorRegistry<A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorRegistry")
+            .field("kind", &self.kind)
+            .field("config", &self.config)
+            .field("entry_count", &self.entries.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

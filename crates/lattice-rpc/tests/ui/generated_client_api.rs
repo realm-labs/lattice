@@ -42,6 +42,7 @@ impl ShardedRpcCore for GeneratedCore {
     }
 }
 
+#[derive(Debug)]
 pub struct WorldClient<C> {
     inner: TypedRpcClient<C>,
 }

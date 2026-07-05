@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -101,6 +102,20 @@ pub trait VirtualShardAssigner: Send + Sync + 'static {
 #[derive(Default, Clone)]
 pub struct VirtualShardAssignerRegistry {
     assigners: Arc<std::sync::Mutex<HashMap<&'static str, Arc<dyn VirtualShardAssigner>>>>,
+}
+
+impl fmt::Debug for VirtualShardAssignerRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let assigner_count = self
+            .assigners
+            .lock()
+            .map(|assigners| assigners.len())
+            .unwrap_or_default();
+        formatter
+            .debug_struct("VirtualShardAssignerRegistry")
+            .field("assigner_count", &assigner_count)
+            .finish()
+    }
 }
 
 impl VirtualShardAssignerRegistry {

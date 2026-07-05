@@ -9,6 +9,7 @@ use crate::security::security_status;
 use crate::security::{PeerIdentity, RpcSecurityPolicy};
 use crate::{RoutedRequest, Rpc, RpcContext, RpcRequest};
 
+#[derive(Debug)]
 pub struct ActorRpcAdapter<A: Actor> {
     handle: ActorHandle<A>,
     owner_epoch: Option<Epoch>,

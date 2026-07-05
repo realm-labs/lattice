@@ -12,6 +12,7 @@ use crate::game::{
 use crate::generated::player_rpc::Client as PlayerRpcClient;
 use crate::placement::DemoRpcCore;
 
+#[derive(Debug)]
 pub struct WorldActor {
     world_id: u64,
     sessions: HashMap<u64, String>,
@@ -75,7 +76,7 @@ impl Handler<Rpc<LoginRequest>> for WorldActor {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct WorldActorFactory {
     player_core: DemoRpcCore,
 }

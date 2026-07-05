@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -11,7 +12,7 @@ use crate::{
     EventBus, EventBusError, EventEnvelope, EventId, EventSubscription, EventSubscriptionHandle,
 };
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct NatsEventBus {
     client: InMemoryNatsClient,
     config: Option<NatsEventBusConfig>,
@@ -44,7 +45,7 @@ pub struct NatsEventBusConfig {
     pub durable_prefix: String,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct InMemoryNatsClient {
     inner: Arc<NatsInner>,
 }
@@ -73,6 +74,15 @@ struct NatsInner {
     stream: Mutex<Vec<EventEnvelope>>,
     subscribers: Mutex<HashMap<u64, NatsSubscriber>>,
     durable_acks: Mutex<HashMap<String, HashSet<EventId>>>,
+}
+
+impl fmt::Debug for NatsInner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NatsInner")
+            .field("next_id", &self.next_id.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]

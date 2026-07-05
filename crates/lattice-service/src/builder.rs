@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::net::SocketAddr;
 
 use lattice_actor::Actor;
@@ -21,6 +22,25 @@ pub struct LatticeServiceBuilder {
     rpc_services: Vec<Box<dyn RpcServiceBinding>>,
     client_bindings: Vec<String>,
     component_labels: Vec<&'static str>,
+}
+
+impl fmt::Debug for LatticeServiceBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LatticeServiceBuilder")
+            .field("service_kind", &self.service_kind)
+            .field("instance", &self.instance)
+            .field(
+                "listener",
+                &self.listener.as_ref().map(TcpListener::local_addr),
+            )
+            .field("has_ready_signal", &self.ready.is_some())
+            .field("actor_registration_count", &self.actor_registrations.len())
+            .field("rpc_service_count", &self.rpc_services.len())
+            .field("client_bindings", &self.client_bindings)
+            .field("component_labels", &self.component_labels)
+            .finish()
+    }
 }
 
 impl LatticeServiceBuilder {

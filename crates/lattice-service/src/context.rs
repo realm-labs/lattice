@@ -13,6 +13,7 @@ use tonic::transport::server::Router;
 use crate::LatticeServiceError;
 use crate::actor::RegisteredActor;
 
+#[derive(Debug)]
 pub struct ServiceContext {
     service_kind: ServiceKind,
 }
@@ -23,6 +24,7 @@ impl ServiceContext {
     }
 }
 
+#[derive(Debug)]
 pub struct ServiceBuildContext {
     service_kind: ServiceKind,
     pub(crate) actors: HashMap<ActorKind, Box<dyn Any + Send>>,

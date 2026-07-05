@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -266,6 +267,15 @@ impl EtcdWatch {
 pub struct RealEtcdClient {
     client: Client,
     activation_lock_ttl: ActivationLockTtl,
+}
+
+impl fmt::Debug for RealEtcdClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RealEtcdClient")
+            .field("activation_lock_ttl", &self.activation_lock_ttl)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RealEtcdClient {

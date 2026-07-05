@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use lattice_config::{ConfigStore, ConfigStoreError, ConfigWatch};
+use std::fmt;
 
 use crate::client::{EtcdConfigClient, RealEtcdConfigClient};
 use crate::codec::{decode_value, encode_value, normalize_prefix};
 use crate::config::EtcdConfigStoreConfig;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct EtcdConfigStore {
     inner: EtcdConfigStoreInner<RealEtcdConfigClient>,
 }
@@ -42,6 +43,15 @@ impl ConfigStore for EtcdConfigStore {
 pub(crate) struct EtcdConfigStoreInner<C> {
     client: C,
     key_prefix: String,
+}
+
+impl<C> fmt::Debug for EtcdConfigStoreInner<C> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EtcdConfigStoreInner")
+            .field("key_prefix", &self.key_prefix)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<C> EtcdConfigStoreInner<C> {

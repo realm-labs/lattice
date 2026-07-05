@@ -9,6 +9,7 @@ use tonic::transport::server::Router;
 use crate::config::InstanceConfig;
 use crate::{LatticeServiceBuilder, LatticeServiceError};
 
+#[derive(Debug)]
 pub struct LatticeService {
     service_kind: ServiceKind,
     instance: InstanceConfig,

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::marker::PhantomData;
 
 use tokio::sync::{
@@ -18,6 +19,16 @@ pub struct ActorHandle<A: Actor> {
     normal_tx: mpsc::Sender<ActorCommand<A>>,
     system_tx: mpsc::Sender<ActorCommand<A>>,
     _marker: PhantomData<A>,
+}
+
+impl<A: Actor> fmt::Debug for ActorHandle<A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorHandle")
+            .field("local_ref", &self.local_ref)
+            .field("lifecycle_state", &self.lifecycle_state())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<A: Actor> Clone for ActorHandle<A> {

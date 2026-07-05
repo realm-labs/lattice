@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -56,7 +57,7 @@ impl EventSubscriptionHandle {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct LocalEventBus {
     inner: Arc<LocalEventBusInner>,
 }
@@ -81,6 +82,15 @@ impl Default for LocalEventBus {
 struct LocalEventBusInner {
     next_id: AtomicU64,
     subscribers: Mutex<HashMap<u64, LocalSubscriber>>,
+}
+
+impl fmt::Debug for LocalEventBusInner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalEventBusInner")
+            .field("next_id", &self.next_id.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 struct LocalSubscriber {

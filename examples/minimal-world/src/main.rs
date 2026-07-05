@@ -77,6 +77,7 @@ pub struct PlayerRuntimeState {
     ticks_seen: u64,
 }
 
+#[derive(Debug)]
 pub struct WorldActor {
     pub world_id: WorldId,
     pub tick_ms: u64,

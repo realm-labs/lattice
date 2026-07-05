@@ -1,5 +1,6 @@
 use std::any::type_name;
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,6 +27,21 @@ pub struct ActorContext<A: Actor> {
     watches: HashMap<WatchId, JoinHandle<()>>,
     children: HashMap<ChildActorKey, Box<dyn ChildStop>>,
     next_watch_id: u64,
+}
+
+impl<A: Actor> fmt::Debug for ActorContext<A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorContext")
+            .field("handle", &self.handle)
+            .field("self_ref", &self.self_ref)
+            .field("lifecycle_request", &self.lifecycle_request)
+            .field("task_count", &self.tasks.len())
+            .field("watch_count", &self.watches.len())
+            .field("child_count", &self.children.len())
+            .field("next_watch_id", &self.next_watch_id)
+            .finish()
+    }
 }
 
 impl<A: Actor> ActorContext<A> {

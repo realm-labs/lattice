@@ -14,6 +14,7 @@ use crate::game::{
 };
 use crate::placement::DemoActorRefRpcCore;
 
+#[derive(Debug)]
 pub struct PlayerActor {
     player_id: u64,
     sessions: HashMap<String, u64>,
@@ -132,7 +133,7 @@ impl Handler<Rpc<PlayerPingRequest>> for PlayerActor {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PlayerActorFactory {
     actor_ref_client: ActorRefRpcClient<DemoActorRefRpcCore>,
 }

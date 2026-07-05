@@ -236,6 +236,7 @@ fn push_service_module(rust: &mut String, methods: &[&RpcMethodSpec]) {
 }
 
 fn push_typed_client(rust: &mut String, methods: &[&RpcMethodSpec]) {
+    rust.push_str("    #[derive(Debug)]\n");
     rust.push_str("    pub struct Client<C> {\n        inner: TypedRpcClient<C>,\n    }\n\n");
     rust.push_str("    impl<C> Client<C>\n");
     rust.push_str("    where\n        C: ShardedRpcCore,\n    {\n");
@@ -256,6 +257,7 @@ fn push_typed_client(rust: &mut String, methods: &[&RpcMethodSpec]) {
 fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let service = methods[0];
     let server_path = tonic_server_path(service);
+    rust.push_str("    #[derive(Debug)]\n");
     rust.push_str("    pub struct Binding<A = ()> {\n        actor_kind: ActorKind,\n        _actor: PhantomData<fn() -> A>,\n    }\n\n");
     rust.push_str("    impl Binding<()> {\n");
     rust.push_str("        pub fn for_actor<A>(actor_kind: ActorKind) -> Binding<A>\n        where\n            A: Actor,\n        {\n");
@@ -294,7 +296,7 @@ fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
 fn push_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let service = methods[0];
     let trait_path = tonic_service_trait_path(service);
-    rust.push_str("    #[derive(Clone)]\n");
+    rust.push_str("    #[derive(Debug, Clone)]\n");
     rust.push_str(
         "    pub struct ActorService<A: Actor> {\n        inner: ActorRpcAdapter<A>,\n    }\n\n",
     );
@@ -328,7 +330,7 @@ fn push_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
 fn push_registry_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let service = methods[0];
     let trait_path = tonic_service_trait_path(service);
-    rust.push_str("    #[derive(Clone)]\n");
+    rust.push_str("    #[derive(Debug, Clone)]\n");
     rust.push_str("    pub struct RegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n    }\n\n");
     rust.push_str("    impl<A, L> RegistryService<A, L>\n    where\n        A: Actor,\n        L: ActorLoader<A>,\n    {\n");
     rust.push_str("        pub fn new(registry: Arc<ActorRegistry<A>>, loader: L) -> Self {\n");
@@ -376,7 +378,7 @@ fn push_registry_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
 }
 
 fn push_tonic_endpoint_transport(rust: &mut String, methods: &[RpcMethodSpec]) {
-    rust.push_str("#[derive(Clone, Default)]\n");
+    rust.push_str("#[derive(Debug, Clone, Default)]\n");
     rust.push_str("pub struct GeneratedTonicEndpointTransport {\n    channels: TonicEndpointChannelPool,\n}\n\n");
     rust.push_str("impl GeneratedTonicEndpointTransport {\n");
     rust.push_str("    pub fn new() -> Self {\n        Self { channels: TonicEndpointChannelPool::new() }\n    }\n\n");
@@ -463,6 +465,7 @@ fn push_method_module(rust: &mut String, method: &RpcMethodSpec) {
     rust.push_str(">>,\n");
     rust.push_str("        {\n");
     rust.push_str("        }\n\n");
+    rust.push_str("        #[derive(Debug, Clone, Copy, Default)]\n");
     rust.push_str("        pub struct GatewayBinding;\n\n");
     rust.push_str("        impl GatewayBinding {\n");
     if let Some(msg_id) = method.gateway_msg_id {
@@ -556,7 +559,7 @@ fn push_gateway_dispatcher(rust: &mut String, methods: &[RpcMethodSpec]) {
         .collect::<Vec<_>>();
     let type_params_csv = type_params.join(", ");
 
-    rust.push_str("#[derive(Clone)]\n");
+    rust.push_str("#[derive(Debug, Clone)]\n");
     rust.push_str(&format!(
         "pub struct GatewayDispatcher<{type_params_csv}> {{\n"
     ));
