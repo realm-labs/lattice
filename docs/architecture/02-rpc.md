@@ -442,7 +442,9 @@ key: instance_id + advertised_endpoint
 value: shared tonic channel/client factory
 ```
 
-It should support connection reuse, eviction, TLS/mTLS config, backoff, readiness changes, and metrics.
+It should support connection reuse, eviction, backoff, readiness changes, and metrics. TLS/mTLS is
+configured through `RpcTransportSecurity` and applied by the generated tonic endpoint transport when
+it creates or reuses channels.
 
 ---
 

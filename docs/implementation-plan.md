@@ -207,7 +207,7 @@ Status: `[x]` complete.
 - [x] Local passivation, supervision, scoped task cleanup, and stop-failed behavior exist.
 - [x] Admin/ops helper modules and inspector models exist.
 - [x] Config source and config store abstractions exist, including local and etcd config adapters.
-- [x] LocalEventBus and NATS event bus adapters exist.
+- [x] LocalEventBus, in-memory NATS-like test adapter, and real async-nats-backed `NatsEventBus` adapter exist with clear naming boundaries.
 - [x] Typed event publisher and current `ServiceEvents::subscribe_actor` bridge exist.
 - [x] Gateway binary frame codec, generated gateway binding, push validation, keyed Governor rate limiter, and tower-style pipeline tests exist.
 - [x] OpenTelemetry/fmt telemetry setup exists.
@@ -218,14 +218,15 @@ Status: `[x]` complete.
 - [x] `subscribe_actor` has typed owner-routed actor delivery semantics through `subscribe_actor_routed`, which builds routed `ActorRef`s from event actor metadata and delivers through `ActorRefRpcCore`.
 - [x] Event subscriptions owned by service event buses are cancelled by `LatticeService` shutdown/drain.
 - [x] Service scheduler is exposed through `ServiceContext`.
-- [x] Admin HTTP is wired into `LatticeService` startup as a managed listener.
+- [x] Admin HTTP is wired into `LatticeService` startup as a managed listener, including authenticated/audited/rate-limited mutating endpoints and service-backed instance drain.
 - [x] Node graceful shutdown is wired into `LatticeService::run_until_shutdown`.
 - [x] `LatticeService` shutdown drains runtime actor registries with `PassivationReason::Drain`.
 - [x] Service drain invokes coordinator-driven placement migration for owned actors before final stop.
 - [x] RPC readiness/drain behavior for new requests during shutdown is explicit: `LatticeService` publishes `Draining`, stops accepting RPC before placement/runtime drain, keeps lifecycle drain running after the listener closes, and tests cover listener closure while actor drain is blocked.
-- [x] Gateway startup is represented as a framework service API: `GatewayService` owns the TCP accept loop, supports custom connection handlers, manages background tasks such as push RPC listeners, and distributed-login starts through it with gateway crate coverage.
+- [x] Gateway startup is represented as a framework service API: `GatewayService` owns the TCP accept loop, supports custom connection handlers, manages background tasks and managed tonic service listeners such as push RPC listeners, and distributed-login starts through it with gateway crate coverage.
 - [x] Cluster/node inspection queries live services through Admin APIs: services now build admin snapshots from Ready placement records and registered actor kinds at startup, expose node summaries over managed Admin HTTP, and `ClusterInspector`/`HttpNodeInspectorClient` coverage verifies live-node aggregation and partial failures.
-- [x] Security/mTLS-equivalent service identity is connected to service builders by default: `RpcSecurityPolicy` derives client auth and SPIFFE-shaped peer identity metadata, generated placement-backed clients receive it through `RpcClientContextFactory`, and servers validate identity from either transport extensions or framework metadata.
+- [x] Service identity security is connected to service builders by default: `RpcSecurityPolicy::require_service_identity(...)` derives client auth and SPIFFE-shaped peer identity metadata, generated placement-backed clients receive it through `RpcClientContextFactory`, and servers validate identity from either transport extensions or framework metadata.
+- [x] Transport security is connected to service builders by default: `RpcTransportSecurity::tls(...)` configures tonic server TLS/mTLS and is propagated to generated placement-backed clients through `TonicEndpointChannelPool`, without exposing certificate/channel setup to actor handlers.
 - [x] Full chaos test suite is implemented across placement, ops, and actor chaos tests.
   - [x] Stale owner recovers after lease expiry and is fenced; route cache invalidates and retries with the same request id.
   - [x] Target service succeeds but response is lost/unknown-result handling is covered by `operation_tracker_models_lost_response_unknown_result_reconciliation`.
@@ -594,7 +595,7 @@ cross-node actor watch/unwatch
 ActorExecutionPolicy::DedicatedThreadPool implementation
 business saga / pending operation example
 transactional outbox guidance example
-security/mTLS integration
+service identity security integration
 chaos tests
 ```
 

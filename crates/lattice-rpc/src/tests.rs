@@ -1,7 +1,7 @@
 use crate::dedup::{RequestDedupKey, RequestDeduplicator};
 use crate::metadata::RpcMetadataError;
 use crate::security::{
-    MtlsConfig, PeerIdentity, RpcSecurityError, RpcSecurityPolicy, RpcServerSecurity,
+    PeerIdentity, RpcSecurityError, RpcSecurityPolicy, RpcServerSecurity, ServiceIdentityConfig,
 };
 use crate::server::{RpcServerBuildError, RpcServerBuilder};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -125,7 +125,7 @@ fn rpc_context_requires_framework_metadata() {
 }
 
 #[test]
-fn rpc_security_policy_validates_mtls_peer_identity_against_metadata() {
+fn rpc_security_policy_validates_service_identity_peer_against_metadata() {
     let ctx = RpcContext {
         request_id: RequestId::new("req-1"),
         route_epoch: None,
@@ -140,7 +140,7 @@ fn rpc_security_policy_validates_mtls_peer_identity_against_metadata() {
     let mut metadata = MetadataMap::new();
     ctx.inject_metadata(&mut metadata).unwrap();
     let extracted = RpcContext::from_metadata(&metadata).unwrap();
-    let policy = RpcSecurityPolicy::require_mtls(mtls_config())
+    let policy = RpcSecurityPolicy::require_service_identity(service_identity_config())
         .allow_service(service_kind!("Player"))
         .require_authorization();
     let peer = PeerIdentity::new(
@@ -172,7 +172,9 @@ fn rpc_security_policy_validates_mtls_peer_identity_against_metadata() {
 
 #[test]
 fn rpc_server_security_reads_peer_identity_from_request_extensions() {
-    let security = RpcServerSecurity::new(RpcSecurityPolicy::require_mtls(mtls_config()));
+    let security = RpcServerSecurity::new(RpcSecurityPolicy::require_service_identity(
+        service_identity_config(),
+    ));
     let peer = PeerIdentity::new(
         service_kind!("Player"),
         InstanceId::new("player-0"),
@@ -189,7 +191,9 @@ fn rpc_server_security_reads_peer_identity_from_request_extensions() {
 
 #[test]
 fn rpc_server_security_reads_peer_identity_from_metadata() {
-    let security = RpcServerSecurity::new(RpcSecurityPolicy::require_mtls(mtls_config()));
+    let security = RpcServerSecurity::new(RpcSecurityPolicy::require_service_identity(
+        service_identity_config(),
+    ));
     let peer = PeerIdentity::new(
         service_kind!("Player"),
         InstanceId::new("player-0"),
@@ -207,7 +211,8 @@ fn rpc_server_security_reads_peer_identity_from_metadata() {
 #[test]
 fn rpc_security_policy_builds_default_client_context() {
     let security = RpcServerSecurity::new(
-        RpcSecurityPolicy::require_mtls(mtls_config()).require_authorization(),
+        RpcSecurityPolicy::require_service_identity(service_identity_config())
+            .require_authorization(),
     );
     let ctx = security
         .client_context_factory(service_kind!("Player"), InstanceId::new("player-0"))
@@ -222,6 +227,42 @@ fn rpc_security_policy_builds_default_client_context() {
     assert_eq!(peer.instance_id, InstanceId::new("player-0"));
     assert!(peer.spiffe_id.starts_with("spiffe://lattice.test/"));
     assert_eq!(security.policy().validate(&extracted, Some(peer)), Ok(()));
+}
+
+#[test]
+fn rpc_transport_security_plaintext_does_not_configure_tls() {
+    let endpoint: Uri = "http://world-0.world:18080".parse().unwrap();
+
+    assert!(
+        RpcTransportSecurity::plaintext()
+            .client_tls_config(&endpoint)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        RpcTransportSecurity::plaintext()
+            .server_tls_config()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn rpc_transport_security_builds_client_tls_from_endpoint_host() {
+    let endpoint: Uri = "https://world-0.world:18080".parse().unwrap();
+    let security = RpcTransportSecurity::tls(RpcTlsConfig::new());
+
+    assert!(security.client_tls_config(&endpoint).unwrap().is_some());
+}
+
+#[test]
+fn rpc_transport_security_server_tls_requires_identity() {
+    let security = RpcTransportSecurity::tls(RpcTlsConfig::new());
+
+    assert_eq!(
+        security.server_tls_config().unwrap_err(),
+        "server TLS requires certificate/key identity"
+    );
 }
 
 #[test]
@@ -433,8 +474,8 @@ async fn actor_rpc_adapter_secure_unary_rejects_mismatched_peer_identity() {
         .await
         .unwrap();
     let adapter = ActorRpcAdapter::new(handle).with_owner_epoch(Epoch(7));
-    let policy =
-        RpcSecurityPolicy::require_mtls(mtls_config()).allow_service(service_kind!("World"));
+    let policy = RpcSecurityPolicy::require_service_identity(service_identity_config())
+        .allow_service(service_kind!("World"));
     let peer = PeerIdentity::new(
         service_kind!("Gateway"),
         InstanceId::new("world-0"),
@@ -522,12 +563,9 @@ fn test_context(route_epoch: Option<Epoch>) -> RpcContext {
     }
 }
 
-fn mtls_config() -> MtlsConfig {
-    MtlsConfig {
+fn service_identity_config() -> ServiceIdentityConfig {
+    ServiceIdentityConfig {
         trust_domain: "lattice.test".to_string(),
-        ca_cert_path: "/etc/lattice/ca.pem".to_string(),
-        cert_chain_path: "/etc/lattice/tls.crt".to_string(),
-        private_key_path: "/etc/lattice/tls.key".to_string(),
     }
 }
 

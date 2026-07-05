@@ -62,6 +62,16 @@ fn generated_output_matches_phase_two_shape() {
             .rust
             .contains("retry_policy: lattice_placement::RpcRetryPolicy")
     );
+    assert!(
+        generated
+            .rust
+            .contains("transport_security: lattice_rpc::RpcTransportSecurity")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("super::GeneratedTonicEndpointTransport::with_transport_security")
+    );
     assert!(generated.rust.contains(".with_retry_policy(retry_policy)"));
     assert!(
         generated
@@ -107,6 +117,7 @@ fn generated_output_matches_phase_two_shape() {
             .rust
             .contains("pub struct GeneratedTonicEndpointTransport")
     );
+    assert!(generated.rust.contains("pub fn with_transport_security"));
     assert!(generated.rust.contains("\"world.WorldRpc/EnterWorld\" => self.call_world_rpc_enter_world::<Req>(target, metadata, request).await"));
     assert!(
         generated

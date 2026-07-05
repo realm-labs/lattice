@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use lattice_actor::Actor;
 use lattice_core::{ActorKind, ServiceContext};
-use lattice_rpc::RpcServerSecurity;
+use lattice_rpc::{RpcServerSecurity, RpcTransportSecurity};
 use tonic::body::Body;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
@@ -20,6 +20,7 @@ pub struct ServiceBuildContext {
     rpc_security: RpcServerSecurity,
     pub(crate) actors: HashMap<ActorKind, Box<dyn Any + Send>>,
     pub(crate) logic_actors: HashMap<ActorKind, Arc<dyn ErasedLogicActor>>,
+    server: Option<Server>,
     pub(crate) router: Option<Router>,
 }
 
@@ -31,6 +32,7 @@ impl std::fmt::Debug for ServiceBuildContext {
             .field("rpc_security", &self.rpc_security)
             .field("actor_count", &self.actors.len())
             .field("logic_actor_count", &self.logic_actors.len())
+            .field("has_server", &self.server.is_some())
             .field("has_router", &self.router.is_some())
             .finish()
     }
@@ -50,8 +52,38 @@ impl ServiceBuildContext {
             rpc_security,
             actors: HashMap::new(),
             logic_actors: HashMap::new(),
+            server: Some(Server::builder()),
             router: None,
         }
+    }
+
+    pub(crate) fn with_rpc_security_and_transport(
+        service: ServiceContext,
+        rpc_security: RpcServerSecurity,
+        transport_security: RpcTransportSecurity,
+    ) -> Result<Self, LatticeServiceError> {
+        let mut server = Server::builder();
+        if let Some(tls_config) = transport_security.server_tls_config().map_err(|message| {
+            LatticeServiceError::ComponentBuild {
+                slot: "rpc_transport_security".to_string(),
+                message,
+            }
+        })? {
+            server = server.tls_config(tls_config).map_err(|error| {
+                LatticeServiceError::ComponentBuild {
+                    slot: "rpc_transport_security".to_string(),
+                    message: error.to_string(),
+                }
+            })?;
+        }
+        Ok(Self {
+            service,
+            rpc_security,
+            actors: HashMap::new(),
+            logic_actors: HashMap::new(),
+            server: Some(server),
+            router: None,
+        })
     }
 
     pub fn service_context(&self) -> ServiceContext {
@@ -75,7 +107,11 @@ impl ServiceBuildContext {
     {
         self.router = Some(match self.router.take() {
             Some(router) => router.add_service(service),
-            None => Server::builder().add_service(service),
+            None => self
+                .server
+                .take()
+                .unwrap_or_else(Server::builder)
+                .add_service(service),
         });
     }
 

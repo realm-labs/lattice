@@ -4,9 +4,13 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use lattice_core::instance::InstanceCapacity;
 use lattice_core::{ActorKind, ServiceContext, ServiceKind};
-use lattice_ops::admin::{AdminAuth, AdminHttpAdapter, AdminSnapshot};
+use lattice_ops::admin::{
+    AdminActorTarget, AdminApiError, AdminAuth, AdminHttpAdapter, AdminMutationHandler,
+    AdminMutationReply, AdminSnapshot,
+};
 use lattice_placement::PlacementError;
 use lattice_placement::coordinator::PlacementWatchTask;
 use lattice_placement::instance::{InstanceRecord, InstanceState};
@@ -21,7 +25,8 @@ use crate::actor::ErasedLogicActor;
 use crate::component::ErasedPlacementStore;
 use crate::config::InstanceConfig;
 use crate::framework::{
-    ClusterEventBusComponent, LocalEventBusComponent, ServiceSchedulerComponent,
+    ClusterEventBusComponent, DynPlacementStore, LocalEventBusComponent, ServiceContextExt,
+    ServiceSchedulerComponent,
 };
 use crate::{LatticeServiceBuilder, LatticeServiceError};
 
@@ -135,6 +140,7 @@ impl LatticeService {
         let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel::<()>();
         let (admin_shutdown_tx, admin_task) = start_admin_http_server(
             admin_http,
+            &service_context,
             placement_store.as_ref(),
             &service_kind,
             &instance.instance_id,
@@ -320,6 +326,7 @@ type AdminHttpTask = tokio::task::JoinHandle<Result<(), LatticeServiceError>>;
 
 async fn start_admin_http_server(
     admin_http: Option<AdminHttpServer>,
+    service_context: &ServiceContext,
     placement_store: &dyn ErasedPlacementStore,
     service_kind: &ServiceKind,
     instance_id: &lattice_core::InstanceId,
@@ -334,7 +341,12 @@ async fn start_admin_http_server(
         admin_http.actor_kinds,
     )
     .await?;
-    let router = AdminHttpAdapter::new(admin_http.auth, snapshot).router();
+    let router = AdminHttpAdapter::new(admin_http.auth, snapshot)
+        .with_mutation_handler(ServiceAdminMutations {
+            service_kind: service_kind.clone(),
+            placement_store: service_context.placement_store(),
+        })
+        .router();
     let local_addr = admin_http.listener.local_addr().ok();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {
@@ -349,6 +361,68 @@ async fn start_admin_http_server(
             .map_err(LatticeServiceError::from)
     });
     Ok((Some(shutdown_tx), Some(task)))
+}
+
+#[derive(Clone)]
+struct ServiceAdminMutations {
+    service_kind: ServiceKind,
+    placement_store: Arc<dyn DynPlacementStore>,
+}
+
+impl std::fmt::Debug for ServiceAdminMutations {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceAdminMutations")
+            .field("service_kind", &self.service_kind)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl AdminMutationHandler for ServiceAdminMutations {
+    async fn drain_instance(
+        &self,
+        instance_id: lattice_core::InstanceId,
+    ) -> Result<AdminMutationReply, AdminApiError> {
+        let report = self
+            .placement_store
+            .drain_instance(self.service_kind.clone(), instance_id.clone())
+            .await
+            .map_err(|error| AdminApiError::MutationFailed {
+                message: error.to_string(),
+            })?;
+        Ok(AdminMutationReply::accepted(format!(
+            "drained {instance_id}: migrated {} actors and {} virtual shards",
+            report.migrated_actors, report.migrated_virtual_shards
+        )))
+    }
+
+    async fn retry_actor_stop(
+        &self,
+        _target: AdminActorTarget,
+    ) -> Result<AdminMutationReply, AdminApiError> {
+        Err(AdminApiError::MutationUnsupported {
+            operation: "retry_actor_stop",
+        })
+    }
+
+    async fn force_actor_stop(
+        &self,
+        _target: AdminActorTarget,
+    ) -> Result<AdminMutationReply, AdminApiError> {
+        Err(AdminApiError::MutationUnsupported {
+            operation: "force_actor_stop",
+        })
+    }
+
+    async fn migrate_actor(
+        &self,
+        _target: AdminActorTarget,
+    ) -> Result<AdminMutationReply, AdminApiError> {
+        Err(AdminApiError::MutationUnsupported {
+            operation: "migrate_actor",
+        })
+    }
 }
 
 async fn build_admin_snapshot(

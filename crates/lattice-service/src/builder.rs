@@ -13,7 +13,7 @@ use lattice_ops::{AdminHttpConfig, ServiceScheduler};
 use lattice_placement::coordinator::{PlacementWatchStarter, PlacementWatchTask};
 use lattice_placement::route::RpcRetryPolicy;
 use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix, PlacementStore};
-use lattice_rpc::{RpcSecurityPolicy, RpcServerSecurity};
+use lattice_rpc::{RpcSecurityPolicy, RpcServerSecurity, RpcTransportSecurity};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::{debug, info};
@@ -50,6 +50,7 @@ pub struct LatticeServiceBuilder {
     config_store: Option<Box<dyn ErasedServiceComponent>>,
     admin_http: Option<AdminHttpConfig>,
     rpc_security: RpcServerSecurity,
+    rpc_transport_security: RpcTransportSecurity,
     rpc_retry_policy: RpcRetryPolicy,
     placement_watchers: Vec<Box<dyn ErasedPlacementWatchStarter>>,
     duplicate_framework_component: Option<&'static str>,
@@ -82,6 +83,7 @@ impl fmt::Debug for LatticeServiceBuilder {
             .field("has_config_store", &self.config_store.is_some())
             .field("has_admin_http", &self.admin_http.is_some())
             .field("rpc_security", &self.rpc_security)
+            .field("rpc_transport_security", &self.rpc_transport_security)
             .field("rpc_retry_policy", &self.rpc_retry_policy)
             .field("placement_watch_count", &self.placement_watchers.len())
             .field("extension_count", &self.extensions.len())
@@ -107,6 +109,7 @@ impl LatticeServiceBuilder {
             config_store: None,
             admin_http: None,
             rpc_security: RpcServerSecurity::disabled(),
+            rpc_transport_security: RpcTransportSecurity::plaintext(),
             rpc_retry_policy: RpcRetryPolicy::default(),
             placement_watchers: Vec::new(),
             duplicate_framework_component: None,
@@ -223,6 +226,11 @@ impl LatticeServiceBuilder {
 
     pub fn rpc_security(mut self, policy: RpcSecurityPolicy) -> Self {
         self.rpc_security = RpcServerSecurity::new(policy);
+        self
+    }
+
+    pub fn rpc_transport_security(mut self, security: RpcTransportSecurity) -> Self {
+        self.rpc_transport_security = security;
         self
     }
 
@@ -424,6 +432,7 @@ impl LatticeServiceBuilder {
                 Some(default_resolver),
                 context_factory,
                 self.rpc_retry_policy,
+                self.rpc_transport_security.clone(),
             )?;
         }
         let service_context = service_context.build();
@@ -438,8 +447,11 @@ impl LatticeServiceBuilder {
             service.extensions = service_context.extension_count(),
             "building lattice service"
         );
-        let mut context =
-            ServiceBuildContext::with_rpc_security(service_context.clone(), self.rpc_security);
+        let mut context = ServiceBuildContext::with_rpc_security_and_transport(
+            service_context.clone(),
+            self.rpc_security,
+            self.rpc_transport_security,
+        )?;
         let mut actor_kinds = HashSet::<ActorKind>::new();
 
         for registration in self.actor_registrations {

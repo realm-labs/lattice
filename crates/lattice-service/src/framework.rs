@@ -9,6 +9,8 @@ use lattice_eventbus::{
 };
 use lattice_ops::ServiceScheduler;
 use lattice_placement::PlacementError;
+use lattice_placement::control::TonicLogicControl;
+use lattice_placement::coordinator::{DrainReport, PlacementCoordinator};
 use lattice_placement::instance::InstanceRecord;
 use lattice_placement::store::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementStore,
@@ -31,6 +33,11 @@ pub trait DynPlacementStore: Send + Sync + 'static {
         service_kind: &ServiceKind,
     ) -> Result<Vec<InstanceRecord>, PlacementError>;
     async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError>;
+    async fn drain_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+    ) -> Result<DrainReport, PlacementError>;
     async fn get_actor(
         &self,
         key: &ActorPlacementKey,
@@ -109,6 +116,16 @@ where
 
     async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError> {
         PlacementStore::list_all_instances(self).await
+    }
+
+    async fn drain_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+    ) -> Result<DrainReport, PlacementError> {
+        PlacementCoordinator::new(self.clone(), TonicLogicControl)
+            .drain_instance(service_kind, instance_id)
+            .await
     }
 
     async fn get_actor(

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use lattice_core::{InstanceId, TraceContext, service_kind};
-use lattice_eventbus::nats::{InMemoryNatsClient, NatsEventBus};
+use lattice_eventbus::nats::{InMemoryNatsClient, InMemoryNatsEventBus};
 use lattice_eventbus::{
     EventBus, EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter,
 };
@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 #[tokio::test]
 async fn durable_subscriber_deduplicates_duplicate_event_delivery_by_event_id() {
-    let bus = NatsEventBus::new(InMemoryNatsClient::new());
+    let bus = InMemoryNatsEventBus::new(InMemoryNatsClient::new());
     let durable_seen = Arc::new(Mutex::new(Vec::new()));
     let local_seen = Arc::new(Mutex::new(Vec::new()));
 

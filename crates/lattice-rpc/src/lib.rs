@@ -13,7 +13,8 @@ pub use client::{ActorRefRpcClient, TonicEndpointChannelPool, TypedRpcClient};
 pub use error::RpcError;
 pub use metadata::{AuthContext, RpcClientContextFactory, RpcContext};
 pub use security::{
-    MtlsConfig, PeerIdentity, RpcSecurityError, RpcSecurityPolicy, RpcServerSecurity,
+    PeerIdentity, RpcSecurityError, RpcSecurityPolicy, RpcServerSecurity, RpcTlsConfig,
+    RpcTlsIdentity, RpcTransportSecurity, ServiceIdentityConfig,
 };
 pub use traits::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpcCore};
 pub use types::{RouteTarget, Rpc};

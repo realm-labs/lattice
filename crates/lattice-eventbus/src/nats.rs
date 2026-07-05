@@ -4,9 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use lattice_core::ConfiguredComponent;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tracing::{Instrument, warn};
 
 use crate::local::EventHandler;
 use crate::{
@@ -15,22 +17,144 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct NatsEventBus {
+    client: async_nats::Client,
+    config: NatsEventBusConfig,
+}
+
+impl NatsEventBus {
+    pub async fn connect(config: NatsEventBusConfig) -> Result<Self, EventBusError> {
+        let client = async_nats::connect(config.endpoint.clone())
+            .await
+            .map_err(|error| EventBusError::Backend {
+                reason: error.to_string(),
+            })?;
+        Ok(Self { client, config })
+    }
+
+    pub fn from_config() -> ConfiguredComponent<Self> {
+        ConfiguredComponent::from_section("event_bus", |config| async move {
+            Self::connect(config).await
+        })
+    }
+
+    pub fn from_client(client: async_nats::Client, config: NatsEventBusConfig) -> Self {
+        Self { client, config }
+    }
+
+    pub fn config(&self) -> &NatsEventBusConfig {
+        &self.config
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NatsEventBusConfig {
+    pub endpoint: String,
+    pub stream: String,
+    #[serde(default)]
+    pub durable_prefix: String,
+}
+
+#[async_trait]
+impl EventBus for NatsEventBus {
+    async fn publish(&self, event: EventEnvelope) -> Result<(), EventBusError> {
+        let subject = event.subject.as_str().to_string();
+        let payload =
+            serde_json::to_vec(&event).map_err(|error| EventBusError::EncodeEnvelope {
+                reason: error.to_string(),
+            })?;
+        self.client
+            .publish(subject, payload.into())
+            .await
+            .map_err(|error| EventBusError::Backend {
+                reason: error.to_string(),
+            })
+    }
+
+    async fn subscribe<H>(
+        &self,
+        subscription: EventSubscription,
+        handler: H,
+    ) -> Result<EventSubscriptionHandle, EventBusError>
+    where
+        H: EventHandler,
+    {
+        let id = NATS_SUBSCRIPTION_ID.fetch_add(1, Ordering::SeqCst);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let handler = Arc::new(handler);
+        let mut subscriber = if let Some(durable_name) = &subscription.durable_name {
+            let queue_group = durable_queue_group(&self.config, durable_name);
+            self.client
+                .queue_subscribe(subscription.filter.as_str().to_string(), queue_group)
+                .await
+        } else {
+            self.client
+                .subscribe(subscription.filter.as_str().to_string())
+                .await
+        }
+        .map_err(|error| EventBusError::Backend {
+            reason: error.to_string(),
+        })?;
+
+        let cancelled_task = cancelled.clone();
+        let subject_filter = subscription.filter.clone();
+        tokio::spawn(
+            async move {
+                while !cancelled_task.load(Ordering::SeqCst) {
+                    let Some(message) = subscriber.next().await else {
+                        break;
+                    };
+                    if cancelled_task.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let event: EventEnvelope =
+                        match serde_json::from_slice(message.payload.as_ref()) {
+                            Ok(event) => event,
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    subject = %message.subject,
+                                    "failed to decode NATS event envelope"
+                                );
+                                continue;
+                            }
+                        };
+                    if !subject_filter.matches(&event.subject) {
+                        continue;
+                    }
+                    if let Err(error) = handler.handle(event).await {
+                        warn!(%error, "NATS event handler failed");
+                    }
+                }
+            }
+            .instrument(tracing::info_span!("eventbus.nats.subscription")),
+        );
+
+        Ok(EventSubscriptionHandle::new(id, cancelled))
+    }
+}
+
+fn durable_queue_group(config: &NatsEventBusConfig, durable_name: &str) -> String {
+    if config.durable_prefix.is_empty() {
+        durable_name.to_string()
+    } else {
+        format!("{}-{durable_name}", config.durable_prefix)
+    }
+}
+
+static NATS_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone)]
+pub struct InMemoryNatsEventBus {
     client: InMemoryNatsClient,
     config: Option<NatsEventBusConfig>,
 }
 
-impl NatsEventBus {
+impl InMemoryNatsEventBus {
     pub fn new(client: InMemoryNatsClient) -> Self {
         Self {
             client,
             config: None,
         }
-    }
-
-    pub fn from_config() -> ConfiguredComponent<Self> {
-        ConfiguredComponent::from_section("event_bus", |config| async move {
-            Ok::<_, EventBusError>(Self::from_options(config))
-        })
     }
 
     pub fn from_options(config: NatsEventBusConfig) -> Self {
@@ -45,11 +169,10 @@ impl NatsEventBus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NatsEventBusConfig {
-    pub endpoint: String,
-    pub stream: String,
-    pub durable_prefix: String,
+impl Default for InMemoryNatsEventBus {
+    fn default() -> Self {
+        Self::new(InMemoryNatsClient::new())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +223,7 @@ struct NatsSubscriber {
 }
 
 #[async_trait]
-impl EventBus for NatsEventBus {
+impl EventBus for InMemoryNatsEventBus {
     async fn publish(&self, event: EventEnvelope) -> Result<(), EventBusError> {
         self.client.inner.stream.lock().await.push(event.clone());
         let subscribers = self
@@ -198,8 +321,8 @@ mod tests {
     use crate::{EventEnvelope, Subject, SubjectFilter};
 
     #[tokio::test]
-    async fn durable_nats_subscriber_replays_unseen_stream_events() {
-        let bus = NatsEventBus::new(InMemoryNatsClient::new());
+    async fn in_memory_nats_subscriber_replays_unseen_stream_events() {
+        let bus = InMemoryNatsEventBus::new(InMemoryNatsClient::new());
         bus.publish(test_event("event-1")).await.unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = seen.clone();
@@ -221,8 +344,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_nats_subscriber_is_idempotent_by_event_id() {
-        let bus = NatsEventBus::new(InMemoryNatsClient::new());
+    async fn in_memory_nats_subscriber_is_idempotent_by_event_id() {
+        let bus = InMemoryNatsEventBus::new(InMemoryNatsClient::new());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = seen.clone();
         bus.subscribe(
@@ -245,29 +368,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nats_event_bus_builds_from_config() {
+    async fn in_memory_nats_event_bus_builds_from_options() {
         let config = NatsEventBusConfig {
             endpoint: "nats://nats:4222".to_string(),
             stream: "lattice-events".to_string(),
             durable_prefix: "world".to_string(),
         };
-        let bus = NatsEventBus::from_options(config.clone());
+        let bus = InMemoryNatsEventBus::from_options(config.clone());
 
         assert_eq!(bus.config(), Some(&config));
+    }
 
-        let bootstrap = lattice_config::BootstrapConfig::parse(
-            r#"
-            [event_bus]
-            endpoint = "nats://nats:4222"
-            stream = "lattice-events"
-            durable_prefix = "world"
-            "#,
-            lattice_config::ConfigFormat::Toml,
-        )
-        .unwrap();
-        let configured = NatsEventBus::from_config().build(&bootstrap).await.unwrap();
+    #[test]
+    fn durable_queue_group_uses_configured_prefix() {
+        let config = NatsEventBusConfig {
+            endpoint: "nats://nats:4222".to_string(),
+            stream: "lattice-events".to_string(),
+            durable_prefix: "world".to_string(),
+        };
 
-        assert_eq!(configured.config(), Some(&config));
+        assert_eq!(
+            durable_queue_group(&config, "cache"),
+            "world-cache".to_string()
+        );
     }
 
     fn test_event(event_id: &str) -> EventEnvelope {

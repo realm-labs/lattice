@@ -31,6 +31,7 @@ pub trait RpcClientBinding: Send + Sync + 'static {
         _resolver: lattice_placement::BoxRouteResolver,
         _context_factory: lattice_rpc::RpcClientContextFactory,
         _retry_policy: lattice_placement::RpcRetryPolicy,
+        _transport_security: lattice_rpc::RpcTransportSecurity,
     ) -> Option<Self::Core> {
         None
     }
@@ -47,6 +48,7 @@ pub(crate) trait ErasedRpcClientBinding: Send + Sync + 'static {
         default_resolver: Option<lattice_placement::BoxRouteResolver>,
         context_factory: lattice_rpc::RpcClientContextFactory,
         retry_policy: lattice_placement::RpcRetryPolicy,
+        transport_security: lattice_rpc::RpcTransportSecurity,
     ) -> Result<(), LatticeServiceError>;
 }
 
@@ -84,6 +86,7 @@ where
         default_resolver: Option<lattice_placement::BoxRouteResolver>,
         context_factory: lattice_rpc::RpcClientContextFactory,
         retry_policy: lattice_placement::RpcRetryPolicy,
+        transport_security: lattice_rpc::RpcTransportSecurity,
     ) -> Result<(), LatticeServiceError> {
         let service_kind = self.service_kind();
         let core = service_context
@@ -91,7 +94,14 @@ where
             .map(|core| (*core).clone())
             .or_else(|| {
                 default_resolver
-                    .map(|resolver| B::build_default_core(resolver, context_factory, retry_policy))
+                    .map(|resolver| {
+                        B::build_default_core(
+                            resolver,
+                            context_factory,
+                            retry_policy,
+                            transport_security,
+                        )
+                    })
                     .unwrap_or(None)
             })
             .ok_or(LatticeServiceError::MissingRpcClientCore {

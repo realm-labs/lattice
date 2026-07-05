@@ -7,11 +7,15 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+axum.workspace = true
 dashmap.workspace = true
+http.workspace = true
 lattice-core.workspace = true
 lattice-rpc.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
 
 [dev-dependencies]

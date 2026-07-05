@@ -45,8 +45,8 @@ use lattice_placement::{
     ResolvingRpcCore, RouteResolver,
 };
 use lattice_rpc::{
-    AuthContext, MtlsConfig, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError,
-    RpcRequest, RpcSecurityError, RpcSecurityPolicy, ShardedRpcCore,
+    AuthContext, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError, RpcRequest,
+    RpcSecurityError, RpcSecurityPolicy, ServiceIdentityConfig, ShardedRpcCore,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -267,6 +267,7 @@ impl RpcClientBinding for SecurityClientProbeBinding {
         _resolver: BoxRouteResolver,
         context_factory: RpcClientContextFactory,
         _retry_policy: lattice_placement::RpcRetryPolicy,
+        _transport_security: lattice_rpc::RpcTransportSecurity,
     ) -> Option<Self::Core> {
         let ctx = context_factory.next_context(None);
         assert!(ctx.auth.is_some());
@@ -391,6 +392,7 @@ impl RpcClientBinding for FakePlacementClientBinding {
         resolver: BoxRouteResolver,
         context_factory: RpcClientContextFactory,
         retry_policy: lattice_placement::RpcRetryPolicy,
+        _transport_security: lattice_rpc::RpcTransportSecurity,
     ) -> Option<Self::Core> {
         Some(
             ResolvingRpcCore::new(
@@ -425,6 +427,7 @@ impl RpcClientBinding for FakeSingletonClientBinding {
         resolver: BoxRouteResolver,
         context_factory: RpcClientContextFactory,
         retry_policy: lattice_placement::RpcRetryPolicy,
+        _transport_security: lattice_rpc::RpcTransportSecurity,
     ) -> Option<Self::Core> {
         Some(
             ResolvingRpcCore::new(
@@ -663,7 +666,7 @@ async fn builder_propagates_rpc_security_to_service_bindings() {
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .rpc_security(
-            RpcSecurityPolicy::require_mtls(test_mtls_config())
+            RpcSecurityPolicy::require_service_identity(test_service_identity_config())
                 .allow_service(service_kind!("Player"))
                 .require_authorization(),
         )
@@ -956,6 +959,7 @@ async fn service_starts_admin_http_as_managed_listener() {
     let admin_addr = admin_probe.local_addr().unwrap();
     drop(admin_probe);
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let store_for_assert = store.clone();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let service = LatticeService::builder(service_kind!("World"))
@@ -994,16 +998,72 @@ async fn service_starts_admin_http_as_managed_listener() {
     assert!(response.contains("\"instance_id\":\"world-1\""));
     assert!(response.contains("\"actor_kinds\":[\"World\"]"));
 
+    let replacement = InstanceRecord {
+        service_kind: service_kind!("World"),
+        instance_id: InstanceId::new("world-2"),
+        lease_id: store_for_assert.grant_instance_lease().await.unwrap(),
+        advertised_endpoint: "http://127.0.0.1:19002".parse().unwrap(),
+        control_endpoint: "http://127.0.0.1:19002".parse().unwrap(),
+        version: "test".to_string(),
+        state: InstanceState::Ready,
+        capacity: Default::default(),
+        labels: Default::default(),
+    };
+    store_for_assert.upsert_instance(replacement).await.unwrap();
+    let actor_key = ActorPlacementKey {
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(42),
+    };
+    store_for_assert
+        .compare_and_put_actor(
+            actor_key.clone(),
+            None,
+            ActorPlacementRecord {
+                actor_kind: actor_kind!("World"),
+                actor_id: ActorId::U64(42),
+                owner: InstanceId::new("world-1"),
+                epoch: Epoch(1),
+                lease_id: LeaseId(99),
+                state: PlacementState::Running,
+            },
+        )
+        .await
+        .unwrap();
+
+    let response = write_admin_http(admin_addr, "POST", "/admin/instances/world-1/drain", "").await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("\"accepted\":true"));
+    let migrated = store_for_assert
+        .get_actor(&actor_key)
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(migrated.owner, InstanceId::new("world-2"));
+    assert_eq!(migrated.epoch, Epoch(2));
+
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();
 }
 
 async fn read_admin_http(admin_addr: std::net::SocketAddr, path: &str) -> String {
+    write_admin_http(admin_addr, "GET", path, "").await
+}
+
+async fn write_admin_http(
+    admin_addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> String {
     let mut stream = TcpStream::connect(admin_addr).await.unwrap();
     stream
         .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();
@@ -1786,11 +1846,8 @@ fn placement_actor_record(
     }
 }
 
-fn test_mtls_config() -> MtlsConfig {
-    MtlsConfig {
+fn test_service_identity_config() -> ServiceIdentityConfig {
+    ServiceIdentityConfig {
         trust_domain: "lattice.test".to_string(),
-        ca_cert_path: "/etc/lattice/ca.pem".to_string(),
-        cert_chain_path: "/etc/lattice/tls.crt".to_string(),
-        private_key_path: "/etc/lattice/tls.key".to_string(),
     }
 }

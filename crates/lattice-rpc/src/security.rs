@@ -1,15 +1,152 @@
+use std::fs;
+use std::path::Path;
+
+use http::Uri;
 use lattice_core::{InstanceId, ServiceKind};
+use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 use tonic::{Request, Status};
 
 use crate::RpcContext;
 use crate::metadata::{AuthContext, RpcClientContextFactory, peer_identity_from_metadata};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MtlsConfig {
+pub struct ServiceIdentityConfig {
     pub trust_domain: String,
-    pub ca_cert_path: String,
-    pub cert_chain_path: String,
-    pub private_key_path: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RpcTransportSecurity {
+    #[default]
+    Plaintext,
+    Tls(RpcTlsConfig),
+}
+
+impl RpcTransportSecurity {
+    pub fn plaintext() -> Self {
+        Self::Plaintext
+    }
+
+    pub fn tls(config: RpcTlsConfig) -> Self {
+        Self::Tls(config)
+    }
+
+    pub fn client_tls_config(&self, endpoint: &Uri) -> Result<Option<ClientTlsConfig>, String> {
+        let Self::Tls(config) = self else {
+            return Ok(None);
+        };
+        let domain = config
+            .domain_name
+            .clone()
+            .or_else(|| endpoint.host().map(ToString::to_string))
+            .ok_or_else(|| format!("TLS endpoint {endpoint} has no host for SNI"))?;
+        let mut tls = ClientTlsConfig::new().domain_name(domain);
+        if let Some(ca) = &config.ca_certificate_pem {
+            tls = tls.ca_certificate(Certificate::from_pem(ca.clone()));
+        }
+        if let Some(identity) = &config.identity {
+            tls = tls.identity(identity.to_tonic_identity());
+        }
+        Ok(Some(tls))
+    }
+
+    pub fn server_tls_config(&self) -> Result<Option<ServerTlsConfig>, String> {
+        let Self::Tls(config) = self else {
+            return Ok(None);
+        };
+        let identity = config
+            .identity
+            .as_ref()
+            .ok_or_else(|| "server TLS requires certificate/key identity".to_string())?;
+        let mut tls = ServerTlsConfig::new().identity(identity.to_tonic_identity());
+        if let Some(client_ca) = &config.client_ca_root_pem {
+            tls = tls.client_ca_root(Certificate::from_pem(client_ca.clone()));
+        }
+        Ok(Some(tls))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RpcTlsConfig {
+    pub domain_name: Option<String>,
+    pub ca_certificate_pem: Option<Vec<u8>>,
+    pub identity: Option<RpcTlsIdentity>,
+    pub client_ca_root_pem: Option<Vec<u8>>,
+}
+
+impl RpcTlsConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn domain_name(mut self, domain_name: impl Into<String>) -> Self {
+        self.domain_name = Some(domain_name.into());
+        self
+    }
+
+    pub fn ca_certificate_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.ca_certificate_pem = Some(pem.into());
+        self
+    }
+
+    pub fn identity(mut self, identity: RpcTlsIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    pub fn identity_pem(
+        mut self,
+        cert_pem: impl Into<Vec<u8>>,
+        key_pem: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.identity = Some(RpcTlsIdentity::from_pem(cert_pem, key_pem));
+        self
+    }
+
+    pub fn client_ca_root_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.client_ca_root_pem = Some(pem.into());
+        self
+    }
+
+    pub fn ca_certificate_file(mut self, path: impl AsRef<Path>) -> std::io::Result<Self> {
+        self.ca_certificate_pem = Some(fs::read(path)?);
+        Ok(self)
+    }
+
+    pub fn identity_files(
+        mut self,
+        cert_path: impl AsRef<Path>,
+        key_path: impl AsRef<Path>,
+    ) -> std::io::Result<Self> {
+        self.identity = Some(RpcTlsIdentity {
+            cert_pem: fs::read(cert_path)?,
+            key_pem: fs::read(key_path)?,
+        });
+        Ok(self)
+    }
+
+    pub fn client_ca_root_file(mut self, path: impl AsRef<Path>) -> std::io::Result<Self> {
+        self.client_ca_root_pem = Some(fs::read(path)?);
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcTlsIdentity {
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+}
+
+impl RpcTlsIdentity {
+    pub fn from_pem(cert_pem: impl Into<Vec<u8>>, key_pem: impl Into<Vec<u8>>) -> Self {
+        Self {
+            cert_pem: cert_pem.into(),
+            key_pem: key_pem.into(),
+        }
+    }
+
+    fn to_tonic_identity(&self) -> Identity {
+        Identity::from_pem(self.cert_pem.clone(), self.key_pem.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +172,7 @@ impl PeerIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcSecurityPolicy {
-    mtls: Option<MtlsConfig>,
+    service_identity: Option<ServiceIdentityConfig>,
     allowed_services: Vec<ServiceKind>,
     require_authorization: bool,
 }
@@ -43,15 +180,15 @@ pub struct RpcSecurityPolicy {
 impl RpcSecurityPolicy {
     pub fn disabled() -> Self {
         Self {
-            mtls: None,
+            service_identity: None,
             allowed_services: Vec::new(),
             require_authorization: false,
         }
     }
 
-    pub fn require_mtls(config: MtlsConfig) -> Self {
+    pub fn require_service_identity(config: ServiceIdentityConfig) -> Self {
         Self {
-            mtls: Some(config),
+            service_identity: Some(config),
             allowed_services: Vec::new(),
             require_authorization: false,
         }
@@ -80,10 +217,10 @@ impl RpcSecurityPolicy {
         service_kind: ServiceKind,
         instance_id: InstanceId,
     ) -> Option<PeerIdentity> {
-        self.mtls.as_ref().map(|mtls| {
+        self.service_identity.as_ref().map(|identity| {
             let spiffe_id = format!(
                 "spiffe://{}/svc/{}/instance/{}",
-                mtls.trust_domain,
+                identity.trust_domain,
                 service_kind.as_str(),
                 instance_id.as_str()
             );
@@ -110,7 +247,7 @@ impl RpcSecurityPolicy {
             });
         }
 
-        let Some(mtls) = &self.mtls else {
+        let Some(identity) = &self.service_identity else {
             return Ok(());
         };
         let peer = peer.ok_or(RpcSecurityError::MissingPeerIdentity)?;
@@ -126,10 +263,10 @@ impl RpcSecurityPolicy {
                 peer: peer.instance_id.clone(),
             });
         }
-        let expected_prefix = format!("spiffe://{}/", mtls.trust_domain);
+        let expected_prefix = format!("spiffe://{}/", identity.trust_domain);
         if !peer.spiffe_id.starts_with(&expected_prefix) {
             return Err(RpcSecurityError::TrustDomainMismatch {
-                expected: mtls.trust_domain.clone(),
+                expected: identity.trust_domain.clone(),
                 spiffe_id: peer.spiffe_id.clone(),
             });
         }

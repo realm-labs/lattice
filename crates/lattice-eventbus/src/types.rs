@@ -1,6 +1,8 @@
 use lattice_core::{ActorId, ActorKind, InstanceId, RequestId, ServiceKind, TraceContext};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Subject(String);
 
 impl Subject {
@@ -13,7 +15,8 @@ impl Subject {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct EventId(String);
 
 impl EventId {
@@ -26,7 +29,7 @@ impl EventId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub event_id: EventId,
     pub subject: Subject,
@@ -41,7 +44,7 @@ pub struct EventEnvelope {
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventSubscription {
     pub filter: SubjectFilter,
     pub durable_name: Option<String>,
@@ -63,12 +66,17 @@ impl EventSubscription {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SubjectFilter(String);
 
 impl SubjectFilter {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
     pub(crate) fn matches(&self, subject: &Subject) -> bool {

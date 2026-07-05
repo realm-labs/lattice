@@ -94,6 +94,16 @@ NATS JetStream:
   broker-side persistence, consumer groups, replay, ack, durable subscriptions
 ```
 
+Framework adapters:
+
+```text
+LocalEventBus: in-process delivery only.
+InMemoryNatsEventBus: test/local NATS-like stream and durable-idempotency semantics.
+NatsEventBus: real NATS client backed by async-nats; Core NATS publish/subscribe is available
+and durable_name maps to a queue group. Broker-side durable replay requires JetStream-specific
+adapter work or external bridge configuration.
+```
+
 Cluster EventBus is useful for:
 
 ```text

@@ -147,7 +147,30 @@ Stale refs are dropped safely.
 
 ### 24.1 Internal RPC Identity
 
-Internal logic/control/admin RPC should use mTLS or an equivalent service identity mechanism.
+Internal logic/control/admin RPC should separate service identity authorization from transport
+encryption:
+
+```rust
+LatticeService::builder(WORLD_SERVICE)
+    .rpc_security(
+        RpcSecurityPolicy::require_service_identity(ServiceIdentityConfig {
+            trust_domain: "lattice.internal".to_string(),
+        })
+        .allow_service(PLAYER_SERVICE)
+        .require_authorization(),
+    )
+    .rpc_transport_security(RpcTransportSecurity::tls(
+        RpcTlsConfig::new()
+            .ca_certificate_file("certs/ca.pem")?
+            .identity_files("certs/world.pem", "certs/world-key.pem")?
+            .client_ca_root_file("certs/ca.pem")?,
+    ));
+```
+
+`RpcSecurityPolicy` controls framework metadata, allowed peer services, and request authorization.
+`RpcTransportSecurity` controls tonic channel/server TLS or mTLS. Generated placement-backed clients
+receive the same transport policy from `LatticeServiceBuilder`, so business handlers do not need to
+configure certificates or channels manually.
 
 ```text
 business RPC between logic services: authenticated internal identity

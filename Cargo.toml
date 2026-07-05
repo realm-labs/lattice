@@ -25,10 +25,12 @@ repository = "https://github.com/realm-labs/lattice"
 
 [workspace.dependencies]
 async-trait = "0.1.89"
+async-nats = "0.49.1"
 axum = "0.8.9"
 clap = { version = "4.5.53", features = ["derive"] }
 dashmap = "6.1.0"
 etcd-client = "0.19.0"
+futures-util = "0.3.31"
 http = "1.4.2"
 lattice-config = { path = "crates/lattice-config" }
 lattice-config-etcd = { path = "crates/lattice-config-etcd" }
@@ -56,7 +58,7 @@ thiserror = "2.0.18"
 tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
 toml = "0.9.7"
-tonic = "0.14.6"
+tonic = { version = "0.14.6", features = ["tls-ring"] }
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tracing = "0.1.44"

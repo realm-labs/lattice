@@ -16,7 +16,6 @@ use prost::Message as ProstMessage;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
-use tonic::transport::Server;
 use tracing::info;
 
 use crate::game::{LoginRequest, gateway_push_rpc_server::GatewayPushRpcServer};
@@ -46,15 +45,6 @@ pub async fn run_gateway(
     let sessions = GatewaySessions::new(gateway_push_endpoint);
     let push_service =
         gateway_push_rpc::RegistryService::new(sessions.registry(), GatewaySessionLoader);
-    let push_task = async move {
-        Server::builder()
-            .add_service(GatewayPushRpcServer::new(push_service))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
-                push_listener,
-            ))
-            .await
-            .map_err(|error| GatewayError::Io(error.to_string()))
-    };
     let service = GatewayService::new(
         client_listener,
         DemoGatewayConnectionHandler {
@@ -62,7 +52,11 @@ pub async fn run_gateway(
             sessions,
         },
     )
-    .background_task("gateway-push-rpc", push_task);
+    .background_tonic_service(
+        "gateway-push-rpc",
+        push_listener,
+        GatewayPushRpcServer::new(push_service),
+    );
     let service = if let Some(ready) = ready {
         service.ready_signal(ready)
     } else {

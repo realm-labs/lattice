@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::get;
+use axum::routing::{get, post};
 use lattice_core::{ActorKind, InstanceId, ServiceKind};
 use lattice_placement::instance::InstanceRecord;
 use lattice_placement::store::{
@@ -14,6 +16,8 @@ use lattice_placement::store::{
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 use crate::OpsError;
 
@@ -242,6 +246,8 @@ impl AdminSnapshot {
 pub struct AdminHttpState {
     auth: AdminAuth,
     snapshot: AdminSnapshot,
+    mutations: Arc<dyn AdminMutationHandler>,
+    mutation_limiter: AdminMutationRateLimiter,
 }
 
 #[derive(Debug, Clone)]
@@ -252,12 +258,33 @@ pub struct AdminHttpAdapter {
 impl AdminHttpAdapter {
     pub fn new(auth: AdminAuth, snapshot: AdminSnapshot) -> Self {
         Self {
-            state: AdminHttpState { auth, snapshot },
+            state: AdminHttpState {
+                auth,
+                snapshot,
+                mutations: Arc::new(DisabledAdminMutationHandler),
+                mutation_limiter: AdminMutationRateLimiter::default(),
+            },
         }
+    }
+
+    pub fn with_mutation_handler<H>(mut self, handler: H) -> Self
+    where
+        H: AdminMutationHandler,
+    {
+        self.state.mutations = Arc::new(handler);
+        self
+    }
+
+    pub fn with_mutation_rate_limit(mut self, max_per_minute: u32) -> Self {
+        self.state.mutation_limiter = AdminMutationRateLimiter::new(max_per_minute);
+        self
     }
 
     pub fn router(self) -> Router {
         Router::new()
+            .route("/healthz", get(admin_healthz))
+            .route("/readyz", get(admin_readyz))
+            .route("/metrics", get(admin_metrics))
             .route("/admin/cluster/summary", get(admin_cluster_summary))
             .route("/admin/node/summary", get(admin_node_summary))
             .route("/admin/instances", get(admin_instances))
@@ -266,10 +293,48 @@ impl AdminHttpAdapter {
             .route("/admin/vshards", get(admin_virtual_shards))
             .route("/admin/singletons", get(admin_singletons))
             .route("/admin/mailboxes", get(admin_mailboxes))
+            .route("/admin/node/mailboxes", get(admin_mailboxes))
             .route("/admin/schedulers", get(admin_schedulers))
+            .route("/admin/node/schedulers", get(admin_schedulers))
             .route("/admin/event-subscriptions", get(admin_event_subscriptions))
+            .route(
+                "/admin/node/event-subscriptions",
+                get(admin_event_subscriptions),
+            )
+            .route("/admin/instances/{id}/drain", post(admin_drain_instance))
+            .route(
+                "/admin/actors/{kind}/{id}/retry-stop",
+                post(admin_retry_actor_stop),
+            )
+            .route(
+                "/admin/actors/{kind}/{id}/force-stop",
+                post(admin_force_actor_stop),
+            )
+            .route(
+                "/admin/actors/{kind}/{id}/migrate",
+                post(admin_migrate_actor),
+            )
             .with_state(self.state)
     }
+}
+
+async fn admin_healthz() -> &'static str {
+    "ok\n"
+}
+
+async fn admin_readyz(State(state): State<AdminHttpState>) -> Result<&'static str, AdminApiError> {
+    if state.snapshot.node_summary.is_some() {
+        Ok("ready\n")
+    } else {
+        Err(AdminApiError::NotFound)
+    }
+}
+
+async fn admin_metrics(State(state): State<AdminHttpState>) -> String {
+    format!(
+        "lattice_admin_instances {}\nlattice_admin_actor_owners {}\n",
+        state.snapshot.summary.instance_count, state.snapshot.summary.actor_owner_count
+    )
 }
 
 async fn admin_cluster_summary(
@@ -330,12 +395,250 @@ admin_inspection_handler!(admin_mailboxes, mailboxes);
 admin_inspection_handler!(admin_schedulers, schedulers);
 admin_inspection_handler!(admin_event_subscriptions, event_subscriptions);
 
+async fn admin_drain_instance(
+    State(state): State<AdminHttpState>,
+    headers: HeaderMap,
+    Path(instance_id): Path<String>,
+) -> Result<Json<AdminMutationReply>, AdminApiError> {
+    authorize_mutation(&state, &headers, "drain_instance").await?;
+    let instance_id = InstanceId::new(instance_id);
+    let reply = state.mutations.drain_instance(instance_id.clone()).await?;
+    audit_mutation("drain_instance", &instance_id.to_string(), &reply);
+    Ok(Json(reply))
+}
+
+async fn admin_retry_actor_stop(
+    State(state): State<AdminHttpState>,
+    headers: HeaderMap,
+    Path((kind, id)): Path<(String, String)>,
+) -> Result<Json<AdminMutationReply>, AdminApiError> {
+    authorize_mutation(&state, &headers, "retry_actor_stop").await?;
+    let target = AdminActorTarget::new(kind, id);
+    let reply = state.mutations.retry_actor_stop(target.clone()).await?;
+    audit_mutation("retry_actor_stop", &target.audit_key(), &reply);
+    Ok(Json(reply))
+}
+
+async fn admin_force_actor_stop(
+    State(state): State<AdminHttpState>,
+    headers: HeaderMap,
+    Path((kind, id)): Path<(String, String)>,
+) -> Result<Json<AdminMutationReply>, AdminApiError> {
+    authorize_mutation(&state, &headers, "force_actor_stop").await?;
+    let target = AdminActorTarget::new(kind, id);
+    let reply = state.mutations.force_actor_stop(target.clone()).await?;
+    audit_mutation("force_actor_stop", &target.audit_key(), &reply);
+    Ok(Json(reply))
+}
+
+async fn admin_migrate_actor(
+    State(state): State<AdminHttpState>,
+    headers: HeaderMap,
+    Path((kind, id)): Path<(String, String)>,
+) -> Result<Json<AdminMutationReply>, AdminApiError> {
+    authorize_mutation(&state, &headers, "migrate_actor").await?;
+    let target = AdminActorTarget::new(kind, id);
+    let reply = state.mutations.migrate_actor(target.clone()).await?;
+    audit_mutation("migrate_actor", &target.audit_key(), &reply);
+    Ok(Json(reply))
+}
+
+async fn authorize_mutation(
+    state: &AdminHttpState,
+    headers: &HeaderMap,
+    operation: &'static str,
+) -> Result<(), AdminApiError> {
+    state.auth.authorize(headers)?;
+    state.mutation_limiter.check(operation).await?;
+    Ok(())
+}
+
+fn audit_mutation(operation: &'static str, target: &str, reply: &AdminMutationReply) {
+    if reply.accepted {
+        info!(
+            admin.operation = operation,
+            admin.target = target,
+            "admin mutation accepted"
+        );
+    } else {
+        warn!(
+            admin.operation = operation,
+            admin.target = target,
+            admin.message = reply.message,
+            "admin mutation rejected"
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdminMutationReply {
+    pub accepted: bool,
+    pub message: String,
+}
+
+impl AdminMutationReply {
+    pub fn accepted(message: impl Into<String>) -> Self {
+        Self {
+            accepted: true,
+            message: message.into(),
+        }
+    }
+
+    pub fn rejected(message: impl Into<String>) -> Self {
+        Self {
+            accepted: false,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminActorTarget {
+    pub actor_kind: ActorKind,
+    pub actor_id: String,
+}
+
+impl AdminActorTarget {
+    pub fn new(actor_kind: impl Into<String>, actor_id: impl Into<String>) -> Self {
+        Self {
+            actor_kind: ActorKind::new(actor_kind.into()),
+            actor_id: actor_id.into(),
+        }
+    }
+
+    fn audit_key(&self) -> String {
+        format!("{}/{}", self.actor_kind.as_str(), self.actor_id)
+    }
+}
+
+#[async_trait]
+pub trait AdminMutationHandler: Send + Sync + std::fmt::Debug + 'static {
+    async fn drain_instance(
+        &self,
+        instance_id: InstanceId,
+    ) -> Result<AdminMutationReply, AdminApiError>;
+
+    async fn retry_actor_stop(
+        &self,
+        target: AdminActorTarget,
+    ) -> Result<AdminMutationReply, AdminApiError>;
+
+    async fn force_actor_stop(
+        &self,
+        target: AdminActorTarget,
+    ) -> Result<AdminMutationReply, AdminApiError>;
+
+    async fn migrate_actor(
+        &self,
+        target: AdminActorTarget,
+    ) -> Result<AdminMutationReply, AdminApiError>;
+}
+
+#[derive(Debug)]
+pub struct DisabledAdminMutationHandler;
+
+#[async_trait]
+impl AdminMutationHandler for DisabledAdminMutationHandler {
+    async fn drain_instance(
+        &self,
+        _instance_id: InstanceId,
+    ) -> Result<AdminMutationReply, AdminApiError> {
+        Err(AdminApiError::MutationUnsupported {
+            operation: "drain_instance",
+        })
+    }
+
+    async fn retry_actor_stop(
+        &self,
+        _target: AdminActorTarget,
+    ) -> Result<AdminMutationReply, AdminApiError> {
+        Err(AdminApiError::MutationUnsupported {
+            operation: "retry_actor_stop",
+        })
+    }
+
+    async fn force_actor_stop(
+        &self,
+        _target: AdminActorTarget,
+    ) -> Result<AdminMutationReply, AdminApiError> {
+        Err(AdminApiError::MutationUnsupported {
+            operation: "force_actor_stop",
+        })
+    }
+
+    async fn migrate_actor(
+        &self,
+        _target: AdminActorTarget,
+    ) -> Result<AdminMutationReply, AdminApiError> {
+        Err(AdminApiError::MutationUnsupported {
+            operation: "migrate_actor",
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminMutationRateLimiter {
+    max_per_minute: u32,
+    state: Arc<Mutex<RateLimitState>>,
+}
+
+impl AdminMutationRateLimiter {
+    pub fn new(max_per_minute: u32) -> Self {
+        Self {
+            max_per_minute,
+            state: Arc::new(Mutex::new(RateLimitState::new())),
+        }
+    }
+
+    async fn check(&self, operation: &'static str) -> Result<(), AdminApiError> {
+        if self.max_per_minute == 0 {
+            return Err(AdminApiError::RateLimited { operation });
+        }
+        let mut state = self.state.lock().await;
+        if state.window_started.elapsed() >= Duration::from_secs(60) {
+            *state = RateLimitState::new();
+        }
+        if state.count >= self.max_per_minute {
+            return Err(AdminApiError::RateLimited { operation });
+        }
+        state.count += 1;
+        Ok(())
+    }
+}
+
+impl Default for AdminMutationRateLimiter {
+    fn default() -> Self {
+        Self::new(60)
+    }
+}
+
+#[derive(Debug)]
+struct RateLimitState {
+    window_started: Instant,
+    count: u32,
+}
+
+impl RateLimitState {
+    fn new() -> Self {
+        Self {
+            window_started: Instant::now(),
+            count: 0,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AdminApiError {
     #[error("admin request is unauthorized")]
     Unauthorized,
     #[error("admin resource was not found")]
     NotFound,
+    #[error("admin mutation {operation} is unsupported")]
+    MutationUnsupported { operation: &'static str },
+    #[error("admin mutation {operation} is rate limited")]
+    RateLimited { operation: &'static str },
+    #[error("admin mutation failed: {message}")]
+    MutationFailed { message: String },
 }
 
 impl axum::response::IntoResponse for AdminApiError {
@@ -345,6 +648,15 @@ impl axum::response::IntoResponse for AdminApiError {
                 (StatusCode::UNAUTHORIZED, self.to_string()).into_response()
             }
             AdminApiError::NotFound => (StatusCode::NOT_FOUND, self.to_string()).into_response(),
+            AdminApiError::MutationUnsupported { .. } => {
+                (StatusCode::NOT_IMPLEMENTED, self.to_string()).into_response()
+            }
+            AdminApiError::RateLimited { .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, self.to_string()).into_response()
+            }
+            AdminApiError::MutationFailed { .. } => {
+                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()).into_response()
+            }
         }
     }
 }

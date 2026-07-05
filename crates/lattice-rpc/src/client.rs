@@ -10,17 +10,26 @@ use tonic::{Request, Status};
 use tracing::{debug, warn};
 
 use crate::metadata::RpcClientContextFactory;
+use crate::security::RpcTransportSecurity;
 use crate::traits::UnaryRpcTransport;
 use crate::{ActorRefRpcCore, RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 
 #[derive(Debug, Default, Clone)]
 pub struct TonicEndpointChannelPool {
     channels: Arc<DashMap<String, Channel>>,
+    transport_security: RpcTransportSecurity,
 }
 
 impl TonicEndpointChannelPool {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_transport_security(transport_security: RpcTransportSecurity) -> Self {
+        Self {
+            channels: Arc::new(DashMap::new()),
+            transport_security,
+        }
     }
 
     pub async fn get_or_connect(&self, endpoint: &Uri) -> Result<Channel, RpcError> {
@@ -31,13 +40,20 @@ impl TonicEndpointChannelPool {
         }
 
         debug!(%endpoint, "connecting tonic endpoint channel");
-        let channel = Channel::builder(endpoint.clone())
-            .connect()
-            .await
-            .map_err(|error| {
-                warn!(%endpoint, %error, "failed to connect tonic endpoint channel");
-                RpcError::Business(format!("connect {endpoint}: {error}"))
+        let mut builder = Channel::builder(endpoint.clone());
+        if let Some(tls) = self
+            .transport_security
+            .client_tls_config(endpoint)
+            .map_err(RpcError::Business)?
+        {
+            builder = builder.tls_config(tls).map_err(|error| {
+                RpcError::Business(format!("configure TLS for {endpoint}: {error}"))
             })?;
+        }
+        let channel = builder.connect().await.map_err(|error| {
+            warn!(%endpoint, %error, "failed to connect tonic endpoint channel");
+            RpcError::Business(format!("connect {endpoint}: {error}"))
+        })?;
         match self.channels.entry(key) {
             Entry::Occupied(entry) => {
                 debug!(%endpoint, "using concurrently established tonic endpoint channel");
