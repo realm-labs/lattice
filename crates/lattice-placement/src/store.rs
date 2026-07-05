@@ -61,6 +61,12 @@ pub struct VirtualShardPlacementRecord {
     pub epoch: Epoch,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinatorLeadership {
+    pub candidate_id: InstanceId,
+    pub lease_id: LeaseId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlacementWatchEvent {
     InstanceUpdated {
@@ -118,6 +124,18 @@ impl PlacementPrefix {
 pub trait PlacementStore: Clone + Send + Sync + 'static {
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
     async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
+    async fn campaign_coordinator_leader(
+        &self,
+        candidate_id: InstanceId,
+    ) -> Result<Option<CoordinatorLeadership>, PlacementError>;
+    async fn keepalive_coordinator_leader(
+        &self,
+        leadership: &CoordinatorLeadership,
+    ) -> Result<(), PlacementError>;
+    async fn resign_coordinator_leader(
+        &self,
+        leadership: &CoordinatorLeadership,
+    ) -> Result<(), PlacementError>;
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError>;
     async fn get_instance(
         &self,
@@ -201,6 +219,14 @@ impl InMemoryPlacementStore {
             .copied()
     }
 
+    pub fn coordinator_leader(&self) -> Option<CoordinatorLeadership> {
+        self.inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .coordinator_leader
+            .clone()
+    }
+
     fn prefixed_actor_key(&self, key: &ActorPlacementKey) -> PrefixedActorKey {
         PrefixedActorKey {
             prefix: self.prefix.clone(),
@@ -238,6 +264,52 @@ impl PlacementStore for InMemoryPlacementStore {
             return Err(PlacementError::InstanceLeaseNotFound { lease_id });
         };
         *keepalives += 1;
+        Ok(())
+    }
+
+    async fn campaign_coordinator_leader(
+        &self,
+        candidate_id: InstanceId,
+    ) -> Result<Option<CoordinatorLeadership>, PlacementError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        if inner.coordinator_leader.is_some() {
+            return Ok(None);
+        }
+        let leadership = CoordinatorLeadership {
+            candidate_id,
+            lease_id: LeaseId(self.next_lease_id.fetch_add(1, Ordering::SeqCst)),
+        };
+        inner.instance_leases.insert(leadership.lease_id, 0);
+        inner.coordinator_leader = Some(leadership.clone());
+        Ok(Some(leadership))
+    }
+
+    async fn keepalive_coordinator_leader(
+        &self,
+        leadership: &CoordinatorLeadership,
+    ) -> Result<(), PlacementError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        if inner.coordinator_leader.as_ref() != Some(leadership) {
+            return Err(PlacementError::CoordinatorLeadershipLost);
+        }
+        let Some(keepalives) = inner.instance_leases.get_mut(&leadership.lease_id) else {
+            return Err(PlacementError::InstanceLeaseNotFound {
+                lease_id: leadership.lease_id,
+            });
+        };
+        *keepalives += 1;
+        Ok(())
+    }
+
+    async fn resign_coordinator_leader(
+        &self,
+        leadership: &CoordinatorLeadership,
+    ) -> Result<(), PlacementError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        if inner.coordinator_leader.as_ref() == Some(leadership) {
+            inner.coordinator_leader = None;
+            inner.instance_leases.remove(&leadership.lease_id);
+        }
         Ok(())
     }
 
@@ -455,6 +527,7 @@ impl PlacementStore for InMemoryPlacementStore {
 #[derive(Debug, Default)]
 struct PlacementStoreInner {
     instance_leases: HashMap<LeaseId, u64>,
+    coordinator_leader: Option<CoordinatorLeadership>,
     instances: HashMap<PrefixedInstanceKey, InstanceRecord>,
     actors: HashMap<PrefixedActorKey, (PlacementVersion, ActorPlacementRecord)>,
     vshards: HashMap<PrefixedVShardKey, (PlacementVersion, VirtualShardPlacementRecord)>,

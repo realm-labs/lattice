@@ -14,9 +14,9 @@ use tokio::sync::broadcast;
 use crate::error::PlacementError;
 use crate::instance::InstanceRecord;
 use crate::store::{
-    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementStore,
-    PlacementVersion, PlacementWatch, PlacementWatchEvent, VirtualShardPlacementKey,
-    VirtualShardPlacementRecord,
+    ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, LeaseId, PlacementPrefix,
+    PlacementStore, PlacementVersion, PlacementWatch, PlacementWatchEvent,
+    VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
 #[derive(Debug, Clone)]
@@ -80,6 +80,68 @@ where
 
     async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
         self.client.keepalive_instance_lease(lease_id).await
+    }
+
+    async fn campaign_coordinator_leader(
+        &self,
+        candidate_id: InstanceId,
+    ) -> Result<Option<CoordinatorLeadership>, PlacementError> {
+        let lease_id = self.client.grant_instance_lease().await?;
+        let leadership = CoordinatorLeadership {
+            candidate_id,
+            lease_id,
+        };
+        match self
+            .client
+            .compare_and_put(
+                coordinator_leader_key(&self.prefix),
+                None,
+                EtcdValue::CoordinatorLeader(Box::new(leadership.clone())),
+            )
+            .await
+        {
+            Ok(_) => Ok(Some(leadership)),
+            Err(PlacementError::CompareAndPutFailed) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn keepalive_coordinator_leader(
+        &self,
+        leadership: &CoordinatorLeadership,
+    ) -> Result<(), PlacementError> {
+        let Some((_, EtcdValue::CoordinatorLeader(current))) = self
+            .client
+            .get(&coordinator_leader_key(&self.prefix))
+            .await?
+        else {
+            return Err(PlacementError::CoordinatorLeadershipLost);
+        };
+        if current.as_ref() != leadership {
+            return Err(PlacementError::CoordinatorLeadershipLost);
+        }
+        self.client
+            .keepalive_instance_lease(leadership.lease_id)
+            .await
+    }
+
+    async fn resign_coordinator_leader(
+        &self,
+        leadership: &CoordinatorLeadership,
+    ) -> Result<(), PlacementError> {
+        let Some((_, EtcdValue::CoordinatorLeader(current))) = self
+            .client
+            .get(&coordinator_leader_key(&self.prefix))
+            .await?
+        else {
+            return Ok(());
+        };
+        if current.as_ref() == leadership {
+            self.client
+                .delete(&coordinator_leader_key(&self.prefix))
+                .await?;
+        }
+        Ok(())
     }
 
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError> {
@@ -340,6 +402,7 @@ pub enum EtcdValue {
     Instance(Box<InstanceRecord>),
     Actor(Box<ActorPlacementRecord>),
     VirtualShard(Box<VirtualShardPlacementRecord>),
+    CoordinatorLeader(Box<CoordinatorLeadership>),
     ActivationLock(LeaseId),
 }
 
@@ -774,6 +837,10 @@ fn put_options_for(value: &EtcdValue) -> Result<Option<PutOptions>, PlacementErr
             let lease_id = i64::try_from(record.lease_id.0).map_err(codec_error)?;
             Ok(Some(PutOptions::new().with_lease(lease_id)))
         }
+        EtcdValue::CoordinatorLeader(leadership) => {
+            let lease_id = i64::try_from(leadership.lease_id.0).map_err(codec_error)?;
+            Ok(Some(PutOptions::new().with_lease(lease_id)))
+        }
         EtcdValue::ActivationLock(lease_id) => {
             let lease_id = i64::try_from(lease_id.0).map_err(codec_error)?;
             Ok(Some(PutOptions::new().with_lease(lease_id)))
@@ -847,6 +914,10 @@ fn activation_lock_key(prefix: &PlacementPrefix, key: &ActorPlacementKey) -> Str
         key.actor_kind.as_str(),
         actor_id_segment(&key.actor_id)
     )
+}
+
+fn coordinator_leader_key(prefix: &PlacementPrefix) -> String {
+    format!("{}/coordinator/leader", clean_prefix(prefix))
 }
 
 fn actor_id_segment(actor_id: &ActorId) -> String {
@@ -1044,6 +1115,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn etcd_store_elects_one_coordinator_leader_until_resign() {
+        let store = EtcdPlacementStore::new(
+            PlacementPrefix::new("/lattice/test"),
+            InMemoryEtcdClient::new(),
+        );
+
+        let first = store
+            .campaign_coordinator_leader(InstanceId::new("coordinator-a"))
+            .await
+            .unwrap()
+            .unwrap();
+        let second = store
+            .campaign_coordinator_leader(InstanceId::new("coordinator-b"))
+            .await
+            .unwrap();
+        store.keepalive_coordinator_leader(&first).await.unwrap();
+        store.resign_coordinator_leader(&first).await.unwrap();
+        let third = store
+            .campaign_coordinator_leader(InstanceId::new("coordinator-b"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.candidate_id, InstanceId::new("coordinator-a"));
+        assert_eq!(second, None);
+        assert_eq!(third.candidate_id, InstanceId::new("coordinator-b"));
+    }
+
+    #[tokio::test]
     async fn etcd_store_activation_lock_is_exclusive_until_release() {
         let store = EtcdPlacementStore::new(
             PlacementPrefix::new("/lattice/test"),
@@ -1082,9 +1182,13 @@ mod tests {
         let instance =
             EtcdValue::Instance(Box::new(instance_record("world-a", InstanceState::Ready)));
         let actor = EtcdValue::Actor(Box::new(actor_record(7, "world-a", 3, LeaseId(5))));
+        let leader = EtcdValue::CoordinatorLeader(Box::new(CoordinatorLeadership {
+            candidate_id: InstanceId::new("coordinator-a"),
+            lease_id: LeaseId(99),
+        }));
         let lock = EtcdValue::ActivationLock(LeaseId(42));
 
-        for value in [instance, actor, lock] {
+        for value in [instance, actor, leader, lock] {
             let encoded = encode_etcd_value(&value).unwrap();
             let decoded = decode_etcd_value(&encoded).unwrap();
             assert_eq!(decoded, value);

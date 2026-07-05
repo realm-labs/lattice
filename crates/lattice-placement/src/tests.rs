@@ -496,6 +496,33 @@ async fn in_memory_placement_store_grants_and_keeps_instance_leases_alive() {
 }
 
 #[tokio::test]
+async fn in_memory_placement_store_elects_one_coordinator_leader_until_resign() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+
+    let first = store
+        .campaign_coordinator_leader(InstanceId::new("coordinator-a"))
+        .await
+        .unwrap()
+        .unwrap();
+    let second = store
+        .campaign_coordinator_leader(InstanceId::new("coordinator-b"))
+        .await
+        .unwrap();
+    store.keepalive_coordinator_leader(&first).await.unwrap();
+    store.resign_coordinator_leader(&first).await.unwrap();
+    let third = store
+        .campaign_coordinator_leader(InstanceId::new("coordinator-b"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(first.candidate_id, InstanceId::new("coordinator-a"));
+    assert_eq!(second, None);
+    assert_eq!(third.candidate_id, InstanceId::new("coordinator-b"));
+    assert_eq!(store.coordinator_leader(), Some(third));
+}
+
+#[tokio::test]
 async fn in_memory_placement_store_activation_lock_is_exclusive_until_release() {
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
     let key = actor_key(7);

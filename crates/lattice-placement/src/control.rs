@@ -189,7 +189,10 @@ fn status_from_placement(error: PlacementError) -> Status {
         PlacementError::InstanceNotReady { .. }
         | PlacementError::ActivationLockHeld
         | PlacementError::SingletonLockHeld
-        | PlacementError::CompareAndPutFailed => Status::failed_precondition(error.to_string()),
+        | PlacementError::CompareAndPutFailed
+        | PlacementError::CoordinatorLeadershipLost => {
+            Status::failed_precondition(error.to_string())
+        }
         PlacementError::UnsupportedRouteKey | PlacementError::InvalidShardCount => {
             Status::invalid_argument(error.to_string())
         }

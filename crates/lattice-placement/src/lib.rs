@@ -19,8 +19,8 @@ pub use route::{
 };
 pub use static_resolver::{StaticPlacementConfig, StaticRouteRange, StaticRouteResolver};
 pub use store::{
-    InMemoryPlacementStore, PlacementPrefix, PlacementStore, VirtualShardPlacementKey,
-    VirtualShardPlacementRecord,
+    CoordinatorLeadership, InMemoryPlacementStore, PlacementPrefix, PlacementStore,
+    VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
 #[cfg(test)]

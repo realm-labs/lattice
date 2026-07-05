@@ -176,7 +176,7 @@ Status: `[ ]` incomplete and currently the highest-priority gap.
 - [x] etcd instance registration is ordinary KV, not lease-backed liveness.
 - [x] `LogicControl` is only a Rust trait; no tonic control-plane RPC service is exposed by logic services.
 - [x] Coordinator is only an in-process library type; there is no runnable coordinator service/binary.
-- [ ] Coordinator leader election is not implemented.
+- [x] Coordinator leader election is not implemented.
 - [ ] Store-backed `PlacementRouteResolver` is missing: cache miss should read placement, call Coordinator activation if absent, and cache the target.
 - [ ] Explicit actor activation is not wired into generated clients or `LatticeService`.
 - [ ] `register_client` does not build a resolver/core from the configured placement store.

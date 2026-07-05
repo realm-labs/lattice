@@ -28,6 +28,8 @@ pub enum PlacementError {
     ActivationLockHeld,
     #[error("instance lease {lease_id:?} was not found")]
     InstanceLeaseNotFound { lease_id: LeaseId },
+    #[error("coordinator leadership has been lost")]
+    CoordinatorLeadershipLost,
     #[error("singleton activation lock is already held")]
     SingletonLockHeld,
     #[error("placement watch closed")]
