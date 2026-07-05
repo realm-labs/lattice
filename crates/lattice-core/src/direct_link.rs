@@ -538,6 +538,38 @@ pub trait DirectLinkRuntime: Send + Sync + fmt::Debug + 'static {
     async fn close_all(&self, link_id: LinkId, reason: LinkCloseReason) -> Result<(), LinkError>;
 }
 
+#[async_trait]
+pub trait DirectLinkLifecycleRuntime: Send + Sync + fmt::Debug + 'static {
+    async fn close_for_actor(
+        &self,
+        actor: ActorRef,
+        reason: LinkCloseReason,
+    ) -> Result<usize, LinkError>;
+}
+
+#[derive(Clone)]
+pub struct DirectLinkLifecycleRuntimeHandle {
+    runtime: Arc<dyn DirectLinkLifecycleRuntime>,
+}
+
+impl DirectLinkLifecycleRuntimeHandle {
+    pub fn new(runtime: Arc<dyn DirectLinkLifecycleRuntime>) -> Self {
+        Self { runtime }
+    }
+
+    pub fn runtime(&self) -> Arc<dyn DirectLinkLifecycleRuntime> {
+        self.runtime.clone()
+    }
+}
+
+impl fmt::Debug for DirectLinkLifecycleRuntimeHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DirectLinkLifecycleRuntimeHandle")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct DirectLinkRuntimeHandle {
     runtime: Arc<dyn DirectLinkRuntime>,

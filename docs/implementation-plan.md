@@ -280,7 +280,7 @@ Status: `[ ]` in progress.
   - [x] Reusable `BackpressureQueue` policy engine implements and tests all six policy decisions with pending/drop/coalesce counters.
   - [x] Outbound direct-link send queues use `BackpressureQueue` and map decisions to send results, drops/coalesces, or disconnect close reasons.
   - [x] Inbound remote mailbox delivery applies negotiated backpressure state before actor mailbox enqueue and emits `LinkBackpressure`.
-- [ ] Heartbeat, heartbeat timeout, protocol error, node draining, target passivation/migration, and backpressure disconnect close links with structured reasons.
+- [x] Heartbeat, heartbeat timeout, protocol error, node draining, target passivation/migration, and backpressure disconnect close links with structured reasons.
   - [x] Whole-link close transitions and router delivery preserve structured reasons for heartbeat timeout, protocol error, node draining, target passivation, target migration, connection loss, and backpressure disconnect.
   - [x] Backpressure disconnect closes the affected link direction and emits `LinkDirectionClosed` / `LinkClosed` with `BackpressureExceeded`.
   - [x] Heartbeat / heartbeat-ack frame processing refreshes liveness, and idle-timeout scans close stale links with `HeartbeatTimeout`.
@@ -289,7 +289,7 @@ Status: `[ ]` in progress.
   - [x] Protocol-error frame handling and invalid post-open frames close links with `ProtocolError`.
   - [x] Service node-drain hook closes active links with `NodeDraining` during shutdown before actor registry drain.
   - [x] Actor migration hook closes affected links with `TargetMigrating` before migration passivation.
-  - [ ] Actor passivation hook closes affected links with `TargetPassivated`.
+  - [x] Actor passivation hook closes affected links with `TargetPassivated`.
 - [ ] Security hooks cover internal bind policy, peer identity/auth, source service/actor authorization, max frame size, connection limit, link limit, and rate limit.
 - [ ] Observability emits link open/close/send/receive/drop/coalesce/backpressure/decode-error metrics and sampled tracing without per-message spans by default.
 - [ ] Direct Link benchmark exists for TCP single-process, local multi-process, and payload/backpressure matrices.

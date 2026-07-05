@@ -1,9 +1,14 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::Mutex;
 
+use async_trait::async_trait;
 use lattice_actor::{Actor, Handler};
-use lattice_core::{LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened};
+use lattice_core::{
+    ActorRef, DirectLinkLifecycleRuntime, LinkBackpressure, LinkCloseReason, LinkClosed,
+    LinkDirectionClosed, LinkError, LinkOpened,
+};
 use lattice_direct_link::{
     DirectLinkActorBinding, DirectLinkDispatch, DirectLinkInboundRouter,
     DirectLinkInboundRouterBuilder, DirectLinkSessionManager,
@@ -35,6 +40,52 @@ impl DirectLinkServiceRuntime {
 
     pub(crate) fn inbound_router(&self) -> Arc<DirectLinkInboundRouter> {
         self.inbound_router.clone()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DeferredDirectLinkLifecycleRuntime {
+    runtime: Mutex<Option<DirectLinkServiceRuntime>>,
+}
+
+impl DeferredDirectLinkLifecycleRuntime {
+    pub(crate) fn set_runtime(&self, runtime: DirectLinkServiceRuntime) {
+        *self
+            .runtime
+            .lock()
+            .expect("deferred direct-link lifecycle runtime poisoned") = Some(runtime);
+    }
+}
+
+#[async_trait]
+impl DirectLinkLifecycleRuntime for DeferredDirectLinkLifecycleRuntime {
+    async fn close_for_actor(
+        &self,
+        actor: ActorRef,
+        reason: LinkCloseReason,
+    ) -> Result<usize, LinkError> {
+        let runtime = self
+            .runtime
+            .lock()
+            .expect("deferred direct-link lifecycle runtime poisoned")
+            .clone();
+        let Some(runtime) = runtime else {
+            return Ok(0);
+        };
+        runtime.close_for_actor(actor, reason).await
+    }
+}
+
+#[async_trait]
+impl DirectLinkLifecycleRuntime for DirectLinkServiceRuntime {
+    async fn close_for_actor(
+        &self,
+        actor: ActorRef,
+        reason: LinkCloseReason,
+    ) -> Result<usize, LinkError> {
+        self.inbound_router
+            .close_active_links_for_actor(&actor.actor_kind, &actor.actor_id, reason)
+            .map_err(|error| LinkError::Protocol(error.to_string()))
     }
 }
 

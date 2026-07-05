@@ -4,6 +4,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use lattice_actor::Actor;
+use lattice_actor::registry::ActorRefConfig;
 use lattice_core::{ActorKind, ServiceContext};
 use lattice_rpc::{RpcServerSecurity, RpcTransportSecurity};
 use tonic::body::Body;
@@ -20,6 +21,7 @@ pub struct ServiceBuildContext {
     rpc_security: RpcServerSecurity,
     pub(crate) actors: HashMap<ActorKind, Box<dyn Any + Send>>,
     pub(crate) logic_actors: HashMap<ActorKind, Arc<dyn ErasedLogicActor>>,
+    actor_ref_endpoint: Option<http::Uri>,
     server: Option<Server>,
     pub(crate) router: Option<Router>,
 }
@@ -32,6 +34,7 @@ impl std::fmt::Debug for ServiceBuildContext {
             .field("rpc_security", &self.rpc_security)
             .field("actor_count", &self.actors.len())
             .field("logic_actor_count", &self.logic_actors.len())
+            .field("actor_ref_endpoint", &self.actor_ref_endpoint)
             .field("has_server", &self.server.is_some())
             .field("has_router", &self.router.is_some())
             .finish()
@@ -52,6 +55,7 @@ impl ServiceBuildContext {
             rpc_security,
             actors: HashMap::new(),
             logic_actors: HashMap::new(),
+            actor_ref_endpoint: None,
             server: Some(Server::builder()),
             router: None,
         }
@@ -81,6 +85,7 @@ impl ServiceBuildContext {
             rpc_security,
             actors: HashMap::new(),
             logic_actors: HashMap::new(),
+            actor_ref_endpoint: None,
             server: Some(server),
             router: None,
         })
@@ -88,6 +93,19 @@ impl ServiceBuildContext {
 
     pub fn service_context(&self) -> ServiceContext {
         self.service.clone()
+    }
+
+    pub(crate) fn set_actor_ref_endpoint(&mut self, endpoint: http::Uri) {
+        self.actor_ref_endpoint = Some(endpoint);
+    }
+
+    pub(crate) fn actor_ref_config(&self) -> Option<ActorRefConfig> {
+        Some(ActorRefConfig {
+            service_kind: self.service.service_kind().clone(),
+            instance_id: self.service.instance_id().clone(),
+            endpoint: self.actor_ref_endpoint.clone()?,
+            owner_epoch: None,
+        })
     }
 
     pub fn rpc_security(&self) -> RpcServerSecurity {

@@ -2,14 +2,15 @@ use std::any::{TypeId, type_name};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use lattice_actor::{Actor, Handler};
 use lattice_config::{BootstrapConfig, ConfigSource};
 use lattice_config::{ConfigStore, LocalConfigStore};
 use lattice_core::{
-    ActorKind, InstanceId, LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened,
-    ServiceContext, ServiceKind,
+    ActorKind, DirectLinkLifecycleRuntimeHandle, InstanceId, LinkBackpressure, LinkClosed,
+    LinkDirectionClosed, LinkOpened, ServiceContext, ServiceKind,
 };
 use lattice_direct_link::{DirectLinkActorBinding, DirectLinkDispatch};
 use lattice_eventbus::{EventBus, LocalEventBus};
@@ -35,7 +36,8 @@ use crate::config::{DirectLinkConfig, InstanceConfig};
 use crate::context::ServiceBuildContext;
 use crate::control::ServiceLogicControlHandler;
 use crate::direct_link::{
-    DirectLinkBindingRegistration, ErasedDirectLinkBinding, build_direct_link_runtime,
+    DeferredDirectLinkLifecycleRuntime, DirectLinkBindingRegistration, ErasedDirectLinkBinding,
+    build_direct_link_runtime,
 };
 use crate::framework::ServiceSchedulerComponent;
 use crate::rpc::{ErasedRpcClientBinding, RpcClientPlacement, RpcClientRegistration};
@@ -484,6 +486,17 @@ impl LatticeServiceBuilder {
                 self.rpc_client_transport,
             )?;
         }
+        let direct_link_lifecycle_runtime = if self.direct_link_bindings.is_empty() {
+            None
+        } else {
+            let runtime = Arc::new(DeferredDirectLinkLifecycleRuntime::default());
+            service_context
+                .insert_extension(DirectLinkLifecycleRuntimeHandle::new(runtime.clone()))
+                .map_err(|component| LatticeServiceError::DuplicateServiceComponent {
+                    component: component.to_string(),
+                })?;
+            Some(runtime)
+        };
         let service_context = service_context.build();
 
         info!(
@@ -501,6 +514,13 @@ impl LatticeServiceBuilder {
             self.rpc_security,
             self.rpc_transport_security,
         )?;
+        let actor_ref_endpoint: http::Uri = format!("http://{}", listener.local_addr()?)
+            .parse()
+            .map_err(|error| LatticeServiceError::ComponentBuild {
+                slot: "actor_ref".to_string(),
+                message: format!("failed to build actor self endpoint: {error}"),
+            })?;
+        context.set_actor_ref_endpoint(actor_ref_endpoint);
         let mut actor_kinds = HashSet::<ActorKind>::new();
 
         for registration in self.actor_registrations {
@@ -516,6 +536,12 @@ impl LatticeServiceBuilder {
             registration.register(&mut context)?;
         }
         let direct_link_runtime = build_direct_link_runtime(self.direct_link_bindings, &context)?;
+        if let (Some(deferred), Some(runtime)) = (
+            direct_link_lifecycle_runtime.as_ref(),
+            direct_link_runtime.clone(),
+        ) {
+            deferred.set_runtime(runtime);
+        }
         if !context.logic_actors.is_empty() {
             let handler = ServiceLogicControlHandler::new(
                 context.logic_actors.clone(),

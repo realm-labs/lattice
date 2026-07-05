@@ -257,9 +257,45 @@ struct DirectLinkLifecycleActor {
     closed: Arc<Mutex<Vec<LinkCloseReason>>>,
 }
 
+#[derive(Clone)]
+struct AutoPassivatingDirectLinkFactory {
+    closed: Arc<Mutex<Vec<LinkCloseReason>>>,
+    stopped: Arc<tokio::sync::Mutex<Vec<StopReason>>>,
+}
+
+struct AutoPassivatingDirectLinkActor {
+    closed: Arc<Mutex<Vec<LinkCloseReason>>>,
+    stopped: Arc<tokio::sync::Mutex<Vec<StopReason>>>,
+}
+
+struct PassivateSelf;
+
+impl Message for PassivateSelf {
+    type Reply = ();
+}
+
 #[async_trait]
 impl Actor for DirectLinkLifecycleActor {
     type Error = ActorError;
+}
+
+#[async_trait]
+impl Actor for AutoPassivatingDirectLinkActor {
+    type Error = ActorError;
+
+    async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+        ctx.notify_after(Duration::from_millis(250), PassivateSelf);
+        Ok(())
+    }
+
+    async fn stopping(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        reason: StopReason,
+    ) -> Result<(), ActorStopError> {
+        self.stopped.lock().await.push(reason);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -270,6 +306,19 @@ impl ActorFactory<DirectLinkLifecycleActor> for DirectLinkLifecycleFactory {
     ) -> Result<DirectLinkLifecycleActor, ActorError> {
         Ok(DirectLinkLifecycleActor {
             closed: self.closed.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl ActorFactory<AutoPassivatingDirectLinkActor> for AutoPassivatingDirectLinkFactory {
+    async fn create(
+        &self,
+        _ctx: ActorCreateContext,
+    ) -> Result<AutoPassivatingDirectLinkActor, ActorError> {
+        Ok(AutoPassivatingDirectLinkActor {
+            closed: self.closed.clone(),
+            stopped: self.stopped.clone(),
         })
     }
 }
@@ -286,6 +335,29 @@ impl Handler<Linked<DirectLinkTestPayload>> for DirectLinkLifecycleActor {
 }
 
 #[async_trait]
+impl Handler<Linked<DirectLinkTestPayload>> for AutoPassivatingDirectLinkActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _msg: Linked<DirectLinkTestPayload>,
+    ) -> Result<(), ActorError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<PassivateSelf> for AutoPassivatingDirectLinkActor {
+    async fn handle(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        _msg: PassivateSelf,
+    ) -> Result<(), ActorError> {
+        ctx.request_passivation(PassivationReason::BusinessIdle)?;
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl Handler<LinkOpened> for DirectLinkLifecycleActor {
     async fn handle(
         &mut self,
@@ -297,7 +369,29 @@ impl Handler<LinkOpened> for DirectLinkLifecycleActor {
 }
 
 #[async_trait]
+impl Handler<LinkOpened> for AutoPassivatingDirectLinkActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _msg: LinkOpened,
+    ) -> Result<(), ActorError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl Handler<LinkDirectionClosed> for DirectLinkLifecycleActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _msg: LinkDirectionClosed,
+    ) -> Result<(), ActorError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<LinkDirectionClosed> for AutoPassivatingDirectLinkActor {
     async fn handle(
         &mut self,
         _ctx: &mut ActorContext<Self>,
@@ -323,7 +417,33 @@ impl Handler<LinkClosed> for DirectLinkLifecycleActor {
 }
 
 #[async_trait]
+impl Handler<LinkClosed> for AutoPassivatingDirectLinkActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        msg: LinkClosed,
+    ) -> Result<(), ActorError> {
+        self.closed
+            .lock()
+            .expect("closed reasons mutex poisoned")
+            .push(msg.reason);
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl Handler<LinkBackpressure> for DirectLinkLifecycleActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _msg: LinkBackpressure,
+    ) -> Result<(), ActorError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<LinkBackpressure> for AutoPassivatingDirectLinkActor {
     async fn handle(
         &mut self,
         _ctx: &mut ActorContext<Self>,
@@ -1550,6 +1670,105 @@ async fn service_shutdown_closes_active_direct_links_with_node_draining() {
         .unwrap();
     assert!(snapshot.closed);
     assert_eq!(snapshot.close_reason, Some(LinkCloseReason::NodeDraining));
+}
+
+#[tokio::test]
+async fn actor_idle_passivation_closes_active_direct_links_with_target_passivated() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store =
+        InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test-direct-link-passivate"));
+    let closed = Arc::new(Mutex::new(Vec::new()));
+    let stopped = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let stream = DirectLinkStream::new("movement").message::<DirectLinkTestPayload>();
+    let descriptor = stream.descriptor();
+    let link_id = LinkId::new("service-link-target-passivated");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(AutoPassivatingDirectLinkFactory {
+                    closed: closed.clone(),
+                    stopped: stopped.clone(),
+                })
+                .build(),
+        )
+        .register_direct_link(
+            stream.for_actor::<AutoPassivatingDirectLinkActor>(actor_kind!("World")),
+        )
+        .build()
+        .await
+        .unwrap();
+    let direct_link_runtime = service.direct_link_runtime().unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let addr = ready_rx.await.unwrap();
+    let mut client = LogicControlClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    client
+        .activate_actor(proto::ActivateActorRequest {
+            service_kind: "World".to_string(),
+            actor_kind: "World".to_string(),
+            actor_id: Some(actor_id_to_proto(&ActorId::U64(7))),
+            epoch: 1,
+        })
+        .await
+        .unwrap();
+
+    direct_link_runtime
+        .session_manager()
+        .open_link(OpenLinkRequest {
+            protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+            link_id: link_id.clone(),
+            source: direct_actor_ref(
+                service_kind!("Gateway"),
+                actor_kind!("GatewaySession"),
+                ActorId::U64(99),
+                "tcp://127.0.0.1:1".parse().unwrap(),
+            ),
+            target: direct_actor_ref(
+                service_kind!("World"),
+                actor_kind!("World"),
+                ActorId::U64(7),
+                "tcp://127.0.0.1:2".parse().unwrap(),
+            ),
+            mode: DirectLinkMode::Unidirectional,
+            source_to_target: OpenLinkDirection::from_stream(link_id.clone(), &descriptor),
+            target_to_source: None,
+            options: DirectLinkOptions::unidirectional(),
+        })
+        .unwrap();
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = direct_link_runtime
+                .session_manager()
+                .link_snapshot(&link_id)
+                .unwrap();
+            if snapshot.close_reason == Some(LinkCloseReason::TargetPassivated) {
+                break;
+            }
+            let stopped_reasons = stopped.lock().await.clone();
+            assert!(
+                stopped_reasons.is_empty(),
+                "actor stopped without closing direct link: {stopped_reasons:?}, snapshot: {snapshot:?}"
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }
 
 fn direct_actor_ref(

@@ -358,6 +358,9 @@ where
     ) -> Result<(), LatticeServiceError> {
         let mut config = self.config;
         config.service = context.service_context();
+        if config.actor_ref.is_none() {
+            config.actor_ref = context.actor_ref_config();
+        }
         let registry = Arc::new(ActorRegistry::new(self.actor_kind.clone(), config));
         let registered = RegisteredActor {
             registry,
