@@ -83,6 +83,26 @@ impl DirectLinkFrame {
         }
     }
 
+    pub fn heartbeat(link_id: LinkId) -> Self {
+        Self::control(DirectLinkFrameKind::Heartbeat, link_id)
+    }
+
+    pub fn heartbeat_ack(link_id: LinkId) -> Self {
+        Self::control(DirectLinkFrameKind::HeartbeatAck, link_id)
+    }
+
+    fn control(kind: DirectLinkFrameKind, link_id: LinkId) -> Self {
+        Self {
+            kind,
+            link_id,
+            sequence: LinkSequence(0),
+            message_id: None,
+            flags: LinkMessageFlags::EMPTY,
+            header: Vec::new(),
+            payload: Vec::new(),
+        }
+    }
+
     pub fn direction(&self) -> LinkDirection {
         direction_from_flags(&self.flags)
     }

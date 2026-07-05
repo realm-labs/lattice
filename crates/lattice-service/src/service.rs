@@ -617,7 +617,7 @@ async fn handle_direct_link_connection(
                 return;
             }
         };
-        if let Err(error) = inbound_router.deliver_frame(frame) {
+        if let Err(error) = inbound_router.process_frame(frame) {
             warn!(%error, "closing direct-link connection after inbound delivery failure");
             let _ = connection.close().await;
             return;

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // This module currently keeps Direct Link session state and its white-box tests
 // together because the Phase 8 runtime surface is still being assembled. Split
@@ -242,6 +243,9 @@ impl DirectLinkSessionManager {
             source: request.source,
             target: request.target,
             mode: request.mode,
+            heartbeat_interval: request.options.heartbeat_interval,
+            idle_timeout: request.options.idle_timeout,
+            last_heartbeat_at: Instant::now(),
             directions: [Some(source_to_target.clone()), target_to_source.clone()]
                 .into_iter()
                 .flatten()
@@ -512,6 +516,36 @@ impl DirectLinkSessionManager {
             .directions
             .get(&direction)
             .map(|direction| direction.backpressure.clone())
+    }
+
+    pub fn record_heartbeat_at(
+        &self,
+        link_id: &LinkId,
+        now: Instant,
+    ) -> Result<(), SessionManagerError> {
+        let mut links = self
+            .links
+            .lock()
+            .expect("direct link managed links poisoned");
+        let link = links
+            .get_mut(link_id)
+            .ok_or(SessionManagerError::UnknownLink)?;
+        link.last_heartbeat_at = now;
+        tracing::trace!(link.id = link_id.as_str(), "direct link heartbeat received");
+        Ok(())
+    }
+
+    pub fn idle_link_snapshots_at(&self, now: Instant) -> Vec<ManagedLinkSnapshot> {
+        self.links
+            .lock()
+            .expect("direct link managed links poisoned")
+            .values()
+            .filter(|link| {
+                !link.closed
+                    && now.saturating_duration_since(link.last_heartbeat_at) >= link.idle_timeout
+            })
+            .map(ManagedLinkSnapshot::from)
+            .collect()
     }
 
     pub fn close(&self, link_id: &LinkId, _reason: LinkCloseReason) -> bool {
@@ -933,6 +967,9 @@ struct ManagedLink {
     source: ActorRef,
     target: ActorRef,
     mode: DirectLinkMode,
+    heartbeat_interval: Duration,
+    idle_timeout: Duration,
+    last_heartbeat_at: Instant,
     directions: BTreeMap<LinkDirection, NegotiatedDirection>,
     closed: bool,
 }
@@ -943,6 +980,8 @@ pub struct ManagedLinkSnapshot {
     pub source: ActorRef,
     pub target: ActorRef,
     pub mode: DirectLinkMode,
+    pub heartbeat_interval: Duration,
+    pub idle_timeout: Duration,
     pub directions: BTreeSet<LinkDirection>,
     pub closed: bool,
 }
@@ -954,6 +993,8 @@ impl From<&ManagedLink> for ManagedLinkSnapshot {
             source: value.source.clone(),
             target: value.target.clone(),
             mode: value.mode,
+            heartbeat_interval: value.heartbeat_interval,
+            idle_timeout: value.idle_timeout,
             directions: value.directions.keys().copied().collect(),
             closed: value.closed,
         }

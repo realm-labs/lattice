@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use lattice_actor::{Actor, ActorHandle, ActorTellError, Handler};
 use lattice_core::{
@@ -125,6 +126,25 @@ impl DirectLinkInboundRouter {
         }
     }
 
+    pub fn process_frame(&self, frame: DirectLinkFrame) -> Result<(), InboundDeliveryError> {
+        self.process_frame_at(frame, Instant::now())
+    }
+
+    pub fn process_frame_at(
+        &self,
+        frame: DirectLinkFrame,
+        now: Instant,
+    ) -> Result<(), InboundDeliveryError> {
+        match frame.kind {
+            DirectLinkFrameKind::Message => self.deliver_frame(frame),
+            DirectLinkFrameKind::Heartbeat | DirectLinkFrameKind::HeartbeatAck => self
+                .session_manager
+                .record_heartbeat_at(&frame.link_id, now)
+                .map_err(Into::into),
+            _ => Err(InboundDeliveryError::NotMessageFrame),
+        }
+    }
+
     pub fn deliver_link_opened_to_target(
         &self,
         link_id: &LinkId,
@@ -198,6 +218,16 @@ impl DirectLinkInboundRouter {
                 self.deliver_link_closed_to_bound_actors(&snapshot, link_closed)
             }
         }
+    }
+
+    pub fn close_idle_links_at(&self, now: Instant) -> Result<usize, InboundDeliveryError> {
+        let snapshots = self.session_manager.idle_link_snapshots_at(now);
+        let mut closed = 0;
+        for snapshot in snapshots {
+            self.close_all(&snapshot.link_id, LinkCloseReason::HeartbeatTimeout)?;
+            closed += 1;
+        }
+        Ok(closed)
     }
 
     fn deliver_direction_closed(
@@ -538,6 +568,8 @@ mod tests {
         OutboundDirectLinkMessage, ServiceContext, ServiceKind, actor_kind, service_kind,
     };
     use prost::Message as _;
+    use std::time::Instant;
+
     use tokio::time::{Duration, timeout};
 
     use super::*;
@@ -1593,6 +1625,95 @@ mod tests {
                 }]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_and_ack_refresh_liveness_before_idle_timeout_close() {
+        let direction_closed = Arc::new(Mutex::new(Vec::new()));
+        let link_closed = Arc::new(Mutex::new(Vec::new()));
+        let handle = ActorRuntime::default()
+            .spawn_actor(
+                ClosingActor {
+                    direction_closed: direction_closed.clone(),
+                    link_closed: link_closed.clone(),
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let manager = Arc::new(DirectLinkSessionManager::new());
+        let input_stream = DirectLinkStream::new("gateway-input").message::<InputCommand>();
+        let input_descriptor = input_stream.descriptor();
+        manager
+            .register_binding(actor_kind!("Battle"), input_descriptor.clone())
+            .unwrap();
+        let link_id = LinkId::new("link-heartbeat");
+        let mut options = DirectLinkOptions::unidirectional();
+        options.idle_timeout = Duration::from_secs(30);
+        manager
+            .open_link(OpenLinkRequest {
+                protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                link_id: link_id.clone(),
+                source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+                target: actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9),
+                mode: DirectLinkMode::Unidirectional,
+                source_to_target: OpenLinkDirection::from_stream(
+                    link_id.clone(),
+                    &input_descriptor,
+                ),
+                target_to_source: None,
+                options,
+            })
+            .unwrap();
+        let router = DirectLinkInboundRouter::builder(manager)
+            .bind_actor(
+                input_stream.for_actor::<ClosingActor>(actor_kind!("Battle")),
+                move |_| Some(handle.clone()),
+            )
+            .build();
+        let heartbeat_at = Instant::now() + Duration::from_secs(10);
+
+        router
+            .process_frame_at(DirectLinkFrame::heartbeat(link_id.clone()), heartbeat_at)
+            .unwrap();
+        assert_eq!(
+            router
+                .close_idle_links_at(heartbeat_at + Duration::from_secs(29))
+                .unwrap(),
+            0
+        );
+        router
+            .process_frame_at(
+                DirectLinkFrame::heartbeat_ack(link_id.clone()),
+                heartbeat_at + Duration::from_secs(29),
+            )
+            .unwrap();
+        assert_eq!(
+            router
+                .close_idle_links_at(heartbeat_at + Duration::from_secs(58))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            router
+                .close_idle_links_at(heartbeat_at + Duration::from_secs(59))
+                .unwrap(),
+            1
+        );
+
+        wait_for_len(&direction_closed, 1).await;
+        wait_for_len(&link_closed, 1).await;
+        assert_eq!(
+            direction_closed
+                .lock()
+                .expect("direction closed mutex poisoned")[0]
+                .reason,
+            LinkCloseReason::HeartbeatTimeout
+        );
+        assert_eq!(
+            link_closed.lock().expect("link closed mutex poisoned")[0].reason,
+            LinkCloseReason::HeartbeatTimeout
+        );
     }
 
     #[tokio::test]
