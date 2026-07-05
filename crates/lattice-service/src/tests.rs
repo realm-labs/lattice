@@ -18,12 +18,16 @@ struct TestFactory;
 struct TestActor;
 
 #[async_trait]
-impl Actor for TestActor {}
+impl Actor for TestActor {
+    type Error = ActorError;
+}
 
 struct OtherActor;
 
 #[async_trait]
-impl Actor for OtherActor {}
+impl Actor for OtherActor {
+    type Error = ActorError;
+}
 
 #[async_trait]
 impl ActorFactory<TestActor> for TestFactory {

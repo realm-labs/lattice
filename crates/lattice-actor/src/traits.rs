@@ -1,10 +1,23 @@
 use async_trait::async_trait;
+use std::error::Error as StdError;
 
-use crate::{ActorContext, ActorError, ActorStopError, MailboxConfig};
+use crate::{ActorContext, ActorStopError, MailboxConfig};
+
+pub trait Message: Send + 'static {
+    type Reply: Send + 'static;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandlerErrorAction<Reply, Error> {
+    Reply(Reply),
+    Propagate(Error),
+}
 
 #[async_trait]
 pub trait Actor: Sized + Send + 'static {
-    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+    type Error: StdError + Send + Sync + 'static;
+
+    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -15,10 +28,12 @@ pub trait Actor: Sized + Send + 'static {
     ) -> Result<(), ActorStopError> {
         Ok(())
     }
-}
 
-pub trait Message: Send + 'static {
-    type Reply: Send + 'static;
+    async fn on_error<M>(&mut self, _ctx: &mut ActorContext<Self>, _error: &Self::Error)
+    where
+        M: Message,
+    {
+    }
 }
 
 #[async_trait]
@@ -30,7 +45,15 @@ where
         &mut self,
         ctx: &mut ActorContext<Self>,
         msg: M,
-    ) -> Result<M::Reply, ActorError>;
+    ) -> Result<M::Reply, Self::Error>;
+
+    async fn handle_error(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        error: Self::Error,
+    ) -> HandlerErrorAction<M::Reply, Self::Error> {
+        HandlerErrorAction::Propagate(error)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

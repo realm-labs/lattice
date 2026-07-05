@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore, oneshot};
 
 use crate::context::ActorContext;
@@ -15,7 +16,7 @@ use crate::runtime::{
 };
 use crate::traits::{
     Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
-    Message, PassivationReason, StopReason,
+    HandlerErrorAction, Message, PassivationReason, StopReason,
 };
 use crate::watch::{ActorTerminated, TerminatedReason};
 use lattice_core::{ActorId, actor_kind};
@@ -82,6 +83,7 @@ impl Message for Fail {
 
 #[async_trait]
 impl Actor for TestActor {
+    type Error = ActorError;
     async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         if let Some(gate) = self.start_gate.take() {
             let permit = gate
@@ -175,10 +177,125 @@ where
 {
 }
 
+#[derive(Debug, Error)]
+enum BusinessActorError {
+    #[error("business store is unavailable")]
+    StoreUnavailable,
+    #[error(transparent)]
+    Framework(#[from] ActorError),
+}
+
+struct BusinessErrorActor {
+    observed_errors: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait]
+impl Actor for BusinessErrorActor {
+    type Error = BusinessActorError;
+
+    async fn on_error<M>(&mut self, _ctx: &mut ActorContext<Self>, error: &BusinessActorError)
+    where
+        M: Message,
+    {
+        let label = match error {
+            BusinessActorError::StoreUnavailable => "store_unavailable",
+            BusinessActorError::Framework(_) => "framework",
+        };
+        self.observed_errors.lock().await.push(label);
+    }
+}
+
+struct LoadBusinessState;
+
+impl Message for LoadBusinessState {
+    type Reply = ();
+}
+
+struct RecoverBusinessState;
+
+impl Message for RecoverBusinessState {
+    type Reply = &'static str;
+}
+
+fn load_business_state() -> Result<(), BusinessActorError> {
+    Err(BusinessActorError::StoreUnavailable)
+}
+
+#[async_trait]
+impl Handler<LoadBusinessState> for BusinessErrorActor {
+    async fn handle(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        _msg: LoadBusinessState,
+    ) -> Result<(), BusinessActorError> {
+        ctx.request_passivation(PassivationReason::BusinessIdle)?;
+        load_business_state()?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<RecoverBusinessState> for BusinessErrorActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _msg: RecoverBusinessState,
+    ) -> Result<&'static str, BusinessActorError> {
+        load_business_state()?;
+        Ok("loaded")
+    }
+
+    async fn handle_error(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        error: BusinessActorError,
+    ) -> HandlerErrorAction<&'static str, BusinessActorError> {
+        match error {
+            BusinessActorError::StoreUnavailable => HandlerErrorAction::Reply("fallback"),
+            other => HandlerErrorAction::Propagate(other),
+        }
+    }
+}
+
 #[test]
 fn handler_compile_time_bounds_are_typed() {
     assert_handler_bound::<TestActor, Ping>();
     assert_handler_bound::<TestActor, Record>();
+}
+
+#[tokio::test]
+async fn actor_handler_can_use_business_error_with_question_mark() {
+    let handle = spawn_actor(
+        BusinessErrorActor {
+            observed_errors: Arc::new(Mutex::new(Vec::new())),
+        },
+        MailboxConfig::default(),
+    );
+
+    let error = handle.call(LoadBusinessState).await.unwrap_err();
+
+    match error {
+        ActorCallError::Handler(error) => {
+            assert_eq!(error.message(), "business store is unavailable");
+        }
+        other => panic!("expected business handler error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn actor_handler_error_hook_can_recover_reply() {
+    let observed_errors = Arc::new(Mutex::new(Vec::new()));
+    let handle = spawn_actor(
+        BusinessErrorActor {
+            observed_errors: observed_errors.clone(),
+        },
+        MailboxConfig::default(),
+    );
+
+    let reply = handle.call(RecoverBusinessState).await.unwrap();
+
+    assert_eq!(reply, "fallback");
+    assert_eq!(*observed_errors.lock().await, vec!["store_unavailable"]);
 }
 
 #[tokio::test]
@@ -330,6 +447,7 @@ async fn local_timer_delivers_message_to_actor() {
 
     #[async_trait]
     impl Actor for TimerActor {
+        type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             ctx.notify_after(std::time::Duration::from_millis(5), Tick);
             Ok(())
@@ -378,6 +496,7 @@ async fn scoped_task_is_cancelled_when_actor_stops() {
 
     #[async_trait]
     impl Actor for TaskActor {
+        type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             let signal = DropSignal(self.dropped_tx.take());
             ctx.spawn_scoped(async move {
@@ -633,7 +752,9 @@ async fn local_actor_watch_sends_typed_termination_notification() {
     struct TargetActor;
 
     #[async_trait]
-    impl Actor for TargetActor {}
+    impl Actor for TargetActor {
+        type Error = ActorError;
+    }
 
     struct WatcherActor {
         target: ActorHandle<TargetActor>,
@@ -643,6 +764,7 @@ async fn local_actor_watch_sends_typed_termination_notification() {
 
     #[async_trait]
     impl Actor for WatcherActor {
+        type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             ctx.watch(&self.target)?;
             Ok(())
@@ -686,7 +808,9 @@ async fn watcher_stop_auto_unwatches_local_target() {
     struct TargetActor;
 
     #[async_trait]
-    impl Actor for TargetActor {}
+    impl Actor for TargetActor {
+        type Error = ActorError;
+    }
 
     struct WatcherActor {
         target: ActorHandle<TargetActor>,
@@ -695,6 +819,7 @@ async fn watcher_stop_auto_unwatches_local_target() {
 
     #[async_trait]
     impl Actor for WatcherActor {
+        type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             ctx.watch(&self.target)?;
             Ok(())
@@ -740,6 +865,7 @@ async fn local_child_actor_stops_with_parent_lifecycle() {
 
     #[async_trait]
     impl Actor for ChildActor {
+        type Error = ActorError;
         async fn stopping(
             &mut self,
             _ctx: &mut ActorContext<Self>,
@@ -758,6 +884,7 @@ async fn local_child_actor_stops_with_parent_lifecycle() {
 
     #[async_trait]
     impl Actor for ParentActor {
+        type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             ctx.spawn_child(
                 ChildActorKey::new("child"),
@@ -796,7 +923,9 @@ async fn local_child_actor_duplicate_key_is_rejected() {
     struct ChildActor;
 
     #[async_trait]
-    impl Actor for ChildActor {}
+    impl Actor for ChildActor {
+        type Error = ActorError;
+    }
 
     struct ParentActor {
         duplicate_rejected: Arc<Semaphore>,
@@ -804,6 +933,7 @@ async fn local_child_actor_duplicate_key_is_rejected() {
 
     #[async_trait]
     impl Actor for ParentActor {
+        type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             let key = ChildActorKey::new("child");
             ctx.spawn_child(key.clone(), ChildActor, ChildActorOptions::default())?;
@@ -840,7 +970,9 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
     struct ChildActor;
 
     #[async_trait]
-    impl Actor for ChildActor {}
+    impl Actor for ChildActor {
+        type Error = ActorError;
+    }
 
     #[derive(Debug)]
     struct StopChild;
@@ -856,6 +988,7 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
 
     #[async_trait]
     impl Actor for ParentActor {
+        type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             self.child = Some(ctx.spawn_child(
                 ChildActorKey::new("child"),
@@ -919,7 +1052,9 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
     struct ChildActor;
 
     #[async_trait]
-    impl Actor for ChildActor {}
+    impl Actor for ChildActor {
+        type Error = ActorError;
+    }
 
     #[derive(Debug)]
     struct StopChild;
@@ -935,6 +1070,7 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
 
     #[async_trait]
     impl Actor for ParentActor {
+        type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             let child_started = self.child_started.clone();
             self.child = Some(ctx.spawn_child_with_factory(
@@ -1014,6 +1150,7 @@ async fn stopping_failure_enters_stop_failed_state() {
 
     #[async_trait]
     impl Actor for FailingStopActor {
+        type Error = ActorError;
         async fn stopping(
             &mut self,
             _ctx: &mut ActorContext<Self>,
@@ -1049,6 +1186,7 @@ async fn passivation_policy_idle_timeout_stops_idle_actor() {
 
     #[async_trait]
     impl Actor for IdleActor {
+        type Error = ActorError;
         async fn stopping(
             &mut self,
             _ctx: &mut ActorContext<Self>,

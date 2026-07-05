@@ -61,7 +61,7 @@ pub trait ActorFactory<A>: Clone + Send + Sync + 'static
 where
     A: Actor,
 {
-    async fn create(&self, ctx: ActorCreateContext) -> Result<A, ActorError>;
+    async fn create(&self, ctx: ActorCreateContext) -> Result<A, A::Error>;
 }
 
 #[async_trait]
@@ -69,7 +69,7 @@ pub trait ActorLoader<A>: Clone + Send + Sync + 'static
 where
     A: Actor,
 {
-    async fn load(&self, ctx: ActorCreateContext) -> Result<A, ActorError>;
+    async fn load(&self, ctx: ActorCreateContext) -> Result<A, A::Error>;
 }
 
 impl<A: Actor> ActorRegistry<A> {
@@ -127,7 +127,7 @@ impl<A: Actor> ActorRegistry<A> {
     ) -> Result<ActorHandle<A>, ActorActivationError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<A, ActorError>>,
+        Fut: Future<Output = Result<A, A::Error>>,
     {
         let lookup = match self.entries.entry(actor_id.clone()) {
             Entry::Occupied(entry) => match entry.get() {
@@ -159,7 +159,9 @@ impl<A: Actor> ActorRegistry<A> {
                 self.entries.remove_if(&actor_id, |_, entry| {
                     matches!(entry, RegistryEntry::Activating(existing) if Arc::ptr_eq(existing, &activation))
                 });
-                Err(ActorActivationError::ActivationFailed(error))
+                Err(ActorActivationError::ActivationFailed(
+                    ActorError::from_error(error),
+                ))
             }
         };
 

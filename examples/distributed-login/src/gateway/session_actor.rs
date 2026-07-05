@@ -29,6 +29,7 @@ impl GatewaySessionActor {
 
 #[async_trait]
 impl Actor for GatewaySessionActor {
+    type Error = ActorError;
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         if let Some(self_ref_tx) = self.self_ref_tx.take() {
             let _ = self_ref_tx.send(ctx.require_self_ref()?.clone());

@@ -16,7 +16,7 @@ pub use registry::{ActorFactory, ActorLoader, ActorRegistry};
 pub use runtime::{
     ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, PassivationPolicy, spawn_actor,
 };
-pub use traits::{Actor, Handler, Message, PassivationReason, StopReason};
+pub use traits::{Actor, Handler, HandlerErrorAction, Message, PassivationReason, StopReason};
 
 #[cfg(test)]
 mod tests;

@@ -20,7 +20,9 @@ impl Message for Ping {
 struct LazyActor;
 
 #[async_trait]
-impl Actor for LazyActor {}
+impl Actor for LazyActor {
+    type Error = ActorError;
+}
 
 #[async_trait]
 impl Handler<Ping> for LazyActor {

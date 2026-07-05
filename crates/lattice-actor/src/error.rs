@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -13,6 +14,10 @@ impl ActorError {
         Self {
             message: message.into(),
         }
+    }
+
+    pub fn from_error(error: impl StdError + Send + Sync + 'static) -> Self {
+        Self::new(error.to_string())
     }
 
     pub fn message(&self) -> &str {

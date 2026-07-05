@@ -49,7 +49,9 @@ impl RpcRequest for EnterWorldRequest {
 struct WorldActor;
 
 #[async_trait]
-impl Actor for WorldActor {}
+impl Actor for WorldActor {
+    type Error = ActorError;
+}
 
 #[async_trait]
 impl Handler<Rpc<EnterWorldRequest>> for WorldActor {
@@ -70,7 +72,9 @@ struct CountingWorldActor {
 }
 
 #[async_trait]
-impl Actor for CountingWorldActor {}
+impl Actor for CountingWorldActor {
+    type Error = ActorError;
+}
 
 #[async_trait]
 impl Handler<Rpc<EnterWorldRequest>> for CountingWorldActor {

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use lattice_actor::{Actor, Handler};
+use lattice_actor::{Actor, ActorError, Handler};
 use lattice_core::{ActorKind, RouteKey, actor_kind};
 use lattice_rpc::{Rpc, RpcRequest, RoutedRequest};
 
@@ -33,7 +33,9 @@ impl RpcRequest for EnterWorldRequest {
 struct WorldActor;
 
 #[async_trait]
-impl Actor for WorldActor {}
+impl Actor for WorldActor {
+    type Error = ActorError;
+}
 
 fn assert_generated_adapter_bound<A>()
 where

@@ -4,7 +4,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_actor::error::ActorError;
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::registry::{
     ActorCreateContext, ActorFactory, ActorLoader, ActorRegistry, ActorRegistryConfig,
@@ -16,7 +15,7 @@ use lattice_core::ActorKind;
 use crate::LatticeServiceError;
 use crate::context::ServiceBuildContext;
 
-type ActorCreateFuture<A> = Pin<Box<dyn Future<Output = Result<A, ActorError>> + Send>>;
+type ActorCreateFuture<A> = Pin<Box<dyn Future<Output = Result<A, <A as Actor>::Error>> + Send>>;
 type ActorCreateFn<A> = dyn Fn(ActorCreateContext) -> ActorCreateFuture<A> + Send + Sync;
 
 pub struct ActorRegistration<A>
@@ -140,7 +139,7 @@ impl<A> ActorLoader<A> for ServiceActorLoader<A>
 where
     A: Actor,
 {
-    async fn load(&self, ctx: ActorCreateContext) -> Result<A, ActorError> {
+    async fn load(&self, ctx: ActorCreateContext) -> Result<A, A::Error> {
         (self.create)(ctx).await
     }
 }

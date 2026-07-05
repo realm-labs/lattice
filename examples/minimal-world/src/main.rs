@@ -86,6 +86,7 @@ pub struct WorldActor {
 
 #[async_trait]
 impl Actor for WorldActor {
+    type Error = ActorError;
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         let tick_ms = self.tick_ms;
         ctx.notify_interval(Duration::from_millis(tick_ms), move || WorldTick {

@@ -58,7 +58,9 @@ impl PlayerActor {
 }
 
 #[async_trait]
-impl Actor for PlayerActor {}
+impl Actor for PlayerActor {
+    type Error = ActorError;
+}
 
 #[async_trait]
 impl Handler<Rpc<InitSessionRequest>> for PlayerActor {

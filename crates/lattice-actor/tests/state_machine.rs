@@ -20,6 +20,7 @@ struct MatchActor {
 
 #[async_trait]
 impl Actor for MatchActor {
+    type Error = ActorError;
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         ctx.notify_after(Duration::from_millis(10), LoadingFinished);
         Ok(())

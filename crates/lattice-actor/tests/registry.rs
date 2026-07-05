@@ -12,6 +12,7 @@ struct SlowActor;
 
 #[async_trait]
 impl Actor for SlowActor {
+    type Error = ActorError;
     async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         Ok(())
     }
@@ -89,6 +90,7 @@ struct SelfRefActor {
 
 #[async_trait]
 impl Actor for SelfRefActor {
+    type Error = ActorError;
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         if let Some(tx) = self.tx.take() {
             let _ = tx.send(ctx.require_self_ref()?.clone());

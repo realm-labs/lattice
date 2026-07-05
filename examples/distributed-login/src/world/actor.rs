@@ -29,7 +29,9 @@ impl WorldActor {
 }
 
 #[async_trait]
-impl Actor for WorldActor {}
+impl Actor for WorldActor {
+    type Error = ActorError;
+}
 
 #[async_trait]
 impl Handler<Rpc<LoginRequest>> for WorldActor {

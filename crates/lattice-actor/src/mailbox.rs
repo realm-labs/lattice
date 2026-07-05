@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use tokio::sync::oneshot;
 
-use crate::{Actor, ActorCallError, ActorContext, Handler, Message, StopReason};
+use crate::traits::HandlerErrorAction;
+use crate::{Actor, ActorCallError, ActorContext, ActorError, Handler, Message, StopReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailboxConfig {
@@ -88,10 +89,18 @@ where
     }
 
     async fn handle(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>) {
-        let result = actor
-            .handle(ctx, self.msg)
-            .await
-            .map_err(ActorCallError::Handler);
+        let result = match actor.handle(ctx, self.msg).await {
+            Ok(reply) => Ok(reply),
+            Err(error) => {
+                actor.on_error::<M>(ctx, &error).await;
+                match actor.handle_error(ctx, error).await {
+                    HandlerErrorAction::Reply(reply) => Ok(reply),
+                    HandlerErrorAction::Propagate(error) => {
+                        Err(ActorCallError::Handler(ActorError::from_error(error)))
+                    }
+                }
+            }
+        };
         let _ = self.reply_tx.send(result);
     }
 }

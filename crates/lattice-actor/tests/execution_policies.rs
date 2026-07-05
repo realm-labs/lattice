@@ -29,10 +29,14 @@ struct TestActor {
 struct OtherActor;
 
 #[async_trait]
-impl Actor for TestActor {}
+impl Actor for TestActor {
+    type Error = ActorError;
+}
 
 #[async_trait]
-impl Actor for OtherActor {}
+impl Actor for OtherActor {
+    type Error = ActorError;
+}
 
 #[async_trait]
 impl Handler<Ping> for TestActor {
