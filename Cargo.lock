@@ -1207,6 +1207,7 @@ dependencies = [
  "prost",
  "serde",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 
