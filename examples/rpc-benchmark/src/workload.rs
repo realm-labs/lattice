@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::bench::{ChainPingRequest, PingRequest};
@@ -43,30 +41,37 @@ pub async fn run_routed_rpc_fanout(
     config: &WorkloadConfig,
 ) -> BenchmarkResult<WorkloadReport> {
     let client = topology.bench_client();
-    let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
     let mut tasks = JoinSet::new();
     let started = Instant::now();
+    let worker_count = worker_count(config);
 
-    for sequence in 0..config.requests {
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore open");
+    for worker_id in 0..worker_count {
         let client = client.clone();
-        let actor_id = actor_id_for(sequence, config.actors);
+        let config = config.clone();
         tasks.spawn(async move {
-            let _permit = permit;
-            let request_started = Instant::now();
-            let reply = client
-                .ping(PingRequest {
-                    actor_id,
-                    sequence: sequence as u64,
-                    payload: Vec::new(),
-                })
-                .await
-                .map_err(BenchmarkError::from)?;
-            Ok::<_, BenchmarkError>((request_started.elapsed(), reply.actor_id))
+            let mut report = WorkerReport::with_capacity(requests_for_worker(
+                worker_id,
+                worker_count,
+                config.requests,
+            ));
+            let mut sequence = worker_id;
+            while sequence < config.requests {
+                let actor_id = actor_id_for(sequence, config.actors);
+                let request_started = Instant::now();
+                match client
+                    .ping(PingRequest {
+                        actor_id,
+                        sequence: sequence as u64,
+                        payload: Vec::new(),
+                    })
+                    .await
+                {
+                    Ok(reply) => report.record_success(request_started.elapsed(), reply.actor_id),
+                    Err(_) => report.record_error(),
+                }
+                sequence += worker_count;
+            }
+            Ok::<_, BenchmarkError>(report)
         });
     }
 
@@ -84,31 +89,38 @@ pub async fn run_cross_service_chain(
     config: &WorkloadConfig,
 ) -> BenchmarkResult<WorkloadReport> {
     let client = topology.chain_client();
-    let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
     let mut tasks = JoinSet::new();
     let started = Instant::now();
+    let worker_count = worker_count(config);
 
-    for sequence in 0..config.requests {
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore open");
+    for worker_id in 0..worker_count {
         let client = client.clone();
-        let actor_id = actor_id_for(sequence, config.actors);
-        let worker_actor_id = actor_id_for(sequence + 17, config.actors);
+        let config = config.clone();
         tasks.spawn(async move {
-            let _permit = permit;
-            let request_started = Instant::now();
-            let reply = client
-                .chain_ping(ChainPingRequest {
-                    actor_id,
-                    worker_actor_id,
-                    sequence: sequence as u64,
-                })
-                .await
-                .map_err(BenchmarkError::from)?;
-            Ok::<_, BenchmarkError>((request_started.elapsed(), reply.actor_id))
+            let mut report = WorkerReport::with_capacity(requests_for_worker(
+                worker_id,
+                worker_count,
+                config.requests,
+            ));
+            let mut sequence = worker_id;
+            while sequence < config.requests {
+                let actor_id = actor_id_for(sequence, config.actors);
+                let worker_actor_id = actor_id_for(sequence + 17, config.actors);
+                let request_started = Instant::now();
+                match client
+                    .chain_ping(ChainPingRequest {
+                        actor_id,
+                        worker_actor_id,
+                        sequence: sequence as u64,
+                    })
+                    .await
+                {
+                    Ok(reply) => report.record_success(request_started.elapsed(), reply.actor_id),
+                    Err(_) => report.record_error(),
+                }
+                sequence += worker_count;
+            }
+            Ok::<_, BenchmarkError>(report)
         });
     }
 
@@ -125,22 +137,17 @@ async fn collect_report(
     name: &'static str,
     requests: usize,
     started: Instant,
-    mut tasks: JoinSet<BenchmarkResult<(Duration, u64)>>,
+    mut tasks: JoinSet<BenchmarkResult<WorkerReport>>,
 ) -> BenchmarkResult<WorkloadReport> {
     let mut latencies = Vec::with_capacity(requests);
     let mut observed_actor_ids = BTreeSet::new();
     let mut errors = 0;
 
     while let Some(result) = tasks.join_next().await {
-        match result? {
-            Ok((latency, actor_id)) => {
-                latencies.push(latency);
-                observed_actor_ids.insert(actor_id);
-            }
-            Err(_) => {
-                errors += 1;
-            }
-        }
+        let worker = result??;
+        latencies.extend(worker.latencies);
+        observed_actor_ids.extend(worker.observed_actor_ids);
+        errors += worker.errors;
     }
 
     Ok(WorkloadReport {
@@ -152,6 +159,43 @@ async fn collect_report(
         latencies,
         observed_actor_ids,
     })
+}
+
+#[derive(Debug)]
+struct WorkerReport {
+    latencies: Vec<Duration>,
+    observed_actor_ids: BTreeSet<u64>,
+    errors: usize,
+}
+
+impl WorkerReport {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            latencies: Vec::with_capacity(capacity),
+            observed_actor_ids: BTreeSet::new(),
+            errors: 0,
+        }
+    }
+
+    fn record_success(&mut self, latency: Duration, actor_id: u64) {
+        self.latencies.push(latency);
+        self.observed_actor_ids.insert(actor_id);
+    }
+
+    fn record_error(&mut self) {
+        self.errors += 1;
+    }
+}
+
+fn worker_count(config: &WorkloadConfig) -> usize {
+    config.concurrency.max(1).min(config.requests.max(1))
+}
+
+fn requests_for_worker(worker_id: usize, worker_count: usize, requests: usize) -> usize {
+    if worker_id >= requests {
+        return 0;
+    }
+    ((requests - 1 - worker_id) / worker_count) + 1
 }
 
 fn actor_id_for(sequence: usize, actors: u64) -> u64 {
