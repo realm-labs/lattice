@@ -1,0 +1,298 @@
+use std::collections::HashMap;
+
+use axum::Json;
+use axum::Router;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::routing::get;
+use lattice_core::{ActorKind, InstanceId, ServiceKind};
+use lattice_placement::{ActorPlacementRecord, InstanceRecord, PlacementStore};
+use serde::{Deserialize, Serialize};
+
+use crate::OpsError;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClusterSummary {
+    pub instance_count: usize,
+    pub actor_owner_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NodeSummary {
+    pub instance_id: InstanceId,
+    pub service_kind: ServiceKind,
+    pub actor_kinds: Vec<ActorKind>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminAuth {
+    token: Option<String>,
+}
+
+impl AdminAuth {
+    pub fn disabled() -> Self {
+        Self { token: None }
+    }
+
+    pub fn bearer_token(token: impl Into<String>) -> Self {
+        Self {
+            token: Some(token.into()),
+        }
+    }
+
+    pub fn authorize(&self, headers: &HeaderMap) -> Result<(), AdminApiError> {
+        let Some(expected) = &self.token else {
+            return Ok(());
+        };
+        let actual = headers
+            .get("x-lattice-admin-token")
+            .and_then(|value| value.to_str().ok());
+        if actual == Some(expected.as_str()) {
+            Ok(())
+        } else {
+            Err(AdminApiError::Unauthorized)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct PageRequest {
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_page_limit")]
+    pub limit: usize,
+}
+
+fn default_page_limit() -> usize {
+    100
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub partial: bool,
+}
+
+pub fn paginate<T: Clone>(items: &[T], request: PageRequest) -> Page<T> {
+    let limit = request.limit.clamp(1, 500);
+    let offset = request.offset.min(items.len());
+    let end = (offset + limit).min(items.len());
+    Page {
+        items: items[offset..end].to_vec(),
+        offset,
+        limit,
+        total: items.len(),
+        partial: end < items.len(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InstanceView {
+    pub service_kind: ServiceKind,
+    pub instance_id: InstanceId,
+    pub state: String,
+    pub advertised_endpoint: String,
+    pub control_endpoint: String,
+    pub version: String,
+}
+
+impl From<InstanceRecord> for InstanceView {
+    fn from(record: InstanceRecord) -> Self {
+        Self {
+            service_kind: record.service_kind,
+            instance_id: record.instance_id,
+            state: format!("{:?}", record.state),
+            advertised_endpoint: record.advertised_endpoint.to_string(),
+            control_endpoint: record.control_endpoint.to_string(),
+            version: record.version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeInspectView {
+    pub instance_id: InstanceId,
+    pub reachable: bool,
+    pub summary: Option<NodeSummary>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InspectionView {
+    pub name: String,
+    pub owner: Option<InstanceId>,
+    pub state: String,
+    pub details: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminSnapshot {
+    pub summary: ClusterSummary,
+    pub instances: Vec<InstanceView>,
+    pub nodes: Vec<NodeInspectView>,
+    pub placements: Vec<InspectionView>,
+    pub virtual_shards: Vec<InspectionView>,
+    pub singletons: Vec<InspectionView>,
+    pub mailboxes: Vec<InspectionView>,
+    pub schedulers: Vec<InspectionView>,
+    pub event_subscriptions: Vec<InspectionView>,
+}
+
+impl AdminSnapshot {
+    pub fn new(summary: ClusterSummary, instances: Vec<InstanceView>) -> Self {
+        Self {
+            summary,
+            instances,
+            nodes: Vec::new(),
+            placements: Vec::new(),
+            virtual_shards: Vec::new(),
+            singletons: Vec::new(),
+            mailboxes: Vec::new(),
+            schedulers: Vec::new(),
+            event_subscriptions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminHttpState {
+    auth: AdminAuth,
+    snapshot: AdminSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminHttpAdapter {
+    state: AdminHttpState,
+}
+
+impl AdminHttpAdapter {
+    pub fn new(auth: AdminAuth, snapshot: AdminSnapshot) -> Self {
+        Self {
+            state: AdminHttpState { auth, snapshot },
+        }
+    }
+
+    pub fn router(self) -> Router {
+        Router::new()
+            .route("/admin/cluster/summary", get(admin_cluster_summary))
+            .route("/admin/instances", get(admin_instances))
+            .route("/admin/nodes", get(admin_nodes))
+            .route("/admin/placements", get(admin_placements))
+            .route("/admin/vshards", get(admin_virtual_shards))
+            .route("/admin/singletons", get(admin_singletons))
+            .route("/admin/mailboxes", get(admin_mailboxes))
+            .route("/admin/schedulers", get(admin_schedulers))
+            .route("/admin/event-subscriptions", get(admin_event_subscriptions))
+            .with_state(self.state)
+    }
+}
+
+async fn admin_cluster_summary(
+    State(state): State<AdminHttpState>,
+    headers: HeaderMap,
+) -> Result<Json<ClusterSummary>, AdminApiError> {
+    state.auth.authorize(&headers)?;
+    Ok(Json(state.snapshot.summary))
+}
+
+async fn admin_instances(
+    State(state): State<AdminHttpState>,
+    headers: HeaderMap,
+    Query(page): Query<PageRequest>,
+) -> Result<Json<Page<InstanceView>>, AdminApiError> {
+    state.auth.authorize(&headers)?;
+    Ok(Json(paginate(&state.snapshot.instances, page)))
+}
+
+async fn admin_nodes(
+    State(state): State<AdminHttpState>,
+    headers: HeaderMap,
+    Query(page): Query<PageRequest>,
+) -> Result<Json<Page<NodeInspectView>>, AdminApiError> {
+    state.auth.authorize(&headers)?;
+    Ok(Json(paginate(&state.snapshot.nodes, page)))
+}
+
+macro_rules! admin_inspection_handler {
+    ($name:ident, $field:ident) => {
+        async fn $name(
+            State(state): State<AdminHttpState>,
+            headers: HeaderMap,
+            Query(page): Query<PageRequest>,
+        ) -> Result<Json<Page<InspectionView>>, AdminApiError> {
+            state.auth.authorize(&headers)?;
+            Ok(Json(paginate(&state.snapshot.$field, page)))
+        }
+    };
+}
+
+admin_inspection_handler!(admin_placements, placements);
+admin_inspection_handler!(admin_virtual_shards, virtual_shards);
+admin_inspection_handler!(admin_singletons, singletons);
+admin_inspection_handler!(admin_mailboxes, mailboxes);
+admin_inspection_handler!(admin_schedulers, schedulers);
+admin_inspection_handler!(admin_event_subscriptions, event_subscriptions);
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AdminApiError {
+    #[error("admin request is unauthorized")]
+    Unauthorized,
+}
+
+impl axum::response::IntoResponse for AdminApiError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            AdminApiError::Unauthorized => {
+                (StatusCode::UNAUTHORIZED, self.to_string()).into_response()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusterInspector<S> {
+    store: S,
+}
+
+impl<S> ClusterInspector<S>
+where
+    S: PlacementStore,
+{
+    pub fn new(store: S) -> Self {
+        Self { store }
+    }
+
+    pub async fn summarize(
+        &self,
+        service_kind: &ServiceKind,
+        actors: &[ActorPlacementRecord],
+    ) -> Result<ClusterSummary, OpsError> {
+        let instances = self.store.list_instances(service_kind).await?;
+        Ok(ClusterSummary {
+            instance_count: instances.len(),
+            actor_owner_count: actors.len(),
+        })
+    }
+
+    pub fn summarize_node(
+        &self,
+        instance: &InstanceRecord,
+        actors: &[ActorPlacementRecord],
+    ) -> NodeSummary {
+        let mut actor_kinds = actors
+            .iter()
+            .filter(|record| record.owner == instance.instance_id)
+            .map(|record| record.actor_kind.clone())
+            .collect::<Vec<_>>();
+        actor_kinds.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        actor_kinds.dedup();
+        NodeSummary {
+            instance_id: instance.instance_id.clone(),
+            service_kind: instance.service_kind.clone(),
+            actor_kinds,
+        }
+    }
+}
