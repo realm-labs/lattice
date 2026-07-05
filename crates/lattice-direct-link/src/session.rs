@@ -1893,8 +1893,22 @@ mod tests {
 
     #[test]
     fn observability_hooks_increment_metrics() {
-        let manager = DirectLinkSessionManager::new();
-        let link_id = LinkId::new("link-1");
+        let descriptor = stream("movement", &[10]);
+        let manager = configured_manager(&descriptor);
+        let link_id = LinkId::new("link-observed");
+
+        manager
+            .open_link(open_request_with_id(&descriptor, link_id.clone()))
+            .unwrap();
+        manager
+            .validate_message_frame(
+                &link_id,
+                LinkDirection::SourceToTarget,
+                DirectLinkMessageId(10),
+                LinkSequence(1),
+            )
+            .unwrap();
+        assert!(manager.close(&link_id, LinkCloseReason::Done));
 
         manager.record_decode_error(Some(&link_id), "bad payload");
         manager.record_backpressure(
@@ -1906,6 +1920,9 @@ mod tests {
         manager.record_coalesce(&link_id, DirectLinkMessageId(10));
 
         let metrics = manager.metrics().snapshot();
+        assert_eq!(metrics.opened, 1);
+        assert_eq!(metrics.received, 1);
+        assert_eq!(metrics.closed, 1);
         assert_eq!(metrics.decode_errors, 1);
         assert_eq!(metrics.backpressure_events, 1);
         assert_eq!(metrics.dropped, 1);

@@ -299,7 +299,9 @@ Status: `[ ]` in progress.
   - [x] Managed TCP listener enforces a configured connection limit.
   - [x] Session manager enforces a configured active link limit.
   - [x] Direct Link open/data path enforces configured rate limits.
-- [ ] Observability emits link open/close/send/receive/drop/coalesce/backpressure/decode-error metrics and sampled tracing without per-message spans by default.
+- [x] Observability emits link open/close/send/receive/drop/coalesce/backpressure/decode-error metrics and sampled tracing without per-message spans by default.
+  - [x] Session metrics for link open, close, receive validation, drop, coalesce, backpressure, and decode errors are covered by `observability_hooks_increment_metrics`.
+  - [x] TCP transport send/receive metrics and trace-level frame events are covered by transport tests; direct-link tracing uses lifecycle/frame events and does not create per-message spans by default.
 - [ ] Direct Link benchmark exists for TCP single-process, local multi-process, and payload/backpressure matrices.
 - [ ] Architecture/API examples document when to use gRPC RPC versus Direct Actor Link and show unidirectional and bidirectional flows.
 
