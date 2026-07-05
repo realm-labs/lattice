@@ -23,6 +23,7 @@ Then execute the plan through the "Current Progress Tracker" in docs/implementat
 Do not skip phases. Do not stop at documentation. Do not stop at API sketches.
 The implementation must use the Cargo workspace crate split defined in docs/architecture/00-overview.md and docs/implementation-plan.md. Do not implement lattice as one root crate with many internal modules.
 For each phase, complete the code implementation, examples, tests, and acceptance checklist before moving to the next phase.
+When resuming from an existing implementation, do not trust tracker checkmarks as proof of completion. Audit checked items in the current phase and earlier dependency phases against the codebase before continuing. A checked item is valid only if it has concrete framework implementation plus executable test or runnable example coverage, or an explicit documented rationale for why no code is required. If a checked item is not backed by implementation/coverage, change it back to `[ ]` or add a precise missing-work subitem, then work on the earliest missing item.
 Always choose the earliest unchecked item in the Current Progress Tracker unless it is explicitly blocked by an earlier missing dependency.
 Within a phase, work in small slices: choose one or a few checklist items, implement them end to end, verify them, then commit that slice before continuing.
 After each completed slice, update docs/implementation-plan.md:

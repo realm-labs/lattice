@@ -881,23 +881,28 @@ This section defines how a Codex goal should execute this plan. The standalone p
 
 ```text
 1. Read docs/implementation-plan.md and start from "2.1 Current Progress Tracker".
-2. Identify the earliest phase whose phase status is still [ ].
-3. Within that phase, identify the earliest unchecked checklist item that is not blocked by a later-phase dependency.
-4. Read the detailed phase deliverables, acceptance items, and suggested tests below the tracker.
-5. Read the docs/architecture/* chapters relevant to that unchecked item.
-6. Select a small slice: one checklist item, or a few tightly related checklist items that can be completed end to end.
-7. Inspect the current codebase and classify what is done, missing, or inconsistent with the architecture for that slice.
-8. Implement the missing capability, keeping public APIs aligned with docs/architecture/07-api-examples.md where applicable.
-9. Add tests for the new capability, using this file's test scope.
-10. Run the required verification commands for the slice.
-11. Update "2.1 Current Progress Tracker":
+2. Audit checked tracker items before trusting them:
+    - validate checked items in the current phase and earlier dependency phases against concrete code;
+    - require framework implementation plus executable test or runnable example coverage;
+    - accept a checked documentation-only item only when this plan records an explicit rationale for why no code is required;
+    - if a checked item is not backed by implementation/coverage, change it back to [ ] or add a precise [ ] missing-work subitem.
+3. Identify the earliest phase whose phase status is still [ ].
+4. Within that phase, identify the earliest unchecked checklist item that is not blocked by a later-phase dependency.
+5. Read the detailed phase deliverables, acceptance items, and suggested tests below the tracker.
+6. Read the docs/architecture/* chapters relevant to that unchecked item.
+7. Select a small slice: one checklist item, or a few tightly related checklist items that can be completed end to end.
+8. Inspect the current codebase and classify what is done, missing, or inconsistent with the architecture for that slice.
+9. Implement the missing capability, keeping public APIs aligned with docs/architecture/07-api-examples.md where applicable.
+10. Add tests for the new capability, using this file's test scope.
+11. Run the required verification commands for the slice.
+12. Update "2.1 Current Progress Tracker":
     - mark completed checklist items [x];
     - add newly discovered missing work as [ ] items;
     - mark the phase status [x] only when all required items in that phase are [x].
-12. If implementation proves architecture or plan text stale, update both docs and this plan. Do not use doc edits as a substitute for implementation.
-13. Commit the completed slice with an English conventional commit message.
-14. Summarize completed work, remaining work, verification results, and commit id/message.
-15. If the current phase checklist is fully satisfied, move to the next phase. Otherwise choose the next small slice in the same phase.
+13. If implementation proves architecture or plan text stale, update both docs and this plan. Do not use doc edits as a substitute for implementation.
+14. Commit the completed slice with an English conventional commit message.
+15. Summarize completed work, remaining work, verification results, and commit id/message.
+16. If the current phase checklist is fully satisfied, move to the next phase. Otherwise choose the next small slice in the same phase.
 ```
 
 ### 5.2 Per-Phase Checklist Template
@@ -940,6 +945,7 @@ Exit decision:
 - [ ] All acceptance items are satisfied
 - [ ] Tests pass
 - [ ] No architecture item in this phase remains documentation-only
+- [ ] Checked tracker items were audited against code, tests, and examples
 ```
 
 ### 5.3 Phase Exit Rules
@@ -958,6 +964,7 @@ Each phase can exit only when all items are true:
 [ ] cargo test passes.
 [ ] Every completed slice has an English conventional commit.
 [ ] No framework capability in this phase remains documentation-only.
+[ ] Checked tracker items in this phase are backed by code plus tests/examples, or an explicit no-code rationale.
 ```
 
 ### 5.4 Goal Completion Criteria
