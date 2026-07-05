@@ -7,6 +7,7 @@ use std::time::Duration;
 use axum::Router as AxumRouter;
 use lattice_core::instance::InstanceCapacity;
 use lattice_core::{ServiceContext, ServiceKind};
+use lattice_placement::PlacementError;
 use lattice_placement::coordinator::PlacementWatchTask;
 use lattice_placement::instance::{InstanceRecord, InstanceState};
 use lattice_placement::store::LeaseId;
@@ -153,6 +154,8 @@ impl LatticeService {
                 lease_id,
             )
             .await;
+            let placement_drain =
+                drain_placement(placement_store.as_ref(), &service_kind, &instance).await;
             let cancelled_subscriptions = cancel_event_subscriptions(&service_context).await;
             debug!(
                 service.kind = service_kind.as_str(),
@@ -172,7 +175,8 @@ impl LatticeService {
             if let Some(admin_shutdown_tx) = admin_shutdown_tx {
                 let _ = admin_shutdown_tx.send(());
             }
-            result
+            result?;
+            placement_drain
         };
         tokio::pin!(keepalive);
         tokio::pin!(lifecycle_shutdown);
@@ -344,6 +348,37 @@ async fn drain_runtime_actors(logic_actors: &[Arc<dyn ErasedLogicActor>]) -> usi
         drained += actor.drain().await;
     }
     drained
+}
+
+async fn drain_placement(
+    placement_store: &dyn ErasedPlacementStore,
+    service_kind: &ServiceKind,
+    instance: &InstanceConfig,
+) -> Result<(), LatticeServiceError> {
+    match placement_store
+        .drain_instance(service_kind.clone(), instance.instance_id.clone())
+        .await
+    {
+        Ok(report) => {
+            debug!(
+                service.kind = service_kind.as_str(),
+                instance.id = instance.instance_id.as_str(),
+                placement.actors.migrated = report.migrated_actors,
+                placement.virtual_shards.migrated = report.migrated_virtual_shards,
+                "drained placement ownership"
+            );
+            Ok(())
+        }
+        Err(PlacementError::NoReadyInstances) => {
+            debug!(
+                service.kind = service_kind.as_str(),
+                instance.id = instance.instance_id.as_str(),
+                "skipping placement migration because no replacement instance is ready"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn publish_instance_record(

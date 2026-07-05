@@ -6,7 +6,8 @@ use lattice_placement::PlacementError;
 use lattice_placement::cache::RouteCacheConfig;
 use lattice_placement::control::TonicLogicControl;
 use lattice_placement::coordinator::{
-    PlacementCoordinator, PlacementRouteResolver, PlacementWatchStarter, PlacementWatchTask,
+    DrainReport, PlacementCoordinator, PlacementRouteResolver, PlacementWatchStarter,
+    PlacementWatchTask,
 };
 use lattice_placement::instance::InstanceRecord;
 use lattice_placement::singleton::SingletonRouteResolver;
@@ -147,6 +148,11 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
         service_kind: &ServiceKind,
         instance_id: &InstanceId,
     ) -> Result<usize, PlacementError>;
+    async fn drain_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+    ) -> Result<DrainReport, PlacementError>;
     async fn placement_route_resolver(
         &self,
         service_kind: ServiceKind,
@@ -226,6 +232,16 @@ where
             }
         }
         Ok(kept_alive)
+    }
+
+    async fn drain_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+    ) -> Result<DrainReport, PlacementError> {
+        PlacementCoordinator::new(self.store.clone(), TonicLogicControl)
+            .drain_instance(service_kind, instance_id)
+            .await
     }
 
     async fn placement_route_resolver(

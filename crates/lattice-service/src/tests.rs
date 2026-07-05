@@ -646,12 +646,14 @@ async fn service_lifecycle_writes_starting_ready_draining_stopping() {
     shutdown_tx.send(()).unwrap();
 
     let mut states = Vec::new();
-    while states.len() < 4 {
+    while !states.contains(&InstanceState::Stopping) {
         let event = timeout(Duration::from_secs(1), watch.next())
             .await
             .unwrap()
             .unwrap();
-        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event {
+        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+            && states.last() != Some(&record.state)
+        {
             states.push(record.state);
         }
     }
@@ -996,6 +998,55 @@ async fn service_shutdown_drains_runtime_actor_registries() {
         *reasons.lock().await,
         vec![StopReason::Passivated(PassivationReason::Drain)]
     );
+}
+
+#[tokio::test]
+async fn service_shutdown_migrates_owned_placement_records() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    store
+        .upsert_instance(placement_instance("world-2"))
+        .await
+        .unwrap();
+    let actor_key = placement_actor_key(7);
+    store
+        .compare_and_put_actor(
+            actor_key.clone(),
+            None,
+            placement_actor_record(7, "world-1", 1, 1),
+        )
+        .await
+        .unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .placement_store::<InMemoryPlacementStore, _>(store.clone())
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+
+    let (_version, migrated) = store.get_actor(&actor_key).await.unwrap().unwrap();
+    assert_eq!(migrated.owner, InstanceId::new("world-2"));
+    assert_eq!(migrated.epoch, Epoch(2));
 }
 
 #[tokio::test]
