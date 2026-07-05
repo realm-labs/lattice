@@ -1,4 +1,5 @@
 use super::*;
+use crate::descriptor::messages_from_descriptor;
 use crate::descriptor::methods_from_descriptor;
 use crate::render::generate_rpc_bindings;
 use crate::route_key::{ProtoRouteKeyOption, RouteKeyType};
@@ -189,6 +190,33 @@ fn generated_output_matches_phase_two_shape() {
         generated
             .rust
             .contains("pub async fn dispatch(&self, frame: ClientFrame)")
+    );
+}
+
+#[test]
+fn descriptor_messages_generate_direct_link_message_metadata() {
+    let messages = messages_from_descriptor(&world_descriptor());
+    let generated = crate::render::generate_rpc_bindings_with_options(
+        &[world_enter_method()],
+        &messages,
+        crate::render::RenderOptions::default(),
+    )
+    .unwrap();
+
+    assert!(
+        generated
+            .rust
+            .contains("impl lattice_core::DirectLinkMessage for crate::world::EnterWorldRequest")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("const PROTO_FULL_NAME: &'static str = \"world.EnterWorldRequest\"")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("impl lattice_core::DirectLinkMessage for crate::world::EnterWorldReply")
     );
 }
 

@@ -253,11 +253,14 @@ Status: `[x]` complete.
 
 Status: `[ ]` not started.
 
-- [ ] Direct Link public API exists: `DirectLinkStream`, `DirectLinkMode::{Unidirectional, Bidirectional}`, `ActorContext::links()`, `connect`, `connect_bidirectional`, `get::<S>`, `close_all`, `tell`, `try_tell`, and directional `close`.
-- [ ] `lattice-codegen` emits `DirectLinkMessage` metadata for generated protobuf messages without requiring per-message proto options.
-- [ ] Typed stream binding validates at compile time that the target actor implements `Handler<Linked<T>>` for every message in the stream.
-- [ ] Direct-link message ids are generated deterministically from stream name plus protobuf full name, with explicit Rust-side manual id override for compatibility.
+- [x] Direct Link public API exists: `DirectLinkStream`, `DirectLinkMode::{Unidirectional, Bidirectional}`, `ActorContext::links()`, `connect`, `connect_bidirectional`, `get::<S>`, `close_all`, `tell`, `try_tell`, and directional `close`.
+- [x] `lattice-codegen` emits `DirectLinkMessage` metadata for generated protobuf messages without requiring per-message proto options.
+- [x] Typed stream binding validates at compile time that the target actor implements `Handler<Linked<T>>` for every message in the stream.
+- [x] Direct-link message ids are generated deterministically from stream name plus protobuf full name, with explicit Rust-side manual id override for compatibility.
 - [ ] `lattice-direct-link` crate exists with transport-independent frame codec, message catalog, stream binding, session manager, and metrics/tracing hooks.
+  - [x] Initial `lattice-direct-link` crate, stream message catalog, frame codec, handler-bound actor binding, session registry, and metrics scaffolding exist with focused tests.
+  - [ ] Concrete session manager drives OpenLink state, negotiated directions, send/receive sequencing, and close transitions instead of only storing sessions.
+  - [ ] Metrics/tracing hooks are emitted from concrete open/close/send/receive/drop/coalesce/backpressure/decode-error runtime paths.
 - [ ] TCP direct-link transport exists as the default implementation behind `DirectLinkTransport` / `DirectLinkConnection`.
 - [ ] Direct Link listener is managed by `LatticeService`, publishes direct-link endpoint metadata, and shuts down/drains with the service lifecycle.
 - [ ] OpenLink handshake validates service/actor identity, stream binding, accepted message ids, activation policy, owner epoch, auth, and backpressure policy before creating sessions.

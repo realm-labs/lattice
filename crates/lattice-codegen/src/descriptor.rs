@@ -7,7 +7,7 @@ use prost_types::{
 
 use crate::CodegenError;
 use crate::route_key::{ProtoRouteKeyOption, RouteKeyType};
-use crate::spec::RpcMethodSpec;
+use crate::spec::{ProtoMessageSpec, RpcMethodSpec};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedOptions {
@@ -164,6 +164,41 @@ pub fn methods_from_descriptor(
         }
     }
     Ok(methods)
+}
+
+pub fn messages_from_descriptor(descriptor: &FileDescriptorSet) -> Vec<ProtoMessageSpec> {
+    let mut messages = Vec::new();
+    for file in &descriptor.file {
+        let package = file.package.clone().unwrap_or_default();
+        for message in &file.message_type {
+            collect_message_specs(&mut messages, &package, Vec::new(), message);
+        }
+    }
+    messages
+}
+
+fn collect_message_specs(
+    messages: &mut Vec<ProtoMessageSpec>,
+    package: &str,
+    parents: Vec<String>,
+    message: &DescriptorProto,
+) {
+    let name = message.name.clone().unwrap_or_default();
+    let proto_full_name = if parents.is_empty() {
+        scoped_name(package, &name)
+    } else {
+        scoped_name(package, &format!("{}.{}", parents.join("."), name))
+    };
+    messages.push(ProtoMessageSpec {
+        proto_full_name: proto_full_name.clone(),
+        rust_type: rust_type_path(&proto_full_name),
+    });
+
+    let mut nested_parents = parents;
+    nested_parents.push(name);
+    for nested in &message.nested_type {
+        collect_message_specs(messages, package, nested_parents.clone(), nested);
+    }
 }
 
 fn find_message<'a>(

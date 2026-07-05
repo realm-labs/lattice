@@ -5,6 +5,7 @@ members = [
     "crates/lattice-config-etcd",
     "crates/lattice-core",
     "crates/lattice-codegen",
+    "crates/lattice-direct-link",
     "crates/lattice-gateway",
     "crates/lattice-eventbus",
     "crates/lattice-placement",
@@ -39,6 +40,7 @@ lattice-config-etcd = { path = "crates/lattice-config-etcd" }
 lattice-core = { path = "crates/lattice-core" }
 lattice-actor = { path = "crates/lattice-actor" }
 lattice-codegen = { path = "crates/lattice-codegen" }
+lattice-direct-link = { path = "crates/lattice-direct-link" }
 lattice-eventbus = { path = "crates/lattice-eventbus" }
 lattice-gateway = { path = "crates/lattice-gateway" }
 lattice-ops = { path = "crates/lattice-ops" }

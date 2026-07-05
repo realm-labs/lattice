@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
-use lattice_core::{ActorRef, ServiceContext};
+use lattice_core::{ActorRef, DirectLinkManager, ServiceContext};
 
 use crate::ActorError;
 use crate::handle::ActorHandle;
@@ -69,6 +69,10 @@ impl<A: Actor> ActorContext<A> {
 
     pub fn service(&self) -> &ServiceContext {
         &self.service
+    }
+
+    pub fn links(&self) -> DirectLinkManager {
+        DirectLinkManager::new(self.service.clone(), self.self_ref.clone())
     }
 
     pub fn require_self_ref(&self) -> Result<&ActorRef, ActorError> {

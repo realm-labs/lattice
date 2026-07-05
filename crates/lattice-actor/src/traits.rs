@@ -1,10 +1,40 @@
 use async_trait::async_trait;
+use lattice_core::{
+    LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened, LinkProtocolError, Linked,
+};
 use std::error::Error as StdError;
 
 use crate::{ActorContext, ActorStopError, MailboxConfig};
 
 pub trait Message: Send + 'static {
     type Reply: Send + 'static;
+}
+
+impl<T> Message for Linked<T>
+where
+    T: Send + 'static,
+{
+    type Reply = ();
+}
+
+impl Message for LinkOpened {
+    type Reply = ();
+}
+
+impl Message for LinkDirectionClosed {
+    type Reply = ();
+}
+
+impl Message for LinkClosed {
+    type Reply = ();
+}
+
+impl Message for LinkBackpressure {
+    type Reply = ();
+}
+
+impl Message for LinkProtocolError {
+    type Reply = ();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

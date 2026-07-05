@@ -1201,10 +1201,25 @@ dependencies = [
 name = "lattice-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "http",
  "lattice-config",
+ "prost",
  "serde",
  "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "lattice-direct-link"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "lattice-actor",
+ "lattice-core",
+ "prost",
+ "thiserror",
+ "tokio",
  "tracing",
 ]
 

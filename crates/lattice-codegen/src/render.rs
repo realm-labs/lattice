@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::CodegenError;
 use crate::route_key::{ProtoRouteKeyOption, RouteKeyType};
-use crate::spec::RpcMethodSpec;
+use crate::spec::{ProtoMessageSpec, RpcMethodSpec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedRpcBindings {
@@ -17,11 +17,12 @@ pub struct RenderOptions {
 pub fn generate_rpc_bindings(
     methods: &[RpcMethodSpec],
 ) -> Result<GeneratedRpcBindings, CodegenError> {
-    generate_rpc_bindings_with_options(methods, RenderOptions::default())
+    generate_rpc_bindings_with_options(methods, &[], RenderOptions::default())
 }
 
 pub fn generate_rpc_bindings_with_options(
     methods: &[RpcMethodSpec],
+    messages: &[ProtoMessageSpec],
     options: RenderOptions,
 ) -> Result<GeneratedRpcBindings, CodegenError> {
     validate_methods(methods)?;
@@ -47,6 +48,7 @@ pub fn generate_rpc_bindings_with_options(
     if options.actor_ref_proto {
         push_actor_ref_conversions(&mut rust);
     }
+    push_direct_link_messages(&mut rust, messages);
     for method in methods {
         push_routed_request(&mut rust, method);
         push_rpc_request(&mut rust, method);
@@ -59,6 +61,24 @@ pub fn generate_rpc_bindings_with_options(
     push_gateway_dispatcher(&mut rust, methods);
 
     Ok(GeneratedRpcBindings { rust })
+}
+
+fn push_direct_link_messages(rust: &mut String, messages: &[ProtoMessageSpec]) {
+    let mut emitted = BTreeSet::new();
+    for message in messages {
+        if !emitted.insert(message.rust_type.clone()) {
+            continue;
+        }
+        rust.push_str(&format!(
+            "impl lattice_core::DirectLinkMessage for {rust_type} {{\n",
+            rust_type = message.rust_type
+        ));
+        rust.push_str(&format!(
+            "    const PROTO_FULL_NAME: &'static str = \"{}\";\n",
+            message.proto_full_name
+        ));
+        rust.push_str("}\n\n");
+    }
 }
 
 fn push_actor_ref_conversions(rust: &mut String) {

@@ -12,6 +12,12 @@ pub struct RpcMethodSpec {
     pub gateway_msg_id: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtoMessageSpec {
+    pub proto_full_name: String,
+    pub rust_type: String,
+}
+
 impl RpcMethodSpec {
     pub(crate) fn method_path(&self) -> String {
         if self.package.is_empty() {
