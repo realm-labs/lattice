@@ -62,6 +62,10 @@ impl LatticeService {
         &self.service_context
     }
 
+    pub fn placement_watch_count(&self) -> usize {
+        self.placement_watch_tasks.len()
+    }
+
     pub async fn run_until_shutdown(self) -> Result<(), LatticeServiceError> {
         self.run_until_shutdown_signal(pending::<()>()).await
     }

@@ -696,6 +696,7 @@ async fn register_client_builds_default_placement_core_from_store() {
         std::mem::size_of_val(&client.core),
         std::mem::size_of::<FakePlacementCore>()
     );
+    assert_eq!(service.placement_watch_count(), 1);
 }
 
 #[tokio::test]

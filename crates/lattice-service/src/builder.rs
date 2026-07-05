@@ -358,6 +358,8 @@ impl LatticeServiceBuilder {
             .await?;
         }
         let rpc_client_count = self.client_bindings.len();
+        let mut placement_watch_tasks =
+            start_placement_watchers(placement_watchers, self.service_kind.as_str()).await?;
         for binding in self.client_bindings {
             let client_service_kind = binding.service_kind();
             debug!(
@@ -366,17 +368,21 @@ impl LatticeServiceBuilder {
                 rpc.client.core = binding.core_type(),
                 "registering rpc client binding"
             );
-            let default_resolver =
-                Some(placement_store.placement_route_resolver(client_service_kind));
+            let (default_resolver, watch_task) = placement_store
+                .placement_route_resolver(client_service_kind)
+                .await?;
+            placement_watch_tasks.push(watch_task);
             let context_factory = RpcClientContextFactory::new(
                 self.service_kind.clone(),
                 instance.instance_id.clone(),
             );
-            binding.register(&mut service_context, default_resolver, context_factory)?;
+            binding.register(
+                &mut service_context,
+                Some(default_resolver),
+                context_factory,
+            )?;
         }
         let service_context = service_context.build();
-        let placement_watch_tasks =
-            start_placement_watchers(placement_watchers, self.service_kind.as_str()).await?;
 
         info!(
             service.kind = self.service_kind.as_str(),

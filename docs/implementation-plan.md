@@ -180,7 +180,7 @@ Status: `[ ]` incomplete and currently the highest-priority gap.
 - [x] Store-backed `PlacementRouteResolver` is missing: cache miss should read placement, call Coordinator activation if absent, and cache the target.
 - [x] Explicit actor activation is not wired into generated clients or `LatticeService`.
 - [x] `register_client` does not build a resolver/core from the configured placement store.
-- [ ] Placement watch is not wired into route cache invalidation in running services.
+- [x] Placement watch is not wired into route cache invalidation in running services.
 - [ ] Deployment still requires examples to hand-build static resolvers for real RPC calls.
 
 #### Phase 6: Cluster Singleton
