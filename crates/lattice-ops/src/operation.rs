@@ -23,6 +23,7 @@ impl OperationId {
 pub enum OperationStatus {
     Pending,
     Retrying { attempts: u32 },
+    UnknownResult { reason: String },
     Completed,
     CompensationRequired { reason: String },
     ManualRequired { reason: String },
@@ -64,6 +65,20 @@ impl OperationTracker {
     ) -> Result<(), OpsError> {
         self.update(operation_id, OperationStatus::Retrying { attempts })
             .await
+    }
+
+    pub async fn mark_unknown_result(
+        &self,
+        operation_id: &OperationId,
+        reason: impl Into<String>,
+    ) -> Result<(), OpsError> {
+        self.update(
+            operation_id,
+            OperationStatus::UnknownResult {
+                reason: reason.into(),
+            },
+        )
+        .await
     }
 
     pub async fn mark_compensation_required(

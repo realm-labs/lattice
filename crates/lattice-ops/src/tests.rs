@@ -439,6 +439,36 @@ async fn operation_tracker_models_retry_compensation_and_manual_repair() {
 }
 
 #[tokio::test]
+async fn operation_tracker_models_lost_response_unknown_result_reconciliation() {
+    let tracker = OperationTracker::default();
+    let operation_id = OperationId::new("trade-lost-response");
+
+    tracker.start(operation_id.clone()).await.unwrap();
+    tracker
+        .mark_unknown_result(&operation_id, "target applied but response was lost")
+        .await
+        .unwrap();
+    assert_eq!(
+        tracker.get(&operation_id).await.unwrap().status,
+        OperationStatus::UnknownResult {
+            reason: "target applied but response was lost".to_string(),
+        }
+    );
+
+    let duplicate = tracker.start(operation_id.clone()).await;
+    assert!(matches!(
+        duplicate,
+        Err(OpsError::DuplicateOperation { .. })
+    ));
+
+    tracker.complete(&operation_id).await.unwrap();
+    assert_eq!(
+        tracker.get(&operation_id).await.unwrap().status,
+        OperationStatus::Completed
+    );
+}
+
+#[tokio::test]
 async fn transactional_outbox_tracks_unpublished_events_idempotently() {
     let outbox = TransactionalOutbox::default();
     let event_id = OutboxEventId::new("event-1");
