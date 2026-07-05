@@ -284,7 +284,8 @@ Status: `[ ]` in progress.
   - [x] Whole-link close transitions and router delivery preserve structured reasons for heartbeat timeout, protocol error, node draining, target passivation, target migration, connection loss, and backpressure disconnect.
   - [x] Backpressure disconnect closes the affected link direction and emits `LinkDirectionClosed` / `LinkClosed` with `BackpressureExceeded`.
   - [x] Heartbeat / heartbeat-ack frame processing refreshes liveness, and idle-timeout scans close stale links with `HeartbeatTimeout`.
-  - [ ] Managed TCP heartbeat send and idle-timeout background tasks drive heartbeat frames and liveness scans during service runtime.
+  - [x] Managed TCP idle-timeout background task drives liveness scans during service runtime.
+  - [ ] Managed TCP heartbeat send task writes heartbeat frames on open direct-link connections.
   - [ ] Protocol-error frame handling and invalid post-open frames close links with `ProtocolError`.
   - [ ] Service node-drain, actor passivation, and actor migration hooks close affected links with `NodeDraining`, `TargetPassivated`, or `TargetMigrating`.
 - [ ] Security hooks cover internal bind policy, peer identity/auth, source service/actor authorization, max frame size, connection limit, link limit, and rate limit.

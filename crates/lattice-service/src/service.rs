@@ -2,7 +2,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use lattice_core::instance::InstanceCapacity;
@@ -556,6 +556,7 @@ async fn start_direct_link_listener(
                 slot: "direct_links".to_string(),
                 message,
             })?;
+    let maintenance_interval = config.maintenance_interval_config();
     let transport = TcpDirectLinkTransport::new();
     let listener = transport.bind(listen_config).await.map_err(|error| {
         LatticeServiceError::ComponentBuild {
@@ -567,11 +568,19 @@ async fn start_direct_link_listener(
     let inbound_router = runtime.map(|runtime| runtime.inbound_router());
     let (shutdown, mut shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
+        let mut maintenance = tokio::time::interval(maintenance_interval);
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
                     debug!("direct-link listener shutting down");
                     return Ok(());
+                }
+                _ = maintenance.tick(), if inbound_router.is_some() => {
+                    if let Some(inbound_router) = &inbound_router
+                        && let Err(error) = inbound_router.close_idle_links_at(Instant::now())
+                    {
+                        warn!(%error, "direct-link idle maintenance failed");
+                    }
                 }
                 accepted = listener.accept() => {
                     match accepted {

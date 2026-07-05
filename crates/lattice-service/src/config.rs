@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use lattice_core::{DirectLinkEndpoint, InstanceId};
 use lattice_direct_link::DirectLinkListenConfig;
 
@@ -25,6 +27,7 @@ impl InstanceConfig {
 pub struct DirectLinkConfig {
     bind_endpoint: String,
     max_frame_size: usize,
+    maintenance_interval: Duration,
 }
 
 impl DirectLinkConfig {
@@ -32,6 +35,7 @@ impl DirectLinkConfig {
         Self {
             bind_endpoint: bind_endpoint.into(),
             max_frame_size: 256 * 1024,
+            maintenance_interval: Duration::from_secs(1),
         }
     }
 
@@ -40,6 +44,17 @@ impl DirectLinkConfig {
             self.max_frame_size = max_frame_size;
         }
         self
+    }
+
+    pub fn maintenance_interval(mut self, interval: Duration) -> Self {
+        if !interval.is_zero() {
+            self.maintenance_interval = interval;
+        }
+        self
+    }
+
+    pub(crate) fn maintenance_interval_config(&self) -> Duration {
+        self.maintenance_interval
     }
 
     pub(crate) fn listen_config(&self) -> Result<DirectLinkListenConfig, String> {
