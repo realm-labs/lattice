@@ -256,35 +256,117 @@ async fn temporary_etcd_outage_during_activation_is_retryable_without_partial_ow
     assert_eq!(retry.epoch, Epoch(1));
 }
 
+#[tokio::test]
+async fn partial_placement_write_failure_can_be_retried_to_complete_failover() {
+    let client = FlakyEtcdClient::new(InMemoryEtcdClient::new());
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/chaos-partial-write"),
+        client.clone(),
+    );
+    store
+        .upsert_instance(instance_record("world-a", InstanceState::Ready))
+        .await
+        .unwrap();
+    store
+        .upsert_instance(instance_record("world-b", InstanceState::Ready))
+        .await
+        .unwrap();
+    let first_key = ActorPlacementKey {
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(7),
+    };
+    let second_key = ActorPlacementKey {
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(8),
+    };
+    store
+        .compare_and_put_actor(
+            first_key.clone(),
+            None,
+            actor_record(7, "world-a", 1, LeaseId(9)),
+        )
+        .await
+        .unwrap();
+    store
+        .compare_and_put_actor(
+            second_key.clone(),
+            None,
+            actor_record(8, "world-a", 1, LeaseId(10)),
+        )
+        .await
+        .unwrap();
+    client.fail_on_future_compare_and_put(2);
+    let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+
+    let failed = coordinator
+        .failover_expired_instance(service_kind!("World"), InstanceId::new("world-a"))
+        .await;
+    let first_after_failure = store.get_actor(&first_key).await.unwrap().unwrap().1;
+    let second_after_failure = store.get_actor(&second_key).await.unwrap().unwrap().1;
+    let retry = coordinator
+        .failover_expired_instance(service_kind!("World"), InstanceId::new("world-a"))
+        .await
+        .unwrap();
+    let first_after_retry = store.get_actor(&first_key).await.unwrap().unwrap().1;
+    let second_after_retry = store.get_actor(&second_key).await.unwrap().unwrap().1;
+
+    assert!(matches!(failed, Err(PlacementError::Etcd { .. })));
+    let owners_after_failure = [
+        first_after_failure.owner.clone(),
+        second_after_failure.owner.clone(),
+    ];
+    assert_eq!(
+        owners_after_failure
+            .iter()
+            .filter(|owner| **owner == InstanceId::new("world-b"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        owners_after_failure
+            .iter()
+            .filter(|owner| **owner == InstanceId::new("world-a"))
+            .count(),
+        1
+    );
+    assert_eq!(retry.reassigned_actors, 1);
+    assert_eq!(first_after_retry.owner, InstanceId::new("world-b"));
+    assert_eq!(first_after_retry.epoch, Epoch(2));
+    assert_eq!(second_after_retry.owner, InstanceId::new("world-b"));
+    assert_eq!(second_after_retry.epoch, Epoch(2));
+}
+
 #[derive(Debug, Clone)]
 struct FlakyEtcdClient {
     inner: InMemoryEtcdClient,
-    fail_compare_and_puts: Arc<AtomicUsize>,
+    compare_and_put_calls: Arc<AtomicUsize>,
+    fail_on_compare_and_put_call: Arc<AtomicUsize>,
 }
 
 impl FlakyEtcdClient {
     fn new(inner: InMemoryEtcdClient) -> Self {
         Self {
             inner,
-            fail_compare_and_puts: Arc::new(AtomicUsize::new(0)),
+            compare_and_put_calls: Arc::new(AtomicUsize::new(0)),
+            fail_on_compare_and_put_call: Arc::new(AtomicUsize::new(usize::MAX)),
         }
     }
 
     fn fail_next_compare_and_put(&self) {
-        self.fail_compare_and_puts.store(1, Ordering::SeqCst);
+        self.fail_on_future_compare_and_put(1);
+    }
+
+    fn fail_on_future_compare_and_put(&self, future_call: usize) {
+        let current = self.compare_and_put_calls.load(Ordering::SeqCst);
+        self.fail_on_compare_and_put_call
+            .store(current + future_call, Ordering::SeqCst);
     }
 
     fn check_compare_and_put(&self) -> Result<(), PlacementError> {
-        if self.fail_compare_and_puts.load(Ordering::SeqCst) == 0 {
-            return Ok(());
-        }
-        if self
-            .fail_compare_and_puts
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
+        let call = self.compare_and_put_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_on_compare_and_put_call.load(Ordering::SeqCst) == call {
+            self.fail_on_compare_and_put_call
+                .store(usize::MAX, Ordering::SeqCst);
             return Err(PlacementError::Etcd {
                 message: "temporary etcd outage".to_string(),
             });

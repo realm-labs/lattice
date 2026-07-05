@@ -226,7 +226,7 @@ Status: `[ ]` incomplete.
   - [x] Timeout followed by retry/reconciliation is covered.
   - [x] Coordinator leader switch is covered.
   - [x] Temporary etcd outage is covered.
-  - [ ] Partial placement write failure is covered.
+  - [x] Partial placement write failure is covered.
   - [ ] New request arriving while an actor is passivating is covered.
   - [ ] Singleton failover while a long business job is running is covered.
   - [ ] Rolling update with mixed versions is covered.
