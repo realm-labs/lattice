@@ -8,6 +8,7 @@ use lattice_config::{BootstrapConfig, ConfigSource};
 use lattice_config::{ConfigStore, LocalConfigStore};
 use lattice_core::{ActorKind, InstanceId, ServiceContext, ServiceKind};
 use lattice_eventbus::{EventBus, LocalEventBus};
+use lattice_placement::coordinator::{PlacementWatchStarter, PlacementWatchTask};
 use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix, PlacementStore};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -23,6 +24,7 @@ use crate::component::{
 use crate::config::InstanceConfig;
 use crate::context::ServiceBuildContext;
 use crate::rpc::{ErasedRpcClientBinding, RpcClientRegistration};
+use crate::service::LatticeServiceParts;
 use crate::{LatticeService, LatticeServiceError, RpcClientBinding, RpcServiceBinding};
 
 pub struct LatticeServiceBuilder {
@@ -38,6 +40,7 @@ pub struct LatticeServiceBuilder {
     cluster_event_bus: Option<Box<dyn ErasedServiceComponent>>,
     local_event_bus: Option<Box<dyn ErasedServiceComponent>>,
     config_store: Option<Box<dyn ErasedServiceComponent>>,
+    placement_watchers: Vec<Box<dyn ErasedPlacementWatchStarter>>,
     duplicate_framework_component: Option<&'static str>,
     duplicate_extension: Option<&'static str>,
     extensions: HashMap<TypeId, Box<dyn ErasedServiceComponent>>,
@@ -62,6 +65,7 @@ impl fmt::Debug for LatticeServiceBuilder {
             .field("has_cluster_event_bus", &self.cluster_event_bus.is_some())
             .field("has_local_event_bus", &self.local_event_bus.is_some())
             .field("has_config_store", &self.config_store.is_some())
+            .field("placement_watch_count", &self.placement_watchers.len())
             .field("extension_count", &self.extensions.len())
             .finish()
     }
@@ -82,6 +86,7 @@ impl LatticeServiceBuilder {
             cluster_event_bus: None,
             local_event_bus: None,
             config_store: None,
+            placement_watchers: Vec::new(),
             duplicate_framework_component: None,
             duplicate_extension: None,
             extensions: HashMap::new(),
@@ -226,6 +231,15 @@ impl LatticeServiceBuilder {
         self
     }
 
+    pub fn placement_watch<W>(mut self, watcher: W) -> Self
+    where
+        W: PlacementWatchStarter,
+    {
+        self.placement_watchers
+            .push(Box::new(PlacementWatchRegistration { watcher }));
+        self
+    }
+
     pub async fn build(self) -> Result<LatticeService, LatticeServiceError> {
         let listener = self.listener.ok_or(LatticeServiceError::MissingListener)?;
         let instance = self
@@ -254,6 +268,7 @@ impl LatticeServiceBuilder {
         }
         let mut service_context =
             ServiceContext::builder(self.service_kind.clone(), instance.instance_id.clone());
+        let placement_watchers = self.placement_watchers;
         let placement_store = build_placement_store_or_default(
             self.placement_store,
             Box::new(PlacementStoreRegistration::<InMemoryPlacementStore>::new(
@@ -337,6 +352,8 @@ impl LatticeServiceBuilder {
             binding.register(&mut service_context)?;
         }
         let service_context = service_context.build();
+        let placement_watch_tasks =
+            start_placement_watchers(placement_watchers, self.service_kind.as_str()).await?;
 
         info!(
             service.kind = self.service_kind.as_str(),
@@ -344,6 +361,7 @@ impl LatticeServiceBuilder {
             actor.registrations = self.actor_registrations.len(),
             rpc.services = self.rpc_services.len(),
             rpc.clients = rpc_client_count,
+            placement.watches = placement_watch_tasks.len(),
             service.extensions = service_context.extension_count(),
             "building lattice service"
         );
@@ -380,16 +398,60 @@ impl LatticeServiceBuilder {
         }
 
         let router = context.router.ok_or(LatticeServiceError::NoRpcServices)?;
-        Ok(LatticeService::new(
-            self.service_kind,
+        Ok(LatticeService::new(LatticeServiceParts {
+            service_kind: self.service_kind,
             instance,
             listener,
             router,
             service_context,
             placement_store,
-            self.ready,
-        ))
+            placement_watch_tasks,
+            ready: self.ready,
+        }))
     }
+}
+
+#[async_trait::async_trait]
+trait ErasedPlacementWatchStarter: Send + Sync {
+    fn type_name(&self) -> &'static str;
+    async fn start(self: Box<Self>) -> Result<PlacementWatchTask, LatticeServiceError>;
+}
+
+struct PlacementWatchRegistration<W> {
+    watcher: W,
+}
+
+#[async_trait::async_trait]
+impl<W> ErasedPlacementWatchStarter for PlacementWatchRegistration<W>
+where
+    W: PlacementWatchStarter,
+{
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<W>()
+    }
+
+    async fn start(self: Box<Self>) -> Result<PlacementWatchTask, LatticeServiceError> {
+        self.watcher
+            .start_placement_watch()
+            .await
+            .map_err(Into::into)
+    }
+}
+
+async fn start_placement_watchers(
+    watchers: Vec<Box<dyn ErasedPlacementWatchStarter>>,
+    service_kind: &str,
+) -> Result<Vec<PlacementWatchTask>, LatticeServiceError> {
+    let mut tasks = Vec::with_capacity(watchers.len());
+    for watcher in watchers {
+        debug!(
+            service.kind = service_kind,
+            placement.watch.type = watcher.type_name(),
+            "starting placement cache watch"
+        );
+        tasks.push(watcher.start().await?);
+    }
+    Ok(tasks)
 }
 
 async fn build_placement_store_or_default(

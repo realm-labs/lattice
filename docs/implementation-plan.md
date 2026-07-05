@@ -154,7 +154,7 @@ Status: `[ ]` incomplete.
 - [x] Concurrent local lazy activation starts one actor and shares waiters.
 - [x] Loader/factory failure wakes waiters and remains retryable.
 - [x] Virtual shard ownership is not yet persisted through a production `PlacementStore` keyspace.
-- [ ] `LatticeService` does not yet start a placement watch to refresh local shard/owner caches.
+- [x] `LatticeService` does not yet start a placement watch to refresh local shard/owner caches.
 - [ ] Scale-out does not yet make new service instances automatically participate in shard assignment.
 - [ ] Scale-in does not yet drain/rebalance shard ownership before termination.
 - [ ] Running actor migration/passivation policy is not yet connected to shard rebalance decisions.

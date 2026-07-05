@@ -385,6 +385,22 @@ where
     }
 }
 
+#[async_trait]
+pub trait PlacementWatchStarter: Clone + Send + Sync + 'static {
+    async fn start_placement_watch(&self) -> Result<PlacementWatchTask, PlacementError>;
+}
+
+#[async_trait]
+impl<S, L> PlacementWatchStarter for ExplicitRouteResolver<S, L>
+where
+    S: PlacementStore,
+    L: Clone + Send + Sync + 'static,
+{
+    async fn start_placement_watch(&self) -> Result<PlacementWatchTask, PlacementError> {
+        self.watch_cache_updates().await
+    }
+}
+
 #[derive(Debug)]
 pub struct PlacementWatchTask {
     handle: tokio::task::JoinHandle<()>,
@@ -392,6 +408,12 @@ pub struct PlacementWatchTask {
 
 impl PlacementWatchTask {
     pub fn cancel(&self) {
+        self.handle.abort();
+    }
+}
+
+impl Drop for PlacementWatchTask {
+    fn drop(&mut self) {
         self.handle.abort();
     }
 }

@@ -9,8 +9,20 @@ use http::{Request, Response};
 use lattice_actor::registry::ActorCreateContext;
 use lattice_actor::{Actor, ActorContext, ActorError, ActorFactory, Handler, Message};
 use lattice_config::{ConfigFormat, ConfigSource};
-use lattice_core::{ActorId, ActorKind, ConfiguredComponent, InstanceId, actor_kind, service_kind};
+use lattice_core::{
+    ActorId, ActorKind, ConfiguredComponent, Epoch, InstanceId, RouteKey, actor_kind, service_kind,
+};
 use lattice_eventbus::LocalEventBus;
+use lattice_placement::cache::RouteCacheConfig;
+use lattice_placement::coordinator::{
+    ExplicitRouteResolver, NoopLogicControl, PlacementCoordinator,
+};
+use lattice_placement::instance::{InstanceRecord, InstanceState};
+use lattice_placement::store::{
+    ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
+    PlacementState, PlacementStore,
+};
+use lattice_placement::{ResolveRequest, RouteResolver};
 use lattice_rpc::{RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 use tokio::net::TcpListener;
 use tonic::body::Body;
@@ -561,4 +573,111 @@ async fn service_context_reaches_actor_factory_and_handler() {
         *observed_instance.lock().await,
         Some(InstanceId::new("world-ctx"))
     );
+}
+
+#[tokio::test]
+async fn service_build_starts_registered_placement_watch_for_route_cache_refresh() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/watch"));
+    store
+        .upsert_instance(placement_instance("world-a"))
+        .await
+        .unwrap();
+    store
+        .upsert_instance(placement_instance("world-b"))
+        .await
+        .unwrap();
+    let key = placement_actor_key(7);
+    let first_record = placement_actor_record(7, "world-a", 1, 1);
+    let version = store
+        .compare_and_put_actor(key.clone(), None, first_record)
+        .await
+        .unwrap();
+    let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+    let resolver = ExplicitRouteResolver::new(
+        service_kind!("World"),
+        store.clone(),
+        coordinator,
+        RouteCacheConfig::default(),
+    );
+    let request = ResolveRequest {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        route_key: RouteKey::U64(7),
+    };
+    let cached = resolver.resolve(request.clone()).await.unwrap();
+    assert_eq!(cached.instance_id, InstanceId::new("world-a"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _service = LatticeService::builder(service_kind!("Player"))
+        .instance_id(InstanceId::new("player-1"))
+        .listen(listener)
+        .placement_watch(resolver.clone())
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    store
+        .compare_and_put_actor(
+            key,
+            Some(version),
+            placement_actor_record(7, "world-b", 2, 2),
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        let refreshed = resolver.resolve(request.clone()).await.unwrap();
+        if refreshed.instance_id == InstanceId::new("world-b") {
+            assert_eq!(refreshed.owner_epoch, Some(Epoch(2)));
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    panic!("service-owned placement watch did not refresh route cache");
+}
+
+fn placement_instance(instance_id: &str) -> InstanceRecord {
+    InstanceRecord {
+        service_kind: service_kind!("World"),
+        instance_id: InstanceId::new(instance_id),
+        advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
+        control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),
+        version: "test".to_string(),
+        state: InstanceState::Ready,
+        capacity: Default::default(),
+        labels: Default::default(),
+    }
+}
+
+fn placement_actor_key(actor_id: u64) -> ActorPlacementKey {
+    ActorPlacementKey {
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(actor_id),
+    }
+}
+
+fn placement_actor_record(
+    actor_id: u64,
+    owner: &str,
+    epoch: u64,
+    lease_id: u64,
+) -> ActorPlacementRecord {
+    ActorPlacementRecord {
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(actor_id),
+        owner: InstanceId::new(owner),
+        epoch: Epoch(epoch),
+        lease_id: LeaseId(lease_id),
+        state: PlacementState::Running,
+    }
 }

@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use lattice_core::instance::InstanceCapacity;
 use lattice_core::{ServiceContext, ServiceKind};
+use lattice_placement::coordinator::PlacementWatchTask;
 use lattice_placement::instance::{InstanceRecord, InstanceState};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -22,6 +23,7 @@ pub struct LatticeService {
     router: Router,
     service_context: ServiceContext,
     placement_store: Box<dyn ErasedPlacementStore>,
+    placement_watch_tasks: Vec<PlacementWatchTask>,
     ready: Option<oneshot::Sender<SocketAddr>>,
 }
 
@@ -30,23 +32,16 @@ impl LatticeService {
         LatticeServiceBuilder::new(service_kind)
     }
 
-    pub(crate) fn new(
-        service_kind: ServiceKind,
-        instance: InstanceConfig,
-        listener: TcpListener,
-        router: Router,
-        service_context: ServiceContext,
-        placement_store: Box<dyn ErasedPlacementStore>,
-        ready: Option<oneshot::Sender<SocketAddr>>,
-    ) -> Self {
+    pub(crate) fn new(parts: LatticeServiceParts) -> Self {
         Self {
-            service_kind,
-            instance,
-            listener,
-            router,
-            service_context,
-            placement_store,
-            ready,
+            service_kind: parts.service_kind,
+            instance: parts.instance,
+            listener: parts.listener,
+            router: parts.router,
+            service_context: parts.service_context,
+            placement_store: parts.placement_store,
+            placement_watch_tasks: parts.placement_watch_tasks,
+            ready: parts.ready,
         }
     }
 
@@ -73,6 +68,7 @@ impl LatticeService {
         info!(
             service.kind = self.service_kind.as_str(),
             instance.id = self.instance.instance_id.as_str(),
+            placement.watches = self.placement_watch_tasks.len(),
             %local_addr,
             "lattice service listening"
         );
@@ -125,6 +121,17 @@ impl LatticeService {
         self.placement_store.upsert_instance(record).await?;
         Ok(())
     }
+}
+
+pub(crate) struct LatticeServiceParts {
+    pub service_kind: ServiceKind,
+    pub instance: InstanceConfig,
+    pub listener: TcpListener,
+    pub router: Router,
+    pub service_context: ServiceContext,
+    pub placement_store: Box<dyn ErasedPlacementStore>,
+    pub placement_watch_tasks: Vec<PlacementWatchTask>,
+    pub ready: Option<oneshot::Sender<SocketAddr>>,
 }
 
 fn socket_addr_to_uri(addr: SocketAddr) -> http::Uri {
