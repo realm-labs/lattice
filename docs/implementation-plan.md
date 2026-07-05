@@ -111,7 +111,7 @@ Status: `[x]` complete.
 
 #### Phase 2: Typed RPC + Codegen MVP
 
-Status: `[x]` complete.
+Status: `[ ]` incomplete.
 
 - [x] `lattice_codegen::configure()` build script API exists.
 - [x] `proto/lattice/options.proto` exists with service and method options.
@@ -123,8 +123,8 @@ Status: `[x]` complete.
 - [x] gRPC metadata carries framework RPC context instead of business request fields.
 - [x] Codegen rejects missing service/actor/route metadata, unsupported route key types, optional/repeated route keys, and duplicate gateway ids.
 - [x] Multiple generated gRPC services can be registered on one endpoint.
-- [x] `LatticeService::register_client::<Binding>()` must construct and expose generated typed clients through service/actor context instead of only recording the service kind.
-- [x] `examples/minimal-world` should use the final generated client access path, not ad hoc client/core construction.
+- [x] `LatticeService::register_client::<Binding>()` constructs and exposes generated typed clients through service/actor context.
+- [ ] `examples/minimal-world` should use the final generated client access path, not ad hoc client/core construction.
 - [x] Generated transport should avoid unnecessary encode/decode when the concrete request type is already known, or document why that cost is acceptable.
   - Documented tradeoff: the generated endpoint transport currently crosses the object-safe `EndpointRpcTransport::unary<Req>` boundary and dispatches by `Req::METHOD`, so it re-encodes the generic request into the concrete generated tonic request and decodes the concrete reply back into `Req::Reply`. This keeps one generated transport usable by `ResolvingRpcCore`, gateway dispatch, and fake transports while Phase 5 placement-backed client construction is still pending. The extra encode/decode happens only on the client transport boundary, after gateway payload decode and before tonic encode, and is acceptable for the Phase 2 MVP. A later specialized typed transport can remove it without changing business handlers or generated client APIs.
 
@@ -143,7 +143,7 @@ Status: `[x]` complete for static placement.
 
 #### Phase 4: Virtual Shard + Lazy Activation
 
-Status: `[x]` complete.
+Status: `[ ]` incomplete.
 
 - [x] Virtual shard id mapping exists.
 - [x] Virtual shard assignment model exists.
@@ -153,15 +153,15 @@ Status: `[x]` complete.
 - [x] Registry-backed lazy actor activation exists.
 - [x] Concurrent local lazy activation starts one actor and shares waiters.
 - [x] Loader/factory failure wakes waiters and remains retryable.
-- [x] Virtual shard ownership is not yet persisted through a production `PlacementStore` keyspace.
-- [x] `LatticeService` does not yet start a placement watch to refresh local shard/owner caches.
-- [x] Scale-out does not yet make new service instances automatically participate in shard assignment.
-- [x] Scale-in does not yet drain/rebalance shard ownership before termination.
-- [x] Running actor migration/passivation policy is not yet connected to shard rebalance decisions.
+- [x] Virtual shard ownership is persisted through the `PlacementStore` keyspace, including the etcd adapter.
+- [x] `LatticeService` can start placement watches for service-owned route caches.
+- [ ] Scale-out does not yet make new service instances automatically participate in shard assignment.
+- [x] Scale-in service shutdown drains placement ownership and migrates owned actors/virtual shards when a replacement instance exists.
+- [ ] Running actor migration/passivation policy is not yet connected to shard rebalance decisions.
 
 #### Phase 5: Explicit Placement + Coordinator
 
-Status: `[x]` complete.
+Status: `[ ]` incomplete.
 
 - [x] `PlacementStore` trait exists.
 - [x] In-memory placement store exists.
@@ -170,34 +170,37 @@ Status: `[x]` complete.
 - [x] Actor placement records include owner, epoch, lease id, and state.
 - [x] `PlacementCoordinator` library type can activate/move/drain/fail over actors in tests.
 - [x] `LatticeService` writes an `InstanceRecord` at startup.
-- [x] `InstanceRecord` does not yet include a real liveness lease/keepalive contract.
-- [x] `LatticeService` does not write `Starting -> Ready -> Draining -> Stopping` state transitions as a lifecycle.
-- [x] `LatticeService` does not keep an instance lease alive or remove/expire records on crash.
-- [x] etcd instance registration is ordinary KV, not lease-backed liveness.
-- [x] `LogicControl` is only a Rust trait; no tonic control-plane RPC service is exposed by logic services.
-- [x] Coordinator is only an in-process library type; there is no runnable coordinator service/binary.
-- [x] Coordinator leader election is not implemented.
-- [x] Store-backed `PlacementRouteResolver` is missing: cache miss should read placement, call Coordinator activation if absent, and cache the target.
-- [x] Explicit actor activation is not wired into generated clients or `LatticeService`.
-- [x] `register_client` does not build a resolver/core from the configured placement store.
-- [x] Placement watch is not wired into route cache invalidation in running services.
-- [x] Deployment still requires examples to hand-build static resolvers for real RPC calls.
+- [x] `InstanceRecord` includes a liveness lease/keepalive contract.
+- [x] `LatticeService` writes `Starting -> Ready -> Draining -> Stopping` state transitions as a lifecycle.
+- [x] `LatticeService` keeps an instance lease alive while running.
+- [x] etcd instance registration is lease-backed.
+- [x] Logic services expose a tonic `LogicControl` endpoint for activation.
+- [x] A runnable `lattice-coordinator` binary exists.
+- [x] Coordinator leader election exists through `PlacementStore::campaign_coordinator_leader`.
+- [x] Store-backed `PlacementRouteResolver` resolves cache misses through placement and coordinator activation.
+- [x] Explicit actor activation is wired into generated clients through placement-backed client cores.
+- [x] `register_client` builds resolver/core from the configured placement store by default.
+- [x] Placement watch is wired into route cache invalidation in running services.
+- [ ] Crash handling still needs a full lease-expiry reconciliation loop that observes expired instances and invokes coordinator failover automatically.
+- [ ] The runnable coordinator currently exits when leadership is held; it does not yet wait/re-campaign as a long-running standby.
+- [ ] Examples still include static-resolver/demo-specific paths and should be moved to placement-backed defaults where appropriate.
 
 #### Phase 6: Cluster Singleton
 
-Status: `[x]` complete.
+Status: `[ ]` incomplete.
 
 - [x] In-memory singleton placement model and activation race tests exist.
 - [x] Singleton owner record has owner, epoch, lease id, and state in the current model.
-- [x] Singleton ownership is not stored through the production `PlacementStore`/etcd keyspace.
-- [x] `ActivateSingleton` control-plane API is not implemented as a service endpoint.
-- [x] Generated singleton client/adapter is missing.
-- [x] Singleton owner lease/keepalive/failover is not connected to service lifecycle.
-- [x] Old singleton owner fencing is not enforced in the runtime path.
+- [x] Singleton ownership is stored through the `PlacementStore`/etcd keyspace.
+- [x] `ActivateSingleton` control-plane API is implemented as a service endpoint.
+- [ ] Generated singleton client/adapter is missing.
+- [x] Singleton owner lease/keepalive is connected to service lifecycle for owners held by the running instance.
+- [ ] Automatic singleton failover after owner crash still needs lease-expiry reconciliation.
+- [ ] Old singleton owner fencing is not enforced in the runtime path.
 
 #### Phase 7: Ops Production Features
 
-Status: `[x]` complete.
+Status: `[ ]` incomplete.
 
 - [x] Local passivation, supervision, scoped task cleanup, and stop-failed behavior exist.
 - [x] Admin/ops helper modules and inspector models exist.
@@ -209,29 +212,30 @@ Status: `[x]` complete.
 - [x] Actor scheduler and service scheduler exist as non-durable lifecycle-bound schedulers.
 - [x] Direct/routed `ActorRef` messaging exists.
 - [x] Cross-node remote watch model exists in framework code/tests.
-- [x] `subscribe_actor` is not yet the final typed API from `ctx.service().cluster_events()/local_events()` to actor handlers; it still requires manual event-to-RPC mapping.
-- [x] Event subscriptions are not yet owned and cancelled by `LatticeService` shutdown/drain.
-- [x] Service scheduler is not yet exposed through `ServiceContext`.
-- [x] Admin HTTP is not wired into `LatticeService` startup as a managed listener.
-- [x] Node graceful shutdown is not wired into `LatticeService::run_until_shutdown`.
-- [x] Drain/migration are not connected to runtime actor registries, placement leases, or RPC readiness.
-  - [x] `LatticeService` shutdown does not drain runtime actor registries with `PassivationReason::Drain`.
-  - [x] Service drain does not yet invoke coordinator-driven placement migration for owned actors before releasing readiness.
-- [x] Gateway startup is still mostly example-specific and not represented as a framework service API.
-- [x] Cluster/node inspection does not query live services through LogicControl/Admin APIs.
-- [x] Security/mTLS integration is partial and not connected to service builders by default.
-- [x] Full chaos test suite is not implemented.
+- [x] `ctx.service().cluster_event_bus()/local_event_bus()` and `cluster_events()/local_events()` accessors exist.
+- [ ] `subscribe_actor` still needs final typed owner-routed actor delivery semantics beyond the current bridge.
+- [x] Event subscriptions owned by service event buses are cancelled by `LatticeService` shutdown/drain.
+- [x] Service scheduler is exposed through `ServiceContext`.
+- [x] Admin HTTP is wired into `LatticeService` startup as a managed listener.
+- [x] Node graceful shutdown is wired into `LatticeService::run_until_shutdown`.
+- [x] `LatticeService` shutdown drains runtime actor registries with `PassivationReason::Drain`.
+- [x] Service drain invokes coordinator-driven placement migration for owned actors before final stop.
+- [ ] RPC readiness/drain behavior for new requests during shutdown still needs a clear framework path.
+- [ ] Gateway startup is still mostly example-specific and not represented as a framework service API.
+- [ ] Cluster/node inspection does not query live services through LogicControl/Admin APIs.
+- [ ] Security/mTLS integration is partial and not connected to service builders by default.
+- [ ] Full chaos test suite is not implemented.
   - [x] Stale owner recovers after lease expiry and is fenced; route cache invalidates and retries with the same request id.
-  - [x] Target service succeeds but response is lost/unknown-result handling is covered.
-  - [x] Timeout followed by retry/reconciliation is covered.
+  - [ ] Target service succeeds but response is lost/unknown-result handling is covered.
+  - [ ] Timeout followed by retry/reconciliation is covered.
   - [x] Coordinator leader switch is covered.
   - [x] Temporary etcd outage is covered.
   - [x] Partial placement write failure is covered.
-  - [x] New request arriving while an actor is passivating is covered.
+  - [ ] New request arriving while an actor is passivating is covered.
   - [x] Singleton failover while a long business job is running is covered.
   - [x] Rolling update with mixed versions is covered.
-- [x] EventBus subscriber duplicate delivery is covered.
-- [x] `crates/lattice-actor/src/tests.rs` exceeds 1200 LOC and needs a documented split or explicit rationale before final exit.
+- [ ] EventBus subscriber duplicate delivery is covered.
+- [ ] `crates/lattice-actor/src/tests.rs` exceeds 1200 LOC and needs a documented split or explicit rationale before final exit.
 - [x] `crates/lattice-service/src/tests.rs` exceeds 1200 LOC and has a module-level rationale for its crate-private service lifecycle coverage.
 
 ### Phase 1: Single-Node Actor Runtime
@@ -959,25 +963,25 @@ Each phase can exit only when all items are true:
 The whole goal can be marked complete only when:
 
 ```text
-[x] Phase 1 through Phase 7 are complete.
-[x] This file's global acceptance checklist is fully satisfied.
-[x] architecture/00-overview.md system boundaries and module responsibilities are implemented.
-[x] architecture/01-actor-runtime.md actor runtime capabilities are implemented and tested.
-[x] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, KeyedWorkerPool, and DedicatedThreadPool.
-[x] UnsupportedExecutionPolicy is used only for invalid configuration, not for planned policies in the completed framework.
-[x] architecture/02-rpc.md typed RPC, metadata, codegen, and gateway decode/forward are implemented and tested.
-[x] architecture/03-placement.md placement, scale, drain, shutdown, crash, and watch are implemented and tested.
-[x] architecture/04-eventbus-scheduler-config.md event bus, scheduler, and config are implemented and tested.
-[x] architecture/05-gateway-ops.md gateway, rate limit, admin, telemetry, and inspection are implemented and tested.
-[x] Valid constraints in architecture/06-appendix.md are not violated.
-[x] API sketches in architecture/07-api-examples.md are covered by examples or compile tests.
-[x] The implementation uses the planned Cargo workspace crate split; the root crate is not a monolithic implementation crate.
-[x] examples/minimal-world runs as an end-to-end example.
-[x] cargo fmt passes.
-[x] cargo clippy passes.
-[x] cargo test passes.
-[x] All completed implementation slices are committed with English conventional commit messages.
-[x] Production paths have no unexplained TODO / FIXME / unimplemented! / todo!.
+[ ] Phase 1 through Phase 7 are complete.
+[ ] This file's global acceptance checklist is fully satisfied.
+[ ] architecture/00-overview.md system boundaries and module responsibilities are implemented.
+[ ] architecture/01-actor-runtime.md actor runtime capabilities are implemented and tested.
+[ ] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, KeyedWorkerPool, and DedicatedThreadPool.
+[ ] UnsupportedExecutionPolicy is used only for invalid configuration, not for planned policies in the completed framework.
+[ ] architecture/02-rpc.md typed RPC, metadata, codegen, and gateway decode/forward are implemented and tested.
+[ ] architecture/03-placement.md placement, scale, drain, shutdown, crash, and watch are implemented and tested.
+[ ] architecture/04-eventbus-scheduler-config.md event bus, scheduler, and config are implemented and tested.
+[ ] architecture/05-gateway-ops.md gateway, rate limit, admin, telemetry, and inspection are implemented and tested.
+[ ] Valid constraints in architecture/06-appendix.md are not violated.
+[ ] API sketches in architecture/07-api-examples.md are covered by examples or compile tests.
+[ ] The implementation uses the planned Cargo workspace crate split; the root crate is not a monolithic implementation crate.
+[ ] examples/minimal-world runs as an end-to-end example.
+[ ] cargo fmt passes.
+[ ] cargo clippy passes.
+[ ] cargo test passes.
+[ ] All completed implementation slices are committed with English conventional commit messages.
+[ ] Production paths have no unexplained TODO / FIXME / unimplemented! / todo!.
 ```
 
 ### 5.5 Working Constraints
