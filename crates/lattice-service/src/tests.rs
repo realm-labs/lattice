@@ -31,9 +31,9 @@ use lattice_core::{
 };
 use lattice_direct_link::{
     DIRECT_LINK_PROTOCOL_VERSION, DirectLinkConnection, DirectLinkFrame, DirectLinkFrameKind,
-    DirectLinkInboundRouter, DirectLinkListenConfig, DirectLinkSessionManager, DirectLinkStream,
-    DirectLinkTransport, OpenLinkDirection, OpenLinkRejectReason, OpenLinkRequest,
-    TcpDirectLinkTransport,
+    DirectLinkInboundRouter, DirectLinkListenConfig, DirectLinkPeerIdentity,
+    DirectLinkSessionManager, DirectLinkStream, DirectLinkTransport, OpenLinkDirection,
+    OpenLinkRejectReason, OpenLinkRequest, OpenLinkValidationPolicy, TcpDirectLinkTransport,
 };
 use lattice_eventbus::{
     EventBus, EventEnvelope, EventId, EventSubscription, LocalEventBus, Subject, SubjectFilter,
@@ -1382,9 +1382,13 @@ async fn direct_link_connection_writes_open_link_reject_frames() {
         .await
         .unwrap();
     let endpoint = listener.local_endpoint();
-    let router = Arc::new(
-        DirectLinkInboundRouter::builder(Arc::new(DirectLinkSessionManager::new())).build(),
+    let manager = Arc::new(DirectLinkSessionManager::new());
+    manager.set_validation_policy(
+        OpenLinkValidationPolicy::hosted(service_kind!("World"))
+            .authorize_sources([service_kind!("Gateway")])
+            .require_peer_identity("lattice.test"),
     );
+    let router = Arc::new(DirectLinkInboundRouter::builder(manager).build());
     let server = tokio::spawn(async move {
         let connection = listener.accept().await.unwrap();
         crate::service::handle_direct_link_connection(
@@ -1402,32 +1406,39 @@ async fn direct_link_connection_writes_open_link_reject_frames() {
         .unwrap();
     connection
         .write_frame(
-            DirectLinkFrame::open_link(&OpenLinkRequest {
-                protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
-                link_id: link_id.clone(),
-                source: direct_actor_ref(
-                    service_kind!("Gateway"),
-                    actor_kind!("GatewaySession"),
-                    ActorId::U64(99),
-                    "tcp://127.0.0.1:1".parse().unwrap(),
-                ),
-                target: direct_actor_ref(
-                    service_kind!("World"),
-                    actor_kind!("World"),
-                    ActorId::U64(7),
-                    "tcp://127.0.0.1:2".parse().unwrap(),
-                ),
-                mode: DirectLinkMode::Unidirectional,
-                source_to_target: OpenLinkDirection {
+            DirectLinkFrame::open_link_with_peer_identity(
+                &OpenLinkRequest {
+                    protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
                     link_id: link_id.clone(),
-                    stream_name: "unregistered".to_string(),
-                    supported_message_type_ids: [lattice_core::DirectLinkMessageId(1)]
-                        .into_iter()
-                        .collect(),
+                    source: direct_actor_ref(
+                        service_kind!("Gateway"),
+                        actor_kind!("GatewaySession"),
+                        ActorId::U64(99),
+                        "tcp://127.0.0.1:1".parse().unwrap(),
+                    ),
+                    target: direct_actor_ref(
+                        service_kind!("World"),
+                        actor_kind!("World"),
+                        ActorId::U64(7),
+                        "tcp://127.0.0.1:2".parse().unwrap(),
+                    ),
+                    mode: DirectLinkMode::Unidirectional,
+                    source_to_target: OpenLinkDirection {
+                        link_id: link_id.clone(),
+                        stream_name: "unregistered".to_string(),
+                        supported_message_type_ids: [lattice_core::DirectLinkMessageId(1)]
+                            .into_iter()
+                            .collect(),
+                    },
+                    target_to_source: None,
+                    options: DirectLinkOptions::default(),
                 },
-                target_to_source: None,
-                options: DirectLinkOptions::default(),
-            })
+                DirectLinkPeerIdentity::new(
+                    service_kind!("Gateway"),
+                    InstanceId::new("direct-link-test"),
+                    "spiffe://lattice.test/svc/gateway/instance/direct-link-test",
+                ),
+            )
             .unwrap(),
         )
         .await

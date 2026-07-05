@@ -819,6 +819,31 @@ pub struct OpenLinkRequest {
     pub options: DirectLinkOptions,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenLinkEnvelope {
+    pub request: OpenLinkRequest,
+    pub peer_identity: Option<DirectLinkPeerIdentity>,
+}
+
+impl OpenLinkEnvelope {
+    pub fn new(request: OpenLinkRequest) -> Self {
+        Self {
+            request,
+            peer_identity: None,
+        }
+    }
+
+    pub fn with_peer_identity(
+        request: OpenLinkRequest,
+        peer_identity: DirectLinkPeerIdentity,
+    ) -> Self {
+        Self {
+            request,
+            peer_identity: Some(peer_identity),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenLinkValidationPolicy {
     pub hosted_service: Option<ServiceKind>,

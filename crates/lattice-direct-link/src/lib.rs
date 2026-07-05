@@ -17,8 +17,8 @@ pub use session::{
     DirectLinkActorPolicy, DirectLinkAuthPolicy, DirectLinkMetrics, DirectLinkMetricsSnapshot,
     DirectLinkPeerIdentity, DirectLinkPeerIdentityPolicy, DirectLinkSessionManager,
     ManagedLinkSnapshot, MessageFrameError, NegotiatedDirection, OpenLinkAck, OpenLinkDirection,
-    OpenLinkReject, OpenLinkRejectReason, OpenLinkRequest, OpenLinkValidationPolicy,
-    SessionManagerError,
+    OpenLinkEnvelope, OpenLinkReject, OpenLinkRejectReason, OpenLinkRequest,
+    OpenLinkValidationPolicy, SessionManagerError,
 };
 pub use stream::{DirectLinkActorBinding, DirectLinkHandlers, DirectLinkStream};
 pub use transport::{

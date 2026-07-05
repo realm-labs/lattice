@@ -1,7 +1,9 @@
 use lattice_core::{DirectLinkMessageId, LinkDirection, LinkId, LinkMessageFlags, LinkSequence};
 use thiserror::Error;
 
-use crate::session::{OpenLinkAck, OpenLinkReject, OpenLinkRequest};
+use crate::session::{
+    DirectLinkPeerIdentity, OpenLinkAck, OpenLinkEnvelope, OpenLinkReject, OpenLinkRequest,
+};
 
 const MAGIC: u32 = 0x4c44_4c4b;
 const VERSION: u16 = 1;
@@ -94,20 +96,46 @@ impl DirectLinkFrame {
     }
 
     pub fn open_link(request: &OpenLinkRequest) -> Result<Self, FrameCodecError> {
+        Self::open_link_envelope(&OpenLinkEnvelope::new(request.clone()))
+    }
+
+    pub fn open_link_with_peer_identity(
+        request: &OpenLinkRequest,
+        peer_identity: DirectLinkPeerIdentity,
+    ) -> Result<Self, FrameCodecError> {
+        Self::open_link_envelope(&OpenLinkEnvelope::with_peer_identity(
+            request.clone(),
+            peer_identity,
+        ))
+    }
+
+    pub fn open_link_envelope(envelope: &OpenLinkEnvelope) -> Result<Self, FrameCodecError> {
         Ok(Self {
             kind: DirectLinkFrameKind::OpenLink,
-            link_id: request.link_id.clone(),
+            link_id: envelope.request.link_id.clone(),
             sequence: LinkSequence(0),
             message_id: None,
             flags: LinkMessageFlags::EMPTY,
             header: Vec::new(),
-            payload: serde_json::to_vec(request)
+            payload: serde_json::to_vec(envelope)
                 .map_err(|error| FrameCodecError::HandshakePayload(error.to_string()))?,
         })
     }
 
     pub fn decode_open_link(&self) -> Result<OpenLinkRequest, FrameCodecError> {
-        self.decode_handshake_payload(DirectLinkFrameKind::OpenLink)
+        Ok(self.decode_open_link_envelope()?.request)
+    }
+
+    pub fn decode_open_link_envelope(&self) -> Result<OpenLinkEnvelope, FrameCodecError> {
+        if self.kind != DirectLinkFrameKind::OpenLink {
+            return Err(FrameCodecError::UnexpectedFrameKind {
+                expected: DirectLinkFrameKind::OpenLink,
+                actual: self.kind,
+            });
+        }
+        serde_json::from_slice::<OpenLinkPayload>(&self.payload)
+            .map(OpenLinkPayload::into_envelope)
+            .map_err(|error| FrameCodecError::HandshakePayload(error.to_string()))
     }
 
     pub fn open_link_ack(ack: &OpenLinkAck) -> Result<Self, FrameCodecError> {
@@ -175,6 +203,22 @@ impl DirectLinkFrame {
         }
         serde_json::from_slice(&self.payload)
             .map_err(|error| FrameCodecError::HandshakePayload(error.to_string()))
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum OpenLinkPayload {
+    Envelope(OpenLinkEnvelope),
+    Request(OpenLinkRequest),
+}
+
+impl OpenLinkPayload {
+    fn into_envelope(self) -> OpenLinkEnvelope {
+        match self {
+            Self::Envelope(envelope) => envelope,
+            Self::Request(request) => OpenLinkEnvelope::new(request),
+        }
     }
 }
 
@@ -461,6 +505,22 @@ mod tests {
             decoded_request.source_to_target.supported_message_type_ids,
             BTreeSet::from([message_id])
         );
+
+        let peer_identity = DirectLinkPeerIdentity::new(
+            ServiceKind::new("Gateway"),
+            InstanceId::new("instance-99"),
+            "spiffe://lattice.test/svc/Gateway/instance/instance-99",
+        );
+        let authenticated_open_frame =
+            DirectLinkFrame::open_link_with_peer_identity(&request, peer_identity.clone()).unwrap();
+        let decoded_authenticated_frame = codec
+            .decode(&codec.encode(&authenticated_open_frame).unwrap())
+            .unwrap();
+        let decoded_envelope = decoded_authenticated_frame
+            .decode_open_link_envelope()
+            .unwrap();
+        assert_eq!(decoded_envelope.request.source, request.source);
+        assert_eq!(decoded_envelope.peer_identity, Some(peer_identity));
 
         let ack = OpenLinkAck {
             link_id: link_id.clone(),

@@ -170,9 +170,11 @@ impl DirectLinkInboundRouter {
         frame: DirectLinkFrame,
         peer_identity: Option<DirectLinkPeerIdentity>,
     ) -> Result<DirectLinkFrame, InboundDeliveryError> {
-        let request = frame
-            .decode_open_link()
+        let envelope = frame
+            .decode_open_link_envelope()
             .map_err(|error| InboundDeliveryError::Handshake(error.to_string()))?;
+        let request = envelope.request;
+        let peer_identity = peer_identity.or(envelope.peer_identity);
         match self
             .session_manager
             .open_link_from_peer(request, peer_identity)
@@ -691,7 +693,10 @@ mod tests {
 
     use super::*;
     use crate::codec::DirectLinkFrame;
-    use crate::session::{DIRECT_LINK_PROTOCOL_VERSION, OpenLinkDirection, OpenLinkRequest};
+    use crate::session::{
+        DIRECT_LINK_PROTOCOL_VERSION, DirectLinkActorPolicy, OpenLinkDirection,
+        OpenLinkRejectReason, OpenLinkRequest, OpenLinkValidationPolicy,
+    };
     use crate::stream::DirectLinkStream;
 
     #[derive(Clone, PartialEq, prost::Message)]
@@ -1501,6 +1506,11 @@ mod tests {
         manager
             .register_binding(actor_kind!("GatewaySession"), update_descriptor.clone())
             .unwrap();
+        manager.set_validation_policy(
+            OpenLinkValidationPolicy::hosted(service_kind!("Battle"))
+                .authorize_sources([service_kind!("Gateway")])
+                .require_peer_identity("lattice.test"),
+        );
         let router = DirectLinkInboundRouter::builder(manager)
             .bind_actor(
                 input_stream.for_actor::<OpeningBattleActor>(actor_kind!("Battle")),
@@ -1510,22 +1520,33 @@ mod tests {
 
         let response = router
             .process_open_link_frame(
-                DirectLinkFrame::open_link(&OpenLinkRequest {
-                    protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
-                    link_id: link_id.clone(),
-                    source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
-                    target: target_ref,
-                    mode: DirectLinkMode::Bidirectional,
-                    source_to_target: OpenLinkDirection::from_stream(
-                        link_id.clone(),
-                        &input_descriptor,
+                DirectLinkFrame::open_link_with_peer_identity(
+                    &OpenLinkRequest {
+                        protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                        link_id: link_id.clone(),
+                        source: actor_ref(
+                            service_kind!("Gateway"),
+                            actor_kind!("GatewaySession"),
+                            7,
+                        ),
+                        target: target_ref,
+                        mode: DirectLinkMode::Bidirectional,
+                        source_to_target: OpenLinkDirection::from_stream(
+                            link_id.clone(),
+                            &input_descriptor,
+                        ),
+                        target_to_source: Some(OpenLinkDirection::from_stream(
+                            link_id.clone(),
+                            &update_descriptor,
+                        )),
+                        options: DirectLinkOptions::bidirectional(),
+                    },
+                    DirectLinkPeerIdentity::new(
+                        service_kind!("Gateway"),
+                        InstanceId::new("instance-7"),
+                        "spiffe://lattice.test/svc/gateway/instance/instance-7",
                     ),
-                    target_to_source: Some(OpenLinkDirection::from_stream(
-                        link_id.clone(),
-                        &update_descriptor,
-                    )),
-                    options: DirectLinkOptions::bidirectional(),
-                })
+                )
                 .unwrap(),
                 None,
             )
@@ -1552,6 +1573,45 @@ mod tests {
             *outbound.lock().expect("outbound handle mutex poisoned"),
             Some((LinkDirection::TargetToSource, "battle-update".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn process_open_link_frame_rejects_missing_required_peer_identity() {
+        let manager = Arc::new(DirectLinkSessionManager::new());
+        let stream = DirectLinkStream::new("gateway-input").message::<InputCommand>();
+        let descriptor = stream.descriptor();
+        manager
+            .register_binding(actor_kind!("Battle"), descriptor.clone())
+            .unwrap();
+        manager.register_actor(actor_kind!("Battle"), DirectLinkActorPolicy::lazy(None));
+        manager.set_validation_policy(
+            OpenLinkValidationPolicy::hosted(service_kind!("Battle"))
+                .authorize_sources([service_kind!("Gateway")])
+                .require_peer_identity("lattice.test"),
+        );
+        let link_id = LinkId::new("link-open-missing-identity");
+        let router = DirectLinkInboundRouter::builder(manager).build();
+
+        let response = router
+            .process_open_link_frame(
+                DirectLinkFrame::open_link(&OpenLinkRequest {
+                    protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                    link_id: link_id.clone(),
+                    source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+                    target: actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9),
+                    mode: DirectLinkMode::Unidirectional,
+                    source_to_target: OpenLinkDirection::from_stream(link_id.clone(), &descriptor),
+                    target_to_source: None,
+                    options: DirectLinkOptions::default(),
+                })
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(response.kind, DirectLinkFrameKind::OpenLinkReject);
+        let reject = response.decode_open_link_reject().unwrap();
+        assert_eq!(reject.reason, OpenLinkRejectReason::Unauthorized);
     }
 
     #[tokio::test]
