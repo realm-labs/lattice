@@ -244,6 +244,18 @@ impl DirectLinkServiceRuntime {
         };
         Ok(request)
     }
+
+    pub(crate) async fn close_for_node_drain(&self) -> Result<usize, LinkError> {
+        let inbound = self
+            .inbound_router
+            .close_active_links(LinkCloseReason::NodeDraining)
+            .map_err(|error| LinkError::Protocol(error.to_string()))?;
+        let outbound = self
+            .endpoint_pool
+            .close_all_logical_links(LinkCloseReason::NodeDraining)
+            .await?;
+        Ok(inbound + outbound)
+    }
 }
 
 pub(crate) trait ErasedDirectLinkBinding: Send + Sync + 'static {

@@ -6,9 +6,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::{
-    ActorKind, DirectLinkEndpoint, LinkCloseReason, LinkError, ServiceContext, ServiceKind,
-};
+use lattice_core::{ActorKind, DirectLinkEndpoint, LinkError, ServiceContext, ServiceKind};
 use lattice_direct_link::transport::TcpDirectLinkWriter;
 use lattice_direct_link::{
     DirectLinkConnection, DirectLinkFrameKind, DirectLinkInboundRouter, DirectLinkTransport,
@@ -202,7 +200,8 @@ impl LatticeService {
             if let Some(direct_link_shutdown_tx) = direct_link_shutdown_tx {
                 let _ = direct_link_shutdown_tx.send(());
             }
-            let drained_direct_links = drain_direct_links(direct_link_runtime_for_drain.as_ref())?;
+            let drained_direct_links =
+                drain_direct_links(direct_link_runtime_for_drain.as_ref()).await?;
             debug!(
                 service.kind = service_kind.as_str(),
                 instance.id = instance.instance_id.as_str(),
@@ -737,15 +736,15 @@ async fn drain_placement(
     }
 }
 
-fn drain_direct_links(
+async fn drain_direct_links(
     runtime: Option<&DirectLinkServiceRuntime>,
 ) -> Result<usize, LatticeServiceError> {
     let Some(runtime) = runtime else {
         return Ok(0);
     };
     runtime
-        .inbound_router()
-        .close_active_links(LinkCloseReason::NodeDraining)
+        .close_for_node_drain()
+        .await
         .map_err(|error| LatticeServiceError::ComponentBuild {
             slot: "direct_links".to_string(),
             message: error.to_string(),

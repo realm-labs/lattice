@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
@@ -227,6 +227,13 @@ where
             .map(EndpointState::active_links)
             .unwrap_or_default()
     }
+
+    pub async fn close_all_logical_links(
+        &self,
+        reason: LinkCloseReason,
+    ) -> Result<usize, LinkError> {
+        self.inner.close_all_logical_links(reason).await
+    }
 }
 
 #[async_trait]
@@ -352,8 +359,12 @@ where
                         request.link_id, ack.link_id
                     )));
                 }
-                self.increment_link_count(&endpoint_key, stripe.stripe.connection_id)
-                    .await;
+                self.register_link(
+                    request.link_id.clone(),
+                    &endpoint_key,
+                    stripe.stripe.connection_id,
+                )
+                .await;
                 self.metrics.record_link_opened();
                 let session = DirectLinkSession {
                     link_id: request.link_id.clone(),
@@ -406,29 +417,67 @@ where
         send_frame(&writer, frame).await
     }
 
-    async fn increment_link_count(
+    async fn register_link(
         &self,
+        link_id: LinkId,
         endpoint_key: &DirectLinkEndpointKey,
         connection_id: DirectLinkConnectionId,
     ) {
         let mut state = self.state.lock().await;
         if let Some(stripe) = state.find_stripe_mut(endpoint_key, connection_id) {
             stripe.active_links += 1;
+            state.links.insert(
+                link_id,
+                PooledLinkState {
+                    endpoint_key: endpoint_key.clone(),
+                    connection_id,
+                },
+            );
         }
     }
 
-    async fn release_link(
-        &self,
-        endpoint_key: &DirectLinkEndpointKey,
-        connection_id: DirectLinkConnectionId,
-    ) {
+    async fn release_link(&self, link_id: &LinkId) {
         let mut state = self.state.lock().await;
-        if let Some(stripe) = state.find_stripe_mut(endpoint_key, connection_id)
+        let Some(link) = state.links.remove(link_id) else {
+            return;
+        };
+        if let Some(stripe) = state.find_stripe_mut(&link.endpoint_key, link.connection_id)
             && stripe.active_links > 0
         {
             stripe.active_links -= 1;
             self.metrics.record_link_closed();
         }
+    }
+
+    async fn close_all_logical_links(&self, reason: LinkCloseReason) -> Result<usize, LinkError> {
+        let links = {
+            let mut state = self.state.lock().await;
+            let links = std::mem::take(&mut state.links);
+            for link in links.values() {
+                if let Some(stripe) = state.find_stripe_mut(&link.endpoint_key, link.connection_id)
+                {
+                    stripe.active_links = stripe.active_links.saturating_sub(1);
+                    self.metrics.record_link_closed();
+                }
+            }
+            links
+                .into_iter()
+                .filter_map(|(link_id, link)| {
+                    state
+                        .find_writer(link.connection_id)
+                        .map(|writer| (link_id, writer))
+                })
+                .collect::<Vec<_>>()
+        };
+        let count = links.len();
+        for (link_id, writer) in links {
+            send_frame(
+                &writer,
+                close_frame(DirectLinkFrameKind::Close, link_id, reason.clone()),
+            )
+            .await?;
+        }
+        Ok(count)
     }
 
     async fn remove_connection(&self, connection_id: DirectLinkConnectionId) {
@@ -451,6 +500,7 @@ where
 #[derive(Debug, Default)]
 struct PoolState {
     endpoints: HashMap<DirectLinkEndpointKey, EndpointState>,
+    links: BTreeMap<LinkId, PooledLinkState>,
 }
 
 impl PoolState {
@@ -506,6 +556,12 @@ struct PooledStripeState {
     stripe: DirectLinkConnectionStripe,
     writer: mpsc::Sender<ConnectionCommand>,
     active_links: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PooledLinkState {
+    endpoint_key: DirectLinkEndpointKey,
+    connection_id: DirectLinkConnectionId,
 }
 
 enum ConnectionCommand {
@@ -607,19 +663,13 @@ where
         if self.closed.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
-        let frame = DirectLinkFrame {
-            kind: DirectLinkFrameKind::CloseDirection,
-            link_id: self.link_id.clone(),
-            sequence: LinkSequence(0),
-            message_id: None,
-            flags: Default::default(),
-            header: Vec::new(),
-            payload: Vec::new(),
-        };
+        let frame = close_frame(
+            DirectLinkFrameKind::CloseDirection,
+            self.link_id.clone(),
+            _reason,
+        );
         let _ = self.inner.write_frame(self.connection_id, frame).await;
-        self.inner
-            .release_link(&self.endpoint_key, self.connection_id)
-            .await;
+        self.inner.release_link(&self.link_id).await;
         Ok(())
     }
 }
@@ -758,6 +808,22 @@ fn stable_stripe_index(link_id: &LinkId, stripe_count: NonZeroUsize) -> usize {
     let mut hasher = DefaultHasher::new();
     link_id.hash(&mut hasher);
     (hasher.finish() as usize) % stripe_count.get()
+}
+
+fn close_frame(
+    kind: DirectLinkFrameKind,
+    link_id: LinkId,
+    reason: LinkCloseReason,
+) -> DirectLinkFrame {
+    DirectLinkFrame {
+        kind,
+        link_id,
+        sequence: LinkSequence(0),
+        message_id: None,
+        flags: Default::default(),
+        header: Vec::new(),
+        payload: format!("{reason:?}").into_bytes(),
+    }
 }
 
 #[cfg(test)]
@@ -904,6 +970,38 @@ mod tests {
         assert_eq!(metrics.physical_connections_opened, 1);
         assert_eq!(metrics.logical_links_opened, 2);
         assert_eq!(metrics.active_logical_links, 2);
+    }
+
+    #[tokio::test]
+    async fn node_drain_closes_logical_links_before_physical_connection() {
+        let transport = FakeTransport::default();
+        let pool = PooledDirectLinkEndpointPool::new(
+            transport.clone(),
+            DirectLinkEndpointPoolConfig::default(),
+        );
+        let first = pool.open_link(request("link-1")).await.unwrap();
+        let second = pool.open_link(request("link-2")).await.unwrap();
+        assert_eq!(first.connection_id, second.connection_id);
+
+        let closed = pool
+            .close_all_logical_links(LinkCloseReason::NodeDraining)
+            .await
+            .unwrap();
+
+        assert_eq!(closed, 2);
+        assert_eq!(pool.active_links_for_endpoint(&endpoint()).await, 0);
+        let metrics = pool.metrics_snapshot();
+        assert_eq!(metrics.active_logical_links, 0);
+        assert_eq!(metrics.logical_links_closed, 2);
+        assert_eq!(metrics.active_physical_connections, 1);
+        let close_frames = transport
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| frame.kind == DirectLinkFrameKind::Close)
+            .count();
+        assert_eq!(close_frames, 2);
     }
 
     #[tokio::test]
