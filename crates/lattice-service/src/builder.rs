@@ -9,8 +9,8 @@ use lattice_actor::{Actor, Handler};
 use lattice_config::{BootstrapConfig, ConfigSource};
 use lattice_config::{ConfigStore, LocalConfigStore};
 use lattice_core::{
-    ActorKind, DirectLinkLifecycleRuntimeHandle, InstanceId, LinkBackpressure, LinkClosed,
-    LinkDirectionClosed, LinkOpened, ServiceContext, ServiceKind,
+    ActorKind, DirectLinkLifecycleRuntimeHandle, DirectLinkRuntimeHandle, InstanceId,
+    LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened, ServiceContext, ServiceKind,
 };
 use lattice_direct_link::{DirectLinkActorBinding, DirectLinkDispatch};
 use lattice_eventbus::{EventBus, LocalEventBus};
@@ -36,8 +36,8 @@ use crate::config::{DirectLinkConfig, InstanceConfig};
 use crate::context::ServiceBuildContext;
 use crate::control::ServiceLogicControlHandler;
 use crate::direct_link::{
-    DeferredDirectLinkLifecycleRuntime, DirectLinkBindingRegistration, ErasedDirectLinkBinding,
-    build_direct_link_runtime,
+    DeferredDirectLinkLifecycleRuntime, DeferredDirectLinkRuntime, DirectLinkBindingRegistration,
+    ErasedDirectLinkBinding, build_direct_link_runtime,
 };
 use crate::framework::ServiceSchedulerComponent;
 use crate::rpc::{ErasedRpcClientBinding, RpcClientPlacement, RpcClientRegistration};
@@ -486,9 +486,20 @@ impl LatticeServiceBuilder {
                 self.rpc_client_transport,
             )?;
         }
-        let direct_link_lifecycle_runtime = if self.direct_link_bindings.is_empty() {
-            None
+        let direct_link_enabled =
+            self.direct_link.is_some() || !self.direct_link_bindings.is_empty();
+        let direct_link_runtime_handle = if direct_link_enabled {
+            let runtime = Arc::new(DeferredDirectLinkRuntime::default());
+            service_context
+                .insert_extension(DirectLinkRuntimeHandle::new(runtime.clone()))
+                .map_err(|component| LatticeServiceError::DuplicateServiceComponent {
+                    component: component.to_string(),
+                })?;
+            Some(runtime)
         } else {
+            None
+        };
+        let direct_link_lifecycle_runtime = if direct_link_enabled {
             let runtime = Arc::new(DeferredDirectLinkLifecycleRuntime::default());
             service_context
                 .insert_extension(DirectLinkLifecycleRuntimeHandle::new(runtime.clone()))
@@ -496,6 +507,8 @@ impl LatticeServiceBuilder {
                     component: component.to_string(),
                 })?;
             Some(runtime)
+        } else {
+            None
         };
         let service_context = service_context.build();
 
@@ -535,7 +548,8 @@ impl LatticeServiceBuilder {
             );
             registration.register(&mut context)?;
         }
-        let direct_link_runtime = build_direct_link_runtime(self.direct_link_bindings, &context)?;
+        let direct_link_runtime =
+            build_direct_link_runtime(self.direct_link_bindings, &context, direct_link_enabled)?;
         if let (Some(runtime), Some(direct_link_config)) =
             (direct_link_runtime.as_ref(), self.direct_link.as_ref())
         {
@@ -560,6 +574,12 @@ impl LatticeServiceBuilder {
         }
         if let (Some(deferred), Some(runtime)) = (
             direct_link_lifecycle_runtime.as_ref(),
+            direct_link_runtime.clone(),
+        ) {
+            deferred.set_runtime(runtime);
+        }
+        if let (Some(deferred), Some(runtime)) = (
+            direct_link_runtime_handle.as_ref(),
             direct_link_runtime.clone(),
         ) {
             deferred.set_runtime(runtime);

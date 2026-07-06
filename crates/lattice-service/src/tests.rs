@@ -24,10 +24,11 @@ use lattice_actor::{
 };
 use lattice_config::{ConfigFormat, ConfigSource};
 use lattice_core::{
-    ActorId, ActorKind, ActorRef, ConfiguredComponent, DirectLinkEndpoint, DirectLinkMessage,
-    DirectLinkMode, DirectLinkOptions, Epoch, InstanceId, LinkBackpressure, LinkCloseReason,
-    LinkClosed, LinkDirectionClosed, LinkId, LinkOpened, LinkSequence, Linked, RequestId, RouteKey,
-    TraceContext, actor_kind, service_kind,
+    ActorId, ActorKind, ActorRef, ConfiguredComponent, DirectLinkEndpoint, DirectLinkManager,
+    DirectLinkMessage, DirectLinkMode, DirectLinkOptions, DirectLinkRuntimeHandle, Epoch,
+    InstanceId, LinkBackpressure, LinkCloseReason, LinkClosed, LinkDirectionClosed, LinkId,
+    LinkOpened, LinkSequence, LinkTarget, Linked, RequestId, RouteKey, TraceContext, actor_kind,
+    service_kind,
 };
 use lattice_direct_link::{
     DIRECT_LINK_PROTOCOL_VERSION, DirectLinkConnection, DirectLinkFrame, DirectLinkFrameKind,
@@ -1521,6 +1522,110 @@ async fn direct_link_listener_demultiplexes_multiple_links_on_one_connection() {
 
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn service_context_installs_direct_link_runtime_handle_for_connect() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service = LatticeService::builder(service_kind!("Gateway"))
+        .instance_id(InstanceId::new("gateway-1"))
+        .listen(listener)
+        .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("GatewaySession"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("GatewaySession"),
+            "GatewayRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+    assert!(
+        service
+            .context()
+            .extension::<DirectLinkRuntimeHandle>()
+            .is_some()
+    );
+
+    let transport = TcpDirectLinkTransport::new();
+    let listener = transport
+        .bind(DirectLinkListenConfig {
+            endpoint: DirectLinkEndpoint::new("tcp://127.0.0.1:0".parse().unwrap()),
+            max_frame_size: 4096,
+        })
+        .await
+        .unwrap();
+    let target_endpoint = listener.local_endpoint();
+    let stream = DirectLinkStream::new("movement").message::<DirectLinkTestPayload>();
+    let descriptor = stream.descriptor();
+    let server = tokio::spawn({
+        let descriptor = descriptor.clone();
+        async move {
+            let mut connection = listener.accept().await.unwrap();
+            let open = connection
+                .read_frame()
+                .await
+                .unwrap()
+                .decode_open_link()
+                .unwrap();
+            let ack = lattice_direct_link::OpenLinkAck {
+                link_id: open.link_id.clone(),
+                source_to_target: lattice_direct_link::NegotiatedDirection {
+                    direction: lattice_core::LinkDirection::SourceToTarget,
+                    stream_name: open.source_to_target.stream_name,
+                    accepted_message_type_ids: descriptor.accepted_message_ids(),
+                    next_receive_sequence: LinkSequence(1),
+                    backpressure: open.options.backpressure,
+                    closed: false,
+                },
+                target_to_source: None,
+            };
+            connection
+                .write_frame(DirectLinkFrame::open_link_ack(&ack).unwrap())
+                .await
+                .unwrap();
+            connection.read_frame().await.unwrap()
+        }
+    });
+
+    let source = direct_actor_ref(
+        service_kind!("Gateway"),
+        actor_kind!("GatewaySession"),
+        ActorId::U64(99),
+        "http://127.0.0.1:18080".parse().unwrap(),
+    );
+    let target = direct_actor_ref(
+        service_kind!("World"),
+        actor_kind!("World"),
+        ActorId::U64(7),
+        target_endpoint.uri.clone(),
+    );
+    let manager = DirectLinkManager::new(service.context().clone(), Some(source));
+    let link = manager
+        .connect(
+            LinkTarget::Endpoint {
+                endpoint: target_endpoint,
+                target,
+            },
+            stream,
+            DirectLinkOptions::default(),
+        )
+        .await
+        .unwrap();
+    link.tell(DirectLinkTestPayload { tick: 7 }).await.unwrap();
+
+    let frame = timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame.kind, DirectLinkFrameKind::Message);
+    assert_eq!(
+        frame.message_id,
+        descriptor.message_id_for::<DirectLinkTestPayload>()
+    );
 }
 
 #[tokio::test]

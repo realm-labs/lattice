@@ -6,12 +6,14 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use lattice_actor::{Actor, Handler};
 use lattice_core::{
-    ActorRef, DirectLinkLifecycleRuntime, LinkBackpressure, LinkCloseReason, LinkClosed,
-    LinkDirectionClosed, LinkError, LinkOpened,
+    ActorRef, DirectLinkLifecycleRuntime, DirectLinkOpenRequest, DirectLinkRuntime,
+    DirectLinkSession, LinkBackpressure, LinkCloseReason, LinkClosed, LinkDirectionClosed,
+    LinkError, LinkId, LinkOpened,
 };
 use lattice_direct_link::{
-    DirectLinkActorBinding, DirectLinkDispatch, DirectLinkInboundRouter,
-    DirectLinkInboundRouterBuilder, DirectLinkSessionManager,
+    DirectLinkActorBinding, DirectLinkDispatch, DirectLinkEndpointPool, DirectLinkInboundRouter,
+    DirectLinkInboundRouterBuilder, DirectLinkSessionManager, PooledDirectLinkEndpointPool,
+    TcpDirectLinkTransport,
 };
 
 use crate::LatticeServiceError;
@@ -21,6 +23,7 @@ use crate::context::ServiceBuildContext;
 pub struct DirectLinkServiceRuntime {
     session_manager: Arc<DirectLinkSessionManager>,
     inbound_router: Arc<DirectLinkInboundRouter>,
+    endpoint_pool: PooledDirectLinkEndpointPool<TcpDirectLinkTransport>,
 }
 
 impl fmt::Debug for DirectLinkServiceRuntime {
@@ -29,6 +32,7 @@ impl fmt::Debug for DirectLinkServiceRuntime {
             .debug_struct("DirectLinkServiceRuntime")
             .field("session_manager", &self.session_manager)
             .field("inbound_router", &self.inbound_router)
+            .field("endpoint_pool", &self.endpoint_pool)
             .finish()
     }
 }
@@ -40,6 +44,60 @@ impl DirectLinkServiceRuntime {
 
     pub(crate) fn inbound_router(&self) -> Arc<DirectLinkInboundRouter> {
         self.inbound_router.clone()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DeferredDirectLinkRuntime {
+    runtime: Mutex<Option<DirectLinkServiceRuntime>>,
+}
+
+impl DeferredDirectLinkRuntime {
+    pub(crate) fn set_runtime(&self, runtime: DirectLinkServiceRuntime) {
+        *self
+            .runtime
+            .lock()
+            .expect("deferred direct-link runtime poisoned") = Some(runtime);
+    }
+}
+
+#[async_trait]
+impl DirectLinkRuntime for DeferredDirectLinkRuntime {
+    async fn open_link(
+        &self,
+        request: DirectLinkOpenRequest,
+    ) -> Result<DirectLinkSession, LinkError> {
+        let runtime = self
+            .runtime
+            .lock()
+            .expect("deferred direct-link runtime poisoned")
+            .clone()
+            .ok_or(LinkError::Unavailable)?;
+        runtime.open_link(request).await
+    }
+
+    async fn get_outbound(
+        &self,
+        link_id: LinkId,
+        stream: lattice_core::DirectLinkStreamDescriptor,
+    ) -> Result<DirectLinkSession, LinkError> {
+        let runtime = self
+            .runtime
+            .lock()
+            .expect("deferred direct-link runtime poisoned")
+            .clone()
+            .ok_or(LinkError::Unavailable)?;
+        runtime.get_outbound(link_id, stream).await
+    }
+
+    async fn close_all(&self, link_id: LinkId, reason: LinkCloseReason) -> Result<(), LinkError> {
+        let runtime = self
+            .runtime
+            .lock()
+            .expect("deferred direct-link runtime poisoned")
+            .clone()
+            .ok_or(LinkError::Unavailable)?;
+        runtime.close_all(link_id, reason).await
     }
 }
 
@@ -85,6 +143,30 @@ impl DirectLinkLifecycleRuntime for DirectLinkServiceRuntime {
     ) -> Result<usize, LinkError> {
         self.inbound_router
             .close_active_links_for_actor(&actor.actor_kind, &actor.actor_id, reason)
+            .map_err(|error| LinkError::Protocol(error.to_string()))
+    }
+}
+
+#[async_trait]
+impl DirectLinkRuntime for DirectLinkServiceRuntime {
+    async fn open_link(
+        &self,
+        request: DirectLinkOpenRequest,
+    ) -> Result<DirectLinkSession, LinkError> {
+        Ok(self.endpoint_pool.open_link(request).await?.session)
+    }
+
+    async fn get_outbound(
+        &self,
+        _link_id: LinkId,
+        _stream: lattice_core::DirectLinkStreamDescriptor,
+    ) -> Result<DirectLinkSession, LinkError> {
+        Err(LinkError::Unavailable)
+    }
+
+    async fn close_all(&self, link_id: LinkId, reason: LinkCloseReason) -> Result<(), LinkError> {
+        self.inbound_router
+            .close_all(&link_id, reason)
             .map_err(|error| LinkError::Protocol(error.to_string()))
     }
 }
@@ -152,8 +234,9 @@ where
 pub(crate) fn build_direct_link_runtime(
     bindings: Vec<Box<dyn ErasedDirectLinkBinding>>,
     context: &ServiceBuildContext,
+    enable_outbound: bool,
 ) -> Result<Option<DirectLinkServiceRuntime>, LatticeServiceError> {
-    if bindings.is_empty() {
+    if bindings.is_empty() && !enable_outbound {
         return Ok(None);
     }
 
@@ -166,5 +249,9 @@ pub(crate) fn build_direct_link_runtime(
     Ok(Some(DirectLinkServiceRuntime {
         session_manager,
         inbound_router: Arc::new(router.build()),
+        endpoint_pool: PooledDirectLinkEndpointPool::new(
+            TcpDirectLinkTransport::new(),
+            Default::default(),
+        ),
     }))
 }
