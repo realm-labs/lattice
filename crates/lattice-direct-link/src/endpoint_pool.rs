@@ -244,6 +244,13 @@ where
         let state = self.inner.state.lock().await;
         state.closed_links.clone()
     }
+
+    pub async fn process_protocol_error_frame(
+        &self,
+        frame: DirectLinkFrame,
+    ) -> Result<(), LinkError> {
+        self.inner.process_protocol_error_frame(frame).await
+    }
 }
 
 #[async_trait]
@@ -500,6 +507,31 @@ where
         Ok(count)
     }
 
+    async fn process_protocol_error_frame(&self, frame: DirectLinkFrame) -> Result<(), LinkError> {
+        if frame.kind != DirectLinkFrameKind::ProtocolError {
+            return Err(LinkError::Protocol(format!(
+                "expected ProtocolError frame, got {:?}",
+                frame.kind
+            )));
+        }
+        let reason = String::from_utf8(frame.payload)
+            .unwrap_or_else(|_| "remote protocol error".to_string());
+        if self
+            .close_logical_link(
+                &frame.link_id,
+                LinkCloseReason::ProtocolError(reason.clone()),
+            )
+            .await
+        {
+            Ok(())
+        } else {
+            Err(LinkError::Protocol(format!(
+                "protocol error for unknown direct link {}: {reason}",
+                frame.link_id
+            )))
+        }
+    }
+
     async fn remove_connection(&self, connection_id: DirectLinkConnectionId) {
         self.close_connection(connection_id, LinkCloseReason::ConnectionLost)
             .await;
@@ -552,6 +584,19 @@ where
             }
         }
         affected.len()
+    }
+
+    async fn close_logical_link(&self, link_id: &LinkId, reason: LinkCloseReason) -> bool {
+        let mut state = self.state.lock().await;
+        let Some(link) = state.links.remove(link_id) else {
+            return false;
+        };
+        if let Some(stripe) = state.find_stripe_mut(&link.endpoint_key, link.connection_id) {
+            stripe.active_links = stripe.active_links.saturating_sub(1);
+        }
+        state.closed_links.insert(link_id.clone(), reason);
+        self.metrics.record_link_closed();
+        true
     }
 }
 
@@ -1184,6 +1229,57 @@ mod tests {
         .unwrap();
         assert_eq!(pool.active_links_for_endpoint(&endpoint()).await, 0);
         assert_eq!(pool.metrics_snapshot().physical_connections_closed, 1);
+    }
+
+    #[tokio::test]
+    async fn link_level_protocol_error_closes_only_affected_logical_link() {
+        let transport = FakeTransport::default();
+        let pool = PooledDirectLinkEndpointPool::new(
+            transport.clone(),
+            DirectLinkEndpointPoolConfig::default(),
+        );
+        let first = pool.open_link(request("link-1")).await.unwrap();
+        let second = pool.open_link(request("link-2")).await.unwrap();
+
+        pool.process_protocol_error_frame(DirectLinkFrame {
+            kind: DirectLinkFrameKind::ProtocolError,
+            link_id: first.session.link_id.clone(),
+            sequence: LinkSequence(0),
+            message_id: None,
+            flags: Default::default(),
+            header: Vec::new(),
+            payload: b"bad message on link-1".to_vec(),
+        })
+        .await
+        .unwrap();
+        second.session.sender.tell(message("link-2")).await.unwrap();
+
+        assert_eq!(pool.active_links_for_endpoint(&endpoint()).await, 1);
+        assert_eq!(
+            pool.closed_link_reasons().await,
+            BTreeMap::from([(
+                LinkId::new("link-1"),
+                LinkCloseReason::ProtocolError("bad message on link-1".to_string())
+            )])
+        );
+        let metrics = pool.metrics_snapshot();
+        assert_eq!(metrics.logical_links_closed, 1);
+        assert_eq!(metrics.active_logical_links, 1);
+        assert_eq!(metrics.active_physical_connections, 1);
+        assert!(transport.frames.lock().unwrap().iter().any(|frame| {
+            frame.kind == DirectLinkFrameKind::Message && frame.link_id == LinkId::new("link-2")
+        }));
+
+        fn message(link_id: &str) -> OutboundDirectLinkMessage {
+            OutboundDirectLinkMessage {
+                link_id: LinkId::new(link_id),
+                direction: LinkDirection::SourceToTarget,
+                message_id: DirectLinkMessageId(7),
+                proto_full_name: "game.Position",
+                payload: b"abc".to_vec(),
+                flags: LinkMessageFlags::EMPTY,
+            }
+        }
     }
 
     #[tokio::test]

@@ -329,7 +329,7 @@ This phase intentionally breaks the current Direct Link transport/runtime shape.
 - [x] Node drain closes logical sessions before closing pooled TCP connections.
 - [x] Peer connection loss closes all sessions multiplexed on that TCP connection with `ConnectionLost`.
 - [x] Connection-level protocol fatal error closes the connection and every multiplexed session.
-- [ ] Link-level protocol error closes only the affected logical link unless the frame corrupts connection state.
+- [x] Link-level protocol error closes only the affected logical link unless the frame corrupts connection state.
 - [ ] Metrics distinguish physical connections from logical links: connection open/close, active connections, links per connection, frames per connection, reconnects, and pool queue/backpressure.
 - [ ] Direct Link benchmark compares one connection per link versus pooled striped connections and documents the fd/port/throughput impact.
 
