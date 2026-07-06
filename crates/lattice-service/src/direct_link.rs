@@ -12,8 +12,8 @@ use lattice_core::{
 };
 use lattice_direct_link::{
     DirectLinkActorBinding, DirectLinkDispatch, DirectLinkEndpointPool, DirectLinkInboundRouter,
-    DirectLinkInboundRouterBuilder, DirectLinkSessionManager, PooledDirectLinkEndpointPool,
-    TcpDirectLinkTransport,
+    DirectLinkInboundRouterBuilder, DirectLinkSessionManager, OpenLinkValidationPolicy,
+    PooledDirectLinkEndpointPool, TcpDirectLinkTransport,
 };
 use lattice_placement::instance::InstanceState;
 use lattice_placement::store::{ActorPlacementKey, PlacementState};
@@ -328,6 +328,9 @@ pub(crate) fn build_direct_link_runtime(
     }
 
     let session_manager = Arc::new(DirectLinkSessionManager::new());
+    session_manager.set_validation_policy(OpenLinkValidationPolicy::hosted(
+        context.service_context().service_kind().clone(),
+    ));
     let mut router = DirectLinkInboundRouter::builder(session_manager.clone());
     for binding in bindings {
         router = binding.register(context, &session_manager, router)?;

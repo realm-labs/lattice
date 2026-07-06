@@ -1888,6 +1888,60 @@ async fn direct_link_config_applies_active_link_limit_to_session_manager() {
 }
 
 #[tokio::test]
+async fn direct_link_runtime_rejects_open_links_for_other_service_kind() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store =
+        InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test-direct-link-hosted"));
+    let stream = DirectLinkStream::new("movement").message::<DirectLinkTestPayload>();
+    let descriptor = stream.descriptor();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+    let link_id = LinkId::new("service-link-wrong-owner");
+    let reject = service
+        .direct_link_runtime()
+        .unwrap()
+        .session_manager()
+        .open_link(OpenLinkRequest {
+            protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+            link_id: link_id.clone(),
+            source: direct_actor_ref(
+                service_kind!("Gateway"),
+                actor_kind!("GatewaySession"),
+                ActorId::U64(99),
+                "tcp://127.0.0.1:1".parse().unwrap(),
+            ),
+            target: direct_actor_ref(
+                service_kind!("Inventory"),
+                actor_kind!("Inventory"),
+                ActorId::U64(7),
+                "tcp://127.0.0.1:2".parse().unwrap(),
+            ),
+            mode: DirectLinkMode::Unidirectional,
+            source_to_target: OpenLinkDirection::from_stream(link_id, &descriptor),
+            target_to_source: None,
+            options: DirectLinkOptions::default(),
+        })
+        .unwrap_err();
+
+    assert_eq!(reject.reason, OpenLinkRejectReason::NotOwner);
+}
+
+#[tokio::test]
 async fn direct_link_config_applies_rate_limits_to_session_manager() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let store =

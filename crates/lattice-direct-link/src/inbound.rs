@@ -85,7 +85,7 @@ impl DirectLinkInboundRouter {
         let message_id = frame
             .message_id
             .ok_or(InboundDeliveryError::MissingMessageId)?;
-        self.session_manager.validate_message_frame(
+        self.session_manager.reserve_message_frame(
             &frame.link_id,
             direction,
             message_id,
@@ -103,6 +103,12 @@ impl DirectLinkInboundRouter {
         })?;
         let action = self.apply_inbound_backpressure(&snapshot, direction, message_id)?;
         if action == InboundBackpressureAction::Drop {
+            self.session_manager.complete_message_frame(
+                &frame.link_id,
+                direction,
+                message_id,
+                frame.sequence,
+            )?;
             return Ok(());
         }
         let context = LinkMessageContext {
@@ -115,6 +121,12 @@ impl DirectLinkInboundRouter {
         };
         match binding.deliver(&actor_ref, message_id, &frame.payload, context) {
             Ok(()) => {
+                self.session_manager.complete_message_frame(
+                    &frame.link_id,
+                    direction,
+                    message_id,
+                    frame.sequence,
+                )?;
                 self.complete_inbound_backpressure(&frame.link_id, direction);
                 Ok(())
             }
@@ -680,7 +692,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use lattice_actor::{ActorContext, ActorRuntime, ActorSpawnOptions, Handler};
+    use lattice_actor::{
+        ActorContext, ActorRuntime, ActorSpawnOptions, ActorTellError, Handler, MailboxConfig,
+    };
     use lattice_core::{
         ActorId, ActorKind, ActorRef, BackpressurePolicy, DirectLinkMessage, DirectLinkMode,
         DirectLinkOptions, DirectLinkRuntime, DirectLinkRuntimeHandle, DirectLinkSender,
@@ -692,6 +706,7 @@ mod tests {
     use prost::Message as _;
     use std::time::Instant;
 
+    use tokio::sync::Notify;
     use tokio::time::{Duration, timeout};
 
     use super::*;
@@ -1198,6 +1213,80 @@ mod tests {
         }
     }
 
+    struct BlockingActor {
+        received: Arc<Mutex<Vec<u64>>>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl lattice_actor::Actor for BlockingActor {
+        type Error = Infallible;
+    }
+
+    #[async_trait]
+    impl Handler<Linked<InputCommand>> for BlockingActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            msg: Linked<InputCommand>,
+        ) -> Result<(), Self::Error> {
+            if msg.payload.command_id == 100 {
+                self.entered.notify_waiters();
+                self.release.notified().await;
+            }
+            self.received
+                .lock()
+                .expect("received mutex poisoned")
+                .push(msg.payload.command_id);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkOpened> for BlockingActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkOpened,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkDirectionClosed> for BlockingActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkDirectionClosed,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkClosed> for BlockingActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkClosed,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<LinkBackpressure> for BlockingActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: LinkBackpressure,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn inbound_router_delivers_message_frame_to_target_actor_mailbox() {
         let received = Arc::new(Mutex::new(Vec::new()));
@@ -1254,6 +1343,85 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(*received.lock().expect("received mutex poisoned"), vec![99]);
+    }
+
+    #[tokio::test]
+    async fn inbound_router_does_not_advance_sequence_when_mailbox_is_full() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let handle = ActorRuntime::default()
+            .spawn_actor(
+                BlockingActor {
+                    received: received.clone(),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                },
+                ActorSpawnOptions {
+                    mailbox: MailboxConfig::bounded(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        handle.try_tell(linked_command(100)).unwrap();
+        timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        handle.try_tell(linked_command(101)).unwrap();
+
+        let manager = Arc::new(DirectLinkSessionManager::new());
+        let stream = DirectLinkStream::new("gateway-input").message::<InputCommand>();
+        let descriptor = stream.descriptor();
+        manager
+            .register_binding(actor_kind!("Battle"), descriptor.clone())
+            .unwrap();
+        let link_id = LinkId::new("link-mailbox-full-sequence");
+        manager
+            .open_link(OpenLinkRequest {
+                protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                link_id: link_id.clone(),
+                source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+                target: actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9),
+                mode: DirectLinkMode::Unidirectional,
+                source_to_target: OpenLinkDirection::from_stream(link_id.clone(), &descriptor),
+                target_to_source: None,
+                options: DirectLinkOptions::default(),
+            })
+            .unwrap();
+        let handle_for_router = handle.clone();
+        let router = DirectLinkInboundRouter::builder(manager)
+            .bind_actor(
+                stream.for_actor::<BlockingActor>(actor_kind!("Battle")),
+                move |_| Some(handle_for_router.clone()),
+            )
+            .build();
+        let message_id = descriptor.message_id_for::<InputCommand>().unwrap();
+        let frame = || {
+            DirectLinkFrame::message(
+                link_id.clone(),
+                LinkSequence(1),
+                message_id,
+                InputCommand { command_id: 11 }.encode_to_vec(),
+            )
+        };
+
+        assert!(matches!(
+            router.deliver_frame(frame()),
+            Err(InboundDeliveryError::Delivery(
+                DirectLinkDeliveryError::Mailbox(ActorTellError::MailboxFull)
+            ))
+        ));
+
+        release.notify_waiters();
+        wait_for_len(&received, 2).await;
+
+        router.deliver_frame(frame()).unwrap();
+        wait_for_len(&received, 3).await;
+        assert_eq!(
+            *received.lock().expect("received mutex poisoned"),
+            vec![100, 101, 11]
+        );
     }
 
     #[tokio::test]
@@ -2311,6 +2479,20 @@ mod tests {
             "http://127.0.0.1:10000".parse().unwrap(),
             None,
         )
+    }
+
+    fn linked_command(command_id: u64) -> Linked<InputCommand> {
+        Linked {
+            payload: InputCommand { command_id },
+            context: LinkMessageContext {
+                link_id: LinkId::new("prefill"),
+                source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+                target: actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9),
+                sequence: 0,
+                received_at: Instant::now(),
+                flags: LinkMessageFlags::EMPTY,
+            },
+        }
     }
 
     async fn wait_for_len<T>(items: &Arc<Mutex<Vec<T>>>, expected: usize) {

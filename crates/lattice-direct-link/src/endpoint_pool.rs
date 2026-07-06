@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -451,7 +451,7 @@ where
                         connection_id: stripe.stripe.connection_id,
                         link_id: request.link_id.clone(),
                         direction: LinkDirection::SourceToTarget,
-                        next_sequence: AtomicU64::new(1),
+                        next_sequence: StdMutex::new(1),
                         closed: AtomicBool::new(false),
                     }),
                 };
@@ -761,7 +761,7 @@ where
     connection_id: DirectLinkConnectionId,
     link_id: LinkId,
     direction: LinkDirection,
-    next_sequence: AtomicU64,
+    next_sequence: StdMutex<u64>,
     closed: AtomicBool,
 }
 
@@ -791,7 +791,7 @@ where
                 reason: LinkCloseReason::Done,
             });
         }
-        let frame = self.message_to_frame(message)?;
+        let frame = self.next_message_frame(message)?;
         self.inner
             .write_frame(self.connection_id, frame)
             .await
@@ -804,7 +804,6 @@ where
                 reason: LinkCloseReason::Done,
             });
         }
-        let frame = self.message_to_frame(message)?;
         let writer = self
             .inner
             .state
@@ -815,15 +814,24 @@ where
                 self.inner.metrics.record_pool_queue_backpressure();
                 LinkSendError::BackpressureFull
             })?;
-        writer
-            .try_send(ConnectionCommand::Write {
-                frame,
-                completion: None,
-            })
-            .map_err(|_| {
+        let mut next_sequence = self
+            .next_sequence
+            .lock()
+            .expect("direct link pooled sender sequence poisoned");
+        let frame = self.message_to_frame(message, LinkSequence(*next_sequence))?;
+        match writer.try_send(ConnectionCommand::Write {
+            frame,
+            completion: None,
+        }) {
+            Ok(()) => {
+                *next_sequence += 1;
+                Ok(())
+            }
+            Err(_) => {
                 self.inner.metrics.record_pool_queue_backpressure();
-                LinkSendError::BackpressureFull
-            })
+                Err(LinkSendError::BackpressureFull)
+            }
+        }
     }
 
     async fn close(&self, _reason: LinkCloseReason) -> Result<(), LinkSendError> {
@@ -845,9 +853,23 @@ impl<T> PooledDirectLinkSender<T>
 where
     T: DirectLinkTransport,
 {
+    fn next_message_frame(
+        &self,
+        message: OutboundDirectLinkMessage,
+    ) -> Result<DirectLinkFrame, LinkSendError> {
+        let mut next_sequence = self
+            .next_sequence
+            .lock()
+            .expect("direct link pooled sender sequence poisoned");
+        let frame = self.message_to_frame(message, LinkSequence(*next_sequence))?;
+        *next_sequence += 1;
+        Ok(frame)
+    }
+
     fn message_to_frame(
         &self,
         message: OutboundDirectLinkMessage,
+        sequence: LinkSequence,
     ) -> Result<DirectLinkFrame, LinkSendError> {
         if message.direction != self.direction {
             return Err(LinkSendError::Protocol(
@@ -857,7 +879,7 @@ where
         Ok(DirectLinkFrame::directed_message(
             message.link_id,
             message.direction,
-            LinkSequence(self.next_sequence.fetch_add(1, Ordering::Relaxed)),
+            sequence,
             message.message_id,
             message.payload,
         ))
@@ -1368,7 +1390,7 @@ mod tests {
     async fn pool_queue_backpressure_is_recorded_for_try_tell_enqueue_failure() {
         let pool = PooledDirectLinkEndpointPool::new(FakeTransport::default(), Default::default());
         let session = pool.open_link(request("link-1")).await.unwrap();
-        let _state = pool.inner.state.lock().await;
+        let state_guard = pool.inner.state.lock().await;
 
         let error = session.session.sender.try_tell(OutboundDirectLinkMessage {
             link_id: LinkId::new("link-1"),
@@ -1381,6 +1403,28 @@ mod tests {
 
         assert!(matches!(error, Err(LinkSendError::BackpressureFull)));
         assert_eq!(pool.metrics_snapshot().pool_queue_backpressure_events, 1);
+        drop(state_guard);
+
+        session
+            .session
+            .sender
+            .tell(OutboundDirectLinkMessage {
+                link_id: LinkId::new("link-1"),
+                direction: LinkDirection::SourceToTarget,
+                message_id: DirectLinkMessageId(7),
+                proto_full_name: "game.Position",
+                payload: b"abc".to_vec(),
+                flags: LinkMessageFlags::EMPTY,
+            })
+            .await
+            .unwrap();
+
+        let frames = pool.inner.transport.frames.lock().unwrap();
+        let message_frame = frames
+            .iter()
+            .find(|frame| frame.kind == DirectLinkFrameKind::Message)
+            .expect("message frame was written after retry");
+        assert_eq!(message_frame.sequence, LinkSequence(1));
     }
 
     #[tokio::test]

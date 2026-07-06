@@ -327,7 +327,7 @@ impl DirectLinkFrameCodec {
         })
     }
 
-    fn check_frame_size(&self, size: usize) -> Result<(), FrameCodecError> {
+    pub(crate) fn check_frame_size(&self, size: usize) -> Result<(), FrameCodecError> {
         if self.max_frame_size != 0 && size > self.max_frame_size {
             return Err(FrameCodecError::FrameTooLarge);
         }

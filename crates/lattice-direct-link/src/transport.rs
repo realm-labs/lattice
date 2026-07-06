@@ -207,6 +207,10 @@ where
     })?;
     let len = usize::try_from(len)
         .map_err(|_| LinkError::Protocol("TCP direct link frame length overflow".to_string()))?;
+    codec.check_frame_size(len).map_err(|error| {
+        metrics.record_decode_error();
+        LinkError::Protocol(error.to_string())
+    })?;
     let mut payload = vec![0; len];
     reader.read_exact(&mut payload).await.map_err(|error| {
         LinkError::Protocol(format!("failed to read TCP direct link frame: {error}"))
@@ -323,5 +327,21 @@ mod tests {
         let metrics = transport.metrics().snapshot();
         assert_eq!(metrics.sent, 1);
         assert_eq!(metrics.received, 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_reader_rejects_oversized_length_before_payload_allocation() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_u32(1024).await.unwrap();
+
+        let metrics = DirectLinkMetrics::default();
+        let error = read_tcp_frame(&mut reader, DirectLinkFrameCodec::new(128), &metrics)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, LinkError::Protocol(message) if message.contains("exceeds maximum size"))
+        );
+        assert_eq!(metrics.snapshot().decode_errors, 1);
     }
 }

@@ -304,11 +304,79 @@ impl DirectLinkSessionManager {
         message_id: DirectLinkMessageId,
         sequence: LinkSequence,
     ) -> Result<(), MessageFrameError> {
+        self.reserve_message_frame(link_id, direction, message_id, sequence)?;
+        self.complete_message_frame(link_id, direction, message_id, sequence)
+    }
+
+    pub fn check_message_frame(
+        &self,
+        link_id: &LinkId,
+        direction: LinkDirection,
+        message_id: DirectLinkMessageId,
+        sequence: LinkSequence,
+    ) -> Result<(), MessageFrameError> {
+        let links = self
+            .links
+            .lock()
+            .expect("direct link managed links poisoned");
+        let Some(link) = links.get(link_id) else {
+            return self.message_frame_error(link_id, MessageFrameError::UnknownLink);
+        };
+        if link.closed {
+            return self.message_frame_error(link_id, MessageFrameError::Closed);
+        }
+        self.validate_frame_target(link_id, link)?;
+        let Some(direction_state) = link.directions.get(&direction) else {
+            return self.message_frame_error(link_id, MessageFrameError::WrongDirection);
+        };
+        if direction_state.closed {
+            return self.message_frame_error(link_id, MessageFrameError::Closed);
+        }
+        if !direction_state
+            .accepted_message_type_ids
+            .contains(&message_id)
+        {
+            return self.message_frame_error(link_id, MessageFrameError::UnsupportedMessageType);
+        }
+        let expected = direction_state.next_receive_sequence;
+        if sequence != expected {
+            return self.message_frame_error(
+                link_id,
+                MessageFrameError::InvalidSequence {
+                    expected,
+                    actual: sequence,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub fn reserve_message_frame(
+        &self,
+        link_id: &LinkId,
+        direction: LinkDirection,
+        message_id: DirectLinkMessageId,
+        sequence: LinkSequence,
+    ) -> Result<(), MessageFrameError> {
         let message_rate_limit = self
             .validation
             .lock()
             .expect("direct link validation policy poisoned")
             .message_rate_limit;
+        self.check_message_frame(link_id, direction, message_id, sequence)?;
+        if !self.consume_message_rate_limit(link_id, message_rate_limit, Instant::now()) {
+            return self.message_frame_error(link_id, MessageFrameError::RateLimited);
+        }
+        Ok(())
+    }
+
+    pub fn complete_message_frame(
+        &self,
+        link_id: &LinkId,
+        direction: LinkDirection,
+        message_id: DirectLinkMessageId,
+        sequence: LinkSequence,
+    ) -> Result<(), MessageFrameError> {
         let mut links = self
             .links
             .lock()
@@ -342,9 +410,6 @@ impl DirectLinkSessionManager {
                 },
             );
         }
-        if !self.consume_message_rate_limit(link_id, message_rate_limit, Instant::now()) {
-            return self.message_frame_error(link_id, MessageFrameError::RateLimited);
-        }
         direction_state.next_receive_sequence = LinkSequence(expected.0 + 1);
         self.metrics.record_receive();
         tracing::trace!(
@@ -368,8 +433,8 @@ impl DirectLinkSessionManager {
     where
         T: DirectLinkMessage,
     {
-        self.validate_message_frame(link_id, direction, message_id, sequence)?;
-        T::decode(payload).map_err(|error| {
+        self.check_message_frame(link_id, direction, message_id, sequence)?;
+        let decoded = T::decode(payload).map_err(|error| {
             self.metrics.record_decode_error();
             tracing::warn!(
                 link.id = link_id.as_str(),
@@ -378,7 +443,10 @@ impl DirectLinkSessionManager {
                 "direct link message decode failed"
             );
             MessageFrameError::DecodeError(error.to_string())
-        })
+        })?;
+        self.reserve_message_frame(link_id, direction, message_id, sequence)?;
+        self.complete_message_frame(link_id, direction, message_id, sequence)?;
+        Ok(decoded)
     }
 
     pub fn close_direction(
