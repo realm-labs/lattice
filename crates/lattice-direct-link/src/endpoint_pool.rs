@@ -403,6 +403,16 @@ where
                     .map_err(|error| LinkError::Protocol(error.to_string()))?;
                 Err(reject_reason_to_error(reject.reason))
             }
+            DirectLinkFrameKind::ProtocolError => {
+                let reason = String::from_utf8(response.payload)
+                    .unwrap_or_else(|_| "remote protocol error".to_string());
+                self.close_connection(
+                    stripe.stripe.connection_id,
+                    LinkCloseReason::ProtocolError(reason.clone()),
+                )
+                .await;
+                Err(LinkError::Protocol(reason))
+            }
             other => Err(LinkError::Protocol(format!(
                 "expected OpenLinkAck/OpenLinkReject from direct link pool, got {other:?}"
             ))),
@@ -491,8 +501,17 @@ where
     }
 
     async fn remove_connection(&self, connection_id: DirectLinkConnectionId) {
+        self.close_connection(connection_id, LinkCloseReason::ConnectionLost)
+            .await;
+    }
+
+    async fn close_connection(
+        &self,
+        connection_id: DirectLinkConnectionId,
+        reason: LinkCloseReason,
+    ) {
         let _ = self
-            .close_logical_links_for_connection(connection_id, LinkCloseReason::ConnectionLost)
+            .close_logical_links_for_connection(connection_id, reason)
             .await;
         let mut state = self.state.lock().await;
         for endpoint in state.endpoints.values_mut() {
@@ -869,6 +888,7 @@ fn close_frame(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicUsize;
 
     use lattice_core::{
         ActorId, DirectLinkMessageDescriptor, DirectLinkMessageId, DirectLinkMode,
@@ -883,6 +903,8 @@ mod tests {
         connects: Arc<StdMutex<Vec<DirectLinkEndpoint>>>,
         frames: Arc<StdMutex<Vec<DirectLinkFrame>>>,
         fail_message_writes: bool,
+        protocol_error_on_read: Option<usize>,
+        read_count: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -905,6 +927,8 @@ mod tests {
             Ok(FakeConnection {
                 frames: self.frames.clone(),
                 fail_message_writes: self.fail_message_writes,
+                protocol_error_on_read: self.protocol_error_on_read,
+                read_count: self.read_count.clone(),
             })
         }
     }
@@ -913,6 +937,8 @@ mod tests {
     struct FakeConnection {
         frames: Arc<StdMutex<Vec<DirectLinkFrame>>>,
         fail_message_writes: bool,
+        protocol_error_on_read: Option<usize>,
+        read_count: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -926,6 +952,18 @@ mod tests {
                 .expect("open frame was written")
                 .decode_open_link()
                 .unwrap();
+            let read = self.read_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.protocol_error_on_read == Some(read) {
+                return Ok(DirectLinkFrame {
+                    kind: DirectLinkFrameKind::ProtocolError,
+                    link_id: open.link_id,
+                    sequence: LinkSequence(0),
+                    message_id: None,
+                    flags: Default::default(),
+                    header: Vec::new(),
+                    payload: b"connection fatal".to_vec(),
+                });
+            }
             let ack = crate::session::OpenLinkAck {
                 link_id: open.link_id.clone(),
                 source_to_target: crate::session::NegotiatedDirection {
@@ -1114,6 +1152,38 @@ mod tests {
                 flags: LinkMessageFlags::EMPTY,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn connection_level_protocol_error_closes_connection_and_multiplexed_links() {
+        let pool = PooledDirectLinkEndpointPool::new(
+            FakeTransport {
+                protocol_error_on_read: Some(2),
+                ..FakeTransport::default()
+            },
+            DirectLinkEndpointPoolConfig::default(),
+        );
+        let first = pool.open_link(request("link-1")).await.unwrap();
+        let error = pool.open_link(request("link-2")).await.unwrap_err();
+
+        assert!(matches!(error, LinkError::Protocol(ref reason) if reason == "connection fatal"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let closed = pool.closed_link_reasons().await;
+                if closed.len() == 1 {
+                    assert!(matches!(
+                        closed.get(&first.session.link_id),
+                        Some(LinkCloseReason::ProtocolError(reason)) if reason == "connection fatal"
+                    ));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pool.active_links_for_endpoint(&endpoint()).await, 0);
+        assert_eq!(pool.metrics_snapshot().physical_connections_closed, 1);
     }
 
     #[tokio::test]
