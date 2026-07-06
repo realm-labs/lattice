@@ -6,24 +6,28 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use lattice_actor::{Actor, Handler};
 use lattice_core::{
-    ActorRef, DirectLinkLifecycleRuntime, DirectLinkOpenRequest, DirectLinkRuntime,
-    DirectLinkSession, LinkBackpressure, LinkCloseReason, LinkClosed, LinkDirectionClosed,
-    LinkError, LinkId, LinkOpened,
+    ActorRef, DirectLinkEndpoint, DirectLinkLifecycleRuntime, DirectLinkOpenRequest,
+    DirectLinkRuntime, DirectLinkSession, LinkBackpressure, LinkCloseReason, LinkClosed,
+    LinkDirectionClosed, LinkError, LinkId, LinkOpened, LinkTarget,
 };
 use lattice_direct_link::{
     DirectLinkActorBinding, DirectLinkDispatch, DirectLinkEndpointPool, DirectLinkInboundRouter,
     DirectLinkInboundRouterBuilder, DirectLinkSessionManager, PooledDirectLinkEndpointPool,
     TcpDirectLinkTransport,
 };
+use lattice_placement::instance::InstanceState;
+use lattice_placement::store::{ActorPlacementKey, PlacementState};
 
 use crate::LatticeServiceError;
 use crate::context::ServiceBuildContext;
+use crate::framework::{DynPlacementStore, PlacementStoreComponent};
 
 #[derive(Clone)]
 pub struct DirectLinkServiceRuntime {
     session_manager: Arc<DirectLinkSessionManager>,
     inbound_router: Arc<DirectLinkInboundRouter>,
     endpoint_pool: PooledDirectLinkEndpointPool<TcpDirectLinkTransport>,
+    placement_store: Option<Arc<dyn DynPlacementStore>>,
 }
 
 impl fmt::Debug for DirectLinkServiceRuntime {
@@ -33,6 +37,7 @@ impl fmt::Debug for DirectLinkServiceRuntime {
             .field("session_manager", &self.session_manager)
             .field("inbound_router", &self.inbound_router)
             .field("endpoint_pool", &self.endpoint_pool)
+            .field("has_placement_store", &self.placement_store.is_some())
             .finish()
     }
 }
@@ -153,6 +158,7 @@ impl DirectLinkRuntime for DirectLinkServiceRuntime {
         &self,
         request: DirectLinkOpenRequest,
     ) -> Result<DirectLinkSession, LinkError> {
+        let request = self.resolve_open_request(request).await?;
         Ok(self.endpoint_pool.open_link(request).await?.session)
     }
 
@@ -168,6 +174,75 @@ impl DirectLinkRuntime for DirectLinkServiceRuntime {
         self.inbound_router
             .close_all(&link_id, reason)
             .map_err(|error| LinkError::Protocol(error.to_string()))
+    }
+}
+
+impl DirectLinkServiceRuntime {
+    async fn resolve_open_request(
+        &self,
+        mut request: DirectLinkOpenRequest,
+    ) -> Result<DirectLinkOpenRequest, LinkError> {
+        let LinkTarget::Actor(actor_ref) = &request.target else {
+            return Ok(request);
+        };
+        let placement_store = self.placement_store.as_ref().ok_or_else(|| {
+            LinkError::Protocol(
+                "direct link ActorRef target resolution requires a placement store".to_string(),
+            )
+        })?;
+        let key = ActorPlacementKey {
+            actor_kind: actor_ref.actor_kind.clone(),
+            actor_id: actor_ref.actor_id.clone(),
+        };
+        let Some((_version, placement)) = placement_store
+            .get_actor(&key)
+            .await
+            .map_err(|error| LinkError::Protocol(error.to_string()))?
+        else {
+            return Err(LinkError::ActorUnavailable);
+        };
+        if placement.state != PlacementState::Running {
+            return Err(LinkError::ActorUnavailable);
+        }
+        let Some(instance) = placement_store
+            .get_instance(&placement.owner)
+            .await
+            .map_err(|error| LinkError::Protocol(error.to_string()))?
+        else {
+            return Err(LinkError::ActorUnavailable);
+        };
+        if instance.state != InstanceState::Ready {
+            return Err(LinkError::ActorUnavailable);
+        }
+        let endpoint = instance
+            .labels
+            .get("direct_link_endpoint")
+            .ok_or_else(|| {
+                LinkError::Protocol(format!(
+                    "instance {} has no direct_link_endpoint label",
+                    instance.instance_id
+                ))
+            })?
+            .parse()
+            .map_err(|error| {
+                LinkError::Protocol(format!(
+                    "invalid direct_link_endpoint for instance {}: {error}",
+                    instance.instance_id
+                ))
+            })?;
+        let target = ActorRef::direct(
+            actor_ref.service_kind.clone(),
+            actor_ref.actor_kind.clone(),
+            actor_ref.actor_id.clone(),
+            instance.instance_id,
+            instance.advertised_endpoint,
+            Some(placement.epoch),
+        );
+        request.target = LinkTarget::Endpoint {
+            endpoint: DirectLinkEndpoint::new(endpoint),
+            target,
+        };
+        Ok(request)
     }
 }
 
@@ -253,5 +328,9 @@ pub(crate) fn build_direct_link_runtime(
             TcpDirectLinkTransport::new(),
             Default::default(),
         ),
+        placement_store: context
+            .service_context()
+            .extension::<PlacementStoreComponent>()
+            .map(|component| component.inner()),
     }))
 }

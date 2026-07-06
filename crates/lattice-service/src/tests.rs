@@ -27,8 +27,7 @@ use lattice_core::{
     ActorId, ActorKind, ActorRef, ConfiguredComponent, DirectLinkEndpoint, DirectLinkManager,
     DirectLinkMessage, DirectLinkMode, DirectLinkOptions, DirectLinkRuntimeHandle, Epoch,
     InstanceId, LinkBackpressure, LinkCloseReason, LinkClosed, LinkDirectionClosed, LinkId,
-    LinkOpened, LinkSequence, LinkTarget, Linked, RequestId, RouteKey, TraceContext, actor_kind,
-    service_kind,
+    LinkOpened, LinkSequence, Linked, RequestId, RouteKey, TraceContext, actor_kind, service_kind,
 };
 use lattice_direct_link::{
     DIRECT_LINK_PROTOCOL_VERSION, DirectLinkConnection, DirectLinkFrame, DirectLinkFrameKind,
@@ -1527,10 +1526,14 @@ async fn direct_link_listener_demultiplexes_multiple_links_on_one_connection() {
 #[tokio::test]
 async fn service_context_installs_direct_link_runtime_handle_for_connect() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new(
+        "/lattice/test-direct-link-runtime-handle",
+    ));
     let service = LatticeService::builder(service_kind!("Gateway"))
         .instance_id(InstanceId::new("gateway-1"))
         .listen(listener)
         .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
+        .placement_store::<InMemoryPlacementStore, _>(store.clone())
         .register_actor(
             ActorRegistration::builder(actor_kind!("GatewaySession"))
                 .factory(TestFactory)
@@ -1559,6 +1562,43 @@ async fn service_context_installs_direct_link_runtime_handle_for_connect() {
         .await
         .unwrap();
     let target_endpoint = listener.local_endpoint();
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert(
+        "direct_link_endpoint".to_string(),
+        target_endpoint.uri.to_string(),
+    );
+    store
+        .upsert_instance(InstanceRecord {
+            service_kind: service_kind!("World"),
+            instance_id: InstanceId::new("world-1"),
+            lease_id: LeaseId(1),
+            advertised_endpoint: "http://127.0.0.1:18080".parse().unwrap(),
+            control_endpoint: "http://127.0.0.1:18081".parse().unwrap(),
+            version: "test".to_string(),
+            state: InstanceState::Ready,
+            capacity: lattice_core::instance::InstanceCapacity::default(),
+            labels,
+        })
+        .await
+        .unwrap();
+    store
+        .compare_and_put_actor(
+            ActorPlacementKey {
+                actor_kind: actor_kind!("World"),
+                actor_id: ActorId::U64(7),
+            },
+            None,
+            ActorPlacementRecord {
+                actor_kind: actor_kind!("World"),
+                actor_id: ActorId::U64(7),
+                owner: InstanceId::new("world-1"),
+                epoch: Epoch(3),
+                lease_id: LeaseId(2),
+                state: PlacementState::Running,
+            },
+        )
+        .await
+        .unwrap();
     let stream = DirectLinkStream::new("movement").message::<DirectLinkTestPayload>();
     let descriptor = stream.descriptor();
     let server = tokio::spawn({
@@ -1571,6 +1611,13 @@ async fn service_context_installs_direct_link_runtime_handle_for_connect() {
                 .unwrap()
                 .decode_open_link()
                 .unwrap();
+            assert!(matches!(
+                open.target.target,
+                lattice_core::ActorRefTarget::Direct {
+                    owner_epoch: Some(Epoch(3)),
+                    ..
+                }
+            ));
             let ack = lattice_direct_link::OpenLinkAck {
                 link_id: open.link_id.clone(),
                 source_to_target: lattice_direct_link::NegotiatedDirection {
@@ -1597,22 +1644,14 @@ async fn service_context_installs_direct_link_runtime_handle_for_connect() {
         ActorId::U64(99),
         "http://127.0.0.1:18080".parse().unwrap(),
     );
-    let target = direct_actor_ref(
+    let target = ActorRef::routed(
         service_kind!("World"),
         actor_kind!("World"),
         ActorId::U64(7),
-        target_endpoint.uri.clone(),
     );
     let manager = DirectLinkManager::new(service.context().clone(), Some(source));
     let link = manager
-        .connect(
-            LinkTarget::Endpoint {
-                endpoint: target_endpoint,
-                target,
-            },
-            stream,
-            DirectLinkOptions::default(),
-        )
+        .connect(target, stream, DirectLinkOptions::default())
         .await
         .unwrap();
     link.tell(DirectLinkTestPayload { tick: 7 }).await.unwrap();
