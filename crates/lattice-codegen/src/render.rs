@@ -974,10 +974,18 @@ struct NameDisambiguation {
 
 impl NameDisambiguation {
     fn new(methods: &[RpcMethodSpec]) -> Self {
-        let mut seen = BTreeSet::new();
+        let mut seen = BTreeSet::<(String, String)>::new();
         let mut duplicate_service_names = BTreeSet::new();
         for method in methods {
-            if !seen.insert(method.service_name.clone()) {
+            if !seen.insert((method.package.clone(), method.service_name.clone())) {
+                continue;
+            }
+            if seen
+                .iter()
+                .filter(|(_, service)| service == &method.service_name)
+                .count()
+                > 1
+            {
                 duplicate_service_names.insert(method.service_name.clone());
             }
         }

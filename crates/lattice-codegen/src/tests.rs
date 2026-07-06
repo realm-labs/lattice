@@ -513,6 +513,31 @@ fn gateway_route_table_registration_is_generated_from_method_metadata() {
 }
 
 #[test]
+fn multiple_methods_on_one_service_do_not_force_package_disambiguation() {
+    let first = world_enter_method();
+    let mut second = world_enter_method();
+    second.method_name = "LeaveWorld".into();
+    second.request_type = "crate::world::LeaveWorldRequest".into();
+    second.reply_type = "crate::world::LeaveWorldReply".into();
+    second.gateway_msg_id = Some(101);
+
+    let generated = generate_rpc_bindings(&[first, second]).unwrap();
+
+    assert!(generated.rust.contains("pub mod world_rpc"));
+    assert!(!generated.rust.contains("pub mod world_world_rpc"));
+    assert!(
+        generated
+            .rust
+            .contains("table.register(world_rpc::enter_world::GatewayBinding::route_spec())?;")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("table.register(world_rpc::leave_world::GatewayBinding::route_spec())?;")
+    );
+}
+
+#[test]
 fn gateway_binding_is_generated_without_default_registration() {
     let mut method = world_enter_method();
     method.gateway_msg_id = None;
