@@ -327,7 +327,7 @@ This phase intentionally breaks the current Direct Link transport/runtime shape.
 - [x] `LinkTarget::Endpoint` remains available for explicit business endpoints, but it also goes through the endpoint pool.
 - [x] Endpoint pool enforces connection count, per-connection link count, and per-endpoint link count before OpenLink.
 - [x] Node drain closes logical sessions before closing pooled TCP connections.
-- [ ] Peer connection loss closes all sessions multiplexed on that TCP connection with `ConnectionLost`.
+- [x] Peer connection loss closes all sessions multiplexed on that TCP connection with `ConnectionLost`.
 - [ ] Connection-level protocol fatal error closes the connection and every multiplexed session.
 - [ ] Link-level protocol error closes only the affected logical link unless the frame corrupts connection state.
 - [ ] Metrics distinguish physical connections from logical links: connection open/close, active connections, links per connection, frames per connection, reconnects, and pool queue/backpressure.

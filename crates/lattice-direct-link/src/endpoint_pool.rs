@@ -1,3 +1,8 @@
+// This module keeps endpoint-pool internals and their white-box tests together
+// while Phase 9 connection pooling is still being assembled. The tests inspect
+// private stripe/link tables so connection-loss and drain semantics can be
+// covered before stable public inspection APIs exist.
+
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -233,6 +238,11 @@ where
         reason: LinkCloseReason,
     ) -> Result<usize, LinkError> {
         self.inner.close_all_logical_links(reason).await
+    }
+
+    pub async fn closed_link_reasons(&self) -> BTreeMap<LinkId, LinkCloseReason> {
+        let state = self.inner.state.lock().await;
+        state.closed_links.clone()
     }
 }
 
@@ -481,6 +491,9 @@ where
     }
 
     async fn remove_connection(&self, connection_id: DirectLinkConnectionId) {
+        let _ = self
+            .close_logical_links_for_connection(connection_id, LinkCloseReason::ConnectionLost)
+            .await;
         let mut state = self.state.lock().await;
         for endpoint in state.endpoints.values_mut() {
             for stripe in &mut endpoint.stripes {
@@ -495,12 +508,39 @@ where
             }
         }
     }
+
+    async fn close_logical_links_for_connection(
+        &self,
+        connection_id: DirectLinkConnectionId,
+        reason: LinkCloseReason,
+    ) -> usize {
+        let mut state = self.state.lock().await;
+        let affected = state
+            .links
+            .iter()
+            .filter_map(|(link_id, link)| {
+                (link.connection_id == connection_id).then_some(link_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for link_id in &affected {
+            if let Some(link) = state.links.remove(link_id) {
+                if let Some(stripe) = state.find_stripe_mut(&link.endpoint_key, link.connection_id)
+                {
+                    stripe.active_links = stripe.active_links.saturating_sub(1);
+                }
+                state.closed_links.insert(link_id.clone(), reason.clone());
+                self.metrics.record_link_closed();
+            }
+        }
+        affected.len()
+    }
 }
 
 #[derive(Debug, Default)]
 struct PoolState {
     endpoints: HashMap<DirectLinkEndpointKey, EndpointState>,
     links: BTreeMap<LinkId, PooledLinkState>,
+    closed_links: BTreeMap<LinkId, LinkCloseReason>,
 }
 
 impl PoolState {
@@ -842,6 +882,7 @@ mod tests {
     struct FakeTransport {
         connects: Arc<StdMutex<Vec<DirectLinkEndpoint>>>,
         frames: Arc<StdMutex<Vec<DirectLinkFrame>>>,
+        fail_message_writes: bool,
     }
 
     #[async_trait]
@@ -863,6 +904,7 @@ mod tests {
             self.connects.lock().unwrap().push(endpoint);
             Ok(FakeConnection {
                 frames: self.frames.clone(),
+                fail_message_writes: self.fail_message_writes,
             })
         }
     }
@@ -870,6 +912,7 @@ mod tests {
     #[derive(Debug)]
     struct FakeConnection {
         frames: Arc<StdMutex<Vec<DirectLinkFrame>>>,
+        fail_message_writes: bool,
     }
 
     #[async_trait]
@@ -900,6 +943,9 @@ mod tests {
         }
 
         async fn write_frame(&mut self, frame: DirectLinkFrame) -> Result<(), LinkError> {
+            if self.fail_message_writes && frame.kind == DirectLinkFrameKind::Message {
+                return Err(LinkError::Protocol("simulated connection loss".to_string()));
+            }
             self.frames.lock().unwrap().push(frame);
             Ok(())
         }
@@ -1002,6 +1048,72 @@ mod tests {
             .filter(|frame| frame.kind == DirectLinkFrameKind::Close)
             .count();
         assert_eq!(close_frames, 2);
+    }
+
+    #[tokio::test]
+    async fn peer_connection_loss_closes_every_multiplexed_logical_link() {
+        let pool = PooledDirectLinkEndpointPool::new(
+            FakeTransport {
+                fail_message_writes: true,
+                ..FakeTransport::default()
+            },
+            DirectLinkEndpointPoolConfig::default(),
+        );
+        let first = pool.open_link(request("link-1")).await.unwrap();
+        let second = pool.open_link(request("link-2")).await.unwrap();
+        assert_eq!(first.connection_id, second.connection_id);
+        let send_error = first
+            .session
+            .sender
+            .tell(message("link-1"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(send_error, LinkSendError::Protocol(_)));
+        let closed = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let closed = pool.closed_link_reasons().await;
+                if closed.len() == 2 {
+                    break closed;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            closed,
+            BTreeMap::from([
+                (LinkId::new("link-1"), LinkCloseReason::ConnectionLost),
+                (LinkId::new("link-2"), LinkCloseReason::ConnectionLost),
+            ])
+        );
+        assert_eq!(pool.active_links_for_endpoint(&endpoint()).await, 0);
+        assert_eq!(
+            pool.metrics_snapshot(),
+            DirectLinkEndpointPoolMetricsSnapshot {
+                physical_connections_opened: 1,
+                physical_connections_closed: 1,
+                active_physical_connections: 0,
+                logical_links_opened: 2,
+                logical_links_closed: 2,
+                active_logical_links: 0,
+                frames_written: 2,
+                reconnects: 0,
+                pool_rejections: 0,
+            }
+        );
+
+        fn message(link_id: &str) -> OutboundDirectLinkMessage {
+            OutboundDirectLinkMessage {
+                link_id: LinkId::new(link_id),
+                direction: LinkDirection::SourceToTarget,
+                message_id: DirectLinkMessageId(7),
+                proto_full_name: "game.Position",
+                payload: b"abc".to_vec(),
+                flags: LinkMessageFlags::EMPTY,
+            }
+        }
     }
 
     #[tokio::test]
