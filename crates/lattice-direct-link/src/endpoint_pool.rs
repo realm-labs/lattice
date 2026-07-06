@@ -68,7 +68,7 @@ impl DirectLinkEndpointKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DirectLinkConnectionId(pub u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +96,9 @@ pub struct DirectLinkEndpointPoolMetricsSnapshot {
     pub frames_written: u64,
     pub reconnects: u64,
     pub pool_rejections: u64,
+    pub pool_queue_backpressure_events: u64,
+    pub links_per_connection: BTreeMap<DirectLinkConnectionId, usize>,
+    pub frames_per_connection: BTreeMap<DirectLinkConnectionId, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -109,6 +112,9 @@ struct DirectLinkEndpointPoolMetrics {
     frames_written: AtomicU64,
     reconnects: AtomicU64,
     pool_rejections: AtomicU64,
+    pool_queue_backpressure_events: AtomicU64,
+    links_per_connection: std::sync::Mutex<BTreeMap<DirectLinkConnectionId, usize>>,
+    frames_per_connection: std::sync::Mutex<BTreeMap<DirectLinkConnectionId, u64>>,
 }
 
 impl DirectLinkEndpointPoolMetrics {
@@ -123,17 +129,40 @@ impl DirectLinkEndpointPoolMetrics {
             frames_written: self.frames_written.load(Ordering::Relaxed),
             reconnects: self.reconnects.load(Ordering::Relaxed),
             pool_rejections: self.pool_rejections.load(Ordering::Relaxed),
+            pool_queue_backpressure_events: self
+                .pool_queue_backpressure_events
+                .load(Ordering::Relaxed),
+            links_per_connection: self
+                .links_per_connection
+                .lock()
+                .expect("direct link endpoint pool link metrics poisoned")
+                .clone(),
+            frames_per_connection: self
+                .frames_per_connection
+                .lock()
+                .expect("direct link endpoint pool frame metrics poisoned")
+                .clone(),
         }
     }
 
-    fn record_connection_opened(&self) {
+    fn record_connection_opened(&self, connection_id: DirectLinkConnectionId) {
         self.physical_connections_opened
             .fetch_add(1, Ordering::Relaxed);
         self.active_physical_connections
             .fetch_add(1, Ordering::Relaxed);
+        self.links_per_connection
+            .lock()
+            .expect("direct link endpoint pool link metrics poisoned")
+            .entry(connection_id)
+            .or_insert(0);
+        self.frames_per_connection
+            .lock()
+            .expect("direct link endpoint pool frame metrics poisoned")
+            .entry(connection_id)
+            .or_insert(0);
     }
 
-    fn record_connection_closed(&self) {
+    fn record_connection_closed(&self, connection_id: DirectLinkConnectionId) {
         self.physical_connections_closed
             .fetch_add(1, Ordering::Relaxed);
         self.active_physical_connections
@@ -141,28 +170,56 @@ impl DirectLinkEndpointPoolMetrics {
                 Some(value.saturating_sub(1))
             })
             .ok();
+        self.links_per_connection
+            .lock()
+            .expect("direct link endpoint pool link metrics poisoned")
+            .remove(&connection_id);
     }
 
-    fn record_link_opened(&self) {
+    fn record_link_opened(&self, connection_id: DirectLinkConnectionId) {
         self.logical_links_opened.fetch_add(1, Ordering::Relaxed);
         self.active_logical_links.fetch_add(1, Ordering::Relaxed);
+        *self
+            .links_per_connection
+            .lock()
+            .expect("direct link endpoint pool link metrics poisoned")
+            .entry(connection_id)
+            .or_insert(0) += 1;
     }
 
-    fn record_link_closed(&self) {
+    fn record_link_closed(&self, connection_id: DirectLinkConnectionId) {
         self.logical_links_closed.fetch_add(1, Ordering::Relaxed);
         self.active_logical_links
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 Some(value.saturating_sub(1))
             })
             .ok();
+        let mut links = self
+            .links_per_connection
+            .lock()
+            .expect("direct link endpoint pool link metrics poisoned");
+        if let Some(count) = links.get_mut(&connection_id) {
+            *count = count.saturating_sub(1);
+        }
     }
 
-    fn record_frame_written(&self) {
+    fn record_frame_written(&self, connection_id: DirectLinkConnectionId) {
         self.frames_written.fetch_add(1, Ordering::Relaxed);
+        *self
+            .frames_per_connection
+            .lock()
+            .expect("direct link endpoint pool frame metrics poisoned")
+            .entry(connection_id)
+            .or_insert(0) += 1;
     }
 
     fn record_pool_rejection(&self) {
         self.pool_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_pool_queue_backpressure(&self) {
+        self.pool_queue_backpressure_events
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -327,7 +384,7 @@ where
                 .await
                 .map_err(|_| LinkError::Protocol("direct link connect timed out".to_string()))??;
                 let writer = spawn_connection_task(connection, self.clone(), connection_id);
-                self.metrics.record_connection_opened();
+                self.metrics.record_connection_opened(connection_id);
                 *stripe_state = Some(PooledStripeState {
                     stripe: DirectLinkConnectionStripe {
                         endpoint: endpoint_key.clone(),
@@ -382,7 +439,7 @@ where
                     stripe.stripe.connection_id,
                 )
                 .await;
-                self.metrics.record_link_opened();
+                self.metrics.record_link_opened(stripe.stripe.connection_id);
                 let session = DirectLinkSession {
                     link_id: request.link_id.clone(),
                     direction: LinkDirection::SourceToTarget,
@@ -472,7 +529,7 @@ where
             && stripe.active_links > 0
         {
             stripe.active_links -= 1;
-            self.metrics.record_link_closed();
+            self.metrics.record_link_closed(link.connection_id);
         }
     }
 
@@ -484,7 +541,7 @@ where
                 if let Some(stripe) = state.find_stripe_mut(&link.endpoint_key, link.connection_id)
                 {
                     stripe.active_links = stripe.active_links.saturating_sub(1);
-                    self.metrics.record_link_closed();
+                    self.metrics.record_link_closed(link.connection_id);
                 }
             }
             links
@@ -553,7 +610,7 @@ where
                     .is_some_and(|stripe| stripe.stripe.connection_id == connection_id)
                 {
                     *stripe = None;
-                    self.metrics.record_connection_closed();
+                    self.metrics.record_connection_closed(connection_id);
                     return;
                 }
             }
@@ -580,7 +637,7 @@ where
                     stripe.active_links = stripe.active_links.saturating_sub(1);
                 }
                 state.closed_links.insert(link_id.clone(), reason.clone());
-                self.metrics.record_link_closed();
+                self.metrics.record_link_closed(link.connection_id);
             }
         }
         affected.len()
@@ -595,7 +652,7 @@ where
             stripe.active_links = stripe.active_links.saturating_sub(1);
         }
         state.closed_links.insert(link_id.clone(), reason);
-        self.metrics.record_link_closed();
+        self.metrics.record_link_closed(link.connection_id);
         true
     }
 }
@@ -754,13 +811,19 @@ where
             .try_lock()
             .ok()
             .and_then(|state| state.find_writer(self.connection_id))
-            .ok_or(LinkSendError::BackpressureFull)?;
+            .ok_or_else(|| {
+                self.inner.metrics.record_pool_queue_backpressure();
+                LinkSendError::BackpressureFull
+            })?;
         writer
             .try_send(ConnectionCommand::Write {
                 frame,
                 completion: None,
             })
-            .map_err(|_| LinkSendError::BackpressureFull)
+            .map_err(|_| {
+                self.inner.metrics.record_pool_queue_backpressure();
+                LinkSendError::BackpressureFull
+            })
     }
 
     async fn close(&self, _reason: LinkCloseReason) -> Result<(), LinkSendError> {
@@ -821,7 +884,7 @@ where
                         }
                         break;
                     }
-                    pool.metrics.record_frame_written();
+                    pool.metrics.record_frame_written(connection_id);
                     if let Some(completion) = completion {
                         let _ = completion.send(Ok(()));
                     }
@@ -832,7 +895,7 @@ where
                         let _ = response.send(Err(error));
                         break;
                     }
-                    pool.metrics.record_frame_written();
+                    pool.metrics.record_frame_written(connection_id);
                     let result = connection.read_frame().await;
                     let should_break = result.is_err();
                     let _ = response.send(result);
@@ -1099,6 +1162,14 @@ mod tests {
         assert_eq!(metrics.physical_connections_opened, 1);
         assert_eq!(metrics.logical_links_opened, 2);
         assert_eq!(metrics.active_logical_links, 2);
+        assert_eq!(
+            metrics.links_per_connection,
+            BTreeMap::from([(first.connection_id, 2)])
+        );
+        assert_eq!(
+            metrics.frames_per_connection,
+            BTreeMap::from([(first.connection_id, 2)])
+        );
     }
 
     #[tokio::test]
@@ -1123,6 +1194,10 @@ mod tests {
         assert_eq!(metrics.active_logical_links, 0);
         assert_eq!(metrics.logical_links_closed, 2);
         assert_eq!(metrics.active_physical_connections, 1);
+        assert_eq!(
+            metrics.links_per_connection,
+            BTreeMap::from([(first.connection_id, 0)])
+        );
         let close_frames = transport
             .frames
             .lock()
@@ -1184,6 +1259,9 @@ mod tests {
                 frames_written: 2,
                 reconnects: 0,
                 pool_rejections: 0,
+                pool_queue_backpressure_events: 0,
+                links_per_connection: BTreeMap::new(),
+                frames_per_connection: BTreeMap::from([(first.connection_id, 2)]),
             }
         );
 
@@ -1266,6 +1344,10 @@ mod tests {
         assert_eq!(metrics.logical_links_closed, 1);
         assert_eq!(metrics.active_logical_links, 1);
         assert_eq!(metrics.active_physical_connections, 1);
+        assert_eq!(
+            metrics.links_per_connection,
+            BTreeMap::from([(first.connection_id, 1)])
+        );
         assert!(transport.frames.lock().unwrap().iter().any(|frame| {
             frame.kind == DirectLinkFrameKind::Message && frame.link_id == LinkId::new("link-2")
         }));
@@ -1280,6 +1362,25 @@ mod tests {
                 flags: LinkMessageFlags::EMPTY,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn pool_queue_backpressure_is_recorded_for_try_tell_enqueue_failure() {
+        let pool = PooledDirectLinkEndpointPool::new(FakeTransport::default(), Default::default());
+        let session = pool.open_link(request("link-1")).await.unwrap();
+        let _state = pool.inner.state.lock().await;
+
+        let error = session.session.sender.try_tell(OutboundDirectLinkMessage {
+            link_id: LinkId::new("link-1"),
+            direction: LinkDirection::SourceToTarget,
+            message_id: DirectLinkMessageId(7),
+            proto_full_name: "game.Position",
+            payload: b"abc".to_vec(),
+            flags: LinkMessageFlags::EMPTY,
+        });
+
+        assert!(matches!(error, Err(LinkSendError::BackpressureFull)));
+        assert_eq!(pool.metrics_snapshot().pool_queue_backpressure_events, 1);
     }
 
     #[tokio::test]
