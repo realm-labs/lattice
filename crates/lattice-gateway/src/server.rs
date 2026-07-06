@@ -16,6 +16,8 @@ use tonic::transport::Server;
 
 use crate::{BinaryClientCodec, ClientCodec, ClientFrame, GatewayError};
 
+pub const DEFAULT_MAX_CLIENT_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 type GatewayTaskFuture = Pin<Box<dyn Future<Output = Result<(), GatewayError>> + Send + 'static>>;
 
 #[async_trait]
@@ -275,10 +277,26 @@ pub async fn read_client_frame<R>(reader: &mut R) -> Result<ClientFrame, Gateway
 where
     R: AsyncRead + Unpin,
 {
+    read_client_frame_with_limit(reader, DEFAULT_MAX_CLIENT_FRAME_SIZE).await
+}
+
+pub async fn read_client_frame_with_limit<R>(
+    reader: &mut R,
+    max_frame_size: usize,
+) -> Result<ClientFrame, GatewayError>
+where
+    R: AsyncRead + Unpin,
+{
     let len = reader
         .read_u32()
         .await
         .map_err(|error| GatewayError::Io(error.to_string()))? as usize;
+    if len > max_frame_size {
+        return Err(GatewayError::FrameTooLarge {
+            actual: len,
+            max: max_frame_size,
+        });
+    }
     let mut bytes = vec![0; len];
     reader
         .read_exact(&mut bytes)

@@ -381,10 +381,36 @@ where
         }
     }
 
-    async fn release_singleton_lock(&self, key: &SingletonKey) -> Result<(), PlacementError> {
+    async fn validate_singleton_lock(
+        &self,
+        key: &SingletonKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
+        match self
+            .client
+            .get(&singleton_lock_key(&self.prefix, key))
+            .await?
+        {
+            Some((_, EtcdValue::SingletonLock(current))) if current == lease_id => Ok(()),
+            _ => Err(PlacementError::SingletonLockLost),
+        }
+    }
+
+    async fn release_singleton_lock(
+        &self,
+        key: &SingletonKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
         self.client
-            .delete(&singleton_lock_key(&self.prefix, key))
+            .compare_and_delete(
+                singleton_lock_key(&self.prefix, key),
+                EtcdValue::SingletonLock(lease_id),
+            )
             .await
+            .map_err(|error| match error {
+                PlacementError::CompareAndPutFailed => PlacementError::SingletonLockLost,
+                error => error,
+            })
     }
 
     async fn acquire_activation_lock(
@@ -407,10 +433,36 @@ where
         }
     }
 
-    async fn release_activation_lock(&self, key: &ActorPlacementKey) -> Result<(), PlacementError> {
+    async fn validate_activation_lock(
+        &self,
+        key: &ActorPlacementKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
+        match self
+            .client
+            .get(&activation_lock_key(&self.prefix, key))
+            .await?
+        {
+            Some((_, EtcdValue::ActivationLock(current))) if current == lease_id => Ok(()),
+            _ => Err(PlacementError::ActivationLockLost),
+        }
+    }
+
+    async fn release_activation_lock(
+        &self,
+        key: &ActorPlacementKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
         self.client
-            .delete(&activation_lock_key(&self.prefix, key))
+            .compare_and_delete(
+                activation_lock_key(&self.prefix, key),
+                EtcdValue::ActivationLock(lease_id),
+            )
             .await
+            .map_err(|error| match error {
+                PlacementError::CompareAndPutFailed => PlacementError::ActivationLockLost,
+                error => error,
+            })
     }
 
     async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError> {
@@ -423,6 +475,7 @@ where
                     Some(EtcdValue::Actor(record)) => {
                         let record = *record;
                         let key = ActorPlacementKey {
+                            service_kind: record.service_kind.clone(),
                             actor_kind: record.actor_kind.clone(),
                             actor_id: record.actor_id.clone(),
                         };
@@ -485,6 +538,11 @@ pub trait EtcdKv: Clone + Send + Sync + 'static {
         expected: Option<PlacementVersion>,
         value: EtcdValue,
     ) -> Result<PlacementVersion, PlacementError>;
+    async fn compare_and_delete(
+        &self,
+        key: String,
+        expected: EtcdValue,
+    ) -> Result<(), PlacementError>;
     async fn delete(&self, key: &str) -> Result<(), PlacementError>;
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
     async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
@@ -682,6 +740,28 @@ impl EtcdKv for RealEtcdClient {
         Ok(())
     }
 
+    async fn compare_and_delete(
+        &self,
+        key: String,
+        expected: EtcdValue,
+    ) -> Result<(), PlacementError> {
+        let expected = encode_etcd_value(&expected)?;
+        let txn = Txn::new()
+            .when(vec![Compare::value(
+                key.as_bytes(),
+                CompareOp::Equal,
+                expected,
+            )])
+            .and_then(vec![TxnOp::delete(key, None)]);
+        let mut client = self.client.clone();
+        let response = client.txn(txn).await.map_err(etcd_error)?;
+        if response.succeeded() {
+            Ok(())
+        } else {
+            Err(PlacementError::CompareAndPutFailed)
+        }
+    }
+
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
         let mut client = self.client.clone();
         let response = client
@@ -859,6 +939,28 @@ impl EtcdKv for InMemoryEtcdClient {
         Ok(())
     }
 
+    async fn compare_and_delete(
+        &self,
+        key: String,
+        expected: EtcdValue,
+    ) -> Result<(), PlacementError> {
+        let mut inner = self.inner.lock().expect("in-memory etcd mutex poisoned");
+        match inner.get(&key) {
+            Some((_, current)) if current == &expected => {}
+            _ => return Err(PlacementError::CompareAndPutFailed),
+        }
+        let removed = inner.remove(&key);
+        drop(inner);
+        if let Some((version, _)) = removed {
+            self.notify_watchers(EtcdWatchEvent {
+                key,
+                version,
+                value: None,
+            });
+        }
+        Ok(())
+    }
+
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
         let lease_id = LeaseId(self.next_lease_id.fetch_add(1, Ordering::SeqCst));
         self.instance_leases
@@ -991,8 +1093,9 @@ fn instance_key(
 
 fn actor_key(prefix: &PlacementPrefix, key: &ActorPlacementKey) -> String {
     format!(
-        "{}/logic/actors/{}/{}",
+        "{}/logic/actors/{}/{}/{}",
         clean_prefix(prefix),
+        key.service_kind.as_str(),
         key.actor_kind.as_str(),
         actor_id_segment(&key.actor_id)
     )
@@ -1020,8 +1123,9 @@ fn singleton_key(prefix: &PlacementPrefix, key: &SingletonKey) -> String {
 
 fn activation_lock_key(prefix: &PlacementPrefix, key: &ActorPlacementKey) -> String {
     format!(
-        "{}/logic/activation_locks/{}/{}",
+        "{}/logic/activation_locks/{}/{}/{}",
         clean_prefix(prefix),
+        key.service_kind.as_str(),
         key.actor_kind.as_str(),
         actor_id_segment(&key.actor_id)
     )

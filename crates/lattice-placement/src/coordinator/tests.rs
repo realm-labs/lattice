@@ -154,6 +154,7 @@ async fn explicit_route_resolver_activates_missing_owner_and_uses_cache() {
 async fn placement_route_resolver_reads_existing_store_record_without_activation() {
     let store = ready_store().await;
     let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
@@ -162,6 +163,7 @@ async fn placement_route_resolver_reads_existing_store_record_without_activation
             key,
             None,
             ActorPlacementRecord {
+                service_kind: service_kind!("World"),
                 actor_kind: actor_kind!("World"),
                 actor_id: ActorId::U64(7),
                 owner: InstanceId::new("world-a"),
@@ -205,6 +207,7 @@ async fn coordinator_owner_move_increments_epoch() {
         .unwrap();
     let coordinator = PlacementCoordinator::new(store, NoopLogicControl);
     let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
@@ -247,6 +250,7 @@ async fn explicit_route_resolver_refreshes_cache_from_placement_watch() {
         route_key: RouteKey::U64(7),
     };
     let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
@@ -521,6 +525,7 @@ async fn coordinator_drain_marks_instance_draining_and_migrates_owned_actors() {
         .unwrap();
     let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
     let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
@@ -595,6 +600,7 @@ async fn lease_expiry_reconciler_observes_missing_instance_and_fails_over() {
         .await
         .unwrap();
     let actor_key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
@@ -603,6 +609,7 @@ async fn lease_expiry_reconciler_observes_missing_instance_and_fails_over() {
             actor_key.clone(),
             None,
             ActorPlacementRecord {
+                service_kind: service_kind!("World"),
                 actor_kind: actor_kind!("World"),
                 actor_id: ActorId::U64(7),
                 owner: InstanceId::new("world-a"),

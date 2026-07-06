@@ -95,6 +95,7 @@ async fn node_crash_lease_expiry_reassigns_owned_actors_with_new_epoch() {
         .await
         .unwrap();
     let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
@@ -160,6 +161,7 @@ async fn stale_owner_recovery_after_lease_expiry_is_fenced_and_retried() {
         .await
         .unwrap();
     let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
@@ -268,6 +270,7 @@ async fn temporary_etcd_outage_during_activation_is_retryable_without_partial_ow
     client.fail_next_compare_and_put();
     let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
     let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
@@ -301,10 +304,12 @@ async fn partial_placement_write_failure_can_be_retried_to_complete_failover() {
         .await
         .unwrap();
     let first_key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
     let second_key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(8),
     };
@@ -450,6 +455,7 @@ async fn rolling_update_with_mixed_versions_drains_old_owner_to_ready_new_versio
         .await
         .unwrap();
     let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
@@ -571,6 +577,14 @@ impl EtcdKv for FlakyEtcdClient {
 
     async fn delete(&self, key: &str) -> Result<(), PlacementError> {
         self.inner.delete(key).await
+    }
+
+    async fn compare_and_delete(
+        &self,
+        key: String,
+        expected: EtcdValue,
+    ) -> Result<(), PlacementError> {
+        self.inner.compare_and_delete(key, expected).await
     }
 
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
@@ -737,6 +751,7 @@ fn instance_record_with_version(
 
 fn actor_record(actor_id: u64, owner: &str, epoch: u64, lease_id: LeaseId) -> ActorPlacementRecord {
     ActorPlacementRecord {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(actor_id),
         owner: InstanceId::new(owner),

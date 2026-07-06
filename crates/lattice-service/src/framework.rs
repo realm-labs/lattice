@@ -78,7 +78,16 @@ pub trait DynPlacementStore: Send + Sync + 'static {
         &self,
         key: ActorPlacementKey,
     ) -> Result<LeaseId, PlacementError>;
-    async fn release_activation_lock(&self, key: &ActorPlacementKey) -> Result<(), PlacementError>;
+    async fn validate_activation_lock(
+        &self,
+        key: &ActorPlacementKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError>;
+    async fn release_activation_lock(
+        &self,
+        key: &ActorPlacementKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError>;
     async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError>;
     fn prefix(&self) -> PlacementPrefix;
 }
@@ -195,8 +204,20 @@ where
         PlacementStore::acquire_activation_lock(self, key).await
     }
 
-    async fn release_activation_lock(&self, key: &ActorPlacementKey) -> Result<(), PlacementError> {
-        PlacementStore::release_activation_lock(self, key).await
+    async fn validate_activation_lock(
+        &self,
+        key: &ActorPlacementKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
+        PlacementStore::validate_activation_lock(self, key, lease_id).await
+    }
+
+    async fn release_activation_lock(
+        &self,
+        key: &ActorPlacementKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
+        PlacementStore::release_activation_lock(self, key, lease_id).await
     }
 
     async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError> {

@@ -26,12 +26,16 @@ pub enum PlacementError {
     CompareAndPutFailed,
     #[error("activation lock is already held for actor")]
     ActivationLockHeld,
+    #[error("activation lock was lost for actor")]
+    ActivationLockLost,
     #[error("instance lease {lease_id:?} was not found")]
     InstanceLeaseNotFound { lease_id: LeaseId },
     #[error("coordinator leadership has been lost")]
     CoordinatorLeadershipLost,
     #[error("singleton activation lock is already held")]
     SingletonLockHeld,
+    #[error("singleton activation lock was lost")]
+    SingletonLockLost,
     #[error("placement watch closed")]
     PlacementWatchClosed,
     #[error("etcd placement store error: {message}")]

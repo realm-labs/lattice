@@ -13,6 +13,7 @@ use crate::vshard::VirtualShardId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActorPlacementKey {
+    pub service_kind: ServiceKind,
     pub actor_kind: ActorKind,
     pub actor_id: ActorId,
 }
@@ -37,6 +38,7 @@ pub enum PlacementState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorPlacementRecord {
+    pub service_kind: ServiceKind,
     pub actor_kind: ActorKind,
     pub actor_id: ActorId,
     pub owner: InstanceId,
@@ -215,12 +217,30 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
         value: SingletonPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError>;
     async fn acquire_singleton_lock(&self, key: SingletonKey) -> Result<LeaseId, PlacementError>;
-    async fn release_singleton_lock(&self, key: &SingletonKey) -> Result<(), PlacementError>;
+    async fn validate_singleton_lock(
+        &self,
+        key: &SingletonKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError>;
+    async fn release_singleton_lock(
+        &self,
+        key: &SingletonKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError>;
     async fn acquire_activation_lock(
         &self,
         key: ActorPlacementKey,
     ) -> Result<LeaseId, PlacementError>;
-    async fn release_activation_lock(&self, key: &ActorPlacementKey) -> Result<(), PlacementError>;
+    async fn validate_activation_lock(
+        &self,
+        key: &ActorPlacementKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError>;
+    async fn release_activation_lock(
+        &self,
+        key: &ActorPlacementKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError>;
     async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError>;
     fn prefix(&self) -> &PlacementPrefix;
 }
@@ -617,13 +637,32 @@ impl PlacementStore for InMemoryPlacementStore {
         Ok(lease)
     }
 
-    async fn release_singleton_lock(&self, key: &SingletonKey) -> Result<(), PlacementError> {
-        self.inner
-            .lock()
-            .expect("placement store mutex poisoned")
-            .singleton_locks
-            .remove(&self.prefixed_singleton_key(key));
-        Ok(())
+    async fn validate_singleton_lock(
+        &self,
+        key: &SingletonKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
+        let inner = self.inner.lock().expect("placement store mutex poisoned");
+        match inner.singleton_locks.get(&self.prefixed_singleton_key(key)) {
+            Some(current) if *current == lease_id => Ok(()),
+            _ => Err(PlacementError::SingletonLockLost),
+        }
+    }
+
+    async fn release_singleton_lock(
+        &self,
+        key: &SingletonKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let key = self.prefixed_singleton_key(key);
+        match inner.singleton_locks.get(&key) {
+            Some(current) if *current == lease_id => {
+                inner.singleton_locks.remove(&key);
+                Ok(())
+            }
+            _ => Err(PlacementError::SingletonLockLost),
+        }
     }
 
     async fn acquire_activation_lock(
@@ -640,13 +679,32 @@ impl PlacementStore for InMemoryPlacementStore {
         Ok(lease)
     }
 
-    async fn release_activation_lock(&self, key: &ActorPlacementKey) -> Result<(), PlacementError> {
-        self.inner
-            .lock()
-            .expect("placement store mutex poisoned")
-            .activation_locks
-            .remove(&self.prefixed_actor_key(key));
-        Ok(())
+    async fn validate_activation_lock(
+        &self,
+        key: &ActorPlacementKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
+        let inner = self.inner.lock().expect("placement store mutex poisoned");
+        match inner.activation_locks.get(&self.prefixed_actor_key(key)) {
+            Some(current) if *current == lease_id => Ok(()),
+            _ => Err(PlacementError::ActivationLockLost),
+        }
+    }
+
+    async fn release_activation_lock(
+        &self,
+        key: &ActorPlacementKey,
+        lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let key = self.prefixed_actor_key(key);
+        match inner.activation_locks.get(&key) {
+            Some(current) if *current == lease_id => {
+                inner.activation_locks.remove(&key);
+                Ok(())
+            }
+            _ => Err(PlacementError::ActivationLockLost),
+        }
     }
 
     async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError> {

@@ -4,6 +4,8 @@ use lattice_rpc::RpcError;
 pub enum GatewayError {
     #[error("client frame is too short")]
     FrameTooShort,
+    #[error("client frame length {actual} exceeds maximum {max}")]
+    FrameTooLarge { actual: usize, max: usize },
     #[error("duplicate gateway route for msg_id {msg_id}")]
     DuplicateRoute { msg_id: u32 },
     #[error("unexpected msg_id: expected {expected}, got {actual}")]

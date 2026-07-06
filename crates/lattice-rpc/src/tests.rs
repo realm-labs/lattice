@@ -133,7 +133,7 @@ fn rpc_security_policy_validates_service_identity_peer_against_metadata() {
         source_instance: InstanceId::new("player-0"),
         trace: TraceContext::default(),
         auth: Some(AuthContext {
-            authorization: "Bearer internal".to_string(),
+            authorization: "Bearer lattice-internal".to_string(),
         }),
         peer_identity: None,
     };
@@ -190,7 +190,7 @@ fn rpc_server_security_reads_peer_identity_from_request_extensions() {
 }
 
 #[test]
-fn rpc_server_security_reads_peer_identity_from_metadata() {
+fn rpc_server_security_ignores_peer_identity_from_metadata() {
     let security = RpcServerSecurity::new(RpcSecurityPolicy::require_service_identity(
         service_identity_config(),
     ));
@@ -205,7 +205,7 @@ fn rpc_server_security_reads_peer_identity_from_metadata() {
     let mut request = Request::new(EnterWorldRequest { world_id: 9 });
     ctx.inject_metadata(request.metadata_mut()).unwrap();
 
-    assert_eq!(security.peer_identity(&request), Some(peer));
+    assert_eq!(security.peer_identity(&request), None);
 }
 
 #[test]

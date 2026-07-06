@@ -167,8 +167,17 @@ async fn business_actor_models_state_machine_with_typed_messages_and_timer() {
         (MatchState::Loading, vec![7])
     );
 
-    tokio::time::sleep(Duration::from_millis(35)).await;
-    let (state, pending) = handle.call(InspectState).await.unwrap();
+    let (state, pending) = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            let snapshot = handle.call(InspectState).await.unwrap();
+            if matches!(snapshot.0, MatchState::Running { tick } if tick >= 1) {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
 
     assert!(matches!(state, MatchState::Running { tick } if tick >= 1));
     assert!(pending.is_empty());

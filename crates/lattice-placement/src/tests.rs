@@ -529,7 +529,7 @@ async fn in_memory_placement_store_activation_lock_is_exclusive_until_release() 
 
     let first = store.acquire_activation_lock(key.clone()).await.unwrap();
     let second = store.acquire_activation_lock(key.clone()).await;
-    store.release_activation_lock(&key).await.unwrap();
+    store.release_activation_lock(&key, first).await.unwrap();
     let third = store.acquire_activation_lock(key).await.unwrap();
 
     assert_eq!(first, LeaseId(1));
@@ -788,6 +788,7 @@ fn instance_record(instance_id: &str, state: InstanceState) -> InstanceRecord {
 
 fn actor_key(actor_id: u64) -> ActorPlacementKey {
     ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(actor_id),
     }
@@ -795,6 +796,7 @@ fn actor_key(actor_id: u64) -> ActorPlacementKey {
 
 fn actor_record(actor_id: u64, owner: &str, epoch: u64, lease_id: LeaseId) -> ActorPlacementRecord {
     ActorPlacementRecord {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(actor_id),
         owner: InstanceId::new(owner),

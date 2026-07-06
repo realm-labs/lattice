@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use async_nats::jetstream;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use lattice_core::ConfiguredComponent;
@@ -62,12 +63,19 @@ impl EventBus for NatsEventBus {
             serde_json::to_vec(&event).map_err(|error| EventBusError::EncodeEnvelope {
                 reason: error.to_string(),
             })?;
-        self.client
+        let jetstream = jetstream::new(self.client.clone());
+        ensure_stream(&jetstream, &self.config).await?;
+        jetstream
             .publish(subject, payload.into())
             .await
             .map_err(|error| EventBusError::Backend {
                 reason: error.to_string(),
-            })
+            })?
+            .await
+            .map_err(|error| EventBusError::Backend {
+                reason: error.to_string(),
+            })?;
+        Ok(())
     }
 
     async fn subscribe<H>(
@@ -81,58 +89,148 @@ impl EventBus for NatsEventBus {
         let id = NATS_SUBSCRIPTION_ID.fetch_add(1, Ordering::SeqCst);
         let cancelled = Arc::new(AtomicBool::new(false));
         let handler = Arc::new(handler);
-        let mut subscriber = if let Some(durable_name) = &subscription.durable_name {
-            let queue_group = durable_queue_group(&self.config, durable_name);
-            self.client
-                .queue_subscribe(subscription.filter.as_str().to_string(), queue_group)
+        if let Some(durable_name) = &subscription.durable_name {
+            let jetstream = jetstream::new(self.client.clone());
+            let stream = ensure_stream(&jetstream, &self.config).await?;
+            let consumer_name = durable_consumer_name(&self.config, durable_name);
+            let consumer = stream
+                .get_or_create_consumer(
+                    &consumer_name,
+                    jetstream::consumer::pull::Config {
+                        durable_name: Some(consumer_name.clone()),
+                        filter_subject: subscription.filter.as_str().to_string(),
+                        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                        ..Default::default()
+                    },
+                )
                 .await
-        } else {
-            self.client
-                .subscribe(subscription.filter.as_str().to_string())
-                .await
-        }
-        .map_err(|error| EventBusError::Backend {
-            reason: error.to_string(),
-        })?;
+                .map_err(|error| EventBusError::Backend {
+                    reason: error.to_string(),
+                })?;
+            let mut messages =
+                consumer
+                    .messages()
+                    .await
+                    .map_err(|error| EventBusError::Backend {
+                        reason: error.to_string(),
+                    })?;
 
-        let cancelled_task = cancelled.clone();
-        let subject_filter = subscription.filter.clone();
-        tokio::spawn(
-            async move {
-                while !cancelled_task.load(Ordering::SeqCst) {
-                    let Some(message) = subscriber.next().await else {
-                        break;
-                    };
-                    if cancelled_task.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let event: EventEnvelope =
-                        match serde_json::from_slice(message.payload.as_ref()) {
-                            Ok(event) => event,
-                            Err(error) => {
-                                warn!(
-                                    error = %error,
-                                    subject = %message.subject,
-                                    "failed to decode NATS event envelope"
-                                );
-                                continue;
-                            }
+            let cancelled_task = cancelled.clone();
+            let subject_filter = subscription.filter.clone();
+            tokio::spawn(
+                async move {
+                    while !cancelled_task.load(Ordering::SeqCst) {
+                        let Some(message) = messages.next().await else {
+                            break;
                         };
-                    if !subject_filter.matches(&event.subject) {
-                        continue;
-                    }
-                    if let Err(error) = handler.handle(event).await {
-                        warn!(%error, "NATS event handler failed");
+                        let Ok(message) = message else {
+                            continue;
+                        };
+                        if cancelled_task.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let event: EventEnvelope =
+                            match serde_json::from_slice(message.payload.as_ref()) {
+                                Ok(event) => event,
+                                Err(error) => {
+                                    warn!(
+                                        error = %error,
+                                        subject = %message.subject,
+                                        "failed to decode NATS event envelope"
+                                    );
+                                    let _ = message.ack().await;
+                                    continue;
+                                }
+                            };
+                        if !subject_filter.matches(&event.subject) {
+                            let _ = message.ack().await;
+                            continue;
+                        }
+                        match handler.handle(event).await {
+                            Ok(()) => {
+                                let _ = message.ack().await;
+                            }
+                            Err(error) => {
+                                warn!(%error, "NATS event handler failed");
+                            }
+                        }
                     }
                 }
-            }
-            .instrument(tracing::info_span!("eventbus.nats.subscription")),
-        );
+                .instrument(tracing::info_span!("eventbus.nats.durable_subscription")),
+            );
+        } else {
+            let mut subscriber = self
+                .client
+                .subscribe(subscription.filter.as_str().to_string())
+                .await
+                .map_err(|error| EventBusError::Backend {
+                    reason: error.to_string(),
+                })?;
+
+            let cancelled_task = cancelled.clone();
+            let subject_filter = subscription.filter.clone();
+            tokio::spawn(
+                async move {
+                    while !cancelled_task.load(Ordering::SeqCst) {
+                        let Some(message) = subscriber.next().await else {
+                            break;
+                        };
+                        if cancelled_task.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let event: EventEnvelope =
+                            match serde_json::from_slice(message.payload.as_ref()) {
+                                Ok(event) => event,
+                                Err(error) => {
+                                    warn!(
+                                        error = %error,
+                                        subject = %message.subject,
+                                        "failed to decode NATS event envelope"
+                                    );
+                                    continue;
+                                }
+                            };
+                        if !subject_filter.matches(&event.subject) {
+                            continue;
+                        }
+                        if let Err(error) = handler.handle(event).await {
+                            warn!(%error, "NATS event handler failed");
+                        }
+                    }
+                }
+                .instrument(tracing::info_span!("eventbus.nats.subscription")),
+            );
+        }
 
         Ok(EventSubscriptionHandle::new(id, cancelled))
     }
 }
 
+async fn ensure_stream(
+    jetstream: &jetstream::Context,
+    config: &NatsEventBusConfig,
+) -> Result<jetstream::stream::Stream, EventBusError> {
+    jetstream
+        .get_or_create_stream(jetstream::stream::Config {
+            name: config.stream.clone(),
+            subjects: vec![">".to_string()],
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| EventBusError::Backend {
+            reason: error.to_string(),
+        })
+}
+
+fn durable_consumer_name(config: &NatsEventBusConfig, durable_name: &str) -> String {
+    if config.durable_prefix.is_empty() {
+        durable_name.to_string()
+    } else {
+        format!("{}-{durable_name}", config.durable_prefix)
+    }
+}
+
+#[cfg(test)]
 fn durable_queue_group(config: &NatsEventBusConfig, durable_name: &str) -> String {
     if config.durable_prefix.is_empty() {
         durable_name.to_string()

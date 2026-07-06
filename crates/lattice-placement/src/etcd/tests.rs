@@ -39,7 +39,7 @@ async fn etcd_store_writes_under_cluster_prefix_and_isolates_reads() {
     assert_eq!(
         client.keys(),
         vec![
-            "/lattice/cluster-a/logic/actors/World/u64:7".to_string(),
+            "/lattice/cluster-a/logic/actors/World/World/u64:7".to_string(),
             "/lattice/cluster-a/logic/instances/World/world-a".to_string(),
             "/lattice/cluster-a/logic/singletons/World/SeasonManager/676c6f62616c".to_string(),
             "/lattice/cluster-a/logic/vshards/World/World/3".to_string(),
@@ -286,7 +286,7 @@ async fn etcd_store_activation_lock_is_exclusive_until_release() {
 
     let first = store.acquire_activation_lock(key.clone()).await.unwrap();
     let second = store.acquire_activation_lock(key.clone()).await;
-    store.release_activation_lock(&key).await.unwrap();
+    store.release_activation_lock(&key, first).await.unwrap();
     let third = store.acquire_activation_lock(key).await.unwrap();
 
     assert_eq!(first, LeaseId(1));
@@ -304,7 +304,7 @@ async fn etcd_store_singleton_lock_is_exclusive_until_release() {
 
     let first = store.acquire_singleton_lock(key.clone()).await.unwrap();
     let second = store.acquire_singleton_lock(key.clone()).await;
-    store.release_singleton_lock(&key).await.unwrap();
+    store.release_singleton_lock(&key, first).await.unwrap();
     let third = store.acquire_singleton_lock(key).await.unwrap();
 
     assert_eq!(first, LeaseId(1));
@@ -377,6 +377,7 @@ fn etcd_singleton_records_are_written_with_their_owner_lease() {
 
 fn actor_key_for(actor_id: u64) -> ActorPlacementKey {
     ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(actor_id),
     }
@@ -414,6 +415,7 @@ fn instance_record(instance_id: &str, state: InstanceState) -> InstanceRecord {
 
 fn actor_record(actor_id: u64, owner: &str, epoch: u64, lease_id: LeaseId) -> ActorPlacementRecord {
     ActorPlacementRecord {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(actor_id),
         owner: InstanceId::new(owner),

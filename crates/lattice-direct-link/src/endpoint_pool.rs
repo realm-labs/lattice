@@ -876,6 +876,12 @@ where
                 "direct link sender used with the wrong direction".to_string(),
             ));
         }
+        if message.link_id != self.link_id {
+            return Err(LinkSendError::Protocol(format!(
+                "direct link sender for {} cannot send frame for {}",
+                self.link_id, message.link_id
+            )));
+        }
         Ok(DirectLinkFrame::directed_message(
             message.link_id,
             message.direction,
@@ -896,9 +902,20 @@ where
 {
     let (tx, mut rx) = mpsc::channel(1024);
     tokio::spawn(async move {
-        while let Some(command) = rx.recv().await {
-            match command {
-                ConnectionCommand::Write { frame, completion } => {
+        let mut pending_responses: HashMap<
+            LinkId,
+            oneshot::Sender<Result<DirectLinkFrame, LinkError>>,
+        > = HashMap::new();
+        let mut read_enabled = false;
+        loop {
+            tokio::select! {
+                biased;
+                command = rx.recv() => {
+                    let Some(command) = command else {
+                        break;
+                    };
+                    match command {
+                        ConnectionCommand::Write { frame, completion } => {
                     let write_result = connection.write_frame(frame).await;
                     if let Err(error) = write_result {
                         if let Some(completion) = completion {
@@ -910,27 +927,96 @@ where
                     if let Some(completion) = completion {
                         let _ = completion.send(Ok(()));
                     }
-                }
-                ConnectionCommand::WriteAndRead { frame, response } => {
+                    read_enabled = true;
+                        }
+                        ConnectionCommand::WriteAndRead { frame, response } => {
+                    let link_id = frame.link_id.clone();
                     let write_result = connection.write_frame(frame).await;
                     if let Err(error) = write_result {
                         let _ = response.send(Err(error));
                         break;
                     }
                     pool.metrics.record_frame_written(connection_id);
-                    let result = connection.read_frame().await;
-                    let should_break = result.is_err();
-                    let _ = response.send(result);
-                    if should_break {
-                        break;
+                    pending_responses.insert(link_id, response);
+                    read_enabled = true;
+                        }
                     }
-                }
+                },
+                frame = connection.read_frame(), if read_enabled => {
+                    match frame {
+                        Ok(frame) => {
+                            let should_break = handle_connection_frame(
+                                &mut connection,
+                                &pool,
+                                connection_id,
+                                frame,
+                                &mut pending_responses,
+                            )
+                            .await;
+                            if should_break {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            for (_, response) in pending_responses.drain() {
+                                let _ = response.send(Err(LinkError::Protocol(error.to_string())));
+                            }
+                            break;
+                        }
+                    }
+                },
             }
         }
         let _ = connection.close().await;
         pool.remove_connection(connection_id).await;
     });
     tx
+}
+
+async fn handle_connection_frame<T>(
+    connection: &mut T::Connection,
+    pool: &Arc<PooledDirectLinkEndpointPoolInner<T>>,
+    _connection_id: DirectLinkConnectionId,
+    frame: DirectLinkFrame,
+    pending_responses: &mut HashMap<LinkId, oneshot::Sender<Result<DirectLinkFrame, LinkError>>>,
+) -> bool
+where
+    T: DirectLinkTransport,
+{
+    if matches!(
+        frame.kind,
+        DirectLinkFrameKind::OpenLinkAck | DirectLinkFrameKind::OpenLinkReject
+    ) {
+        if let Some(response) = pending_responses.remove(&frame.link_id) {
+            let _ = response.send(Ok(frame));
+            return false;
+        }
+        return true;
+    }
+
+    match frame.kind {
+        DirectLinkFrameKind::ProtocolError => {
+            let reason = String::from_utf8(frame.payload.clone())
+                .unwrap_or_else(|_| "remote protocol error".to_string());
+            if let Some(response) = pending_responses.remove(&frame.link_id) {
+                let _ = response.send(Err(LinkError::Protocol(reason.clone())));
+                pool.close_connection(_connection_id, LinkCloseReason::ProtocolError(reason))
+                    .await;
+                return true;
+            }
+            pool.process_protocol_error_frame(frame).await.is_err()
+        }
+        DirectLinkFrameKind::Close | DirectLinkFrameKind::CloseDirection => {
+            pool.close_logical_link(&frame.link_id, LinkCloseReason::RemoteClose)
+                .await;
+            false
+        }
+        DirectLinkFrameKind::Heartbeat => connection
+            .write_frame(DirectLinkFrame::heartbeat_ack(frame.link_id))
+            .await
+            .is_err(),
+        _ => false,
+    }
 }
 
 async fn send_frame(
@@ -1054,11 +1140,14 @@ mod tests {
             endpoint: DirectLinkEndpoint,
         ) -> Result<Self::Connection, LinkError> {
             self.connects.lock().unwrap().push(endpoint);
+            let frame_start_index = self.frames.lock().unwrap().len();
             Ok(FakeConnection {
                 frames: self.frames.clone(),
                 fail_message_writes: self.fail_message_writes,
                 protocol_error_on_read: self.protocol_error_on_read,
                 read_count: self.read_count.clone(),
+                acknowledged_opens: 0,
+                frame_start_index,
             })
         }
     }
@@ -1069,19 +1158,30 @@ mod tests {
         fail_message_writes: bool,
         protocol_error_on_read: Option<usize>,
         read_count: Arc<AtomicUsize>,
+        acknowledged_opens: usize,
+        frame_start_index: usize,
     }
 
     #[async_trait]
     impl DirectLinkConnection for FakeConnection {
         async fn read_frame(&mut self) -> Result<DirectLinkFrame, LinkError> {
-            let open = self
-                .frames
-                .lock()
-                .unwrap()
-                .last()
-                .expect("open frame was written")
-                .decode_open_link()
-                .unwrap();
+            let open = loop {
+                let open_frames = self
+                    .frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .skip(self.frame_start_index)
+                    .filter(|frame| frame.kind == DirectLinkFrameKind::OpenLink)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if open_frames.len() > self.acknowledged_opens {
+                    let frame = open_frames[self.acknowledged_opens].clone();
+                    self.acknowledged_opens += 1;
+                    break frame.decode_open_link().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            };
             let read = self.read_count.fetch_add(1, Ordering::Relaxed) + 1;
             if self.protocol_error_on_read == Some(read) {
                 return Ok(DirectLinkFrame {

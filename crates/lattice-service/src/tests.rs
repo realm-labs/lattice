@@ -534,7 +534,7 @@ impl RpcServiceBinding for SecurityProbeBinding {
         };
         let result = context.rpc_security().policy().validate(&rpc_context, None);
 
-        assert_eq!(result, Err(RpcSecurityError::MissingPeerIdentity));
+        assert_eq!(result, Err(RpcSecurityError::InvalidAuthorization));
 
         context.add_rpc_service(EmptyRpcService);
         Ok(())
@@ -1584,11 +1584,13 @@ async fn service_context_installs_direct_link_runtime_handle_for_connect() {
     store
         .compare_and_put_actor(
             ActorPlacementKey {
+                service_kind: service_kind!("World"),
                 actor_kind: actor_kind!("World"),
                 actor_id: ActorId::U64(7),
             },
             None,
             ActorPlacementRecord {
+                service_kind: service_kind!("World"),
                 actor_kind: actor_kind!("World"),
                 actor_id: ActorId::U64(7),
                 owner: InstanceId::new("world-1"),
@@ -2625,6 +2627,7 @@ async fn service_starts_admin_http_as_managed_listener() {
     };
     store_for_assert.upsert_instance(replacement).await.unwrap();
     let actor_key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(42),
     };
@@ -2633,6 +2636,7 @@ async fn service_starts_admin_http_as_managed_listener() {
             actor_key.clone(),
             None,
             ActorPlacementRecord {
+                service_kind: service_kind!("World"),
                 actor_kind: actor_kind!("World"),
                 actor_id: ActorId::U64(42),
                 owner: InstanceId::new("world-1"),
@@ -3278,6 +3282,7 @@ async fn register_client_builds_default_singleton_core_from_store() {
     assert!(
         store
             .get_actor(&ActorPlacementKey {
+                service_kind: service_kind!("World"),
                 actor_kind: actor_kind!("SeasonManager"),
                 actor_id: ActorId::Str("global".to_string()),
             })
@@ -3574,6 +3579,7 @@ async fn prepare_virtual_shard_migration_with_policy(
 
 fn placement_actor_key(actor_id: u64) -> ActorPlacementKey {
     ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(actor_id),
     }
@@ -3586,6 +3592,7 @@ fn placement_actor_record(
     lease_id: u64,
 ) -> ActorPlacementRecord {
     ActorPlacementRecord {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(actor_id),
         owner: InstanceId::new(owner),

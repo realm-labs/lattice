@@ -186,6 +186,7 @@ where
     ) -> Result<ActorPlacementRecord, PlacementError> {
         let service_kind = request.service_kind;
         let key = ActorPlacementKey {
+            service_kind: service_kind.clone(),
             actor_kind: request.actor_kind,
             actor_id: request.actor_id,
         };
@@ -232,7 +233,7 @@ where
                 actor.id = ?key.actor_id
             );
             self.store
-                .release_activation_lock(&key)
+                .release_activation_lock(&key, lease_id)
                 .instrument(release_span)
                 .await?;
             result
@@ -309,10 +310,11 @@ where
                 .ok_or(PlacementError::NoReadyInstances)?;
             let mut migrated_actors = 0;
             for (version, record) in self.store.list_actors().await? {
-                if record.owner != instance_id {
+                if record.service_kind != service_kind || record.owner != instance_id {
                     continue;
                 }
                 let key = ActorPlacementKey {
+                    service_kind: record.service_kind.clone(),
                     actor_kind: record.actor_kind.clone(),
                     actor_id: record.actor_id.clone(),
                 };
@@ -390,10 +392,11 @@ where
                 .ok_or(PlacementError::NoReadyInstances)?;
             let mut reassigned_actors = 0;
             for (version, record) in self.store.list_actors().await? {
-                if record.owner != instance_id {
+                if record.service_kind != service_kind || record.owner != instance_id {
                     continue;
                 }
                 let key = ActorPlacementKey {
+                    service_kind: record.service_kind.clone(),
                     actor_kind: record.actor_kind.clone(),
                     actor_id: record.actor_id.clone(),
                 };
@@ -896,6 +899,7 @@ where
             .min_by_key(|instance| instance.instance_id.clone())
             .ok_or(PlacementError::NoReadyInstances)?;
         let record = ActorPlacementRecord {
+            service_kind: key.service_kind.clone(),
             actor_kind: key.actor_kind.clone(),
             actor_id: key.actor_id.clone(),
             owner: instance.instance_id.clone(),
@@ -906,6 +910,7 @@ where
         self.logic
             .activate_actor(&instance, &key, record.epoch)
             .await?;
+        self.store.validate_activation_lock(&key, lease_id).await?;
         self.store
             .compare_and_put_actor(key, None, record.clone())
             .await?;
@@ -1033,6 +1038,7 @@ where
         self.placement_lookups.fetch_add(1, Ordering::SeqCst);
         let actor_id = actor_id_from_route_key(request.route_key);
         let placement_key = ActorPlacementKey {
+            service_kind: self.service_kind.clone(),
             actor_kind: request.actor_kind.clone(),
             actor_id: actor_id.clone(),
         };

@@ -14,7 +14,7 @@ use crate::error::{ActorActivationError, ActorError};
 use crate::handle::ActorHandle;
 use crate::mailbox::MailboxConfig;
 use crate::runtime::{PassivationPolicy, ShardMigrationPolicy, spawn_actor_with_self_ref};
-use crate::traits::{Actor, PassivationReason, StopReason};
+use crate::traits::{Actor, ActorLifecycleState, PassivationReason, StopReason};
 
 #[derive(Debug, Clone)]
 pub struct ActorRegistryConfig {
@@ -52,7 +52,7 @@ impl Default for ActorRegistryConfig {
 pub struct ActorRegistry<A: Actor> {
     kind: ActorKind,
     config: ActorRegistryConfig,
-    entries: DashMap<ActorId, RegistryEntry<A>>,
+    entries: Arc<DashMap<ActorId, RegistryEntry<A>>>,
 }
 
 impl<A: Actor> fmt::Debug for ActorRegistry<A> {
@@ -94,7 +94,7 @@ impl<A: Actor> ActorRegistry<A> {
         Self {
             kind,
             config,
-            entries: DashMap::new(),
+            entries: Arc::new(DashMap::new()),
         }
     }
 
@@ -122,7 +122,13 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub fn get_running(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
         match self.entries.get(actor_id).as_deref() {
-            Some(RegistryEntry::Running(handle)) => Some(handle.clone()),
+            Some(RegistryEntry::Running(handle)) if !is_terminal(handle.lifecycle_state()) => {
+                Some(handle.clone())
+            }
+            Some(RegistryEntry::Running(_)) => {
+                self.entries.remove(actor_id);
+                None
+            }
             Some(RegistryEntry::Activating(_)) | None => None,
         }
     }
@@ -177,6 +183,7 @@ impl<A: Actor> ActorRegistry<A> {
         actor_id: ActorId,
         actor: A,
     ) -> Result<ActorHandle<A>, ActorActivationError> {
+        self.remove_stopped_running_entry(&actor_id);
         match self.entries.entry(actor_id.clone()) {
             Entry::Occupied(_) => Err(ActorActivationError::AlreadyExists),
             Entry::Vacant(entry) => {
@@ -196,6 +203,7 @@ impl<A: Actor> ActorRegistry<A> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<A, A::Error>>,
     {
+        self.remove_stopped_running_entry(&actor_id);
         let lookup = match self.entries.entry(actor_id.clone()) {
             Entry::Occupied(entry) => match entry.get() {
                 RegistryEntry::Running(handle) => return Ok(handle.clone()),
@@ -217,6 +225,14 @@ impl<A: Actor> ActorRegistry<A> {
 
         let result = match activate().await {
             Ok(actor) => {
+                let still_activating = self.entries.remove_if(&actor_id, |_, entry| {
+                    matches!(entry, RegistryEntry::Activating(existing) if Arc::ptr_eq(existing, &activation))
+                });
+                if still_activating.is_none() {
+                    return Err(ActorActivationError::ActivationFailed(ActorError::new(
+                        "actor registry entry removed during activation",
+                    )));
+                }
                 let handle = self.spawn_actor(actor_id.clone(), actor);
                 self.entries
                     .insert(actor_id, RegistryEntry::Running(handle.clone()));
@@ -308,8 +324,18 @@ impl<A: Actor> ActorRegistry<A> {
         result
     }
 
+    fn remove_stopped_running_entry(&self, actor_id: &ActorId) {
+        self.entries.remove_if(actor_id, |_, entry| {
+            matches!(
+                entry,
+                RegistryEntry::Running(handle)
+                    if is_terminal(handle.lifecycle_state())
+            )
+        });
+    }
+
     fn spawn_actor(&self, actor_id: ActorId, actor: A) -> ActorHandle<A> {
-        let self_ref = self.actor_ref_for(actor_id);
+        let self_ref = self.actor_ref_for(actor_id.clone());
         spawn_actor_with_self_ref(
             actor,
             self.config.mailbox,
@@ -330,6 +356,13 @@ impl<A: Actor> ActorRegistry<A> {
             config.owner_epoch,
         ))
     }
+}
+
+fn is_terminal(state: ActorLifecycleState) -> bool {
+    matches!(
+        state,
+        ActorLifecycleState::Stopped | ActorLifecycleState::StopFailed
+    )
 }
 
 enum RegistryEntry<A: Actor> {

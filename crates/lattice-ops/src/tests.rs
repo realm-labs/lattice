@@ -68,6 +68,7 @@ async fn graceful_shutdown_drains_before_releasing_lease_and_cancels_runtime_wor
         .await
         .unwrap();
     let actor_key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
@@ -76,6 +77,7 @@ async fn graceful_shutdown_drains_before_releasing_lease_and_cancels_runtime_wor
             actor_key.clone(),
             None,
             ActorPlacementRecord {
+                service_kind: service_kind!("World"),
                 actor_kind: actor_kind!("World"),
                 actor_id: ActorId::U64(7),
                 owner: InstanceId::new("world-a"),
@@ -172,6 +174,7 @@ async fn cluster_inspector_summarizes_instances_and_actor_owners() {
     let instance = instance_record("world-a");
     store.upsert_instance(instance.clone()).await.unwrap();
     let actors = vec![ActorPlacementRecord {
+        service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
         owner: InstanceId::new("world-a"),
@@ -206,6 +209,7 @@ fn admin_snapshot_builds_views_from_live_placement_records() {
         vec![actor_kind!("World")],
         vec![instance],
         vec![ActorPlacementRecord {
+            service_kind: service_kind!("World"),
             actor_kind: actor_kind!("World"),
             actor_id: ActorId::U64(7),
             owner: InstanceId::new("world-a"),

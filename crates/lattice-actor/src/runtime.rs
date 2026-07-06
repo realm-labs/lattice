@@ -673,6 +673,12 @@ async fn run_actor<A>(
             handle.set_lifecycle_state(ActorLifecycleState::Stopped);
         }
         ctx.cancel_all_tasks();
+        ctx.stop_all_children(StopReason::StartFailed);
+        handle.publish_terminated(ActorTerminated {
+            target: handle.local_ref(),
+            incarnation: ActorIncarnation::new(handle.local_ref().id()),
+            reason: TerminatedReason::from(StopReason::StartFailed),
+        });
         return;
     }
     handle.set_lifecycle_state(ActorLifecycleState::Running);

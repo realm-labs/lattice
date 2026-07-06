@@ -131,6 +131,7 @@ impl DirectLinkInboundRouter {
                 Ok(())
             }
             Err(error) if is_mailbox_full(&error) => {
+                self.complete_inbound_backpressure(&frame.link_id, direction);
                 self.emit_inbound_backpressure(&actor_ref, &frame.link_id, direction)?;
                 Err(error)
             }

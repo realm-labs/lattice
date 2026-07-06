@@ -7,7 +7,9 @@ use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 use tonic::{Request, Status};
 
 use crate::RpcContext;
-use crate::metadata::{AuthContext, RpcClientContextFactory, peer_identity_from_metadata};
+use crate::metadata::{AuthContext, RpcClientContextFactory};
+
+const INTERNAL_AUTHORIZATION: &str = "Bearer lattice-internal";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceIdentityConfig {
@@ -208,7 +210,7 @@ impl RpcSecurityPolicy {
 
     pub fn client_auth_context(&self) -> Option<AuthContext> {
         self.require_authorization.then(|| AuthContext {
-            authorization: "Bearer lattice-internal".to_string(),
+            authorization: INTERNAL_AUTHORIZATION.to_string(),
         })
     }
 
@@ -233,8 +235,12 @@ impl RpcSecurityPolicy {
         ctx: &RpcContext,
         peer: Option<&PeerIdentity>,
     ) -> Result<(), RpcSecurityError> {
-        if self.require_authorization && ctx.auth.is_none() {
-            return Err(RpcSecurityError::MissingAuthorization);
+        if self.require_authorization {
+            match &ctx.auth {
+                Some(auth) if auth.authorization == INTERNAL_AUTHORIZATION => {}
+                Some(_) => return Err(RpcSecurityError::InvalidAuthorization),
+                None => return Err(RpcSecurityError::MissingAuthorization),
+            }
         }
         if !self.allowed_services.is_empty()
             && !self
@@ -303,15 +309,7 @@ impl RpcServerSecurity {
     }
 
     pub fn peer_identity<T>(&self, request: &Request<T>) -> Option<PeerIdentity> {
-        request
-            .extensions()
-            .get::<PeerIdentity>()
-            .cloned()
-            .or_else(|| {
-                peer_identity_from_metadata(request.metadata())
-                    .ok()
-                    .flatten()
-            })
+        request.extensions().get::<PeerIdentity>().cloned()
     }
 
     pub fn client_context_factory(
@@ -336,6 +334,8 @@ pub enum RpcSecurityError {
     MissingPeerIdentity,
     #[error("missing authorization context")]
     MissingAuthorization,
+    #[error("invalid authorization context")]
+    InvalidAuthorization,
     #[error("source service {service_kind} is not allowed by rpc security policy")]
     ServiceNotAllowed { service_kind: ServiceKind },
     #[error("source service metadata {metadata} does not match peer identity {peer}")]
@@ -354,9 +354,9 @@ pub enum RpcSecurityError {
 
 pub(crate) fn security_status(error: RpcSecurityError) -> Status {
     match error {
-        RpcSecurityError::MissingPeerIdentity | RpcSecurityError::MissingAuthorization => {
-            Status::unauthenticated(error.to_string())
-        }
+        RpcSecurityError::MissingPeerIdentity
+        | RpcSecurityError::MissingAuthorization
+        | RpcSecurityError::InvalidAuthorization => Status::unauthenticated(error.to_string()),
         RpcSecurityError::ServiceNotAllowed { .. }
         | RpcSecurityError::SourceServiceMismatch { .. }
         | RpcSecurityError::SourceInstanceMismatch { .. }

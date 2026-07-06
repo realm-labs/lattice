@@ -53,12 +53,13 @@ pub fn generate_rpc_bindings_with_options(
         push_routed_request(&mut rust, method);
         push_rpc_request(&mut rust, method);
     }
+    let names = NameDisambiguation::new(methods);
     for service_methods in group_by_service(methods).values() {
-        push_service_module(&mut rust, service_methods);
+        push_service_module(&mut rust, service_methods, &names);
     }
     push_tonic_endpoint_transport(&mut rust, methods);
-    push_gateway_route_table(&mut rust, methods);
-    push_gateway_dispatcher(&mut rust, methods);
+    push_gateway_route_table(&mut rust, methods, &names);
+    push_gateway_dispatcher(&mut rust, methods, &names);
 
     Ok(GeneratedRpcBindings { rust })
 }
@@ -222,9 +223,9 @@ fn push_rpc_request(rust: &mut String, method: &RpcMethodSpec) {
     rust.push_str("}\n\n");
 }
 
-fn push_service_module(rust: &mut String, methods: &[&RpcMethodSpec]) {
+fn push_service_module(rust: &mut String, methods: &[&RpcMethodSpec], names: &NameDisambiguation) {
     let service = methods[0];
-    let module_name = lower_camel_to_snake(&service.service_name);
+    let module_name = service_module_name(service, names);
     rust.push_str(&format!("pub mod {module_name} {{\n"));
     rust.push_str("    use std::sync::Arc;\n");
     rust.push_str("    use std::marker::PhantomData;\n");
@@ -761,7 +762,11 @@ fn push_method_module(rust: &mut String, method: &RpcMethodSpec) {
     rust.push_str("    }\n\n");
 }
 
-fn push_gateway_route_table(rust: &mut String, methods: &[RpcMethodSpec]) {
+fn push_gateway_route_table(
+    rust: &mut String,
+    methods: &[RpcMethodSpec],
+    names: &NameDisambiguation,
+) {
     let gateway_methods: Vec<&RpcMethodSpec> = methods
         .iter()
         .filter(|method| method.gateway_msg_id.is_some())
@@ -775,7 +780,7 @@ fn push_gateway_route_table(rust: &mut String, methods: &[RpcMethodSpec]) {
     );
     for method in gateway_methods {
         rust.push_str("    table.register(");
-        rust.push_str(&gateway_binding_path(method));
+        rust.push_str(&gateway_binding_path(method, names));
         rust.push_str("::route_spec()");
         rust.push_str(")?;\n");
     }
@@ -783,7 +788,11 @@ fn push_gateway_route_table(rust: &mut String, methods: &[RpcMethodSpec]) {
     rust.push_str("}\n\n");
 }
 
-fn push_gateway_dispatcher(rust: &mut String, methods: &[RpcMethodSpec]) {
+fn push_gateway_dispatcher(
+    rust: &mut String,
+    methods: &[RpcMethodSpec],
+    names: &NameDisambiguation,
+) {
     let gateway_methods: Vec<&RpcMethodSpec> = methods
         .iter()
         .filter(|method| method.gateway_msg_id.is_some())
@@ -794,7 +803,7 @@ fn push_gateway_dispatcher(rust: &mut String, methods: &[RpcMethodSpec]) {
     let service_groups = gateway_service_groups(&gateway_methods);
     let type_params = service_groups
         .iter()
-        .map(|methods| gateway_core_type_param(methods[0]))
+        .map(|methods| gateway_core_type_param(methods[0], names))
         .collect::<Vec<_>>();
     let type_params_csv = type_params.join(", ");
 
@@ -805,8 +814,8 @@ fn push_gateway_dispatcher(rust: &mut String, methods: &[RpcMethodSpec]) {
     for methods in &service_groups {
         rust.push_str(&format!(
             "    {}: {},\n",
-            lower_camel_to_snake(&methods[0].service_name),
-            gateway_core_type_param(methods[0])
+            service_field_name(methods[0], names),
+            gateway_core_type_param(methods[0], names)
         ));
     }
     rust.push_str("}\n\n");
@@ -821,11 +830,11 @@ fn push_gateway_dispatcher(rust: &mut String, methods: &[RpcMethodSpec]) {
     rust.push_str("{\n");
     rust.push_str(&format!(
         "    pub fn new({}) -> Self {{\n",
-        gateway_new_args(&service_groups)
+        gateway_new_args(&service_groups, names)
     ));
     rust.push_str("        Self {\n");
     for methods in &service_groups {
-        let field = lower_camel_to_snake(&methods[0].service_name);
+        let field = service_field_name(methods[0], names);
         rust.push_str(&format!("            {field},\n"));
     }
     rust.push_str("        }\n");
@@ -835,8 +844,8 @@ fn push_gateway_dispatcher(rust: &mut String, methods: &[RpcMethodSpec]) {
     );
     rust.push_str("        match frame.msg_id {\n");
     for method in gateway_methods {
-        let field = lower_camel_to_snake(&method.service_name);
-        let binding_path = gateway_binding_path(method);
+        let field = service_field_name(method, names);
+        let binding_path = gateway_binding_path(method, names);
         rust.push_str(&format!(
             "            {binding_path}::DEFAULT_MSG_ID => {binding_path}::decode_and_forward(frame, self.{field}.clone()).await,\n"
         ));
@@ -861,28 +870,28 @@ fn gateway_service_groups<'a>(methods: &[&'a RpcMethodSpec]) -> Vec<Vec<&'a RpcM
     groups
 }
 
-fn gateway_core_type_param(method: &RpcMethodSpec) -> String {
-    format!("{}Core", method.service_name)
+fn gateway_core_type_param(method: &RpcMethodSpec, names: &NameDisambiguation) -> String {
+    format!("{}Core", service_type_prefix(method, names))
 }
 
-fn gateway_new_args(service_groups: &[Vec<&RpcMethodSpec>]) -> String {
+fn gateway_new_args(service_groups: &[Vec<&RpcMethodSpec>], names: &NameDisambiguation) -> String {
     service_groups
         .iter()
         .map(|methods| {
             format!(
                 "{}: {}",
-                lower_camel_to_snake(&methods[0].service_name),
-                gateway_core_type_param(methods[0])
+                service_field_name(methods[0], names),
+                gateway_core_type_param(methods[0], names)
             )
         })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn gateway_binding_path(method: &RpcMethodSpec) -> String {
+fn gateway_binding_path(method: &RpcMethodSpec, names: &NameDisambiguation) -> String {
     format!(
         "{}::{}::GatewayBinding",
-        lower_camel_to_snake(&method.service_name),
+        service_module_name(method, names),
         lower_camel_to_snake(&method.method_name)
     )
 }
@@ -957,6 +966,79 @@ fn package_module(package: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("::")
+}
+
+struct NameDisambiguation {
+    duplicate_service_names: BTreeSet<String>,
+}
+
+impl NameDisambiguation {
+    fn new(methods: &[RpcMethodSpec]) -> Self {
+        let mut seen = BTreeSet::new();
+        let mut duplicate_service_names = BTreeSet::new();
+        for method in methods {
+            if !seen.insert(method.service_name.clone()) {
+                duplicate_service_names.insert(method.service_name.clone());
+            }
+        }
+        Self {
+            duplicate_service_names,
+        }
+    }
+
+    fn disambiguate(&self, method: &RpcMethodSpec) -> bool {
+        self.duplicate_service_names.contains(&method.service_name)
+    }
+}
+
+fn service_module_name(method: &RpcMethodSpec, names: &NameDisambiguation) -> String {
+    let service = lower_camel_to_snake(&method.service_name);
+    if !names.disambiguate(method) {
+        return service;
+    }
+    let package = package_identifier_prefix(&method.package);
+    if package.is_empty() {
+        service
+    } else {
+        format!("{package}_{service}")
+    }
+}
+
+fn service_field_name(method: &RpcMethodSpec, names: &NameDisambiguation) -> String {
+    service_module_name(method, names)
+}
+
+fn service_type_prefix(method: &RpcMethodSpec, names: &NameDisambiguation) -> String {
+    if !names.disambiguate(method) {
+        return method.service_name.clone();
+    }
+    let package = method
+        .package
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(upper_camel_identifier)
+        .collect::<String>();
+    format!("{package}{}", method.service_name)
+}
+
+fn package_identifier_prefix(package: &str) -> String {
+    package
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(lower_camel_to_snake)
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn upper_camel_identifier(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut output = String::new();
+    output.push(first.to_ascii_uppercase());
+    output.extend(chars);
+    output
 }
 
 fn lower_camel_to_snake(value: &str) -> String {

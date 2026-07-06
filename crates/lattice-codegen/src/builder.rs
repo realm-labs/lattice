@@ -205,6 +205,14 @@ fn apply_gateway_routes(
     routes: &[GatewayRoute],
 ) -> Result<(), CodegenError> {
     let mut assigned_methods = std::collections::BTreeSet::new();
+    let mut assigned_msg_ids = methods
+        .iter()
+        .filter_map(|method| {
+            method
+                .gateway_msg_id
+                .map(|msg_id| (msg_id, gateway_method_name(method)))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     for route in routes {
         if !assigned_methods.insert(route.method.clone()) {
             return Err(CodegenError::DuplicateGatewayRouteMethod {
@@ -228,7 +236,15 @@ fn apply_gateway_routes(
                 route_msg_id: route.msg_id,
             });
         }
+        if let Some(existing) = assigned_msg_ids.get(&route.msg_id)
+            && existing != &route.method
+        {
+            return Err(CodegenError::DuplicateGatewayMessageId {
+                msg_id: route.msg_id,
+            });
+        }
         method.gateway_msg_id = Some(route.msg_id);
+        assigned_msg_ids.insert(route.msg_id, route.method.clone());
     }
     Ok(())
 }

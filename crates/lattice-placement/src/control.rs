@@ -145,6 +145,7 @@ where
     ) -> Result<Response<proto::ActivateActorReply>, Status> {
         let request = request.into_inner();
         let key = ActorPlacementKey {
+            service_kind: ServiceKind::new(request.service_kind),
             actor_kind: ActorKind::new(request.actor_kind),
             actor_id: actor_id_from_proto(
                 request
@@ -351,7 +352,9 @@ fn status_from_placement(error: PlacementError) -> Status {
         | PlacementError::NoReadyInstances => Status::not_found(error.to_string()),
         PlacementError::InstanceNotReady { .. }
         | PlacementError::ActivationLockHeld
+        | PlacementError::ActivationLockLost
         | PlacementError::SingletonLockHeld
+        | PlacementError::SingletonLockLost
         | PlacementError::CompareAndPutFailed
         | PlacementError::CoordinatorLeadershipLost => {
             Status::failed_precondition(error.to_string())

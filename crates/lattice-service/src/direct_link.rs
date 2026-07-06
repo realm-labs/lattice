@@ -191,6 +191,7 @@ impl DirectLinkServiceRuntime {
             )
         })?;
         let key = ActorPlacementKey {
+            service_kind: actor_ref.service_kind.clone(),
             actor_kind: actor_ref.actor_kind.clone(),
             actor_id: actor_ref.actor_id.clone(),
         };
