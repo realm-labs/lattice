@@ -310,7 +310,7 @@ Status: `[x]` complete.
 
 #### Phase 9: Direct Link Multiplexed Transport Runtime
 
-Status: `[ ]` not started.
+Status: `[x]` complete.
 
 This phase intentionally breaks the current Direct Link transport/runtime shape. Do not preserve compatibility with the one-connection-per-open path or the low-level `DirectLinkTransport::connect(endpoint) -> Connection` API if it blocks endpoint pooling.
 
@@ -331,7 +331,7 @@ This phase intentionally breaks the current Direct Link transport/runtime shape.
 - [x] Connection-level protocol fatal error closes the connection and every multiplexed session.
 - [x] Link-level protocol error closes only the affected logical link unless the frame corrupts connection state.
 - [x] Metrics distinguish physical connections from logical links: connection open/close, active connections, links per connection, frames per connection, reconnects, and pool queue/backpressure.
-- [ ] Direct Link benchmark compares one connection per link versus pooled striped connections and documents the fd/port/throughput impact.
+- [x] Direct Link benchmark compares one connection per link versus pooled striped connections and documents the fd/port/throughput impact.
 
 ### Phase 1: Single-Node Actor Runtime
 
@@ -1161,8 +1161,8 @@ Pre-implementation checks:
 [x] Direct Actor Link supports TCP unidirectional and bidirectional streams with typed `Linked<T>` actor handlers.
 [x] Direct Actor Link stream binding uses real Rust message types and compile-time handler checks.
 [x] Direct Actor Link lifecycle, close semantics, backpressure, validation, security, and observability match architecture/02-rpc.md.
-[ ] Direct Actor Link production transport multiplexes many logical actor links over bounded instance-to-instance TCP connection pools.
-[ ] `ctx.links().connect(...)` works through a production `DirectLinkRuntimeHandle` installed by `LatticeService`, not only through test/runtime injection.
+[x] Direct Actor Link production transport multiplexes many logical actor links over bounded instance-to-instance TCP connection pools.
+[x] `ctx.links().connect(...)` works through a production `DirectLinkRuntimeHandle` installed by `LatticeService`, not only through test/runtime injection.
 ```
 
 ---
@@ -1266,13 +1266,13 @@ Each phase can exit only when all items are true:
 The whole goal can be marked complete only when:
 
 ```text
-[ ] Phase 1 through Phase 9 are complete.
-[ ] This file's global acceptance checklist is fully satisfied.
+[x] Phase 1 through Phase 9 are complete.
+[x] This file's global acceptance checklist is fully satisfied.
 [x] architecture/00-overview.md system boundaries and module responsibilities are implemented.
 [x] architecture/01-actor-runtime.md actor runtime capabilities are implemented and tested.
 [x] All ActorExecutionPolicy variants are implemented and tested: TaskPerActor, KeyedWorkerPool, and DedicatedThreadPool.
 [x] UnsupportedExecutionPolicy is used only for invalid configuration, not for planned policies in the completed framework.
-[ ] architecture/02-rpc.md typed RPC, metadata, codegen, gateway decode/forward, Direct Actor Link, and Direct Link endpoint pooling are implemented and tested.
+[x] architecture/02-rpc.md typed RPC, metadata, codegen, gateway decode/forward, Direct Actor Link, and Direct Link endpoint pooling are implemented and tested.
 [x] architecture/03-placement.md placement, scale, drain, shutdown, crash, and watch are implemented and tested.
 [x] architecture/04-eventbus-scheduler-config.md event bus, scheduler, and config are implemented and tested.
 [x] architecture/05-gateway-ops.md gateway, rate limit, admin, telemetry, and inspection are implemented and tested.
