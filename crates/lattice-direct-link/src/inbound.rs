@@ -21,7 +21,8 @@ use crate::codec::{DirectLinkFrame, DirectLinkFrameKind};
 use crate::delivery::{DirectLinkDeliveryError, DirectLinkDispatch};
 use crate::session::{
     CloseAllTransition, CloseTransition, DirectLinkPeerIdentity, DirectLinkSessionManager,
-    ManagedLinkSnapshot, MessageFrameError, SessionManagerError,
+    ManagedLinkSnapshot, MessageFrameError, OpenLinkReject, OpenLinkRejectReason,
+    SessionManagerError,
 };
 use crate::stream::DirectLinkActorBinding;
 
@@ -193,7 +194,19 @@ impl DirectLinkInboundRouter {
             .open_link_from_peer(request, peer_identity)
         {
             Ok(ack) => {
-                self.deliver_link_opened_to_target(&ack.link_id)?;
+                if let Err(error) = self.deliver_link_opened_to_target(&ack.link_id) {
+                    let _ = self.session_manager.close_all(
+                        &ack.link_id,
+                        LinkCloseReason::ProtocolError(format!(
+                            "open-link delivery failed: {error}"
+                        )),
+                    );
+                    return DirectLinkFrame::open_link_reject(&OpenLinkReject::new(
+                        ack.link_id,
+                        open_link_delivery_reject_reason(&error),
+                    ))
+                    .map_err(|error| InboundDeliveryError::Handshake(error.to_string()));
+                }
                 DirectLinkFrame::open_link_ack(&ack)
                     .map_err(|error| InboundDeliveryError::Handshake(error.to_string()))
             }
@@ -684,6 +697,20 @@ fn protocol_error_close_reason(error: &InboundDeliveryError) -> Option<String> {
             Some(format!("decode error: {error}"))
         }
         _ => None,
+    }
+}
+
+fn open_link_delivery_reject_reason(error: &InboundDeliveryError) -> OpenLinkRejectReason {
+    match error {
+        InboundDeliveryError::ActorUnavailable
+        | InboundDeliveryError::LinkOpenUnavailable
+        | InboundDeliveryError::UnboundActorKind { .. } => OpenLinkRejectReason::ActorUnavailable,
+        InboundDeliveryError::Delivery(DirectLinkDeliveryError::Mailbox(
+            ActorTellError::MailboxFull,
+        ))
+        | InboundDeliveryError::BackpressureFull
+        | InboundDeliveryError::BackpressureExceeded => OpenLinkRejectReason::Overloaded,
+        _ => OpenLinkRejectReason::ActorUnavailable,
     }
 }
 
@@ -1784,6 +1811,50 @@ mod tests {
         assert_eq!(response.kind, DirectLinkFrameKind::OpenLinkReject);
         let reject = response.decode_open_link_reject().unwrap();
         assert_eq!(reject.reason, OpenLinkRejectReason::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn process_open_link_frame_rejects_when_link_open_delivery_fails() {
+        let manager = Arc::new(DirectLinkSessionManager::new());
+        let stream = DirectLinkStream::new("gateway-input").message::<InputCommand>();
+        let descriptor = stream.descriptor();
+        manager
+            .register_binding(actor_kind!("Battle"), descriptor.clone())
+            .unwrap();
+        manager.register_actor(actor_kind!("Battle"), DirectLinkActorPolicy::lazy(None));
+        manager.set_validation_policy(
+            OpenLinkValidationPolicy::hosted(service_kind!("Battle"))
+                .authorize_sources([service_kind!("Gateway")]),
+        );
+        let link_id = LinkId::new("link-open-delivery-fails");
+        let router = DirectLinkInboundRouter::builder(manager)
+            .bind_actor(
+                stream.for_actor::<BattleActor>(actor_kind!("Battle")),
+                |_| None,
+            )
+            .build();
+
+        let response = router
+            .process_open_link_frame(
+                DirectLinkFrame::open_link(&OpenLinkRequest {
+                    protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                    link_id: link_id.clone(),
+                    source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),
+                    target: actor_ref(service_kind!("Battle"), actor_kind!("Battle"), 9),
+                    mode: DirectLinkMode::Unidirectional,
+                    source_to_target: OpenLinkDirection::from_stream(link_id.clone(), &descriptor),
+                    target_to_source: None,
+                    options: DirectLinkOptions::default(),
+                })
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(response.kind, DirectLinkFrameKind::OpenLinkReject);
+        let reject = response.decode_open_link_reject().unwrap();
+        assert_eq!(reject.link_id, link_id);
+        assert_eq!(reject.reason, OpenLinkRejectReason::ActorUnavailable);
     }
 
     #[tokio::test]
