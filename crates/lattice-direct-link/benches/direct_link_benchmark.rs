@@ -116,7 +116,7 @@ async fn tcp_write_read(
         server_transport
     };
     let mut client = client_transport
-        .connect(endpoint)
+        .connect_physical(endpoint)
         .await
         .expect("connect direct-link");
     let payload = vec![0; payload_size];

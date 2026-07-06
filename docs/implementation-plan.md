@@ -314,13 +314,13 @@ Status: `[ ]` not started.
 
 This phase intentionally breaks the current Direct Link transport/runtime shape. Do not preserve compatibility with the one-connection-per-open path or the low-level `DirectLinkTransport::connect(endpoint) -> Connection` API if it blocks endpoint pooling.
 
-- [ ] Replace per-link TCP connection assumptions with an instance-to-instance `DirectLinkEndpointPool`.
-- [ ] Add `DirectLinkEndpointPoolConfig` with `connections_per_endpoint`, `max_links_per_connection`, `max_links_per_endpoint`, idle timeout, connect timeout, and reconnect/backoff settings.
-- [ ] Replace or narrow `DirectLinkTransport` so business/runtime code opens logical link sessions through the endpoint pool, not raw TCP connections.
-- [ ] Add pooled connection stripes keyed by target direct-link endpoint and stable link/session hash.
-- [ ] Multiplex many `link_id` logical sessions over each TCP connection.
-- [ ] OpenLink frames are routed over a selected endpoint stripe and do not create a dedicated TCP connection per actor pair.
-- [ ] Outbound `DirectLinkSender` writes frames through a pooled connection writer task.
+- [x] Replace per-link TCP connection assumptions with an instance-to-instance `DirectLinkEndpointPool`.
+- [x] Add `DirectLinkEndpointPoolConfig` with `connections_per_endpoint`, `max_links_per_connection`, `max_links_per_endpoint`, idle timeout, connect timeout, and reconnect/backoff settings.
+- [x] Replace or narrow `DirectLinkTransport` so business/runtime code opens logical link sessions through the endpoint pool, not raw TCP connections.
+- [x] Add pooled connection stripes keyed by target direct-link endpoint and stable link/session hash.
+- [x] Multiplex many `link_id` logical sessions over each TCP connection.
+- [x] OpenLink frames are routed over a selected endpoint stripe and do not create a dedicated TCP connection per actor pair.
+- [x] Outbound `DirectLinkSender` writes frames through a pooled connection writer task.
 - [ ] Inbound connection task demultiplexes frames by `link_id` and routes them through `DirectLinkInboundRouter`.
 - [ ] Production `DirectLinkRuntimeHandle` is installed into `ServiceContext` by `LatticeService` so `ctx.links().connect(...)` works without test-only runtime injection.
 - [ ] Direct Link endpoint resolution uses `ActorRef` / placement instance metadata to find the target instance `direct_link_endpoint`.

@@ -19,7 +19,10 @@ pub trait DirectLinkTransport: Clone + Send + Sync + 'static {
     type Connection: DirectLinkConnection;
 
     async fn bind(&self, config: DirectLinkListenConfig) -> Result<Self::Listener, LinkError>;
-    async fn connect(&self, endpoint: DirectLinkEndpoint) -> Result<Self::Connection, LinkError>;
+    async fn connect_physical(
+        &self,
+        endpoint: DirectLinkEndpoint,
+    ) -> Result<Self::Connection, LinkError>;
 }
 
 #[async_trait]
@@ -71,7 +74,10 @@ impl DirectLinkTransport for TcpDirectLinkTransport {
         })
     }
 
-    async fn connect(&self, endpoint: DirectLinkEndpoint) -> Result<Self::Connection, LinkError> {
+    async fn connect_physical(
+        &self,
+        endpoint: DirectLinkEndpoint,
+    ) -> Result<Self::Connection, LinkError> {
         let address = endpoint_socket_address(&endpoint).await?;
         let stream = TcpStream::connect(address).await.map_err(|error| {
             LinkError::Protocol(format!("failed to connect TCP direct link: {error}"))
@@ -303,7 +309,7 @@ mod tests {
             let mut server = listener.accept().await.unwrap();
             server.read_frame().await.unwrap()
         });
-        let mut client = transport.connect(endpoint).await.unwrap();
+        let mut client = transport.connect_physical(endpoint).await.unwrap();
         let frame = DirectLinkFrame::message(
             LinkId::new("link-1"),
             LinkSequence(1),

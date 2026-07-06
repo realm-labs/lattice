@@ -1330,7 +1330,7 @@ async fn direct_link_listener_routes_message_frames_to_registered_actor() {
         })
         .unwrap();
     let mut connection = TcpDirectLinkTransport::new()
-        .connect(DirectLinkEndpoint::new(direct_link_endpoint))
+        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint))
         .await
         .unwrap();
     connection
@@ -1511,11 +1511,11 @@ async fn direct_link_listener_enforces_connection_limit() {
         .unwrap();
     let transport = TcpDirectLinkTransport::new();
     let mut first = transport
-        .connect(DirectLinkEndpoint::new(direct_link_endpoint.clone()))
+        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint.clone()))
         .await
         .unwrap();
     let mut second = transport
-        .connect(DirectLinkEndpoint::new(direct_link_endpoint))
+        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint))
         .await
         .unwrap();
 
@@ -1872,7 +1872,7 @@ async fn direct_link_listener_writes_heartbeat_frames_for_open_links() {
         .unwrap();
 
     let mut connection = TcpDirectLinkTransport::new()
-        .connect(DirectLinkEndpoint::new(direct_link_endpoint))
+        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint))
         .await
         .unwrap();
     let frame = timeout(Duration::from_secs(1), connection.read_frame())
