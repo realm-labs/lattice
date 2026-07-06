@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -9,11 +11,10 @@ use lattice_core::{
     TraceContext,
 };
 use lattice_direct_link::{
-    BackpressureQueue, DIRECT_LINK_PROTOCOL_VERSION, DirectLinkConnection, DirectLinkEndpointPool,
-    DirectLinkEndpointPoolConfig, DirectLinkFrame, DirectLinkFrameCodec, DirectLinkFrameKind,
-    DirectLinkListenConfig, DirectLinkTransport, NegotiatedDirection, OpenLinkAck,
-    OpenLinkDirection, OpenLinkRequest, PooledDirectLinkEndpointPool, TcpDirectLinkListener,
-    TcpDirectLinkTransport,
+    BackpressureQueue, DirectLinkConnection, DirectLinkEndpointPool, DirectLinkEndpointPoolConfig,
+    DirectLinkFrame, DirectLinkFrameCodec, DirectLinkFrameKind, DirectLinkListenConfig,
+    DirectLinkTransport, NegotiatedDirection, OpenLinkAck, PooledDirectLinkEndpointPool,
+    TcpDirectLinkListener, TcpDirectLinkTransport,
 };
 use tokio::runtime::Runtime;
 
@@ -90,25 +91,16 @@ fn direct_link_benchmark(c: &mut Criterion) {
     }
     matrix.finish();
 
-    let mut pooling = c.benchmark_group("direct_link_pooling_comparison");
+    let mut pooling = c.benchmark_group("direct_link_steady_state_throughput");
     pooling.sample_size(10);
     pooling.measurement_time(Duration::from_secs(5));
     for link_count in [16_usize, 64] {
         pooling.bench_with_input(
-            BenchmarkId::new("one_tcp_connection_per_link", link_count),
+            BenchmarkId::new("pooled_striped_tcp_connections_concurrent_64", link_count),
             &link_count,
             |bench, link_count| {
                 bench.to_async(&runtime).iter_custom(|iterations| {
-                    one_connection_per_link(iterations.min(16), *link_count, 128)
-                });
-            },
-        );
-        pooling.bench_with_input(
-            BenchmarkId::new("pooled_striped_tcp_connections", link_count),
-            &link_count,
-            |bench, link_count| {
-                bench.to_async(&runtime).iter_custom(|iterations| {
-                    pooled_striped_links(iterations.min(16), *link_count, 128, 4)
+                    pooled_striped_concurrent_steady_state(iterations, *link_count, 128, 4, 64)
                 });
             },
         );
@@ -169,60 +161,17 @@ async fn tcp_write_read(
     start.elapsed()
 }
 
-async fn one_connection_per_link(
-    iterations: u64,
-    link_count: usize,
-    payload_size: usize,
-) -> Duration {
-    let transport = TcpDirectLinkTransport::new();
-    let listener = bind_listener(&transport).await;
-    let endpoint = listener.local_endpoint();
-    let expected_messages = iterations as usize * link_count;
-    let server = tokio::spawn(handle_link_server(listener, expected_messages));
-    let payload = vec![0; payload_size];
-    let start = Instant::now();
-    for iteration in 0..iterations {
-        for link_index in 0..link_count {
-            let link_id = LinkId::new(format!("raw-{iteration}-{link_index}"));
-            let mut connection = transport
-                .connect_physical(endpoint.clone())
-                .await
-                .expect("connect direct-link");
-            connection
-                .write_frame(
-                    DirectLinkFrame::open_link(&wire_open_link_request(link_id.clone()))
-                        .expect("encode open-link"),
-                )
-                .await
-                .expect("write open-link");
-            let response = connection.read_frame().await.expect("read open-link ack");
-            assert_eq!(response.kind, DirectLinkFrameKind::OpenLinkAck);
-            connection
-                .write_frame(DirectLinkFrame::message(
-                    link_id,
-                    LinkSequence(1),
-                    DirectLinkMessageId(7),
-                    payload.clone(),
-                ))
-                .await
-                .expect("write direct-link frame");
-            connection.close().await.expect("close direct-link client");
-        }
-    }
-    server.await.expect("server task");
-    start.elapsed()
-}
-
-async fn pooled_striped_links(
+async fn pooled_striped_concurrent_steady_state(
     iterations: u64,
     link_count: usize,
     payload_size: usize,
     connections_per_endpoint: usize,
+    concurrency: usize,
 ) -> Duration {
     let transport = TcpDirectLinkTransport::new();
     let listener = bind_listener(&transport).await;
     let endpoint = listener.local_endpoint();
-    let expected_messages = iterations as usize * link_count;
+    let expected_messages = usize::try_from(iterations).unwrap_or(usize::MAX);
     let server = tokio::spawn(handle_link_server(listener, expected_messages));
     let pool_config = DirectLinkEndpointPoolConfig {
         connections_per_endpoint: std::num::NonZeroUsize::new(connections_per_endpoint).unwrap(),
@@ -230,29 +179,49 @@ async fn pooled_striped_links(
     };
     let pool = PooledDirectLinkEndpointPool::new(transport, pool_config.clone());
     let link_ids = striped_link_ids(&pool_config, link_count);
+    let mut sessions = Vec::with_capacity(link_ids.len());
+    for link_id in link_ids {
+        let link_id = LinkId::new(link_id);
+        let session = pool
+            .open_link(open_link_request(link_id, endpoint.clone()))
+            .await
+            .expect("open pooled direct-link");
+        sessions.push(session.session);
+    }
     let payload = vec![0; payload_size];
+    let sessions = Arc::new(sessions);
+    let next_message = Arc::new(AtomicU64::new(0));
+    let worker_count = concurrency.max(1).min(expected_messages.max(1));
     let start = Instant::now();
-    for iteration in 0..iterations {
-        for link_id in &link_ids {
-            let link_id = LinkId::new(format!("{iteration}-{link_id}"));
-            let session = pool
-                .open_link(open_link_request(link_id.clone(), endpoint.clone()))
-                .await
-                .expect("open pooled direct-link");
-            session
-                .session
-                .sender
-                .tell(OutboundDirectLinkMessage {
-                    link_id,
-                    direction: LinkDirection::SourceToTarget,
-                    message_id: DirectLinkMessageId(7),
-                    proto_full_name: "bench.Payload",
-                    payload: payload.clone(),
-                    flags: LinkMessageFlags::EMPTY,
-                })
-                .await
-                .expect("write pooled direct-link frame");
-        }
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..worker_count {
+        let sessions = sessions.clone();
+        let next_message = next_message.clone();
+        let payload = payload.clone();
+        workers.spawn(async move {
+            loop {
+                let message_index = next_message.fetch_add(1, Ordering::Relaxed);
+                if message_index >= iterations {
+                    break;
+                }
+                let session = &sessions[message_index as usize % sessions.len()];
+                session
+                    .sender
+                    .tell(OutboundDirectLinkMessage {
+                        link_id: session.link_id.clone(),
+                        direction: LinkDirection::SourceToTarget,
+                        message_id: DirectLinkMessageId(7),
+                        proto_full_name: "bench.Payload",
+                        payload: payload.clone(),
+                        flags: LinkMessageFlags::EMPTY,
+                    })
+                    .await
+                    .expect("write pooled direct-link frame");
+            }
+        });
+    }
+    while let Some(result) = workers.join_next().await {
+        result.expect("direct-link benchmark worker");
     }
     criterion::black_box(pool.metrics_snapshot().physical_connections_opened);
     criterion::black_box(pool.metrics_snapshot().links_per_connection);
@@ -334,19 +303,6 @@ fn open_link_request(link_id: LinkId, endpoint: DirectLinkEndpoint) -> DirectLin
         target_to_source: None,
         options: DirectLinkOptions::default(),
         trace: TraceContext::default(),
-    }
-}
-
-fn wire_open_link_request(link_id: LinkId) -> OpenLinkRequest {
-    OpenLinkRequest {
-        protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
-        link_id: link_id.clone(),
-        source: bench_actor_ref("Gateway", 1),
-        target: bench_actor_ref("World", 2),
-        mode: DirectLinkMode::Unidirectional,
-        source_to_target: OpenLinkDirection::from_stream(link_id, &bench_stream()),
-        target_to_source: None,
-        options: DirectLinkOptions::default(),
     }
 }
 
