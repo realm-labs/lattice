@@ -1372,6 +1372,158 @@ async fn direct_link_listener_routes_message_frames_to_registered_actor() {
 }
 
 #[tokio::test]
+async fn direct_link_listener_demultiplexes_multiple_links_on_one_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store =
+        InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test-direct-link-multiplex"));
+    let mut watch = store.watch(store.prefix().clone()).await.unwrap();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let stream = DirectLinkStream::new("movement").message::<DirectLinkTestPayload>();
+    let descriptor = stream.descriptor();
+    let link_a = LinkId::new("service-link-mux-a");
+    let link_b = LinkId::new("service-link-mux-b");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(DirectLinkTestFactory {
+                    received: received.clone(),
+                })
+                .build(),
+        )
+        .register_direct_link(stream.for_actor::<DirectLinkTestActor>(actor_kind!("World")))
+        .register_sharded_rpc(FakeRpcBinding::<DirectLinkTestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let addr = ready_rx.await.unwrap();
+    let mut client = LogicControlClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    client
+        .activate_actor(proto::ActivateActorRequest {
+            service_kind: "World".to_string(),
+            actor_kind: "World".to_string(),
+            actor_id: Some(actor_id_to_proto(&ActorId::U64(7))),
+            epoch: 1,
+        })
+        .await
+        .unwrap();
+
+    let ready_record = loop {
+        let event = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .unwrap()
+            .unwrap();
+        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+            && record.state == InstanceState::Ready
+        {
+            break record;
+        }
+    };
+    let direct_link_endpoint: http::Uri = ready_record
+        .labels
+        .get("direct_link_endpoint")
+        .expect("direct-link endpoint label")
+        .parse()
+        .unwrap();
+    let target_ref = direct_actor_ref(
+        service_kind!("World"),
+        actor_kind!("World"),
+        ActorId::U64(7),
+        direct_link_endpoint.clone(),
+    );
+    let source_ref = direct_actor_ref(
+        service_kind!("Gateway"),
+        actor_kind!("GatewaySession"),
+        ActorId::U64(99),
+        "tcp://127.0.0.1:1".parse().unwrap(),
+    );
+    let mut connection = TcpDirectLinkTransport::new()
+        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint))
+        .await
+        .unwrap();
+
+    for link_id in [&link_a, &link_b] {
+        connection
+            .write_frame(
+                DirectLinkFrame::open_link(&OpenLinkRequest {
+                    protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                    link_id: link_id.clone(),
+                    source: source_ref.clone(),
+                    target: target_ref.clone(),
+                    mode: DirectLinkMode::Unidirectional,
+                    source_to_target: OpenLinkDirection::from_stream(link_id.clone(), &descriptor),
+                    target_to_source: None,
+                    options: DirectLinkOptions::default(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ack = timeout(Duration::from_secs(1), connection.read_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ack.kind, DirectLinkFrameKind::OpenLinkAck);
+        assert_eq!(ack.decode_open_link_ack().unwrap().link_id, *link_id);
+    }
+
+    for (link_id, tick) in [(link_a, 41), (link_b, 42)] {
+        connection
+            .write_frame(DirectLinkFrame::message(
+                link_id,
+                LinkSequence(1),
+                descriptor
+                    .message_id_for::<DirectLinkTestPayload>()
+                    .unwrap(),
+                DirectLinkTestPayload { tick }.encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+    }
+    connection.close().await.unwrap();
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if received
+                .lock()
+                .expect("received direct-link payloads mutex poisoned")
+                .len()
+                == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut received_ticks = received
+        .lock()
+        .expect("received direct-link payloads mutex poisoned")
+        .clone();
+    received_ticks.sort_unstable();
+    assert_eq!(received_ticks, vec![41, 42]);
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn direct_link_connection_writes_open_link_reject_frames() {
     let transport = TcpDirectLinkTransport::new();
     let listener = transport
@@ -1401,7 +1553,7 @@ async fn direct_link_connection_writes_open_link_reject_frames() {
 
     let link_id = LinkId::new("service-link-open-reject");
     let mut connection = TcpDirectLinkTransport::new()
-        .connect(endpoint)
+        .connect_physical(endpoint)
         .await
         .unwrap();
     connection

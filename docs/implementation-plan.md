@@ -321,7 +321,7 @@ This phase intentionally breaks the current Direct Link transport/runtime shape.
 - [x] Multiplex many `link_id` logical sessions over each TCP connection.
 - [x] OpenLink frames are routed over a selected endpoint stripe and do not create a dedicated TCP connection per actor pair.
 - [x] Outbound `DirectLinkSender` writes frames through a pooled connection writer task.
-- [ ] Inbound connection task demultiplexes frames by `link_id` and routes them through `DirectLinkInboundRouter`.
+- [x] Inbound connection task demultiplexes frames by `link_id` and routes them through `DirectLinkInboundRouter`.
 - [ ] Production `DirectLinkRuntimeHandle` is installed into `ServiceContext` by `LatticeService` so `ctx.links().connect(...)` works without test-only runtime injection.
 - [ ] Direct Link endpoint resolution uses `ActorRef` / placement instance metadata to find the target instance `direct_link_endpoint`.
 - [ ] `LinkTarget::Endpoint` remains available for explicit business endpoints, but it also goes through the endpoint pool.
