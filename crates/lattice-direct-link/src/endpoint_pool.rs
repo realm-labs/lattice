@@ -922,6 +922,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_pool_honors_connections_per_endpoint() {
+        let transport = FakeTransport::default();
+        let config = DirectLinkEndpointPoolConfig {
+            connections_per_endpoint: NonZeroUsize::new(2).unwrap(),
+            ..DirectLinkEndpointPoolConfig::default()
+        };
+        let first = LinkId::new("striped-link-0");
+        let second = (1..100)
+            .map(|index| LinkId::new(format!("striped-link-{index}")))
+            .find(|candidate| {
+                config.stripe_index_for_link(candidate) != config.stripe_index_for_link(&first)
+            })
+            .expect("test should find link ids for both stripes");
+        let pool = PooledDirectLinkEndpointPool::new(transport.clone(), config);
+
+        let first = pool.open_link(request(first.as_str())).await.unwrap();
+        let second = pool.open_link(request(second.as_str())).await.unwrap();
+
+        assert_ne!(first.connection_id, second.connection_id);
+        assert_eq!(transport.connects.lock().unwrap().len(), 2);
+        let metrics = pool.metrics_snapshot();
+        assert_eq!(metrics.physical_connections_opened, 2);
+        assert_eq!(metrics.logical_links_opened, 2);
+    }
+
+    #[tokio::test]
     async fn max_links_per_connection_rejects_before_openlink() {
         let transport = FakeTransport::default();
         let config = DirectLinkEndpointPoolConfig {

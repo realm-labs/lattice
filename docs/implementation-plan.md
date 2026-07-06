@@ -324,8 +324,8 @@ This phase intentionally breaks the current Direct Link transport/runtime shape.
 - [x] Inbound connection task demultiplexes frames by `link_id` and routes them through `DirectLinkInboundRouter`.
 - [x] Production `DirectLinkRuntimeHandle` is installed into `ServiceContext` by `LatticeService` so `ctx.links().connect(...)` works without test-only runtime injection.
 - [x] Direct Link endpoint resolution uses `ActorRef` / placement instance metadata to find the target instance `direct_link_endpoint`.
-- [ ] `LinkTarget::Endpoint` remains available for explicit business endpoints, but it also goes through the endpoint pool.
-- [ ] Endpoint pool enforces connection count, per-connection link count, and per-endpoint link count before OpenLink.
+- [x] `LinkTarget::Endpoint` remains available for explicit business endpoints, but it also goes through the endpoint pool.
+- [x] Endpoint pool enforces connection count, per-connection link count, and per-endpoint link count before OpenLink.
 - [ ] Node drain closes logical sessions before closing pooled TCP connections.
 - [ ] Peer connection loss closes all sessions multiplexed on that TCP connection with `ConnectionLost`.
 - [ ] Connection-level protocol fatal error closes the connection and every multiplexed session.
