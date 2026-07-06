@@ -472,6 +472,9 @@ where
         tokio::spawn(async move {
             while let Ok(event) = etcd_watch.next().await {
                 match event.value {
+                    Some(EtcdValue::Instance(record)) => {
+                        let _ = tx.send(PlacementWatchEvent::InstanceUpdated { record: *record });
+                    }
                     Some(EtcdValue::Actor(record)) => {
                         let record = *record;
                         let key = ActorPlacementKey {

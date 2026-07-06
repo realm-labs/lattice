@@ -101,10 +101,11 @@ where
 
         tokio::spawn(async move {
             while raw_watch.changed().await.is_ok() {
-                let value = raw_watch.borrow().as_deref().map(decode_value).transpose();
-                if let Ok(value) = value {
-                    tx.send_replace(value);
-                }
+                let value = match raw_watch.borrow().as_deref().map(decode_value).transpose() {
+                    Ok(value) => value,
+                    Err(_) => break,
+                };
+                tx.send_replace(value);
             }
         });
 

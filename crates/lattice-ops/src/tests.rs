@@ -251,6 +251,37 @@ fn admin_snapshot_builds_views_from_live_placement_records() {
     assert_eq!(snapshot.singletons[0].name, "SeasonManager/default");
 }
 
+#[test]
+fn admin_snapshot_filters_virtual_shards_by_requested_service() {
+    let snapshot = AdminSnapshot::from_placement_records(
+        service_kind!("World"),
+        InstanceId::new("world-a"),
+        vec![actor_kind!("World")],
+        vec![instance_record("world-a")],
+        vec![],
+        vec![
+            VirtualShardPlacementRecord {
+                service_kind: service_kind!("World"),
+                actor_kind: actor_kind!("World"),
+                shard_id: VirtualShardId(4),
+                owner: InstanceId::new("world-a"),
+                epoch: Epoch(5),
+            },
+            VirtualShardPlacementRecord {
+                service_kind: service_kind!("Inventory"),
+                actor_kind: actor_kind!("Inventory"),
+                shard_id: VirtualShardId(9),
+                owner: InstanceId::new("inventory-a"),
+                epoch: Epoch(6),
+            },
+        ],
+        vec![],
+    );
+
+    assert_eq!(snapshot.virtual_shards.len(), 1);
+    assert_eq!(snapshot.virtual_shards[0].name, "World/#4");
+}
+
 #[derive(Clone)]
 struct FakeNodeInspectorClient {
     summaries: Arc<HashMap<InstanceId, Result<NodeSummary, String>>>,

@@ -90,6 +90,19 @@ struct GatewayBackgroundTask {
     future: GatewayTaskFuture,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayTaskKind {
+    Background,
+    Connection,
+}
+
+#[derive(Debug)]
+struct GatewayTaskCompletion {
+    kind: GatewayTaskKind,
+    name: String,
+    result: Result<(), GatewayError>,
+}
+
 impl fmt::Debug for GatewayBackgroundTask {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GatewayBackgroundTask")
@@ -187,25 +200,46 @@ where
             tasks.spawn(async move {
                 let name = task.name;
                 let result = task.future.await;
-                (name, result)
+                GatewayTaskCompletion {
+                    kind: GatewayTaskKind::Background,
+                    name,
+                    result,
+                }
             });
         }
 
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
-                () = &mut shutdown => return Ok(()),
+                () = &mut shutdown => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Ok(());
+                }
                 joined = tasks.join_next(), if !tasks.is_empty() => {
                     match joined {
-                        Some(Ok((name, Ok(())))) => {
+                        Some(Ok(GatewayTaskCompletion {
+                            kind: GatewayTaskKind::Background,
+                            name,
+                            result: Ok(()),
+                        })) => {
                             return Err(GatewayError::BackgroundTaskExited { task: name });
                         }
-                        Some(Ok((name, Err(error)))) => {
+                        Some(Ok(GatewayTaskCompletion {
+                            kind: GatewayTaskKind::Background | GatewayTaskKind::Connection,
+                            name,
+                            result: Err(error),
+                        })) => {
                             return Err(GatewayError::BackgroundTaskFailed {
                                 task: name,
                                 error: error.to_string(),
                             });
                         }
+                        Some(Ok(GatewayTaskCompletion {
+                            kind: GatewayTaskKind::Connection,
+                            result: Ok(()),
+                            ..
+                        })) => {}
                         Some(Err(error)) => {
                             return Err(GatewayError::BackgroundTaskFailed {
                                 task: "unknown".to_string(),
@@ -219,8 +253,13 @@ where
                     let (socket, peer) = accepted
                         .map_err(|error| GatewayError::Io(error.to_string()))?;
                     let connection_handler = connection_handler.clone();
-                    tokio::spawn(async move {
-                        let _ = connection_handler.handle_connection(socket, peer).await;
+                    tasks.spawn(async move {
+                        let result = connection_handler.handle_connection(socket, peer).await;
+                        GatewayTaskCompletion {
+                            kind: GatewayTaskKind::Connection,
+                            name: format!("connection {peer}"),
+                            result,
+                        }
                     });
                 }
             }

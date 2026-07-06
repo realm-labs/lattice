@@ -178,6 +178,21 @@ async fn etcd_store_persists_singletons_with_versions() {
 }
 
 #[tokio::test]
+async fn etcd_watch_reports_instance_updates() {
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/test"),
+        InMemoryEtcdClient::new(),
+    );
+    let mut watch = store.watch(store.prefix().clone()).await.unwrap();
+    let record = instance_record("world-a", InstanceState::Ready);
+
+    store.upsert_instance(record.clone()).await.unwrap();
+
+    let event = watch.next().await.unwrap();
+    assert_eq!(event, PlacementWatchEvent::InstanceUpdated { record });
+}
+
+#[tokio::test]
 async fn etcd_watch_reports_virtual_shard_updates() {
     let store = EtcdPlacementStore::new(
         PlacementPrefix::new("/lattice/test"),

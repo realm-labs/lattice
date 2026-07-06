@@ -32,4 +32,6 @@ pub enum ConfigError {
     },
     #[error("environment config separator cannot be empty")]
     EmptyEnvSeparator,
+    #[error("environment config path collision at {path}")]
+    EnvPathCollision { path: String },
 }

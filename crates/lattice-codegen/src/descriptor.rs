@@ -125,7 +125,7 @@ pub fn methods_from_descriptor(
                         message: request_proto.clone(),
                     }
                 })?;
-                let field = find_field(request, &route_key).ok_or_else(|| {
+                let field = find_field(request.descriptor, &route_key).ok_or_else(|| {
                     CodegenError::RouteKeyFieldNotFound {
                         message: request_proto.clone(),
                         field: route_key.clone(),
@@ -151,8 +151,10 @@ pub fn methods_from_descriptor(
                     service_kind: service_kind.clone(),
                     service_name: service_name.clone(),
                     method_name,
-                    request_type: rust_type_path(&request_proto),
-                    reply_type: rust_type_path(&reply_proto),
+                    request_type: request.rust_type,
+                    reply_type: find_message(descriptor, &reply_proto)
+                        .map(|message| message.rust_type)
+                        .unwrap_or_else(|| rust_type_path(&reply_proto)),
                     route_key: ProtoRouteKeyOption {
                         actor_kind: service_actor_kind.clone(),
                         key_field: route_key,
@@ -215,7 +217,7 @@ fn collect_message_specs(
     };
     messages.push(ProtoMessageSpec {
         proto_full_name: proto_full_name.clone(),
-        rust_type: rust_type_path(&proto_full_name),
+        rust_type: rust_type_path_from_parts(package, &parents, &name),
     });
 
     let mut nested_parents = parents;
@@ -225,16 +227,52 @@ fn collect_message_specs(
     }
 }
 
+struct ResolvedMessage<'a> {
+    descriptor: &'a DescriptorProto,
+    rust_type: String,
+}
+
 fn find_message<'a>(
     descriptor: &'a FileDescriptorSet,
     full_name: &str,
-) -> Option<&'a DescriptorProto> {
+) -> Option<ResolvedMessage<'a>> {
     for file in &descriptor.file {
         let package = file.package.clone().unwrap_or_default();
         for message in &file.message_type {
-            if scoped_name(&package, message.name.as_deref().unwrap_or_default()) == full_name {
-                return Some(message);
+            if let Some(found) = find_message_in_message(&package, Vec::new(), message, full_name) {
+                return Some(found);
             }
+        }
+    }
+    None
+}
+
+fn find_message_in_message<'a>(
+    package: &str,
+    parents: Vec<String>,
+    message: &'a DescriptorProto,
+    full_name: &str,
+) -> Option<ResolvedMessage<'a>> {
+    let name = message.name.clone().unwrap_or_default();
+    let proto_full_name = if parents.is_empty() {
+        scoped_name(package, &name)
+    } else {
+        scoped_name(package, &format!("{}.{}", parents.join("."), name))
+    };
+    if proto_full_name == full_name {
+        return Some(ResolvedMessage {
+            descriptor: message,
+            rust_type: rust_type_path_from_parts(package, &parents, &name),
+        });
+    }
+
+    let mut nested_parents = parents;
+    nested_parents.push(name);
+    for nested in &message.nested_type {
+        if let Some(found) =
+            find_message_in_message(package, nested_parents.clone(), nested, full_name)
+        {
+            return Some(found);
         }
     }
     None
@@ -307,6 +345,36 @@ fn rust_type_path(proto_type: &str) -> String {
     } else {
         format!("crate::{module_path}::{type_name}")
     }
+}
+
+fn rust_type_path_from_parts(package: &str, parents: &[String], type_name: &str) -> String {
+    let mut modules = package
+        .split('.')
+        .flat_map(|part| part.split('_'))
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    modules.extend(parents.iter().map(|parent| message_module_name(parent)));
+    if modules.is_empty() {
+        format!("crate::{type_name}")
+    } else {
+        format!("crate::{}::{type_name}", modules.join("::"))
+    }
+}
+
+fn message_module_name(name: &str) -> String {
+    let mut output = String::new();
+    for (index, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if index > 0 {
+                output.push('_');
+            }
+            output.push(ch.to_ascii_lowercase());
+        } else {
+            output.push(ch);
+        }
+    }
+    output
 }
 
 fn scoped_name(package: &str, name: &str) -> String {

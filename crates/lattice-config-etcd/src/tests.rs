@@ -72,6 +72,28 @@ async fn malformed_config_value_returns_codec_error() {
     assert!(matches!(error, Err(ConfigStoreError::Codec { .. })));
 }
 
+#[tokio::test]
+async fn malformed_watch_update_closes_config_watch() {
+    let client = InMemoryEtcdConfigClient::new();
+    let store = EtcdConfigStoreInner::new(client.clone(), "/lattice/test/config");
+    store
+        .put("feature.flag".to_string(), json!(true))
+        .await
+        .unwrap();
+    let mut watch = store.watch("feature.flag").await.unwrap();
+
+    client
+        .put(
+            "/lattice/test/config/feature.flag".to_string(),
+            b"not-json".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    let error = watch.changed().await.unwrap_err();
+    assert!(matches!(error, ConfigStoreError::WatchClosed));
+}
+
 #[test]
 fn config_builds_from_normalized_prefix() {
     let store = test_store("lattice/test/config");

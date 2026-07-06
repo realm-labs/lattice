@@ -253,6 +253,29 @@ fn direct_link_message_metadata_ignores_descriptor_dependencies_not_compiled_int
 }
 
 #[test]
+fn descriptor_messages_resolve_nested_prost_type_paths() {
+    let messages = messages_from_descriptor(&nested_world_descriptor());
+    let generated = crate::render::generate_rpc_bindings_with_options(
+        &[nested_world_enter_method()],
+        &messages,
+        crate::render::RenderOptions::default(),
+    )
+    .unwrap();
+
+    assert!(generated.rust.contains(
+        "impl lattice_core::DirectLinkMessage for crate::world::envelope::EnterWorldRequest"
+    ));
+    assert!(
+        generated
+            .rust
+            .contains("const PROTO_FULL_NAME: &'static str = \"world.Envelope.EnterWorldRequest\"")
+    );
+    assert!(generated.rust.contains(
+        "impl lattice_core::DirectLinkMessage for crate::world::envelope::EnterWorldReply"
+    ));
+}
+
+#[test]
 fn duplicate_gateway_msg_id_is_rejected() {
     let mut first = world_enter_method();
     let mut second = world_enter_method();
@@ -283,6 +306,24 @@ fn descriptor_parsing_builds_method_specs() {
     let methods = methods_from_descriptor(&descriptor, &options).unwrap();
 
     assert_eq!(methods, vec![world_enter_method()]);
+}
+
+#[test]
+fn descriptor_parsing_resolves_nested_request_and_reply_types() {
+    let descriptor = nested_world_descriptor();
+    let mut options = std::collections::BTreeMap::new();
+    options.insert(
+        "world.WorldRpc".to_string(),
+        service_options("World", "World"),
+    );
+    options.insert(
+        "world.WorldRpc.EnterWorld".to_string(),
+        method_options("world_id", Some(100)),
+    );
+
+    let methods = methods_from_descriptor(&descriptor, &options).unwrap();
+
+    assert_eq!(methods, vec![nested_world_enter_method()]);
 }
 
 #[test]
@@ -537,6 +578,56 @@ fn world_descriptor() -> FileDescriptorSet {
             syntax: Some("proto3".into()),
             ..Default::default()
         }],
+    }
+}
+
+fn nested_world_descriptor() -> FileDescriptorSet {
+    FileDescriptorSet {
+        file: vec![FileDescriptorProto {
+            name: Some("world.proto".into()),
+            package: Some("world".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Envelope".into()),
+                nested_type: vec![
+                    DescriptorProto {
+                        name: Some("EnterWorldRequest".into()),
+                        field: vec![FieldDescriptorProto {
+                            name: Some("world_id".into()),
+                            number: Some(1),
+                            label: Some(Label::Optional as i32),
+                            r#type: Some(Type::Uint64 as i32),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    DescriptorProto {
+                        name: Some("EnterWorldReply".into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            service: vec![ServiceDescriptorProto {
+                name: Some("WorldRpc".into()),
+                method: vec![MethodDescriptorProto {
+                    name: Some("EnterWorld".into()),
+                    input_type: Some(".world.Envelope.EnterWorldRequest".into()),
+                    output_type: Some(".world.Envelope.EnterWorldReply".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            syntax: Some("proto3".into()),
+            ..Default::default()
+        }],
+    }
+}
+
+fn nested_world_enter_method() -> RpcMethodSpec {
+    RpcMethodSpec {
+        request_type: "crate::world::envelope::EnterWorldRequest".into(),
+        reply_type: "crate::world::envelope::EnterWorldReply".into(),
+        ..world_enter_method()
     }
 }
 

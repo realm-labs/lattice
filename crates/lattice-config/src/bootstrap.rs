@@ -108,7 +108,7 @@ impl BootstrapConfig {
                 continue;
             }
 
-            insert_path(&mut root, &segments, parse_env_value(&value));
+            insert_path(&mut root, &segments, parse_env_value(&value))?;
         }
 
         Ok(Self { root })
@@ -128,20 +128,40 @@ fn merge_object(target: &mut Map<String, Value>, source: Map<String, Value>) {
     }
 }
 
-fn insert_path(root: &mut Map<String, Value>, segments: &[String], value: Value) {
+fn insert_path(
+    root: &mut Map<String, Value>,
+    segments: &[String],
+    value: Value,
+) -> Result<(), ConfigError> {
     let Some((leaf, parents)) = segments.split_last() else {
-        return;
+        return Ok(());
     };
 
     let mut current = root;
+    let mut traversed = Vec::new();
     for segment in parents {
-        current = current
+        traversed.push(segment.clone());
+        let value = current
             .entry(segment.clone())
-            .or_insert_with(|| Value::Object(Map::new()))
-            .as_object_mut()
-            .expect("env config path collision with scalar value");
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(child) = value.as_object_mut() else {
+            return Err(ConfigError::EnvPathCollision {
+                path: traversed.join("."),
+            });
+        };
+        current = child;
+    }
+    if let Some(existing) = current.get(leaf)
+        && existing.is_object() != value.is_object()
+    {
+        let mut path = traversed;
+        path.push(leaf.clone());
+        return Err(ConfigError::EnvPathCollision {
+            path: path.join("."),
+        });
     }
     current.insert(leaf.clone(), value);
+    Ok(())
 }
 
 fn parse_env_value(value: &str) -> Value {

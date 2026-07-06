@@ -209,6 +209,39 @@ fn env_source_builds_nested_config_and_parses_json_scalars() {
 }
 
 #[test]
+fn env_source_reports_scalar_object_path_collisions() {
+    let error = BootstrapConfig::from_env_iter(
+        "LATTICE",
+        "__",
+        BTreeMap::from([
+            ("LATTICE__SERVICE", "world"),
+            ("LATTICE__SERVICE__WORKERS", "12"),
+        ]),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConfigError::EnvPathCollision { path } if path == "service"
+    ));
+
+    let error = BootstrapConfig::from_env_iter(
+        "LATTICE",
+        "__",
+        vec![
+            ("LATTICE__SERVICE__WORKERS", "12"),
+            ("LATTICE__SERVICE", "world"),
+        ],
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ConfigError::EnvPathCollision { path } if path == "service"
+    ));
+}
+
+#[test]
 fn file_source_detects_format_from_extension() {
     let temp = tempfile::NamedTempFile::with_suffix(".json").unwrap();
     fs::write(

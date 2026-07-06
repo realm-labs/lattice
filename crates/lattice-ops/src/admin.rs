@@ -212,8 +212,10 @@ impl AdminSnapshot {
                 ]),
             })
             .collect();
+        let virtual_shard_service_filter = service_kind_filter.clone();
         snapshot.virtual_shards = virtual_shards
             .into_iter()
+            .filter(|record| record.service_kind == virtual_shard_service_filter)
             .map(|record| InspectionView {
                 name: format!("{}/#{}", record.actor_kind.as_str(), record.shard_id.0),
                 owner: Some(record.owner),

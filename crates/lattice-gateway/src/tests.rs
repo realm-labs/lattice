@@ -167,6 +167,49 @@ async fn gateway_service_runs_connection_handler_and_background_task() {
 }
 
 #[tokio::test]
+async fn gateway_service_aborts_connection_tasks_before_shutdown_returns() {
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (dropped_tx, mut dropped_rx) = tokio::sync::oneshot::channel();
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let drop_sender = Arc::new(Mutex::new(Some(dropped_tx)));
+    let handler_drop_sender = drop_sender.clone();
+    let handler_started = started.clone();
+    let server = GatewayService::new(listener, move |_socket: TcpStream, _peer| {
+        let handler_drop_sender = handler_drop_sender.clone();
+        let handler_started = handler_started.clone();
+        async move {
+            let _guard = DropSignal(handler_drop_sender.lock().unwrap().take());
+            handler_started.add_permits(1);
+            std::future::pending::<Result<(), GatewayError>>().await
+        }
+    })
+    .ready_signal(ready_tx);
+
+    let task = tokio::spawn(server.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    let addr = ready_rx.await.unwrap();
+    let _stream = TcpStream::connect(addr).await.unwrap();
+    started.acquire().await.unwrap().forget();
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    dropped_rx.try_recv().unwrap();
+}
+
+#[tokio::test]
 async fn gateway_service_reports_background_task_failure() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let result = GatewayService::new(listener, |_socket: TcpStream, _peer| async { Ok(()) })

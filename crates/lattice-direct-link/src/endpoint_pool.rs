@@ -27,6 +27,7 @@ use crate::transport::{DirectLinkConnection, DirectLinkTransport};
 #[derive(Debug, Clone)]
 pub struct DirectLinkEndpointPoolConfig {
     pub connections_per_endpoint: NonZeroUsize,
+    pub max_frame_size: usize,
     pub max_links_per_connection: usize,
     pub max_links_per_endpoint: usize,
     pub connect_timeout: Duration,
@@ -39,6 +40,7 @@ impl Default for DirectLinkEndpointPoolConfig {
     fn default() -> Self {
         Self {
             connections_per_endpoint: NonZeroUsize::new(1).expect("one is non-zero"),
+            max_frame_size: 256 * 1024,
             max_links_per_connection: usize::MAX,
             max_links_per_endpoint: usize::MAX,
             connect_timeout: Duration::from_secs(3),
@@ -379,7 +381,8 @@ where
                     DirectLinkConnectionId(self.next_connection_id.fetch_add(1, Ordering::Relaxed));
                 let connection = tokio::time::timeout(
                     self.config.connect_timeout,
-                    self.transport.connect_physical(endpoint.clone()),
+                    self.transport
+                        .connect_physical(endpoint.clone(), self.config.max_frame_size),
                 )
                 .await
                 .map_err(|_| LinkError::Protocol("direct link connect timed out".to_string()))??;
@@ -1138,6 +1141,7 @@ mod tests {
         async fn connect_physical(
             &self,
             endpoint: DirectLinkEndpoint,
+            _max_frame_size: usize,
         ) -> Result<Self::Connection, LinkError> {
             self.connects.lock().unwrap().push(endpoint);
             let frame_start_index = self.frames.lock().unwrap().len();
@@ -1525,6 +1529,30 @@ mod tests {
             .find(|frame| frame.kind == DirectLinkFrameKind::Message)
             .expect("message frame was written after retry");
         assert_eq!(message_frame.sequence, LinkSequence(1));
+    }
+
+    #[tokio::test]
+    async fn pooled_sender_rejects_messages_for_other_logical_links() {
+        let pool = PooledDirectLinkEndpointPool::new(FakeTransport::default(), Default::default());
+        let session = pool.open_link(request("link-1")).await.unwrap();
+
+        let error = session
+            .session
+            .sender
+            .tell(OutboundDirectLinkMessage {
+                link_id: LinkId::new("link-2"),
+                direction: LinkDirection::SourceToTarget,
+                message_id: DirectLinkMessageId(7),
+                proto_full_name: "game.Position",
+                payload: b"abc".to_vec(),
+                flags: LinkMessageFlags::EMPTY,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, LinkSendError::Protocol(message) if message.contains("cannot send frame"))
+        );
     }
 
     #[tokio::test]

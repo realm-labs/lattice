@@ -1330,7 +1330,7 @@ async fn direct_link_listener_routes_message_frames_to_registered_actor() {
         })
         .unwrap();
     let mut connection = TcpDirectLinkTransport::new()
-        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint))
+        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint), 4096)
         .await
         .unwrap();
     connection
@@ -1453,7 +1453,7 @@ async fn direct_link_listener_demultiplexes_multiple_links_on_one_connection() {
         "tcp://127.0.0.1:1".parse().unwrap(),
     );
     let mut connection = TcpDirectLinkTransport::new()
-        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint))
+        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint), 4096)
         .await
         .unwrap();
 
@@ -1699,7 +1699,7 @@ async fn direct_link_connection_writes_open_link_reject_frames() {
 
     let link_id = LinkId::new("service-link-open-reject");
     let mut connection = TcpDirectLinkTransport::new()
-        .connect_physical(endpoint)
+        .connect_physical(endpoint, 4096)
         .await
         .unwrap();
     connection
@@ -1809,11 +1809,11 @@ async fn direct_link_listener_enforces_connection_limit() {
         .unwrap();
     let transport = TcpDirectLinkTransport::new();
     let mut first = transport
-        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint.clone()))
+        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint.clone()), 4096)
         .await
         .unwrap();
     let mut second = transport
-        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint))
+        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint), 4096)
         .await
         .unwrap();
 
@@ -2224,7 +2224,7 @@ async fn direct_link_listener_writes_heartbeat_frames_for_open_links() {
         .unwrap();
 
     let mut connection = TcpDirectLinkTransport::new()
-        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint))
+        .connect_physical(DirectLinkEndpoint::new(direct_link_endpoint), 4096)
         .await
         .unwrap();
     let frame = timeout(Duration::from_secs(1), connection.read_frame())

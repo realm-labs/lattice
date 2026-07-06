@@ -22,6 +22,7 @@ pub trait DirectLinkTransport: Clone + Send + Sync + 'static {
     async fn connect_physical(
         &self,
         endpoint: DirectLinkEndpoint,
+        max_frame_size: usize,
     ) -> Result<Self::Connection, LinkError>;
 }
 
@@ -77,6 +78,7 @@ impl DirectLinkTransport for TcpDirectLinkTransport {
     async fn connect_physical(
         &self,
         endpoint: DirectLinkEndpoint,
+        max_frame_size: usize,
     ) -> Result<Self::Connection, LinkError> {
         let address = endpoint_socket_address(&endpoint).await?;
         let stream = TcpStream::connect(address).await.map_err(|error| {
@@ -84,7 +86,7 @@ impl DirectLinkTransport for TcpDirectLinkTransport {
         })?;
         Ok(TcpDirectLinkConnection::new(
             stream,
-            0,
+            max_frame_size,
             self.metrics.clone(),
         ))
     }
@@ -313,7 +315,7 @@ mod tests {
             let mut server = listener.accept().await.unwrap();
             server.read_frame().await.unwrap()
         });
-        let mut client = transport.connect_physical(endpoint).await.unwrap();
+        let mut client = transport.connect_physical(endpoint, 1024).await.unwrap();
         let frame = DirectLinkFrame::message(
             LinkId::new("link-1"),
             LinkSequence(1),
@@ -327,6 +329,39 @@ mod tests {
         let metrics = transport.metrics().snapshot();
         assert_eq!(metrics.sent, 1);
         assert_eq!(metrics.received, 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_outbound_connection_enforces_client_frame_limit() {
+        let transport = TcpDirectLinkTransport::new();
+        let listener = transport
+            .bind(DirectLinkListenConfig {
+                endpoint: DirectLinkEndpoint::new("tcp://127.0.0.1:0".parse().unwrap()),
+                max_frame_size: 1024,
+            })
+            .await
+            .unwrap();
+        let endpoint = listener.local_endpoint();
+        let server = tokio::spawn(async move {
+            let mut server = listener.accept().await.unwrap();
+            server
+                .write_frame(DirectLinkFrame::message(
+                    LinkId::new("link-1"),
+                    LinkSequence(1),
+                    DirectLinkMessageId(7),
+                    vec![0; 128],
+                ))
+                .await
+                .unwrap();
+        });
+        let mut client = transport.connect_physical(endpoint, 16).await.unwrap();
+
+        let error = client.read_frame().await.unwrap_err();
+
+        assert!(
+            matches!(error, LinkError::Protocol(message) if message.contains("exceeds maximum size"))
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
