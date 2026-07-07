@@ -10,6 +10,14 @@ pub struct RpcMethodSpec {
     pub reply_type: String,
     pub route_key: ProtoRouteKeyOption,
     pub gateway_msg_id: Option<u32>,
+    pub gateway_route_key: Option<GatewayRouteKeySpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayRouteKeySpec {
+    RequestField(String),
+    ContextKey(String),
+    Constant(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

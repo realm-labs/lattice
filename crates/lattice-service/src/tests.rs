@@ -713,11 +713,12 @@ impl EndpointRpcTransport for FakeEndpointTransport {
         &self,
         _endpoint: EndpointLease,
         _target: lattice_rpc::RouteTarget,
+        _route_key: &RouteKey,
         _metadata: tonic::metadata::MetadataMap,
         _request: Req,
     ) -> Result<tonic::Response<Req::Reply>, RpcError>
     where
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
         Err(RpcError::Business(
             "fake endpoint transport is not used by service build tests".to_string(),

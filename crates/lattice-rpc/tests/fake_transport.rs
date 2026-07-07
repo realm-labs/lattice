@@ -78,7 +78,7 @@ struct FakeTonicTransport {
 impl UnaryRpcTransport for FakeTonicTransport {
     async fn unary<Req>(&self, request: Request<Req>) -> Result<Response<Req::Reply>, RpcError>
     where
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
         let metadata = request.metadata().clone();
         let injected = RpcContext::from_metadata(&metadata)

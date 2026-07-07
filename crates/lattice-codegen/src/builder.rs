@@ -11,7 +11,7 @@ use crate::descriptor::{
 };
 use crate::gateway::GatewayRoute;
 use crate::render::{RenderOptions, generate_rpc_bindings_with_options};
-use crate::spec::RpcMethodSpec;
+use crate::spec::{GatewayRouteKeySpec, RpcMethodSpec};
 use crate::{CodegenError, proto_include};
 
 #[derive(Debug, Clone)]
@@ -149,7 +149,8 @@ impl LatticeCodegenBuilder {
                 parsed
                     .routes
                     .into_iter()
-                    .map(|route| GatewayRoute::new(route.msg_id, route.method)),
+                    .map(GatewayRouteEntry::try_into_route)
+                    .collect::<Result<Vec<_>, _>>()?,
             );
         }
         Ok(routes)
@@ -198,6 +199,34 @@ struct GatewayRouteFile {
 struct GatewayRouteEntry {
     msg_id: u32,
     method: String,
+    route_key: Option<GatewayRouteKeyEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayRouteKeyEntry {
+    source: String,
+    key: String,
+}
+
+impl GatewayRouteEntry {
+    fn try_into_route(self) -> Result<GatewayRoute, CodegenError> {
+        let mut route = GatewayRoute::new(self.msg_id, self.method.clone());
+        if let Some(route_key) = self.route_key {
+            let key = match route_key.source.as_str() {
+                "request_field" => GatewayRouteKeySpec::RequestField(route_key.key),
+                "context_key" => GatewayRouteKeySpec::ContextKey(route_key.key),
+                "constant" => GatewayRouteKeySpec::Constant(route_key.key),
+                other => {
+                    return Err(CodegenError::UnsupportedGatewayRouteKeySource {
+                        method: self.method,
+                        route_key_source: other.to_string(),
+                    });
+                }
+            };
+            route = route.with_route_key(key);
+        }
+        Ok(route)
+    }
 }
 
 fn apply_gateway_routes(
@@ -244,6 +273,7 @@ fn apply_gateway_routes(
             });
         }
         method.gateway_msg_id = Some(route.msg_id);
+        method.gateway_route_key = route.route_key.clone();
         assigned_msg_ids.insert(route.msg_id, route.method.clone());
     }
     Ok(())

@@ -106,11 +106,12 @@ impl EndpointRpcTransport for OkTransport {
         &self,
         endpoint: EndpointLease,
         target: RouteTarget,
+        _route_key: &RouteKey,
         metadata: tonic::metadata::MetadataMap,
         _request: Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
         let ctx = RpcContext::from_metadata(&metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;
@@ -130,11 +131,12 @@ impl EndpointRpcTransport for NotOwnerThenOkTransport {
         &self,
         endpoint: EndpointLease,
         target: RouteTarget,
+        _route_key: &RouteKey,
         metadata: tonic::metadata::MetadataMap,
         _request: Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
         let ctx = RpcContext::from_metadata(&metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;

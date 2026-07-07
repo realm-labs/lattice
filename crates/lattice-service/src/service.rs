@@ -361,6 +361,7 @@ async fn default_shutdown_signal() {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) async fn first_shutdown_signal<C, T>(ctrl_c: C, terminate: T)
 where
     C: Future<Output = ()>,

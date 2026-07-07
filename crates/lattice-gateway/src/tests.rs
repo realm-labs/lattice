@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lattice_core::{ActorKind, RouteKey, actor_kind};
-use lattice_rpc::{RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
+use lattice_rpc::{RoutedEnvelope, RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 use prost::Message as ProstMessage;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -40,6 +40,34 @@ impl RpcRequest for EnterWorldRequest {
     const METHOD: &'static str = "world.WorldRpc/EnterWorld";
 }
 
+#[derive(Clone, PartialEq, prost::Message)]
+struct AllItemRequest {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct AllItemReply {
+    #[prost(uint32, tag = "1")]
+    count: u32,
+}
+
+impl RpcRequest for AllItemRequest {
+    type Reply = AllItemReply;
+    const METHOD: &'static str = "item.ItemRpc/AllItem";
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct LoginRequest {
+    #[prost(string, tag = "1")]
+    account: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct LoginReply {}
+
+impl RpcRequest for LoginRequest {
+    type Reply = LoginReply;
+    const METHOD: &'static str = "login.LoginRpc/Login";
+}
+
 #[derive(Clone, Default)]
 struct FakeCore {
     routed: Arc<Mutex<Vec<RouteKey>>>,
@@ -47,11 +75,11 @@ struct FakeCore {
 
 #[async_trait]
 impl ShardedRpcCore for FakeCore {
-    async fn call<Req>(&self, req: Req) -> Result<Req::Reply, RpcError>
+    async fn call_routed<Req>(&self, envelope: RoutedEnvelope<Req>) -> Result<Req::Reply, RpcError>
     where
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
-        self.routed.lock().unwrap().push(req.route_key());
+        self.routed.lock().unwrap().push(envelope.route_key);
         Ok(Req::Reply::default())
     }
 }
@@ -238,6 +266,10 @@ fn gateway_route_table_rejects_duplicate_msg_id() {
 
     assert_eq!(duplicate, Err(GatewayError::DuplicateRoute { msg_id: 100 }));
     assert_eq!(table.get(100).unwrap().method, EnterWorldRequest::METHOD);
+    assert_eq!(
+        table.get(100).unwrap().route_key_policy,
+        GatewayRouteKeyPolicy::request_field("<routed-request>")
+    );
 }
 
 #[tokio::test]
@@ -257,6 +289,88 @@ async fn generated_binding_decodes_payload_and_forwards_typed_request() {
     assert_eq!(*routed.lock().unwrap(), vec![RouteKey::U64(42)]);
     let reply = EnterWorldReply::decode(reply_frame.payload.as_slice()).unwrap();
     assert!(!reply.ok);
+}
+
+#[tokio::test]
+async fn generated_binding_forwards_empty_request_with_session_route_key() {
+    let binding = ProstClientMessageBinding::<AllItemRequest>::with_context_route_key(
+        101,
+        actor_kind!("Player"),
+        "session_actor",
+    );
+    let core = FakeCore::default();
+    let routed = core.routed.clone();
+    let frame = ClientFrame {
+        msg_id: 101,
+        payload: AllItemRequest::default().encode_to_vec(),
+    };
+    let context = GatewayRouteContext::new().with_route_key("session_actor", RouteKey::U64(42));
+
+    let reply_frame = binding
+        .decode_and_forward_with_context(frame, core, &context)
+        .await
+        .unwrap();
+
+    assert_eq!(reply_frame.msg_id, 101);
+    assert_eq!(*routed.lock().unwrap(), vec![RouteKey::U64(42)]);
+    let reply = AllItemReply::decode(reply_frame.payload.as_slice()).unwrap();
+    assert_eq!(reply.count, 0);
+}
+
+#[tokio::test]
+async fn gateway_binding_routes_login_by_business_request_field_extractor() {
+    let binding = ProstClientMessageBinding::<LoginRequest>::with_route_extractor(
+        102,
+        actor_kind!("Login"),
+        GatewayRouteKeyPolicy::request_field("account"),
+        |req, _context| Ok(RouteKey::Str(req.account.clone())),
+    );
+    let core = FakeCore::default();
+    let routed = core.routed.clone();
+    let frame = ClientFrame {
+        msg_id: 102,
+        payload: LoginRequest {
+            account: "account-7".to_string(),
+        }
+        .encode_to_vec(),
+    };
+
+    let reply_frame = binding.decode_and_forward(frame, core).await.unwrap();
+
+    assert_eq!(reply_frame.msg_id, 102);
+    assert_eq!(
+        binding.route_spec().route_key_policy,
+        GatewayRouteKeyPolicy::request_field("account")
+    );
+    assert_eq!(
+        *routed.lock().unwrap(),
+        vec![RouteKey::Str("account-7".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn generated_binding_reports_missing_session_route_key() {
+    let binding = ProstClientMessageBinding::<AllItemRequest>::with_context_route_key(
+        101,
+        actor_kind!("Player"),
+        "session_actor",
+    );
+    let frame = ClientFrame {
+        msg_id: 101,
+        payload: AllItemRequest::default().encode_to_vec(),
+    };
+
+    let error = binding
+        .decode_and_forward_with_context(frame, FakeCore::default(), &GatewayRouteContext::new())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        GatewayError::MissingRouteContextKey {
+            key: "session_actor".to_string()
+        }
+    );
 }
 
 #[test]

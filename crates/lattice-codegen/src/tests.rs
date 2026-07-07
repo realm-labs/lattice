@@ -5,7 +5,7 @@ use crate::descriptor::methods_from_descriptor;
 use crate::descriptor::{messages_from_descriptor, messages_from_descriptor_for_files};
 use crate::render::generate_rpc_bindings;
 use crate::route_key::{ProtoRouteKeyOption, RouteKeyType};
-use crate::spec::RpcMethodSpec;
+use crate::spec::{GatewayRouteKeySpec, RpcMethodSpec};
 use prost::Message;
 use prost_types::{
     DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
@@ -113,12 +113,12 @@ fn generated_output_matches_phase_two_shape() {
     );
     assert!(generated.rust.contains("if self.request_dedup"));
     assert!(generated.rust.contains(
-        "lattice_rpc::adapter::dispatch_actor_rpc_dedup(handle, req, ctx, &self.deduplicator)"
+        "lattice_rpc::adapter::dispatch_actor_rpc_dedup_with_route(handle, route, req, ctx, &self.deduplicator)"
     ));
     assert!(
-        generated
-            .rust
-            .contains("lattice_rpc::adapter::dispatch_actor_rpc(handle, req, ctx)")
+        generated.rust.contains(
+            "lattice_rpc::adapter::dispatch_actor_rpc_with_route(handle, route, req, ctx)"
+        )
     );
     assert!(
         generated
@@ -137,16 +137,16 @@ fn generated_output_matches_phase_two_shape() {
     );
     assert!(generated.rust.contains("pub fn with_transport_security"));
     assert!(generated.rust.contains("pub fn with_transport_config"));
-    assert!(generated.rust.contains("\"world.WorldRpc/EnterWorld\" => self.call_world_rpc_enter_world::<Req>(target, metadata, request).await"));
+    assert!(generated.rust.contains("\"world.WorldRpc/EnterWorld\" => self.call_world_rpc_enter_world::<Req>(target, route_key, metadata, request).await"));
     assert!(
-        generated
+        !generated
             .rust
             .contains("let route_key = request.route_key();")
     );
     assert!(
         generated
             .rust
-            .contains("get_or_connect_for_route_key(&target.advertised_endpoint, &route_key)")
+            .contains("get_or_connect_for_route_key(&target.advertised_endpoint, route_key)")
     );
     assert!(
         generated
@@ -182,6 +182,11 @@ fn generated_output_matches_phase_two_shape() {
     );
     assert!(generated.rust.contains("pub mod enter_world"));
     assert!(generated.rust.contains("pub struct GatewayBinding"));
+    assert!(
+        generated
+            .rust
+            .contains("route_key_policy: GatewayRouteKeyPolicy::request_field(\"world_id\")")
+    );
     assert!(generated.rust.contains("register_gateway_routes"));
     assert!(
         generated
@@ -192,6 +197,11 @@ fn generated_output_matches_phase_two_shape() {
         generated
             .rust
             .contains("pub async fn dispatch(&self, frame: ClientFrame)")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("pub async fn dispatch_with_context(&self, frame: ClientFrame, context: &lattice_gateway::GatewayRouteContext)")
     );
 }
 
@@ -513,6 +523,35 @@ fn gateway_route_table_registration_is_generated_from_method_metadata() {
 }
 
 #[test]
+fn gateway_binding_can_be_generated_with_context_route_key_policy() {
+    let mut method = world_enter_method();
+    method.gateway_route_key = Some(GatewayRouteKeySpec::ContextKey("player_id".into()));
+
+    let generated = generate_rpc_bindings(&[method]).unwrap();
+
+    assert!(
+        generated
+            .rust
+            .contains("route_key_policy: GatewayRouteKeyPolicy::context_key(\"player_id\")")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("let route_key = context.require_route_key(\"player_id\")?;")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("|req: &crate::world::EnterWorldRequest, context|")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("Ok(context.require_route_key(\"player_id\")?)")
+    );
+}
+
+#[test]
 fn multiple_methods_on_one_service_do_not_force_package_disambiguation() {
     let first = world_enter_method();
     let mut second = world_enter_method();
@@ -565,6 +604,7 @@ fn world_enter_method() -> RpcMethodSpec {
             key_type: RouteKeyType::U64,
         },
         gateway_msg_id: Some(100),
+        gateway_route_key: None,
     }
 }
 
@@ -773,6 +813,7 @@ message EnterWorldReply {
         r#"[[routes]]
 msg_id = 100
 method = "world.WorldRpc.EnterWorld"
+route_key = { source = "context_key", key = "player_id" }
 "#,
     )
     .unwrap();
@@ -788,6 +829,8 @@ method = "world.WorldRpc.EnterWorld"
     let generated = std::fs::read_to_string(out_dir.join("lattice.generated.rs")).unwrap();
     assert!(generated.contains("pub const DEFAULT_MSG_ID: u32 = 100;"));
     assert!(generated.contains("register_gateway_routes"));
+    assert!(generated.contains("GatewayRouteKeyPolicy::context_key(\"player_id\")"));
+    assert!(generated.contains("context.require_route_key(\"player_id\")?"));
 }
 
 #[test]

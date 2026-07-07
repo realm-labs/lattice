@@ -72,11 +72,12 @@ impl EndpointRpcTransport for FencedThenOkTransport {
         &self,
         _endpoint: EndpointLease,
         _target: RouteTarget,
+        _route_key: &RouteKey,
         metadata: tonic::metadata::MetadataMap,
         _request: Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
         let ctx = RpcContext::from_metadata(&metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;

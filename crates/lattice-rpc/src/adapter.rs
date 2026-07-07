@@ -6,7 +6,7 @@ use tracing::{Instrument, debug, warn};
 use crate::dedup::{RequestDedupKey, RequestDeduplicator};
 use crate::metadata::metadata_status;
 use crate::security::{PeerIdentity, RpcSecurityPolicy};
-use crate::{RoutedRequest, Rpc, RpcContext, RpcRequest};
+use crate::{RoutedRequest, Rpc, RpcContext, RpcRequest, RpcRoute};
 
 #[derive(Debug)]
 pub struct ActorRpcAdapter<A: Actor> {
@@ -39,13 +39,14 @@ impl<A: Actor> ActorRpcAdapter<A> {
     pub async fn unary<Req>(&self, request: Request<Req>) -> Result<Response<Req::Reply>, Status>
     where
         A: Handler<Rpc<Req>>,
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
         let ctx = RpcContext::from_metadata(request.metadata()).map_err(metadata_status)?;
         self.validate_owner_epoch(&ctx)?;
+        let route = optional_route_from_metadata(request.metadata())?;
 
         let req = request.into_inner();
-        self.dispatch(req, ctx).await
+        self.dispatch(req, ctx, route).await
     }
 
     pub async fn unary_secure<Req>(
@@ -56,36 +57,32 @@ impl<A: Actor> ActorRpcAdapter<A> {
     ) -> Result<Response<Req::Reply>, Status>
     where
         A: Handler<Rpc<Req>>,
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
         let ctx = RpcContext::from_metadata(request.metadata()).map_err(metadata_status)?;
         self.validate_owner_epoch(&ctx)?;
         policy
             .validate(&ctx, peer)
             .map_err(crate::security::security_status)?;
+        let route = optional_route_from_metadata(request.metadata())?;
 
         let req = request.into_inner();
-        self.dispatch(req, ctx).await
+        self.dispatch(req, ctx, route).await
     }
 
-    async fn dispatch<Req>(&self, req: Req, ctx: RpcContext) -> Result<Response<Req::Reply>, Status>
-    where
-        A: Handler<Rpc<Req>>,
-        Req: RoutedRequest + RpcRequest,
-    {
-        self.dispatch_raw(req, ctx).await.map_err(actor_call_status)
-    }
-
-    async fn dispatch_raw<Req>(
+    async fn dispatch<Req>(
         &self,
         req: Req,
         ctx: RpcContext,
-    ) -> Result<Response<Req::Reply>, ActorCallError>
+        route: Option<RpcRoute>,
+    ) -> Result<Response<Req::Reply>, Status>
     where
         A: Handler<Rpc<Req>>,
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
-        dispatch_actor_rpc_raw(self.handle.clone(), req, ctx).await
+        dispatch_actor_rpc_raw_with_route(self.handle.clone(), req, ctx, route)
+            .await
+            .map_err(actor_call_status)
     }
 
     pub async fn unary_dedup<Req>(
@@ -95,11 +92,12 @@ impl<A: Actor> ActorRpcAdapter<A> {
     ) -> Result<Response<Req::Reply>, Status>
     where
         A: Handler<Rpc<Req>>,
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
         let ctx = RpcContext::from_metadata(request.metadata()).map_err(metadata_status)?;
         self.validate_owner_epoch(&ctx)?;
-        self.dispatch_dedup(request, ctx, deduplicator).await
+        let route = optional_route_from_metadata(request.metadata())?;
+        self.dispatch_dedup(request, ctx, route, deduplicator).await
     }
 
     pub async fn unary_dedup_secure<Req>(
@@ -111,25 +109,27 @@ impl<A: Actor> ActorRpcAdapter<A> {
     ) -> Result<Response<Req::Reply>, Status>
     where
         A: Handler<Rpc<Req>>,
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
         let ctx = RpcContext::from_metadata(request.metadata()).map_err(metadata_status)?;
         self.validate_owner_epoch(&ctx)?;
         policy
             .validate(&ctx, peer)
             .map_err(crate::security::security_status)?;
-        self.dispatch_dedup(request, ctx, deduplicator).await
+        let route = optional_route_from_metadata(request.metadata())?;
+        self.dispatch_dedup(request, ctx, route, deduplicator).await
     }
 
     async fn dispatch_dedup<Req>(
         &self,
         request: Request<Req>,
         ctx: RpcContext,
+        route: Option<RpcRoute>,
         deduplicator: &RequestDeduplicator,
     ) -> Result<Response<Req::Reply>, Status>
     where
         A: Handler<Rpc<Req>>,
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
         let key = RequestDedupKey::new(Req::METHOD, &ctx.request_id);
         if !deduplicator.begin(&key) {
@@ -137,7 +137,7 @@ impl<A: Actor> ActorRpcAdapter<A> {
         }
 
         let req = request.into_inner();
-        match self.dispatch_raw(req, ctx).await {
+        match dispatch_actor_rpc_raw_with_route(self.handle.clone(), req, ctx, route).await {
             Ok(response) => Ok(response),
             Err(error) => {
                 if should_release_dedup_key(&error) {
@@ -198,6 +198,48 @@ where
     }
 }
 
+pub async fn dispatch_actor_rpc_with_route<A, Req>(
+    handle: ActorHandle<A>,
+    route: RpcRoute,
+    req: Req,
+    ctx: RpcContext,
+) -> Result<Response<Req::Reply>, Status>
+where
+    A: Actor + Handler<Rpc<Req>>,
+    Req: RpcRequest,
+{
+    dispatch_actor_rpc_raw_with_route(handle, req, ctx, Some(route))
+        .await
+        .map_err(actor_call_status)
+}
+
+pub async fn dispatch_actor_rpc_dedup_with_route<A, Req>(
+    handle: ActorHandle<A>,
+    route: RpcRoute,
+    req: Req,
+    ctx: RpcContext,
+    deduplicator: &RequestDeduplicator,
+) -> Result<Response<Req::Reply>, Status>
+where
+    A: Actor + Handler<Rpc<Req>>,
+    Req: RpcRequest,
+{
+    let key = RequestDedupKey::new(Req::METHOD, &ctx.request_id);
+    if !deduplicator.begin(&key) {
+        return Err(Status::already_exists("duplicate request id"));
+    }
+
+    match dispatch_actor_rpc_raw_with_route(handle, req, ctx, Some(route)).await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            if should_release_dedup_key(&error) {
+                deduplicator.forget(&key);
+            }
+            Err(actor_call_status(error))
+        }
+    }
+}
+
 async fn dispatch_actor_rpc_raw<A, Req>(
     handle: ActorHandle<A>,
     req: Req,
@@ -207,13 +249,30 @@ where
     A: Actor + Handler<Rpc<Req>>,
     Req: RoutedRequest + RpcRequest,
 {
-    let actor_kind = req.actor_kind();
-    let route_key = req.route_key();
+    let route = RpcRoute::from_request(&req);
+    dispatch_actor_rpc_raw_with_route(handle, req, ctx, Some(route)).await
+}
+
+async fn dispatch_actor_rpc_raw_with_route<A, Req>(
+    handle: ActorHandle<A>,
+    req: Req,
+    ctx: RpcContext,
+    route: Option<RpcRoute>,
+) -> Result<Response<Req::Reply>, ActorCallError>
+where
+    A: Actor + Handler<Rpc<Req>>,
+    Req: RpcRequest,
+{
+    let actor_kind = route
+        .as_ref()
+        .map(|route| route.actor_kind.as_str())
+        .unwrap_or("<unknown>");
+    let route_key = route.as_ref().map(|route| &route.route_key);
     let span = tracing::info_span!(
         "rpc.server",
         otel.kind = "server",
         rpc.method = Req::METHOD,
-        actor.kind = actor_kind.as_str(),
+        actor.kind = actor_kind,
         route.key = ?route_key,
         request.id = ctx.request_id.as_str(),
         source.service = ctx.source_service.as_str(),
@@ -242,6 +301,12 @@ where
     }
     .instrument(span)
     .await
+}
+
+fn optional_route_from_metadata(
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<Option<RpcRoute>, Status> {
+    RpcRoute::from_metadata(metadata).map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
 fn should_release_dedup_key(error: &ActorCallError) -> bool {

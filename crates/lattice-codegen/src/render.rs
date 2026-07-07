@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::CodegenError;
 use crate::route_key::{ProtoRouteKeyOption, RouteKeyType};
-use crate::spec::{ProtoMessageSpec, RpcMethodSpec};
+use crate::spec::{GatewayRouteKeySpec, ProtoMessageSpec, RpcMethodSpec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedRpcBindings {
@@ -235,7 +235,7 @@ fn push_service_module(rust: &mut String, methods: &[&RpcMethodSpec], names: &Na
     rust.push_str(
         "    use lattice_core::{ActorId, ActorKind, InstanceId, RouteKey, ServiceKind};\n",
     );
-    rust.push_str("    use lattice_rpc::{ActorRpcAdapter, Rpc, RpcContext, RpcRequest, RpcServerSecurity, RoutedRequest, ShardedRpcCore, TypedRpcClient};\n\n");
+    rust.push_str("    use lattice_rpc::{ActorRpcAdapter, Rpc, RpcContext, RpcRequest, RpcServerSecurity, ShardedRpcCore, TypedRpcClient};\n\n");
     rust.push_str(
         "    use lattice_service::{LatticeServiceError, RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
     use lattice_service::ServiceContextExt;
@@ -462,12 +462,19 @@ fn push_registry_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     rust.push_str("            self\n");
     rust.push_str("        }\n\n");
     rust.push_str("        async fn unary<Req>(&self, request: tonic::Request<Req>) -> Result<tonic::Response<Req::Reply>, tonic::Status>\n");
-    rust.push_str("        where\n            A: Handler<Rpc<Req>>,\n            Req: RoutedRequest + RpcRequest,\n        {\n");
+    rust.push_str("        where\n            A: Handler<Rpc<Req>>,\n            Req: RpcRequest,\n        {\n");
     rust.push_str("            let peer = self.security.peer_identity(&request);\n");
     rust.push_str("            let ctx = RpcContext::from_metadata(request.metadata()).map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;\n");
     rust.push_str("            self.security.validate_context(&ctx, peer.as_ref())?;\n");
+    rust.push_str(
+        "            let route = lattice_rpc::RpcRoute::from_metadata(request.metadata())\n",
+    );
+    rust.push_str(
+        "                .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?\n",
+    );
+    rust.push_str("                .ok_or_else(|| tonic::Status::invalid_argument(\"missing rpc route metadata\"))?;\n");
     rust.push_str("            let req = request.into_inner();\n");
-    rust.push_str("            let actor_id = actor_id_from_route_key(req.route_key());\n");
+    rust.push_str("            let actor_id = actor_id_from_route_key(route.route_key.clone());\n");
     rust.push_str("            let handle = self\n");
     rust.push_str("                .registry\n");
     rust.push_str("                .get_or_load(actor_id, self.loader.clone())\n");
@@ -476,10 +483,10 @@ fn push_registry_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
         "                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;\n",
     );
     rust.push_str("            if self.request_dedup {\n");
-    rust.push_str("                lattice_rpc::adapter::dispatch_actor_rpc_dedup(handle, req, ctx, &self.deduplicator).await\n");
+    rust.push_str("                lattice_rpc::adapter::dispatch_actor_rpc_dedup_with_route(handle, route, req, ctx, &self.deduplicator).await\n");
     rust.push_str("            } else {\n");
     rust.push_str(
-        "                lattice_rpc::adapter::dispatch_actor_rpc(handle, req, ctx).await\n",
+        "                lattice_rpc::adapter::dispatch_actor_rpc_with_route(handle, route, req, ctx).await\n",
     );
     rust.push_str("            }\n");
     rust.push_str("        }\n");
@@ -535,19 +542,26 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
     rust.push_str("            self\n");
     rust.push_str("        }\n\n");
     rust.push_str("        async fn unary<Req>(&self, request: tonic::Request<Req>) -> Result<tonic::Response<Req::Reply>, tonic::Status>\n");
-    rust.push_str("        where\n            A: Handler<Rpc<Req>>,\n            Req: RoutedRequest + RpcRequest,\n        {\n");
+    rust.push_str("        where\n            A: Handler<Rpc<Req>>,\n            Req: RpcRequest,\n        {\n");
     rust.push_str("            let peer = self.security.peer_identity(&request);\n");
     rust.push_str("            let ctx = RpcContext::from_metadata(request.metadata()).map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;\n");
     rust.push_str("            self.security.validate_context(&ctx, peer.as_ref())?;\n");
+    rust.push_str(
+        "            let route = lattice_rpc::RpcRoute::from_metadata(request.metadata())\n",
+    );
+    rust.push_str(
+        "                .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?\n",
+    );
+    rust.push_str("                .ok_or_else(|| tonic::Status::invalid_argument(\"missing rpc route metadata\"))?;\n");
     rust.push_str("            let req = request.into_inner();\n");
-    rust.push_str("            let route_key = req.route_key();\n");
+    rust.push_str("            let route_key = route.route_key.clone();\n");
     rust.push_str("            let actor_id = actor_id_from_route_key(route_key.clone());\n");
     rust.push_str("            let singleton_key = lattice_placement::store::SingletonKey {\n");
     rust.push_str(&format!(
         "                service_kind: ServiceKind::from_static(\"{}\"),\n",
         service.service_kind
     ));
-    rust.push_str("                singleton_kind: req.actor_kind(),\n");
+    rust.push_str("                singleton_kind: route.actor_kind.clone(),\n");
     rust.push_str("                scope: singleton_scope_from_route_key(route_key),\n");
     rust.push_str("            };\n");
     rust.push_str(
@@ -574,10 +588,10 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
         "                .map_err(|error| tonic::Status::unavailable(error.to_string()))?;\n",
     );
     rust.push_str("            if self.request_dedup {\n");
-    rust.push_str("                lattice_rpc::adapter::dispatch_actor_rpc_dedup(handle, req, ctx, &self.deduplicator).await\n");
+    rust.push_str("                lattice_rpc::adapter::dispatch_actor_rpc_dedup_with_route(handle, route, req, ctx, &self.deduplicator).await\n");
     rust.push_str("            } else {\n");
     rust.push_str(
-        "                lattice_rpc::adapter::dispatch_actor_rpc(handle, req, ctx).await\n",
+        "                lattice_rpc::adapter::dispatch_actor_rpc_with_route(handle, route, req, ctx).await\n",
     );
     rust.push_str("            }\n");
     rust.push_str("        }\n");
@@ -617,12 +631,12 @@ fn push_tonic_endpoint_transport(rust: &mut String, methods: &[RpcMethodSpec]) {
     rust.push_str("}\n\n");
     rust.push_str("#[tonic::async_trait]\n");
     rust.push_str("impl EndpointRpcTransport for GeneratedTonicEndpointTransport {\n");
-    rust.push_str("    async fn unary<Req>(&self, _endpoint: EndpointLease, target: lattice_rpc::RouteTarget, metadata: tonic::metadata::MetadataMap, request: Req) -> Result<tonic::Response<Req::Reply>, RpcError>\n");
-    rust.push_str("    where\n        Req: RoutedRequest + RpcRequest,\n    {\n");
+    rust.push_str("    async fn unary<Req>(&self, _endpoint: EndpointLease, target: lattice_rpc::RouteTarget, route_key: &RouteKey, metadata: tonic::metadata::MetadataMap, request: Req) -> Result<tonic::Response<Req::Reply>, RpcError>\n");
+    rust.push_str("    where\n        Req: RpcRequest,\n    {\n");
     rust.push_str("        match Req::METHOD {\n");
     for method in methods {
         rust.push_str(&format!(
-            "            \"{}\" => self.call_{}::<Req>(target, metadata, request).await,\n",
+            "            \"{}\" => self.call_{}::<Req>(target, route_key, metadata, request).await,\n",
             method.method_path(),
             method_fn_suffix(method)
         ));
@@ -643,10 +657,9 @@ fn push_tonic_transport_method(rust: &mut String, method: &RpcMethodSpec) {
     let client_path = tonic_client_path(method);
     let suffix = method_fn_suffix(method);
     rust.push_str(&format!(
-        "    async fn call_{suffix}<Req>(&self, target: lattice_rpc::RouteTarget, metadata: tonic::metadata::MetadataMap, request: Req) -> Result<tonic::Response<Req::Reply>, RpcError>\n",
+        "    async fn call_{suffix}<Req>(&self, target: lattice_rpc::RouteTarget, route_key: &RouteKey, metadata: tonic::metadata::MetadataMap, request: Req) -> Result<tonic::Response<Req::Reply>, RpcError>\n",
     ));
-    rust.push_str("    where\n        Req: RoutedRequest + RpcRequest,\n    {\n");
-    rust.push_str("        let route_key = request.route_key();\n");
+    rust.push_str("    where\n        Req: RpcRequest,\n    {\n");
     rust.push_str(
         "        let typed_request = (Box::new(request) as Box<dyn std::any::Any + Send + Sync>)\n",
     );
@@ -661,7 +674,7 @@ fn push_tonic_transport_method(rust: &mut String, method: &RpcMethodSpec) {
         "            .unwrap_or_else(|_| lattice_core::RequestId::new(\"<missing>\"));\n",
     );
     rust.push_str(
-        "        let channel = self.channels.get_or_connect_for_route_key(&target.advertised_endpoint, &route_key).await?;\n",
+        "        let channel = self.channels.get_or_connect_for_route_key(&target.advertised_endpoint, route_key).await?;\n",
     );
     rust.push_str(&format!(
         "        let mut client = {client_path}::new(channel);\n",
@@ -688,13 +701,16 @@ fn push_method_module(rust: &mut String, method: &RpcMethodSpec) {
     let module_name = lower_camel_to_snake(&method.method_name);
     rust.push_str(&format!("    pub mod {module_name} {{\n"));
     rust.push_str("        use lattice_actor::{Actor, Handler};\n");
-    rust.push_str("        use lattice_gateway::ProstClientMessageBinding;\n");
+    rust.push_str("        use lattice_core::RouteKey;\n");
+    rust.push_str(
+        "        use lattice_gateway::{GatewayRouteKeyPolicy, ProstClientMessageBinding};\n",
+    );
     rust.push_str("        use lattice_rpc::Rpc;\n");
     if method.gateway_msg_id.is_some() {
         rust.push_str(
-            "        use lattice_gateway::{ClientFrame, GatewayError, GatewayRouteSpec};\n",
+            "        use lattice_gateway::{ClientFrame, GatewayError, GatewayRouteContext, GatewayRouteSpec};\n",
         );
-        rust.push_str("        use lattice_rpc::{RoutedRequest, RpcRequest, ShardedRpcCore};\n");
+        rust.push_str("        use lattice_rpc::{RoutedEnvelope, RpcRequest, ShardedRpcCore};\n");
         rust.push_str("        use prost::Message as ProstMessage;\n");
     }
     rust.push('\n');
@@ -714,12 +730,16 @@ fn push_method_module(rust: &mut String, method: &RpcMethodSpec) {
             msg_id
         ));
         rust.push_str("            pub fn route_spec() -> GatewayRouteSpec {\n");
-        rust.push_str("                let default_req = <");
-        rust.push_str(&method.request_type);
-        rust.push_str(" as Default>::default();\n");
         rust.push_str("                GatewayRouteSpec {\n");
         rust.push_str("                    msg_id: Self::DEFAULT_MSG_ID,\n");
-        rust.push_str("                    actor_kind: default_req.actor_kind(),\n");
+        rust.push_str(&format!(
+            "                    actor_kind: lattice_core::ActorKind::from_static(\"{}\"),\n",
+            method.route_key.actor_kind
+        ));
+        rust.push_str(&format!(
+            "                    route_key_policy: {},\n",
+            gateway_route_key_policy_expr(method)
+        ));
         rust.push_str("                    method: <");
         rust.push_str(&method.request_type);
         rust.push_str(" as RpcRequest>::METHOD,\n");
@@ -729,6 +749,13 @@ fn push_method_module(rust: &mut String, method: &RpcMethodSpec) {
         rust.push_str("            where\n");
         rust.push_str("                C: ShardedRpcCore,\n");
         rust.push_str("            {\n");
+        rust.push_str("                Self::decode_and_forward_with_context(frame, core, &GatewayRouteContext::new()).await\n");
+        rust.push_str("            }\n\n");
+        rust.push_str("            pub async fn decode_and_forward_with_context<C>(frame: ClientFrame, core: C, context: &GatewayRouteContext) -> Result<ClientFrame, GatewayError>\n");
+        rust.push_str("            where\n");
+        rust.push_str("                C: ShardedRpcCore,\n");
+        rust.push_str("            {\n");
+        rust.push_str("                let _ = context;\n");
         rust.push_str("                if frame.msg_id != Self::DEFAULT_MSG_ID {\n");
         rust.push_str("                    return Err(GatewayError::UnexpectedMessageId {\n");
         rust.push_str("                        expected: Self::DEFAULT_MSG_ID,\n");
@@ -739,9 +766,18 @@ fn push_method_module(rust: &mut String, method: &RpcMethodSpec) {
         rust.push_str(&method.request_type);
         rust.push_str(" as ProstMessage>::decode(frame.payload.as_slice())\n");
         rust.push_str("                    .map_err(|source| GatewayError::DecodePayload(source.to_string()))?;\n");
-        rust.push_str(
-            "                let reply = core.call(req).await.map_err(GatewayError::Rpc)?;\n",
-        );
+        rust.push_str(&format!(
+            "                let route_key = {};\n",
+            gateway_route_key_expr(method, "req", "context")
+        ));
+        rust.push_str("                let reply = core.call_routed(RoutedEnvelope::new(\n");
+        rust.push_str("                    req,\n");
+        rust.push_str(&format!(
+            "                    lattice_core::ActorKind::from_static(\"{}\"),\n",
+            method.route_key.actor_kind
+        ));
+        rust.push_str("                    route_key,\n");
+        rust.push_str("                )).await.map_err(GatewayError::Rpc)?;\n");
         rust.push_str("                Ok(ClientFrame {\n");
         rust.push_str("                    msg_id: Self::DEFAULT_MSG_ID,\n");
         rust.push_str("                    payload: reply.encode_to_vec(),\n");
@@ -756,7 +792,26 @@ fn push_method_module(rust: &mut String, method: &RpcMethodSpec) {
     rust.push_str("            pub fn binding(msg_id: u32) -> ProstClientMessageBinding<");
     rust.push_str(&method.request_type);
     rust.push_str("> {\n");
-    rust.push_str("                ProstClientMessageBinding::new(msg_id)\n");
+    rust.push_str("                ProstClientMessageBinding::with_route_extractor(\n");
+    rust.push_str("                    msg_id,\n");
+    rust.push_str(&format!(
+        "                    lattice_core::ActorKind::from_static(\"{}\"),\n",
+        method.route_key.actor_kind
+    ));
+    rust.push_str(&format!(
+        "                    {},\n",
+        gateway_route_key_policy_expr(method)
+    ));
+    rust.push_str("                    |req: &");
+    rust.push_str(&method.request_type);
+    rust.push_str(", context| {\n");
+    rust.push_str("                        let _ = req;\n");
+    rust.push_str("                        let _ = context;\n");
+    rust.push_str("                        Ok(");
+    rust.push_str(&gateway_route_key_expr(method, "req", "context"));
+    rust.push_str(")\n");
+    rust.push_str("                    },\n");
+    rust.push_str("                )\n");
     rust.push_str("            }\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
@@ -842,12 +897,17 @@ fn push_gateway_dispatcher(
     rust.push_str(
         "    pub async fn dispatch(&self, frame: ClientFrame) -> Result<ClientFrame, GatewayError> {\n",
     );
+    rust.push_str("        self.dispatch_with_context(frame, &lattice_gateway::GatewayRouteContext::new()).await\n");
+    rust.push_str("    }\n\n");
+    rust.push_str(
+        "    pub async fn dispatch_with_context(&self, frame: ClientFrame, context: &lattice_gateway::GatewayRouteContext) -> Result<ClientFrame, GatewayError> {\n",
+    );
     rust.push_str("        match frame.msg_id {\n");
     for method in gateway_methods {
         let field = service_field_name(method, names);
         let binding_path = gateway_binding_path(method, names);
         rust.push_str(&format!(
-            "            {binding_path}::DEFAULT_MSG_ID => {binding_path}::decode_and_forward(frame, self.{field}.clone()).await,\n"
+            "            {binding_path}::DEFAULT_MSG_ID => {binding_path}::decode_and_forward_with_context(frame, self.{field}.clone(), context).await,\n"
         ));
     }
     rust.push_str("            msg_id => Err(GatewayError::UnknownMessageId { msg_id }),\n");
@@ -908,11 +968,52 @@ fn group_by_service(methods: &[RpcMethodSpec]) -> BTreeMap<(&str, &str), Vec<&Rp
 }
 
 fn route_key_expr(option: &ProtoRouteKeyOption) -> String {
+    route_key_expr_with_receiver(option, "self")
+}
+
+fn route_key_expr_with_receiver(option: &ProtoRouteKeyOption, receiver: &str) -> String {
+    route_key_expr_with_field(option, receiver, &option.key_field)
+}
+
+fn route_key_expr_with_field(option: &ProtoRouteKeyOption, receiver: &str, field: &str) -> String {
     match option.key_type {
-        RouteKeyType::U64 => format!("RouteKey::U64(self.{})", option.key_field),
-        RouteKeyType::I64 => format!("RouteKey::I64(self.{})", option.key_field),
-        RouteKeyType::String => format!("RouteKey::Str(self.{}.clone())", option.key_field),
-        RouteKeyType::Bytes => format!("RouteKey::Bytes(self.{}.clone())", option.key_field),
+        RouteKeyType::U64 => format!("RouteKey::U64({receiver}.{field})"),
+        RouteKeyType::I64 => format!("RouteKey::I64({receiver}.{field})"),
+        RouteKeyType::String => format!("RouteKey::Str({receiver}.{field}.clone())"),
+        RouteKeyType::Bytes => format!("RouteKey::Bytes({receiver}.{field}.clone())"),
+    }
+}
+
+fn gateway_route_key_policy_expr(method: &RpcMethodSpec) -> String {
+    match &method.gateway_route_key {
+        Some(GatewayRouteKeySpec::RequestField(field)) => {
+            format!("GatewayRouteKeyPolicy::request_field({field:?})")
+        }
+        Some(GatewayRouteKeySpec::ContextKey(key)) => {
+            format!("GatewayRouteKeyPolicy::context_key({key:?})")
+        }
+        Some(GatewayRouteKeySpec::Constant(value)) => {
+            format!("GatewayRouteKeyPolicy::constant({value:?})")
+        }
+        None => format!(
+            "GatewayRouteKeyPolicy::request_field({:?})",
+            method.route_key.key_field
+        ),
+    }
+}
+
+fn gateway_route_key_expr(method: &RpcMethodSpec, req: &str, context: &str) -> String {
+    match &method.gateway_route_key {
+        Some(GatewayRouteKeySpec::RequestField(field)) => {
+            route_key_expr_with_field(&method.route_key, req, field)
+        }
+        Some(GatewayRouteKeySpec::ContextKey(key)) => {
+            format!("{context}.require_route_key({key:?})?")
+        }
+        Some(GatewayRouteKeySpec::Constant(value)) => {
+            format!("RouteKey::Str({value:?}.to_string())")
+        }
+        None => route_key_expr_with_receiver(&method.route_key, req),
     }
 }
 

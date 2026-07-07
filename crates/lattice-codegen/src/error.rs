@@ -35,6 +35,11 @@ pub enum CodegenError {
     UnknownGatewayRouteMethod { method: String },
     #[error("duplicate gateway route method {method}")]
     DuplicateGatewayRouteMethod { method: String },
+    #[error("unsupported gateway route key source {route_key_source} for {method}")]
+    UnsupportedGatewayRouteKeySource {
+        method: String,
+        route_key_source: String,
+    },
     #[error(
         "gateway route for {method} conflicts with proto option: proto msg_id={proto_msg_id}, route msg_id={route_msg_id}"
     )]

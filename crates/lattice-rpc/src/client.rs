@@ -16,7 +16,7 @@ use tracing::{debug, warn};
 use crate::metadata::RpcClientContextFactory;
 use crate::security::RpcTransportSecurity;
 use crate::traits::UnaryRpcTransport;
-use crate::{ActorRefRpcCore, RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
+use crate::{ActorRefRpcCore, RoutedEnvelope, RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
 
 const DEFAULT_CHANNELS_PER_ENDPOINT: NonZeroUsize =
     NonZeroUsize::new(4).expect("default tonic channel stripe count is non-zero");
@@ -263,22 +263,24 @@ impl<T> ShardedRpcCore for MetadataInjectingRpcCore<T>
 where
     T: UnaryRpcTransport,
 {
-    async fn call<Req>(&self, req: Req) -> Result<Req::Reply, RpcError>
+    async fn call_routed<Req>(&self, envelope: RoutedEnvelope<Req>) -> Result<Req::Reply, RpcError>
     where
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
-        let actor_kind = req.actor_kind();
-        let route_key = req.route_key();
-        let mut request = Request::new(req);
+        let route = envelope.route();
+        let mut request = Request::new(envelope.req);
         let ctx = self.context_factory.next_context(self.route_epoch);
         debug!(
             rpc.method = Req::METHOD,
-            actor.kind = actor_kind.as_str(),
-            route.key = ?route_key,
+            actor.kind = route.actor_kind.as_str(),
+            route.key = ?route.route_key,
             request.id = ctx.request_id.as_str(),
             "sending rpc request"
         );
         ctx.inject_metadata(request.metadata_mut())
+            .map_err(|error| RpcError::Business(error.to_string()))?;
+        route
+            .inject_metadata(request.metadata_mut())
             .map_err(|error| RpcError::Business(error.to_string()))?;
         match self.transport.unary(request).await {
             Ok(response) => {

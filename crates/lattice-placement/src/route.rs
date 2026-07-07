@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use lattice_core::{ActorId, ActorKind, ActorRef, ActorRefTarget, RouteKey, ServiceKind};
 use lattice_rpc::{
-    ActorRefRpcCore, RouteTarget, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError,
-    RpcRequest, ShardedRpcCore,
+    ActorRefRpcCore, RouteTarget, RoutedEnvelope, RoutedRequest, RpcClientContextFactory,
+    RpcContext, RpcError, RpcRequest, ShardedRpcCore,
 };
 use tonic::Response;
 use tracing::{Instrument, debug, warn};
@@ -184,11 +184,12 @@ pub trait EndpointRpcTransport: Clone + Send + Sync + 'static {
         &self,
         endpoint: EndpointLease,
         target: RouteTarget,
+        route_key: &RouteKey,
         metadata: tonic::metadata::MetadataMap,
         request: Req,
     ) -> Result<Response<Req::Reply>, RpcError>
     where
-        Req: RoutedRequest + RpcRequest;
+        Req: RpcRequest;
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -238,26 +239,25 @@ where
     R: RouteResolver,
     T: EndpointRpcTransport,
 {
-    async fn call<Req>(&self, req: Req) -> Result<Req::Reply, RpcError>
+    async fn call_routed<Req>(&self, envelope: RoutedEnvelope<Req>) -> Result<Req::Reply, RpcError>
     where
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
-        let actor_kind = req.actor_kind();
-        let route_key = req.route_key();
+        let route = envelope.route();
         let span = tracing::info_span!(
             "rpc.client",
             otel.kind = "client",
             rpc.method = Req::METHOD,
             service.kind = self.service_kind.as_str(),
-            actor.kind = actor_kind.as_str(),
-            route.key = ?route_key
+            actor.kind = route.actor_kind.as_str(),
+            route.key = ?route.route_key
         );
 
         async {
             let resolve_request = ResolveRequest {
                 service_kind: self.service_kind.clone(),
-                actor_kind,
-                route_key,
+                actor_kind: route.actor_kind.clone(),
+                route_key: route.route_key.clone(),
             };
             let key = resolve_request.cache_key();
 
@@ -270,11 +270,16 @@ where
             );
             let ctx = self.context_factory.next_context(target.owner_epoch);
             if self.retry_policy == RpcRetryPolicy::Disabled {
-                return self.send_with_context(target, ctx, req).await;
+                return self
+                    .send_with_context(target, ctx, &route.route_key, &route, envelope.req)
+                    .await;
             }
 
-            let retry_request = <Req as prost::Message>::encode_to_vec(&req);
-            match self.send_with_context(target, ctx.clone(), req).await {
+            let retry_request = <Req as prost::Message>::encode_to_vec(&envelope.req);
+            match self
+                .send_with_context(target, ctx.clone(), &route.route_key, &route, envelope.req)
+                .await
+            {
                 Ok(reply) => Ok(reply),
                 Err(RpcError::NotOwner { .. }) => {
                     warn!(
@@ -304,8 +309,14 @@ where
                         retry_ctx.route_epoch = retry_target.owner_epoch;
                         let retry_req = <Req as prost::Message>::decode(retry_request.as_slice())
                             .map_err(|error| RpcError::Business(error.to_string()))?;
-                        self.send_with_context(retry_target, retry_ctx, retry_req)
-                            .await
+                        self.send_with_context(
+                            retry_target,
+                            retry_ctx,
+                            &route.route_key,
+                            &route,
+                            retry_req,
+                        )
+                        .await
                     }
                     .instrument(retry_span)
                     .await
@@ -338,8 +349,14 @@ where
                         retry_ctx.route_epoch = retry_target.owner_epoch;
                         let retry_req = <Req as prost::Message>::decode(retry_request.as_slice())
                             .map_err(|error| RpcError::Business(error.to_string()))?;
-                        self.send_with_context(retry_target, retry_ctx, retry_req)
-                            .await
+                        self.send_with_context(
+                            retry_target,
+                            retry_ctx,
+                            &route.route_key,
+                            &route,
+                            retry_req,
+                        )
+                        .await
                     }
                     .instrument(retry_span)
                     .await
@@ -375,10 +392,12 @@ where
         &self,
         target: RouteTarget,
         ctx: RpcContext,
+        route_key: &RouteKey,
+        route: &lattice_rpc::RpcRoute,
         req: Req,
     ) -> Result<Req::Reply, RpcError>
     where
-        Req: RoutedRequest + RpcRequest,
+        Req: RpcRequest,
     {
         let target_instance = target.instance_id.as_str().to_owned();
         let target_endpoint = target.advertised_endpoint.to_string();
@@ -395,6 +414,9 @@ where
         let mut metadata = tonic::metadata::MetadataMap::new();
         ctx.inject_metadata(&mut metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;
+        route
+            .inject_metadata(&mut metadata)
+            .map_err(|error| RpcError::Business(error.to_string()))?;
         debug!(
             rpc.method = Req::METHOD,
             request.id = ctx.request_id.as_str(),
@@ -402,7 +424,11 @@ where
             target.endpoint = target_endpoint.as_str(),
             "sending routed rpc request"
         );
-        match self.transport.unary(endpoint, target, metadata, req).await {
+        match self
+            .transport
+            .unary(endpoint, target, route_key, metadata, req)
+            .await
+        {
             Ok(response) => {
                 debug!(
                     rpc.method = Req::METHOD,
@@ -534,6 +560,10 @@ where
         let mut metadata = tonic::metadata::MetadataMap::new();
         ctx.inject_metadata(&mut metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;
+        let route = lattice_rpc::RpcRoute::from_request(&req);
+        route
+            .inject_metadata(&mut metadata)
+            .map_err(|error| RpcError::Business(error.to_string()))?;
         debug!(
             rpc.method = Req::METHOD,
             request.id = ctx.request_id.as_str(),
@@ -541,7 +571,12 @@ where
             target.endpoint = target_endpoint.as_str(),
             "sending actor-ref rpc request"
         );
-        match self.transport.unary(endpoint, target, metadata, req).await {
+        let route_key = route.route_key;
+        match self
+            .transport
+            .unary(endpoint, target, &route_key, metadata, req)
+            .await
+        {
             Ok(response) => {
                 debug!(
                     rpc.method = Req::METHOD,

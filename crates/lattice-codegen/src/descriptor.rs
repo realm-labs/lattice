@@ -161,6 +161,7 @@ pub fn methods_from_descriptor(
                         key_type: field_type,
                     },
                     gateway_msg_id: method_options.and_then(|options| options.gateway_msg_id),
+                    gateway_route_key: None,
                 });
             }
         }

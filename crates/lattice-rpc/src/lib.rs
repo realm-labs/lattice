@@ -19,7 +19,7 @@ pub use security::{
     RpcTlsIdentity, RpcTransportSecurity, ServiceIdentityConfig,
 };
 pub use traits::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpcCore};
-pub use types::{RouteTarget, Rpc};
+pub use types::{RouteTarget, RoutedEnvelope, Rpc, RpcRoute, RpcRouteMetadataError};
 
 #[cfg(test)]
 mod tests;

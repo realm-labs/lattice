@@ -14,6 +14,8 @@ pub enum GatewayError {
     UnknownMessageId { msg_id: u32 },
     #[error("failed to decode client payload: {0}")]
     DecodePayload(String),
+    #[error("missing gateway route context key {key}")]
+    MissingRouteContextKey { key: String },
     #[error("rpc failed: {0}")]
     Rpc(RpcError),
     #[error("unknown gateway session {session_id}")]
