@@ -1,4 +1,4 @@
-use crate::RouteTarget;
+use crate::types::RouteTarget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredRpcService {

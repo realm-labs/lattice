@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use lattice_core::{ActorKind, RouteKey, ServiceKind};
-use lattice_rpc::RouteTarget;
+use lattice_core::id::RouteKey;
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_rpc::types::RouteTarget;
 
 use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::error::PlacementError;

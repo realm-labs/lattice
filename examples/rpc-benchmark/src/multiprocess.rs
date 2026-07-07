@@ -3,15 +3,21 @@ use std::process::Child;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use lattice_core::{InstanceId, ServiceKind, service_kind};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
+use lattice_core::service_kind;
 use lattice_placement::cache::RouteCacheConfig;
 use lattice_placement::control::TonicLogicControl;
+use lattice_placement::coordinator::PlacementRouteResolver;
 use lattice_placement::coordinator::{PlacementCoordinator, PlacementWatchStarter};
+use lattice_placement::endpoint::EndpointPool;
 use lattice_placement::etcd::{EtcdPlacementStore, EtcdPlacementStoreConfig, RealEtcdClient};
 use lattice_placement::instance::InstanceState;
+use lattice_placement::route::{BoxRouteResolver, ResolvingRpcCore};
 use lattice_placement::store::{PlacementPrefix, PlacementStore};
-use lattice_placement::{BoxRouteResolver, EndpointPool, PlacementRouteResolver, ResolvingRpcCore};
-use lattice_rpc::{RpcClientContextFactory, RpcTransportSecurity, TonicEndpointChannelPoolConfig};
+use lattice_rpc::client::TonicEndpointChannelPoolConfig;
+use lattice_rpc::metadata::RpcClientContextFactory;
+use lattice_rpc::security::RpcTransportSecurity;
 use tokio::fs;
 use tokio::time::sleep;
 

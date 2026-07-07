@@ -1,7 +1,10 @@
 use async_trait::async_trait;
-use lattice_core::{ActorId, ActorKind, Epoch, ServiceKind};
+use lattice_core::actor_ref::Epoch;
+use lattice_core::id::ActorId;
+use lattice_core::kind::{ActorKind, ServiceKind};
 use tonic::{Request, Response, Status};
 
+use crate::control::proto::logic_control_client::LogicControlClient;
 use crate::coordinator::{
     ActivateActorRequest as CoordinatorActivateActorRequest,
     LogicControl as CoordinatorLogicControl, PlacementCoordinator,
@@ -23,11 +26,6 @@ use crate::vshard::VirtualShardId;
 pub mod proto {
     tonic::include_proto!("lattice.placement.control");
 }
-
-pub use proto::logic_control_client::LogicControlClient;
-pub use proto::logic_control_server::LogicControlServer;
-pub use proto::placement_coordinator_client::PlacementCoordinatorClient;
-pub use proto::placement_coordinator_server::PlacementCoordinatorServer;
 
 #[async_trait]
 pub trait LogicControlHandler: Clone + Send + Sync + 'static {
@@ -380,13 +378,16 @@ fn logic_error(error: impl std::fmt::Display) -> PlacementError {
 #[cfg(test)]
 mod tests {
     use lattice_core::instance::InstanceCapacity;
-    use lattice_core::{InstanceId, service_kind};
+    use lattice_core::instance::InstanceId;
+    use lattice_core::service_kind;
     use std::collections::BTreeMap;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
 
     use super::*;
+    use crate::control::proto::placement_coordinator_client::PlacementCoordinatorClient;
+    use crate::control::proto::placement_coordinator_server::PlacementCoordinatorServer;
     use crate::coordinator::NoopLogicControl;
     use crate::instance::{InstanceRecord, InstanceState};
     use crate::store::{InMemoryPlacementStore, LeaseId, PlacementPrefix};

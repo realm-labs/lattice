@@ -1,4 +1,5 @@
-use lattice_gateway::{BinaryClientCodec, ClientCodec, ClientFrame, GatewayError};
+use lattice_gateway::error::GatewayError;
+use lattice_gateway::frame::{BinaryClientCodec, ClientCodec, ClientFrame};
 use prost::Message as ProstMessage;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 

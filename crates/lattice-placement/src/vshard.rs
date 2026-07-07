@@ -3,10 +3,13 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_core::{ActorKind, Epoch, InstanceId, RouteKey, ServiceKind};
+use lattice_core::actor_ref::Epoch;
+use lattice_core::id::RouteKey;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
 use serde::{Deserialize, Serialize};
 
-use crate::PlacementError;
+use crate::error::PlacementError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

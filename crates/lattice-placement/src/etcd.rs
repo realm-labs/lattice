@@ -7,7 +7,10 @@ use async_trait::async_trait;
 use etcd_client::{
     Client, Compare, CompareOp, EventType, GetOptions, PutOptions, Txn, TxnOp, WatchOptions,
 };
-use lattice_core::{ActorId, ActorKind, ConfiguredComponent, InstanceId, ServiceKind};
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_core::service_context::ConfiguredComponent;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 

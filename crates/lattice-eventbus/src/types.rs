@@ -1,4 +1,8 @@
-use lattice_core::{ActorId, ActorKind, InstanceId, RequestId, ServiceKind, TraceContext};
+use lattice_core::actor_ref::RequestId;
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_core::trace::TraceContext;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

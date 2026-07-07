@@ -41,8 +41,8 @@ pub struct InstanceConfig {
 }
 
 impl InstanceConfig {
-    pub fn from_env() -> Result<Self, lattice_config::ConfigError> {
-        lattice_config::ConfigSource::env("LATTICE")
+    pub fn from_env() -> Result<Self, lattice_config::error::ConfigError> {
+        lattice_config::source::ConfigSource::env("LATTICE")
             .load()?
             .section("instance")
     }

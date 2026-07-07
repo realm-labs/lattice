@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_core::{InstanceId, ServiceKind, TraceContext};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
+use lattice_core::trace::TraceContext;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::OpsError;
+use crate::error::OpsError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum TraceSpanKind {

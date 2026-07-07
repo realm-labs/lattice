@@ -54,13 +54,13 @@ impl fmt::Display for ActorKind {
 #[macro_export]
 macro_rules! actor_kind {
     ($name:literal) => {
-        $crate::ActorKind::from_static($name)
+        $crate::kind::ActorKind::from_static($name)
     };
 }
 
 #[macro_export]
 macro_rules! service_kind {
     ($name:literal) => {
-        $crate::ServiceKind::from_static($name)
+        $crate::kind::ServiceKind::from_static($name)
     };
 }

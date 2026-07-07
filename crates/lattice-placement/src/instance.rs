@@ -4,10 +4,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use http::Uri;
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::{InstanceId, ServiceKind};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
 use serde::{Deserialize, Serialize};
 
-use crate::PlacementError;
+use crate::error::PlacementError;
 use crate::store::LeaseId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

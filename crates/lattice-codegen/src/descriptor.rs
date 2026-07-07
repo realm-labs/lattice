@@ -5,7 +5,7 @@ use prost_types::{
     DescriptorProto, FieldDescriptorProto, FileDescriptorSet, field_descriptor_proto::Label,
 };
 
-use crate::CodegenError;
+use crate::error::CodegenError;
 use crate::route_key::{ProtoRouteKeyOption, RouteKeyType};
 use crate::spec::{ProtoMessageSpec, RpcMethodSpec};
 

@@ -1,13 +1,21 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_core::{ActorId, ActorKind, ActorRef, ActorRefTarget, RouteKey, actor_kind};
-use lattice_core::{InstanceId, TraceContext, service_kind};
-use lattice_rpc::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpcCore};
+use lattice_core::actor_ref::{ActorRef, ActorRefTarget};
+use lattice_core::id::{ActorId, RouteKey};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ActorKind;
+use lattice_core::trace::TraceContext;
+use lattice_core::{actor_kind, service_kind};
+use lattice_rpc::error::RpcError;
+use lattice_rpc::traits::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpcCore};
 use prost::Message as ProstMessage;
 use tokio::sync::Mutex;
 
-use crate::*;
+use crate::error::EventBusError;
+use crate::local::{EventBus, LocalEventBus};
+use crate::publisher::{DeliveryOptions, EventPublisher, ServiceEvents};
+use crate::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
 
 #[tokio::test]
 async fn local_event_bus_publishes_to_matching_subject_subscribers() {
@@ -147,7 +155,7 @@ struct RecordingCore {
 
 #[async_trait]
 impl ShardedRpcCore for RecordingCore {
-    async fn call<Req>(&self, req: Req) -> Result<Req::Reply, lattice_rpc::RpcError>
+    async fn call<Req>(&self, req: Req) -> Result<Req::Reply, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
     {
@@ -163,11 +171,7 @@ struct RecordingActorRefCore {
 
 #[async_trait]
 impl ActorRefRpcCore for RecordingActorRefCore {
-    async fn call_ref<Req>(
-        &self,
-        actor_ref: ActorRef,
-        _req: Req,
-    ) -> Result<Req::Reply, lattice_rpc::RpcError>
+    async fn call_ref<Req>(&self, actor_ref: ActorRef, _req: Req) -> Result<Req::Reply, RpcError>
     where
         Req: RoutedRequest + RpcRequest,
     {

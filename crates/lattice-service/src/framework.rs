@@ -1,16 +1,18 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_config::{ConfigStore, ConfigStoreError, ConfigWatch};
-use lattice_core::{InstanceId, ServiceContext, ServiceKind};
-use lattice_eventbus::{
-    EventBus, EventBusError, EventEnvelope, EventHandler, EventSubscription,
-    EventSubscriptionHandle, ServiceEvents,
-};
-use lattice_ops::ServiceScheduler;
-use lattice_placement::PlacementError;
+use lattice_config::store::{ConfigStore, ConfigStoreError, ConfigWatch};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
+use lattice_core::service_context::ServiceContext;
+use lattice_eventbus::error::EventBusError;
+use lattice_eventbus::local::{EventBus, EventHandler, EventSubscriptionHandle};
+use lattice_eventbus::publisher::ServiceEvents;
+use lattice_eventbus::types::{EventEnvelope, EventSubscription};
+use lattice_ops::scheduler::ServiceScheduler;
 use lattice_placement::control::TonicLogicControl;
 use lattice_placement::coordinator::{DrainReport, PlacementCoordinator};
+use lattice_placement::error::PlacementError;
 use lattice_placement::instance::InstanceRecord;
 use lattice_placement::store::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementStore,
@@ -58,7 +60,7 @@ pub trait DynPlacementStore: Send + Sync + 'static {
     async fn list_virtual_shards(
         &self,
         service_kind: &ServiceKind,
-        actor_kind: &lattice_core::ActorKind,
+        actor_kind: &lattice_core::kind::ActorKind,
     ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
     async fn list_virtual_shards_for_service(
         &self,
@@ -169,7 +171,7 @@ where
     async fn list_virtual_shards(
         &self,
         service_kind: &ServiceKind,
-        actor_kind: &lattice_core::ActorKind,
+        actor_kind: &lattice_core::kind::ActorKind,
     ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
         PlacementStore::list_virtual_shards(self, service_kind, actor_kind).await
     }

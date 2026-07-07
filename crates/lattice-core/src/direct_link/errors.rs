@@ -1,8 +1,9 @@
 use thiserror::Error;
 
-use crate::ActorRef;
+use crate::actor_ref::ActorRef;
 
-use super::{DirectLinkMessageId, LinkCloseReason};
+use crate::direct_link::ids::DirectLinkMessageId;
+use crate::direct_link::options::LinkCloseReason;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LinkMetadataError {

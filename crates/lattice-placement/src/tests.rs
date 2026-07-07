@@ -4,12 +4,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lattice_core::actor_ref::{ActorRef, Epoch};
+use lattice_core::id::{ActorId, RouteKey};
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::{ActorId, ActorRef, Epoch, InstanceId, RouteKey, actor_kind, service_kind};
-use lattice_rpc::{
-    ActorRefRpcCore, AuthContext, RouteTarget, RoutedRequest, RpcClientContextFactory, RpcContext,
-    RpcError, RpcRequest, ShardedRpcCore,
-};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ActorKind;
+use lattice_core::{actor_kind, service_kind};
+use lattice_rpc::error::RpcError;
+use lattice_rpc::metadata::{AuthContext, RpcClientContextFactory, RpcContext};
+use lattice_rpc::traits::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpcCore};
+use lattice_rpc::types::RouteTarget;
 use tonic::Response;
 
 use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
@@ -45,7 +49,7 @@ struct EnterWorldReply {
 }
 
 impl RoutedRequest for EnterWorldRequest {
-    fn actor_kind(&self) -> lattice_core::ActorKind {
+    fn actor_kind(&self) -> ActorKind {
         actor_kind!("World")
     }
 

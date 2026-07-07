@@ -1,6 +1,8 @@
-use lattice_core::{InstanceId, service_kind};
+use lattice_core::instance::InstanceId;
+use lattice_core::service_kind;
 
-use super::*;
+use crate::config::TelemetryConfig;
+use crate::telemetry::LatticeTelemetry;
 
 #[test]
 fn telemetry_config_defaults_to_fmt_only() {

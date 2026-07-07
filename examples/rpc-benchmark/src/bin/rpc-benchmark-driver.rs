@@ -3,7 +3,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use clap::Parser;
-use lattice_core::InstanceId;
+use lattice_core::instance::InstanceId;
 use rpc_benchmark::error::BenchmarkResult;
 use rpc_benchmark::multiprocess::{
     EtcdBenchmarkConfig, build_bench_client_from_etcd, default_multi_process_prefix, parse_csv,

@@ -1,4 +1,4 @@
-use lattice_rpc::RpcError;
+use lattice_rpc::error::RpcError;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum EventBusError {

@@ -17,19 +17,32 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use http::{Request, Response};
-use lattice_actor::registry::ActorCreateContext;
-use lattice_actor::{
-    Actor, ActorContext, ActorError, ActorFactory, ActorStopError, Handler, Message,
-    PassivationReason, ShardMigrationPolicy, StopReason,
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::{ActorError, ActorStopError};
+use lattice_actor::registry::{ActorCreateContext, ActorFactory};
+use lattice_actor::runtime::{ActorRuntime, ShardMigrationPolicy};
+use lattice_actor::traits::{Actor, Handler, Message, PassivationReason, StopReason};
+use lattice_config::format::ConfigFormat;
+use lattice_config::source::ConfigSource;
+use lattice_core::actor_ref::{ActorRef, Epoch, RequestId};
+use lattice_core::direct_link::ids::{DirectLinkMessageId, LinkId, LinkSequence};
+use lattice_core::direct_link::messages::{
+    LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkMessageFlags, LinkOpened, Linked,
 };
-use lattice_config::{ConfigFormat, ConfigSource};
-use lattice_core::{
-    ActorId, ActorKind, ActorRef, ConfiguredComponent, DirectLinkEndpoint, DirectLinkManager,
-    DirectLinkMessage, DirectLinkMode, DirectLinkOptions, DirectLinkRuntimeHandle, Epoch,
-    InstanceId, LinkBackpressure, LinkCloseReason, LinkClosed, LinkDirection, LinkDirectionClosed,
-    LinkId, LinkMessageFlags, LinkOpened, LinkSequence, Linked, OutboundDirectLinkMessage,
-    RequestId, RouteKey, TraceContext, actor_kind, service_kind,
+use lattice_core::direct_link::options::{
+    DirectLinkMode, DirectLinkOptions, LinkCloseReason, LinkDirection,
 };
+use lattice_core::direct_link::runtime::{
+    DirectLinkManager, DirectLinkRuntimeHandle, OutboundDirectLinkMessage,
+};
+use lattice_core::direct_link::stream::DirectLinkMessage;
+use lattice_core::direct_link::target::DirectLinkEndpoint;
+use lattice_core::id::{ActorId, RouteKey};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ActorKind;
+use lattice_core::service_context::ConfiguredComponent;
+use lattice_core::trace::TraceContext;
+use lattice_core::{actor_kind, service_kind};
 use lattice_direct_link::inbound::DirectLinkInboundRouter;
 use lattice_direct_link::protocol::{DirectLinkFrame, DirectLinkFrameKind};
 use lattice_direct_link::session::{
@@ -41,29 +54,31 @@ use lattice_direct_link::stream::DirectLinkStream;
 use lattice_direct_link::transport::{
     DirectLinkConnection, DirectLinkListenConfig, DirectLinkTransport, TcpDirectLinkTransport,
 };
-use lattice_eventbus::{
-    EventBus, EventEnvelope, EventId, EventSubscription, LocalEventBus, Subject, SubjectFilter,
-};
+use lattice_eventbus::local::{EventBus, LocalEventBus};
+use lattice_eventbus::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
+use lattice_ops::ops_config::AdminHttpConfig;
 use lattice_placement::cache::RouteCacheConfig;
-use lattice_placement::control::{LogicControlClient, actor_id_to_proto, proto};
+use lattice_placement::control::proto::logic_control_client::LogicControlClient;
+use lattice_placement::control::{actor_id_to_proto, proto};
 use lattice_placement::coordinator::{
     ExplicitRouteResolver, NoopLogicControl, PlacementCoordinator,
 };
+use lattice_placement::endpoint::{EndpointLease, EndpointPool};
 use lattice_placement::instance::{InstanceRecord, InstanceState};
+use lattice_placement::route::{
+    BoxRouteResolver, EndpointRpcTransport, ResolveRequest, ResolvingRpcCore, RouteResolver,
+};
 use lattice_placement::store::{
     ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
     PlacementState, PlacementStore, SingletonKey,
 };
 use lattice_placement::vshard::VirtualShardMapper;
-use lattice_placement::{
-    BoxRouteResolver, EndpointLease, EndpointPool, EndpointRpcTransport, ResolveRequest,
-    ResolvingRpcCore, RouteResolver,
-};
-use lattice_rpc::{
-    AuthContext, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError, RpcRequest,
-    RpcSecurityError, RpcSecurityPolicy, ServiceIdentityConfig, ShardedRpcCore,
-    TonicEndpointChannelPoolConfig,
-};
+use lattice_rpc::client::TonicEndpointChannelPoolConfig;
+use lattice_rpc::error::RpcError;
+use lattice_rpc::metadata::{AuthContext, RpcClientContextFactory, RpcContext};
+use lattice_rpc::security::{RpcSecurityError, RpcSecurityPolicy, ServiceIdentityConfig};
+use lattice_rpc::traits::{RoutedRequest, RpcRequest, ShardedRpcCore};
+use lattice_rpc::types::RouteTarget;
 use prost::Message as ProstMessage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -72,12 +87,14 @@ use tonic::body::Body;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
 
+use crate::actor::ActorRegistration;
 use crate::actor::ErasedActorRegistration;
+use crate::config::DirectLinkConfig;
 use crate::context::ServiceBuildContext;
-use crate::{
-    ActorRegistration, AdminHttpConfig, DirectLinkConfig, LatticeService, LatticeServiceError,
-    RpcClientBinding, RpcClientPlacement, RpcServiceBinding, ServiceContextExt,
-};
+use crate::error::LatticeServiceError;
+use crate::framework::ServiceContextExt;
+use crate::rpc::{RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
+use crate::service::LatticeService;
 
 #[derive(Clone)]
 struct TestFactory;
@@ -580,9 +597,9 @@ impl RpcClientBinding for SecurityClientProbeBinding {
     fn build_default_core(
         _resolver: BoxRouteResolver,
         context_factory: RpcClientContextFactory,
-        _retry_policy: lattice_placement::RpcRetryPolicy,
-        _transport_security: lattice_rpc::RpcTransportSecurity,
-        _transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
+        _retry_policy: lattice_placement::route::RpcRetryPolicy,
+        _transport_security: lattice_rpc::security::RpcTransportSecurity,
+        _transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
         let ctx = context_factory.next_context(None);
         assert!(ctx.auth.is_some());
@@ -698,9 +715,9 @@ impl RpcClientBinding for TransportConfigProbeBinding {
     fn build_default_core(
         _resolver: BoxRouteResolver,
         _context_factory: RpcClientContextFactory,
-        _retry_policy: lattice_placement::RpcRetryPolicy,
-        _transport_security: lattice_rpc::RpcTransportSecurity,
-        transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
+        _retry_policy: lattice_placement::route::RpcRetryPolicy,
+        _transport_security: lattice_rpc::security::RpcTransportSecurity,
+        transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
         OBSERVED_RPC_CLIENT_STRIPES.store(
             transport_config.channels_per_endpoint().get(),
@@ -718,7 +735,7 @@ impl EndpointRpcTransport for FakeEndpointTransport {
     async fn unary<Req>(
         &self,
         _endpoint: EndpointLease,
-        _target: lattice_rpc::RouteTarget,
+        _target: RouteTarget,
         _route_key: &RouteKey,
         _metadata: tonic::metadata::MetadataMap,
         _request: Req,
@@ -754,9 +771,9 @@ impl RpcClientBinding for FakePlacementClientBinding {
     fn build_default_core(
         resolver: BoxRouteResolver,
         context_factory: RpcClientContextFactory,
-        retry_policy: lattice_placement::RpcRetryPolicy,
-        _transport_security: lattice_rpc::RpcTransportSecurity,
-        _transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
+        retry_policy: lattice_placement::route::RpcRetryPolicy,
+        _transport_security: lattice_rpc::security::RpcTransportSecurity,
+        _transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
         Some(
             ResolvingRpcCore::new(
@@ -790,9 +807,9 @@ impl RpcClientBinding for FakeSingletonClientBinding {
     fn build_default_core(
         resolver: BoxRouteResolver,
         context_factory: RpcClientContextFactory,
-        retry_policy: lattice_placement::RpcRetryPolicy,
-        _transport_security: lattice_rpc::RpcTransportSecurity,
-        _transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
+        retry_policy: lattice_placement::route::RpcRetryPolicy,
+        _transport_security: lattice_rpc::security::RpcTransportSecurity,
+        _transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
         Some(
             ResolvingRpcCore::new(
@@ -1047,8 +1064,10 @@ async fn registered_factory_activates_actor_once_and_can_retry_failures() {
     let registration = ActorRegistration::builder(actor_kind!("World"))
         .factory(TestFactory)
         .build();
-    let context_service =
-        lattice_core::ServiceContext::new(service_kind!("World"), InstanceId::new("world-1"));
+    let context_service = lattice_core::service_context::ServiceContext::new(
+        service_kind!("World"),
+        InstanceId::new("world-1"),
+    );
     let mut context = ServiceBuildContext::new(context_service);
     Box::new(registration).register(&mut context).unwrap();
     let registered = context.actor::<TestActor>(&actor_kind!("World")).unwrap();
@@ -1069,8 +1088,10 @@ async fn factory_activation_failure_does_not_leave_zombie_actor() {
             attempts: attempts.clone(),
         })
         .build();
-    let context_service =
-        lattice_core::ServiceContext::new(service_kind!("World"), InstanceId::new("world-1"));
+    let context_service = lattice_core::service_context::ServiceContext::new(
+        service_kind!("World"),
+        InstanceId::new("world-1"),
+    );
     let mut context = ServiceBuildContext::new(context_service);
     Box::new(registration).register(&mut context).unwrap();
     let registered = context.actor::<TestActor>(&actor_kind!("World")).unwrap();
@@ -1622,7 +1643,7 @@ async fn service_context_installs_direct_link_runtime_handle_for_connect() {
                 .unwrap();
             assert!(matches!(
                 open.target.target,
-                lattice_core::ActorRefTarget::Direct {
+                lattice_core::actor_ref::ActorRefTarget::Direct {
                     owner_epoch: Some(Epoch(3)),
                     ..
                 }
@@ -1630,7 +1651,7 @@ async fn service_context_installs_direct_link_runtime_handle_for_connect() {
             let ack = OpenLinkAck {
                 link_id: open.link_id.clone(),
                 source_to_target: NegotiatedDirection {
-                    direction: lattice_core::LinkDirection::SourceToTarget,
+                    direction: LinkDirection::SourceToTarget,
                     stream_name: open.source_to_target.stream_name,
                     accepted_message_type_ids: descriptor.accepted_message_ids(),
                     next_receive_sequence: LinkSequence(1),
@@ -1731,9 +1752,7 @@ async fn direct_link_connection_writes_open_link_reject_frames() {
                     source_to_target: OpenLinkDirection {
                         link_id: link_id.clone(),
                         stream_name: "unregistered".to_string(),
-                        supported_message_type_ids: [lattice_core::DirectLinkMessageId(1)]
-                            .into_iter()
-                            .collect(),
+                        supported_message_type_ids: [DirectLinkMessageId(1)].into_iter().collect(),
                     },
                     target_to_source: None,
                     options: DirectLinkOptions::default(),
@@ -1792,7 +1811,7 @@ async fn direct_link_connection_allows_target_to_source_outbound_session() {
     );
 
     let received = Arc::new(Mutex::new(Vec::new()));
-    let actor_handle = lattice_actor::ActorRuntime::default()
+    let actor_handle = ActorRuntime::default()
         .spawn_actor(
             DirectLinkTestActor {
                 received: received.clone(),
@@ -2150,7 +2169,7 @@ async fn direct_link_config_applies_rate_limits_to_session_manager() {
     session_manager
         .validate_message_frame(
             &link_id,
-            lattice_core::LinkDirection::SourceToTarget,
+            LinkDirection::SourceToTarget,
             message_id,
             LinkSequence(1),
         )
@@ -2159,7 +2178,7 @@ async fn direct_link_config_applies_rate_limits_to_session_manager() {
         session_manager
             .validate_message_frame(
                 &link_id,
-                lattice_core::LinkDirection::SourceToTarget,
+                LinkDirection::SourceToTarget,
                 message_id,
                 LinkSequence(2),
             )
@@ -2567,7 +2586,7 @@ async fn actor_idle_passivation_closes_active_direct_links_with_target_passivate
 }
 
 fn direct_actor_ref(
-    service_kind: lattice_core::ServiceKind,
+    service_kind: lattice_core::kind::ServiceKind,
     actor_kind: ActorKind,
     actor_id: ActorId,
     endpoint: http::Uri,

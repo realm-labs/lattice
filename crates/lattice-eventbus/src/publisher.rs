@@ -2,14 +2,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lattice_core::{ActorRef, InstanceId, ServiceKind, TraceContext};
-use lattice_rpc::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpcCore};
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
+use lattice_core::trace::TraceContext;
+use lattice_rpc::traits::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpcCore};
 use prost::Message as ProstMessage;
 
-use crate::{
-    EventBus, EventBusError, EventEnvelope, EventId, EventSubscription, EventSubscriptionHandle,
-    Subject,
-};
+use crate::error::EventBusError;
+use crate::local::{EventBus, EventSubscriptionHandle};
+use crate::types::{EventEnvelope, EventId, EventSubscription, Subject};
 
 #[derive(Debug, Clone)]
 pub struct EventPublisher<B> {

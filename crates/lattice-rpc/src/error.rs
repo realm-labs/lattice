@@ -1,4 +1,4 @@
-use lattice_core::{Epoch, RequestId};
+use lattice_core::actor_ref::{Epoch, RequestId};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RpcError {

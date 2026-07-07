@@ -1,5 +1,5 @@
-use crate::LatticeServiceError;
 use crate::context::ServiceBuildContext;
+use crate::error::LatticeServiceError;
 
 pub trait RpcServiceBinding: Send + Sync + 'static {
     fn service_name(&self) -> &'static str;
@@ -16,7 +16,7 @@ pub enum RpcClientPlacement {
 }
 
 pub trait RpcClientBinding: Send + Sync + 'static {
-    type Core: lattice_rpc::ShardedRpcCore + Clone + Send + Sync + 'static;
+    type Core: lattice_rpc::traits::ShardedRpcCore + Clone + Send + Sync + 'static;
     type Client: Send + Sync + 'static;
 
     const SERVICE_KIND: &'static str;
@@ -28,29 +28,29 @@ pub trait RpcClientBinding: Send + Sync + 'static {
     }
 
     fn build_default_core(
-        _resolver: lattice_placement::BoxRouteResolver,
-        _context_factory: lattice_rpc::RpcClientContextFactory,
-        _retry_policy: lattice_placement::RpcRetryPolicy,
-        _transport_security: lattice_rpc::RpcTransportSecurity,
-        _transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
+        _resolver: lattice_placement::route::BoxRouteResolver,
+        _context_factory: lattice_rpc::metadata::RpcClientContextFactory,
+        _retry_policy: lattice_placement::route::RpcRetryPolicy,
+        _transport_security: lattice_rpc::security::RpcTransportSecurity,
+        _transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
         None
     }
 }
 
 pub(crate) trait ErasedRpcClientBinding: Send + Sync + 'static {
-    fn service_kind(&self) -> lattice_core::ServiceKind;
+    fn service_kind(&self) -> lattice_core::kind::ServiceKind;
     fn core_type(&self) -> &'static str;
     fn placement(&self) -> RpcClientPlacement;
 
     fn register(
         self: Box<Self>,
-        service_context: &mut lattice_core::ServiceContextBuilder,
-        default_resolver: Option<lattice_placement::BoxRouteResolver>,
-        context_factory: lattice_rpc::RpcClientContextFactory,
-        retry_policy: lattice_placement::RpcRetryPolicy,
-        transport_security: lattice_rpc::RpcTransportSecurity,
-        transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
+        service_context: &mut lattice_core::service_context::ServiceContextBuilder,
+        default_resolver: Option<lattice_placement::route::BoxRouteResolver>,
+        context_factory: lattice_rpc::metadata::RpcClientContextFactory,
+        retry_policy: lattice_placement::route::RpcRetryPolicy,
+        transport_security: lattice_rpc::security::RpcTransportSecurity,
+        transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Result<(), LatticeServiceError>;
 }
 
@@ -70,8 +70,8 @@ impl<B> ErasedRpcClientBinding for RpcClientRegistration<B>
 where
     B: RpcClientBinding,
 {
-    fn service_kind(&self) -> lattice_core::ServiceKind {
-        lattice_core::ServiceKind::from_static(B::SERVICE_KIND)
+    fn service_kind(&self) -> lattice_core::kind::ServiceKind {
+        lattice_core::kind::ServiceKind::from_static(B::SERVICE_KIND)
     }
 
     fn core_type(&self) -> &'static str {
@@ -84,12 +84,12 @@ where
 
     fn register(
         self: Box<Self>,
-        service_context: &mut lattice_core::ServiceContextBuilder,
-        default_resolver: Option<lattice_placement::BoxRouteResolver>,
-        context_factory: lattice_rpc::RpcClientContextFactory,
-        retry_policy: lattice_placement::RpcRetryPolicy,
-        transport_security: lattice_rpc::RpcTransportSecurity,
-        transport_config: lattice_rpc::TonicEndpointChannelPoolConfig,
+        service_context: &mut lattice_core::service_context::ServiceContextBuilder,
+        default_resolver: Option<lattice_placement::route::BoxRouteResolver>,
+        context_factory: lattice_rpc::metadata::RpcClientContextFactory,
+        retry_policy: lattice_placement::route::RpcRetryPolicy,
+        transport_security: lattice_rpc::security::RpcTransportSecurity,
+        transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Result<(), LatticeServiceError> {
         let service_kind = self.service_kind();
         let core = service_context

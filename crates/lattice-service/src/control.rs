@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_core::{ActorId, ActorKind, Epoch};
-use lattice_placement::PlacementError;
+use lattice_core::actor_ref::Epoch;
+use lattice_core::id::ActorId;
+use lattice_core::kind::ActorKind;
 use lattice_placement::control::LogicControlHandler;
 use lattice_placement::coordinator::{
     PrepareVirtualShardMigrationRequest, VirtualShardMigrationOutcome,
 };
+use lattice_placement::error::PlacementError;
 use lattice_placement::store::{ActorPlacementKey, SingletonKey};
 
 use crate::actor::ErasedLogicActor;

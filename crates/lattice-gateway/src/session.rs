@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use crate::{ClientFrame, GatewayError};
+use crate::error::GatewayError;
+use crate::frame::ClientFrame;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GatewaySessionRef {

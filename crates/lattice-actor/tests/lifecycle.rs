@@ -2,15 +2,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::{ActorCallError, ActorError, ActorStopError};
+use lattice_actor::handle::ActorHandle;
+use lattice_actor::mailbox::MailboxConfig;
+use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions, PassivationPolicy, spawn_actor};
 use lattice_actor::traits::{
-    ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision,
+    Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
+    Message, PassivationReason, StopReason,
 };
 use lattice_actor::watch::{ActorTerminated, TerminatedReason};
-use lattice_actor::{
-    Actor, ActorCallError, ActorContext, ActorError, ActorHandle, ActorRuntime, ActorSpawnOptions,
-    Handler, MailboxConfig, Message, PassivationPolicy, PassivationReason, StopReason, spawn_actor,
-};
-use lattice_core::ServiceContext;
+use lattice_core::service_context::ServiceContext;
 use tokio::sync::{Mutex, Semaphore};
 
 #[tokio::test]
@@ -136,7 +138,7 @@ async fn local_child_actor_stops_with_parent_lifecycle() {
             &mut self,
             _ctx: &mut ActorContext<Self>,
             _reason: StopReason,
-        ) -> Result<(), lattice_actor::ActorStopError> {
+        ) -> Result<(), ActorStopError> {
             if let Some(stopped) = self.stopped.take() {
                 stopped.add_permits(1);
             }
@@ -265,7 +267,7 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
             &mut self,
             _ctx: &mut ActorContext<Self>,
             _reason: StopReason,
-        ) -> Result<(), lattice_actor::ActorStopError> {
+        ) -> Result<(), ActorStopError> {
             if let Some(stopped) = self.stopped.take() {
                 stopped.add_permits(1);
             }
@@ -449,8 +451,8 @@ async fn stopping_failure_enters_stop_failed_state() {
             &mut self,
             _ctx: &mut ActorContext<Self>,
             _reason: StopReason,
-        ) -> Result<(), lattice_actor::ActorStopError> {
-            Err(lattice_actor::ActorStopError::new("save failed"))
+        ) -> Result<(), ActorStopError> {
+            Err(ActorStopError::new("save failed"))
         }
     }
 
@@ -485,7 +487,7 @@ async fn passivation_policy_idle_timeout_stops_idle_actor() {
             &mut self,
             _ctx: &mut ActorContext<Self>,
             reason: StopReason,
-        ) -> Result<(), lattice_actor::ActorStopError> {
+        ) -> Result<(), ActorStopError> {
             assert_eq!(
                 reason,
                 StopReason::Passivated(PassivationReason::IdleTimeout)

@@ -2,12 +2,14 @@ use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use lattice_core::InstanceId;
+use lattice_core::instance::InstanceId;
+use lattice_placement::control::PlacementCoordinatorService;
 use lattice_placement::control::TonicLogicControl;
-use lattice_placement::control::{PlacementCoordinatorServer, PlacementCoordinatorService};
+use lattice_placement::control::proto::placement_coordinator_server::PlacementCoordinatorServer;
 use lattice_placement::coordinator::PlacementCoordinator;
+use lattice_placement::error::PlacementError;
 use lattice_placement::etcd::{EtcdPlacementStore, EtcdPlacementStoreConfig};
-use lattice_placement::{CoordinatorLeadership, PlacementStore};
+use lattice_placement::store::{CoordinatorLeadership, PlacementStore};
 use tonic::transport::Server;
 
 #[tokio::main]
@@ -66,7 +68,7 @@ async fn campaign_until_leader<S>(
     store: S,
     candidate_id: InstanceId,
     retry_interval: Duration,
-) -> Result<CoordinatorLeadership, lattice_placement::PlacementError>
+) -> Result<CoordinatorLeadership, PlacementError>
 where
     S: PlacementStore,
 {
@@ -84,7 +86,7 @@ where
 async fn keepalive_loop<S>(
     store: S,
     leadership: CoordinatorLeadership,
-) -> Result<(), lattice_placement::PlacementError>
+) -> Result<(), PlacementError>
 where
     S: PlacementStore,
 {

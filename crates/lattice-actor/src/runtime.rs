@@ -12,13 +12,16 @@ use tokio::sync::{broadcast, oneshot, watch};
 use tracing::{Instrument, debug, error, info};
 
 use crate::context::ActorContext;
+use crate::error::ActorSpawnError;
 use crate::handle::ActorHandle;
 use crate::mailbox::{ActorCommand, MailboxConfig, MailboxLane};
 use crate::traits::{Actor, ActorLifecycleState, PassivationReason, StopReason};
 use crate::watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason};
-use lattice_core::{
-    ActorId, ActorRef, DirectLinkLifecycleRuntimeHandle, LinkCloseReason, ServiceContext,
-};
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::direct_link::options::LinkCloseReason;
+use lattice_core::direct_link::runtime::DirectLinkLifecycleRuntimeHandle;
+use lattice_core::id::ActorId;
+use lattice_core::service_context::ServiceContext;
 
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -88,7 +91,7 @@ impl ActorRuntime {
         &self,
         actor: A,
         options: ActorSpawnOptions,
-    ) -> Result<ActorHandle<A>, crate::ActorSpawnError>
+    ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor,
     {
@@ -99,7 +102,7 @@ impl ActorRuntime {
         &self,
         actor: A,
         options: ActorSpawnOptions,
-    ) -> Result<ActorHandle<A>, crate::ActorSpawnError>
+    ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor,
     {
@@ -149,9 +152,9 @@ impl ActorScheduler {
     pub fn keyed_worker_index(
         actor_id: &ActorId,
         worker_count: usize,
-    ) -> Result<usize, crate::ActorSpawnError> {
+    ) -> Result<usize, ActorSpawnError> {
         if worker_count == 0 {
-            return Err(crate::ActorSpawnError::InvalidExecutionPolicy {
+            return Err(ActorSpawnError::InvalidExecutionPolicy {
                 reason: "KeyedWorkerPool worker_count must be greater than zero",
             });
         }
@@ -163,7 +166,7 @@ impl ActorScheduler {
         actor: A,
         options: ActorSpawnOptions,
         execution: ActorExecutionPolicy,
-    ) -> Result<ActorHandle<A>, crate::ActorSpawnError>
+    ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor,
     {
@@ -171,7 +174,7 @@ impl ActorScheduler {
             ActorExecutionPolicy::TaskPerActor => Ok(spawn_task_per_actor(actor, options)),
             ActorExecutionPolicy::KeyedWorkerPool { worker_count } => {
                 if worker_count == 0 {
-                    return Err(crate::ActorSpawnError::InvalidExecutionPolicy {
+                    return Err(ActorSpawnError::InvalidExecutionPolicy {
                         reason: "KeyedWorkerPool worker_count must be greater than zero",
                     });
                 }
@@ -179,7 +182,7 @@ impl ActorScheduler {
             }
             ActorExecutionPolicy::DedicatedThreadPool { worker_count } => {
                 if worker_count == 0 {
-                    return Err(crate::ActorSpawnError::InvalidExecutionPolicy {
+                    return Err(ActorSpawnError::InvalidExecutionPolicy {
                         reason: "DedicatedThreadPool worker_count must be greater than zero",
                     });
                 }
@@ -193,7 +196,7 @@ impl ActorScheduler {
         actor: A,
         options: ActorSpawnOptions,
         worker_count: usize,
-    ) -> Result<ActorHandle<A>, crate::ActorSpawnError>
+    ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor,
     {
@@ -225,7 +228,7 @@ impl ActorScheduler {
         actor: A,
         options: ActorSpawnOptions,
         worker_count: usize,
-    ) -> Result<ActorHandle<A>, crate::ActorSpawnError>
+    ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor,
     {
@@ -252,7 +255,7 @@ impl ActorScheduler {
     fn keyed_worker_pool(
         &self,
         worker_count: usize,
-    ) -> Result<Arc<ActorWorkerPool>, crate::ActorSpawnError> {
+    ) -> Result<Arc<ActorWorkerPool>, ActorSpawnError> {
         let mut pools = self
             .pools
             .keyed_workers
@@ -270,7 +273,7 @@ impl ActorScheduler {
     fn dedicated_worker_pool<A>(
         &self,
         worker_count: usize,
-    ) -> Result<Arc<ActorWorkerPool>, crate::ActorSpawnError>
+    ) -> Result<Arc<ActorWorkerPool>, ActorSpawnError>
     where
         A: Actor,
     {
@@ -321,7 +324,7 @@ struct ActorWorkerPool {
 }
 
 impl ActorWorkerPool {
-    fn start(kind: WorkerPoolKind, worker_count: usize) -> Result<Self, crate::ActorSpawnError> {
+    fn start(kind: WorkerPoolKind, worker_count: usize) -> Result<Self, ActorSpawnError> {
         let mut workers = Vec::with_capacity(worker_count);
         for worker_index in 0..worker_count {
             workers.push(ActorWorker::start(kind, worker_index)?);
@@ -368,7 +371,7 @@ struct ActorWorker {
 }
 
 impl ActorWorker {
-    fn start(kind: WorkerPoolKind, worker_index: usize) -> Result<Self, crate::ActorSpawnError> {
+    fn start(kind: WorkerPoolKind, worker_index: usize) -> Result<Self, ActorSpawnError> {
         let (handle_tx, handle_rx) = std_mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let join_handle = std::thread::Builder::new()
@@ -384,12 +387,12 @@ impl ActorWorker {
                     let _ = shutdown_rx.await;
                 });
             })
-            .map_err(|_| crate::ActorSpawnError::ExecutorStartFailed {
+            .map_err(|_| ActorSpawnError::ExecutorStartFailed {
                 reason: "failed to spawn actor worker thread",
             })?;
         let handle = handle_rx
             .recv()
-            .map_err(|_| crate::ActorSpawnError::ExecutorStartFailed {
+            .map_err(|_| ActorSpawnError::ExecutorStartFailed {
                 reason: "actor worker runtime stopped before publishing its handle",
             })?;
 

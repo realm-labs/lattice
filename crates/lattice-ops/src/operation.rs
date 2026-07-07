@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::OpsError;
+use crate::error::OpsError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct OperationId(String);

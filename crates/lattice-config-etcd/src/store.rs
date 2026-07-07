@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use lattice_config::{ConfigStore, ConfigStoreError, ConfigWatch};
-use lattice_core::ConfiguredComponent;
+use lattice_config::store::{ConfigStore, ConfigStoreError, ConfigWatch};
+use lattice_core::service_context::ConfiguredComponent;
 use std::fmt;
 
 use crate::client::{EtcdConfigClient, RealEtcdConfigClient};

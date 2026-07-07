@@ -5,7 +5,8 @@ pub mod multiprocess;
 pub mod topology;
 pub mod workload;
 
-use lattice_core::{ActorKind, ServiceKind, actor_kind, service_kind};
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_core::{actor_kind, service_kind};
 
 pub mod bench {
     tonic::include_proto!("bench");

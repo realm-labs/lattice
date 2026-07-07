@@ -3,13 +3,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::{ActorCallError, ActorError, ActorStopError};
+use lattice_actor::registry::ActorRegistry;
 use lattice_actor::registry::ActorRegistryConfig;
-use lattice_actor::traits::ActorLifecycleState;
-use lattice_actor::{
-    Actor, ActorCallError, ActorContext, ActorError, ActorRegistry, ActorStopError, Handler,
-    Message, PassivationReason,
+use lattice_actor::traits::{
+    Actor, ActorLifecycleState, Handler, Message, PassivationReason, StopReason,
 };
-use lattice_core::{ActorId, actor_kind};
+use lattice_core::actor_kind;
+use lattice_core::id::ActorId;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
@@ -26,7 +28,7 @@ impl Actor for PassivatingActor {
     async fn stopping(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        _reason: lattice_actor::StopReason,
+        _reason: StopReason,
     ) -> Result<(), ActorStopError> {
         self.stop_entered.add_permits(1);
         self.release_stop.acquire().await.unwrap().forget();

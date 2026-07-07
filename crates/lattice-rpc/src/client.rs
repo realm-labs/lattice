@@ -7,16 +7,19 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use http::Uri;
-use lattice_core::{ActorRef, Epoch, RequestId, RouteKey};
+use lattice_core::actor_ref::{ActorRef, Epoch, RequestId};
+use lattice_core::id::RouteKey;
 use tokio::sync::OnceCell;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 use tracing::{debug, warn};
 
+use crate::error::RpcError;
 use crate::metadata::RpcClientContextFactory;
 use crate::security::RpcTransportSecurity;
 use crate::traits::UnaryRpcTransport;
-use crate::{ActorRefRpcCore, RoutedEnvelope, RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
+use crate::traits::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpcCore};
+use crate::types::RoutedEnvelope;
 
 const DEFAULT_CHANNELS_PER_ENDPOINT: NonZeroUsize =
     NonZeroUsize::new(4).expect("default tonic channel stripe count is non-zero");

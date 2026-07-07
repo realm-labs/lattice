@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use lattice_core::{ActorId, ActorKind, ActorRef, ActorRefTarget, RouteKey, ServiceKind};
-use lattice_rpc::{
-    ActorRefRpcCore, RouteTarget, RoutedEnvelope, RoutedRequest, RpcClientContextFactory,
-    RpcContext, RpcError, RpcRequest, ShardedRpcCore,
-};
+use lattice_core::actor_ref::{ActorRef, ActorRefTarget};
+use lattice_core::id::{ActorId, RouteKey};
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_rpc::error::RpcError;
+use lattice_rpc::metadata::{RpcClientContextFactory, RpcContext};
+use lattice_rpc::traits::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpcCore};
+use lattice_rpc::types::{RouteTarget, RoutedEnvelope, RpcRoute};
 use tonic::Response;
 use tracing::{Instrument, debug, warn};
 
@@ -393,7 +395,7 @@ where
         target: RouteTarget,
         ctx: RpcContext,
         route_key: &RouteKey,
-        route: &lattice_rpc::RpcRoute,
+        route: &RpcRoute,
         req: Req,
     ) -> Result<Req::Reply, RpcError>
     where
@@ -560,7 +562,7 @@ where
         let mut metadata = tonic::metadata::MetadataMap::new();
         ctx.inject_metadata(&mut metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;
-        let route = lattice_rpc::RpcRoute::from_request(&req);
+        let route = RpcRoute::from_request(&req);
         route
             .inject_metadata(&mut metadata)
             .map_err(|error| RpcError::Business(error.to_string()))?;

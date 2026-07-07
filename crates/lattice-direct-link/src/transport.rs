@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use lattice_core::{DirectLinkEndpoint, LinkError};
+use lattice_core::direct_link::errors::LinkError;
+use lattice_core::direct_link::target::DirectLinkEndpoint;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, lookup_host};

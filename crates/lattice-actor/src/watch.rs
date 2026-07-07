@@ -1,4 +1,4 @@
-use crate::{Message, PassivationReason, StopReason};
+use crate::traits::{Message, PassivationReason, StopReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WatchId(u64);

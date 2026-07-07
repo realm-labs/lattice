@@ -11,18 +11,5 @@ pub mod static_resolver;
 pub mod store;
 pub mod vshard;
 
-pub use coordinator::PlacementRouteResolver;
-pub use endpoint::{EndpointLease, EndpointPool};
-pub use error::PlacementError;
-pub use route::{
-    BoxRouteResolver, DynRouteResolver, EndpointRpcTransport, InvalidateReason, ResolveRequest,
-    ResolvingActorRefRpcCore, ResolvingRpcCore, RouteCacheKey, RouteResolver, RpcRetryPolicy,
-};
-pub use static_resolver::{StaticPlacementConfig, StaticRouteRange, StaticRouteResolver};
-pub use store::{
-    CoordinatorLeadership, InMemoryPlacementStore, PlacementPrefix, PlacementStore,
-    VirtualShardPlacementKey, VirtualShardPlacementRecord,
-};
-
 #[cfg(test)]
 mod tests;

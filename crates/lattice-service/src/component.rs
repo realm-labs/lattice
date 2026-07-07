@@ -1,14 +1,16 @@
 use async_trait::async_trait;
-use lattice_config::BootstrapConfig;
+use lattice_config::bootstrap::BootstrapConfig;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ConfiguredComponentBuilder;
-use lattice_core::{ConfiguredComponent, InstanceId, ServiceContextBuilder, ServiceKind};
-use lattice_placement::PlacementError;
+use lattice_core::service_context::{ConfiguredComponent, ServiceContextBuilder};
 use lattice_placement::cache::RouteCacheConfig;
 use lattice_placement::control::TonicLogicControl;
 use lattice_placement::coordinator::{
     DrainReport, PlacementCoordinator, PlacementRouteResolver, PlacementWatchStarter,
     PlacementWatchTask,
 };
+use lattice_placement::error::PlacementError;
 use lattice_placement::instance::InstanceRecord;
 use lattice_placement::singleton::SingletonRouteResolver;
 use lattice_placement::store::{
@@ -16,7 +18,7 @@ use lattice_placement::store::{
     VirtualShardPlacementRecord,
 };
 
-use crate::LatticeServiceError;
+use crate::error::LatticeServiceError;
 use crate::framework::{
     ClusterEventBusComponent, ConfigStoreComponent, LocalEventBusComponent, PlacementStoreComponent,
 };
@@ -173,10 +175,22 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
     async fn placement_route_resolver(
         &self,
         service_kind: ServiceKind,
-    ) -> Result<(lattice_placement::BoxRouteResolver, PlacementWatchTask), PlacementError>;
+    ) -> Result<
+        (
+            lattice_placement::route::BoxRouteResolver,
+            PlacementWatchTask,
+        ),
+        PlacementError,
+    >;
     async fn singleton_route_resolver(
         &self,
-    ) -> Result<(lattice_placement::BoxRouteResolver, PlacementWatchTask), PlacementError>;
+    ) -> Result<
+        (
+            lattice_placement::route::BoxRouteResolver,
+            PlacementWatchTask,
+        ),
+        PlacementError,
+    >;
 }
 
 #[async_trait]
@@ -292,7 +306,13 @@ where
     async fn placement_route_resolver(
         &self,
         service_kind: ServiceKind,
-    ) -> Result<(lattice_placement::BoxRouteResolver, PlacementWatchTask), PlacementError> {
+    ) -> Result<
+        (
+            lattice_placement::route::BoxRouteResolver,
+            PlacementWatchTask,
+        ),
+        PlacementError,
+    > {
         let coordinator = PlacementCoordinator::new(self.store.clone(), TonicLogicControl);
         let resolver = PlacementRouteResolver::new(
             service_kind,
@@ -301,19 +321,28 @@ where
             RouteCacheConfig::default(),
         );
         let watch = resolver.start_placement_watch().await?;
-        Ok((lattice_placement::BoxRouteResolver::new(resolver), watch))
+        Ok((
+            lattice_placement::route::BoxRouteResolver::new(resolver),
+            watch,
+        ))
     }
 
     async fn singleton_route_resolver(
         &self,
-    ) -> Result<(lattice_placement::BoxRouteResolver, PlacementWatchTask), PlacementError> {
+    ) -> Result<
+        (
+            lattice_placement::route::BoxRouteResolver,
+            PlacementWatchTask,
+        ),
+        PlacementError,
+    > {
         let coordinator = lattice_placement::singleton::SingletonCoordinator::from_store(
             self.store.clone(),
             TonicLogicControl,
         );
         let resolver = SingletonRouteResolver::new(coordinator, RouteCacheConfig::default());
         Ok((
-            lattice_placement::BoxRouteResolver::new(resolver),
+            lattice_placement::route::BoxRouteResolver::new(resolver),
             PlacementWatchTask::noop(),
         ))
     }
@@ -383,7 +412,7 @@ where
 {
     pub(crate) fn cluster_event_bus<C>(component: C) -> Self
     where
-        T: lattice_eventbus::EventBus,
+        T: lattice_eventbus::local::EventBus,
         C: IntoServiceComponent<T>,
     {
         Self {
@@ -395,7 +424,7 @@ where
 
     pub(crate) fn local_event_bus<C>(component: C) -> Self
     where
-        T: lattice_eventbus::EventBus,
+        T: lattice_eventbus::local::EventBus,
         C: IntoServiceComponent<T>,
     {
         Self {
@@ -407,7 +436,7 @@ where
 
     pub(crate) fn config_store<C>(component: C) -> Self
     where
-        T: lattice_config::ConfigStore,
+        T: lattice_config::store::ConfigStore,
         C: IntoServiceComponent<T>,
     {
         Self {
@@ -434,7 +463,7 @@ fn insert_cluster_event_bus_component<T>(
     event_bus: T,
 ) -> Result<(), &'static str>
 where
-    T: lattice_eventbus::EventBus,
+    T: lattice_eventbus::local::EventBus,
 {
     service.insert_extension(ClusterEventBusComponent::new(event_bus))
 }
@@ -444,7 +473,7 @@ fn insert_local_event_bus_component<T>(
     event_bus: T,
 ) -> Result<(), &'static str>
 where
-    T: lattice_eventbus::EventBus,
+    T: lattice_eventbus::local::EventBus,
 {
     service.insert_extension(LocalEventBusComponent::new(event_bus))
 }
@@ -454,7 +483,7 @@ fn insert_config_store_component<T>(
     store: T,
 ) -> Result<(), &'static str>
 where
-    T: lattice_config::ConfigStore,
+    T: lattice_config::store::ConfigStore,
 {
     service.insert_extension(ConfigStoreComponent::new(store))
 }

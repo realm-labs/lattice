@@ -5,13 +5,21 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{ActorRef, ServiceContext, TraceContext};
+use crate::actor_ref::ActorRef;
+use crate::service_context::ServiceContext;
+use crate::trace::TraceContext;
 
-use super::{
-    DirectLinkMessage, DirectLinkMessageId, DirectLinkMetadata, DirectLinkMode, DirectLinkOptions,
-    DirectLinkStreamDescriptor, DirectLinkStreamSpec, DirectLinkStreamType, LinkCloseReason,
-    LinkDirection, LinkError, LinkId, LinkMessageFlags, LinkSendError, LinkTarget,
+use crate::direct_link::errors::{LinkError, LinkSendError};
+use crate::direct_link::ids::{DirectLinkMessageId, LinkId};
+use crate::direct_link::messages::LinkMessageFlags;
+use crate::direct_link::options::{
+    DirectLinkMode, DirectLinkOptions, LinkCloseReason, LinkDirection,
 };
+use crate::direct_link::stream::{
+    DirectLinkMessage, DirectLinkMetadata, DirectLinkStreamDescriptor, DirectLinkStreamSpec,
+    DirectLinkStreamType,
+};
+use crate::direct_link::target::LinkTarget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundDirectLinkMessage {

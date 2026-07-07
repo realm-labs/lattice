@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use lattice_core::{InstanceId, TraceContext, service_kind};
+use lattice_core::instance::InstanceId;
+use lattice_core::service_kind;
+use lattice_core::trace::TraceContext;
+use lattice_eventbus::local::EventBus;
 use lattice_eventbus::nats::{InMemoryNatsClient, InMemoryNatsEventBus};
-use lattice_eventbus::{
-    EventBus, EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter,
-};
+use lattice_eventbus::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
 use tokio::sync::Mutex;
 
 #[tokio::test]

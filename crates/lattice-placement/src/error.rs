@@ -1,4 +1,4 @@
-use lattice_core::InstanceId;
+use lattice_core::instance::InstanceId;
 
 use crate::instance::InstanceState;
 use crate::store::LeaseId;

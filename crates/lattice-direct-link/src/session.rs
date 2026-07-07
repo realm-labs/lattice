@@ -6,12 +6,17 @@ use std::time::{Duration, Instant};
 // together because the Phase 8 runtime surface is still being assembled. Split
 // the tests into integration fixtures once mailbox delivery and service wiring
 // expose stable public seams.
-use lattice_core::{
-    ActorKind, ActorRef, ActorRefTarget, BackpressurePolicy, DirectLinkMessage,
-    DirectLinkMessageId, DirectLinkMode, DirectLinkOptions, DirectLinkSender, DirectLinkSession,
-    DirectLinkStreamDescriptor, Epoch, InstanceId, LinkCloseReason, LinkClosed, LinkDirection,
-    LinkDirectionClosed, LinkError, LinkId, LinkOpened, LinkSequence, ServiceKind,
+use lattice_core::actor_ref::{ActorRef, ActorRefTarget, Epoch};
+use lattice_core::direct_link::errors::LinkError;
+use lattice_core::direct_link::ids::{DirectLinkMessageId, LinkId, LinkSequence};
+use lattice_core::direct_link::messages::{LinkClosed, LinkDirectionClosed, LinkOpened};
+use lattice_core::direct_link::options::{
+    BackpressurePolicy, DirectLinkMode, DirectLinkOptions, LinkCloseReason, LinkDirection,
 };
+use lattice_core::direct_link::runtime::{DirectLinkSender, DirectLinkSession};
+use lattice_core::direct_link::stream::{DirectLinkMessage, DirectLinkStreamDescriptor};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

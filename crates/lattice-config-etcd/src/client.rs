@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use etcd_client::{Client, EventType};
-use lattice_config::ConfigStoreError;
+use lattice_config::store::ConfigStoreError;
 use tokio::sync::watch;
 
 use crate::codec::etcd_error;

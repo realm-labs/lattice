@@ -1,5 +1,5 @@
-use lattice_core::{ActorKind, ServiceKind};
-use lattice_placement::PlacementError;
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_placement::error::PlacementError;
 use thiserror::Error;
 use tonic::transport::Error as TransportError;
 

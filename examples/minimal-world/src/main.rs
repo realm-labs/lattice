@@ -4,29 +4,32 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lattice_actor::registry::ActorCreateContext;
-use lattice_actor::{
-    Actor, ActorContext, ActorError, ActorFactory, Handler, MailboxConfig, Message,
-};
-use lattice_config::{ConfigSource, ConfigStore, LocalConfigStore};
-use lattice_core::{
-    ActorId, ActorKey, ActorKeyDecodeError, ActorKind, InstanceId, RouteKey, ServiceKind,
-    TraceContext, actor_kind, service_kind,
-};
-use lattice_eventbus::{
-    EventBus, EventEnvelope, EventPublisher, EventSubscription, LocalEventBus, Subject,
-    SubjectFilter,
-};
-use lattice_gateway::{BinaryClientCodec, ClientCodec, ClientFrame};
-use lattice_ops::ServiceScheduler;
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::ActorError;
+use lattice_actor::mailbox::MailboxConfig;
+use lattice_actor::registry::{ActorCreateContext, ActorFactory};
+use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_config::source::ConfigSource;
+use lattice_config::store::{ConfigStore, LocalConfigStore};
+use lattice_core::id::{ActorId, ActorKey, ActorKeyDecodeError, RouteKey};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_core::trace::TraceContext;
+use lattice_core::{actor_kind, service_kind};
+use lattice_eventbus::local::{EventBus, LocalEventBus};
+use lattice_eventbus::publisher::EventPublisher;
+use lattice_eventbus::types::{EventEnvelope, EventSubscription, Subject, SubjectFilter};
+use lattice_gateway::frame::{BinaryClientCodec, ClientCodec, ClientFrame};
 use lattice_ops::admin::{AdminSnapshot, ClusterSummary, NodeSummary};
+use lattice_ops::scheduler::ServiceScheduler;
 use lattice_ops::telemetry::{
     InMemoryTelemetryExporter, MetricSample, OpenTelemetryPipeline, TelemetryRecorder,
     TelemetryResource, TraceSpan, TraceSpanKind,
 };
-use lattice_placement::{InMemoryPlacementStore, PlacementPrefix};
-use lattice_rpc::Rpc;
-use lattice_service::{ActorRegistration, LatticeService};
+use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix};
+use lattice_rpc::types::Rpc;
+use lattice_service::actor::ActorRegistration;
+use lattice_service::service::LatticeService;
 use prost::Message as ProstMessage;
 use serde::Deserialize;
 use serde_json::json;

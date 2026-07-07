@@ -7,7 +7,11 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use http::Uri;
-use lattice_core::{ActorId, ActorKind, ActorRef, Epoch, InstanceId, ServiceContext, ServiceKind};
+use lattice_core::actor_ref::{ActorRef, Epoch};
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_core::service_context::ServiceContext;
 use tokio::sync::{Semaphore, watch};
 
 use crate::error::{ActorActivationError, ActorError};

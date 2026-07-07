@@ -1,10 +1,11 @@
-use super::*;
+use crate::protocol::*;
 use std::collections::BTreeSet;
 
-use lattice_core::{
-    ActorId, ActorKind, ActorRef, BackpressurePolicy, DirectLinkMode, DirectLinkOptions,
-    InstanceId, ServiceKind,
-};
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::direct_link::options::{BackpressurePolicy, DirectLinkMode, DirectLinkOptions};
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
 
 use crate::session::{
     DIRECT_LINK_PROTOCOL_VERSION, NegotiatedDirection, OpenLinkDirection, OpenLinkRejectReason,

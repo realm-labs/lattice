@@ -1,10 +1,14 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lattice_core::{InstanceId, ServiceContext};
-use lattice_placement::{InMemoryPlacementStore, PlacementPrefix, RpcRetryPolicy};
-use lattice_rpc::TonicEndpointChannelPoolConfig;
-use lattice_service::{ActorRegistration, LatticeService};
+use lattice_core::instance::InstanceId;
+use lattice_core::service_context::ServiceContext;
+use lattice_placement::route::RpcRetryPolicy;
+use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix};
+use lattice_rpc::client::TonicEndpointChannelPoolConfig;
+use lattice_service::actor::ActorRegistration;
+use lattice_service::error::LatticeServiceError;
+use lattice_service::service::LatticeService;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
@@ -82,7 +86,7 @@ struct BenchmarkTopologyInner {
     bench_client: Arc<BenchClient>,
     chain_client: Arc<ChainClient>,
     shutdowns: Mutex<Vec<oneshot::Sender<()>>>,
-    tasks: Mutex<Vec<JoinHandle<Result<(), lattice_service::LatticeServiceError>>>>,
+    tasks: Mutex<Vec<JoinHandle<Result<(), LatticeServiceError>>>>,
 }
 
 impl BenchmarkTopology {
@@ -161,7 +165,7 @@ impl BenchmarkTopology {
 struct StartedNode {
     context: ServiceContext,
     shutdown: oneshot::Sender<()>,
-    task: JoinHandle<Result<(), lattice_service::LatticeServiceError>>,
+    task: JoinHandle<Result<(), LatticeServiceError>>,
 }
 
 async fn start_bench_node(

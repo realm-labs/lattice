@@ -3,29 +3,34 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use lattice_core::actor_ref::Epoch;
+use lattice_core::id::{ActorId, RouteKey};
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::{ActorId, ActorKind, Epoch, InstanceId, RouteKey, actor_kind, service_kind};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ActorKind;
+use lattice_core::{actor_kind, service_kind};
 use lattice_placement::coordinator::{
     ActivateActorRequest, ExplicitRouteResolver, FailoverReport, NoopLogicControl,
     PlacementCoordinator,
 };
+use lattice_placement::endpoint::{EndpointLease, EndpointPool};
+use lattice_placement::error::PlacementError;
 use lattice_placement::etcd::{
     EtcdKv, EtcdPlacementStore, EtcdValue, EtcdWatch, InMemoryEtcdClient,
 };
 use lattice_placement::instance::{InstanceRecord, InstanceState};
+use lattice_placement::route::{
+    EndpointRpcTransport, ResolveRequest, ResolvingRpcCore, RouteResolver,
+};
 use lattice_placement::singleton::{SingletonCoordinator, SingletonRouteResolver};
 use lattice_placement::store::{
     ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
     PlacementState, PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
 };
-use lattice_placement::{
-    EndpointLease, EndpointPool, EndpointRpcTransport, PlacementError, ResolveRequest,
-    ResolvingRpcCore, RouteResolver,
-};
-use lattice_rpc::{
-    RouteTarget, RoutedRequest, RpcClientContextFactory, RpcContext, RpcError, RpcRequest,
-    ShardedRpcCore,
-};
+use lattice_rpc::error::RpcError;
+use lattice_rpc::metadata::{RpcClientContextFactory, RpcContext};
+use lattice_rpc::traits::{RoutedRequest, RpcRequest, ShardedRpcCore};
+use lattice_rpc::types::RouteTarget;
 use tokio::sync::Semaphore;
 use tonic::Response;
 

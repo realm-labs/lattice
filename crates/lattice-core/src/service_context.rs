@@ -7,11 +7,13 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use lattice_config::{BootstrapConfig, ConfigError};
+use lattice_config::bootstrap::BootstrapConfig;
+use lattice_config::error::ConfigError;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
-use crate::{InstanceId, ServiceKind};
+use crate::instance::InstanceId;
+use crate::kind::ServiceKind;
 
 type ComponentFuture<T> = Pin<Box<dyn Future<Output = Result<T, ServiceComponentError>> + Send>>;
 type ComponentBuildFn<T> = dyn Fn(BootstrapConfig) -> ComponentFuture<T> + Send + Sync;

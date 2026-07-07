@@ -3,18 +3,19 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use lattice_actor::Actor;
 use lattice_actor::registry::ActorRefConfig;
-use lattice_core::{ActorKind, ServiceContext};
-use lattice_rpc::{RpcServerSecurity, RpcTransportSecurity};
+use lattice_actor::traits::Actor;
+use lattice_core::kind::ActorKind;
+use lattice_core::service_context::ServiceContext;
+use lattice_rpc::security::{RpcServerSecurity, RpcTransportSecurity};
 use tonic::body::Body;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
 use tonic::transport::Server;
 use tonic::transport::server::Router;
 
-use crate::LatticeServiceError;
 use crate::actor::{ErasedLogicActor, RegisteredActor};
+use crate::error::LatticeServiceError;
 
 pub struct ServiceBuildContext {
     service: ServiceContext,

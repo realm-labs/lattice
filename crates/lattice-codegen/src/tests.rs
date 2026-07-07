@@ -1,8 +1,10 @@
 use super::*;
 use std::collections::BTreeSet;
 
+use crate::builder::configure;
 use crate::descriptor::methods_from_descriptor;
 use crate::descriptor::{messages_from_descriptor, messages_from_descriptor_for_files};
+use crate::error::CodegenError;
 use crate::render::generate_rpc_bindings;
 use crate::route_key::{ProtoRouteKeyOption, RouteKeyType};
 use crate::spec::{GeneratedDirectLinkMessageSpec, GeneratedDirectLinkStreamSpec, RpcMethodSpec};
@@ -54,26 +56,24 @@ fn generated_output_matches_phase_two_shape() {
     assert!(generated.rust.contains("singleton route epoch mismatch"));
     assert!(generated.rust.contains("type Core = C;"));
     assert!(generated.rust.contains("type Client = Client<C>;"));
-    assert!(
-        generated
-            .rust
-            .contains("lattice_placement::ResolvingRpcCore<lattice_placement::BoxRouteResolver")
-    );
+    assert!(generated.rust.contains(
+        "lattice_placement::route::ResolvingRpcCore<lattice_placement::route::BoxRouteResolver"
+    ));
     assert!(generated.rust.contains("fn build_default_core("));
     assert!(
         generated
             .rust
-            .contains("retry_policy: lattice_placement::RpcRetryPolicy")
+            .contains("retry_policy: lattice_placement::route::RpcRetryPolicy")
     );
     assert!(
         generated
             .rust
-            .contains("transport_security: lattice_rpc::RpcTransportSecurity")
+            .contains("transport_security: lattice_rpc::security::RpcTransportSecurity")
     );
     assert!(
         generated
             .rust
-            .contains("transport_config: lattice_rpc::TonicEndpointChannelPoolConfig")
+            .contains("transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig")
     );
     assert!(
         generated
@@ -161,9 +161,9 @@ fn generated_output_matches_phase_two_shape() {
             .contains("downcast_ref::<crate::world::EnterWorldRequest>()")
     );
     assert!(
-        generated
-            .rust
-            .contains("let request_id = lattice_rpc::RpcContext::from_metadata(&metadata)")
+        generated.rust.contains(
+            "let request_id = lattice_rpc::metadata::RpcContext::from_metadata(&metadata)"
+        )
     );
     assert!(
         generated
@@ -192,7 +192,7 @@ fn generated_output_matches_phase_two_shape() {
     assert!(
         generated
             .rust
-            .contains("pub async fn dispatch_with_context<R>(&self, frame: ClientFrame, router: &mut R, context: &lattice_gateway::GatewayRouteContext)")
+            .contains("pub async fn dispatch_with_context<R>(&self, frame: ClientFrame, router: &mut R, context: &lattice_gateway::route::GatewayRouteContext)")
     );
 }
 
@@ -209,7 +209,7 @@ fn descriptor_messages_generate_direct_link_message_metadata() {
     assert!(
         generated
             .rust
-            .contains("impl lattice_core::DirectLinkMessage for crate::world::EnterWorldRequest")
+            .contains("impl lattice_core::direct_link::stream::DirectLinkMessage for crate::world::EnterWorldRequest")
     );
     assert!(
         generated
@@ -219,7 +219,7 @@ fn descriptor_messages_generate_direct_link_message_metadata() {
     assert!(
         generated
             .rust
-            .contains("impl lattice_core::DirectLinkMessage for crate::world::EnterWorldReply")
+            .contains("impl lattice_core::direct_link::stream::DirectLinkMessage for crate::world::EnterWorldReply")
     );
 }
 
@@ -248,7 +248,7 @@ fn direct_link_message_metadata_ignores_descriptor_dependencies_not_compiled_int
     assert!(
         generated
             .rust
-            .contains("impl lattice_core::DirectLinkMessage for crate::world::EnterWorldRequest")
+            .contains("impl lattice_core::direct_link::stream::DirectLinkMessage for crate::world::EnterWorldRequest")
     );
     assert!(!generated.rust.contains("crate::google::protobuf"));
 }
@@ -264,7 +264,7 @@ fn descriptor_messages_resolve_nested_prost_type_paths() {
     .unwrap();
 
     assert!(generated.rust.contains(
-        "impl lattice_core::DirectLinkMessage for crate::world::envelope::EnterWorldRequest"
+        "impl lattice_core::direct_link::stream::DirectLinkMessage for crate::world::envelope::EnterWorldRequest"
     ));
     assert!(
         generated
@@ -272,7 +272,7 @@ fn descriptor_messages_resolve_nested_prost_type_paths() {
             .contains("const PROTO_FULL_NAME: &'static str = \"world.Envelope.EnterWorldRequest\"")
     );
     assert!(generated.rust.contains(
-        "impl lattice_core::DirectLinkMessage for crate::world::envelope::EnterWorldReply"
+        "impl lattice_core::direct_link::stream::DirectLinkMessage for crate::world::envelope::EnterWorldReply"
     ));
 }
 
@@ -305,10 +305,10 @@ fn direct_link_stream_codegen_uses_static_match_dispatch() {
     assert!(
         generated
             .rust
-            .contains("pub fn bind<A>(actor_kind: lattice_core::ActorKind)")
+            .contains("pub fn bind<A>(actor_kind: lattice_core::kind::ActorKind)")
     );
     assert!(generated.rust.contains(
-        "A: lattice_actor::Actor + lattice_actor::Handler<lattice_core::Linked<crate::world::EnterWorldRequest, ()>> + lattice_actor::Handler<lattice_core::Linked<crate::world::MoveWorldRequest, ()>>,"
+        "A: lattice_actor::traits::Actor + lattice_actor::traits::Handler<lattice_core::direct_link::messages::Linked<crate::world::EnterWorldRequest, ()>> + lattice_actor::traits::Handler<lattice_core::direct_link::messages::Linked<crate::world::MoveWorldRequest, ()>>,"
     ));
     assert!(
         generated.rust.contains(
@@ -353,28 +353,24 @@ fn direct_link_bidirectional_codegen_keeps_direction_handler_bounds_separate() {
         .nth(1)
         .and_then(|source| source.split("pub mod client_player_response").next())
         .expect("request stream module");
-    assert!(
-        request_module
-            .contains("Handler<lattice_core::Linked<crate::world::EnterWorldRequest, ()>>")
-    );
-    assert!(
-        !request_module
-            .contains("Handler<lattice_core::Linked<crate::world::EnterWorldReply, ()>>")
-    );
+    assert!(request_module.contains(
+        "Handler<lattice_core::direct_link::messages::Linked<crate::world::EnterWorldRequest, ()>>"
+    ));
+    assert!(!request_module.contains(
+        "Handler<lattice_core::direct_link::messages::Linked<crate::world::EnterWorldReply, ()>>"
+    ));
 
     let response_module = generated
         .rust
         .split("pub mod client_player_response")
         .nth(1)
         .expect("response stream module");
-    assert!(
-        response_module
-            .contains("Handler<lattice_core::Linked<crate::world::EnterWorldReply, ()>>")
-    );
-    assert!(
-        !response_module
-            .contains("Handler<lattice_core::Linked<crate::world::EnterWorldRequest, ()>>")
-    );
+    assert!(response_module.contains(
+        "Handler<lattice_core::direct_link::messages::Linked<crate::world::EnterWorldReply, ()>>"
+    ));
+    assert!(!response_module.contains(
+        "Handler<lattice_core::direct_link::messages::Linked<crate::world::EnterWorldRequest, ()>>"
+    ));
 }
 
 #[test]
@@ -402,7 +398,7 @@ fn direct_link_stream_codegen_supports_typed_metadata() {
         )
     );
     assert!(generated.rust.contains(
-        "Handler<lattice_core::Linked<crate::world::EnterWorldRequest, crate::direct_link::ClientRequestContext>>"
+        "Handler<lattice_core::direct_link::messages::Linked<crate::world::EnterWorldRequest, crate::direct_link::ClientRequestContext>>"
     ));
     assert!(generated.rust.contains(
         "impl<A> lattice_direct_link::delivery::DirectLinkDispatch<A, crate::direct_link::ClientRequestContext> for Stream"

@@ -1,4 +1,4 @@
-use lattice_config::ConfigStoreError;
+use lattice_config::store::ConfigStoreError;
 
 pub(crate) fn encode_value(value: &serde_json::Value) -> Result<Vec<u8>, ConfigStoreError> {
     serde_json::to_vec(value).map_err(codec_error)

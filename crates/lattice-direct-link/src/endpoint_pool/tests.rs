@@ -1,13 +1,17 @@
-use super::*;
+use crate::endpoint_pool::*;
 
 use std::collections::BTreeSet;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicUsize;
 
-use lattice_core::{
-    ActorId, DirectLinkMessageDescriptor, DirectLinkMessageId, DirectLinkMode, DirectLinkOptions,
-    DirectLinkStreamDescriptor, InstanceId, LinkMessageFlags, actor_kind, service_kind,
-};
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::direct_link::ids::DirectLinkMessageId;
+use lattice_core::direct_link::messages::LinkMessageFlags;
+use lattice_core::direct_link::options::{DirectLinkMode, DirectLinkOptions};
+use lattice_core::direct_link::stream::{DirectLinkMessageDescriptor, DirectLinkStreamDescriptor};
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_core::{actor_kind, service_kind};
 
 #[derive(Debug, Default)]
 struct RecordingLifecycle {
@@ -159,8 +163,8 @@ fn stream() -> DirectLinkStreamDescriptor {
     }
 }
 
-fn actor_ref(actor_id: u64) -> lattice_core::ActorRef {
-    lattice_core::ActorRef::direct(
+fn actor_ref(actor_id: u64) -> ActorRef {
+    ActorRef::direct(
         service_kind!("Battle"),
         actor_kind!("BattleActor"),
         ActorId::U64(actor_id),

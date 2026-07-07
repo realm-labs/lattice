@@ -1,11 +1,12 @@
-use lattice_core::InstanceId;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
 use lattice_placement::cache::RouteCacheConfig;
 use lattice_placement::control::TonicLogicControl;
 use lattice_placement::coordinator::{PlacementCoordinator, PlacementRouteResolver};
-use lattice_placement::{
-    EndpointPool, InMemoryPlacementStore, ResolvingActorRefRpcCore, ResolvingRpcCore,
-};
-use lattice_rpc::RpcClientContextFactory;
+use lattice_placement::endpoint::EndpointPool;
+use lattice_placement::route::{ResolvingActorRefRpcCore, ResolvingRpcCore};
+use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix};
+use lattice_rpc::metadata::RpcClientContextFactory;
 
 use crate::generated::GeneratedTonicEndpointTransport;
 use crate::{GATEWAY_SERVICE, PLAYER_SERVICE, WORLD_SERVICE};
@@ -20,9 +21,7 @@ pub type DemoActorRefRpcCore = ResolvingActorRefRpcCore<
 >;
 
 pub fn local_placement_store() -> InMemoryPlacementStore {
-    InMemoryPlacementStore::new(lattice_placement::PlacementPrefix::new(
-        "/lattice/distributed-login",
-    ))
+    InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/distributed-login"))
 }
 
 pub fn world_core(store: InMemoryPlacementStore, source_instance: InstanceId) -> DemoRpcCore {
@@ -34,7 +33,7 @@ pub fn player_core(store: InMemoryPlacementStore, source_instance: InstanceId) -
 }
 
 pub fn actor_ref_core(
-    source_service: lattice_core::ServiceKind,
+    source_service: ServiceKind,
     source_instance: InstanceId,
     store: InMemoryPlacementStore,
 ) -> DemoActorRefRpcCore {
@@ -53,8 +52,8 @@ pub fn actor_ref_core(
 }
 
 fn rpc_core(
-    service_kind: lattice_core::ServiceKind,
-    source_service: lattice_core::ServiceKind,
+    service_kind: ServiceKind,
+    source_service: ServiceKind,
     source_instance: InstanceId,
     store: InMemoryPlacementStore,
 ) -> DemoRpcCore {

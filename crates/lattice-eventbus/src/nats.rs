@@ -6,15 +6,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use async_nats::jetstream;
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use lattice_core::ConfiguredComponent;
+use lattice_core::service_context::ConfiguredComponent;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{Instrument, warn};
 
-use crate::local::EventHandler;
-use crate::{
-    EventBus, EventBusError, EventEnvelope, EventId, EventSubscription, EventSubscriptionHandle,
-};
+use crate::error::EventBusError;
+use crate::local::{EventBus, EventHandler, EventSubscriptionHandle};
+use crate::types::{EventEnvelope, EventId, EventSubscription};
 
 #[derive(Debug, Clone)]
 pub struct NatsEventBus {
@@ -412,11 +411,13 @@ async fn deliver_if_needed(
 mod tests {
     use std::sync::Arc;
 
-    use lattice_core::{InstanceId, TraceContext, service_kind};
+    use lattice_core::instance::InstanceId;
+    use lattice_core::service_kind;
+    use lattice_core::trace::TraceContext;
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::{EventEnvelope, Subject, SubjectFilter};
+    use crate::types::{EventEnvelope, EventId, Subject, SubjectFilter};
 
     #[tokio::test]
     async fn in_memory_nats_subscriber_replays_unseen_stream_events() {
@@ -493,7 +494,7 @@ mod tests {
 
     fn test_event(event_id: &str) -> EventEnvelope {
         EventEnvelope {
-            event_id: crate::EventId::new(event_id),
+            event_id: EventId::new(event_id),
             subject: Subject::new("game.world.player_entered"),
             event_type: "PlayerEntered".to_string(),
             source_service: service_kind!("World"),

@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
 
-use super::{DirectLinkMessageId, LinkMetadataError};
+use crate::direct_link::errors::LinkMetadataError;
+use crate::direct_link::ids::DirectLinkMessageId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectLinkMessageDescriptor {

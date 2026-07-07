@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::ConfigError;
+use crate::error::ConfigError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFormat {

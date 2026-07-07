@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_actor::runtime::{ActorExecutionPolicy, ActorScheduler};
-use lattice_actor::{
-    Actor, ActorContext, ActorError, ActorRuntime, ActorSpawnError, ActorSpawnOptions, Handler,
-    MailboxConfig, Message, PassivationPolicy,
-};
-use lattice_core::{ActorId, ServiceContext};
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::{ActorError, ActorSpawnError};
+use lattice_actor::mailbox::MailboxConfig;
+use lattice_actor::runtime::{ActorExecutionPolicy, ActorScheduler, PassivationPolicy};
+use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
+use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_core::id::ActorId;
+use lattice_core::service_context::ServiceContext;
 use tokio::sync::Mutex;
 
 #[derive(Debug)]

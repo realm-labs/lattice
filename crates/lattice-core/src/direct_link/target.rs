@@ -1,7 +1,7 @@
 use http::Uri;
 use serde::{Deserialize, Serialize};
 
-use crate::ActorRef;
+use crate::actor_ref::ActorRef;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectLinkEndpoint {

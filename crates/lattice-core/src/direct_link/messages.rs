@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-use crate::ActorRef;
+use crate::actor_ref::ActorRef;
 
-use super::{
-    BackpressurePolicy, DirectLinkMessageId, DirectLinkMode, LinkCloseReason, LinkDirection,
-    LinkId, LinkSequence,
+use crate::direct_link::ids::{DirectLinkMessageId, LinkId, LinkSequence};
+use crate::direct_link::options::{
+    BackpressurePolicy, DirectLinkMode, LinkCloseReason, LinkDirection,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

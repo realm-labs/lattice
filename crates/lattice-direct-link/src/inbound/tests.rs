@@ -1,20 +1,35 @@
-use super::*;
+use crate::inbound::*;
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use lattice_actor::{
-    ActorContext, ActorRuntime, ActorSpawnOptions, ActorTellError, Handler, MailboxConfig,
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::ActorTellError;
+use lattice_actor::mailbox::MailboxConfig;
+use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
+use lattice_actor::traits::{Actor, Handler};
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::direct_link::errors::{LinkError, LinkSendError};
+use lattice_core::direct_link::ids::{DirectLinkMessageId, LinkId, LinkSequence};
+use lattice_core::direct_link::messages::{
+    LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened, Linked,
 };
-use lattice_core::{
-    ActorId, ActorKind, ActorRef, BackpressurePolicy, DirectLinkMessage, DirectLinkMode,
-    DirectLinkOptions, DirectLinkRuntime, DirectLinkRuntimeHandle, DirectLinkSender,
-    DirectLinkSession, DirectLinkStreamDescriptor, DirectLinkStreamType, InstanceId,
-    LinkBackpressure, LinkCloseReason, LinkClosed, LinkDirection, LinkDirectionClosed, LinkError,
-    LinkId, LinkOpened, LinkSendError, LinkSequence, Linked, OutboundDirectLinkMessage,
-    ServiceContext, ServiceKind, actor_kind, service_kind,
+use lattice_core::direct_link::options::{
+    BackpressurePolicy, DirectLinkMode, DirectLinkOptions, LinkCloseReason, LinkDirection,
 };
+use lattice_core::direct_link::runtime::{
+    DirectLinkOpenRequest, DirectLinkRuntime, DirectLinkRuntimeHandle, DirectLinkSender,
+    DirectLinkSession, OutboundDirectLinkMessage,
+};
+use lattice_core::direct_link::stream::{
+    DirectLinkMessage, DirectLinkStreamDescriptor, DirectLinkStreamType,
+};
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_core::service_context::ServiceContext;
+use lattice_core::{actor_kind, service_kind};
 use prost::Message as _;
 use std::time::Instant;
 
@@ -53,7 +68,7 @@ struct BattleActor {
 }
 
 #[async_trait]
-impl lattice_actor::Actor for BattleActor {
+impl Actor for BattleActor {
     type Error = Infallible;
 }
 
@@ -136,7 +151,7 @@ struct GatewayActor {
 }
 
 #[async_trait]
-impl lattice_actor::Actor for GatewayActor {
+impl Actor for GatewayActor {
     type Error = Infallible;
 }
 
@@ -209,7 +224,7 @@ struct RecordingLinkRuntime {
 impl DirectLinkRuntime for RecordingLinkRuntime {
     async fn open_link(
         &self,
-        _request: lattice_core::DirectLinkOpenRequest,
+        _request: DirectLinkOpenRequest,
     ) -> Result<DirectLinkSession, LinkError> {
         Err(LinkError::Protocol(
             "open_link is not used by this test".to_string(),
@@ -234,11 +249,7 @@ impl DirectLinkRuntime for RecordingLinkRuntime {
         })
     }
 
-    async fn close_all(
-        &self,
-        _link_id: LinkId,
-        _reason: lattice_core::LinkCloseReason,
-    ) -> Result<(), LinkError> {
+    async fn close_all(&self, _link_id: LinkId, _reason: LinkCloseReason) -> Result<(), LinkError> {
         Ok(())
     }
 }
@@ -262,7 +273,7 @@ impl DirectLinkSender for RecordingLinkSender {
         Ok(())
     }
 
-    async fn close(&self, _reason: lattice_core::LinkCloseReason) -> Result<(), LinkSendError> {
+    async fn close(&self, _reason: LinkCloseReason) -> Result<(), LinkSendError> {
         Ok(())
     }
 }
@@ -286,7 +297,7 @@ struct OpeningBattleActor {
 }
 
 #[async_trait]
-impl lattice_actor::Actor for OpeningBattleActor {
+impl Actor for OpeningBattleActor {
     type Error = Infallible;
 }
 
@@ -365,7 +376,7 @@ struct ClosingActor {
 }
 
 #[async_trait]
-impl lattice_actor::Actor for ClosingActor {
+impl Actor for ClosingActor {
     type Error = Infallible;
 }
 
@@ -451,7 +462,7 @@ struct BackpressureActor {
 }
 
 #[async_trait]
-impl lattice_actor::Actor for BackpressureActor {
+impl Actor for BackpressureActor {
     type Error = Infallible;
 }
 
@@ -533,7 +544,7 @@ struct BlockingActor {
 }
 
 #[async_trait]
-impl lattice_actor::Actor for BlockingActor {
+impl Actor for BlockingActor {
     type Error = Infallible;
 }
 

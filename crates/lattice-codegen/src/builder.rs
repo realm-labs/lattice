@@ -8,9 +8,10 @@ use prost_types::FileDescriptorSet;
 use crate::descriptor::{
     messages_from_descriptor_for_files, methods_from_descriptor, parse_proto_options,
 };
+use crate::error::CodegenError;
+use crate::proto_include;
 use crate::render::{RenderOptions, generate_rpc_bindings_with_direct_link_streams};
 use crate::spec::GeneratedDirectLinkStreamSpec;
-use crate::{CodegenError, proto_include};
 
 #[derive(Debug, Clone)]
 pub struct LatticeCodegenBuilder {

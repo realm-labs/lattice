@@ -6,11 +6,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::http::HeaderMap;
 
+use lattice_core::actor_ref::Epoch;
+use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::{ActorId, Epoch, InstanceId, TraceContext, actor_kind, service_kind};
-use lattice_eventbus::{
-    EventBus, EventEnvelope, EventId, EventSubscription, LocalEventBus, Subject, SubjectFilter,
-};
+use lattice_core::instance::InstanceId;
+use lattice_core::trace::TraceContext;
+use lattice_core::{actor_kind, service_kind};
+use lattice_eventbus::local::{EventBus, LocalEventBus};
+use lattice_eventbus::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
 use lattice_placement::coordinator::{NoopLogicControl, PlacementCoordinator};
 use lattice_placement::instance::{InstanceRecord, InstanceState};
 use lattice_placement::store::{
@@ -20,15 +23,19 @@ use lattice_placement::store::{
 use lattice_placement::vshard::VirtualShardId;
 use serde_json::json;
 
-use super::*;
 use crate::admin::{
     AdminApiError, AdminAuth, AdminHttpAdapter, AdminSnapshot, ClusterInspector, ClusterSummary,
     HttpNodeInspectorClient, InspectionView, InstanceView, NodeInspectView, NodeInspectorClient,
     NodeSummary, PageRequest, paginate,
 };
+use crate::error::OpsError;
 use crate::operation::{OperationId, OperationStatus, OperationTracker};
+use crate::ops_config::TelemetryConfig;
 use crate::outbox::{OutboxEvent, OutboxEventId, TransactionalOutbox};
-use crate::shutdown::{InMemoryShutdownLeaseController, LeaseEvent, ShutdownStage};
+use crate::scheduler::ServiceScheduler;
+use crate::shutdown::{
+    GracefulShutdown, InMemoryShutdownLeaseController, LeaseEvent, ShutdownStage, ShutdownTrigger,
+};
 use crate::telemetry::{
     InMemoryTelemetryExporter, MetricSample, TelemetryRecorder, TraceSpan, TraceSpanKind,
 };

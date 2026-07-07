@@ -1,7 +1,11 @@
 use async_trait::async_trait;
-use lattice_actor::{Actor, ActorError, Handler};
-use lattice_core::{ActorKind, RouteKey, actor_kind};
-use lattice_rpc::{Rpc, RpcRequest, RoutedRequest};
+use lattice_actor::error::ActorError;
+use lattice_actor::traits::{Actor, Handler};
+use lattice_core::actor_kind;
+use lattice_core::id::RouteKey;
+use lattice_core::kind::ActorKind;
+use lattice_rpc::traits::{RoutedRequest, RpcRequest};
+use lattice_rpc::types::Rpc;
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct EnterWorldRequest {

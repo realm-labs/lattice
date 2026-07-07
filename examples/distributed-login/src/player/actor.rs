@@ -1,10 +1,16 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::ActorError;
 use lattice_actor::registry::ActorCreateContext;
-use lattice_actor::{Actor, ActorContext, ActorError, ActorFactory, Handler};
-use lattice_core::{ActorId, ActorRef};
-use lattice_rpc::{ActorRefRpcClient, Rpc};
+use lattice_actor::registry::ActorFactory;
+use lattice_actor::traits::{Actor, Handler};
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::id::ActorId;
+use lattice_rpc::client::ActorRefRpcClient;
+use lattice_rpc::error::RpcError;
+use lattice_rpc::types::Rpc;
 use prost::Message as ProstMessage;
 
 use crate::LOGIN_MSG_ID;
@@ -88,7 +94,7 @@ impl Handler<Rpc<InitSessionRequest>> for PlayerActor {
             .gateway_session
             .ok_or_else(|| ActorError::new("missing gateway session actor ref"))?
             .try_into()
-            .map_err(|error: lattice_rpc::RpcError| ActorError::new(error.to_string()))?;
+            .map_err(|error: RpcError| ActorError::new(error.to_string()))?;
         let push = self
             .push_login_reply(
                 gateway_session,

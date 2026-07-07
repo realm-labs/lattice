@@ -3,7 +3,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::bootstrap::BootstrapConfig;
-use crate::{ConfigError, ConfigFormat};
+use crate::error::ConfigError;
+use crate::format::ConfigFormat;
 
 #[derive(Debug, Clone)]
 pub enum ConfigSource {

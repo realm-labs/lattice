@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 
-use lattice_core::{ActorId, ActorKind, Epoch, InstanceId};
+use lattice_core::actor_ref::Epoch;
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ActorKind;
 use tokio::sync::mpsc;
 
-use crate::PassivationReason;
+use crate::traits::PassivationReason;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RemoteActorRef {
@@ -82,9 +85,12 @@ impl RemoteWatchEvent {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::{ActorId, Epoch, InstanceId, actor_kind};
+    use lattice_core::actor_kind;
+    use lattice_core::actor_ref::Epoch;
+    use lattice_core::id::ActorId;
+    use lattice_core::instance::InstanceId;
 
-    use super::*;
+    use crate::remote_watch::*;
 
     #[tokio::test]
     async fn remote_watch_delivers_migration_and_fence_notifications_by_epoch() {

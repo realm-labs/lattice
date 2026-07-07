@@ -2,15 +2,17 @@ mod actor;
 
 use std::net::SocketAddr;
 
-use lattice_core::InstanceId;
-use lattice_placement::InMemoryPlacementStore;
-use lattice_service::{ActorRegistration, LatticeService};
+use lattice_core::instance::InstanceId;
+use lattice_placement::store::InMemoryPlacementStore;
+use lattice_service::actor::ActorRegistration;
+use lattice_service::service::LatticeService;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+use crate::error::ExampleResult;
 use crate::generated::{player_rpc, world_rpc};
 use crate::world::actor::{WorldActor, WorldActorFactory};
-use crate::{ExampleResult, WORLD_ACTOR, WORLD_SERVICE};
+use crate::{WORLD_ACTOR, WORLD_SERVICE};
 
 pub async fn run_world_service(
     listener: TcpListener,

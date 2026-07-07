@@ -14,7 +14,8 @@ use tonic::codegen::Service;
 use tonic::server::NamedService;
 use tonic::transport::Server;
 
-use crate::{BinaryClientCodec, ClientCodec, ClientFrame, GatewayError};
+use crate::error::GatewayError;
+use crate::frame::{BinaryClientCodec, ClientCodec, ClientFrame};
 
 pub const DEFAULT_MAX_CLIENT_FRAME_SIZE: usize = 16 * 1024 * 1024;
 

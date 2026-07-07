@@ -6,7 +6,9 @@ use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore, oneshot};
 
 use crate::context::ActorContext;
-use crate::error::{ActorActivationError, ActorCallError, ActorError, ActorTellError};
+use crate::error::{
+    ActorActivationError, ActorCallError, ActorError, ActorStopError, ActorTellError,
+};
 use crate::mailbox::MailboxConfig;
 use crate::registry::{ActorRegistry, ActorRegistryConfig};
 use crate::runtime::{
@@ -17,7 +19,10 @@ use crate::traits::{
     Actor, ChildActorKey, ChildActorOptions, Handler, HandlerErrorAction, Message,
     PassivationReason, StopReason,
 };
-use lattice_core::{ActorId, InstanceId, ServiceContext, actor_kind, service_kind};
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_core::service_context::ServiceContext;
+use lattice_core::{actor_kind, service_kind};
 
 #[derive(Debug)]
 struct Ping(&'static str);
@@ -111,7 +116,7 @@ impl Actor for TestActor {
         &mut self,
         _ctx: &mut ActorContext<Self>,
         _reason: StopReason,
-    ) -> Result<(), crate::ActorStopError> {
+    ) -> Result<(), ActorStopError> {
         if let Some(stopped) = self.stopped.take() {
             stopped.add_permits(1);
         }

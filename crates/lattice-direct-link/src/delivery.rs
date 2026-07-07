@@ -1,7 +1,10 @@
-use lattice_actor::{Actor, ActorHandle, ActorTellError, Handler};
-use lattice_core::{
-    DirectLinkMessage, DirectLinkMessageId, DirectLinkMetadata, DirectLinkStreamDescriptor,
-    LinkMessageContext, Linked,
+use lattice_actor::error::ActorTellError;
+use lattice_actor::handle::ActorHandle;
+use lattice_actor::traits::{Actor, Handler};
+use lattice_core::direct_link::ids::DirectLinkMessageId;
+use lattice_core::direct_link::messages::{LinkMessageContext, Linked};
+use lattice_core::direct_link::stream::{
+    DirectLinkMessage, DirectLinkMetadata, DirectLinkStreamDescriptor,
 };
 use thiserror::Error;
 
@@ -99,16 +102,22 @@ mod tests {
 
     use async_trait::async_trait;
     use http::Uri;
-    use lattice_actor::{ActorContext, ActorRuntime};
-    use lattice_core::{
-        ActorId, ActorKind, ActorRef, DirectLinkMessage, DirectLinkMessageId, DirectLinkMetadata,
-        InstanceId, LinkId, LinkMessageFlags, LinkMetadataError, LinkSequence, ServiceKind,
-    };
+    use lattice_actor::context::ActorContext;
+    use lattice_actor::runtime::ActorRuntime;
+    use lattice_actor::traits::Actor;
+    use lattice_core::actor_ref::ActorRef;
+    use lattice_core::direct_link::errors::LinkMetadataError;
+    use lattice_core::direct_link::ids::{DirectLinkMessageId, LinkId, LinkSequence};
+    use lattice_core::direct_link::messages::LinkMessageFlags;
+    use lattice_core::direct_link::stream::{DirectLinkMessage, DirectLinkMetadata};
+    use lattice_core::id::ActorId;
+    use lattice_core::instance::InstanceId;
+    use lattice_core::kind::{ActorKind, ServiceKind};
     use prost::Message as _;
     use tokio::sync::Notify;
     use tokio::time::{Duration, timeout};
 
-    use super::*;
+    use crate::delivery::*;
     use crate::stream::DirectLinkStream;
 
     #[derive(Clone, PartialEq, prost::Message)]
@@ -126,7 +135,7 @@ mod tests {
         package_index: u32,
     }
 
-    impl lattice_core::DirectLinkMetadata for TestMetadata {
+    impl DirectLinkMetadata for TestMetadata {
         fn encode_metadata(&self) -> Result<Vec<u8>, LinkMetadataError> {
             Ok(self.package_index.to_be_bytes().to_vec())
         }
@@ -148,7 +157,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl lattice_actor::Actor for LinkActor {
+    impl Actor for LinkActor {
         type Error = Infallible;
     }
 
@@ -174,7 +183,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl lattice_actor::Actor for MetadataActor {
+    impl Actor for MetadataActor {
         type Error = Infallible;
     }
 

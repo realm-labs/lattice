@@ -1,4 +1,4 @@
-use lattice_placement::PlacementError;
+use lattice_placement::error::PlacementError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {

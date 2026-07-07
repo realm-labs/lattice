@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use lattice_core::{ActorId, ActorKind, Epoch, InstanceId, ServiceKind};
+use lattice_core::actor_ref::Epoch;
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 

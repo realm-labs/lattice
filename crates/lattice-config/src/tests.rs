@@ -1,11 +1,14 @@
-use crate::bootstrap::BootstrapConfig;
 use std::fs;
 
 use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::watch;
 
-use super::*;
+use crate::bootstrap::BootstrapConfig;
+use crate::error::ConfigError;
+use crate::format::ConfigFormat;
+use crate::source::ConfigSource;
+use crate::store::{ConfigStore, ConfigStoreError, ConfigWatch, LocalConfigStore};
 
 #[tokio::test]
 async fn local_config_store_supports_watch_reload() {

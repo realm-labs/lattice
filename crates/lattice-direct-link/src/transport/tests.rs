@@ -1,6 +1,6 @@
-use super::*;
+use crate::transport::*;
 
-use lattice_core::{DirectLinkMessageId, LinkId, LinkSequence};
+use lattice_core::direct_link::ids::{DirectLinkMessageId, LinkId, LinkSequence};
 
 use crate::protocol::DirectLinkFrame;
 

@@ -1,12 +1,15 @@
-use super::*;
+use crate::session::*;
 
 use std::str::FromStr;
 
 use http::Uri;
-use lattice_core::{
-    ActorId, DirectLinkMessageDescriptor, DirectLinkMessageId, Epoch, InstanceId, ServiceKind,
-    actor_kind, service_kind,
-};
+use lattice_core::actor_ref::Epoch;
+use lattice_core::direct_link::ids::DirectLinkMessageId;
+use lattice_core::direct_link::stream::DirectLinkMessageDescriptor;
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
+use lattice_core::{actor_kind, service_kind};
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct TestPayload {

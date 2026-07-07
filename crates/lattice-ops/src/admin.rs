@@ -8,7 +8,8 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
-use lattice_core::{ActorKind, InstanceId, ServiceKind};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_placement::instance::InstanceRecord;
 use lattice_placement::store::{
     ActorPlacementRecord, PlacementStore, SingletonPlacementRecord, VirtualShardPlacementRecord,
@@ -19,7 +20,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::OpsError;
+use crate::error::OpsError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterSummary {

@@ -2,12 +2,15 @@ use std::any::type_name;
 use std::fmt;
 use std::marker::PhantomData;
 
-use lattice_actor::{Actor, ActorHandle, Handler};
-use lattice_core::{
-    ActorKind, DirectLinkMessage, DirectLinkMessageDescriptor, DirectLinkMessageId,
-    DirectLinkMetadata, DirectLinkStreamDescriptor, DirectLinkStreamSpec, LinkMessageContext,
-    Linked,
+use lattice_actor::handle::ActorHandle;
+use lattice_actor::traits::{Actor, Handler};
+use lattice_core::direct_link::ids::DirectLinkMessageId;
+use lattice_core::direct_link::messages::{LinkMessageContext, Linked};
+use lattice_core::direct_link::stream::{
+    DirectLinkMessage, DirectLinkMessageDescriptor, DirectLinkMetadata, DirectLinkStreamDescriptor,
+    DirectLinkStreamSpec,
 };
+use lattice_core::kind::ActorKind;
 
 use crate::delivery::{DirectLinkDeliveryError, DirectLinkDispatch};
 
@@ -191,10 +194,13 @@ mod tests {
     use std::convert::Infallible;
 
     use async_trait::async_trait;
-    use lattice_actor::{ActorContext, Handler};
-    use lattice_core::{DirectLinkMessage, Linked, actor_kind};
+    use lattice_actor::context::ActorContext;
+    use lattice_actor::traits::{Actor, Handler};
+    use lattice_core::actor_kind;
+    use lattice_core::direct_link::messages::Linked;
+    use lattice_core::direct_link::stream::DirectLinkMessage;
 
-    use super::*;
+    use crate::stream::*;
 
     #[derive(Clone, PartialEq, ::prost::Message)]
     struct PositionUpdate {
@@ -219,7 +225,7 @@ mod tests {
     struct BattleActor;
 
     #[async_trait]
-    impl lattice_actor::Actor for BattleActor {
+    impl Actor for BattleActor {
         type Error = Infallible;
     }
 

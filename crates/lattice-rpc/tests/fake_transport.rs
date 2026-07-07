@@ -1,14 +1,20 @@
 use async_trait::async_trait;
-use lattice_actor::{Actor, ActorContext, ActorError, ActorRuntime, ActorSpawnOptions, Handler};
-use lattice_core::{
-    ActorKind, Epoch, InstanceId, RouteKey, TraceContext, actor_kind, service_kind,
-};
-use lattice_rpc::client::MetadataInjectingRpcCore;
-use lattice_rpc::traits::UnaryRpcTransport;
-use lattice_rpc::{
-    ActorRpcAdapter, RoutedRequest, Rpc, RpcClientContextFactory, RpcContext, RpcError, RpcRequest,
-    ShardedRpcCore, TypedRpcClient,
-};
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::ActorError;
+use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
+use lattice_actor::traits::{Actor, Handler};
+use lattice_core::actor_ref::Epoch;
+use lattice_core::id::RouteKey;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ActorKind;
+use lattice_core::trace::TraceContext;
+use lattice_core::{actor_kind, service_kind};
+use lattice_rpc::adapter::ActorRpcAdapter;
+use lattice_rpc::client::{MetadataInjectingRpcCore, TypedRpcClient};
+use lattice_rpc::error::RpcError;
+use lattice_rpc::metadata::{RpcClientContextFactory, RpcContext};
+use lattice_rpc::traits::{RoutedRequest, RpcRequest, ShardedRpcCore, UnaryRpcTransport};
+use lattice_rpc::types::Rpc;
 use prost::Message as ProstMessage;
 use std::sync::{Arc, Mutex};
 use tonic::{Request, Response};

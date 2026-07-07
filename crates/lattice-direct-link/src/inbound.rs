@@ -9,13 +9,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use lattice_actor::{Actor, ActorHandle, ActorTellError, Handler};
-use lattice_core::{
-    ActorId, ActorKind, ActorRef, DirectLinkMessageId, DirectLinkMetadata, DirectLinkSender,
-    DirectLinkSession, DirectLinkStreamDescriptor, LinkBackpressure, LinkCloseReason, LinkClosed,
-    LinkDirection, LinkDirectionClosed, LinkError, LinkId, LinkMessageContext, LinkMessageFlags,
-    LinkOpened, LinkSendError, LinkSequence, OutboundDirectLinkMessage,
+use lattice_actor::error::ActorTellError;
+use lattice_actor::handle::ActorHandle;
+use lattice_actor::traits::{Actor, Handler};
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::direct_link::errors::{LinkError, LinkSendError};
+use lattice_core::direct_link::ids::{DirectLinkMessageId, LinkId, LinkSequence};
+use lattice_core::direct_link::messages::{
+    LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkMessageContext, LinkMessageFlags,
+    LinkOpened,
 };
+use lattice_core::direct_link::options::{LinkCloseReason, LinkDirection};
+use lattice_core::direct_link::runtime::{
+    DirectLinkSender, DirectLinkSession, OutboundDirectLinkMessage,
+};
+use lattice_core::direct_link::stream::{DirectLinkMetadata, DirectLinkStreamDescriptor};
+use lattice_core::id::ActorId;
+use lattice_core::kind::ActorKind;
 use thiserror::Error;
 use tokio::sync::mpsc;
 

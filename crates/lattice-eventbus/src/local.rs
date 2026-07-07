@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::{EventBusError, EventEnvelope, EventSubscription};
+use crate::error::EventBusError;
+use crate::types::{EventEnvelope, EventSubscription};
 
 #[async_trait]
 pub trait EventHandler: Send + Sync + 'static {

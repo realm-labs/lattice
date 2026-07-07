@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use lattice_core::BackpressurePolicy;
+use lattice_core::direct_link::options::BackpressurePolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackpressureOutcome<T> {
@@ -105,9 +105,9 @@ impl<T> BackpressureQueue<T> {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::CoalesceKey;
+    use lattice_core::direct_link::options::CoalesceKey;
 
-    use super::*;
+    use crate::backpressure::*;
 
     #[test]
     fn block_policy_reports_would_block_without_mutating_queue() {

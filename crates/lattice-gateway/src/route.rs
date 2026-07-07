@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
-use lattice_core::{ActorKind, RouteKey};
+use lattice_core::id::RouteKey;
+use lattice_core::kind::ActorKind;
 
-use crate::GatewayError;
+use crate::error::GatewayError;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewayRouteContext {

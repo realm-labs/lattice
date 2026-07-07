@@ -1,26 +1,38 @@
-use crate::dedup::{RequestDedupKey, RequestDeduplicator};
-use crate::metadata::RpcMetadataError;
-use crate::security::{
-    PeerIdentity, RpcSecurityError, RpcSecurityPolicy, RpcServerSecurity, ServiceIdentityConfig,
-};
-use crate::server::{RpcServerBuildError, RpcServerBuilder};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use http::Uri;
-use lattice_actor::{
-    Actor, ActorContext, ActorError, ActorRuntime, ActorSpawnOptions, Handler, Message,
-};
-use lattice_core::{
-    ActorKind, Epoch, InstanceId, RequestId, RouteKey, TraceContext, actor_kind, service_kind,
-};
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::ActorError;
+use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
+use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_core::actor_ref::{Epoch, RequestId};
+use lattice_core::id::RouteKey;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ActorKind;
+use lattice_core::trace::TraceContext;
+use lattice_core::{actor_kind, service_kind};
 use tonic::Request;
 use tonic::metadata::MetadataMap;
 
-use crate::metadata::REQUEST_ID;
-use crate::*;
+use crate::adapter::ActorRpcAdapter;
+use crate::client::{
+    self, TonicEndpointChannelPool, TonicEndpointChannelPoolConfig, TypedRpcClient,
+};
+use crate::dedup::{RequestDedupKey, RequestDeduplicator};
+use crate::error::RpcError;
+use crate::metadata::{
+    AuthContext, REQUEST_ID, RpcClientContextFactory, RpcContext, RpcMetadataError,
+};
+use crate::security::{
+    PeerIdentity, RpcSecurityError, RpcSecurityPolicy, RpcServerSecurity, RpcTlsConfig,
+    RpcTransportSecurity, ServiceIdentityConfig,
+};
+use crate::server::{RpcServerBuildError, RpcServerBuilder};
+use crate::traits::{RoutedRequest, RpcRequest, ShardedRpcCore};
+use crate::types::{RouteTarget, Rpc};
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct EnterWorldRequest {

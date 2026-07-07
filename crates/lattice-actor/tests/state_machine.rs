@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lattice_actor::{
-    Actor, ActorContext, ActorError, ActorRuntime, ActorSpawnOptions, Handler, Message,
-};
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::ActorError;
+use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
+use lattice_actor::traits::{Actor, Handler, Message};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchState {

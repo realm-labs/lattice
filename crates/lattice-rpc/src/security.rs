@@ -2,11 +2,12 @@ use std::fs;
 use std::path::Path;
 
 use http::Uri;
-use lattice_core::{InstanceId, ServiceKind};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 use tonic::{Request, Status};
 
-use crate::RpcContext;
+use crate::metadata::RpcContext;
 use crate::metadata::{AuthContext, RpcClientContextFactory};
 
 const INTERNAL_AUTHORIZATION: &str = "Bearer lattice-internal";

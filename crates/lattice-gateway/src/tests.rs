@@ -6,12 +6,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lattice_core::{ActorKind, RouteKey, actor_kind};
-use lattice_rpc::{RoutedEnvelope, RoutedRequest, RpcError, RpcRequest, ShardedRpcCore};
+use lattice_core::actor_kind;
+use lattice_core::id::RouteKey;
+use lattice_core::kind::ActorKind;
+use lattice_rpc::error::RpcError;
+use lattice_rpc::traits::{RoutedRequest, RpcRequest, ShardedRpcCore};
+use lattice_rpc::types::RoutedEnvelope;
 use prost::Message as ProstMessage;
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::*;
+use crate::binding::ProstClientMessageBinding;
+use crate::error::GatewayError;
+use crate::frame::{BinaryClientCodec, ClientCodec, ClientFrame};
+use crate::route::{
+    GatewayRouteContext, GatewayRouteSpec, GatewayRouteTable, MessageRouter, RouteDecision,
+};
+use crate::server::{GatewayService, GatewayTcpServer, read_client_frame, write_client_frame};
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct EnterWorldRequest {

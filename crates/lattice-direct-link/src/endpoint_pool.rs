@@ -13,11 +13,15 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lattice_core::{
-    ActorRef, DirectLinkEndpoint, DirectLinkOpenRequest, DirectLinkSender, DirectLinkSession,
-    LinkCloseReason, LinkClosed, LinkDirection, LinkDirectionClosed, LinkError, LinkId,
-    LinkSendError, LinkSequence, LinkTarget, OutboundDirectLinkMessage,
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::direct_link::errors::{LinkError, LinkSendError};
+use lattice_core::direct_link::ids::{LinkId, LinkSequence};
+use lattice_core::direct_link::messages::{LinkClosed, LinkDirectionClosed};
+use lattice_core::direct_link::options::{LinkCloseReason, LinkDirection};
+use lattice_core::direct_link::runtime::{
+    DirectLinkOpenRequest, DirectLinkSender, DirectLinkSession, OutboundDirectLinkMessage,
 };
+use lattice_core::direct_link::target::{DirectLinkEndpoint, LinkTarget};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::protocol::{DirectLinkFrame, DirectLinkFrameKind};
@@ -883,14 +887,13 @@ impl PooledLinkState {
             .directions
             .iter()
             .filter(|(_, state)| !state.closed)
-            .filter_map(|(direction, state)| {
-                source_observes_direction(*direction).then(|| LinkDirectionClosed {
-                    link_id: link_id.clone(),
-                    direction: *direction,
-                    stream: state.stream_name.clone(),
-                    reason: reason.clone(),
-                    last_sequence_seen: None,
-                })
+            .filter(|(direction, _)| source_observes_direction(**direction))
+            .map(|(direction, state)| LinkDirectionClosed {
+                link_id: link_id.clone(),
+                direction: *direction,
+                stream: state.stream_name.clone(),
+                reason: reason.clone(),
+                last_sequence_seen: None,
             })
             .collect();
         PooledLinkClosure {
@@ -1255,7 +1258,7 @@ async fn send_frame_for_response(
 
 fn endpoint_and_target(
     request: &DirectLinkOpenRequest,
-) -> Result<(DirectLinkEndpoint, lattice_core::ActorRef), LinkError> {
+) -> Result<(DirectLinkEndpoint, lattice_core::actor_ref::ActorRef), LinkError> {
     match &request.target {
         LinkTarget::Endpoint { endpoint, target } => Ok((endpoint.clone(), target.clone())),
         LinkTarget::Actor(_) => Err(LinkError::Protocol(

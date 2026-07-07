@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
-use lattice_core::{InstanceId, ServiceKind};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
 use serde::{Deserialize, Serialize};
 
 use crate::admin::AdminAuth;

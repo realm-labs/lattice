@@ -6,9 +6,8 @@ pub mod player;
 pub mod tcp;
 pub mod world;
 
-pub use error::ExampleResult;
-
-use lattice_core::{ActorKind, ServiceKind, actor_kind, service_kind};
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_core::{actor_kind, service_kind};
 
 pub mod game {
     tonic::include_proto!("game");

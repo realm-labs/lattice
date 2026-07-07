@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use lattice_rpc::RouteTarget;
+use lattice_rpc::types::RouteTarget;
 
-use crate::RouteCacheKey;
+use crate::route::RouteCacheKey;
 
 #[derive(Debug, Clone)]
 pub struct RouteCacheConfig {

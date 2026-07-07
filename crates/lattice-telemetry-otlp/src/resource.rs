@@ -1,4 +1,5 @@
-use lattice_core::{InstanceId, ServiceKind};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::Resource;
 

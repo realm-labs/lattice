@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use lattice_core::InstanceId;
-use lattice_rpc::RouteTarget;
+use lattice_core::instance::InstanceId;
+use lattice_rpc::types::RouteTarget;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EndpointPoolKey {

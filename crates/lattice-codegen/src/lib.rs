@@ -7,10 +7,6 @@ pub mod spec;
 
 use std::path::PathBuf;
 
-pub use builder::{LatticeCodegenBuilder, configure};
-pub use error::CodegenError;
-pub use spec::{GeneratedDirectLinkMessageSpec, GeneratedDirectLinkStreamSpec};
-
 pub fn proto_include() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("proto")
 }

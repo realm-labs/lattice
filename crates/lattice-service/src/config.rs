@@ -1,7 +1,8 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use lattice_core::{DirectLinkEndpoint, InstanceId};
+use lattice_core::direct_link::target::DirectLinkEndpoint;
+use lattice_core::instance::InstanceId;
 use lattice_direct_link::transport::DirectLinkListenConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

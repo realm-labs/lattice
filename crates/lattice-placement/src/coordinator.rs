@@ -4,8 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lattice_core::{ActorId, ActorKind, Epoch, InstanceId, RouteKey, ServiceKind};
-use lattice_rpc::RouteTarget;
+use lattice_core::actor_ref::Epoch;
+use lattice_core::id::{ActorId, RouteKey};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_rpc::types::RouteTarget;
 use tracing::{Instrument, warn};
 
 use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};

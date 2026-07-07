@@ -1,9 +1,13 @@
 use http::Uri;
-use lattice_actor::Message;
-use lattice_core::{ActorKind, Epoch, InstanceId, RouteKey, ServiceKind};
+use lattice_actor::traits::Message;
+use lattice_core::actor_ref::Epoch;
+use lattice_core::id::RouteKey;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 
-use crate::{RoutedRequest, RpcContext, RpcRequest};
+use crate::metadata::RpcContext;
+use crate::traits::{RoutedRequest, RpcRequest};
 
 const ROUTE_ACTOR_KIND: &str = "lattice-route-actor-kind";
 const ROUTE_KEY_KIND: &str = "lattice-route-key-kind";

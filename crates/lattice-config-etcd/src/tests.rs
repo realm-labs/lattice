@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_config::{ConfigStore, ConfigStoreError};
+use lattice_config::store::{ConfigStore, ConfigStoreError};
 use serde_json::json;
 use tokio::sync::{Mutex, watch};
 

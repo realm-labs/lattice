@@ -1,12 +1,16 @@
-use lattice_actor::{Actor, ActorCallError, ActorHandle, Handler};
-use lattice_core::Epoch;
+use lattice_actor::error::ActorCallError;
+use lattice_actor::handle::ActorHandle;
+use lattice_actor::traits::{Actor, Handler};
+use lattice_core::actor_ref::Epoch;
 use tonic::{Request, Response, Status};
 use tracing::{Instrument, debug, warn};
 
 use crate::dedup::{RequestDedupKey, RequestDeduplicator};
+use crate::metadata::RpcContext;
 use crate::metadata::metadata_status;
 use crate::security::{PeerIdentity, RpcSecurityPolicy};
-use crate::{RoutedRequest, Rpc, RpcContext, RpcRequest, RpcRoute};
+use crate::traits::{RoutedRequest, RpcRequest};
+use crate::types::{Rpc, RpcRoute};
 
 #[derive(Debug)]
 pub struct ActorRpcAdapter<A: Actor> {

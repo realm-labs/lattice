@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use lattice_core::{Epoch, InstanceId, RequestId, ServiceKind, TraceContext};
+use lattice_core::actor_ref::{Epoch, RequestId};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
+use lattice_core::trace::TraceContext;
 use tonic::Status;
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
 

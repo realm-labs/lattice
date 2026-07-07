@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
+use lattice_core::actor_ref::Epoch;
+use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::{ActorId, Epoch, actor_kind, service_kind};
+use lattice_core::{actor_kind, service_kind};
 
 use super::*;
 use crate::instance::InstanceState;

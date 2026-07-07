@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
-use crate::traits::HandlerErrorAction;
-use crate::{Actor, ActorCallError, ActorContext, ActorError, Handler, Message, StopReason};
+use crate::context::ActorContext;
+use crate::error::{ActorCallError, ActorError};
+use crate::traits::{Actor, Handler, HandlerErrorAction, Message, StopReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailboxConfig {

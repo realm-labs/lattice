@@ -1,4 +1,4 @@
-use crate::GatewayError;
+use crate::error::GatewayError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientFrame {

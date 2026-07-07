@@ -1,8 +1,10 @@
 use async_trait::async_trait;
-use lattice_actor::{Actor, ActorContext, ActorError, Handler};
-use lattice_core::ActorRef;
-use lattice_gateway::ClientFrame;
-use lattice_rpc::Rpc;
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::ActorError;
+use lattice_actor::traits::{Actor, Handler};
+use lattice_core::actor_ref::ActorRef;
+use lattice_gateway::frame::ClientFrame;
+use lattice_rpc::types::Rpc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::game::{PushToClientReply, PushToClientRequest};

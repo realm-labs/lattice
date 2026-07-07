@@ -1,10 +1,13 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use lattice_core::InstanceId;
+use lattice_core::instance::InstanceId;
 use lattice_placement::etcd::{EtcdPlacementStore, EtcdPlacementStoreConfig, RealEtcdClient};
+use lattice_placement::route::RpcRetryPolicy;
+use lattice_rpc::client::TonicEndpointChannelPoolConfig;
+use lattice_service::actor::ActorRegistration;
 use lattice_service::config::InstanceConfig;
-use lattice_service::{ActorRegistration, LatticeService};
+use lattice_service::service::LatticeService;
 use rpc_benchmark::actors::{BenchActor, BenchActorFactory};
 use rpc_benchmark::error::BenchmarkResult;
 use rpc_benchmark::generated::bench_rpc;
@@ -52,7 +55,7 @@ async fn main() -> BenchmarkResult<()> {
         .listen(listener)
         .ready_signal(ready_tx)
         .rpc_client_transport(
-            lattice_rpc::TonicEndpointChannelPoolConfig::try_new(args.channel_stripes)
+            TonicEndpointChannelPoolConfig::try_new(args.channel_stripes)
                 .expect("channel_stripes is provided by benchmark driver"),
         )
         .placement_store::<EtcdPlacementStore<RealEtcdClient>, _>(placement_store)
@@ -66,7 +69,7 @@ async fn main() -> BenchmarkResult<()> {
                 .request_dedup(args.request_dedup),
         );
     if !args.rpc_retry {
-        builder = builder.rpc_retry_policy(lattice_placement::RpcRetryPolicy::Disabled);
+        builder = builder.rpc_retry_policy(RpcRetryPolicy::Disabled);
     }
     let service = builder.build().await?;
     let task = tokio::spawn(service.run_until_shutdown());

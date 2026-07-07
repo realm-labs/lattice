@@ -12,12 +12,14 @@ use lattice_actor::registry::{
 };
 use lattice_actor::runtime::{PassivationPolicy, ShardMigrationPolicy};
 use lattice_actor::traits::{Actor, PassivationReason};
-use lattice_core::{ActorId, ActorKind, LinkCloseReason, RouteKey};
+use lattice_core::direct_link::options::LinkCloseReason;
+use lattice_core::id::{ActorId, RouteKey};
+use lattice_core::kind::ActorKind;
 use lattice_placement::vshard::{VirtualShardId, VirtualShardMapper};
 
-use crate::LatticeServiceError;
 use crate::context::ServiceBuildContext;
 use crate::direct_link::DirectLinkServiceRuntime;
+use crate::error::LatticeServiceError;
 
 type ActorCreateFuture<A> = Pin<Box<dyn Future<Output = Result<A, <A as Actor>::Error>> + Send>>;
 type ActorCreateFn<A> = dyn Fn(ActorCreateContext) -> ActorCreateFuture<A> + Send + Sync;

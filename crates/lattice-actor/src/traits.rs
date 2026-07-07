@@ -1,10 +1,12 @@
 use async_trait::async_trait;
-use lattice_core::{
+use lattice_core::direct_link::messages::{
     LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened, LinkProtocolError, Linked,
 };
 use std::error::Error as StdError;
 
-use crate::{ActorContext, ActorStopError, MailboxConfig};
+use crate::context::ActorContext;
+use crate::error::ActorStopError;
+use crate::mailbox::MailboxConfig;
 
 pub trait Message: Send + 'static {
     type Reply: Send + 'static;

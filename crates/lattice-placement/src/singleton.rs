@@ -1,16 +1,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lattice_core::{ActorKind, Epoch, InstanceId, RouteKey, ServiceKind};
-use lattice_rpc::RouteTarget;
+use lattice_core::actor_ref::Epoch;
+use lattice_core::id::RouteKey;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_rpc::types::RouteTarget;
 
 use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::error::PlacementError;
 use crate::instance::{InstanceRecord, InstanceState};
-use crate::route::{ResolveRequest, RouteCacheKey, RouteResolver};
-use crate::store::{LeaseId, PlacementState, PlacementStore, SingletonKey};
-
-pub use crate::store::SingletonPlacementRecord;
+use crate::route::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
+use crate::store::{
+    LeaseId, PlacementState, PlacementStore, SingletonKey, SingletonPlacementRecord,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivateSingletonRequest {
@@ -255,7 +258,7 @@ where
         Ok(target)
     }
 
-    async fn invalidate(&self, key: RouteCacheKey, _reason: crate::InvalidateReason) {
+    async fn invalidate(&self, key: RouteCacheKey, _reason: InvalidateReason) {
         self.cache.invalidate(&key);
     }
 }
@@ -271,8 +274,7 @@ mod tests {
 
     use super::*;
     use crate::instance::InstanceState;
-    use crate::store::{LeaseId, PlacementVersion};
-    use crate::{InMemoryPlacementStore, PlacementPrefix};
+    use crate::store::{InMemoryPlacementStore, LeaseId, PlacementPrefix, PlacementVersion};
 
     #[derive(Debug, Clone, Default)]
     struct CountingSingletonControl {

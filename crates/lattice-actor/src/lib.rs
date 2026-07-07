@@ -8,16 +8,5 @@ pub mod runtime;
 pub mod traits;
 pub mod watch;
 
-pub use context::ActorContext;
-pub use error::{ActorCallError, ActorError, ActorSpawnError, ActorStopError, ActorTellError};
-pub use handle::ActorHandle;
-pub use mailbox::MailboxConfig;
-pub use registry::{ActorFactory, ActorLoader, ActorRegistry};
-pub use runtime::{
-    ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, PassivationPolicy, ShardMigrationPolicy,
-    spawn_actor,
-};
-pub use traits::{Actor, Handler, HandlerErrorAction, Message, PassivationReason, StopReason};
-
 #[cfg(test)]
 mod tests;

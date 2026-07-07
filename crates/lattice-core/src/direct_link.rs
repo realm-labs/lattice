@@ -6,27 +6,6 @@ pub mod runtime;
 pub mod stream;
 pub mod target;
 
-pub use errors::{LinkError, LinkMetadataError, LinkSendError};
-pub use ids::{DirectLinkMessageId, LinkId, LinkSequence};
-pub use messages::{
-    LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkMessageContext, LinkMessageFlags,
-    LinkOpened, LinkProtocolError, Linked,
-};
-pub use options::{
-    BackpressurePolicy, CoalesceKey, DirectLinkMode, DirectLinkOptions, LinkCloseReason,
-    LinkDirection, ReconnectPolicy,
-};
-pub use runtime::{
-    DirectLink, DirectLinkLifecycleRuntime, DirectLinkLifecycleRuntimeHandle, DirectLinkManager,
-    DirectLinkOpenRequest, DirectLinkRuntime, DirectLinkRuntimeHandle, DirectLinkSender,
-    DirectLinkSession, OutboundDirectLinkMessage,
-};
-pub use stream::{
-    DirectLinkMessage, DirectLinkMessageDescriptor, DirectLinkMetadata, DirectLinkStreamDescriptor,
-    DirectLinkStreamSpec, DirectLinkStreamType,
-};
-pub use target::{DirectLinkEndpoint, LinkTarget};
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -34,8 +13,17 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::*;
-    use crate::{ActorId, ActorRef, InstanceId, ServiceContext, ServiceKind};
+    use crate::actor_ref::ActorRef;
+    use crate::direct_link::errors::*;
+    use crate::direct_link::ids::*;
+    use crate::direct_link::options::*;
+    use crate::direct_link::runtime::*;
+    use crate::direct_link::stream::*;
+    use crate::direct_link::target::*;
+    use crate::id::ActorId;
+    use crate::instance::InstanceId;
+    use crate::kind::{ActorKind, ServiceKind};
+    use crate::service_context::ServiceContext;
 
     #[derive(Clone, PartialEq, prost::Message)]
     struct InputCommand {
@@ -305,7 +293,7 @@ mod tests {
     fn actor_ref(service_kind: &'static str, actor_kind: &'static str, id: u64) -> ActorRef {
         ActorRef::direct(
             ServiceKind::from_static(service_kind),
-            crate::ActorKind::from_static(actor_kind),
+            ActorKind::from_static(actor_kind),
             ActorId::U64(id),
             InstanceId::new(format!("{service_kind}-{id}")),
             "http://127.0.0.1:10000".parse().unwrap(),

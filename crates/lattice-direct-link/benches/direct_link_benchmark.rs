@@ -3,13 +3,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use lattice_core::{
-    ActorId, ActorKind, ActorRef, BackpressurePolicy, CoalesceKey, DirectLinkEndpoint,
-    DirectLinkMessageDescriptor, DirectLinkMessageId, DirectLinkMode, DirectLinkOpenRequest,
-    DirectLinkOptions, DirectLinkStreamDescriptor, InstanceId, LinkDirection, LinkId,
-    LinkMessageFlags, LinkSequence, LinkTarget, OutboundDirectLinkMessage, ServiceKind,
-    TraceContext,
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::direct_link::ids::{DirectLinkMessageId, LinkId, LinkSequence};
+use lattice_core::direct_link::messages::LinkMessageFlags;
+use lattice_core::direct_link::options::{
+    BackpressurePolicy, CoalesceKey, DirectLinkMode, DirectLinkOptions, LinkDirection,
 };
+use lattice_core::direct_link::runtime::{DirectLinkOpenRequest, OutboundDirectLinkMessage};
+use lattice_core::direct_link::stream::{DirectLinkMessageDescriptor, DirectLinkStreamDescriptor};
+use lattice_core::direct_link::target::{DirectLinkEndpoint, LinkTarget};
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_core::trace::TraceContext;
 use lattice_direct_link::backpressure::BackpressureQueue;
 use lattice_direct_link::endpoint_pool::{
     DirectLinkEndpointPool, DirectLinkEndpointPoolConfig, PooledDirectLinkEndpointPool,

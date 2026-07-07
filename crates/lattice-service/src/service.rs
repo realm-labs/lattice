@@ -5,8 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use lattice_core::direct_link::errors::LinkError;
+use lattice_core::direct_link::target::DirectLinkEndpoint;
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::{ActorKind, DirectLinkEndpoint, LinkError, ServiceContext, ServiceKind};
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_core::service_context::ServiceContext;
 use lattice_direct_link::inbound::{DirectLinkInboundRouter, InboundConnectionSender};
 use lattice_direct_link::protocol::DirectLinkFrameKind;
 use lattice_direct_link::transport::{
@@ -17,8 +20,8 @@ use lattice_ops::admin::{
     AdminActorTarget, AdminApiError, AdminAuth, AdminHttpAdapter, AdminMutationHandler,
     AdminMutationReply, AdminSnapshot,
 };
-use lattice_placement::PlacementError;
 use lattice_placement::coordinator::PlacementWatchTask;
+use lattice_placement::error::PlacementError;
 use lattice_placement::instance::{InstanceRecord, InstanceState};
 use lattice_placement::store::LeaseId;
 use tokio::net::TcpListener;
@@ -29,14 +32,15 @@ use tonic::transport::server::Router;
 use tracing::{debug, error, info, warn};
 
 use crate::actor::ErasedLogicActor;
+use crate::builder::LatticeServiceBuilder;
 use crate::component::ErasedPlacementStore;
 use crate::config::{DirectLinkConfig, InstanceConfig};
 use crate::direct_link::DirectLinkServiceRuntime;
+use crate::error::LatticeServiceError;
 use crate::framework::{
     ClusterEventBusComponent, DynPlacementStore, LocalEventBusComponent, ServiceContextExt,
     ServiceSchedulerComponent,
 };
-use crate::{LatticeServiceBuilder, LatticeServiceError};
 
 #[derive(Debug)]
 pub struct LatticeService {
@@ -384,7 +388,7 @@ async fn start_admin_http_server(
     service_context: &ServiceContext,
     placement_store: &dyn ErasedPlacementStore,
     service_kind: &ServiceKind,
-    instance_id: &lattice_core::InstanceId,
+    instance_id: &lattice_core::instance::InstanceId,
 ) -> Result<(Option<AdminShutdownSignal>, Option<AdminHttpTask>), LatticeServiceError> {
     let Some(admin_http) = admin_http else {
         return Ok((None, None));
@@ -437,7 +441,7 @@ impl std::fmt::Debug for ServiceAdminMutations {
 impl AdminMutationHandler for ServiceAdminMutations {
     async fn drain_instance(
         &self,
-        instance_id: lattice_core::InstanceId,
+        instance_id: lattice_core::instance::InstanceId,
     ) -> Result<AdminMutationReply, AdminApiError> {
         let report = self
             .placement_store
@@ -483,7 +487,7 @@ impl AdminMutationHandler for ServiceAdminMutations {
 async fn build_admin_snapshot(
     placement_store: &dyn ErasedPlacementStore,
     service_kind: &ServiceKind,
-    instance_id: &lattice_core::InstanceId,
+    instance_id: &lattice_core::instance::InstanceId,
     actor_kinds: Vec<ActorKind>,
 ) -> Result<AdminSnapshot, LatticeServiceError> {
     let instances = placement_store.list_instances(service_kind).await?;

@@ -2,13 +2,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use lattice_core::{InstanceId, ServiceKind};
-use lattice_eventbus::EventSubscriptionHandle;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
+use lattice_eventbus::local::EventSubscriptionHandle;
 use lattice_placement::coordinator::{DrainReport, LogicControl, PlacementCoordinator};
 use lattice_placement::store::PlacementStore;
 use tokio::sync::Mutex;
 
-use crate::{OpsError, ServiceScheduler};
+use crate::error::OpsError;
+use crate::scheduler::ServiceScheduler;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownTrigger {

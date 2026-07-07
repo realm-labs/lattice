@@ -5,8 +5,8 @@ use lattice_core::{actor_kind, service_kind};
 
 use super::*;
 use crate::instance::InstanceState;
+use crate::store::{InMemoryPlacementStore, PlacementPrefix};
 use crate::vshard::{GradualRebalanceShardAssigner, RoundRobinShardAssigner, VirtualShardId};
-use crate::{InMemoryPlacementStore, PlacementPrefix};
 
 #[derive(Debug, Clone, Default)]
 struct CountingLogicControl {

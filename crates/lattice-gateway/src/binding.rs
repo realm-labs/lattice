@@ -1,10 +1,13 @@
 use std::marker::PhantomData;
 
-use lattice_core::ActorKind;
-use lattice_rpc::{RoutedEnvelope, RpcRequest, ShardedRpcCore};
+use lattice_core::kind::ActorKind;
+use lattice_rpc::traits::{RpcRequest, ShardedRpcCore};
+use lattice_rpc::types::RoutedEnvelope;
 use prost::Message as ProstMessage;
 
-use crate::{ClientFrame, GatewayError, GatewayRouteContext, GatewayRouteSpec, MessageRouter};
+use crate::error::GatewayError;
+use crate::frame::ClientFrame;
+use crate::route::{GatewayRouteContext, GatewayRouteSpec, MessageRouter};
 
 #[derive(Clone)]
 pub struct ProstClientMessageBinding<Req> {

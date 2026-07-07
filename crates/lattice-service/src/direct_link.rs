@@ -4,12 +4,19 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use lattice_actor::{Actor, Handler};
-use lattice_core::{
-    ActorRef, DirectLinkEndpoint, DirectLinkLifecycleRuntime, DirectLinkMetadata,
-    DirectLinkOpenRequest, DirectLinkRuntime, DirectLinkSession, LinkBackpressure, LinkCloseReason,
-    LinkClosed, LinkDirectionClosed, LinkError, LinkId, LinkOpened, LinkTarget,
+use lattice_actor::traits::{Actor, Handler};
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::direct_link::errors::LinkError;
+use lattice_core::direct_link::ids::LinkId;
+use lattice_core::direct_link::messages::{
+    LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened,
 };
+use lattice_core::direct_link::options::LinkCloseReason;
+use lattice_core::direct_link::runtime::{
+    DirectLinkLifecycleRuntime, DirectLinkOpenRequest, DirectLinkRuntime, DirectLinkSession,
+};
+use lattice_core::direct_link::stream::DirectLinkMetadata;
+use lattice_core::direct_link::target::{DirectLinkEndpoint, LinkTarget};
 use lattice_direct_link::delivery::DirectLinkDispatch;
 use lattice_direct_link::endpoint_pool::{
     DirectLinkEndpointPool, DirectLinkEndpointPoolLifecycle, PooledDirectLinkEndpointPool,
@@ -21,8 +28,8 @@ use lattice_direct_link::transport::TcpDirectLinkTransport;
 use lattice_placement::instance::InstanceState;
 use lattice_placement::store::{ActorPlacementKey, PlacementState};
 
-use crate::LatticeServiceError;
 use crate::context::ServiceBuildContext;
+use crate::error::LatticeServiceError;
 use crate::framework::{DynPlacementStore, PlacementStoreComponent};
 
 #[derive(Clone)]
@@ -87,7 +94,7 @@ impl DirectLinkRuntime for DeferredDirectLinkRuntime {
     async fn get_outbound(
         &self,
         link_id: LinkId,
-        stream: lattice_core::DirectLinkStreamDescriptor,
+        stream: lattice_core::direct_link::stream::DirectLinkStreamDescriptor,
     ) -> Result<DirectLinkSession, LinkError> {
         let runtime = self
             .runtime
@@ -168,7 +175,7 @@ impl DirectLinkRuntime for DirectLinkServiceRuntime {
     async fn get_outbound(
         &self,
         link_id: LinkId,
-        stream: lattice_core::DirectLinkStreamDescriptor,
+        stream: lattice_core::direct_link::stream::DirectLinkStreamDescriptor,
     ) -> Result<DirectLinkSession, LinkError> {
         self.inbound_router.outbound_session(link_id, stream)
     }

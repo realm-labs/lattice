@@ -3,7 +3,8 @@ use std::ffi::OsString;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
-use crate::{ConfigError, ConfigFormat};
+use crate::error::ConfigError;
+use crate::format::ConfigFormat;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BootstrapConfig {

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 
-use crate::GatewayError;
+use crate::error::GatewayError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RateLimitKey {

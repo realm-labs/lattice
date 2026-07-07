@@ -9,8 +9,10 @@ use distributed_login::world::run_world_service;
 use distributed_login::{
     GATEWAY_SERVICE, GATEWAY_SESSION_ACTOR, LOGIN_MSG_ID, PLAYER_PING_MSG_ID, WORLD_PING_MSG_ID,
 };
-use lattice_core::{ActorId as CoreActorId, ActorRef as CoreActorRef, ActorRefTarget, InstanceId};
-use lattice_placement::{InMemoryPlacementStore, PlacementPrefix};
+use lattice_core::actor_ref::{ActorRef as CoreActorRef, ActorRefTarget};
+use lattice_core::id::ActorId as CoreActorId;
+use lattice_core::instance::InstanceId;
+use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 

@@ -1,6 +1,6 @@
-use lattice_core::{
-    DirectLinkMessageId, LinkCloseReason, LinkDirection, LinkId, LinkMessageFlags, LinkSequence,
-};
+use lattice_core::direct_link::ids::{DirectLinkMessageId, LinkId, LinkSequence};
+use lattice_core::direct_link::messages::LinkMessageFlags;
+use lattice_core::direct_link::options::{LinkCloseReason, LinkDirection};
 use thiserror::Error;
 
 use crate::session::{

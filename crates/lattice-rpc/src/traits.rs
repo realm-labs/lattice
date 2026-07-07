@@ -1,8 +1,11 @@
 use async_trait::async_trait;
-use lattice_core::{ActorKind, ActorRef, RouteKey};
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::id::RouteKey;
+use lattice_core::kind::ActorKind;
 use tonic::{Request, Response};
 
-use crate::{RoutedEnvelope, RpcError, RpcRoute};
+use crate::error::RpcError;
+use crate::types::{RoutedEnvelope, RpcRoute};
 
 pub trait RoutedRequest {
     fn actor_kind(&self) -> ActorKind;

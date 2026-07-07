@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use lattice_core::RequestId;
+use lattice_core::actor_ref::RequestId;
 
 const DEFAULT_REQUEST_DEDUP_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_REQUEST_DEDUP_SWEEP_INTERVAL: Duration = Duration::from_secs(30);

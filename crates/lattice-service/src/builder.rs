@@ -5,24 +5,30 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lattice_actor::{Actor, Handler};
-use lattice_config::{BootstrapConfig, ConfigSource};
-use lattice_config::{ConfigStore, LocalConfigStore};
-use lattice_core::{
-    ActorKind, DirectLinkLifecycleRuntimeHandle, DirectLinkMetadata, DirectLinkRuntimeHandle,
-    InstanceId, LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened, ServiceContext,
-    ServiceKind,
+use lattice_actor::traits::{Actor, Handler};
+use lattice_config::bootstrap::BootstrapConfig;
+use lattice_config::source::ConfigSource;
+use lattice_config::store::{ConfigStore, LocalConfigStore};
+use lattice_core::direct_link::messages::{
+    LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened,
 };
+use lattice_core::direct_link::runtime::{
+    DirectLinkLifecycleRuntimeHandle, DirectLinkRuntimeHandle,
+};
+use lattice_core::direct_link::stream::DirectLinkMetadata;
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_core::service_context::ServiceContext;
 use lattice_direct_link::delivery::DirectLinkDispatch;
 use lattice_direct_link::stream::DirectLinkActorBinding;
-use lattice_eventbus::{EventBus, LocalEventBus};
-use lattice_ops::{AdminHttpConfig, ServiceScheduler};
+use lattice_eventbus::local::{EventBus, LocalEventBus};
+use lattice_ops::ops_config::AdminHttpConfig;
+use lattice_ops::scheduler::ServiceScheduler;
 use lattice_placement::coordinator::{PlacementWatchStarter, PlacementWatchTask};
 use lattice_placement::route::RpcRetryPolicy;
 use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix, PlacementStore};
-use lattice_rpc::{
-    RpcSecurityPolicy, RpcServerSecurity, RpcTransportSecurity, TonicEndpointChannelPoolConfig,
-};
+use lattice_rpc::client::TonicEndpointChannelPoolConfig;
+use lattice_rpc::security::{RpcSecurityPolicy, RpcServerSecurity, RpcTransportSecurity};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::{debug, info};
@@ -41,11 +47,13 @@ use crate::direct_link::{
     DeferredDirectLinkLifecycleRuntime, DeferredDirectLinkRuntime, DirectLinkBindingRegistration,
     ErasedDirectLinkBinding, build_direct_link_runtime,
 };
+use crate::error::LatticeServiceError;
 use crate::framework::ServiceSchedulerComponent;
 use crate::rpc::{ErasedRpcClientBinding, RpcClientPlacement, RpcClientRegistration};
+use crate::rpc::{RpcClientBinding, RpcServiceBinding};
 use crate::service::AdminHttpServer;
+use crate::service::LatticeService;
 use crate::service::LatticeServiceParts;
-use crate::{LatticeService, LatticeServiceError, RpcClientBinding, RpcServiceBinding};
 
 pub struct LatticeServiceBuilder {
     service_kind: ServiceKind,
@@ -592,9 +600,11 @@ impl LatticeServiceBuilder {
                 context.logic_actors.clone(),
                 direct_link_runtime.clone(),
             );
-            context.add_rpc_service(lattice_placement::control::LogicControlServer::new(
-                lattice_placement::control::LogicControlService::new(handler),
-            ));
+            context.add_rpc_service(
+                lattice_placement::control::proto::logic_control_server::LogicControlServer::new(
+                    lattice_placement::control::LogicControlService::new(handler),
+                ),
+            );
         }
 
         let mut rpc_services = HashSet::<String>::new();
@@ -698,7 +708,7 @@ async fn build_placement_store_or_default(
     configured: Option<Box<dyn ErasedPlacementStoreComponent>>,
     default: Box<dyn ErasedPlacementStoreComponent>,
     component_context: &ServiceComponentContext,
-    service_context: &mut lattice_core::ServiceContextBuilder,
+    service_context: &mut lattice_core::service_context::ServiceContextBuilder,
     service_kind: &str,
 ) -> Result<Box<dyn ErasedPlacementStore>, LatticeServiceError> {
     let component = configured.unwrap_or(default);
@@ -715,7 +725,7 @@ async fn build_framework_component_or_default(
     configured: Option<Box<dyn ErasedServiceComponent>>,
     default: Box<dyn ErasedServiceComponent>,
     component_context: &ServiceComponentContext,
-    service_context: &mut lattice_core::ServiceContextBuilder,
+    service_context: &mut lattice_core::service_context::ServiceContextBuilder,
     service_kind: &str,
 ) -> Result<(), LatticeServiceError> {
     build_service_component(
@@ -730,7 +740,7 @@ async fn build_framework_component_or_default(
 async fn build_service_component(
     component: Box<dyn ErasedServiceComponent>,
     component_context: &ServiceComponentContext,
-    service_context: &mut lattice_core::ServiceContextBuilder,
+    service_context: &mut lattice_core::service_context::ServiceContextBuilder,
     service_kind: &str,
 ) -> Result<(), LatticeServiceError> {
     debug!(

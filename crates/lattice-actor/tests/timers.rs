@@ -2,9 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lattice_actor::{
-    Actor, ActorContext, ActorError, ActorRuntime, ActorSpawnOptions, Handler, Message,
-};
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::{ActorError, ActorStopError};
+use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
+use lattice_actor::traits::{Actor, Handler, Message, StopReason};
 use tokio::sync::{Mutex, Semaphore};
 
 struct WorldActor {
@@ -23,8 +24,8 @@ impl Actor for WorldActor {
     async fn stopping(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        _reason: lattice_actor::StopReason,
-    ) -> Result<(), lattice_actor::ActorStopError> {
+        _reason: StopReason,
+    ) -> Result<(), ActorStopError> {
         if let Some(stopped) = self.stopped.take() {
             stopped.add_permits(1);
         }

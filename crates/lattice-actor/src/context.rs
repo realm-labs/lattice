@@ -8,9 +8,11 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
-use lattice_core::{ActorRef, DirectLinkManager, ServiceContext};
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::direct_link::runtime::DirectLinkManager;
+use lattice_core::service_context::ServiceContext;
 
-use crate::ActorError;
+use crate::error::ActorError;
 use crate::handle::ActorHandle;
 use crate::traits::{
     Actor, ChildActorKey, ChildActorOptions, ChildSupervision, Handler, Message, PassivationReason,

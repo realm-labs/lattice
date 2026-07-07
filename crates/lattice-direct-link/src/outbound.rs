@@ -1,4 +1,6 @@
-use lattice_core::{LinkCloseReason, LinkSendError, OutboundDirectLinkMessage};
+use lattice_core::direct_link::errors::LinkSendError;
+use lattice_core::direct_link::options::LinkCloseReason;
+use lattice_core::direct_link::runtime::OutboundDirectLinkMessage;
 
 use crate::backpressure::{BackpressureOutcome, BackpressureQueue, BackpressureSnapshot};
 
@@ -67,12 +69,11 @@ impl OutboundDirectLinkQueue {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::{
-        BackpressurePolicy, CoalesceKey, DirectLinkMessageId, LinkDirection, LinkId,
-        LinkMessageFlags,
-    };
+    use lattice_core::direct_link::ids::{DirectLinkMessageId, LinkId};
+    use lattice_core::direct_link::messages::LinkMessageFlags;
+    use lattice_core::direct_link::options::{BackpressurePolicy, CoalesceKey, LinkDirection};
 
-    use super::*;
+    use crate::outbound::*;
 
     #[test]
     fn block_and_fail_fast_map_full_queue_to_backpressure_error() {

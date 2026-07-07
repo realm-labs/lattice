@@ -1,7 +1,10 @@
 use http::Uri;
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorId, ActorKind, InstanceId, ServiceKind, uri_serde};
+use crate::id::ActorId;
+use crate::instance::InstanceId;
+use crate::kind::{ActorKind, ServiceKind};
+use crate::uri_serde;
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,

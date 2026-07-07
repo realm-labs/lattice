@@ -2,12 +2,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorActivationError;
-use lattice_actor::registry::{ActorCreateContext, ActorRegistryConfig};
-use lattice_actor::{
-    Actor, ActorContext, ActorError, ActorLoader, ActorRegistry, Handler, MailboxConfig, Message,
+use lattice_actor::error::ActorError;
+use lattice_actor::mailbox::MailboxConfig;
+use lattice_actor::registry::{
+    ActorCreateContext, ActorLoader, ActorRegistry, ActorRegistryConfig,
 };
-use lattice_core::{ActorId, actor_kind};
+use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_core::actor_kind;
+use lattice_core::id::ActorId;
 use tokio::sync::Semaphore;
 
 #[derive(Debug)]

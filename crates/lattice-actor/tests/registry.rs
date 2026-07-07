@@ -2,12 +2,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorActivationError;
+use lattice_actor::error::ActorError;
+use lattice_actor::mailbox::MailboxConfig;
+use lattice_actor::registry::ActorRegistry;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistryConfig};
-use lattice_actor::{Actor, ActorContext, ActorError, ActorRegistry, MailboxConfig};
-use lattice_core::{
-    ActorId, ActorRef, ActorRefTarget, InstanceId, ServiceContext, actor_kind, service_kind,
-};
+use lattice_actor::traits::Actor;
+use lattice_core::actor_ref::{ActorRef, ActorRefTarget};
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_core::service_context::ServiceContext;
+use lattice_core::{actor_kind, service_kind};
 use tokio::sync::{Semaphore, oneshot};
 
 struct SlowActor;
@@ -80,7 +86,7 @@ async fn remove_running_actor_allows_restart_with_same_id() {
     let first = registry.start(actor_id.clone(), SlowActor).await.unwrap();
     let removed = registry.remove(&actor_id).await.unwrap();
     removed
-        .stop(lattice_actor::StopReason::Requested)
+        .stop(lattice_actor::traits::StopReason::Requested)
         .await
         .unwrap();
     let second = registry.start(actor_id, SlowActor).await.unwrap();

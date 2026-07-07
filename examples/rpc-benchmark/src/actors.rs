@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::ActorError;
 use lattice_actor::registry::{ActorCreateContext, ActorFactory};
-use lattice_actor::{Actor, ActorContext, ActorError, Handler};
-use lattice_core::ActorId;
-use lattice_rpc::Rpc;
+use lattice_actor::traits::{Actor, Handler};
+use lattice_core::id::ActorId;
+use lattice_rpc::types::Rpc;
 
 use crate::bench::{
     ChainPingReply, ChainPingRequest, PingReply, PingRequest, WorkReply, WorkRequest,

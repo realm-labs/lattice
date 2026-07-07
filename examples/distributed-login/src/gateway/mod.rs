@@ -5,18 +5,25 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use http::Uri;
+use lattice_actor::error::ActorError;
 use lattice_actor::registry::{ActorCreateContext, ActorRefConfig, ActorRegistryConfig};
-use lattice_actor::{ActorError, ActorLoader, ActorRegistry, StopReason};
-use lattice_core::{ActorId, ActorRef, InstanceId};
-use lattice_gateway::{ClientFrame, GatewayConnectionHandler, GatewayError, GatewayService};
-use lattice_placement::InMemoryPlacementStore;
-use lattice_rpc::ShardedRpcCore;
+use lattice_actor::registry::{ActorLoader, ActorRegistry};
+use lattice_actor::traits::StopReason;
+use lattice_core::actor_ref::ActorRef;
+use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceId;
+use lattice_gateway::error::GatewayError;
+use lattice_gateway::frame::ClientFrame;
+use lattice_gateway::server::{GatewayConnectionHandler, GatewayService};
+use lattice_placement::store::InMemoryPlacementStore;
+use lattice_rpc::traits::ShardedRpcCore;
 use prost::Message as ProstMessage;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
+use crate::error::ExampleResult;
 use crate::game::{
     LoginRequest, PlayerPingRequest, WorldPingRequest,
     gateway_push_rpc_server::GatewayPushRpcServer,
@@ -25,7 +32,7 @@ use crate::gateway::session_actor::GatewaySessionActor;
 use crate::generated::gateway_push_rpc;
 use crate::placement::{DemoRpcCore, player_core, world_core};
 use crate::tcp::{read_client_frame, write_client_frame};
-use crate::{ExampleResult, GATEWAY_SERVICE, GATEWAY_SESSION_ACTOR};
+use crate::{GATEWAY_SERVICE, GATEWAY_SESSION_ACTOR};
 
 pub async fn run_gateway(
     client_listener: TcpListener,

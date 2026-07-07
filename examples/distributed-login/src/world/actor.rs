@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use lattice_actor::context::ActorContext;
+use lattice_actor::error::ActorError;
 use lattice_actor::registry::ActorCreateContext;
-use lattice_actor::{Actor, ActorContext, ActorError, ActorFactory, Handler};
-use lattice_core::ActorId;
-use lattice_rpc::Rpc;
+use lattice_actor::registry::ActorFactory;
+use lattice_actor::traits::{Actor, Handler};
+use lattice_core::id::ActorId;
+use lattice_rpc::types::Rpc;
 
 use crate::game::{
     InitSessionRequest, LoginAcceptedReply, LoginRequest, WorldPingReply, WorldPingRequest,

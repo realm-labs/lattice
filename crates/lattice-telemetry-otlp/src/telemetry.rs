@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use lattice_core::{InstanceId, ServiceKind};
+use lattice_core::instance::InstanceId;
+use lattice_core::kind::ServiceKind;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
