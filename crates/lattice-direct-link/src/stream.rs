@@ -5,26 +5,27 @@ use std::marker::PhantomData;
 use lattice_actor::{Actor, ActorHandle, Handler};
 use lattice_core::{
     ActorKind, DirectLinkMessage, DirectLinkMessageDescriptor, DirectLinkMessageId,
-    DirectLinkStreamDescriptor, DirectLinkStreamSpec, LinkMessageContext, Linked,
+    DirectLinkMetadata, DirectLinkStreamDescriptor, DirectLinkStreamSpec, LinkMessageContext,
+    Linked,
 };
 
 use crate::delivery::{DirectLinkDeliveryError, DirectLinkDispatch};
 
-pub struct DirectLinkStream<Messages = ()> {
+pub struct DirectLinkStream<Messages = (), Metadata = ()> {
     descriptor: DirectLinkStreamDescriptor,
-    _messages: PhantomData<fn() -> Messages>,
+    _marker: PhantomData<fn() -> (Messages, Metadata)>,
 }
 
-impl<Messages> Clone for DirectLinkStream<Messages> {
+impl<Messages, Metadata> Clone for DirectLinkStream<Messages, Metadata> {
     fn clone(&self) -> Self {
         Self {
             descriptor: self.descriptor.clone(),
-            _messages: PhantomData,
+            _marker: PhantomData,
         }
     }
 }
 
-impl<Messages> fmt::Debug for DirectLinkStream<Messages> {
+impl<Messages, Metadata> fmt::Debug for DirectLinkStream<Messages, Metadata> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DirectLinkStream")
@@ -33,17 +34,27 @@ impl<Messages> fmt::Debug for DirectLinkStream<Messages> {
     }
 }
 
-impl DirectLinkStream<()> {
+impl DirectLinkStream<(), ()> {
     pub fn new(stream_name: impl Into<String>) -> Self {
         Self {
             descriptor: DirectLinkStreamDescriptor::new(stream_name),
-            _messages: PhantomData,
+            _marker: PhantomData,
         }
     }
 }
 
-impl<Messages> DirectLinkStream<Messages> {
-    pub fn message<T>(self) -> DirectLinkStream<(T, Messages)>
+impl<Messages, Metadata> DirectLinkStream<Messages, Metadata> {
+    pub fn metadata<M>(self) -> DirectLinkStream<Messages, M>
+    where
+        M: DirectLinkMetadata,
+    {
+        DirectLinkStream {
+            descriptor: self.descriptor,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn message<T>(self) -> DirectLinkStream<(T, Messages), Metadata>
     where
         T: DirectLinkMessage,
     {
@@ -52,7 +63,7 @@ impl<Messages> DirectLinkStream<Messages> {
         self.message_with_id::<T>(message_id)
     }
 
-    pub fn manual_id<T>(self, message_id: u64) -> DirectLinkStream<(T, Messages)>
+    pub fn manual_id<T>(self, message_id: u64) -> DirectLinkStream<(T, Messages), Metadata>
     where
         T: DirectLinkMessage,
     {
@@ -63,22 +74,26 @@ impl<Messages> DirectLinkStream<Messages> {
         self.descriptor.clone()
     }
 
-    pub fn for_actor<A>(&self, actor_kind: ActorKind) -> DirectLinkActorBinding<A, Messages>
+    pub fn for_actor<A>(
+        &self,
+        actor_kind: ActorKind,
+    ) -> DirectLinkActorBinding<A, Messages, Metadata>
     where
-        A: Actor + DirectLinkHandlers<Messages>,
+        A: Actor + DirectLinkHandlers<Messages, Metadata>,
+        Metadata: DirectLinkMetadata,
     {
         DirectLinkActorBinding {
             actor_kind,
             stream: self.descriptor.clone(),
             _actor: PhantomData,
-            _messages: PhantomData,
+            _marker: PhantomData,
         }
     }
 
     fn message_with_id<T>(
         mut self,
         message_id: DirectLinkMessageId,
-    ) -> DirectLinkStream<(T, Messages)>
+    ) -> DirectLinkStream<(T, Messages), Metadata>
     where
         T: DirectLinkMessage,
     {
@@ -89,35 +104,38 @@ impl<Messages> DirectLinkStream<Messages> {
         });
         DirectLinkStream {
             descriptor: self.descriptor,
-            _messages: PhantomData,
+            _marker: PhantomData,
         }
     }
 }
 
-impl<Messages> DirectLinkStreamSpec for DirectLinkStream<Messages>
+impl<Messages, Metadata> DirectLinkStreamSpec for DirectLinkStream<Messages, Metadata>
 where
     Messages: Send + Sync + 'static,
+    Metadata: DirectLinkMetadata,
 {
+    type Metadata = Metadata;
+
     fn descriptor(&self) -> DirectLinkStreamDescriptor {
         self.descriptor.clone()
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct DirectLinkActorBinding<A, Messages> {
+pub struct DirectLinkActorBinding<A, Messages, Metadata = ()> {
     actor_kind: ActorKind,
     stream: DirectLinkStreamDescriptor,
     _actor: PhantomData<fn() -> A>,
-    _messages: PhantomData<fn() -> Messages>,
+    _marker: PhantomData<fn() -> (Messages, Metadata)>,
 }
 
-impl<A, Messages> DirectLinkActorBinding<A, Messages> {
+impl<A, Messages, Metadata> DirectLinkActorBinding<A, Messages, Metadata> {
     pub fn new(actor_kind: ActorKind, stream: DirectLinkStreamDescriptor) -> Self {
         Self {
             actor_kind,
             stream,
             _actor: PhantomData,
-            _messages: PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -130,29 +148,39 @@ impl<A, Messages> DirectLinkActorBinding<A, Messages> {
     }
 }
 
-impl<A, Messages> DirectLinkActorBinding<A, Messages>
+impl<A, Messages, Metadata> DirectLinkActorBinding<A, Messages, Metadata>
 where
     A: Actor,
-    Messages: DirectLinkDispatch<A>,
+    Metadata: DirectLinkMetadata,
+    Messages: DirectLinkDispatch<A, Metadata>,
 {
     pub fn try_deliver(
         &self,
         handle: &ActorHandle<A>,
         message_id: DirectLinkMessageId,
         payload: &[u8],
+        metadata: &[u8],
         context: LinkMessageContext,
     ) -> Result<(), DirectLinkDeliveryError> {
-        Messages::try_dispatch(handle, &self.stream, message_id, payload, context)
+        let metadata = Metadata::decode_metadata(metadata)
+            .map_err(|error| DirectLinkDeliveryError::DecodeMetadata(error.to_string()))?;
+        Messages::try_dispatch(handle, &self.stream, message_id, payload, metadata, context)
     }
 }
 
-pub trait DirectLinkHandlers<Messages>: Actor {}
+pub trait DirectLinkHandlers<Messages, Metadata>: Actor {}
 
-impl<A> DirectLinkHandlers<()> for A where A: Actor {}
-
-impl<A, Head, Tail> DirectLinkHandlers<(Head, Tail)> for A
+impl<A, Metadata> DirectLinkHandlers<(), Metadata> for A
 where
-    A: Actor + Handler<Linked<Head>> + DirectLinkHandlers<Tail>,
+    A: Actor,
+    Metadata: DirectLinkMetadata,
+{
+}
+
+impl<A, Metadata, Head, Tail> DirectLinkHandlers<(Head, Tail), Metadata> for A
+where
+    A: Actor + Handler<Linked<Head, Metadata>> + DirectLinkHandlers<Tail, Metadata>,
+    Metadata: DirectLinkMetadata,
     Head: Send + 'static,
     Tail: Send + Sync + 'static,
 {

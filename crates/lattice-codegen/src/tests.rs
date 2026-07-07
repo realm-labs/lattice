@@ -282,6 +282,7 @@ fn direct_link_stream_codegen_uses_static_match_dispatch() {
         crate::render::generate_direct_link_stream_bindings(&[GeneratedDirectLinkStreamSpec {
             module_name: "client_player_request".into(),
             stream_name: "client.player.request".into(),
+            metadata_type: None,
             messages: vec![
                 GeneratedDirectLinkMessageSpec {
                     message_id: 7001,
@@ -307,20 +308,20 @@ fn direct_link_stream_codegen_uses_static_match_dispatch() {
             .contains("pub fn bind<A>(actor_kind: lattice_core::ActorKind)")
     );
     assert!(generated.rust.contains(
-        "A: lattice_actor::Actor + lattice_actor::Handler<lattice_core::Linked<crate::world::EnterWorldRequest>> + lattice_actor::Handler<lattice_core::Linked<crate::world::MoveWorldRequest>>,"
+        "A: lattice_actor::Actor + lattice_actor::Handler<lattice_core::Linked<crate::world::EnterWorldRequest, ()>> + lattice_actor::Handler<lattice_core::Linked<crate::world::MoveWorldRequest, ()>>,"
     ));
     assert!(
         generated
             .rust
-            .contains("impl<A> lattice_direct_link::DirectLinkDispatch<A> for Stream")
+            .contains("impl<A> lattice_direct_link::DirectLinkDispatch<A, ()> for Stream")
     );
     assert!(generated.rust.contains("match message_id.0"));
     assert!(generated.rust.contains("7001 =>"));
     assert!(generated.rust.contains("7101 =>"));
     assert!(
-        generated
-            .rust
-            .contains("lattice_direct_link::try_deliver_linked(handle, payload, context)")
+        generated.rust.contains(
+            "lattice_direct_link::try_deliver_linked(handle, payload, metadata, context)"
+        )
     );
 }
 
@@ -330,6 +331,7 @@ fn direct_link_bidirectional_codegen_keeps_direction_handler_bounds_separate() {
         GeneratedDirectLinkStreamSpec {
             module_name: "client_player_request".into(),
             stream_name: "client.player.request".into(),
+            metadata_type: None,
             messages: vec![GeneratedDirectLinkMessageSpec {
                 message_id: 7001,
                 rust_type: "crate::world::EnterWorldRequest".into(),
@@ -338,6 +340,7 @@ fn direct_link_bidirectional_codegen_keeps_direction_handler_bounds_separate() {
         GeneratedDirectLinkStreamSpec {
             module_name: "client_player_response".into(),
             stream_name: "client.player.response".into(),
+            metadata_type: None,
             messages: vec![GeneratedDirectLinkMessageSpec {
                 message_id: 7002,
                 rust_type: "crate::world::EnterWorldReply".into(),
@@ -353,10 +356,12 @@ fn direct_link_bidirectional_codegen_keeps_direction_handler_bounds_separate() {
         .and_then(|source| source.split("pub mod client_player_response").next())
         .expect("request stream module");
     assert!(
-        request_module.contains("Handler<lattice_core::Linked<crate::world::EnterWorldRequest>>")
+        request_module
+            .contains("Handler<lattice_core::Linked<crate::world::EnterWorldRequest, ()>>")
     );
     assert!(
-        !request_module.contains("Handler<lattice_core::Linked<crate::world::EnterWorldReply>>")
+        !request_module
+            .contains("Handler<lattice_core::Linked<crate::world::EnterWorldReply, ()>>")
     );
 
     let response_module = generated
@@ -365,11 +370,45 @@ fn direct_link_bidirectional_codegen_keeps_direction_handler_bounds_separate() {
         .nth(1)
         .expect("response stream module");
     assert!(
-        response_module.contains("Handler<lattice_core::Linked<crate::world::EnterWorldReply>>")
+        response_module
+            .contains("Handler<lattice_core::Linked<crate::world::EnterWorldReply, ()>>")
     );
     assert!(
-        !response_module.contains("Handler<lattice_core::Linked<crate::world::EnterWorldRequest>>")
+        !response_module
+            .contains("Handler<lattice_core::Linked<crate::world::EnterWorldRequest, ()>>")
     );
+}
+
+#[test]
+fn direct_link_stream_codegen_supports_typed_metadata() {
+    let generated =
+        crate::render::generate_direct_link_stream_bindings(&[GeneratedDirectLinkStreamSpec {
+            module_name: "client_player_request".into(),
+            stream_name: "client.player.request".into(),
+            metadata_type: Some("crate::direct_link::ClientRequestContext".into()),
+            messages: vec![GeneratedDirectLinkMessageSpec {
+                message_id: 7001,
+                rust_type: "crate::world::EnterWorldRequest".into(),
+            }],
+        }])
+        .unwrap();
+
+    assert!(
+        generated
+            .rust
+            .contains("type Metadata = crate::direct_link::ClientRequestContext;")
+    );
+    assert!(
+        generated.rust.contains(
+            "DirectLinkActorBinding<A, Stream, crate::direct_link::ClientRequestContext>"
+        )
+    );
+    assert!(generated.rust.contains(
+        "Handler<lattice_core::Linked<crate::world::EnterWorldRequest, crate::direct_link::ClientRequestContext>>"
+    ));
+    assert!(generated.rust.contains(
+        "impl<A> lattice_direct_link::DirectLinkDispatch<A, crate::direct_link::ClientRequestContext> for Stream"
+    ));
 }
 
 #[test]
@@ -378,6 +417,7 @@ fn direct_link_stream_codegen_rejects_duplicate_message_ids() {
         crate::render::generate_direct_link_stream_bindings(&[GeneratedDirectLinkStreamSpec {
             module_name: "client_player".into(),
             stream_name: "client.player".into(),
+            metadata_type: None,
             messages: vec![
                 GeneratedDirectLinkMessageSpec {
                     message_id: 7001,

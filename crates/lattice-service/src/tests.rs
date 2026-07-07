@@ -1870,6 +1870,7 @@ async fn direct_link_connection_allows_target_to_source_outbound_session() {
                 .message_id_for::<DirectLinkTestPayload>()
                 .unwrap(),
             proto_full_name: DirectLinkTestPayload::PROTO_FULL_NAME,
+            metadata: Vec::new(),
             payload: DirectLinkTestPayload { tick: 55 }.encode_to_vec(),
             flags: LinkMessageFlags::EMPTY,
         })

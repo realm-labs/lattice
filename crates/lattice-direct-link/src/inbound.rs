@@ -11,10 +11,10 @@ use std::time::Instant;
 
 use lattice_actor::{Actor, ActorHandle, ActorTellError, Handler};
 use lattice_core::{
-    ActorId, ActorKind, ActorRef, DirectLinkMessageId, DirectLinkSender, DirectLinkSession,
-    DirectLinkStreamDescriptor, LinkBackpressure, LinkCloseReason, LinkClosed, LinkDirection,
-    LinkDirectionClosed, LinkError, LinkId, LinkMessageContext, LinkMessageFlags, LinkOpened,
-    LinkSendError, LinkSequence, OutboundDirectLinkMessage,
+    ActorId, ActorKind, ActorRef, DirectLinkMessageId, DirectLinkMetadata, DirectLinkSender,
+    DirectLinkSession, DirectLinkStreamDescriptor, LinkBackpressure, LinkCloseReason, LinkClosed,
+    LinkDirection, LinkDirectionClosed, LinkError, LinkId, LinkMessageContext, LinkMessageFlags,
+    LinkOpened, LinkSendError, LinkSequence, OutboundDirectLinkMessage,
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -159,7 +159,13 @@ impl DirectLinkInboundRouter {
             received_at: std::time::Instant::now(),
             flags: LinkMessageFlags::from_bits(frame.flags.bits()),
         };
-        match binding.deliver(&actor_ref, message_id, &frame.payload, context) {
+        match binding.deliver(
+            &actor_ref,
+            message_id,
+            &frame.payload,
+            &frame.header,
+            context,
+        ) {
             Ok(()) => {
                 self.session_manager.complete_message_frame(
                     &frame.link_id,
@@ -532,14 +538,15 @@ pub struct DirectLinkInboundRouterBuilder {
 }
 
 impl DirectLinkInboundRouterBuilder {
-    pub fn bind_actor<A, Messages, F>(
+    pub fn bind_actor<A, Messages, Metadata, F>(
         mut self,
-        binding: DirectLinkActorBinding<A, Messages>,
+        binding: DirectLinkActorBinding<A, Messages, Metadata>,
         resolver: F,
     ) -> Self
     where
         A: Actor,
-        Messages: DirectLinkDispatch<A>,
+        Metadata: DirectLinkMetadata,
+        Messages: DirectLinkDispatch<A, Metadata>,
         A: Handler<LinkOpened>
             + Handler<LinkDirectionClosed>
             + Handler<LinkClosed>
@@ -604,11 +611,12 @@ impl InboundConnectionSender {
             .next_sequence
             .lock()
             .expect("direct-link inbound sender sequence poisoned");
-        let frame = DirectLinkFrame::directed_message(
+        let frame = DirectLinkFrame::directed_message_with_header(
             message.link_id,
             message.direction,
             LinkSequence(*next_sequence),
             message.message_id,
+            message.metadata,
             message.payload,
         );
         *next_sequence += 1;
@@ -661,6 +669,7 @@ trait ErasedInboundBinding: Send + Sync + 'static {
         actor_ref: &ActorRef,
         message_id: DirectLinkMessageId,
         payload: &[u8],
+        metadata: &[u8],
         context: LinkMessageContext,
     ) -> Result<(), InboundDeliveryError>;
 
@@ -691,34 +700,36 @@ trait ErasedInboundBinding: Send + Sync + 'static {
 
 type ActorResolver<A> = dyn Fn(&ActorRef) -> Option<ActorHandle<A>> + Send + Sync;
 
-struct TypedInboundBinding<A, Messages>
+struct TypedInboundBinding<A, Messages, Metadata>
 where
     A: Actor,
 {
-    binding: DirectLinkActorBinding<A, Messages>,
+    binding: DirectLinkActorBinding<A, Messages, Metadata>,
     resolver: Arc<ActorResolver<A>>,
-    _actor: PhantomData<fn() -> A>,
+    _actor: PhantomData<fn() -> (A, Metadata)>,
 }
 
-impl<A, Messages> ErasedInboundBinding for TypedInboundBinding<A, Messages>
+impl<A, Messages, Metadata> ErasedInboundBinding for TypedInboundBinding<A, Messages, Metadata>
 where
     A: Actor
         + Handler<LinkOpened>
         + Handler<LinkDirectionClosed>
         + Handler<LinkClosed>
         + Handler<LinkBackpressure>,
-    Messages: DirectLinkDispatch<A>,
+    Metadata: DirectLinkMetadata,
+    Messages: DirectLinkDispatch<A, Metadata>,
 {
     fn deliver(
         &self,
         actor_ref: &ActorRef,
         message_id: DirectLinkMessageId,
         payload: &[u8],
+        metadata: &[u8],
         context: LinkMessageContext,
     ) -> Result<(), InboundDeliveryError> {
         let handle = (self.resolver)(actor_ref).ok_or(InboundDeliveryError::ActorUnavailable)?;
         self.binding
-            .try_deliver(&handle, message_id, payload, context)
+            .try_deliver(&handle, message_id, payload, metadata, context)
             .map_err(Into::into)
     }
 
@@ -1111,6 +1122,8 @@ mod tests {
     struct BattleUpdateStream;
 
     impl DirectLinkStreamType for BattleUpdateStream {
+        type Metadata = ();
+
         fn descriptor() -> DirectLinkStreamDescriptor {
             DirectLinkStream::new("battle-update")
                 .message::<PositionUpdate>()
@@ -2679,6 +2692,7 @@ mod tests {
     fn linked_command(command_id: u64) -> Linked<InputCommand> {
         Linked {
             payload: InputCommand { command_id },
+            metadata: (),
             context: LinkMessageContext {
                 link_id: LinkId::new("prefill"),
                 source: actor_ref(service_kind!("Gateway"), actor_kind!("GatewaySession"), 7),

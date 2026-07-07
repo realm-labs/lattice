@@ -29,6 +29,7 @@ pub struct GeneratedDirectLinkStreamSpec {
     /// each actor side.
     pub module_name: String,
     pub stream_name: String,
+    pub metadata_type: Option<String>,
     pub messages: Vec<GeneratedDirectLinkMessageSpec>,
 }
 

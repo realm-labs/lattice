@@ -115,6 +115,15 @@ fn validate_direct_link_streams(
         if stream.stream_name.trim().is_empty() {
             return Err(CodegenError::MissingField("direct_link_stream.stream_name"));
         }
+        if stream
+            .metadata_type
+            .as_ref()
+            .is_some_and(|metadata_type| metadata_type.trim().is_empty())
+        {
+            return Err(CodegenError::MissingField(
+                "direct_link_stream.metadata_type",
+            ));
+        }
         if stream.messages.is_empty() {
             return Err(CodegenError::MissingField("direct_link_stream.messages"));
         }
@@ -141,11 +150,13 @@ fn push_generated_direct_link_streams(
     streams: &[GeneratedDirectLinkStreamSpec],
 ) {
     for stream in streams {
+        let metadata_type = direct_link_metadata_type(stream);
         rust.push_str(&format!("pub mod {} {{\n", stream.module_name));
         rust.push_str("    #[derive(Debug, Clone, Copy, Default)]\n");
         rust.push_str("    pub struct Stream;\n\n");
 
         rust.push_str("    impl lattice_core::DirectLinkStreamType for Stream {\n");
+        rust.push_str(&format!("        type Metadata = {metadata_type};\n\n"));
         rust.push_str("        fn descriptor() -> lattice_core::DirectLinkStreamDescriptor {\n");
         rust.push_str("            descriptor()\n");
         rust.push_str("        }\n");
@@ -179,8 +190,10 @@ fn push_generated_direct_link_streams(
         rust.push_str("    }\n\n");
 
         rust.push_str(
-            "    pub fn bind<A>(actor_kind: lattice_core::ActorKind) -> lattice_direct_link::DirectLinkActorBinding<A, Stream>\n",
+            "    pub fn bind<A>(actor_kind: lattice_core::ActorKind) -> lattice_direct_link::DirectLinkActorBinding<A, Stream, ",
         );
+        rust.push_str(&metadata_type);
+        rust.push_str(">\n");
         rust.push_str("    where\n");
         push_direct_link_handler_bounds(rust, stream);
         rust.push_str("    {\n");
@@ -189,7 +202,9 @@ fn push_generated_direct_link_streams(
         );
         rust.push_str("    }\n\n");
 
-        rust.push_str("    impl<A> lattice_direct_link::DirectLinkDispatch<A> for Stream\n");
+        rust.push_str("    impl<A> lattice_direct_link::DirectLinkDispatch<A, ");
+        rust.push_str(&metadata_type);
+        rust.push_str("> for Stream\n");
         rust.push_str("    where\n");
         push_direct_link_handler_bounds(rust, stream);
         rust.push_str("    {\n");
@@ -198,6 +213,9 @@ fn push_generated_direct_link_streams(
         rust.push_str("            _stream: &lattice_core::DirectLinkStreamDescriptor,\n");
         rust.push_str("            message_id: lattice_core::DirectLinkMessageId,\n");
         rust.push_str("            payload: &[u8],\n");
+        rust.push_str("            metadata: ");
+        rust.push_str(&metadata_type);
+        rust.push_str(",\n");
         rust.push_str("            context: lattice_core::LinkMessageContext,\n");
         rust.push_str("        ) -> Result<(), lattice_direct_link::DirectLinkDeliveryError> {\n");
         rust.push_str("            match message_id.0 {\n");
@@ -208,7 +226,7 @@ fn push_generated_direct_link_streams(
                 message.rust_type
             ));
             rust.push_str("                        .map_err(|error| lattice_direct_link::DirectLinkDeliveryError::Decode(error.to_string()))?;\n");
-            rust.push_str("                    lattice_direct_link::try_deliver_linked(handle, payload, context)\n");
+            rust.push_str("                    lattice_direct_link::try_deliver_linked(handle, payload, metadata, context)\n");
             rust.push_str("                        .map_err(lattice_direct_link::DirectLinkDeliveryError::from)\n");
             rust.push_str("                }\n");
         }
@@ -223,14 +241,19 @@ fn push_generated_direct_link_streams(
 }
 
 fn push_direct_link_handler_bounds(rust: &mut String, stream: &GeneratedDirectLinkStreamSpec) {
+    let metadata_type = direct_link_metadata_type(stream);
     rust.push_str("        A: lattice_actor::Actor");
     for message in &stream.messages {
         rust.push_str(&format!(
-            " + lattice_actor::Handler<lattice_core::Linked<{}>>",
-            message.rust_type
+            " + lattice_actor::Handler<lattice_core::Linked<{}, {}>>",
+            message.rust_type, metadata_type
         ));
     }
     rust.push_str(",\n");
+}
+
+fn direct_link_metadata_type(stream: &GeneratedDirectLinkStreamSpec) -> String {
+    stream.metadata_type.as_deref().unwrap_or("()").to_string()
 }
 
 fn push_actor_ref_conversions(rust: &mut String) {

@@ -186,6 +186,7 @@ mod tests {
             direction: LinkDirection::SourceToTarget,
             message_id: DirectLinkMessageId(sequence),
             proto_full_name: "test.Payload",
+            metadata: Vec::new(),
             payload: vec![sequence as u8],
             flags: LinkMessageFlags::EMPTY,
         }

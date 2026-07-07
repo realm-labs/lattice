@@ -76,13 +76,31 @@ impl DirectLinkFrame {
         message_id: DirectLinkMessageId,
         payload: Vec<u8>,
     ) -> Self {
+        Self::directed_message_with_header(
+            link_id,
+            direction,
+            sequence,
+            message_id,
+            Vec::new(),
+            payload,
+        )
+    }
+
+    pub fn directed_message_with_header(
+        link_id: LinkId,
+        direction: LinkDirection,
+        sequence: LinkSequence,
+        message_id: DirectLinkMessageId,
+        header: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> Self {
         Self {
             kind: DirectLinkFrameKind::Message,
             link_id,
             sequence,
             message_id: Some(message_id),
             flags: flags_for_direction(direction),
-            header: Vec::new(),
+            header,
             payload,
         }
     }

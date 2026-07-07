@@ -885,11 +885,12 @@ where
                 self.link_id, message.link_id
             )));
         }
-        Ok(DirectLinkFrame::directed_message(
+        Ok(DirectLinkFrame::directed_message_with_header(
             message.link_id,
             message.direction,
             sequence,
             message.message_id,
+            message.metadata,
             message.payload,
         ))
     }
@@ -1397,6 +1398,7 @@ mod tests {
                 direction: LinkDirection::SourceToTarget,
                 message_id: DirectLinkMessageId(7),
                 proto_full_name: "game.Position",
+                metadata: Vec::new(),
                 payload: b"abc".to_vec(),
                 flags: LinkMessageFlags::EMPTY,
             }
@@ -1484,6 +1486,7 @@ mod tests {
                 direction: LinkDirection::SourceToTarget,
                 message_id: DirectLinkMessageId(7),
                 proto_full_name: "game.Position",
+                metadata: Vec::new(),
                 payload: b"abc".to_vec(),
                 flags: LinkMessageFlags::EMPTY,
             }
@@ -1501,6 +1504,7 @@ mod tests {
             direction: LinkDirection::SourceToTarget,
             message_id: DirectLinkMessageId(7),
             proto_full_name: "game.Position",
+            metadata: Vec::new(),
             payload: b"abc".to_vec(),
             flags: LinkMessageFlags::EMPTY,
         });
@@ -1517,6 +1521,7 @@ mod tests {
                 direction: LinkDirection::SourceToTarget,
                 message_id: DirectLinkMessageId(7),
                 proto_full_name: "game.Position",
+                metadata: Vec::new(),
                 payload: b"abc".to_vec(),
                 flags: LinkMessageFlags::EMPTY,
             })
@@ -1544,6 +1549,7 @@ mod tests {
                 direction: LinkDirection::SourceToTarget,
                 message_id: DirectLinkMessageId(7),
                 proto_full_name: "game.Position",
+                metadata: Vec::new(),
                 payload: b"abc".to_vec(),
                 flags: LinkMessageFlags::EMPTY,
             })
@@ -1662,6 +1668,7 @@ mod tests {
                 direction: LinkDirection::SourceToTarget,
                 message_id: DirectLinkMessageId(7),
                 proto_full_name: "game.Position",
+                metadata: Vec::new(),
                 payload: b"abc".to_vec(),
                 flags: LinkMessageFlags::EMPTY,
             })

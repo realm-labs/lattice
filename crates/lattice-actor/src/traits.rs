@@ -10,9 +10,10 @@ pub trait Message: Send + 'static {
     type Reply: Send + 'static;
 }
 
-impl<T> Message for Linked<T>
+impl<T, M> Message for Linked<T, M>
 where
     T: Send + 'static,
+    M: Send + 'static,
 {
     type Reply = ();
 }

@@ -260,11 +260,36 @@ pub trait DirectLinkMessage: ProstMessage + Default + Send + Sync + 'static {
     const PROTO_FULL_NAME: &'static str;
 }
 
+pub trait DirectLinkMetadata: Clone + Send + Sync + 'static {
+    fn encode_metadata(&self) -> Result<Vec<u8>, LinkMetadataError>;
+    fn decode_metadata(bytes: &[u8]) -> Result<Self, LinkMetadataError>
+    where
+        Self: Sized;
+}
+
+impl DirectLinkMetadata for () {
+    fn encode_metadata(&self) -> Result<Vec<u8>, LinkMetadataError> {
+        Ok(Vec::new())
+    }
+
+    fn decode_metadata(bytes: &[u8]) -> Result<Self, LinkMetadataError> {
+        if bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(LinkMetadataError::UnexpectedMetadata)
+        }
+    }
+}
+
 pub trait DirectLinkStreamSpec: Clone + Send + Sync + 'static {
+    type Metadata: DirectLinkMetadata;
+
     fn descriptor(&self) -> DirectLinkStreamDescriptor;
 }
 
 pub trait DirectLinkStreamType: Clone + Send + Sync + 'static {
+    type Metadata: DirectLinkMetadata;
+
     fn descriptor() -> DirectLinkStreamDescriptor;
 }
 
@@ -272,6 +297,8 @@ impl<T> DirectLinkStreamSpec for T
 where
     T: DirectLinkStreamType,
 {
+    type Metadata = T::Metadata;
+
     fn descriptor(&self) -> DirectLinkStreamDescriptor {
         T::descriptor()
     }
@@ -311,8 +338,9 @@ pub struct LinkMessageContext {
 }
 
 #[derive(Debug, Clone)]
-pub struct Linked<T> {
+pub struct Linked<T, M = ()> {
     pub payload: T,
+    pub metadata: M,
     pub context: LinkMessageContext,
 }
 
@@ -367,6 +395,7 @@ pub struct OutboundDirectLinkMessage {
     pub direction: LinkDirection,
     pub message_id: DirectLinkMessageId,
     pub proto_full_name: &'static str,
+    pub metadata: Vec<u8>,
     pub payload: Vec<u8>,
     pub flags: LinkMessageFlags,
 }
@@ -418,17 +447,45 @@ where
 
     pub async fn tell<T>(&self, payload: T) -> Result<(), LinkSendError>
     where
+        S: DirectLinkStreamSpec<Metadata = ()>,
         T: DirectLinkMessage,
     {
-        let message = self.encode_message(payload)?;
+        let message = self.encode_message_with_metadata(payload, ())?;
         self.session.sender.tell(message).await
     }
 
     pub fn try_tell<T>(&self, payload: T) -> Result<(), LinkSendError>
     where
+        S: DirectLinkStreamSpec<Metadata = ()>,
         T: DirectLinkMessage,
     {
-        let message = self.encode_message(payload)?;
+        let message = self.encode_message_with_metadata(payload, ())?;
+        self.session.sender.try_tell(message)
+    }
+
+    pub async fn tell_with_metadata<T>(
+        &self,
+        payload: T,
+        metadata: S::Metadata,
+    ) -> Result<(), LinkSendError>
+    where
+        S: DirectLinkStreamSpec,
+        T: DirectLinkMessage,
+    {
+        let message = self.encode_message_with_metadata(payload, metadata)?;
+        self.session.sender.tell(message).await
+    }
+
+    pub fn try_tell_with_metadata<T>(
+        &self,
+        payload: T,
+        metadata: S::Metadata,
+    ) -> Result<(), LinkSendError>
+    where
+        S: DirectLinkStreamSpec,
+        T: DirectLinkMessage,
+    {
+        let message = self.encode_message_with_metadata(payload, metadata)?;
         self.session.sender.try_tell(message)
     }
 
@@ -436,8 +493,13 @@ where
         self.session.sender.close(reason).await
     }
 
-    fn encode_message<T>(&self, payload: T) -> Result<OutboundDirectLinkMessage, LinkSendError>
+    fn encode_message_with_metadata<T>(
+        &self,
+        payload: T,
+        metadata: S::Metadata,
+    ) -> Result<OutboundDirectLinkMessage, LinkSendError>
     where
+        S: DirectLinkStreamSpec,
         T: DirectLinkMessage,
     {
         let message_id = self
@@ -452,15 +514,27 @@ where
         payload
             .encode(&mut encoded)
             .map_err(|error| LinkSendError::Encode(error.to_string()))?;
+        let metadata = metadata
+            .encode_metadata()
+            .map_err(|error| LinkSendError::EncodeMetadata(error.to_string()))?;
         Ok(OutboundDirectLinkMessage {
             link_id: self.session.link_id.clone(),
             direction: self.session.direction,
             message_id,
             proto_full_name: T::PROTO_FULL_NAME,
+            metadata,
             payload: encoded,
             flags: LinkMessageFlags::EMPTY,
         })
     }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum LinkMetadataError {
+    #[error("direct-link metadata bytes were provided for a unit metadata stream")]
+    UnexpectedMetadata,
+    #[error("failed to decode direct-link metadata: {0}")]
+    Decode(String),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -475,6 +549,8 @@ pub enum LinkSendError {
     MessageTooLarge,
     #[error("failed to encode direct link message: {0}")]
     Encode(String),
+    #[error("failed to encode direct link metadata: {0}")]
+    EncodeMetadata(String),
     #[error("direct link protocol error: {0}")]
     Protocol(String),
 }
@@ -743,10 +819,32 @@ mod tests {
         const PROTO_FULL_NAME: &'static str = "game.StateDelta";
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestMetadata {
+        package_index: u32,
+    }
+
+    impl DirectLinkMetadata for TestMetadata {
+        fn encode_metadata(&self) -> Result<Vec<u8>, LinkMetadataError> {
+            Ok(self.package_index.to_be_bytes().to_vec())
+        }
+
+        fn decode_metadata(bytes: &[u8]) -> Result<Self, LinkMetadataError> {
+            let bytes: [u8; 4] = bytes
+                .try_into()
+                .map_err(|_| LinkMetadataError::Decode("expected u32 metadata".to_string()))?;
+            Ok(Self {
+                package_index: u32::from_be_bytes(bytes),
+            })
+        }
+    }
+
     #[derive(Clone)]
     struct SourceToTargetStream;
 
     impl DirectLinkStreamType for SourceToTargetStream {
+        type Metadata = ();
+
         fn descriptor() -> DirectLinkStreamDescriptor {
             stream("gateway-input", &[message::<InputCommand>("gateway-input")])
         }
@@ -756,8 +854,24 @@ mod tests {
     struct TargetToSourceStream;
 
     impl DirectLinkStreamType for TargetToSourceStream {
+        type Metadata = ();
+
         fn descriptor() -> DirectLinkStreamDescriptor {
             stream("battle-update", &[message::<StateDelta>("battle-update")])
+        }
+    }
+
+    #[derive(Clone)]
+    struct MetadataStream;
+
+    impl DirectLinkStreamType for MetadataStream {
+        type Metadata = TestMetadata;
+
+        fn descriptor() -> DirectLinkStreamDescriptor {
+            stream(
+                "metadata-input",
+                &[message::<InputCommand>("metadata-input")],
+            )
         }
     }
 
@@ -895,6 +1009,38 @@ mod tests {
             DirectLinkMessageId::for_proto("gateway-input", InputCommand::PROTO_FULL_NAME)
         );
         assert_eq!(messages[0].proto_full_name, InputCommand::PROTO_FULL_NAME);
+    }
+
+    #[tokio::test]
+    async fn tell_with_metadata_encodes_stream_metadata() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let mut context = ServiceContext::builder(
+            ServiceKind::from_static("Gateway"),
+            InstanceId::new("gateway-1"),
+        );
+        context
+            .insert_extension(DirectLinkRuntimeHandle::new(runtime.clone()))
+            .unwrap();
+        let source = actor_ref("Gateway", "GatewaySession", 7);
+        let target = actor_ref("Player", "Player", 9);
+        let manager = DirectLinkManager::new(context.build(), Some(source));
+
+        let link = manager
+            .connect(target, MetadataStream, DirectLinkOptions::unidirectional())
+            .await
+            .unwrap();
+        link.try_tell_with_metadata(
+            InputCommand { command_id: 42 },
+            TestMetadata { package_index: 88 },
+        )
+        .unwrap();
+
+        let messages = runtime
+            .sender
+            .messages
+            .lock()
+            .expect("sent messages mutex poisoned");
+        assert_eq!(messages[0].metadata, 88u32.to_be_bytes());
     }
 
     fn stream(

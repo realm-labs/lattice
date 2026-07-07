@@ -9,8 +9,9 @@ use lattice_actor::{Actor, Handler};
 use lattice_config::{BootstrapConfig, ConfigSource};
 use lattice_config::{ConfigStore, LocalConfigStore};
 use lattice_core::{
-    ActorKind, DirectLinkLifecycleRuntimeHandle, DirectLinkRuntimeHandle, InstanceId,
-    LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened, ServiceContext, ServiceKind,
+    ActorKind, DirectLinkLifecycleRuntimeHandle, DirectLinkMetadata, DirectLinkRuntimeHandle,
+    InstanceId, LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened, ServiceContext,
+    ServiceKind,
 };
 use lattice_direct_link::{DirectLinkActorBinding, DirectLinkDispatch};
 use lattice_eventbus::{EventBus, LocalEventBus};
@@ -272,9 +273,9 @@ impl LatticeServiceBuilder {
         self
     }
 
-    pub fn register_direct_link<A, Messages>(
+    pub fn register_direct_link<A, Messages, Metadata>(
         mut self,
-        binding: DirectLinkActorBinding<A, Messages>,
+        binding: DirectLinkActorBinding<A, Messages, Metadata>,
     ) -> Self
     where
         A: Actor + Sync,
@@ -282,7 +283,8 @@ impl LatticeServiceBuilder {
             + Handler<LinkDirectionClosed>
             + Handler<LinkClosed>
             + Handler<LinkBackpressure>,
-        Messages: DirectLinkDispatch<A>,
+        Metadata: DirectLinkMetadata,
+        Messages: DirectLinkDispatch<A, Metadata>,
     {
         self.direct_link_bindings
             .push(Box::new(DirectLinkBindingRegistration::new(binding)));

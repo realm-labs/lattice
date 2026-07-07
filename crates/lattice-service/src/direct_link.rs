@@ -6,9 +6,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use lattice_actor::{Actor, Handler};
 use lattice_core::{
-    ActorRef, DirectLinkEndpoint, DirectLinkLifecycleRuntime, DirectLinkOpenRequest,
-    DirectLinkRuntime, DirectLinkSession, LinkBackpressure, LinkCloseReason, LinkClosed,
-    LinkDirectionClosed, LinkError, LinkId, LinkOpened, LinkTarget,
+    ActorRef, DirectLinkEndpoint, DirectLinkLifecycleRuntime, DirectLinkMetadata,
+    DirectLinkOpenRequest, DirectLinkRuntime, DirectLinkSession, LinkBackpressure, LinkCloseReason,
+    LinkClosed, LinkDirectionClosed, LinkError, LinkId, LinkOpened, LinkTarget,
 };
 use lattice_direct_link::{
     DirectLinkActorBinding, DirectLinkDispatch, DirectLinkEndpointPool, DirectLinkInboundRouter,
@@ -268,19 +268,19 @@ pub(crate) trait ErasedDirectLinkBinding: Send + Sync + 'static {
     ) -> Result<DirectLinkInboundRouterBuilder, LatticeServiceError>;
 }
 
-pub(crate) struct DirectLinkBindingRegistration<A, Messages>
+pub(crate) struct DirectLinkBindingRegistration<A, Messages, Metadata = ()>
 where
     A: Actor,
 {
-    binding: DirectLinkActorBinding<A, Messages>,
-    _actor: PhantomData<fn() -> A>,
+    binding: DirectLinkActorBinding<A, Messages, Metadata>,
+    _actor: PhantomData<fn() -> (A, Metadata)>,
 }
 
-impl<A, Messages> DirectLinkBindingRegistration<A, Messages>
+impl<A, Messages, Metadata> DirectLinkBindingRegistration<A, Messages, Metadata>
 where
     A: Actor,
 {
-    pub fn new(binding: DirectLinkActorBinding<A, Messages>) -> Self {
+    pub fn new(binding: DirectLinkActorBinding<A, Messages, Metadata>) -> Self {
         Self {
             binding,
             _actor: PhantomData,
@@ -288,14 +288,16 @@ where
     }
 }
 
-impl<A, Messages> ErasedDirectLinkBinding for DirectLinkBindingRegistration<A, Messages>
+impl<A, Messages, Metadata> ErasedDirectLinkBinding
+    for DirectLinkBindingRegistration<A, Messages, Metadata>
 where
     A: Actor + Sync,
     A: Handler<LinkOpened>
         + Handler<LinkDirectionClosed>
         + Handler<LinkClosed>
         + Handler<LinkBackpressure>,
-    Messages: DirectLinkDispatch<A>,
+    Metadata: DirectLinkMetadata,
+    Messages: DirectLinkDispatch<A, Metadata>,
 {
     fn register(
         self: Box<Self>,

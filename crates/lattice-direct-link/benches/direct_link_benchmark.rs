@@ -212,6 +212,7 @@ async fn pooled_striped_concurrent_steady_state(
                         direction: LinkDirection::SourceToTarget,
                         message_id: DirectLinkMessageId(7),
                         proto_full_name: "bench.Payload",
+                        metadata: Vec::new(),
                         payload: payload.clone(),
                         flags: LinkMessageFlags::EMPTY,
                     })
