@@ -13,8 +13,8 @@ pub use codec::{DirectLinkFrame, DirectLinkFrameCodec, DirectLinkFrameKind, Fram
 pub use delivery::{DirectLinkDeliveryError, DirectLinkDispatch, try_deliver_linked};
 pub use endpoint_pool::{
     DirectLinkConnectionId, DirectLinkConnectionStripe, DirectLinkEndpointKey,
-    DirectLinkEndpointPool, DirectLinkEndpointPoolConfig, DirectLinkEndpointPoolMetricsSnapshot,
-    PooledDirectLinkEndpointPool, PooledDirectLinkSession,
+    DirectLinkEndpointPool, DirectLinkEndpointPoolConfig, DirectLinkEndpointPoolLifecycle,
+    DirectLinkEndpointPoolMetricsSnapshot, PooledDirectLinkEndpointPool, PooledDirectLinkSession,
 };
 pub use inbound::{
     DirectLinkInboundRouter, DirectLinkInboundRouterBuilder, InboundConnectionSender,

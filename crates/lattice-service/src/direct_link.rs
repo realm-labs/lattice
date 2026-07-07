@@ -11,9 +11,10 @@ use lattice_core::{
     LinkClosed, LinkDirectionClosed, LinkError, LinkId, LinkOpened, LinkTarget,
 };
 use lattice_direct_link::{
-    DirectLinkActorBinding, DirectLinkDispatch, DirectLinkEndpointPool, DirectLinkInboundRouter,
-    DirectLinkInboundRouterBuilder, DirectLinkSessionManager, OpenLinkValidationPolicy,
-    PooledDirectLinkEndpointPool, TcpDirectLinkTransport,
+    DirectLinkActorBinding, DirectLinkDispatch, DirectLinkEndpointPool,
+    DirectLinkEndpointPoolLifecycle, DirectLinkInboundRouter, DirectLinkInboundRouterBuilder,
+    DirectLinkSessionManager, OpenLinkValidationPolicy, PooledDirectLinkEndpointPool,
+    TcpDirectLinkTransport,
 };
 use lattice_placement::instance::InstanceState;
 use lattice_placement::store::{ActorPlacementKey, PlacementState};
@@ -259,6 +260,33 @@ impl DirectLinkServiceRuntime {
     }
 }
 
+#[derive(Debug)]
+struct DirectLinkSourceLifecycle {
+    inbound_router: Arc<DirectLinkInboundRouter>,
+}
+
+impl DirectLinkEndpointPoolLifecycle for DirectLinkSourceLifecycle {
+    fn deliver_direction_closed(
+        &self,
+        actor_ref: &ActorRef,
+        event: LinkDirectionClosed,
+    ) -> Result<(), LinkError> {
+        self.inbound_router
+            .deliver_direction_closed_to_actor(actor_ref, event)
+            .map_err(|error| LinkError::Protocol(error.to_string()))
+    }
+
+    fn deliver_link_closed(
+        &self,
+        actor_ref: &ActorRef,
+        event: LinkClosed,
+    ) -> Result<(), LinkError> {
+        self.inbound_router
+            .deliver_link_closed_to_actor(actor_ref, event)
+            .map_err(|error| LinkError::Protocol(error.to_string()))
+    }
+}
+
 pub(crate) trait ErasedDirectLinkBinding: Send + Sync + 'static {
     fn register(
         self: Box<Self>,
@@ -339,12 +367,18 @@ pub(crate) fn build_direct_link_runtime(
         router = binding.register(context, &session_manager, router)?;
     }
 
+    let inbound_router = Arc::new(router.build());
+    let source_lifecycle = Arc::new(DirectLinkSourceLifecycle {
+        inbound_router: inbound_router.clone(),
+    });
+
     Ok(Some(DirectLinkServiceRuntime {
         session_manager,
-        inbound_router: Arc::new(router.build()),
-        endpoint_pool: PooledDirectLinkEndpointPool::new(
+        inbound_router,
+        endpoint_pool: PooledDirectLinkEndpointPool::new_with_lifecycle(
             TcpDirectLinkTransport::new(),
             Default::default(),
+            Some(source_lifecycle),
         ),
         placement_store: context
             .service_context()

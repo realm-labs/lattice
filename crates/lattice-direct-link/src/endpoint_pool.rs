@@ -14,15 +14,28 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lattice_core::{
-    DirectLinkEndpoint, DirectLinkOpenRequest, DirectLinkSender, DirectLinkSession,
-    LinkCloseReason, LinkDirection, LinkError, LinkId, LinkSendError, LinkSequence, LinkTarget,
-    OutboundDirectLinkMessage,
+    ActorRef, DirectLinkEndpoint, DirectLinkOpenRequest, DirectLinkSender, DirectLinkSession,
+    LinkCloseReason, LinkClosed, LinkDirection, LinkDirectionClosed, LinkError, LinkId,
+    LinkSendError, LinkSequence, LinkTarget, OutboundDirectLinkMessage,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::codec::{DirectLinkFrame, DirectLinkFrameKind};
-use crate::session::{DIRECT_LINK_PROTOCOL_VERSION, OpenLinkDirection, OpenLinkRequest};
+use crate::session::{
+    DIRECT_LINK_PROTOCOL_VERSION, OpenLinkAck, OpenLinkDirection, OpenLinkRequest,
+};
 use crate::transport::{DirectLinkConnection, DirectLinkTransport};
+
+pub trait DirectLinkEndpointPoolLifecycle: Send + Sync + 'static {
+    fn deliver_direction_closed(
+        &self,
+        actor_ref: &ActorRef,
+        event: LinkDirectionClosed,
+    ) -> Result<(), LinkError>;
+
+    fn deliver_link_closed(&self, actor_ref: &ActorRef, event: LinkClosed)
+    -> Result<(), LinkError>;
+}
 
 #[derive(Debug, Clone)]
 pub struct DirectLinkEndpointPoolConfig {
@@ -264,10 +277,19 @@ where
     T: DirectLinkTransport,
 {
     pub fn new(transport: T, config: DirectLinkEndpointPoolConfig) -> Self {
+        Self::new_with_lifecycle(transport, config, None)
+    }
+
+    pub fn new_with_lifecycle(
+        transport: T,
+        config: DirectLinkEndpointPoolConfig,
+        lifecycle: Option<Arc<dyn DirectLinkEndpointPoolLifecycle>>,
+    ) -> Self {
         Self {
             inner: Arc::new(PooledDirectLinkEndpointPoolInner {
                 transport,
                 config,
+                lifecycle,
                 state: Mutex::new(PoolState::default()),
                 next_connection_id: AtomicU64::new(1),
                 metrics: DirectLinkEndpointPoolMetrics::default(),
@@ -339,6 +361,7 @@ where
 {
     transport: T,
     config: DirectLinkEndpointPoolConfig,
+    lifecycle: Option<Arc<dyn DirectLinkEndpointPoolLifecycle>>,
     state: Mutex<PoolState>,
     next_connection_id: AtomicU64,
     metrics: DirectLinkEndpointPoolMetrics,
@@ -408,8 +431,8 @@ where
         let open_request = OpenLinkRequest {
             protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
             link_id: request.link_id.clone(),
-            source: request.source,
-            target,
+            source: request.source.clone(),
+            target: target.clone(),
             mode: request.mode,
             source_to_target: OpenLinkDirection::from_stream(
                 request.link_id.clone(),
@@ -419,7 +442,7 @@ where
                 .target_to_source
                 .as_ref()
                 .map(|stream| OpenLinkDirection::from_stream(request.link_id.clone(), stream)),
-            options: request.options,
+            options: request.options.clone(),
         };
         let frame = DirectLinkFrame::open_link(&open_request)
             .map_err(|error| LinkError::Protocol(error.to_string()))?;
@@ -440,6 +463,12 @@ where
                     request.link_id.clone(),
                     &endpoint_key,
                     stripe.stripe.connection_id,
+                    PooledLinkState::from_open_ack(
+                        endpoint_key.clone(),
+                        stripe.stripe.connection_id,
+                        &request,
+                        &ack,
+                    ),
                 )
                 .await;
                 self.metrics.record_link_opened(stripe.stripe.connection_id);
@@ -509,35 +538,17 @@ where
         link_id: LinkId,
         endpoint_key: &DirectLinkEndpointKey,
         connection_id: DirectLinkConnectionId,
+        link_state: PooledLinkState,
     ) {
         let mut state = self.state.lock().await;
         if let Some(stripe) = state.find_stripe_mut(endpoint_key, connection_id) {
             stripe.active_links += 1;
-            state.links.insert(
-                link_id,
-                PooledLinkState {
-                    endpoint_key: endpoint_key.clone(),
-                    connection_id,
-                },
-            );
-        }
-    }
-
-    async fn release_link(&self, link_id: &LinkId) {
-        let mut state = self.state.lock().await;
-        let Some(link) = state.links.remove(link_id) else {
-            return;
-        };
-        if let Some(stripe) = state.find_stripe_mut(&link.endpoint_key, link.connection_id)
-            && stripe.active_links > 0
-        {
-            stripe.active_links -= 1;
-            self.metrics.record_link_closed(link.connection_id);
+            state.links.insert(link_id, link_state);
         }
     }
 
     async fn close_all_logical_links(&self, reason: LinkCloseReason) -> Result<usize, LinkError> {
-        let links = {
+        let (links, closures) = {
             let mut state = self.state.lock().await;
             let links = std::mem::take(&mut state.links);
             for link in links.values() {
@@ -547,22 +558,26 @@ where
                     self.metrics.record_link_closed(link.connection_id);
                 }
             }
-            links
+            let closures = links
+                .iter()
+                .map(|(link_id, link)| link.close_all_event(link_id, reason.clone()))
+                .collect::<Vec<_>>();
+            let writers = links
                 .into_iter()
                 .filter_map(|(link_id, link)| {
                     state
                         .find_writer(link.connection_id)
                         .map(|writer| (link_id, writer))
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (writers, closures)
         };
         let count = links.len();
         for (link_id, writer) in links {
-            send_frame(
-                &writer,
-                close_frame(DirectLinkFrameKind::Close, link_id, reason.clone()),
-            )
-            .await?;
+            send_frame(&writer, DirectLinkFrame::close(link_id, reason.clone())).await?;
+        }
+        for closure in closures {
+            self.deliver_link_closure(closure);
         }
         Ok(count)
     }
@@ -582,6 +597,7 @@ where
                 LinkCloseReason::ProtocolError(reason.clone()),
             )
             .await
+            .is_some()
         {
             Ok(())
         } else {
@@ -625,38 +641,98 @@ where
         connection_id: DirectLinkConnectionId,
         reason: LinkCloseReason,
     ) -> usize {
-        let mut state = self.state.lock().await;
-        let affected = state
-            .links
-            .iter()
-            .filter_map(|(link_id, link)| {
-                (link.connection_id == connection_id).then_some(link_id.clone())
-            })
-            .collect::<Vec<_>>();
-        for link_id in &affected {
-            if let Some(link) = state.links.remove(link_id) {
-                if let Some(stripe) = state.find_stripe_mut(&link.endpoint_key, link.connection_id)
-                {
-                    stripe.active_links = stripe.active_links.saturating_sub(1);
+        let (affected, closures) = {
+            let mut state = self.state.lock().await;
+            let affected = state
+                .links
+                .iter()
+                .filter_map(|(link_id, link)| {
+                    (link.connection_id == connection_id).then_some(link_id.clone())
+                })
+                .collect::<Vec<_>>();
+            let mut closures = Vec::new();
+            for link_id in &affected {
+                if let Some(link) = state.links.remove(link_id) {
+                    if let Some(stripe) =
+                        state.find_stripe_mut(&link.endpoint_key, link.connection_id)
+                    {
+                        stripe.active_links = stripe.active_links.saturating_sub(1);
+                    }
+                    closures.push(link.close_all_event(link_id, reason.clone()));
+                    state.closed_links.insert(link_id.clone(), reason.clone());
+                    self.metrics.record_link_closed(link.connection_id);
                 }
-                state.closed_links.insert(link_id.clone(), reason.clone());
-                self.metrics.record_link_closed(link.connection_id);
             }
+            (affected, closures)
+        };
+        for closure in closures {
+            self.deliver_link_closure(closure);
         }
         affected.len()
     }
 
-    async fn close_logical_link(&self, link_id: &LinkId, reason: LinkCloseReason) -> bool {
-        let mut state = self.state.lock().await;
-        let Some(link) = state.links.remove(link_id) else {
-            return false;
+    async fn close_logical_link(
+        &self,
+        link_id: &LinkId,
+        reason: LinkCloseReason,
+    ) -> Option<PooledLinkClosure> {
+        let closure = {
+            let mut state = self.state.lock().await;
+            let link = state.links.remove(link_id)?;
+            if let Some(stripe) = state.find_stripe_mut(&link.endpoint_key, link.connection_id) {
+                stripe.active_links = stripe.active_links.saturating_sub(1);
+            }
+            let closure = link.close_all_event(link_id, reason.clone());
+            state.closed_links.insert(link_id.clone(), reason);
+            self.metrics.record_link_closed(link.connection_id);
+            closure
         };
-        if let Some(stripe) = state.find_stripe_mut(&link.endpoint_key, link.connection_id) {
-            stripe.active_links = stripe.active_links.saturating_sub(1);
+        self.deliver_link_closure(closure.clone());
+        Some(closure)
+    }
+
+    async fn close_logical_direction(
+        &self,
+        link_id: &LinkId,
+        direction: LinkDirection,
+        reason: LinkCloseReason,
+    ) -> Option<PooledLinkClosure> {
+        let closure = {
+            let mut state = self.state.lock().await;
+            let link = state.links.get_mut(link_id)?;
+            let closure = link.close_direction_event(link_id, direction, reason.clone())?;
+            if link.is_fully_closed() {
+                let link = state
+                    .links
+                    .remove(link_id)
+                    .expect("link exists after get_mut");
+                if let Some(stripe) = state.find_stripe_mut(&link.endpoint_key, link.connection_id)
+                {
+                    stripe.active_links = stripe.active_links.saturating_sub(1);
+                }
+                state.closed_links.insert(link_id.clone(), reason);
+                self.metrics.record_link_closed(link.connection_id);
+            }
+            closure
+        };
+        self.deliver_link_closure(closure.clone());
+        Some(closure)
+    }
+
+    fn deliver_link_closure(&self, closure: PooledLinkClosure) {
+        let Some(lifecycle) = &self.lifecycle else {
+            return;
+        };
+        for event in closure.direction_closed {
+            if let Err(error) = lifecycle.deliver_direction_closed(&closure.source, event) {
+                tracing::warn!(%error, "failed to deliver source direct-link direction close");
+            }
         }
-        state.closed_links.insert(link_id.clone(), reason);
-        self.metrics.record_link_closed(link.connection_id);
-        true
+        if let Some(event) = closure.link_closed
+            && let Err(error) = lifecycle.deliver_link_closed(&closure.source, event)
+        {
+            tracing::warn!(%error, "failed to deliver source direct-link close");
+        }
     }
 }
 
@@ -726,6 +802,120 @@ struct PooledStripeState {
 struct PooledLinkState {
     endpoint_key: DirectLinkEndpointKey,
     connection_id: DirectLinkConnectionId,
+    source: ActorRef,
+    directions: BTreeMap<LinkDirection, PooledDirectionState>,
+}
+
+#[derive(Debug, Clone)]
+struct PooledDirectionState {
+    stream_name: String,
+    closed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PooledLinkClosure {
+    source: ActorRef,
+    direction_closed: Vec<LinkDirectionClosed>,
+    link_closed: Option<LinkClosed>,
+}
+
+impl PooledLinkState {
+    fn from_open_ack(
+        endpoint_key: DirectLinkEndpointKey,
+        connection_id: DirectLinkConnectionId,
+        request: &DirectLinkOpenRequest,
+        ack: &OpenLinkAck,
+    ) -> Self {
+        let mut directions = BTreeMap::from([(
+            LinkDirection::SourceToTarget,
+            PooledDirectionState {
+                stream_name: ack.source_to_target.stream_name.clone(),
+                closed: false,
+            },
+        )]);
+        if let Some(direction) = &ack.target_to_source {
+            directions.insert(
+                LinkDirection::TargetToSource,
+                PooledDirectionState {
+                    stream_name: direction.stream_name.clone(),
+                    closed: false,
+                },
+            );
+        }
+        Self {
+            endpoint_key,
+            connection_id,
+            source: request.source.clone(),
+            directions,
+        }
+    }
+
+    fn close_direction_event(
+        &mut self,
+        link_id: &LinkId,
+        direction: LinkDirection,
+        reason: LinkCloseReason,
+    ) -> Option<PooledLinkClosure> {
+        let direction_state = self.directions.get_mut(&direction)?;
+        if direction_state.closed {
+            return None;
+        }
+        direction_state.closed = true;
+        let direction_closed = source_observes_direction(direction).then(|| LinkDirectionClosed {
+            link_id: link_id.clone(),
+            direction,
+            stream: direction_state.stream_name.clone(),
+            reason: reason.clone(),
+            last_sequence_seen: None,
+        });
+        let link_closed = self
+            .is_fully_closed()
+            .then(|| self.link_closed(link_id, reason));
+        Some(PooledLinkClosure {
+            source: self.source.clone(),
+            direction_closed: direction_closed.into_iter().collect(),
+            link_closed,
+        })
+    }
+
+    fn close_all_event(&self, link_id: &LinkId, reason: LinkCloseReason) -> PooledLinkClosure {
+        let direction_closed = self
+            .directions
+            .iter()
+            .filter(|(_, state)| !state.closed)
+            .filter_map(|(direction, state)| {
+                source_observes_direction(*direction).then(|| LinkDirectionClosed {
+                    link_id: link_id.clone(),
+                    direction: *direction,
+                    stream: state.stream_name.clone(),
+                    reason: reason.clone(),
+                    last_sequence_seen: None,
+                })
+            })
+            .collect();
+        PooledLinkClosure {
+            source: self.source.clone(),
+            direction_closed,
+            link_closed: Some(self.link_closed(link_id, reason)),
+        }
+    }
+
+    fn link_closed(&self, link_id: &LinkId, reason: LinkCloseReason) -> LinkClosed {
+        LinkClosed {
+            link_id: link_id.clone(),
+            reason,
+            closed_directions: self.directions.keys().copied().collect(),
+            last_sequence_seen: None,
+        }
+    }
+
+    fn is_fully_closed(&self) -> bool {
+        self.directions.values().all(|direction| direction.closed)
+    }
+}
+
+fn source_observes_direction(direction: LinkDirection) -> bool {
+    direction == LinkDirection::TargetToSource
 }
 
 enum ConnectionCommand {
@@ -841,13 +1031,12 @@ where
         if self.closed.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
-        let frame = close_frame(
-            DirectLinkFrameKind::CloseDirection,
-            self.link_id.clone(),
-            _reason,
-        );
+        let frame =
+            DirectLinkFrame::close_direction(self.link_id.clone(), self.direction, _reason.clone());
         let _ = self.inner.write_frame(self.connection_id, frame).await;
-        self.inner.release_link(&self.link_id).await;
+        self.inner
+            .close_logical_direction(&self.link_id, self.direction, _reason)
+            .await;
         Ok(())
     }
 }
@@ -1011,8 +1200,17 @@ where
             pool.process_protocol_error_frame(frame).await.is_err()
         }
         DirectLinkFrameKind::Close | DirectLinkFrameKind::CloseDirection => {
-            pool.close_logical_link(&frame.link_id, LinkCloseReason::RemoteClose)
-                .await;
+            let reason = frame.decode_close_reason();
+            match frame.kind {
+                DirectLinkFrameKind::CloseDirection => {
+                    pool.close_logical_direction(&frame.link_id, frame.direction(), reason)
+                        .await;
+                }
+                DirectLinkFrameKind::Close => {
+                    pool.close_logical_link(&frame.link_id, reason).await;
+                }
+                _ => {}
+            }
             false
         }
         DirectLinkFrameKind::Heartbeat => connection
@@ -1089,24 +1287,9 @@ fn stable_stripe_index(link_id: &LinkId, stripe_count: NonZeroUsize) -> usize {
     (hasher.finish() as usize) % stripe_count.get()
 }
 
-fn close_frame(
-    kind: DirectLinkFrameKind,
-    link_id: LinkId,
-    reason: LinkCloseReason,
-) -> DirectLinkFrame {
-    DirectLinkFrame {
-        kind,
-        link_id,
-        sequence: LinkSequence(0),
-        message_id: None,
-        flags: Default::default(),
-        header: Vec::new(),
-        payload: format!("{reason:?}").into_bytes(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicUsize;
 
@@ -1117,6 +1300,32 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct RecordingLifecycle {
+        direction_closed: StdMutex<Vec<LinkDirectionClosed>>,
+        link_closed: StdMutex<Vec<LinkClosed>>,
+    }
+
+    impl DirectLinkEndpointPoolLifecycle for RecordingLifecycle {
+        fn deliver_direction_closed(
+            &self,
+            _actor_ref: &ActorRef,
+            event: LinkDirectionClosed,
+        ) -> Result<(), LinkError> {
+            self.direction_closed.lock().unwrap().push(event);
+            Ok(())
+        }
+
+        fn deliver_link_closed(
+            &self,
+            _actor_ref: &ActorRef,
+            event: LinkClosed,
+        ) -> Result<(), LinkError> {
+            self.link_closed.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
 
     #[derive(Debug, Clone, Default)]
     struct FakeTransport {
@@ -1336,13 +1545,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_drain_delivers_source_link_closed_events() {
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let pool = PooledDirectLinkEndpointPool::new_with_lifecycle(
+            FakeTransport::default(),
+            DirectLinkEndpointPoolConfig::default(),
+            Some(lifecycle.clone()),
+        );
+        pool.open_link(request("link-1")).await.unwrap();
+        pool.open_link(request("link-2")).await.unwrap();
+
+        let closed = pool
+            .close_all_logical_links(LinkCloseReason::NodeDraining)
+            .await
+            .unwrap();
+
+        assert_eq!(closed, 2);
+        let link_closed = lifecycle.link_closed.lock().unwrap().clone();
+        assert_eq!(link_closed.len(), 2);
+        assert!(link_closed.iter().all(|event| {
+            event.reason == LinkCloseReason::NodeDraining
+                && event.closed_directions == BTreeSet::from([LinkDirection::SourceToTarget])
+        }));
+        assert!(lifecycle.direction_closed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn peer_connection_loss_closes_every_multiplexed_logical_link() {
-        let pool = PooledDirectLinkEndpointPool::new(
+        let lifecycle = Arc::new(RecordingLifecycle::default());
+        let pool = PooledDirectLinkEndpointPool::new_with_lifecycle(
             FakeTransport {
                 fail_message_writes: true,
                 ..FakeTransport::default()
             },
             DirectLinkEndpointPoolConfig::default(),
+            Some(lifecycle.clone()),
         );
         let first = pool.open_link(request("link-1")).await.unwrap();
         let second = pool.open_link(request("link-2")).await.unwrap();
@@ -1390,6 +1627,13 @@ mod tests {
                 links_per_connection: BTreeMap::new(),
                 frames_per_connection: BTreeMap::from([(first.connection_id, 2)]),
             }
+        );
+        let link_closed = lifecycle.link_closed.lock().unwrap().clone();
+        assert_eq!(link_closed.len(), 2);
+        assert!(
+            link_closed
+                .iter()
+                .all(|event| event.reason == LinkCloseReason::ConnectionLost)
         );
 
         fn message(link_id: &str) -> OutboundDirectLinkMessage {

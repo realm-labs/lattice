@@ -215,6 +215,15 @@ impl DirectLinkInboundRouter {
                 .session_manager
                 .record_heartbeat_at(&frame.link_id, now)
                 .map_err(Into::into),
+            DirectLinkFrameKind::CloseDirection => {
+                let direction = frame.direction();
+                let reason = frame.decode_close_reason();
+                self.close_direction(&frame.link_id, direction, reason)
+            }
+            DirectLinkFrameKind::Close => {
+                let reason = frame.decode_close_reason();
+                self.close_all(&frame.link_id, reason)
+            }
             DirectLinkFrameKind::ProtocolError => {
                 let reason = String::from_utf8(frame.payload)
                     .unwrap_or_else(|_| "remote protocol error".to_string());
@@ -411,6 +420,27 @@ impl DirectLinkInboundRouter {
             }
         }
         Ok(())
+    }
+
+    pub fn deliver_direction_closed_to_actor(
+        &self,
+        actor_ref: &ActorRef,
+        event: LinkDirectionClosed,
+    ) -> Result<(), InboundDeliveryError> {
+        self.deliver_direction_closed(actor_ref, event)
+    }
+
+    pub fn deliver_link_closed_to_actor(
+        &self,
+        actor_ref: &ActorRef,
+        event: LinkClosed,
+    ) -> Result<(), InboundDeliveryError> {
+        let binding = self.bindings.get(&actor_ref.actor_kind).ok_or_else(|| {
+            InboundDeliveryError::UnboundActorKind {
+                actor_kind: actor_ref.actor_kind.clone(),
+            }
+        })?;
+        binding.deliver_link_closed(actor_ref, event)
     }
 
     fn apply_inbound_backpressure(

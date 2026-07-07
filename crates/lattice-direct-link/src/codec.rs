@@ -1,4 +1,6 @@
-use lattice_core::{DirectLinkMessageId, LinkDirection, LinkId, LinkMessageFlags, LinkSequence};
+use lattice_core::{
+    DirectLinkMessageId, LinkCloseReason, LinkDirection, LinkId, LinkMessageFlags, LinkSequence,
+};
 use thiserror::Error;
 
 use crate::session::{
@@ -113,6 +115,23 @@ impl DirectLinkFrame {
         Self::control(DirectLinkFrameKind::HeartbeatAck, link_id)
     }
 
+    pub fn close_direction(
+        link_id: LinkId,
+        direction: LinkDirection,
+        reason: LinkCloseReason,
+    ) -> Self {
+        Self::close_control(
+            DirectLinkFrameKind::CloseDirection,
+            link_id,
+            Some(direction),
+            reason,
+        )
+    }
+
+    pub fn close(link_id: LinkId, reason: LinkCloseReason) -> Self {
+        Self::close_control(DirectLinkFrameKind::Close, link_id, None, reason)
+    }
+
     pub fn open_link(request: &OpenLinkRequest) -> Result<Self, FrameCodecError> {
         Self::open_link_envelope(&OpenLinkEnvelope::new(request.clone()))
     }
@@ -206,6 +225,10 @@ impl DirectLinkFrame {
         direction_from_flags(&self.flags)
     }
 
+    pub fn decode_close_reason(&self) -> LinkCloseReason {
+        serde_json::from_slice(&self.payload).unwrap_or(LinkCloseReason::RemoteClose)
+    }
+
     fn decode_handshake_payload<T>(
         &self,
         expected_kind: DirectLinkFrameKind,
@@ -221,6 +244,23 @@ impl DirectLinkFrame {
         }
         serde_json::from_slice(&self.payload)
             .map_err(|error| FrameCodecError::HandshakePayload(error.to_string()))
+    }
+
+    fn close_control(
+        kind: DirectLinkFrameKind,
+        link_id: LinkId,
+        direction: Option<LinkDirection>,
+        reason: LinkCloseReason,
+    ) -> Self {
+        Self {
+            kind,
+            link_id,
+            sequence: LinkSequence(0),
+            message_id: None,
+            flags: direction.map_or(LinkMessageFlags::EMPTY, flags_for_direction),
+            header: Vec::new(),
+            payload: serde_json::to_vec(&reason).unwrap_or_default(),
+        }
     }
 }
 
