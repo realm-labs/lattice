@@ -13,7 +13,8 @@ use lattice_core::{
     InstanceId, LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened, ServiceContext,
     ServiceKind,
 };
-use lattice_direct_link::{DirectLinkActorBinding, DirectLinkDispatch};
+use lattice_direct_link::delivery::DirectLinkDispatch;
+use lattice_direct_link::stream::DirectLinkActorBinding;
 use lattice_eventbus::{EventBus, LocalEventBus};
 use lattice_ops::{AdminHttpConfig, ServiceScheduler};
 use lattice_placement::coordinator::{PlacementWatchStarter, PlacementWatchTask};

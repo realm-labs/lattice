@@ -10,12 +10,14 @@ use lattice_core::{
     DirectLinkOpenRequest, DirectLinkRuntime, DirectLinkSession, LinkBackpressure, LinkCloseReason,
     LinkClosed, LinkDirectionClosed, LinkError, LinkId, LinkOpened, LinkTarget,
 };
-use lattice_direct_link::{
-    DirectLinkActorBinding, DirectLinkDispatch, DirectLinkEndpointPool,
-    DirectLinkEndpointPoolLifecycle, DirectLinkInboundRouter, DirectLinkInboundRouterBuilder,
-    DirectLinkSessionManager, OpenLinkValidationPolicy, PooledDirectLinkEndpointPool,
-    TcpDirectLinkTransport,
+use lattice_direct_link::delivery::DirectLinkDispatch;
+use lattice_direct_link::endpoint_pool::{
+    DirectLinkEndpointPool, DirectLinkEndpointPoolLifecycle, PooledDirectLinkEndpointPool,
 };
+use lattice_direct_link::inbound::{DirectLinkInboundRouter, DirectLinkInboundRouterBuilder};
+use lattice_direct_link::session::{DirectLinkSessionManager, OpenLinkValidationPolicy};
+use lattice_direct_link::stream::DirectLinkActorBinding;
+use lattice_direct_link::transport::TcpDirectLinkTransport;
 use lattice_placement::instance::InstanceState;
 use lattice_placement::store::{ActorPlacementKey, PlacementState};
 

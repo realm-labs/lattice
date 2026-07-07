@@ -10,11 +10,15 @@ use lattice_core::{
     LinkMessageFlags, LinkSequence, LinkTarget, OutboundDirectLinkMessage, ServiceKind,
     TraceContext,
 };
-use lattice_direct_link::{
-    BackpressureQueue, DirectLinkConnection, DirectLinkEndpointPool, DirectLinkEndpointPoolConfig,
-    DirectLinkFrame, DirectLinkFrameCodec, DirectLinkFrameKind, DirectLinkListenConfig,
-    DirectLinkTransport, NegotiatedDirection, OpenLinkAck, PooledDirectLinkEndpointPool,
-    TcpDirectLinkListener, TcpDirectLinkTransport,
+use lattice_direct_link::backpressure::BackpressureQueue;
+use lattice_direct_link::endpoint_pool::{
+    DirectLinkEndpointPool, DirectLinkEndpointPoolConfig, PooledDirectLinkEndpointPool,
+};
+use lattice_direct_link::protocol::{DirectLinkFrame, DirectLinkFrameCodec, DirectLinkFrameKind};
+use lattice_direct_link::session::{NegotiatedDirection, OpenLinkAck};
+use lattice_direct_link::transport::{
+    DirectLinkConnection, DirectLinkListenConfig, DirectLinkTransport, TcpDirectLinkListener,
+    TcpDirectLinkTransport,
 };
 use tokio::runtime::Runtime;
 

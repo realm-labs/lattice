@@ -190,7 +190,7 @@ fn push_generated_direct_link_streams(
         rust.push_str("    }\n\n");
 
         rust.push_str(
-            "    pub fn bind<A>(actor_kind: lattice_core::ActorKind) -> lattice_direct_link::DirectLinkActorBinding<A, Stream, ",
+            "    pub fn bind<A>(actor_kind: lattice_core::ActorKind) -> lattice_direct_link::stream::DirectLinkActorBinding<A, Stream, ",
         );
         rust.push_str(&metadata_type);
         rust.push_str(">\n");
@@ -198,11 +198,11 @@ fn push_generated_direct_link_streams(
         push_direct_link_handler_bounds(rust, stream);
         rust.push_str("    {\n");
         rust.push_str(
-            "        lattice_direct_link::DirectLinkActorBinding::new(actor_kind, descriptor())\n",
+            "        lattice_direct_link::stream::DirectLinkActorBinding::new(actor_kind, descriptor())\n",
         );
         rust.push_str("    }\n\n");
 
-        rust.push_str("    impl<A> lattice_direct_link::DirectLinkDispatch<A, ");
+        rust.push_str("    impl<A> lattice_direct_link::delivery::DirectLinkDispatch<A, ");
         rust.push_str(&metadata_type);
         rust.push_str("> for Stream\n");
         rust.push_str("    where\n");
@@ -217,7 +217,9 @@ fn push_generated_direct_link_streams(
         rust.push_str(&metadata_type);
         rust.push_str(",\n");
         rust.push_str("            context: lattice_core::LinkMessageContext,\n");
-        rust.push_str("        ) -> Result<(), lattice_direct_link::DirectLinkDeliveryError> {\n");
+        rust.push_str(
+            "        ) -> Result<(), lattice_direct_link::delivery::DirectLinkDeliveryError> {\n",
+        );
         rust.push_str("            match message_id.0 {\n");
         for message in &stream.messages {
             rust.push_str(&format!("                {} => {{\n", message.message_id));
@@ -225,13 +227,13 @@ fn push_generated_direct_link_streams(
                 "                    let payload = <{} as prost::Message>::decode(payload)\n",
                 message.rust_type
             ));
-            rust.push_str("                        .map_err(|error| lattice_direct_link::DirectLinkDeliveryError::Decode(error.to_string()))?;\n");
-            rust.push_str("                    lattice_direct_link::try_deliver_linked(handle, payload, metadata, context)\n");
-            rust.push_str("                        .map_err(lattice_direct_link::DirectLinkDeliveryError::from)\n");
+            rust.push_str("                        .map_err(|error| lattice_direct_link::delivery::DirectLinkDeliveryError::Decode(error.to_string()))?;\n");
+            rust.push_str("                    lattice_direct_link::delivery::try_deliver_linked(handle, payload, metadata, context)\n");
+            rust.push_str("                        .map_err(lattice_direct_link::delivery::DirectLinkDeliveryError::from)\n");
             rust.push_str("                }\n");
         }
         rust.push_str(
-            "                _ => Err(lattice_direct_link::DirectLinkDeliveryError::UnsupportedMessageType),\n",
+            "                _ => Err(lattice_direct_link::delivery::DirectLinkDeliveryError::UnsupportedMessageType),\n",
         );
         rust.push_str("            }\n");
         rust.push_str("        }\n");

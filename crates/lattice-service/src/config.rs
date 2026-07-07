@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use lattice_core::{DirectLinkEndpoint, InstanceId};
-use lattice_direct_link::DirectLinkListenConfig;
+use lattice_direct_link::transport::DirectLinkListenConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceConfig {

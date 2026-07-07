@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use lattice_core::instance::InstanceCapacity;
 use lattice_core::{ActorKind, DirectLinkEndpoint, LinkError, ServiceContext, ServiceKind};
-use lattice_direct_link::transport::TcpDirectLinkWriter;
-use lattice_direct_link::{
-    DirectLinkConnection, DirectLinkFrameKind, DirectLinkInboundRouter, DirectLinkTransport,
-    InboundConnectionSender, TcpDirectLinkConnection, TcpDirectLinkTransport,
+use lattice_direct_link::inbound::{DirectLinkInboundRouter, InboundConnectionSender};
+use lattice_direct_link::protocol::DirectLinkFrameKind;
+use lattice_direct_link::transport::{
+    DirectLinkConnection, DirectLinkTransport, TcpDirectLinkConnection, TcpDirectLinkTransport,
+    TcpDirectLinkWriter,
 };
 use lattice_ops::admin::{
     AdminActorTarget, AdminApiError, AdminAuth, AdminHttpAdapter, AdminMutationHandler,

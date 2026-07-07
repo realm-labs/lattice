@@ -311,18 +311,16 @@ fn direct_link_stream_codegen_uses_static_match_dispatch() {
         "A: lattice_actor::Actor + lattice_actor::Handler<lattice_core::Linked<crate::world::EnterWorldRequest, ()>> + lattice_actor::Handler<lattice_core::Linked<crate::world::MoveWorldRequest, ()>>,"
     ));
     assert!(
-        generated
-            .rust
-            .contains("impl<A> lattice_direct_link::DirectLinkDispatch<A, ()> for Stream")
+        generated.rust.contains(
+            "impl<A> lattice_direct_link::delivery::DirectLinkDispatch<A, ()> for Stream"
+        )
     );
     assert!(generated.rust.contains("match message_id.0"));
     assert!(generated.rust.contains("7001 =>"));
     assert!(generated.rust.contains("7101 =>"));
-    assert!(
-        generated.rust.contains(
-            "lattice_direct_link::try_deliver_linked(handle, payload, metadata, context)"
-        )
-    );
+    assert!(generated.rust.contains(
+        "lattice_direct_link::delivery::try_deliver_linked(handle, payload, metadata, context)"
+    ));
 }
 
 #[test]
@@ -407,7 +405,7 @@ fn direct_link_stream_codegen_supports_typed_metadata() {
         "Handler<lattice_core::Linked<crate::world::EnterWorldRequest, crate::direct_link::ClientRequestContext>>"
     ));
     assert!(generated.rust.contains(
-        "impl<A> lattice_direct_link::DirectLinkDispatch<A, crate::direct_link::ClientRequestContext> for Stream"
+        "impl<A> lattice_direct_link::delivery::DirectLinkDispatch<A, crate::direct_link::ClientRequestContext> for Stream"
     ));
 }
 

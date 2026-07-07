@@ -30,11 +30,16 @@ use lattice_core::{
     LinkId, LinkMessageFlags, LinkOpened, LinkSequence, Linked, OutboundDirectLinkMessage,
     RequestId, RouteKey, TraceContext, actor_kind, service_kind,
 };
-use lattice_direct_link::{
-    DIRECT_LINK_PROTOCOL_VERSION, DirectLinkActorPolicy, DirectLinkConnection, DirectLinkFrame,
-    DirectLinkFrameKind, DirectLinkInboundRouter, DirectLinkListenConfig, DirectLinkPeerIdentity,
-    DirectLinkSessionManager, DirectLinkStream, DirectLinkTransport, OpenLinkDirection,
-    OpenLinkRejectReason, OpenLinkRequest, OpenLinkValidationPolicy, TcpDirectLinkTransport,
+use lattice_direct_link::inbound::DirectLinkInboundRouter;
+use lattice_direct_link::protocol::{DirectLinkFrame, DirectLinkFrameKind};
+use lattice_direct_link::session::{
+    DIRECT_LINK_PROTOCOL_VERSION, DirectLinkActorPolicy, DirectLinkPeerIdentity,
+    DirectLinkSessionManager, NegotiatedDirection, OpenLinkAck, OpenLinkDirection,
+    OpenLinkRejectReason, OpenLinkRequest, OpenLinkValidationPolicy,
+};
+use lattice_direct_link::stream::DirectLinkStream;
+use lattice_direct_link::transport::{
+    DirectLinkConnection, DirectLinkListenConfig, DirectLinkTransport, TcpDirectLinkTransport,
 };
 use lattice_eventbus::{
     EventBus, EventEnvelope, EventId, EventSubscription, LocalEventBus, Subject, SubjectFilter,
@@ -1622,9 +1627,9 @@ async fn service_context_installs_direct_link_runtime_handle_for_connect() {
                     ..
                 }
             ));
-            let ack = lattice_direct_link::OpenLinkAck {
+            let ack = OpenLinkAck {
                 link_id: open.link_id.clone(),
-                source_to_target: lattice_direct_link::NegotiatedDirection {
+                source_to_target: NegotiatedDirection {
                     direction: lattice_core::LinkDirection::SourceToTarget,
                     stream_name: open.source_to_target.stream_name,
                     accepted_message_type_ids: descriptor.accepted_message_ids(),
