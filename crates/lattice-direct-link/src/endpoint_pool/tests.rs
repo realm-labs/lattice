@@ -5,13 +5,19 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicUsize;
 
 use lattice_core::actor_ref::ActorRef;
-use lattice_core::direct_link::ids::DirectLinkMessageId;
+use lattice_core::direct_link::errors::{LinkError, LinkSendError};
+use lattice_core::direct_link::ids::{DirectLinkMessageId, LinkSequence};
 use lattice_core::direct_link::messages::LinkMessageFlags;
 use lattice_core::direct_link::options::{DirectLinkMode, DirectLinkOptions};
+use lattice_core::direct_link::runtime::OutboundDirectLinkMessage;
 use lattice_core::direct_link::stream::{DirectLinkMessageDescriptor, DirectLinkStreamDescriptor};
+use lattice_core::direct_link::target::LinkTarget;
 use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
 use lattice_core::{actor_kind, service_kind};
+
+use crate::protocol::{DirectLinkFrame, DirectLinkFrameKind};
+use crate::transport::{DirectLinkConnection, DirectLinkTransport};
 
 #[derive(Debug, Default)]
 struct RecordingLifecycle {
