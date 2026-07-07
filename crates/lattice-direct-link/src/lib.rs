@@ -16,7 +16,10 @@ pub use endpoint_pool::{
     DirectLinkEndpointPool, DirectLinkEndpointPoolConfig, DirectLinkEndpointPoolMetricsSnapshot,
     PooledDirectLinkEndpointPool, PooledDirectLinkSession,
 };
-pub use inbound::{DirectLinkInboundRouter, DirectLinkInboundRouterBuilder, InboundDeliveryError};
+pub use inbound::{
+    DirectLinkInboundRouter, DirectLinkInboundRouterBuilder, InboundConnectionSender,
+    InboundDeliveryError,
+};
 pub use outbound::{OutboundDirectLinkQueue, OutboundQueueEvent};
 pub use session::{
     CloseAllTransition, CloseTransition, DIRECT_LINK_PROTOCOL_VERSION, DirectLinkActivationPolicy,

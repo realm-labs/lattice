@@ -5,16 +5,19 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use lattice_actor::{Actor, ActorHandle, ActorTellError, Handler};
 use lattice_core::{
-    ActorId, ActorKind, ActorRef, DirectLinkMessageId, LinkBackpressure, LinkCloseReason,
-    LinkClosed, LinkDirection, LinkDirectionClosed, LinkId, LinkMessageContext, LinkMessageFlags,
-    LinkOpened,
+    ActorId, ActorKind, ActorRef, DirectLinkMessageId, DirectLinkSender, DirectLinkSession,
+    DirectLinkStreamDescriptor, LinkBackpressure, LinkCloseReason, LinkClosed, LinkDirection,
+    LinkDirectionClosed, LinkError, LinkId, LinkMessageContext, LinkMessageFlags, LinkOpened,
+    LinkSendError, LinkSequence, OutboundDirectLinkMessage,
 };
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 use crate::backpressure::{BackpressureOutcome, BackpressureQueue, BackpressureSnapshot};
 use crate::codec::{DirectLinkFrame, DirectLinkFrameKind};
@@ -56,6 +59,7 @@ pub struct DirectLinkInboundRouter {
     session_manager: Arc<DirectLinkSessionManager>,
     bindings: HashMap<ActorKind, Box<dyn ErasedInboundBinding>>,
     backpressure: Mutex<HashMap<(LinkId, LinkDirection), BackpressureQueue<DirectLinkMessageId>>>,
+    outbound_senders: Mutex<HashMap<LinkId, Arc<dyn DirectLinkSender>>>,
 }
 
 impl fmt::Debug for DirectLinkInboundRouter {
@@ -75,7 +79,42 @@ impl DirectLinkInboundRouter {
             session_manager,
             bindings: HashMap::new(),
             backpressure: HashMap::new(),
+            outbound_senders: HashMap::new(),
         }
+    }
+
+    pub fn register_outbound_sender(&self, link_id: LinkId, sender: Arc<dyn DirectLinkSender>) {
+        self.outbound_senders
+            .lock()
+            .expect("direct-link outbound senders poisoned")
+            .insert(link_id, sender);
+    }
+
+    pub fn unregister_outbound_sender(&self, link_id: &LinkId) {
+        self.outbound_senders
+            .lock()
+            .expect("direct-link outbound senders poisoned")
+            .remove(link_id);
+    }
+
+    pub fn outbound_session(
+        &self,
+        link_id: LinkId,
+        stream: DirectLinkStreamDescriptor,
+    ) -> Result<DirectLinkSession, LinkError> {
+        let sender = self
+            .outbound_senders
+            .lock()
+            .expect("direct-link outbound senders poisoned")
+            .get(&link_id)
+            .cloned()
+            .ok_or(LinkError::Unavailable)?;
+        self.session_manager.outbound_session(
+            link_id,
+            LinkDirection::TargetToSource,
+            stream,
+            sender,
+        )
     }
 
     pub fn deliver_frame(&self, frame: DirectLinkFrame) -> Result<(), InboundDeliveryError> {
@@ -489,6 +528,7 @@ pub struct DirectLinkInboundRouterBuilder {
     session_manager: Arc<DirectLinkSessionManager>,
     bindings: HashMap<ActorKind, Box<dyn ErasedInboundBinding>>,
     backpressure: HashMap<(LinkId, LinkDirection), BackpressureQueue<DirectLinkMessageId>>,
+    outbound_senders: HashMap<LinkId, Arc<dyn DirectLinkSender>>,
 }
 
 impl DirectLinkInboundRouterBuilder {
@@ -522,7 +562,90 @@ impl DirectLinkInboundRouterBuilder {
             session_manager: self.session_manager,
             bindings: self.bindings,
             backpressure: Mutex::new(self.backpressure),
+            outbound_senders: Mutex::new(self.outbound_senders),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct InboundConnectionSender {
+    link_id: LinkId,
+    tx: mpsc::Sender<DirectLinkFrame>,
+    next_sequence: Mutex<u64>,
+    closed: AtomicBool,
+}
+
+impl InboundConnectionSender {
+    pub fn new(link_id: LinkId, tx: mpsc::Sender<DirectLinkFrame>) -> Self {
+        Self {
+            link_id,
+            tx,
+            next_sequence: Mutex::new(1),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn next_message_frame(
+        &self,
+        message: OutboundDirectLinkMessage,
+    ) -> Result<DirectLinkFrame, LinkSendError> {
+        if message.direction != LinkDirection::TargetToSource {
+            return Err(LinkSendError::Protocol(
+                "inbound direct-link sender only supports TargetToSource messages".to_string(),
+            ));
+        }
+        if message.link_id != self.link_id {
+            return Err(LinkSendError::Protocol(format!(
+                "direct-link sender for {} cannot send frame for {}",
+                self.link_id, message.link_id
+            )));
+        }
+        let mut next_sequence = self
+            .next_sequence
+            .lock()
+            .expect("direct-link inbound sender sequence poisoned");
+        let frame = DirectLinkFrame::directed_message(
+            message.link_id,
+            message.direction,
+            LinkSequence(*next_sequence),
+            message.message_id,
+            message.payload,
+        );
+        *next_sequence += 1;
+        Ok(frame)
+    }
+}
+
+#[async_trait::async_trait]
+impl DirectLinkSender for InboundConnectionSender {
+    async fn tell(&self, message: OutboundDirectLinkMessage) -> Result<(), LinkSendError> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(LinkSendError::Closed {
+                reason: LinkCloseReason::Done,
+            });
+        }
+        let frame = self.next_message_frame(message)?;
+        self.tx
+            .send(frame)
+            .await
+            .map_err(|_| LinkSendError::BackpressureFull)
+    }
+
+    fn try_tell(&self, message: OutboundDirectLinkMessage) -> Result<(), LinkSendError> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(LinkSendError::Closed {
+                reason: LinkCloseReason::Done,
+            });
+        }
+        let frame = self.next_message_frame(message)?;
+        self.tx
+            .try_send(frame)
+            .map_err(|_| LinkSendError::BackpressureFull)
+    }
+
+    async fn close(&self, _reason: LinkCloseReason) -> Result<(), LinkSendError> {
+        self.closed.store(true, Ordering::Relaxed);
+        Ok(())
     }
 }
 

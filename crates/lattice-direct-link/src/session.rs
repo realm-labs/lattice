@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 // expose stable public seams.
 use lattice_core::{
     ActorKind, ActorRef, ActorRefTarget, BackpressurePolicy, DirectLinkMessage,
-    DirectLinkMessageId, DirectLinkMode, DirectLinkOptions, DirectLinkSession,
+    DirectLinkMessageId, DirectLinkMode, DirectLinkOptions, DirectLinkSender, DirectLinkSession,
     DirectLinkStreamDescriptor, Epoch, InstanceId, LinkCloseReason, LinkClosed, LinkDirection,
     LinkDirectionClosed, LinkError, LinkId, LinkOpened, LinkSequence, ServiceKind,
 };
@@ -585,6 +585,53 @@ impl DirectLinkSessionManager {
             .expect("direct link sessions poisoned")
             .get(link_id)
             .map(|session| session.accepted_message_ids.clone())
+    }
+
+    pub fn outbound_session(
+        &self,
+        link_id: LinkId,
+        direction: LinkDirection,
+        stream: DirectLinkStreamDescriptor,
+        sender: Arc<dyn DirectLinkSender>,
+    ) -> Result<DirectLinkSession, LinkError> {
+        let links = self
+            .links
+            .lock()
+            .expect("direct link managed links poisoned");
+        let Some(link) = links.get(&link_id) else {
+            return Err(LinkError::Protocol(format!(
+                "direct link {} is not open",
+                link_id
+            )));
+        };
+        if link.closed {
+            return Err(LinkError::Protocol(format!(
+                "direct link {} is closed",
+                link_id
+            )));
+        }
+        let Some(direction_state) = link.directions.get(&direction) else {
+            return Err(LinkError::Protocol(format!(
+                "direct link {} does not support direction {:?}",
+                link_id, direction
+            )));
+        };
+        if direction_state.closed {
+            return Err(LinkError::Protocol(format!(
+                "direct link {} direction {:?} is closed",
+                link_id, direction
+            )));
+        }
+        if direction_state.stream_name != stream.stream_name {
+            return Err(LinkError::UnsupportedStream);
+        }
+        Ok(DirectLinkSession {
+            link_id,
+            direction,
+            stream,
+            accepted_message_ids: direction_state.accepted_message_type_ids.clone(),
+            sender,
+        })
     }
 
     pub fn link_snapshot(&self, link_id: &LinkId) -> Option<ManagedLinkSnapshot> {

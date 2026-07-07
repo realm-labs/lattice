@@ -4,30 +4,26 @@ use std::path::{Path, PathBuf};
 
 use prost::Message;
 use prost_types::FileDescriptorSet;
-use serde::Deserialize;
 
 use crate::descriptor::{
     messages_from_descriptor_for_files, methods_from_descriptor, parse_proto_options,
 };
-use crate::gateway::GatewayRoute;
-use crate::render::{RenderOptions, generate_rpc_bindings_with_options};
-use crate::spec::{GatewayRouteKeySpec, RpcMethodSpec};
+use crate::render::{RenderOptions, generate_rpc_bindings_with_direct_link_streams};
+use crate::spec::GeneratedDirectLinkStreamSpec;
 use crate::{CodegenError, proto_include};
 
 #[derive(Debug, Clone)]
 pub struct LatticeCodegenBuilder {
     out_dir: Option<PathBuf>,
     emit_descriptor_set: bool,
-    gateway_routes: Vec<GatewayRoute>,
-    gateway_route_files: Vec<PathBuf>,
+    direct_link_streams: Vec<GeneratedDirectLinkStreamSpec>,
 }
 
 pub fn configure() -> LatticeCodegenBuilder {
     LatticeCodegenBuilder {
         out_dir: None,
         emit_descriptor_set: false,
-        gateway_routes: Vec::new(),
-        gateway_route_files: Vec::new(),
+        direct_link_streams: Vec::new(),
     }
 }
 
@@ -42,21 +38,16 @@ impl LatticeCodegenBuilder {
         self
     }
 
-    pub fn gateway_route_ids<I, M>(mut self, routes: I) -> Self
-    where
-        I: IntoIterator<Item = (u32, M)>,
-        M: Into<String>,
-    {
-        self.gateway_routes.extend(
-            routes
-                .into_iter()
-                .map(|(msg_id, method)| GatewayRoute::new(msg_id, method)),
-        );
+    pub fn direct_link_stream(mut self, stream: GeneratedDirectLinkStreamSpec) -> Self {
+        self.direct_link_streams.push(stream);
         self
     }
 
-    pub fn gateway_routes(mut self, path: impl AsRef<Path>) -> Self {
-        self.gateway_route_files.push(path.as_ref().to_path_buf());
+    pub fn direct_link_streams<I>(mut self, streams: I) -> Self
+    where
+        I: IntoIterator<Item = GeneratedDirectLinkStreamSpec>,
+    {
+        self.direct_link_streams.extend(streams);
         self
     }
 
@@ -99,19 +90,18 @@ impl LatticeCodegenBuilder {
         let descriptor = FileDescriptorSet::decode(descriptor_bytes.as_slice())
             .map_err(|error| CodegenError::DescriptorRead(error.to_string()))?;
         let options = parse_proto_options(&descriptor, &descriptor_bytes)?;
-        let mut methods = methods_from_descriptor(&descriptor, &options)?;
+        let methods = methods_from_descriptor(&descriptor, &options)?;
         let messages = messages_from_descriptor_for_files(
             &descriptor,
             &descriptor_input_file_names(&proto_paths, &include_paths),
         );
-        let gateway_routes = self.load_gateway_routes()?;
-        apply_gateway_routes(&mut methods, &gateway_routes)?;
-        let generated = generate_rpc_bindings_with_options(
+        let generated = generate_rpc_bindings_with_direct_link_streams(
             &methods,
             &messages,
             RenderOptions {
                 actor_ref_proto: descriptor_has_actor_ref_proto(&descriptor),
             },
+            &self.direct_link_streams,
         )?;
         let generated_path = out_dir.join("lattice.generated.rs");
         fs::write(generated_path, generated.rust)
@@ -124,36 +114,8 @@ impl LatticeCodegenBuilder {
         for proto_file in proto_files {
             println!("cargo:rerun-if-changed={}", proto_file.as_ref().display());
         }
-        for route_file in &self.gateway_route_files {
-            println!("cargo:rerun-if-changed={}", route_file.display());
-        }
 
         Ok(())
-    }
-
-    fn load_gateway_routes(&self) -> Result<Vec<GatewayRoute>, CodegenError> {
-        let mut routes = self.gateway_routes.clone();
-        for path in &self.gateway_route_files {
-            let source =
-                fs::read_to_string(path).map_err(|source| CodegenError::GatewayRouteRead {
-                    path: path.clone(),
-                    source,
-                })?;
-            let parsed = toml::from_str::<GatewayRouteFile>(&source).map_err(|source| {
-                CodegenError::GatewayRouteParse {
-                    path: path.clone(),
-                    details: source.to_string(),
-                }
-            })?;
-            routes.extend(
-                parsed
-                    .routes
-                    .into_iter()
-                    .map(GatewayRouteEntry::try_into_route)
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-        }
-        Ok(routes)
     }
 }
 
@@ -188,104 +150,4 @@ fn descriptor_has_actor_ref_proto(descriptor: &FileDescriptorSet) -> bool {
         .file
         .iter()
         .any(|file| file.package.as_deref() == Some("lattice.actor"))
-}
-
-#[derive(Debug, Deserialize)]
-struct GatewayRouteFile {
-    routes: Vec<GatewayRouteEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GatewayRouteEntry {
-    msg_id: u32,
-    method: String,
-    route_key: Option<GatewayRouteKeyEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GatewayRouteKeyEntry {
-    source: String,
-    key: String,
-}
-
-impl GatewayRouteEntry {
-    fn try_into_route(self) -> Result<GatewayRoute, CodegenError> {
-        let mut route = GatewayRoute::new(self.msg_id, self.method.clone());
-        if let Some(route_key) = self.route_key {
-            let key = match route_key.source.as_str() {
-                "request_field" => GatewayRouteKeySpec::RequestField(route_key.key),
-                "context_key" => GatewayRouteKeySpec::ContextKey(route_key.key),
-                "constant" => GatewayRouteKeySpec::Constant(route_key.key),
-                other => {
-                    return Err(CodegenError::UnsupportedGatewayRouteKeySource {
-                        method: self.method,
-                        route_key_source: other.to_string(),
-                    });
-                }
-            };
-            route = route.with_route_key(key);
-        }
-        Ok(route)
-    }
-}
-
-fn apply_gateway_routes(
-    methods: &mut [RpcMethodSpec],
-    routes: &[GatewayRoute],
-) -> Result<(), CodegenError> {
-    let mut assigned_methods = std::collections::BTreeSet::new();
-    let mut assigned_msg_ids = methods
-        .iter()
-        .filter_map(|method| {
-            method
-                .gateway_msg_id
-                .map(|msg_id| (msg_id, gateway_method_name(method)))
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    for route in routes {
-        if !assigned_methods.insert(route.method.clone()) {
-            return Err(CodegenError::DuplicateGatewayRouteMethod {
-                method: route.method.clone(),
-            });
-        }
-        let Some(method) = methods
-            .iter_mut()
-            .find(|method| gateway_method_name(method) == route.method)
-        else {
-            return Err(CodegenError::UnknownGatewayRouteMethod {
-                method: route.method.clone(),
-            });
-        };
-        if let Some(proto_msg_id) = method.gateway_msg_id
-            && proto_msg_id != route.msg_id
-        {
-            return Err(CodegenError::ConflictingGatewayMessageId {
-                method: route.method.clone(),
-                proto_msg_id,
-                route_msg_id: route.msg_id,
-            });
-        }
-        if let Some(existing) = assigned_msg_ids.get(&route.msg_id)
-            && existing != &route.method
-        {
-            return Err(CodegenError::DuplicateGatewayMessageId {
-                msg_id: route.msg_id,
-            });
-        }
-        method.gateway_msg_id = Some(route.msg_id);
-        method.gateway_route_key = route.route_key.clone();
-        assigned_msg_ids.insert(route.msg_id, route.method.clone());
-    }
-    Ok(())
-}
-
-fn gateway_method_name(method: &RpcMethodSpec) -> String {
-    if method.package.is_empty() {
-        format!("{}.{}", method.service_name, method.method_name)
-    } else {
-        format!(
-            "{}.{}.{}",
-            method.package, method.service_name, method.method_name
-        )
-    }
 }

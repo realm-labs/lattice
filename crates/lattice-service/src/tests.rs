@@ -26,12 +26,13 @@ use lattice_config::{ConfigFormat, ConfigSource};
 use lattice_core::{
     ActorId, ActorKind, ActorRef, ConfiguredComponent, DirectLinkEndpoint, DirectLinkManager,
     DirectLinkMessage, DirectLinkMode, DirectLinkOptions, DirectLinkRuntimeHandle, Epoch,
-    InstanceId, LinkBackpressure, LinkCloseReason, LinkClosed, LinkDirectionClosed, LinkId,
-    LinkOpened, LinkSequence, Linked, RequestId, RouteKey, TraceContext, actor_kind, service_kind,
+    InstanceId, LinkBackpressure, LinkCloseReason, LinkClosed, LinkDirection, LinkDirectionClosed,
+    LinkId, LinkMessageFlags, LinkOpened, LinkSequence, Linked, OutboundDirectLinkMessage,
+    RequestId, RouteKey, TraceContext, actor_kind, service_kind,
 };
 use lattice_direct_link::{
-    DIRECT_LINK_PROTOCOL_VERSION, DirectLinkConnection, DirectLinkFrame, DirectLinkFrameKind,
-    DirectLinkInboundRouter, DirectLinkListenConfig, DirectLinkPeerIdentity,
+    DIRECT_LINK_PROTOCOL_VERSION, DirectLinkActorPolicy, DirectLinkConnection, DirectLinkFrame,
+    DirectLinkFrameKind, DirectLinkInboundRouter, DirectLinkListenConfig, DirectLinkPeerIdentity,
     DirectLinkSessionManager, DirectLinkStream, DirectLinkTransport, OpenLinkDirection,
     OpenLinkRejectReason, OpenLinkRequest, OpenLinkValidationPolicy, TcpDirectLinkTransport,
 };
@@ -1751,6 +1752,139 @@ async fn direct_link_connection_writes_open_link_reject_frames() {
     let reject = response.decode_open_link_reject().unwrap();
     assert_eq!(reject.link_id, link_id);
     assert_eq!(reject.reason, OpenLinkRejectReason::ActorUnavailable);
+
+    connection.close().await.unwrap();
+    timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn direct_link_connection_allows_target_to_source_outbound_session() {
+    let transport = TcpDirectLinkTransport::new();
+    let listener = transport
+        .bind(DirectLinkListenConfig {
+            endpoint: DirectLinkEndpoint::new("tcp://127.0.0.1:0".parse().unwrap()),
+            max_frame_size: 4096,
+        })
+        .await
+        .unwrap();
+    let endpoint = listener.local_endpoint();
+    let manager = Arc::new(DirectLinkSessionManager::new());
+    let stream = DirectLinkStream::new("movement").message::<DirectLinkTestPayload>();
+    let descriptor = stream.descriptor();
+    manager
+        .register_binding(actor_kind!("World"), descriptor.clone())
+        .unwrap();
+    manager
+        .register_binding(actor_kind!("GatewaySession"), descriptor.clone())
+        .unwrap();
+    manager.register_actor(actor_kind!("World"), DirectLinkActorPolicy::active(None));
+    manager.register_actor(
+        actor_kind!("GatewaySession"),
+        DirectLinkActorPolicy::active(None),
+    );
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let actor_handle = lattice_actor::ActorRuntime::default()
+        .spawn_actor(
+            DirectLinkTestActor {
+                received: received.clone(),
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let router = Arc::new(
+        DirectLinkInboundRouter::builder(manager)
+            .bind_actor(
+                stream.for_actor::<DirectLinkTestActor>(actor_kind!("World")),
+                move |_| Some(actor_handle.clone()),
+            )
+            .build(),
+    );
+    let server = tokio::spawn({
+        let router = router.clone();
+        async move {
+            let connection = listener.accept().await.unwrap();
+            crate::service::handle_direct_link_connection(
+                connection,
+                Some(router),
+                Duration::from_secs(60),
+            )
+            .await;
+        }
+    });
+
+    let link_id = LinkId::new("service-link-target-to-source");
+    let mut connection = TcpDirectLinkTransport::new()
+        .connect_physical(endpoint, 4096)
+        .await
+        .unwrap();
+    connection
+        .write_frame(
+            DirectLinkFrame::open_link(&OpenLinkRequest {
+                protocol_version: DIRECT_LINK_PROTOCOL_VERSION,
+                link_id: link_id.clone(),
+                source: direct_actor_ref(
+                    service_kind!("Gateway"),
+                    actor_kind!("GatewaySession"),
+                    ActorId::U64(99),
+                    "tcp://127.0.0.1:1".parse().unwrap(),
+                ),
+                target: direct_actor_ref(
+                    service_kind!("World"),
+                    actor_kind!("World"),
+                    ActorId::U64(7),
+                    "tcp://127.0.0.1:2".parse().unwrap(),
+                ),
+                mode: DirectLinkMode::Bidirectional,
+                source_to_target: OpenLinkDirection::from_stream(link_id.clone(), &descriptor),
+                target_to_source: Some(OpenLinkDirection::from_stream(
+                    link_id.clone(),
+                    &descriptor,
+                )),
+                options: DirectLinkOptions::bidirectional(),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let ack = timeout(Duration::from_secs(1), connection.read_frame())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ack.kind, DirectLinkFrameKind::OpenLinkAck);
+
+    let session = router
+        .outbound_session(link_id.clone(), descriptor.clone())
+        .unwrap();
+    session
+        .sender
+        .tell(OutboundDirectLinkMessage {
+            link_id: link_id.clone(),
+            direction: LinkDirection::TargetToSource,
+            message_id: descriptor
+                .message_id_for::<DirectLinkTestPayload>()
+                .unwrap(),
+            proto_full_name: DirectLinkTestPayload::PROTO_FULL_NAME,
+            payload: DirectLinkTestPayload { tick: 55 }.encode_to_vec(),
+            flags: LinkMessageFlags::EMPTY,
+        })
+        .await
+        .unwrap();
+
+    let outbound = timeout(Duration::from_secs(1), connection.read_frame())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outbound.kind, DirectLinkFrameKind::Message);
+    assert_eq!(outbound.link_id, link_id);
+    assert_eq!(outbound.direction(), LinkDirection::TargetToSource);
+    let payload = DirectLinkTestPayload::decode(outbound.payload.as_slice()).unwrap();
+    assert_eq!(payload.tick, 55);
 
     connection.close().await.unwrap();
     timeout(Duration::from_secs(1), server)

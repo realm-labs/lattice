@@ -70,6 +70,7 @@ pub fn methods_from_descriptor(
     options: &BTreeMap<String, ParsedOptions>,
 ) -> Result<Vec<RpcMethodSpec>, CodegenError> {
     let mut methods = Vec::new();
+    let mut gateway_msg_ids = BTreeMap::<u32, String>::new();
     for file in &descriptor.file {
         let package = file.package.clone().unwrap_or_default();
         for service in &file.service {
@@ -107,6 +108,15 @@ pub fn methods_from_descriptor(
                         option: "lattice.route_key",
                         target: method_key.clone(),
                     })?;
+                let method_gateway_msg_id =
+                    method_options.and_then(|options| options.gateway_msg_id);
+                if let Some(msg_id) = method_gateway_msg_id
+                    && gateway_msg_ids.insert(msg_id, method_key.clone()).is_some()
+                {
+                    return Err(CodegenError::DuplicateGatewayMessageId { msg_id });
+                }
+                let is_gateway_route = method_gateway_msg_id.is_some();
+                let request_route_key = route_key.clone();
 
                 let request_proto = method
                     .input_type
@@ -125,26 +135,35 @@ pub fn methods_from_descriptor(
                         message: request_proto.clone(),
                     }
                 })?;
-                let field = find_field(request.descriptor, &route_key).ok_or_else(|| {
-                    CodegenError::RouteKeyFieldNotFound {
-                        message: request_proto.clone(),
-                        field: route_key.clone(),
+                let (field_type, route_key_from_request) = if is_gateway_route {
+                    (RouteKeyType::U64, false)
+                } else {
+                    match find_field(request.descriptor, &request_route_key) {
+                        Some(field) => {
+                            validate_route_key_field_presence(
+                                file.syntax.as_deref(),
+                                &request_proto,
+                                field,
+                                &request_route_key,
+                            )?;
+                            let field_type = field
+                                .r#type
+                                .and_then(|value| value.try_into().ok())
+                                .and_then(RouteKeyType::from_field_type)
+                                .ok_or_else(|| CodegenError::UnsupportedRouteKeyFieldType {
+                                    message: request_proto.clone(),
+                                    field: request_route_key.clone(),
+                                })?;
+                            (field_type, true)
+                        }
+                        None => {
+                            return Err(CodegenError::RouteKeyFieldNotFound {
+                                message: request_proto.clone(),
+                                field: request_route_key.clone(),
+                            });
+                        }
                     }
-                })?;
-                validate_route_key_field_presence(
-                    file.syntax.as_deref(),
-                    &request_proto,
-                    field,
-                    &route_key,
-                )?;
-                let field_type = field
-                    .r#type
-                    .and_then(|value| value.try_into().ok())
-                    .and_then(RouteKeyType::from_field_type)
-                    .ok_or_else(|| CodegenError::UnsupportedRouteKeyFieldType {
-                        message: request_proto.clone(),
-                        field: route_key.clone(),
-                    })?;
+                };
 
                 methods.push(RpcMethodSpec {
                     package: package.clone(),
@@ -157,11 +176,11 @@ pub fn methods_from_descriptor(
                         .unwrap_or_else(|| rust_type_path(&reply_proto)),
                     route_key: ProtoRouteKeyOption {
                         actor_kind: service_actor_kind.clone(),
-                        key_field: route_key,
+                        key_field: request_route_key,
                         key_type: field_type,
                     },
-                    gateway_msg_id: method_options.and_then(|options| options.gateway_msg_id),
-                    gateway_route_key: None,
+                    route_key_from_request,
+                    gateway_msg_id: method_gateway_msg_id,
                 });
             }
         }

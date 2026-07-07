@@ -4,34 +4,6 @@ use lattice_core::{ActorKind, RouteKey};
 
 use crate::GatewayError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GatewayRouteKeyPolicy {
-    pub source: &'static str,
-    pub key: Option<&'static str>,
-}
-
-impl GatewayRouteKeyPolicy {
-    pub const fn new(source: &'static str, key: Option<&'static str>) -> Self {
-        Self { source, key }
-    }
-
-    pub const fn request_field(field: &'static str) -> Self {
-        Self::new("request_field", Some(field))
-    }
-
-    pub const fn context_key(key: &'static str) -> Self {
-        Self::new("context_key", Some(key))
-    }
-
-    pub const fn constant(name: &'static str) -> Self {
-        Self::new("constant", Some(name))
-    }
-
-    pub const fn custom(source: &'static str) -> Self {
-        Self::new(source, None)
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewayRouteContext {
     route_keys: HashMap<String, RouteKey>,
@@ -68,8 +40,30 @@ impl GatewayRouteContext {
 pub struct GatewayRouteSpec {
     pub msg_id: u32,
     pub actor_kind: ActorKind,
-    pub route_key_policy: GatewayRouteKeyPolicy,
     pub method: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteDecision {
+    pub actor_kind: ActorKind,
+    pub route_key: RouteKey,
+}
+
+impl RouteDecision {
+    pub fn new(actor_kind: ActorKind, route_key: RouteKey) -> Self {
+        Self {
+            actor_kind,
+            route_key,
+        }
+    }
+}
+
+pub trait MessageRouter {
+    fn route(
+        &mut self,
+        context: &GatewayRouteContext,
+        route: &GatewayRouteSpec,
+    ) -> Result<RouteDecision, GatewayError>;
 }
 
 #[derive(Debug, Default)]

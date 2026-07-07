@@ -112,6 +112,15 @@ pub struct DirectLinkActorBinding<A, Messages> {
 }
 
 impl<A, Messages> DirectLinkActorBinding<A, Messages> {
+    pub fn new(actor_kind: ActorKind, stream: DirectLinkStreamDescriptor) -> Self {
+        Self {
+            actor_kind,
+            stream,
+            _actor: PhantomData,
+            _messages: PhantomData,
+        }
+    }
+
     pub fn actor_kind(&self) -> &ActorKind {
         &self.actor_kind
     }

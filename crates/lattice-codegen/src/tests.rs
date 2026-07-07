@@ -5,7 +5,7 @@ use crate::descriptor::methods_from_descriptor;
 use crate::descriptor::{messages_from_descriptor, messages_from_descriptor_for_files};
 use crate::render::generate_rpc_bindings;
 use crate::route_key::{ProtoRouteKeyOption, RouteKeyType};
-use crate::spec::{GatewayRouteKeySpec, RpcMethodSpec};
+use crate::spec::{GeneratedDirectLinkMessageSpec, GeneratedDirectLinkStreamSpec, RpcMethodSpec};
 use prost::Message;
 use prost_types::{
     DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
@@ -182,11 +182,7 @@ fn generated_output_matches_phase_two_shape() {
     );
     assert!(generated.rust.contains("pub mod enter_world"));
     assert!(generated.rust.contains("pub struct GatewayBinding"));
-    assert!(
-        generated
-            .rust
-            .contains("route_key_policy: GatewayRouteKeyPolicy::request_field(\"world_id\")")
-    );
+    assert!(!generated.rust.contains("GatewayRouteKeyPolicy"));
     assert!(generated.rust.contains("register_gateway_routes"));
     assert!(
         generated
@@ -196,12 +192,7 @@ fn generated_output_matches_phase_two_shape() {
     assert!(
         generated
             .rust
-            .contains("pub async fn dispatch(&self, frame: ClientFrame)")
-    );
-    assert!(
-        generated
-            .rust
-            .contains("pub async fn dispatch_with_context(&self, frame: ClientFrame, context: &lattice_gateway::GatewayRouteContext)")
+            .contains("pub async fn dispatch_with_context<R>(&self, frame: ClientFrame, router: &mut R, context: &lattice_gateway::GatewayRouteContext)")
     );
 }
 
@@ -286,6 +277,130 @@ fn descriptor_messages_resolve_nested_prost_type_paths() {
 }
 
 #[test]
+fn direct_link_stream_codegen_uses_static_match_dispatch() {
+    let generated =
+        crate::render::generate_direct_link_stream_bindings(&[GeneratedDirectLinkStreamSpec {
+            module_name: "client_player_request".into(),
+            stream_name: "client.player.request".into(),
+            messages: vec![
+                GeneratedDirectLinkMessageSpec {
+                    message_id: 7001,
+                    rust_type: "crate::world::EnterWorldRequest".into(),
+                },
+                GeneratedDirectLinkMessageSpec {
+                    message_id: 7101,
+                    rust_type: "crate::world::MoveWorldRequest".into(),
+                },
+            ],
+        }])
+        .unwrap();
+
+    assert!(generated.rust.contains("pub mod client_player_request"));
+    assert!(
+        generated
+            .rust
+            .contains("impl lattice_core::DirectLinkStreamType for Stream")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("pub fn bind<A>(actor_kind: lattice_core::ActorKind)")
+    );
+    assert!(generated.rust.contains(
+        "A: lattice_actor::Actor + lattice_actor::Handler<lattice_core::Linked<crate::world::EnterWorldRequest>> + lattice_actor::Handler<lattice_core::Linked<crate::world::MoveWorldRequest>>,"
+    ));
+    assert!(
+        generated
+            .rust
+            .contains("impl<A> lattice_direct_link::DirectLinkDispatch<A> for Stream")
+    );
+    assert!(generated.rust.contains("match message_id.0"));
+    assert!(generated.rust.contains("7001 =>"));
+    assert!(generated.rust.contains("7101 =>"));
+    assert!(
+        generated
+            .rust
+            .contains("lattice_direct_link::try_deliver_linked(handle, payload, context)")
+    );
+}
+
+#[test]
+fn direct_link_bidirectional_codegen_keeps_direction_handler_bounds_separate() {
+    let generated = crate::render::generate_direct_link_stream_bindings(&[
+        GeneratedDirectLinkStreamSpec {
+            module_name: "client_player_request".into(),
+            stream_name: "client.player.request".into(),
+            messages: vec![GeneratedDirectLinkMessageSpec {
+                message_id: 7001,
+                rust_type: "crate::world::EnterWorldRequest".into(),
+            }],
+        },
+        GeneratedDirectLinkStreamSpec {
+            module_name: "client_player_response".into(),
+            stream_name: "client.player.response".into(),
+            messages: vec![GeneratedDirectLinkMessageSpec {
+                message_id: 7002,
+                rust_type: "crate::world::EnterWorldReply".into(),
+            }],
+        },
+    ])
+    .unwrap();
+
+    let request_module = generated
+        .rust
+        .split("pub mod client_player_request")
+        .nth(1)
+        .and_then(|source| source.split("pub mod client_player_response").next())
+        .expect("request stream module");
+    assert!(
+        request_module.contains("Handler<lattice_core::Linked<crate::world::EnterWorldRequest>>")
+    );
+    assert!(
+        !request_module.contains("Handler<lattice_core::Linked<crate::world::EnterWorldReply>>")
+    );
+
+    let response_module = generated
+        .rust
+        .split("pub mod client_player_response")
+        .nth(1)
+        .expect("response stream module");
+    assert!(
+        response_module.contains("Handler<lattice_core::Linked<crate::world::EnterWorldReply>>")
+    );
+    assert!(
+        !response_module.contains("Handler<lattice_core::Linked<crate::world::EnterWorldRequest>>")
+    );
+}
+
+#[test]
+fn direct_link_stream_codegen_rejects_duplicate_message_ids() {
+    let error =
+        crate::render::generate_direct_link_stream_bindings(&[GeneratedDirectLinkStreamSpec {
+            module_name: "client_player".into(),
+            stream_name: "client.player".into(),
+            messages: vec![
+                GeneratedDirectLinkMessageSpec {
+                    message_id: 7001,
+                    rust_type: "crate::world::EnterWorldRequest".into(),
+                },
+                GeneratedDirectLinkMessageSpec {
+                    message_id: 7001,
+                    rust_type: "crate::world::MoveWorldRequest".into(),
+                },
+            ],
+        }])
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CodegenError::DuplicateDirectLinkMessageId {
+            message_id: 7001,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn duplicate_gateway_msg_id_is_rejected() {
     let mut first = world_enter_method();
     let mut second = world_enter_method();
@@ -310,12 +425,14 @@ fn descriptor_parsing_builds_method_specs() {
     );
     options.insert(
         "world.WorldRpc.EnterWorld".to_string(),
-        method_options("world_id", Some(100)),
+        method_options("world_id", None),
     );
 
     let methods = methods_from_descriptor(&descriptor, &options).unwrap();
 
-    assert_eq!(methods, vec![world_enter_method()]);
+    let mut expected = world_enter_method();
+    expected.gateway_msg_id = None;
+    assert_eq!(methods, vec![expected]);
 }
 
 #[test]
@@ -328,12 +445,14 @@ fn descriptor_parsing_resolves_nested_request_and_reply_types() {
     );
     options.insert(
         "world.WorldRpc.EnterWorld".to_string(),
-        method_options("world_id", Some(100)),
+        method_options("world_id", None),
     );
 
     let methods = methods_from_descriptor(&descriptor, &options).unwrap();
 
-    assert_eq!(methods, vec![nested_world_enter_method()]);
+    let mut expected = nested_world_enter_method();
+    expected.gateway_msg_id = None;
+    assert_eq!(methods, vec![expected]);
 }
 
 #[test]
@@ -371,13 +490,14 @@ fn descriptor_parsing_allows_method_route_key_override() {
     );
     options.insert(
         "world.WorldRpc.EnterWorld".to_string(),
-        method_options("override_world_id", Some(100)),
+        method_options("override_world_id", None),
     );
 
     let methods = methods_from_descriptor(&descriptor, &options).unwrap();
 
     let mut expected = world_enter_method();
     expected.route_key.key_field = "override_world_id".into();
+    expected.gateway_msg_id = None;
     assert_eq!(methods, vec![expected]);
 }
 
@@ -402,7 +522,7 @@ fn descriptor_parsing_rejects_unsupported_route_key_type() {
     );
     options.insert(
         "world.WorldRpc.EnterWorld".to_string(),
-        method_options("world_id", Some(100)),
+        method_options("world_id", None),
     );
 
     let error = methods_from_descriptor(&descriptor, &options).unwrap_err();
@@ -425,12 +545,14 @@ fn descriptor_parsing_accepts_proto2_required_route_key() {
     );
     options.insert(
         "world.WorldRpc.EnterWorld".to_string(),
-        method_options("world_id", Some(100)),
+        method_options("world_id", None),
     );
 
     let methods = methods_from_descriptor(&descriptor, &options).unwrap();
 
-    assert_eq!(methods, vec![world_enter_method()]);
+    let mut expected = world_enter_method();
+    expected.gateway_msg_id = None;
+    assert_eq!(methods, vec![expected]);
 }
 
 #[test]
@@ -445,7 +567,7 @@ fn descriptor_parsing_rejects_proto2_optional_route_key() {
     );
     options.insert(
         "world.WorldRpc.EnterWorld".to_string(),
-        method_options("world_id", Some(100)),
+        method_options("world_id", None),
     );
 
     let error = methods_from_descriptor(&descriptor, &options).unwrap_err();
@@ -466,7 +588,7 @@ fn descriptor_parsing_rejects_proto3_optional_route_key() {
     );
     options.insert(
         "world.WorldRpc.EnterWorld".to_string(),
-        method_options("world_id", Some(100)),
+        method_options("world_id", None),
     );
 
     let error = methods_from_descriptor(&descriptor, &options).unwrap_err();
@@ -485,7 +607,7 @@ fn descriptor_parsing_rejects_repeated_route_key() {
     );
     options.insert(
         "world.WorldRpc.EnterWorld".to_string(),
-        method_options("world_id", Some(100)),
+        method_options("world_id", None),
     );
 
     let error = methods_from_descriptor(&descriptor, &options).unwrap_err();
@@ -523,32 +645,21 @@ fn gateway_route_table_registration_is_generated_from_method_metadata() {
 }
 
 #[test]
-fn gateway_binding_can_be_generated_with_context_route_key_policy() {
-    let mut method = world_enter_method();
-    method.gateway_route_key = Some(GatewayRouteKeySpec::ContextKey("player_id".into()));
+fn gateway_binding_uses_message_router_for_route_decision() {
+    let generated = generate_rpc_bindings(&[world_enter_method()]).unwrap();
 
-    let generated = generate_rpc_bindings(&[method]).unwrap();
-
+    assert!(generated.rust.contains("R: MessageRouter"));
     assert!(
         generated
             .rust
-            .contains("route_key_policy: GatewayRouteKeyPolicy::context_key(\"player_id\")")
+            .contains("let decision = router.route(context, &route)?;")
     );
     assert!(
         generated
             .rust
-            .contains("let route_key = context.require_route_key(\"player_id\")?;")
+            .contains("decision.actor_kind,\n                    decision.route_key,")
     );
-    assert!(
-        generated
-            .rust
-            .contains("|req: &crate::world::EnterWorldRequest, context|")
-    );
-    assert!(
-        generated
-            .rust
-            .contains("Ok(context.require_route_key(\"player_id\")?)")
-    );
+    assert!(!generated.rust.contains("GatewayRouteKeyPolicy"));
 }
 
 #[test]
@@ -603,8 +714,8 @@ fn world_enter_method() -> RpcMethodSpec {
             key_field: "world_id".into(),
             key_type: RouteKeyType::U64,
         },
+        route_key_from_request: true,
         gateway_msg_id: Some(100),
-        gateway_route_key: None,
     }
 }
 
@@ -752,7 +863,9 @@ service WorldRpc {
   option (lattice.options.service_kind) = "World";
   option (lattice.options.actor_kind) = "World";
   option (lattice.options.default_route_key) = "world_id";
-  rpc EnterWorld(EnterWorldRequest) returns (EnterWorldReply);
+  rpc EnterWorld(EnterWorldRequest) returns (EnterWorldReply) {
+    option (lattice.options.gateway_msg_id) = 100;
+  }
 }
 message EnterWorldRequest {
   uint64 world_id = 1;
@@ -768,25 +881,24 @@ message EnterWorldReply {
 
     configure()
         .out_dir(&out_dir)
-        .gateway_route_ids([(100, "world.WorldRpc.EnterWorld")])
         .compile_protos(&protos, &includes)
         .unwrap();
 
     let generated = std::fs::read_to_string(out_dir.join("lattice.generated.rs")).unwrap();
-    assert!(generated.contains("impl RoutedRequest for crate::world::EnterWorldRequest"));
+    assert!(!generated.contains("impl RoutedRequest for crate::world::EnterWorldRequest"));
     assert!(generated.contains("pub mod world_rpc"));
     assert!(generated.contains("pub struct Client<C>"));
     assert!(generated.contains("pub const DEFAULT_MSG_ID: u32 = 100;"));
+    assert!(generated.contains("let decision = router.route(context, &route)?;"));
     assert!(out_dir.join("world.rs").exists());
     assert!(!out_dir.join("lattice.descriptor.bin").exists());
 }
 
 #[test]
-fn builder_accepts_gateway_routes_from_toml_file() {
+fn builder_accepts_gateway_msg_id_method_option() {
     let temp = tempfile::tempdir().unwrap();
     let proto_dir = temp.path().join("proto");
     let out_dir = temp.path().join("out");
-    let routes_path = temp.path().join("gateway-routes.toml");
     std::fs::create_dir_all(&proto_dir).unwrap();
     std::fs::write(
         proto_dir.join("world.proto"),
@@ -797,7 +909,9 @@ service WorldRpc {
   option (lattice.options.service_kind) = "World";
   option (lattice.options.actor_kind) = "World";
   option (lattice.options.default_route_key) = "world_id";
-  rpc EnterWorld(EnterWorldRequest) returns (EnterWorldReply);
+  rpc EnterWorld(EnterWorldRequest) returns (EnterWorldReply) {
+    option (lattice.options.gateway_msg_id) = 100;
+  }
 }
 message EnterWorldRequest {
   uint64 world_id = 1;
@@ -808,29 +922,218 @@ message EnterWorldReply {
 "#,
     )
     .unwrap();
-    std::fs::write(
-        &routes_path,
-        r#"[[routes]]
-msg_id = 100
-method = "world.WorldRpc.EnterWorld"
-route_key = { source = "context_key", key = "player_id" }
-"#,
-    )
-    .unwrap();
     let protos = vec![proto_dir.join("world.proto")];
     let includes = vec![proto_dir, proto_include()];
 
     configure()
         .out_dir(&out_dir)
-        .gateway_routes(&routes_path)
         .compile_protos(&protos, &includes)
         .unwrap();
 
     let generated = std::fs::read_to_string(out_dir.join("lattice.generated.rs")).unwrap();
     assert!(generated.contains("pub const DEFAULT_MSG_ID: u32 = 100;"));
     assert!(generated.contains("register_gateway_routes"));
-    assert!(generated.contains("GatewayRouteKeyPolicy::context_key(\"player_id\")"));
-    assert!(generated.contains("context.require_route_key(\"player_id\")?"));
+    assert!(generated.contains("let decision = router.route(context, &route)?;"));
+    assert!(!generated.contains("GatewayRouteKeyPolicy"));
+}
+
+#[test]
+fn builder_allows_context_routed_gateway_method_without_request_route_key_field() {
+    let temp = tempfile::tempdir().unwrap();
+    let proto_dir = temp.path().join("proto");
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir_all(&proto_dir).unwrap();
+    std::fs::write(
+        proto_dir.join("player.proto"),
+        r#"syntax = "proto3";
+package player;
+import "lattice/options.proto";
+service PlayerRpc {
+  option (lattice.options.service_kind) = "Player";
+  option (lattice.options.actor_kind) = "Player";
+  option (lattice.options.default_route_key) = "player_id";
+  rpc AllItem(AllItemRequest) returns (AllItemReply) {
+    option (lattice.options.gateway_msg_id) = 7101;
+  }
+}
+message AllItemRequest {
+}
+message AllItemReply {
+  bool ok = 1;
+}
+"#,
+    )
+    .unwrap();
+    let protos = vec![proto_dir.join("player.proto")];
+    let includes = vec![proto_dir, proto_include()];
+
+    configure()
+        .out_dir(&out_dir)
+        .compile_protos(&protos, &includes)
+        .unwrap();
+
+    let generated = std::fs::read_to_string(out_dir.join("lattice.generated.rs")).unwrap();
+    assert!(!generated.contains("impl RoutedRequest for crate::player::AllItemRequest"));
+    assert!(generated.contains(
+        "pub async fn all_item(&self, route_key: RouteKey, req: crate::player::AllItemRequest)"
+    ));
+    assert!(generated.contains("let decision = router.route(context, &route)?;"));
+    assert!(generated.contains("core.call_routed(RoutedEnvelope::new("));
+}
+
+#[test]
+fn builder_does_not_generate_request_route_key_for_gateway_method() {
+    let temp = tempfile::tempdir().unwrap();
+    let proto_dir = temp.path().join("proto");
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir_all(&proto_dir).unwrap();
+    std::fs::write(
+        proto_dir.join("player.proto"),
+        r#"syntax = "proto3";
+package player;
+import "lattice/options.proto";
+service PlayerRpc {
+  option (lattice.options.service_kind) = "Player";
+  option (lattice.options.actor_kind) = "Player";
+  option (lattice.options.default_route_key) = "player_id";
+  rpc Login(LoginRequest) returns (LoginReply) {
+    option (lattice.options.gateway_msg_id) = 7001;
+  }
+}
+message LoginRequest {
+  string account = 1;
+}
+message LoginReply {
+  bool ok = 1;
+}
+"#,
+    )
+    .unwrap();
+    let protos = vec![proto_dir.join("player.proto")];
+    let includes = vec![proto_dir, proto_include()];
+
+    configure()
+        .out_dir(&out_dir)
+        .compile_protos(&protos, &includes)
+        .unwrap();
+
+    let generated = std::fs::read_to_string(out_dir.join("lattice.generated.rs")).unwrap();
+    assert!(generated.contains(
+        "pub async fn login(&self, route_key: RouteKey, req: crate::player::LoginRequest)"
+    ));
+    assert!(!generated.contains("RouteKey::Str(self.account.clone())"));
+    assert!(!generated.contains("GatewayRouteKeyPolicy"));
+    assert!(!generated.contains("self.player_id"));
+}
+
+#[test]
+fn builder_keeps_mixed_gateway_methods_router_based() {
+    let temp = tempfile::tempdir().unwrap();
+    let proto_dir = temp.path().join("proto");
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir_all(&proto_dir).unwrap();
+    std::fs::write(
+        proto_dir.join("player.proto"),
+        r#"syntax = "proto3";
+package player;
+import "lattice/options.proto";
+service PlayerRpc {
+  option (lattice.options.service_kind) = "Player";
+  option (lattice.options.actor_kind) = "Player";
+  option (lattice.options.default_route_key) = "player_id";
+  rpc Login(LoginRequest) returns (LoginReply) {
+    option (lattice.options.gateway_msg_id) = 7001;
+  }
+  rpc AllItem(AllItemRequest) returns (AllItemReply) {
+    option (lattice.options.gateway_msg_id) = 7101;
+  }
+}
+message LoginRequest {
+  string account = 1;
+}
+message LoginReply {
+  bool ok = 1;
+}
+message AllItemRequest {
+}
+message AllItemReply {
+  bool ok = 1;
+}
+"#,
+    )
+    .unwrap();
+    let protos = vec![proto_dir.join("player.proto")];
+    let includes = vec![proto_dir, proto_include()];
+
+    configure()
+        .out_dir(&out_dir)
+        .compile_protos(&protos, &includes)
+        .unwrap();
+
+    let generated = std::fs::read_to_string(out_dir.join("lattice.generated.rs")).unwrap();
+    assert!(!generated.contains("GatewayRouteKeyPolicy"));
+    assert!(generated.contains("let decision = router.route(context, &route)?;"));
+    assert!(generated.contains(
+        "pub async fn all_item(&self, route_key: RouteKey, req: crate::player::AllItemRequest)"
+    ));
+}
+
+#[test]
+fn builder_keeps_imported_proto2_gateway_methods_router_based() {
+    let temp = tempfile::tempdir().unwrap();
+    let proto_dir = temp.path().join("proto");
+    let out_dir = temp.path().join("out");
+    std::fs::create_dir_all(&proto_dir).unwrap();
+    std::fs::write(
+        proto_dir.join("client.proto"),
+        r#"syntax = "proto2";
+package com.yanmonet.p9server.protocol;
+message LoginRequest {
+  required string account = 1;
+}
+message LoginResponse {
+  optional bool ok = 1;
+}
+message AllItemRequest {
+}
+message AllItemResponse {
+  optional bool ok = 1;
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        proto_dir.join("player.proto"),
+        r#"syntax = "proto3";
+package player;
+import "lattice/options.proto";
+import "client.proto";
+service PlayerRpc {
+  option (lattice.options.service_kind) = "Player";
+  option (lattice.options.actor_kind) = "Player";
+  option (lattice.options.default_route_key) = "player_id";
+  rpc Login(.com.yanmonet.p9server.protocol.LoginRequest) returns (.com.yanmonet.p9server.protocol.LoginResponse) {
+    option (lattice.options.gateway_msg_id) = 7001;
+  }
+  rpc AllItem(.com.yanmonet.p9server.protocol.AllItemRequest) returns (.com.yanmonet.p9server.protocol.AllItemResponse) {
+    option (lattice.options.gateway_msg_id) = 7101;
+  }
+}
+"#,
+    )
+    .unwrap();
+    let protos = vec![proto_dir.join("player.proto")];
+    let includes = vec![proto_dir, proto_include()];
+
+    configure()
+        .out_dir(&out_dir)
+        .compile_protos(&protos, &includes)
+        .unwrap();
+
+    let generated = std::fs::read_to_string(out_dir.join("lattice.generated.rs")).unwrap();
+    assert!(!generated.contains("GatewayRouteKeyPolicy"));
+    assert!(generated.contains("let decision = router.route(context, &route)?;"));
+    assert!(generated.contains("pub async fn all_item(&self, route_key: RouteKey, req: crate::com::yanmonet::p9server::protocol::AllItemRequest)"));
 }
 
 #[test]

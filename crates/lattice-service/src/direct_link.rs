@@ -164,10 +164,10 @@ impl DirectLinkRuntime for DirectLinkServiceRuntime {
 
     async fn get_outbound(
         &self,
-        _link_id: LinkId,
-        _stream: lattice_core::DirectLinkStreamDescriptor,
+        link_id: LinkId,
+        stream: lattice_core::DirectLinkStreamDescriptor,
     ) -> Result<DirectLinkSession, LinkError> {
-        Err(LinkError::Unavailable)
+        self.inbound_router.outbound_session(link_id, stream)
     }
 
     async fn close_all(&self, link_id: LinkId, reason: LinkCloseReason) -> Result<(), LinkError> {

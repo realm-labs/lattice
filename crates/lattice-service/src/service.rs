@@ -10,7 +10,7 @@ use lattice_core::{ActorKind, DirectLinkEndpoint, LinkError, ServiceContext, Ser
 use lattice_direct_link::transport::TcpDirectLinkWriter;
 use lattice_direct_link::{
     DirectLinkConnection, DirectLinkFrameKind, DirectLinkInboundRouter, DirectLinkTransport,
-    TcpDirectLinkConnection, TcpDirectLinkTransport,
+    InboundConnectionSender, TcpDirectLinkConnection, TcpDirectLinkTransport,
 };
 use lattice_ops::admin::{
     AdminActorTarget, AdminApiError, AdminAuth, AdminHttpAdapter, AdminMutationHandler,
@@ -21,7 +21,7 @@ use lattice_placement::coordinator::PlacementWatchTask;
 use lattice_placement::instance::{InstanceRecord, InstanceState};
 use lattice_placement::store::LeaseId;
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::server::Router;
@@ -652,14 +652,24 @@ pub(crate) async fn handle_direct_link_connection(
     };
 
     let (mut reader, mut writer) = connection.split();
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(1024);
+    let mut registered_links = Vec::new();
     let mut heartbeat = tokio::time::interval(maintenance_interval);
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 if let Err(error) = write_due_direct_link_heartbeats(&mut writer, &inbound_router).await {
                     debug!(%error, "closing direct-link connection after heartbeat write failure");
-                    let _ = writer.close().await;
-                    return;
+                    break;
+                }
+            }
+            outbound = outbound_rx.recv() => {
+                let Some(frame) = outbound else {
+                    break;
+                };
+                if let Err(error) = writer.write_frame(frame).await {
+                    debug!(%error, "closing direct-link connection after outbound write failure");
+                    break;
                 }
             }
             frame = reader.read_frame() => {
@@ -667,33 +677,44 @@ pub(crate) async fn handle_direct_link_connection(
                     Ok(frame) => frame,
                     Err(error) => {
                         debug!(%error, "closing direct-link connection after read failure");
-                        let _ = writer.close().await;
-                        return;
+                        break;
                     }
                 };
                 if frame.kind == DirectLinkFrameKind::OpenLink {
                     match inbound_router.process_open_link_frame(frame, None) {
                         Ok(response) => {
+                            if response.kind == DirectLinkFrameKind::OpenLinkAck {
+                                let link_id = response.link_id.clone();
+                                inbound_router.register_outbound_sender(
+                                    link_id.clone(),
+                                    Arc::new(InboundConnectionSender::new(
+                                        link_id.clone(),
+                                        outbound_tx.clone(),
+                                    )),
+                                );
+                                registered_links.push(link_id);
+                            }
                             if let Err(error) = writer.write_frame(response).await {
                                 warn!(%error, "closing direct-link connection after open-link response write failure");
-                                let _ = writer.close().await;
-                                return;
+                                break;
                             }
                         }
                         Err(error) => {
                             warn!(%error, "closing direct-link connection after open-link handling failure");
-                            let _ = writer.close().await;
-                            return;
+                            break;
                         }
                     }
                 } else if let Err(error) = inbound_router.process_frame(frame) {
                     warn!(%error, "closing direct-link connection after inbound delivery failure");
-                    let _ = writer.close().await;
-                    return;
+                    break;
                 }
             }
         }
     }
+    for link_id in registered_links {
+        inbound_router.unregister_outbound_sender(&link_id);
+    }
+    let _ = writer.close().await;
 }
 
 async fn write_due_direct_link_heartbeats(

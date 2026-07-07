@@ -84,6 +84,48 @@ impl ShardedRpcCore for FakeCore {
     }
 }
 
+#[derive(Debug)]
+struct FixedRouter {
+    decision: RouteDecision,
+}
+
+impl FixedRouter {
+    fn new(actor_kind: ActorKind, route_key: RouteKey) -> Self {
+        Self {
+            decision: RouteDecision::new(actor_kind, route_key),
+        }
+    }
+}
+
+impl MessageRouter for FixedRouter {
+    fn route(
+        &mut self,
+        _context: &GatewayRouteContext,
+        _route: &GatewayRouteSpec,
+    ) -> Result<RouteDecision, GatewayError> {
+        Ok(self.decision.clone())
+    }
+}
+
+#[derive(Debug)]
+struct ContextRouter {
+    actor_kind: ActorKind,
+    key: &'static str,
+}
+
+impl MessageRouter for ContextRouter {
+    fn route(
+        &mut self,
+        context: &GatewayRouteContext,
+        _route: &GatewayRouteSpec,
+    ) -> Result<RouteDecision, GatewayError> {
+        Ok(RouteDecision::new(
+            self.actor_kind.clone(),
+            context.require_route_key(self.key)?,
+        ))
+    }
+}
+
 #[test]
 fn binary_client_codec_decodes_and_encodes_frame() {
     let codec = BinaryClientCodec;
@@ -258,7 +300,7 @@ async fn gateway_service_reports_background_task_failure() {
 
 #[test]
 fn gateway_route_table_rejects_duplicate_msg_id() {
-    let binding = ProstClientMessageBinding::<EnterWorldRequest>::new(100);
+    let binding = ProstClientMessageBinding::<EnterWorldRequest>::new(100, actor_kind!("World"));
     let mut table = GatewayRouteTable::new();
 
     table.register(binding.route_spec()).unwrap();
@@ -266,24 +308,25 @@ fn gateway_route_table_rejects_duplicate_msg_id() {
 
     assert_eq!(duplicate, Err(GatewayError::DuplicateRoute { msg_id: 100 }));
     assert_eq!(table.get(100).unwrap().method, EnterWorldRequest::METHOD);
-    assert_eq!(
-        table.get(100).unwrap().route_key_policy,
-        GatewayRouteKeyPolicy::request_field("<routed-request>")
-    );
+    assert_eq!(table.get(100).unwrap().actor_kind, actor_kind!("World"));
 }
 
 #[tokio::test]
 async fn generated_binding_decodes_payload_and_forwards_typed_request() {
-    let binding = ProstClientMessageBinding::<EnterWorldRequest>::new(100);
+    let binding = ProstClientMessageBinding::<EnterWorldRequest>::new(100, actor_kind!("World"));
     let core = FakeCore::default();
     let routed = core.routed.clone();
+    let mut router = FixedRouter::new(actor_kind!("World"), RouteKey::U64(42));
     let request = EnterWorldRequest { world_id: 42 };
     let frame = ClientFrame {
         msg_id: 100,
         payload: request.encode_to_vec(),
     };
 
-    let reply_frame = binding.decode_and_forward(frame, core).await.unwrap();
+    let reply_frame = binding
+        .decode_and_forward(frame, core, &mut router, &GatewayRouteContext::new())
+        .await
+        .unwrap();
 
     assert_eq!(reply_frame.msg_id, 100);
     assert_eq!(*routed.lock().unwrap(), vec![RouteKey::U64(42)]);
@@ -293,13 +336,13 @@ async fn generated_binding_decodes_payload_and_forwards_typed_request() {
 
 #[tokio::test]
 async fn generated_binding_forwards_empty_request_with_session_route_key() {
-    let binding = ProstClientMessageBinding::<AllItemRequest>::with_context_route_key(
-        101,
-        actor_kind!("Player"),
-        "session_actor",
-    );
+    let binding = ProstClientMessageBinding::<AllItemRequest>::new(101, actor_kind!("Player"));
     let core = FakeCore::default();
     let routed = core.routed.clone();
+    let mut router = ContextRouter {
+        actor_kind: actor_kind!("Player"),
+        key: "session_actor",
+    };
     let frame = ClientFrame {
         msg_id: 101,
         payload: AllItemRequest::default().encode_to_vec(),
@@ -307,7 +350,7 @@ async fn generated_binding_forwards_empty_request_with_session_route_key() {
     let context = GatewayRouteContext::new().with_route_key("session_actor", RouteKey::U64(42));
 
     let reply_frame = binding
-        .decode_and_forward_with_context(frame, core, &context)
+        .decode_and_forward(frame, core, &mut router, &context)
         .await
         .unwrap();
 
@@ -318,15 +361,11 @@ async fn generated_binding_forwards_empty_request_with_session_route_key() {
 }
 
 #[tokio::test]
-async fn gateway_binding_routes_login_by_business_request_field_extractor() {
-    let binding = ProstClientMessageBinding::<LoginRequest>::with_route_extractor(
-        102,
-        actor_kind!("Login"),
-        GatewayRouteKeyPolicy::request_field("account"),
-        |req, _context| Ok(RouteKey::Str(req.account.clone())),
-    );
+async fn gateway_binding_uses_router_decision_for_login() {
+    let binding = ProstClientMessageBinding::<LoginRequest>::new(102, actor_kind!("Login"));
     let core = FakeCore::default();
     let routed = core.routed.clone();
+    let mut router = FixedRouter::new(actor_kind!("Login"), RouteKey::Str("account-7".to_string()));
     let frame = ClientFrame {
         msg_id: 102,
         payload: LoginRequest {
@@ -335,13 +374,12 @@ async fn gateway_binding_routes_login_by_business_request_field_extractor() {
         .encode_to_vec(),
     };
 
-    let reply_frame = binding.decode_and_forward(frame, core).await.unwrap();
+    let reply_frame = binding
+        .decode_and_forward(frame, core, &mut router, &GatewayRouteContext::new())
+        .await
+        .unwrap();
 
     assert_eq!(reply_frame.msg_id, 102);
-    assert_eq!(
-        binding.route_spec().route_key_policy,
-        GatewayRouteKeyPolicy::request_field("account")
-    );
     assert_eq!(
         *routed.lock().unwrap(),
         vec![RouteKey::Str("account-7".to_string())]
@@ -350,18 +388,23 @@ async fn gateway_binding_routes_login_by_business_request_field_extractor() {
 
 #[tokio::test]
 async fn generated_binding_reports_missing_session_route_key() {
-    let binding = ProstClientMessageBinding::<AllItemRequest>::with_context_route_key(
-        101,
-        actor_kind!("Player"),
-        "session_actor",
-    );
+    let binding = ProstClientMessageBinding::<AllItemRequest>::new(101, actor_kind!("Player"));
+    let mut router = ContextRouter {
+        actor_kind: actor_kind!("Player"),
+        key: "session_actor",
+    };
     let frame = ClientFrame {
         msg_id: 101,
         payload: AllItemRequest::default().encode_to_vec(),
     };
 
     let error = binding
-        .decode_and_forward_with_context(frame, FakeCore::default(), &GatewayRouteContext::new())
+        .decode_and_forward(
+            frame,
+            FakeCore::default(),
+            &mut router,
+            &GatewayRouteContext::new(),
+        )
         .await
         .unwrap_err();
 

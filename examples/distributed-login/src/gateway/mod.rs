@@ -8,24 +8,24 @@ use http::Uri;
 use lattice_actor::registry::{ActorCreateContext, ActorRefConfig, ActorRegistryConfig};
 use lattice_actor::{ActorError, ActorLoader, ActorRegistry, StopReason};
 use lattice_core::{ActorId, ActorRef, InstanceId};
-use lattice_gateway::{
-    ClientFrame, GatewayConnectionHandler, GatewayError, GatewayRouteTable, GatewayService,
-};
+use lattice_gateway::{ClientFrame, GatewayConnectionHandler, GatewayError, GatewayService};
 use lattice_placement::InMemoryPlacementStore;
+use lattice_rpc::ShardedRpcCore;
 use prost::Message as ProstMessage;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
-use crate::game::{LoginRequest, gateway_push_rpc_server::GatewayPushRpcServer};
+use crate::game::{
+    LoginRequest, PlayerPingRequest, WorldPingRequest,
+    gateway_push_rpc_server::GatewayPushRpcServer,
+};
 use crate::gateway::session_actor::GatewaySessionActor;
-use crate::generated::{GatewayDispatcher, gateway_push_rpc, register_gateway_routes};
+use crate::generated::gateway_push_rpc;
 use crate::placement::{DemoRpcCore, player_core, world_core};
 use crate::tcp::{read_client_frame, write_client_frame};
 use crate::{ExampleResult, GATEWAY_SERVICE, GATEWAY_SESSION_ACTOR};
-
-type DemoGatewayDispatcher = GatewayDispatcher<DemoRpcCore, DemoRpcCore>;
 
 pub async fn run_gateway(
     client_listener: TcpListener,
@@ -35,12 +35,9 @@ pub async fn run_gateway(
 ) -> ExampleResult<()> {
     let local_addr = client_listener.local_addr()?;
     let push_addr = push_listener.local_addr()?;
-    let mut route_table = GatewayRouteTable::new();
-    register_gateway_routes(&mut route_table)?;
 
     let world_core = world_core(placement_store.clone(), InstanceId::new("gateway-1"));
     let player_core = player_core(placement_store, InstanceId::new("gateway-1"));
-    let dispatcher = DemoGatewayDispatcher::new(world_core, player_core);
     let gateway_push_endpoint = format!("http://{push_addr}").parse::<Uri>()?;
     let sessions = GatewaySessions::new(gateway_push_endpoint);
     let push_service =
@@ -48,7 +45,8 @@ pub async fn run_gateway(
     let service = GatewayService::new(
         client_listener,
         DemoGatewayConnectionHandler {
-            dispatcher,
+            world_core,
+            player_core,
             sessions,
         },
     )
@@ -142,7 +140,8 @@ impl ActorLoader<GatewaySessionActor> for GatewaySessionLoader {
 
 #[derive(Clone)]
 struct DemoGatewayConnectionHandler {
-    dispatcher: DemoGatewayDispatcher,
+    world_core: DemoRpcCore,
+    player_core: DemoRpcCore,
     sessions: GatewaySessions,
 }
 
@@ -153,21 +152,33 @@ impl GatewayConnectionHandler for DemoGatewayConnectionHandler {
         socket: TcpStream,
         _peer: SocketAddr,
     ) -> Result<(), GatewayError> {
-        handle_connection(socket, self.dispatcher.clone(), self.sessions.clone())
-            .await
-            .map_err(|error| GatewayError::Io(error.to_string()))
+        handle_connection(
+            socket,
+            self.world_core.clone(),
+            self.player_core.clone(),
+            self.sessions.clone(),
+        )
+        .await
+        .map_err(|error| GatewayError::Io(error.to_string()))
     }
 }
 
 async fn handle_connection(
     socket: TcpStream,
-    dispatcher: DemoGatewayDispatcher,
+    world_core: DemoRpcCore,
+    player_core: DemoRpcCore,
     sessions: GatewaySessions,
 ) -> ExampleResult<()> {
     let (reader, writer) = socket.into_split();
     let (tx, rx) = mpsc::channel::<ClientFrame>(16);
 
-    let read_task = tokio::spawn(read_client_messages(reader, tx, dispatcher, sessions));
+    let read_task = tokio::spawn(read_client_messages(
+        reader,
+        tx,
+        world_core,
+        player_core,
+        sessions,
+    ));
     let write_task = tokio::spawn(write_client_messages(writer, rx));
 
     let read_result = read_task.await?;
@@ -180,14 +191,16 @@ async fn handle_connection(
 async fn read_client_messages(
     mut reader: OwnedReadHalf,
     tx: mpsc::Sender<ClientFrame>,
-    dispatcher: DemoGatewayDispatcher,
+    world_core: DemoRpcCore,
+    player_core: DemoRpcCore,
     sessions: GatewaySessions,
 ) -> ExampleResult<()> {
     let mut registered_session = None::<String>;
     let result = read_client_messages_inner(
         &mut reader,
         &tx,
-        dispatcher,
+        world_core,
+        player_core,
         sessions.clone(),
         &mut registered_session,
     )
@@ -202,7 +215,8 @@ async fn read_client_messages(
 async fn read_client_messages_inner(
     reader: &mut OwnedReadHalf,
     tx: &mpsc::Sender<ClientFrame>,
-    dispatcher: DemoGatewayDispatcher,
+    world_core: DemoRpcCore,
+    player_core: DemoRpcCore,
     sessions: GatewaySessions,
     registered_session: &mut Option<String>,
 ) -> ExampleResult<()> {
@@ -237,14 +251,26 @@ async fn read_client_messages_inner(
                 let gateway_session_ref = sessions.register(session_id.clone(), tx.clone()).await?;
                 login.gateway_session = Some(gateway_session_ref.into());
                 *registered_session = Some(session_id);
-                let frame = ClientFrame {
-                    msg_id: frame.msg_id,
-                    payload: login.encode_to_vec(),
-                };
-                let _ack = dispatcher.dispatch(frame).await?;
+                let _ack = world_core.call(login).await?;
                 continue;
             }
-            _ => dispatcher.dispatch(frame).await?,
+            crate::WORLD_PING_MSG_ID => {
+                let request = WorldPingRequest::decode(frame.payload.as_slice())?;
+                let reply = world_core.call(request).await?;
+                ClientFrame {
+                    msg_id: frame.msg_id,
+                    payload: reply.encode_to_vec(),
+                }
+            }
+            crate::PLAYER_PING_MSG_ID => {
+                let request = PlayerPingRequest::decode(frame.payload.as_slice())?;
+                let reply = player_core.call(request).await?;
+                ClientFrame {
+                    msg_id: frame.msg_id,
+                    payload: reply.encode_to_vec(),
+                }
+            }
+            msg_id => return Err(format!("unknown client msg_id {msg_id}").into()),
         };
         tx.send(response)
             .await

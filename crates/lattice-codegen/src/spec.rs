@@ -9,20 +9,32 @@ pub struct RpcMethodSpec {
     pub request_type: String,
     pub reply_type: String,
     pub route_key: ProtoRouteKeyOption,
+    pub route_key_from_request: bool,
     pub gateway_msg_id: Option<u32>,
-    pub gateway_route_key: Option<GatewayRouteKeySpec>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GatewayRouteKeySpec {
-    RequestField(String),
-    ContextKey(String),
-    Constant(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtoMessageSpec {
     pub proto_full_name: String,
+    pub rust_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedDirectLinkStreamSpec {
+    /// Rust module name for one logical Direct Link direction.
+    ///
+    /// Bidirectional links should generate two stream specs: one for
+    /// SourceToTarget messages and one for TargetToSource messages. Keeping the
+    /// directions separate preserves precise `Handler<Linked<T>>` bounds for
+    /// each actor side.
+    pub module_name: String,
+    pub stream_name: String,
+    pub messages: Vec<GeneratedDirectLinkMessageSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedDirectLinkMessageSpec {
+    pub message_id: u64,
     pub rust_type: String,
 }
 

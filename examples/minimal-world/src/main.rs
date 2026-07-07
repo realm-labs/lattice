@@ -17,7 +17,7 @@ use lattice_eventbus::{
     EventBus, EventEnvelope, EventPublisher, EventSubscription, LocalEventBus, Subject,
     SubjectFilter,
 };
-use lattice_gateway::{BinaryClientCodec, ClientCodec, ClientFrame, GatewayRouteTable};
+use lattice_gateway::{BinaryClientCodec, ClientCodec, ClientFrame};
 use lattice_ops::ServiceScheduler;
 use lattice_ops::admin::{AdminSnapshot, ClusterSummary, NodeSummary};
 use lattice_ops::telemetry::{
@@ -40,7 +40,7 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/lattice.generated.rs"));
 }
 
-use generated::{register_gateway_routes, world_rpc::Client as WorldClient};
+use generated::world_rpc::Client as WorldClient;
 use world::{EnterWorldReply, EnterWorldRequest};
 
 pub const WORLD_SERVICE: ServiceKind = service_kind!("World");
@@ -292,8 +292,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    let mut route_table = GatewayRouteTable::new();
-    register_gateway_routes(&mut route_table)?;
     let codec = BinaryClientCodec;
     let gateway_request = EnterWorldRequest {
         world_id: 1,
@@ -349,14 +347,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     service_task.await??;
 
     println!(
-        "{}:{} rpc_ok={} second_actor_ok={} gateway_msg_id={} gateway_world_id={} routes={} events={} scheduled={} config_tick={} trace={} event_id={} ops_actor_kinds={} telemetry_spans={} telemetry_metrics={}",
+        "{}:{} rpc_ok={} second_actor_ok={} client_msg_id={} gateway_world_id={} events={} scheduled={} config_tick={} trace={} event_id={} ops_actor_kinds={} telemetry_spans={} telemetry_metrics={}",
         WORLD_SERVICE.as_str(),
         WORLD_ACTOR.as_str(),
         rpc_reply.ok,
         second_actor_reply.ok,
         decoded.msg_id,
         gateway_decoded.world_id,
-        usize::from(route_table.get(100).is_some()),
         event_count.load(Ordering::SeqCst),
         scheduled_ticks.load(Ordering::SeqCst),
         configured_tick.unwrap_or_default(),
