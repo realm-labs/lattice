@@ -30,7 +30,7 @@ use lattice_placement::storage::{ActorPlacementKey, PlacementState};
 
 use crate::context::ServiceBuildContext;
 use crate::error::LatticeServiceError;
-use crate::framework::{DynPlacementStore, PlacementStoreComponent};
+use crate::framework::placement::{DynPlacementStore, PlacementStoreComponent};
 
 #[derive(Clone)]
 pub struct DirectLinkServiceRuntime {

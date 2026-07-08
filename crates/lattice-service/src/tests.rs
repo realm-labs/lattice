@@ -87,14 +87,14 @@ use tonic::body::Body;
 use tonic::codegen::Service;
 use tonic::server::NamedService;
 
-use crate::actor::ActorRegistration;
-use crate::actor::ErasedActorRegistration;
+use crate::actors::registration::ActorRegistration;
+use crate::actors::registration::ErasedActorRegistration;
+use crate::clients::{RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
 use crate::config::DirectLinkConfig;
 use crate::context::ServiceBuildContext;
 use crate::error::LatticeServiceError;
-use crate::framework::ServiceContextExt;
-use crate::rpc::{RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
-use crate::service::LatticeService;
+use crate::framework::context::ServiceContextExt;
+use crate::runtime::service::LatticeService;
 
 #[derive(Clone)]
 struct TestFactory;

@@ -506,7 +506,7 @@ async fn direct_link_connection_writes_open_link_reject_frames() {
     let router = Arc::new(DirectLinkInboundRouter::builder(manager).build());
     let server = tokio::spawn(async move {
         let connection = listener.accept().await.unwrap();
-        crate::service::handle_direct_link_connection(
+        crate::runtime::direct_link_listener::handle_direct_link_connection(
             connection,
             Some(router),
             Duration::from_secs(1),
@@ -621,7 +621,7 @@ async fn direct_link_connection_allows_target_to_source_outbound_session() {
         let router = router.clone();
         async move {
             let connection = listener.accept().await.unwrap();
-            crate::service::handle_direct_link_connection(
+            crate::runtime::direct_link_listener::handle_direct_link_connection(
                 connection,
                 Some(router),
                 Duration::from_secs(60),

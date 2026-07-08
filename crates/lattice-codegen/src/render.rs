@@ -461,8 +461,8 @@ use lattice_actor::traits::{Actor, Handler};\n",
     );
     rust.push_str(
         "    use lattice_service::error::LatticeServiceError;
-    use lattice_service::framework::ServiceContextExt;
-    use lattice_service::rpc::{RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
+    use lattice_service::framework::context::ServiceContextExt;
+    use lattice_service::clients::{RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
     use lattice_service::context::ServiceBuildContext;\n\n",
     );
     push_typed_client(rust, methods);
@@ -763,7 +763,7 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
     let service = methods[0];
     let trait_path = tonic_service_trait_path(service);
     rust.push_str("    #[derive(Clone)]\n");
-    rust.push_str("    pub struct SingletonRegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n        placement_store: Arc<dyn lattice_service::framework::DynPlacementStore>,\n        instance_id: InstanceId,\n        security: RpcServerSecurity,\n        request_dedup: bool,\n        deduplicator: lattice_rpc::dedup::RequestDeduplicator,\n    }\n\n");
+    rust.push_str("    pub struct SingletonRegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n        placement_store: Arc<dyn lattice_service::framework::placement::DynPlacementStore>,\n        instance_id: InstanceId,\n        security: RpcServerSecurity,\n        request_dedup: bool,\n        deduplicator: lattice_rpc::dedup::RequestDeduplicator,\n    }\n\n");
     rust.push_str("    impl<A, L> std::fmt::Debug for SingletonRegistryService<A, L>\n");
     rust.push_str("    where\n        A: Actor,\n    {\n");
     rust.push_str(
@@ -773,10 +773,10 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
     rust.push_str("    impl<A, L> SingletonRegistryService<A, L>\n    where\n        A: Actor,\n        L: ActorLoader<A>,\n    {\n");
-    rust.push_str("        pub fn new(registry: Arc<ActorRegistry<A>>, loader: L, placement_store: Arc<dyn lattice_service::framework::DynPlacementStore>, instance_id: InstanceId) -> Self {\n");
+    rust.push_str("        pub fn new(registry: Arc<ActorRegistry<A>>, loader: L, placement_store: Arc<dyn lattice_service::framework::placement::DynPlacementStore>, instance_id: InstanceId) -> Self {\n");
     rust.push_str("            Self { registry, loader, placement_store, instance_id, security: RpcServerSecurity::disabled(), request_dedup: true, deduplicator: lattice_rpc::dedup::RequestDeduplicator::new() }\n");
     rust.push_str("        }\n\n");
-    rust.push_str("        pub fn with_security(registry: Arc<ActorRegistry<A>>, loader: L, placement_store: Arc<dyn lattice_service::framework::DynPlacementStore>, instance_id: InstanceId, security: RpcServerSecurity) -> Self {\n");
+    rust.push_str("        pub fn with_security(registry: Arc<ActorRegistry<A>>, loader: L, placement_store: Arc<dyn lattice_service::framework::placement::DynPlacementStore>, instance_id: InstanceId, security: RpcServerSecurity) -> Self {\n");
     rust.push_str(
         "            Self { registry, loader, placement_store, instance_id, security, request_dedup: true, deduplicator: lattice_rpc::dedup::RequestDeduplicator::new() }\n",
     );

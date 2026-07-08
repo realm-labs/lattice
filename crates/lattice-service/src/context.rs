@@ -14,7 +14,7 @@ use tonic::server::NamedService;
 use tonic::transport::Server;
 use tonic::transport::server::Router;
 
-use crate::actor::{ErasedLogicActor, RegisteredActor};
+use crate::actors::registration::{ErasedLogicActor, RegisteredActor};
 use crate::error::LatticeServiceError;
 
 pub struct ServiceBuildContext {

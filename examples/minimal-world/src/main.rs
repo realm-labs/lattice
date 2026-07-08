@@ -29,8 +29,8 @@ use lattice_ops::telemetry::{
 use lattice_placement::storage::PlacementPrefix;
 use lattice_placement::storage::memory::InMemoryPlacementStore;
 use lattice_rpc::types::Rpc;
-use lattice_service::actor::ActorRegistration;
-use lattice_service::service::LatticeService;
+use lattice_service::actors::registration::ActorRegistration;
+use lattice_service::runtime::service::LatticeService;
 use prost::Message as ProstMessage;
 use serde::Deserialize;
 use serde_json::json;

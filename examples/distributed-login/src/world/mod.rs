@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 
 use lattice_core::instance::InstanceId;
 use lattice_placement::storage::memory::InMemoryPlacementStore;
-use lattice_service::actor::ActorRegistration;
-use lattice_service::service::LatticeService;
+use lattice_service::actors::registration::ActorRegistration;
+use lattice_service::runtime::service::LatticeService;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 

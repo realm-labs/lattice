@@ -20,9 +20,9 @@ use lattice_placement::storage::{
 };
 
 use crate::error::LatticeServiceError;
-use crate::framework::{
-    ClusterEventBusComponent, ConfigStoreComponent, LocalEventBusComponent, PlacementStoreComponent,
-};
+use crate::framework::config_store::ConfigStoreComponent;
+use crate::framework::event_bus::{ClusterEventBusComponent, LocalEventBusComponent};
+use crate::framework::placement::PlacementStoreComponent;
 
 #[derive(Debug)]
 pub struct ServiceComponentContext {

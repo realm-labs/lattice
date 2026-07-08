@@ -7,7 +7,7 @@ async fn shutdown_signal_helper_returns_on_first_trigger() {
 
     timeout(
         Duration::from_millis(50),
-        crate::service::first_shutdown_signal(
+        crate::runtime::shutdown::first_shutdown_signal(
             async {
                 let _ = trigger_rx.await;
             },

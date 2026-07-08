@@ -18,7 +18,7 @@ use lattice_core::kind::ActorKind;
 use lattice_placement::sharding::{VirtualShardId, VirtualShardMapper};
 
 use crate::context::ServiceBuildContext;
-use crate::direct_link::DirectLinkServiceRuntime;
+use crate::direct_links::DirectLinkServiceRuntime;
 use crate::error::LatticeServiceError;
 
 type ActorCreateFuture<A> = Pin<Box<dyn Future<Output = Result<A, <A as Actor>::Error>> + Send>>;

@@ -12,8 +12,8 @@ use lattice_placement::coordination::reports::{
 use lattice_placement::error::PlacementError;
 use lattice_placement::storage::{ActorPlacementKey, SingletonKey};
 
-use crate::actor::ErasedLogicActor;
-use crate::direct_link::DirectLinkServiceRuntime;
+use crate::actors::registration::ErasedLogicActor;
+use crate::direct_links::DirectLinkServiceRuntime;
 
 #[derive(Clone)]
 pub(crate) struct ServiceLogicControlHandler {
