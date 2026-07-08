@@ -28,9 +28,9 @@ pub trait RpcClientBinding: Send + Sync + 'static {
     }
 
     fn build_default_core(
-        _resolver: lattice_placement::route::BoxRouteResolver,
+        _resolver: lattice_placement::routing::resolver::BoxRouteResolver,
         _context_factory: lattice_rpc::metadata::RpcClientContextFactory,
-        _retry_policy: lattice_placement::route::RpcRetryPolicy,
+        _retry_policy: lattice_placement::routing::rpc::RpcRetryPolicy,
         _transport_security: lattice_rpc::security::RpcTransportSecurity,
         _transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
@@ -46,9 +46,9 @@ pub(crate) trait ErasedRpcClientBinding: Send + Sync + 'static {
     fn register(
         self: Box<Self>,
         service_context: &mut lattice_core::service_context::ServiceContextBuilder,
-        default_resolver: Option<lattice_placement::route::BoxRouteResolver>,
+        default_resolver: Option<lattice_placement::routing::resolver::BoxRouteResolver>,
         context_factory: lattice_rpc::metadata::RpcClientContextFactory,
-        retry_policy: lattice_placement::route::RpcRetryPolicy,
+        retry_policy: lattice_placement::routing::rpc::RpcRetryPolicy,
         transport_security: lattice_rpc::security::RpcTransportSecurity,
         transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Result<(), LatticeServiceError>;
@@ -85,9 +85,9 @@ where
     fn register(
         self: Box<Self>,
         service_context: &mut lattice_core::service_context::ServiceContextBuilder,
-        default_resolver: Option<lattice_placement::route::BoxRouteResolver>,
+        default_resolver: Option<lattice_placement::routing::resolver::BoxRouteResolver>,
         context_factory: lattice_rpc::metadata::RpcClientContextFactory,
-        retry_policy: lattice_placement::route::RpcRetryPolicy,
+        retry_policy: lattice_placement::routing::rpc::RpcRetryPolicy,
         transport_security: lattice_rpc::security::RpcTransportSecurity,
         transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Result<(), LatticeServiceError> {

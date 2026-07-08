@@ -3,7 +3,7 @@ mod actor;
 use std::net::SocketAddr;
 
 use lattice_core::instance::InstanceId;
-use lattice_placement::store::InMemoryPlacementStore;
+use lattice_placement::storage::memory::InMemoryPlacementStore;
 use lattice_rpc::client::ActorRefRpcClient;
 use lattice_service::actor::ActorRegistration;
 use lattice_service::service::LatticeService;

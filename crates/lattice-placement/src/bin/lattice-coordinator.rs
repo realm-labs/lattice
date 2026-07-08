@@ -6,10 +6,10 @@ use lattice_core::instance::InstanceId;
 use lattice_placement::control::PlacementCoordinatorService;
 use lattice_placement::control::TonicLogicControl;
 use lattice_placement::control::proto::placement_coordinator_server::PlacementCoordinatorServer;
-use lattice_placement::coordinator::PlacementCoordinator;
+use lattice_placement::coordination::actor::PlacementCoordinator;
 use lattice_placement::error::PlacementError;
-use lattice_placement::etcd::{EtcdPlacementStore, EtcdPlacementStoreConfig};
-use lattice_placement::store::{CoordinatorLeadership, PlacementStore};
+use lattice_placement::storage::etcd::{EtcdPlacementStore, EtcdPlacementStoreConfig};
+use lattice_placement::storage::{CoordinatorLeadership, PlacementStore};
 use tonic::transport::Server;
 
 #[tokio::main]
@@ -117,7 +117,8 @@ fn env_u64(name: &str, default: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix};
+    use lattice_placement::storage::PlacementPrefix;
+    use lattice_placement::storage::memory::InMemoryPlacementStore;
 
     #[tokio::test]
     async fn campaign_until_leader_waits_and_recampaigns_as_standby() {

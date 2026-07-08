@@ -5,23 +5,26 @@ use lattice_core::kind::{ActorKind, ServiceKind};
 use tonic::{Request, Response, Status};
 
 use crate::control::proto::logic_control_client::LogicControlClient;
-use crate::coordinator::{
-    ActivateActorRequest as CoordinatorActivateActorRequest,
-    LogicControl as CoordinatorLogicControl, PlacementCoordinator,
-    PrepareVirtualShardMigrationRequest, VirtualShardMigrationControl,
-    VirtualShardMigrationOutcome,
+use crate::coordination::actor::{
+    ActivateActorRequest as CoordinatorActivateActorRequest, PlacementCoordinator,
 };
-use crate::error::PlacementError;
-use crate::instance::InstanceRecord;
-use crate::singleton::{
+use crate::coordination::logic::{
+    LogicControl as CoordinatorLogicControl, VirtualShardMigrationControl,
+};
+use crate::coordination::reports::{
+    PrepareVirtualShardMigrationRequest, VirtualShardMigrationOutcome,
+};
+use crate::coordination::singleton::{
     ActivateSingletonRequest as CoordinatorActivateSingletonRequest, SingletonControl,
     SingletonCoordinator,
 };
-use crate::store::{
+use crate::error::PlacementError;
+use crate::registry::InstanceRecord;
+use crate::sharding::VirtualShardId;
+use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, PlacementState, PlacementStore, SingletonKey,
     SingletonPlacementRecord,
 };
-use crate::vshard::VirtualShardId;
 
 pub mod proto {
     tonic::include_proto!("lattice.placement.control");
@@ -388,9 +391,10 @@ mod tests {
     use super::*;
     use crate::control::proto::placement_coordinator_client::PlacementCoordinatorClient;
     use crate::control::proto::placement_coordinator_server::PlacementCoordinatorServer;
-    use crate::coordinator::NoopLogicControl;
-    use crate::instance::{InstanceRecord, InstanceState};
-    use crate::store::{InMemoryPlacementStore, LeaseId, PlacementPrefix};
+    use crate::coordination::logic::NoopLogicControl;
+    use crate::registry::{InstanceRecord, InstanceState};
+    use crate::storage::memory::InMemoryPlacementStore;
+    use crate::storage::{LeaseId, PlacementPrefix};
 
     #[tokio::test]
     async fn coordinator_rpc_activates_actor_and_returns_owner_record() {

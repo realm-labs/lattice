@@ -37,7 +37,7 @@ async fn direct_link_listener_enforces_connection_limit() {
             .await
             .unwrap()
             .unwrap();
-        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+        if let lattice_placement::storage::PlacementWatchEvent::InstanceUpdated { record } = event
             && record.state == InstanceState::Ready
         {
             break record;
@@ -425,7 +425,7 @@ async fn direct_link_listener_writes_heartbeat_frames_for_open_links() {
             .await
             .unwrap()
             .unwrap();
-        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+        if let lattice_placement::storage::PlacementWatchEvent::InstanceUpdated { record } = event
             && record.state == InstanceState::Ready
         {
             break record;

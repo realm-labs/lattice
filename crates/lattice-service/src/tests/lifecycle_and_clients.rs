@@ -286,7 +286,7 @@ async fn service_keeps_instance_lease_alive_while_running() {
             .await
             .unwrap()
             .unwrap();
-        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+        if let lattice_placement::storage::PlacementWatchEvent::InstanceUpdated { record } = event
             && record.state == InstanceState::Ready
         {
             break record.lease_id;

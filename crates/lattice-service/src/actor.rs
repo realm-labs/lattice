@@ -15,7 +15,7 @@ use lattice_actor::traits::{Actor, PassivationReason};
 use lattice_core::direct_link::options::LinkCloseReason;
 use lattice_core::id::{ActorId, RouteKey};
 use lattice_core::kind::ActorKind;
-use lattice_placement::vshard::{VirtualShardId, VirtualShardMapper};
+use lattice_placement::sharding::{VirtualShardId, VirtualShardMapper};
 
 use crate::context::ServiceBuildContext;
 use crate::direct_link::DirectLinkServiceRuntime;

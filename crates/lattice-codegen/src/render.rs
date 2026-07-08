@@ -60,7 +60,7 @@ use lattice_core::actor_kind;\n",
     rust.push_str(
         "#[allow(unused_imports)]\nuse lattice_placement::endpoint::EndpointLease;
 #[allow(unused_imports)]
-use lattice_placement::route::EndpointRpcTransport;\n",
+use lattice_placement::routing::rpc::EndpointRpcTransport;\n",
     );
     rust.push_str(
         "#[allow(unused_imports)]\nuse lattice_rpc::adapter::ActorRpcAdapter;
@@ -533,7 +533,7 @@ fn push_typed_client(rust: &mut String, methods: &[&RpcMethodSpec]) {
 fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let service = methods[0];
     let server_path = tonic_server_path(service);
-    rust.push_str("    pub type DefaultClientCore = lattice_placement::route::ResolvingRpcCore<lattice_placement::route::BoxRouteResolver, super::GeneratedTonicEndpointTransport>;\n\n");
+    rust.push_str("    pub type DefaultClientCore = lattice_placement::routing::rpc::ResolvingRpcCore<lattice_placement::routing::resolver::BoxRouteResolver, super::GeneratedTonicEndpointTransport>;\n\n");
     rust.push_str("    #[derive(Debug)]\n");
     rust.push_str("    pub struct Binding<A = (), C = DefaultClientCore> {\n        actor_kind: ActorKind,\n        request_dedup: bool,\n        _actor: PhantomData<fn() -> A>,\n        _core: PhantomData<fn() -> C>,\n    }\n\n");
     rust.push_str("    impl<A, C> Binding<A, C> {\n");
@@ -555,7 +555,7 @@ fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
         service.service_kind
     ));
     rust.push_str("\n        fn build_client(core: Self::Core) -> Self::Client {\n            Client::new(core)\n        }\n\n");
-    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::route::BoxRouteResolver,\n            context_factory: lattice_rpc::metadata::RpcClientContextFactory,\n            retry_policy: lattice_placement::route::RpcRetryPolicy,\n            transport_security: lattice_rpc::security::RpcTransportSecurity,\n            transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::route::ResolvingRpcCore::new(\n                lattice_core::kind::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::endpoint::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::with_transport_config(transport_security, transport_config),\n            ).with_retry_policy(retry_policy);\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
+    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::routing::resolver::BoxRouteResolver,\n            context_factory: lattice_rpc::metadata::RpcClientContextFactory,\n            retry_policy: lattice_placement::routing::rpc::RpcRetryPolicy,\n            transport_security: lattice_rpc::security::RpcTransportSecurity,\n            transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::routing::rpc::ResolvingRpcCore::new(\n                lattice_core::kind::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::endpoint::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::with_transport_config(transport_security, transport_config),\n            ).with_retry_policy(retry_policy);\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
     rust.push_str("    }\n\n");
     rust.push_str(
         "    impl<A, C> RpcServiceBinding for Binding<A, C>\n    where\n        A: Actor + Sync,\n        C: Send + Sync + 'static",
@@ -613,7 +613,7 @@ fn push_singleton_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     ));
     rust.push_str("\n        fn placement() -> RpcClientPlacement {\n            RpcClientPlacement::Singleton\n        }\n\n");
     rust.push_str("        fn build_client(core: Self::Core) -> Self::Client {\n            Client::new(core)\n        }\n\n");
-    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::route::BoxRouteResolver,\n            context_factory: lattice_rpc::metadata::RpcClientContextFactory,\n            retry_policy: lattice_placement::route::RpcRetryPolicy,\n            transport_security: lattice_rpc::security::RpcTransportSecurity,\n            transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::route::ResolvingRpcCore::new(\n                lattice_core::kind::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::endpoint::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::with_transport_config(transport_security, transport_config),\n            ).with_retry_policy(retry_policy);\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
+    rust.push_str("        fn build_default_core(\n            resolver: lattice_placement::routing::resolver::BoxRouteResolver,\n            context_factory: lattice_rpc::metadata::RpcClientContextFactory,\n            retry_policy: lattice_placement::routing::rpc::RpcRetryPolicy,\n            transport_security: lattice_rpc::security::RpcTransportSecurity,\n            transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,\n        ) -> Option<Self::Core> {\n            let core = lattice_placement::routing::rpc::ResolvingRpcCore::new(\n                lattice_core::kind::ServiceKind::from_static(Self::SERVICE_KIND),\n                resolver,\n                lattice_placement::endpoint::EndpointPool::new(),\n                context_factory,\n                super::GeneratedTonicEndpointTransport::with_transport_config(transport_security, transport_config),\n            ).with_retry_policy(retry_policy);\n            let core: Box<dyn std::any::Any + Send + Sync> = Box::new(core);\n            core.downcast::<Self::Core>().ok().map(|core| *core)\n        }\n");
     rust.push_str("    }\n\n");
     rust.push_str(
         "    impl<A, C> RpcServiceBinding for SingletonBinding<A, C>\n    where\n        A: Actor + Sync,\n        C: Send + Sync + 'static",
@@ -800,7 +800,7 @@ fn push_singleton_registry_server_adapter(rust: &mut String, methods: &[&RpcMeth
     rust.push_str("            let req = request.into_inner();\n");
     rust.push_str("            let route_key = route.route_key.clone();\n");
     rust.push_str("            let actor_id = actor_id_from_route_key(route_key.clone());\n");
-    rust.push_str("            let singleton_key = lattice_placement::store::SingletonKey {\n");
+    rust.push_str("            let singleton_key = lattice_placement::storage::SingletonKey {\n");
     rust.push_str(&format!(
         "                service_kind: ServiceKind::from_static(\"{}\"),\n",
         service.service_kind

@@ -20,10 +20,10 @@ use lattice_ops::admin::{
     AdminActorTarget, AdminApiError, AdminAuth, AdminHttpAdapter, AdminMutationHandler,
     AdminMutationReply, AdminSnapshot,
 };
-use lattice_placement::coordinator::PlacementWatchTask;
 use lattice_placement::error::PlacementError;
-use lattice_placement::instance::{InstanceRecord, InstanceState};
-use lattice_placement::store::LeaseId;
+use lattice_placement::registry::{InstanceRecord, InstanceState};
+use lattice_placement::routing::placement::PlacementWatchTask;
+use lattice_placement::storage::LeaseId;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;

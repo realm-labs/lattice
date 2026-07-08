@@ -9,10 +9,10 @@ use lattice_core::kind::ActorKind;
 use lattice_core::{actor_kind, service_kind};
 use lattice_placement::endpoint::{EndpointLease, EndpointPool};
 use lattice_placement::error::PlacementError;
-use lattice_placement::route::{
-    EndpointRpcTransport, InvalidateReason, ResolveRequest, ResolvingRpcCore, RouteCacheKey,
-    RouteResolver,
+use lattice_placement::routing::resolver::{
+    InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver,
 };
+use lattice_placement::routing::rpc::{EndpointRpcTransport, ResolvingRpcCore};
 use lattice_rpc::error::RpcError;
 use lattice_rpc::metadata::{RpcClientContextFactory, RpcContext};
 use lattice_rpc::traits::{RoutedRequest, RpcRequest, ShardedRpcCore};

@@ -6,9 +6,9 @@ use lattice_core::id::RouteKey;
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_rpc::types::RouteTarget;
 
-use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::error::PlacementError;
-use crate::route::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
+use crate::routing::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
+use crate::routing::resolver::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
 
 #[derive(Debug, Clone)]
 pub struct StaticPlacementConfig {

@@ -259,7 +259,7 @@ async fn service_lifecycle_writes_starting_ready_draining_stopping() {
             .await
             .unwrap()
             .unwrap();
-        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+        if let lattice_placement::storage::PlacementWatchEvent::InstanceUpdated { record } = event
             && states.last() != Some(&record.state)
         {
             states.push(record.state);

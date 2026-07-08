@@ -7,11 +7,11 @@ use lattice_core::instance::InstanceId;
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_rpc::types::RouteTarget;
 
-use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::error::PlacementError;
-use crate::instance::{InstanceRecord, InstanceState};
-use crate::route::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
-use crate::store::{
+use crate::registry::{InstanceRecord, InstanceState};
+use crate::routing::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
+use crate::routing::resolver::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
+use crate::storage::{
     LeaseId, PlacementState, PlacementStore, SingletonKey, SingletonPlacementRecord,
 };
 
@@ -273,8 +273,9 @@ mod tests {
     use lattice_core::{actor_kind, service_kind};
 
     use super::*;
-    use crate::instance::InstanceState;
-    use crate::store::{InMemoryPlacementStore, LeaseId, PlacementPrefix, PlacementVersion};
+    use crate::registry::InstanceState;
+    use crate::storage::memory::InMemoryPlacementStore;
+    use crate::storage::{LeaseId, PlacementPrefix, PlacementVersion};
 
     #[derive(Debug, Clone, Default)]
     struct CountingSingletonControl {

@@ -42,13 +42,13 @@ fn generated_output_matches_phase_two_shape() {
     assert!(generated.rust.contains("type Core = C;"));
     assert!(generated.rust.contains("type Client = Client<C>;"));
     assert!(generated.rust.contains(
-        "lattice_placement::route::ResolvingRpcCore<lattice_placement::route::BoxRouteResolver"
+        "lattice_placement::routing::rpc::ResolvingRpcCore<lattice_placement::routing::resolver::BoxRouteResolver"
     ));
     assert!(generated.rust.contains("fn build_default_core("));
     assert!(
         generated
             .rust
-            .contains("retry_policy: lattice_placement::route::RpcRetryPolicy")
+            .contains("retry_policy: lattice_placement::routing::rpc::RpcRetryPolicy")
     );
     assert!(
         generated

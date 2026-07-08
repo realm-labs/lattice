@@ -6,11 +6,11 @@ use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
 use lattice_core::kind::ActorKind;
 use lattice_placement::control::LogicControlHandler;
-use lattice_placement::coordinator::{
+use lattice_placement::coordination::reports::{
     PrepareVirtualShardMigrationRequest, VirtualShardMigrationOutcome,
 };
 use lattice_placement::error::PlacementError;
-use lattice_placement::store::{ActorPlacementKey, SingletonKey};
+use lattice_placement::storage::{ActorPlacementKey, SingletonKey};
 
 use crate::actor::ErasedLogicActor;
 use crate::direct_link::DirectLinkServiceRuntime;

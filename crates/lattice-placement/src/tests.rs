@@ -16,24 +16,29 @@ use lattice_rpc::traits::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpc
 use lattice_rpc::types::RouteTarget;
 use tonic::Response;
 
-use crate::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::endpoint::{EndpointLease, EndpointPool};
 use crate::error::PlacementError;
-use crate::instance::{InMemoryInstanceRegistry, InstanceRecord, InstanceRegistry, InstanceState};
-use crate::route::{
-    EndpointRpcTransport, InvalidateReason, ResolveRequest, ResolvingActorRefRpcCore,
-    ResolvingRpcCore, RouteCacheKey, RouteResolver, RpcRetryPolicy, VirtualShardRouteTable,
+use crate::registry::{InMemoryInstanceRegistry, InstanceRecord, InstanceRegistry, InstanceState};
+use crate::routing::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
+use crate::routing::resolver::{
+    InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver, VirtualShardRouteTable,
 };
-use crate::static_resolver::{StaticPlacementConfig, StaticRouteRange, StaticRouteResolver};
-use crate::store::{
-    ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
-    PlacementState, PlacementStore, PlacementVersion, PlacementWatchEvent,
-    VirtualShardPlacementKey, VirtualShardPlacementRecord,
+use crate::routing::rpc::{
+    EndpointRpcTransport, ResolvingActorRefRpcCore, ResolvingRpcCore, RpcRetryPolicy,
 };
-use crate::vshard::{
+use crate::routing::static_resolver::{
+    StaticPlacementConfig, StaticRouteRange, StaticRouteResolver,
+};
+use crate::sharding::{
     GradualRebalanceShardAssigner, RoundRobinShardAssigner, VirtualShardAssignInput,
     VirtualShardAssigner, VirtualShardAssignerRegistry, VirtualShardAssignment, VirtualShardId,
     VirtualShardMapper,
+};
+use crate::storage::memory::InMemoryPlacementStore;
+use crate::storage::{
+    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementState,
+    PlacementStore, PlacementVersion, PlacementWatchEvent, VirtualShardPlacementKey,
+    VirtualShardPlacementRecord,
 };
 
 #[derive(Clone, PartialEq, prost::Message)]

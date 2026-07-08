@@ -9,7 +9,7 @@ use lattice_core::kind::ServiceKind;
 use serde::{Deserialize, Serialize};
 
 use crate::error::PlacementError;
-use crate::store::LeaseId;
+use crate::storage::LeaseId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

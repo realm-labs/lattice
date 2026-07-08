@@ -9,23 +9,23 @@ use lattice_core::instance::InstanceCapacity;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ActorKind;
 use lattice_core::{actor_kind, service_kind};
-use lattice_placement::coordinator::{
-    ActivateActorRequest, ExplicitRouteResolver, FailoverReport, NoopLogicControl,
-    PlacementCoordinator,
-};
+use lattice_placement::coordination::actor::{ActivateActorRequest, PlacementCoordinator};
+use lattice_placement::coordination::logic::NoopLogicControl;
+use lattice_placement::coordination::reports::FailoverReport;
+use lattice_placement::coordination::singleton::{SingletonCoordinator, SingletonRouteResolver};
 use lattice_placement::endpoint::{EndpointLease, EndpointPool};
 use lattice_placement::error::PlacementError;
-use lattice_placement::etcd::{
-    EtcdKv, EtcdPlacementStore, EtcdValue, EtcdWatch, InMemoryEtcdClient,
-};
-use lattice_placement::instance::{InstanceRecord, InstanceState};
-use lattice_placement::route::{
-    EndpointRpcTransport, ResolveRequest, ResolvingRpcCore, RouteResolver,
-};
-use lattice_placement::singleton::{SingletonCoordinator, SingletonRouteResolver};
-use lattice_placement::store::{
-    ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
-    PlacementState, PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
+use lattice_placement::registry::{InstanceRecord, InstanceState};
+use lattice_placement::routing::placement::ExplicitRouteResolver;
+use lattice_placement::routing::resolver::{ResolveRequest, RouteResolver};
+use lattice_placement::routing::rpc::{EndpointRpcTransport, ResolvingRpcCore};
+use lattice_placement::storage::etcd::EtcdPlacementStore;
+use lattice_placement::storage::etcd::client::{EtcdKv, EtcdWatch, InMemoryEtcdClient};
+use lattice_placement::storage::etcd::codec::EtcdValue;
+use lattice_placement::storage::memory::InMemoryPlacementStore;
+use lattice_placement::storage::{
+    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementState,
+    PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
 };
 use lattice_rpc::error::RpcError;
 use lattice_rpc::metadata::{RpcClientContextFactory, RpcContext};

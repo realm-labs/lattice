@@ -1,11 +1,13 @@
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
-use lattice_placement::cache::RouteCacheConfig;
 use lattice_placement::control::TonicLogicControl;
-use lattice_placement::coordinator::{PlacementCoordinator, PlacementRouteResolver};
+use lattice_placement::coordination::actor::PlacementCoordinator;
 use lattice_placement::endpoint::EndpointPool;
-use lattice_placement::route::{ResolvingActorRefRpcCore, ResolvingRpcCore};
-use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix};
+use lattice_placement::routing::cache::RouteCacheConfig;
+use lattice_placement::routing::placement::PlacementRouteResolver;
+use lattice_placement::routing::rpc::{ResolvingActorRefRpcCore, ResolvingRpcCore};
+use lattice_placement::storage::PlacementPrefix;
+use lattice_placement::storage::memory::InMemoryPlacementStore;
 use lattice_rpc::metadata::RpcClientContextFactory;
 
 use crate::generated::GeneratedTonicEndpointTransport;

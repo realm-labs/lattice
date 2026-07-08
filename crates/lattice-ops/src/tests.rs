@@ -14,13 +14,15 @@ use lattice_core::trace::TraceContext;
 use lattice_core::{actor_kind, service_kind};
 use lattice_eventbus::local::{EventBus, LocalEventBus};
 use lattice_eventbus::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
-use lattice_placement::coordinator::{NoopLogicControl, PlacementCoordinator};
-use lattice_placement::instance::{InstanceRecord, InstanceState};
-use lattice_placement::store::{
-    ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
-    PlacementState, PlacementStore, SingletonPlacementRecord, VirtualShardPlacementRecord,
+use lattice_placement::coordination::actor::PlacementCoordinator;
+use lattice_placement::coordination::logic::NoopLogicControl;
+use lattice_placement::registry::{InstanceRecord, InstanceState};
+use lattice_placement::sharding::VirtualShardId;
+use lattice_placement::storage::memory::InMemoryPlacementStore;
+use lattice_placement::storage::{
+    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementState,
+    PlacementStore, SingletonPlacementRecord, VirtualShardPlacementRecord,
 };
-use lattice_placement::vshard::VirtualShardId;
 use serde_json::json;
 
 use crate::admin::{

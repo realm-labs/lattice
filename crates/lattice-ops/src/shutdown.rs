@@ -5,8 +5,10 @@ use async_trait::async_trait;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_eventbus::local::EventSubscriptionHandle;
-use lattice_placement::coordinator::{DrainReport, LogicControl, PlacementCoordinator};
-use lattice_placement::store::PlacementStore;
+use lattice_placement::coordination::actor::PlacementCoordinator;
+use lattice_placement::coordination::logic::LogicControl;
+use lattice_placement::coordination::reports::DrainReport;
+use lattice_placement::storage::PlacementStore;
 use tokio::sync::Mutex;
 
 use crate::error::OpsError;

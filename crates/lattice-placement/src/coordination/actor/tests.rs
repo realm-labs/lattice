@@ -1,12 +1,27 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use async_trait::async_trait;
+use lattice_core::id::RouteKey;
 use lattice_core::instance::InstanceCapacity;
 use lattice_core::{actor_kind, service_kind};
 
 use super::*;
-use crate::instance::InstanceState;
-use crate::store::{InMemoryPlacementStore, PlacementPrefix};
-use crate::vshard::{GradualRebalanceShardAssigner, RoundRobinShardAssigner, VirtualShardId};
+use crate::coordination::logic::{NoopLogicControl, VirtualShardMigrationControl};
+use crate::coordination::reports::{
+    PrepareVirtualShardMigrationRequest, RebalanceVirtualShardsReport,
+    RebalanceVirtualShardsRequest, VirtualShardMigrationOutcome, VirtualShardMovementPolicy,
+};
+use crate::registry::InstanceRecord;
+use crate::registry::InstanceState;
+use crate::routing::cache::RouteCacheConfig;
+use crate::routing::placement::{ExplicitRouteResolver, PlacementRouteResolver};
+use crate::routing::resolver::{ResolveRequest, RouteResolver};
+use crate::sharding::{GradualRebalanceShardAssigner, RoundRobinShardAssigner, VirtualShardId};
+use crate::storage::PlacementPrefix;
+use crate::storage::memory::InMemoryPlacementStore;
 
 #[derive(Debug, Clone, Default)]
 struct CountingLogicControl {

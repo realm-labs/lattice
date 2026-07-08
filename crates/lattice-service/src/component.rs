@@ -4,16 +4,17 @@ use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ConfiguredComponentBuilder;
 use lattice_core::service_context::{ConfiguredComponent, ServiceContextBuilder};
-use lattice_placement::cache::RouteCacheConfig;
 use lattice_placement::control::TonicLogicControl;
-use lattice_placement::coordinator::{
-    DrainReport, PlacementCoordinator, PlacementRouteResolver, PlacementWatchStarter,
-    PlacementWatchTask,
-};
+use lattice_placement::coordination::actor::PlacementCoordinator;
+use lattice_placement::coordination::reports::DrainReport;
+use lattice_placement::coordination::singleton::SingletonRouteResolver;
 use lattice_placement::error::PlacementError;
-use lattice_placement::instance::InstanceRecord;
-use lattice_placement::singleton::SingletonRouteResolver;
-use lattice_placement::store::{
+use lattice_placement::registry::InstanceRecord;
+use lattice_placement::routing::cache::RouteCacheConfig;
+use lattice_placement::routing::placement::{
+    PlacementRouteResolver, PlacementWatchStarter, PlacementWatchTask,
+};
+use lattice_placement::storage::{
     ActorPlacementRecord, LeaseId, PlacementStore, PlacementVersion, SingletonPlacementRecord,
     VirtualShardPlacementRecord,
 };
@@ -177,7 +178,7 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
         service_kind: ServiceKind,
     ) -> Result<
         (
-            lattice_placement::route::BoxRouteResolver,
+            lattice_placement::routing::resolver::BoxRouteResolver,
             PlacementWatchTask,
         ),
         PlacementError,
@@ -186,7 +187,7 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
         &self,
     ) -> Result<
         (
-            lattice_placement::route::BoxRouteResolver,
+            lattice_placement::routing::resolver::BoxRouteResolver,
             PlacementWatchTask,
         ),
         PlacementError,
@@ -308,7 +309,7 @@ where
         service_kind: ServiceKind,
     ) -> Result<
         (
-            lattice_placement::route::BoxRouteResolver,
+            lattice_placement::routing::resolver::BoxRouteResolver,
             PlacementWatchTask,
         ),
         PlacementError,
@@ -322,7 +323,7 @@ where
         );
         let watch = resolver.start_placement_watch().await?;
         Ok((
-            lattice_placement::route::BoxRouteResolver::new(resolver),
+            lattice_placement::routing::resolver::BoxRouteResolver::new(resolver),
             watch,
         ))
     }
@@ -331,18 +332,19 @@ where
         &self,
     ) -> Result<
         (
-            lattice_placement::route::BoxRouteResolver,
+            lattice_placement::routing::resolver::BoxRouteResolver,
             PlacementWatchTask,
         ),
         PlacementError,
     > {
-        let coordinator = lattice_placement::singleton::SingletonCoordinator::from_store(
-            self.store.clone(),
-            TonicLogicControl,
-        );
+        let coordinator =
+            lattice_placement::coordination::singleton::SingletonCoordinator::from_store(
+                self.store.clone(),
+                TonicLogicControl,
+            );
         let resolver = SingletonRouteResolver::new(coordinator, RouteCacheConfig::default());
         Ok((
-            lattice_placement::route::BoxRouteResolver::new(resolver),
+            lattice_placement::routing::resolver::BoxRouteResolver::new(resolver),
             PlacementWatchTask::noop(),
         ))
     }

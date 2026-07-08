@@ -12,7 +12,8 @@ use distributed_login::{
 use lattice_core::actor_ref::{ActorRef as CoreActorRef, ActorRefTarget};
 use lattice_core::id::ActorId as CoreActorId;
 use lattice_core::instance::InstanceId;
-use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix};
+use lattice_placement::storage::PlacementPrefix;
+use lattice_placement::storage::memory::InMemoryPlacementStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 

@@ -11,10 +11,11 @@ use lattice_eventbus::publisher::ServiceEvents;
 use lattice_eventbus::types::{EventEnvelope, EventSubscription};
 use lattice_ops::scheduler::ServiceScheduler;
 use lattice_placement::control::TonicLogicControl;
-use lattice_placement::coordinator::{DrainReport, PlacementCoordinator};
+use lattice_placement::coordination::actor::PlacementCoordinator;
+use lattice_placement::coordination::reports::DrainReport;
 use lattice_placement::error::PlacementError;
-use lattice_placement::instance::InstanceRecord;
-use lattice_placement::store::{
+use lattice_placement::registry::InstanceRecord;
+use lattice_placement::storage::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementStore,
     PlacementVersion, PlacementWatch, SingletonKey, SingletonPlacementRecord,
     VirtualShardPlacementKey, VirtualShardPlacementRecord,

@@ -1,7 +1,7 @@
 use lattice_core::instance::InstanceId;
 
-use crate::instance::InstanceState;
-use crate::store::LeaseId;
+use crate::registry::InstanceState;
+use crate::storage::LeaseId;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PlacementError {

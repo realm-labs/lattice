@@ -57,22 +57,22 @@ use lattice_direct_link::transport::{
 use lattice_eventbus::local::{EventBus, LocalEventBus};
 use lattice_eventbus::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
 use lattice_ops::ops_config::AdminHttpConfig;
-use lattice_placement::cache::RouteCacheConfig;
 use lattice_placement::control::proto::logic_control_client::LogicControlClient;
 use lattice_placement::control::{actor_id_to_proto, proto};
-use lattice_placement::coordinator::{
-    ExplicitRouteResolver, NoopLogicControl, PlacementCoordinator,
-};
+use lattice_placement::coordination::actor::PlacementCoordinator;
+use lattice_placement::coordination::logic::NoopLogicControl;
 use lattice_placement::endpoint::{EndpointLease, EndpointPool};
-use lattice_placement::instance::{InstanceRecord, InstanceState};
-use lattice_placement::route::{
-    BoxRouteResolver, EndpointRpcTransport, ResolveRequest, ResolvingRpcCore, RouteResolver,
+use lattice_placement::registry::{InstanceRecord, InstanceState};
+use lattice_placement::routing::cache::RouteCacheConfig;
+use lattice_placement::routing::placement::ExplicitRouteResolver;
+use lattice_placement::routing::resolver::{BoxRouteResolver, ResolveRequest, RouteResolver};
+use lattice_placement::routing::rpc::{EndpointRpcTransport, ResolvingRpcCore};
+use lattice_placement::sharding::VirtualShardMapper;
+use lattice_placement::storage::memory::InMemoryPlacementStore;
+use lattice_placement::storage::{
+    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementState,
+    PlacementStore, SingletonKey,
 };
-use lattice_placement::store::{
-    ActorPlacementKey, ActorPlacementRecord, InMemoryPlacementStore, LeaseId, PlacementPrefix,
-    PlacementState, PlacementStore, SingletonKey,
-};
-use lattice_placement::vshard::VirtualShardMapper;
 use lattice_rpc::client::TonicEndpointChannelPoolConfig;
 use lattice_rpc::error::RpcError;
 use lattice_rpc::metadata::{AuthContext, RpcClientContextFactory, RpcContext};
@@ -597,7 +597,7 @@ impl RpcClientBinding for SecurityClientProbeBinding {
     fn build_default_core(
         _resolver: BoxRouteResolver,
         context_factory: RpcClientContextFactory,
-        _retry_policy: lattice_placement::route::RpcRetryPolicy,
+        _retry_policy: lattice_placement::routing::rpc::RpcRetryPolicy,
         _transport_security: lattice_rpc::security::RpcTransportSecurity,
         _transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
@@ -715,7 +715,7 @@ impl RpcClientBinding for TransportConfigProbeBinding {
     fn build_default_core(
         _resolver: BoxRouteResolver,
         _context_factory: RpcClientContextFactory,
-        _retry_policy: lattice_placement::route::RpcRetryPolicy,
+        _retry_policy: lattice_placement::routing::rpc::RpcRetryPolicy,
         _transport_security: lattice_rpc::security::RpcTransportSecurity,
         transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
@@ -771,7 +771,7 @@ impl RpcClientBinding for FakePlacementClientBinding {
     fn build_default_core(
         resolver: BoxRouteResolver,
         context_factory: RpcClientContextFactory,
-        retry_policy: lattice_placement::route::RpcRetryPolicy,
+        retry_policy: lattice_placement::routing::rpc::RpcRetryPolicy,
         _transport_security: lattice_rpc::security::RpcTransportSecurity,
         _transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {
@@ -807,7 +807,7 @@ impl RpcClientBinding for FakeSingletonClientBinding {
     fn build_default_core(
         resolver: BoxRouteResolver,
         context_factory: RpcClientContextFactory,
-        retry_policy: lattice_placement::route::RpcRetryPolicy,
+        retry_policy: lattice_placement::routing::rpc::RpcRetryPolicy,
         _transport_security: lattice_rpc::security::RpcTransportSecurity,
         _transport_config: lattice_rpc::client::TonicEndpointChannelPoolConfig,
     ) -> Option<Self::Core> {

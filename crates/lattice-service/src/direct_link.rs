@@ -25,8 +25,8 @@ use lattice_direct_link::inbound::{DirectLinkInboundRouter, DirectLinkInboundRou
 use lattice_direct_link::session::{DirectLinkSessionManager, OpenLinkValidationPolicy};
 use lattice_direct_link::stream::DirectLinkActorBinding;
 use lattice_direct_link::transport::TcpDirectLinkTransport;
-use lattice_placement::instance::InstanceState;
-use lattice_placement::store::{ActorPlacementKey, PlacementState};
+use lattice_placement::registry::InstanceState;
+use lattice_placement::storage::{ActorPlacementKey, PlacementState};
 
 use crate::context::ServiceBuildContext;
 use crate::error::LatticeServiceError;

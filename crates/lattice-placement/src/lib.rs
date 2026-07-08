@@ -1,15 +1,11 @@
-pub mod cache;
 pub mod control;
-pub mod coordinator;
+pub mod coordination;
 pub mod endpoint;
 pub mod error;
-pub mod etcd;
-pub mod instance;
-pub mod route;
-pub mod singleton;
-pub mod static_resolver;
-pub mod store;
-pub mod vshard;
+pub mod registry;
+pub mod routing;
+pub mod sharding;
+pub mod storage;
 
 #[cfg(test)]
 mod tests;

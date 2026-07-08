@@ -10,8 +10,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::{ActorKind, ServiceKind};
-use lattice_placement::instance::InstanceRecord;
-use lattice_placement::store::{
+use lattice_placement::registry::InstanceRecord;
+use lattice_placement::storage::{
     ActorPlacementRecord, PlacementStore, SingletonPlacementRecord, VirtualShardPlacementRecord,
 };
 use serde::{Deserialize, Serialize};

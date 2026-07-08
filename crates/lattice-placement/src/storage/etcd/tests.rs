@@ -6,8 +6,9 @@ use lattice_core::instance::InstanceCapacity;
 use lattice_core::{actor_kind, service_kind};
 
 use super::*;
-use crate::instance::InstanceState;
-use crate::store::PlacementState;
+use crate::registry::InstanceState;
+use crate::storage::PlacementState;
+use crate::storage::etcd::codec::{decode_etcd_value, encode_etcd_value, put_options_for};
 
 #[tokio::test]
 async fn etcd_store_writes_under_cluster_prefix_and_isolates_reads() {
@@ -404,7 +405,7 @@ fn vshard_key_for(shard_id: u32) -> VirtualShardPlacementKey {
     VirtualShardPlacementKey {
         service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
-        shard_id: crate::vshard::VirtualShardId(shard_id),
+        shard_id: crate::sharding::VirtualShardId(shard_id),
     }
 }
 
@@ -446,7 +447,7 @@ fn vshard_record(shard_id: u32, owner: &str, epoch: u64) -> VirtualShardPlacemen
     VirtualShardPlacementRecord {
         service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
-        shard_id: crate::vshard::VirtualShardId(shard_id),
+        shard_id: crate::sharding::VirtualShardId(shard_id),
         owner: InstanceId::new(owner),
         epoch: Epoch(epoch),
     }

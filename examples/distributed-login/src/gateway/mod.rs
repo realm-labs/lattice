@@ -15,7 +15,7 @@ use lattice_core::instance::InstanceId;
 use lattice_gateway::error::GatewayError;
 use lattice_gateway::frame::ClientFrame;
 use lattice_gateway::server::{GatewayConnectionHandler, GatewayService};
-use lattice_placement::store::InMemoryPlacementStore;
+use lattice_placement::storage::memory::InMemoryPlacementStore;
 use lattice_rpc::traits::ShardedRpcCore;
 use prost::Message as ProstMessage;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};

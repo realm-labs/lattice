@@ -35,7 +35,7 @@ async fn direct_link_listener_publishes_endpoint_and_stops_with_service() {
             .await
             .unwrap()
             .unwrap();
-        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+        if let lattice_placement::storage::PlacementWatchEvent::InstanceUpdated { record } = event
             && record.state == InstanceState::Ready
         {
             break record;
@@ -110,7 +110,7 @@ async fn direct_link_listener_routes_message_frames_to_registered_actor() {
             .await
             .unwrap()
             .unwrap();
-        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+        if let lattice_placement::storage::PlacementWatchEvent::InstanceUpdated { record } = event
             && record.state == InstanceState::Ready
         {
             break record;
@@ -245,7 +245,7 @@ async fn direct_link_listener_demultiplexes_multiple_links_on_one_connection() {
             .await
             .unwrap()
             .unwrap();
-        if let lattice_placement::store::PlacementWatchEvent::InstanceUpdated { record } = event
+        if let lattice_placement::storage::PlacementWatchEvent::InstanceUpdated { record } = event
             && record.state == InstanceState::Ready
         {
             break record;

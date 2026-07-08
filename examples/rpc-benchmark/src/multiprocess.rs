@@ -6,15 +6,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_kind;
-use lattice_placement::cache::RouteCacheConfig;
 use lattice_placement::control::TonicLogicControl;
-use lattice_placement::coordinator::PlacementRouteResolver;
-use lattice_placement::coordinator::{PlacementCoordinator, PlacementWatchStarter};
+use lattice_placement::coordination::actor::PlacementCoordinator;
 use lattice_placement::endpoint::EndpointPool;
-use lattice_placement::etcd::{EtcdPlacementStore, EtcdPlacementStoreConfig, RealEtcdClient};
-use lattice_placement::instance::InstanceState;
-use lattice_placement::route::{BoxRouteResolver, ResolvingRpcCore};
-use lattice_placement::store::{PlacementPrefix, PlacementStore};
+use lattice_placement::registry::InstanceState;
+use lattice_placement::routing::cache::RouteCacheConfig;
+use lattice_placement::routing::placement::PlacementRouteResolver;
+use lattice_placement::routing::placement::PlacementWatchStarter;
+use lattice_placement::routing::resolver::BoxRouteResolver;
+use lattice_placement::routing::rpc::ResolvingRpcCore;
+use lattice_placement::storage::etcd::client::RealEtcdClient;
+use lattice_placement::storage::etcd::{EtcdPlacementStore, EtcdPlacementStoreConfig};
+use lattice_placement::storage::{PlacementPrefix, PlacementStore};
 use lattice_rpc::client::TonicEndpointChannelPoolConfig;
 use lattice_rpc::metadata::RpcClientContextFactory;
 use lattice_rpc::security::RpcTransportSecurity;
@@ -66,7 +69,7 @@ pub async fn build_bench_client_from_etcd(
     instance_id: InstanceId,
 ) -> BenchmarkResult<(
     Arc<BenchClient>,
-    lattice_placement::coordinator::PlacementWatchTask,
+    lattice_placement::routing::placement::PlacementWatchTask,
 )> {
     let store = etcd.connect_store().await?;
     let coordinator = PlacementCoordinator::new(store.clone(), TonicLogicControl);

@@ -3,8 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lattice_core::instance::InstanceId;
 use lattice_core::service_context::ServiceContext;
-use lattice_placement::route::RpcRetryPolicy;
-use lattice_placement::store::{InMemoryPlacementStore, PlacementPrefix};
+use lattice_placement::routing::rpc::RpcRetryPolicy;
+use lattice_placement::storage::PlacementPrefix;
+use lattice_placement::storage::memory::InMemoryPlacementStore;
 use lattice_rpc::client::TonicEndpointChannelPoolConfig;
 use lattice_service::actor::ActorRegistration;
 use lattice_service::error::LatticeServiceError;

@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use lattice_core::instance::InstanceId;
-use lattice_placement::etcd::{EtcdPlacementStore, EtcdPlacementStoreConfig, RealEtcdClient};
-use lattice_placement::route::RpcRetryPolicy;
+use lattice_placement::routing::rpc::RpcRetryPolicy;
+use lattice_placement::storage::etcd::client::RealEtcdClient;
+use lattice_placement::storage::etcd::{EtcdPlacementStore, EtcdPlacementStoreConfig};
 use lattice_rpc::client::TonicEndpointChannelPoolConfig;
 use lattice_service::actor::ActorRegistration;
 use lattice_service::config::InstanceConfig;
