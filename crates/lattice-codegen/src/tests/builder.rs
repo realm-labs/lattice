@@ -1,5 +1,5 @@
-use super::*;
 use crate::proto_include;
+use crate::tests::*;
 
 #[test]
 fn generated_code_snapshot_can_be_encoded_in_descriptor_test() {

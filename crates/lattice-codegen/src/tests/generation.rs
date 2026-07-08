@@ -1,4 +1,4 @@
-use super::*;
+use crate::tests::*;
 
 #[test]
 fn generated_output_matches_phase_two_shape() {

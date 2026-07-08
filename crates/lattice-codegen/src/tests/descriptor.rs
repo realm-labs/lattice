@@ -1,4 +1,4 @@
-use super::*;
+use crate::tests::*;
 
 #[test]
 fn duplicate_gateway_msg_id_is_rejected() {
