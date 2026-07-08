@@ -70,15 +70,17 @@ pub(crate) fn push_generated_direct_link_streams(
         rust.push_str("    #[derive(Debug, Clone, Copy, Default)]\n");
         rust.push_str("    pub struct Stream;\n\n");
 
-        rust.push_str("    impl lattice_core::DirectLinkStreamType for Stream {\n");
+        rust.push_str(
+            "    impl lattice_core::direct_link::stream::DirectLinkStreamType for Stream {\n",
+        );
         rust.push_str(&format!("        type Metadata = {metadata_type};\n\n"));
-        rust.push_str("        fn descriptor() -> lattice_core::DirectLinkStreamDescriptor {\n");
+        rust.push_str("        fn descriptor() -> lattice_core::direct_link::stream::DirectLinkStreamDescriptor {\n");
         rust.push_str("            descriptor()\n");
         rust.push_str("        }\n");
         rust.push_str("    }\n\n");
 
-        rust.push_str("    pub fn descriptor() -> lattice_core::DirectLinkStreamDescriptor {\n");
-        rust.push_str("        lattice_core::DirectLinkStreamDescriptor {\n");
+        rust.push_str("    pub fn descriptor() -> lattice_core::direct_link::stream::DirectLinkStreamDescriptor {\n");
+        rust.push_str("        lattice_core::direct_link::stream::DirectLinkStreamDescriptor {\n");
         rust.push_str(&format!(
             "            stream_name: {:?}.to_string(),\n",
             stream.stream_name

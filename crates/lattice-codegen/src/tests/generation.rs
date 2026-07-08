@@ -285,7 +285,7 @@ fn direct_link_stream_codegen_uses_static_match_dispatch() {
     assert!(
         generated
             .rust
-            .contains("impl lattice_core::DirectLinkStreamType for Stream")
+            .contains("impl lattice_core::direct_link::stream::DirectLinkStreamType for Stream")
     );
     assert!(
         generated
