@@ -1,0 +1,11 @@
+error[E0603]: trait `EtcdKv` is private
+ --> tests/ui/raw_etcd_transport.rs:1:47
+  |
+1 | use lattice_placement::storage::etcd::client::EtcdKv;
+  |                                               ^^^^^^ private trait
+  |
+note: the trait `EtcdKv` is defined here
+ --> src/storage/etcd/client.rs
+  |
+  | pub(crate) trait EtcdKv: Clone + Send + Sync + 'static {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

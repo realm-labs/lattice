@@ -13,7 +13,7 @@ use crate::storage::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EtcdValue {
+pub(crate) enum EtcdValue {
     Instance(Box<InstanceRecord>),
     Actor(Box<ActorPlacementRecord>),
     VirtualShard(Box<VirtualShardPlacementRecord>),

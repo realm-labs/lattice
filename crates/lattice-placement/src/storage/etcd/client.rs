@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use etcd_client::{
@@ -39,20 +39,20 @@ pub(crate) fn ownership_watch_event_limit(max_entries: NonZeroUsize) -> Option<u
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EtcdOwnershipRecordRange {
+pub(crate) struct EtcdOwnershipRecordRange {
     pub record_prefix: String,
     pub floor_prefix: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct EtcdOwnershipRanges {
+pub(crate) struct EtcdOwnershipRanges {
     pub local_instance_key: String,
     pub record_ranges: Vec<EtcdOwnershipRecordRange>,
     pub watch_prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EtcdOwnershipFloorProof {
+pub(crate) struct EtcdOwnershipFloorProof {
     pub observed_revision: PlacementRevision,
     pub key: String,
     pub version: PlacementVersion,
@@ -60,7 +60,7 @@ pub struct EtcdOwnershipFloorProof {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EtcdOwnershipSnapshotEntry {
+pub(crate) struct EtcdOwnershipSnapshotEntry {
     pub key: String,
     pub revision: PlacementRevision,
     pub value: EtcdValue,
@@ -68,13 +68,13 @@ pub struct EtcdOwnershipSnapshotEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EtcdOwnershipSnapshot {
+pub(crate) struct EtcdOwnershipSnapshot {
     pub revision: PlacementRevision,
     pub entries: Vec<EtcdOwnershipSnapshotEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EtcdOwnershipWatchEvent {
+pub(crate) enum EtcdOwnershipWatchEvent {
     Upserted {
         key: String,
         version: PlacementVersion,
@@ -90,13 +90,13 @@ pub enum EtcdOwnershipWatchEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EtcdOwnershipWatchBatch {
+pub(crate) struct EtcdOwnershipWatchBatch {
     pub revision: PlacementRevision,
     pub events: Vec<EtcdOwnershipWatchEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EtcdOwnershipWatchUpdate {
+pub(crate) enum EtcdOwnershipWatchUpdate {
     Batch(EtcdOwnershipWatchBatch),
     Progress { revision: PlacementRevision },
 }
@@ -108,7 +108,7 @@ enum EtcdOwnershipWatchMessage {
 }
 
 #[derive(Debug)]
-pub struct EtcdOwnershipWatch {
+pub(crate) struct EtcdOwnershipWatch {
     rx: broadcast::Receiver<EtcdOwnershipWatchMessage>,
     abort_handle: Option<tokio::task::AbortHandle>,
 }
@@ -135,19 +135,19 @@ impl Drop for EtcdOwnershipWatch {
 }
 
 #[derive(Debug)]
-pub struct EtcdOwnershipView {
+pub(crate) struct EtcdOwnershipView {
     pub snapshot: EtcdOwnershipSnapshot,
     pub watch: EtcdOwnershipWatch,
 }
 
 #[derive(Debug, Clone)]
-pub struct EtcdValueGuard {
+pub(crate) struct EtcdValueGuard {
     pub key: String,
     pub value: EtcdValue,
 }
 
 #[derive(Debug, Clone)]
-pub struct EtcdEpochReservationRequest {
+pub(crate) struct EtcdEpochReservationRequest {
     pub record_key: String,
     pub expected_record: Option<PlacementVersion>,
     pub floor_key: String,
@@ -157,7 +157,7 @@ pub struct EtcdEpochReservationRequest {
 }
 
 #[derive(Debug, Clone)]
-pub struct EtcdEpochCommitRequest {
+pub(crate) struct EtcdEpochCommitRequest {
     pub record_key: String,
     pub expected_record: Option<PlacementVersion>,
     pub floor_key: String,
@@ -168,7 +168,7 @@ pub struct EtcdEpochCommitRequest {
 }
 
 #[derive(Debug, Clone)]
-pub struct EtcdLegacyEpochPutRequest {
+pub(crate) struct EtcdLegacyEpochPutRequest {
     pub record_key: String,
     pub expected_record: Option<PlacementVersion>,
     pub floor_key: String,
@@ -178,7 +178,7 @@ pub struct EtcdLegacyEpochPutRequest {
 }
 
 #[async_trait]
-pub trait EtcdKv: Clone + Send + Sync + 'static {
+pub(crate) trait EtcdKv: Clone + Send + Sync + 'static {
     async fn put(&self, key: String, value: EtcdValue) -> Result<(), PlacementError>;
     async fn get(&self, key: &str)
     -> Result<Option<(PlacementVersion, EtcdValue)>, PlacementError>;
@@ -228,14 +228,14 @@ pub trait EtcdKv: Clone + Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EtcdWatchEvent {
+pub(crate) struct EtcdWatchEvent {
     pub key: String,
     pub version: PlacementVersion,
     pub value: Option<EtcdValue>,
 }
 
 #[derive(Debug)]
-pub struct EtcdWatch {
+pub(crate) struct EtcdWatch {
     rx: broadcast::Receiver<EtcdWatchEvent>,
 }
 
@@ -1705,7 +1705,7 @@ fn view_protocol_error(error: impl std::fmt::Display) -> OwnershipViewError {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct InMemoryEtcdClient {
+pub(crate) struct InMemoryEtcdClient {
     inner: Arc<std::sync::Mutex<InMemoryEtcdState>>,
     instance_leases: Arc<std::sync::Mutex<HashMap<LeaseId, u64>>>,
     next_lease_id: Arc<AtomicU64>,
@@ -1799,7 +1799,8 @@ impl InMemoryEtcdClient {
         }
     }
 
-    pub fn keys(&self) -> Vec<String> {
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> Vec<String> {
         let mut keys = self
             .inner
             .lock()
@@ -2080,6 +2081,160 @@ impl EtcdKv for InMemoryEtcdClient {
             })
             .subscribe();
         Ok(EtcdWatch { rx })
+    }
+}
+
+/// Test-only construction support for exercising typed placement-store
+/// failure handling without exposing the raw etcd key/value transport.
+///
+/// This module is public only because Cargo integration tests compile as an
+/// external crate. Its client deliberately exposes failure scheduling, not
+/// arbitrary key puts or deletes.
+#[doc(hidden)]
+pub mod test_support {
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    pub struct FaultInjectingEtcdClient {
+        inner: InMemoryEtcdClient,
+        mutation_calls: Arc<AtomicUsize>,
+        fail_on_mutation_call: Arc<AtomicUsize>,
+    }
+
+    impl Default for FaultInjectingEtcdClient {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl FaultInjectingEtcdClient {
+        pub fn new() -> Self {
+            Self {
+                inner: InMemoryEtcdClient::new(),
+                mutation_calls: Arc::new(AtomicUsize::new(0)),
+                fail_on_mutation_call: Arc::new(AtomicUsize::new(usize::MAX)),
+            }
+        }
+
+        pub fn fail_next_mutation(&self) {
+            self.fail_on_future_mutation(1);
+        }
+
+        pub fn fail_on_future_mutation(&self, future_call: usize) {
+            let current = self.mutation_calls.load(Ordering::SeqCst);
+            self.fail_on_mutation_call
+                .store(current.saturating_add(future_call), Ordering::SeqCst);
+        }
+
+        pub fn placement_store(
+            &self,
+            prefix: crate::storage::PlacementPrefix,
+        ) -> crate::storage::etcd::EtcdPlacementStore<Self> {
+            crate::storage::etcd::EtcdPlacementStore::new(prefix, self.clone())
+        }
+
+        fn check_mutation(&self) -> Result<(), PlacementError> {
+            let call = self.mutation_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_on_mutation_call.load(Ordering::SeqCst) == call {
+                self.fail_on_mutation_call
+                    .store(usize::MAX, Ordering::SeqCst);
+                return Err(PlacementError::Etcd {
+                    message: "injected temporary etcd outage".to_string(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl EtcdKv for FaultInjectingEtcdClient {
+        async fn put(&self, key: String, value: EtcdValue) -> Result<(), PlacementError> {
+            self.inner.put(key, value).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<(PlacementVersion, EtcdValue)>, PlacementError> {
+            self.inner.get(key).await
+        }
+
+        async fn list_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<(String, PlacementVersion, EtcdValue)>, PlacementError> {
+            self.inner.list_prefix(prefix).await
+        }
+
+        async fn compare_and_put(
+            &self,
+            key: String,
+            expected: Option<PlacementVersion>,
+            value: EtcdValue,
+        ) -> Result<PlacementVersion, PlacementError> {
+            self.check_mutation()?;
+            self.inner.compare_and_put(key, expected, value).await
+        }
+
+        async fn reserve_epoch(
+            &self,
+            request: EtcdEpochReservationRequest,
+        ) -> Result<PlacementVersion, PlacementError> {
+            self.check_mutation()?;
+            self.inner.reserve_epoch(request).await
+        }
+
+        async fn commit_epoch(
+            &self,
+            request: EtcdEpochCommitRequest,
+        ) -> Result<PlacementVersion, PlacementError> {
+            self.check_mutation()?;
+            self.inner.commit_epoch(request).await
+        }
+
+        async fn compare_and_put_epoch(
+            &self,
+            request: EtcdLegacyEpochPutRequest,
+        ) -> Result<PlacementVersion, PlacementError> {
+            self.check_mutation()?;
+            self.inner.compare_and_put_epoch(request).await
+        }
+
+        async fn compare_and_delete(
+            &self,
+            key: String,
+            expected: EtcdValue,
+        ) -> Result<(), PlacementError> {
+            self.inner.compare_and_delete(key, expected).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), PlacementError> {
+            self.inner.delete(key).await
+        }
+
+        async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
+            self.inner.grant_instance_lease().await
+        }
+
+        async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
+            self.inner.keepalive_instance_lease(lease_id).await
+        }
+
+        async fn next_lease_id(&self) -> Result<LeaseId, PlacementError> {
+            self.inner.next_lease_id().await
+        }
+
+        async fn open_ownership_view(
+            &self,
+            ranges: EtcdOwnershipRanges,
+            max_entries: NonZeroUsize,
+        ) -> Result<EtcdOwnershipView, OwnershipViewError> {
+            self.inner.open_ownership_view(ranges, max_entries).await
+        }
+
+        async fn watch_prefix(&self, prefix: &str) -> Result<EtcdWatch, PlacementError> {
+            self.inner.watch_prefix(prefix).await
+        }
     }
 }
 

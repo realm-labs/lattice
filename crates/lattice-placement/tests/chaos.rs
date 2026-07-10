@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -20,16 +18,11 @@ use lattice_placement::registry::{InstanceRecord, InstanceState};
 use lattice_placement::routing::placement::ExplicitRouteResolver;
 use lattice_placement::routing::resolver::{ResolveRequest, RouteResolver};
 use lattice_placement::routing::rpc::{EndpointRpcTransport, ResolvingRpcCore};
-use lattice_placement::storage::etcd::EtcdPlacementStore;
-use lattice_placement::storage::etcd::client::{
-    EtcdEpochCommitRequest, EtcdEpochReservationRequest, EtcdKv, EtcdLegacyEpochPutRequest,
-    EtcdOwnershipRanges, EtcdOwnershipView, EtcdWatch, InMemoryEtcdClient,
-};
-use lattice_placement::storage::etcd::codec::EtcdValue;
+use lattice_placement::storage::etcd::client::test_support::FaultInjectingEtcdClient;
 use lattice_placement::storage::memory::InMemoryPlacementStore;
 use lattice_placement::storage::{
-    ActorPlacementKey, ActorPlacementRecord, LeaseId, OwnershipViewError, PlacementPrefix,
-    PlacementState, PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
+    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementState,
+    PlacementStore, SingletonKey, SingletonPlacementRecord,
 };
 use lattice_rpc::error::RpcError;
 use lattice_rpc::metadata::{RpcClientContextFactory, RpcContext};
@@ -273,14 +266,13 @@ async fn coordinator_leader_switch_rejects_stale_keepalive_and_continues_placeme
 
 #[tokio::test]
 async fn temporary_etcd_outage_during_activation_is_retryable_without_partial_owner() {
-    let client = FlakyEtcdClient::new(InMemoryEtcdClient::new());
-    let store =
-        EtcdPlacementStore::new(PlacementPrefix::new("/lattice/chaos-etcd"), client.clone());
+    let client = FaultInjectingEtcdClient::new();
+    let store = client.placement_store(PlacementPrefix::new("/lattice/chaos-etcd"));
     store
         .upsert_instance(instance_record("world-a", InstanceState::Ready))
         .await
         .unwrap();
-    client.fail_next_compare_and_put();
+    client.fail_next_mutation();
     let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
     let key = ActorPlacementKey {
         service_kind: service_kind!("World"),
@@ -303,11 +295,8 @@ async fn temporary_etcd_outage_during_activation_is_retryable_without_partial_ow
 
 #[tokio::test]
 async fn partial_placement_write_failure_can_be_retried_to_complete_failover() {
-    let client = FlakyEtcdClient::new(InMemoryEtcdClient::new());
-    let store = EtcdPlacementStore::new(
-        PlacementPrefix::new("/lattice/chaos-partial-write"),
-        client.clone(),
-    );
+    let client = FaultInjectingEtcdClient::new();
+    let store = client.placement_store(PlacementPrefix::new("/lattice/chaos-partial-write"));
     store
         .upsert_instance(instance_record("world-a", InstanceState::Ready))
         .await
@@ -345,7 +334,7 @@ async fn partial_placement_write_failure_can_be_retried_to_complete_failover() {
     // Each reassignment reserves and then commits its epoch. Fail the second
     // record's commit so the first record is durably moved while the second
     // record burns its reserved epoch before the retry.
-    client.fail_on_future_compare_and_put(4);
+    client.fail_on_future_mutation(4);
     let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
 
     let failed = coordinator
@@ -527,136 +516,6 @@ async fn rolling_update_with_mixed_versions_drains_old_owner_to_ready_new_versio
     );
     assert_eq!(target.instance_id, InstanceId::new("world-b"));
     assert_eq!(target.owner_epoch, Some(Epoch(4)));
-}
-
-#[derive(Debug, Clone)]
-struct FlakyEtcdClient {
-    inner: InMemoryEtcdClient,
-    compare_and_put_calls: Arc<AtomicUsize>,
-    fail_on_compare_and_put_call: Arc<AtomicUsize>,
-}
-
-impl FlakyEtcdClient {
-    fn new(inner: InMemoryEtcdClient) -> Self {
-        Self {
-            inner,
-            compare_and_put_calls: Arc::new(AtomicUsize::new(0)),
-            fail_on_compare_and_put_call: Arc::new(AtomicUsize::new(usize::MAX)),
-        }
-    }
-
-    fn fail_next_compare_and_put(&self) {
-        self.fail_on_future_compare_and_put(1);
-    }
-
-    fn fail_on_future_compare_and_put(&self, future_call: usize) {
-        let current = self.compare_and_put_calls.load(Ordering::SeqCst);
-        self.fail_on_compare_and_put_call
-            .store(current + future_call, Ordering::SeqCst);
-    }
-
-    fn check_compare_and_put(&self) -> Result<(), PlacementError> {
-        let call = self.compare_and_put_calls.fetch_add(1, Ordering::SeqCst) + 1;
-        if self.fail_on_compare_and_put_call.load(Ordering::SeqCst) == call {
-            self.fail_on_compare_and_put_call
-                .store(usize::MAX, Ordering::SeqCst);
-            return Err(PlacementError::Etcd {
-                message: "temporary etcd outage".to_string(),
-            });
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl EtcdKv for FlakyEtcdClient {
-    async fn put(&self, key: String, value: EtcdValue) -> Result<(), PlacementError> {
-        self.inner.put(key, value).await
-    }
-
-    async fn get(
-        &self,
-        key: &str,
-    ) -> Result<Option<(PlacementVersion, EtcdValue)>, PlacementError> {
-        self.inner.get(key).await
-    }
-
-    async fn list_prefix(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<(String, PlacementVersion, EtcdValue)>, PlacementError> {
-        self.inner.list_prefix(prefix).await
-    }
-
-    async fn compare_and_put(
-        &self,
-        key: String,
-        expected: Option<PlacementVersion>,
-        value: EtcdValue,
-    ) -> Result<PlacementVersion, PlacementError> {
-        self.check_compare_and_put()?;
-        self.inner.compare_and_put(key, expected, value).await
-    }
-
-    async fn reserve_epoch(
-        &self,
-        request: EtcdEpochReservationRequest,
-    ) -> Result<PlacementVersion, PlacementError> {
-        self.check_compare_and_put()?;
-        self.inner.reserve_epoch(request).await
-    }
-
-    async fn commit_epoch(
-        &self,
-        request: EtcdEpochCommitRequest,
-    ) -> Result<PlacementVersion, PlacementError> {
-        self.check_compare_and_put()?;
-        self.inner.commit_epoch(request).await
-    }
-
-    async fn compare_and_put_epoch(
-        &self,
-        request: EtcdLegacyEpochPutRequest,
-    ) -> Result<PlacementVersion, PlacementError> {
-        self.check_compare_and_put()?;
-        self.inner.compare_and_put_epoch(request).await
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), PlacementError> {
-        self.inner.delete(key).await
-    }
-
-    async fn compare_and_delete(
-        &self,
-        key: String,
-        expected: EtcdValue,
-    ) -> Result<(), PlacementError> {
-        self.inner.compare_and_delete(key, expected).await
-    }
-
-    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
-        self.inner.grant_instance_lease().await
-    }
-
-    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
-        self.inner.keepalive_instance_lease(lease_id).await
-    }
-
-    async fn next_lease_id(&self) -> Result<LeaseId, PlacementError> {
-        self.inner.next_lease_id().await
-    }
-
-    async fn open_ownership_view(
-        &self,
-        ranges: EtcdOwnershipRanges,
-        max_entries: NonZeroUsize,
-    ) -> Result<EtcdOwnershipView, OwnershipViewError> {
-        self.inner.open_ownership_view(ranges, max_entries).await
-    }
-
-    async fn watch_prefix(&self, prefix: &str) -> Result<EtcdWatch, PlacementError> {
-        self.inner.watch_prefix(prefix).await
-    }
 }
 
 #[derive(Clone)]

@@ -1300,6 +1300,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "trybuild",
 ]
 
 [[package]]

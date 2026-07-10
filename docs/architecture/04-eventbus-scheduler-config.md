@@ -319,10 +319,15 @@ let service = LatticeService::builder(WORLD_SERVICE)
 Explicit config must also be supported for tests and non-file deployments:
 
 ```rust
-.placement_store(EtcdPlacementStore::new(EtcdConfig {
-    endpoints: vec!["http://127.0.0.1:2379".into()],
-    key_prefix: "/lattice/dev".into(),
-}))
+.placement_store(
+    EtcdPlacementStore::<RealEtcdClient>::from_options(EtcdPlacementStoreConfig {
+        endpoints: vec!["http://127.0.0.1:2379".into()],
+        key_prefix: "/lattice/dev".into(),
+        instance_lease_ttl_secs: 30,
+        activation_lock_ttl_secs: 30,
+    })
+    .await?,
+)
 ```
 
 ### 22.3 ConfigStore

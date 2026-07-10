@@ -10,11 +10,13 @@ use tokio::sync::broadcast;
 
 use crate::error::PlacementError;
 use crate::registry::InstanceRecord;
+#[cfg(test)]
+use crate::storage::etcd::client::InMemoryEtcdClient;
 use crate::storage::etcd::client::{
     ActivationLockTtl, EtcdEpochCommitRequest, EtcdEpochReservationRequest, EtcdKv,
     EtcdLegacyEpochPutRequest, EtcdOwnershipFloorProof, EtcdOwnershipRanges,
     EtcdOwnershipRecordRange, EtcdOwnershipWatchEvent, EtcdOwnershipWatchUpdate, EtcdValueGuard,
-    InMemoryEtcdClient, InstanceLeaseTtl, RealEtcdClient,
+    InstanceLeaseTtl, RealEtcdClient,
 };
 use crate::storage::etcd::codec::{
     EtcdValue, activation_lock_key, activation_lock_namespace_prefix,
@@ -38,7 +40,7 @@ use crate::storage::{
 };
 
 pub mod client;
-pub mod codec;
+pub(crate) mod codec;
 
 #[derive(Debug, Clone)]
 pub struct EtcdPlacementStore<C> {
@@ -47,7 +49,7 @@ pub struct EtcdPlacementStore<C> {
 }
 
 impl<C> EtcdPlacementStore<C> {
-    pub fn new(prefix: PlacementPrefix, client: C) -> Self {
+    pub(crate) fn new(prefix: PlacementPrefix, client: C) -> Self {
         Self { prefix, client }
     }
 }
@@ -81,8 +83,9 @@ impl EtcdPlacementStore<RealEtcdClient> {
     }
 }
 
+#[cfg(test)]
 impl EtcdPlacementStore<InMemoryEtcdClient> {
-    pub fn in_memory_from_config(config: EtcdPlacementStoreConfig) -> Self {
+    pub(crate) fn in_memory_from_config(config: EtcdPlacementStoreConfig) -> Self {
         Self::new(
             PlacementPrefix::new(config.key_prefix),
             InMemoryEtcdClient::new(),
@@ -90,6 +93,9 @@ impl EtcdPlacementStore<InMemoryEtcdClient> {
     }
 }
 
+// The raw transport bound is intentionally private: callers receive the typed
+// PlacementStore API but cannot import the arbitrary-key put/delete surface.
+#[allow(private_bounds)]
 impl<C> EtcdPlacementStore<C>
 where
     C: EtcdKv,
@@ -125,6 +131,7 @@ where
 }
 
 #[async_trait]
+#[allow(private_bounds)]
 impl<C> PlacementStore for EtcdPlacementStore<C>
 where
     C: EtcdKv,
