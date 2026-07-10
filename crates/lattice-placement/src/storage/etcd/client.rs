@@ -158,6 +158,8 @@ pub struct RealEtcdClient {
     client: Client,
     instance_lease_ttl: InstanceLeaseTtl,
     activation_lock_ttl: ActivationLockTtl,
+    #[cfg(test)]
+    ownership_view_gap: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl fmt::Debug for RealEtcdClient {
@@ -181,6 +183,8 @@ impl RealEtcdClient {
             client,
             instance_lease_ttl,
             activation_lock_ttl,
+            #[cfg(test)]
+            ownership_view_gap: None,
         })
     }
 }
@@ -444,6 +448,16 @@ impl EtcdKv for RealEtcdClient {
             }
         }
 
+        #[cfg(test)]
+        if let Some(gap) = &self.ownership_view_gap {
+            // Real-etcd coverage uses the two barrier phases to insert a
+            // mutation after the snapshot transaction and before watch
+            // creation. This is deliberately test-only: production always
+            // proceeds directly from the coherent snapshot to an R+1 watch.
+            gap.wait().await;
+            gap.wait().await;
+        }
+
         let start_revision = revision
             .0
             .checked_add(1)
@@ -559,9 +573,60 @@ async fn start_real_ownership_watch(
                 message: error.to_string(),
             },
         })?;
+
+    // A Created response only acknowledges the watch ID. etcd may send
+    // historical events or an immediate compaction/cancellation response
+    // afterward. Do not expose the view until an explicit progress response
+    // proves the R+1 watch has caught up. Buffering is bounded so a long replay
+    // fails closed instead of returning an already-lagged receiver.
+    let mut high_water = PlacementRevision(requested_revision.0.saturating_sub(1));
+    let mut startup_updates = Vec::new();
+    loop {
+        let response = stream
+            .message()
+            .await
+            .map_err(|error| OwnershipViewError::WatchStart {
+                error: OwnershipWatchError::Backend {
+                    message: error.to_string(),
+                },
+            })?
+            .ok_or(OwnershipViewError::WatchStart {
+                error: OwnershipWatchError::Closed,
+            })?;
+        let response_had_events = !response.events().is_empty();
+        let updates = decode_watch_response(&response, requested_revision, max_entries)
+            .map_err(|error| OwnershipViewError::WatchStart { error })?;
+        let mut caught_up = false;
+        for update in updates {
+            validate_watch_update(&update, &mut high_water)
+                .map_err(|error| OwnershipViewError::WatchStart { error })?;
+            caught_up |= matches!(&update, EtcdOwnershipWatchUpdate::Progress { .. });
+            push_startup_update(&mut startup_updates, update)
+                .map_err(|error| OwnershipViewError::WatchStart { error })?;
+        }
+        if caught_up {
+            break;
+        }
+        if response_had_events {
+            // etcd does not retain a progress request made while historical
+            // replay is pending, so request another barrier after each replay
+            // response until the watcher is caught up.
+            stream
+                .request_progress()
+                .await
+                .map_err(|error| OwnershipViewError::WatchStart {
+                    error: OwnershipWatchError::Backend {
+                        message: error.to_string(),
+                    },
+                })?;
+        }
+    }
+
     let (tx, rx) = broadcast::channel(WATCH_CAPACITY);
+    for update in startup_updates {
+        let _ = tx.send(EtcdOwnershipWatchMessage::Update(update));
+    }
     tokio::spawn(async move {
-        let mut high_water = PlacementRevision(requested_revision.0.saturating_sub(1));
         loop {
             let response = match stream.message().await {
                 Ok(Some(response)) => response,
@@ -737,6 +802,19 @@ fn validate_watch_update(
             *high_water = *revision;
         }
     }
+    Ok(())
+}
+
+fn push_startup_update(
+    updates: &mut Vec<EtcdOwnershipWatchUpdate>,
+    update: EtcdOwnershipWatchUpdate,
+) -> Result<(), OwnershipWatchError> {
+    if updates.len() >= WATCH_CAPACITY {
+        return Err(OwnershipWatchError::StartupBacklogExceeded {
+            max_updates: WATCH_CAPACITY,
+        });
+    }
+    updates.push(update);
     Ok(())
 }
 
@@ -1245,3 +1323,6 @@ fn ownership_event_key(event: &EtcdOwnershipWatchEvent) -> &str {
         | EtcdOwnershipWatchEvent::Deleted { key, .. } => key,
     }
 }
+
+#[cfg(test)]
+mod real_tests;

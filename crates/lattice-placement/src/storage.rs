@@ -199,6 +199,8 @@ pub enum OwnershipWatchError {
     Protocol { message: String },
     #[error("ownership watch revision exceeded its {max_entries} event limit")]
     CapacityExceeded { max_entries: usize },
+    #[error("ownership watch startup exceeded its {max_updates} buffered-update limit")]
+    StartupBacklogExceeded { max_updates: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -96,7 +96,7 @@ Status: `[ ]` in progress.
 - [x] Bind explicit actor placement records to the owner's live instance lease rather than the short-lived activation-lock lease. The durable actor record carries that lease as fencing authority while retaining the prior epoch for CAS failover; the short-lived activation-lock lease is never published as ownership.
 - [x] Add a bounded atomic ownership snapshot/watch handoff with store-global revisions, typed ownership events, and surfaced lag for the in-memory placement backend.
 - [x] Implement the same bounded, globally revised ownership view for etcd using one read transaction, `mod_revision`, watch-from-revision, previous values for deletions, same-revision batches, progress barriers, and explicit terminal errors. The production `RealEtcdClient` path is implemented and compile-checked; deterministic contract coverage exercises the adapter and atomic in-memory etcd model without claiming to verify server behavior.
-- [ ] Add executable real-etcd coverage for historical `R+1` replay across the snapshot/watch creation interval, the Created handshake, immediate compaction, progress responses, `prev_kv` deletion decoding, and same-revision transaction batching.
+- [x] Add executable real-etcd coverage for historical `R+1` replay across the snapshot/watch creation interval, the Created handshake, immediate compaction before readiness, progress responses, `prev_kv` deletion decoding, and same-revision transaction batching. The real client now buffers a bounded startup replay until an explicit progress barrier, retries progress after historical responses, and reports compaction/cancellation before that barrier as a watch-start failure.
 - [ ] Encode or reject dynamic etcd key path segments so service kinds, actor kinds, and instance IDs cannot overlap placement prefixes or cause fail-closed capacity exhaustion.
 - [ ] Apply each ownership watch batch atomically to `LocalOwnershipSnapshot` at one global revision so a multi-key etcd transaction cannot cause later same-revision events to be discarded.
 - [ ] Make generated RPC binding placement mode explicit: explicit-fenced by default, validated shard count for virtual shards, and named opt-in only for static/local unfenced use. The mode type, generated constructors, compiled call sites, and named raw-registry opt-in are complete; this remains unchecked until fenced modes are enforced at ingress and virtual-shard client/server configuration is proven consistent with the authoritative assignment set.
@@ -445,6 +445,7 @@ cargo test -p lattice-placement ownership
 cargo test -p lattice-placement ownership_view
 cargo test -p lattice-placement ownership_watch
 cargo test -p lattice-placement coordination::actor::tests
+cargo test -p lattice-placement 'storage::etcd::client::real_tests::real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compaction' -- --ignored --exact --test-threads=1
 cargo test -p lattice-gateway
 cargo test -p lattice-actor
 cargo test -p lattice-service
@@ -452,6 +453,8 @@ cargo test -p lattice-service tests::production_hardening::service_keeps_instanc
 cargo test -p distributed-login --test distributed_flow
 cargo test -p distributed-login --test generated_binding_placement
 ```
+
+The ignored real-etcd command requires `LATTICE_TEST_ETCD_ENDPOINT` to name a dedicated disposable server; it fails rather than silently skipping when the variable is absent. The test performs cluster-global physical compaction. The verified slice used the official `gcr.io/etcd-development/etcd:v3.6.11` image (`sha256:fbab3d2954652f592b2653cc1b9decdbe2a633de9320735e9f364b185b6b309a`).
 
 Performance validation must compare before/after results using the existing benchmark harness. Do not turn unstable absolute throughput numbers into correctness gates; gate on bounded regression criteria documented with the benchmark environment.
 
