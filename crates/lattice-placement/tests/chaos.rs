@@ -22,7 +22,8 @@ use lattice_placement::routing::resolver::{ResolveRequest, RouteResolver};
 use lattice_placement::routing::rpc::{EndpointRpcTransport, ResolvingRpcCore};
 use lattice_placement::storage::etcd::EtcdPlacementStore;
 use lattice_placement::storage::etcd::client::{
-    EtcdKv, EtcdOwnershipRanges, EtcdOwnershipView, EtcdWatch, InMemoryEtcdClient,
+    EtcdEpochCommitRequest, EtcdEpochReservationRequest, EtcdKv, EtcdLegacyEpochPutRequest,
+    EtcdOwnershipRanges, EtcdOwnershipView, EtcdWatch, InMemoryEtcdClient,
 };
 use lattice_placement::storage::etcd::codec::EtcdValue;
 use lattice_placement::storage::memory::InMemoryPlacementStore;
@@ -341,7 +342,10 @@ async fn partial_placement_write_failure_can_be_retried_to_complete_failover() {
         )
         .await
         .unwrap();
-    client.fail_on_future_compare_and_put(2);
+    // Each reassignment reserves and then commits its epoch. Fail the second
+    // record's commit so the first record is durably moved while the second
+    // record burns its reserved epoch before the retry.
+    client.fail_on_future_compare_and_put(4);
     let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
 
     let failed = coordinator
@@ -377,9 +381,19 @@ async fn partial_placement_write_failure_can_be_retried_to_complete_failover() {
     );
     assert_eq!(retry.reassigned_actors, 1);
     assert_eq!(first_after_retry.owner, InstanceId::new("world-b"));
-    assert_eq!(first_after_retry.epoch, Epoch(2));
     assert_eq!(second_after_retry.owner, InstanceId::new("world-b"));
-    assert_eq!(second_after_retry.epoch, Epoch(2));
+    for (after_failure, after_retry) in [
+        (&first_after_failure, &first_after_retry),
+        (&second_after_failure, &second_after_retry),
+    ] {
+        if after_failure.owner == InstanceId::new("world-b") {
+            assert_eq!(after_failure.epoch, Epoch(2));
+            assert_eq!(after_retry.epoch, Epoch(2));
+        } else {
+            assert_eq!(after_failure.epoch, Epoch(1));
+            assert_eq!(after_retry.epoch, Epoch(3));
+        }
+    }
 }
 
 #[tokio::test]
@@ -582,6 +596,30 @@ impl EtcdKv for FlakyEtcdClient {
     ) -> Result<PlacementVersion, PlacementError> {
         self.check_compare_and_put()?;
         self.inner.compare_and_put(key, expected, value).await
+    }
+
+    async fn reserve_epoch(
+        &self,
+        request: EtcdEpochReservationRequest,
+    ) -> Result<PlacementVersion, PlacementError> {
+        self.check_compare_and_put()?;
+        self.inner.reserve_epoch(request).await
+    }
+
+    async fn commit_epoch(
+        &self,
+        request: EtcdEpochCommitRequest,
+    ) -> Result<PlacementVersion, PlacementError> {
+        self.check_compare_and_put()?;
+        self.inner.commit_epoch(request).await
+    }
+
+    async fn compare_and_put_epoch(
+        &self,
+        request: EtcdLegacyEpochPutRequest,
+    ) -> Result<PlacementVersion, PlacementError> {
+        self.check_compare_and_put()?;
+        self.inner.compare_and_put_epoch(request).await
     }
 
     async fn delete(&self, key: &str) -> Result<(), PlacementError> {

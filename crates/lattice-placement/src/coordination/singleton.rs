@@ -129,19 +129,34 @@ where
             .get_singleton(key)
             .await?
             .ok_or(PlacementError::NoRoute)?;
+        let instance = self.store.get_instance(&new_owner).await?.ok_or_else(|| {
+            PlacementError::InstanceNotFound {
+                instance_id: new_owner.clone(),
+            }
+        })?;
+        if instance.state != InstanceState::Ready {
+            return Err(PlacementError::InstanceNotReady {
+                instance_id: instance.instance_id,
+                state: instance.state,
+            });
+        }
         let lease_id = self.store.grant_instance_lease().await?;
+        let reservation = self
+            .store
+            .reserve_singleton_epoch(key.clone(), Some(version), Some(lock_lease_id))
+            .await?;
         let record = SingletonPlacementRecord {
-            owner: new_owner,
-            epoch: Epoch(current.epoch.0 + 1),
+            owner: instance.instance_id.clone(),
+            epoch: reservation.epoch(),
             lease_id,
             state: PlacementState::Running,
             ..current
         };
-        self.store
-            .validate_singleton_lock(key, lock_lease_id)
+        self.control
+            .activate_singleton(&instance, key, record.epoch)
             .await?;
         self.store
-            .compare_and_put_singleton(key.clone(), Some(version), record.clone())
+            .commit_singleton_epoch(reservation, record.clone())
             .await?;
         Ok(record)
     }
@@ -163,12 +178,16 @@ where
             .min_by_key(|instance| instance.instance_id.clone())
             .ok_or(PlacementError::NoReadyInstances)?;
         let lease_id = self.store.grant_instance_lease().await?;
+        let reservation = self
+            .store
+            .reserve_singleton_epoch(key.clone(), None, Some(lock_lease_id))
+            .await?;
         let record = SingletonPlacementRecord {
             service_kind: key.service_kind.clone(),
             singleton_kind: key.singleton_kind.clone(),
             scope: key.scope.clone(),
             owner: instance.instance_id.clone(),
-            epoch: Epoch(1),
+            epoch: reservation.epoch(),
             lease_id,
             state: PlacementState::Running,
         };
@@ -176,10 +195,7 @@ where
             .activate_singleton(&instance, &key, record.epoch)
             .await?;
         self.store
-            .validate_singleton_lock(&key, lock_lease_id)
-            .await?;
-        self.store
-            .compare_and_put_singleton(key, None, record.clone())
+            .commit_singleton_epoch(reservation, record.clone())
             .await?;
         Ok(record)
     }
@@ -275,7 +291,7 @@ mod tests {
     use super::*;
     use crate::registry::InstanceState;
     use crate::storage::memory::InMemoryPlacementStore;
-    use crate::storage::{LeaseId, PlacementPrefix, PlacementVersion};
+    use crate::storage::{LeaseId, PlacementPrefix};
 
     #[derive(Debug, Clone, Default)]
     struct CountingSingletonControl {
@@ -334,6 +350,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn singleton_recreation_after_record_deletion_uses_the_durable_epoch_floor() {
+        let store = ready_store().await;
+        let request = ActivateSingletonRequest {
+            service_kind: service_kind!("Control"),
+            singleton_kind: actor_kind!("SeasonManager"),
+            scope: "global".to_string(),
+        };
+        let first = SingletonCoordinator::new(
+            service_kind!("Control"),
+            store.clone(),
+            NoopSingletonControl,
+        )
+        .activate_singleton(request.clone())
+        .await
+        .unwrap();
+        let key = SingletonKey {
+            service_kind: request.service_kind.clone(),
+            singleton_kind: request.singleton_kind.clone(),
+            scope: request.scope.clone(),
+        };
+
+        assert!(store.remove_singleton_for_test(&key).is_some());
+        let recreated =
+            SingletonCoordinator::new(service_kind!("Control"), store, NoopSingletonControl)
+                .activate_singleton(request)
+                .await
+                .unwrap();
+
+        assert_eq!(first.epoch, Epoch(1));
+        assert_eq!(recreated.epoch, Epoch(2));
+    }
+
+    #[tokio::test]
     async fn singleton_failover_increments_epoch() {
         let store = ready_store().await;
         store
@@ -387,14 +436,14 @@ mod tests {
             })
             .await
             .unwrap();
-        let stored = store.get_singleton(&key).await.unwrap().unwrap().1;
+        let (stored_version, stored) = store.get_singleton(&key).await.unwrap().unwrap();
 
         assert_eq!(stored, record);
         assert_eq!(stored.state, PlacementState::Running);
         assert_eq!(stored.service_kind, service_kind!("Control"));
         assert_eq!(
             store.list_singletons().await.unwrap(),
-            vec![(PlacementVersion(1), stored)]
+            vec![(stored_version, stored)]
         );
     }
 

@@ -182,7 +182,7 @@ impl VirtualShardAssigner for RoundRobinShardAssigner {
         for shard in 0..input.shard_count {
             let shard_id = VirtualShardId(shard);
             let owner = input.instances[shard as usize % input.instances.len()].clone();
-            let epoch = next_epoch(previous.get(&shard_id), &owner);
+            let epoch = next_epoch(previous.get(&shard_id), &owner)?;
             assignments.push(VirtualShardAssignment {
                 shard_id,
                 owner,
@@ -247,10 +247,18 @@ fn previous_assignments_by_shard(
         .collect()
 }
 
-fn next_epoch(previous: Option<&VirtualShardAssignment>, owner: &InstanceId) -> Epoch {
+fn next_epoch(
+    previous: Option<&VirtualShardAssignment>,
+    owner: &InstanceId,
+) -> Result<Epoch, PlacementError> {
     match previous {
-        Some(previous) if &previous.owner == owner => previous.epoch,
-        Some(previous) => Epoch(previous.epoch.0 + 1),
-        None => Epoch(1),
+        Some(previous) if &previous.owner == owner => Ok(previous.epoch),
+        Some(previous) => previous
+            .epoch
+            .0
+            .checked_add(1)
+            .map(Epoch)
+            .ok_or(PlacementError::EpochExhausted),
+        None => Ok(Epoch(1)),
     }
 }

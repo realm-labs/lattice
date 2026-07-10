@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::{ActorKind, ServiceKind};
@@ -145,15 +144,19 @@ where
                     state: replacement.state,
                 });
             }
+            let reservation = self
+                .store
+                .reserve_actor_epoch(key, Some(version), None)
+                .await?;
             let record = ActorPlacementRecord {
                 owner: replacement.instance_id,
-                epoch: Epoch(current.epoch.0 + 1),
+                epoch: reservation.epoch(),
                 lease_id: replacement.lease_id,
                 state: PlacementState::Running,
                 ..current
             };
             self.store
-                .compare_and_put_actor(key, Some(version), record.clone())
+                .commit_actor_epoch(reservation, record.clone())
                 .await?;
             Ok(record)
         }
@@ -203,16 +206,18 @@ where
                     actor_kind: record.actor_kind.clone(),
                     actor_id: record.actor_id.clone(),
                 };
+                let reservation = self
+                    .store
+                    .reserve_actor_epoch(key, Some(version), None)
+                    .await?;
                 let migrated = ActorPlacementRecord {
                     owner: replacement.instance_id.clone(),
-                    epoch: Epoch(record.epoch.0 + 1),
+                    epoch: reservation.epoch(),
                     lease_id: replacement.lease_id,
                     state: PlacementState::Running,
                     ..record
                 };
-                self.store
-                    .compare_and_put_actor(key, Some(version), migrated)
-                    .await?;
+                self.store.commit_actor_epoch(reservation, migrated).await?;
                 migrated_actors += 1;
             }
             let mut migrated_virtual_shards = 0;
@@ -229,13 +234,17 @@ where
                     actor_kind: record.actor_kind.clone(),
                     shard_id: record.shard_id,
                 };
+                let reservation = self
+                    .store
+                    .reserve_virtual_shard_epoch(key, Some(version))
+                    .await?;
                 let migrated = VirtualShardPlacementRecord {
                     owner: replacement.instance_id.clone(),
-                    epoch: Epoch(record.epoch.0 + 1),
+                    epoch: reservation.epoch(),
                     ..record
                 };
                 self.store
-                    .compare_and_put_virtual_shard(key, Some(version), migrated)
+                    .commit_virtual_shard_epoch(reservation, migrated)
                     .await?;
                 migrated_virtual_shards += 1;
             }
@@ -285,15 +294,19 @@ where
                     actor_kind: record.actor_kind.clone(),
                     actor_id: record.actor_id.clone(),
                 };
+                let reservation = self
+                    .store
+                    .reserve_actor_epoch(key, Some(version), None)
+                    .await?;
                 let reassigned = ActorPlacementRecord {
                     owner: replacement.instance_id.clone(),
-                    epoch: Epoch(record.epoch.0 + 1),
+                    epoch: reservation.epoch(),
                     lease_id: replacement.lease_id,
                     state: PlacementState::Running,
                     ..record
                 };
                 self.store
-                    .compare_and_put_actor(key, Some(version), reassigned)
+                    .commit_actor_epoch(reservation, reassigned)
                     .await?;
                 reassigned_actors += 1;
             }
@@ -309,9 +322,13 @@ where
                     scope: record.scope.clone(),
                 };
                 let lease_id = self.store.grant_instance_lease().await?;
+                let reservation = self
+                    .store
+                    .reserve_singleton_epoch(key.clone(), Some(version), None)
+                    .await?;
                 let reassigned = SingletonPlacementRecord {
                     owner: replacement.instance_id.clone(),
-                    epoch: Epoch(record.epoch.0 + 1),
+                    epoch: reservation.epoch(),
                     lease_id,
                     state: PlacementState::Running,
                     ..record
@@ -320,7 +337,7 @@ where
                     .activate_singleton(&replacement, &key, reassigned.epoch)
                     .await?;
                 self.store
-                    .compare_and_put_singleton(key, Some(version), reassigned)
+                    .commit_singleton_epoch(reservation, reassigned)
                     .await?;
                 reassigned_singletons += 1;
             }
@@ -353,12 +370,16 @@ where
             .filter(|instance| instance.state == InstanceState::Ready)
             .min_by_key(|instance| instance.instance_id.clone())
             .ok_or(PlacementError::NoReadyInstances)?;
+        let reservation = self
+            .store
+            .reserve_actor_epoch(key.clone(), None, Some(activation_lock_lease_id))
+            .await?;
         let record = ActorPlacementRecord {
             service_kind: key.service_kind.clone(),
             actor_kind: key.actor_kind.clone(),
             actor_id: key.actor_id.clone(),
             owner: instance.instance_id.clone(),
-            epoch: Epoch(1),
+            epoch: reservation.epoch(),
             lease_id: instance.lease_id,
             state: PlacementState::Running,
         };
@@ -366,10 +387,7 @@ where
             .activate_actor(&instance, &key, record.epoch)
             .await?;
         self.store
-            .validate_activation_lock(&key, activation_lock_lease_id)
-            .await?;
-        self.store
-            .compare_and_put_actor(key, None, record.clone())
+            .commit_actor_epoch(reservation, record.clone())
             .await?;
         Ok(record)
     }

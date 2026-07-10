@@ -357,6 +357,13 @@ fn status_from_placement(error: PlacementError) -> Status {
         | PlacementError::SingletonLockHeld
         | PlacementError::SingletonLockLost
         | PlacementError::CompareAndPutFailed
+        | PlacementError::EpochExhausted
+        | PlacementError::EpochRegression { .. }
+        | PlacementError::EpochAuthorityConflict { .. }
+        | PlacementError::EpochReactivation { .. }
+        | PlacementError::EpochMismatch { .. }
+        | PlacementError::EpochFloorCorrupt { .. }
+        | PlacementError::EpochReservationMismatch
         | PlacementError::CoordinatorLeadershipLost => {
             Status::failed_precondition(error.to_string())
         }
@@ -368,6 +375,7 @@ fn status_from_placement(error: PlacementError) -> Status {
         | PlacementError::PlacementCodec { .. }
         | PlacementError::InstanceLeaseNotFound { .. }
         | PlacementError::DuplicateAssigner { .. }
+        | PlacementError::EpochReservationsUnsupported
         | PlacementError::LogicControl { .. } => Status::internal(error.to_string()),
     }
 }

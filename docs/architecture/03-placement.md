@@ -81,10 +81,13 @@ Runtime keys:
 ```text
 /logic/instances/{service_kind}/{instance_id}
 /logic/vshards/{service_kind}/{actor_kind}/{shard_id}
-/logic/actors/{actor_kind}/{actor_id}
-/logic/activation_locks/{actor_kind}/{actor_id}
-/logic/singletons/{singleton_kind}/{scope}
-/logic/epochs/{actor_kind}/{actor_id}
+/logic/actors/{service_kind}/{actor_kind}/{actor_id}
+/logic/activation_locks/{service_kind}/{actor_kind}/{actor_id}
+/logic/singletons/{service_kind}/{singleton_kind}/{scope}
+/logic/singleton_locks/{service_kind}/{singleton_kind}/{scope}
+/authority/epoch_floors/v1/actors/{service_kind}/{actor_kind}/{actor_id}
+/authority/epoch_floors/v1/vshards/{service_kind}/{actor_kind}/{shard_id}
+/authority/epoch_floors/v1/singletons/{service_kind}/{singleton_kind}/{scope}
 ```
 
 ### 12.0 Deployment Bootstrap
@@ -148,15 +151,22 @@ Activation lock prevents concurrent owners:
 ```text
 try create activation lock with short lease
 select target instance
-ask target LogicControl.ActivateActor
-target starts actor and confirms epoch
-write placement record with CAS
+reserve the next durable epoch with CAS while checking the lock
+ask target LogicControl.ActivateActor with the reserved epoch
+target starts actor and confirms the reserved epoch
+atomically commit the reservation and placement record while checking the lock
 release activation lock
 ```
 
 ### 12.4 Epoch
 
 Epoch is the fencing token. Every owner change increments it. Old owners must reject writes once they observe a newer epoch or lose their lease.
+
+Each actor, virtual-shard, and singleton identity has a durable, non-leased epoch-floor record under `/authority/epoch_floors/v1`. A placement-record lease may delete the current owner record, but it must not delete or lower this floor. A new owner first reserves an epoch above both the current record and the durable floor with compare-and-swap, then commits that exact reservation and the placement record in one transaction. The placement record remains the ownership authority throughout reservation; a failed activation or commit may burn an epoch, but it never publishes an owner. Gaps are therefore valid and epochs must never be reused after deletion, lease expiry, or service-process restart.
+
+`PlacementVersion` is an opaque per-write modification-revision token. It must not be implemented as an etcd key `version`, because key versions restart after deletion and permit an old pre-delete CAS token to match a recreated key.
+
+This guarantee begins only after an identity has a floor written by a hardened writer or an upgrade backfill. Before rollout, stop every writer that does not maintain floors and CAS-backfill each live placement record's epoch. An identity whose record was already deleted has no reconstructable last epoch; deployment must seed it from an authoritative source or prohibit its reuse. Mixed old/new placement writers are not a supported rolling-upgrade mode.
 
 ### 12.5 Singleton Owner
 

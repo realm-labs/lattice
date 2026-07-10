@@ -11,24 +11,26 @@ use tokio::sync::broadcast;
 use crate::error::PlacementError;
 use crate::registry::InstanceRecord;
 use crate::storage::etcd::client::{
-    ActivationLockTtl, EtcdKv, EtcdOwnershipRanges, EtcdOwnershipWatchEvent,
-    EtcdOwnershipWatchUpdate, InMemoryEtcdClient, InstanceLeaseTtl, RealEtcdClient,
+    ActivationLockTtl, EtcdEpochCommitRequest, EtcdEpochReservationRequest, EtcdKv,
+    EtcdLegacyEpochPutRequest, EtcdOwnershipRanges, EtcdOwnershipWatchEvent,
+    EtcdOwnershipWatchUpdate, EtcdValueGuard, InMemoryEtcdClient, InstanceLeaseTtl, RealEtcdClient,
 };
 use crate::storage::etcd::codec::{
     EtcdValue, activation_lock_key, activation_lock_namespace_prefix, actor_key,
     actor_namespace_prefix, actor_service_prefix, coordinator_leader_key,
-    default_instance_lease_ttl_secs, instance_key, instance_namespace_prefix,
+    default_instance_lease_ttl_secs, epoch_floor_key, instance_key, instance_namespace_prefix,
     instance_service_prefix, logic_prefix, singleton_key, singleton_lock_key,
     singleton_lock_namespace_prefix, singleton_namespace_prefix, singleton_service_prefix,
     vshard_actor_prefix, vshard_key, vshard_service_prefix,
 };
 use crate::storage::{
-    ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, LeaseId, OwnershipView,
-    OwnershipViewError, OwnershipViewRecord, OwnershipViewSnapshot, OwnershipWatch,
+    ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, EpochFloorRecord, LeaseId,
+    OwnershipView, OwnershipViewError, OwnershipViewRecord, OwnershipViewSnapshot, OwnershipWatch,
     OwnershipWatchBatch, OwnershipWatchError, OwnershipWatchEvent, OwnershipWatchMessage,
-    OwnershipWatchUpdate, PlacementPrefix, PlacementStore, PlacementVersion, PlacementWatch,
-    PlacementWatchEvent, SingletonKey, SingletonPlacementRecord, VirtualShardPlacementKey,
-    VirtualShardPlacementRecord,
+    OwnershipWatchUpdate, PlacementEpochGuard, PlacementEpochKey, PlacementEpochReservation,
+    PlacementPrefix, PlacementStore, PlacementVersion, PlacementWatch, PlacementWatchEvent,
+    SingletonKey, SingletonPlacementRecord, VirtualShardPlacementKey, VirtualShardPlacementRecord,
+    next_reserved_epoch, validate_legacy_epoch,
 };
 
 pub mod client;
@@ -81,6 +83,40 @@ impl EtcdPlacementStore<InMemoryEtcdClient> {
             PlacementPrefix::new(config.key_prefix),
             InMemoryEtcdClient::new(),
         )
+    }
+}
+
+impl<C> EtcdPlacementStore<C>
+where
+    C: EtcdKv,
+{
+    async fn get_epoch_floor(
+        &self,
+        key: &PlacementEpochKey,
+    ) -> Result<Option<(PlacementVersion, EpochFloorRecord)>, PlacementError> {
+        validate_placement_epoch_key(key)?;
+        let storage_key = epoch_floor_key(&self.prefix, key);
+        let Some((token, value)) = self.client.get(&storage_key).await? else {
+            return Ok(None);
+        };
+        validate_etcd_value_key(&self.prefix, &storage_key, &value)
+            .map_err(placement_key_validation_error)?;
+        match value {
+            EtcdValue::EpochFloor(record) => Ok(Some((token, *record))),
+            _ => Err(unexpected_etcd_value("epoch floor", &storage_key)),
+        }
+    }
+
+    fn floor_compare(
+        floor: &Option<(PlacementVersion, EpochFloorRecord)>,
+    ) -> Option<(PlacementVersion, EtcdValue)> {
+        floor
+            .as_ref()
+            .map(|(token, record)| (*token, EtcdValue::EpochFloor(Box::new(record.clone()))))
+    }
+
+    fn floor_value(key: PlacementEpochKey, epoch: lattice_core::actor_ref::Epoch) -> EtcdValue {
+        EtcdValue::EpochFloor(Box::new(EpochFloorRecord { key, epoch }))
     }
 }
 
@@ -230,6 +266,88 @@ where
         collect_actors(&self.prefix, self.client.list_prefix(&prefix).await?)
     }
 
+    async fn reserve_actor_epoch(
+        &self,
+        key: ActorPlacementKey,
+        expected: Option<PlacementVersion>,
+        activation_lock: Option<LeaseId>,
+    ) -> Result<PlacementEpochReservation, PlacementError> {
+        validate_actor_key(&key)?;
+        let current = self.get_actor(&key).await?;
+        if current.as_ref().map(|(token, _)| *token) != expected {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let epoch_key = PlacementEpochKey::Actor(key.clone());
+        let floor = self.get_epoch_floor(&epoch_key).await?;
+        let epoch = next_reserved_epoch(
+            current.as_ref().map(|(_, record)| record.epoch),
+            floor.as_ref().map(|(_, record)| record.epoch),
+        )?;
+        let guard = activation_lock.map(|lease_id| EtcdValueGuard {
+            key: activation_lock_key(&self.prefix, &key),
+            value: EtcdValue::ActivationLock(lease_id),
+        });
+        let floor_token = self
+            .client
+            .reserve_epoch(EtcdEpochReservationRequest {
+                record_key: actor_key(&self.prefix, &key),
+                expected_record: expected,
+                floor_key: epoch_floor_key(&self.prefix, &epoch_key),
+                expected_floor: Self::floor_compare(&floor),
+                floor_value: Self::floor_value(epoch_key.clone(), epoch),
+                guard,
+            })
+            .await?;
+        Ok(PlacementEpochReservation::new(
+            epoch_key,
+            epoch,
+            expected,
+            floor_token,
+            activation_lock.map(PlacementEpochGuard::Actor),
+        ))
+    }
+
+    async fn commit_actor_epoch(
+        &self,
+        reservation: PlacementEpochReservation,
+        value: ActorPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        validate_actor_record(&value)?;
+        let PlacementEpochKey::Actor(key) = reservation.key() else {
+            return Err(PlacementError::EpochReservationMismatch);
+        };
+        validate_actor_key(key)?;
+        if key.service_kind != value.service_kind
+            || key.actor_kind != value.actor_kind
+            || key.actor_id != value.actor_id
+            || reservation.epoch() != value.epoch
+        {
+            return Err(PlacementError::EpochReservationMismatch);
+        }
+        let guard = match reservation.guard() {
+            Some(PlacementEpochGuard::Actor(lease_id)) => Some(EtcdValueGuard {
+                key: activation_lock_key(&self.prefix, key),
+                value: EtcdValue::ActivationLock(lease_id),
+            }),
+            None => None,
+            Some(PlacementEpochGuard::Singleton(_)) => {
+                return Err(PlacementError::EpochReservationMismatch);
+            }
+        };
+        let epoch_key = reservation.key().clone();
+        self.client
+            .commit_epoch(EtcdEpochCommitRequest {
+                record_key: actor_key(&self.prefix, key),
+                expected_record: reservation.expected_record(),
+                floor_key: epoch_floor_key(&self.prefix, &epoch_key),
+                floor_token: reservation.floor_token(),
+                floor_value: Self::floor_value(epoch_key, reservation.epoch()),
+                record_value: EtcdValue::Actor(Box::new(value)),
+                guard,
+            })
+            .await
+    }
+
     async fn compare_and_put_actor(
         &self,
         key: ActorPlacementKey,
@@ -237,12 +355,35 @@ where
         value: ActorPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError> {
         validate_actor_key_record(&key, &value)?;
+        let current = self.get_actor(&key).await?;
+        if current.as_ref().map(|(token, _)| *token) != expected {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let epoch_key = PlacementEpochKey::Actor(key.clone());
+        let floor = self.get_epoch_floor(&epoch_key).await?;
+        let authority_changed = current.as_ref().is_some_and(|(_, record)| {
+            record.owner != value.owner || record.lease_id != value.lease_id
+        });
+        let reactivating = current.as_ref().is_some_and(|(_, record)| {
+            record.state == crate::storage::PlacementState::Stopped
+                && value.state != crate::storage::PlacementState::Stopped
+        });
+        validate_legacy_epoch(
+            current.as_ref().map(|(_, record)| record.epoch),
+            floor.as_ref().map(|(_, record)| record.epoch),
+            value.epoch,
+            authority_changed,
+            reactivating,
+        )?;
         self.client
-            .compare_and_put(
-                actor_key(&self.prefix, &key),
-                expected,
-                EtcdValue::Actor(Box::new(value)),
-            )
+            .compare_and_put_epoch(EtcdLegacyEpochPutRequest {
+                record_key: actor_key(&self.prefix, &key),
+                expected_record: expected,
+                floor_key: epoch_floor_key(&self.prefix, &epoch_key),
+                expected_floor: Self::floor_compare(&floor),
+                floor_value: Self::floor_value(epoch_key, value.epoch),
+                record_value: EtcdValue::Actor(Box::new(value)),
+            })
             .await
     }
 
@@ -283,6 +424,74 @@ where
         collect_virtual_shards(&self.prefix, self.client.list_prefix(&prefix).await?)
     }
 
+    async fn reserve_virtual_shard_epoch(
+        &self,
+        key: VirtualShardPlacementKey,
+        expected: Option<PlacementVersion>,
+    ) -> Result<PlacementEpochReservation, PlacementError> {
+        validate_virtual_shard_key(&key)?;
+        let current = self.get_virtual_shard(&key).await?;
+        if current.as_ref().map(|(token, _)| *token) != expected {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let epoch_key = PlacementEpochKey::VirtualShard(key.clone());
+        let floor = self.get_epoch_floor(&epoch_key).await?;
+        let epoch = next_reserved_epoch(
+            current.as_ref().map(|(_, record)| record.epoch),
+            floor.as_ref().map(|(_, record)| record.epoch),
+        )?;
+        let floor_token = self
+            .client
+            .reserve_epoch(EtcdEpochReservationRequest {
+                record_key: vshard_key(&self.prefix, &key),
+                expected_record: expected,
+                floor_key: epoch_floor_key(&self.prefix, &epoch_key),
+                expected_floor: Self::floor_compare(&floor),
+                floor_value: Self::floor_value(epoch_key.clone(), epoch),
+                guard: None,
+            })
+            .await?;
+        Ok(PlacementEpochReservation::new(
+            epoch_key,
+            epoch,
+            expected,
+            floor_token,
+            None,
+        ))
+    }
+
+    async fn commit_virtual_shard_epoch(
+        &self,
+        reservation: PlacementEpochReservation,
+        value: VirtualShardPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        validate_virtual_shard_record(&value)?;
+        let PlacementEpochKey::VirtualShard(key) = reservation.key() else {
+            return Err(PlacementError::EpochReservationMismatch);
+        };
+        validate_virtual_shard_key(key)?;
+        if key.service_kind != value.service_kind
+            || key.actor_kind != value.actor_kind
+            || key.shard_id != value.shard_id
+            || reservation.epoch() != value.epoch
+            || reservation.guard().is_some()
+        {
+            return Err(PlacementError::EpochReservationMismatch);
+        }
+        let epoch_key = reservation.key().clone();
+        self.client
+            .commit_epoch(EtcdEpochCommitRequest {
+                record_key: vshard_key(&self.prefix, key),
+                expected_record: reservation.expected_record(),
+                floor_key: epoch_floor_key(&self.prefix, &epoch_key),
+                floor_token: reservation.floor_token(),
+                floor_value: Self::floor_value(epoch_key, reservation.epoch()),
+                record_value: EtcdValue::VirtualShard(Box::new(value)),
+                guard: None,
+            })
+            .await
+    }
+
     async fn compare_and_put_virtual_shard(
         &self,
         key: VirtualShardPlacementKey,
@@ -290,12 +499,31 @@ where
         value: VirtualShardPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError> {
         validate_virtual_shard_key_record(&key, &value)?;
+        let current = self.get_virtual_shard(&key).await?;
+        if current.as_ref().map(|(token, _)| *token) != expected {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let epoch_key = PlacementEpochKey::VirtualShard(key.clone());
+        let floor = self.get_epoch_floor(&epoch_key).await?;
+        let authority_changed = current
+            .as_ref()
+            .is_some_and(|(_, record)| record.owner != value.owner);
+        validate_legacy_epoch(
+            current.as_ref().map(|(_, record)| record.epoch),
+            floor.as_ref().map(|(_, record)| record.epoch),
+            value.epoch,
+            authority_changed,
+            false,
+        )?;
         self.client
-            .compare_and_put(
-                vshard_key(&self.prefix, &key),
-                expected,
-                EtcdValue::VirtualShard(Box::new(value)),
-            )
+            .compare_and_put_epoch(EtcdLegacyEpochPutRequest {
+                record_key: vshard_key(&self.prefix, &key),
+                expected_record: expected,
+                floor_key: epoch_floor_key(&self.prefix, &epoch_key),
+                expected_floor: Self::floor_compare(&floor),
+                floor_value: Self::floor_value(epoch_key, value.epoch),
+                record_value: EtcdValue::VirtualShard(Box::new(value)),
+            })
             .await
     }
 
@@ -323,6 +551,88 @@ where
         collect_singletons(&self.prefix, self.client.list_prefix(&prefix).await?)
     }
 
+    async fn reserve_singleton_epoch(
+        &self,
+        key: SingletonKey,
+        expected: Option<PlacementVersion>,
+        singleton_lock: Option<LeaseId>,
+    ) -> Result<PlacementEpochReservation, PlacementError> {
+        validate_singleton_key(&key)?;
+        let current = self.get_singleton(&key).await?;
+        if current.as_ref().map(|(token, _)| *token) != expected {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let epoch_key = PlacementEpochKey::Singleton(key.clone());
+        let floor = self.get_epoch_floor(&epoch_key).await?;
+        let epoch = next_reserved_epoch(
+            current.as_ref().map(|(_, record)| record.epoch),
+            floor.as_ref().map(|(_, record)| record.epoch),
+        )?;
+        let guard = singleton_lock.map(|lease_id| EtcdValueGuard {
+            key: singleton_lock_key(&self.prefix, &key),
+            value: EtcdValue::SingletonLock(lease_id),
+        });
+        let floor_token = self
+            .client
+            .reserve_epoch(EtcdEpochReservationRequest {
+                record_key: singleton_key(&self.prefix, &key),
+                expected_record: expected,
+                floor_key: epoch_floor_key(&self.prefix, &epoch_key),
+                expected_floor: Self::floor_compare(&floor),
+                floor_value: Self::floor_value(epoch_key.clone(), epoch),
+                guard,
+            })
+            .await?;
+        Ok(PlacementEpochReservation::new(
+            epoch_key,
+            epoch,
+            expected,
+            floor_token,
+            singleton_lock.map(PlacementEpochGuard::Singleton),
+        ))
+    }
+
+    async fn commit_singleton_epoch(
+        &self,
+        reservation: PlacementEpochReservation,
+        value: SingletonPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        validate_singleton_record(&value)?;
+        let PlacementEpochKey::Singleton(key) = reservation.key() else {
+            return Err(PlacementError::EpochReservationMismatch);
+        };
+        validate_singleton_key(key)?;
+        if key.service_kind != value.service_kind
+            || key.singleton_kind != value.singleton_kind
+            || key.scope != value.scope
+            || reservation.epoch() != value.epoch
+        {
+            return Err(PlacementError::EpochReservationMismatch);
+        }
+        let guard = match reservation.guard() {
+            Some(PlacementEpochGuard::Singleton(lease_id)) => Some(EtcdValueGuard {
+                key: singleton_lock_key(&self.prefix, key),
+                value: EtcdValue::SingletonLock(lease_id),
+            }),
+            None => None,
+            Some(PlacementEpochGuard::Actor(_)) => {
+                return Err(PlacementError::EpochReservationMismatch);
+            }
+        };
+        let epoch_key = reservation.key().clone();
+        self.client
+            .commit_epoch(EtcdEpochCommitRequest {
+                record_key: singleton_key(&self.prefix, key),
+                expected_record: reservation.expected_record(),
+                floor_key: epoch_floor_key(&self.prefix, &epoch_key),
+                floor_token: reservation.floor_token(),
+                floor_value: Self::floor_value(epoch_key, reservation.epoch()),
+                record_value: EtcdValue::Singleton(Box::new(value)),
+                guard,
+            })
+            .await
+    }
+
     async fn compare_and_put_singleton(
         &self,
         key: SingletonKey,
@@ -330,12 +640,35 @@ where
         value: SingletonPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError> {
         validate_singleton_key_record(&key, &value)?;
+        let current = self.get_singleton(&key).await?;
+        if current.as_ref().map(|(token, _)| *token) != expected {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let epoch_key = PlacementEpochKey::Singleton(key.clone());
+        let floor = self.get_epoch_floor(&epoch_key).await?;
+        let authority_changed = current.as_ref().is_some_and(|(_, record)| {
+            record.owner != value.owner || record.lease_id != value.lease_id
+        });
+        let reactivating = current.as_ref().is_some_and(|(_, record)| {
+            record.state == crate::storage::PlacementState::Stopped
+                && value.state != crate::storage::PlacementState::Stopped
+        });
+        validate_legacy_epoch(
+            current.as_ref().map(|(_, record)| record.epoch),
+            floor.as_ref().map(|(_, record)| record.epoch),
+            value.epoch,
+            authority_changed,
+            reactivating,
+        )?;
         self.client
-            .compare_and_put(
-                singleton_key(&self.prefix, &key),
-                expected,
-                EtcdValue::Singleton(Box::new(value)),
-            )
+            .compare_and_put_epoch(EtcdLegacyEpochPutRequest {
+                record_key: singleton_key(&self.prefix, &key),
+                expected_record: expected,
+                floor_key: epoch_floor_key(&self.prefix, &epoch_key),
+                expected_floor: Self::floor_compare(&floor),
+                floor_value: Self::floor_value(epoch_key, value.epoch),
+                record_value: EtcdValue::Singleton(Box::new(value)),
+            })
             .await
     }
 
@@ -528,7 +861,8 @@ where
                 }
                 EtcdValue::CoordinatorLeader(_)
                 | EtcdValue::ActivationLock(_)
-                | EtcdValue::SingletonLock(_) => {
+                | EtcdValue::SingletonLock(_)
+                | EtcdValue::EpochFloor(_) => {
                     return Err(OwnershipViewError::Protocol {
                         message: format!(
                             "etcd ownership snapshot returned non-ownership key {}",
@@ -860,6 +1194,14 @@ fn validate_singleton_key(key: &SingletonKey) -> Result<(), PlacementError> {
     validate_actor_kind(&key.singleton_kind)
 }
 
+fn validate_placement_epoch_key(key: &PlacementEpochKey) -> Result<(), PlacementError> {
+    match key {
+        PlacementEpochKey::Actor(key) => validate_actor_key(key),
+        PlacementEpochKey::VirtualShard(key) => validate_virtual_shard_key(key),
+        PlacementEpochKey::Singleton(key) => validate_singleton_key(key),
+    }
+}
+
 fn validate_instance_record(record: &InstanceRecord) -> Result<(), PlacementError> {
     validate_service_kind(&record.service_kind)?;
     validate_instance_id(&record.instance_id)
@@ -892,6 +1234,7 @@ fn validate_etcd_value_identity(value: &EtcdValue) -> Result<(), PlacementError>
         EtcdValue::Actor(record) => validate_actor_record(record),
         EtcdValue::VirtualShard(record) => validate_virtual_shard_record(record),
         EtcdValue::Singleton(record) => validate_singleton_record(record),
+        EtcdValue::EpochFloor(record) => validate_placement_epoch_key(&record.key),
         EtcdValue::CoordinatorLeader(leadership) => validate_instance_id(&leadership.candidate_id),
         EtcdValue::ActivationLock(_) | EtcdValue::SingletonLock(_) => Ok(()),
     }
@@ -966,6 +1309,7 @@ fn validate_etcd_value_key(
                 scope: record.scope.clone(),
             },
         ),
+        EtcdValue::EpochFloor(record) => epoch_floor_key(prefix, &record.key),
         EtcdValue::CoordinatorLeader(_) => coordinator_leader_key(prefix),
         EtcdValue::ActivationLock(_) => {
             let namespace = activation_lock_namespace_prefix(prefix);
@@ -1191,7 +1535,8 @@ fn map_etcd_watch_value(
         }
         EtcdValue::CoordinatorLeader(_)
         | EtcdValue::ActivationLock(_)
-        | EtcdValue::SingletonLock(_) => return Ok(None),
+        | EtcdValue::SingletonLock(_)
+        | EtcdValue::EpochFloor(_) => return Ok(None),
     };
     Ok(Some(event))
 }

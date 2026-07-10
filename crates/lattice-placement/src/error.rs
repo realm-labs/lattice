@@ -1,3 +1,4 @@
+use lattice_core::actor_ref::Epoch;
 use lattice_core::instance::InstanceId;
 
 use crate::registry::InstanceState;
@@ -24,6 +25,22 @@ pub enum PlacementError {
     },
     #[error("placement compare-and-put failed")]
     CompareAndPutFailed,
+    #[error("this placement store does not support durable epoch reservations")]
+    EpochReservationsUnsupported,
+    #[error("placement epoch is exhausted")]
+    EpochExhausted,
+    #[error("placement epoch regressed from {current:?} to {incoming:?}")]
+    EpochRegression { current: Epoch, incoming: Epoch },
+    #[error("placement authority changed without advancing epoch {epoch:?}")]
+    EpochAuthorityConflict { epoch: Epoch },
+    #[error("stopped placement reactivated without advancing epoch {epoch:?}")]
+    EpochReactivation { epoch: Epoch },
+    #[error("placement epoch must be {expected:?}, got {incoming:?}")]
+    EpochMismatch { expected: Epoch, incoming: Epoch },
+    #[error("durable epoch floor {floor:?} is behind placement epoch {record:?}")]
+    EpochFloorCorrupt { floor: Epoch, record: Epoch },
+    #[error("placement epoch reservation does not match its record")]
+    EpochReservationMismatch,
     #[error("activation lock is already held for actor")]
     ActivationLockHeld,
     #[error("activation lock was lost for actor")]

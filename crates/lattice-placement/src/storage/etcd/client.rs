@@ -97,6 +97,43 @@ pub struct EtcdOwnershipView {
     pub watch: EtcdOwnershipWatch,
 }
 
+#[derive(Debug, Clone)]
+pub struct EtcdValueGuard {
+    pub key: String,
+    pub value: EtcdValue,
+}
+
+#[derive(Debug, Clone)]
+pub struct EtcdEpochReservationRequest {
+    pub record_key: String,
+    pub expected_record: Option<PlacementVersion>,
+    pub floor_key: String,
+    pub expected_floor: Option<(PlacementVersion, EtcdValue)>,
+    pub floor_value: EtcdValue,
+    pub guard: Option<EtcdValueGuard>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EtcdEpochCommitRequest {
+    pub record_key: String,
+    pub expected_record: Option<PlacementVersion>,
+    pub floor_key: String,
+    pub floor_token: PlacementVersion,
+    pub floor_value: EtcdValue,
+    pub record_value: EtcdValue,
+    pub guard: Option<EtcdValueGuard>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EtcdLegacyEpochPutRequest {
+    pub record_key: String,
+    pub expected_record: Option<PlacementVersion>,
+    pub floor_key: String,
+    pub expected_floor: Option<(PlacementVersion, EtcdValue)>,
+    pub floor_value: EtcdValue,
+    pub record_value: EtcdValue,
+}
+
 #[async_trait]
 pub trait EtcdKv: Clone + Send + Sync + 'static {
     async fn put(&self, key: String, value: EtcdValue) -> Result<(), PlacementError>;
@@ -112,6 +149,24 @@ pub trait EtcdKv: Clone + Send + Sync + 'static {
         expected: Option<PlacementVersion>,
         value: EtcdValue,
     ) -> Result<PlacementVersion, PlacementError>;
+    async fn reserve_epoch(
+        &self,
+        _request: EtcdEpochReservationRequest,
+    ) -> Result<PlacementVersion, PlacementError> {
+        Err(PlacementError::EpochReservationsUnsupported)
+    }
+    async fn commit_epoch(
+        &self,
+        _request: EtcdEpochCommitRequest,
+    ) -> Result<PlacementVersion, PlacementError> {
+        Err(PlacementError::EpochReservationsUnsupported)
+    }
+    async fn compare_and_put_epoch(
+        &self,
+        _request: EtcdLegacyEpochPutRequest,
+    ) -> Result<PlacementVersion, PlacementError> {
+        Err(PlacementError::EpochReservationsUnsupported)
+    }
     async fn compare_and_delete(
         &self,
         key: String,
@@ -248,7 +303,7 @@ impl EtcdKv for RealEtcdClient {
             return Ok(None);
         };
         Ok(Some((
-            placement_version(kv.version())?,
+            placement_version(kv.mod_revision())?,
             decode_etcd_value(kv.value())?,
         )))
     }
@@ -268,7 +323,7 @@ impl EtcdKv for RealEtcdClient {
             .map(|kv| {
                 Ok((
                     String::from_utf8(kv.key().to_vec()).map_err(codec_error)?,
-                    placement_version(kv.version())?,
+                    placement_version(kv.mod_revision())?,
                     decode_etcd_value(kv.value())?,
                 ))
             })
@@ -281,30 +336,148 @@ impl EtcdKv for RealEtcdClient {
         expected: Option<PlacementVersion>,
         value: EtcdValue,
     ) -> Result<PlacementVersion, PlacementError> {
-        let expected_version = expected.map_or(Ok(0), |version| {
-            i64::try_from(version.0).map_err(codec_error)
-        })?;
-        let next_version = PlacementVersion(
-            expected
-                .map_or(0, |version| version.0)
-                .checked_add(1)
-                .ok_or_else(|| codec_error("etcd key version exhausted"))?,
-        );
-        let bytes = encode_etcd_value(&value)?;
-        let put_options = put_options_for(&value)?;
-        let txn = Txn::new()
-            .when(vec![Compare::version(
+        let compare = match expected {
+            Some(version) => Compare::mod_revision(
                 key.as_bytes(),
                 CompareOp::Equal,
-                expected_version,
-            )])
-            .and_then(vec![TxnOp::put(key.clone(), bytes, put_options)]);
+                i64::try_from(version.modification_revision()).map_err(codec_error)?,
+            ),
+            None => Compare::version(key.as_bytes(), CompareOp::Equal, 0),
+        };
+        let bytes = encode_etcd_value(&value)?;
+        let put_options = put_options_for(&value)?;
+        let txn = Txn::new().when(vec![compare]).and_then(vec![TxnOp::put(
+            key.clone(),
+            bytes,
+            put_options,
+        )]);
         let mut client = self.client.clone();
         let response = client.txn(txn).await.map_err(etcd_error)?;
         if !response.succeeded() {
             return Err(PlacementError::CompareAndPutFailed);
         }
-        Ok(next_version)
+        response
+            .header()
+            .ok_or_else(|| codec_error("etcd compare-and-put response omitted its header"))
+            .and_then(|header| placement_version(header.revision()))
+    }
+
+    async fn reserve_epoch(
+        &self,
+        request: EtcdEpochReservationRequest,
+    ) -> Result<PlacementVersion, PlacementError> {
+        let EtcdEpochReservationRequest {
+            record_key,
+            expected_record,
+            floor_key,
+            expected_floor,
+            floor_value,
+            guard,
+        } = request;
+        let mut compares = vec![revision_compare(&record_key, expected_record)?];
+        match expected_floor {
+            Some((token, value)) => {
+                compares.push(revision_compare(&floor_key, Some(token))?);
+                compares.push(Compare::value(
+                    floor_key.as_bytes(),
+                    CompareOp::Equal,
+                    encode_etcd_value(&value)?,
+                ));
+            }
+            None => compares.push(revision_compare(&floor_key, None)?),
+        }
+        if let Some(guard) = guard {
+            compares.push(Compare::value(
+                guard.key.as_bytes(),
+                CompareOp::Equal,
+                encode_etcd_value(&guard.value)?,
+            ));
+        }
+        let floor_bytes = encode_etcd_value(&floor_value)?;
+        let floor_options = put_options_for(&floor_value)?;
+        let txn = Txn::new().when(compares).and_then(vec![TxnOp::put(
+            floor_key,
+            floor_bytes,
+            floor_options,
+        )]);
+        let mut client = self.client.clone();
+        let response = client.txn(txn).await.map_err(etcd_error)?;
+        successful_txn_revision(response, "epoch reservation")
+    }
+
+    async fn commit_epoch(
+        &self,
+        request: EtcdEpochCommitRequest,
+    ) -> Result<PlacementVersion, PlacementError> {
+        let EtcdEpochCommitRequest {
+            record_key,
+            expected_record,
+            floor_key,
+            floor_token,
+            floor_value,
+            record_value,
+            guard,
+        } = request;
+        let floor_bytes = encode_etcd_value(&floor_value)?;
+        let mut compares = vec![
+            revision_compare(&record_key, expected_record)?,
+            revision_compare(&floor_key, Some(floor_token))?,
+            Compare::value(floor_key.as_bytes(), CompareOp::Equal, floor_bytes.clone()),
+        ];
+        if let Some(guard) = guard {
+            compares.push(Compare::value(
+                guard.key.as_bytes(),
+                CompareOp::Equal,
+                encode_etcd_value(&guard.value)?,
+            ));
+        }
+        let floor_options = put_options_for(&floor_value)?;
+        let record_bytes = encode_etcd_value(&record_value)?;
+        let record_options = put_options_for(&record_value)?;
+        let txn = Txn::new().when(compares).and_then(vec![
+            TxnOp::put(floor_key, floor_bytes, floor_options),
+            TxnOp::put(record_key, record_bytes, record_options),
+        ]);
+        let mut client = self.client.clone();
+        let response = client.txn(txn).await.map_err(etcd_error)?;
+        successful_txn_revision(response, "epoch commit")
+    }
+
+    async fn compare_and_put_epoch(
+        &self,
+        request: EtcdLegacyEpochPutRequest,
+    ) -> Result<PlacementVersion, PlacementError> {
+        let EtcdLegacyEpochPutRequest {
+            record_key,
+            expected_record,
+            floor_key,
+            expected_floor,
+            floor_value,
+            record_value,
+        } = request;
+        let mut compares = vec![revision_compare(&record_key, expected_record)?];
+        match expected_floor {
+            Some((token, value)) => {
+                compares.push(revision_compare(&floor_key, Some(token))?);
+                compares.push(Compare::value(
+                    floor_key.as_bytes(),
+                    CompareOp::Equal,
+                    encode_etcd_value(&value)?,
+                ));
+            }
+            None => compares.push(revision_compare(&floor_key, None)?),
+        }
+        let floor_bytes = encode_etcd_value(&floor_value)?;
+        let floor_options = put_options_for(&floor_value)?;
+        let record_bytes = encode_etcd_value(&record_value)?;
+        let record_options = put_options_for(&record_value)?;
+        let txn = Txn::new().when(compares).and_then(vec![
+            TxnOp::put(floor_key, floor_bytes, floor_options),
+            TxnOp::put(record_key, record_bytes, record_options),
+        ]);
+        let mut client = self.client.clone();
+        let response = client.txn(txn).await.map_err(etcd_error)?;
+        successful_txn_revision(response, "legacy epoch compare-and-put")
     }
 
     async fn delete(&self, key: &str) -> Result<(), PlacementError> {
@@ -492,7 +665,7 @@ impl EtcdKv for RealEtcdClient {
                     let Ok(key) = String::from_utf8(kv.key().to_vec()) else {
                         continue;
                     };
-                    let Ok(version) = placement_version(kv.version()) else {
+                    let Ok(version) = placement_version(kv.mod_revision()) else {
                         continue;
                     };
                     let value = match event.event_type() {
@@ -509,6 +682,33 @@ impl EtcdKv for RealEtcdClient {
         });
         Ok(EtcdWatch { rx })
     }
+}
+
+fn revision_compare(
+    key: &str,
+    expected: Option<PlacementVersion>,
+) -> Result<Compare, PlacementError> {
+    match expected {
+        Some(version) => Ok(Compare::mod_revision(
+            key.as_bytes(),
+            CompareOp::Equal,
+            i64::try_from(version.modification_revision()).map_err(codec_error)?,
+        )),
+        None => Ok(Compare::version(key.as_bytes(), CompareOp::Equal, 0)),
+    }
+}
+
+fn successful_txn_revision(
+    response: etcd_client::TxnResponse,
+    operation: &str,
+) -> Result<PlacementVersion, PlacementError> {
+    if !response.succeeded() {
+        return Err(PlacementError::CompareAndPutFailed);
+    }
+    response
+        .header()
+        .ok_or_else(|| codec_error(format!("etcd {operation} response omitted its header")))
+        .and_then(|header| placement_version(header.revision()))
 }
 
 async fn start_real_ownership_watch(
@@ -725,7 +925,7 @@ fn decode_watch_response(
         let event = match event.event_type() {
             EventType::Put => EtcdOwnershipWatchEvent::Upserted {
                 key,
-                version: watch_version(kv.version())?,
+                version: watch_version(kv.mod_revision())?,
                 value: decode_etcd_value(kv.value()).map_err(watch_protocol_error)?,
             },
             EventType::Delete => {
@@ -741,7 +941,7 @@ fn decode_watch_response(
                 }
                 EtcdOwnershipWatchEvent::Deleted {
                     key,
-                    previous_version: watch_version(previous.version())?,
+                    previous_version: watch_version(previous.mod_revision())?,
                     previous_value: decode_etcd_value(previous.value())
                         .map_err(watch_protocol_error)?,
                 }
@@ -871,6 +1071,8 @@ pub struct InMemoryEtcdClient {
     inner: Arc<std::sync::Mutex<InMemoryEtcdState>>,
     instance_leases: Arc<std::sync::Mutex<HashMap<LeaseId, u64>>>,
     next_lease_id: Arc<AtomicU64>,
+    #[cfg(test)]
+    epoch_reservation_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
 #[derive(Debug, Default)]
@@ -883,7 +1085,6 @@ struct InMemoryEtcdState {
 
 #[derive(Debug, Clone)]
 struct InMemoryEtcdValue {
-    version: PlacementVersion,
     revision: PlacementRevision,
     value: EtcdValue,
 }
@@ -900,6 +1101,8 @@ impl InMemoryEtcdClient {
             inner: Arc::new(std::sync::Mutex::new(InMemoryEtcdState::default())),
             instance_leases: Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_lease_id: Arc::new(AtomicU64::new(1)),
+            #[cfg(test)]
+            epoch_reservation_barrier: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -935,7 +1138,12 @@ impl EtcdKv for InMemoryEtcdClient {
             .expect("in-memory etcd mutex poisoned")
             .values
             .get(key)
-            .map(|entry| (entry.version, entry.value.clone())))
+            .map(|entry| {
+                (
+                    placement_version_from_revision(entry.revision),
+                    entry.value.clone(),
+                )
+            }))
     }
 
     async fn list_prefix(
@@ -949,7 +1157,13 @@ impl EtcdKv for InMemoryEtcdClient {
             .values
             .iter()
             .filter(|(key, _)| key.starts_with(prefix))
-            .map(|(key, entry)| (key.clone(), entry.version, entry.value.clone()))
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    placement_version_from_revision(entry.revision),
+                    entry.value.clone(),
+                )
+            })
             .collect())
     }
 
@@ -960,12 +1174,77 @@ impl EtcdKv for InMemoryEtcdClient {
         value: EtcdValue,
     ) -> Result<PlacementVersion, PlacementError> {
         let mut inner = self.inner.lock().expect("in-memory etcd mutex poisoned");
-        let current = inner.values.get(&key).map(|entry| entry.version);
+        let current = inner
+            .values
+            .get(&key)
+            .map(|entry| placement_version_from_revision(entry.revision));
         if current != expected {
             return Err(PlacementError::CompareAndPutFailed);
         }
-        inner.put_values(vec![(key, value)])?;
-        Ok(PlacementVersion(current.map_or(1, |version| version.0 + 1)))
+        let revision = inner.put_values(vec![(key, value)])?;
+        Ok(placement_version_from_revision(revision))
+    }
+
+    async fn reserve_epoch(
+        &self,
+        request: EtcdEpochReservationRequest,
+    ) -> Result<PlacementVersion, PlacementError> {
+        #[cfg(test)]
+        let barrier = {
+            self.epoch_reservation_barrier
+                .lock()
+                .expect("in-memory etcd epoch barrier mutex poisoned")
+                .clone()
+        };
+        #[cfg(test)]
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+        }
+        let mut inner = self.inner.lock().expect("in-memory etcd mutex poisoned");
+        if !inner.matches_revision(&request.record_key, request.expected_record)
+            || !inner.matches_versioned_value(&request.floor_key, request.expected_floor.as_ref())
+            || !inner.matches_guard(request.guard.as_ref())
+        {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let revision = inner.put_values(vec![(request.floor_key, request.floor_value)])?;
+        Ok(placement_version_from_revision(revision))
+    }
+
+    async fn commit_epoch(
+        &self,
+        request: EtcdEpochCommitRequest,
+    ) -> Result<PlacementVersion, PlacementError> {
+        let mut inner = self.inner.lock().expect("in-memory etcd mutex poisoned");
+        let expected_floor = (request.floor_token, request.floor_value.clone());
+        if !inner.matches_revision(&request.record_key, request.expected_record)
+            || !inner.matches_versioned_value(&request.floor_key, Some(&expected_floor))
+            || !inner.matches_guard(request.guard.as_ref())
+        {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let revision = inner.put_values(vec![
+            (request.floor_key, request.floor_value),
+            (request.record_key, request.record_value),
+        ])?;
+        Ok(placement_version_from_revision(revision))
+    }
+
+    async fn compare_and_put_epoch(
+        &self,
+        request: EtcdLegacyEpochPutRequest,
+    ) -> Result<PlacementVersion, PlacementError> {
+        let mut inner = self.inner.lock().expect("in-memory etcd mutex poisoned");
+        if !inner.matches_revision(&request.record_key, request.expected_record)
+            || !inner.matches_versioned_value(&request.floor_key, request.expected_floor.as_ref())
+        {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let revision = inner.put_values(vec![
+            (request.floor_key, request.floor_value),
+            (request.record_key, request.record_value),
+        ])?;
+        Ok(placement_version_from_revision(revision))
     }
 
     async fn delete(&self, key: &str) -> Result<(), PlacementError> {
@@ -1087,6 +1366,17 @@ impl EtcdKv for InMemoryEtcdClient {
 
 impl InMemoryEtcdClient {
     #[cfg(test)]
+    pub(crate) fn set_epoch_reservation_barrier_for_test(
+        &self,
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+    ) {
+        *self
+            .epoch_reservation_barrier
+            .lock()
+            .expect("in-memory etcd epoch barrier mutex poisoned") = barrier;
+    }
+
+    #[cfg(test)]
     pub(crate) fn put_same_revision_for_test(
         &self,
         values: Vec<(String, EtcdValue)>,
@@ -1128,6 +1418,38 @@ impl InMemoryEtcdClient {
 }
 
 impl InMemoryEtcdState {
+    fn matches_revision(&self, key: &str, expected: Option<PlacementVersion>) -> bool {
+        self.values
+            .get(key)
+            .map(|entry| placement_version_from_revision(entry.revision))
+            == expected
+    }
+
+    fn matches_versioned_value(
+        &self,
+        key: &str,
+        expected: Option<&(PlacementVersion, EtcdValue)>,
+    ) -> bool {
+        match (self.values.get(key), expected) {
+            (None, None) => true,
+            (Some(current), Some((token, value))) => {
+                placement_version_from_revision(current.revision) == *token
+                    && current.value == *value
+            }
+            _ => false,
+        }
+    }
+
+    fn matches_guard(&self, guard: Option<&EtcdValueGuard>) -> bool {
+        match guard {
+            None => true,
+            Some(guard) => self
+                .values
+                .get(&guard.key)
+                .is_some_and(|current| current.value == guard.value),
+        }
+    }
+
     fn next_revision(&mut self) -> Result<PlacementRevision, PlacementError> {
         self.revision = self
             .revision
@@ -1151,22 +1473,15 @@ impl InMemoryEtcdState {
                     "in-memory etcd batch modifies key {key} more than once"
                 )));
             }
-            let version = PlacementVersion(
-                self.values
-                    .get(&key)
-                    .map_or(0, |entry| entry.version.0)
-                    .checked_add(1)
-                    .ok_or_else(|| codec_error("in-memory etcd key version exhausted"))?,
-            );
-            prepared.push((key, version, value));
+            prepared.push((key, value));
         }
         let revision = self.next_revision()?;
+        let version = placement_version_from_revision(revision);
         let mut ownership_events = Vec::with_capacity(prepared.len());
-        for (key, version, value) in prepared {
+        for (key, value) in prepared {
             self.values.insert(
                 key.clone(),
                 InMemoryEtcdValue {
-                    version,
                     revision,
                     value: value.clone(),
                 },
@@ -1197,14 +1512,14 @@ impl InMemoryEtcdState {
         self.values.remove(key);
         self.notify_legacy(EtcdWatchEvent {
             key: key.to_string(),
-            version: previous.version,
+            version: placement_version_from_revision(revision),
             value: None,
         });
         self.notify_ownership(EtcdOwnershipWatchBatch {
             revision,
             events: vec![EtcdOwnershipWatchEvent::Deleted {
                 key: key.to_string(),
-                previous_version: previous.version,
+                previous_version: placement_version_from_revision(previous.revision),
                 previous_value: previous.value,
             }],
         });
@@ -1232,14 +1547,7 @@ impl InMemoryEtcdState {
             }
             match mutation {
                 InMemoryEtcdMutation::Put { key, value } => {
-                    let version = PlacementVersion(
-                        self.values
-                            .get(&key)
-                            .map_or(0, |entry| entry.version.0)
-                            .checked_add(1)
-                            .ok_or_else(|| codec_error("in-memory etcd key version exhausted"))?,
-                    );
-                    prepared.push((key, Some((version, value)), None));
+                    prepared.push((key, Some(value), None));
                 }
                 InMemoryEtcdMutation::Delete { key } => {
                     prepared.push((key.clone(), None, self.values.get(&key).cloned()));
@@ -1247,13 +1555,13 @@ impl InMemoryEtcdState {
             }
         }
         let revision = self.next_revision()?;
+        let version = placement_version_from_revision(revision);
         let mut ownership_events = Vec::new();
         for (key, put, delete) in prepared {
-            if let Some((version, value)) = put {
+            if let Some(value) = put {
                 self.values.insert(
                     key.clone(),
                     InMemoryEtcdValue {
-                        version,
                         revision,
                         value: value.clone(),
                     },
@@ -1272,12 +1580,12 @@ impl InMemoryEtcdState {
                 self.values.remove(&key);
                 self.notify_legacy(EtcdWatchEvent {
                     key: key.clone(),
-                    version: previous.version,
+                    version,
                     value: None,
                 });
                 ownership_events.push(EtcdOwnershipWatchEvent::Deleted {
                     key,
-                    previous_version: previous.version,
+                    previous_version: placement_version_from_revision(previous.revision),
                     previous_value: previous.value,
                 });
             }
@@ -1315,6 +1623,10 @@ impl InMemoryEtcdState {
             }
         }
     }
+}
+
+fn placement_version_from_revision(revision: PlacementRevision) -> PlacementVersion {
+    PlacementVersion::from_modification_revision(revision.0)
 }
 
 fn ownership_event_key(event: &EtcdOwnershipWatchEvent) -> &str {

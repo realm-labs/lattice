@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lattice_core::actor_ref::Epoch;
 use lattice_core::id::RouteKey;
 use lattice_core::instance::InstanceCapacity;
 use lattice_core::{actor_kind, service_kind};
@@ -19,7 +20,10 @@ use crate::registry::InstanceState;
 use crate::routing::cache::RouteCacheConfig;
 use crate::routing::placement::{ExplicitRouteResolver, PlacementRouteResolver};
 use crate::routing::resolver::{ResolveRequest, RouteResolver};
-use crate::sharding::{GradualRebalanceShardAssigner, RoundRobinShardAssigner, VirtualShardId};
+use crate::sharding::{
+    GradualRebalanceShardAssigner, RoundRobinShardAssigner, VirtualShardAssignInput,
+    VirtualShardAssignPlan, VirtualShardAssigner, VirtualShardAssignment, VirtualShardId,
+};
 use crate::storage::PlacementPrefix;
 use crate::storage::memory::InMemoryPlacementStore;
 
@@ -42,6 +46,61 @@ impl LogicControl for CountingLogicControl {
             tokio::time::sleep(self.delay).await;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FailFirstLogicControl {
+    calls: Arc<AtomicU64>,
+    epochs: Arc<std::sync::Mutex<Vec<Epoch>>>,
+}
+
+#[async_trait]
+impl LogicControl for FailFirstLogicControl {
+    async fn activate_actor(
+        &self,
+        _instance: &InstanceRecord,
+        _key: &ActorPlacementKey,
+        epoch: Epoch,
+    ) -> Result<(), PlacementError> {
+        self.epochs
+            .lock()
+            .expect("activation epochs mutex poisoned")
+            .push(epoch);
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(PlacementError::LogicControl {
+                message: "injected activation failure".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ForcedEpochShardAssigner {
+    owner: InstanceId,
+    epoch: Epoch,
+}
+
+#[async_trait]
+impl VirtualShardAssigner for ForcedEpochShardAssigner {
+    fn name(&self) -> &'static str {
+        "forced_epoch"
+    }
+
+    async fn plan(
+        &self,
+        input: VirtualShardAssignInput,
+    ) -> Result<VirtualShardAssignPlan, PlacementError> {
+        Ok(VirtualShardAssignPlan {
+            assignments: (0..input.shard_count)
+                .map(|shard_id| VirtualShardAssignment {
+                    shard_id: VirtualShardId(shard_id),
+                    owner: self.owner.clone(),
+                    epoch: self.epoch,
+                })
+                .collect(),
+        })
     }
 }
 
@@ -145,6 +204,100 @@ async fn concurrent_coordinator_activation_creates_one_owner() {
     }
     assert_eq!(store.instance_lease_keepalive_count(owner_lease), Some(1));
     assert_eq!(logic.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn failed_actor_activation_burns_its_reserved_epoch_before_retry() {
+    let store = ready_store().await;
+    let logic = FailFirstLogicControl::default();
+    let coordinator = PlacementCoordinator::new(store.clone(), logic.clone());
+    let request = ActivateActorRequest {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(7),
+    };
+
+    let first = coordinator.activate_actor(request.clone()).await;
+    let retry = coordinator.activate_actor(request).await.unwrap();
+
+    assert!(matches!(first, Err(PlacementError::LogicControl { .. })));
+    assert_eq!(retry.epoch, Epoch(2));
+    assert_eq!(
+        *logic
+            .epochs
+            .lock()
+            .expect("activation epochs mutex poisoned"),
+        vec![Epoch(1), Epoch(2)]
+    );
+}
+
+#[tokio::test]
+async fn actor_recreation_after_record_deletion_uses_the_durable_epoch_floor() {
+    let store = ready_store().await;
+    let request = ActivateActorRequest {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(7),
+    };
+    let first = PlacementCoordinator::new(store.clone(), NoopLogicControl)
+        .activate_actor(request.clone())
+        .await
+        .unwrap();
+    let key = ActorPlacementKey {
+        service_kind: request.service_kind.clone(),
+        actor_kind: request.actor_kind.clone(),
+        actor_id: request.actor_id.clone(),
+    };
+
+    assert!(store.remove_actor_for_test(&key).is_some());
+    let recreated = PlacementCoordinator::new(store, NoopLogicControl)
+        .activate_actor(request)
+        .await
+        .unwrap();
+
+    assert_eq!(first.epoch, Epoch(1));
+    assert_eq!(recreated.epoch, Epoch(2));
+}
+
+#[tokio::test]
+async fn actor_commit_rejects_a_reservation_whose_activation_lock_was_lost() {
+    let store = ready_store().await;
+    let instance = store
+        .get_instance(&InstanceId::new("world-a"))
+        .await
+        .unwrap()
+        .unwrap();
+    let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(7),
+    };
+    let lock = store.acquire_activation_lock(key.clone()).await.unwrap();
+    let reservation = store
+        .reserve_actor_epoch(key.clone(), None, Some(lock))
+        .await
+        .unwrap();
+    let epoch = reservation.epoch();
+    store.release_activation_lock(&key, lock).await.unwrap();
+
+    let error = store
+        .commit_actor_epoch(
+            reservation,
+            ActorPlacementRecord {
+                service_kind: key.service_kind.clone(),
+                actor_kind: key.actor_kind.clone(),
+                actor_id: key.actor_id.clone(),
+                owner: instance.instance_id,
+                epoch,
+                lease_id: instance.lease_id,
+                state: PlacementState::Running,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, PlacementError::ActivationLockLost);
+    assert!(store.get_actor(&key).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -399,6 +552,86 @@ async fn scale_out_ready_instance_participates_in_virtual_shard_assignment() {
         assignments.get(&VirtualShardId(3)),
         Some(&(InstanceId::new("world-b"), Epoch(2)))
     );
+}
+
+#[tokio::test]
+async fn virtual_shard_recreation_after_deletion_uses_the_durable_epoch_floor() {
+    let store = ready_store().await;
+    let request = RebalanceVirtualShardsRequest {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        shard_count: 1,
+        eligible_shards: BTreeSet::new(),
+        max_migrations: usize::MAX,
+        movement_policy: VirtualShardMovementPolicy::AllowRunningMigration,
+    };
+    PlacementCoordinator::new(store.clone(), NoopLogicControl)
+        .rebalance_virtual_shards(request.clone(), &RoundRobinShardAssigner)
+        .await
+        .unwrap();
+    let key = VirtualShardPlacementKey {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        shard_id: VirtualShardId(0),
+    };
+    let first = store.get_virtual_shard(&key).await.unwrap().unwrap().1;
+
+    assert!(store.remove_virtual_shard_for_test(&key).is_some());
+    PlacementCoordinator::new(store.clone(), NoopLogicControl)
+        .rebalance_virtual_shards(request, &RoundRobinShardAssigner)
+        .await
+        .unwrap();
+    let recreated = store.get_virtual_shard(&key).await.unwrap().unwrap().1;
+
+    assert_eq!(first.epoch, Epoch(1));
+    assert_eq!(recreated.epoch, Epoch(2));
+}
+
+#[tokio::test]
+async fn virtual_shard_coordinator_ignores_assigner_supplied_epochs() {
+    let store = ready_store_with_replacement().await;
+    let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+    let request = RebalanceVirtualShardsRequest {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        shard_count: 1,
+        eligible_shards: BTreeSet::new(),
+        max_migrations: usize::MAX,
+        movement_policy: VirtualShardMovementPolicy::AllowRunningMigration,
+    };
+    coordinator
+        .rebalance_virtual_shards(
+            request.clone(),
+            &ForcedEpochShardAssigner {
+                owner: InstanceId::new("world-a"),
+                epoch: Epoch(u64::MAX),
+            },
+        )
+        .await
+        .unwrap();
+    coordinator
+        .rebalance_virtual_shards(
+            request,
+            &ForcedEpochShardAssigner {
+                owner: InstanceId::new("world-b"),
+                epoch: Epoch(1),
+            },
+        )
+        .await
+        .unwrap();
+    let record = store
+        .get_virtual_shard(&VirtualShardPlacementKey {
+            service_kind: service_kind!("World"),
+            actor_kind: actor_kind!("World"),
+            shard_id: VirtualShardId(0),
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+
+    assert_eq!(record.owner, InstanceId::new("world-b"));
+    assert_eq!(record.epoch, Epoch(2));
 }
 
 #[tokio::test]

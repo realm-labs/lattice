@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::Duration;
 
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
@@ -445,6 +447,11 @@ async fn etcd_store_writes_under_cluster_prefix_and_isolates_reads() {
     assert_eq!(
         client.keys(),
         vec![
+            "/lattice/cluster-a/authority/epoch_floors/v1/actors/World/World/u64:7"
+                .to_string(),
+            "/lattice/cluster-a/authority/epoch_floors/v1/singletons/World/SeasonManager/676c6f62616c"
+                .to_string(),
+            "/lattice/cluster-a/authority/epoch_floors/v1/vshards/World/World/3".to_string(),
             "/lattice/cluster-a/logic/actors/World/World/u64:7".to_string(),
             "/lattice/cluster-a/logic/instances/World/world-a".to_string(),
             "/lattice/cluster-a/logic/singletons/World/SeasonManager/676c6f62616c".to_string(),
@@ -492,6 +499,7 @@ async fn etcd_store_compare_and_put_uses_versions() {
         .compare_and_put_actor(key.clone(), None, record.clone())
         .await;
     let updated = ActorPlacementRecord {
+        owner: InstanceId::new("world-b"),
         epoch: Epoch(2),
         ..record
     };
@@ -500,9 +508,9 @@ async fn etcd_store_compare_and_put_uses_versions() {
         .await
         .unwrap();
 
-    assert_eq!(version, PlacementVersion(1));
+    assert_eq!(version.modification_revision(), 1);
     assert_eq!(stale, Err(PlacementError::CompareAndPutFailed));
-    assert_eq!(next, PlacementVersion(2));
+    assert_eq!(next.modification_revision(), 2);
     assert_eq!(store.get_actor(&key).await.unwrap().unwrap().1, updated);
 }
 
@@ -532,9 +540,9 @@ async fn etcd_store_persists_virtual_shards_with_versions() {
         .await
         .unwrap();
 
-    assert_eq!(version, PlacementVersion(1));
+    assert_eq!(version.modification_revision(), 1);
     assert_eq!(stale, Err(PlacementError::CompareAndPutFailed));
-    assert_eq!(next, PlacementVersion(2));
+    assert_eq!(next.modification_revision(), 2);
     assert_eq!(
         store.get_virtual_shard(&key).await.unwrap().unwrap().1,
         updated
@@ -576,9 +584,9 @@ async fn etcd_store_persists_singletons_with_versions() {
         .await
         .unwrap();
 
-    assert_eq!(version, PlacementVersion(1));
+    assert_eq!(version.modification_revision(), 1);
     assert_eq!(stale, Err(PlacementError::CompareAndPutFailed));
-    assert_eq!(next, PlacementVersion(2));
+    assert_eq!(next.modification_revision(), 2);
     assert_eq!(store.get_singleton(&key).await.unwrap().unwrap().1, updated);
     assert_eq!(store.list_singletons().await.unwrap().len(), 1);
 }
@@ -662,7 +670,10 @@ async fn etcd_ownership_view_uses_mod_revisions_and_subscribes_to_later_changes(
         .compare_and_put_actor(key.clone(), None, first)
         .await
         .unwrap();
-    let current = actor_record(7, "world-a", 2, LeaseId(1));
+    let current = ActorPlacementRecord {
+        state: PlacementState::Draining,
+        ..actor_record(7, "world-a", 1, LeaseId(1))
+    };
     let current_version = store
         .compare_and_put_actor(key.clone(), Some(first_version), current.clone())
         .await
@@ -722,9 +733,9 @@ async fn etcd_ownership_view_uses_mod_revisions_and_subscribes_to_later_changes(
             _ => None,
         })
         .unwrap();
-    assert_eq!(current_version, PlacementVersion(2));
+    assert_eq!(current_version.modification_revision(), 3);
     assert_eq!(actor_revision, PlacementRevision(3));
-    assert_ne!(actor_revision.0, current_version.0);
+    assert_eq!(actor_revision.0, current_version.modification_revision());
     assert_eq!(view.snapshot.records.len(), 5);
     assert!(view.snapshot.records.iter().any(|record| matches!(
         record,
@@ -887,7 +898,7 @@ async fn etcd_ownership_watch_reports_record_backed_deletes() {
 }
 
 #[tokio::test]
-async fn in_memory_etcd_failed_cas_does_not_advance_and_recreate_resets_only_key_version() {
+async fn in_memory_etcd_failed_cas_does_not_advance_and_recreate_gets_a_fresh_mod_revision() {
     let client = InMemoryEtcdClient::new();
     let store = EtcdPlacementStore::new(PlacementPrefix::new("/lattice/test"), client.clone());
     let key = actor_key_for(7);
@@ -914,7 +925,7 @@ async fn in_memory_etcd_failed_cas_does_not_advance_and_recreate_resets_only_key
         .compare_and_put_virtual_shard(vshard_key_for(3), None, vshard_record(3, "world-a", 1))
         .await
         .unwrap();
-    assert_eq!(first_version, PlacementVersion(1));
+    assert_eq!(first_version.modification_revision(), 1);
     assert_eq!(view.snapshot.revision, PlacementRevision(1));
     let next = view.watch.next().await.unwrap();
     assert_eq!(next.revision, PlacementRevision(2));
@@ -932,13 +943,536 @@ async fn in_memory_etcd_failed_cas_does_not_advance_and_recreate_resets_only_key
         PlacementRevision(3)
     );
     let recreated_version = store
-        .compare_and_put_actor(key, None, record)
+        .compare_and_put_actor(
+            key,
+            None,
+            ActorPlacementRecord {
+                epoch: Epoch(2),
+                ..record
+            },
+        )
         .await
         .unwrap();
-    assert_eq!(recreated_version, PlacementVersion(1));
+    assert_eq!(recreated_version.modification_revision(), 4);
+    assert_eq!(
+        store
+            .compare_and_put_actor(
+                actor_key_for(7),
+                Some(first_version),
+                actor_record(7, "world-b", 2, LeaseId(2)),
+            )
+            .await,
+        Err(PlacementError::CompareAndPutFailed),
+        "a pre-delete token must not match a recreated key",
+    );
     assert_eq!(
         view.watch.next().await.unwrap().revision,
         PlacementRevision(4)
+    );
+}
+
+#[tokio::test]
+async fn etcd_epoch_reservation_commits_floor_and_record_at_one_revision_for_every_family() {
+    let client = InMemoryEtcdClient::new();
+    let prefix = PlacementPrefix::new("/lattice/epoch-atomic");
+    let store = EtcdPlacementStore::new(prefix.clone(), client.clone());
+
+    let actor = actor_key_for(7);
+    let actor_reservation = store
+        .reserve_actor_epoch(actor.clone(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(actor_reservation.epoch(), Epoch(1));
+    let actor_token = store
+        .commit_actor_epoch(actor_reservation, actor_record(7, "world-a", 1, LeaseId(1)))
+        .await
+        .unwrap();
+    let actor_floor = PlacementEpochKey::Actor(actor.clone());
+    let (actor_floor_token, actor_floor_value) = client
+        .get(&epoch_floor_key(&prefix, &actor_floor))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actor_floor_token, actor_token);
+    assert_eq!(
+        store.get_actor(&actor).await.unwrap().unwrap().0,
+        actor_token
+    );
+    assert_eq!(
+        actor_floor_value,
+        EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+            key: actor_floor,
+            epoch: Epoch(1),
+        }))
+    );
+
+    let shard = vshard_key_for(3);
+    let shard_reservation = store
+        .reserve_virtual_shard_epoch(shard.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(shard_reservation.epoch(), Epoch(1));
+    let shard_token = store
+        .commit_virtual_shard_epoch(shard_reservation, vshard_record(3, "world-a", 1))
+        .await
+        .unwrap();
+    let shard_floor = PlacementEpochKey::VirtualShard(shard.clone());
+    assert_eq!(
+        client
+            .get(&epoch_floor_key(&prefix, &shard_floor))
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        shard_token
+    );
+    assert_eq!(
+        store.get_virtual_shard(&shard).await.unwrap().unwrap().0,
+        shard_token
+    );
+
+    let singleton = singleton_key_for("global");
+    let singleton_reservation = store
+        .reserve_singleton_epoch(singleton.clone(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(singleton_reservation.epoch(), Epoch(1));
+    let singleton_token = store
+        .commit_singleton_epoch(
+            singleton_reservation,
+            singleton_record("global", "world-a", 1, LeaseId(9)),
+        )
+        .await
+        .unwrap();
+    let singleton_floor = PlacementEpochKey::Singleton(singleton.clone());
+    assert_eq!(
+        client
+            .get(&epoch_floor_key(&prefix, &singleton_floor))
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        singleton_token
+    );
+    assert_eq!(
+        store.get_singleton(&singleton).await.unwrap().unwrap().0,
+        singleton_token
+    );
+}
+
+#[tokio::test]
+async fn etcd_epoch_commit_rejects_reservation_family_key_and_epoch_mismatches() {
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/epoch-mismatch"),
+        InMemoryEtcdClient::new(),
+    );
+
+    let actor_reservation = store
+        .reserve_actor_epoch(actor_key_for(7), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .commit_actor_epoch(actor_reservation, actor_record(8, "world-a", 1, LeaseId(1)),)
+            .await,
+        Err(PlacementError::EpochReservationMismatch)
+    );
+
+    let shard_reservation = store
+        .reserve_virtual_shard_epoch(vshard_key_for(3), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .commit_singleton_epoch(
+                shard_reservation,
+                singleton_record("global", "world-a", 1, LeaseId(9)),
+            )
+            .await,
+        Err(PlacementError::EpochReservationMismatch)
+    );
+
+    let singleton_reservation = store
+        .reserve_singleton_epoch(singleton_key_for("global"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .commit_singleton_epoch(
+                singleton_reservation,
+                singleton_record("global", "world-a", 2, LeaseId(9)),
+            )
+            .await,
+        Err(PlacementError::EpochReservationMismatch)
+    );
+}
+
+#[tokio::test]
+async fn etcd_epoch_floors_survive_delete_and_store_reconstruction_without_aba_for_every_family() {
+    let client = InMemoryEtcdClient::new();
+    let prefix = PlacementPrefix::new("/lattice/epoch-restart");
+    let store = EtcdPlacementStore::new(prefix.clone(), client.clone());
+    let actor = actor_key_for(7);
+    let shard = vshard_key_for(3);
+    let singleton = singleton_key_for("global");
+
+    let actor_token = store
+        .compare_and_put_actor(
+            actor.clone(),
+            None,
+            actor_record(7, "world-a", 5, LeaseId(1)),
+        )
+        .await
+        .unwrap();
+    let shard_token = store
+        .compare_and_put_virtual_shard(shard.clone(), None, vshard_record(3, "world-a", 5))
+        .await
+        .unwrap();
+    let singleton_token = store
+        .compare_and_put_singleton(
+            singleton.clone(),
+            None,
+            singleton_record("global", "world-a", 5, LeaseId(9)),
+        )
+        .await
+        .unwrap();
+
+    client.delete(&actor_key(&prefix, &actor)).await.unwrap();
+    client.delete(&vshard_key(&prefix, &shard)).await.unwrap();
+    client
+        .delete(&singleton_key(&prefix, &singleton))
+        .await
+        .unwrap();
+    drop(store);
+    let restarted = EtcdPlacementStore::new(prefix.clone(), client.clone());
+
+    assert_eq!(
+        restarted
+            .compare_and_put_actor(
+                actor.clone(),
+                Some(actor_token),
+                actor_record(7, "world-b", 6, LeaseId(2)),
+            )
+            .await,
+        Err(PlacementError::CompareAndPutFailed)
+    );
+    assert_eq!(
+        restarted
+            .compare_and_put_virtual_shard(
+                shard.clone(),
+                Some(shard_token),
+                vshard_record(3, "world-b", 6),
+            )
+            .await,
+        Err(PlacementError::CompareAndPutFailed)
+    );
+    assert_eq!(
+        restarted
+            .compare_and_put_singleton(
+                singleton.clone(),
+                Some(singleton_token),
+                singleton_record("global", "world-b", 6, LeaseId(10)),
+            )
+            .await,
+        Err(PlacementError::CompareAndPutFailed)
+    );
+
+    let actor_reservation = restarted
+        .reserve_actor_epoch(actor.clone(), None, None)
+        .await
+        .unwrap();
+    let shard_reservation = restarted
+        .reserve_virtual_shard_epoch(shard.clone(), None)
+        .await
+        .unwrap();
+    let singleton_reservation = restarted
+        .reserve_singleton_epoch(singleton.clone(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(actor_reservation.epoch(), Epoch(6));
+    assert_eq!(shard_reservation.epoch(), Epoch(6));
+    assert_eq!(singleton_reservation.epoch(), Epoch(6));
+    restarted
+        .commit_actor_epoch(actor_reservation, actor_record(7, "world-b", 6, LeaseId(2)))
+        .await
+        .unwrap();
+    restarted
+        .commit_virtual_shard_epoch(shard_reservation, vshard_record(3, "world-b", 6))
+        .await
+        .unwrap();
+    restarted
+        .commit_singleton_epoch(
+            singleton_reservation,
+            singleton_record("global", "world-b", 6, LeaseId(10)),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn etcd_concurrent_epoch_reservations_have_one_cas_winner_for_every_family() {
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/epoch-concurrency"),
+        client.clone(),
+    );
+
+    let actor = actor_key_for(7);
+    client.set_epoch_reservation_barrier_for_test(Some(Arc::new(tokio::sync::Barrier::new(2))));
+    let (left, right) = tokio::join!(
+        store.reserve_actor_epoch(actor.clone(), None, None),
+        store.reserve_actor_epoch(actor.clone(), None, None),
+    );
+    client.set_epoch_reservation_barrier_for_test(None);
+    let actor_winner = one_reservation_winner(left, right);
+    store
+        .commit_actor_epoch(actor_winner, actor_record(7, "world-a", 1, LeaseId(1)))
+        .await
+        .unwrap();
+
+    let shard = vshard_key_for(3);
+    client.set_epoch_reservation_barrier_for_test(Some(Arc::new(tokio::sync::Barrier::new(2))));
+    let (left, right) = tokio::join!(
+        store.reserve_virtual_shard_epoch(shard.clone(), None),
+        store.reserve_virtual_shard_epoch(shard.clone(), None),
+    );
+    client.set_epoch_reservation_barrier_for_test(None);
+    let shard_winner = one_reservation_winner(left, right);
+    store
+        .commit_virtual_shard_epoch(shard_winner, vshard_record(3, "world-a", 1))
+        .await
+        .unwrap();
+
+    let singleton = singleton_key_for("global");
+    client.set_epoch_reservation_barrier_for_test(Some(Arc::new(tokio::sync::Barrier::new(2))));
+    let (left, right) = tokio::join!(
+        store.reserve_singleton_epoch(singleton.clone(), None, None),
+        store.reserve_singleton_epoch(singleton.clone(), None, None),
+    );
+    client.set_epoch_reservation_barrier_for_test(None);
+    let singleton_winner = one_reservation_winner(left, right);
+    store
+        .commit_singleton_epoch(
+            singleton_winner,
+            singleton_record("global", "world-a", 1, LeaseId(9)),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn etcd_epoch_reservation_guards_are_rechecked_at_commit() {
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/epoch-guards"),
+        client.clone(),
+    );
+
+    let actor = actor_key_for(7);
+    let actor_lock = store.acquire_activation_lock(actor.clone()).await.unwrap();
+    let actor_reservation = store
+        .reserve_actor_epoch(actor.clone(), None, Some(actor_lock))
+        .await
+        .unwrap();
+    store
+        .release_activation_lock(&actor, actor_lock)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .commit_actor_epoch(actor_reservation, actor_record(7, "world-a", 1, LeaseId(1)),)
+            .await,
+        Err(PlacementError::CompareAndPutFailed)
+    );
+    assert!(store.get_actor(&actor).await.unwrap().is_none());
+
+    let singleton = singleton_key_for("global");
+    let singleton_lock = store
+        .acquire_singleton_lock(singleton.clone())
+        .await
+        .unwrap();
+    let singleton_reservation = store
+        .reserve_singleton_epoch(singleton.clone(), None, Some(singleton_lock))
+        .await
+        .unwrap();
+    store
+        .release_singleton_lock(&singleton, singleton_lock)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .commit_singleton_epoch(
+                singleton_reservation,
+                singleton_record("global", "world-a", 1, LeaseId(9)),
+            )
+            .await,
+        Err(PlacementError::CompareAndPutFailed)
+    );
+    assert!(store.get_singleton(&singleton).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn etcd_rejects_malformed_and_exhausted_epoch_floors_for_every_family() {
+    let client = InMemoryEtcdClient::new();
+    let prefix = PlacementPrefix::new("/lattice/epoch-invalid");
+    let store = EtcdPlacementStore::new(prefix.clone(), client.clone());
+    let actor = actor_key_for(7);
+    let shard = vshard_key_for(3);
+    let singleton = singleton_key_for("global");
+    for (path_key, value_key) in [
+        (
+            PlacementEpochKey::Actor(actor.clone()),
+            PlacementEpochKey::Actor(actor_key_for(8)),
+        ),
+        (
+            PlacementEpochKey::VirtualShard(shard.clone()),
+            PlacementEpochKey::VirtualShard(vshard_key_for(4)),
+        ),
+        (
+            PlacementEpochKey::Singleton(singleton.clone()),
+            PlacementEpochKey::Singleton(singleton_key_for("other")),
+        ),
+    ] {
+        client
+            .put(
+                epoch_floor_key(&prefix, &path_key),
+                EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key: value_key,
+                    epoch: Epoch(5),
+                })),
+            )
+            .await
+            .unwrap();
+    }
+    assert_codec_error(store.reserve_actor_epoch(actor, None, None).await);
+    assert_codec_error(store.reserve_virtual_shard_epoch(shard, None).await);
+    assert_codec_error(store.reserve_singleton_epoch(singleton, None, None).await);
+
+    let actor = actor_key_for(70);
+    let shard = vshard_key_for(30);
+    let singleton = singleton_key_for("overflow");
+    for key in [
+        PlacementEpochKey::Actor(actor.clone()),
+        PlacementEpochKey::VirtualShard(shard.clone()),
+        PlacementEpochKey::Singleton(singleton.clone()),
+    ] {
+        client
+            .put(
+                epoch_floor_key(&prefix, &key),
+                EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key,
+                    epoch: Epoch(u64::MAX),
+                })),
+            )
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        store.reserve_actor_epoch(actor, None, None).await,
+        Err(PlacementError::EpochExhausted)
+    ));
+    assert!(matches!(
+        store.reserve_virtual_shard_epoch(shard, None).await,
+        Err(PlacementError::EpochExhausted)
+    ));
+    assert!(matches!(
+        store.reserve_singleton_epoch(singleton, None, None).await,
+        Err(PlacementError::EpochExhausted)
+    ));
+}
+
+#[tokio::test]
+async fn epoch_floor_mutations_are_outside_legacy_and_ownership_watch_ranges() {
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/epoch-watch-isolation"),
+        client,
+    );
+    let mut legacy = store.watch(store.prefix().clone()).await.unwrap();
+    let mut ownership = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let reservation = store
+        .reserve_actor_epoch(actor_key_for(7), None, None)
+        .await
+        .unwrap();
+    assert_eq!(reservation.epoch(), Epoch(1));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), legacy.next())
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), ownership.watch.next_update())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn etcd_legacy_compare_and_put_cannot_bypass_epoch_transition_rules() {
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/epoch-legacy"),
+        InMemoryEtcdClient::new(),
+    );
+    let key = actor_key_for(7);
+    let initial = actor_record(7, "world-a", 5, LeaseId(1));
+    let token = store
+        .compare_and_put_actor(key.clone(), None, initial.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compare_and_put_actor(
+                key.clone(),
+                Some(token),
+                actor_record(7, "world-b", 5, LeaseId(2)),
+            )
+            .await,
+        Err(PlacementError::EpochAuthorityConflict { epoch: Epoch(5) })
+    );
+    assert_eq!(
+        store
+            .compare_and_put_actor(
+                key.clone(),
+                Some(token),
+                ActorPlacementRecord {
+                    epoch: Epoch(6),
+                    ..initial.clone()
+                },
+            )
+            .await,
+        Err(PlacementError::EpochMismatch {
+            expected: Epoch(5),
+            incoming: Epoch(6),
+        })
+    );
+    let stopped = ActorPlacementRecord {
+        state: PlacementState::Stopped,
+        ..initial
+    };
+    let stopped_token = store
+        .compare_and_put_actor(key.clone(), Some(token), stopped.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compare_and_put_actor(
+                key,
+                Some(stopped_token),
+                ActorPlacementRecord {
+                    state: PlacementState::Running,
+                    ..stopped
+                },
+            )
+            .await,
+        Err(PlacementError::EpochReactivation { epoch: Epoch(5) })
     );
 }
 
@@ -1239,8 +1773,20 @@ fn etcd_value_codec_round_trips_placement_metadata() {
     }));
     let lock = EtcdValue::ActivationLock(LeaseId(42));
     let singleton_lock = EtcdValue::SingletonLock(LeaseId(43));
+    let floor = EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+        key: PlacementEpochKey::Actor(actor_key_for(7)),
+        epoch: Epoch(3),
+    }));
 
-    for value in [instance, actor, singleton, leader, lock, singleton_lock] {
+    for value in [
+        instance,
+        actor,
+        singleton,
+        leader,
+        lock,
+        singleton_lock,
+        floor,
+    ] {
         let encoded = encode_etcd_value(&value).unwrap();
         let decoded = decode_etcd_value(&encoded).unwrap();
         assert_eq!(decoded, value);
@@ -1261,6 +1807,18 @@ fn etcd_actor_records_remain_durable_for_epoch_preserving_failover() {
     let actor = EtcdValue::Actor(Box::new(actor_record(7, "world-a", 3, LeaseId(5))));
 
     let options = put_options_for(&actor).unwrap();
+
+    assert!(options.is_none());
+}
+
+#[test]
+fn etcd_epoch_floor_records_are_never_leased() {
+    let floor = EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+        key: PlacementEpochKey::Actor(actor_key_for(7)),
+        epoch: Epoch(3),
+    }));
+
+    let options = put_options_for(&floor).unwrap();
 
     assert!(options.is_none());
 }
@@ -1354,4 +1912,23 @@ fn singleton_record(
         lease_id,
         state: PlacementState::Running,
     }
+}
+
+fn one_reservation_winner(
+    left: Result<PlacementEpochReservation, PlacementError>,
+    right: Result<PlacementEpochReservation, PlacementError>,
+) -> PlacementEpochReservation {
+    let winner = match (left, right) {
+        (Ok(winner), Err(PlacementError::CompareAndPutFailed))
+        | (Err(PlacementError::CompareAndPutFailed), Ok(winner)) => winner,
+        (Ok(_), Ok(_)) => panic!("both concurrent epoch reservations won the same CAS"),
+        (Err(left), Err(right)) => {
+            panic!("both concurrent epoch reservations failed: {left}; {right}")
+        }
+        (Ok(_), Err(error)) | (Err(error), Ok(_)) => {
+            panic!("concurrent epoch reservation returned unexpected error: {error}")
+        }
+    };
+    assert_eq!(winner.epoch(), Epoch(1));
+    winner
 }

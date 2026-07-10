@@ -101,27 +101,26 @@ where
                 let current = current_by_shard.get(&assignment.shard_id);
                 if let Some((_, record)) = current
                     && record.owner == assignment.owner
-                    && record.epoch == assignment.epoch
                 {
                     continue;
                 }
                 let moved = current
                     .map(|(_, current)| current.owner != assignment.owner)
                     .unwrap_or(false);
+                let reservation = self
+                    .store
+                    .reserve_virtual_shard_epoch(key, current.map(|(version, _)| *version))
+                    .await?;
 
                 let record = VirtualShardPlacementRecord {
                     service_kind: request.service_kind.clone(),
                     actor_kind: request.actor_kind.clone(),
                     shard_id: assignment.shard_id,
                     owner: assignment.owner,
-                    epoch: assignment.epoch,
+                    epoch: reservation.epoch(),
                 };
                 self.store
-                    .compare_and_put_virtual_shard(
-                        key,
-                        current.map(|(version, _)| *version),
-                        record,
-                    )
+                    .commit_virtual_shard_epoch(reservation, record)
                     .await?;
                 assignments_written += 1;
                 if moved {

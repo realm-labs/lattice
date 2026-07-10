@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::PlacementError;
 use crate::registry::InstanceRecord;
 use crate::storage::{
-    ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, LeaseId, PlacementPrefix,
-    PlacementRevision, PlacementVersion, SingletonKey, SingletonPlacementRecord,
-    VirtualShardPlacementKey, VirtualShardPlacementRecord,
+    ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, EpochFloorRecord, LeaseId,
+    PlacementEpochKey, PlacementPrefix, PlacementRevision, PlacementVersion, SingletonKey,
+    SingletonPlacementRecord, VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +18,7 @@ pub enum EtcdValue {
     Actor(Box<ActorPlacementRecord>),
     VirtualShard(Box<VirtualShardPlacementRecord>),
     Singleton(Box<SingletonPlacementRecord>),
+    EpochFloor(Box<EpochFloorRecord>),
     CoordinatorLeader(Box<CoordinatorLeadership>),
     ActivationLock(LeaseId),
     SingletonLock(LeaseId),
@@ -53,7 +54,7 @@ pub(crate) fn put_options_for(value: &EtcdValue) -> Result<Option<PutOptions>, P
             let lease_id = i64::try_from(record.lease_id.0).map_err(codec_error)?;
             Ok(Some(PutOptions::new().with_lease(lease_id)))
         }
-        EtcdValue::Actor(_) | EtcdValue::VirtualShard(_) => Ok(None),
+        EtcdValue::Actor(_) | EtcdValue::VirtualShard(_) | EtcdValue::EpochFloor(_) => Ok(None),
     }
 }
 
@@ -63,7 +64,7 @@ pub(crate) fn default_instance_lease_ttl_secs() -> i64 {
 
 pub(crate) fn placement_version(version: i64) -> Result<PlacementVersion, PlacementError> {
     let version = u64::try_from(version).map_err(codec_error)?;
-    Ok(PlacementVersion(version))
+    Ok(PlacementVersion::from_modification_revision(version))
 }
 
 pub(crate) fn placement_revision(revision: i64) -> Result<PlacementRevision, PlacementError> {
@@ -194,6 +195,47 @@ pub(crate) fn vshard_key(prefix: &PlacementPrefix, key: &VirtualShardPlacementKe
 pub(crate) fn singleton_key(prefix: &PlacementPrefix, key: &SingletonKey) -> String {
     format!(
         "{}/logic/singletons/{}/{}/{}",
+        clean_prefix(prefix),
+        key.service_kind.as_str(),
+        key.singleton_kind.as_str(),
+        scope_segment(&key.scope)
+    )
+}
+
+pub(crate) fn epoch_floor_key(prefix: &PlacementPrefix, key: &PlacementEpochKey) -> String {
+    match key {
+        PlacementEpochKey::Actor(key) => actor_epoch_floor_key(prefix, key),
+        PlacementEpochKey::VirtualShard(key) => virtual_shard_epoch_floor_key(prefix, key),
+        PlacementEpochKey::Singleton(key) => singleton_epoch_floor_key(prefix, key),
+    }
+}
+
+pub(crate) fn actor_epoch_floor_key(prefix: &PlacementPrefix, key: &ActorPlacementKey) -> String {
+    format!(
+        "{}/authority/epoch_floors/v1/actors/{}/{}/{}",
+        clean_prefix(prefix),
+        key.service_kind.as_str(),
+        key.actor_kind.as_str(),
+        actor_id_segment(&key.actor_id)
+    )
+}
+
+pub(crate) fn virtual_shard_epoch_floor_key(
+    prefix: &PlacementPrefix,
+    key: &VirtualShardPlacementKey,
+) -> String {
+    format!(
+        "{}/authority/epoch_floors/v1/vshards/{}/{}/{}",
+        clean_prefix(prefix),
+        key.service_kind.as_str(),
+        key.actor_kind.as_str(),
+        key.shard_id.0
+    )
+}
+
+pub(crate) fn singleton_epoch_floor_key(prefix: &PlacementPrefix, key: &SingletonKey) -> String {
+    format!(
+        "{}/authority/epoch_floors/v1/singletons/{}/{}/{}",
         clean_prefix(prefix),
         key.service_kind.as_str(),
         key.singleton_kind.as_str(),

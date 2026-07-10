@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use lattice_core::actor_ref::Epoch;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::{ActorKind, ServiceKind};
 use tokio::sync::broadcast;
@@ -11,12 +12,12 @@ use tokio::sync::broadcast;
 use crate::error::PlacementError;
 use crate::registry::InstanceRecord;
 use crate::storage::{
-    ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, LeaseId, OwnershipView,
-    OwnershipViewError, OwnershipViewRecord, OwnershipViewSnapshot, OwnershipWatch,
+    ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, EpochFloorRecord, LeaseId,
+    OwnershipView, OwnershipViewError, OwnershipViewRecord, OwnershipViewSnapshot, OwnershipWatch,
     OwnershipWatchBatch, OwnershipWatchEvent, OwnershipWatchMessage, OwnershipWatchUpdate,
-    PlacementPrefix, PlacementRevision, PlacementStore, PlacementVersion, PlacementWatch,
-    PlacementWatchEvent, SingletonKey, SingletonPlacementRecord, VirtualShardPlacementKey,
-    VirtualShardPlacementRecord,
+    PlacementEpochGuard, PlacementEpochKey, PlacementEpochReservation, PlacementPrefix,
+    PlacementRevision, PlacementStore, PlacementVersion, PlacementWatch, PlacementWatchEvent,
+    SingletonKey, SingletonPlacementRecord, VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
 const WATCH_CAPACITY: usize = 128;
@@ -84,6 +85,63 @@ impl InMemoryPlacementStore {
         Some(record)
     }
 
+    #[cfg(test)]
+    pub(crate) fn remove_actor_for_test(
+        &self,
+        key: &ActorPlacementKey,
+    ) -> Option<ActorPlacementRecord> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let (_token, _record_revision, record) =
+            inner.actors.remove(&self.prefixed_actor_key(key))?;
+        let revision = inner.next_placement_revision();
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::ActorDeleted { key: key.clone() }],
+            },
+        );
+        Some(record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_virtual_shard_for_test(
+        &self,
+        key: &VirtualShardPlacementKey,
+    ) -> Option<VirtualShardPlacementRecord> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let (_token, _record_revision, record) =
+            inner.vshards.remove(&self.prefixed_vshard_key(key))?;
+        let revision = inner.next_placement_revision();
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::VirtualShardDeleted { key: key.clone() }],
+            },
+        );
+        Some(record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_singleton_for_test(
+        &self,
+        key: &SingletonKey,
+    ) -> Option<SingletonPlacementRecord> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let (_token, _record_revision, record) =
+            inner.singletons.remove(&self.prefixed_singleton_key(key))?;
+        let revision = inner.next_placement_revision();
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::SingletonDeleted { key: key.clone() }],
+            },
+        );
+        Some(record)
+    }
+
     fn prefixed_actor_key(&self, key: &ActorPlacementKey) -> PrefixedActorKey {
         PrefixedActorKey {
             prefix: self.prefix.clone(),
@@ -110,6 +168,26 @@ impl InMemoryPlacementStore {
             prefix: self.prefix.clone(),
             instance_id: instance_id.clone(),
         }
+    }
+
+    fn prefixed_epoch_key(&self, key: &PlacementEpochKey) -> PrefixedEpochKey {
+        PrefixedEpochKey {
+            prefix: self.prefix.clone(),
+            key: key.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn epoch_floor_for_test(
+        &self,
+        key: &PlacementEpochKey,
+    ) -> Option<(PlacementVersion, EpochFloorRecord)> {
+        self.inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .epoch_floors
+            .get(&self.prefixed_epoch_key(key))
+            .cloned()
     }
 }
 
@@ -269,30 +347,78 @@ impl PlacementStore for InMemoryPlacementStore {
             .collect())
     }
 
-    async fn compare_and_put_actor(
+    async fn reserve_actor_epoch(
         &self,
         key: ActorPlacementKey,
         expected: Option<PlacementVersion>,
-        value: ActorPlacementRecord,
-    ) -> Result<PlacementVersion, PlacementError> {
+        activation_lock: Option<LeaseId>,
+    ) -> Result<PlacementEpochReservation, PlacementError> {
+        let placement_key = self.prefixed_actor_key(&key);
+        let epoch_key = PlacementEpochKey::Actor(key);
+        let floor_key = self.prefixed_epoch_key(&epoch_key);
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
-        let key = self.prefixed_actor_key(&key);
         let current = inner
             .actors
-            .get(&key)
-            .map(|(version, _revision, _record)| *version);
-        if current != expected {
+            .get(&placement_key)
+            .map(|(token, _revision, record)| (*token, record.epoch));
+        if current.map(|(token, _epoch)| token) != expected {
             return Err(PlacementError::CompareAndPutFailed);
         }
-        let next = PlacementVersion(current.map_or(1, |version| version.0 + 1));
+        let guard = activation_lock.map(PlacementEpochGuard::Actor);
+        validate_memory_guard(&inner, Some(&placement_key), None, guard)?;
+        reserve_memory_epoch(&mut inner, floor_key, epoch_key, current, expected, guard)
+    }
+
+    async fn commit_actor_epoch(
+        &self,
+        reservation: PlacementEpochReservation,
+        value: ActorPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        let PlacementEpochKey::Actor(key) = reservation.key().clone() else {
+            return Err(PlacementError::EpochReservationMismatch);
+        };
+        if actor_record_key(&value) != key || value.epoch != reservation.epoch() {
+            return Err(PlacementError::EpochReservationMismatch);
+        }
+        let placement_key = self.prefixed_actor_key(&key);
+        let floor_key = self.prefixed_epoch_key(reservation.key());
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        validate_memory_reservation(
+            &inner,
+            &floor_key,
+            reservation.key(),
+            reservation.epoch(),
+            reservation.floor_token(),
+        )?;
+        let current = inner
+            .actors
+            .get(&placement_key)
+            .map(|(token, _revision, _record)| *token);
+        if current != reservation.expected_record() {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        validate_memory_guard(&inner, Some(&placement_key), None, reservation.guard())?;
+
         let revision = inner.next_placement_revision();
-        let watch_key = key.key.clone();
-        inner.actors.insert(key, (next, revision, value.clone()));
+        let token = placement_token(revision);
+        inner.epoch_floors.insert(
+            floor_key,
+            (
+                token,
+                EpochFloorRecord {
+                    key: reservation.key,
+                    epoch: reservation.epoch,
+                },
+            ),
+        );
+        inner
+            .actors
+            .insert(placement_key, (token, revision, value.clone()));
         inner.notify(
             &self.prefix,
             PlacementWatchEvent::ActorUpdated {
-                key: watch_key.clone(),
-                version: next,
+                key: key.clone(),
+                version: token,
                 record: value.clone(),
             },
         );
@@ -300,13 +426,78 @@ impl PlacementStore for InMemoryPlacementStore {
             &self.prefix,
             OwnershipWatchBatch {
                 revision,
-                events: vec![OwnershipWatchEvent::ActorUpserted {
-                    key: watch_key,
-                    record: value,
-                }],
+                events: vec![OwnershipWatchEvent::ActorUpserted { key, record: value }],
             },
         );
-        Ok(next)
+        Ok(token)
+    }
+
+    async fn compare_and_put_actor(
+        &self,
+        key: ActorPlacementKey,
+        expected: Option<PlacementVersion>,
+        value: ActorPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        if actor_record_key(&value) != key {
+            return Err(PlacementError::EpochReservationMismatch);
+        }
+        let placement_key = self.prefixed_actor_key(&key);
+        let epoch_key = PlacementEpochKey::Actor(key.clone());
+        let floor_key = self.prefixed_epoch_key(&epoch_key);
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let current = inner
+            .actors
+            .get(&placement_key)
+            .map(|(token, _revision, record)| (*token, record.clone()));
+        if current.as_ref().map(|(token, _record)| *token) != expected {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let floor = memory_floor(&inner, &floor_key, &epoch_key)?;
+        let authority_changed = current.as_ref().is_some_and(|(_token, record)| {
+            record.owner != value.owner || record.lease_id != value.lease_id
+        });
+        let reactivating = current.as_ref().is_some_and(|(_token, record)| {
+            record.state == crate::storage::PlacementState::Stopped
+                && value.state != crate::storage::PlacementState::Stopped
+        });
+        crate::storage::validate_legacy_epoch(
+            current.as_ref().map(|(_token, record)| record.epoch),
+            floor.as_ref().map(|(_token, floor)| floor.epoch),
+            value.epoch,
+            authority_changed,
+            reactivating,
+        )?;
+        let revision = inner.next_placement_revision();
+        let token = placement_token(revision);
+        inner.epoch_floors.insert(
+            floor_key,
+            (
+                token,
+                EpochFloorRecord {
+                    key: epoch_key,
+                    epoch: value.epoch,
+                },
+            ),
+        );
+        inner
+            .actors
+            .insert(placement_key, (token, revision, value.clone()));
+        inner.notify(
+            &self.prefix,
+            PlacementWatchEvent::ActorUpdated {
+                key: key.clone(),
+                version: token,
+                record: value.clone(),
+            },
+        );
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::ActorUpserted { key, record: value }],
+            },
+        );
+        Ok(token)
     }
 
     async fn get_virtual_shard(
@@ -357,30 +548,73 @@ impl PlacementStore for InMemoryPlacementStore {
             .collect())
     }
 
-    async fn compare_and_put_virtual_shard(
+    async fn reserve_virtual_shard_epoch(
         &self,
         key: VirtualShardPlacementKey,
         expected: Option<PlacementVersion>,
-        value: VirtualShardPlacementRecord,
-    ) -> Result<PlacementVersion, PlacementError> {
+    ) -> Result<PlacementEpochReservation, PlacementError> {
+        let placement_key = self.prefixed_vshard_key(&key);
+        let epoch_key = PlacementEpochKey::VirtualShard(key);
+        let floor_key = self.prefixed_epoch_key(&epoch_key);
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
-        let key = self.prefixed_vshard_key(&key);
         let current = inner
             .vshards
-            .get(&key)
-            .map(|(version, _revision, _record)| *version);
-        if current != expected {
+            .get(&placement_key)
+            .map(|(token, _revision, record)| (*token, record.epoch));
+        if current.map(|(token, _epoch)| token) != expected {
             return Err(PlacementError::CompareAndPutFailed);
         }
-        let next = PlacementVersion(current.map_or(1, |version| version.0 + 1));
+        reserve_memory_epoch(&mut inner, floor_key, epoch_key, current, expected, None)
+    }
+
+    async fn commit_virtual_shard_epoch(
+        &self,
+        reservation: PlacementEpochReservation,
+        value: VirtualShardPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        let PlacementEpochKey::VirtualShard(key) = reservation.key().clone() else {
+            return Err(PlacementError::EpochReservationMismatch);
+        };
+        if virtual_shard_record_key(&value) != key || value.epoch != reservation.epoch() {
+            return Err(PlacementError::EpochReservationMismatch);
+        }
+        let placement_key = self.prefixed_vshard_key(&key);
+        let floor_key = self.prefixed_epoch_key(reservation.key());
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        validate_memory_reservation(
+            &inner,
+            &floor_key,
+            reservation.key(),
+            reservation.epoch(),
+            reservation.floor_token(),
+        )?;
+        let current = inner
+            .vshards
+            .get(&placement_key)
+            .map(|(token, _revision, _record)| *token);
+        if current != reservation.expected_record() || reservation.guard().is_some() {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
         let revision = inner.next_placement_revision();
-        let watch_key = key.key.clone();
-        inner.vshards.insert(key, (next, revision, value.clone()));
+        let token = placement_token(revision);
+        inner.epoch_floors.insert(
+            floor_key,
+            (
+                token,
+                EpochFloorRecord {
+                    key: reservation.key,
+                    epoch: reservation.epoch,
+                },
+            ),
+        );
+        inner
+            .vshards
+            .insert(placement_key, (token, revision, value.clone()));
         inner.notify(
             &self.prefix,
             PlacementWatchEvent::VirtualShardUpdated {
-                key: watch_key.clone(),
-                version: next,
+                key: key.clone(),
+                version: token,
                 record: value.clone(),
             },
         );
@@ -388,13 +622,74 @@ impl PlacementStore for InMemoryPlacementStore {
             &self.prefix,
             OwnershipWatchBatch {
                 revision,
-                events: vec![OwnershipWatchEvent::VirtualShardUpserted {
-                    key: watch_key,
-                    record: value,
-                }],
+                events: vec![OwnershipWatchEvent::VirtualShardUpserted { key, record: value }],
             },
         );
-        Ok(next)
+        Ok(token)
+    }
+
+    async fn compare_and_put_virtual_shard(
+        &self,
+        key: VirtualShardPlacementKey,
+        expected: Option<PlacementVersion>,
+        value: VirtualShardPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        if virtual_shard_record_key(&value) != key {
+            return Err(PlacementError::EpochReservationMismatch);
+        }
+        let placement_key = self.prefixed_vshard_key(&key);
+        let epoch_key = PlacementEpochKey::VirtualShard(key.clone());
+        let floor_key = self.prefixed_epoch_key(&epoch_key);
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let current = inner
+            .vshards
+            .get(&placement_key)
+            .map(|(token, _revision, record)| (*token, record.clone()));
+        if current.as_ref().map(|(token, _record)| *token) != expected {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let floor = memory_floor(&inner, &floor_key, &epoch_key)?;
+        let authority_changed = current
+            .as_ref()
+            .is_some_and(|(_token, record)| record.owner != value.owner);
+        crate::storage::validate_legacy_epoch(
+            current.as_ref().map(|(_token, record)| record.epoch),
+            floor.as_ref().map(|(_token, floor)| floor.epoch),
+            value.epoch,
+            authority_changed,
+            false,
+        )?;
+        let revision = inner.next_placement_revision();
+        let token = placement_token(revision);
+        inner.epoch_floors.insert(
+            floor_key,
+            (
+                token,
+                EpochFloorRecord {
+                    key: epoch_key,
+                    epoch: value.epoch,
+                },
+            ),
+        );
+        inner
+            .vshards
+            .insert(placement_key, (token, revision, value.clone()));
+        inner.notify(
+            &self.prefix,
+            PlacementWatchEvent::VirtualShardUpdated {
+                key: key.clone(),
+                version: token,
+                record: value.clone(),
+            },
+        );
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::VirtualShardUpserted { key, record: value }],
+            },
+        );
+        Ok(token)
     }
 
     async fn get_singleton(
@@ -424,32 +719,77 @@ impl PlacementStore for InMemoryPlacementStore {
             .collect())
     }
 
-    async fn compare_and_put_singleton(
+    async fn reserve_singleton_epoch(
         &self,
         key: SingletonKey,
         expected: Option<PlacementVersion>,
-        value: SingletonPlacementRecord,
-    ) -> Result<PlacementVersion, PlacementError> {
+        singleton_lock: Option<LeaseId>,
+    ) -> Result<PlacementEpochReservation, PlacementError> {
+        let placement_key = self.prefixed_singleton_key(&key);
+        let epoch_key = PlacementEpochKey::Singleton(key);
+        let floor_key = self.prefixed_epoch_key(&epoch_key);
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
-        let key = self.prefixed_singleton_key(&key);
         let current = inner
             .singletons
-            .get(&key)
-            .map(|(version, _revision, _record)| *version);
-        if current != expected {
+            .get(&placement_key)
+            .map(|(token, _revision, record)| (*token, record.epoch));
+        if current.map(|(token, _epoch)| token) != expected {
             return Err(PlacementError::CompareAndPutFailed);
         }
-        let next = PlacementVersion(current.map_or(1, |version| version.0 + 1));
+        let guard = singleton_lock.map(PlacementEpochGuard::Singleton);
+        validate_memory_guard(&inner, None, Some(&placement_key), guard)?;
+        reserve_memory_epoch(&mut inner, floor_key, epoch_key, current, expected, guard)
+    }
+
+    async fn commit_singleton_epoch(
+        &self,
+        reservation: PlacementEpochReservation,
+        value: SingletonPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        let PlacementEpochKey::Singleton(key) = reservation.key().clone() else {
+            return Err(PlacementError::EpochReservationMismatch);
+        };
+        if singleton_record_key(&value) != key || value.epoch != reservation.epoch() {
+            return Err(PlacementError::EpochReservationMismatch);
+        }
+        let placement_key = self.prefixed_singleton_key(&key);
+        let floor_key = self.prefixed_epoch_key(reservation.key());
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        validate_memory_reservation(
+            &inner,
+            &floor_key,
+            reservation.key(),
+            reservation.epoch(),
+            reservation.floor_token(),
+        )?;
+        let current = inner
+            .singletons
+            .get(&placement_key)
+            .map(|(token, _revision, _record)| *token);
+        if current != reservation.expected_record() {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        validate_memory_guard(&inner, None, Some(&placement_key), reservation.guard())?;
         let revision = inner.next_placement_revision();
-        let watch_key = key.key.clone();
+        let token = placement_token(revision);
+        inner.epoch_floors.insert(
+            floor_key,
+            (
+                token,
+                EpochFloorRecord {
+                    key: reservation.key,
+                    epoch: reservation.epoch,
+                },
+            ),
+        );
         inner
             .singletons
-            .insert(key, (next, revision, value.clone()));
+            .insert(placement_key, (token, revision, value.clone()));
         inner.notify(
             &self.prefix,
             PlacementWatchEvent::SingletonUpdated {
-                key: watch_key.clone(),
-                version: next,
+                key: key.clone(),
+                version: token,
                 record: value.clone(),
             },
         );
@@ -457,13 +797,78 @@ impl PlacementStore for InMemoryPlacementStore {
             &self.prefix,
             OwnershipWatchBatch {
                 revision,
-                events: vec![OwnershipWatchEvent::SingletonUpserted {
-                    key: watch_key,
-                    record: value,
-                }],
+                events: vec![OwnershipWatchEvent::SingletonUpserted { key, record: value }],
             },
         );
-        Ok(next)
+        Ok(token)
+    }
+
+    async fn compare_and_put_singleton(
+        &self,
+        key: SingletonKey,
+        expected: Option<PlacementVersion>,
+        value: SingletonPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        if singleton_record_key(&value) != key {
+            return Err(PlacementError::EpochReservationMismatch);
+        }
+        let placement_key = self.prefixed_singleton_key(&key);
+        let epoch_key = PlacementEpochKey::Singleton(key.clone());
+        let floor_key = self.prefixed_epoch_key(&epoch_key);
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let current = inner
+            .singletons
+            .get(&placement_key)
+            .map(|(token, _revision, record)| (*token, record.clone()));
+        if current.as_ref().map(|(token, _record)| *token) != expected {
+            return Err(PlacementError::CompareAndPutFailed);
+        }
+        let floor = memory_floor(&inner, &floor_key, &epoch_key)?;
+        let authority_changed = current.as_ref().is_some_and(|(_token, record)| {
+            record.owner != value.owner || record.lease_id != value.lease_id
+        });
+        let reactivating = current.as_ref().is_some_and(|(_token, record)| {
+            record.state == crate::storage::PlacementState::Stopped
+                && value.state != crate::storage::PlacementState::Stopped
+        });
+        crate::storage::validate_legacy_epoch(
+            current.as_ref().map(|(_token, record)| record.epoch),
+            floor.as_ref().map(|(_token, floor)| floor.epoch),
+            value.epoch,
+            authority_changed,
+            reactivating,
+        )?;
+        let revision = inner.next_placement_revision();
+        let token = placement_token(revision);
+        inner.epoch_floors.insert(
+            floor_key,
+            (
+                token,
+                EpochFloorRecord {
+                    key: epoch_key,
+                    epoch: value.epoch,
+                },
+            ),
+        );
+        inner
+            .singletons
+            .insert(placement_key, (token, revision, value.clone()));
+        inner.notify(
+            &self.prefix,
+            PlacementWatchEvent::SingletonUpdated {
+                key: key.clone(),
+                version: token,
+                record: value.clone(),
+            },
+        );
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::SingletonUpserted { key, record: value }],
+            },
+        );
+        Ok(token)
     }
 
     async fn acquire_singleton_lock(&self, key: SingletonKey) -> Result<LeaseId, PlacementError> {
@@ -636,6 +1041,115 @@ impl PlacementStore for InMemoryPlacementStore {
     }
 }
 
+fn placement_token(revision: PlacementRevision) -> PlacementVersion {
+    PlacementVersion::from_modification_revision(revision.0)
+}
+
+fn reserve_memory_epoch(
+    inner: &mut PlacementStoreInner,
+    floor_key: PrefixedEpochKey,
+    epoch_key: PlacementEpochKey,
+    current: Option<(PlacementVersion, Epoch)>,
+    expected: Option<PlacementVersion>,
+    guard: Option<PlacementEpochGuard>,
+) -> Result<PlacementEpochReservation, PlacementError> {
+    let floor = memory_floor(inner, &floor_key, &epoch_key)?;
+    let epoch = crate::storage::next_reserved_epoch(
+        current.map(|(_token, epoch)| epoch),
+        floor.as_ref().map(|(_token, floor)| floor.epoch),
+    )?;
+    let revision = inner.next_placement_revision();
+    let floor_token = placement_token(revision);
+    inner.epoch_floors.insert(
+        floor_key,
+        (
+            floor_token,
+            EpochFloorRecord {
+                key: epoch_key.clone(),
+                epoch,
+            },
+        ),
+    );
+    Ok(PlacementEpochReservation::new(
+        epoch_key,
+        epoch,
+        expected,
+        floor_token,
+        guard,
+    ))
+}
+
+fn memory_floor(
+    inner: &PlacementStoreInner,
+    floor_key: &PrefixedEpochKey,
+    expected_key: &PlacementEpochKey,
+) -> Result<Option<(PlacementVersion, EpochFloorRecord)>, PlacementError> {
+    let floor = inner.epoch_floors.get(floor_key).cloned();
+    if floor
+        .as_ref()
+        .is_some_and(|(_token, floor)| &floor.key != expected_key)
+    {
+        return Err(PlacementError::EpochReservationMismatch);
+    }
+    Ok(floor)
+}
+
+fn validate_memory_reservation(
+    inner: &PlacementStoreInner,
+    floor_key: &PrefixedEpochKey,
+    expected_key: &PlacementEpochKey,
+    expected_epoch: Epoch,
+    expected_token: PlacementVersion,
+) -> Result<(), PlacementError> {
+    match memory_floor(inner, floor_key, expected_key)? {
+        Some((token, floor)) if token == expected_token && floor.epoch == expected_epoch => Ok(()),
+        _ => Err(PlacementError::CompareAndPutFailed),
+    }
+}
+
+fn validate_memory_guard(
+    inner: &PlacementStoreInner,
+    actor_key: Option<&PrefixedActorKey>,
+    singleton_key: Option<&PrefixedSingletonKey>,
+    guard: Option<PlacementEpochGuard>,
+) -> Result<(), PlacementError> {
+    match guard {
+        None => Ok(()),
+        Some(PlacementEpochGuard::Actor(expected)) => match actor_key {
+            Some(key) if inner.activation_locks.get(key) == Some(&expected) => Ok(()),
+            _ => Err(PlacementError::ActivationLockLost),
+        },
+        Some(PlacementEpochGuard::Singleton(expected)) => match singleton_key {
+            Some(key) if inner.singleton_locks.get(key) == Some(&expected) => Ok(()),
+            _ => Err(PlacementError::SingletonLockLost),
+        },
+    }
+}
+
+fn actor_record_key(record: &ActorPlacementRecord) -> ActorPlacementKey {
+    ActorPlacementKey {
+        service_kind: record.service_kind.clone(),
+        actor_kind: record.actor_kind.clone(),
+        actor_id: record.actor_id.clone(),
+    }
+}
+
+fn virtual_shard_record_key(record: &VirtualShardPlacementRecord) -> VirtualShardPlacementKey {
+    VirtualShardPlacementKey {
+        service_kind: record.service_kind.clone(),
+        actor_kind: record.actor_kind.clone(),
+        shard_id: record.shard_id,
+    }
+}
+
+fn singleton_record_key(record: &SingletonPlacementRecord) -> SingletonKey {
+    SingletonKey {
+        service_kind: record.service_kind.clone(),
+        singleton_kind: record.singleton_kind.clone(),
+        scope: record.scope.clone(),
+    }
+}
+
 #[derive(Debug, Default)]
 struct PlacementStoreInner {
     placement_revision: u64,
@@ -659,6 +1173,7 @@ struct PlacementStoreInner {
             SingletonPlacementRecord,
         ),
     >,
+    epoch_floors: HashMap<PrefixedEpochKey, (PlacementVersion, EpochFloorRecord)>,
     activation_locks: HashMap<PrefixedActorKey, LeaseId>,
     singleton_locks: HashMap<PrefixedSingletonKey, LeaseId>,
     watchers: HashMap<PlacementPrefix, broadcast::Sender<PlacementWatchEvent>>,
@@ -724,3 +1239,12 @@ struct PrefixedSingletonKey {
     prefix: PlacementPrefix,
     key: SingletonKey,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PrefixedEpochKey {
+    prefix: PlacementPrefix,
+    key: PlacementEpochKey,
+}
+
+#[cfg(test)]
+mod tests;

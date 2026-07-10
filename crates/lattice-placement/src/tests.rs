@@ -39,7 +39,7 @@ use crate::storage::memory::InMemoryPlacementStore;
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, OwnershipViewError, OwnershipViewRecord,
     OwnershipWatchError, OwnershipWatchEvent, PlacementPrefix, PlacementRevision, PlacementState,
-    PlacementStore, PlacementVersion, PlacementWatchEvent, SingletonKey, SingletonPlacementRecord,
+    PlacementStore, PlacementWatchEvent, SingletonKey, SingletonPlacementRecord,
     VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
@@ -285,6 +285,25 @@ async fn round_robin_assigner_plans_deterministic_shard_owners() {
 }
 
 #[tokio::test]
+async fn round_robin_assigner_rejects_owner_change_after_epoch_exhaustion() {
+    let result = RoundRobinShardAssigner
+        .plan(assign_input(
+            1,
+            vec![InstanceId::new("b")],
+            vec![VirtualShardAssignment {
+                shard_id: VirtualShardId(0),
+                owner: InstanceId::new("a"),
+                epoch: Epoch(u64::MAX),
+            }],
+            BTreeSet::new(),
+            usize::MAX,
+        ))
+        .await;
+
+    assert_eq!(result, Err(PlacementError::EpochExhausted));
+}
+
+#[tokio::test]
 async fn assigner_registry_returns_registered_assigner_by_stable_name() {
     let registry = VirtualShardAssignerRegistry::new();
 
@@ -414,7 +433,9 @@ async fn in_memory_placement_store_compare_and_puts_actor_records() {
         .compare_and_put_actor(key.clone(), None, record.clone())
         .await;
     let updated = ActorPlacementRecord {
+        owner: InstanceId::new("world-b"),
         epoch: Epoch(2),
+        lease_id: LeaseId(11),
         ..record
     };
     let next = store
@@ -422,9 +443,8 @@ async fn in_memory_placement_store_compare_and_puts_actor_records() {
         .await
         .unwrap();
 
-    assert_eq!(version, PlacementVersion(1));
+    assert_ne!(version, next);
     assert_eq!(stale, Err(PlacementError::CompareAndPutFailed));
-    assert_eq!(next, PlacementVersion(2));
     assert_eq!(store.get_actor(&key).await.unwrap().unwrap().1, updated);
 }
 
@@ -451,9 +471,8 @@ async fn in_memory_placement_store_persists_virtual_shard_records() {
         .await
         .unwrap();
 
-    assert_eq!(version, PlacementVersion(1));
+    assert_ne!(version, next);
     assert_eq!(stale, Err(PlacementError::CompareAndPutFailed));
-    assert_eq!(next, PlacementVersion(2));
     assert_eq!(
         store.get_virtual_shard(&key).await.unwrap().unwrap().1,
         updated
@@ -492,7 +511,7 @@ async fn placement_watch_reports_virtual_shard_updates() {
 }
 
 #[tokio::test]
-async fn ownership_view_orders_independent_per_key_versions_with_global_revisions() {
+async fn ownership_view_uses_non_aba_modification_tokens_with_global_revisions() {
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
     let mut view = store
         .open_ownership_view(
@@ -518,8 +537,7 @@ async fn ownership_view_orders_independent_per_key_versions_with_global_revision
     let first_batch = view.watch.next().await.unwrap();
     let second_batch = view.watch.next().await.unwrap();
 
-    assert_eq!(first_version, PlacementVersion(1));
-    assert_eq!(second_version, PlacementVersion(1));
+    assert_ne!(first_version, second_version);
     assert_eq!(view.snapshot.revision, PlacementRevision(0));
     assert_eq!(first_batch.revision, PlacementRevision(1));
     assert_eq!(second_batch.revision, PlacementRevision(2));

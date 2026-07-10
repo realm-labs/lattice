@@ -13,10 +13,13 @@ use tokio::time::timeout;
 use super::*;
 use crate::sharding::VirtualShardId;
 use crate::storage::etcd::EtcdPlacementStore;
-use crate::storage::etcd::codec::{actor_key, encode_etcd_value, vshard_key};
+use crate::storage::etcd::codec::{
+    actor_key, encode_etcd_value, epoch_floor_key, singleton_key, vshard_key,
+};
 use crate::storage::{
-    ActorPlacementKey, ActorPlacementRecord, OwnershipWatch, OwnershipWatchBatch,
-    OwnershipWatchEvent, OwnershipWatchUpdate, PlacementPrefix, PlacementState, PlacementStore,
+    ActorPlacementKey, ActorPlacementRecord, EpochFloorRecord, OwnershipWatch, OwnershipWatchBatch,
+    OwnershipWatchEvent, OwnershipWatchUpdate, PlacementEpochKey, PlacementEpochReservation,
+    PlacementPrefix, PlacementState, PlacementStore, SingletonKey, SingletonPlacementRecord,
     VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
@@ -294,6 +297,381 @@ async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compac
     delete_namespace(&mut raw, &compact_namespace).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a real etcd endpoint in LATTICE_TEST_ETCD_ENDPOINT"]
+async fn real_etcd_epoch_floors_fence_delete_restart_guards_concurrency_and_overflow() {
+    let endpoint = std::env::var(TEST_ETCD_ENDPOINT)
+        .unwrap_or_else(|_| panic!("set {TEST_ETCD_ENDPOINT} to a real etcd endpoint"));
+    assert!(
+        !endpoint.trim().is_empty(),
+        "{TEST_ETCD_ENDPOINT} must not be blank"
+    );
+    let endpoints = vec![endpoint];
+    let mut raw = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("connect raw real-etcd epoch test client");
+    let namespace = unique_namespace("epoch-floors");
+    delete_namespace(&mut raw, &namespace).await;
+    let prefix = PlacementPrefix::new(namespace.clone());
+    let real = RealEtcdClient::connect(
+        endpoints.clone(),
+        InstanceLeaseTtl::new(30),
+        ActivationLockTtl::new(30),
+    )
+    .await
+    .expect("connect epoch placement client");
+    let inspector = real.clone();
+    let store = EtcdPlacementStore::new(prefix.clone(), real);
+    let actor = actor_key_for_real_test(7);
+    let shard = vshard_key_for_real_test(3);
+    let singleton = singleton_key_for_real_test("global");
+    let singleton_lease = store
+        .grant_instance_lease()
+        .await
+        .expect("grant singleton owner lease");
+
+    let actor_token = store
+        .compare_and_put_actor(actor.clone(), None, actor_record(7, "world-a", 5))
+        .await
+        .expect("seed actor floor and record");
+    let shard_token = store
+        .compare_and_put_virtual_shard(
+            shard.clone(),
+            None,
+            vshard_record_for_real_test(3, "world-a", 5),
+        )
+        .await
+        .expect("seed shard floor and record");
+    let singleton_token = store
+        .compare_and_put_singleton(
+            singleton.clone(),
+            None,
+            singleton_record_for_real_test("global", "world-a", 5, singleton_lease),
+        )
+        .await
+        .expect("seed leased singleton floor and record");
+
+    for (record_token, floor_key) in [
+        (actor_token, PlacementEpochKey::Actor(actor.clone())),
+        (shard_token, PlacementEpochKey::VirtualShard(shard.clone())),
+        (
+            singleton_token,
+            PlacementEpochKey::Singleton(singleton.clone()),
+        ),
+    ] {
+        let (floor_token, _) = inspector
+            .get(&epoch_floor_key(&prefix, &floor_key))
+            .await
+            .expect("read committed real-etcd floor")
+            .expect("committed real-etcd floor must exist");
+        assert_eq!(floor_token, record_token);
+    }
+
+    raw.delete(actor_key(&prefix, &actor), None)
+        .await
+        .expect("delete real-etcd actor record");
+    raw.delete(vshard_key(&prefix, &shard), None)
+        .await
+        .expect("delete real-etcd shard record");
+    raw.lease_revoke(
+        i64::try_from(singleton_lease.0).expect("singleton lease must fit real-etcd i64"),
+    )
+    .await
+    .expect("revoke singleton owner lease");
+    assert!(
+        inspector
+            .get(&singleton_key(&prefix, &singleton))
+            .await
+            .expect("read singleton after lease revoke")
+            .is_none()
+    );
+    assert!(
+        inspector
+            .get(&epoch_floor_key(
+                &prefix,
+                &PlacementEpochKey::Singleton(singleton.clone()),
+            ))
+            .await
+            .expect("read singleton floor after lease revoke")
+            .is_some(),
+        "the singleton floor must not share its placement lease"
+    );
+    drop(store);
+
+    let reconstructed_client = RealEtcdClient::connect(
+        endpoints.clone(),
+        InstanceLeaseTtl::new(30),
+        ActivationLockTtl::new(30),
+    )
+    .await
+    .expect("reconstruct real-etcd epoch placement client");
+    let reconstructed_inspector = reconstructed_client.clone();
+    let reconstructed = EtcdPlacementStore::new(prefix.clone(), reconstructed_client);
+    let replacement_lease = reconstructed
+        .grant_instance_lease()
+        .await
+        .expect("grant replacement singleton lease");
+
+    assert_eq!(
+        reconstructed
+            .compare_and_put_actor(
+                actor.clone(),
+                Some(actor_token),
+                actor_record(7, "world-b", 6),
+            )
+            .await,
+        Err(PlacementError::CompareAndPutFailed)
+    );
+    assert_eq!(
+        reconstructed
+            .compare_and_put_virtual_shard(
+                shard.clone(),
+                Some(shard_token),
+                vshard_record_for_real_test(3, "world-b", 6),
+            )
+            .await,
+        Err(PlacementError::CompareAndPutFailed)
+    );
+    assert_eq!(
+        reconstructed
+            .compare_and_put_singleton(
+                singleton.clone(),
+                Some(singleton_token),
+                singleton_record_for_real_test("global", "world-b", 6, replacement_lease,),
+            )
+            .await,
+        Err(PlacementError::CompareAndPutFailed)
+    );
+
+    let actor_reservation = reconstructed
+        .reserve_actor_epoch(actor.clone(), None, None)
+        .await
+        .expect("reserve post-delete actor epoch");
+    let shard_reservation = reconstructed
+        .reserve_virtual_shard_epoch(shard.clone(), None)
+        .await
+        .expect("reserve post-delete shard epoch");
+    let singleton_reservation = reconstructed
+        .reserve_singleton_epoch(singleton.clone(), None, None)
+        .await
+        .expect("reserve post-delete singleton epoch");
+    assert_eq!(actor_reservation.epoch(), Epoch(6));
+    assert_eq!(shard_reservation.epoch(), Epoch(6));
+    assert_eq!(singleton_reservation.epoch(), Epoch(6));
+    let actor_committed = reconstructed
+        .commit_actor_epoch(actor_reservation, actor_record(7, "world-b", 6))
+        .await
+        .expect("commit post-delete actor");
+    let shard_committed = reconstructed
+        .commit_virtual_shard_epoch(
+            shard_reservation,
+            vshard_record_for_real_test(3, "world-b", 6),
+        )
+        .await
+        .expect("commit post-delete shard");
+    let singleton_committed = reconstructed
+        .commit_singleton_epoch(
+            singleton_reservation,
+            singleton_record_for_real_test("global", "world-b", 6, replacement_lease),
+        )
+        .await
+        .expect("commit post-delete singleton");
+    for (record_token, floor_key) in [
+        (actor_committed, PlacementEpochKey::Actor(actor.clone())),
+        (
+            shard_committed,
+            PlacementEpochKey::VirtualShard(shard.clone()),
+        ),
+        (
+            singleton_committed,
+            PlacementEpochKey::Singleton(singleton.clone()),
+        ),
+    ] {
+        let floor_token = reconstructed_inspector
+            .get(&epoch_floor_key(&prefix, &floor_key))
+            .await
+            .expect("read reconstructed floor")
+            .expect("reconstructed floor must exist")
+            .0;
+        assert_eq!(floor_token, record_token);
+    }
+
+    assert_eq!(
+        reconstructed
+            .compare_and_put_actor(
+                actor.clone(),
+                Some(actor_token),
+                actor_record(7, "world-c", 7),
+            )
+            .await,
+        Err(PlacementError::CompareAndPutFailed),
+        "a pre-delete actor token must not match the recreated key",
+    );
+    assert_eq!(
+        reconstructed
+            .compare_and_put_virtual_shard(
+                shard.clone(),
+                Some(shard_token),
+                vshard_record_for_real_test(3, "world-c", 7),
+            )
+            .await,
+        Err(PlacementError::CompareAndPutFailed),
+        "a pre-delete shard token must not match the recreated key",
+    );
+    assert_eq!(
+        reconstructed
+            .compare_and_put_singleton(
+                singleton.clone(),
+                Some(singleton_token),
+                singleton_record_for_real_test("global", "world-c", 7, replacement_lease),
+            )
+            .await,
+        Err(PlacementError::CompareAndPutFailed),
+        "a pre-delete singleton token must not match the recreated key",
+    );
+
+    let guarded_actor = actor_key_for_real_test(8);
+    let activation_lock = reconstructed
+        .acquire_activation_lock(guarded_actor.clone())
+        .await
+        .expect("acquire real-etcd activation lock");
+    let guarded_actor_reservation = reconstructed
+        .reserve_actor_epoch(guarded_actor.clone(), None, Some(activation_lock))
+        .await
+        .expect("reserve guarded actor epoch");
+    reconstructed
+        .release_activation_lock(&guarded_actor, activation_lock)
+        .await
+        .expect("release real-etcd activation lock");
+    assert_eq!(
+        reconstructed
+            .commit_actor_epoch(guarded_actor_reservation, actor_record(8, "world-a", 1),)
+            .await,
+        Err(PlacementError::CompareAndPutFailed)
+    );
+
+    let guarded_singleton = singleton_key_for_real_test("guarded");
+    let singleton_lock = reconstructed
+        .acquire_singleton_lock(guarded_singleton.clone())
+        .await
+        .expect("acquire real-etcd singleton lock");
+    let guarded_singleton_reservation = reconstructed
+        .reserve_singleton_epoch(guarded_singleton.clone(), None, Some(singleton_lock))
+        .await
+        .expect("reserve guarded singleton epoch");
+    reconstructed
+        .release_singleton_lock(&guarded_singleton, singleton_lock)
+        .await
+        .expect("release real-etcd singleton lock");
+    assert_eq!(
+        reconstructed
+            .commit_singleton_epoch(
+                guarded_singleton_reservation,
+                singleton_record_for_real_test("guarded", "world-a", 1, replacement_lease,),
+            )
+            .await,
+        Err(PlacementError::CompareAndPutFailed)
+    );
+
+    let racing_actor = actor_key_for_real_test(70);
+    let (left, right) = tokio::join!(
+        reconstructed.reserve_actor_epoch(racing_actor.clone(), None, None),
+        reconstructed.reserve_actor_epoch(racing_actor.clone(), None, None),
+    );
+    let mut actor_reservations = successful_real_reservations(left, right);
+    let actor_winner = actor_reservations.pop().unwrap();
+    for loser in actor_reservations {
+        let epoch = loser.epoch().0;
+        assert_eq!(
+            reconstructed
+                .commit_actor_epoch(loser, actor_record(70, "world-a", epoch))
+                .await,
+            Err(PlacementError::CompareAndPutFailed)
+        );
+    }
+    let actor_epoch = actor_winner.epoch().0;
+    reconstructed
+        .commit_actor_epoch(actor_winner, actor_record(70, "world-a", actor_epoch))
+        .await
+        .expect("commit winning concurrent actor reservation");
+
+    let racing_shard = vshard_key_for_real_test(30);
+    let (left, right) = tokio::join!(
+        reconstructed.reserve_virtual_shard_epoch(racing_shard.clone(), None),
+        reconstructed.reserve_virtual_shard_epoch(racing_shard.clone(), None),
+    );
+    let mut shard_reservations = successful_real_reservations(left, right);
+    let shard_winner = shard_reservations.pop().unwrap();
+    for loser in shard_reservations {
+        let epoch = loser.epoch().0;
+        assert_eq!(
+            reconstructed
+                .commit_virtual_shard_epoch(
+                    loser,
+                    vshard_record_for_real_test(30, "world-a", epoch),
+                )
+                .await,
+            Err(PlacementError::CompareAndPutFailed)
+        );
+    }
+    let shard_epoch = shard_winner.epoch().0;
+    reconstructed
+        .commit_virtual_shard_epoch(
+            shard_winner,
+            vshard_record_for_real_test(30, "world-a", shard_epoch),
+        )
+        .await
+        .expect("commit winning concurrent shard reservation");
+
+    let racing_singleton = singleton_key_for_real_test("racing");
+    let (left, right) = tokio::join!(
+        reconstructed.reserve_singleton_epoch(racing_singleton.clone(), None, None),
+        reconstructed.reserve_singleton_epoch(racing_singleton.clone(), None, None),
+    );
+    let mut singleton_reservations = successful_real_reservations(left, right);
+    let singleton_winner = singleton_reservations.pop().unwrap();
+    for loser in singleton_reservations {
+        let epoch = loser.epoch().0;
+        assert_eq!(
+            reconstructed
+                .commit_singleton_epoch(
+                    loser,
+                    singleton_record_for_real_test("racing", "world-a", epoch, replacement_lease,),
+                )
+                .await,
+            Err(PlacementError::CompareAndPutFailed)
+        );
+    }
+    let singleton_epoch = singleton_winner.epoch().0;
+    reconstructed
+        .commit_singleton_epoch(
+            singleton_winner,
+            singleton_record_for_real_test("racing", "world-a", singleton_epoch, replacement_lease),
+        )
+        .await
+        .expect("commit winning concurrent singleton reservation");
+
+    let exhausted_actor = actor_key_for_real_test(99);
+    let exhausted_key = PlacementEpochKey::Actor(exhausted_actor.clone());
+    put_value(
+        &mut raw,
+        epoch_floor_key(&prefix, &exhausted_key),
+        EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+            key: exhausted_key,
+            epoch: Epoch(u64::MAX),
+        })),
+    )
+    .await;
+    assert!(matches!(
+        reconstructed
+            .reserve_actor_epoch(exhausted_actor, None, None)
+            .await,
+        Err(PlacementError::EpochExhausted)
+    ));
+
+    delete_namespace(&mut raw, &namespace).await;
+}
+
 async fn next_batch(watch: &mut OwnershipWatch) -> OwnershipWatchBatch {
     timeout(TEST_TIMEOUT, async {
         loop {
@@ -392,4 +770,85 @@ fn actor_record(actor_id: u64, owner: &str, epoch: u64) -> ActorPlacementRecord 
         lease_id: LeaseId(1),
         state: PlacementState::Running,
     }
+}
+
+fn actor_key_for_real_test(actor_id: u64) -> ActorPlacementKey {
+    ActorPlacementKey {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(actor_id),
+    }
+}
+
+fn vshard_key_for_real_test(shard_id: u32) -> VirtualShardPlacementKey {
+    VirtualShardPlacementKey {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        shard_id: VirtualShardId(shard_id),
+    }
+}
+
+fn vshard_record_for_real_test(
+    shard_id: u32,
+    owner: &str,
+    epoch: u64,
+) -> VirtualShardPlacementRecord {
+    VirtualShardPlacementRecord {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        shard_id: VirtualShardId(shard_id),
+        owner: InstanceId::new(owner),
+        epoch: Epoch(epoch),
+    }
+}
+
+fn singleton_key_for_real_test(scope: &str) -> SingletonKey {
+    SingletonKey {
+        service_kind: service_kind!("World"),
+        singleton_kind: actor_kind!("SeasonManager"),
+        scope: scope.to_string(),
+    }
+}
+
+fn singleton_record_for_real_test(
+    scope: &str,
+    owner: &str,
+    epoch: u64,
+    lease_id: LeaseId,
+) -> SingletonPlacementRecord {
+    SingletonPlacementRecord {
+        service_kind: service_kind!("World"),
+        singleton_kind: actor_kind!("SeasonManager"),
+        scope: scope.to_string(),
+        owner: InstanceId::new(owner),
+        epoch: Epoch(epoch),
+        lease_id,
+        state: PlacementState::Running,
+    }
+}
+
+fn successful_real_reservations(
+    left: Result<PlacementEpochReservation, PlacementError>,
+    right: Result<PlacementEpochReservation, PlacementError>,
+) -> Vec<PlacementEpochReservation> {
+    let mut reservations = Vec::new();
+    for result in [left, right] {
+        match result {
+            Ok(reservation) => reservations.push(reservation),
+            Err(PlacementError::CompareAndPutFailed) => {}
+            Err(error) => panic!("concurrent real-etcd reservation failed unexpectedly: {error}"),
+        }
+    }
+    assert!(
+        !reservations.is_empty(),
+        "at least one concurrent real-etcd reservation must succeed"
+    );
+    reservations.sort_by_key(|reservation| reservation.epoch());
+    assert!(
+        reservations
+            .windows(2)
+            .all(|pair| pair[0].epoch() < pair[1].epoch()),
+        "successful concurrent reservations must have distinct epochs"
+    );
+    reservations
 }

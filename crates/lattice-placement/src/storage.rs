@@ -23,14 +23,31 @@ pub struct ActorPlacementKey {
 #[serde(transparent)]
 pub struct LeaseId(pub u64);
 
+/// Opaque non-ABA token for one placement record modification.
+///
+/// Backends must derive this from a store revision that never resets when a
+/// key is deleted and recreated. Callers may compare and return the token but
+/// must not construct it or perform arithmetic on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct PlacementVersion(pub u64);
+pub struct PlacementVersion(u64);
+
+impl PlacementVersion {
+    pub(crate) const fn from_modification_revision(revision: u64) -> Self {
+        Self(revision)
+    }
+
+    pub(crate) const fn modification_revision(self) -> u64 {
+        self.0
+    }
+}
 
 /// A store-wide ordering token for coherent placement snapshots and watches.
 ///
-/// Unlike [`PlacementVersion`], this revision must not restart for each key.
-/// It orders all ownership mutations observed through one placement store.
+/// [`PlacementVersion`] is an opaque modification token used only for one
+/// record's compare-and-set. `PlacementRevision` orders all ownership
+/// mutations observed through one placement store, including changes that do
+/// not modify that record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PlacementRevision(pub u64);
@@ -77,6 +94,160 @@ pub struct SingletonKey {
     pub service_kind: ServiceKind,
     pub singleton_kind: ActorKind,
     pub scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PlacementEpochKey {
+    Actor(ActorPlacementKey),
+    VirtualShard(VirtualShardPlacementKey),
+    Singleton(SingletonKey),
+}
+
+/// Durable, non-leased high-water mark for one placement identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochFloorRecord {
+    pub key: PlacementEpochKey,
+    pub epoch: Epoch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlacementEpochGuard {
+    Actor(LeaseId),
+    Singleton(LeaseId),
+}
+
+/// One-shot proof that a store atomically advanced an identity's epoch floor.
+///
+/// A reservation is not ownership. It may be consumed only by the matching
+/// commit operation, and abandoning it intentionally burns its epoch.
+#[derive(Debug)]
+pub struct PlacementEpochReservation {
+    pub(crate) key: PlacementEpochKey,
+    pub(crate) epoch: Epoch,
+    pub(crate) expected_record: Option<PlacementVersion>,
+    pub(crate) floor_token: PlacementVersion,
+    pub(crate) guard: Option<PlacementEpochGuard>,
+}
+
+impl PlacementEpochReservation {
+    pub(crate) const fn new(
+        key: PlacementEpochKey,
+        epoch: Epoch,
+        expected_record: Option<PlacementVersion>,
+        floor_token: PlacementVersion,
+        guard: Option<PlacementEpochGuard>,
+    ) -> Self {
+        Self {
+            key,
+            epoch,
+            expected_record,
+            floor_token,
+            guard,
+        }
+    }
+
+    pub fn key(&self) -> &PlacementEpochKey {
+        &self.key
+    }
+
+    pub const fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    pub(crate) const fn expected_record(&self) -> Option<PlacementVersion> {
+        self.expected_record
+    }
+
+    pub(crate) const fn floor_token(&self) -> PlacementVersion {
+        self.floor_token
+    }
+
+    pub(crate) const fn guard(&self) -> Option<PlacementEpochGuard> {
+        self.guard
+    }
+}
+
+pub(crate) fn next_reserved_epoch(
+    record_epoch: Option<Epoch>,
+    floor_epoch: Option<Epoch>,
+) -> Result<Epoch, PlacementError> {
+    validate_floor(record_epoch, floor_epoch)?;
+    let base = record_epoch
+        .into_iter()
+        .chain(floor_epoch)
+        .max()
+        .unwrap_or(Epoch(0));
+    base.0
+        .checked_add(1)
+        .map(Epoch)
+        .ok_or(PlacementError::EpochExhausted)
+}
+
+pub(crate) fn validate_legacy_epoch(
+    record_epoch: Option<Epoch>,
+    floor_epoch: Option<Epoch>,
+    incoming: Epoch,
+    authority_changed: bool,
+    reactivating: bool,
+) -> Result<(), PlacementError> {
+    validate_floor(record_epoch, floor_epoch)?;
+    let Some(current) = record_epoch else {
+        let floor = floor_epoch.unwrap_or(Epoch(0));
+        if floor.0 == u64::MAX {
+            return Err(PlacementError::EpochExhausted);
+        }
+        return if incoming > floor {
+            Ok(())
+        } else {
+            Err(PlacementError::EpochRegression {
+                current: floor,
+                incoming,
+            })
+        };
+    };
+    let floor = floor_epoch.unwrap_or(current);
+    let base = current.max(floor);
+    let must_advance = authority_changed || reactivating || floor > current;
+    if must_advance {
+        if base.0 == u64::MAX {
+            return Err(PlacementError::EpochExhausted);
+        }
+        if incoming > base {
+            return Ok(());
+        }
+        if incoming == current && authority_changed {
+            return Err(PlacementError::EpochAuthorityConflict { epoch: incoming });
+        }
+        if incoming == current && reactivating {
+            return Err(PlacementError::EpochReactivation { epoch: incoming });
+        }
+        return Err(PlacementError::EpochRegression {
+            current: base,
+            incoming,
+        });
+    }
+    if incoming < current {
+        return Err(PlacementError::EpochRegression { current, incoming });
+    }
+    if incoming > current {
+        return Err(PlacementError::EpochMismatch {
+            expected: current,
+            incoming,
+        });
+    }
+    Ok(())
+}
+
+fn validate_floor(
+    record_epoch: Option<Epoch>,
+    floor_epoch: Option<Epoch>,
+) -> Result<(), PlacementError> {
+    if let (Some(record), Some(floor)) = (record_epoch, floor_epoch)
+        && floor < record
+    {
+        return Err(PlacementError::EpochFloorCorrupt { floor, record });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +517,21 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
     async fn list_actors(
         &self,
     ) -> Result<Vec<(PlacementVersion, ActorPlacementRecord)>, PlacementError>;
+    async fn reserve_actor_epoch(
+        &self,
+        _key: ActorPlacementKey,
+        _expected: Option<PlacementVersion>,
+        _activation_lock: Option<LeaseId>,
+    ) -> Result<PlacementEpochReservation, PlacementError> {
+        Err(PlacementError::EpochReservationsUnsupported)
+    }
+    async fn commit_actor_epoch(
+        &self,
+        _reservation: PlacementEpochReservation,
+        _value: ActorPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        Err(PlacementError::EpochReservationsUnsupported)
+    }
     async fn compare_and_put_actor(
         &self,
         key: ActorPlacementKey,
@@ -365,6 +551,20 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
         &self,
         service_kind: &ServiceKind,
     ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
+    async fn reserve_virtual_shard_epoch(
+        &self,
+        _key: VirtualShardPlacementKey,
+        _expected: Option<PlacementVersion>,
+    ) -> Result<PlacementEpochReservation, PlacementError> {
+        Err(PlacementError::EpochReservationsUnsupported)
+    }
+    async fn commit_virtual_shard_epoch(
+        &self,
+        _reservation: PlacementEpochReservation,
+        _value: VirtualShardPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        Err(PlacementError::EpochReservationsUnsupported)
+    }
     async fn compare_and_put_virtual_shard(
         &self,
         key: VirtualShardPlacementKey,
@@ -378,6 +578,21 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
     async fn list_singletons(
         &self,
     ) -> Result<Vec<(PlacementVersion, SingletonPlacementRecord)>, PlacementError>;
+    async fn reserve_singleton_epoch(
+        &self,
+        _key: SingletonKey,
+        _expected: Option<PlacementVersion>,
+        _singleton_lock: Option<LeaseId>,
+    ) -> Result<PlacementEpochReservation, PlacementError> {
+        Err(PlacementError::EpochReservationsUnsupported)
+    }
+    async fn commit_singleton_epoch(
+        &self,
+        _reservation: PlacementEpochReservation,
+        _value: SingletonPlacementRecord,
+    ) -> Result<PlacementVersion, PlacementError> {
+        Err(PlacementError::EpochReservationsUnsupported)
+    }
     async fn compare_and_put_singleton(
         &self,
         key: SingletonKey,
