@@ -672,6 +672,104 @@ async fn real_etcd_epoch_floors_fence_delete_restart_guards_concurrency_and_over
     delete_namespace(&mut raw, &namespace).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a real etcd endpoint in LATTICE_TEST_ETCD_ENDPOINT"]
+async fn real_etcd_record_only_replay_cannot_be_laundered_into_a_hardened_epoch() {
+    let endpoint = std::env::var(TEST_ETCD_ENDPOINT)
+        .unwrap_or_else(|_| panic!("set {TEST_ETCD_ENDPOINT} to a real etcd endpoint"));
+    assert!(
+        !endpoint.trim().is_empty(),
+        "{TEST_ETCD_ENDPOINT} must not be blank"
+    );
+    let endpoints = vec![endpoint];
+    let mut raw = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("connect raw real-etcd lineage test client");
+    let namespace = unique_namespace("epoch-lineage");
+    delete_namespace(&mut raw, &namespace).await;
+    let prefix = PlacementPrefix::new(namespace.clone());
+    let real = RealEtcdClient::connect(
+        endpoints,
+        InstanceLeaseTtl::new(30),
+        ActivationLockTtl::new(30),
+    )
+    .await
+    .expect("connect real-etcd lineage placement client");
+    let inspector = real.clone();
+    let store = EtcdPlacementStore::new(prefix.clone(), real);
+    let actor = actor_key_for_real_test(7);
+    let record_path = actor_key(&prefix, &actor);
+    let floor_path = epoch_floor_key(&prefix, &PlacementEpochKey::Actor(actor.clone()));
+
+    let record_token = store
+        .compare_and_put_actor(actor.clone(), None, actor_record(7, "world-a", 5))
+        .await
+        .expect("seed hardened actor lineage");
+    let burned = store
+        .reserve_actor_epoch(actor.clone(), Some(record_token), None)
+        .await
+        .expect("burn one actor epoch before replay");
+    assert_eq!(burned.epoch(), Epoch(6));
+    drop(burned);
+    let floor_before_replay = inspector
+        .get(&floor_path)
+        .await
+        .expect("read burned real-etcd floor")
+        .expect("burned real-etcd floor must exist");
+
+    put_value(
+        &mut raw,
+        record_path.clone(),
+        EtcdValue::Actor(Box::new(actor_record(7, "world-a", 5))),
+    )
+    .await;
+    let replay_pair = inspector
+        .get(&record_path)
+        .await
+        .expect("read record-only real-etcd replay")
+        .expect("record-only real-etcd replay must exist");
+    assert!(
+        replay_pair.0.modification_revision() > floor_before_replay.0.modification_revision(),
+        "the replay must be newer than the burned floor for this regression",
+    );
+
+    for result in [
+        store
+            .reserve_actor_epoch(actor.clone(), Some(replay_pair.0), None)
+            .await
+            .map(|_| ()),
+        store
+            .compare_and_put_actor(
+                actor.clone(),
+                Some(replay_pair.0),
+                actor_record(7, "world-b", 7),
+            )
+            .await
+            .map(|_| ()),
+    ] {
+        match result {
+            Err(PlacementError::EpochFloorUnproven { record, floor }) => {
+                assert_eq!(record, replay_pair.0);
+                assert_eq!(floor, Some(floor_before_replay.0));
+            }
+            Err(error) => panic!("expected unproven real-etcd lineage, got {error}"),
+            Ok(()) => panic!("record-only real-etcd replay was laundered"),
+        }
+    }
+    assert_eq!(
+        inspector.get(&record_path).await.unwrap().unwrap(),
+        replay_pair,
+        "rejected laundering must not mutate the replayed record",
+    );
+    assert_eq!(
+        inspector.get(&floor_path).await.unwrap().unwrap(),
+        floor_before_replay,
+        "rejected laundering must not advance the durable floor",
+    );
+
+    delete_namespace(&mut raw, &namespace).await;
+}
+
 async fn next_batch(watch: &mut OwnershipWatch) -> OwnershipWatchBatch {
     timeout(TEST_TIMEOUT, async {
         loop {

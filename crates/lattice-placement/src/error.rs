@@ -2,7 +2,7 @@ use lattice_core::actor_ref::Epoch;
 use lattice_core::instance::InstanceId;
 
 use crate::registry::InstanceState;
-use crate::storage::LeaseId;
+use crate::storage::{LeaseId, PlacementVersion};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PlacementError {
@@ -39,6 +39,13 @@ pub enum PlacementError {
     EpochMismatch { expected: Epoch, incoming: Epoch },
     #[error("durable epoch floor {floor:?} is behind placement epoch {record:?}")]
     EpochFloorCorrupt { floor: Epoch, record: Epoch },
+    #[error(
+        "placement record token {record:?} is not proven by durable epoch floor token {floor:?}"
+    )]
+    EpochFloorUnproven {
+        record: PlacementVersion,
+        floor: Option<PlacementVersion>,
+    },
     #[error("placement epoch reservation does not match its record")]
     EpochReservationMismatch,
     #[error("activation lock is already held for actor")]

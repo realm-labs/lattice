@@ -166,7 +166,11 @@ Each actor, virtual-shard, and singleton identity has a durable, non-leased epoc
 
 `PlacementVersion` is an opaque per-write modification-revision token. It must not be implemented as an etcd key `version`, because key versions restart after deletion and permit an old pre-delete CAS token to match a recreated key.
 
-This guarantee begins only after an identity has a floor written by a hardened writer or an upgrade backfill. Before rollout, stop every writer that does not maintain floors and CAS-backfill each live placement record's epoch. An identity whose record was already deleted has no reconstructable last epoch; deployment must seed it from an authoritative source or prohibit its reuse. Mixed old/new placement writers are not a supported rolling-upgrade mode.
+Before advancing a floor, every hardened reservation and compatibility compare-and-put path validates the current record/floor lineage. A live record with no floor fails closed. When their epochs are equal, both keys must have the same modification revision because a hardened commit writes them in one transaction. When the floor is ahead after a burned reservation, its epoch and modification revision must both be newer than the record's. A lower floor or any other token relationship is corrupt or unproven and must not be repaired implicitly by a later write.
+
+Ownership snapshots and watch events may reclaim local tombstones only from a durable floor proof read at the placement record's exact source revision. A latest-value floor read is insufficient because a later reservation could otherwise hide an intervening record-only replay. Missing, malformed, leased, compacted, or lineage-inconsistent proof must fence the view without publishing a partial batch.
+
+This guarantee begins only after an identity has a floor written by a hardened writer or an upgrade backfill. Before rollout, stop every writer that does not maintain floors and prevent its credentials or protocol from writing the hardened namespace. Atomically CAS-backfill each live placement record and its floor at one modification revision, and reject any floor attached to a lease. An identity whose record was already deleted has no reconstructable last epoch; deployment must seed it from an authoritative source or prohibit its reuse. Floors cannot later be deleted as ordinary cleanup. Mixed old/new placement writers are not a supported rolling-upgrade mode.
 
 ### 12.5 Singleton Owner
 

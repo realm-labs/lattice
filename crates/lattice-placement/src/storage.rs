@@ -183,6 +183,48 @@ pub(crate) fn next_reserved_epoch(
         .ok_or(PlacementError::EpochExhausted)
 }
 
+/// Verifies that a live placement record descends from the durable epoch floor.
+///
+/// A hardened record write updates the record and floor in one transaction, so
+/// equal epochs have the same modification revision. A reservation may burn a
+/// newer floor without replacing the incumbent record; in that case both the
+/// floor epoch and its modification revision are strictly newer. Missing
+/// records are valid with or without a floor, but an existing record without a
+/// floor cannot be distinguished from a legacy replay and must fail closed.
+pub(crate) fn validate_epoch_floor_lineage(
+    record: Option<(PlacementVersion, Epoch)>,
+    floor: Option<(PlacementVersion, Epoch)>,
+) -> Result<(), PlacementError> {
+    let Some((record_token, record_epoch)) = record else {
+        return Ok(());
+    };
+    let Some((floor_token, floor_epoch)) = floor else {
+        return Err(PlacementError::EpochFloorUnproven {
+            record: record_token,
+            floor: None,
+        });
+    };
+    if floor_epoch < record_epoch {
+        return Err(PlacementError::EpochFloorCorrupt {
+            floor: floor_epoch,
+            record: record_epoch,
+        });
+    }
+
+    let proven = if floor_epoch == record_epoch {
+        floor_token == record_token
+    } else {
+        floor_token.modification_revision() > record_token.modification_revision()
+    };
+    if !proven {
+        return Err(PlacementError::EpochFloorUnproven {
+            record: record_token,
+            floor: Some(floor_token),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_legacy_epoch(
     record_epoch: Option<Epoch>,
     floor_epoch: Option<Epoch>,

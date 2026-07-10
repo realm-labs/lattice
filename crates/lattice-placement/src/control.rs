@@ -363,6 +363,7 @@ fn status_from_placement(error: PlacementError) -> Status {
         | PlacementError::EpochReactivation { .. }
         | PlacementError::EpochMismatch { .. }
         | PlacementError::EpochFloorCorrupt { .. }
+        | PlacementError::EpochFloorUnproven { .. }
         | PlacementError::EpochReservationMismatch
         | PlacementError::CoordinatorLeadershipLost => {
             Status::failed_precondition(error.to_string())

@@ -453,6 +453,12 @@ impl PlacementStore for InMemoryPlacementStore {
             return Err(PlacementError::CompareAndPutFailed);
         }
         let floor = memory_floor(&inner, &floor_key, &epoch_key)?;
+        crate::storage::validate_epoch_floor_lineage(
+            current
+                .as_ref()
+                .map(|(token, record)| (*token, record.epoch)),
+            floor.as_ref().map(|(token, floor)| (*token, floor.epoch)),
+        )?;
         let authority_changed = current.as_ref().is_some_and(|(_token, record)| {
             record.owner != value.owner || record.lease_id != value.lease_id
         });
@@ -649,6 +655,12 @@ impl PlacementStore for InMemoryPlacementStore {
             return Err(PlacementError::CompareAndPutFailed);
         }
         let floor = memory_floor(&inner, &floor_key, &epoch_key)?;
+        crate::storage::validate_epoch_floor_lineage(
+            current
+                .as_ref()
+                .map(|(token, record)| (*token, record.epoch)),
+            floor.as_ref().map(|(token, floor)| (*token, floor.epoch)),
+        )?;
         let authority_changed = current
             .as_ref()
             .is_some_and(|(_token, record)| record.owner != value.owner);
@@ -824,6 +836,12 @@ impl PlacementStore for InMemoryPlacementStore {
             return Err(PlacementError::CompareAndPutFailed);
         }
         let floor = memory_floor(&inner, &floor_key, &epoch_key)?;
+        crate::storage::validate_epoch_floor_lineage(
+            current
+                .as_ref()
+                .map(|(token, record)| (*token, record.epoch)),
+            floor.as_ref().map(|(token, floor)| (*token, floor.epoch)),
+        )?;
         let authority_changed = current.as_ref().is_some_and(|(_token, record)| {
             record.owner != value.owner || record.lease_id != value.lease_id
         });
@@ -1054,6 +1072,10 @@ fn reserve_memory_epoch(
     guard: Option<PlacementEpochGuard>,
 ) -> Result<PlacementEpochReservation, PlacementError> {
     let floor = memory_floor(inner, &floor_key, &epoch_key)?;
+    crate::storage::validate_epoch_floor_lineage(
+        current,
+        floor.as_ref().map(|(token, floor)| (*token, floor.epoch)),
+    )?;
     let epoch = crate::storage::next_reserved_epoch(
         current.map(|(_token, epoch)| epoch),
         floor.as_ref().map(|(_token, floor)| floor.epoch),

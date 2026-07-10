@@ -8,7 +8,7 @@ use crate::error::PlacementError;
 use crate::sharding::VirtualShardId;
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementEpochKey, PlacementPrefix,
-    PlacementState, PlacementStore, SingletonKey, SingletonPlacementRecord,
+    PlacementState, PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
     VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
@@ -234,6 +234,451 @@ async fn legacy_create_cannot_bypass_retained_floors_after_deletion() {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn live_records_without_floors_fail_closed_without_mutation_for_every_family() {
+    let store = store();
+    let actor_key = actor_key(11);
+    let shard_key = shard_key(11);
+    let singleton_key = singleton_key("missing-floor");
+    let actor = actor_record(11, "world-a", 1, LeaseId(10), PlacementState::Running);
+    let shard = shard_record(11, "world-a", 1);
+    let singleton = singleton_record(
+        "missing-floor",
+        "world-a",
+        1,
+        LeaseId(10),
+        PlacementState::Running,
+    );
+    let actor_token = store
+        .compare_and_put_actor(actor_key.clone(), None, actor.clone())
+        .await
+        .unwrap();
+    let shard_token = store
+        .compare_and_put_virtual_shard(shard_key.clone(), None, shard.clone())
+        .await
+        .unwrap();
+    let singleton_token = store
+        .compare_and_put_singleton(singleton_key.clone(), None, singleton.clone())
+        .await
+        .unwrap();
+    remove_floor(&store, &PlacementEpochKey::Actor(actor_key.clone()));
+    remove_floor(&store, &PlacementEpochKey::VirtualShard(shard_key.clone()));
+    remove_floor(&store, &PlacementEpochKey::Singleton(singleton_key.clone()));
+    let revision = placement_revision(&store);
+
+    assert_eq!(
+        store
+            .reserve_actor_epoch(actor_key.clone(), Some(actor_token), None)
+            .await
+            .unwrap_err(),
+        PlacementError::EpochFloorUnproven {
+            record: actor_token,
+            floor: None,
+        }
+    );
+    assert_eq!(
+        store
+            .compare_and_put_actor(
+                actor_key.clone(),
+                Some(actor_token),
+                ActorPlacementRecord {
+                    state: PlacementState::Draining,
+                    ..actor.clone()
+                },
+            )
+            .await,
+        Err(PlacementError::EpochFloorUnproven {
+            record: actor_token,
+            floor: None,
+        })
+    );
+    assert_eq!(
+        store
+            .reserve_virtual_shard_epoch(shard_key.clone(), Some(shard_token))
+            .await
+            .unwrap_err(),
+        PlacementError::EpochFloorUnproven {
+            record: shard_token,
+            floor: None,
+        }
+    );
+    assert_eq!(
+        store
+            .compare_and_put_virtual_shard(shard_key.clone(), Some(shard_token), shard.clone())
+            .await,
+        Err(PlacementError::EpochFloorUnproven {
+            record: shard_token,
+            floor: None,
+        })
+    );
+    assert_eq!(
+        store
+            .reserve_singleton_epoch(singleton_key.clone(), Some(singleton_token), None)
+            .await
+            .unwrap_err(),
+        PlacementError::EpochFloorUnproven {
+            record: singleton_token,
+            floor: None,
+        }
+    );
+    assert_eq!(
+        store
+            .compare_and_put_singleton(
+                singleton_key.clone(),
+                Some(singleton_token),
+                SingletonPlacementRecord {
+                    state: PlacementState::Draining,
+                    ..singleton.clone()
+                },
+            )
+            .await,
+        Err(PlacementError::EpochFloorUnproven {
+            record: singleton_token,
+            floor: None,
+        })
+    );
+
+    assert_eq!(
+        store.get_actor(&actor_key).await.unwrap(),
+        Some((actor_token, actor))
+    );
+    assert_eq!(
+        store.get_virtual_shard(&shard_key).await.unwrap(),
+        Some((shard_token, shard))
+    );
+    assert_eq!(
+        store.get_singleton(&singleton_key).await.unwrap(),
+        Some((singleton_token, singleton))
+    );
+    assert_eq!(placement_revision(&store), revision);
+}
+
+#[tokio::test]
+async fn record_only_replays_cannot_be_laundered_for_every_family() {
+    let store = store();
+    let actor_key = actor_key(12);
+    let shard_key = shard_key(12);
+    let singleton_key = singleton_key("replayed");
+    let original_actor = actor_record(12, "world-a", 1, LeaseId(10), PlacementState::Running);
+    let original_shard = shard_record(12, "world-a", 1);
+    let original_singleton = singleton_record(
+        "replayed",
+        "world-a",
+        1,
+        LeaseId(10),
+        PlacementState::Running,
+    );
+    let original_actor_token = store
+        .compare_and_put_actor(actor_key.clone(), None, original_actor.clone())
+        .await
+        .unwrap();
+    let original_shard_token = store
+        .compare_and_put_virtual_shard(shard_key.clone(), None, original_shard.clone())
+        .await
+        .unwrap();
+    let original_singleton_token = store
+        .compare_and_put_singleton(singleton_key.clone(), None, original_singleton.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .reserve_actor_epoch(actor_key.clone(), Some(original_actor_token), None)
+            .await
+            .unwrap()
+            .epoch(),
+        Epoch(2)
+    );
+    assert_eq!(
+        store
+            .reserve_virtual_shard_epoch(shard_key.clone(), Some(original_shard_token))
+            .await
+            .unwrap()
+            .epoch(),
+        Epoch(2)
+    );
+    assert_eq!(
+        store
+            .reserve_singleton_epoch(singleton_key.clone(), Some(original_singleton_token), None,)
+            .await
+            .unwrap()
+            .epoch(),
+        Epoch(2)
+    );
+    let actor_floor = store
+        .epoch_floor_for_test(&PlacementEpochKey::Actor(actor_key.clone()))
+        .unwrap();
+    let shard_floor = store
+        .epoch_floor_for_test(&PlacementEpochKey::VirtualShard(shard_key.clone()))
+        .unwrap();
+    let singleton_floor = store
+        .epoch_floor_for_test(&PlacementEpochKey::Singleton(singleton_key.clone()))
+        .unwrap();
+    assert_eq!(actor_floor.1.epoch, Epoch(2));
+    assert_eq!(shard_floor.1.epoch, Epoch(2));
+    assert_eq!(singleton_floor.1.epoch, Epoch(2));
+
+    let replayed_actor = ActorPlacementRecord {
+        owner: InstanceId::new("world-b"),
+        lease_id: LeaseId(20),
+        ..original_actor
+    };
+    let replayed_shard = VirtualShardPlacementRecord {
+        owner: InstanceId::new("world-b"),
+        ..original_shard
+    };
+    let replayed_singleton = SingletonPlacementRecord {
+        owner: InstanceId::new("world-b"),
+        lease_id: LeaseId(20),
+        ..original_singleton
+    };
+    let actor_token = put_actor_record_only(&store, actor_key.clone(), replayed_actor.clone());
+    let shard_token = put_shard_record_only(&store, shard_key.clone(), replayed_shard.clone());
+    let singleton_token =
+        put_singleton_record_only(&store, singleton_key.clone(), replayed_singleton.clone());
+    assert!(actor_floor.0.modification_revision() < actor_token.modification_revision());
+    assert!(shard_floor.0.modification_revision() < shard_token.modification_revision());
+    assert!(singleton_floor.0.modification_revision() < singleton_token.modification_revision());
+    let revision = placement_revision(&store);
+
+    assert_eq!(
+        store
+            .reserve_actor_epoch(actor_key.clone(), Some(actor_token), None)
+            .await
+            .unwrap_err(),
+        PlacementError::EpochFloorUnproven {
+            record: actor_token,
+            floor: Some(actor_floor.0),
+        }
+    );
+    assert_eq!(
+        store
+            .compare_and_put_actor(
+                actor_key.clone(),
+                Some(actor_token),
+                ActorPlacementRecord {
+                    epoch: Epoch(3),
+                    ..replayed_actor.clone()
+                },
+            )
+            .await,
+        Err(PlacementError::EpochFloorUnproven {
+            record: actor_token,
+            floor: Some(actor_floor.0),
+        })
+    );
+    assert_eq!(
+        store
+            .reserve_virtual_shard_epoch(shard_key.clone(), Some(shard_token))
+            .await
+            .unwrap_err(),
+        PlacementError::EpochFloorUnproven {
+            record: shard_token,
+            floor: Some(shard_floor.0),
+        }
+    );
+    assert_eq!(
+        store
+            .compare_and_put_virtual_shard(
+                shard_key.clone(),
+                Some(shard_token),
+                VirtualShardPlacementRecord {
+                    epoch: Epoch(3),
+                    ..replayed_shard.clone()
+                },
+            )
+            .await,
+        Err(PlacementError::EpochFloorUnproven {
+            record: shard_token,
+            floor: Some(shard_floor.0),
+        })
+    );
+    assert_eq!(
+        store
+            .reserve_singleton_epoch(singleton_key.clone(), Some(singleton_token), None)
+            .await
+            .unwrap_err(),
+        PlacementError::EpochFloorUnproven {
+            record: singleton_token,
+            floor: Some(singleton_floor.0),
+        }
+    );
+    assert_eq!(
+        store
+            .compare_and_put_singleton(
+                singleton_key.clone(),
+                Some(singleton_token),
+                SingletonPlacementRecord {
+                    epoch: Epoch(3),
+                    ..replayed_singleton.clone()
+                },
+            )
+            .await,
+        Err(PlacementError::EpochFloorUnproven {
+            record: singleton_token,
+            floor: Some(singleton_floor.0),
+        })
+    );
+
+    assert_eq!(
+        store.get_actor(&actor_key).await.unwrap(),
+        Some((actor_token, replayed_actor))
+    );
+    assert_eq!(
+        store.get_virtual_shard(&shard_key).await.unwrap(),
+        Some((shard_token, replayed_shard))
+    );
+    assert_eq!(
+        store.get_singleton(&singleton_key).await.unwrap(),
+        Some((singleton_token, replayed_singleton))
+    );
+    assert_eq!(
+        store
+            .epoch_floor_for_test(&PlacementEpochKey::Actor(actor_key))
+            .unwrap(),
+        actor_floor
+    );
+    assert_eq!(
+        store
+            .epoch_floor_for_test(&PlacementEpochKey::VirtualShard(shard_key))
+            .unwrap(),
+        shard_floor
+    );
+    assert_eq!(
+        store
+            .epoch_floor_for_test(&PlacementEpochKey::Singleton(singleton_key))
+            .unwrap(),
+        singleton_floor
+    );
+    assert_eq!(placement_revision(&store), revision);
+}
+
+#[tokio::test]
+async fn burned_reservation_lineage_remains_valid_for_every_family() {
+    let store = store();
+    let actor_key = actor_key(13);
+    let shard_key = shard_key(13);
+    let singleton_key = singleton_key("burned");
+    let actor_token = store
+        .compare_and_put_actor(
+            actor_key.clone(),
+            None,
+            actor_record(13, "world-a", 1, LeaseId(10), PlacementState::Running),
+        )
+        .await
+        .unwrap();
+    let shard_token = store
+        .compare_and_put_virtual_shard(shard_key.clone(), None, shard_record(13, "world-a", 1))
+        .await
+        .unwrap();
+    let singleton_token = store
+        .compare_and_put_singleton(
+            singleton_key.clone(),
+            None,
+            singleton_record("burned", "world-a", 1, LeaseId(10), PlacementState::Running),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .reserve_actor_epoch(actor_key.clone(), Some(actor_token), None)
+            .await
+            .unwrap()
+            .epoch(),
+        Epoch(2)
+    );
+    assert_eq!(
+        store
+            .reserve_virtual_shard_epoch(shard_key.clone(), Some(shard_token))
+            .await
+            .unwrap()
+            .epoch(),
+        Epoch(2)
+    );
+    assert_eq!(
+        store
+            .reserve_singleton_epoch(singleton_key.clone(), Some(singleton_token), None)
+            .await
+            .unwrap()
+            .epoch(),
+        Epoch(2)
+    );
+    assert_eq!(
+        store
+            .reserve_actor_epoch(actor_key.clone(), Some(actor_token), None)
+            .await
+            .unwrap()
+            .epoch(),
+        Epoch(3)
+    );
+    assert_eq!(
+        store
+            .reserve_virtual_shard_epoch(shard_key.clone(), Some(shard_token))
+            .await
+            .unwrap()
+            .epoch(),
+        Epoch(3)
+    );
+    assert_eq!(
+        store
+            .reserve_singleton_epoch(singleton_key.clone(), Some(singleton_token), None)
+            .await
+            .unwrap()
+            .epoch(),
+        Epoch(3)
+    );
+
+    store
+        .compare_and_put_actor(
+            actor_key.clone(),
+            Some(actor_token),
+            actor_record(13, "world-b", 4, LeaseId(20), PlacementState::Running),
+        )
+        .await
+        .unwrap();
+    store
+        .compare_and_put_virtual_shard(
+            shard_key.clone(),
+            Some(shard_token),
+            shard_record(13, "world-b", 4),
+        )
+        .await
+        .unwrap();
+    store
+        .compare_and_put_singleton(
+            singleton_key.clone(),
+            Some(singleton_token),
+            singleton_record("burned", "world-b", 4, LeaseId(20), PlacementState::Running),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.get_actor(&actor_key).await.unwrap().unwrap().1.epoch,
+        Epoch(4)
+    );
+    assert_eq!(
+        store
+            .get_virtual_shard(&shard_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .epoch,
+        Epoch(4)
+    );
+    assert_eq!(
+        store
+            .get_singleton(&singleton_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .epoch,
+        Epoch(4)
+    );
 }
 
 #[tokio::test]
@@ -774,4 +1219,66 @@ fn singleton_record(
         lease_id,
         state,
     }
+}
+
+fn remove_floor(store: &InMemoryPlacementStore, key: &PlacementEpochKey) {
+    let storage_key = store.prefixed_epoch_key(key);
+    assert!(
+        store
+            .inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .epoch_floors
+            .remove(&storage_key)
+            .is_some()
+    );
+}
+
+fn put_actor_record_only(
+    store: &InMemoryPlacementStore,
+    key: ActorPlacementKey,
+    record: ActorPlacementRecord,
+) -> PlacementVersion {
+    let storage_key = store.prefixed_actor_key(&key);
+    let mut inner = store.inner.lock().expect("placement store mutex poisoned");
+    let revision = inner.next_placement_revision();
+    let token = super::placement_token(revision);
+    inner.actors.insert(storage_key, (token, revision, record));
+    token
+}
+
+fn put_shard_record_only(
+    store: &InMemoryPlacementStore,
+    key: VirtualShardPlacementKey,
+    record: VirtualShardPlacementRecord,
+) -> PlacementVersion {
+    let storage_key = store.prefixed_vshard_key(&key);
+    let mut inner = store.inner.lock().expect("placement store mutex poisoned");
+    let revision = inner.next_placement_revision();
+    let token = super::placement_token(revision);
+    inner.vshards.insert(storage_key, (token, revision, record));
+    token
+}
+
+fn put_singleton_record_only(
+    store: &InMemoryPlacementStore,
+    key: SingletonKey,
+    record: SingletonPlacementRecord,
+) -> PlacementVersion {
+    let storage_key = store.prefixed_singleton_key(&key);
+    let mut inner = store.inner.lock().expect("placement store mutex poisoned");
+    let revision = inner.next_placement_revision();
+    let token = super::placement_token(revision);
+    inner
+        .singletons
+        .insert(storage_key, (token, revision, record));
+    token
+}
+
+fn placement_revision(store: &InMemoryPlacementStore) -> u64 {
+    store
+        .inner
+        .lock()
+        .expect("placement store mutex poisoned")
+        .placement_revision
 }

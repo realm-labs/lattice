@@ -30,7 +30,7 @@ use crate::storage::{
     OwnershipWatchUpdate, PlacementEpochGuard, PlacementEpochKey, PlacementEpochReservation,
     PlacementPrefix, PlacementStore, PlacementVersion, PlacementWatch, PlacementWatchEvent,
     SingletonKey, SingletonPlacementRecord, VirtualShardPlacementKey, VirtualShardPlacementRecord,
-    next_reserved_epoch, validate_legacy_epoch,
+    next_reserved_epoch, validate_epoch_floor_lineage, validate_legacy_epoch,
 };
 
 pub mod client;
@@ -279,6 +279,12 @@ where
         }
         let epoch_key = PlacementEpochKey::Actor(key.clone());
         let floor = self.get_epoch_floor(&epoch_key).await?;
+        validate_epoch_floor_lineage(
+            current
+                .as_ref()
+                .map(|(token, record)| (*token, record.epoch)),
+            floor.as_ref().map(|(token, record)| (*token, record.epoch)),
+        )?;
         let epoch = next_reserved_epoch(
             current.as_ref().map(|(_, record)| record.epoch),
             floor.as_ref().map(|(_, record)| record.epoch),
@@ -361,6 +367,12 @@ where
         }
         let epoch_key = PlacementEpochKey::Actor(key.clone());
         let floor = self.get_epoch_floor(&epoch_key).await?;
+        validate_epoch_floor_lineage(
+            current
+                .as_ref()
+                .map(|(token, record)| (*token, record.epoch)),
+            floor.as_ref().map(|(token, record)| (*token, record.epoch)),
+        )?;
         let authority_changed = current.as_ref().is_some_and(|(_, record)| {
             record.owner != value.owner || record.lease_id != value.lease_id
         });
@@ -436,6 +448,12 @@ where
         }
         let epoch_key = PlacementEpochKey::VirtualShard(key.clone());
         let floor = self.get_epoch_floor(&epoch_key).await?;
+        validate_epoch_floor_lineage(
+            current
+                .as_ref()
+                .map(|(token, record)| (*token, record.epoch)),
+            floor.as_ref().map(|(token, record)| (*token, record.epoch)),
+        )?;
         let epoch = next_reserved_epoch(
             current.as_ref().map(|(_, record)| record.epoch),
             floor.as_ref().map(|(_, record)| record.epoch),
@@ -505,6 +523,12 @@ where
         }
         let epoch_key = PlacementEpochKey::VirtualShard(key.clone());
         let floor = self.get_epoch_floor(&epoch_key).await?;
+        validate_epoch_floor_lineage(
+            current
+                .as_ref()
+                .map(|(token, record)| (*token, record.epoch)),
+            floor.as_ref().map(|(token, record)| (*token, record.epoch)),
+        )?;
         let authority_changed = current
             .as_ref()
             .is_some_and(|(_, record)| record.owner != value.owner);
@@ -564,6 +588,12 @@ where
         }
         let epoch_key = PlacementEpochKey::Singleton(key.clone());
         let floor = self.get_epoch_floor(&epoch_key).await?;
+        validate_epoch_floor_lineage(
+            current
+                .as_ref()
+                .map(|(token, record)| (*token, record.epoch)),
+            floor.as_ref().map(|(token, record)| (*token, record.epoch)),
+        )?;
         let epoch = next_reserved_epoch(
             current.as_ref().map(|(_, record)| record.epoch),
             floor.as_ref().map(|(_, record)| record.epoch),
@@ -646,6 +676,12 @@ where
         }
         let epoch_key = PlacementEpochKey::Singleton(key.clone());
         let floor = self.get_epoch_floor(&epoch_key).await?;
+        validate_epoch_floor_lineage(
+            current
+                .as_ref()
+                .map(|(token, record)| (*token, record.epoch)),
+            floor.as_ref().map(|(token, record)| (*token, record.epoch)),
+        )?;
         let authority_changed = current.as_ref().is_some_and(|(_, record)| {
             record.owner != value.owner || record.lease_id != value.lease_id
         });
