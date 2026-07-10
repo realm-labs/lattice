@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use async_trait::async_trait;
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
@@ -24,6 +26,14 @@ pub struct LeaseId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PlacementVersion(pub u64);
+
+/// A store-wide ordering token for coherent placement snapshots and watches.
+///
+/// Unlike [`PlacementVersion`], this revision must not restart for each key.
+/// It orders all ownership mutations observed through one placement store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PlacementRevision(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +116,117 @@ pub enum PlacementWatchEvent {
         version: PlacementVersion,
         record: SingletonPlacementRecord,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipViewRecord {
+    Actor {
+        revision: PlacementRevision,
+        record: ActorPlacementRecord,
+    },
+    VirtualShard {
+        revision: PlacementRevision,
+        record: VirtualShardPlacementRecord,
+    },
+    Singleton {
+        revision: PlacementRevision,
+        record: SingletonPlacementRecord,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnershipViewSnapshot {
+    pub revision: PlacementRevision,
+    pub local_instance: Option<InstanceRecord>,
+    pub records: Vec<OwnershipViewRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipWatchEvent {
+    InstanceUpserted {
+        record: InstanceRecord,
+    },
+    InstanceDeleted {
+        record: InstanceRecord,
+    },
+    ActorUpserted {
+        key: ActorPlacementKey,
+        record: ActorPlacementRecord,
+    },
+    ActorDeleted {
+        key: ActorPlacementKey,
+    },
+    VirtualShardUpserted {
+        key: VirtualShardPlacementKey,
+        record: VirtualShardPlacementRecord,
+    },
+    VirtualShardDeleted {
+        key: VirtualShardPlacementKey,
+    },
+    SingletonUpserted {
+        key: SingletonKey,
+        record: SingletonPlacementRecord,
+    },
+    SingletonDeleted {
+        key: SingletonKey,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnershipWatchBatch {
+    pub revision: PlacementRevision,
+    pub events: Vec<OwnershipWatchEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OwnershipWatchError {
+    #[error("ownership watch lagged and skipped {skipped} batches")]
+    Lagged { skipped: u64 },
+    #[error("ownership watch closed")]
+    Closed,
+}
+
+#[derive(Debug)]
+pub struct OwnershipWatch {
+    rx: broadcast::Receiver<OwnershipWatchBatch>,
+}
+
+impl OwnershipWatch {
+    pub async fn next(&mut self) -> Result<OwnershipWatchBatch, OwnershipWatchError> {
+        match self.rx.recv().await {
+            Ok(batch) => Ok(batch),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                Err(OwnershipWatchError::Lagged { skipped })
+            }
+            Err(broadcast::error::RecvError::Closed) => Err(OwnershipWatchError::Closed),
+        }
+    }
+
+    pub(crate) fn new(rx: broadcast::Receiver<OwnershipWatchBatch>) -> Self {
+        Self { rx }
+    }
+}
+
+#[derive(Debug)]
+pub struct OwnershipView {
+    /// Coherent state at `snapshot.revision`.
+    pub snapshot: OwnershipViewSnapshot,
+    /// Mutations committed after the snapshot revision.
+    ///
+    /// Batch revisions strictly increase for this view but may contain gaps
+    /// caused by unrelated store mutations. Lag or closure invalidates the
+    /// view and requires callers to fence before opening a new one.
+    pub watch: OwnershipWatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OwnershipViewError {
+    #[error("this placement store does not support coherent ownership views")]
+    Unsupported,
+    #[error("ownership view exceeded its {max_entries} entry limit")]
+    CapacityExceeded { max_entries: usize },
+    #[error("ownership view backend error: {message}")]
+    Backend { message: String },
 }
 
 #[derive(Debug)]
@@ -240,6 +361,18 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
         key: &ActorPlacementKey,
         lease_id: LeaseId,
     ) -> Result<(), PlacementError>;
+    /// Atomically snapshots ownership state and subscribes to later changes.
+    ///
+    /// `max_entries` bounds same-service records scanned by the backend before
+    /// local-owner filtering. Exceeding it must fail closed.
+    async fn open_ownership_view(
+        &self,
+        _service_kind: &ServiceKind,
+        _instance_id: &InstanceId,
+        _max_entries: NonZeroUsize,
+    ) -> Result<OwnershipView, OwnershipViewError> {
+        Err(OwnershipViewError::Unsupported)
+    }
     async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError>;
     fn prefix(&self) -> &PlacementPrefix;
 }

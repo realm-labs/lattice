@@ -94,6 +94,8 @@ Status: `[ ]` in progress.
 
 - [x] Add a reusable local ownership snapshot/gate for explicit actors, virtual shards, and singletons.
 - [x] Bind explicit actor placement records to the owner's live instance lease rather than the short-lived activation-lock lease. The durable actor record carries that lease as fencing authority while retaining the prior epoch for CAS failover; the short-lived activation-lock lease is never published as ownership.
+- [x] Add a bounded atomic ownership snapshot/watch handoff with store-global revisions, typed ownership events, and surfaced lag for the in-memory placement backend.
+- [ ] Implement the same bounded, globally revised ownership view for etcd using `mod_revision`, watch-from-revision, previous values for deletions, same-revision batches, progress barriers, and explicit terminal errors.
 - [ ] Make generated RPC binding placement mode explicit: explicit-fenced by default, validated shard count for virtual shards, and named opt-in only for static/local unfenced use. The mode type, generated constructors, compiled call sites, and named raw-registry opt-in are complete; this remains unchecked until fenced modes are enforced at ingress and virtual-shard client/server configuration is proven consistent with the authoritative assignment set.
 - [ ] Require generated placement-backed RPC services to validate expected service, actor kind, route, owner, state, lease validity, and epoch before actor lookup.
 - [ ] Prevent `ActorRegistry::get_or_load` from being reached after a failed ownership decision.
@@ -437,6 +439,8 @@ cargo test -p lattice-rpc
 cargo test -p lattice-placement --test fenced_retry
 cargo test -p lattice-placement --test chaos
 cargo test -p lattice-placement ownership
+cargo test -p lattice-placement ownership_view
+cargo test -p lattice-placement ownership_watch
 cargo test -p lattice-placement coordination::actor::tests
 cargo test -p lattice-gateway
 cargo test -p lattice-actor

@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,9 +37,10 @@ use crate::sharding::{
 };
 use crate::storage::memory::InMemoryPlacementStore;
 use crate::storage::{
-    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementState,
-    PlacementStore, PlacementVersion, PlacementWatchEvent, VirtualShardPlacementKey,
-    VirtualShardPlacementRecord,
+    ActorPlacementKey, ActorPlacementRecord, LeaseId, OwnershipViewError, OwnershipViewRecord,
+    OwnershipWatchError, OwnershipWatchEvent, PlacementPrefix, PlacementRevision, PlacementState,
+    PlacementStore, PlacementVersion, PlacementWatchEvent, SingletonKey, SingletonPlacementRecord,
+    VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -490,6 +492,252 @@ async fn placement_watch_reports_virtual_shard_updates() {
 }
 
 #[tokio::test]
+async fn ownership_view_orders_independent_per_key_versions_with_global_revisions() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let mut view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .await
+        .unwrap();
+    let first_key = actor_key(1);
+    let first_record = actor_record(1, "world-a", 1, LeaseId(10));
+    let second_key = actor_key(2);
+    let second_record = actor_record(2, "world-a", 1, LeaseId(10));
+
+    let first_version = store
+        .compare_and_put_actor(first_key.clone(), None, first_record.clone())
+        .await
+        .unwrap();
+    let second_version = store
+        .compare_and_put_actor(second_key.clone(), None, second_record.clone())
+        .await
+        .unwrap();
+    let first_batch = view.watch.next().await.unwrap();
+    let second_batch = view.watch.next().await.unwrap();
+
+    assert_eq!(first_version, PlacementVersion(1));
+    assert_eq!(second_version, PlacementVersion(1));
+    assert_eq!(view.snapshot.revision, PlacementRevision(0));
+    assert_eq!(first_batch.revision, PlacementRevision(1));
+    assert_eq!(second_batch.revision, PlacementRevision(2));
+    assert_eq!(
+        first_batch.events,
+        vec![OwnershipWatchEvent::ActorUpserted {
+            key: first_key,
+            record: first_record,
+        }]
+    );
+    assert_eq!(
+        second_batch.events,
+        vec![OwnershipWatchEvent::ActorUpserted {
+            key: second_key,
+            record: second_record,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn ownership_view_has_no_gap_between_snapshot_and_remote_owner_update() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let key = actor_key(7);
+    let local = actor_record(7, "world-a", 1, LeaseId(10));
+    let version = store
+        .compare_and_put_actor(key.clone(), None, local.clone())
+        .await
+        .unwrap();
+    let mut view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .await
+        .unwrap();
+    let remote = ActorPlacementRecord {
+        owner: InstanceId::new("world-b"),
+        epoch: Epoch(2),
+        lease_id: LeaseId(20),
+        ..local.clone()
+    };
+
+    store
+        .compare_and_put_actor(key.clone(), Some(version), remote.clone())
+        .await
+        .unwrap();
+    let batch = view.watch.next().await.unwrap();
+
+    assert_eq!(view.snapshot.revision, PlacementRevision(1));
+    assert_eq!(
+        view.snapshot.records,
+        vec![OwnershipViewRecord::Actor {
+            revision: PlacementRevision(1),
+            record: local,
+        }]
+    );
+    assert_eq!(batch.revision, PlacementRevision(2));
+    assert_eq!(
+        batch.events,
+        vec![OwnershipWatchEvent::ActorUpserted {
+            key,
+            record: remote,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn ownership_view_bounds_scanned_service_records_before_local_filtering() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    store
+        .upsert_instance(instance_record("world-a", InstanceState::Ready))
+        .await
+        .unwrap();
+    store
+        .compare_and_put_actor(
+            actor_key(1),
+            None,
+            actor_record(1, "world-a", 1, LeaseId(10)),
+        )
+        .await
+        .unwrap();
+    store
+        .compare_and_put_actor(
+            actor_key(2),
+            None,
+            actor_record(2, "world-b", 1, LeaseId(20)),
+        )
+        .await
+        .unwrap();
+    store
+        .compare_and_put_virtual_shard(vshard_key(3), None, vshard_record(3, "world-a", 1))
+        .await
+        .unwrap();
+    store
+        .compare_and_put_singleton(
+            singleton_key("global"),
+            None,
+            singleton_record("global", "world-a", 1, LeaseId(30)),
+        )
+        .await
+        .unwrap();
+
+    let bounded = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(3).unwrap(),
+        )
+        .await;
+    let view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(4).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        bounded,
+        Err(OwnershipViewError::CapacityExceeded { max_entries: 3 })
+    ));
+    assert_eq!(
+        view.snapshot.local_instance.unwrap().instance_id,
+        InstanceId::new("world-a")
+    );
+    assert_eq!(view.snapshot.records.len(), 3);
+    assert_eq!(
+        view.snapshot
+            .records
+            .iter()
+            .filter(|record| matches!(record, OwnershipViewRecord::Actor { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        view.snapshot
+            .records
+            .iter()
+            .all(|record| ownership_record_owner(record) == InstanceId::new("world-a"))
+    );
+}
+
+#[tokio::test]
+async fn ownership_watch_surfaces_instance_deletion() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let record = instance_record("world-a", InstanceState::Ready);
+    store.upsert_instance(record.clone()).await.unwrap();
+    let mut view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.remove_instance_for_test(&InstanceId::new("world-a")),
+        Some(record.clone())
+    );
+    let batch = view.watch.next().await.unwrap();
+
+    assert_eq!(batch.revision, PlacementRevision(2));
+    assert_eq!(
+        batch.events,
+        vec![OwnershipWatchEvent::InstanceDeleted { record }]
+    );
+}
+
+#[tokio::test]
+async fn ownership_watch_surfaces_lag_instead_of_skipping_it() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let mut view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(256).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    for actor_id in 0..129 {
+        store
+            .compare_and_put_actor(
+                actor_key(actor_id),
+                None,
+                actor_record(actor_id, "world-a", 1, LeaseId(10)),
+            )
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        view.watch.next().await,
+        Err(OwnershipWatchError::Lagged { skipped: 1 })
+    );
+}
+
+#[tokio::test]
+async fn ownership_watch_surfaces_store_closure() {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let mut view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    drop(store);
+
+    assert_eq!(view.watch.next().await, Err(OwnershipWatchError::Closed));
+}
+
+#[tokio::test]
 async fn in_memory_placement_store_grants_and_keeps_instance_leases_alive() {
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
 
@@ -832,5 +1080,38 @@ fn vshard_record(shard_id: u32, owner: &str, epoch: u64) -> VirtualShardPlacemen
         shard_id: VirtualShardId(shard_id),
         owner: InstanceId::new(owner),
         epoch: Epoch(epoch),
+    }
+}
+
+fn singleton_key(scope: &str) -> SingletonKey {
+    SingletonKey {
+        service_kind: service_kind!("World"),
+        singleton_kind: actor_kind!("SeasonManager"),
+        scope: scope.to_string(),
+    }
+}
+
+fn singleton_record(
+    scope: &str,
+    owner: &str,
+    epoch: u64,
+    lease_id: LeaseId,
+) -> SingletonPlacementRecord {
+    SingletonPlacementRecord {
+        service_kind: service_kind!("World"),
+        singleton_kind: actor_kind!("SeasonManager"),
+        scope: scope.to_string(),
+        owner: InstanceId::new(owner),
+        epoch: Epoch(epoch),
+        lease_id,
+        state: PlacementState::Running,
+    }
+}
+
+fn ownership_record_owner(record: &OwnershipViewRecord) -> InstanceId {
+    match record {
+        OwnershipViewRecord::Actor { record, .. } => record.owner.clone(),
+        OwnershipViewRecord::VirtualShard { record, .. } => record.owner.clone(),
+        OwnershipViewRecord::Singleton { record, .. } => record.owner.clone(),
     }
 }

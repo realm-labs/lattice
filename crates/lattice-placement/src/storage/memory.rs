@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10,10 +11,14 @@ use tokio::sync::broadcast;
 use crate::error::PlacementError;
 use crate::registry::InstanceRecord;
 use crate::storage::{
-    ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, LeaseId, PlacementPrefix,
-    PlacementStore, PlacementVersion, PlacementWatch, PlacementWatchEvent, SingletonKey,
-    SingletonPlacementRecord, VirtualShardPlacementKey, VirtualShardPlacementRecord,
+    ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, LeaseId, OwnershipView,
+    OwnershipViewError, OwnershipViewRecord, OwnershipViewSnapshot, OwnershipWatch,
+    OwnershipWatchBatch, OwnershipWatchEvent, PlacementPrefix, PlacementRevision, PlacementStore,
+    PlacementVersion, PlacementWatch, PlacementWatchEvent, SingletonKey, SingletonPlacementRecord,
+    VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
+
+const WATCH_CAPACITY: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct InMemoryPlacementStore {
@@ -61,11 +66,21 @@ impl InMemoryPlacementStore {
         &self,
         instance_id: &InstanceId,
     ) -> Option<InstanceRecord> {
-        self.inner
-            .lock()
-            .expect("placement store mutex poisoned")
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let record = inner
             .instances
-            .remove(&self.prefixed_instance_key(instance_id))
+            .remove(&self.prefixed_instance_key(instance_id))?;
+        let revision = inner.next_placement_revision();
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::InstanceDeleted {
+                    record: record.clone(),
+                }],
+            },
+        );
+        Some(record)
     }
 
     fn prefixed_actor_key(&self, key: &ActorPlacementKey) -> PrefixedActorKey {
@@ -163,13 +178,23 @@ impl PlacementStore for InMemoryPlacementStore {
 
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError> {
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let revision = inner.next_placement_revision();
         inner.instances.insert(
             self.prefixed_instance_key(&record.instance_id),
             record.clone(),
         );
         inner.notify(
             &self.prefix,
-            PlacementWatchEvent::InstanceUpdated { record },
+            PlacementWatchEvent::InstanceUpdated {
+                record: record.clone(),
+            },
+        );
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::InstanceUpserted { record }],
+            },
         );
         Ok(())
     }
@@ -226,7 +251,7 @@ impl PlacementStore for InMemoryPlacementStore {
             .expect("placement store mutex poisoned")
             .actors
             .get(&self.prefixed_actor_key(key))
-            .cloned())
+            .map(|(version, _revision, record)| (*version, record.clone())))
     }
 
     async fn list_actors(
@@ -239,7 +264,7 @@ impl PlacementStore for InMemoryPlacementStore {
             .actors
             .iter()
             .filter(|(key, _)| key.prefix == self.prefix)
-            .map(|(_, value)| value.clone())
+            .map(|(_, (version, _revision, record))| (*version, record.clone()))
             .collect())
     }
 
@@ -251,19 +276,33 @@ impl PlacementStore for InMemoryPlacementStore {
     ) -> Result<PlacementVersion, PlacementError> {
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
         let key = self.prefixed_actor_key(&key);
-        let current = inner.actors.get(&key).map(|(version, _)| *version);
+        let current = inner
+            .actors
+            .get(&key)
+            .map(|(version, _revision, _record)| *version);
         if current != expected {
             return Err(PlacementError::CompareAndPutFailed);
         }
         let next = PlacementVersion(current.map_or(1, |version| version.0 + 1));
+        let revision = inner.next_placement_revision();
         let watch_key = key.key.clone();
-        inner.actors.insert(key, (next, value.clone()));
+        inner.actors.insert(key, (next, revision, value.clone()));
         inner.notify(
             &self.prefix,
             PlacementWatchEvent::ActorUpdated {
-                key: watch_key,
+                key: watch_key.clone(),
                 version: next,
-                record: value,
+                record: value.clone(),
+            },
+        );
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::ActorUpserted {
+                    key: watch_key,
+                    record: value,
+                }],
             },
         );
         Ok(next)
@@ -279,7 +318,7 @@ impl PlacementStore for InMemoryPlacementStore {
             .expect("placement store mutex poisoned")
             .vshards
             .get(&self.prefixed_vshard_key(key))
-            .cloned())
+            .map(|(version, _revision, record)| (*version, record.clone())))
     }
 
     async fn list_virtual_shards(
@@ -298,7 +337,7 @@ impl PlacementStore for InMemoryPlacementStore {
                     && &key.key.service_kind == service_kind
                     && &key.key.actor_kind == actor_kind
             })
-            .map(|(_, value)| value.clone())
+            .map(|(_, (version, _revision, record))| (*version, record.clone()))
             .collect())
     }
 
@@ -313,7 +352,7 @@ impl PlacementStore for InMemoryPlacementStore {
             .vshards
             .iter()
             .filter(|(key, _)| key.prefix == self.prefix && &key.key.service_kind == service_kind)
-            .map(|(_, value)| value.clone())
+            .map(|(_, (version, _revision, record))| (*version, record.clone()))
             .collect())
     }
 
@@ -325,19 +364,33 @@ impl PlacementStore for InMemoryPlacementStore {
     ) -> Result<PlacementVersion, PlacementError> {
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
         let key = self.prefixed_vshard_key(&key);
-        let current = inner.vshards.get(&key).map(|(version, _)| *version);
+        let current = inner
+            .vshards
+            .get(&key)
+            .map(|(version, _revision, _record)| *version);
         if current != expected {
             return Err(PlacementError::CompareAndPutFailed);
         }
         let next = PlacementVersion(current.map_or(1, |version| version.0 + 1));
+        let revision = inner.next_placement_revision();
         let watch_key = key.key.clone();
-        inner.vshards.insert(key, (next, value.clone()));
+        inner.vshards.insert(key, (next, revision, value.clone()));
         inner.notify(
             &self.prefix,
             PlacementWatchEvent::VirtualShardUpdated {
-                key: watch_key,
+                key: watch_key.clone(),
                 version: next,
-                record: value,
+                record: value.clone(),
+            },
+        );
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::VirtualShardUpserted {
+                    key: watch_key,
+                    record: value,
+                }],
             },
         );
         Ok(next)
@@ -353,7 +406,7 @@ impl PlacementStore for InMemoryPlacementStore {
             .expect("placement store mutex poisoned")
             .singletons
             .get(&self.prefixed_singleton_key(key))
-            .cloned())
+            .map(|(version, _revision, record)| (*version, record.clone())))
     }
 
     async fn list_singletons(
@@ -366,7 +419,7 @@ impl PlacementStore for InMemoryPlacementStore {
             .singletons
             .iter()
             .filter(|(key, _)| key.prefix == self.prefix)
-            .map(|(_, value)| value.clone())
+            .map(|(_, (version, _revision, record))| (*version, record.clone()))
             .collect())
     }
 
@@ -378,19 +431,35 @@ impl PlacementStore for InMemoryPlacementStore {
     ) -> Result<PlacementVersion, PlacementError> {
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
         let key = self.prefixed_singleton_key(&key);
-        let current = inner.singletons.get(&key).map(|(version, _)| *version);
+        let current = inner
+            .singletons
+            .get(&key)
+            .map(|(version, _revision, _record)| *version);
         if current != expected {
             return Err(PlacementError::CompareAndPutFailed);
         }
         let next = PlacementVersion(current.map_or(1, |version| version.0 + 1));
+        let revision = inner.next_placement_revision();
         let watch_key = key.key.clone();
-        inner.singletons.insert(key, (next, value.clone()));
+        inner
+            .singletons
+            .insert(key, (next, revision, value.clone()));
         inner.notify(
             &self.prefix,
             PlacementWatchEvent::SingletonUpdated {
-                key: watch_key,
+                key: watch_key.clone(),
                 version: next,
-                record: value,
+                record: value.clone(),
+            },
+        );
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::SingletonUpserted {
+                    key: watch_key,
+                    record: value,
+                }],
             },
         );
         Ok(next)
@@ -477,13 +546,93 @@ impl PlacementStore for InMemoryPlacementStore {
         }
     }
 
+    async fn open_ownership_view(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        max_entries: NonZeroUsize,
+    ) -> Result<OwnershipView, OwnershipViewError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let local_instance = inner
+            .instances
+            .get(&self.prefixed_instance_key(instance_id))
+            .filter(|record| &record.service_kind == service_kind)
+            .cloned();
+        let mut records = Vec::new();
+        let mut scanned_entries = 0;
+
+        for (key, (_version, revision, record)) in &inner.actors {
+            if key.prefix == self.prefix && &record.service_kind == service_kind {
+                ensure_ownership_view_capacity(scanned_entries, max_entries)?;
+                scanned_entries += 1;
+            }
+            if key.prefix == self.prefix
+                && &record.service_kind == service_kind
+                && &record.owner == instance_id
+            {
+                records.push(OwnershipViewRecord::Actor {
+                    revision: *revision,
+                    record: record.clone(),
+                });
+            }
+        }
+        for (key, (_version, revision, record)) in &inner.vshards {
+            if key.prefix == self.prefix && &record.service_kind == service_kind {
+                ensure_ownership_view_capacity(scanned_entries, max_entries)?;
+                scanned_entries += 1;
+            }
+            if key.prefix == self.prefix
+                && &record.service_kind == service_kind
+                && &record.owner == instance_id
+            {
+                records.push(OwnershipViewRecord::VirtualShard {
+                    revision: *revision,
+                    record: record.clone(),
+                });
+            }
+        }
+        for (key, (_version, revision, record)) in &inner.singletons {
+            if key.prefix == self.prefix && &record.service_kind == service_kind {
+                ensure_ownership_view_capacity(scanned_entries, max_entries)?;
+                scanned_entries += 1;
+            }
+            if key.prefix == self.prefix
+                && &record.service_kind == service_kind
+                && &record.owner == instance_id
+            {
+                records.push(OwnershipViewRecord::Singleton {
+                    revision: *revision,
+                    record: record.clone(),
+                });
+            }
+        }
+
+        let snapshot = OwnershipViewSnapshot {
+            revision: PlacementRevision(inner.placement_revision),
+            local_instance,
+            records,
+        };
+        let rx = inner
+            .ownership_watchers
+            .entry(self.prefix.clone())
+            .or_insert_with(|| {
+                let (tx, _rx) = broadcast::channel(WATCH_CAPACITY);
+                tx
+            })
+            .subscribe();
+        Ok(OwnershipView {
+            snapshot,
+            watch: OwnershipWatch::new(rx),
+        })
+    }
+
     async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError> {
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
         let rx = inner
             .watchers
             .entry(prefix)
             .or_insert_with(|| {
-                let (tx, _rx) = broadcast::channel(128);
+                let (tx, _rx) = broadcast::channel(WATCH_CAPACITY);
                 tx
             })
             .subscribe();
@@ -497,23 +646,65 @@ impl PlacementStore for InMemoryPlacementStore {
 
 #[derive(Debug, Default)]
 struct PlacementStoreInner {
+    placement_revision: u64,
     instance_leases: HashMap<LeaseId, u64>,
     coordinator_leader: Option<CoordinatorLeadership>,
     instances: HashMap<PrefixedInstanceKey, InstanceRecord>,
-    actors: HashMap<PrefixedActorKey, (PlacementVersion, ActorPlacementRecord)>,
-    vshards: HashMap<PrefixedVShardKey, (PlacementVersion, VirtualShardPlacementRecord)>,
-    singletons: HashMap<PrefixedSingletonKey, (PlacementVersion, SingletonPlacementRecord)>,
+    actors: HashMap<PrefixedActorKey, (PlacementVersion, PlacementRevision, ActorPlacementRecord)>,
+    vshards: HashMap<
+        PrefixedVShardKey,
+        (
+            PlacementVersion,
+            PlacementRevision,
+            VirtualShardPlacementRecord,
+        ),
+    >,
+    singletons: HashMap<
+        PrefixedSingletonKey,
+        (
+            PlacementVersion,
+            PlacementRevision,
+            SingletonPlacementRecord,
+        ),
+    >,
     activation_locks: HashMap<PrefixedActorKey, LeaseId>,
     singleton_locks: HashMap<PrefixedSingletonKey, LeaseId>,
     watchers: HashMap<PlacementPrefix, broadcast::Sender<PlacementWatchEvent>>,
+    ownership_watchers: HashMap<PlacementPrefix, broadcast::Sender<OwnershipWatchBatch>>,
 }
 
 impl PlacementStoreInner {
+    fn next_placement_revision(&mut self) -> PlacementRevision {
+        self.placement_revision = self
+            .placement_revision
+            .checked_add(1)
+            .expect("in-memory placement revision exhausted");
+        PlacementRevision(self.placement_revision)
+    }
+
     fn notify(&self, prefix: &PlacementPrefix, event: PlacementWatchEvent) {
         if let Some(tx) = self.watchers.get(prefix) {
             let _ = tx.send(event);
         }
     }
+
+    fn notify_ownership(&self, prefix: &PlacementPrefix, batch: OwnershipWatchBatch) {
+        if let Some(tx) = self.ownership_watchers.get(prefix) {
+            let _ = tx.send(batch);
+        }
+    }
+}
+
+fn ensure_ownership_view_capacity(
+    current_len: usize,
+    max_entries: NonZeroUsize,
+) -> Result<(), OwnershipViewError> {
+    if current_len >= max_entries.get() {
+        return Err(OwnershipViewError::CapacityExceeded {
+            max_entries: max_entries.get(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
