@@ -305,6 +305,7 @@ impl LatticeServiceBuilder {
             binding.register(&mut context)?;
         }
 
+        let actors = std::mem::take(&mut context.actors);
         let logic_actors = context.logic_actors.values().cloned().collect();
         let router = context.router.ok_or(LatticeServiceError::NoRpcServices)?;
         Ok(LatticeService::new(LatticeServiceParts {
@@ -313,6 +314,7 @@ impl LatticeServiceBuilder {
             listener,
             router,
             service_context,
+            actors,
             logic_actors,
             placement_store,
             placement_watch_tasks,

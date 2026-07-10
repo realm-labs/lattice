@@ -253,12 +253,11 @@ impl DirectLinkSessionManager {
                         OpenLinkRejectReason::UnsupportedStream,
                     )
                 })?;
-                Some(self.negotiate_direction(
-                    &request.source.actor_kind,
+                Some(negotiate_remote_direction(
                     requested,
                     LinkDirection::TargetToSource,
                     request.options.backpressure.clone(),
-                )?)
+                ))
             }
         };
 
@@ -302,6 +301,59 @@ impl DirectLinkSessionManager {
         })
     }
 
+    pub fn record_opened_link_from_ack(
+        &self,
+        request: OpenLinkRequest,
+        ack: OpenLinkAck,
+    ) -> Result<(), LinkError> {
+        if request.link_id != ack.link_id {
+            return Err(LinkError::Protocol(format!(
+                "direct link OpenLinkAck link id mismatch: expected {}, got {}",
+                request.link_id, ack.link_id
+            )));
+        }
+        let source_to_target = ack.source_to_target;
+        if source_to_target.direction != LinkDirection::SourceToTarget {
+            return Err(LinkError::Protocol(format!(
+                "direct link OpenLinkAck source_to_target has direction {:?}",
+                source_to_target.direction
+            )));
+        }
+        let target_to_source = ack.target_to_source;
+        if let Some(direction) = &target_to_source
+            && direction.direction != LinkDirection::TargetToSource
+        {
+            return Err(LinkError::Protocol(format!(
+                "direct link OpenLinkAck target_to_source has direction {:?}",
+                direction.direction
+            )));
+        }
+        let now = Instant::now();
+        let link = ManagedLink {
+            link_id: request.link_id.clone(),
+            source: request.source,
+            target: request.target,
+            mode: request.mode,
+            heartbeat_interval: request.options.heartbeat_interval,
+            idle_timeout: request.options.idle_timeout,
+            last_heartbeat_at: now,
+            last_heartbeat_sent_at: now,
+            directions: [Some(source_to_target), target_to_source]
+                .into_iter()
+                .flatten()
+                .map(|direction| (direction.direction, direction))
+                .collect(),
+            closed: false,
+            close_reason: None,
+        };
+        self.links
+            .lock()
+            .expect("direct link managed links poisoned")
+            .insert(request.link_id.clone(), link);
+        self.metrics.record_open();
+        Ok(())
+    }
+
     pub fn validate_message_frame(
         &self,
         link_id: &LinkId,
@@ -330,10 +382,10 @@ impl DirectLinkSessionManager {
         if link.closed {
             return self.message_frame_error(link_id, MessageFrameError::Closed);
         }
-        self.validate_frame_target(link_id, link)?;
         let Some(direction_state) = link.directions.get(&direction) else {
             return self.message_frame_error(link_id, MessageFrameError::WrongDirection);
         };
+        self.validate_frame_receiver(link_id, link, direction)?;
         if direction_state.closed {
             return self.message_frame_error(link_id, MessageFrameError::Closed);
         }
@@ -392,10 +444,14 @@ impl DirectLinkSessionManager {
         if link.closed {
             return self.message_frame_error(link_id, MessageFrameError::Closed);
         }
-        self.validate_frame_target(link_id, link)?;
-        let Some(direction_state) = link.directions.get_mut(&direction) else {
+        if !link.directions.contains_key(&direction) {
             return self.message_frame_error(link_id, MessageFrameError::WrongDirection);
-        };
+        }
+        self.validate_frame_receiver(link_id, link, direction)?;
+        let direction_state = link
+            .directions
+            .get_mut(&direction)
+            .expect("direction existence checked");
         if direction_state.closed {
             return self.message_frame_error(link_id, MessageFrameError::Closed);
         }
@@ -846,16 +902,21 @@ impl DirectLinkSessionManager {
         Err(error)
     }
 
-    fn validate_frame_target(
+    fn validate_frame_receiver(
         &self,
         link_id: &LinkId,
         link: &ManagedLink,
+        direction: LinkDirection,
     ) -> Result<(), MessageFrameError> {
+        let actor_kind = match direction {
+            LinkDirection::SourceToTarget => &link.target.actor_kind,
+            LinkDirection::TargetToSource => &link.source.actor_kind,
+        };
         let actors = self
             .actors
             .lock()
             .expect("direct link actor policies poisoned");
-        let Some(policy) = actors.get(&link.target.actor_kind) else {
+        let Some(policy) = actors.get(actor_kind) else {
             return self.message_frame_error(link_id, MessageFrameError::NonActivatableTarget);
         };
         if !policy.active && policy.activation == DirectLinkActivationPolicy::ExistingOnly {
@@ -980,21 +1041,22 @@ impl DirectLinkSessionManager {
             )
         })?;
         target_policy.validate_target(request)?;
-        if matches!(request.mode, DirectLinkMode::Bidirectional) {
-            let source_policy = actors.get(&request.source.actor_kind).ok_or_else(|| {
-                OpenLinkReject::new(
-                    request.link_id.clone(),
-                    OpenLinkRejectReason::ActorUnavailable,
-                )
-            })?;
-            if !source_policy.active {
-                return Err(OpenLinkReject::new(
-                    request.link_id.clone(),
-                    OpenLinkRejectReason::ActorUnavailable,
-                ));
-            }
-        }
         Ok(())
+    }
+}
+
+fn negotiate_remote_direction(
+    requested: OpenLinkDirection,
+    direction: LinkDirection,
+    backpressure: BackpressurePolicy,
+) -> NegotiatedDirection {
+    NegotiatedDirection {
+        direction,
+        stream_name: requested.stream_name,
+        accepted_message_type_ids: requested.supported_message_type_ids,
+        next_receive_sequence: LinkSequence(1),
+        backpressure,
+        closed: false,
     }
 }
 

@@ -170,6 +170,7 @@ where
             .write_frame(DirectLinkFrame::heartbeat_ack(frame.link_id))
             .await
             .is_err(),
+        DirectLinkFrameKind::Message => pool.process_message_frame(frame).await.is_err(),
         _ => false,
     }
 }

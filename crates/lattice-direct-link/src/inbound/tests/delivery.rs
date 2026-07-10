@@ -310,7 +310,10 @@ async fn inbound_router_delivers_link_opened_and_actor_gets_target_to_source_han
         )
         .build();
 
-    router.deliver_link_opened_to_target(&link_id).unwrap();
+    router
+        .deliver_link_opened_to_target(&link_id)
+        .await
+        .unwrap();
 
     timeout(Duration::from_secs(1), async {
         loop {
@@ -422,6 +425,7 @@ async fn process_open_link_frame_returns_ack_and_delivers_link_opened() {
             .unwrap(),
             None,
         )
+        .await
         .unwrap();
 
     assert_eq!(response.kind, DirectLinkFrameKind::OpenLinkAck);
@@ -479,6 +483,7 @@ async fn process_open_link_frame_rejects_missing_required_peer_identity() {
             .unwrap(),
             None,
         )
+        .await
         .unwrap();
 
     assert_eq!(response.kind, DirectLinkFrameKind::OpenLinkReject);
@@ -522,6 +527,7 @@ async fn process_open_link_frame_rejects_when_link_open_delivery_fails() {
             .unwrap(),
             None,
         )
+        .await
         .unwrap();
 
     assert_eq!(response.kind, DirectLinkFrameKind::OpenLinkReject);

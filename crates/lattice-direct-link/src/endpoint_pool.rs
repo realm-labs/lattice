@@ -35,10 +35,14 @@ use crate::endpoint_pool::state::{
     EndpointState, PoolState, PooledLinkClosure, PooledLinkState, PooledStripeState,
 };
 use crate::protocol::{DirectLinkFrame, DirectLinkFrameKind};
-use crate::session::{DIRECT_LINK_PROTOCOL_VERSION, OpenLinkDirection, OpenLinkRequest};
+use crate::session::{
+    DIRECT_LINK_PROTOCOL_VERSION, OpenLinkAck, OpenLinkDirection, OpenLinkRequest,
+};
 use crate::transport::DirectLinkTransport;
 
 pub trait DirectLinkEndpointPoolLifecycle: Send + Sync + 'static {
+    fn process_message_frame(&self, frame: DirectLinkFrame) -> Result<(), LinkError>;
+
     fn deliver_direction_closed(
         &self,
         actor_ref: &ActorRef,
@@ -109,6 +113,8 @@ pub struct DirectLinkConnectionStripe {
 pub struct PooledDirectLinkSession {
     pub connection_id: DirectLinkConnectionId,
     pub endpoint: DirectLinkEndpoint,
+    pub open_request: OpenLinkRequest,
+    pub ack: OpenLinkAck,
     pub session: DirectLinkSession,
 }
 
@@ -205,6 +211,10 @@ where
         frame: DirectLinkFrame,
     ) -> Result<(), LinkError> {
         self.inner.process_protocol_error_frame(frame).await
+    }
+
+    pub async fn process_message_frame(&self, frame: DirectLinkFrame) -> Result<(), LinkError> {
+        self.inner.process_message_frame(frame).await
     }
 }
 
@@ -350,7 +360,7 @@ where
                     link_id: request.link_id.clone(),
                     direction: LinkDirection::SourceToTarget,
                     stream: request.source_to_target,
-                    accepted_message_ids: ack.source_to_target.accepted_message_type_ids,
+                    accepted_message_ids: ack.source_to_target.accepted_message_type_ids.clone(),
                     sender: Arc::new(PooledDirectLinkSender {
                         inner: self,
                         endpoint_key,
@@ -364,6 +374,8 @@ where
                 Ok(PooledDirectLinkSession {
                     connection_id: stripe.stripe.connection_id,
                     endpoint,
+                    open_request,
+                    ack,
                     session,
                 })
             }
@@ -480,6 +492,33 @@ where
                 frame.link_id
             )))
         }
+    }
+
+    async fn process_message_frame(&self, frame: DirectLinkFrame) -> Result<(), LinkError> {
+        if frame.kind != DirectLinkFrameKind::Message {
+            return Err(LinkError::Protocol(format!(
+                "expected Message frame, got {:?}",
+                frame.kind
+            )));
+        }
+        let link = {
+            let state = self.state.lock().await;
+            state.links.get(&frame.link_id).cloned()
+        }
+        .ok_or_else(|| LinkError::Protocol(format!("unknown direct link {}", frame.link_id)))?;
+        if !link.directions.contains_key(&frame.direction()) {
+            return Err(LinkError::Protocol(format!(
+                "direct link {} does not support direction {:?}",
+                frame.link_id,
+                frame.direction()
+            )));
+        }
+        let Some(lifecycle) = &self.lifecycle else {
+            return Err(LinkError::Protocol(
+                "direct link endpoint pool has no lifecycle for inbound message frame".to_string(),
+            ));
+        };
+        lifecycle.process_message_frame(frame)
     }
 
     async fn remove_connection(&self, connection_id: DirectLinkConnectionId) {

@@ -1,3 +1,5 @@
+use std::any::Any;
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,7 +15,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::server::Router;
 use tracing::{debug, error, info};
 
-use crate::actors::registration::ErasedLogicActor;
+use lattice_actor::traits::Actor;
+
+use crate::actors::registration::{ErasedLogicActor, RegisteredActor};
 use crate::assembly::builder::LatticeServiceBuilder;
 use crate::components::ErasedPlacementStore;
 use crate::config::{DirectLinkConfig, InstanceConfig};
@@ -27,13 +31,13 @@ use crate::runtime::drain::{
 };
 use crate::runtime::shutdown::default_shutdown_signal;
 
-#[derive(Debug)]
 pub struct LatticeService {
     service_kind: ServiceKind,
     instance: InstanceConfig,
     listener: TcpListener,
     router: Router,
     service_context: ServiceContext,
+    actors: HashMap<lattice_core::kind::ActorKind, Box<dyn Any + Send>>,
     logic_actors: Vec<Arc<dyn ErasedLogicActor>>,
     placement_store: Box<dyn ErasedPlacementStore>,
     placement_watch_tasks: Vec<PlacementWatchTask>,
@@ -42,6 +46,27 @@ pub struct LatticeService {
     direct_link: Option<DirectLinkConfig>,
     direct_link_runtime: Option<DirectLinkServiceRuntime>,
     ready: Option<oneshot::Sender<SocketAddr>>,
+}
+
+impl std::fmt::Debug for LatticeService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LatticeService")
+            .field("service_kind", &self.service_kind)
+            .field("instance", &self.instance)
+            .field("service_context", &self.service_context)
+            .field("actor_count", &self.actors.len())
+            .field("logic_actor_count", &self.logic_actors.len())
+            .field("placement_watch_tasks", &self.placement_watch_tasks.len())
+            .field("admin_http", &self.admin_http)
+            .field(
+                "instance_lease_keepalive_interval",
+                &self.instance_lease_keepalive_interval,
+            )
+            .field("direct_link", &self.direct_link)
+            .field("direct_link_runtime", &self.direct_link_runtime)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LatticeService {
@@ -56,6 +81,7 @@ impl LatticeService {
             listener: parts.listener,
             router: parts.router,
             service_context: parts.service_context,
+            actors: parts.actors,
             logic_actors: parts.logic_actors,
             placement_store: parts.placement_store,
             placement_watch_tasks: parts.placement_watch_tasks,
@@ -87,6 +113,27 @@ impl LatticeService {
         self.direct_link_runtime.clone()
     }
 
+    pub fn actor<A>(
+        &self,
+        actor_kind: &lattice_core::kind::ActorKind,
+    ) -> Result<RegisteredActor<A>, LatticeServiceError>
+    where
+        A: Actor,
+    {
+        let registered = self.actors.get(actor_kind).ok_or_else(|| {
+            LatticeServiceError::MissingActorRegistration {
+                actor_kind: actor_kind.clone(),
+            }
+        })?;
+        registered
+            .downcast_ref::<RegisteredActor<A>>()
+            .cloned()
+            .ok_or_else(|| LatticeServiceError::ActorTypeMismatch {
+                actor_kind: actor_kind.clone(),
+                expected_type: std::any::type_name::<A>(),
+            })
+    }
+
     pub async fn run_until_shutdown(self) -> Result<(), LatticeServiceError> {
         self.run_until_shutdown_signal(default_shutdown_signal())
             .await
@@ -102,6 +149,7 @@ impl LatticeService {
             listener,
             router,
             service_context,
+            actors: _,
             logic_actors,
             placement_store,
             placement_watch_tasks,
@@ -327,6 +375,7 @@ pub(crate) struct LatticeServiceParts {
     pub listener: TcpListener,
     pub router: Router,
     pub service_context: ServiceContext,
+    pub actors: HashMap<lattice_core::kind::ActorKind, Box<dyn Any + Send>>,
     pub logic_actors: Vec<Arc<dyn ErasedLogicActor>>,
     pub placement_store: Box<dyn ErasedPlacementStore>,
     pub placement_watch_tasks: Vec<PlacementWatchTask>,

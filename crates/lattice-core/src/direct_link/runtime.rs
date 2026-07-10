@@ -121,8 +121,51 @@ where
         self.session.sender.try_tell(message)
     }
 
+    pub async fn tell_encoded(
+        &self,
+        message_id: DirectLinkMessageId,
+        proto_full_name: &'static str,
+        metadata: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> Result<(), LinkSendError> {
+        let message = self.encoded_message(message_id, proto_full_name, metadata, payload)?;
+        self.session.sender.tell(message).await
+    }
+
+    pub fn try_tell_encoded(
+        &self,
+        message_id: DirectLinkMessageId,
+        proto_full_name: &'static str,
+        metadata: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> Result<(), LinkSendError> {
+        let message = self.encoded_message(message_id, proto_full_name, metadata, payload)?;
+        self.session.sender.try_tell(message)
+    }
+
     pub async fn close(&self, reason: LinkCloseReason) -> Result<(), LinkSendError> {
         self.session.sender.close(reason).await
+    }
+
+    fn encoded_message(
+        &self,
+        message_id: DirectLinkMessageId,
+        proto_full_name: &'static str,
+        metadata: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> Result<OutboundDirectLinkMessage, LinkSendError> {
+        if !self.session.accepted_message_ids.contains(&message_id) {
+            return Err(LinkSendError::UnsupportedMessageType);
+        }
+        Ok(OutboundDirectLinkMessage {
+            link_id: self.session.link_id.clone(),
+            direction: self.session.direction,
+            message_id,
+            proto_full_name,
+            metadata,
+            payload,
+            flags: LinkMessageFlags::EMPTY,
+        })
     }
 
     fn encode_message_with_metadata<T>(

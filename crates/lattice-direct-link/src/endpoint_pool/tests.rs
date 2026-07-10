@@ -21,11 +21,17 @@ use crate::transport::{DirectLinkConnection, DirectLinkTransport};
 
 #[derive(Debug, Default)]
 struct RecordingLifecycle {
+    message_frames: StdMutex<Vec<DirectLinkFrame>>,
     direction_closed: StdMutex<Vec<LinkDirectionClosed>>,
     link_closed: StdMutex<Vec<LinkClosed>>,
 }
 
 impl DirectLinkEndpointPoolLifecycle for RecordingLifecycle {
+    fn process_message_frame(&self, frame: DirectLinkFrame) -> Result<(), LinkError> {
+        self.message_frames.lock().unwrap().push(frame);
+        Ok(())
+    }
+
     fn deliver_direction_closed(
         &self,
         _actor_ref: &ActorRef,

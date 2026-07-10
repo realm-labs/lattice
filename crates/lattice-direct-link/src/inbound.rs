@@ -4,7 +4,9 @@
 // integration fixtures that do not weaken coverage of private routing behavior.
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -243,7 +245,7 @@ impl DirectLinkInboundRouter {
         }
     }
 
-    pub fn process_open_link_frame(
+    pub async fn process_open_link_frame(
         &self,
         frame: DirectLinkFrame,
         peer_identity: Option<DirectLinkPeerIdentity>,
@@ -258,7 +260,7 @@ impl DirectLinkInboundRouter {
             .open_link_from_peer(request, peer_identity)
         {
             Ok(ack) => {
-                if let Err(error) = self.deliver_link_opened_to_target(&ack.link_id) {
+                if let Err(error) = self.deliver_link_opened_to_target(&ack.link_id).await {
                     let _ = self.session_manager.close_all(
                         &ack.link_id,
                         LinkCloseReason::ProtocolError(format!(
@@ -279,7 +281,7 @@ impl DirectLinkInboundRouter {
         }
     }
 
-    pub fn deliver_link_opened_to_target(
+    pub async fn deliver_link_opened_to_target(
         &self,
         link_id: &LinkId,
     ) -> Result<(), InboundDeliveryError> {
@@ -297,7 +299,7 @@ impl DirectLinkInboundRouter {
             .ok_or_else(|| InboundDeliveryError::UnboundActorKind {
                 actor_kind: snapshot.target.actor_kind.clone(),
             })?;
-        binding.deliver_link_opened(&snapshot.target, opened)
+        binding.deliver_link_opened(&snapshot.target, opened).await
     }
 
     pub fn close_direction(
@@ -593,11 +595,50 @@ impl DirectLinkInboundRouterBuilder {
             + Handler<LinkBackpressure>,
         F: Fn(&ActorRef) -> Option<ActorHandle<A>> + Send + Sync + 'static,
     {
+        let resolver = Arc::new(resolver);
+        let open_resolver: Arc<ActorOpenResolver<A>> = {
+            let resolver = resolver.clone();
+            Arc::new(move |actor_ref| {
+                let handle = resolver(&actor_ref);
+                Box::pin(async move { handle })
+            })
+        };
+        self.bindings.insert(
+            binding.actor_kind().clone(),
+            Box::new(TypedInboundBinding {
+                binding,
+                resolver,
+                open_resolver,
+                _actor: PhantomData,
+            }),
+        );
+        self
+    }
+
+    pub fn bind_actor_with_open_resolver<A, Messages, Metadata, F, O, Fut>(
+        mut self,
+        binding: DirectLinkActorBinding<A, Messages, Metadata>,
+        resolver: F,
+        open_resolver: O,
+    ) -> Self
+    where
+        A: Actor,
+        Metadata: DirectLinkMetadata,
+        Messages: DirectLinkDispatch<A, Metadata>,
+        A: Handler<LinkOpened>
+            + Handler<LinkDirectionClosed>
+            + Handler<LinkClosed>
+            + Handler<LinkBackpressure>,
+        F: Fn(&ActorRef) -> Option<ActorHandle<A>> + Send + Sync + 'static,
+        O: Fn(ActorRef) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<ActorHandle<A>>> + Send + 'static,
+    {
         self.bindings.insert(
             binding.actor_kind().clone(),
             Box::new(TypedInboundBinding {
                 binding,
                 resolver: Arc::new(resolver),
+                open_resolver: Arc::new(move |actor_ref| Box::pin(open_resolver(actor_ref))),
                 _actor: PhantomData,
             }),
         );
@@ -703,6 +744,7 @@ enum InboundBackpressureAction {
     Drop,
 }
 
+#[async_trait::async_trait]
 trait ErasedInboundBinding: Send + Sync + 'static {
     fn deliver(
         &self,
@@ -713,7 +755,7 @@ trait ErasedInboundBinding: Send + Sync + 'static {
         context: LinkMessageContext,
     ) -> Result<(), InboundDeliveryError>;
 
-    fn deliver_link_opened(
+    async fn deliver_link_opened(
         &self,
         actor_ref: &ActorRef,
         opened: LinkOpened,
@@ -739,6 +781,8 @@ trait ErasedInboundBinding: Send + Sync + 'static {
 }
 
 type ActorResolver<A> = dyn Fn(&ActorRef) -> Option<ActorHandle<A>> + Send + Sync;
+type ActorOpenResolveFuture<A> = Pin<Box<dyn Future<Output = Option<ActorHandle<A>>> + Send>>;
+type ActorOpenResolver<A> = dyn Fn(ActorRef) -> ActorOpenResolveFuture<A> + Send + Sync;
 
 struct TypedInboundBinding<A, Messages, Metadata>
 where
@@ -746,9 +790,11 @@ where
 {
     binding: DirectLinkActorBinding<A, Messages, Metadata>,
     resolver: Arc<ActorResolver<A>>,
+    open_resolver: Arc<ActorOpenResolver<A>>,
     _actor: PhantomData<fn() -> (A, Metadata)>,
 }
 
+#[async_trait::async_trait]
 impl<A, Messages, Metadata> ErasedInboundBinding for TypedInboundBinding<A, Messages, Metadata>
 where
     A: Actor
@@ -773,12 +819,14 @@ where
             .map_err(Into::into)
     }
 
-    fn deliver_link_opened(
+    async fn deliver_link_opened(
         &self,
         actor_ref: &ActorRef,
         opened: LinkOpened,
     ) -> Result<(), InboundDeliveryError> {
-        let handle = (self.resolver)(actor_ref).ok_or(InboundDeliveryError::ActorUnavailable)?;
+        let handle = (self.open_resolver)(actor_ref.clone())
+            .await
+            .ok_or(InboundDeliveryError::ActorUnavailable)?;
         handle
             .try_tell(opened)
             .map_err(DirectLinkDeliveryError::from)

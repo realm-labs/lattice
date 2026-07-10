@@ -25,6 +25,7 @@ use lattice_direct_link::inbound::{DirectLinkInboundRouter, DirectLinkInboundRou
 use lattice_direct_link::session::{DirectLinkSessionManager, OpenLinkValidationPolicy};
 use lattice_direct_link::stream::DirectLinkActorBinding;
 use lattice_direct_link::transport::TcpDirectLinkTransport;
+use lattice_placement::coordination::actor::ActivateActorRequest;
 use lattice_placement::registry::InstanceState;
 use lattice_placement::storage::{ActorPlacementKey, PlacementState};
 
@@ -169,7 +170,10 @@ impl DirectLinkRuntime for DirectLinkServiceRuntime {
         request: DirectLinkOpenRequest,
     ) -> Result<DirectLinkSession, LinkError> {
         let request = self.resolve_open_request(request).await?;
-        Ok(self.endpoint_pool.open_link(request).await?.session)
+        let opened = self.endpoint_pool.open_link(request).await?;
+        self.session_manager
+            .record_opened_link_from_ack(opened.open_request, opened.ack)?;
+        Ok(opened.session)
     }
 
     async fn get_outbound(
@@ -205,12 +209,20 @@ impl DirectLinkServiceRuntime {
             actor_kind: actor_ref.actor_kind.clone(),
             actor_id: actor_ref.actor_id.clone(),
         };
-        let Some((_version, placement)) = placement_store
+        let placement = match placement_store
             .get_actor(&key)
             .await
             .map_err(|error| LinkError::Protocol(error.to_string()))?
-        else {
-            return Err(LinkError::ActorUnavailable);
+        {
+            Some((_version, placement)) => placement,
+            None => placement_store
+                .activate_actor(ActivateActorRequest {
+                    service_kind: actor_ref.service_kind.clone(),
+                    actor_kind: actor_ref.actor_kind.clone(),
+                    actor_id: actor_ref.actor_id.clone(),
+                })
+                .await
+                .map_err(|error| LinkError::Protocol(error.to_string()))?,
         };
         if placement.state != PlacementState::Running {
             return Err(LinkError::ActorUnavailable);
@@ -275,6 +287,15 @@ struct DirectLinkSourceLifecycle {
 }
 
 impl DirectLinkEndpointPoolLifecycle for DirectLinkSourceLifecycle {
+    fn process_message_frame(
+        &self,
+        frame: lattice_direct_link::protocol::DirectLinkFrame,
+    ) -> Result<(), LinkError> {
+        self.inbound_router
+            .process_frame(frame)
+            .map_err(|error| LinkError::Protocol(error.to_string()))
+    }
+
     fn deliver_direction_closed(
         &self,
         actor_ref: &ActorRef,
@@ -352,9 +373,25 @@ where
 
         let registered = context.actor::<A>(self.binding.actor_kind())?;
         let registry = registered.registry();
-        Ok(router.bind_actor(self.binding, move |actor_ref| {
-            registry.get_running(&actor_ref.actor_id)
-        }))
+        let open_registry = registered.registry();
+        let loader = registered.loader();
+        Ok(router.bind_actor_with_open_resolver(
+            self.binding,
+            move |actor_ref| registry.get_running(&actor_ref.actor_id),
+            move |actor_ref| {
+                let registry = open_registry.clone();
+                let loader = loader.clone();
+                async move {
+                    match registry.get_or_load(actor_ref.actor_id, loader).await {
+                        Ok(handle) => Some(handle),
+                        Err(error) => {
+                            tracing::warn!(%error, "direct_link.actor_load_failed");
+                            None
+                        }
+                    }
+                }
+            },
+        ))
     }
 }
 

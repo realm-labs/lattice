@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_placement::control::TonicLogicControl;
-use lattice_placement::coordination::actor::PlacementCoordinator;
+use lattice_placement::coordination::actor::{ActivateActorRequest, PlacementCoordinator};
 use lattice_placement::coordination::reports::DrainReport;
 use lattice_placement::error::PlacementError;
 use lattice_placement::registry::InstanceRecord;
@@ -37,6 +37,10 @@ pub trait DynPlacementStore: Send + Sync + 'static {
         &self,
         key: &ActorPlacementKey,
     ) -> Result<Option<(PlacementVersion, ActorPlacementRecord)>, PlacementError>;
+    async fn activate_actor(
+        &self,
+        request: ActivateActorRequest,
+    ) -> Result<ActorPlacementRecord, PlacementError>;
     async fn list_actors(
         &self,
     ) -> Result<Vec<(PlacementVersion, ActorPlacementRecord)>, PlacementError>;
@@ -137,6 +141,15 @@ where
         key: &ActorPlacementKey,
     ) -> Result<Option<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
         PlacementStore::get_actor(self, key).await
+    }
+
+    async fn activate_actor(
+        &self,
+        request: ActivateActorRequest,
+    ) -> Result<ActorPlacementRecord, PlacementError> {
+        PlacementCoordinator::new(self.clone(), TonicLogicControl)
+            .activate_actor(request)
+            .await
     }
 
     async fn list_actors(

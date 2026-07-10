@@ -158,7 +158,7 @@ pub(crate) async fn handle_direct_link_connection(
                     }
                 };
                 if frame.kind == DirectLinkFrameKind::OpenLink {
-                    match inbound_router.process_open_link_frame(frame, None) {
+                    match inbound_router.process_open_link_frame(frame, None).await {
                         Ok(response) => {
                             if response.kind == DirectLinkFrameKind::OpenLinkAck {
                                 let link_id = response.link_id.clone();
