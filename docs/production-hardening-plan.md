@@ -1,6 +1,6 @@
 # lattice Production Hardening Execution Plan
 
-> Status: not started
+> Status: in progress
 > Purpose: turn the current functionally complete framework into a production-safe distributed actor runtime.
 > Execution model: implement the earliest unfinished phase in small, tested, committed slices.
 > Source: code review performed against the workspace after the original Phase 1-9 implementation plan was marked complete.
@@ -80,11 +80,11 @@ Admin inspection reports live or explicitly stale/partial state.
 
 ### Phase 0: Baseline and Regression Guardrails
 
-Status: `[ ]` not started.
+Status: `[ ]` in progress.
 
-- [ ] Record the current workspace verification baseline in this document.
-- [ ] Map every hardening invariant to at least one planned executable test.
-- [ ] Confirm no existing public API must remain insecure for compatibility.
+- [x] Record the current workspace verification baseline in this document.
+- [x] Map every hardening invariant to at least one planned executable test.
+- [x] Confirm no existing public API must remain insecure for compatibility.
 - [ ] Add a production-hardening test module/layout without committing intentionally failing tests.
 - [ ] Phase 0 verification and conventional commit complete.
 
@@ -177,6 +177,7 @@ Status: `[ ]` not started.
 - [ ] Preserve one RequestId across transparent route-correction retry.
 - [ ] Define duplicate state explicitly, including in-flight and completed/unknown-result behavior.
 - [ ] Ensure duplicate protection executes before business side effects and cannot be bypassed by alternate generated adapters.
+- [ ] Bound duplicate-state cardinality and eviction under untrusted request-id churn.
 - [ ] Replace client-core-static trace/auth state with a per-call RPC context API.
 - [ ] Propagate the active trace context, authenticated principal/session context, and deadline on every generated call.
 - [ ] Validate inbound deadline and cancellation behavior without claiming that cancellation rolls back actor side effects.
@@ -236,6 +237,43 @@ No intentionally failing test is committed.
 Every P0 behavior has a named future test location.
 The tracker reflects the actual repository state rather than review assumptions.
 ```
+
+#### Phase 0 invariant test matrix
+
+The baseline audit found no invariant with complete executable coverage. Seven have partial supporting tests and four have no meaningful coverage. A mock or a test that implements the required behavior inside its fake transport is not acceptance evidence for the production ingress path.
+
+| Required invariant | Baseline evidence | Named executable coverage required before completion |
+|---|---|---|
+| A stale or non-owner instance never loads or invokes an actor | Partial: the bare `ActorRpcAdapter` rejects a stale epoch, while placement chaos tests implement fencing in fake transports; generated `RegistryService` still reaches `ActorRegistry::get_or_load` | `crates/lattice-service/src/tests/production_hardening/ownership.rs::generated_placement_rpc_rejects_stale_and_non_owner_before_loader_and_handler` for explicit, virtual-shard, and singleton routes over real generated tonic transport |
+| A placement-backed request cannot bypass fencing by omitting route epoch metadata | None: current adapter and generated singleton checks accept the missing/optional case | `crates/lattice-service/src/tests/production_hardening/ownership.rs::missing_epoch_is_rejected_before_loader_for_every_placement_mode` with loader and handler counters remaining zero |
+| Lease loss fences local ownership before more actor mutations are served | None: existing tests cover successful keepalive and later coordinator reassignment, not the old service's local ingress | `crates/lattice-service/src/tests/production_hardening/lease_fencing.rs::keepalive_loss_fences_mutations_before_service_exit` and `watch_failure_cannot_leave_old_owner_ready` |
+| NOT_OWNER and FENCED are structured protocol outcomes | Partial: typed Rust variants exist, but tonic normalization parses human-readable status messages | `crates/lattice-rpc/tests/production_hardening/structured_fencing.rs::real_tonic_round_trips_not_owner_and_fenced_details_without_message_parsing` |
+| A malformed or disconnected client affects only its Gateway connection | None: connection errors currently become service-level background-task failures | `crates/lattice-gateway/src/tests/production_hardening.rs::malformed_and_disconnected_clients_close_only_their_connection`, followed by a healthy request on the same listener |
+| All untrusted-input collections, queues, connections, and caches are bounded or evicted | Partial: concurrency load shedding and Direct Link limits are covered, but Gateway connections/outbound pressure, limiter/session maps, and duplicate state are not all bounded | `crates/lattice-gateway/src/tests/production_hardening.rs::{connection_admission_never_exceeds_limit,outbound_queue_rejects_when_full,limiter_and_session_cardinality_stay_bounded_under_churn}` and `crates/lattice-rpc/tests/production_hardening/bounds.rs::request_dedup_cardinality_stays_bounded_under_churn` |
+| Authenticated peer identity comes from the transport | Partial: policy unit tests ignore spoofed metadata and accept a manually installed extension, but no certificate-to-extension bridge exists | `crates/lattice-rpc/tests/production_hardening/mtls_identity.rs::mtls_certificate_identity_wins_over_spoofed_metadata` plus missing-certificate, wrong-service, and wrong-trust-domain real-network cases |
+| Actor activation cannot remain stuck after cancellation or panic | Partial: concurrent activation and ordinary loader errors are covered, not cancellation or panic | `crates/lattice-actor/tests/production_hardening.rs::{aborted_loader_does_not_leave_activating_entry,panicking_loader_wakes_waiters_and_allows_retry}` |
+| Every runtime-owned task has ownership, failure policy, cancellation, and deadline | Partial: selected shutdown paths are tested, while placement-watch and other task exits can remain unobserved | `crates/lattice-service/src/tests/production_hardening/supervision.rs::{critical_task_failure_drops_readiness_and_starts_shutdown,hung_task_is_aborted_after_join_deadline,placement_watch_failure_is_not_silent}` |
+| Request IDs cannot repeat across process restarts with the same instance ID | None: the process-local sequence restarts and the current test covers only two calls from one factory | `crates/lattice-rpc/tests/production_hardening/request_identity.rs::same_instance_two_boots_generate_disjoint_request_ids` |
+| Admin inspection is live or explicitly stale/partial | Partial: standalone snapshot/partial abstractions are covered, but the running HTTP service keeps a startup snapshot | `crates/lattice-service/src/tests/production_hardening/admin_live.rs::{admin_http_observes_placement_update_without_restart,unreachable_node_is_reported_as_partial_or_explicitly_stale}` |
+
+The hardening layout keeps crate-private tests beside their owning runtime module and public/transport tests in Cargo integration targets. Cross-crate generated transport scenarios live under `examples/distributed-login/tests/production_hardening.rs`; no new umbrella workspace crate is planned.
+
+#### Phase 0 compatibility decision
+
+No existing public API must remain insecure for compatibility. Ownership fencing, authenticated identity, bounded resources, secret redaction, and deadline-bounded shutdown take precedence over source, wire-shape, serialized-shape, default-behavior, Debug-output, and error-classification compatibility.
+
+Permitted compatibility breaks are:
+
+- placement-backed calls may reject a missing epoch, and `RpcContext`, `RouteTarget`, `ActorRef`, adapter, generated binding, or constructor signatures may change to make the fenced mode explicit;
+- caller-supplied `lattice-peer-*` metadata and Direct Link envelope identity cease to authenticate a peer, and the fixed framework-known `Bearer lattice-internal` mechanism may be removed;
+- production profiles may reject disabled security, plaintext external RPC/admin/Direct Link binds, missing identity material, and unauthenticated mutating admin APIs at startup;
+- TLS keys, bearer tokens, authorization context, and other credentials may become redacted or unavailable through derived `Debug` output;
+- unlimited or zero-invalid Gateway, limiter, session, duplicate-state, Direct Link, mailbox, and worker configurations may gain finite defaults, validation, or fallible constructors;
+- generated duplicate-protection bypasses may be removed for placement-backed mutations, request-id format may become boot-unique, and static client trace/auth builders may be replaced by per-call context;
+- `GatewaySessionRef` may gain gateway and boot-incarnation fields, with old or stale serialized references rejected;
+- connection failure, task supervision, and shutdown error behavior may change where the old behavior was service-fatal, detached, silent, or unbounded.
+
+The only compatibility exception is an explicitly selected static/local development mode that is unfenced or plaintext. Generated placement-backed services and production profiles must never select it implicitly.
 
 ### 3.2 Phase 1 Acceptance
 
@@ -405,17 +443,25 @@ Performance validation must compare before/after results using the existing benc
 
 ### 5.1 Baseline Record
 
-Fill this during Phase 0:
-
 ```text
-Date:
-Commit:
-Rust toolchain:
-cargo fmt --all -- --check:
-cargo clippy --workspace --all-targets -- -D warnings:
-cargo test --workspace --all-targets:
+Date: 2026-07-10 (Asia/Shanghai)
+Commit: 17d57c58aca4ed57c7ae385b3f38d3b85f09fd9c
+Rust toolchain: rustc 1.96.1 (31fca3adb 2026-06-26), cargo 1.96.1, x86_64-pc-windows-msvc
+cargo fmt --all -- --check: PASS (5.7s)
+cargo clippy --workspace --all-targets -- -D warnings: PASS (18.7s)
+cargo test --workspace --all-targets: PASS (53.6s); all unit, integration, UI, and benchmark smoke targets passed
 Relevant benchmark results:
+  cargo bench -p rpc-benchmark --bench rpc_benchmark -- --quick: PASS
+  environment: release profile, local Windows host, loopback tonic, in-memory placement,
+    2 nodes per service, 256 actors, concurrency 64, 10,000 base requests,
+    4 channel stripes, route correction and request dedup enabled, zero-byte extra payload
+  multi_node_rpc/routed_rpc_fanout_warm_cache/10000: [189.86ms, 198.37ms, 200.50ms]
+  multi_node_rpc/cross_service_chain_warm_cache/10000: [364.76ms, 398.97ms, 407.52ms]
+  lattice-direct-link benchmark target: compiled and every scenario passed in Criterion smoke mode
 Known environment limitations:
+  Criterion quick-mode intervals are comparison evidence, not an absolute throughput gate.
+  The baseline is single-host and does not exercise external etcd, NATS, a true multi-process
+  deployment, network impairment, or real TLS/mTLS. Gnuplot was absent, so Criterion used plotters.
 ```
 
 ---
