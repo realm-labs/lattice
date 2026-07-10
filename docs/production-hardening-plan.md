@@ -80,13 +80,13 @@ Admin inspection reports live or explicitly stale/partial state.
 
 ### Phase 0: Baseline and Regression Guardrails
 
-Status: `[ ]` in progress.
+Status: `[x]` complete.
 
 - [x] Record the current workspace verification baseline in this document.
 - [x] Map every hardening invariant to at least one planned executable test.
 - [x] Confirm no existing public API must remain insecure for compatibility.
-- [ ] Add a production-hardening test module/layout without committing intentionally failing tests.
-- [ ] Phase 0 verification and conventional commit complete.
+- [x] Add a production-hardening test module/layout without committing intentionally failing tests.
+- [x] Phase 0 verification and conventional commit complete.
 
 ### Phase 1: Ownership Gate and Structured Fencing
 
@@ -436,6 +436,7 @@ cargo test -p lattice-placement --test chaos
 cargo test -p lattice-gateway
 cargo test -p lattice-actor
 cargo test -p lattice-service
+cargo test -p lattice-service tests::production_hardening::service_keeps_instance_lease_alive_while_running -- --exact
 cargo test -p distributed-login --test distributed_flow
 ```
 
