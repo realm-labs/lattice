@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
                 .passivation(PassivationPolicy::IdleTimeout(Duration::from_secs(300)))
                 .build(),
         )
-        .register_sharded_rpc(generated::world_rpc::Binding::for_actor::<WorldActor>(WORLD_ACTOR))
+        .register_sharded_rpc(generated::world_rpc::Binding::for_explicit_actor::<WorldActor>(WORLD_ACTOR))
         .register_client::<generated::player_rpc::Binding>()
         .build()
         .await?;
@@ -241,14 +241,14 @@ LatticeService::builder(BATTLE_SERVICE)
     )
     .register_direct_link(movement_stream.for_actor::<BattleActor>(BATTLE_ACTOR))
     .register_direct_link(input_stream.for_actor::<BattleActor>(BATTLE_ACTOR))
-    .register_sharded_rpc(generated::battle_rpc::Binding::for_actor::<BattleActor>(BATTLE_ACTOR));
+    .register_sharded_rpc(generated::battle_rpc::Binding::for_explicit_actor::<BattleActor>(BATTLE_ACTOR));
 ```
 
 Generated RPC service bindings enable the lightweight request-id duplicate guard by default. Disable it explicitly only for endpoints where duplicate delivery is acceptable or handled elsewhere:
 
 ```rust
 .register_sharded_rpc(
-    generated::world_rpc::Binding::for_actor::<WorldActor>(WORLD_ACTOR)
+    generated::world_rpc::Binding::for_explicit_actor::<WorldActor>(WORLD_ACTOR)
         .request_dedup(false),
 )
 ```

@@ -191,7 +191,7 @@ async fn start_bench_node(
                 .build(),
         )
         .register_sharded_rpc(
-            bench_rpc::Binding::for_actor::<BenchActor>(BENCH_ACTOR)
+            bench_rpc::Binding::for_explicit_actor::<BenchActor>(BENCH_ACTOR)
                 .request_dedup(config.request_dedup),
         )
         .build()
@@ -222,7 +222,7 @@ async fn start_chain_node(
                 .build(),
         )
         .register_sharded_rpc(
-            chain_rpc::Binding::for_actor::<ChainActor>(CHAIN_ACTOR)
+            chain_rpc::Binding::for_explicit_actor::<ChainActor>(CHAIN_ACTOR)
                 .request_dedup(config.request_dedup),
         )
         .build()
@@ -251,7 +251,7 @@ async fn start_worker_node(
                 .build(),
         )
         .register_sharded_rpc(
-            worker_rpc::Binding::for_actor::<WorkerActor>(WORKER_ACTOR)
+            worker_rpc::Binding::for_explicit_actor::<WorkerActor>(WORKER_ACTOR)
                 .request_dedup(config.request_dedup),
         )
         .build()

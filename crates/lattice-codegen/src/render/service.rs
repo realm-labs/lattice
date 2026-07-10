@@ -34,7 +34,7 @@ use lattice_actor::traits::{Actor, Handler};\n",
     rust.push_str(
         "    use lattice_service::error::LatticeServiceError;
     use lattice_service::framework::context::ServiceContextExt;
-    use lattice_service::clients::{RpcClientBinding, RpcClientPlacement, RpcServiceBinding};
+    use lattice_service::clients::{RpcClientBinding, RpcClientPlacement, RpcServiceBinding, RpcServicePlacement};
     use lattice_service::context::ServiceBuildContext;\n\n",
     );
     push_typed_client(rust, methods);
@@ -107,16 +107,25 @@ fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let server_path = tonic_server_path(service);
     rust.push_str("    pub type DefaultClientCore = lattice_placement::routing::rpc::ResolvingRpcCore<lattice_placement::routing::resolver::BoxRouteResolver, super::GeneratedTonicEndpointTransport>;\n\n");
     rust.push_str("    #[derive(Debug)]\n");
-    rust.push_str("    pub struct Binding<A = (), C = DefaultClientCore> {\n        actor_kind: ActorKind,\n        request_dedup: bool,\n        _actor: PhantomData<fn() -> A>,\n        _core: PhantomData<fn() -> C>,\n    }\n\n");
+    rust.push_str("    pub struct Binding<A = (), C = DefaultClientCore> {\n        actor_kind: ActorKind,\n        placement: RpcServicePlacement,\n        request_dedup: bool,\n        _actor: PhantomData<fn() -> A>,\n        _core: PhantomData<fn() -> C>,\n    }\n\n");
     rust.push_str("    impl<A, C> Binding<A, C> {\n");
+    rust.push_str("        pub fn placement_mode(&self) -> RpcServicePlacement {\n");
+    rust.push_str("            self.placement\n");
+    rust.push_str("        }\n\n");
     rust.push_str("        pub fn request_dedup(mut self, enabled: bool) -> Self {\n");
     rust.push_str("            self.request_dedup = enabled;\n");
     rust.push_str("            self\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
     rust.push_str("    impl Binding<()> {\n");
-    rust.push_str("        pub fn for_actor<A>(actor_kind: ActorKind) -> Binding<A>\n        where\n            A: Actor,\n        {\n");
-    rust.push_str("            Binding { actor_kind, request_dedup: true, _actor: PhantomData, _core: PhantomData }\n");
+    rust.push_str("        pub fn for_explicit_actor<A>(actor_kind: ActorKind) -> Binding<A>\n        where\n            A: Actor,\n        {\n");
+    rust.push_str("            Binding { actor_kind, placement: RpcServicePlacement::ExplicitFenced, request_dedup: true, _actor: PhantomData, _core: PhantomData }\n");
+    rust.push_str("        }\n\n");
+    rust.push_str("        pub fn for_virtual_sharded_actor<A>(actor_kind: ActorKind, shard_count: u32) -> Result<Binding<A>, lattice_placement::error::PlacementError>\n        where\n            A: Actor,\n        {\n");
+    rust.push_str("            Ok(Binding { actor_kind, placement: RpcServicePlacement::virtual_shards(shard_count)?, request_dedup: true, _actor: PhantomData, _core: PhantomData })\n");
+    rust.push_str("        }\n\n");
+    rust.push_str("        pub fn for_static_local_actor_unfenced<A>(actor_kind: ActorKind) -> Binding<A>\n        where\n            A: Actor,\n        {\n");
+    rust.push_str("            Binding { actor_kind, placement: RpcServicePlacement::StaticLocalUnfenced, request_dedup: true, _actor: PhantomData, _core: PhantomData }\n");
     rust.push_str("        }\n");
     rust.push_str("    }\n\n");
     rust.push_str("    impl<A, C> RpcClientBinding for Binding<A, C>\n    where\n        A: Send + Sync + 'static,\n        C: ShardedRpcCore + Clone,\n    {\n");
@@ -142,10 +151,11 @@ fn push_service_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
         "        fn service_name(&self) -> &'static str {{ \"{}\" }}\n\n",
         service.service_name
     ));
+    rust.push_str("        fn ingress_placement(&self) -> RpcServicePlacement {\n            self.placement\n        }\n\n");
     rust.push_str("        fn register(self: Box<Self>, context: &mut ServiceBuildContext) -> Result<(), LatticeServiceError> {\n");
     rust.push_str("            let actor = context.actor::<A>(&self.actor_kind)?;\n");
     rust.push_str(&format!(
-        "            context.add_rpc_service({server_path}::new(RegistryService::with_security(actor.registry(), actor.loader(), context.rpc_security()).with_request_dedup(self.request_dedup)));\n"
+        "            context.add_rpc_service({server_path}::new(RegistryService::with_security_and_placement(actor.registry(), actor.loader(), context.rpc_security(), self.placement).with_request_dedup(self.request_dedup)));\n"
     ));
     rust.push_str("            Ok(())\n");
     rust.push_str("        }\n");
@@ -158,6 +168,9 @@ fn push_singleton_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
     rust.push_str("    #[derive(Debug)]\n");
     rust.push_str("    pub struct SingletonBinding<A = (), C = DefaultClientCore> {\n        actor_kind: ActorKind,\n        request_dedup: bool,\n        _actor: PhantomData<fn() -> A>,\n        _core: PhantomData<fn() -> C>,\n    }\n\n");
     rust.push_str("    impl<A, C> SingletonBinding<A, C> {\n");
+    rust.push_str("        pub fn placement_mode(&self) -> RpcServicePlacement {\n");
+    rust.push_str("            RpcServicePlacement::SingletonFenced\n");
+    rust.push_str("        }\n\n");
     rust.push_str("        pub fn request_dedup(mut self, enabled: bool) -> Self {\n");
     rust.push_str("            self.request_dedup = enabled;\n");
     rust.push_str("            self\n");
@@ -200,6 +213,7 @@ fn push_singleton_binding(rust: &mut String, methods: &[&RpcMethodSpec]) {
         "        fn service_name(&self) -> &'static str {{ \"{}\" }}\n\n",
         service.service_name
     ));
+    rust.push_str("        fn ingress_placement(&self) -> RpcServicePlacement {\n            RpcServicePlacement::SingletonFenced\n        }\n\n");
     rust.push_str("        fn register(self: Box<Self>, context: &mut ServiceBuildContext) -> Result<(), LatticeServiceError> {\n");
     rust.push_str("            let actor = context.actor::<A>(&self.actor_kind)?;\n");
     rust.push_str("            let service = context.service_context();\n");
@@ -263,15 +277,18 @@ fn push_registry_server_adapter(rust: &mut String, methods: &[&RpcMethodSpec]) {
     let service = methods[0];
     let trait_path = tonic_service_trait_path(service);
     rust.push_str("    #[derive(Debug, Clone)]\n");
-    rust.push_str("    pub struct RegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n        security: RpcServerSecurity,\n        request_dedup: bool,\n        deduplicator: lattice_rpc::dedup::RequestDeduplicator,\n    }\n\n");
+    rust.push_str("    pub struct RegistryService<A: Actor, L> {\n        registry: Arc<ActorRegistry<A>>,\n        loader: L,\n        placement: RpcServicePlacement,\n        security: RpcServerSecurity,\n        request_dedup: bool,\n        deduplicator: lattice_rpc::dedup::RequestDeduplicator,\n    }\n\n");
     rust.push_str("    impl<A, L> RegistryService<A, L>\n    where\n        A: Actor,\n        L: ActorLoader<A>,\n    {\n");
-    rust.push_str("        pub fn new(registry: Arc<ActorRegistry<A>>, loader: L) -> Self {\n");
+    rust.push_str("        pub fn new_static_local_unfenced(registry: Arc<ActorRegistry<A>>, loader: L) -> Self {\n");
     rust.push_str(
-        "            Self { registry, loader, security: RpcServerSecurity::disabled(), request_dedup: true, deduplicator: lattice_rpc::dedup::RequestDeduplicator::new() }\n",
+        "            Self { registry, loader, placement: RpcServicePlacement::StaticLocalUnfenced, security: RpcServerSecurity::disabled(), request_dedup: true, deduplicator: lattice_rpc::dedup::RequestDeduplicator::new() }\n",
     );
     rust.push_str("        }\n\n");
-    rust.push_str("        pub fn with_security(registry: Arc<ActorRegistry<A>>, loader: L, security: RpcServerSecurity) -> Self {\n");
-    rust.push_str("            Self { registry, loader, security, request_dedup: true, deduplicator: lattice_rpc::dedup::RequestDeduplicator::new() }\n");
+    rust.push_str("        fn with_security_and_placement(registry: Arc<ActorRegistry<A>>, loader: L, security: RpcServerSecurity, placement: RpcServicePlacement) -> Self {\n");
+    rust.push_str("            Self { registry, loader, placement, security, request_dedup: true, deduplicator: lattice_rpc::dedup::RequestDeduplicator::new() }\n");
+    rust.push_str("        }\n\n");
+    rust.push_str("        pub fn placement_mode(&self) -> RpcServicePlacement {\n");
+    rust.push_str("            self.placement\n");
     rust.push_str("        }\n\n");
     rust.push_str("        pub fn with_request_dedup(mut self, enabled: bool) -> Self {\n");
     rust.push_str("            self.request_dedup = enabled;\n");

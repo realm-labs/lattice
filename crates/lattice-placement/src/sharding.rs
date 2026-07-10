@@ -31,6 +31,10 @@ impl VirtualShardMapper {
     pub fn shard_for_route_key(&self, route_key: &RouteKey) -> VirtualShardId {
         VirtualShardId((stable_route_hash(route_key) % u64::from(self.shard_count)) as u32)
     }
+
+    pub fn shard_count(self) -> u32 {
+        self.shard_count
+    }
 }
 
 fn stable_route_hash(route_key: &RouteKey) -> u64 {

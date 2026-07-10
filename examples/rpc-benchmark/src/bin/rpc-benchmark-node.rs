@@ -66,7 +66,7 @@ async fn main() -> BenchmarkResult<()> {
                 .build(),
         )
         .register_sharded_rpc(
-            bench_rpc::Binding::for_actor::<BenchActor>(BENCH_ACTOR)
+            bench_rpc::Binding::for_explicit_actor::<BenchActor>(BENCH_ACTOR)
                 .request_dedup(args.request_dedup),
         );
     if !args.rpc_retry {

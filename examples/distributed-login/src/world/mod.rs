@@ -34,7 +34,9 @@ pub async fn run_world_service(
                 .factory(WorldActorFactory::new())
                 .build(),
         )
-        .register_sharded_rpc(world_rpc::Binding::for_actor::<WorldActor>(WORLD_ACTOR))
+        .register_sharded_rpc(world_rpc::Binding::for_explicit_actor::<WorldActor>(
+            WORLD_ACTOR,
+        ))
         .build()
         .await?
         .run_until_shutdown()

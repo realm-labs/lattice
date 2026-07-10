@@ -40,7 +40,9 @@ pub async fn run_player_service(
                 .factory(PlayerActorFactory::new(actor_ref_client))
                 .build(),
         )
-        .register_sharded_rpc(player_rpc::Binding::for_actor::<PlayerActor>(PLAYER_ACTOR))
+        .register_sharded_rpc(player_rpc::Binding::for_explicit_actor::<PlayerActor>(
+            PLAYER_ACTOR,
+        ))
         .build()
         .await?
         .run_until_shutdown()

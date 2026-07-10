@@ -47,8 +47,10 @@ pub async fn run_gateway(
     let player_core = player_core(placement_store, InstanceId::new("gateway-1"));
     let gateway_push_endpoint = format!("http://{push_addr}").parse::<Uri>()?;
     let sessions = GatewaySessions::new(gateway_push_endpoint);
-    let push_service =
-        gateway_push_rpc::RegistryService::new(sessions.registry(), GatewaySessionLoader);
+    let push_service = gateway_push_rpc::RegistryService::new_static_local_unfenced(
+        sessions.registry(),
+        GatewaySessionLoader,
+    );
     let service = GatewayService::new(
         client_listener,
         DemoGatewayConnectionHandler {

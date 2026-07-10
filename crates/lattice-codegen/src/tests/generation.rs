@@ -16,11 +16,47 @@ fn generated_output_matches_phase_two_shape() {
             .rust
             .contains("pub struct Binding<A = (), C = DefaultClientCore>")
     );
+    assert!(generated.rust.contains("placement: RpcServicePlacement"));
+    assert!(
+        generated
+            .rust
+            .contains("pub fn placement_mode(&self) -> RpcServicePlacement")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("pub fn for_explicit_actor<A>(actor_kind: ActorKind) -> Binding<A>")
+    );
+    assert!(
+        generated
+            .rust
+            .contains("placement: RpcServicePlacement::ExplicitFenced")
+    );
+    assert!(generated.rust.contains(
+        "pub fn for_virtual_sharded_actor<A>(actor_kind: ActorKind, shard_count: u32) -> Result<Binding<A>, lattice_placement::error::PlacementError>"
+    ));
+    assert!(
+        generated
+            .rust
+            .contains("placement: RpcServicePlacement::virtual_shards(shard_count)?")
+    );
+    assert!(generated.rust.contains(
+        "pub fn for_static_local_actor_unfenced<A>(actor_kind: ActorKind) -> Binding<A>"
+    ));
+    assert!(
+        generated
+            .rust
+            .contains("placement: RpcServicePlacement::StaticLocalUnfenced")
+    );
+    assert!(!generated.rust.contains("pub fn for_actor<A>(actor_kind"));
     assert!(
         generated
             .rust
             .contains("pub struct SingletonBinding<A = (), C = DefaultClientCore>")
     );
+    assert!(generated.rust.contains(
+        "pub fn placement_mode(&self) -> RpcServicePlacement {\n            RpcServicePlacement::SingletonFenced"
+    ));
     assert!(
         generated
             .rust
@@ -71,12 +107,42 @@ fn generated_output_matches_phase_two_shape() {
             .rust
             .contains("impl<A, C> RpcServiceBinding for Binding<A, C>")
     );
+    assert!(
+        generated
+            .rust
+            .contains("fn ingress_placement(&self) -> RpcServicePlacement")
+    );
+    assert!(generated.rust.contains(
+        "RegistryService::with_security_and_placement(actor.registry(), actor.loader(), context.rpc_security(), self.placement)"
+    ));
+    assert!(
+        generated
+            .rust
+            .contains("RpcServicePlacement::SingletonFenced")
+    );
     assert!(generated.rust.contains("pub struct ActorService<A: Actor>"));
     assert!(
         generated
             .rust
             .contains("pub struct RegistryService<A: Actor, L>")
     );
+    assert!(generated.rust.contains(
+        "pub fn new_static_local_unfenced(registry: Arc<ActorRegistry<A>>, loader: L) -> Self"
+    ));
+    assert!(generated.rust.contains(
+        "fn with_security_and_placement(registry: Arc<ActorRegistry<A>>, loader: L, security: RpcServerSecurity, placement: RpcServicePlacement) -> Self"
+    ));
+    assert!(!generated.rust.contains(
+        "pub fn with_security_and_placement(registry: Arc<ActorRegistry<A>>, loader: L, security: RpcServerSecurity, placement: RpcServicePlacement) -> Self"
+    ));
+    assert!(
+        !generated
+            .rust
+            .contains("pub fn new(registry: Arc<ActorRegistry<A>>, loader: L) -> Self")
+    );
+    assert!(!generated.rust.contains(
+        "pub fn with_security(registry: Arc<ActorRegistry<A>>, loader: L, security: RpcServerSecurity) -> Self"
+    ));
     assert!(generated.rust.contains("RpcServerSecurity"));
     assert!(generated.rust.contains("context.rpc_security()"));
     assert!(

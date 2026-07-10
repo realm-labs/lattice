@@ -94,7 +94,7 @@ Status: `[ ]` in progress.
 
 - [x] Add a reusable local ownership snapshot/gate for explicit actors, virtual shards, and singletons.
 - [x] Bind explicit actor placement records to the owner's live instance lease rather than the short-lived activation-lock lease. The durable actor record carries that lease as fencing authority while retaining the prior epoch for CAS failover; the short-lived activation-lock lease is never published as ownership.
-- [ ] Make generated RPC binding placement mode explicit: explicit-fenced by default, validated shard count for virtual shards, and named opt-in only for static/local unfenced use.
+- [ ] Make generated RPC binding placement mode explicit: explicit-fenced by default, validated shard count for virtual shards, and named opt-in only for static/local unfenced use. The mode type, generated constructors, compiled call sites, and named raw-registry opt-in are complete; this remains unchecked until fenced modes are enforced at ingress and virtual-shard client/server configuration is proven consistent with the authoritative assignment set.
 - [ ] Require generated placement-backed RPC services to validate expected service, actor kind, route, owner, state, lease validity, and epoch before actor lookup.
 - [ ] Prevent `ActorRegistry::get_or_load` from being reached after a failed ownership decision.
 - [ ] Require route epoch for fenced placement modes; retain an explicit unfenced mode only for deliberate static/local use.
@@ -443,6 +443,7 @@ cargo test -p lattice-actor
 cargo test -p lattice-service
 cargo test -p lattice-service tests::production_hardening::service_keeps_instance_lease_alive_while_running -- --exact
 cargo test -p distributed-login --test distributed_flow
+cargo test -p distributed-login --test generated_binding_placement
 ```
 
 Performance validation must compare before/after results using the existing benchmark harness. Do not turn unstable absolute throughput numbers into correctness gates; gate on bounded regression criteria documented with the benchmark environment.

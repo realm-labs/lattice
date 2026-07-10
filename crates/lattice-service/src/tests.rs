@@ -522,6 +522,10 @@ where
         self.service_name
     }
 
+    fn ingress_placement(&self) -> crate::clients::RpcServicePlacement {
+        crate::clients::RpcServicePlacement::StaticLocalUnfenced
+    }
+
     fn register(
         self: Box<Self>,
         context: &mut ServiceBuildContext,
@@ -538,6 +542,10 @@ struct SecurityProbeBinding;
 impl RpcServiceBinding for SecurityProbeBinding {
     fn service_name(&self) -> &'static str {
         "SecurityProbeRpc"
+    }
+
+    fn ingress_placement(&self) -> crate::clients::RpcServicePlacement {
+        crate::clients::RpcServicePlacement::StaticLocalUnfenced
     }
 
     fn register(

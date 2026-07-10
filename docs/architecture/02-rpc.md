@@ -364,10 +364,19 @@ Generated `ActorService`, `RegistryService`, and `SingletonRegistryService` adap
 
 ```rust
 service.register_sharded_rpc(
-    generated::world_rpc::Binding::for_actor::<WorldActor>(WORLD_ACTOR)
+    generated::world_rpc::Binding::for_explicit_actor::<WorldActor>(WORLD_ACTOR)
         .request_dedup(false),
 );
 ```
+
+Generated registry bindings declare their server ingress placement mode. Use
+`for_explicit_actor` for coordinator-owned actors,
+`for_virtual_sharded_actor(actor_kind, shard_count)?` for a validated nonzero
+virtual-shard mapping, and only use the deliberately named
+`for_static_local_actor_unfenced` for endpoint-affine actors that have no
+distributed placement record. Singleton bindings always declare singleton
+fencing. The generated raw registry constructor follows the same rule:
+unplaced local actors require `new_static_local_unfenced`.
 
 Low-level hand-written `ActorRpcAdapter::unary(...)` calls do not enable it unless they explicitly use the dedup variant.
 

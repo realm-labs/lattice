@@ -207,9 +207,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .mailbox(MailboxConfig::bounded(config.mailbox_capacity))
                 .build(),
         )
-        .register_sharded_rpc(generated::world_rpc::Binding::for_actor::<WorldActor>(
-            WORLD_ACTOR,
-        ))
+        .register_sharded_rpc(generated::world_rpc::Binding::for_explicit_actor::<
+            WorldActor,
+        >(WORLD_ACTOR))
         .build()
         .await?;
     let service_context = service.context().clone();
