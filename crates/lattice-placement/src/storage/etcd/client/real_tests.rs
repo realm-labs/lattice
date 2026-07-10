@@ -391,6 +391,127 @@ async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compac
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a real etcd endpoint in LATTICE_TEST_ETCD_ENDPOINT"]
+async fn real_etcd_ownership_watch_allows_a_full_capacity_same_revision_replacement() {
+    let endpoint = std::env::var(TEST_ETCD_ENDPOINT)
+        .unwrap_or_else(|_| panic!("set {TEST_ETCD_ENDPOINT} to a real etcd endpoint"));
+    assert!(
+        !endpoint.trim().is_empty(),
+        "{TEST_ETCD_ENDPOINT} must not be blank"
+    );
+    let endpoints = vec![endpoint];
+    let mut raw = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("connect raw real-etcd capacity test client");
+
+    let namespace = unique_namespace("ownership-capacity-replacement");
+    delete_namespace(&mut raw, &namespace).await;
+    let prefix = PlacementPrefix::new(namespace.clone());
+    let actor = actor_key_for_real_test(7);
+    let actor_record = actor_record(7, "world-a", 1);
+    put_actor_with_floor(&mut raw, &prefix, &actor, &actor_record).await;
+
+    let real = RealEtcdClient::connect(
+        endpoints,
+        InstanceLeaseTtl::new(30),
+        ActivationLockTtl::new(30),
+    )
+    .await
+    .expect("connect real-etcd capacity ownership client");
+    let store = EtcdPlacementStore::new(prefix.clone(), real);
+    let mut view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .expect("open full-capacity real-etcd ownership view");
+    assert_eq!(view.snapshot.records.len(), 1);
+
+    let shard = vshard_key_for_real_test(3);
+    let shard_record = vshard_record_for_real_test(3, "world-a", 1);
+    let shard_epoch_key = PlacementEpochKey::VirtualShard(shard.clone());
+    let mut operations = vec![
+        TxnOp::delete(actor_key(&prefix, &actor), None),
+        TxnOp::put(
+            epoch_floor_key(&prefix, &shard_epoch_key),
+            encode_etcd_value(&EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                key: shard_epoch_key,
+                epoch: shard_record.epoch,
+            })))
+            .expect("encode replacement shard floor"),
+            None,
+        ),
+        TxnOp::put(
+            vshard_key(&prefix, &shard),
+            encode_etcd_value(&EtcdValue::VirtualShard(Box::new(shard_record.clone())))
+                .expect("encode replacement shard"),
+            None,
+        ),
+    ];
+    for actor_id in 90..94 {
+        let unrelated_key = ActorPlacementKey {
+            service_kind: service_kind!("Other"),
+            actor_kind: actor_kind!("Other"),
+            actor_id: ActorId::U64(actor_id),
+        };
+        operations.push(TxnOp::put(
+            actor_key(&prefix, &unrelated_key),
+            b"malformed-unselected-ownership-record".to_vec(),
+            None,
+        ));
+    }
+    let transaction = raw
+        .txn(Txn::new().and_then(operations))
+        .await
+        .expect("commit full-capacity replacement transaction");
+    let transaction_revision = response_revision(transaction.header(), "capacity transaction");
+
+    let batch = next_batch(&mut view.watch).await;
+    assert_eq!(batch.revision, PlacementRevision(transaction_revision));
+    assert_eq!(batch.events.len(), 2);
+    assert!(batch.events.iter().any(|event| matches!(
+        event,
+        OwnershipWatchEvent::ActorDeleted {
+            key,
+            previous_record,
+            proof,
+        } if key == &actor
+            && previous_record == &actor_record
+            && proof.observed_revision() == PlacementRevision(transaction_revision)
+    )));
+    assert!(batch.events.iter().any(|event| matches!(
+        event,
+        OwnershipWatchEvent::VirtualShardUpserted { key, record, proof }
+            if key == &shard
+                && record == &shard_record
+                && proof.observed_revision() == PlacementRevision(transaction_revision)
+    )));
+
+    drop(view);
+    let final_view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .expect("reopen bounded real-etcd ownership view after replacement");
+    assert!(matches!(
+        final_view.snapshot.records.as_slice(),
+        [crate::storage::OwnershipViewRecord::VirtualShard {
+            revision,
+            record,
+            ..
+        }] if *revision == PlacementRevision(transaction_revision)
+            && record == &shard_record
+    ));
+    drop(final_view);
+    delete_namespace(&mut raw, &namespace).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a real etcd endpoint in LATTICE_TEST_ETCD_ENDPOINT"]
 async fn real_etcd_ownership_floor_proofs_reject_missing_leased_and_laundered_state_atomically() {
     let endpoint = std::env::var(TEST_ETCD_ENDPOINT)
         .unwrap_or_else(|_| panic!("set {TEST_ETCD_ENDPOINT} to a real etcd endpoint"));

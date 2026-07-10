@@ -26,6 +26,18 @@ const WATCH_CAPACITY: usize = 128;
 // closed rather than falling back to an unproven latest-value read.
 const FLOOR_PROOF_TXN_OP_LIMIT: usize = 64;
 
+/// A revision can replace every retained ownership record: at most
+/// `max_entries` old keys can disappear and `max_entries` new keys can appear.
+/// The exact local-instance key is the only additional selected watch key.
+/// Keeping this separate from the final live-record bound avoids rejecting a
+/// safe full-capacity replacement because of its transient event count.
+pub(crate) fn ownership_watch_event_limit(max_entries: NonZeroUsize) -> Option<usize> {
+    max_entries
+        .get()
+        .checked_mul(2)
+        .and_then(|limit| limit.checked_add(1))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EtcdOwnershipRecordRange {
     pub record_prefix: String,
@@ -1320,8 +1332,9 @@ async fn start_real_ownership_watch(
                 .ok_or(OwnershipViewError::WatchStart {
                     error: OwnershipWatchError::Closed,
                 })?;
-            let updates = decode_watch_response(&response, requested_revision, max_entries)
-                .map_err(|error| OwnershipViewError::WatchStart { error })?;
+            let updates =
+                decode_watch_response(&response, requested_revision, &ranges, max_entries)
+                    .map_err(|error| OwnershipViewError::WatchStart { error })?;
             let mut caught_up = false;
             for mut update in updates {
                 validate_watch_update(&update, &mut high_water)
@@ -1394,7 +1407,7 @@ async fn start_real_ownership_watch(
                     break;
                 }
             };
-            match decode_watch_response(&response, requested_revision, max_entries) {
+            match decode_watch_response(&response, requested_revision, &ranges, max_entries) {
                 Ok(updates) => {
                     for mut update in updates {
                         if let Err(error) = validate_watch_update(&update, &mut high_water) {
@@ -1471,6 +1484,7 @@ async fn current_linearizable_revision(
 fn decode_watch_response(
     response: &etcd_client::WatchResponse,
     requested_revision: PlacementRevision,
+    ranges: &EtcdOwnershipRanges,
     max_entries: NonZeroUsize,
 ) -> Result<Vec<EtcdOwnershipWatchUpdate>, OwnershipWatchError> {
     if let Some(error) = terminal_watch_error(response, requested_revision).map_err(|error| {
@@ -1493,12 +1507,20 @@ fn decode_watch_response(
         })
         .and_then(|header| watch_revision(header.revision()))?;
 
+    let max_events =
+        ownership_watch_event_limit(max_entries).ok_or(OwnershipWatchError::CapacityExceeded {
+            max_entries: max_entries.get(),
+        })?;
     let mut batches = BTreeMap::<PlacementRevision, Vec<EtcdOwnershipWatchEvent>>::new();
+    let mut seen_keys = HashMap::<PlacementRevision, HashSet<String>>::new();
     let mut previous_event_revision = None;
     for event in response.events() {
         let kv = event.kv().ok_or_else(|| OwnershipWatchError::Protocol {
             message: "etcd ownership watch event omitted its key-value".to_string(),
         })?;
+        if !ownership_key_is_selected(ranges, kv.key()) {
+            continue;
+        }
         let revision = watch_revision(kv.mod_revision())?;
         if revision > response_revision {
             return Err(OwnershipWatchError::Protocol {
@@ -1523,6 +1545,13 @@ fn decode_watch_response(
                 message: error.to_string(),
             }
         })?;
+        if !seen_keys.entry(revision).or_default().insert(key.clone()) {
+            return Err(OwnershipWatchError::Protocol {
+                message: format!(
+                    "etcd ownership watch revision {revision:?} modified selected key {key} more than once"
+                ),
+            });
+        }
         let event = match event.event_type() {
             EventType::Put => EtcdOwnershipWatchEvent::Upserted {
                 key,
@@ -1551,10 +1580,8 @@ fn decode_watch_response(
             }
         };
         let events = batches.entry(revision).or_default();
-        if events.len() >= max_entries.get() {
-            return Err(OwnershipWatchError::CapacityExceeded {
-                max_entries: max_entries.get(),
-            });
+        if events.len() >= max_events {
+            return Err(OwnershipWatchError::BatchCapacityExceeded { max_events });
         }
         events.push(event);
     }
@@ -1575,6 +1602,14 @@ fn decode_watch_response(
         });
     }
     Ok(updates)
+}
+
+fn ownership_key_is_selected(ranges: &EtcdOwnershipRanges, key: &[u8]) -> bool {
+    key == ranges.local_instance_key.as_bytes()
+        || ranges
+            .record_ranges
+            .iter()
+            .any(|range| key.starts_with(range.record_prefix.as_bytes()))
 }
 
 fn validate_watch_update(
@@ -2324,16 +2359,47 @@ impl InMemoryEtcdState {
             if watcher.tx.receiver_count() == 0 {
                 return false;
             }
-            let events = batch
-                .events
-                .iter()
-                .filter(|event| {
-                    ownership_event_key(event).starts_with(&watcher.ranges.watch_prefix)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            if events.is_empty() {
+            let Some(max_events) = ownership_watch_event_limit(watcher.max_entries) else {
+                let _ = watcher.tx.send(EtcdOwnershipWatchMessage::Failed(
+                    OwnershipWatchError::CapacityExceeded {
+                        max_entries: watcher.max_entries.get(),
+                    },
+                ));
+                return false;
+            };
+            let mut saw_watched_event = false;
+            let mut events = Vec::with_capacity(max_events.min(batch.events.len()));
+            for event in &batch.events {
+                if !ownership_event_key(event).starts_with(&watcher.ranges.watch_prefix) {
+                    continue;
+                }
+                saw_watched_event = true;
+                if !ownership_key_is_selected(
+                    &watcher.ranges,
+                    ownership_event_key(event).as_bytes(),
+                ) {
+                    continue;
+                }
+                if events.len() == max_events {
+                    let _ = watcher.tx.send(EtcdOwnershipWatchMessage::Failed(
+                        OwnershipWatchError::BatchCapacityExceeded { max_events },
+                    ));
+                    return false;
+                }
+                events.push(event.clone());
+            }
+            if !saw_watched_event {
                 return true;
+            }
+            if events.is_empty() {
+                return watcher
+                    .tx
+                    .send(EtcdOwnershipWatchMessage::Update(
+                        EtcdOwnershipWatchUpdate::Progress {
+                            revision: batch.revision,
+                        },
+                    ))
+                    .is_ok();
             }
             let mut update = EtcdOwnershipWatchBatch {
                 revision: batch.revision,
@@ -2360,25 +2426,30 @@ fn prove_in_memory_watch_batch(
     watcher: &mut InMemoryOwnershipWatcher,
     batch: &mut EtcdOwnershipWatchBatch,
 ) -> Result<(), OwnershipWatchError> {
-    if batch.events.len() > watcher.max_entries.get() {
-        return Err(OwnershipWatchError::CapacityExceeded {
+    let max_events = ownership_watch_event_limit(watcher.max_entries).ok_or(
+        OwnershipWatchError::CapacityExceeded {
             max_entries: watcher.max_entries.get(),
-        });
+        },
+    )?;
+    if batch.events.len() > max_events {
+        return Err(OwnershipWatchError::BatchCapacityExceeded { max_events });
     }
     let mut staged = watcher.live_records.clone();
     let mut seen = HashSet::new();
     for event in &mut batch.events {
         let record_key = ownership_event_key(event).to_string();
+        if !seen.insert(record_key.clone()) {
+            return Err(OwnershipWatchError::Protocol {
+                message: format!(
+                    "in-memory ownership batch modified selected key {record_key} more than once"
+                ),
+            });
+        }
         let Some(floor_key) = floor_key_for_record(&watcher.ranges, &record_key)
             .map_err(FloorProofReadError::into_watch_error)?
         else {
             continue;
         };
-        if !seen.insert(record_key.clone()) {
-            return Err(OwnershipWatchError::Protocol {
-                message: format!("in-memory ownership batch modified {record_key} more than once"),
-            });
-        }
         let epoch_key = match event {
             EtcdOwnershipWatchEvent::Upserted { value, .. } => epoch_key_for_value(value),
             EtcdOwnershipWatchEvent::Deleted { previous_value, .. } => {

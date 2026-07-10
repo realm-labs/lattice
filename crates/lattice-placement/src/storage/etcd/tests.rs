@@ -371,7 +371,7 @@ async fn etcd_store_rejects_miskeyed_and_legacy_delimited_values_on_reads_and_sn
 }
 
 #[tokio::test]
-async fn etcd_watches_fail_closed_on_legacy_delimited_values_and_noncanonical_locks() {
+async fn etcd_legacy_watch_fails_closed_while_ownership_ignores_noncanonical_locks() {
     let prefix = PlacementPrefix::new("/lattice/test");
 
     let client = InMemoryEtcdClient::new();
@@ -415,21 +415,19 @@ async fn etcd_watches_fail_closed_on_legacy_delimited_values_and_noncanonical_lo
         )
         .await
         .unwrap();
-    client
-        .put(
+    let revision = client
+        .put_same_revision_for_test(vec![(
             format!(
                 "{}/logic/activation_locks/World/poison/World/u64:1",
                 prefix.as_str()
             ),
             EtcdValue::ActivationLock(LeaseId(1)),
-        )
-        .await
+        )])
         .unwrap();
-    assert!(matches!(
-        ownership.watch.next_update().await,
-        Err(OwnershipWatchError::Protocol { message })
-            if message.contains("non-canonical key")
-    ));
+    assert_eq!(
+        ownership.watch.next_update().await.unwrap(),
+        OwnershipWatchUpdate::Progress { revision }
+    );
 }
 
 #[tokio::test]
@@ -899,6 +897,148 @@ async fn etcd_ownership_watch_preserves_mixed_put_delete_revision_batches() {
         OwnershipWatchEvent::VirtualShardUpserted { key, record, .. }
             if key == &shard && record == &vshard_record(3, "world-a", 1)
     )));
+}
+
+#[tokio::test]
+async fn etcd_ownership_watch_allows_a_full_capacity_same_revision_replacement() {
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/ownership-capacity-replacement"),
+        client.clone(),
+    );
+    let actor = actor_key_for(7);
+    let actor_record = actor_record(7, "world-a", 1, LeaseId(1));
+    store
+        .compare_and_put_actor(actor.clone(), None, actor_record.clone())
+        .await
+        .unwrap();
+    let mut view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(view.snapshot.records.len(), 1);
+
+    let shard = vshard_key_for(3);
+    let shard_record = vshard_record(3, "world-a", 1);
+    let shard_epoch_key = PlacementEpochKey::VirtualShard(shard.clone());
+    let revision = client
+        .mutate_same_revision_for_test(vec![
+            InMemoryEtcdMutation::Put {
+                key: epoch_floor_key(&store.prefix, &shard_epoch_key),
+                value: EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key: shard_epoch_key,
+                    epoch: shard_record.epoch,
+                })),
+            },
+            InMemoryEtcdMutation::Put {
+                key: vshard_key(&store.prefix, &shard),
+                value: EtcdValue::VirtualShard(Box::new(shard_record.clone())),
+            },
+            // Put before delete to prove capacity is checked against the final
+            // live set rather than this transient two-record state.
+            InMemoryEtcdMutation::Delete {
+                key: actor_key(&store.prefix, &actor),
+            },
+        ])
+        .unwrap();
+
+    let batch = view.watch.next().await.unwrap();
+    assert_eq!(batch.revision, revision);
+    assert_eq!(batch.events.len(), 2);
+    assert!(batch.events.iter().any(|event| matches!(
+        event,
+        OwnershipWatchEvent::ActorDeleted {
+            key,
+            previous_record,
+            ..
+        } if key == &actor && previous_record == &actor_record
+    )));
+    assert!(batch.events.iter().any(|event| matches!(
+        event,
+        OwnershipWatchEvent::VirtualShardUpserted { key, record, .. }
+            if key == &shard && record == &shard_record
+    )));
+
+    let final_view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(final_view.snapshot.revision, revision);
+    assert!(matches!(
+        final_view.snapshot.records.as_slice(),
+        [OwnershipViewRecord::VirtualShard {
+            revision: record_revision,
+            record,
+            ..
+        }] if *record_revision == revision && record == &shard_record
+    ));
+}
+
+#[tokio::test]
+async fn etcd_ownership_watch_ignores_malformed_unselected_records_before_batch_bounds() {
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/ownership-selected-batch-bound"),
+        client.clone(),
+    );
+    let mut view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut mutations = (90..94)
+        .map(|actor_id| {
+            let unrelated_key = ActorPlacementKey {
+                service_kind: service_kind!("Other"),
+                actor_kind: actor_kind!("Other"),
+                actor_id: ActorId::U64(actor_id),
+            };
+            InMemoryEtcdMutation::Put {
+                key: actor_key(&store.prefix, &unrelated_key),
+                // An activation-lock value is malformed at an actor-record
+                // path. Because the key is outside the selected World ranges,
+                // it must be discarded before decoding/proof and capacity work.
+                value: EtcdValue::ActivationLock(LeaseId(actor_id)),
+            }
+        })
+        .collect::<Vec<_>>();
+    let actor = actor_key_for(7);
+    let actor_record = actor_record(7, "world-a", 1, LeaseId(1));
+    let actor_epoch_key = PlacementEpochKey::Actor(actor.clone());
+    mutations.extend([
+        InMemoryEtcdMutation::Put {
+            key: epoch_floor_key(&store.prefix, &actor_epoch_key),
+            value: EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                key: actor_epoch_key,
+                epoch: actor_record.epoch,
+            })),
+        },
+        InMemoryEtcdMutation::Put {
+            key: actor_key(&store.prefix, &actor),
+            value: EtcdValue::Actor(Box::new(actor_record.clone())),
+        },
+    ]);
+    let revision = client.mutate_same_revision_for_test(mutations).unwrap();
+
+    let batch = view.watch.next().await.unwrap();
+    assert_eq!(batch.revision, revision);
+    assert!(matches!(
+        batch.events.as_slice(),
+        [OwnershipWatchEvent::ActorUpserted { key, record, .. }]
+            if key == &actor && record == &actor_record
+    ));
 }
 
 #[tokio::test]
@@ -2325,6 +2465,49 @@ async fn etcd_ownership_watch_bounds_each_revision_batch() {
     assert_eq!(
         view.watch.next_update().await,
         Err(OwnershipWatchError::CapacityExceeded { max_entries: 1 })
+    );
+}
+
+#[tokio::test]
+async fn etcd_ownership_watch_rejects_selected_work_above_the_union_bound() {
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/ownership-selected-work-bound"),
+        client.clone(),
+    );
+    let mut view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let values = (1..=4)
+        .flat_map(|actor_id| {
+            let key = actor_key_for(actor_id);
+            let epoch_key = PlacementEpochKey::Actor(key.clone());
+            [
+                (
+                    epoch_floor_key(&store.prefix, &epoch_key),
+                    EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                        key: epoch_key,
+                        epoch: Epoch(1),
+                    })),
+                ),
+                (
+                    actor_key(&store.prefix, &key),
+                    EtcdValue::Actor(Box::new(actor_record(actor_id, "world-a", 1, LeaseId(1)))),
+                ),
+            ]
+        })
+        .collect();
+    client.put_same_revision_for_test(values).unwrap();
+
+    assert_eq!(
+        view.watch.next_update().await,
+        Err(OwnershipWatchError::BatchCapacityExceeded { max_events: 3 })
     );
 }
 

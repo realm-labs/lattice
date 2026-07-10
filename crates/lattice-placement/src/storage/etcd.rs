@@ -981,7 +981,11 @@ where
         let expected_service = service_kind.clone();
         let expected_instance = instance_id.clone();
         let snapshot_revision = snapshot.revision;
-        let max_watch_entries = max_entries.get();
+        let max_watch_events = client::ownership_watch_event_limit(max_entries).ok_or(
+            OwnershipViewError::CapacityExceeded {
+                max_entries: max_entries.get(),
+            },
+        )?;
         let (tx, rx) = broadcast::channel(128);
         let bridge_task = tokio::spawn(async move {
             let mut high_water = snapshot_revision;
@@ -1002,10 +1006,10 @@ where
                         }
                     }
                     Ok(EtcdOwnershipWatchUpdate::Batch(batch)) => {
-                        if batch.events.len() > max_watch_entries {
+                        if batch.events.len() > max_watch_events {
                             let _ = tx.send(OwnershipWatchMessage::Failed(
-                                OwnershipWatchError::CapacityExceeded {
-                                    max_entries: max_watch_entries,
+                                OwnershipWatchError::BatchCapacityExceeded {
+                                    max_events: max_watch_events,
                                 },
                             ));
                             break;

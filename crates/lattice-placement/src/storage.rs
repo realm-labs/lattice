@@ -709,8 +709,10 @@ pub enum OwnershipWatchError {
     Canceled { reason: String },
     #[error("ownership watch protocol error: {message}")]
     Protocol { message: String },
-    #[error("ownership watch revision exceeded its {max_entries} event limit")]
+    #[error("ownership watch final live set exceeded its {max_entries} entry limit")]
     CapacityExceeded { max_entries: usize },
+    #[error("ownership watch revision exceeded its {max_events} selected-event limit")]
+    BatchCapacityExceeded { max_events: usize },
     #[error("ownership watch startup exceeded its {max_updates} buffered-update limit")]
     StartupBacklogExceeded { max_updates: usize },
     #[error("ownership watch epoch-floor proof failed: {error}")]
