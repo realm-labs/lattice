@@ -212,11 +212,21 @@ pub(crate) fn epoch_floor_key(prefix: &PlacementPrefix, key: &PlacementEpochKey)
 
 pub(crate) fn actor_epoch_floor_key(prefix: &PlacementPrefix, key: &ActorPlacementKey) -> String {
     format!(
-        "{}/authority/epoch_floors/v1/actors/{}/{}/{}",
-        clean_prefix(prefix),
-        key.service_kind.as_str(),
+        "{}{}/{}",
+        actor_epoch_floor_service_prefix(prefix, &key.service_kind),
         key.actor_kind.as_str(),
         actor_id_segment(&key.actor_id)
+    )
+}
+
+pub(crate) fn actor_epoch_floor_service_prefix(
+    prefix: &PlacementPrefix,
+    service_kind: &ServiceKind,
+) -> String {
+    format!(
+        "{}/authority/epoch_floors/v1/actors/{}/",
+        clean_prefix(prefix),
+        service_kind.as_str()
     )
 }
 
@@ -225,21 +235,41 @@ pub(crate) fn virtual_shard_epoch_floor_key(
     key: &VirtualShardPlacementKey,
 ) -> String {
     format!(
-        "{}/authority/epoch_floors/v1/vshards/{}/{}/{}",
-        clean_prefix(prefix),
-        key.service_kind.as_str(),
+        "{}{}/{}",
+        virtual_shard_epoch_floor_service_prefix(prefix, &key.service_kind),
         key.actor_kind.as_str(),
         key.shard_id.0
     )
 }
 
+pub(crate) fn virtual_shard_epoch_floor_service_prefix(
+    prefix: &PlacementPrefix,
+    service_kind: &ServiceKind,
+) -> String {
+    format!(
+        "{}/authority/epoch_floors/v1/vshards/{}/",
+        clean_prefix(prefix),
+        service_kind.as_str()
+    )
+}
+
 pub(crate) fn singleton_epoch_floor_key(prefix: &PlacementPrefix, key: &SingletonKey) -> String {
     format!(
-        "{}/authority/epoch_floors/v1/singletons/{}/{}/{}",
-        clean_prefix(prefix),
-        key.service_kind.as_str(),
+        "{}{}/{}",
+        singleton_epoch_floor_service_prefix(prefix, &key.service_kind),
         key.singleton_kind.as_str(),
         scope_segment(&key.scope)
+    )
+}
+
+pub(crate) fn singleton_epoch_floor_service_prefix(
+    prefix: &PlacementPrefix,
+    service_kind: &ServiceKind,
+) -> String {
+    format!(
+        "{}/authority/epoch_floors/v1/singletons/{}/",
+        clean_prefix(prefix),
+        service_kind.as_str()
     )
 }
 

@@ -331,19 +331,304 @@ pub enum PlacementWatchEvent {
     },
 }
 
+/// Why a placement record could not be proven against its durable epoch floor.
+///
+/// Ownership views treat every variant as terminal. A caller must fence its
+/// local gate before attempting a no-gap resynchronization; it must never
+/// substitute a latest-value read for the requested revision.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OwnershipProofError {
+    #[error("ownership proof for {key:?} at {observed_revision:?} has no durable epoch floor")]
+    MissingFloor {
+        key: PlacementEpochKey,
+        observed_revision: PlacementRevision,
+    },
+    #[error(
+        "ownership proof for {key:?} at {observed_revision:?} found leased epoch floor {lease_id:?}"
+    )]
+    LeasedFloor {
+        key: PlacementEpochKey,
+        observed_revision: PlacementRevision,
+        lease_id: LeaseId,
+    },
+    #[error("ownership proof for {expected:?} used an epoch floor belonging to {actual:?}")]
+    WrongFloorKey {
+        expected: Box<PlacementEpochKey>,
+        actual: Box<PlacementEpochKey>,
+    },
+    #[error(
+        "ownership proof for {key:?} observed record {record:?} or floor {floor:?} after {observed_revision:?}"
+    )]
+    ObservationRevisionMismatch {
+        key: PlacementEpochKey,
+        observed_revision: PlacementRevision,
+        record: PlacementVersion,
+        floor: PlacementVersion,
+    },
+    #[error("ownership proof for {key:?} has floor epoch {floor:?} behind record epoch {record:?}")]
+    EpochFloorBehind {
+        key: PlacementEpochKey,
+        floor: Epoch,
+        record: Epoch,
+    },
+    #[error(
+        "ownership proof for {key:?} has unproven record token {record:?} and floor token {floor:?}"
+    )]
+    LineageUnproven {
+        key: PlacementEpochKey,
+        record: PlacementVersion,
+        floor: PlacementVersion,
+    },
+    #[error("ownership proof is bound to a different placement record for {key:?}")]
+    RecordBindingMismatch { key: PlacementEpochKey },
+    #[error("ownership proof for {key:?} was used in the wrong snapshot/watch context")]
+    ContextMismatch { key: PlacementEpochKey },
+    #[error(
+        "ownership delete for {key:?} at {observed_revision:?} modified its epoch floor in the delete revision"
+    )]
+    FloorModifiedByDelete {
+        key: PlacementEpochKey,
+        observed_revision: PlacementRevision,
+    },
+    #[error("ownership delete for {key:?} did not match the previously proven record")]
+    DeletePreviousMismatch { key: PlacementEpochKey },
+    #[error(
+        "ownership proof read at {requested_revision:?} was compacted or otherwise unavailable: {message}"
+    )]
+    RevisionUnavailable {
+        requested_revision: PlacementRevision,
+        message: String,
+    },
+    #[error("ownership proof for {key:?} is malformed: {message}")]
+    MalformedFloor {
+        key: PlacementEpochKey,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnershipProofContext {
+    Snapshot,
+    Upsert,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OwnershipRecordBinding {
+    Actor(ActorPlacementRecord),
+    VirtualShard(VirtualShardPlacementRecord),
+    Singleton(SingletonPlacementRecord),
+}
+
+impl OwnershipRecordBinding {
+    pub(crate) fn epoch_key(&self) -> PlacementEpochKey {
+        match self {
+            Self::Actor(record) => PlacementEpochKey::Actor(ActorPlacementKey {
+                service_kind: record.service_kind.clone(),
+                actor_kind: record.actor_kind.clone(),
+                actor_id: record.actor_id.clone(),
+            }),
+            Self::VirtualShard(record) => {
+                PlacementEpochKey::VirtualShard(VirtualShardPlacementKey {
+                    service_kind: record.service_kind.clone(),
+                    actor_kind: record.actor_kind.clone(),
+                    shard_id: record.shard_id,
+                })
+            }
+            Self::Singleton(record) => PlacementEpochKey::Singleton(SingletonKey {
+                service_kind: record.service_kind.clone(),
+                singleton_kind: record.singleton_kind.clone(),
+                scope: record.scope.clone(),
+            }),
+        }
+    }
+
+    pub(crate) const fn epoch(&self) -> Epoch {
+        match self {
+            Self::Actor(record) => record.epoch,
+            Self::VirtualShard(record) => record.epoch,
+            Self::Singleton(record) => record.epoch,
+        }
+    }
+}
+
+/// Opaque evidence that one complete placement record was checked against its
+/// durable, non-leased epoch floor at an exact ownership-view revision.
+///
+/// The complete record is part of the private binding so a proof cannot be
+/// cloned onto a different owner, lease, state, or epoch. Only placement-store
+/// backends can construct proofs; public consumers can carry and compare them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnershipEpochFloorProof {
+    context: OwnershipProofContext,
+    observed_revision: PlacementRevision,
+    record_version: PlacementVersion,
+    binding: OwnershipRecordBinding,
+    floor_version: PlacementVersion,
+    floor: EpochFloorRecord,
+}
+
+impl OwnershipEpochFloorProof {
+    pub(crate) fn new(
+        context: OwnershipProofContext,
+        observed_revision: PlacementRevision,
+        record_version: PlacementVersion,
+        binding: OwnershipRecordBinding,
+        floor_version: PlacementVersion,
+        floor: EpochFloorRecord,
+        floor_lease: Option<LeaseId>,
+    ) -> Result<Self, OwnershipProofError> {
+        let key = binding.epoch_key();
+        if let Some(lease_id) = floor_lease {
+            return Err(OwnershipProofError::LeasedFloor {
+                key,
+                observed_revision,
+                lease_id,
+            });
+        }
+        if floor.key != key {
+            return Err(OwnershipProofError::WrongFloorKey {
+                expected: Box::new(key),
+                actual: Box::new(floor.key),
+            });
+        }
+        if record_version.modification_revision() > observed_revision.0
+            || floor_version.modification_revision() > observed_revision.0
+        {
+            return Err(OwnershipProofError::ObservationRevisionMismatch {
+                key,
+                observed_revision,
+                record: record_version,
+                floor: floor_version,
+            });
+        }
+        match context {
+            OwnershipProofContext::Snapshot => {}
+            OwnershipProofContext::Upsert => {
+                if record_version.modification_revision() != observed_revision.0 {
+                    return Err(OwnershipProofError::ObservationRevisionMismatch {
+                        key,
+                        observed_revision,
+                        record: record_version,
+                        floor: floor_version,
+                    });
+                }
+            }
+            OwnershipProofContext::Delete => {
+                if record_version.modification_revision() >= observed_revision.0 {
+                    return Err(OwnershipProofError::ObservationRevisionMismatch {
+                        key,
+                        observed_revision,
+                        record: record_version,
+                        floor: floor_version,
+                    });
+                }
+                if floor_version.modification_revision() == observed_revision.0 {
+                    return Err(OwnershipProofError::FloorModifiedByDelete {
+                        key,
+                        observed_revision,
+                    });
+                }
+            }
+        }
+        match validate_epoch_floor_lineage(
+            Some((record_version, binding.epoch())),
+            Some((floor_version, floor.epoch)),
+        ) {
+            Ok(()) => Ok(Self {
+                context,
+                observed_revision,
+                record_version,
+                binding,
+                floor_version,
+                floor,
+            }),
+            Err(PlacementError::EpochFloorCorrupt { floor, record }) => {
+                Err(OwnershipProofError::EpochFloorBehind { key, floor, record })
+            }
+            Err(PlacementError::EpochFloorUnproven { record, floor }) => {
+                Err(OwnershipProofError::LineageUnproven {
+                    key,
+                    record,
+                    floor: floor.expect("the proof constructor supplied a floor"),
+                })
+            }
+            Err(error) => unreachable!("unexpected epoch-lineage error: {error}"),
+        }
+    }
+
+    pub const fn observed_revision(&self) -> PlacementRevision {
+        self.observed_revision
+    }
+
+    pub const fn record_revision(&self) -> PlacementRevision {
+        PlacementRevision(self.record_version.modification_revision())
+    }
+
+    pub(crate) fn validate_snapshot(
+        &self,
+        snapshot_revision: PlacementRevision,
+        record_revision: PlacementRevision,
+        binding: &OwnershipRecordBinding,
+    ) -> Result<(), OwnershipProofError> {
+        self.validate_binding(OwnershipProofContext::Snapshot, snapshot_revision, binding)?;
+        if self.record_revision() != record_revision {
+            return Err(OwnershipProofError::RecordBindingMismatch {
+                key: binding.epoch_key(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_upsert(
+        &self,
+        revision: PlacementRevision,
+        binding: &OwnershipRecordBinding,
+    ) -> Result<(), OwnershipProofError> {
+        self.validate_binding(OwnershipProofContext::Upsert, revision, binding)
+    }
+
+    pub(crate) fn validate_delete(
+        &self,
+        revision: PlacementRevision,
+        binding: &OwnershipRecordBinding,
+    ) -> Result<(), OwnershipProofError> {
+        self.validate_binding(OwnershipProofContext::Delete, revision, binding)
+    }
+
+    fn validate_binding(
+        &self,
+        context: OwnershipProofContext,
+        revision: PlacementRevision,
+        binding: &OwnershipRecordBinding,
+    ) -> Result<(), OwnershipProofError> {
+        let key = binding.epoch_key();
+        if self.context != context || self.observed_revision != revision {
+            return Err(OwnershipProofError::ContextMismatch { key });
+        }
+        if &self.binding != binding {
+            return Err(OwnershipProofError::RecordBindingMismatch { key });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnershipViewRecord {
     Actor {
         revision: PlacementRevision,
         record: ActorPlacementRecord,
+        proof: OwnershipEpochFloorProof,
     },
     VirtualShard {
         revision: PlacementRevision,
         record: VirtualShardPlacementRecord,
+        proof: OwnershipEpochFloorProof,
     },
     Singleton {
         revision: PlacementRevision,
         record: SingletonPlacementRecord,
+        proof: OwnershipEpochFloorProof,
     },
 }
 
@@ -370,23 +655,32 @@ pub enum OwnershipWatchEvent {
     ActorUpserted {
         key: ActorPlacementKey,
         record: ActorPlacementRecord,
+        proof: OwnershipEpochFloorProof,
     },
     ActorDeleted {
         key: ActorPlacementKey,
+        previous_record: ActorPlacementRecord,
+        proof: OwnershipEpochFloorProof,
     },
     VirtualShardUpserted {
         key: VirtualShardPlacementKey,
         record: VirtualShardPlacementRecord,
+        proof: OwnershipEpochFloorProof,
     },
     VirtualShardDeleted {
         key: VirtualShardPlacementKey,
+        previous_record: VirtualShardPlacementRecord,
+        proof: OwnershipEpochFloorProof,
     },
     SingletonUpserted {
         key: SingletonKey,
         record: SingletonPlacementRecord,
+        proof: OwnershipEpochFloorProof,
     },
     SingletonDeleted {
         key: SingletonKey,
+        previous_record: SingletonPlacementRecord,
+        proof: OwnershipEpochFloorProof,
     },
 }
 
@@ -419,6 +713,8 @@ pub enum OwnershipWatchError {
     CapacityExceeded { max_entries: usize },
     #[error("ownership watch startup exceeded its {max_updates} buffered-update limit")]
     StartupBacklogExceeded { max_updates: usize },
+    #[error("ownership watch epoch-floor proof failed: {error}")]
+    Proof { error: OwnershipProofError },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,6 +732,7 @@ pub(crate) enum OwnershipWatchMessage {
 #[derive(Debug)]
 pub struct OwnershipWatch {
     rx: broadcast::Receiver<OwnershipWatchMessage>,
+    abort_handle: Option<tokio::task::AbortHandle>,
 }
 
 impl OwnershipWatch {
@@ -460,7 +757,28 @@ impl OwnershipWatch {
     }
 
     pub(crate) fn new(rx: broadcast::Receiver<OwnershipWatchMessage>) -> Self {
-        Self { rx }
+        Self {
+            rx,
+            abort_handle: None,
+        }
+    }
+
+    pub(crate) fn new_cancellable(
+        rx: broadcast::Receiver<OwnershipWatchMessage>,
+        abort_handle: tokio::task::AbortHandle,
+    ) -> Self {
+        Self {
+            rx,
+            abort_handle: Some(abort_handle),
+        }
+    }
+}
+
+impl Drop for OwnershipWatch {
+    fn drop(&mut self) {
+        if let Some(abort_handle) = self.abort_handle.take() {
+            abort_handle.abort();
+        }
     }
 }
 
@@ -486,6 +804,8 @@ pub enum OwnershipViewError {
     Backend { message: String },
     #[error("ownership view protocol error: {message}")]
     Protocol { message: String },
+    #[error("ownership view epoch-floor proof failed: {error}")]
+    Proof { error: OwnershipProofError },
     #[error("ownership view could not start its watch: {error}")]
     WatchStart { error: OwnershipWatchError },
 }
@@ -684,3 +1004,28 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
 
 pub mod etcd;
 pub mod memory;
+
+#[cfg(test)]
+mod ownership_watch_drop_tests {
+    use std::future::pending;
+    use std::time::Duration;
+
+    use tokio::sync::broadcast;
+
+    use super::{OwnershipWatch, OwnershipWatchMessage};
+
+    #[tokio::test]
+    async fn dropping_cancellable_ownership_watch_aborts_its_bridge_task() {
+        let (_tx, rx) = broadcast::channel::<OwnershipWatchMessage>(1);
+        let task = tokio::spawn(pending::<()>());
+        let watch = OwnershipWatch::new_cancellable(rx, task.abort_handle());
+
+        drop(watch);
+
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancellable ownership bridge did not stop")
+            .expect_err("cancellable ownership bridge completed instead of being aborted");
+        assert!(error.is_cancelled());
+    }
+}

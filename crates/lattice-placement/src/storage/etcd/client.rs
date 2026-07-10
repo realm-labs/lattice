@@ -16,16 +16,35 @@ use crate::storage::etcd::codec::{
     placement_revision, placement_version, put_options_for,
 };
 use crate::storage::{
-    LeaseId, OwnershipViewError, OwnershipWatchError, PlacementRevision, PlacementVersion,
+    ActorPlacementKey, LeaseId, OwnershipProofError, OwnershipViewError, OwnershipWatchError,
+    PlacementEpochKey, PlacementRevision, PlacementVersion, SingletonKey, VirtualShardPlacementKey,
 };
 
 const WATCH_CAPACITY: usize = 128;
+// Keep proof reads below etcd's default `--max-txn-ops=128`. A server with a
+// stricter configured limit rejects the request and the ownership view fails
+// closed rather than falling back to an unproven latest-value read.
+const FLOOR_PROOF_TXN_OP_LIMIT: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EtcdOwnershipRecordRange {
+    pub record_prefix: String,
+    pub floor_prefix: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct EtcdOwnershipRanges {
     pub local_instance_key: String,
-    pub record_prefixes: Vec<String>,
+    pub record_ranges: Vec<EtcdOwnershipRecordRange>,
     pub watch_prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EtcdOwnershipFloorProof {
+    pub observed_revision: PlacementRevision,
+    pub key: String,
+    pub version: PlacementVersion,
+    pub value: EtcdValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +52,7 @@ pub struct EtcdOwnershipSnapshotEntry {
     pub key: String,
     pub revision: PlacementRevision,
     pub value: EtcdValue,
+    pub floor: Option<EtcdOwnershipFloorProof>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,11 +67,13 @@ pub enum EtcdOwnershipWatchEvent {
         key: String,
         version: PlacementVersion,
         value: EtcdValue,
+        floor: Option<EtcdOwnershipFloorProof>,
     },
     Deleted {
         key: String,
         previous_version: PlacementVersion,
         previous_value: EtcdValue,
+        floor: Option<EtcdOwnershipFloorProof>,
     },
 }
 
@@ -76,6 +98,7 @@ enum EtcdOwnershipWatchMessage {
 #[derive(Debug)]
 pub struct EtcdOwnershipWatch {
     rx: broadcast::Receiver<EtcdOwnershipWatchMessage>,
+    abort_handle: Option<tokio::task::AbortHandle>,
 }
 
 impl EtcdOwnershipWatch {
@@ -87,6 +110,14 @@ impl EtcdOwnershipWatch {
                 Err(OwnershipWatchError::Lagged { skipped })
             }
             Err(broadcast::error::RecvError::Closed) => Err(OwnershipWatchError::Closed),
+        }
+    }
+}
+
+impl Drop for EtcdOwnershipWatch {
+    fn drop(&mut self) {
+        if let Some(abort_handle) = self.abort_handle.take() {
+            abort_handle.abort();
         }
     }
 }
@@ -215,6 +246,10 @@ pub struct RealEtcdClient {
     activation_lock_ttl: ActivationLockTtl,
     #[cfg(test)]
     ownership_view_gap: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    ownership_snapshot_proof_gap: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    ownership_watch_proof_gap: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
 impl fmt::Debug for RealEtcdClient {
@@ -240,6 +275,10 @@ impl RealEtcdClient {
             activation_lock_ttl,
             #[cfg(test)]
             ownership_view_gap: None,
+            #[cfg(test)]
+            ownership_snapshot_proof_gap: None,
+            #[cfg(test)]
+            ownership_watch_proof_gap: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 }
@@ -550,11 +589,11 @@ impl EtcdKv for RealEtcdClient {
             .ok_or(OwnershipViewError::CapacityExceeded {
                 max_entries: max_entries.get(),
             })?;
-        let mut operations = Vec::with_capacity(ranges.record_prefixes.len() + 1);
+        let mut operations = Vec::with_capacity(ranges.record_ranges.len() + 1);
         operations.push(TxnOp::get(ranges.local_instance_key.clone(), None));
-        operations.extend(ranges.record_prefixes.iter().map(|prefix| {
+        operations.extend(ranges.record_ranges.iter().map(|range| {
             TxnOp::get(
-                prefix.clone(),
+                range.record_prefix.clone(),
                 Some(GetOptions::new().with_prefix().with_limit(limit)),
             )
         }));
@@ -568,11 +607,11 @@ impl EtcdKv for RealEtcdClient {
             .ok_or_else(|| view_protocol_error("etcd ownership snapshot omitted its header"))
             .and_then(|header| view_revision(header.revision()))?;
         let responses = response.op_responses();
-        if responses.len() != ranges.record_prefixes.len() + 1 {
+        if responses.len() != ranges.record_ranges.len() + 1 {
             return Err(view_protocol_error(format!(
                 "etcd ownership snapshot returned {} ranges, expected {}",
                 responses.len(),
-                ranges.record_prefixes.len() + 1
+                ranges.record_ranges.len() + 1
             )));
         }
 
@@ -617,9 +656,20 @@ impl EtcdKv for RealEtcdClient {
                     key: String::from_utf8(kv.key().to_vec()).map_err(view_protocol_error)?,
                     revision: entry_revision,
                     value: decode_etcd_value(kv.value()).map_err(view_protocol_error)?,
+                    floor: None,
                 });
             }
         }
+
+        #[cfg(test)]
+        if let Some(gap) = &self.ownership_snapshot_proof_gap {
+            gap.wait().await;
+            gap.wait().await;
+        }
+
+        let live_records =
+            prove_snapshot_entries(&mut client, &ranges, revision, &mut entries, max_entries)
+                .await?;
 
         #[cfg(test)]
         if let Some(gap) = &self.ownership_view_gap {
@@ -638,9 +688,12 @@ impl EtcdKv for RealEtcdClient {
             .ok_or_else(|| view_protocol_error("etcd ownership revision exhausted"))?;
         let watch = start_real_ownership_watch(
             self.client.clone(),
-            ranges.watch_prefix,
+            ranges,
             start_revision,
             max_entries,
+            live_records,
+            #[cfg(test)]
+            self.ownership_watch_proof_gap.clone(),
         )
         .await?;
         Ok(EtcdOwnershipView {
@@ -711,16 +764,477 @@ fn successful_txn_revision(
         .and_then(|header| placement_version(header.revision()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProvenEtcdOwnershipRecord {
+    version: PlacementVersion,
+    value: EtcdValue,
+}
+
+type ProvenEtcdOwnershipRecords = BTreeMap<String, ProvenEtcdOwnershipRecord>;
+
+#[derive(Debug)]
+struct FloorProofRequest {
+    record_key: String,
+    floor_key: String,
+    epoch_key: Option<PlacementEpochKey>,
+}
+
+#[derive(Debug)]
+enum FloorProofReadError {
+    Compacted {
+        requested_revision: PlacementRevision,
+    },
+    Backend {
+        message: String,
+    },
+    Proof {
+        error: OwnershipProofError,
+    },
+    Protocol {
+        message: String,
+    },
+}
+
+impl FloorProofReadError {
+    fn protocol(message: impl Into<String>) -> Self {
+        Self::Protocol {
+            message: message.into(),
+        }
+    }
+
+    fn from_etcd(error: etcd_client::Error, requested_revision: PlacementRevision) -> Self {
+        if matches!(
+            &error,
+            etcd_client::Error::GRpcStatus(status) if status.code() == tonic::Code::OutOfRange
+        ) {
+            Self::Compacted { requested_revision }
+        } else {
+            Self::Backend {
+                message: error.to_string(),
+            }
+        }
+    }
+
+    fn into_view_error(self) -> OwnershipViewError {
+        match self {
+            Self::Compacted { requested_revision } => OwnershipViewError::Proof {
+                error: OwnershipProofError::RevisionUnavailable {
+                    requested_revision,
+                    message: "etcd compacted the requested historical revision".to_string(),
+                },
+            },
+            Self::Backend { message } => OwnershipViewError::Backend { message },
+            Self::Proof { error } => OwnershipViewError::Proof { error },
+            Self::Protocol { message } => OwnershipViewError::Protocol { message },
+        }
+    }
+
+    fn into_watch_error(self) -> OwnershipWatchError {
+        match self {
+            Self::Compacted { requested_revision } => OwnershipWatchError::Proof {
+                error: OwnershipProofError::RevisionUnavailable {
+                    requested_revision,
+                    message: "etcd compacted the requested historical revision".to_string(),
+                },
+            },
+            Self::Backend { message } => OwnershipWatchError::Backend { message },
+            Self::Proof { error } => OwnershipWatchError::Proof { error },
+            Self::Protocol { message } => OwnershipWatchError::Protocol { message },
+        }
+    }
+}
+
+fn epoch_key_for_value(value: &EtcdValue) -> Option<PlacementEpochKey> {
+    match value {
+        EtcdValue::Actor(record) => Some(PlacementEpochKey::Actor(ActorPlacementKey {
+            service_kind: record.service_kind.clone(),
+            actor_kind: record.actor_kind.clone(),
+            actor_id: record.actor_id.clone(),
+        })),
+        EtcdValue::VirtualShard(record) => {
+            Some(PlacementEpochKey::VirtualShard(VirtualShardPlacementKey {
+                service_kind: record.service_kind.clone(),
+                actor_kind: record.actor_kind.clone(),
+                shard_id: record.shard_id,
+            }))
+        }
+        EtcdValue::Singleton(record) => Some(PlacementEpochKey::Singleton(SingletonKey {
+            service_kind: record.service_kind.clone(),
+            singleton_kind: record.singleton_kind.clone(),
+            scope: record.scope.clone(),
+        })),
+        _ => None,
+    }
+}
+
+fn floor_key_for_record(
+    ranges: &EtcdOwnershipRanges,
+    record_key: &str,
+) -> Result<Option<String>, FloorProofReadError> {
+    let mut matched = ranges.record_ranges.iter().filter_map(|range| {
+        record_key
+            .strip_prefix(&range.record_prefix)
+            .map(|suffix| format!("{}{}", range.floor_prefix, suffix))
+    });
+    let floor_key = matched.next();
+    if matched.next().is_some() {
+        return Err(FloorProofReadError::protocol(format!(
+            "etcd ownership record {record_key} matched multiple floor ranges"
+        )));
+    }
+    Ok(floor_key)
+}
+
+async fn prove_snapshot_entries(
+    client: &mut Client,
+    ranges: &EtcdOwnershipRanges,
+    observed_revision: PlacementRevision,
+    entries: &mut [EtcdOwnershipSnapshotEntry],
+    max_entries: NonZeroUsize,
+) -> Result<ProvenEtcdOwnershipRecords, OwnershipViewError> {
+    let mut requests = Vec::new();
+    let mut entry_indexes = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        match floor_key_for_record(ranges, &entry.key).map_err(|error| error.into_view_error())? {
+            Some(floor_key) => {
+                requests.push(FloorProofRequest {
+                    record_key: entry.key.clone(),
+                    floor_key,
+                    epoch_key: epoch_key_for_value(&entry.value),
+                });
+                entry_indexes.push(index);
+            }
+            None if entry.key == ranges.local_instance_key => {}
+            None => {
+                return Err(view_protocol_error(format!(
+                    "etcd ownership snapshot returned an unrecognized key {}",
+                    entry.key
+                )));
+            }
+        }
+    }
+    if requests.len() > max_entries.get() {
+        return Err(OwnershipViewError::CapacityExceeded {
+            max_entries: max_entries.get(),
+        });
+    }
+
+    let proofs = read_floor_proofs(client, observed_revision, &requests)
+        .await
+        .map_err(FloorProofReadError::into_view_error)?;
+    let mut live_records = ProvenEtcdOwnershipRecords::new();
+    for ((entry_index, request), proof) in entry_indexes.into_iter().zip(requests).zip(proofs) {
+        let entry = &mut entries[entry_index];
+        if live_records
+            .insert(
+                request.record_key.clone(),
+                ProvenEtcdOwnershipRecord {
+                    version: PlacementVersion::from_modification_revision(entry.revision.0),
+                    value: entry.value.clone(),
+                },
+            )
+            .is_some()
+        {
+            return Err(view_protocol_error(format!(
+                "etcd ownership snapshot returned duplicate record {}",
+                request.record_key
+            )));
+        }
+        entry.floor = Some(proof);
+    }
+    Ok(live_records)
+}
+
+async fn read_floor_proofs(
+    client: &mut Client,
+    observed_revision: PlacementRevision,
+    requests: &[FloorProofRequest],
+) -> Result<Vec<EtcdOwnershipFloorProof>, FloorProofReadError> {
+    let revision = i64::try_from(observed_revision.0).map_err(|error| {
+        FloorProofReadError::protocol(format!(
+            "etcd epoch-floor proof revision did not fit i64: {error}"
+        ))
+    })?;
+    let mut seen = HashSet::with_capacity(requests.len());
+    for request in requests {
+        if !seen.insert(request.floor_key.as_str()) {
+            return Err(FloorProofReadError::protocol(format!(
+                "etcd ownership floor proof requested duplicate key {}",
+                request.floor_key
+            )));
+        }
+    }
+
+    let mut proofs = Vec::with_capacity(requests.len());
+    for chunk in requests.chunks(FLOOR_PROOF_TXN_OP_LIMIT) {
+        let operations = chunk
+            .iter()
+            .map(|request| {
+                TxnOp::get(
+                    request.floor_key.clone(),
+                    Some(GetOptions::new().with_revision(revision).with_limit(1)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let response = client
+            .txn(Txn::new().and_then(operations))
+            .await
+            .map_err(|error| FloorProofReadError::from_etcd(error, observed_revision))?;
+        let responses = response.op_responses();
+        if responses.len() != chunk.len() {
+            return Err(FloorProofReadError::protocol(format!(
+                "etcd epoch-floor proof returned {} ranges, expected {}",
+                responses.len(),
+                chunk.len()
+            )));
+        }
+        for (request, response) in chunk.iter().zip(responses) {
+            let TxnOpResponse::Get(range) = response else {
+                return Err(FloorProofReadError::protocol(
+                    "etcd epoch-floor proof returned a non-range response",
+                ));
+            };
+            if range.more() || range.kvs().len() > 1 {
+                return Err(FloorProofReadError::protocol(format!(
+                    "etcd epoch-floor proof returned multiple values for {}",
+                    request.floor_key
+                )));
+            }
+            let Some(kv) = range.kvs().first() else {
+                if let Some(key) = request.epoch_key.clone() {
+                    return Err(FloorProofReadError::Proof {
+                        error: OwnershipProofError::MissingFloor {
+                            key,
+                            observed_revision,
+                        },
+                    });
+                }
+                return Err(FloorProofReadError::protocol(format!(
+                    "etcd ownership record {} has no durable epoch floor at {observed_revision:?}",
+                    request.record_key
+                )));
+            };
+            if kv.key() != request.floor_key.as_bytes() {
+                return Err(FloorProofReadError::protocol(format!(
+                    "etcd epoch-floor proof returned a different key for {}",
+                    request.record_key
+                )));
+            }
+            if kv.lease() != 0 {
+                if let Some(key) = request.epoch_key.clone()
+                    && let Ok(lease_id) = u64::try_from(kv.lease())
+                {
+                    return Err(FloorProofReadError::Proof {
+                        error: OwnershipProofError::LeasedFloor {
+                            key,
+                            observed_revision,
+                            lease_id: LeaseId(lease_id),
+                        },
+                    });
+                }
+                return Err(FloorProofReadError::protocol(format!(
+                    "etcd epoch floor {} is attached to lease {}",
+                    request.floor_key,
+                    kv.lease()
+                )));
+            }
+            let version = placement_version(kv.mod_revision()).map_err(|error| {
+                FloorProofReadError::protocol(format!(
+                    "invalid epoch-floor modification revision for {}: {error}",
+                    request.floor_key
+                ))
+            })?;
+            if version.modification_revision() > observed_revision.0 {
+                return Err(FloorProofReadError::protocol(format!(
+                    "etcd epoch-floor proof {} is newer than observed revision {observed_revision:?}",
+                    request.floor_key
+                )));
+            }
+            let value = decode_etcd_value(kv.value()).map_err(|error| {
+                request.epoch_key.clone().map_or_else(
+                    || {
+                        FloorProofReadError::protocol(format!(
+                            "invalid epoch-floor value for {}: {error}",
+                            request.floor_key
+                        ))
+                    },
+                    |key| FloorProofReadError::Proof {
+                        error: OwnershipProofError::MalformedFloor {
+                            key,
+                            message: error.to_string(),
+                        },
+                    },
+                )
+            })?;
+            if !matches!(value, EtcdValue::EpochFloor(_)) {
+                if let Some(key) = request.epoch_key.clone() {
+                    return Err(FloorProofReadError::Proof {
+                        error: OwnershipProofError::MalformedFloor {
+                            key,
+                            message: "stored value is not an epoch floor".to_string(),
+                        },
+                    });
+                }
+                return Err(FloorProofReadError::protocol(format!(
+                    "etcd epoch-floor proof {} contained a non-floor value",
+                    request.floor_key
+                )));
+            }
+            proofs.push(EtcdOwnershipFloorProof {
+                observed_revision,
+                key: request.floor_key.clone(),
+                version,
+                value,
+            });
+        }
+    }
+    Ok(proofs)
+}
+
+async fn prove_watch_update(
+    client: &mut Client,
+    ranges: &EtcdOwnershipRanges,
+    max_entries: NonZeroUsize,
+    live_records: &mut ProvenEtcdOwnershipRecords,
+    update: &mut EtcdOwnershipWatchUpdate,
+) -> Result<(), OwnershipWatchError> {
+    let EtcdOwnershipWatchUpdate::Batch(batch) = update else {
+        return Ok(());
+    };
+    let mut requests = Vec::new();
+    let mut event_indexes = Vec::new();
+    for (index, event) in batch.events.iter().enumerate() {
+        let record_key = ownership_event_key(event);
+        if let Some(floor_key) = floor_key_for_record(ranges, record_key)
+            .map_err(FloorProofReadError::into_watch_error)?
+        {
+            requests.push(FloorProofRequest {
+                record_key: record_key.to_string(),
+                floor_key,
+                epoch_key: match event {
+                    EtcdOwnershipWatchEvent::Upserted { value, .. } => epoch_key_for_value(value),
+                    EtcdOwnershipWatchEvent::Deleted { previous_value, .. } => {
+                        epoch_key_for_value(previous_value)
+                    }
+                },
+            });
+            event_indexes.push(index);
+        }
+    }
+    if requests.is_empty() {
+        return Ok(());
+    }
+
+    let proofs = read_floor_proofs(client, batch.revision, &requests)
+        .await
+        .map_err(FloorProofReadError::into_watch_error)?;
+    let mut staged = live_records.clone();
+    for ((event_index, request), proof) in event_indexes.into_iter().zip(requests).zip(proofs) {
+        let event = &mut batch.events[event_index];
+        match event {
+            EtcdOwnershipWatchEvent::Upserted {
+                key,
+                version,
+                value,
+                floor,
+            } => {
+                if version.modification_revision() != batch.revision.0 {
+                    return Err(OwnershipWatchError::Protocol {
+                        message: format!(
+                            "etcd ownership put {key} token {version:?} did not match batch revision {:?}",
+                            batch.revision
+                        ),
+                    });
+                }
+                staged.insert(
+                    key.clone(),
+                    ProvenEtcdOwnershipRecord {
+                        version: *version,
+                        value: value.clone(),
+                    },
+                );
+                *floor = Some(proof);
+            }
+            EtcdOwnershipWatchEvent::Deleted {
+                key,
+                previous_version,
+                previous_value,
+                floor,
+            } => {
+                if previous_version.modification_revision() >= batch.revision.0 {
+                    return Err(OwnershipWatchError::Protocol {
+                        message: format!(
+                            "etcd delete {key} previous token {previous_version:?} was not older than batch revision {:?}",
+                            batch.revision
+                        ),
+                    });
+                }
+                let Some(cached) = staged.get(key) else {
+                    if let Some(key) = request.epoch_key.clone() {
+                        return Err(OwnershipWatchError::Proof {
+                            error: OwnershipProofError::DeletePreviousMismatch { key },
+                        });
+                    }
+                    return Err(OwnershipWatchError::Protocol {
+                        message: format!(
+                            "etcd delete {key} had no previously proven live ownership record"
+                        ),
+                    });
+                };
+                if cached.version != *previous_version || cached.value != *previous_value {
+                    if let Some(key) = request.epoch_key.clone() {
+                        return Err(OwnershipWatchError::Proof {
+                            error: OwnershipProofError::DeletePreviousMismatch { key },
+                        });
+                    }
+                    return Err(OwnershipWatchError::Protocol {
+                        message: format!(
+                            "etcd delete {key} prev_kv did not match the previously proven live record"
+                        ),
+                    });
+                }
+                if proof.version.modification_revision() == batch.revision.0 {
+                    if let Some(key) = request.epoch_key.clone() {
+                        return Err(OwnershipWatchError::Proof {
+                            error: OwnershipProofError::FloorModifiedByDelete {
+                                key,
+                                observed_revision: batch.revision,
+                            },
+                        });
+                    }
+                    return Err(OwnershipWatchError::Protocol {
+                        message: format!(
+                            "etcd delete {key} modified its durable epoch floor in the deletion revision"
+                        ),
+                    });
+                }
+                staged.remove(key);
+                *floor = Some(proof);
+            }
+        }
+        debug_assert_eq!(ownership_event_key(event), request.record_key);
+    }
+    if staged.len() > max_entries.get() {
+        return Err(OwnershipWatchError::CapacityExceeded {
+            max_entries: max_entries.get(),
+        });
+    }
+    *live_records = staged;
+    Ok(())
+}
+
 async fn start_real_ownership_watch(
     mut client: Client,
-    prefix: String,
+    ranges: EtcdOwnershipRanges,
     start_revision: i64,
     max_entries: NonZeroUsize,
+    mut live_records: ProvenEtcdOwnershipRecords,
+    #[cfg(test)] proof_gap: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
 ) -> Result<EtcdOwnershipWatch, OwnershipViewError> {
     let requested_revision = view_revision(start_revision)?;
     let mut stream = client
         .watch(
-            prefix,
+            ranges.watch_prefix.clone(),
             Some(
                 WatchOptions::new()
                     .with_prefix()
@@ -765,52 +1279,87 @@ async fn start_real_ownership_watch(
         });
     }
 
-    stream
-        .request_progress()
-        .await
-        .map_err(|error| OwnershipViewError::WatchStart {
-            error: OwnershipWatchError::Backend {
-                message: error.to_string(),
-            },
-        })?;
-
     // A Created response only acknowledges the watch ID. etcd may send
     // historical events or an immediate compaction/cancellation response
-    // afterward. Do not expose the view until an explicit progress response
-    // proves the R+1 watch has caught up. Buffering is bounded so a long replay
+    // afterward. When the cluster is still exactly at snapshot revision R,
+    // the Created handshake plus a later linearizable read at R is an
+    // equivalent no-gap barrier: no R+1 event exists yet and the registered
+    // watch will buffer the first one. Otherwise require an explicit progress
+    // response after historical replay. Buffering is bounded so a long replay
     // fails closed instead of returning an already-lagged receiver.
     let mut high_water = PlacementRevision(requested_revision.0.saturating_sub(1));
     let mut startup_updates = Vec::new();
-    loop {
-        let response = stream
-            .message()
+    let barrier_revision =
+        current_linearizable_revision(&mut client, &ranges.local_instance_key).await?;
+    if barrier_revision == high_water {
+        push_startup_update(
+            &mut startup_updates,
+            EtcdOwnershipWatchUpdate::Progress {
+                revision: barrier_revision,
+            },
+        )
+        .map_err(|error| OwnershipViewError::WatchStart { error })?;
+    } else {
+        stream
+            .request_progress()
             .await
             .map_err(|error| OwnershipViewError::WatchStart {
                 error: OwnershipWatchError::Backend {
                     message: error.to_string(),
                 },
-            })?
-            .ok_or(OwnershipViewError::WatchStart {
-                error: OwnershipWatchError::Closed,
             })?;
-        let response_had_events = !response.events().is_empty();
-        let updates = decode_watch_response(&response, requested_revision, max_entries)
-            .map_err(|error| OwnershipViewError::WatchStart { error })?;
-        let mut caught_up = false;
-        for update in updates {
-            validate_watch_update(&update, &mut high_water)
+        loop {
+            let response = stream
+                .message()
+                .await
+                .map_err(|error| OwnershipViewError::WatchStart {
+                    error: OwnershipWatchError::Backend {
+                        message: error.to_string(),
+                    },
+                })?
+                .ok_or(OwnershipViewError::WatchStart {
+                    error: OwnershipWatchError::Closed,
+                })?;
+            let updates = decode_watch_response(&response, requested_revision, max_entries)
                 .map_err(|error| OwnershipViewError::WatchStart { error })?;
-            caught_up |= matches!(&update, EtcdOwnershipWatchUpdate::Progress { .. });
-            push_startup_update(&mut startup_updates, update)
+            let mut caught_up = false;
+            for mut update in updates {
+                validate_watch_update(&update, &mut high_water)
+                    .map_err(|error| OwnershipViewError::WatchStart { error })?;
+                #[cfg(test)]
+                let gap = matches!(&update, EtcdOwnershipWatchUpdate::Batch(_))
+                    .then(|| {
+                        proof_gap
+                            .lock()
+                            .expect("ownership watch proof-gap mutex poisoned")
+                            .take()
+                    })
+                    .flatten();
+                #[cfg(test)]
+                if let Some(gap) = gap {
+                    gap.wait().await;
+                    gap.wait().await;
+                }
+                prove_watch_update(
+                    &mut client,
+                    &ranges,
+                    max_entries,
+                    &mut live_records,
+                    &mut update,
+                )
+                .await
                 .map_err(|error| OwnershipViewError::WatchStart { error })?;
-        }
-        if caught_up {
-            break;
-        }
-        if response_had_events {
-            // etcd does not retain a progress request made while historical
-            // replay is pending, so request another barrier after each replay
-            // response until the watcher is caught up.
+                caught_up |= startup_progress_reaches_barrier(&update, barrier_revision);
+                push_startup_update(&mut startup_updates, update)
+                    .map_err(|error| OwnershipViewError::WatchStart { error })?;
+            }
+            if caught_up {
+                break;
+            }
+            // A queued periodic notification or a lagging watch member can
+            // report progress below the post-Created linearizable barrier.
+            // Request another response after every non-satisfying response;
+            // etcd also does not retain a request made during replay.
             stream
                 .request_progress()
                 .await
@@ -826,7 +1375,7 @@ async fn start_real_ownership_watch(
     for update in startup_updates {
         let _ = tx.send(EtcdOwnershipWatchMessage::Update(update));
     }
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         loop {
             let response = match stream.message().await {
                 Ok(Some(response)) => response,
@@ -847,8 +1396,34 @@ async fn start_real_ownership_watch(
             };
             match decode_watch_response(&response, requested_revision, max_entries) {
                 Ok(updates) => {
-                    for update in updates {
+                    for mut update in updates {
                         if let Err(error) = validate_watch_update(&update, &mut high_water) {
+                            let _ = tx.send(EtcdOwnershipWatchMessage::Failed(error));
+                            return;
+                        }
+                        #[cfg(test)]
+                        let gap = matches!(&update, EtcdOwnershipWatchUpdate::Batch(_))
+                            .then(|| {
+                                proof_gap
+                                    .lock()
+                                    .expect("ownership watch proof-gap mutex poisoned")
+                                    .take()
+                            })
+                            .flatten();
+                        #[cfg(test)]
+                        if let Some(gap) = gap {
+                            gap.wait().await;
+                            gap.wait().await;
+                        }
+                        if let Err(error) = prove_watch_update(
+                            &mut client,
+                            &ranges,
+                            max_entries,
+                            &mut live_records,
+                            &mut update,
+                        )
+                        .await
+                        {
                             let _ = tx.send(EtcdOwnershipWatchMessage::Failed(error));
                             return;
                         }
@@ -864,7 +1439,33 @@ async fn start_real_ownership_watch(
             }
         }
     });
-    Ok(EtcdOwnershipWatch { rx })
+    Ok(EtcdOwnershipWatch {
+        rx,
+        abort_handle: Some(task.abort_handle()),
+    })
+}
+
+fn startup_progress_reaches_barrier(
+    update: &EtcdOwnershipWatchUpdate,
+    barrier_revision: PlacementRevision,
+) -> bool {
+    matches!(
+        update,
+        EtcdOwnershipWatchUpdate::Progress { revision } if *revision >= barrier_revision
+    )
+}
+
+async fn current_linearizable_revision(
+    client: &mut Client,
+    key: &str,
+) -> Result<PlacementRevision, OwnershipViewError> {
+    client
+        .get(key, Some(GetOptions::new().with_limit(1)))
+        .await
+        .map_err(view_backend_error)?
+        .header()
+        .ok_or_else(|| view_protocol_error("etcd ownership barrier read omitted its header"))
+        .and_then(|header| view_revision(header.revision()))
 }
 
 fn decode_watch_response(
@@ -927,6 +1528,7 @@ fn decode_watch_response(
                 key,
                 version: watch_version(kv.mod_revision())?,
                 value: decode_etcd_value(kv.value()).map_err(watch_protocol_error)?,
+                floor: None,
             },
             EventType::Delete => {
                 let previous = event
@@ -944,6 +1546,7 @@ fn decode_watch_response(
                     previous_version: watch_version(previous.mod_revision())?,
                     previous_value: decode_etcd_value(previous.value())
                         .map_err(watch_protocol_error)?,
+                    floor: None,
                 }
             }
         };
@@ -1080,13 +1683,68 @@ struct InMemoryEtcdState {
     revision: u64,
     values: HashMap<String, InMemoryEtcdValue>,
     watchers: HashMap<String, broadcast::Sender<EtcdWatchEvent>>,
-    ownership_watchers: HashMap<String, broadcast::Sender<EtcdOwnershipWatchMessage>>,
+    ownership_watchers: Vec<InMemoryOwnershipWatcher>,
 }
 
 #[derive(Debug, Clone)]
 struct InMemoryEtcdValue {
     revision: PlacementRevision,
     value: EtcdValue,
+}
+
+#[derive(Debug)]
+struct InMemoryOwnershipWatcher {
+    ranges: EtcdOwnershipRanges,
+    max_entries: NonZeroUsize,
+    live_records: ProvenEtcdOwnershipRecords,
+    tx: broadcast::Sender<EtcdOwnershipWatchMessage>,
+}
+
+fn read_in_memory_floor_proof(
+    values: &HashMap<String, InMemoryEtcdValue>,
+    observed_revision: PlacementRevision,
+    request: &FloorProofRequest,
+) -> Result<EtcdOwnershipFloorProof, FloorProofReadError> {
+    let Some(entry) = values.get(&request.floor_key) else {
+        if let Some(key) = request.epoch_key.clone() {
+            return Err(FloorProofReadError::Proof {
+                error: OwnershipProofError::MissingFloor {
+                    key,
+                    observed_revision,
+                },
+            });
+        }
+        return Err(FloorProofReadError::protocol(format!(
+            "in-memory ownership record {} has no durable epoch floor at {observed_revision:?}",
+            request.record_key
+        )));
+    };
+    if entry.revision > observed_revision {
+        return Err(FloorProofReadError::protocol(format!(
+            "in-memory epoch floor {} is newer than observed revision {observed_revision:?}",
+            request.floor_key
+        )));
+    }
+    if !matches!(entry.value, EtcdValue::EpochFloor(_)) {
+        if let Some(key) = request.epoch_key.clone() {
+            return Err(FloorProofReadError::Proof {
+                error: OwnershipProofError::MalformedFloor {
+                    key,
+                    message: "stored value is not an epoch floor".to_string(),
+                },
+            });
+        }
+        return Err(FloorProofReadError::protocol(format!(
+            "in-memory epoch-floor proof {} contained a non-floor value",
+            request.floor_key
+        )));
+    }
+    Ok(EtcdOwnershipFloorProof {
+        observed_revision,
+        key: request.floor_key.clone(),
+        version: placement_version_from_revision(entry.revision),
+        value: entry.value.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -1300,53 +1958,79 @@ impl EtcdKv for InMemoryEtcdClient {
         max_entries: NonZeroUsize,
     ) -> Result<EtcdOwnershipView, OwnershipViewError> {
         let mut inner = self.inner.lock().expect("in-memory etcd mutex poisoned");
+        inner
+            .ownership_watchers
+            .retain(|watcher| watcher.tx.receiver_count() > 0);
         let mut entries = Vec::new();
         if let Some(entry) = inner.values.get(&ranges.local_instance_key) {
             entries.push(EtcdOwnershipSnapshotEntry {
                 key: ranges.local_instance_key.clone(),
                 revision: entry.revision,
                 value: entry.value.clone(),
+                floor: None,
             });
         }
-        let mut keys = inner
-            .values
-            .keys()
-            .filter(|key| {
-                ranges
-                    .record_prefixes
-                    .iter()
-                    .any(|prefix| key.starts_with(prefix))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut keys = Vec::new();
+        for key in inner.values.keys().filter(|key| {
+            ranges
+                .record_ranges
+                .iter()
+                .any(|range| key.starts_with(&range.record_prefix))
+        }) {
+            keys.push(key.clone());
+            if keys.len() > max_entries.get() {
+                return Err(OwnershipViewError::CapacityExceeded {
+                    max_entries: max_entries.get(),
+                });
+            }
+        }
         keys.sort();
-        if keys.len() > max_entries.get() {
-            return Err(OwnershipViewError::CapacityExceeded {
-                max_entries: max_entries.get(),
-            });
-        }
-        entries.extend(keys.into_iter().filter_map(|key| {
-            inner
+        let revision = PlacementRevision(inner.revision);
+        let mut live_records = ProvenEtcdOwnershipRecords::new();
+        for key in keys {
+            let entry = inner
                 .values
                 .get(&key)
-                .map(|entry| EtcdOwnershipSnapshotEntry {
-                    key,
-                    revision: entry.revision,
-                    value: entry.value.clone(),
-                })
-        }));
-        let revision = PlacementRevision(inner.revision);
-        let rx = inner
-            .ownership_watchers
-            .entry(ranges.watch_prefix)
-            .or_insert_with(|| {
-                let (tx, _rx) = broadcast::channel(WATCH_CAPACITY);
-                tx
-            })
-            .subscribe();
+                .expect("the in-memory ownership key was collected under the same mutex");
+            let floor_key = floor_key_for_record(&ranges, &key)
+                .map_err(FloorProofReadError::into_view_error)?
+                .ok_or_else(|| {
+                    view_protocol_error(format!(
+                        "in-memory ownership snapshot could not derive a floor key for {key}"
+                    ))
+                })?;
+            let request = FloorProofRequest {
+                record_key: key.clone(),
+                floor_key,
+                epoch_key: epoch_key_for_value(&entry.value),
+            };
+            let proof = read_in_memory_floor_proof(&inner.values, revision, &request)
+                .map_err(FloorProofReadError::into_view_error)?;
+            let record = ProvenEtcdOwnershipRecord {
+                version: placement_version_from_revision(entry.revision),
+                value: entry.value.clone(),
+            };
+            live_records.insert(key.clone(), record);
+            entries.push(EtcdOwnershipSnapshotEntry {
+                key,
+                revision: entry.revision,
+                value: entry.value.clone(),
+                floor: Some(proof),
+            });
+        }
+        let (tx, rx) = broadcast::channel(WATCH_CAPACITY);
+        inner.ownership_watchers.push(InMemoryOwnershipWatcher {
+            ranges,
+            max_entries,
+            live_records,
+            tx,
+        });
         Ok(EtcdOwnershipView {
             snapshot: EtcdOwnershipSnapshot { revision, entries },
-            watch: EtcdOwnershipWatch { rx },
+            watch: EtcdOwnershipWatch {
+                rx,
+                abort_handle: None,
+            },
         })
     }
 
@@ -1400,20 +2084,45 @@ impl InMemoryEtcdClient {
 
     #[cfg(test)]
     pub(crate) fn fail_ownership_watches_for_test(&self, error: OwnershipWatchError) {
-        let inner = self.inner.lock().expect("in-memory etcd mutex poisoned");
-        for tx in inner.ownership_watchers.values() {
-            let _ = tx.send(EtcdOwnershipWatchMessage::Failed(error.clone()));
+        let mut inner = self.inner.lock().expect("in-memory etcd mutex poisoned");
+        for watcher in inner.ownership_watchers.drain(..) {
+            let _ = watcher
+                .tx
+                .send(EtcdOwnershipWatchMessage::Failed(error.clone()));
         }
     }
 
     #[cfg(test)]
     pub(crate) fn progress_ownership_watches_for_test(&self, revision: PlacementRevision) {
-        let inner = self.inner.lock().expect("in-memory etcd mutex poisoned");
-        for tx in inner.ownership_watchers.values() {
-            let _ = tx.send(EtcdOwnershipWatchMessage::Update(
-                EtcdOwnershipWatchUpdate::Progress { revision },
-            ));
-        }
+        let mut inner = self.inner.lock().expect("in-memory etcd mutex poisoned");
+        inner.ownership_watchers.retain(|watcher| {
+            watcher
+                .tx
+                .send(EtcdOwnershipWatchMessage::Update(
+                    EtcdOwnershipWatchUpdate::Progress { revision },
+                ))
+                .is_ok()
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ownership_watcher_count_for_test(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("in-memory etcd mutex poisoned")
+            .ownership_watchers
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_ownership_watcher_count_for_test(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("in-memory etcd mutex poisoned")
+            .ownership_watchers
+            .iter()
+            .filter(|watcher| watcher.tx.receiver_count() > 0)
+            .count()
     }
 }
 
@@ -1495,6 +2204,7 @@ impl InMemoryEtcdState {
                 key,
                 version,
                 value,
+                floor: None,
             });
         }
         self.notify_ownership(EtcdOwnershipWatchBatch {
@@ -1521,6 +2231,7 @@ impl InMemoryEtcdState {
                 key: key.to_string(),
                 previous_version: placement_version_from_revision(previous.revision),
                 previous_value: previous.value,
+                floor: None,
             }],
         });
         Ok(())
@@ -1575,6 +2286,7 @@ impl InMemoryEtcdState {
                     key,
                     version,
                     value,
+                    floor: None,
                 });
             } else if let Some(previous) = delete {
                 self.values.remove(&key);
@@ -1587,6 +2299,7 @@ impl InMemoryEtcdState {
                     key,
                     previous_version: placement_version_from_revision(previous.revision),
                     previous_value: previous.value,
+                    floor: None,
                 });
             }
         }
@@ -1605,24 +2318,161 @@ impl InMemoryEtcdState {
         }
     }
 
-    fn notify_ownership(&self, batch: EtcdOwnershipWatchBatch) {
-        for (prefix, tx) in &self.ownership_watchers {
+    fn notify_ownership(&mut self, batch: EtcdOwnershipWatchBatch) {
+        let values = &self.values;
+        self.ownership_watchers.retain_mut(|watcher| {
+            if watcher.tx.receiver_count() == 0 {
+                return false;
+            }
             let events = batch
                 .events
                 .iter()
-                .filter(|event| ownership_event_key(event).starts_with(prefix))
+                .filter(|event| {
+                    ownership_event_key(event).starts_with(&watcher.ranges.watch_prefix)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
-            if !events.is_empty() {
-                let _ = tx.send(EtcdOwnershipWatchMessage::Update(
-                    EtcdOwnershipWatchUpdate::Batch(EtcdOwnershipWatchBatch {
-                        revision: batch.revision,
-                        events,
-                    }),
-                ));
+            if events.is_empty() {
+                return true;
+            }
+            let mut update = EtcdOwnershipWatchBatch {
+                revision: batch.revision,
+                events,
+            };
+            match prove_in_memory_watch_batch(values, watcher, &mut update) {
+                Ok(()) => watcher
+                    .tx
+                    .send(EtcdOwnershipWatchMessage::Update(
+                        EtcdOwnershipWatchUpdate::Batch(update),
+                    ))
+                    .is_ok(),
+                Err(error) => {
+                    let _ = watcher.tx.send(EtcdOwnershipWatchMessage::Failed(error));
+                    false
+                }
+            }
+        });
+    }
+}
+
+fn prove_in_memory_watch_batch(
+    values: &HashMap<String, InMemoryEtcdValue>,
+    watcher: &mut InMemoryOwnershipWatcher,
+    batch: &mut EtcdOwnershipWatchBatch,
+) -> Result<(), OwnershipWatchError> {
+    if batch.events.len() > watcher.max_entries.get() {
+        return Err(OwnershipWatchError::CapacityExceeded {
+            max_entries: watcher.max_entries.get(),
+        });
+    }
+    let mut staged = watcher.live_records.clone();
+    let mut seen = HashSet::new();
+    for event in &mut batch.events {
+        let record_key = ownership_event_key(event).to_string();
+        let Some(floor_key) = floor_key_for_record(&watcher.ranges, &record_key)
+            .map_err(FloorProofReadError::into_watch_error)?
+        else {
+            continue;
+        };
+        if !seen.insert(record_key.clone()) {
+            return Err(OwnershipWatchError::Protocol {
+                message: format!("in-memory ownership batch modified {record_key} more than once"),
+            });
+        }
+        let epoch_key = match event {
+            EtcdOwnershipWatchEvent::Upserted { value, .. } => epoch_key_for_value(value),
+            EtcdOwnershipWatchEvent::Deleted { previous_value, .. } => {
+                epoch_key_for_value(previous_value)
+            }
+        };
+        let request = FloorProofRequest {
+            record_key: record_key.clone(),
+            floor_key,
+            epoch_key: epoch_key.clone(),
+        };
+        let proof = read_in_memory_floor_proof(values, batch.revision, &request)
+            .map_err(FloorProofReadError::into_watch_error)?;
+        match event {
+            EtcdOwnershipWatchEvent::Upserted {
+                key,
+                version,
+                value,
+                floor,
+            } => {
+                if version.modification_revision() != batch.revision.0 {
+                    return Err(OwnershipWatchError::Protocol {
+                        message: format!(
+                            "in-memory ownership put {key} token {version:?} did not match batch revision {:?}",
+                            batch.revision
+                        ),
+                    });
+                }
+                staged.insert(
+                    key.clone(),
+                    ProvenEtcdOwnershipRecord {
+                        version: *version,
+                        value: value.clone(),
+                    },
+                );
+                *floor = Some(proof);
+            }
+            EtcdOwnershipWatchEvent::Deleted {
+                key,
+                previous_version,
+                previous_value,
+                floor,
+            } => {
+                let Some(cached) = staged.get(key) else {
+                    return Err(epoch_key.map_or_else(
+                        || OwnershipWatchError::Protocol {
+                            message: format!(
+                                "in-memory delete {key} had no previously proven live record"
+                            ),
+                        },
+                        |key| OwnershipWatchError::Proof {
+                            error: OwnershipProofError::DeletePreviousMismatch { key },
+                        },
+                    ));
+                };
+                if cached.version != *previous_version || cached.value != *previous_value {
+                    return Err(epoch_key.map_or_else(
+                        || OwnershipWatchError::Protocol {
+                            message: format!(
+                                "in-memory delete {key} prev_kv did not match the proven record"
+                            ),
+                        },
+                        |key| OwnershipWatchError::Proof {
+                            error: OwnershipProofError::DeletePreviousMismatch { key },
+                        },
+                    ));
+                }
+                if proof.version.modification_revision() == batch.revision.0 {
+                    return Err(epoch_key.map_or_else(
+                        || OwnershipWatchError::Protocol {
+                            message: format!(
+                                "in-memory delete {key} modified its floor in the deletion revision"
+                            ),
+                        },
+                        |key| OwnershipWatchError::Proof {
+                            error: OwnershipProofError::FloorModifiedByDelete {
+                                key,
+                                observed_revision: batch.revision,
+                            },
+                        },
+                    ));
+                }
+                staged.remove(key);
+                *floor = Some(proof);
             }
         }
     }
+    if staged.len() > watcher.max_entries.get() {
+        return Err(OwnershipWatchError::CapacityExceeded {
+            max_entries: watcher.max_entries.get(),
+        });
+    }
+    watcher.live_records = staged;
+    Ok(())
 }
 
 fn placement_version_from_revision(revision: PlacementRevision) -> PlacementVersion {

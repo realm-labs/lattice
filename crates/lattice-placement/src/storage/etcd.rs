@@ -12,19 +12,23 @@ use crate::error::PlacementError;
 use crate::registry::InstanceRecord;
 use crate::storage::etcd::client::{
     ActivationLockTtl, EtcdEpochCommitRequest, EtcdEpochReservationRequest, EtcdKv,
-    EtcdLegacyEpochPutRequest, EtcdOwnershipRanges, EtcdOwnershipWatchEvent,
-    EtcdOwnershipWatchUpdate, EtcdValueGuard, InMemoryEtcdClient, InstanceLeaseTtl, RealEtcdClient,
+    EtcdLegacyEpochPutRequest, EtcdOwnershipFloorProof, EtcdOwnershipRanges,
+    EtcdOwnershipRecordRange, EtcdOwnershipWatchEvent, EtcdOwnershipWatchUpdate, EtcdValueGuard,
+    InMemoryEtcdClient, InstanceLeaseTtl, RealEtcdClient,
 };
 use crate::storage::etcd::codec::{
-    EtcdValue, activation_lock_key, activation_lock_namespace_prefix, actor_key,
-    actor_namespace_prefix, actor_service_prefix, coordinator_leader_key,
-    default_instance_lease_ttl_secs, epoch_floor_key, instance_key, instance_namespace_prefix,
-    instance_service_prefix, logic_prefix, singleton_key, singleton_lock_key,
+    EtcdValue, activation_lock_key, activation_lock_namespace_prefix,
+    actor_epoch_floor_service_prefix, actor_key, actor_namespace_prefix, actor_service_prefix,
+    coordinator_leader_key, default_instance_lease_ttl_secs, epoch_floor_key, instance_key,
+    instance_namespace_prefix, instance_service_prefix, logic_prefix,
+    singleton_epoch_floor_service_prefix, singleton_key, singleton_lock_key,
     singleton_lock_namespace_prefix, singleton_namespace_prefix, singleton_service_prefix,
-    vshard_actor_prefix, vshard_key, vshard_service_prefix,
+    virtual_shard_epoch_floor_service_prefix, vshard_actor_prefix, vshard_key,
+    vshard_service_prefix,
 };
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, EpochFloorRecord, LeaseId,
+    OwnershipEpochFloorProof, OwnershipProofContext, OwnershipProofError, OwnershipRecordBinding,
     OwnershipView, OwnershipViewError, OwnershipViewRecord, OwnershipViewSnapshot, OwnershipWatch,
     OwnershipWatchBatch, OwnershipWatchError, OwnershipWatchEvent, OwnershipWatchMessage,
     OwnershipWatchUpdate, PlacementEpochGuard, PlacementEpochKey, PlacementEpochReservation,
@@ -828,10 +832,28 @@ where
             .open_ownership_view(
                 EtcdOwnershipRanges {
                     local_instance_key: instance_key(&self.prefix, service_kind, instance_id),
-                    record_prefixes: vec![
-                        actor_service_prefix(&self.prefix, service_kind),
-                        vshard_service_prefix(&self.prefix, service_kind),
-                        singleton_service_prefix(&self.prefix, service_kind),
+                    record_ranges: vec![
+                        EtcdOwnershipRecordRange {
+                            record_prefix: actor_service_prefix(&self.prefix, service_kind),
+                            floor_prefix: actor_epoch_floor_service_prefix(
+                                &self.prefix,
+                                service_kind,
+                            ),
+                        },
+                        EtcdOwnershipRecordRange {
+                            record_prefix: vshard_service_prefix(&self.prefix, service_kind),
+                            floor_prefix: virtual_shard_epoch_floor_service_prefix(
+                                &self.prefix,
+                                service_kind,
+                            ),
+                        },
+                        EtcdOwnershipRecordRange {
+                            record_prefix: singleton_service_prefix(&self.prefix, service_kind),
+                            floor_prefix: singleton_epoch_floor_service_prefix(
+                                &self.prefix,
+                                service_kind,
+                            ),
+                        },
                     ],
                     watch_prefix: logic_prefix(&self.prefix),
                 },
@@ -841,6 +863,7 @@ where
 
         let mut local_instance = None;
         let mut records = Vec::new();
+        let raw_snapshot_revision = raw.snapshot.revision;
         for entry in raw.snapshot.entries {
             validate_etcd_value_key(&self.prefix, &entry.key, &entry.value).map_err(|error| {
                 OwnershipViewError::Protocol {
@@ -849,6 +872,14 @@ where
             })?;
             match entry.value {
                 EtcdValue::Instance(record) => {
+                    if entry.floor.is_some() {
+                        return Err(OwnershipViewError::Protocol {
+                            message: format!(
+                                "etcd ownership snapshot attached an epoch-floor proof to instance {}",
+                                entry.key
+                            ),
+                        });
+                    }
                     if record.service_kind != *service_kind || record.instance_id != *instance_id {
                         return Err(OwnershipViewError::Protocol {
                             message: format!(
@@ -866,9 +897,18 @@ where
                             &record.service_kind,
                         ));
                     }
+                    let record = *record;
+                    let proof = map_etcd_snapshot_proof(
+                        &self.prefix,
+                        raw_snapshot_revision,
+                        entry.revision,
+                        OwnershipRecordBinding::Actor(record.clone()),
+                        entry.floor,
+                    )?;
                     records.push(OwnershipViewRecord::Actor {
                         revision: entry.revision,
-                        record: *record,
+                        record,
+                        proof,
                     });
                 }
                 EtcdValue::VirtualShard(record) => {
@@ -878,9 +918,18 @@ where
                             &record.service_kind,
                         ));
                     }
+                    let record = *record;
+                    let proof = map_etcd_snapshot_proof(
+                        &self.prefix,
+                        raw_snapshot_revision,
+                        entry.revision,
+                        OwnershipRecordBinding::VirtualShard(record.clone()),
+                        entry.floor,
+                    )?;
                     records.push(OwnershipViewRecord::VirtualShard {
                         revision: entry.revision,
-                        record: *record,
+                        record,
+                        proof,
                     });
                 }
                 EtcdValue::Singleton(record) => {
@@ -890,9 +939,18 @@ where
                             &record.service_kind,
                         ));
                     }
+                    let record = *record;
+                    let proof = map_etcd_snapshot_proof(
+                        &self.prefix,
+                        raw_snapshot_revision,
+                        entry.revision,
+                        OwnershipRecordBinding::Singleton(record.clone()),
+                        entry.floor,
+                    )?;
                     records.push(OwnershipViewRecord::Singleton {
                         revision: entry.revision,
-                        record: *record,
+                        record,
+                        proof,
                     });
                 }
                 EtcdValue::CoordinatorLeader(_)
@@ -915,7 +973,7 @@ where
         }
 
         let snapshot = OwnershipViewSnapshot {
-            revision: raw.snapshot.revision,
+            revision: raw_snapshot_revision,
             local_instance,
             records,
         };
@@ -925,7 +983,7 @@ where
         let snapshot_revision = snapshot.revision;
         let max_watch_entries = max_entries.get();
         let (tx, rx) = broadcast::channel(128);
-        tokio::spawn(async move {
+        let bridge_task = tokio::spawn(async move {
             let mut high_water = snapshot_revision;
             loop {
                 match raw.watch.next_update().await {
@@ -1002,7 +1060,7 @@ where
         });
         Ok(OwnershipView {
             snapshot,
-            watch: OwnershipWatch::new(rx),
+            watch: OwnershipWatch::new_cancellable(rx, bridge_task.abort_handle()),
         })
     }
 
@@ -1422,6 +1480,97 @@ fn is_lower_hex(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn map_etcd_snapshot_proof(
+    prefix: &PlacementPrefix,
+    observed_revision: crate::storage::PlacementRevision,
+    record_revision: crate::storage::PlacementRevision,
+    binding: OwnershipRecordBinding,
+    raw: Option<EtcdOwnershipFloorProof>,
+) -> Result<OwnershipEpochFloorProof, OwnershipViewError> {
+    map_etcd_epoch_floor_proof(
+        prefix,
+        OwnershipProofContext::Snapshot,
+        observed_revision,
+        PlacementVersion::from_modification_revision(record_revision.0),
+        binding,
+        raw,
+    )
+    .map_err(|error| OwnershipViewError::Proof { error })
+}
+
+fn map_etcd_watch_proof(
+    prefix: &PlacementPrefix,
+    context: OwnershipProofContext,
+    observed_revision: crate::storage::PlacementRevision,
+    record_version: PlacementVersion,
+    binding: OwnershipRecordBinding,
+    raw: Option<EtcdOwnershipFloorProof>,
+) -> Result<OwnershipEpochFloorProof, OwnershipWatchError> {
+    map_etcd_epoch_floor_proof(
+        prefix,
+        context,
+        observed_revision,
+        record_version,
+        binding,
+        raw,
+    )
+    .map_err(|error| OwnershipWatchError::Proof { error })
+}
+
+fn map_etcd_epoch_floor_proof(
+    prefix: &PlacementPrefix,
+    context: OwnershipProofContext,
+    observed_revision: crate::storage::PlacementRevision,
+    record_version: PlacementVersion,
+    binding: OwnershipRecordBinding,
+    raw: Option<EtcdOwnershipFloorProof>,
+) -> Result<OwnershipEpochFloorProof, OwnershipProofError> {
+    let key = binding.epoch_key();
+    let raw = raw.ok_or_else(|| OwnershipProofError::MissingFloor {
+        key: key.clone(),
+        observed_revision,
+    })?;
+    if raw.observed_revision != observed_revision {
+        return Err(OwnershipProofError::ObservationRevisionMismatch {
+            key,
+            observed_revision,
+            record: record_version,
+            floor: raw.version,
+        });
+    }
+    let expected_floor_key = epoch_floor_key(prefix, &key);
+    if raw.key != expected_floor_key {
+        return Err(OwnershipProofError::MalformedFloor {
+            key,
+            message: format!(
+                "backend returned floor key {}, expected {expected_floor_key}",
+                raw.key
+            ),
+        });
+    }
+    validate_etcd_value_key(prefix, &raw.key, &raw.value).map_err(|error| {
+        OwnershipProofError::MalformedFloor {
+            key: key.clone(),
+            message: error.to_string(),
+        }
+    })?;
+    let EtcdValue::EpochFloor(floor) = raw.value else {
+        return Err(OwnershipProofError::MalformedFloor {
+            key,
+            message: "backend returned a non-floor value".to_string(),
+        });
+    };
+    OwnershipEpochFloorProof::new(
+        context,
+        observed_revision,
+        record_version,
+        binding,
+        raw.version,
+        *floor,
+        None,
+    )
+}
+
 fn map_etcd_watch_batch(
     prefix: &PlacementPrefix,
     expected_service: &ServiceKind,
@@ -1429,27 +1578,32 @@ fn map_etcd_watch_batch(
     revision: crate::storage::PlacementRevision,
     raw_events: Vec<EtcdOwnershipWatchEvent>,
 ) -> Result<Option<OwnershipWatchBatch>, OwnershipWatchError> {
+    let context = EtcdWatchMappingContext {
+        prefix,
+        expected_service,
+        expected_instance,
+        observed_revision: revision,
+    };
     let mut events = Vec::new();
     for event in raw_events {
         let mapped = match event {
-            EtcdOwnershipWatchEvent::Upserted { key, value, .. } => map_etcd_watch_value(
-                prefix,
-                expected_service,
-                expected_instance,
-                &key,
+            EtcdOwnershipWatchEvent::Upserted {
+                key,
+                version,
                 value,
-                false,
-            )?,
+                floor,
+            } => map_etcd_watch_value(&context, &key, version, value, floor, false)?,
             EtcdOwnershipWatchEvent::Deleted {
                 key,
+                previous_version,
                 previous_value,
-                ..
+                floor,
             } => map_etcd_watch_value(
-                prefix,
-                expected_service,
-                expected_instance,
+                &context,
                 &key,
+                previous_version,
                 previous_value,
+                floor,
                 true,
             )?,
         };
@@ -1462,6 +1616,13 @@ fn map_etcd_watch_batch(
     } else {
         Ok(Some(OwnershipWatchBatch { revision, events }))
     }
+}
+
+struct EtcdWatchMappingContext<'a> {
+    prefix: &'a PlacementPrefix,
+    expected_service: &'a ServiceKind,
+    expected_instance: &'a InstanceId,
+    observed_revision: crate::storage::PlacementRevision,
 }
 
 fn advance_etcd_watch_batch(
@@ -1495,17 +1656,25 @@ fn advance_etcd_watch_progress(
 }
 
 fn map_etcd_watch_value(
-    prefix: &PlacementPrefix,
-    expected_service: &ServiceKind,
-    expected_instance: &InstanceId,
+    context: &EtcdWatchMappingContext<'_>,
     key: &str,
+    record_version: PlacementVersion,
     value: EtcdValue,
+    floor: Option<EtcdOwnershipFloorProof>,
     deleted: bool,
 ) -> Result<Option<OwnershipWatchEvent>, OwnershipWatchError> {
-    validate_etcd_value_key(prefix, key, &value)?;
+    validate_etcd_value_key(context.prefix, key, &value)?;
     let event = match value {
         EtcdValue::Instance(record) => {
-            if record.service_kind != *expected_service || record.instance_id != *expected_instance
+            if floor.is_some() {
+                return Err(OwnershipWatchError::Protocol {
+                    message: format!(
+                        "etcd ownership watch attached an epoch-floor proof to instance {key}"
+                    ),
+                });
+            }
+            if record.service_kind != *context.expected_service
+                || record.instance_id != *context.expected_instance
             {
                 return Ok(None);
             }
@@ -1516,7 +1685,7 @@ fn map_etcd_watch_value(
             }
         }
         EtcdValue::Actor(record) => {
-            if record.service_kind != *expected_service {
+            if record.service_kind != *context.expected_service {
                 return Ok(None);
             }
             let key = ActorPlacementKey {
@@ -1524,17 +1693,31 @@ fn map_etcd_watch_value(
                 actor_kind: record.actor_kind.clone(),
                 actor_id: record.actor_id.clone(),
             };
+            let record = *record;
+            let proof = map_etcd_watch_proof(
+                context.prefix,
+                if deleted {
+                    OwnershipProofContext::Delete
+                } else {
+                    OwnershipProofContext::Upsert
+                },
+                context.observed_revision,
+                record_version,
+                OwnershipRecordBinding::Actor(record.clone()),
+                floor,
+            )?;
             if deleted {
-                OwnershipWatchEvent::ActorDeleted { key }
-            } else {
-                OwnershipWatchEvent::ActorUpserted {
+                OwnershipWatchEvent::ActorDeleted {
                     key,
-                    record: *record,
+                    previous_record: record,
+                    proof,
                 }
+            } else {
+                OwnershipWatchEvent::ActorUpserted { key, record, proof }
             }
         }
         EtcdValue::VirtualShard(record) => {
-            if record.service_kind != *expected_service {
+            if record.service_kind != *context.expected_service {
                 return Ok(None);
             }
             let key = VirtualShardPlacementKey {
@@ -1542,17 +1725,31 @@ fn map_etcd_watch_value(
                 actor_kind: record.actor_kind.clone(),
                 shard_id: record.shard_id,
             };
+            let record = *record;
+            let proof = map_etcd_watch_proof(
+                context.prefix,
+                if deleted {
+                    OwnershipProofContext::Delete
+                } else {
+                    OwnershipProofContext::Upsert
+                },
+                context.observed_revision,
+                record_version,
+                OwnershipRecordBinding::VirtualShard(record.clone()),
+                floor,
+            )?;
             if deleted {
-                OwnershipWatchEvent::VirtualShardDeleted { key }
-            } else {
-                OwnershipWatchEvent::VirtualShardUpserted {
+                OwnershipWatchEvent::VirtualShardDeleted {
                     key,
-                    record: *record,
+                    previous_record: record,
+                    proof,
                 }
+            } else {
+                OwnershipWatchEvent::VirtualShardUpserted { key, record, proof }
             }
         }
         EtcdValue::Singleton(record) => {
-            if record.service_kind != *expected_service {
+            if record.service_kind != *context.expected_service {
                 return Ok(None);
             }
             let key = SingletonKey {
@@ -1560,19 +1757,42 @@ fn map_etcd_watch_value(
                 singleton_kind: record.singleton_kind.clone(),
                 scope: record.scope.clone(),
             };
+            let record = *record;
+            let proof = map_etcd_watch_proof(
+                context.prefix,
+                if deleted {
+                    OwnershipProofContext::Delete
+                } else {
+                    OwnershipProofContext::Upsert
+                },
+                context.observed_revision,
+                record_version,
+                OwnershipRecordBinding::Singleton(record.clone()),
+                floor,
+            )?;
             if deleted {
-                OwnershipWatchEvent::SingletonDeleted { key }
-            } else {
-                OwnershipWatchEvent::SingletonUpserted {
+                OwnershipWatchEvent::SingletonDeleted {
                     key,
-                    record: *record,
+                    previous_record: record,
+                    proof,
                 }
+            } else {
+                OwnershipWatchEvent::SingletonUpserted { key, record, proof }
             }
         }
         EtcdValue::CoordinatorLeader(_)
         | EtcdValue::ActivationLock(_)
         | EtcdValue::SingletonLock(_)
-        | EtcdValue::EpochFloor(_) => return Ok(None),
+        | EtcdValue::EpochFloor(_) => {
+            if floor.is_some() {
+                return Err(OwnershipWatchError::Protocol {
+                    message: format!(
+                        "etcd ownership watch attached an epoch-floor proof to non-placement {key}"
+                    ),
+                });
+            }
+            return Ok(None);
+        }
     };
     Ok(Some(event))
 }

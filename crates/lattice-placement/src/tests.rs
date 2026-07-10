@@ -541,20 +541,23 @@ async fn ownership_view_uses_non_aba_modification_tokens_with_global_revisions()
     assert_eq!(view.snapshot.revision, PlacementRevision(0));
     assert_eq!(first_batch.revision, PlacementRevision(1));
     assert_eq!(second_batch.revision, PlacementRevision(2));
-    assert_eq!(
-        first_batch.events,
-        vec![OwnershipWatchEvent::ActorUpserted {
-            key: first_key,
-            record: first_record,
-        }]
-    );
-    assert_eq!(
-        second_batch.events,
-        vec![OwnershipWatchEvent::ActorUpserted {
-            key: second_key,
-            record: second_record,
-        }]
-    );
+    let [OwnershipWatchEvent::ActorUpserted { key, record, proof }] = first_batch.events.as_slice()
+    else {
+        panic!("expected one actor upsert");
+    };
+    assert_eq!(key, &first_key);
+    assert_eq!(record, &first_record);
+    assert_eq!(proof.observed_revision(), first_batch.revision);
+    assert_eq!(proof.record_revision(), first_batch.revision);
+    let [OwnershipWatchEvent::ActorUpserted { key, record, proof }] =
+        second_batch.events.as_slice()
+    else {
+        panic!("expected one actor upsert");
+    };
+    assert_eq!(key, &second_key);
+    assert_eq!(record, &second_record);
+    assert_eq!(proof.observed_revision(), second_batch.revision);
+    assert_eq!(proof.record_revision(), second_batch.revision);
 }
 
 #[tokio::test]
@@ -588,21 +591,35 @@ async fn ownership_view_has_no_gap_between_snapshot_and_remote_owner_update() {
     let batch = view.watch.next().await.unwrap();
 
     assert_eq!(view.snapshot.revision, PlacementRevision(1));
-    assert_eq!(
-        view.snapshot.records,
-        vec![OwnershipViewRecord::Actor {
-            revision: PlacementRevision(1),
-            record: local,
-        }]
-    );
+    let [
+        OwnershipViewRecord::Actor {
+            revision,
+            record,
+            proof,
+        },
+    ] = view.snapshot.records.as_slice()
+    else {
+        panic!("expected one actor snapshot record");
+    };
+    assert_eq!(*revision, PlacementRevision(1));
+    assert_eq!(record, &local);
+    assert_eq!(proof.observed_revision(), view.snapshot.revision);
+    assert_eq!(proof.record_revision(), *revision);
     assert_eq!(batch.revision, PlacementRevision(2));
-    assert_eq!(
-        batch.events,
-        vec![OwnershipWatchEvent::ActorUpserted {
-            key,
-            record: remote,
-        }]
-    );
+    let [
+        OwnershipWatchEvent::ActorUpserted {
+            key: event_key,
+            record,
+            proof,
+        },
+    ] = batch.events.as_slice()
+    else {
+        panic!("expected one actor upsert");
+    };
+    assert_eq!(event_key, &key);
+    assert_eq!(record, &remote);
+    assert_eq!(proof.observed_revision(), batch.revision);
+    assert_eq!(proof.record_revision(), batch.revision);
 }
 
 #[tokio::test]

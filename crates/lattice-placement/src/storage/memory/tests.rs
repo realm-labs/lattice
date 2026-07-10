@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
@@ -7,12 +9,201 @@ use super::InMemoryPlacementStore;
 use crate::error::PlacementError;
 use crate::sharding::VirtualShardId;
 use crate::storage::{
-    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementEpochKey, PlacementPrefix,
-    PlacementState, PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
-    VirtualShardPlacementKey, VirtualShardPlacementRecord,
+    ActorPlacementKey, ActorPlacementRecord, EpochFloorRecord, LeaseId, OwnershipProofError,
+    OwnershipViewError, OwnershipViewRecord, OwnershipWatchError, OwnershipWatchEvent,
+    PlacementEpochKey, PlacementPrefix, PlacementRevision, PlacementState, PlacementStore,
+    PlacementVersion, SingletonKey, SingletonPlacementRecord, VirtualShardPlacementKey,
+    VirtualShardPlacementRecord,
 };
 
 const PREFIX: &str = "/lattice/memory-epoch-tests";
+
+#[tokio::test]
+async fn ownership_views_capture_exact_snapshot_upsert_and_delete_proofs_for_every_family() {
+    let store = store();
+    let actor_key = actor_key(41);
+    let shard_key = shard_key(42);
+    let singleton_key = singleton_key("proofs");
+    let actor = actor_record(41, "world-a", 1, LeaseId(10), PlacementState::Running);
+    let shard = shard_record(42, "world-a", 1);
+    let singleton = singleton_record("proofs", "world-a", 1, LeaseId(10), PlacementState::Running);
+    let mut watch_view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(3).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let actor_token = store
+        .compare_and_put_actor(actor_key.clone(), None, actor.clone())
+        .await
+        .unwrap();
+    let shard_token = store
+        .compare_and_put_virtual_shard(shard_key.clone(), None, shard.clone())
+        .await
+        .unwrap();
+    let singleton_token = store
+        .compare_and_put_singleton(singleton_key.clone(), None, singleton.clone())
+        .await
+        .unwrap();
+
+    for (expected_revision, expected) in [
+        (PlacementRevision(1), "actor"),
+        (PlacementRevision(2), "shard"),
+        (PlacementRevision(3), "singleton"),
+    ] {
+        let batch = watch_view.watch.next().await.unwrap();
+        assert_eq!(batch.revision, expected_revision);
+        let proof = match batch.events.as_slice() {
+            [OwnershipWatchEvent::ActorUpserted { key, record, proof }] if expected == "actor" => {
+                assert_eq!(key, &actor_key);
+                assert_eq!(record, &actor);
+                proof
+            }
+            [OwnershipWatchEvent::VirtualShardUpserted { key, record, proof }]
+                if expected == "shard" =>
+            {
+                assert_eq!(key, &shard_key);
+                assert_eq!(record, &shard);
+                proof
+            }
+            [OwnershipWatchEvent::SingletonUpserted { key, record, proof }]
+                if expected == "singleton" =>
+            {
+                assert_eq!(key, &singleton_key);
+                assert_eq!(record, &singleton);
+                proof
+            }
+            events => panic!("unexpected {expected} upsert batch: {events:?}"),
+        };
+        assert_eq!(proof.observed_revision(), expected_revision);
+        assert_eq!(proof.record_revision(), expected_revision);
+    }
+
+    assert_eq!(
+        store
+            .reserve_actor_epoch(actor_key.clone(), Some(actor_token), None)
+            .await
+            .unwrap()
+            .epoch(),
+        Epoch(2)
+    );
+    assert_eq!(
+        store
+            .reserve_virtual_shard_epoch(shard_key.clone(), Some(shard_token))
+            .await
+            .unwrap()
+            .epoch(),
+        Epoch(2)
+    );
+    assert_eq!(
+        store
+            .reserve_singleton_epoch(singleton_key.clone(), Some(singleton_token), None)
+            .await
+            .unwrap()
+            .epoch(),
+        Epoch(2)
+    );
+
+    let snapshot_view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(3).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot_view.snapshot.revision, PlacementRevision(6));
+    assert_eq!(snapshot_view.snapshot.records.len(), 3);
+    for record in &snapshot_view.snapshot.records {
+        let (record_revision, proof) = match record {
+            OwnershipViewRecord::Actor {
+                revision,
+                record,
+                proof,
+            } => {
+                assert_eq!(record, &actor);
+                (*revision, proof)
+            }
+            OwnershipViewRecord::VirtualShard {
+                revision,
+                record,
+                proof,
+            } => {
+                assert_eq!(record, &shard);
+                (*revision, proof)
+            }
+            OwnershipViewRecord::Singleton {
+                revision,
+                record,
+                proof,
+            } => {
+                assert_eq!(record, &singleton);
+                (*revision, proof)
+            }
+        };
+        assert_eq!(proof.observed_revision(), snapshot_view.snapshot.revision);
+        assert_eq!(proof.record_revision(), record_revision);
+    }
+
+    assert_eq!(store.remove_actor_for_test(&actor_key), Some(actor.clone()));
+    assert_eq!(
+        store.remove_virtual_shard_for_test(&shard_key),
+        Some(shard.clone())
+    );
+    assert_eq!(
+        store.remove_singleton_for_test(&singleton_key),
+        Some(singleton.clone())
+    );
+    for (expected_revision, expected_record_revision, expected) in [
+        (PlacementRevision(7), PlacementRevision(1), "actor"),
+        (PlacementRevision(8), PlacementRevision(2), "shard"),
+        (PlacementRevision(9), PlacementRevision(3), "singleton"),
+    ] {
+        let batch = watch_view.watch.next().await.unwrap();
+        assert_eq!(batch.revision, expected_revision);
+        let proof = match batch.events.as_slice() {
+            [
+                OwnershipWatchEvent::ActorDeleted {
+                    key,
+                    previous_record,
+                    proof,
+                },
+            ] if expected == "actor" => {
+                assert_eq!(key, &actor_key);
+                assert_eq!(previous_record, &actor);
+                proof
+            }
+            [
+                OwnershipWatchEvent::VirtualShardDeleted {
+                    key,
+                    previous_record,
+                    proof,
+                },
+            ] if expected == "shard" => {
+                assert_eq!(key, &shard_key);
+                assert_eq!(previous_record, &shard);
+                proof
+            }
+            [
+                OwnershipWatchEvent::SingletonDeleted {
+                    key,
+                    previous_record,
+                    proof,
+                },
+            ] if expected == "singleton" => {
+                assert_eq!(key, &singleton_key);
+                assert_eq!(previous_record, &singleton);
+                proof
+            }
+            events => panic!("unexpected {expected} delete batch: {events:?}"),
+        };
+        assert_eq!(proof.observed_revision(), expected_revision);
+        assert_eq!(proof.record_revision(), expected_record_revision);
+    }
+}
 
 #[tokio::test]
 async fn durable_floors_survive_delete_and_shared_store_restart_for_every_family() {
@@ -353,6 +544,242 @@ async fn live_records_without_floors_fail_closed_without_mutation_for_every_fami
         Some((singleton_token, singleton))
     );
     assert_eq!(placement_revision(&store), revision);
+}
+
+#[tokio::test]
+async fn ownership_snapshots_reject_missing_floors_for_every_family() {
+    let service = service_kind!("World");
+    let instance = InstanceId::new("world-a");
+
+    let actor_store = store();
+    let actor_key = actor_key(21);
+    actor_store
+        .compare_and_put_actor(
+            actor_key.clone(),
+            None,
+            actor_record(21, "world-a", 1, LeaseId(10), PlacementState::Running),
+        )
+        .await
+        .unwrap();
+    remove_floor(&actor_store, &PlacementEpochKey::Actor(actor_key.clone()));
+    assert_eq!(
+        actor_store
+            .open_ownership_view(&service, &instance, NonZeroUsize::new(1).unwrap())
+            .await
+            .unwrap_err(),
+        OwnershipViewError::Proof {
+            error: OwnershipProofError::MissingFloor {
+                key: PlacementEpochKey::Actor(actor_key),
+                observed_revision: PlacementRevision(1),
+            }
+        }
+    );
+
+    let shard_store = store();
+    let shard_key = shard_key(22);
+    shard_store
+        .compare_and_put_virtual_shard(shard_key.clone(), None, shard_record(22, "world-a", 1))
+        .await
+        .unwrap();
+    remove_floor(
+        &shard_store,
+        &PlacementEpochKey::VirtualShard(shard_key.clone()),
+    );
+    assert_eq!(
+        shard_store
+            .open_ownership_view(&service, &instance, NonZeroUsize::new(1).unwrap())
+            .await
+            .unwrap_err(),
+        OwnershipViewError::Proof {
+            error: OwnershipProofError::MissingFloor {
+                key: PlacementEpochKey::VirtualShard(shard_key),
+                observed_revision: PlacementRevision(1),
+            }
+        }
+    );
+
+    let singleton_store = store();
+    let singleton_key = singleton_key("missing-proof");
+    singleton_store
+        .compare_and_put_singleton(
+            singleton_key.clone(),
+            None,
+            singleton_record(
+                "missing-proof",
+                "world-a",
+                1,
+                LeaseId(10),
+                PlacementState::Running,
+            ),
+        )
+        .await
+        .unwrap();
+    remove_floor(
+        &singleton_store,
+        &PlacementEpochKey::Singleton(singleton_key.clone()),
+    );
+    assert_eq!(
+        singleton_store
+            .open_ownership_view(&service, &instance, NonZeroUsize::new(1).unwrap())
+            .await
+            .unwrap_err(),
+        OwnershipViewError::Proof {
+            error: OwnershipProofError::MissingFloor {
+                key: PlacementEpochKey::Singleton(singleton_key),
+                observed_revision: PlacementRevision(1),
+            }
+        }
+    );
+}
+
+#[tokio::test]
+async fn ownership_watch_proofs_cannot_be_laundered_by_later_floors_for_every_family() {
+    let service = service_kind!("World");
+    let instance = InstanceId::new("world-a");
+
+    let actor_store = store();
+    let actor_key = actor_key(31);
+    let actor = actor_record(31, "world-a", 1, LeaseId(10), PlacementState::Running);
+    let actor_token = actor_store
+        .compare_and_put_actor(actor_key.clone(), None, actor.clone())
+        .await
+        .unwrap();
+    actor_store
+        .reserve_actor_epoch(actor_key.clone(), Some(actor_token), None)
+        .await
+        .unwrap();
+    let actor_floor = actor_store
+        .epoch_floor_for_test(&PlacementEpochKey::Actor(actor_key.clone()))
+        .unwrap()
+        .0;
+    let mut actor_view = actor_store
+        .open_ownership_view(&service, &instance, NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
+    let actor_replay = ActorPlacementRecord {
+        owner: InstanceId::new("world-b"),
+        lease_id: LeaseId(20),
+        ..actor
+    };
+    let actor_replay_token = put_actor_record_only(&actor_store, actor_key.clone(), actor_replay);
+    put_floor_only(
+        &actor_store,
+        PlacementEpochKey::Actor(actor_key.clone()),
+        Epoch(3),
+    );
+    assert_eq!(
+        actor_view.watch.next_update().await,
+        Err(OwnershipWatchError::Proof {
+            error: OwnershipProofError::LineageUnproven {
+                key: PlacementEpochKey::Actor(actor_key),
+                record: actor_replay_token,
+                floor: actor_floor,
+            }
+        })
+    );
+    assert_eq!(
+        actor_view.watch.next_update().await,
+        Err(OwnershipWatchError::Closed),
+        "a proof failure must terminate the direct-memory view",
+    );
+
+    let shard_store = store();
+    let shard_key = shard_key(32);
+    let shard = shard_record(32, "world-a", 1);
+    let shard_token = shard_store
+        .compare_and_put_virtual_shard(shard_key.clone(), None, shard.clone())
+        .await
+        .unwrap();
+    shard_store
+        .reserve_virtual_shard_epoch(shard_key.clone(), Some(shard_token))
+        .await
+        .unwrap();
+    let shard_floor = shard_store
+        .epoch_floor_for_test(&PlacementEpochKey::VirtualShard(shard_key.clone()))
+        .unwrap()
+        .0;
+    let mut shard_view = shard_store
+        .open_ownership_view(&service, &instance, NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
+    let shard_replay = VirtualShardPlacementRecord {
+        owner: InstanceId::new("world-b"),
+        ..shard
+    };
+    let shard_replay_token = put_shard_record_only(&shard_store, shard_key.clone(), shard_replay);
+    put_floor_only(
+        &shard_store,
+        PlacementEpochKey::VirtualShard(shard_key.clone()),
+        Epoch(3),
+    );
+    assert_eq!(
+        shard_view.watch.next_update().await,
+        Err(OwnershipWatchError::Proof {
+            error: OwnershipProofError::LineageUnproven {
+                key: PlacementEpochKey::VirtualShard(shard_key),
+                record: shard_replay_token,
+                floor: shard_floor,
+            }
+        })
+    );
+    assert_eq!(
+        shard_view.watch.next_update().await,
+        Err(OwnershipWatchError::Closed),
+        "a proof failure must terminate the direct-memory view",
+    );
+
+    let singleton_store = store();
+    let singleton_key = singleton_key("proof-replay");
+    let singleton = singleton_record(
+        "proof-replay",
+        "world-a",
+        1,
+        LeaseId(10),
+        PlacementState::Running,
+    );
+    let singleton_token = singleton_store
+        .compare_and_put_singleton(singleton_key.clone(), None, singleton.clone())
+        .await
+        .unwrap();
+    singleton_store
+        .reserve_singleton_epoch(singleton_key.clone(), Some(singleton_token), None)
+        .await
+        .unwrap();
+    let singleton_floor = singleton_store
+        .epoch_floor_for_test(&PlacementEpochKey::Singleton(singleton_key.clone()))
+        .unwrap()
+        .0;
+    let mut singleton_view = singleton_store
+        .open_ownership_view(&service, &instance, NonZeroUsize::new(1).unwrap())
+        .await
+        .unwrap();
+    let singleton_replay = SingletonPlacementRecord {
+        owner: InstanceId::new("world-b"),
+        lease_id: LeaseId(20),
+        ..singleton
+    };
+    let singleton_replay_token =
+        put_singleton_record_only(&singleton_store, singleton_key.clone(), singleton_replay);
+    put_floor_only(
+        &singleton_store,
+        PlacementEpochKey::Singleton(singleton_key.clone()),
+        Epoch(3),
+    );
+    assert_eq!(
+        singleton_view.watch.next_update().await,
+        Err(OwnershipWatchError::Proof {
+            error: OwnershipProofError::LineageUnproven {
+                key: PlacementEpochKey::Singleton(singleton_key),
+                record: singleton_replay_token,
+                floor: singleton_floor,
+            }
+        })
+    );
+    assert_eq!(
+        singleton_view.watch.next_update().await,
+        Err(OwnershipWatchError::Closed),
+        "a proof failure must terminate the direct-memory view",
+    );
 }
 
 #[tokio::test]
@@ -1240,10 +1667,31 @@ fn put_actor_record_only(
     record: ActorPlacementRecord,
 ) -> PlacementVersion {
     let storage_key = store.prefixed_actor_key(&key);
+    let epoch_key = PlacementEpochKey::Actor(key.clone());
+    let floor_key = store.prefixed_epoch_key(&epoch_key);
     let mut inner = store.inner.lock().expect("placement store mutex poisoned");
     let revision = inner.next_placement_revision();
     let token = super::placement_token(revision);
-    inner.actors.insert(storage_key, (token, revision, record));
+    inner
+        .actors
+        .insert(storage_key, (token, revision, record.clone()));
+    let proof = super::memory_ownership_proof(
+        &inner,
+        &floor_key,
+        crate::storage::OwnershipProofContext::Upsert,
+        revision,
+        token,
+        crate::storage::OwnershipRecordBinding::Actor(record.clone()),
+    );
+    inner.notify_ownership_event(
+        &store.prefix,
+        revision,
+        proof.map(|proof| crate::storage::OwnershipWatchEvent::ActorUpserted {
+            key,
+            record,
+            proof,
+        }),
+    );
     token
 }
 
@@ -1253,10 +1701,33 @@ fn put_shard_record_only(
     record: VirtualShardPlacementRecord,
 ) -> PlacementVersion {
     let storage_key = store.prefixed_vshard_key(&key);
+    let epoch_key = PlacementEpochKey::VirtualShard(key.clone());
+    let floor_key = store.prefixed_epoch_key(&epoch_key);
     let mut inner = store.inner.lock().expect("placement store mutex poisoned");
     let revision = inner.next_placement_revision();
     let token = super::placement_token(revision);
-    inner.vshards.insert(storage_key, (token, revision, record));
+    inner
+        .vshards
+        .insert(storage_key, (token, revision, record.clone()));
+    let proof = super::memory_ownership_proof(
+        &inner,
+        &floor_key,
+        crate::storage::OwnershipProofContext::Upsert,
+        revision,
+        token,
+        crate::storage::OwnershipRecordBinding::VirtualShard(record.clone()),
+    );
+    inner.notify_ownership_event(
+        &store.prefix,
+        revision,
+        proof.map(
+            |proof| crate::storage::OwnershipWatchEvent::VirtualShardUpserted {
+                key,
+                record,
+                proof,
+            },
+        ),
+    );
     token
 }
 
@@ -1266,12 +1737,44 @@ fn put_singleton_record_only(
     record: SingletonPlacementRecord,
 ) -> PlacementVersion {
     let storage_key = store.prefixed_singleton_key(&key);
+    let epoch_key = PlacementEpochKey::Singleton(key.clone());
+    let floor_key = store.prefixed_epoch_key(&epoch_key);
     let mut inner = store.inner.lock().expect("placement store mutex poisoned");
     let revision = inner.next_placement_revision();
     let token = super::placement_token(revision);
     inner
         .singletons
-        .insert(storage_key, (token, revision, record));
+        .insert(storage_key, (token, revision, record.clone()));
+    let proof = super::memory_ownership_proof(
+        &inner,
+        &floor_key,
+        crate::storage::OwnershipProofContext::Upsert,
+        revision,
+        token,
+        crate::storage::OwnershipRecordBinding::Singleton(record.clone()),
+    );
+    inner.notify_ownership_event(
+        &store.prefix,
+        revision,
+        proof.map(
+            |proof| crate::storage::OwnershipWatchEvent::SingletonUpserted { key, record, proof },
+        ),
+    );
+    token
+}
+
+fn put_floor_only(
+    store: &InMemoryPlacementStore,
+    key: PlacementEpochKey,
+    epoch: Epoch,
+) -> PlacementVersion {
+    let storage_key = store.prefixed_epoch_key(&key);
+    let mut inner = store.inner.lock().expect("placement store mutex poisoned");
+    let revision = inner.next_placement_revision();
+    let token = super::placement_token(revision);
+    inner
+        .epoch_floors
+        .insert(storage_key, (token, EpochFloorRecord { key, epoch }));
     token
 }
 

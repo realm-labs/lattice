@@ -13,11 +13,13 @@ use crate::error::PlacementError;
 use crate::registry::InstanceRecord;
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, EpochFloorRecord, LeaseId,
+    OwnershipEpochFloorProof, OwnershipProofContext, OwnershipProofError, OwnershipRecordBinding,
     OwnershipView, OwnershipViewError, OwnershipViewRecord, OwnershipViewSnapshot, OwnershipWatch,
-    OwnershipWatchBatch, OwnershipWatchEvent, OwnershipWatchMessage, OwnershipWatchUpdate,
-    PlacementEpochGuard, PlacementEpochKey, PlacementEpochReservation, PlacementPrefix,
-    PlacementRevision, PlacementStore, PlacementVersion, PlacementWatch, PlacementWatchEvent,
-    SingletonKey, SingletonPlacementRecord, VirtualShardPlacementKey, VirtualShardPlacementRecord,
+    OwnershipWatchBatch, OwnershipWatchError, OwnershipWatchEvent, OwnershipWatchMessage,
+    OwnershipWatchUpdate, PlacementEpochGuard, PlacementEpochKey, PlacementEpochReservation,
+    PlacementPrefix, PlacementRevision, PlacementStore, PlacementVersion, PlacementWatch,
+    PlacementWatchEvent, SingletonKey, SingletonPlacementRecord, VirtualShardPlacementKey,
+    VirtualShardPlacementRecord,
 };
 
 const WATCH_CAPACITY: usize = 128;
@@ -90,16 +92,28 @@ impl InMemoryPlacementStore {
         &self,
         key: &ActorPlacementKey,
     ) -> Option<ActorPlacementRecord> {
+        let epoch_key = PlacementEpochKey::Actor(key.clone());
+        let floor_key = self.prefixed_epoch_key(&epoch_key);
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
-        let (_token, _record_revision, record) =
+        let (token, _record_revision, record) =
             inner.actors.remove(&self.prefixed_actor_key(key))?;
         let revision = inner.next_placement_revision();
-        inner.notify_ownership(
+        let proof = memory_ownership_proof(
+            &inner,
+            &floor_key,
+            OwnershipProofContext::Delete,
+            revision,
+            token,
+            OwnershipRecordBinding::Actor(record.clone()),
+        );
+        inner.notify_ownership_event(
             &self.prefix,
-            OwnershipWatchBatch {
-                revision,
-                events: vec![OwnershipWatchEvent::ActorDeleted { key: key.clone() }],
-            },
+            revision,
+            proof.map(|proof| OwnershipWatchEvent::ActorDeleted {
+                key: key.clone(),
+                previous_record: record.clone(),
+                proof,
+            }),
         );
         Some(record)
     }
@@ -109,16 +123,28 @@ impl InMemoryPlacementStore {
         &self,
         key: &VirtualShardPlacementKey,
     ) -> Option<VirtualShardPlacementRecord> {
+        let epoch_key = PlacementEpochKey::VirtualShard(key.clone());
+        let floor_key = self.prefixed_epoch_key(&epoch_key);
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
-        let (_token, _record_revision, record) =
+        let (token, _record_revision, record) =
             inner.vshards.remove(&self.prefixed_vshard_key(key))?;
         let revision = inner.next_placement_revision();
-        inner.notify_ownership(
+        let proof = memory_ownership_proof(
+            &inner,
+            &floor_key,
+            OwnershipProofContext::Delete,
+            revision,
+            token,
+            OwnershipRecordBinding::VirtualShard(record.clone()),
+        );
+        inner.notify_ownership_event(
             &self.prefix,
-            OwnershipWatchBatch {
-                revision,
-                events: vec![OwnershipWatchEvent::VirtualShardDeleted { key: key.clone() }],
-            },
+            revision,
+            proof.map(|proof| OwnershipWatchEvent::VirtualShardDeleted {
+                key: key.clone(),
+                previous_record: record.clone(),
+                proof,
+            }),
         );
         Some(record)
     }
@@ -128,16 +154,28 @@ impl InMemoryPlacementStore {
         &self,
         key: &SingletonKey,
     ) -> Option<SingletonPlacementRecord> {
+        let epoch_key = PlacementEpochKey::Singleton(key.clone());
+        let floor_key = self.prefixed_epoch_key(&epoch_key);
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
-        let (_token, _record_revision, record) =
+        let (token, _record_revision, record) =
             inner.singletons.remove(&self.prefixed_singleton_key(key))?;
         let revision = inner.next_placement_revision();
-        inner.notify_ownership(
+        let proof = memory_ownership_proof(
+            &inner,
+            &floor_key,
+            OwnershipProofContext::Delete,
+            revision,
+            token,
+            OwnershipRecordBinding::Singleton(record.clone()),
+        );
+        inner.notify_ownership_event(
             &self.prefix,
-            OwnershipWatchBatch {
-                revision,
-                events: vec![OwnershipWatchEvent::SingletonDeleted { key: key.clone() }],
-            },
+            revision,
+            proof.map(|proof| OwnershipWatchEvent::SingletonDeleted {
+                key: key.clone(),
+                previous_record: record.clone(),
+                proof,
+            }),
         );
         Some(record)
     }
@@ -401,16 +439,20 @@ impl PlacementStore for InMemoryPlacementStore {
 
         let revision = inner.next_placement_revision();
         let token = placement_token(revision);
-        inner.epoch_floors.insert(
-            floor_key,
-            (
-                token,
-                EpochFloorRecord {
-                    key: reservation.key,
-                    epoch: reservation.epoch,
-                },
-            ),
+        let floor = EpochFloorRecord {
+            key: reservation.key.clone(),
+            epoch: reservation.epoch,
+        };
+        let proof = OwnershipEpochFloorProof::new(
+            OwnershipProofContext::Upsert,
+            revision,
+            token,
+            OwnershipRecordBinding::Actor(value.clone()),
+            token,
+            floor.clone(),
+            None,
         );
+        inner.epoch_floors.insert(floor_key, (token, floor));
         inner
             .actors
             .insert(placement_key, (token, revision, value.clone()));
@@ -422,12 +464,14 @@ impl PlacementStore for InMemoryPlacementStore {
                 record: value.clone(),
             },
         );
-        inner.notify_ownership(
+        inner.notify_ownership_event(
             &self.prefix,
-            OwnershipWatchBatch {
-                revision,
-                events: vec![OwnershipWatchEvent::ActorUpserted { key, record: value }],
-            },
+            revision,
+            proof.map(|proof| OwnershipWatchEvent::ActorUpserted {
+                key,
+                record: value,
+                proof,
+            }),
         );
         Ok(token)
     }
@@ -475,16 +519,20 @@ impl PlacementStore for InMemoryPlacementStore {
         )?;
         let revision = inner.next_placement_revision();
         let token = placement_token(revision);
-        inner.epoch_floors.insert(
-            floor_key,
-            (
-                token,
-                EpochFloorRecord {
-                    key: epoch_key,
-                    epoch: value.epoch,
-                },
-            ),
+        let floor = EpochFloorRecord {
+            key: epoch_key,
+            epoch: value.epoch,
+        };
+        let proof = OwnershipEpochFloorProof::new(
+            OwnershipProofContext::Upsert,
+            revision,
+            token,
+            OwnershipRecordBinding::Actor(value.clone()),
+            token,
+            floor.clone(),
+            None,
         );
+        inner.epoch_floors.insert(floor_key, (token, floor));
         inner
             .actors
             .insert(placement_key, (token, revision, value.clone()));
@@ -496,12 +544,14 @@ impl PlacementStore for InMemoryPlacementStore {
                 record: value.clone(),
             },
         );
-        inner.notify_ownership(
+        inner.notify_ownership_event(
             &self.prefix,
-            OwnershipWatchBatch {
-                revision,
-                events: vec![OwnershipWatchEvent::ActorUpserted { key, record: value }],
-            },
+            revision,
+            proof.map(|proof| OwnershipWatchEvent::ActorUpserted {
+                key,
+                record: value,
+                proof,
+            }),
         );
         Ok(token)
     }
@@ -603,16 +653,20 @@ impl PlacementStore for InMemoryPlacementStore {
         }
         let revision = inner.next_placement_revision();
         let token = placement_token(revision);
-        inner.epoch_floors.insert(
-            floor_key,
-            (
-                token,
-                EpochFloorRecord {
-                    key: reservation.key,
-                    epoch: reservation.epoch,
-                },
-            ),
+        let floor = EpochFloorRecord {
+            key: reservation.key.clone(),
+            epoch: reservation.epoch,
+        };
+        let proof = OwnershipEpochFloorProof::new(
+            OwnershipProofContext::Upsert,
+            revision,
+            token,
+            OwnershipRecordBinding::VirtualShard(value.clone()),
+            token,
+            floor.clone(),
+            None,
         );
+        inner.epoch_floors.insert(floor_key, (token, floor));
         inner
             .vshards
             .insert(placement_key, (token, revision, value.clone()));
@@ -624,12 +678,14 @@ impl PlacementStore for InMemoryPlacementStore {
                 record: value.clone(),
             },
         );
-        inner.notify_ownership(
+        inner.notify_ownership_event(
             &self.prefix,
-            OwnershipWatchBatch {
-                revision,
-                events: vec![OwnershipWatchEvent::VirtualShardUpserted { key, record: value }],
-            },
+            revision,
+            proof.map(|proof| OwnershipWatchEvent::VirtualShardUpserted {
+                key,
+                record: value,
+                proof,
+            }),
         );
         Ok(token)
     }
@@ -673,16 +729,20 @@ impl PlacementStore for InMemoryPlacementStore {
         )?;
         let revision = inner.next_placement_revision();
         let token = placement_token(revision);
-        inner.epoch_floors.insert(
-            floor_key,
-            (
-                token,
-                EpochFloorRecord {
-                    key: epoch_key,
-                    epoch: value.epoch,
-                },
-            ),
+        let floor = EpochFloorRecord {
+            key: epoch_key,
+            epoch: value.epoch,
+        };
+        let proof = OwnershipEpochFloorProof::new(
+            OwnershipProofContext::Upsert,
+            revision,
+            token,
+            OwnershipRecordBinding::VirtualShard(value.clone()),
+            token,
+            floor.clone(),
+            None,
         );
+        inner.epoch_floors.insert(floor_key, (token, floor));
         inner
             .vshards
             .insert(placement_key, (token, revision, value.clone()));
@@ -694,12 +754,14 @@ impl PlacementStore for InMemoryPlacementStore {
                 record: value.clone(),
             },
         );
-        inner.notify_ownership(
+        inner.notify_ownership_event(
             &self.prefix,
-            OwnershipWatchBatch {
-                revision,
-                events: vec![OwnershipWatchEvent::VirtualShardUpserted { key, record: value }],
-            },
+            revision,
+            proof.map(|proof| OwnershipWatchEvent::VirtualShardUpserted {
+                key,
+                record: value,
+                proof,
+            }),
         );
         Ok(token)
     }
@@ -784,16 +846,20 @@ impl PlacementStore for InMemoryPlacementStore {
         validate_memory_guard(&inner, None, Some(&placement_key), reservation.guard())?;
         let revision = inner.next_placement_revision();
         let token = placement_token(revision);
-        inner.epoch_floors.insert(
-            floor_key,
-            (
-                token,
-                EpochFloorRecord {
-                    key: reservation.key,
-                    epoch: reservation.epoch,
-                },
-            ),
+        let floor = EpochFloorRecord {
+            key: reservation.key.clone(),
+            epoch: reservation.epoch,
+        };
+        let proof = OwnershipEpochFloorProof::new(
+            OwnershipProofContext::Upsert,
+            revision,
+            token,
+            OwnershipRecordBinding::Singleton(value.clone()),
+            token,
+            floor.clone(),
+            None,
         );
+        inner.epoch_floors.insert(floor_key, (token, floor));
         inner
             .singletons
             .insert(placement_key, (token, revision, value.clone()));
@@ -805,12 +871,14 @@ impl PlacementStore for InMemoryPlacementStore {
                 record: value.clone(),
             },
         );
-        inner.notify_ownership(
+        inner.notify_ownership_event(
             &self.prefix,
-            OwnershipWatchBatch {
-                revision,
-                events: vec![OwnershipWatchEvent::SingletonUpserted { key, record: value }],
-            },
+            revision,
+            proof.map(|proof| OwnershipWatchEvent::SingletonUpserted {
+                key,
+                record: value,
+                proof,
+            }),
         );
         Ok(token)
     }
@@ -858,16 +926,20 @@ impl PlacementStore for InMemoryPlacementStore {
         )?;
         let revision = inner.next_placement_revision();
         let token = placement_token(revision);
-        inner.epoch_floors.insert(
-            floor_key,
-            (
-                token,
-                EpochFloorRecord {
-                    key: epoch_key,
-                    epoch: value.epoch,
-                },
-            ),
+        let floor = EpochFloorRecord {
+            key: epoch_key,
+            epoch: value.epoch,
+        };
+        let proof = OwnershipEpochFloorProof::new(
+            OwnershipProofContext::Upsert,
+            revision,
+            token,
+            OwnershipRecordBinding::Singleton(value.clone()),
+            token,
+            floor.clone(),
+            None,
         );
+        inner.epoch_floors.insert(floor_key, (token, floor));
         inner
             .singletons
             .insert(placement_key, (token, revision, value.clone()));
@@ -879,12 +951,14 @@ impl PlacementStore for InMemoryPlacementStore {
                 record: value.clone(),
             },
         );
-        inner.notify_ownership(
+        inner.notify_ownership_event(
             &self.prefix,
-            OwnershipWatchBatch {
-                revision,
-                events: vec![OwnershipWatchEvent::SingletonUpserted { key, record: value }],
-            },
+            revision,
+            proof.map(|proof| OwnershipWatchEvent::SingletonUpserted {
+                key,
+                record: value,
+                proof,
+            }),
         );
         Ok(token)
     }
@@ -977,6 +1051,7 @@ impl PlacementStore for InMemoryPlacementStore {
         max_entries: NonZeroUsize,
     ) -> Result<OwnershipView, OwnershipViewError> {
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let snapshot_revision = PlacementRevision(inner.placement_revision);
         let local_instance = inner
             .instances
             .get(&self.prefixed_instance_key(instance_id))
@@ -985,45 +1060,78 @@ impl PlacementStore for InMemoryPlacementStore {
         let mut records = Vec::new();
         let mut scanned_entries = 0;
 
-        for (key, (_version, revision, record)) in &inner.actors {
+        for (key, (version, revision, record)) in &inner.actors {
             if key.prefix == self.prefix && &record.service_kind == service_kind {
                 ensure_ownership_view_capacity(scanned_entries, max_entries)?;
                 scanned_entries += 1;
             }
             if key.prefix == self.prefix && &record.service_kind == service_kind {
+                let epoch_key = PlacementEpochKey::Actor(key.key.clone());
+                let proof = memory_ownership_proof(
+                    &inner,
+                    &self.prefixed_epoch_key(&epoch_key),
+                    OwnershipProofContext::Snapshot,
+                    snapshot_revision,
+                    *version,
+                    OwnershipRecordBinding::Actor(record.clone()),
+                )
+                .map_err(|error| OwnershipViewError::Proof { error })?;
                 records.push(OwnershipViewRecord::Actor {
                     revision: *revision,
                     record: record.clone(),
+                    proof,
                 });
             }
         }
-        for (key, (_version, revision, record)) in &inner.vshards {
+        for (key, (version, revision, record)) in &inner.vshards {
             if key.prefix == self.prefix && &record.service_kind == service_kind {
                 ensure_ownership_view_capacity(scanned_entries, max_entries)?;
                 scanned_entries += 1;
             }
             if key.prefix == self.prefix && &record.service_kind == service_kind {
+                let epoch_key = PlacementEpochKey::VirtualShard(key.key.clone());
+                let proof = memory_ownership_proof(
+                    &inner,
+                    &self.prefixed_epoch_key(&epoch_key),
+                    OwnershipProofContext::Snapshot,
+                    snapshot_revision,
+                    *version,
+                    OwnershipRecordBinding::VirtualShard(record.clone()),
+                )
+                .map_err(|error| OwnershipViewError::Proof { error })?;
                 records.push(OwnershipViewRecord::VirtualShard {
                     revision: *revision,
                     record: record.clone(),
+                    proof,
                 });
             }
         }
-        for (key, (_version, revision, record)) in &inner.singletons {
+        for (key, (version, revision, record)) in &inner.singletons {
             if key.prefix == self.prefix && &record.service_kind == service_kind {
                 ensure_ownership_view_capacity(scanned_entries, max_entries)?;
                 scanned_entries += 1;
             }
             if key.prefix == self.prefix && &record.service_kind == service_kind {
+                let epoch_key = PlacementEpochKey::Singleton(key.key.clone());
+                let proof = memory_ownership_proof(
+                    &inner,
+                    &self.prefixed_epoch_key(&epoch_key),
+                    OwnershipProofContext::Snapshot,
+                    snapshot_revision,
+                    *version,
+                    OwnershipRecordBinding::Singleton(record.clone()),
+                )
+                .map_err(|error| OwnershipViewError::Proof { error })?;
                 records.push(OwnershipViewRecord::Singleton {
                     revision: *revision,
                     record: record.clone(),
+                    proof,
                 });
             }
         }
 
         let snapshot = OwnershipViewSnapshot {
-            revision: PlacementRevision(inner.placement_revision),
+            revision: snapshot_revision,
             local_instance,
             records,
         };
@@ -1114,6 +1222,32 @@ fn memory_floor(
         return Err(PlacementError::EpochReservationMismatch);
     }
     Ok(floor)
+}
+
+fn memory_ownership_proof(
+    inner: &PlacementStoreInner,
+    floor_key: &PrefixedEpochKey,
+    context: OwnershipProofContext,
+    observed_revision: PlacementRevision,
+    record_token: PlacementVersion,
+    binding: OwnershipRecordBinding,
+) -> Result<OwnershipEpochFloorProof, OwnershipProofError> {
+    let expected_key = binding.epoch_key();
+    let Some((floor_token, floor)) = inner.epoch_floors.get(floor_key).cloned() else {
+        return Err(OwnershipProofError::MissingFloor {
+            key: expected_key,
+            observed_revision,
+        });
+    };
+    OwnershipEpochFloorProof::new(
+        context,
+        observed_revision,
+        record_token,
+        binding,
+        floor_token,
+        floor,
+        None,
+    )
 }
 
 fn validate_memory_reservation(
@@ -1222,6 +1356,36 @@ impl PlacementStoreInner {
             let _ = tx.send(OwnershipWatchMessage::Update(OwnershipWatchUpdate::Batch(
                 batch,
             )));
+        }
+    }
+
+    fn notify_ownership_event(
+        &mut self,
+        prefix: &PlacementPrefix,
+        revision: PlacementRevision,
+        event: Result<OwnershipWatchEvent, OwnershipProofError>,
+    ) {
+        match event {
+            Ok(event) => {
+                if let Some(tx) = self.ownership_watchers.get(prefix) {
+                    let _ = tx.send(OwnershipWatchMessage::Update(OwnershipWatchUpdate::Batch(
+                        OwnershipWatchBatch {
+                            revision,
+                            events: vec![event],
+                        },
+                    )));
+                }
+            }
+            Err(error) => {
+                // A proof failure invalidates every receiver subscribed to this
+                // coherent prefix. Remove the only sender after queuing the
+                // terminal error so callers cannot continue on the same view.
+                if let Some(tx) = self.ownership_watchers.remove(prefix) {
+                    let _ = tx.send(OwnershipWatchMessage::Failed(OwnershipWatchError::Proof {
+                        error,
+                    }));
+                }
+            }
         }
     }
 }

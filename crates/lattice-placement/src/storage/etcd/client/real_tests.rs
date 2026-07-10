@@ -2,12 +2,12 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use etcd_client::{Client, CompactionOptions, DeleteOptions, Txn, TxnOp};
+use etcd_client::{Client, CompactionOptions, DeleteOptions, PutOptions, Txn, TxnOp};
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
 use lattice_core::{actor_kind, service_kind};
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, broadcast};
 use tokio::time::timeout;
 
 use super::*;
@@ -51,6 +51,84 @@ fn real_watch_startup_buffer_reports_its_own_bounded_backlog_error() {
     );
 }
 
+#[test]
+fn startup_progress_must_reach_the_post_created_linearizable_barrier() {
+    let barrier = PlacementRevision(7);
+
+    assert!(!startup_progress_reaches_barrier(
+        &EtcdOwnershipWatchUpdate::Progress {
+            revision: PlacementRevision(6),
+        },
+        barrier,
+    ));
+    assert!(startup_progress_reaches_barrier(
+        &EtcdOwnershipWatchUpdate::Progress { revision: barrier },
+        barrier,
+    ));
+    assert!(startup_progress_reaches_barrier(
+        &EtcdOwnershipWatchUpdate::Progress {
+            revision: PlacementRevision(8),
+        },
+        barrier,
+    ));
+    assert!(!startup_progress_reaches_barrier(
+        &EtcdOwnershipWatchUpdate::Batch(EtcdOwnershipWatchBatch {
+            revision: PlacementRevision(8),
+            events: Vec::new(),
+        }),
+        barrier,
+    ));
+}
+
+#[tokio::test]
+async fn dropping_real_etcd_ownership_watch_aborts_its_stream_task() {
+    let (_tx, rx) = broadcast::channel::<EtcdOwnershipWatchMessage>(1);
+    let task = tokio::spawn(std::future::pending::<()>());
+    let watch = EtcdOwnershipWatch {
+        rx,
+        abort_handle: Some(task.abort_handle()),
+    };
+
+    drop(watch);
+
+    let error = timeout(Duration::from_secs(1), task)
+        .await
+        .expect("raw etcd ownership stream task did not stop")
+        .expect_err("raw etcd ownership stream task completed instead of being aborted");
+    assert!(error.is_cancelled());
+}
+
+#[tokio::test]
+async fn dropping_high_level_etcd_view_cascades_to_the_raw_watch() {
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/drop-cancellable-etcd-view"),
+        client.clone(),
+    );
+    let view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .expect("open cancellable in-memory-etcd ownership view");
+    assert_eq!(client.ownership_watcher_count_for_test(), 1);
+    assert_eq!(client.active_ownership_watcher_count_for_test(), 1);
+
+    drop(view);
+
+    timeout(Duration::from_secs(1), async {
+        while client.active_ownership_watcher_count_for_test() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the public view did not drop its raw watch receiver");
+    client.progress_ownership_watches_for_test(PlacementRevision(1));
+    assert_eq!(client.ownership_watcher_count_for_test(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a real etcd endpoint in LATTICE_TEST_ETCD_ENDPOINT"]
 async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compaction() {
@@ -77,12 +155,7 @@ async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compac
     };
     let actor_path = actor_key(&prefix, &actor);
     let initial = actor_record(7, "world-a", 1);
-    let initial_revision = put_value(
-        &mut raw,
-        actor_path.clone(),
-        EtcdValue::Actor(Box::new(initial.clone())),
-    )
-    .await;
+    let initial_revision = put_actor_with_floor(&mut raw, &prefix, &actor, &initial).await;
 
     let gap = Arc::new(Barrier::new(2));
     let mut real = RealEtcdClient::connect(
@@ -108,12 +181,7 @@ async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compac
         .await
         .expect("snapshot transaction did not reach the deterministic gap");
     let changed = actor_record(7, "world-a", 2);
-    let gap_revision = put_value(
-        &mut raw,
-        actor_path.clone(),
-        EtcdValue::Actor(Box::new(changed.clone())),
-    )
-    .await;
+    let gap_revision = put_actor_with_floor(&mut raw, &prefix, &actor, &changed).await;
     assert!(gap_revision > initial_revision);
     timeout(TEST_TIMEOUT, gap.wait())
         .await
@@ -129,19 +197,19 @@ async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compac
     assert_eq!(view.snapshot.revision, PlacementRevision(initial_revision));
     assert!(view.snapshot.records.iter().any(|record| matches!(
         record,
-        crate::storage::OwnershipViewRecord::Actor { revision, record }
+        crate::storage::OwnershipViewRecord::Actor { revision, record, .. }
             if *revision == PlacementRevision(initial_revision) && record == &initial
     )));
 
     let (historical, progress) = next_batch_and_progress(&mut view.watch).await;
     assert_eq!(historical.revision, PlacementRevision(gap_revision));
-    assert_eq!(
-        historical.events,
-        vec![OwnershipWatchEvent::ActorUpserted {
-            key: actor.clone(),
-            record: changed.clone(),
-        }]
-    );
+    assert!(matches!(
+        historical.events.as_slice(),
+        [OwnershipWatchEvent::ActorUpserted { key, record, proof }]
+            if key == &actor
+                && record == &changed
+                && proof.observed_revision() == PlacementRevision(gap_revision)
+    ));
 
     // The real client explicitly requests this event-free progress barrier
     // after Created; etcd may deliver it immediately before or after historical
@@ -155,10 +223,16 @@ async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compac
     let delete_revision = response_revision(delete.header(), "delete");
     let deleted = next_batch(&mut view.watch).await;
     assert_eq!(deleted.revision, PlacementRevision(delete_revision));
-    assert_eq!(
-        deleted.events,
-        vec![OwnershipWatchEvent::ActorDeleted { key: actor }]
-    );
+    assert!(matches!(
+        deleted.events.as_slice(),
+        [OwnershipWatchEvent::ActorDeleted {
+            key,
+            previous_record,
+            proof,
+        }] if key == &actor
+            && previous_record == &changed
+            && proof.observed_revision() == PlacementRevision(delete_revision)
+    ));
 
     let second_actor = ActorPlacementKey {
         service_kind: service.clone(),
@@ -186,9 +260,27 @@ async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compac
             None,
         ),
         TxnOp::put(
+            epoch_floor_key(&prefix, &PlacementEpochKey::Actor(second_actor.clone())),
+            encode_etcd_value(&EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                key: PlacementEpochKey::Actor(second_actor.clone()),
+                epoch: second_record.epoch,
+            })))
+            .expect("encode actor floor transaction value"),
+            None,
+        ),
+        TxnOp::put(
             vshard_key(&prefix, &shard),
             encode_etcd_value(&EtcdValue::VirtualShard(Box::new(shard_record.clone())))
                 .expect("encode shard transaction value"),
+            None,
+        ),
+        TxnOp::put(
+            epoch_floor_key(&prefix, &PlacementEpochKey::VirtualShard(shard.clone())),
+            encode_etcd_value(&EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                key: PlacementEpochKey::VirtualShard(shard.clone()),
+                epoch: shard_record.epoch,
+            })))
+            .expect("encode shard floor transaction value"),
             None,
         ),
     ]);
@@ -200,18 +292,20 @@ async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compac
     let batch = next_batch(&mut view.watch).await;
     assert_eq!(batch.revision, PlacementRevision(transaction_revision));
     assert_eq!(batch.events.len(), 2);
-    assert!(batch.events.contains(&OwnershipWatchEvent::ActorUpserted {
-        key: second_actor,
-        record: second_record,
-    }));
-    assert!(
-        batch
-            .events
-            .contains(&OwnershipWatchEvent::VirtualShardUpserted {
-                key: shard,
-                record: shard_record,
-            })
-    );
+    assert!(batch.events.iter().any(|event| matches!(
+        event,
+        OwnershipWatchEvent::ActorUpserted { key, record, proof }
+            if key == &second_actor
+                && record == &second_record
+                && proof.observed_revision() == PlacementRevision(transaction_revision)
+    )));
+    assert!(batch.events.iter().any(|event| matches!(
+        event,
+        OwnershipWatchEvent::VirtualShardUpserted { key, record, proof }
+            if key == &shard
+                && record == &shard_record
+                && proof.observed_revision() == PlacementRevision(transaction_revision)
+    )));
     drop(view);
     delete_namespace(&mut raw, &namespace).await;
 
@@ -223,13 +317,9 @@ async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compac
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(99),
     };
-    let compact_path = actor_key(&compact_prefix, &compact_actor);
-    let compact_initial_revision = put_value(
-        &mut raw,
-        compact_path.clone(),
-        EtcdValue::Actor(Box::new(actor_record(99, "world-a", 1))),
-    )
-    .await;
+    let compact_initial = actor_record(99, "world-a", 1);
+    let compact_initial_revision =
+        put_actor_with_floor(&mut raw, &compact_prefix, &compact_actor, &compact_initial).await;
     let compact_gap = Arc::new(Barrier::new(2));
     let mut compact_real = RealEtcdClient::connect(
         endpoints,
@@ -239,7 +329,7 @@ async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compac
     .await
     .expect("connect compaction ownership-view client");
     compact_real.ownership_view_gap = Some(compact_gap.clone());
-    let compact_store = EtcdPlacementStore::new(compact_prefix, compact_real);
+    let compact_store = EtcdPlacementStore::new(compact_prefix.clone(), compact_real);
     let compact_open = tokio::spawn(async move {
         compact_store
             .open_ownership_view(
@@ -253,20 +343,22 @@ async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compac
     timeout(TEST_TIMEOUT, compact_gap.wait())
         .await
         .expect("compaction snapshot did not reach the deterministic gap");
-    let first_compacted_revision = put_value(
+    let first_compacted_revision = put_actor_with_floor(
         &mut raw,
-        compact_path.clone(),
-        EtcdValue::Actor(Box::new(actor_record(99, "world-a", 2))),
+        &compact_prefix,
+        &compact_actor,
+        &actor_record(99, "world-a", 2),
     )
     .await;
     assert!(first_compacted_revision > compact_initial_revision);
     // etcd still permits a watch beginning exactly at the compaction
     // revision. Advance once more so the requested R+1 revision is strictly
     // behind the compaction boundary and must be canceled immediately.
-    let compact_revision = put_value(
+    let compact_revision = put_actor_with_floor(
         &mut raw,
-        compact_path,
-        EtcdValue::Actor(Box::new(actor_record(99, "world-a", 3))),
+        &compact_prefix,
+        &compact_actor,
+        &actor_record(99, "world-a", 3),
     )
     .await;
     assert!(compact_revision > first_compacted_revision);
@@ -295,6 +387,356 @@ async fn real_etcd_ownership_view_covers_gap_progress_deletes_batches_and_compac
         }
     );
     delete_namespace(&mut raw, &compact_namespace).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a real etcd endpoint in LATTICE_TEST_ETCD_ENDPOINT"]
+async fn real_etcd_ownership_floor_proofs_reject_missing_leased_and_laundered_state_atomically() {
+    let endpoint = std::env::var(TEST_ETCD_ENDPOINT)
+        .unwrap_or_else(|_| panic!("set {TEST_ETCD_ENDPOINT} to a real etcd endpoint"));
+    let endpoints = vec![endpoint];
+    let mut raw = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("connect raw real-etcd proof client");
+    let service = service_kind!("World");
+    let owner = InstanceId::new("world-a");
+
+    let missing_namespace = unique_namespace("ownership-proof-missing");
+    delete_namespace(&mut raw, &missing_namespace).await;
+    let missing_prefix = PlacementPrefix::new(missing_namespace.clone());
+    let missing_key = ActorPlacementKey {
+        service_kind: service.clone(),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(1),
+    };
+    put_value(
+        &mut raw,
+        actor_key(&missing_prefix, &missing_key),
+        EtcdValue::Actor(Box::new(actor_record(1, "world-a", 1))),
+    )
+    .await;
+    let missing_store = EtcdPlacementStore::new(
+        missing_prefix,
+        RealEtcdClient::connect(
+            endpoints.clone(),
+            InstanceLeaseTtl::new(30),
+            ActivationLockTtl::new(30),
+        )
+        .await
+        .expect("connect missing-floor ownership client"),
+    );
+    assert!(matches!(
+        missing_store
+            .open_ownership_view(&service, &owner, NonZeroUsize::new(8).unwrap())
+            .await,
+        Err(OwnershipViewError::Proof {
+            error: OwnershipProofError::MissingFloor { key, .. },
+        }) if key == PlacementEpochKey::Actor(missing_key)
+    ));
+    delete_namespace(&mut raw, &missing_namespace).await;
+
+    let leased_namespace = unique_namespace("ownership-proof-leased");
+    delete_namespace(&mut raw, &leased_namespace).await;
+    let leased_prefix = PlacementPrefix::new(leased_namespace.clone());
+    let leased_key = ActorPlacementKey {
+        service_kind: service.clone(),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(2),
+    };
+    let leased_record = actor_record(2, "world-a", 1);
+    let leased_epoch_key = PlacementEpochKey::Actor(leased_key.clone());
+    let lease = raw
+        .lease_grant(30, None)
+        .await
+        .expect("grant real-etcd proof lease")
+        .id();
+    raw.txn(Txn::new().and_then(vec![
+        TxnOp::put(
+            actor_key(&leased_prefix, &leased_key),
+            encode_etcd_value(&EtcdValue::Actor(Box::new(leased_record.clone())))
+                .expect("encode leased-proof actor"),
+            None,
+        ),
+        TxnOp::put(
+            epoch_floor_key(&leased_prefix, &leased_epoch_key),
+            encode_etcd_value(&EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                key: leased_epoch_key.clone(),
+                epoch: leased_record.epoch,
+            })))
+            .expect("encode leased epoch floor"),
+            Some(PutOptions::new().with_lease(lease)),
+        ),
+    ]))
+    .await
+    .expect("put record with leased floor");
+    let leased_store = EtcdPlacementStore::new(
+        leased_prefix,
+        RealEtcdClient::connect(
+            endpoints.clone(),
+            InstanceLeaseTtl::new(30),
+            ActivationLockTtl::new(30),
+        )
+        .await
+        .expect("connect leased-floor ownership client"),
+    );
+    assert!(matches!(
+        leased_store
+            .open_ownership_view(&service, &owner, NonZeroUsize::new(8).unwrap())
+            .await,
+        Err(OwnershipViewError::Proof {
+            error: OwnershipProofError::LeasedFloor { key, lease_id, .. },
+        }) if key == leased_epoch_key
+            && lease_id == LeaseId(u64::try_from(lease).expect("lease ID must be positive"))
+    ));
+    delete_namespace(&mut raw, &leased_namespace).await;
+    raw.lease_revoke(lease)
+        .await
+        .expect("revoke real-etcd proof lease");
+
+    let watch_namespace = unique_namespace("ownership-proof-watch");
+    delete_namespace(&mut raw, &watch_namespace).await;
+    let watch_prefix = PlacementPrefix::new(watch_namespace.clone());
+    let proof_gap = Arc::new(Barrier::new(2));
+    let watching_client = RealEtcdClient::connect(
+        endpoints,
+        InstanceLeaseTtl::new(30),
+        ActivationLockTtl::new(30),
+    )
+    .await
+    .expect("connect watch-proof ownership client");
+    let proof_gap_hook = watching_client.ownership_watch_proof_gap.clone();
+    let watching_store = EtcdPlacementStore::new(watch_prefix.clone(), watching_client);
+    let mut view = timeout(
+        TEST_TIMEOUT,
+        watching_store.open_ownership_view(&service, &owner, NonZeroUsize::new(8).unwrap()),
+    )
+    .await
+    .expect("empty proven ownership view did not open before its deadline")
+    .expect("open empty proven ownership view");
+    *proof_gap_hook
+        .lock()
+        .expect("ownership watch proof-gap mutex poisoned") = Some(proof_gap.clone());
+    let valid_key = ActorPlacementKey {
+        service_kind: service.clone(),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(3),
+    };
+    let invalid_key = ActorPlacementKey {
+        service_kind: service,
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(4),
+    };
+    let valid_record = actor_record(3, "world-a", 1);
+    let invalid_record = actor_record(4, "world-a", 1);
+    let valid_epoch_key = PlacementEpochKey::Actor(valid_key.clone());
+    let invalid_epoch_key = PlacementEpochKey::Actor(invalid_key.clone());
+    let transaction = raw
+        .txn(Txn::new().and_then(vec![
+            TxnOp::put(
+                actor_key(&watch_prefix, &valid_key),
+                encode_etcd_value(&EtcdValue::Actor(Box::new(valid_record.clone())))
+                    .expect("encode valid batched actor"),
+                None,
+            ),
+            TxnOp::put(
+                epoch_floor_key(&watch_prefix, &valid_epoch_key),
+                encode_etcd_value(&EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key: valid_epoch_key,
+                    epoch: valid_record.epoch,
+                })))
+                .expect("encode valid batched floor"),
+                None,
+            ),
+            TxnOp::put(
+                actor_key(&watch_prefix, &invalid_key),
+                encode_etcd_value(&EtcdValue::Actor(Box::new(invalid_record.clone())))
+                    .expect("encode invalid batched actor"),
+                None,
+            ),
+        ]))
+        .await
+        .expect("commit mixed proof batch");
+    let transaction_revision = response_revision(transaction.header(), "mixed proof batch");
+    timeout(TEST_TIMEOUT, proof_gap.wait())
+        .await
+        .expect("watch did not reach exact floor-proof gap");
+    put_value(
+        &mut raw,
+        epoch_floor_key(&watch_prefix, &invalid_epoch_key),
+        EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+            key: invalid_epoch_key.clone(),
+            epoch: invalid_record.epoch,
+        })),
+    )
+    .await;
+    timeout(TEST_TIMEOUT, proof_gap.wait())
+        .await
+        .expect("release exact floor-proof gap");
+
+    let error = timeout(TEST_TIMEOUT, async {
+        loop {
+            match view.watch.next_update().await {
+                Ok(OwnershipWatchUpdate::Progress { .. }) => {}
+                Ok(OwnershipWatchUpdate::Batch(batch)) => {
+                    panic!("invalid same-revision proof published a partial batch: {batch:?}")
+                }
+                Err(error) => break error,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for exact floor-proof failure");
+    assert!(matches!(
+        error,
+        OwnershipWatchError::Proof {
+            error: OwnershipProofError::MissingFloor {
+                key,
+                observed_revision,
+            },
+        } if key == invalid_epoch_key
+            && observed_revision == PlacementRevision(transaction_revision)
+    ));
+    delete_namespace(&mut raw, &watch_namespace).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a real etcd endpoint in LATTICE_TEST_ETCD_ENDPOINT"]
+async fn real_etcd_snapshot_floor_proof_reports_physical_compaction() {
+    let endpoint = std::env::var(TEST_ETCD_ENDPOINT)
+        .unwrap_or_else(|_| panic!("set {TEST_ETCD_ENDPOINT} to a real etcd endpoint"));
+    let endpoints = vec![endpoint];
+    let mut raw = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("connect raw real-etcd compaction-proof client");
+    let namespace = unique_namespace("ownership-proof-compaction");
+    delete_namespace(&mut raw, &namespace).await;
+    let prefix = PlacementPrefix::new(namespace.clone());
+    let actor = ActorPlacementKey {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(1),
+    };
+    let record = actor_record(1, "world-a", 1);
+    let snapshot_revision = put_actor_with_floor(&mut raw, &prefix, &actor, &record).await;
+
+    let proof_gap = Arc::new(Barrier::new(2));
+    let mut real = RealEtcdClient::connect(
+        endpoints,
+        InstanceLeaseTtl::new(30),
+        ActivationLockTtl::new(30),
+    )
+    .await
+    .expect("connect compaction-proof ownership client");
+    real.ownership_snapshot_proof_gap = Some(proof_gap.clone());
+    let store = EtcdPlacementStore::new(prefix, real);
+    let open = tokio::spawn(async move {
+        store
+            .open_ownership_view(
+                &service_kind!("World"),
+                &InstanceId::new("world-a"),
+                NonZeroUsize::new(8).unwrap(),
+            )
+            .await
+    });
+
+    timeout(TEST_TIMEOUT, proof_gap.wait())
+        .await
+        .expect("snapshot did not reach its exact floor-proof gap");
+    let advanced_revision = raw
+        .put(format!("{namespace}/compaction-marker"), b"marker", None)
+        .await
+        .expect("advance real-etcd beyond the proof revision");
+    let advanced_revision = response_revision(advanced_revision.header(), "compaction marker");
+    assert!(advanced_revision > snapshot_revision);
+    raw.compact(
+        i64::try_from(advanced_revision).expect("advanced revision must fit i64"),
+        Some(CompactionOptions::new().with_physical()),
+    )
+    .await
+    .expect("physically compact past the snapshot floor-proof revision");
+    timeout(TEST_TIMEOUT, proof_gap.wait())
+        .await
+        .expect("release snapshot floor-proof gap");
+
+    let error = timeout(TEST_TIMEOUT, open)
+        .await
+        .expect("compacted floor-proof view did not finish")
+        .expect("compacted floor-proof task panicked")
+        .expect_err("compacted exact floor proof must fail closed");
+    assert!(matches!(
+        error,
+        OwnershipViewError::Proof {
+            error: OwnershipProofError::RevisionUnavailable {
+                requested_revision,
+                ..
+            },
+        } if requested_revision == PlacementRevision(snapshot_revision)
+    ));
+    delete_namespace(&mut raw, &namespace).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a real etcd endpoint in LATTICE_TEST_ETCD_ENDPOINT"]
+async fn real_etcd_snapshot_floor_proofs_chunk_more_than_default_transaction_limit() {
+    const RECORD_COUNT: usize = 129;
+    const SEED_RECORDS_PER_TRANSACTION: usize = 32;
+
+    let endpoint = std::env::var(TEST_ETCD_ENDPOINT)
+        .unwrap_or_else(|_| panic!("set {TEST_ETCD_ENDPOINT} to a real etcd endpoint"));
+    let endpoints = vec![endpoint];
+    let mut raw = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("connect raw real-etcd proof-chunk client");
+    let namespace = unique_namespace("ownership-proof-chunks");
+    delete_namespace(&mut raw, &namespace).await;
+    let prefix = PlacementPrefix::new(namespace.clone());
+    let records = (0..RECORD_COUNT)
+        .map(|actor_id| {
+            let actor_id = u64::try_from(actor_id).expect("test actor ID must fit u64");
+            (
+                ActorPlacementKey {
+                    service_kind: service_kind!("World"),
+                    actor_kind: actor_kind!("World"),
+                    actor_id: ActorId::U64(actor_id),
+                },
+                actor_record(actor_id, "world-a", 1),
+            )
+        })
+        .collect::<Vec<_>>();
+    for chunk in records.chunks(SEED_RECORDS_PER_TRANSACTION) {
+        put_actor_batch_with_floors(&mut raw, &prefix, chunk).await;
+    }
+
+    let store = EtcdPlacementStore::new(
+        prefix,
+        RealEtcdClient::connect(
+            endpoints,
+            InstanceLeaseTtl::new(30),
+            ActivationLockTtl::new(30),
+        )
+        .await
+        .expect("connect proof-chunk ownership client"),
+    );
+    let view = timeout(
+        TEST_TIMEOUT,
+        store.open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(RECORD_COUNT).unwrap(),
+        ),
+    )
+    .await
+    .expect("chunked ownership proof view timed out")
+    .expect("open ownership view with chunked floor proofs");
+    assert_eq!(view.snapshot.records.len(), RECORD_COUNT);
+    assert!(view.snapshot.records.iter().all(|record| match record {
+        crate::storage::OwnershipViewRecord::Actor { proof, .. }
+        | crate::storage::OwnershipViewRecord::VirtualShard { proof, .. }
+        | crate::storage::OwnershipViewRecord::Singleton { proof, .. } =>
+            proof.observed_revision() == view.snapshot.revision,
+    }));
+    drop(view);
+    delete_namespace(&mut raw, &namespace).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -828,6 +1270,70 @@ async fn put_value(client: &mut Client, key: String, value: EtcdValue) -> u64 {
         .await
         .expect("put real-etcd test value");
     response_revision(response.header(), "put")
+}
+
+async fn put_actor_with_floor(
+    client: &mut Client,
+    prefix: &PlacementPrefix,
+    key: &ActorPlacementKey,
+    record: &ActorPlacementRecord,
+) -> u64 {
+    let epoch_key = PlacementEpochKey::Actor(key.clone());
+    let transaction = client
+        .txn(Txn::new().and_then(vec![
+            TxnOp::put(
+                actor_key(prefix, key),
+                encode_etcd_value(&EtcdValue::Actor(Box::new(record.clone())))
+                    .expect("encode real-etcd actor"),
+                None,
+            ),
+            TxnOp::put(
+                epoch_floor_key(prefix, &epoch_key),
+                encode_etcd_value(&EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key: epoch_key,
+                    epoch: record.epoch,
+                })))
+                .expect("encode real-etcd actor floor"),
+                None,
+            ),
+        ]))
+        .await
+        .expect("put real-etcd actor and floor");
+    response_revision(transaction.header(), "actor/floor transaction")
+}
+
+async fn put_actor_batch_with_floors(
+    client: &mut Client,
+    prefix: &PlacementPrefix,
+    records: &[(ActorPlacementKey, ActorPlacementRecord)],
+) {
+    let mut operations = Vec::with_capacity(records.len() * 2);
+    for (key, record) in records {
+        let epoch_key = PlacementEpochKey::Actor(key.clone());
+        operations.push(TxnOp::put(
+            actor_key(prefix, key),
+            encode_etcd_value(&EtcdValue::Actor(Box::new(record.clone())))
+                .expect("encode batched real-etcd actor"),
+            None,
+        ));
+        operations.push(TxnOp::put(
+            epoch_floor_key(prefix, &epoch_key),
+            encode_etcd_value(&EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                key: epoch_key,
+                epoch: record.epoch,
+            })))
+            .expect("encode batched real-etcd actor floor"),
+            None,
+        ));
+    }
+    assert!(
+        operations.len() <= FLOOR_PROOF_TXN_OP_LIMIT,
+        "test seeding must remain below the proof chunk limit"
+    );
+    client
+        .txn(Txn::new().and_then(operations))
+        .await
+        .expect("put batched real-etcd actors and floors");
 }
 
 async fn delete_namespace(client: &mut Client, namespace: &str) {

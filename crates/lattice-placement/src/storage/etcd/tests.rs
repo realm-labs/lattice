@@ -16,8 +16,9 @@ use crate::storage::etcd::codec::{
     scope_segment,
 };
 use crate::storage::{
-    OwnershipViewError, OwnershipViewRecord, OwnershipWatchError, OwnershipWatchEvent,
-    OwnershipWatchUpdate, PlacementRevision, PlacementState, PlacementVersion, VirtualShardId,
+    OwnershipProofError, OwnershipViewError, OwnershipViewRecord, OwnershipWatchError,
+    OwnershipWatchEvent, OwnershipWatchUpdate, PlacementRevision, PlacementState, PlacementVersion,
+    VirtualShardId,
 };
 
 fn assert_codec_error<T>(result: Result<T, PlacementError>) {
@@ -296,11 +297,19 @@ async fn etcd_store_rejects_miskeyed_and_legacy_delimited_values_on_reads_and_sn
     let store = EtcdPlacementStore::new(prefix.clone(), client.clone());
     let requested_key = actor_key_for(1);
     client
-        .put(
-            actor_key(&prefix, &requested_key),
-            EtcdValue::Actor(Box::new(actor_record(2, "world-a", 1, LeaseId(1)))),
-        )
-        .await
+        .put_same_revision_for_test(vec![
+            (
+                epoch_floor_key(&prefix, &PlacementEpochKey::Actor(requested_key.clone())),
+                EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key: PlacementEpochKey::Actor(requested_key.clone()),
+                    epoch: Epoch(1),
+                })),
+            ),
+            (
+                actor_key(&prefix, &requested_key),
+                EtcdValue::Actor(Box::new(actor_record(2, "world-a", 1, LeaseId(1)))),
+            ),
+        ])
         .unwrap();
     assert_codec_error(store.get_actor(&requested_key).await);
     assert_codec_error(store.list_actors().await);
@@ -333,11 +342,19 @@ async fn etcd_store_rejects_miskeyed_and_legacy_delimited_values_on_reads_and_sn
         state: PlacementState::Running,
     };
     client
-        .put(
-            actor_key(&prefix, &legacy_key),
-            EtcdValue::Actor(Box::new(legacy_record)),
-        )
-        .await
+        .put_same_revision_for_test(vec![
+            (
+                epoch_floor_key(&prefix, &PlacementEpochKey::Actor(legacy_key.clone())),
+                EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key: PlacementEpochKey::Actor(legacy_key.clone()),
+                    epoch: Epoch(1),
+                })),
+            ),
+            (
+                actor_key(&prefix, &legacy_key),
+                EtcdValue::Actor(Box::new(legacy_record)),
+            ),
+        ])
         .unwrap();
     assert_codec_error(store.list_actors().await);
     assert!(matches!(
@@ -725,11 +742,9 @@ async fn etcd_ownership_view_uses_mod_revisions_and_subscribes_to_later_changes(
         .records
         .iter()
         .find_map(|record| match record {
-            OwnershipViewRecord::Actor { revision, record }
-                if record.actor_id == ActorId::U64(7) =>
-            {
-                Some(*revision)
-            }
+            OwnershipViewRecord::Actor {
+                revision, record, ..
+            } if record.actor_id == ActorId::U64(7) => Some(*revision),
             _ => None,
         })
         .unwrap();
@@ -760,10 +775,14 @@ async fn etcd_ownership_view_uses_mod_revisions_and_subscribes_to_later_changes(
         .unwrap();
     let batch = view.watch.next().await.unwrap();
     assert_eq!(batch.revision, PlacementRevision(8));
-    assert_eq!(
-        batch.events,
-        vec![OwnershipWatchEvent::ActorUpserted { key, record: moved }]
-    );
+    assert!(matches!(
+        batch.events.as_slice(),
+        [OwnershipWatchEvent::ActorUpserted {
+            key: actual_key,
+            record,
+            ..
+        }] if actual_key == &key && record == &moved
+    ));
 }
 
 #[tokio::test]
@@ -780,11 +799,27 @@ async fn etcd_ownership_watch_preserves_same_revision_batches() {
         .unwrap();
     let actor_placement_key = actor_key_for(7);
     let shard_key = vshard_key_for(3);
+    let actor_epoch_key = PlacementEpochKey::Actor(actor_placement_key.clone());
+    let shard_epoch_key = PlacementEpochKey::VirtualShard(shard_key.clone());
     let revision = client
         .put_same_revision_for_test(vec![
             (
+                epoch_floor_key(&store.prefix, &actor_epoch_key),
+                EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key: actor_epoch_key,
+                    epoch: Epoch(1),
+                })),
+            ),
+            (
                 actor_key(&store.prefix, &actor_placement_key),
                 EtcdValue::Actor(Box::new(actor_record(7, "world-a", 1, LeaseId(1)))),
+            ),
+            (
+                epoch_floor_key(&store.prefix, &shard_epoch_key),
+                EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key: shard_epoch_key,
+                    epoch: Epoch(1),
+                })),
             ),
             (
                 vshard_key(&store.prefix, &shard_key),
@@ -828,10 +863,18 @@ async fn etcd_ownership_watch_preserves_mixed_put_delete_revision_batches() {
         .await
         .unwrap();
     let shard = vshard_key_for(3);
+    let shard_epoch_key = PlacementEpochKey::VirtualShard(shard.clone());
     let revision = client
         .mutate_same_revision_for_test(vec![
             InMemoryEtcdMutation::Delete {
                 key: actor_key(&store.prefix, &actor),
+            },
+            InMemoryEtcdMutation::Put {
+                key: epoch_floor_key(&store.prefix, &shard_epoch_key),
+                value: EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key: shard_epoch_key,
+                    epoch: Epoch(1),
+                })),
             },
             InMemoryEtcdMutation::Put {
                 key: vshard_key(&store.prefix, &shard),
@@ -842,16 +885,20 @@ async fn etcd_ownership_watch_preserves_mixed_put_delete_revision_batches() {
 
     let batch = view.watch.next().await.unwrap();
     assert_eq!(batch.revision, revision);
-    assert_eq!(
-        batch.events,
-        vec![
-            OwnershipWatchEvent::ActorDeleted { key: actor },
-            OwnershipWatchEvent::VirtualShardUpserted {
-                key: shard,
-                record: vshard_record(3, "world-a", 1),
-            },
-        ]
-    );
+    assert_eq!(batch.events.len(), 2);
+    assert!(batch.events.iter().any(|event| matches!(
+        event,
+        OwnershipWatchEvent::ActorDeleted {
+            key,
+            previous_record,
+            ..
+        } if key == &actor && previous_record == &actor_record(7, "world-a", 1, LeaseId(1))
+    )));
+    assert!(batch.events.iter().any(|event| matches!(
+        event,
+        OwnershipWatchEvent::VirtualShardUpserted { key, record, .. }
+            if key == &shard && record == &vshard_record(3, "world-a", 1)
+    )));
 }
 
 #[tokio::test]
@@ -878,10 +925,16 @@ async fn etcd_ownership_watch_reports_record_backed_deletes() {
         .delete(&actor_key(&store.prefix, &key))
         .await
         .unwrap();
-    assert_eq!(
-        view.watch.next().await.unwrap().events,
-        vec![OwnershipWatchEvent::ActorDeleted { key: key.clone() }]
-    );
+    let deleted = view.watch.next().await.unwrap();
+    assert!(matches!(
+        deleted.events.as_slice(),
+        [OwnershipWatchEvent::ActorDeleted {
+            key: actual_key,
+            previous_record,
+            ..
+        }] if actual_key == &key
+            && previous_record == &actor_record(7, "world-a", 1, LeaseId(1))
+    ));
 
     client
         .delete(&instance_key(
@@ -894,6 +947,157 @@ async fn etcd_ownership_watch_reports_record_backed_deletes() {
     assert_eq!(
         view.watch.next().await.unwrap().events,
         vec![OwnershipWatchEvent::InstanceDeleted { record: instance }]
+    );
+}
+
+#[tokio::test]
+async fn etcd_ownership_views_require_exact_floor_proofs_without_partial_batches() {
+    let prefix = PlacementPrefix::new("/lattice/ownership-proof-snapshot");
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(prefix.clone(), client.clone());
+    let missing_key = actor_key_for(40);
+    client
+        .put(
+            actor_key(&prefix, &missing_key),
+            EtcdValue::Actor(Box::new(actor_record(40, "world-a", 1, LeaseId(1)))),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .open_ownership_view(
+                &service_kind!("World"),
+                &InstanceId::new("world-a"),
+                NonZeroUsize::new(8).unwrap(),
+            )
+            .await,
+        Err(OwnershipViewError::Proof {
+            error: OwnershipProofError::MissingFloor {
+                key,
+                observed_revision: PlacementRevision(1),
+            },
+        }) if key == PlacementEpochKey::Actor(missing_key)
+    ));
+
+    let prefix = PlacementPrefix::new("/lattice/ownership-proof-watch");
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(prefix.clone(), client.clone());
+    let mut view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .await
+        .unwrap();
+    let valid_key = actor_key_for(41);
+    let invalid_key = actor_key_for(42);
+    let valid_epoch_key = PlacementEpochKey::Actor(valid_key.clone());
+    let invalid_epoch_key = PlacementEpochKey::Actor(invalid_key.clone());
+    let invalid_record = actor_record(42, "world-a", 1, LeaseId(1));
+    let invalid_revision = client
+        .put_same_revision_for_test(vec![
+            (
+                epoch_floor_key(&prefix, &valid_epoch_key),
+                EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key: valid_epoch_key,
+                    epoch: Epoch(1),
+                })),
+            ),
+            (
+                actor_key(&prefix, &valid_key),
+                EtcdValue::Actor(Box::new(actor_record(41, "world-a", 1, LeaseId(1)))),
+            ),
+            (
+                actor_key(&prefix, &invalid_key),
+                EtcdValue::Actor(Box::new(invalid_record.clone())),
+            ),
+        ])
+        .unwrap();
+
+    // Repairing the latest floor after the invalid revision must not alter the
+    // proof already captured for that revision or expose the valid sibling.
+    client
+        .put(
+            epoch_floor_key(&prefix, &invalid_epoch_key),
+            EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                key: invalid_epoch_key.clone(),
+                epoch: invalid_record.epoch,
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        view.watch.next_update().await,
+        Err(OwnershipWatchError::Proof {
+            error: OwnershipProofError::MissingFloor {
+                key: invalid_epoch_key,
+                observed_revision: invalid_revision,
+            },
+        })
+    );
+}
+
+#[tokio::test]
+async fn in_memory_etcd_reclaims_dropped_and_failed_ownership_watchers() {
+    let prefix = PlacementPrefix::new("/lattice/ownership-watcher-cleanup");
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(prefix.clone(), client.clone());
+    let view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(client.ownership_watcher_count_for_test(), 1);
+
+    drop(view);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.active_ownership_watcher_count_for_test() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the public view did not release its raw watcher");
+
+    let mut replacement = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client.ownership_watcher_count_for_test(),
+        1,
+        "opening a replacement must prune the dropped watcher before registration",
+    );
+
+    let key = actor_key_for(77);
+    client
+        .put(
+            actor_key(&prefix, &key),
+            EtcdValue::Actor(Box::new(actor_record(77, "world-a", 1, LeaseId(1)))),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        replacement.watch.next_update().await,
+        Err(OwnershipWatchError::Proof {
+            error: OwnershipProofError::MissingFloor { .. },
+        })
+    ));
+    assert_eq!(
+        replacement.watch.next_update().await,
+        Err(OwnershipWatchError::Closed)
+    );
+    assert_eq!(
+        client.ownership_watcher_count_for_test(),
+        0,
+        "a failed watcher must be removed as soon as its terminal error is queued",
     );
 }
 
@@ -2042,10 +2246,8 @@ async fn etcd_legacy_compare_and_put_cannot_bypass_epoch_transition_rules() {
 
 #[tokio::test]
 async fn etcd_ownership_view_bounds_scanned_service_records() {
-    let store = EtcdPlacementStore::new(
-        PlacementPrefix::new("/lattice/test"),
-        InMemoryEtcdClient::new(),
-    );
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(PlacementPrefix::new("/lattice/test"), client.clone());
     for actor_id in 1..=2 {
         store
             .compare_and_put_actor(
@@ -2074,6 +2276,11 @@ async fn etcd_ownership_view_bounds_scanned_service_records() {
         error,
         OwnershipViewError::CapacityExceeded { max_entries: 1 }
     );
+    assert_eq!(
+        client.ownership_watcher_count_for_test(),
+        0,
+        "the bounded scan must fail before allocating a retained watcher",
+    );
 }
 
 #[tokio::test]
@@ -2091,8 +2298,22 @@ async fn etcd_ownership_watch_bounds_each_revision_batch() {
     client
         .put_same_revision_for_test(vec![
             (
+                epoch_floor_key(&store.prefix, &PlacementEpochKey::Actor(actor_key_for(1))),
+                EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key: PlacementEpochKey::Actor(actor_key_for(1)),
+                    epoch: Epoch(1),
+                })),
+            ),
+            (
                 actor_key(&store.prefix, &actor_key_for(1)),
                 EtcdValue::Actor(Box::new(actor_record(1, "world-a", 1, LeaseId(1)))),
+            ),
+            (
+                epoch_floor_key(&store.prefix, &PlacementEpochKey::Actor(actor_key_for(2))),
+                EtcdValue::EpochFloor(Box::new(EpochFloorRecord {
+                    key: PlacementEpochKey::Actor(actor_key_for(2)),
+                    epoch: Epoch(1),
+                })),
             ),
             (
                 actor_key(&store.prefix, &actor_key_for(2)),
