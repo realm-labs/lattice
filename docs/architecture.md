@@ -16,3 +16,4 @@ The architecture has been split into [docs/architecture/](architecture/README.md
 | [architecture/06-appendix.md](architecture/06-appendix.md) | Appendix |
 | [architecture/07-api-examples.md](architecture/07-api-examples.md) | Framework API examples |
 | [implementation-plan.md](implementation-plan.md) | Phased implementation plan |
+| [production-hardening-plan.md](production-hardening-plan.md) | Production hardening goal and execution tracker |

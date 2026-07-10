@@ -5,6 +5,7 @@
 > Scope: room/instance games, open-world zone services, stateful services such as Player/Guild/Inventory, and cluster-singleton control-plane services.  
 > Non-goals: the first version does not implement seamless cross-machine realtime combat, a strongly consistent distributed ECS, or exactly-once semantics.  
 > Implementation plan: [../implementation-plan.md](../implementation-plan.md).
+> Production hardening plan: [../production-hardening-plan.md](../production-hardening-plan.md).
 
 ---
 
