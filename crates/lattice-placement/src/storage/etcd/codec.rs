@@ -1,7 +1,7 @@
 use etcd_client::PutOptions;
 use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
-use lattice_core::kind::ServiceKind;
+use lattice_core::kind::{ActorKind, ServiceKind};
 use serde::{Deserialize, Serialize};
 
 use crate::error::PlacementError;
@@ -101,6 +101,21 @@ pub(crate) fn instance_key(
     )
 }
 
+pub(crate) fn instance_namespace_prefix(prefix: &PlacementPrefix) -> String {
+    format!("{}/logic/instances/", clean_prefix(prefix))
+}
+
+pub(crate) fn instance_service_prefix(
+    prefix: &PlacementPrefix,
+    service_kind: &ServiceKind,
+) -> String {
+    format!(
+        "{}/logic/instances/{}/",
+        clean_prefix(prefix),
+        service_kind.as_str()
+    )
+}
+
 pub(crate) fn logic_prefix(prefix: &PlacementPrefix) -> String {
     format!("{}/logic/", clean_prefix(prefix))
 }
@@ -111,6 +126,10 @@ pub(crate) fn actor_service_prefix(prefix: &PlacementPrefix, service_kind: &Serv
         clean_prefix(prefix),
         service_kind.as_str()
     )
+}
+
+pub(crate) fn actor_namespace_prefix(prefix: &PlacementPrefix) -> String {
+    format!("{}/logic/actors/", clean_prefix(prefix))
 }
 
 pub(crate) fn vshard_service_prefix(
@@ -124,6 +143,19 @@ pub(crate) fn vshard_service_prefix(
     )
 }
 
+pub(crate) fn vshard_actor_prefix(
+    prefix: &PlacementPrefix,
+    service_kind: &ServiceKind,
+    actor_kind: &ActorKind,
+) -> String {
+    format!(
+        "{}/logic/vshards/{}/{}/",
+        clean_prefix(prefix),
+        service_kind.as_str(),
+        actor_kind.as_str()
+    )
+}
+
 pub(crate) fn singleton_service_prefix(
     prefix: &PlacementPrefix,
     service_kind: &ServiceKind,
@@ -133,6 +165,10 @@ pub(crate) fn singleton_service_prefix(
         clean_prefix(prefix),
         service_kind.as_str()
     )
+}
+
+pub(crate) fn singleton_namespace_prefix(prefix: &PlacementPrefix) -> String {
+    format!("{}/logic/singletons/", clean_prefix(prefix))
 }
 
 pub(crate) fn actor_key(prefix: &PlacementPrefix, key: &ActorPlacementKey) -> String {
@@ -175,6 +211,10 @@ pub(crate) fn activation_lock_key(prefix: &PlacementPrefix, key: &ActorPlacement
     )
 }
 
+pub(crate) fn activation_lock_namespace_prefix(prefix: &PlacementPrefix) -> String {
+    format!("{}/logic/activation_locks/", clean_prefix(prefix))
+}
+
 pub(crate) fn singleton_lock_key(prefix: &PlacementPrefix, key: &SingletonKey) -> String {
     format!(
         "{}/logic/singleton_locks/{}/{}/{}",
@@ -183,6 +223,10 @@ pub(crate) fn singleton_lock_key(prefix: &PlacementPrefix, key: &SingletonKey) -
         key.singleton_kind.as_str(),
         scope_segment(&key.scope)
     )
+}
+
+pub(crate) fn singleton_lock_namespace_prefix(prefix: &PlacementPrefix) -> String {
+    format!("{}/logic/singleton_locks/", clean_prefix(prefix))
 }
 
 pub(crate) fn coordinator_leader_key(prefix: &PlacementPrefix) -> String {

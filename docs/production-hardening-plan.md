@@ -97,8 +97,11 @@ Status: `[ ]` in progress.
 - [x] Add a bounded atomic ownership snapshot/watch handoff with store-global revisions, typed ownership events, and surfaced lag for the in-memory placement backend.
 - [x] Implement the same bounded, globally revised ownership view for etcd using one read transaction, `mod_revision`, watch-from-revision, previous values for deletions, same-revision batches, progress barriers, and explicit terminal errors. The production `RealEtcdClient` path is implemented and compile-checked; deterministic contract coverage exercises the adapter and atomic in-memory etcd model without claiming to verify server behavior.
 - [x] Add executable real-etcd coverage for historical `R+1` replay across the snapshot/watch creation interval, the Created handshake, immediate compaction before readiness, progress responses, `prev_kv` deletion decoding, and same-revision transaction batching. The real client now buffers a bounded startup replay until an explicit progress barrier, retries progress after historical responses, and reports compaction/cancellation before that barrier as a watch-start failure.
-- [ ] Encode or reject dynamic etcd key path segments so service kinds, actor kinds, and instance IDs cannot overlap placement prefixes or cause fail-closed capacity exhaustion.
+- [x] Reject `/` in every raw dynamic etcd path identity before I/O, including service kinds, actor/singleton kinds, instance IDs, and string actor IDs. Preserve every non-delimiter key byte-for-byte, validate owners/candidates and key-record identity, and fail closed on malformed legacy reads, snapshots, and watches rather than using an unsafe dual-read fallback.
 - [ ] Apply each ownership watch batch atomically to `LocalOwnershipSnapshot` at one global revision so a multi-key etcd transaction cannot cause later same-revision events to be discarded.
+- [ ] Bound every dynamic placement identity component and the total etcd key/prefix length, including string/byte actor IDs, singleton scopes, and `PlacementPrefix`, before allocation or backend I/O.
+- [ ] Filter ownership watch events to the exact local instance key and selected service record ranges before JSON/key validation and per-revision capacity accounting, so unrelated service traffic or malformed data cannot fence every view.
+- [ ] Define and test the unsafe legacy-key upgrade preflight: stop old writers and reject startup or clean/migrate slash-bearing keys before rollout; do not claim rolling compatibility for identities that were already ambiguous.
 - [ ] Make generated RPC binding placement mode explicit: explicit-fenced by default, validated shard count for virtual shards, and named opt-in only for static/local unfenced use. The mode type, generated constructors, compiled call sites, and named raw-registry opt-in are complete; this remains unchecked until fenced modes are enforced at ingress and virtual-shard client/server configuration is proven consistent with the authoritative assignment set.
 - [ ] Require generated placement-backed RPC services to validate expected service, actor kind, route, owner, state, lease validity, and epoch before actor lookup.
 - [ ] Prevent `ActorRegistry::get_or_load` from being reached after a failed ownership decision.
@@ -106,7 +109,7 @@ Status: `[ ]` in progress.
 - [ ] Replace status-message substring parsing with structured NOT_OWNER/FENCED error metadata/details.
 - [ ] Make old owners fence locally when ownership changes or lease keepalive fails.
 - [ ] Reconcile durable explicit actor records when their named owner is re-registered under a different lease, preserving monotonic epoch progression instead of leaving a permanently fenced route.
-- [ ] Make placement watches surface lag, closure, and deletions; fence first and perform a no-gap full resync or fail readiness before reopening the ownership view.
+- [ ] Make placement watches surface lag, closure, deletions, malformed JSON, invalid UTF-8, and other decode/protocol failures; fence first and perform a no-gap full resync or fail readiness before reopening the ownership view.
 - [ ] Remove per-request PlacementStore access from singleton data-plane dispatch.
 - [ ] Add stale-route, missing-epoch, migration, lease-loss, and watch-lag tests.
 - [ ] Update ownership/fencing architecture documentation and examples.

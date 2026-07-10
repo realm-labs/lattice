@@ -1,6 +1,7 @@
 use std::num::NonZeroUsize;
 
 use async_trait::async_trait;
+use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_core::service_context::ConfiguredComponent;
@@ -14,9 +15,12 @@ use crate::storage::etcd::client::{
     EtcdOwnershipWatchUpdate, InMemoryEtcdClient, InstanceLeaseTtl, RealEtcdClient,
 };
 use crate::storage::etcd::codec::{
-    EtcdValue, activation_lock_key, actor_key, actor_service_prefix, clean_prefix,
-    coordinator_leader_key, default_instance_lease_ttl_secs, instance_key, logic_prefix,
-    singleton_key, singleton_lock_key, singleton_service_prefix, vshard_key, vshard_service_prefix,
+    EtcdValue, activation_lock_key, activation_lock_namespace_prefix, actor_key,
+    actor_namespace_prefix, actor_service_prefix, coordinator_leader_key,
+    default_instance_lease_ttl_secs, instance_key, instance_namespace_prefix,
+    instance_service_prefix, logic_prefix, singleton_key, singleton_lock_key,
+    singleton_lock_namespace_prefix, singleton_namespace_prefix, singleton_service_prefix,
+    vshard_actor_prefix, vshard_key, vshard_service_prefix,
 };
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, LeaseId, OwnershipView,
@@ -97,6 +101,7 @@ where
         &self,
         candidate_id: InstanceId,
     ) -> Result<Option<CoordinatorLeadership>, PlacementError> {
+        validate_instance_id(&candidate_id)?;
         let lease_id = self.client.grant_instance_lease().await?;
         let leadership = CoordinatorLeadership {
             candidate_id,
@@ -121,6 +126,7 @@ where
         &self,
         leadership: &CoordinatorLeadership,
     ) -> Result<(), PlacementError> {
+        validate_instance_id(&leadership.candidate_id)?;
         let Some((_, EtcdValue::CoordinatorLeader(current))) = self
             .client
             .get(&coordinator_leader_key(&self.prefix))
@@ -128,6 +134,7 @@ where
         else {
             return Err(PlacementError::CoordinatorLeadershipLost);
         };
+        validate_instance_id(&current.candidate_id)?;
         if current.as_ref() != leadership {
             return Err(PlacementError::CoordinatorLeadershipLost);
         }
@@ -140,6 +147,7 @@ where
         &self,
         leadership: &CoordinatorLeadership,
     ) -> Result<(), PlacementError> {
+        validate_instance_id(&leadership.candidate_id)?;
         let Some((_, EtcdValue::CoordinatorLeader(current))) = self
             .client
             .get(&coordinator_leader_key(&self.prefix))
@@ -147,6 +155,7 @@ where
         else {
             return Ok(());
         };
+        validate_instance_id(&current.candidate_id)?;
         if current.as_ref() == leadership {
             self.client
                 .delete(&coordinator_leader_key(&self.prefix))
@@ -156,6 +165,7 @@ where
     }
 
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError> {
+        validate_instance_record(&record)?;
         self.client
             .put(
                 instance_key(&self.prefix, &record.service_kind, &record.instance_id),
@@ -168,8 +178,11 @@ where
         &self,
         instance_id: &InstanceId,
     ) -> Result<Option<InstanceRecord>, PlacementError> {
-        let prefix = format!("{}/logic/instances/", clean_prefix(&self.prefix));
-        for (_key, _version, value) in self.client.list_prefix(&prefix).await? {
+        validate_instance_id(instance_id)?;
+        let prefix = instance_namespace_prefix(&self.prefix);
+        for (key, _version, value) in self.client.list_prefix(&prefix).await? {
+            validate_etcd_value_key(&self.prefix, &key, &value)
+                .map_err(placement_key_validation_error)?;
             if let EtcdValue::Instance(record) = value
                 && &record.instance_id == instance_id
             {
@@ -183,44 +196,27 @@ where
         &self,
         service_kind: &ServiceKind,
     ) -> Result<Vec<InstanceRecord>, PlacementError> {
-        let prefix = format!(
-            "{}/logic/instances/{}/",
-            clean_prefix(&self.prefix),
-            service_kind.as_str()
-        );
-        Ok(self
-            .client
-            .list_prefix(&prefix)
-            .await?
-            .into_iter()
-            .filter_map(|(_key, _version, value)| match value {
-                EtcdValue::Instance(record) => Some(*record),
-                _ => None,
-            })
-            .collect())
+        validate_service_kind(service_kind)?;
+        let prefix = instance_service_prefix(&self.prefix, service_kind);
+        collect_instances(&self.prefix, self.client.list_prefix(&prefix).await?)
     }
 
     async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError> {
-        let prefix = format!("{}/logic/instances/", clean_prefix(&self.prefix));
-        Ok(self
-            .client
-            .list_prefix(&prefix)
-            .await?
-            .into_iter()
-            .filter_map(|(_key, _version, value)| match value {
-                EtcdValue::Instance(record) => Some(*record),
-                _ => None,
-            })
-            .collect())
+        let prefix = instance_namespace_prefix(&self.prefix);
+        collect_instances(&self.prefix, self.client.list_prefix(&prefix).await?)
     }
 
     async fn get_actor(
         &self,
         key: &ActorPlacementKey,
     ) -> Result<Option<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
-        let Some((version, value)) = self.client.get(&actor_key(&self.prefix, key)).await? else {
+        validate_actor_key(key)?;
+        let storage_key = actor_key(&self.prefix, key);
+        let Some((version, value)) = self.client.get(&storage_key).await? else {
             return Ok(None);
         };
+        validate_etcd_value_key(&self.prefix, &storage_key, &value)
+            .map_err(placement_key_validation_error)?;
         match value {
             EtcdValue::Actor(record) => Ok(Some((version, *record))),
             _ => Ok(None),
@@ -230,17 +226,8 @@ where
     async fn list_actors(
         &self,
     ) -> Result<Vec<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
-        let prefix = format!("{}/logic/actors/", clean_prefix(&self.prefix));
-        Ok(self
-            .client
-            .list_prefix(&prefix)
-            .await?
-            .into_iter()
-            .filter_map(|(_key, version, value)| match value {
-                EtcdValue::Actor(record) => Some((version, *record)),
-                _ => None,
-            })
-            .collect())
+        let prefix = actor_namespace_prefix(&self.prefix);
+        collect_actors(&self.prefix, self.client.list_prefix(&prefix).await?)
     }
 
     async fn compare_and_put_actor(
@@ -249,6 +236,7 @@ where
         expected: Option<PlacementVersion>,
         value: ActorPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError> {
+        validate_actor_key_record(&key, &value)?;
         self.client
             .compare_and_put(
                 actor_key(&self.prefix, &key),
@@ -262,9 +250,13 @@ where
         &self,
         key: &VirtualShardPlacementKey,
     ) -> Result<Option<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
-        let Some((version, value)) = self.client.get(&vshard_key(&self.prefix, key)).await? else {
+        validate_virtual_shard_key(key)?;
+        let storage_key = vshard_key(&self.prefix, key);
+        let Some((version, value)) = self.client.get(&storage_key).await? else {
             return Ok(None);
         };
+        validate_etcd_value_key(&self.prefix, &storage_key, &value)
+            .map_err(placement_key_validation_error)?;
         match value {
             EtcdValue::VirtualShard(record) => Ok(Some((version, *record))),
             _ => Ok(None),
@@ -276,43 +268,19 @@ where
         service_kind: &ServiceKind,
         actor_kind: &ActorKind,
     ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
-        let prefix = format!(
-            "{}/logic/vshards/{}/{}/",
-            clean_prefix(&self.prefix),
-            service_kind.as_str(),
-            actor_kind.as_str()
-        );
-        Ok(self
-            .client
-            .list_prefix(&prefix)
-            .await?
-            .into_iter()
-            .filter_map(|(_key, version, value)| match value {
-                EtcdValue::VirtualShard(record) => Some((version, *record)),
-                _ => None,
-            })
-            .collect())
+        validate_service_kind(service_kind)?;
+        validate_actor_kind(actor_kind)?;
+        let prefix = vshard_actor_prefix(&self.prefix, service_kind, actor_kind);
+        collect_virtual_shards(&self.prefix, self.client.list_prefix(&prefix).await?)
     }
 
     async fn list_virtual_shards_for_service(
         &self,
         service_kind: &ServiceKind,
     ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
-        let prefix = format!(
-            "{}/logic/vshards/{}/",
-            clean_prefix(&self.prefix),
-            service_kind.as_str()
-        );
-        Ok(self
-            .client
-            .list_prefix(&prefix)
-            .await?
-            .into_iter()
-            .filter_map(|(_key, version, value)| match value {
-                EtcdValue::VirtualShard(record) => Some((version, *record)),
-                _ => None,
-            })
-            .collect())
+        validate_service_kind(service_kind)?;
+        let prefix = vshard_service_prefix(&self.prefix, service_kind);
+        collect_virtual_shards(&self.prefix, self.client.list_prefix(&prefix).await?)
     }
 
     async fn compare_and_put_virtual_shard(
@@ -321,6 +289,7 @@ where
         expected: Option<PlacementVersion>,
         value: VirtualShardPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError> {
+        validate_virtual_shard_key_record(&key, &value)?;
         self.client
             .compare_and_put(
                 vshard_key(&self.prefix, &key),
@@ -334,10 +303,13 @@ where
         &self,
         key: &SingletonKey,
     ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
-        let Some((version, value)) = self.client.get(&singleton_key(&self.prefix, key)).await?
-        else {
+        validate_singleton_key(key)?;
+        let storage_key = singleton_key(&self.prefix, key);
+        let Some((version, value)) = self.client.get(&storage_key).await? else {
             return Ok(None);
         };
+        validate_etcd_value_key(&self.prefix, &storage_key, &value)
+            .map_err(placement_key_validation_error)?;
         match value {
             EtcdValue::Singleton(record) => Ok(Some((version, *record))),
             _ => Ok(None),
@@ -347,17 +319,8 @@ where
     async fn list_singletons(
         &self,
     ) -> Result<Vec<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
-        let prefix = format!("{}/logic/singletons/", clean_prefix(&self.prefix));
-        Ok(self
-            .client
-            .list_prefix(&prefix)
-            .await?
-            .into_iter()
-            .filter_map(|(_key, version, value)| match value {
-                EtcdValue::Singleton(record) => Some((version, *record)),
-                _ => None,
-            })
-            .collect())
+        let prefix = singleton_namespace_prefix(&self.prefix);
+        collect_singletons(&self.prefix, self.client.list_prefix(&prefix).await?)
     }
 
     async fn compare_and_put_singleton(
@@ -366,6 +329,7 @@ where
         expected: Option<PlacementVersion>,
         value: SingletonPlacementRecord,
     ) -> Result<PlacementVersion, PlacementError> {
+        validate_singleton_key_record(&key, &value)?;
         self.client
             .compare_and_put(
                 singleton_key(&self.prefix, &key),
@@ -376,6 +340,7 @@ where
     }
 
     async fn acquire_singleton_lock(&self, key: SingletonKey) -> Result<LeaseId, PlacementError> {
+        validate_singleton_key(&key)?;
         let lease_id = self.client.next_lease_id().await?;
         match self
             .client
@@ -397,6 +362,7 @@ where
         key: &SingletonKey,
         lease_id: LeaseId,
     ) -> Result<(), PlacementError> {
+        validate_singleton_key(key)?;
         match self
             .client
             .get(&singleton_lock_key(&self.prefix, key))
@@ -412,6 +378,7 @@ where
         key: &SingletonKey,
         lease_id: LeaseId,
     ) -> Result<(), PlacementError> {
+        validate_singleton_key(key)?;
         self.client
             .compare_and_delete(
                 singleton_lock_key(&self.prefix, key),
@@ -428,6 +395,7 @@ where
         &self,
         key: ActorPlacementKey,
     ) -> Result<LeaseId, PlacementError> {
+        validate_actor_key(&key)?;
         let lease_id = self.client.next_lease_id().await?;
         match self
             .client
@@ -449,6 +417,7 @@ where
         key: &ActorPlacementKey,
         lease_id: LeaseId,
     ) -> Result<(), PlacementError> {
+        validate_actor_key(key)?;
         match self
             .client
             .get(&activation_lock_key(&self.prefix, key))
@@ -464,6 +433,7 @@ where
         key: &ActorPlacementKey,
         lease_id: LeaseId,
     ) -> Result<(), PlacementError> {
+        validate_actor_key(key)?;
         self.client
             .compare_and_delete(
                 activation_lock_key(&self.prefix, key),
@@ -482,6 +452,8 @@ where
         instance_id: &InstanceId,
         max_entries: NonZeroUsize,
     ) -> Result<OwnershipView, OwnershipViewError> {
+        validate_service_kind(service_kind).map_err(ownership_identity_error)?;
+        validate_instance_id(instance_id).map_err(ownership_identity_error)?;
         let mut raw = self
             .client
             .open_ownership_view(
@@ -671,11 +643,19 @@ where
     }
 
     async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError> {
-        let logic_prefix = format!("{}/logic/", clean_prefix(&prefix));
+        let logic_prefix = logic_prefix(&prefix);
         let mut etcd_watch = self.client.watch_prefix(&logic_prefix).await?;
         let (tx, rx) = broadcast::channel(128);
         tokio::spawn(async move {
             while let Ok(event) = etcd_watch.next().await {
+                if let Some(value) = event.value.as_ref()
+                    && validate_etcd_value_key(&prefix, &event.key, value).is_err()
+                {
+                    // The legacy watch cannot carry a structured terminal error.
+                    // Closing is still fail-closed: malformed placement identity
+                    // must never enter routing or coordinator caches.
+                    break;
+                }
                 match event.value {
                     Some(EtcdValue::Instance(record)) => {
                         let _ = tx.send(PlacementWatchEvent::InstanceUpdated { record: *record });
@@ -731,6 +711,225 @@ where
     }
 }
 
+type EtcdListEntry = (String, PlacementVersion, EtcdValue);
+
+fn collect_instances(
+    prefix: &PlacementPrefix,
+    entries: Vec<EtcdListEntry>,
+) -> Result<Vec<InstanceRecord>, PlacementError> {
+    let mut records = Vec::with_capacity(entries.len());
+    for (key, _version, value) in entries {
+        validate_etcd_value_key(prefix, &key, &value).map_err(placement_key_validation_error)?;
+        match value {
+            EtcdValue::Instance(record) => records.push(*record),
+            _ => return Err(unexpected_etcd_value("instance", &key)),
+        }
+    }
+    Ok(records)
+}
+
+fn collect_actors(
+    prefix: &PlacementPrefix,
+    entries: Vec<EtcdListEntry>,
+) -> Result<Vec<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
+    let mut records = Vec::with_capacity(entries.len());
+    for (key, version, value) in entries {
+        validate_etcd_value_key(prefix, &key, &value).map_err(placement_key_validation_error)?;
+        match value {
+            EtcdValue::Actor(record) => records.push((version, *record)),
+            _ => return Err(unexpected_etcd_value("actor", &key)),
+        }
+    }
+    Ok(records)
+}
+
+fn collect_virtual_shards(
+    prefix: &PlacementPrefix,
+    entries: Vec<EtcdListEntry>,
+) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+    let mut records = Vec::with_capacity(entries.len());
+    for (key, version, value) in entries {
+        validate_etcd_value_key(prefix, &key, &value).map_err(placement_key_validation_error)?;
+        match value {
+            EtcdValue::VirtualShard(record) => records.push((version, *record)),
+            _ => return Err(unexpected_etcd_value("virtual shard", &key)),
+        }
+    }
+    Ok(records)
+}
+
+fn collect_singletons(
+    prefix: &PlacementPrefix,
+    entries: Vec<EtcdListEntry>,
+) -> Result<Vec<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+    let mut records = Vec::with_capacity(entries.len());
+    for (key, version, value) in entries {
+        validate_etcd_value_key(prefix, &key, &value).map_err(placement_key_validation_error)?;
+        match value {
+            EtcdValue::Singleton(record) => records.push((version, *record)),
+            _ => return Err(unexpected_etcd_value("singleton", &key)),
+        }
+    }
+    Ok(records)
+}
+
+fn validate_actor_key_record(
+    key: &ActorPlacementKey,
+    record: &ActorPlacementRecord,
+) -> Result<(), PlacementError> {
+    validate_actor_key(key)?;
+    validate_actor_record(record)?;
+    if key.service_kind != record.service_kind
+        || key.actor_kind != record.actor_kind
+        || key.actor_id != record.actor_id
+    {
+        return Err(key_record_mismatch("actor"));
+    }
+    Ok(())
+}
+
+fn validate_virtual_shard_key_record(
+    key: &VirtualShardPlacementKey,
+    record: &VirtualShardPlacementRecord,
+) -> Result<(), PlacementError> {
+    validate_virtual_shard_key(key)?;
+    validate_virtual_shard_record(record)?;
+    if key.service_kind != record.service_kind
+        || key.actor_kind != record.actor_kind
+        || key.shard_id != record.shard_id
+    {
+        return Err(key_record_mismatch("virtual shard"));
+    }
+    Ok(())
+}
+
+fn validate_singleton_key_record(
+    key: &SingletonKey,
+    record: &SingletonPlacementRecord,
+) -> Result<(), PlacementError> {
+    validate_singleton_key(key)?;
+    validate_singleton_record(record)?;
+    if key.service_kind != record.service_kind
+        || key.singleton_kind != record.singleton_kind
+        || key.scope != record.scope
+    {
+        return Err(key_record_mismatch("singleton"));
+    }
+    Ok(())
+}
+
+fn validate_service_kind(service_kind: &ServiceKind) -> Result<(), PlacementError> {
+    validate_raw_path_identity("service kind", service_kind.as_str())
+}
+
+fn validate_actor_kind(actor_kind: &ActorKind) -> Result<(), PlacementError> {
+    validate_raw_path_identity("actor kind", actor_kind.as_str())
+}
+
+fn validate_instance_id(instance_id: &InstanceId) -> Result<(), PlacementError> {
+    validate_raw_path_identity("instance ID", instance_id.as_str())
+}
+
+fn validate_actor_id(actor_id: &ActorId) -> Result<(), PlacementError> {
+    if let ActorId::Str(value) = actor_id {
+        validate_raw_path_identity("string actor ID", value)?;
+    }
+    Ok(())
+}
+
+fn validate_raw_path_identity(identity: &str, value: &str) -> Result<(), PlacementError> {
+    // Keep every non-delimiter identity byte-for-byte compatible with existing
+    // keys. Escaping only new values would be unsafe during rolling upgrades:
+    // an encoded `A/B` could collide with a legacy literal identity such as
+    // `A%2FB`. Rejecting `/` makes the raw key grammar unambiguous instead.
+    if value.contains('/') {
+        return Err(PlacementError::PlacementCodec {
+            message: format!("etcd {identity} must not contain the '/' path delimiter"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_actor_key(key: &ActorPlacementKey) -> Result<(), PlacementError> {
+    validate_service_kind(&key.service_kind)?;
+    validate_actor_kind(&key.actor_kind)?;
+    validate_actor_id(&key.actor_id)
+}
+
+fn validate_virtual_shard_key(key: &VirtualShardPlacementKey) -> Result<(), PlacementError> {
+    validate_service_kind(&key.service_kind)?;
+    validate_actor_kind(&key.actor_kind)
+}
+
+fn validate_singleton_key(key: &SingletonKey) -> Result<(), PlacementError> {
+    validate_service_kind(&key.service_kind)?;
+    validate_actor_kind(&key.singleton_kind)
+}
+
+fn validate_instance_record(record: &InstanceRecord) -> Result<(), PlacementError> {
+    validate_service_kind(&record.service_kind)?;
+    validate_instance_id(&record.instance_id)
+}
+
+fn validate_actor_record(record: &ActorPlacementRecord) -> Result<(), PlacementError> {
+    validate_service_kind(&record.service_kind)?;
+    validate_actor_kind(&record.actor_kind)?;
+    validate_actor_id(&record.actor_id)?;
+    validate_instance_id(&record.owner)
+}
+
+fn validate_virtual_shard_record(
+    record: &VirtualShardPlacementRecord,
+) -> Result<(), PlacementError> {
+    validate_service_kind(&record.service_kind)?;
+    validate_actor_kind(&record.actor_kind)?;
+    validate_instance_id(&record.owner)
+}
+
+fn validate_singleton_record(record: &SingletonPlacementRecord) -> Result<(), PlacementError> {
+    validate_service_kind(&record.service_kind)?;
+    validate_actor_kind(&record.singleton_kind)?;
+    validate_instance_id(&record.owner)
+}
+
+fn validate_etcd_value_identity(value: &EtcdValue) -> Result<(), PlacementError> {
+    match value {
+        EtcdValue::Instance(record) => validate_instance_record(record),
+        EtcdValue::Actor(record) => validate_actor_record(record),
+        EtcdValue::VirtualShard(record) => validate_virtual_shard_record(record),
+        EtcdValue::Singleton(record) => validate_singleton_record(record),
+        EtcdValue::CoordinatorLeader(leadership) => validate_instance_id(&leadership.candidate_id),
+        EtcdValue::ActivationLock(_) | EtcdValue::SingletonLock(_) => Ok(()),
+    }
+}
+
+fn key_record_mismatch(record_kind: &str) -> PlacementError {
+    PlacementError::PlacementCodec {
+        message: format!("{record_kind} placement key does not match its record identity"),
+    }
+}
+
+fn placement_key_validation_error(error: OwnershipWatchError) -> PlacementError {
+    match error {
+        OwnershipWatchError::Protocol { message } => PlacementError::PlacementCodec { message },
+        error => PlacementError::PlacementCodec {
+            message: error.to_string(),
+        },
+    }
+}
+
+fn ownership_identity_error(error: PlacementError) -> OwnershipViewError {
+    OwnershipViewError::Protocol {
+        message: error.to_string(),
+    }
+}
+
+fn unexpected_etcd_value(expected: &str, key: &str) -> PlacementError {
+    PlacementError::PlacementCodec {
+        message: format!("etcd {expected} range returned an unexpected value at {key}"),
+    }
+}
+
 fn snapshot_service_mismatch(expected: &ServiceKind, actual: &ServiceKind) -> OwnershipViewError {
     OwnershipViewError::Protocol {
         message: format!("etcd ownership snapshot expected service {expected}, got {actual}"),
@@ -742,6 +941,9 @@ fn validate_etcd_value_key(
     actual_key: &str,
     value: &EtcdValue,
 ) -> Result<(), OwnershipWatchError> {
+    validate_etcd_value_identity(value).map_err(|error| OwnershipWatchError::Protocol {
+        message: error.to_string(),
+    })?;
     let expected_key = match value {
         EtcdValue::Instance(record) => {
             instance_key(prefix, &record.service_kind, &record.instance_id)
@@ -772,21 +974,21 @@ fn validate_etcd_value_key(
         ),
         EtcdValue::CoordinatorLeader(_) => coordinator_leader_key(prefix),
         EtcdValue::ActivationLock(_) => {
-            let namespace = format!("{}/logic/activation_locks/", clean_prefix(prefix));
-            if actual_key.starts_with(&namespace) {
+            let namespace = activation_lock_namespace_prefix(prefix);
+            if is_canonical_activation_lock_key(actual_key, &namespace) {
                 return Ok(());
             }
             return Err(OwnershipWatchError::Protocol {
-                message: format!("etcd activation lock appeared outside {namespace}: {actual_key}"),
+                message: format!("etcd activation lock has a non-canonical key: {actual_key}"),
             });
         }
         EtcdValue::SingletonLock(_) => {
-            let namespace = format!("{}/logic/singleton_locks/", clean_prefix(prefix));
-            if actual_key.starts_with(&namespace) {
+            let namespace = singleton_lock_namespace_prefix(prefix);
+            if is_canonical_singleton_lock_key(actual_key, &namespace) {
                 return Ok(());
             }
             return Err(OwnershipWatchError::Protocol {
-                message: format!("etcd singleton lock appeared outside {namespace}: {actual_key}"),
+                message: format!("etcd singleton lock has a non-canonical key: {actual_key}"),
             });
         }
     };
@@ -798,6 +1000,52 @@ fn validate_etcd_value_key(
         });
     }
     Ok(())
+}
+
+fn is_canonical_activation_lock_key(actual_key: &str, namespace: &str) -> bool {
+    let Some([_service_kind, _actor_kind, actor_id]) = split_lock_segments(actual_key, namespace)
+    else {
+        return false;
+    };
+    is_canonical_actor_id_segment(actor_id)
+}
+
+fn is_canonical_singleton_lock_key(actual_key: &str, namespace: &str) -> bool {
+    let Some([_service_kind, _singleton_kind, scope]) = split_lock_segments(actual_key, namespace)
+    else {
+        return false;
+    };
+    is_lower_hex(scope)
+}
+
+fn split_lock_segments<'a>(actual_key: &'a str, namespace: &str) -> Option<[&'a str; 3]> {
+    let mut segments = actual_key.strip_prefix(namespace)?.split('/');
+    let result = [segments.next()?, segments.next()?, segments.next()?];
+    segments.next().is_none().then_some(result)
+}
+
+fn is_canonical_actor_id_segment(segment: &str) -> bool {
+    if segment.strip_prefix("str:").is_some() {
+        return true;
+    }
+    if let Some(value) = segment.strip_prefix("u64:") {
+        return value
+            .parse::<u64>()
+            .is_ok_and(|parsed| parsed.to_string() == value);
+    }
+    if let Some(value) = segment.strip_prefix("i64:") {
+        return value
+            .parse::<i64>()
+            .is_ok_and(|parsed| parsed.to_string() == value);
+    }
+    segment.strip_prefix("bytes:").is_some_and(is_lower_hex)
+}
+
+fn is_lower_hex(value: &str) -> bool {
+    value.len().is_multiple_of(2)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn map_etcd_watch_batch(

@@ -9,11 +9,409 @@ use lattice_core::{actor_kind, service_kind};
 use super::*;
 use crate::registry::InstanceState;
 use crate::storage::etcd::client::InMemoryEtcdMutation;
-use crate::storage::etcd::codec::{decode_etcd_value, encode_etcd_value, put_options_for};
+use crate::storage::etcd::codec::{
+    actor_id_segment, decode_etcd_value, encode_etcd_value, instance_key, put_options_for,
+    scope_segment,
+};
 use crate::storage::{
     OwnershipViewError, OwnershipViewRecord, OwnershipWatchError, OwnershipWatchEvent,
-    OwnershipWatchUpdate, PlacementRevision, PlacementState,
+    OwnershipWatchUpdate, PlacementRevision, PlacementState, VirtualShardId,
 };
+
+fn assert_codec_error<T>(result: Result<T, PlacementError>) {
+    match result {
+        Err(PlacementError::PlacementCodec { .. }) => {}
+        Err(error) => panic!("expected placement codec error, got {error}"),
+        Ok(_) => panic!("expected placement codec error, operation succeeded"),
+    }
+}
+
+#[test]
+fn etcd_nondelimiter_identities_remain_byte_for_byte_compatible() {
+    let prefix = PlacementPrefix::new("/lattice/test");
+
+    assert_eq!(
+        instance_key(&prefix, &ServiceKind::new("%世界"), &InstanceId::new("")),
+        "/lattice/test/logic/instances/%世界/"
+    );
+    assert_eq!(actor_id_segment(&ActorId::Str(String::new())), "str:");
+    assert_eq!(
+        actor_id_segment(&ActorId::Str("%世界".to_string())),
+        "str:%世界"
+    );
+    assert_eq!(
+        actor_id_segment(&ActorId::Bytes(vec![b'/', b'%', 0])),
+        "bytes:2f2500"
+    );
+    assert_eq!(scope_segment(""), "");
+    assert_eq!(scope_segment("/"), "2f");
+    assert_eq!(scope_segment("%世界"), "25e4b896e7958c");
+    assert_eq!(
+        actor_key(
+            &prefix,
+            &ActorPlacementKey {
+                service_kind: ServiceKind::new(""),
+                actor_kind: ActorKind::new("世界"),
+                actor_id: ActorId::Str("%".to_string()),
+            }
+        ),
+        "/lattice/test/logic/actors//世界/str:%"
+    );
+    assert_eq!(
+        singleton_key(
+            &prefix,
+            &SingletonKey {
+                service_kind: ServiceKind::new("%世界"),
+                singleton_kind: ActorKind::new(""),
+                scope: "/".to_string(),
+            }
+        ),
+        "/lattice/test/logic/singletons/%世界//2f"
+    );
+}
+
+#[tokio::test]
+async fn etcd_store_rejects_path_delimiters_and_identity_mismatches_before_io() {
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(PlacementPrefix::new("/lattice/test"), client.clone());
+
+    let mut invalid_instance = instance_record("world-a", InstanceState::Ready);
+    invalid_instance.service_kind = ServiceKind::new("World/Other");
+    assert_codec_error(store.upsert_instance(invalid_instance).await);
+
+    let mut invalid_instance = instance_record("world-a", InstanceState::Ready);
+    invalid_instance.instance_id = InstanceId::new("world/a");
+    assert_codec_error(store.upsert_instance(invalid_instance).await);
+    assert_codec_error(store.get_instance(&InstanceId::new("world/a")).await);
+    assert_codec_error(store.list_instances(&ServiceKind::new("World/Other")).await);
+
+    let invalid_actor_key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::Str("actor/7".to_string()),
+    };
+    let invalid_actor_record = ActorPlacementRecord {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::Str("actor/7".to_string()),
+        owner: InstanceId::new("world-a"),
+        epoch: Epoch(1),
+        lease_id: LeaseId(1),
+        state: PlacementState::Running,
+    };
+    assert_codec_error(
+        store
+            .compare_and_put_actor(invalid_actor_key.clone(), None, invalid_actor_record)
+            .await,
+    );
+    assert_codec_error(store.acquire_activation_lock(invalid_actor_key).await);
+
+    let safe_actor_key = actor_key_for(7);
+    let mut invalid_owner = actor_record(7, "world-a", 1, LeaseId(1));
+    invalid_owner.owner = InstanceId::new("world/a");
+    assert_codec_error(
+        store
+            .compare_and_put_actor(safe_actor_key.clone(), None, invalid_owner)
+            .await,
+    );
+    assert_codec_error(
+        store
+            .compare_and_put_actor(
+                safe_actor_key,
+                None,
+                actor_record(8, "world-a", 1, LeaseId(1)),
+            )
+            .await,
+    );
+
+    let invalid_shard_key = VirtualShardPlacementKey {
+        service_kind: service_kind!("World"),
+        actor_kind: ActorKind::new("World/Other"),
+        shard_id: VirtualShardId(1),
+    };
+    let invalid_shard_record = VirtualShardPlacementRecord {
+        service_kind: service_kind!("World"),
+        actor_kind: ActorKind::new("World/Other"),
+        shard_id: VirtualShardId(1),
+        owner: InstanceId::new("world-a"),
+        epoch: Epoch(1),
+    };
+    assert_codec_error(
+        store
+            .compare_and_put_virtual_shard(invalid_shard_key, None, invalid_shard_record)
+            .await,
+    );
+    assert_codec_error(
+        store
+            .list_virtual_shards(&service_kind!("World"), &ActorKind::new("World/Other"))
+            .await,
+    );
+
+    let invalid_singleton_key = SingletonKey {
+        service_kind: ServiceKind::new("World/Other"),
+        singleton_kind: actor_kind!("SeasonManager"),
+        scope: "global".to_string(),
+    };
+    let invalid_singleton_record = SingletonPlacementRecord {
+        service_kind: ServiceKind::new("World/Other"),
+        singleton_kind: actor_kind!("SeasonManager"),
+        scope: "global".to_string(),
+        owner: InstanceId::new("world-a"),
+        epoch: Epoch(1),
+        lease_id: LeaseId(1),
+        state: PlacementState::Running,
+    };
+    assert_codec_error(
+        store
+            .compare_and_put_singleton(
+                invalid_singleton_key.clone(),
+                None,
+                invalid_singleton_record,
+            )
+            .await,
+    );
+    assert_codec_error(store.acquire_singleton_lock(invalid_singleton_key).await);
+    assert_codec_error(
+        store
+            .campaign_coordinator_leader(InstanceId::new("coordinator/a"))
+            .await,
+    );
+
+    assert!(matches!(
+        store
+            .open_ownership_view(
+                &ServiceKind::new("World/Other"),
+                &InstanceId::new("world-a"),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .await,
+        Err(OwnershipViewError::Protocol { .. })
+    ));
+    assert!(matches!(
+        store
+            .open_ownership_view(
+                &service_kind!("World"),
+                &InstanceId::new("world/a"),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .await,
+        Err(OwnershipViewError::Protocol { .. })
+    ));
+    assert!(client.keys().is_empty());
+}
+
+#[tokio::test]
+async fn etcd_safe_dynamic_identities_are_isolated_from_bounded_ownership_ranges() {
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(PlacementPrefix::new("/lattice/test"), client.clone());
+
+    store
+        .upsert_instance(instance_record("world-a", InstanceState::Ready))
+        .await
+        .unwrap();
+    store
+        .compare_and_put_actor(
+            actor_key_for(1),
+            None,
+            actor_record(1, "world-a", 1, LeaseId(1)),
+        )
+        .await
+        .unwrap();
+
+    for (index, service) in ["World%2Fpoison", "世界", ""].into_iter().enumerate() {
+        let actor_id = u64::try_from(index + 10).unwrap();
+        let key = ActorPlacementKey {
+            service_kind: ServiceKind::new(service),
+            actor_kind: ActorKind::new(""),
+            actor_id: ActorId::Str(format!("%actor{actor_id}")),
+        };
+        let record = ActorPlacementRecord {
+            service_kind: key.service_kind.clone(),
+            actor_kind: key.actor_kind.clone(),
+            actor_id: key.actor_id.clone(),
+            owner: InstanceId::new(""),
+            epoch: Epoch(1),
+            lease_id: LeaseId(1),
+            state: PlacementState::Running,
+        };
+        store
+            .compare_and_put_actor(key, None, record)
+            .await
+            .unwrap();
+    }
+
+    for actor_id in 20..24 {
+        let key = ActorPlacementKey {
+            service_kind: ServiceKind::new("World/poison"),
+            actor_kind: actor_kind!("World"),
+            actor_id: ActorId::U64(actor_id),
+        };
+        let record = ActorPlacementRecord {
+            service_kind: key.service_kind.clone(),
+            actor_kind: key.actor_kind.clone(),
+            actor_id: key.actor_id.clone(),
+            owner: InstanceId::new("world-a"),
+            epoch: Epoch(1),
+            lease_id: LeaseId(1),
+            state: PlacementState::Running,
+        };
+        assert_codec_error(store.compare_and_put_actor(key, None, record).await);
+    }
+
+    let view = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(view.snapshot.records.len(), 1);
+    assert!(matches!(
+        &view.snapshot.records[0],
+        OwnershipViewRecord::Actor { record, .. } if record.actor_id == ActorId::U64(1)
+    ));
+    assert_eq!(store.list_actors().await.unwrap().len(), 4);
+    assert!(
+        client
+            .keys()
+            .iter()
+            .all(|key| !key.contains("/logic/actors/World/poison/"))
+    );
+    assert!(
+        client
+            .keys()
+            .iter()
+            .any(|key| key.contains("/logic/actors/World%2Fpoison//"))
+    );
+}
+
+#[tokio::test]
+async fn etcd_store_rejects_miskeyed_and_legacy_delimited_values_on_reads_and_snapshots() {
+    let prefix = PlacementPrefix::new("/lattice/test");
+
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(prefix.clone(), client.clone());
+    let requested_key = actor_key_for(1);
+    client
+        .put(
+            actor_key(&prefix, &requested_key),
+            EtcdValue::Actor(Box::new(actor_record(2, "world-a", 1, LeaseId(1)))),
+        )
+        .await
+        .unwrap();
+    assert_codec_error(store.get_actor(&requested_key).await);
+    assert_codec_error(store.list_actors().await);
+    assert!(matches!(
+        store
+            .open_ownership_view(
+                &service_kind!("World"),
+                &InstanceId::new("world-a"),
+                NonZeroUsize::new(4).unwrap(),
+            )
+            .await,
+        Err(OwnershipViewError::Protocol { message })
+            if message.contains("key mismatch")
+    ));
+
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(prefix.clone(), client.clone());
+    let legacy_key = ActorPlacementKey {
+        service_kind: ServiceKind::new("World/poison"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(9),
+    };
+    let legacy_record = ActorPlacementRecord {
+        service_kind: legacy_key.service_kind.clone(),
+        actor_kind: legacy_key.actor_kind.clone(),
+        actor_id: legacy_key.actor_id.clone(),
+        owner: InstanceId::new("world-a"),
+        epoch: Epoch(1),
+        lease_id: LeaseId(1),
+        state: PlacementState::Running,
+    };
+    client
+        .put(
+            actor_key(&prefix, &legacy_key),
+            EtcdValue::Actor(Box::new(legacy_record)),
+        )
+        .await
+        .unwrap();
+    assert_codec_error(store.list_actors().await);
+    assert!(matches!(
+        store
+            .open_ownership_view(
+                &service_kind!("World"),
+                &InstanceId::new("world-a"),
+                NonZeroUsize::new(4).unwrap(),
+            )
+            .await,
+        Err(OwnershipViewError::Protocol { message })
+            if message.contains("path delimiter")
+    ));
+}
+
+#[tokio::test]
+async fn etcd_watches_fail_closed_on_legacy_delimited_values_and_noncanonical_locks() {
+    let prefix = PlacementPrefix::new("/lattice/test");
+
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(prefix.clone(), client.clone());
+    let mut legacy_watch = store.watch(prefix.clone()).await.unwrap();
+    let legacy_key = ActorPlacementKey {
+        service_kind: ServiceKind::new("World/poison"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(1),
+    };
+    let legacy_record = ActorPlacementRecord {
+        service_kind: legacy_key.service_kind.clone(),
+        actor_kind: legacy_key.actor_kind.clone(),
+        actor_id: legacy_key.actor_id.clone(),
+        owner: InstanceId::new("world-a"),
+        epoch: Epoch(1),
+        lease_id: LeaseId(1),
+        state: PlacementState::Running,
+    };
+    client
+        .put(
+            actor_key(&prefix, &legacy_key),
+            EtcdValue::Actor(Box::new(legacy_record)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), legacy_watch.next())
+            .await
+            .unwrap(),
+        Err(PlacementError::PlacementWatchClosed)
+    );
+
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(prefix.clone(), client.clone());
+    let mut ownership = store
+        .open_ownership_view(
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .await
+        .unwrap();
+    client
+        .put(
+            format!(
+                "{}/logic/activation_locks/World/poison/World/u64:1",
+                prefix.as_str()
+            ),
+            EtcdValue::ActivationLock(LeaseId(1)),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        ownership.watch.next_update().await,
+        Err(OwnershipWatchError::Protocol { message })
+            if message.contains("non-canonical key")
+    ));
+}
 
 #[tokio::test]
 async fn etcd_store_writes_under_cluster_prefix_and_isolates_reads() {
