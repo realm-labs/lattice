@@ -679,6 +679,18 @@ async fn etcd_ownership_view_uses_mod_revisions_and_subscribes_to_later_changes(
         .compare_and_put_virtual_shard(vshard_key_for(3), None, vshard_record(3, "world-a", 1))
         .await
         .unwrap();
+    store
+        .compare_and_put_virtual_shard(vshard_key_for(4), None, vshard_record(4, "world-b", 2))
+        .await
+        .unwrap();
+    store
+        .compare_and_put_singleton(
+            singleton_key_for("remote"),
+            None,
+            singleton_record("remote", "world-b", 2, LeaseId(2)),
+        )
+        .await
+        .unwrap();
 
     let mut view = store
         .open_ownership_view(
@@ -689,7 +701,7 @@ async fn etcd_ownership_view_uses_mod_revisions_and_subscribes_to_later_changes(
         .await
         .unwrap();
 
-    assert_eq!(view.snapshot.revision, PlacementRevision(5));
+    assert_eq!(view.snapshot.revision, PlacementRevision(7));
     assert_eq!(
         view.snapshot
             .local_instance
@@ -713,7 +725,22 @@ async fn etcd_ownership_view_uses_mod_revisions_and_subscribes_to_later_changes(
     assert_eq!(current_version, PlacementVersion(2));
     assert_eq!(actor_revision, PlacementRevision(3));
     assert_ne!(actor_revision.0, current_version.0);
-    assert_eq!(view.snapshot.records.len(), 2);
+    assert_eq!(view.snapshot.records.len(), 5);
+    assert!(view.snapshot.records.iter().any(|record| matches!(
+        record,
+        OwnershipViewRecord::Actor { record, .. }
+            if record.actor_id == ActorId::U64(8) && record.owner == InstanceId::new("world-b")
+    )));
+    assert!(view.snapshot.records.iter().any(|record| matches!(
+        record,
+        OwnershipViewRecord::VirtualShard { record, .. }
+            if record.shard_id == VirtualShardId(4) && record.owner == InstanceId::new("world-b")
+    )));
+    assert!(view.snapshot.records.iter().any(|record| matches!(
+        record,
+        OwnershipViewRecord::Singleton { record, .. }
+            if record.scope == "remote" && record.owner == InstanceId::new("world-b")
+    )));
 
     let moved = actor_record(7, "world-b", 3, LeaseId(2));
     store
@@ -721,7 +748,7 @@ async fn etcd_ownership_view_uses_mod_revisions_and_subscribes_to_later_changes(
         .await
         .unwrap();
     let batch = view.watch.next().await.unwrap();
-    assert_eq!(batch.revision, PlacementRevision(6));
+    assert_eq!(batch.revision, PlacementRevision(8));
     assert_eq!(
         batch.events,
         vec![OwnershipWatchEvent::ActorUpserted { key, record: moved }]
@@ -926,7 +953,12 @@ async fn etcd_ownership_view_bounds_scanned_service_records() {
             .compare_and_put_actor(
                 actor_key_for(actor_id),
                 None,
-                actor_record(actor_id, "world-a", 1, LeaseId(1)),
+                actor_record(
+                    actor_id,
+                    if actor_id == 1 { "world-a" } else { "world-b" },
+                    1,
+                    LeaseId(1),
+                ),
             )
             .await
             .unwrap();

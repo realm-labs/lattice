@@ -588,7 +588,7 @@ async fn ownership_view_has_no_gap_between_snapshot_and_remote_owner_update() {
 }
 
 #[tokio::test]
-async fn ownership_view_bounds_scanned_service_records_before_local_filtering() {
+async fn ownership_view_returns_and_bounds_all_selected_service_owners() {
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
     store
         .upsert_instance(instance_record("world-a", InstanceState::Ready))
@@ -615,10 +615,22 @@ async fn ownership_view_bounds_scanned_service_records_before_local_filtering() 
         .await
         .unwrap();
     store
+        .compare_and_put_virtual_shard(vshard_key(4), None, vshard_record(4, "world-b", 2))
+        .await
+        .unwrap();
+    store
         .compare_and_put_singleton(
             singleton_key("global"),
             None,
             singleton_record("global", "world-a", 1, LeaseId(30)),
+        )
+        .await
+        .unwrap();
+    store
+        .compare_and_put_singleton(
+            singleton_key("remote"),
+            None,
+            singleton_record("remote", "world-b", 2, LeaseId(40)),
         )
         .await
         .unwrap();
@@ -627,41 +639,58 @@ async fn ownership_view_bounds_scanned_service_records_before_local_filtering() 
         .open_ownership_view(
             &service_kind!("World"),
             &InstanceId::new("world-a"),
-            NonZeroUsize::new(3).unwrap(),
+            NonZeroUsize::new(5).unwrap(),
         )
         .await;
     let view = store
         .open_ownership_view(
             &service_kind!("World"),
             &InstanceId::new("world-a"),
-            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(6).unwrap(),
         )
         .await
         .unwrap();
 
     assert!(matches!(
         bounded,
-        Err(OwnershipViewError::CapacityExceeded { max_entries: 3 })
+        Err(OwnershipViewError::CapacityExceeded { max_entries: 5 })
     ));
     assert_eq!(
         view.snapshot.local_instance.unwrap().instance_id,
         InstanceId::new("world-a")
     );
-    assert_eq!(view.snapshot.records.len(), 3);
+    assert_eq!(view.snapshot.records.len(), 6);
     assert_eq!(
         view.snapshot
             .records
             .iter()
             .filter(|record| matches!(record, OwnershipViewRecord::Actor { .. }))
             .count(),
-        1
+        2
     );
-    assert!(
+    assert_eq!(
         view.snapshot
             .records
             .iter()
-            .all(|record| ownership_record_owner(record) == InstanceId::new("world-a"))
+            .filter(|record| ownership_record_owner(record) == InstanceId::new("world-b"))
+            .count(),
+        3
     );
+    assert!(view.snapshot.records.iter().any(|record| matches!(
+        record,
+        OwnershipViewRecord::Actor { record, .. }
+            if record.actor_id == ActorId::U64(2) && record.owner == InstanceId::new("world-b")
+    )));
+    assert!(view.snapshot.records.iter().any(|record| matches!(
+        record,
+        OwnershipViewRecord::VirtualShard { record, .. }
+            if record.shard_id == VirtualShardId(4) && record.owner == InstanceId::new("world-b")
+    )));
+    assert!(view.snapshot.records.iter().any(|record| matches!(
+        record,
+        OwnershipViewRecord::Singleton { record, .. }
+            if record.scope == "remote" && record.owner == InstanceId::new("world-b")
+    )));
 }
 
 #[tokio::test]

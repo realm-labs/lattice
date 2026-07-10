@@ -567,10 +567,7 @@ impl PlacementStore for InMemoryPlacementStore {
                 ensure_ownership_view_capacity(scanned_entries, max_entries)?;
                 scanned_entries += 1;
             }
-            if key.prefix == self.prefix
-                && &record.service_kind == service_kind
-                && &record.owner == instance_id
-            {
+            if key.prefix == self.prefix && &record.service_kind == service_kind {
                 records.push(OwnershipViewRecord::Actor {
                     revision: *revision,
                     record: record.clone(),
@@ -582,10 +579,7 @@ impl PlacementStore for InMemoryPlacementStore {
                 ensure_ownership_view_capacity(scanned_entries, max_entries)?;
                 scanned_entries += 1;
             }
-            if key.prefix == self.prefix
-                && &record.service_kind == service_kind
-                && &record.owner == instance_id
-            {
+            if key.prefix == self.prefix && &record.service_kind == service_kind {
                 records.push(OwnershipViewRecord::VirtualShard {
                     revision: *revision,
                     record: record.clone(),
@@ -597,10 +591,7 @@ impl PlacementStore for InMemoryPlacementStore {
                 ensure_ownership_view_capacity(scanned_entries, max_entries)?;
                 scanned_entries += 1;
             }
-            if key.prefix == self.prefix
-                && &record.service_kind == service_kind
-                && &record.owner == instance_id
-            {
+            if key.prefix == self.prefix && &record.service_kind == service_kind {
                 records.push(OwnershipViewRecord::Singleton {
                     revision: *revision,
                     record: record.clone(),

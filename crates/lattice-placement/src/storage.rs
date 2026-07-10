@@ -137,7 +137,12 @@ pub enum OwnershipViewRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnershipViewSnapshot {
     pub revision: PlacementRevision,
+    /// The exact requested instance record, when it belongs to the requested service.
     pub local_instance: Option<InstanceRecord>,
+    /// All bounded actor, virtual-shard, and singleton records for the requested service.
+    ///
+    /// Consumers may filter this service-wide set for local authorization, but retaining
+    /// remote owners lets them preserve ownership epoch floors across resynchronization.
     pub records: Vec<OwnershipViewRecord>,
 }
 
@@ -406,8 +411,8 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
     ) -> Result<(), PlacementError>;
     /// Atomically snapshots ownership state and subscribes to later changes.
     ///
-    /// `max_entries` bounds same-service records scanned by the backend before
-    /// local-owner filtering. Exceeding it must fail closed.
+    /// `max_entries` bounds all selected-service records scanned by the backend
+    /// before any consumer-side owner filtering. Exceeding it must fail closed.
     async fn open_ownership_view(
         &self,
         _service_kind: &ServiceKind,

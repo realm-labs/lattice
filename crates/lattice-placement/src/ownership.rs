@@ -115,6 +115,11 @@ pub enum OwnershipSnapshotError {
         key: Box<OwnershipKey>,
         epoch: Epoch,
     },
+    #[error("ownership for {key:?} cannot reactivate at its removed epoch {epoch:?}")]
+    EpochReactivation {
+        key: Box<OwnershipKey>,
+        epoch: Epoch,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,7 +307,41 @@ struct LocalInstanceAuthority {
 #[derive(Debug, Clone)]
 struct VersionedRecord<T> {
     version: OwnershipRevision,
+    authority: OwnershipAuthorityFloor,
     record: Option<T>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnershipAuthorityFloor {
+    epoch: Epoch,
+    owner: InstanceId,
+    lease_id: Option<LeaseId>,
+}
+
+impl OwnershipAuthorityFloor {
+    fn actor(record: &ActorPlacementRecord) -> Self {
+        Self {
+            epoch: record.epoch,
+            owner: record.owner.clone(),
+            lease_id: Some(record.lease_id),
+        }
+    }
+
+    fn virtual_shard(record: &VirtualShardPlacementRecord) -> Self {
+        Self {
+            epoch: record.epoch,
+            owner: record.owner.clone(),
+            lease_id: None,
+        }
+    }
+
+    fn singleton(record: &SingletonPlacementRecord) -> Self {
+        Self {
+            epoch: record.epoch,
+            owner: record.owner.clone(),
+            lease_id: Some(record.lease_id),
+        }
+    }
 }
 
 impl LocalOwnershipSnapshot {
@@ -357,11 +396,8 @@ impl LocalOwnershipSnapshot {
             .instance
             .is_some_and(|instance| instance.lease_id != record.lease_id);
         if lease_changed {
-            state.actors.clear();
-            state.virtual_shards.clear();
-            state.singletons.clear();
+            state.tombstone_all_placements();
             state.valid_owner_leases.clear();
-            state.revision = None;
             state.availability =
                 SnapshotAvailability::Unavailable(OwnershipFenceReason::Initializing);
         }
@@ -501,6 +537,32 @@ impl LocalOwnershipSnapshot {
                 incoming: snapshot_revision,
             });
         }
+        let mut actors = actors;
+        let mut virtual_shards = virtual_shards;
+        let mut singletons = singletons;
+        if let Err(error) = merge_resync_authority_floors(&state.actors, &mut actors, |key| {
+            OwnershipKey::Explicit(key.clone())
+        })
+        .and_then(|()| {
+            merge_resync_authority_floors(&state.virtual_shards, &mut virtual_shards, |key| {
+                OwnershipKey::VirtualShard(key.clone())
+            })
+        })
+        .and_then(|()| {
+            merge_resync_authority_floors(&state.singletons, &mut singletons, |key| {
+                OwnershipKey::Singleton(key.clone())
+            })
+        }) {
+            state.availability = SnapshotAvailability::Unavailable(OwnershipFenceReason::Resyncing);
+            state.bump_generation();
+            return Err(error);
+        }
+        if actors.len() + virtual_shards.len() + singletons.len() > self.inner.max_entries.get() {
+            state.availability =
+                SnapshotAvailability::Unavailable(OwnershipFenceReason::CapacityExceeded);
+            state.bump_generation();
+            return Err(self.capacity_error());
+        }
         state.actors = actors;
         state.virtual_shards = virtual_shards;
         state.singletons = singletons;
@@ -563,38 +625,44 @@ impl LocalOwnershipSnapshot {
         record: ActorPlacementRecord,
     ) -> Result<bool, OwnershipSnapshotError> {
         let mut state = self.inner.write_state();
-        if !state.accept_revision(version) {
+        if state.revision.is_some_and(|current| current >= version) {
             return Ok(false);
         }
         if record.service_kind != self.inner.service_kind {
+            state.accept_revision(version);
             return Ok(false);
         }
         let key = actor_key(&record);
-        if record.owner != self.inner.instance_id {
-            let changed = apply_remote_update(&mut state.actors, key, version);
-            if changed {
-                state.bump_generation();
-            }
-            return Ok(changed);
-        }
-        if state
-            .actors
-            .get(&key)
-            .is_some_and(|current| current.version >= version)
+        let authority = OwnershipAuthorityFloor::actor(&record);
+        let is_local = record.owner == self.inner.instance_id;
+        if let Some(current) = state.actors.get(&key)
+            && let Err(error) = validate_authority_progression(
+                OwnershipKey::Explicit(key.clone()),
+                &current.authority,
+                &authority,
+                current.record.is_none() && is_local,
+            )
         {
-            return Ok(false);
+            Self::fence_rejected_batch(&mut state, &error);
+            return Err(error);
         }
         let already_present = state.actors.contains_key(&key);
         self.ensure_insert_capacity(&mut state, already_present)?;
+        let authorization_changed =
+            local_authorization_changed(state.actors.get(&key), is_local.then_some(&record));
+        state.accept_revision(version);
         state.actors.insert(
             key,
             VersionedRecord {
                 version,
-                record: Some(record),
+                authority,
+                record: is_local.then_some(record),
             },
         );
-        state.bump_generation();
-        Ok(true)
+        if authorization_changed {
+            state.bump_generation();
+        }
+        Ok(authorization_changed)
     }
 
     pub fn apply_virtual_shard(
@@ -603,38 +671,46 @@ impl LocalOwnershipSnapshot {
         record: VirtualShardPlacementRecord,
     ) -> Result<bool, OwnershipSnapshotError> {
         let mut state = self.inner.write_state();
-        if !state.accept_revision(version) {
+        if state.revision.is_some_and(|current| current >= version) {
             return Ok(false);
         }
         if record.service_kind != self.inner.service_kind {
+            state.accept_revision(version);
             return Ok(false);
         }
         let key = virtual_shard_key(&record);
-        if record.owner != self.inner.instance_id {
-            let changed = apply_remote_update(&mut state.virtual_shards, key, version);
-            if changed {
-                state.bump_generation();
-            }
-            return Ok(changed);
-        }
-        if state
-            .virtual_shards
-            .get(&key)
-            .is_some_and(|current| current.version >= version)
+        let authority = OwnershipAuthorityFloor::virtual_shard(&record);
+        let is_local = record.owner == self.inner.instance_id;
+        if let Some(current) = state.virtual_shards.get(&key)
+            && let Err(error) = validate_authority_progression(
+                OwnershipKey::VirtualShard(key.clone()),
+                &current.authority,
+                &authority,
+                current.record.is_none() && is_local,
+            )
         {
-            return Ok(false);
+            Self::fence_rejected_batch(&mut state, &error);
+            return Err(error);
         }
         let already_present = state.virtual_shards.contains_key(&key);
         self.ensure_insert_capacity(&mut state, already_present)?;
+        let authorization_changed = local_authorization_changed(
+            state.virtual_shards.get(&key),
+            is_local.then_some(&record),
+        );
+        state.accept_revision(version);
         state.virtual_shards.insert(
             key,
             VersionedRecord {
                 version,
-                record: Some(record),
+                authority,
+                record: is_local.then_some(record),
             },
         );
-        state.bump_generation();
-        Ok(true)
+        if authorization_changed {
+            state.bump_generation();
+        }
+        Ok(authorization_changed)
     }
 
     pub fn apply_singleton(
@@ -643,38 +719,44 @@ impl LocalOwnershipSnapshot {
         record: SingletonPlacementRecord,
     ) -> Result<bool, OwnershipSnapshotError> {
         let mut state = self.inner.write_state();
-        if !state.accept_revision(version) {
+        if state.revision.is_some_and(|current| current >= version) {
             return Ok(false);
         }
         if record.service_kind != self.inner.service_kind {
+            state.accept_revision(version);
             return Ok(false);
         }
         let key = singleton_key(&record);
-        if record.owner != self.inner.instance_id {
-            let changed = apply_remote_update(&mut state.singletons, key, version);
-            if changed {
-                state.bump_generation();
-            }
-            return Ok(changed);
-        }
-        if state
-            .singletons
-            .get(&key)
-            .is_some_and(|current| current.version >= version)
+        let authority = OwnershipAuthorityFloor::singleton(&record);
+        let is_local = record.owner == self.inner.instance_id;
+        if let Some(current) = state.singletons.get(&key)
+            && let Err(error) = validate_authority_progression(
+                OwnershipKey::Singleton(key.clone()),
+                &current.authority,
+                &authority,
+                current.record.is_none() && is_local,
+            )
         {
-            return Ok(false);
+            Self::fence_rejected_batch(&mut state, &error);
+            return Err(error);
         }
         let already_present = state.singletons.contains_key(&key);
         self.ensure_insert_capacity(&mut state, already_present)?;
+        let authorization_changed =
+            local_authorization_changed(state.singletons.get(&key), is_local.then_some(&record));
+        state.accept_revision(version);
         state.singletons.insert(
             key,
             VersionedRecord {
                 version,
-                record: Some(record),
+                authority,
+                record: is_local.then_some(record),
             },
         );
-        state.bump_generation();
-        Ok(true)
+        if authorization_changed {
+            state.bump_generation();
+        }
+        Ok(authorization_changed)
     }
 
     pub fn remove(&self, key: &OwnershipKey, version: OwnershipRevision) -> bool {
@@ -682,17 +764,17 @@ impl LocalOwnershipSnapshot {
         if !state.accept_revision(version) {
             return false;
         }
-        let removed = match key {
+        let removal = match key {
             OwnershipKey::Explicit(key) => apply_removal(&mut state.actors, key, version),
             OwnershipKey::VirtualShard(key) => {
                 apply_removal(&mut state.virtual_shards, key, version)
             }
             OwnershipKey::Singleton(key) => apply_removal(&mut state.singletons, key, version),
         };
-        if removed {
+        if removal.authorization_changed {
             state.bump_generation();
         }
-        removed
+        removal.applied
     }
 
     fn validate_instance_identity(
@@ -829,53 +911,61 @@ impl LocalOwnershipSnapshot {
         state: &LocalOwnershipState,
         events: &[OwnershipWatchEvent],
     ) -> Result<(), OwnershipSnapshotError> {
+        let lifecycle_tombstones_placements = events.iter().any(|event| match event {
+            OwnershipWatchEvent::InstanceDeleted { record }
+                if record.service_kind == self.inner.service_kind
+                    && record.instance_id == self.inner.instance_id =>
+            {
+                true
+            }
+            OwnershipWatchEvent::InstanceUpserted { record }
+                if record.service_kind == self.inner.service_kind
+                    && record.instance_id == self.inner.instance_id =>
+            {
+                state
+                    .instance
+                    .is_some_and(|current| current.lease_id != record.lease_id)
+            }
+            _ => false,
+        });
         for event in events {
             match event {
                 OwnershipWatchEvent::ActorUpserted { key, record }
                     if key.service_kind == self.inner.service_kind =>
                 {
-                    if let Some(current) = state
-                        .actors
-                        .get(key)
-                        .and_then(|entry| entry.record.as_ref())
-                    {
-                        validate_epoch_progression(
+                    if let Some(current) = state.actors.get(key) {
+                        validate_authority_progression(
                             OwnershipKey::Explicit(key.clone()),
-                            current.epoch,
-                            record.epoch,
-                            current.owner != record.owner || current.lease_id != record.lease_id,
+                            &current.authority,
+                            &OwnershipAuthorityFloor::actor(record),
+                            (current.record.is_none() || lifecycle_tombstones_placements)
+                                && record.owner == self.inner.instance_id,
                         )?;
                     }
                 }
                 OwnershipWatchEvent::VirtualShardUpserted { key, record }
                     if key.service_kind == self.inner.service_kind =>
                 {
-                    if let Some(current) = state
-                        .virtual_shards
-                        .get(key)
-                        .and_then(|entry| entry.record.as_ref())
-                    {
-                        validate_epoch_progression(
+                    if let Some(current) = state.virtual_shards.get(key) {
+                        validate_authority_progression(
                             OwnershipKey::VirtualShard(key.clone()),
-                            current.epoch,
-                            record.epoch,
-                            current.owner != record.owner,
+                            &current.authority,
+                            &OwnershipAuthorityFloor::virtual_shard(record),
+                            (current.record.is_none() || lifecycle_tombstones_placements)
+                                && record.owner == self.inner.instance_id,
                         )?;
                     }
                 }
                 OwnershipWatchEvent::SingletonUpserted { key, record }
                     if key.service_kind == self.inner.service_kind =>
                 {
-                    if let Some(current) = state
-                        .singletons
-                        .get(key)
-                        .and_then(|entry| entry.record.as_ref())
-                    {
-                        validate_epoch_progression(
+                    if let Some(current) = state.singletons.get(key) {
+                        validate_authority_progression(
                             OwnershipKey::Singleton(key.clone()),
-                            current.epoch,
-                            record.epoch,
-                            current.owner != record.owner || current.lease_id != record.lease_id,
+                            &current.authority,
+                            &OwnershipAuthorityFloor::singleton(record),
+                            (current.record.is_none() || lifecycle_tombstones_placements)
+                                && record.owner == self.inner.instance_id,
                         )?;
                     }
                 }
@@ -923,7 +1013,8 @@ impl LocalOwnershipSnapshot {
                 OwnershipWatchEvent::ActorDeleted { key }
                     if key.service_kind == self.inner.service_kind =>
                 {
-                    changed |= apply_removal(&mut state.actors, key, revision);
+                    changed |=
+                        apply_removal(&mut state.actors, key, revision).authorization_changed;
                 }
                 OwnershipWatchEvent::VirtualShardUpserted { key, record }
                     if key.service_kind == self.inner.service_kind =>
@@ -933,7 +1024,8 @@ impl LocalOwnershipSnapshot {
                 OwnershipWatchEvent::VirtualShardDeleted { key }
                     if key.service_kind == self.inner.service_kind =>
                 {
-                    changed |= apply_removal(&mut state.virtual_shards, key, revision);
+                    changed |= apply_removal(&mut state.virtual_shards, key, revision)
+                        .authorization_changed;
                 }
                 OwnershipWatchEvent::SingletonUpserted { key, record }
                     if key.service_kind == self.inner.service_kind =>
@@ -943,7 +1035,8 @@ impl LocalOwnershipSnapshot {
                 OwnershipWatchEvent::SingletonDeleted { key }
                     if key.service_kind == self.inner.service_kind =>
                 {
-                    changed |= apply_removal(&mut state.singletons, key, revision);
+                    changed |=
+                        apply_removal(&mut state.singletons, key, revision).authorization_changed;
                 }
                 OwnershipWatchEvent::InstanceUpserted { .. }
                 | OwnershipWatchEvent::InstanceDeleted { .. }
@@ -976,9 +1069,7 @@ impl LocalOwnershipSnapshot {
             return true;
         }
 
-        state.actors.clear();
-        state.virtual_shards.clear();
-        state.singletons.clear();
+        state.tombstone_all_placements();
         state.valid_owner_leases.clear();
         state.instance = Some(LocalInstanceAuthority {
             lease_id: record.lease_id,
@@ -994,9 +1085,7 @@ impl LocalOwnershipSnapshot {
         _record: &InstanceRecord,
     ) -> bool {
         state.instance = None;
-        state.actors.clear();
-        state.virtual_shards.clear();
-        state.singletons.clear();
+        state.tombstone_all_placements();
         state.valid_owner_leases.clear();
         state.availability = SnapshotAvailability::Unavailable(OwnershipFenceReason::LeaseLost);
         true
@@ -1009,22 +1098,19 @@ impl LocalOwnershipSnapshot {
         record: &ActorPlacementRecord,
         revision: OwnershipRevision,
     ) -> Result<bool, OwnershipSnapshotError> {
-        if record.owner != self.inner.instance_id {
-            return Ok(apply_remote_update(
-                &mut state.actors,
-                key.clone(),
-                revision,
-            ));
-        }
+        let is_local = record.owner == self.inner.instance_id;
         self.ensure_staged_insert_capacity(state, state.actors.contains_key(key))?;
+        let authorization_changed =
+            local_authorization_changed(state.actors.get(key), is_local.then_some(record));
         state.actors.insert(
             key.clone(),
             VersionedRecord {
                 version: revision,
-                record: Some(record.clone()),
+                authority: OwnershipAuthorityFloor::actor(record),
+                record: is_local.then(|| record.clone()),
             },
         );
-        Ok(true)
+        Ok(authorization_changed)
     }
 
     fn stage_virtual_shard_upsert(
@@ -1034,22 +1120,19 @@ impl LocalOwnershipSnapshot {
         record: &VirtualShardPlacementRecord,
         revision: OwnershipRevision,
     ) -> Result<bool, OwnershipSnapshotError> {
-        if record.owner != self.inner.instance_id {
-            return Ok(apply_remote_update(
-                &mut state.virtual_shards,
-                key.clone(),
-                revision,
-            ));
-        }
+        let is_local = record.owner == self.inner.instance_id;
         self.ensure_staged_insert_capacity(state, state.virtual_shards.contains_key(key))?;
+        let authorization_changed =
+            local_authorization_changed(state.virtual_shards.get(key), is_local.then_some(record));
         state.virtual_shards.insert(
             key.clone(),
             VersionedRecord {
                 version: revision,
-                record: Some(record.clone()),
+                authority: OwnershipAuthorityFloor::virtual_shard(record),
+                record: is_local.then(|| record.clone()),
             },
         );
-        Ok(true)
+        Ok(authorization_changed)
     }
 
     fn stage_singleton_upsert(
@@ -1059,22 +1142,19 @@ impl LocalOwnershipSnapshot {
         record: &SingletonPlacementRecord,
         revision: OwnershipRevision,
     ) -> Result<bool, OwnershipSnapshotError> {
-        if record.owner != self.inner.instance_id {
-            return Ok(apply_remote_update(
-                &mut state.singletons,
-                key.clone(),
-                revision,
-            ));
-        }
+        let is_local = record.owner == self.inner.instance_id;
         self.ensure_staged_insert_capacity(state, state.singletons.contains_key(key))?;
+        let authorization_changed =
+            local_authorization_changed(state.singletons.get(key), is_local.then_some(record));
         state.singletons.insert(
             key.clone(),
             VersionedRecord {
                 version: revision,
-                record: Some(record.clone()),
+                authority: OwnershipAuthorityFloor::singleton(record),
+                record: is_local.then(|| record.clone()),
             },
         );
-        Ok(true)
+        Ok(authorization_changed)
     }
 
     fn ensure_staged_insert_capacity(
@@ -1130,32 +1210,49 @@ impl LocalOwnershipSnapshot {
             }
             match item {
                 OwnershipSnapshotRecord::Actor { version, record }
-                    if record.service_kind == self.inner.service_kind
-                        && record.owner == self.inner.instance_id =>
+                    if record.service_kind == self.inner.service_kind =>
                 {
-                    insert_collected_record(&mut maps.actors, actor_key(&record), version, record);
+                    let key = actor_key(&record);
+                    let authority = OwnershipAuthorityFloor::actor(&record);
+                    let local = record.owner == self.inner.instance_id;
+                    insert_collected_record(
+                        &mut maps.actors,
+                        key,
+                        version,
+                        authority,
+                        local.then_some(record),
+                        OwnershipKey::Explicit,
+                    )?;
                 }
                 OwnershipSnapshotRecord::VirtualShard { version, record }
-                    if record.service_kind == self.inner.service_kind
-                        && record.owner == self.inner.instance_id =>
+                    if record.service_kind == self.inner.service_kind =>
                 {
+                    let key = virtual_shard_key(&record);
+                    let authority = OwnershipAuthorityFloor::virtual_shard(&record);
+                    let local = record.owner == self.inner.instance_id;
                     insert_collected_record(
                         &mut maps.virtual_shards,
-                        virtual_shard_key(&record),
+                        key,
                         version,
-                        record,
-                    );
+                        authority,
+                        local.then_some(record),
+                        OwnershipKey::VirtualShard,
+                    )?;
                 }
                 OwnershipSnapshotRecord::Singleton { version, record }
-                    if record.service_kind == self.inner.service_kind
-                        && record.owner == self.inner.instance_id =>
+                    if record.service_kind == self.inner.service_kind =>
                 {
+                    let key = singleton_key(&record);
+                    let authority = OwnershipAuthorityFloor::singleton(&record);
+                    let local = record.owner == self.inner.instance_id;
                     insert_collected_record(
                         &mut maps.singletons,
-                        singleton_key(&record),
+                        key,
                         version,
-                        record,
-                    );
+                        authority,
+                        local.then_some(record),
+                        OwnershipKey::Singleton,
+                    )?;
                 }
                 _ => {}
             }
@@ -1215,84 +1312,130 @@ impl CollectedLocalRecords {
     }
 }
 
-fn insert_collected_record<K, V>(
+fn insert_collected_record<K, V, F>(
     records: &mut HashMap<K, VersionedRecord<V>>,
     key: K,
     version: OwnershipRevision,
-    record: V,
-) where
-    K: Eq + std::hash::Hash,
+    authority: OwnershipAuthorityFloor,
+    record: Option<V>,
+    ownership_key: F,
+) -> Result<(), OwnershipSnapshotError>
+where
+    K: Clone + Eq + std::hash::Hash,
+    F: FnOnce(K) -> OwnershipKey,
 {
-    if records
-        .get(&key)
-        .is_some_and(|current| current.version >= version)
-    {
-        return;
+    if records.contains_key(&key) {
+        return Err(OwnershipSnapshotError::DuplicatePlacementEvent {
+            key: Box::new(ownership_key(key)),
+        });
     }
     records.insert(
         key,
         VersionedRecord {
             version,
-            record: Some(record),
+            authority,
+            record,
         },
     );
+    Ok(())
 }
 
-fn apply_remote_update<K, V>(
-    records: &mut HashMap<K, VersionedRecord<V>>,
-    key: K,
-    version: OwnershipRevision,
-) -> bool
+fn merge_resync_authority_floors<K, V, F>(
+    current: &HashMap<K, VersionedRecord<V>>,
+    incoming: &mut HashMap<K, VersionedRecord<V>>,
+    ownership_key: F,
+) -> Result<(), OwnershipSnapshotError>
 where
-    K: Eq + std::hash::Hash,
+    K: Clone + Eq + std::hash::Hash,
+    V: Clone,
+    F: Fn(&K) -> OwnershipKey,
 {
-    let Some(current) = records.get_mut(&key) else {
-        return false;
-    };
-    if current.version >= version {
-        return false;
+    for (key, incoming_entry) in incoming.iter_mut() {
+        let Some(current_entry) = current.get(key) else {
+            continue;
+        };
+        validate_authority_progression(
+            ownership_key(key),
+            &current_entry.authority,
+            &incoming_entry.authority,
+            current_entry.record.is_none() && incoming_entry.record.is_some(),
+        )?;
+        incoming_entry.version = incoming_entry.version.max(current_entry.version);
     }
-    current.version = version;
-    current.record = None;
-    true
+
+    for (key, current_entry) in current {
+        incoming
+            .entry(key.clone())
+            .or_insert_with(|| VersionedRecord {
+                version: current_entry.version,
+                authority: current_entry.authority.clone(),
+                record: None,
+            });
+    }
+    Ok(())
 }
 
 fn apply_removal<K, V>(
     records: &mut HashMap<K, VersionedRecord<V>>,
     key: &K,
     version: OwnershipRevision,
-) -> bool
+) -> PlacementMutation
 where
     K: Eq + std::hash::Hash,
 {
     let Some(current) = records.get_mut(key) else {
-        return false;
+        return PlacementMutation::default();
     };
     if current.version > version || (current.version == version && current.record.is_none()) {
-        return false;
+        return PlacementMutation::default();
     }
+    let authorization_changed = current.record.is_some();
     current.version = version;
     current.record = None;
-    true
+    PlacementMutation {
+        applied: true,
+        authorization_changed,
+    }
 }
 
-fn validate_epoch_progression(
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PlacementMutation {
+    applied: bool,
+    authorization_changed: bool,
+}
+
+fn local_authorization_changed<T: PartialEq>(
+    current: Option<&VersionedRecord<T>>,
+    incoming_local: Option<&T>,
+) -> bool {
+    current.and_then(|entry| entry.record.as_ref()) != incoming_local
+}
+
+fn validate_authority_progression(
     key: OwnershipKey,
-    current: Epoch,
-    incoming: Epoch,
-    authority_changed: bool,
+    current: &OwnershipAuthorityFloor,
+    incoming: &OwnershipAuthorityFloor,
+    reactivating: bool,
 ) -> Result<(), OwnershipSnapshotError> {
-    if incoming < current {
+    if incoming.epoch < current.epoch {
         return Err(OwnershipSnapshotError::EpochRegression {
             key: Box::new(key),
-            current,
-            incoming,
+            current: current.epoch,
+            incoming: incoming.epoch,
         });
     }
-    if incoming == current && authority_changed {
+    if incoming.epoch == current.epoch
+        && (incoming.owner != current.owner || incoming.lease_id != current.lease_id)
+    {
         return Err(OwnershipSnapshotError::EpochAuthorityConflict {
             key: Box::new(key),
-            epoch: incoming,
+            epoch: incoming.epoch,
+        });
+    }
+    if incoming.epoch == current.epoch && reactivating {
+        return Err(OwnershipSnapshotError::EpochReactivation {
+            key: Box::new(key),
+            epoch: incoming.epoch,
         });
     }
     Ok(())
@@ -1521,6 +1664,18 @@ impl LocalOwnershipState {
 
     fn bump_generation(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn tombstone_all_placements(&mut self) {
+        for entry in self.actors.values_mut() {
+            entry.record = None;
+        }
+        for entry in self.virtual_shards.values_mut() {
+            entry.record = None;
+        }
+        for entry in self.singletons.values_mut() {
+            entry.record = None;
+        }
     }
 
     fn accept_revision(&mut self, incoming: OwnershipRevision) -> bool {
@@ -1877,7 +2032,7 @@ mod tests {
         snapshot
             .apply_actor(
                 OwnershipRevision(3),
-                actor_record(7, "world-a", 3, LeaseId(99), PlacementState::Running),
+                actor_record(7, "world-a", 4, LeaseId(99), PlacementState::Running),
             )
             .unwrap();
         let invalid_lease = gate
@@ -1886,7 +2041,7 @@ mod tests {
                 &actor,
                 &actor,
                 &route_key,
-                Some(Epoch(3)),
+                Some(Epoch(4)),
                 &placement,
             ))
             .unwrap_err();
@@ -2693,7 +2848,7 @@ mod tests {
 
     #[test]
     fn instance_events_preserve_explicit_lease_validation_and_fence_deletes() {
-        let (snapshot, gate) = ready_snapshot(1);
+        let (snapshot, gate) = ready_snapshot(2);
         let actor = actor_record(1, "world-a", 1, INSTANCE_LEASE, PlacementState::Running);
         snapshot
             .apply_watch_batch(watch_batch(
@@ -2750,7 +2905,8 @@ mod tests {
             ))
             .unwrap();
         let state = snapshot.inner.read_state();
-        assert!(state.actors.is_empty());
+        assert_eq!(state.actors.len(), 1);
+        assert!(state.actors.values().all(|entry| entry.record.is_none()));
         assert!(state.valid_owner_leases.is_empty());
         assert_eq!(state.instance.unwrap().lease_id, new_lease);
         assert_eq!(
@@ -2812,7 +2968,8 @@ mod tests {
             .unwrap();
         let state = snapshot.inner.read_state();
         assert!(state.instance.is_none());
-        assert!(state.actors.is_empty());
+        assert_eq!(state.actors.len(), 2);
+        assert!(state.actors.values().all(|entry| entry.record.is_none()));
         assert!(state.valid_owner_leases.is_empty());
         assert_eq!(
             state.availability,
@@ -2918,8 +3075,1081 @@ mod tests {
     }
 
     #[test]
-    fn remote_absent_updates_consume_no_capacity_but_existing_remote_updates_revoke() {
-        let (snapshot, gate) = ready_snapshot(1);
+    fn all_placement_floors_reject_lower_and_equal_conflicts_but_allow_higher_returns() {
+        let moved_actor = || {
+            let (snapshot, _) = ready_snapshot(1);
+            snapshot
+                .apply_actor(
+                    OwnershipRevision(1),
+                    actor_record(1, "world-a", 5, INSTANCE_LEASE, PlacementState::Running),
+                )
+                .unwrap();
+            snapshot
+                .apply_actor(
+                    OwnershipRevision(2),
+                    actor_record(1, "world-b", 6, LeaseId(22), PlacementState::Running),
+                )
+                .unwrap();
+            snapshot
+        };
+        let actor_lower = moved_actor();
+        assert!(matches!(
+            actor_lower.apply_actor(
+                OwnershipRevision(3),
+                actor_record(1, "world-a", 5, INSTANCE_LEASE, PlacementState::Running),
+            ),
+            Err(OwnershipSnapshotError::EpochRegression { .. })
+        ));
+        assert_eq!(
+            actor_lower.inner.read_state().revision,
+            Some(OwnershipRevision(2))
+        );
+
+        let actor_equal = moved_actor();
+        assert!(matches!(
+            actor_equal.apply_actor(
+                OwnershipRevision(3),
+                actor_record(1, "world-a", 6, INSTANCE_LEASE, PlacementState::Running),
+            ),
+            Err(OwnershipSnapshotError::EpochAuthorityConflict { .. })
+        ));
+
+        let actor_higher = moved_actor();
+        actor_higher
+            .apply_actor(
+                OwnershipRevision(3),
+                actor_record(1, "world-a", 7, INSTANCE_LEASE, PlacementState::Running),
+            )
+            .unwrap();
+        let actor_key = actor_key(&actor_record(
+            1,
+            "world-a",
+            7,
+            INSTANCE_LEASE,
+            PlacementState::Running,
+        ));
+        assert_eq!(
+            actor_higher.inner.read_state().actors[&actor_key]
+                .record
+                .as_ref()
+                .unwrap()
+                .epoch,
+            Epoch(7)
+        );
+
+        let moved_shard = || {
+            let (snapshot, _) = ready_snapshot(1);
+            snapshot
+                .apply_virtual_shard(OwnershipRevision(1), virtual_shard_record(1, "world-a", 5))
+                .unwrap();
+            snapshot
+                .apply_virtual_shard(OwnershipRevision(2), virtual_shard_record(1, "world-b", 6))
+                .unwrap();
+            snapshot
+        };
+        let shard_lower = moved_shard();
+        assert!(matches!(
+            shard_lower
+                .apply_virtual_shard(OwnershipRevision(3), virtual_shard_record(1, "world-a", 5),),
+            Err(OwnershipSnapshotError::EpochRegression { .. })
+        ));
+
+        let shard_equal = moved_shard();
+        let equal_shard = virtual_shard_record(1, "world-a", 6);
+        assert!(matches!(
+            shard_equal.apply_watch_batch(watch_batch(
+                3,
+                vec![OwnershipWatchEvent::VirtualShardUpserted {
+                    key: virtual_shard_key(&equal_shard),
+                    record: equal_shard,
+                }],
+            )),
+            Err(OwnershipSnapshotError::EpochAuthorityConflict { .. })
+        ));
+        assert_eq!(
+            shard_equal.inner.read_state().revision,
+            Some(OwnershipRevision(2))
+        );
+
+        let shard_higher = moved_shard();
+        shard_higher
+            .apply_virtual_shard(OwnershipRevision(3), virtual_shard_record(1, "world-a", 7))
+            .unwrap();
+        let shard_key = virtual_shard_key(&virtual_shard_record(1, "world-a", 7));
+        assert_eq!(
+            shard_higher.inner.read_state().virtual_shards[&shard_key]
+                .record
+                .as_ref()
+                .unwrap()
+                .epoch,
+            Epoch(7)
+        );
+
+        let moved_singleton = || {
+            let (snapshot, _) = ready_snapshot(1);
+            snapshot
+                .apply_singleton(
+                    OwnershipRevision(1),
+                    singleton_record(
+                        "global",
+                        "world-a",
+                        5,
+                        INSTANCE_LEASE,
+                        PlacementState::Running,
+                    ),
+                )
+                .unwrap();
+            snapshot
+                .apply_singleton(
+                    OwnershipRevision(2),
+                    singleton_record("global", "world-b", 6, LeaseId(22), PlacementState::Running),
+                )
+                .unwrap();
+            snapshot
+        };
+        let singleton_lower = moved_singleton();
+        assert!(matches!(
+            singleton_lower.apply_singleton(
+                OwnershipRevision(3),
+                singleton_record(
+                    "global",
+                    "world-a",
+                    5,
+                    INSTANCE_LEASE,
+                    PlacementState::Running,
+                ),
+            ),
+            Err(OwnershipSnapshotError::EpochRegression { .. })
+        ));
+
+        let singleton_equal = moved_singleton();
+        assert!(matches!(
+            singleton_equal.apply_singleton(
+                OwnershipRevision(3),
+                singleton_record(
+                    "global",
+                    "world-a",
+                    6,
+                    INSTANCE_LEASE,
+                    PlacementState::Running,
+                ),
+            ),
+            Err(OwnershipSnapshotError::EpochAuthorityConflict { .. })
+        ));
+
+        let singleton_higher = moved_singleton();
+        singleton_higher
+            .apply_singleton(
+                OwnershipRevision(3),
+                singleton_record(
+                    "global",
+                    "world-a",
+                    7,
+                    INSTANCE_LEASE,
+                    PlacementState::Running,
+                ),
+            )
+            .unwrap();
+        let singleton_key = singleton_key(&singleton_record(
+            "global",
+            "world-a",
+            7,
+            INSTANCE_LEASE,
+            PlacementState::Running,
+        ));
+        assert_eq!(
+            singleton_higher.inner.read_state().singletons[&singleton_key]
+                .record
+                .as_ref()
+                .unwrap()
+                .epoch,
+            Epoch(7)
+        );
+
+        let (state_only, _) = ready_snapshot(1);
+        state_only
+            .apply_singleton(
+                OwnershipRevision(1),
+                singleton_record(
+                    "state-only",
+                    "world-a",
+                    5,
+                    INSTANCE_LEASE,
+                    PlacementState::Running,
+                ),
+            )
+            .unwrap();
+        state_only
+            .apply_singleton(
+                OwnershipRevision(2),
+                singleton_record(
+                    "state-only",
+                    "world-a",
+                    5,
+                    INSTANCE_LEASE,
+                    PlacementState::Draining,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            state_only
+                .inner
+                .read_state()
+                .singletons
+                .values()
+                .next()
+                .unwrap()
+                .record
+                .as_ref()
+                .unwrap()
+                .state,
+            PlacementState::Draining
+        );
+    }
+
+    #[test]
+    fn deleted_placements_require_higher_epochs_to_reactivate_atomically() {
+        let deleted = || {
+            let (snapshot, gate) = ready_snapshot(3);
+            let actor = actor_record(1, "world-a", 5, INSTANCE_LEASE, PlacementState::Running);
+            let shard = virtual_shard_record(1, "world-a", 5);
+            let singleton = singleton_record(
+                "global",
+                "world-a",
+                5,
+                INSTANCE_LEASE,
+                PlacementState::Running,
+            );
+            snapshot
+                .apply_watch_batch(watch_batch(
+                    1,
+                    vec![
+                        OwnershipWatchEvent::ActorUpserted {
+                            key: actor_key(&actor),
+                            record: actor.clone(),
+                        },
+                        OwnershipWatchEvent::VirtualShardUpserted {
+                            key: virtual_shard_key(&shard),
+                            record: shard.clone(),
+                        },
+                        OwnershipWatchEvent::SingletonUpserted {
+                            key: singleton_key(&singleton),
+                            record: singleton.clone(),
+                        },
+                    ],
+                ))
+                .unwrap();
+            let service = service_kind!("World");
+            let kind = actor_kind!("World");
+            let route = RouteKey::U64(1);
+            let grant = gate
+                .authorize(request(
+                    &service,
+                    &kind,
+                    &kind,
+                    &route,
+                    Some(Epoch(5)),
+                    &OwnershipPlacement::Explicit,
+                ))
+                .unwrap();
+            snapshot
+                .apply_watch_batch(watch_batch(
+                    2,
+                    vec![
+                        OwnershipWatchEvent::ActorDeleted {
+                            key: actor_key(&actor),
+                        },
+                        OwnershipWatchEvent::VirtualShardDeleted {
+                            key: virtual_shard_key(&shard),
+                        },
+                        OwnershipWatchEvent::SingletonDeleted {
+                            key: singleton_key(&singleton),
+                        },
+                    ],
+                ))
+                .unwrap();
+            assert!(!gate.is_current(&grant));
+            (snapshot, actor, shard, singleton)
+        };
+
+        let (same_epoch, actor, _, _) = deleted();
+        assert!(matches!(
+            same_epoch.apply_watch_batch(watch_batch(
+                3,
+                vec![OwnershipWatchEvent::ActorUpserted {
+                    key: actor_key(&actor),
+                    record: actor,
+                }],
+            )),
+            Err(OwnershipSnapshotError::EpochReactivation { .. })
+        ));
+        let state = same_epoch.inner.read_state();
+        assert_eq!(state.revision, Some(OwnershipRevision(2)));
+        assert!(state.actors.values().all(|entry| entry.record.is_none()));
+        assert!(
+            state
+                .virtual_shards
+                .values()
+                .all(|entry| entry.record.is_none())
+        );
+        assert!(
+            state
+                .singletons
+                .values()
+                .all(|entry| entry.record.is_none())
+        );
+        drop(state);
+
+        let (same_shard, _, shard, _) = deleted();
+        assert!(matches!(
+            same_shard.apply_watch_batch(watch_batch(
+                3,
+                vec![OwnershipWatchEvent::VirtualShardUpserted {
+                    key: virtual_shard_key(&shard),
+                    record: shard,
+                }],
+            )),
+            Err(OwnershipSnapshotError::EpochReactivation { .. })
+        ));
+        assert_eq!(
+            same_shard.inner.read_state().revision,
+            Some(OwnershipRevision(2))
+        );
+
+        let (same_singleton, _, _, singleton) = deleted();
+        assert!(matches!(
+            same_singleton.apply_watch_batch(watch_batch(
+                3,
+                vec![OwnershipWatchEvent::SingletonUpserted {
+                    key: singleton_key(&singleton),
+                    record: singleton,
+                }],
+            )),
+            Err(OwnershipSnapshotError::EpochReactivation { .. })
+        ));
+        assert_eq!(
+            same_singleton.inner.read_state().revision,
+            Some(OwnershipRevision(2))
+        );
+
+        let (higher, _, _, _) = deleted();
+        let actor = actor_record(1, "world-a", 6, INSTANCE_LEASE, PlacementState::Running);
+        let shard = virtual_shard_record(1, "world-a", 6);
+        let singleton = singleton_record(
+            "global",
+            "world-a",
+            6,
+            INSTANCE_LEASE,
+            PlacementState::Running,
+        );
+        higher
+            .apply_watch_batch(watch_batch(
+                3,
+                vec![
+                    OwnershipWatchEvent::ActorUpserted {
+                        key: actor_key(&actor),
+                        record: actor,
+                    },
+                    OwnershipWatchEvent::VirtualShardUpserted {
+                        key: virtual_shard_key(&shard),
+                        record: shard,
+                    },
+                    OwnershipWatchEvent::SingletonUpserted {
+                        key: singleton_key(&singleton),
+                        record: singleton,
+                    },
+                ],
+            ))
+            .unwrap();
+        let state = higher.inner.read_state();
+        assert!(state.actors.values().all(|entry| entry.record.is_some()));
+        assert!(
+            state
+                .virtual_shards
+                .values()
+                .all(|entry| entry.record.is_some())
+        );
+        assert!(
+            state
+                .singletons
+                .values()
+                .all(|entry| entry.record.is_some())
+        );
+        drop(state);
+
+        let (legacy, _) = ready_snapshot(1);
+        let actor = actor_record(9, "world-a", 4, INSTANCE_LEASE, PlacementState::Running);
+        let key = OwnershipKey::Explicit(actor_key(&actor));
+        legacy
+            .apply_actor(OwnershipRevision(1), actor.clone())
+            .unwrap();
+        assert!(legacy.remove(&key, OwnershipRevision(2)));
+        assert!(matches!(
+            legacy.apply_actor(OwnershipRevision(3), actor),
+            Err(OwnershipSnapshotError::EpochReactivation { .. })
+        ));
+        assert_eq!(
+            legacy.inner.read_state().revision,
+            Some(OwnershipRevision(2))
+        );
+
+        let (bounded_deleted, _) = ready_snapshot(1);
+        let first = actor_record(1, "world-a", 1, INSTANCE_LEASE, PlacementState::Running);
+        bounded_deleted
+            .apply_actor(OwnershipRevision(1), first.clone())
+            .unwrap();
+        assert!(bounded_deleted.remove(
+            &OwnershipKey::Explicit(actor_key(&first)),
+            OwnershipRevision(2),
+        ));
+        assert_eq!(
+            bounded_deleted.apply_actor(
+                OwnershipRevision(3),
+                actor_record(2, "world-a", 1, INSTANCE_LEASE, PlacementState::Running),
+            ),
+            Err(OwnershipSnapshotError::CapacityExceeded { max_entries: 1 })
+        );
+        let state = bounded_deleted.inner.read_state();
+        assert_eq!(state.actors.len(), 1);
+        assert!(state.actors.values().next().unwrap().record.is_none());
+    }
+
+    #[test]
+    fn resync_merges_remote_and_missing_records_into_monotonic_authority_floors() {
+        let moved_by_resync = || {
+            let (snapshot, gate) = ready_snapshot(3);
+            resync(
+                &snapshot,
+                INSTANCE_LEASE,
+                vec![
+                    OwnershipSnapshotRecord::Actor {
+                        version: OwnershipRevision(1),
+                        record: actor_record(
+                            1,
+                            "world-a",
+                            1,
+                            INSTANCE_LEASE,
+                            PlacementState::Running,
+                        ),
+                    },
+                    OwnershipSnapshotRecord::VirtualShard {
+                        version: OwnershipRevision(1),
+                        record: virtual_shard_record(1, "world-a", 1),
+                    },
+                    OwnershipSnapshotRecord::Singleton {
+                        version: OwnershipRevision(1),
+                        record: singleton_record(
+                            "global",
+                            "world-a",
+                            1,
+                            INSTANCE_LEASE,
+                            PlacementState::Running,
+                        ),
+                    },
+                ],
+            );
+            let token = snapshot.begin_resync(INSTANCE_LEASE).unwrap();
+            snapshot
+                .replace_from_resync(
+                    token,
+                    OwnershipRevision(10),
+                    vec![
+                        OwnershipSnapshotRecord::Actor {
+                            version: OwnershipRevision(8),
+                            record: actor_record(
+                                1,
+                                "world-b",
+                                2,
+                                LeaseId(22),
+                                PlacementState::Running,
+                            ),
+                        },
+                        OwnershipSnapshotRecord::VirtualShard {
+                            version: OwnershipRevision(9),
+                            record: virtual_shard_record(1, "world-b", 2),
+                        },
+                        OwnershipSnapshotRecord::Singleton {
+                            version: OwnershipRevision(10),
+                            record: singleton_record(
+                                "global",
+                                "world-b",
+                                2,
+                                LeaseId(22),
+                                PlacementState::Running,
+                            ),
+                        },
+                    ],
+                )
+                .unwrap();
+            (snapshot, gate)
+        };
+
+        let (lower, _) = moved_by_resync();
+        let token = lower.begin_resync(INSTANCE_LEASE).unwrap();
+        assert!(matches!(
+            lower.replace_from_resync(
+                token,
+                OwnershipRevision(11),
+                vec![OwnershipSnapshotRecord::Actor {
+                    version: OwnershipRevision(11),
+                    record: actor_record(1, "world-a", 1, INSTANCE_LEASE, PlacementState::Running,),
+                }],
+            ),
+            Err(OwnershipSnapshotError::EpochRegression { .. })
+        ));
+        let state = lower.inner.read_state();
+        assert_eq!(state.revision, Some(OwnershipRevision(10)));
+        assert_eq!(
+            state.actors.values().next().unwrap().authority.epoch,
+            Epoch(2)
+        );
+        assert!(state.actors.values().next().unwrap().record.is_none());
+        assert_eq!(
+            state.availability,
+            SnapshotAvailability::Unavailable(OwnershipFenceReason::Resyncing)
+        );
+        drop(state);
+
+        let (equal_conflict, _) = moved_by_resync();
+        let token = equal_conflict.begin_resync(INSTANCE_LEASE).unwrap();
+        assert!(matches!(
+            equal_conflict.replace_from_resync(
+                token,
+                OwnershipRevision(11),
+                vec![OwnershipSnapshotRecord::VirtualShard {
+                    version: OwnershipRevision(11),
+                    record: virtual_shard_record(1, "world-a", 2),
+                }],
+            ),
+            Err(OwnershipSnapshotError::EpochAuthorityConflict { .. })
+        ));
+        assert_eq!(
+            equal_conflict.inner.read_state().revision,
+            Some(OwnershipRevision(10))
+        );
+
+        let (missing, _) = moved_by_resync();
+        let token = missing.begin_resync(INSTANCE_LEASE).unwrap();
+        missing
+            .replace_from_resync(
+                token,
+                OwnershipRevision(11),
+                std::iter::empty::<OwnershipSnapshotRecord>(),
+            )
+            .unwrap();
+        let state = missing.inner.read_state();
+        assert_eq!(state.entry_count(), 3);
+        assert!(state.actors.values().all(|entry| entry.record.is_none()));
+        assert!(
+            state
+                .virtual_shards
+                .values()
+                .all(|entry| entry.record.is_none())
+        );
+        assert!(
+            state
+                .singletons
+                .values()
+                .all(|entry| entry.record.is_none())
+        );
+        drop(state);
+        assert!(matches!(
+            missing.apply_singleton(
+                OwnershipRevision(12),
+                singleton_record(
+                    "global",
+                    "world-a",
+                    1,
+                    INSTANCE_LEASE,
+                    PlacementState::Running,
+                ),
+            ),
+            Err(OwnershipSnapshotError::EpochRegression { .. })
+        ));
+
+        let (higher, gate) = moved_by_resync();
+        higher
+            .apply_actor(
+                OwnershipRevision(11),
+                actor_record(1, "world-a", 3, INSTANCE_LEASE, PlacementState::Running),
+            )
+            .unwrap();
+        higher
+            .apply_virtual_shard(OwnershipRevision(12), virtual_shard_record(1, "world-a", 3))
+            .unwrap();
+        higher
+            .apply_singleton(
+                OwnershipRevision(13),
+                singleton_record(
+                    "global",
+                    "world-a",
+                    3,
+                    INSTANCE_LEASE,
+                    PlacementState::Running,
+                ),
+            )
+            .unwrap();
+        let state = higher.inner.read_state();
+        assert!(state.actors.values().all(|entry| entry.record.is_some()));
+        assert!(
+            state
+                .virtual_shards
+                .values()
+                .all(|entry| entry.record.is_some())
+        );
+        assert!(
+            state
+                .singletons
+                .values()
+                .all(|entry| entry.record.is_some())
+        );
+        drop(state);
+        let service = service_kind!("World");
+        let kind = actor_kind!("World");
+        let route = RouteKey::U64(1);
+        assert!(
+            gate.authorize(request(
+                &service,
+                &kind,
+                &kind,
+                &route,
+                Some(Epoch(3)),
+                &OwnershipPlacement::Explicit,
+            ))
+            .is_ok()
+        );
+
+        let (never_local, _) = ready_snapshot(1);
+        resync(
+            &never_local,
+            INSTANCE_LEASE,
+            vec![OwnershipSnapshotRecord::Actor {
+                version: OwnershipRevision(5),
+                record: actor_record(9, "world-b", 5, LeaseId(22), PlacementState::Running),
+            }],
+        );
+        assert!(matches!(
+            never_local.apply_actor(
+                OwnershipRevision(6),
+                actor_record(9, "world-a", 4, INSTANCE_LEASE, PlacementState::Running),
+            ),
+            Err(OwnershipSnapshotError::EpochRegression { .. })
+        ));
+        assert!(
+            never_local
+                .inner
+                .read_state()
+                .actors
+                .values()
+                .next()
+                .unwrap()
+                .record
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resync_rejects_duplicate_logical_keys_for_every_placement_family() {
+        let actor_snapshot = ready_snapshot(2).0;
+        let token = actor_snapshot.begin_resync(INSTANCE_LEASE).unwrap();
+        assert!(matches!(
+            actor_snapshot.replace_from_resync(
+                token,
+                OwnershipRevision(2),
+                vec![
+                    OwnershipSnapshotRecord::Actor {
+                        version: OwnershipRevision(1),
+                        record: actor_record(
+                            1,
+                            "world-a",
+                            1,
+                            INSTANCE_LEASE,
+                            PlacementState::Running,
+                        ),
+                    },
+                    OwnershipSnapshotRecord::Actor {
+                        version: OwnershipRevision(2),
+                        record: actor_record(
+                            1,
+                            "world-b",
+                            2,
+                            LeaseId(22),
+                            PlacementState::Running,
+                        ),
+                    },
+                ],
+            ),
+            Err(OwnershipSnapshotError::DuplicatePlacementEvent { .. })
+        ));
+        assert_eq!(
+            actor_snapshot.inner.read_state().revision,
+            Some(OwnershipRevision(0))
+        );
+
+        let shard_snapshot = ready_snapshot(2).0;
+        let token = shard_snapshot.begin_resync(INSTANCE_LEASE).unwrap();
+        assert!(matches!(
+            shard_snapshot.replace_from_resync(
+                token,
+                OwnershipRevision(2),
+                vec![
+                    OwnershipSnapshotRecord::VirtualShard {
+                        version: OwnershipRevision(1),
+                        record: virtual_shard_record(1, "world-a", 1),
+                    },
+                    OwnershipSnapshotRecord::VirtualShard {
+                        version: OwnershipRevision(2),
+                        record: virtual_shard_record(1, "world-b", 2),
+                    },
+                ],
+            ),
+            Err(OwnershipSnapshotError::DuplicatePlacementEvent { .. })
+        ));
+        assert_eq!(
+            shard_snapshot.inner.read_state().revision,
+            Some(OwnershipRevision(0))
+        );
+
+        let singleton_snapshot = ready_snapshot(2).0;
+        let token = singleton_snapshot.begin_resync(INSTANCE_LEASE).unwrap();
+        assert!(matches!(
+            singleton_snapshot.replace_from_resync(
+                token,
+                OwnershipRevision(2),
+                vec![
+                    OwnershipSnapshotRecord::Singleton {
+                        version: OwnershipRevision(1),
+                        record: singleton_record(
+                            "global",
+                            "world-a",
+                            1,
+                            INSTANCE_LEASE,
+                            PlacementState::Running,
+                        ),
+                    },
+                    OwnershipSnapshotRecord::Singleton {
+                        version: OwnershipRevision(2),
+                        record: singleton_record(
+                            "global",
+                            "world-b",
+                            2,
+                            LeaseId(22),
+                            PlacementState::Running,
+                        ),
+                    },
+                ],
+            ),
+            Err(OwnershipSnapshotError::DuplicatePlacementEvent { .. })
+        ));
+        assert_eq!(
+            singleton_snapshot.inner.read_state().revision,
+            Some(OwnershipRevision(0))
+        );
+    }
+
+    #[test]
+    fn instance_reincarnation_preserves_floors_and_global_revision() {
+        let (snapshot, gate) = ready_snapshot(3);
+        let actor = actor_record(1, "world-a", 5, INSTANCE_LEASE, PlacementState::Running);
+        let shard = virtual_shard_record(1, "world-a", 5);
+        let singleton = singleton_record(
+            "global",
+            "world-a",
+            5,
+            INSTANCE_LEASE,
+            PlacementState::Running,
+        );
+        snapshot
+            .apply_watch_batch(watch_batch(
+                10,
+                vec![
+                    OwnershipWatchEvent::ActorUpserted {
+                        key: actor_key(&actor),
+                        record: actor.clone(),
+                    },
+                    OwnershipWatchEvent::VirtualShardUpserted {
+                        key: virtual_shard_key(&shard),
+                        record: shard.clone(),
+                    },
+                    OwnershipWatchEvent::SingletonUpserted {
+                        key: singleton_key(&singleton),
+                        record: singleton.clone(),
+                    },
+                ],
+            ))
+            .unwrap();
+        let service = service_kind!("World");
+        let kind = actor_kind!("World");
+        let route = RouteKey::U64(1);
+        let grant = gate
+            .authorize(request(
+                &service,
+                &kind,
+                &kind,
+                &route,
+                Some(Epoch(5)),
+                &OwnershipPlacement::Explicit,
+            ))
+            .unwrap();
+
+        let new_lease = LeaseId(22);
+        snapshot
+            .install_local_instance(
+                instance_record("World", "world-a", new_lease, InstanceState::Ready),
+                true,
+            )
+            .unwrap();
+        let actor_key = actor_key(&actor);
+        let shard_key = virtual_shard_key(&shard);
+        let singleton_key = singleton_key(&singleton);
+        let state = snapshot.inner.read_state();
+        assert_eq!(state.revision, Some(OwnershipRevision(10)));
+        assert_eq!(state.actors[&actor_key].version, OwnershipRevision(10));
+        assert_eq!(state.actors[&actor_key].authority.epoch, Epoch(5));
+        assert!(state.actors[&actor_key].record.is_none());
+        assert_eq!(
+            state.virtual_shards[&shard_key].version,
+            OwnershipRevision(10)
+        );
+        assert_eq!(state.virtual_shards[&shard_key].authority.epoch, Epoch(5));
+        assert!(state.virtual_shards[&shard_key].record.is_none());
+        assert_eq!(
+            state.singletons[&singleton_key].version,
+            OwnershipRevision(10)
+        );
+        assert_eq!(state.singletons[&singleton_key].authority.epoch, Epoch(5));
+        assert!(state.singletons[&singleton_key].record.is_none());
+        drop(state);
+        assert!(!gate.is_current(&grant));
+
+        assert!(
+            !snapshot
+                .apply_actor(
+                    OwnershipRevision(9),
+                    actor_record(1, "world-a", 9, new_lease, PlacementState::Running),
+                )
+                .unwrap()
+        );
+        assert!(
+            !snapshot
+                .apply_virtual_shard(OwnershipRevision(9), virtual_shard_record(1, "world-a", 9),)
+                .unwrap()
+        );
+        assert!(
+            !snapshot
+                .apply_singleton(
+                    OwnershipRevision(9),
+                    singleton_record("global", "world-a", 9, new_lease, PlacementState::Running,),
+                )
+                .unwrap()
+        );
+        let state = snapshot.inner.read_state();
+        assert_eq!(state.revision, Some(OwnershipRevision(10)));
+        assert_eq!(state.actors[&actor_key].authority.epoch, Epoch(5));
+        assert_eq!(state.actors[&actor_key].version, OwnershipRevision(10));
+        assert_eq!(state.virtual_shards[&shard_key].authority.epoch, Epoch(5));
+        assert_eq!(state.singletons[&singleton_key].authority.epoch, Epoch(5));
+        drop(state);
+
+        assert!(matches!(
+            snapshot.apply_actor(
+                OwnershipRevision(11),
+                actor_record(1, "world-a", 5, new_lease, PlacementState::Running),
+            ),
+            Err(OwnershipSnapshotError::EpochAuthorityConflict { .. })
+        ));
+        assert!(matches!(
+            snapshot
+                .apply_virtual_shard(OwnershipRevision(11), virtual_shard_record(1, "world-a", 5),),
+            Err(OwnershipSnapshotError::EpochReactivation { .. })
+        ));
+        assert!(matches!(
+            snapshot.apply_singleton(
+                OwnershipRevision(11),
+                singleton_record("global", "world-a", 5, new_lease, PlacementState::Running,),
+            ),
+            Err(OwnershipSnapshotError::EpochAuthorityConflict { .. })
+        ));
+        assert_eq!(
+            snapshot.inner.read_state().revision,
+            Some(OwnershipRevision(10))
+        );
+
+        let (atomic_actor, _) = ready_snapshot(1);
+        atomic_actor
+            .apply_actor(OwnershipRevision(10), actor.clone())
+            .unwrap();
+        assert!(matches!(
+            atomic_actor.apply_watch_batch(watch_batch(
+                11,
+                vec![
+                    OwnershipWatchEvent::InstanceUpserted {
+                        record: instance_record(
+                            "World",
+                            "world-a",
+                            new_lease,
+                            InstanceState::Ready,
+                        ),
+                    },
+                    OwnershipWatchEvent::ActorUpserted {
+                        key: actor_key,
+                        record: actor,
+                    },
+                ],
+            )),
+            Err(OwnershipSnapshotError::EpochReactivation { .. })
+        ));
+        let state = atomic_actor.inner.read_state();
+        assert_eq!(state.revision, Some(OwnershipRevision(10)));
+        assert_eq!(state.instance.unwrap().lease_id, INSTANCE_LEASE);
+        assert!(state.actors.values().next().unwrap().record.is_some());
+        drop(state);
+
+        let (atomic_shard, _) = ready_snapshot(1);
+        atomic_shard
+            .apply_virtual_shard(OwnershipRevision(10), shard.clone())
+            .unwrap();
+        assert!(matches!(
+            atomic_shard.apply_watch_batch(watch_batch(
+                11,
+                vec![
+                    OwnershipWatchEvent::InstanceUpserted {
+                        record: instance_record(
+                            "World",
+                            "world-a",
+                            new_lease,
+                            InstanceState::Ready,
+                        ),
+                    },
+                    OwnershipWatchEvent::VirtualShardUpserted {
+                        key: shard_key,
+                        record: shard,
+                    },
+                ],
+            )),
+            Err(OwnershipSnapshotError::EpochReactivation { .. })
+        ));
+        let state = atomic_shard.inner.read_state();
+        assert_eq!(state.revision, Some(OwnershipRevision(10)));
+        assert_eq!(state.instance.unwrap().lease_id, INSTANCE_LEASE);
+        assert!(
+            state
+                .virtual_shards
+                .values()
+                .next()
+                .unwrap()
+                .record
+                .is_some()
+        );
+        drop(state);
+
+        let (atomic_singleton, _) = ready_snapshot(1);
+        atomic_singleton
+            .apply_singleton(OwnershipRevision(10), singleton.clone())
+            .unwrap();
+        assert!(matches!(
+            atomic_singleton.apply_watch_batch(watch_batch(
+                11,
+                vec![
+                    OwnershipWatchEvent::InstanceUpserted {
+                        record: instance_record(
+                            "World",
+                            "world-a",
+                            new_lease,
+                            InstanceState::Ready,
+                        ),
+                    },
+                    OwnershipWatchEvent::SingletonUpserted {
+                        key: singleton_key,
+                        record: singleton,
+                    },
+                ],
+            )),
+            Err(OwnershipSnapshotError::EpochReactivation { .. })
+        ));
+        let state = atomic_singleton.inner.read_state();
+        assert_eq!(state.revision, Some(OwnershipRevision(10)));
+        assert_eq!(state.instance.unwrap().lease_id, INSTANCE_LEASE);
+        assert!(state.singletons.values().next().unwrap().record.is_some());
+    }
+
+    #[test]
+    fn remote_floor_updates_invalidate_an_active_resync_without_staling_ready_grants() {
+        let (snapshot, gate) = ready_snapshot(2);
+        snapshot
+            .apply_actor(
+                OwnershipRevision(1),
+                actor_record(1, "world-a", 1, INSTANCE_LEASE, PlacementState::Running),
+            )
+            .unwrap();
+        let service = service_kind!("World");
+        let kind = actor_kind!("World");
+        let route = RouteKey::U64(1);
+        let grant = gate
+            .authorize(request(
+                &service,
+                &kind,
+                &kind,
+                &route,
+                Some(Epoch(1)),
+                &OwnershipPlacement::Explicit,
+            ))
+            .unwrap();
+        assert!(
+            !snapshot
+                .apply_actor(
+                    OwnershipRevision(2),
+                    actor_record(2, "world-b", 5, LeaseId(22), PlacementState::Running),
+                )
+                .unwrap()
+        );
+        assert!(gate.is_current(&grant));
+        assert!(matches!(
+            snapshot.apply_actor(
+                OwnershipRevision(3),
+                actor_record(2, "world-a", 4, INSTANCE_LEASE, PlacementState::Running),
+            ),
+            Err(OwnershipSnapshotError::EpochRegression { .. })
+        ));
+        let remote_key = actor_key(&actor_record(
+            2,
+            "world-b",
+            5,
+            LeaseId(22),
+            PlacementState::Running,
+        ));
+        let state = snapshot.inner.read_state();
+        assert_eq!(state.revision, Some(OwnershipRevision(2)));
+        assert_eq!(state.actors[&remote_key].authority.epoch, Epoch(5));
+        assert!(state.actors[&remote_key].record.is_none());
+        drop(state);
+
+        let token = snapshot.begin_resync(INSTANCE_LEASE).unwrap();
+        assert!(
+            !snapshot
+                .apply_actor(
+                    OwnershipRevision(3),
+                    actor_record(2, "world-b", 6, LeaseId(22), PlacementState::Running),
+                )
+                .unwrap()
+        );
+        assert!(matches!(
+            snapshot.replace_from_resync(
+                token,
+                OwnershipRevision(3),
+                std::iter::empty::<OwnershipSnapshotRecord>(),
+            ),
+            Err(OwnershipSnapshotError::StaleResync { .. })
+        ));
+        let state = snapshot.inner.read_state();
+        assert_eq!(state.actors.len(), 2);
+        assert_eq!(state.actors[&remote_key].authority.epoch, Epoch(6));
+        assert!(state.actors[&remote_key].record.is_none());
+    }
+
+    #[test]
+    fn remote_authority_floors_are_bounded_and_existing_remote_updates_revoke() {
+        let (snapshot, gate) = ready_snapshot(2);
         let local = actor_record(1, "world-a", 1, INSTANCE_LEASE, PlacementState::Running);
         snapshot
             .apply_watch_batch(watch_batch(
@@ -2943,9 +4173,8 @@ mod tests {
                 &OwnershipPlacement::Explicit,
             ))
             .unwrap();
-        let generation = snapshot.inner.read_state().generation;
-
         let absent_remote = actor_record(2, "world-b", 1, LeaseId(22), PlacementState::Running);
+        let absent_remote_key = actor_key(&absent_remote);
         snapshot
             .apply_watch_batch(watch_batch(
                 2,
@@ -2956,8 +4185,9 @@ mod tests {
             ))
             .unwrap();
         let state = snapshot.inner.read_state();
-        assert_eq!(state.actors.len(), 1);
-        assert_eq!(state.generation, generation);
+        assert_eq!(state.actors.len(), 2);
+        assert!(state.actors[&absent_remote_key].record.is_none());
+        assert_eq!(state.actors[&absent_remote_key].authority.epoch, Epoch(1));
         drop(state);
         assert!(gate.is_current(&grant));
 
@@ -2986,6 +4216,28 @@ mod tests {
                 .is_none()
         );
         assert!(!gate.is_current(&grant));
+
+        let (bounded, _) = ready_snapshot(1);
+        bounded
+            .apply_actor(
+                OwnershipRevision(1),
+                actor_record(1, "world-a", 1, INSTANCE_LEASE, PlacementState::Running),
+            )
+            .unwrap();
+        assert_eq!(
+            bounded.apply_actor(
+                OwnershipRevision(2),
+                actor_record(2, "world-b", 9, LeaseId(22), PlacementState::Running),
+            ),
+            Err(OwnershipSnapshotError::CapacityExceeded { max_entries: 1 })
+        );
+        let state = bounded.inner.read_state();
+        assert_eq!(state.revision, Some(OwnershipRevision(1)));
+        assert_eq!(state.actors.len(), 1);
+        assert_eq!(
+            state.availability,
+            SnapshotAvailability::Unavailable(OwnershipFenceReason::CapacityExceeded)
+        );
     }
 
     fn resync(
@@ -3066,6 +4318,34 @@ mod tests {
             service_kind: service_kind!("World"),
             actor_kind: actor_kind!("World"),
             actor_id: ActorId::U64(actor_id),
+            owner: InstanceId::new(owner),
+            epoch: Epoch(epoch),
+            lease_id,
+            state,
+        }
+    }
+
+    fn virtual_shard_record(shard_id: u32, owner: &str, epoch: u64) -> VirtualShardPlacementRecord {
+        VirtualShardPlacementRecord {
+            service_kind: service_kind!("World"),
+            actor_kind: actor_kind!("Player"),
+            shard_id: crate::sharding::VirtualShardId(shard_id),
+            owner: InstanceId::new(owner),
+            epoch: Epoch(epoch),
+        }
+    }
+
+    fn singleton_record(
+        scope: &str,
+        owner: &str,
+        epoch: u64,
+        lease_id: LeaseId,
+        state: PlacementState,
+    ) -> SingletonPlacementRecord {
+        SingletonPlacementRecord {
+            service_kind: service_kind!("World"),
+            singleton_kind: actor_kind!("Season"),
+            scope: scope.to_string(),
             owner: InstanceId::new(owner),
             epoch: Epoch(epoch),
             lease_id,

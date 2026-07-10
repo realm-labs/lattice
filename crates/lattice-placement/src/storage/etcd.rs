@@ -497,12 +497,10 @@ where
                             &record.service_kind,
                         ));
                     }
-                    if record.owner == *instance_id {
-                        records.push(OwnershipViewRecord::Actor {
-                            revision: entry.revision,
-                            record: *record,
-                        });
-                    }
+                    records.push(OwnershipViewRecord::Actor {
+                        revision: entry.revision,
+                        record: *record,
+                    });
                 }
                 EtcdValue::VirtualShard(record) => {
                     if record.service_kind != *service_kind {
@@ -511,12 +509,10 @@ where
                             &record.service_kind,
                         ));
                     }
-                    if record.owner == *instance_id {
-                        records.push(OwnershipViewRecord::VirtualShard {
-                            revision: entry.revision,
-                            record: *record,
-                        });
-                    }
+                    records.push(OwnershipViewRecord::VirtualShard {
+                        revision: entry.revision,
+                        record: *record,
+                    });
                 }
                 EtcdValue::Singleton(record) => {
                     if record.service_kind != *service_kind {
@@ -525,12 +521,10 @@ where
                             &record.service_kind,
                         ));
                     }
-                    if record.owner == *instance_id {
-                        records.push(OwnershipViewRecord::Singleton {
-                            revision: entry.revision,
-                            record: *record,
-                        });
-                    }
+                    records.push(OwnershipViewRecord::Singleton {
+                        revision: entry.revision,
+                        record: *record,
+                    });
                 }
                 EtcdValue::CoordinatorLeader(_)
                 | EtcdValue::ActivationLock(_)
