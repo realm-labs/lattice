@@ -79,7 +79,7 @@ where
                 actor.kind = key.actor_kind.as_str(),
                 actor.id = ?key.actor_id
             );
-            let lease_id = match self
+            let activation_lock_lease_id = match self
                 .store
                 .acquire_activation_lock(key.clone())
                 .instrument(lock_span)
@@ -93,7 +93,7 @@ where
             };
 
             let result = self
-                .activate_actor_with_lock(service_kind, key.clone(), lease_id)
+                .activate_actor_with_lock(service_kind, key.clone(), activation_lock_lease_id)
                 .await;
             let release_span = tracing::info_span!(
                 "placement.lock.release",
@@ -103,7 +103,7 @@ where
                 actor.id = ?key.actor_id
             );
             self.store
-                .release_activation_lock(&key, lease_id)
+                .release_activation_lock(&key, activation_lock_lease_id)
                 .instrument(release_span)
                 .await?;
             result
@@ -130,10 +130,25 @@ where
                 .get_actor(&key)
                 .await?
                 .ok_or(PlacementError::NoRoute)?;
+            let replacement = self
+                .store
+                .list_instances(&key.service_kind)
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.instance_id == new_owner)
+                .ok_or_else(|| PlacementError::InstanceNotFound {
+                    instance_id: new_owner.clone(),
+                })?;
+            if replacement.state != InstanceState::Ready {
+                return Err(PlacementError::InstanceNotReady {
+                    instance_id: replacement.instance_id,
+                    state: replacement.state,
+                });
+            }
             let record = ActorPlacementRecord {
-                owner: new_owner,
+                owner: replacement.instance_id,
                 epoch: Epoch(current.epoch.0 + 1),
-                lease_id: LeaseId(current.lease_id.0 + 1),
+                lease_id: replacement.lease_id,
                 state: PlacementState::Running,
                 ..current
             };
@@ -191,7 +206,7 @@ where
                 let migrated = ActorPlacementRecord {
                     owner: replacement.instance_id.clone(),
                     epoch: Epoch(record.epoch.0 + 1),
-                    lease_id: LeaseId(record.lease_id.0 + 1),
+                    lease_id: replacement.lease_id,
                     state: PlacementState::Running,
                     ..record
                 };
@@ -273,7 +288,7 @@ where
                 let reassigned = ActorPlacementRecord {
                     owner: replacement.instance_id.clone(),
                     epoch: Epoch(record.epoch.0 + 1),
-                    lease_id: LeaseId(record.lease_id.0 + 1),
+                    lease_id: replacement.lease_id,
                     state: PlacementState::Running,
                     ..record
                 };
@@ -324,7 +339,7 @@ where
         &self,
         service_kind: ServiceKind,
         key: ActorPlacementKey,
-        lease_id: LeaseId,
+        activation_lock_lease_id: LeaseId,
     ) -> Result<ActorPlacementRecord, PlacementError> {
         if let Some((_, record)) = self.store.get_actor(&key).await? {
             return Ok(record);
@@ -344,13 +359,15 @@ where
             actor_id: key.actor_id.clone(),
             owner: instance.instance_id.clone(),
             epoch: Epoch(1),
-            lease_id,
+            lease_id: instance.lease_id,
             state: PlacementState::Running,
         };
         self.logic
             .activate_actor(&instance, &key, record.epoch)
             .await?;
-        self.store.validate_activation_lock(&key, lease_id).await?;
+        self.store
+            .validate_activation_lock(&key, activation_lock_lease_id)
+            .await?;
         self.store
             .compare_and_put_actor(key, None, record.clone())
             .await?;

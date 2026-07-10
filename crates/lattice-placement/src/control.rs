@@ -399,11 +399,17 @@ mod tests {
     #[tokio::test]
     async fn coordinator_rpc_activates_actor_and_returns_owner_record() {
         let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+        let owner_lease = store.grant_instance_lease().await.unwrap();
+        store.keepalive_instance_lease(owner_lease).await.unwrap();
         store
-            .upsert_instance(instance_record("world-a", InstanceState::Ready))
+            .upsert_instance(instance_record_with_lease(
+                "world-a",
+                InstanceState::Ready,
+                owner_lease,
+            ))
             .await
             .unwrap();
-        let coordinator = PlacementCoordinator::new(store, NoopLogicControl);
+        let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -432,7 +438,8 @@ mod tests {
 
         assert_eq!(response.owner_instance_id, "world-a");
         assert_eq!(response.epoch, 1);
-        assert_eq!(response.lease_id, 1);
+        assert_eq!(response.lease_id, owner_lease.0);
+        assert_eq!(store.instance_lease_keepalive_count(owner_lease), Some(1));
         assert_eq!(response.state, "running");
         assert_eq!(
             actor_id_from_proto(response.actor_id.unwrap()).unwrap(),
@@ -488,10 +495,18 @@ mod tests {
     }
 
     fn instance_record(instance_id: &str, state: InstanceState) -> InstanceRecord {
+        instance_record_with_lease(instance_id, state, LeaseId(1))
+    }
+
+    fn instance_record_with_lease(
+        instance_id: &str,
+        state: InstanceState,
+        lease_id: LeaseId,
+    ) -> InstanceRecord {
         InstanceRecord {
             service_kind: service_kind!("World"),
             instance_id: InstanceId::new(instance_id),
-            lease_id: LeaseId(1),
+            lease_id,
             advertised_endpoint: endpoint(instance_id, 18080),
             control_endpoint: endpoint(instance_id, 18081),
             version: "test".to_string(),

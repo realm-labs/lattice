@@ -380,6 +380,15 @@ fn etcd_instance_records_are_written_with_their_instance_lease() {
 }
 
 #[test]
+fn etcd_actor_records_remain_durable_for_epoch_preserving_failover() {
+    let actor = EtcdValue::Actor(Box::new(actor_record(7, "world-a", 3, LeaseId(5))));
+
+    let options = put_options_for(&actor).unwrap();
+
+    assert!(options.is_none());
+}
+
+#[test]
 fn etcd_singleton_records_are_written_with_their_owner_lease() {
     let singleton = EtcdValue::Singleton(Box::new(singleton_record(
         "global",

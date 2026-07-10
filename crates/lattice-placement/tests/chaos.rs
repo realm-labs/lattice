@@ -91,21 +91,21 @@ impl RpcRequest for SingletonTickRequest {
 #[tokio::test]
 async fn node_crash_lease_expiry_reassigns_owned_actors_with_new_epoch() {
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/chaos"));
-    store
-        .upsert_instance(instance_record("world-a", InstanceState::Ready))
-        .await
-        .unwrap();
-    store
-        .upsert_instance(instance_record("world-b", InstanceState::Ready))
-        .await
-        .unwrap();
+    let replacement =
+        register_instance_with_version(&store, "world-b", InstanceState::Ready, "test").await;
+    let failed =
+        register_instance_with_version(&store, "world-a", InstanceState::Ready, "test").await;
     let key = ActorPlacementKey {
         service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
     store
-        .compare_and_put_actor(key.clone(), None, actor_record(7, "world-a", 3, LeaseId(9)))
+        .compare_and_put_actor(
+            key.clone(),
+            None,
+            actor_record(7, "world-a", 3, failed.lease_id),
+        )
         .await
         .unwrap();
     let singleton_key = SingletonKey {
@@ -145,7 +145,11 @@ async fn node_crash_lease_expiry_reassigns_owned_actors_with_new_epoch() {
     );
     assert_eq!(reassigned.owner, InstanceId::new("world-b"));
     assert_eq!(reassigned.epoch, Epoch(4));
-    assert_eq!(reassigned.lease_id, LeaseId(10));
+    assert_eq!(reassigned.lease_id, replacement.lease_id);
+    assert_eq!(
+        store.instance_lease_keepalive_count(reassigned.lease_id),
+        Some(1)
+    );
     assert_eq!(reassigned_singleton.owner, InstanceId::new("world-b"));
     assert_eq!(reassigned_singleton.epoch, Epoch(6));
     assert_eq!(
@@ -443,29 +447,21 @@ async fn singleton_failover_during_long_job_fences_old_owner_and_retries() {
 #[tokio::test]
 async fn rolling_update_with_mixed_versions_drains_old_owner_to_ready_new_version() {
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/chaos-rolling"));
-    store
-        .upsert_instance(instance_record_with_version(
-            "world-a",
-            InstanceState::Ready,
-            "1.0.0",
-        ))
-        .await
-        .unwrap();
-    store
-        .upsert_instance(instance_record_with_version(
-            "world-b",
-            InstanceState::Ready,
-            "2.0.0",
-        ))
-        .await
-        .unwrap();
+    let new_owner =
+        register_instance_with_version(&store, "world-b", InstanceState::Ready, "2.0.0").await;
+    let old_owner =
+        register_instance_with_version(&store, "world-a", InstanceState::Ready, "1.0.0").await;
     let key = ActorPlacementKey {
         service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
         actor_id: ActorId::U64(7),
     };
     store
-        .compare_and_put_actor(key.clone(), None, actor_record(7, "world-a", 3, LeaseId(9)))
+        .compare_and_put_actor(
+            key.clone(),
+            None,
+            actor_record(7, "world-a", 3, old_owner.lease_id),
+        )
         .await
         .unwrap();
     let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
@@ -507,6 +503,11 @@ async fn rolling_update_with_mixed_versions_drains_old_owner_to_ready_new_versio
     assert_eq!(new_instance.version, "2.0.0");
     assert_eq!(migrated.owner, InstanceId::new("world-b"));
     assert_eq!(migrated.epoch, Epoch(4));
+    assert_eq!(migrated.lease_id, new_owner.lease_id);
+    assert_eq!(
+        store.instance_lease_keepalive_count(migrated.lease_id),
+        Some(1)
+    );
     assert_eq!(target.instance_id, InstanceId::new("world-b"));
     assert_eq!(target.owner_epoch, Some(Epoch(4)));
 }
@@ -754,6 +755,20 @@ fn instance_record_with_version(
         capacity: InstanceCapacity::default(),
         labels: BTreeMap::new(),
     }
+}
+
+async fn register_instance_with_version(
+    store: &InMemoryPlacementStore,
+    instance_id: &str,
+    state: InstanceState,
+    version: &str,
+) -> InstanceRecord {
+    let lease_id = store.grant_instance_lease().await.unwrap();
+    store.keepalive_instance_lease(lease_id).await.unwrap();
+    let mut record = instance_record_with_version(instance_id, state, version);
+    record.lease_id = lease_id;
+    store.upsert_instance(record.clone()).await.unwrap();
+    record
 }
 
 fn actor_record(actor_id: u64, owner: &str, epoch: u64, lease_id: LeaseId) -> ActorPlacementRecord {

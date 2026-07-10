@@ -91,6 +91,7 @@ impl VirtualShardMigrationControl for SelectiveShardMigrationControl {
 #[tokio::test]
 async fn coordinator_activates_missing_actor_owner_without_prewritten_logic_key() {
     let store = ready_store().await;
+    let owner_lease = instance_lease(&store, "world-a").await;
     let logic = CountingLogicControl::default();
     let coordinator = PlacementCoordinator::new(store.clone(), logic.clone());
 
@@ -105,17 +106,23 @@ async fn coordinator_activates_missing_actor_owner_without_prewritten_logic_key(
 
     assert_eq!(record.owner, InstanceId::new("world-a"));
     assert_eq!(record.epoch, Epoch(1));
+    assert_eq!(record.lease_id, owner_lease);
+    assert_eq!(
+        store.instance_lease_keepalive_count(record.lease_id),
+        Some(1)
+    );
     assert_eq!(logic.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn concurrent_coordinator_activation_creates_one_owner() {
     let store = ready_store().await;
+    let owner_lease = instance_lease(&store, "world-a").await;
     let logic = CountingLogicControl {
         calls: Arc::new(AtomicU64::new(0)),
         delay: Duration::from_millis(10),
     };
-    let coordinator = Arc::new(PlacementCoordinator::new(store, logic.clone()));
+    let coordinator = Arc::new(PlacementCoordinator::new(store.clone(), logic.clone()));
 
     let mut tasks = Vec::new();
     for _ in 0..8 {
@@ -134,7 +141,9 @@ async fn concurrent_coordinator_activation_creates_one_owner() {
     for task in tasks {
         let record = task.await.unwrap().unwrap();
         assert_eq!(record.owner, InstanceId::new("world-a"));
+        assert_eq!(record.lease_id, owner_lease);
     }
+    assert_eq!(store.instance_lease_keepalive_count(owner_lease), Some(1));
     assert_eq!(logic.calls.load(Ordering::SeqCst), 1);
 }
 
@@ -168,6 +177,7 @@ async fn explicit_route_resolver_activates_missing_owner_and_uses_cache() {
 #[tokio::test]
 async fn placement_route_resolver_reads_existing_store_record_without_activation() {
     let store = ready_store().await;
+    let owner_lease = instance_lease(&store, "world-a").await;
     let key = ActorPlacementKey {
         service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
@@ -183,7 +193,7 @@ async fn placement_route_resolver_reads_existing_store_record_without_activation
                 actor_id: ActorId::U64(7),
                 owner: InstanceId::new("world-a"),
                 epoch: Epoch(3),
-                lease_id: LeaseId(10),
+                lease_id: owner_lease,
                 state: PlacementState::Running,
             },
         )
@@ -215,12 +225,9 @@ async fn placement_route_resolver_reads_existing_store_record_without_activation
 
 #[tokio::test]
 async fn coordinator_owner_move_increments_epoch() {
-    let store = ready_store().await;
-    store
-        .upsert_instance(instance_record("world-b", InstanceState::Ready))
-        .await
-        .unwrap();
-    let coordinator = PlacementCoordinator::new(store, NoopLogicControl);
+    let store = ready_store_with_replacement().await;
+    let replacement_lease = instance_lease(&store, "world-b").await;
+    let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
     let key = ActorPlacementKey {
         service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
@@ -242,15 +249,51 @@ async fn coordinator_owner_move_increments_epoch() {
 
     assert_eq!(moved.owner, InstanceId::new("world-b"));
     assert_eq!(moved.epoch, Epoch(2));
+    assert_eq!(moved.lease_id, replacement_lease);
+    assert_eq!(
+        store.instance_lease_keepalive_count(moved.lease_id),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn coordinator_owner_move_rejects_non_ready_target_without_changing_placement() {
+    let store = ready_store().await;
+    register_instance(&store, "world-b", InstanceState::Draining).await;
+    let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+    let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(7),
+    };
+    let original = coordinator
+        .activate_actor(ActivateActorRequest {
+            service_kind: service_kind!("World"),
+            actor_kind: actor_kind!("World"),
+            actor_id: ActorId::U64(7),
+        })
+        .await
+        .unwrap();
+
+    let error = coordinator
+        .move_actor(key.clone(), InstanceId::new("world-b"))
+        .await
+        .unwrap_err();
+    let persisted = store.get_actor(&key).await.unwrap().unwrap().1;
+
+    assert_eq!(
+        error,
+        PlacementError::InstanceNotReady {
+            instance_id: InstanceId::new("world-b"),
+            state: InstanceState::Draining,
+        }
+    );
+    assert_eq!(persisted, original);
 }
 
 #[tokio::test]
 async fn explicit_route_resolver_refreshes_cache_from_placement_watch() {
-    let store = ready_store().await;
-    store
-        .upsert_instance(instance_record("world-b", InstanceState::Ready))
-        .await
-        .unwrap();
+    let store = ready_store_with_replacement().await;
     let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
     let resolver = ExplicitRouteResolver::new(
         service_kind!("World"),
@@ -319,10 +362,7 @@ async fn scale_out_ready_instance_participates_in_virtual_shard_assignment() {
         }
     );
 
-    store
-        .upsert_instance(instance_record("world-b", InstanceState::Ready))
-        .await
-        .unwrap();
+    register_instance(&store, "world-b", InstanceState::Ready).await;
     let after_scale_out = coordinator
         .rebalance_virtual_shards(
             RebalanceVirtualShardsRequest {
@@ -380,10 +420,7 @@ async fn ready_instance_watch_triggers_virtual_shard_assignment() {
         .await
         .unwrap();
 
-    store
-        .upsert_instance(instance_record("world-b", InstanceState::Ready))
-        .await
-        .unwrap();
+    register_instance(&store, "world-b", InstanceState::Ready).await;
 
     for _ in 0..50 {
         let assignments = store
@@ -423,10 +460,7 @@ async fn virtual_shard_rebalance_respects_running_actor_movement_policy() {
         .rebalance_virtual_shards(initial, &RoundRobinShardAssigner)
         .await
         .unwrap();
-    store
-        .upsert_instance(instance_record("world-b", InstanceState::Ready))
-        .await
-        .unwrap();
+    register_instance(&store, "world-b", InstanceState::Ready).await;
 
     let running_guarded = coordinator
         .rebalance_virtual_shards(
@@ -479,10 +513,7 @@ async fn prepared_virtual_shard_rebalance_moves_only_policy_eligible_shards() {
         )
         .await
         .unwrap();
-    store
-        .upsert_instance(instance_record("world-b", InstanceState::Ready))
-        .await
-        .unwrap();
+    register_instance(&store, "world-b", InstanceState::Ready).await;
     let logic = SelectiveShardMigrationControl::default();
     logic
         .eligible
@@ -533,11 +564,8 @@ async fn prepared_virtual_shard_rebalance_moves_only_policy_eligible_shards() {
 
 #[tokio::test]
 async fn coordinator_drain_marks_instance_draining_and_migrates_owned_actors() {
-    let store = ready_store().await;
-    store
-        .upsert_instance(instance_record("world-b", InstanceState::Ready))
-        .await
-        .unwrap();
+    let store = ready_store_with_replacement().await;
+    let replacement_lease = instance_lease(&store, "world-b").await;
     let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
     let key = ActorPlacementKey {
         service_kind: service_kind!("World"),
@@ -603,17 +631,20 @@ async fn coordinator_drain_marks_instance_draining_and_migrates_owned_actors() {
     assert_eq!(drained.state, InstanceState::Draining);
     assert_eq!(migrated.owner, InstanceId::new("world-b"));
     assert_eq!(migrated.epoch, Epoch(2));
+    assert_eq!(migrated.lease_id, replacement_lease);
+    assert_eq!(
+        store.instance_lease_keepalive_count(migrated.lease_id),
+        Some(1)
+    );
     assert_eq!(migrated_shard.owner, InstanceId::new("world-b"));
     assert_eq!(migrated_shard.epoch, Epoch(2));
 }
 
 #[tokio::test]
 async fn lease_expiry_reconciler_observes_missing_instance_and_fails_over() {
-    let store = ready_store().await;
-    store
-        .upsert_instance(instance_record("world-b", InstanceState::Ready))
-        .await
-        .unwrap();
+    let store = ready_store_with_replacement().await;
+    let failed_lease = instance_lease(&store, "world-a").await;
+    let replacement_lease = instance_lease(&store, "world-b").await;
     let actor_key = ActorPlacementKey {
         service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
@@ -629,7 +660,7 @@ async fn lease_expiry_reconciler_observes_missing_instance_and_fails_over() {
                 actor_id: ActorId::U64(7),
                 owner: InstanceId::new("world-a"),
                 epoch: Epoch(3),
-                lease_id: LeaseId(9),
+                lease_id: failed_lease,
                 state: PlacementState::Running,
             },
         )
@@ -673,6 +704,11 @@ async fn lease_expiry_reconciler_observes_missing_instance_and_fails_over() {
         {
             task.cancel();
             assert_eq!(actor.epoch, Epoch(4));
+            assert_eq!(actor.lease_id, replacement_lease);
+            assert_eq!(
+                store.instance_lease_keepalive_count(actor.lease_id),
+                Some(1)
+            );
             assert_eq!(singleton.epoch, Epoch(6));
             return;
         }
@@ -685,23 +721,44 @@ async fn lease_expiry_reconciler_observes_missing_instance_and_fails_over() {
 
 async fn ready_store() -> InMemoryPlacementStore {
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
-    store
-        .upsert_instance(instance_record("world-a", InstanceState::Ready))
-        .await
-        .unwrap();
+    register_instance(&store, "world-a", InstanceState::Ready).await;
     store
 }
 
-fn instance_record(instance_id: &str, state: InstanceState) -> InstanceRecord {
-    InstanceRecord {
+async fn ready_store_with_replacement() -> InMemoryPlacementStore {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    register_instance(&store, "world-b", InstanceState::Ready).await;
+    register_instance(&store, "world-a", InstanceState::Ready).await;
+    store
+}
+
+async fn register_instance(
+    store: &InMemoryPlacementStore,
+    instance_id: &str,
+    state: InstanceState,
+) -> InstanceRecord {
+    let lease_id = store.grant_instance_lease().await.unwrap();
+    store.keepalive_instance_lease(lease_id).await.unwrap();
+    let record = InstanceRecord {
         service_kind: service_kind!("World"),
         instance_id: InstanceId::new(instance_id),
-        lease_id: LeaseId(1),
+        lease_id,
         advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
         control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),
         version: "test".to_string(),
         state,
         capacity: InstanceCapacity::default(),
         labels: BTreeMap::new(),
-    }
+    };
+    store.upsert_instance(record.clone()).await.unwrap();
+    record
+}
+
+async fn instance_lease(store: &InMemoryPlacementStore, instance_id: &str) -> LeaseId {
+    store
+        .get_instance(&InstanceId::new(instance_id))
+        .await
+        .unwrap()
+        .unwrap()
+        .lease_id
 }
