@@ -13,9 +13,10 @@ use crate::registry::InstanceRecord;
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, LeaseId, OwnershipView,
     OwnershipViewError, OwnershipViewRecord, OwnershipViewSnapshot, OwnershipWatch,
-    OwnershipWatchBatch, OwnershipWatchEvent, PlacementPrefix, PlacementRevision, PlacementStore,
-    PlacementVersion, PlacementWatch, PlacementWatchEvent, SingletonKey, SingletonPlacementRecord,
-    VirtualShardPlacementKey, VirtualShardPlacementRecord,
+    OwnershipWatchBatch, OwnershipWatchEvent, OwnershipWatchMessage, OwnershipWatchUpdate,
+    PlacementPrefix, PlacementRevision, PlacementStore, PlacementVersion, PlacementWatch,
+    PlacementWatchEvent, SingletonKey, SingletonPlacementRecord, VirtualShardPlacementKey,
+    VirtualShardPlacementRecord,
 };
 
 const WATCH_CAPACITY: usize = 128;
@@ -670,7 +671,7 @@ struct PlacementStoreInner {
     activation_locks: HashMap<PrefixedActorKey, LeaseId>,
     singleton_locks: HashMap<PrefixedSingletonKey, LeaseId>,
     watchers: HashMap<PlacementPrefix, broadcast::Sender<PlacementWatchEvent>>,
-    ownership_watchers: HashMap<PlacementPrefix, broadcast::Sender<OwnershipWatchBatch>>,
+    ownership_watchers: HashMap<PlacementPrefix, broadcast::Sender<OwnershipWatchMessage>>,
 }
 
 impl PlacementStoreInner {
@@ -690,7 +691,9 @@ impl PlacementStoreInner {
 
     fn notify_ownership(&self, prefix: &PlacementPrefix, batch: OwnershipWatchBatch) {
         if let Some(tx) = self.ownership_watchers.get(prefix) {
-            let _ = tx.send(batch);
+            let _ = tx.send(OwnershipWatchMessage::Update(OwnershipWatchUpdate::Batch(
+                batch,
+            )));
         }
     }
 }

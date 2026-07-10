@@ -8,8 +8,8 @@ use crate::error::PlacementError;
 use crate::registry::InstanceRecord;
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, LeaseId, PlacementPrefix,
-    PlacementVersion, SingletonKey, SingletonPlacementRecord, VirtualShardPlacementKey,
-    VirtualShardPlacementRecord,
+    PlacementRevision, PlacementVersion, SingletonKey, SingletonPlacementRecord,
+    VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +66,11 @@ pub(crate) fn placement_version(version: i64) -> Result<PlacementVersion, Placem
     Ok(PlacementVersion(version))
 }
 
+pub(crate) fn placement_revision(revision: i64) -> Result<PlacementRevision, PlacementError> {
+    let revision = u64::try_from(revision).map_err(codec_error)?;
+    Ok(PlacementRevision(revision))
+}
+
 pub(crate) fn lease_id(id: i64) -> Result<LeaseId, PlacementError> {
     let id = u64::try_from(id).map_err(codec_error)?;
     Ok(LeaseId(id))
@@ -93,6 +98,40 @@ pub(crate) fn instance_key(
         clean_prefix(prefix),
         service_kind.as_str(),
         instance_id.as_str()
+    )
+}
+
+pub(crate) fn logic_prefix(prefix: &PlacementPrefix) -> String {
+    format!("{}/logic/", clean_prefix(prefix))
+}
+
+pub(crate) fn actor_service_prefix(prefix: &PlacementPrefix, service_kind: &ServiceKind) -> String {
+    format!(
+        "{}/logic/actors/{}/",
+        clean_prefix(prefix),
+        service_kind.as_str()
+    )
+}
+
+pub(crate) fn vshard_service_prefix(
+    prefix: &PlacementPrefix,
+    service_kind: &ServiceKind,
+) -> String {
+    format!(
+        "{}/logic/vshards/{}/",
+        clean_prefix(prefix),
+        service_kind.as_str()
+    )
+}
+
+pub(crate) fn singleton_service_prefix(
+    prefix: &PlacementPrefix,
+    service_kind: &ServiceKind,
+) -> String {
+    format!(
+        "{}/logic/singletons/{}/",
+        clean_prefix(prefix),
+        service_kind.as_str()
     )
 }
 

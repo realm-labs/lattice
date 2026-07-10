@@ -184,17 +184,54 @@ pub enum OwnershipWatchError {
     Lagged { skipped: u64 },
     #[error("ownership watch closed")]
     Closed,
+    #[error("ownership watch backend error: {message}")]
+    Backend { message: String },
+    #[error(
+        "ownership watch requested revision {requested_revision:?}, compacted through {compact_revision:?}"
+    )]
+    Compacted {
+        requested_revision: PlacementRevision,
+        compact_revision: PlacementRevision,
+    },
+    #[error("ownership watch canceled: {reason}")]
+    Canceled { reason: String },
+    #[error("ownership watch protocol error: {message}")]
+    Protocol { message: String },
+    #[error("ownership watch revision exceeded its {max_entries} event limit")]
+    CapacityExceeded { max_entries: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipWatchUpdate {
+    Batch(OwnershipWatchBatch),
+    Progress { revision: PlacementRevision },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OwnershipWatchMessage {
+    Update(OwnershipWatchUpdate),
+    Failed(OwnershipWatchError),
 }
 
 #[derive(Debug)]
 pub struct OwnershipWatch {
-    rx: broadcast::Receiver<OwnershipWatchBatch>,
+    rx: broadcast::Receiver<OwnershipWatchMessage>,
 }
 
 impl OwnershipWatch {
     pub async fn next(&mut self) -> Result<OwnershipWatchBatch, OwnershipWatchError> {
+        loop {
+            match self.next_update().await? {
+                OwnershipWatchUpdate::Batch(batch) => return Ok(batch),
+                OwnershipWatchUpdate::Progress { .. } => {}
+            }
+        }
+    }
+
+    pub async fn next_update(&mut self) -> Result<OwnershipWatchUpdate, OwnershipWatchError> {
         match self.rx.recv().await {
-            Ok(batch) => Ok(batch),
+            Ok(OwnershipWatchMessage::Update(update)) => Ok(update),
+            Ok(OwnershipWatchMessage::Failed(error)) => Err(error),
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 Err(OwnershipWatchError::Lagged { skipped })
             }
@@ -202,7 +239,7 @@ impl OwnershipWatch {
         }
     }
 
-    pub(crate) fn new(rx: broadcast::Receiver<OwnershipWatchBatch>) -> Self {
+    pub(crate) fn new(rx: broadcast::Receiver<OwnershipWatchMessage>) -> Self {
         Self { rx }
     }
 }
@@ -227,6 +264,10 @@ pub enum OwnershipViewError {
     CapacityExceeded { max_entries: usize },
     #[error("ownership view backend error: {message}")]
     Backend { message: String },
+    #[error("ownership view protocol error: {message}")]
+    Protocol { message: String },
+    #[error("ownership view could not start its watch: {error}")]
+    WatchStart { error: OwnershipWatchError },
 }
 
 #[derive(Debug)]

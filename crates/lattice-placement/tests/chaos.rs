@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -20,12 +21,14 @@ use lattice_placement::routing::placement::ExplicitRouteResolver;
 use lattice_placement::routing::resolver::{ResolveRequest, RouteResolver};
 use lattice_placement::routing::rpc::{EndpointRpcTransport, ResolvingRpcCore};
 use lattice_placement::storage::etcd::EtcdPlacementStore;
-use lattice_placement::storage::etcd::client::{EtcdKv, EtcdWatch, InMemoryEtcdClient};
+use lattice_placement::storage::etcd::client::{
+    EtcdKv, EtcdOwnershipRanges, EtcdOwnershipView, EtcdWatch, InMemoryEtcdClient,
+};
 use lattice_placement::storage::etcd::codec::EtcdValue;
 use lattice_placement::storage::memory::InMemoryPlacementStore;
 use lattice_placement::storage::{
-    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementState,
-    PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
+    ActorPlacementKey, ActorPlacementRecord, LeaseId, OwnershipViewError, PlacementPrefix,
+    PlacementState, PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
 };
 use lattice_rpc::error::RpcError;
 use lattice_rpc::metadata::{RpcClientContextFactory, RpcContext};
@@ -603,6 +606,14 @@ impl EtcdKv for FlakyEtcdClient {
 
     async fn next_lease_id(&self) -> Result<LeaseId, PlacementError> {
         self.inner.next_lease_id().await
+    }
+
+    async fn open_ownership_view(
+        &self,
+        ranges: EtcdOwnershipRanges,
+        max_entries: NonZeroUsize,
+    ) -> Result<EtcdOwnershipView, OwnershipViewError> {
+        self.inner.open_ownership_view(ranges, max_entries).await
     }
 
     async fn watch_prefix(&self, prefix: &str) -> Result<EtcdWatch, PlacementError> {
