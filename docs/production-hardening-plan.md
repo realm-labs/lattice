@@ -90,15 +90,17 @@ Status: `[x]` complete.
 
 ### Phase 1: Ownership Gate and Structured Fencing
 
-Status: `[ ]` not started.
+Status: `[ ]` in progress.
 
-- [ ] Add a reusable local ownership snapshot/gate for explicit actors, virtual shards, and singletons.
+- [x] Add a reusable local ownership snapshot/gate for explicit actors, virtual shards, and singletons.
+- [ ] Bind explicit actor placement records to the owner's live instance lease rather than the short-lived activation-lock lease.
+- [ ] Make generated RPC binding placement mode explicit: explicit-fenced by default, validated shard count for virtual shards, and named opt-in only for static/local unfenced use.
 - [ ] Require generated placement-backed RPC services to validate expected service, actor kind, route, owner, state, lease validity, and epoch before actor lookup.
 - [ ] Prevent `ActorRegistry::get_or_load` from being reached after a failed ownership decision.
 - [ ] Require route epoch for fenced placement modes; retain an explicit unfenced mode only for deliberate static/local use.
 - [ ] Replace status-message substring parsing with structured NOT_OWNER/FENCED error metadata/details.
 - [ ] Make old owners fence locally when ownership changes or lease keepalive fails.
-- [ ] Handle placement watch lag/closure through full resync, cache invalidation, or readiness failure; never silently continue with an indefinitely stale ownership view.
+- [ ] Make placement watches surface lag, closure, and deletions; fence first and perform a no-gap full resync or fail readiness before reopening the ownership view.
 - [ ] Remove per-request PlacementStore access from singleton data-plane dispatch.
 - [ ] Add stale-route, missing-epoch, migration, lease-loss, and watch-lag tests.
 - [ ] Update ownership/fencing architecture documentation and examples.
@@ -433,6 +435,7 @@ Phase-specific commands should be added here as tests are introduced, for exampl
 cargo test -p lattice-rpc
 cargo test -p lattice-placement --test fenced_retry
 cargo test -p lattice-placement --test chaos
+cargo test -p lattice-placement ownership
 cargo test -p lattice-gateway
 cargo test -p lattice-actor
 cargo test -p lattice-service
