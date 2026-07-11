@@ -761,6 +761,16 @@ impl PlacementAuthority for ReplacementDuringDrainAuthority {
             .map(|_| ())
     }
 
+    async fn keepalive_singletons(
+        &self,
+        _service_kind: ServiceKind,
+        _instance_id: InstanceId,
+        _instance_incarnation: InstanceIncarnation,
+        claims: Vec<lattice_placement::storage::SingletonPlacementRecord>,
+    ) -> Result<usize, PlacementError> {
+        Ok(claims.len())
+    }
+
     async fn activate_actor(
         &self,
         _request: lattice_placement::coordination::actor::ActivateActorRequest,

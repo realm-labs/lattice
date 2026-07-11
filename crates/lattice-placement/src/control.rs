@@ -9,6 +9,7 @@ use lattice_rpc::security::{
 };
 use tonic::{Request, Response, Status};
 
+use crate::authority::{MAX_SINGLETON_RENEWAL_CLAIMS, keepalive_singleton_claims};
 use crate::control::proto::logic_control_client::LogicControlClient;
 use crate::coordination::actor::{
     ActivateActorRequest as CoordinatorActivateActorRequest, PlacementCoordinator,
@@ -277,6 +278,51 @@ where
             .await
             .map_err(status_from_placement)?;
         Ok(Response::new(instance_liveness_to_proto(&record)))
+    }
+
+    async fn keepalive_singletons(
+        &self,
+        request: Request<proto::KeepaliveSingletonsRequest>,
+    ) -> Result<Response<proto::KeepaliveSingletonsReply>, Status> {
+        let peer = self.authenticate_current_peer(&request).await?;
+        let request = request.into_inner();
+        if request.claims.len() > MAX_SINGLETON_RENEWAL_CLAIMS {
+            return Err(Status::resource_exhausted(
+                "singleton renewal batch exceeds its bound",
+            ));
+        }
+        let service_kind = ServiceKind::new(request.service_kind);
+        let instance_id = lattice_core::instance::InstanceId::new(request.instance_id);
+        let incarnation = instance_incarnation_from_proto(request.instance_incarnation)?;
+        if !canonical_identity_segment(service_kind.as_str())
+            || !canonical_identity_segment(instance_id.as_str())
+        {
+            return Err(Status::invalid_argument(
+                "instance identity is not canonical",
+            ));
+        }
+        require_peer_instance(peer, &service_kind, &instance_id, &incarnation)?;
+        let claims = request
+            .claims
+            .into_iter()
+            .map(singleton_claim_from_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+        let renewed = keepalive_singleton_claims(
+            &self.coordinator.store,
+            &service_kind,
+            &instance_id,
+            &incarnation,
+            claims,
+        )
+        .await
+        .map_err(status_from_placement)?;
+        Ok(Response::new(proto::KeepaliveSingletonsReply {
+            service_kind: service_kind.as_str().to_string(),
+            instance_id: instance_id.as_str().to_string(),
+            instance_incarnation: incarnation.as_str().to_string(),
+            renewed: u64::try_from(renewed)
+                .map_err(|_| Status::internal("singleton renewal count exceeds protocol range"))?,
+        }))
     }
 
     async fn activate_actor(
@@ -754,6 +800,35 @@ fn singleton_placement_to_proto(
     }
 }
 
+fn singleton_claim_from_proto(
+    claim: proto::SingletonLeaseClaim,
+) -> Result<SingletonPlacementRecord, Status> {
+    const MAX_SCOPE_BYTES: usize = 256;
+    if !canonical_identity_segment(&claim.service_kind)
+        || !canonical_identity_segment(&claim.singleton_kind)
+        || !canonical_identity_segment(&claim.owner_instance_id)
+        || claim.scope.is_empty()
+        || claim.scope.len() > MAX_SCOPE_BYTES
+        || claim.epoch == 0
+        || claim.lease_id == 0
+    {
+        return Err(Status::invalid_argument(
+            "singleton renewal claim is invalid or exceeds its bounds",
+        ));
+    }
+    let owner_incarnation = instance_incarnation_from_proto(claim.owner_incarnation)?;
+    Ok(SingletonPlacementRecord {
+        service_kind: ServiceKind::new(claim.service_kind),
+        singleton_kind: ActorKind::new(claim.singleton_kind),
+        scope: claim.scope,
+        owner: lattice_core::instance::InstanceId::new(claim.owner_instance_id),
+        owner_incarnation,
+        epoch: Epoch(claim.epoch),
+        lease_id: crate::storage::LeaseId(claim.lease_id),
+        state: PlacementState::Running,
+    })
+}
+
 fn placement_state_name(state: PlacementState) -> &'static str {
     match state {
         PlacementState::Activating => "activating",
@@ -772,7 +847,9 @@ fn status_from_placement(error: PlacementError) -> Status {
         PlacementError::InstanceAlreadyRegistered { .. } => {
             Status::already_exists("instance is already registered")
         }
-        PlacementError::NoReadyInstances => Status::resource_exhausted(error.to_string()),
+        PlacementError::NoReadyInstances | PlacementError::SingletonRenewalLimitExceeded { .. } => {
+            Status::resource_exhausted(error.to_string())
+        }
         PlacementError::InstanceNotReady { .. }
         | PlacementError::ActivationLockHeld
         | PlacementError::ActivationLockLost
@@ -790,6 +867,7 @@ fn status_from_placement(error: PlacementError) -> Status {
         | PlacementError::InstanceLeaseMismatch { .. }
         | PlacementError::InstanceIncarnationMismatch { .. }
         | PlacementError::InvalidInstanceStateTransition { .. }
+        | PlacementError::InvalidSingletonRenewalClaim
         | PlacementError::CoordinatorLeadershipLost => {
             Status::failed_precondition(error.to_string())
         }

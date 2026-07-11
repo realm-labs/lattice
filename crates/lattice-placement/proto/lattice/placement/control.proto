@@ -12,9 +12,34 @@ service PlacementCoordinator {
   rpc RegisterInstance(RegisterInstanceRequest) returns (InstanceLivenessReply);
   rpc KeepaliveInstance(InstanceLivenessRequest) returns (InstanceLivenessReply);
   rpc TransitionInstance(TransitionInstanceRequest) returns (InstanceLivenessReply);
+  rpc KeepaliveSingletons(KeepaliveSingletonsRequest) returns (KeepaliveSingletonsReply);
   rpc ActivateActor(ActivateActorRequest) returns (ActorPlacementReply);
   rpc ActivateSingleton(ActivateSingletonRequest) returns (SingletonPlacementReply);
   rpc DrainInstance(DrainInstanceRequest) returns (DrainInstanceReply);
+}
+
+message SingletonLeaseClaim {
+  string service_kind = 1;
+  string singleton_kind = 2;
+  string scope = 3;
+  string owner_instance_id = 4;
+  string owner_incarnation = 5;
+  uint64 epoch = 6;
+  uint64 lease_id = 7;
+}
+
+message KeepaliveSingletonsRequest {
+  string service_kind = 1;
+  string instance_id = 2;
+  string instance_incarnation = 3;
+  repeated SingletonLeaseClaim claims = 4;
+}
+
+message KeepaliveSingletonsReply {
+  string service_kind = 1;
+  string instance_id = 2;
+  string instance_incarnation = 3;
+  uint64 renewed = 4;
 }
 
 message RegisterInstanceRequest {

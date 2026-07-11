@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,11 +22,13 @@ use crate::coordination::singleton::{
 use crate::error::PlacementError;
 use crate::registry::{InstanceRecord, InstanceState};
 use crate::storage::{
-    ActorPlacementRecord, LeaseId, PlacementState, PlacementStore, SingletonPlacementRecord,
+    ActorPlacementRecord, LeaseId, PlacementState, PlacementStore, SingletonKey,
+    SingletonPlacementRecord,
 };
 
 pub const DEFAULT_PLACEMENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_PLACEMENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(60);
+pub const MAX_SINGLETON_RENEWAL_CLAIMS: usize = 4_096;
 
 /// The semantic placement mutation boundary used by ordinary runtime clients.
 ///
@@ -54,6 +57,14 @@ pub trait PlacementAuthority: Send + Sync + 'static {
         expected_lease_id: LeaseId,
         state: InstanceState,
     ) -> Result<(), PlacementError>;
+
+    async fn keepalive_singletons(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
+        claims: Vec<SingletonPlacementRecord>,
+    ) -> Result<usize, PlacementError>;
 
     async fn activate_actor(
         &self,
@@ -175,6 +186,23 @@ where
             )
             .await
             .map(|_| ())
+    }
+
+    async fn keepalive_singletons(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
+        claims: Vec<SingletonPlacementRecord>,
+    ) -> Result<usize, PlacementError> {
+        keepalive_singleton_claims(
+            &self.coordinator.store,
+            &service_kind,
+            &instance_id,
+            &instance_incarnation,
+            claims,
+        )
+        .await
     }
 
     async fn activate_actor(
@@ -357,6 +385,47 @@ impl PlacementAuthority for TonicPlacementAuthority {
         Ok(())
     }
 
+    async fn keepalive_singletons(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
+        claims: Vec<SingletonPlacementRecord>,
+    ) -> Result<usize, PlacementError> {
+        if claims.len() > MAX_SINGLETON_RENEWAL_CLAIMS {
+            return Err(PlacementError::SingletonRenewalLimitExceeded {
+                limit: MAX_SINGLETON_RENEWAL_CLAIMS,
+            });
+        }
+        let expected_renewed = claims.len();
+        let mut request = Request::new(proto::KeepaliveSingletonsRequest {
+            service_kind: service_kind.as_str().to_string(),
+            instance_id: instance_id.as_str().to_string(),
+            instance_incarnation: instance_incarnation.as_str().to_string(),
+            claims: claims.into_iter().map(singleton_claim_to_proto).collect(),
+        });
+        request.set_timeout(self.request_timeout);
+        let mut client = self.client.clone();
+        let reply =
+            tokio::time::timeout(self.request_timeout, client.keepalive_singletons(request))
+                .await
+                .map_err(|_| PlacementError::PlacementAuthorityTimeout)?
+                .map_err(authority_status)?
+                .into_inner();
+        require_equal(&reply.service_kind, service_kind.as_str(), "service_kind")?;
+        require_equal(&reply.instance_id, instance_id.as_str(), "instance_id")?;
+        require_equal(
+            &reply.instance_incarnation,
+            instance_incarnation.as_str(),
+            "instance_incarnation",
+        )?;
+        let renewed = usize::try_from(reply.renewed).map_err(|_| invalid_reply_error("renewed"))?;
+        if renewed != expected_renewed {
+            return invalid_reply("renewed");
+        }
+        Ok(renewed)
+    }
+
     async fn activate_actor(
         &self,
         request: ActivateActorRequest,
@@ -444,6 +513,76 @@ fn authority_status(status: Status) -> PlacementError {
         PlacementError::PlacementAuthorityRpc {
             code: status.code(),
         }
+    }
+}
+
+pub(crate) async fn keepalive_singleton_claims<S: PlacementStore>(
+    store: &S,
+    service_kind: &ServiceKind,
+    instance_id: &InstanceId,
+    instance_incarnation: &InstanceIncarnation,
+    claims: Vec<SingletonPlacementRecord>,
+) -> Result<usize, PlacementError> {
+    if claims.len() > MAX_SINGLETON_RENEWAL_CLAIMS {
+        return Err(PlacementError::SingletonRenewalLimitExceeded {
+            limit: MAX_SINGLETON_RENEWAL_CLAIMS,
+        });
+    }
+    let instance = store
+        .get_service_instance(service_kind, instance_id)
+        .await?
+        .ok_or_else(|| PlacementError::InstanceNotFound {
+            instance_id: instance_id.clone(),
+        })?;
+    require_instance_authority(&instance, instance_incarnation, instance.lease_id)?;
+    if instance.state != InstanceState::Ready {
+        return Err(PlacementError::InstanceNotReady {
+            instance_id: instance_id.clone(),
+            state: instance.state,
+        });
+    }
+
+    let mut keys = HashSet::with_capacity(claims.len());
+    let mut leases = HashSet::with_capacity(claims.len());
+    for claim in &claims {
+        let key = SingletonKey {
+            service_kind: claim.service_kind.clone(),
+            singleton_kind: claim.singleton_kind.clone(),
+            scope: claim.scope.clone(),
+        };
+        if claim.service_kind != *service_kind
+            || claim.owner != *instance_id
+            || claim.owner_incarnation != *instance_incarnation
+            || claim.state != PlacementState::Running
+            || !keys.insert(key.clone())
+            || !leases.insert(claim.lease_id)
+        {
+            return Err(PlacementError::InvalidSingletonRenewalClaim);
+        }
+        let current = store
+            .get_singleton(&key)
+            .await?
+            .map(|(_, record)| record)
+            .ok_or(PlacementError::InvalidSingletonRenewalClaim)?;
+        if &current != claim {
+            return Err(PlacementError::InvalidSingletonRenewalClaim);
+        }
+    }
+    for lease_id in leases {
+        store.keepalive_instance_lease(lease_id).await?;
+    }
+    Ok(claims.len())
+}
+
+fn singleton_claim_to_proto(record: SingletonPlacementRecord) -> proto::SingletonLeaseClaim {
+    proto::SingletonLeaseClaim {
+        service_kind: record.service_kind.as_str().to_string(),
+        singleton_kind: record.singleton_kind.as_str().to_string(),
+        scope: record.scope,
+        owner_instance_id: record.owner.as_str().to_string(),
+        owner_incarnation: record.owner_incarnation.as_str().to_string(),
+        epoch: record.epoch.0,
+        lease_id: record.lease_id.0,
     }
 }
 
@@ -737,6 +876,13 @@ mod tests {
             Err(Status::unimplemented("test authority"))
         }
 
+        async fn keepalive_singletons(
+            &self,
+            _request: Request<proto::KeepaliveSingletonsRequest>,
+        ) -> Result<Response<proto::KeepaliveSingletonsReply>, Status> {
+            Err(Status::unimplemented("test authority"))
+        }
+
         async fn activate_actor(
             &self,
             _request: Request<proto::ActivateActorRequest>,
@@ -775,6 +921,36 @@ mod tests {
             )
             .unwrap_err(),
             PlacementError::InvalidPlacementAuthorityTimeout
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_renewal_rejects_an_oversized_batch_before_transport() {
+        let authority =
+            TonicPlacementAuthority::new(Channel::from_static("http://127.0.0.1:1").connect_lazy());
+        let claim = SingletonPlacementRecord {
+            service_kind: service_kind!("World"),
+            singleton_kind: actor_kind!("SeasonManager"),
+            scope: "global".to_string(),
+            owner: InstanceId::new("world-a"),
+            owner_incarnation: InstanceIncarnation::new("world-a-boot"),
+            epoch: Epoch(1),
+            lease_id: LeaseId(7),
+            state: PlacementState::Running,
+        };
+
+        assert_eq!(
+            authority
+                .keepalive_singletons(
+                    service_kind!("World"),
+                    InstanceId::new("world-a"),
+                    InstanceIncarnation::new("world-a-boot"),
+                    vec![claim; MAX_SINGLETON_RENEWAL_CLAIMS + 1],
+                )
+                .await,
+            Err(PlacementError::SingletonRenewalLimitExceeded {
+                limit: MAX_SINGLETON_RENEWAL_CLAIMS
+            })
         );
     }
 

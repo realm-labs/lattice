@@ -74,6 +74,10 @@ pub enum PlacementError {
         current: crate::registry::InstanceState,
         requested: crate::registry::InstanceState,
     },
+    #[error("singleton renewal batch exceeds limit {limit}")]
+    SingletonRenewalLimitExceeded { limit: usize },
+    #[error("singleton renewal claim is stale, duplicated, or not owned by this boot")]
+    InvalidSingletonRenewalClaim,
     #[error("coordinator leadership has been lost")]
     CoordinatorLeadershipLost,
     #[error("singleton activation lock is already held")]

@@ -225,11 +225,19 @@ impl LatticeService {
                         lease_id,
                     )
                     .await?;
-                placement_store
-                    .keepalive_singleton_owner_leases(
+                let singleton_claims = placement_store
+                    .singleton_owner_lease_claims(
                         &service_kind,
                         &instance.instance_id,
                         &instance.incarnation,
+                    )
+                    .await?;
+                placement_authority
+                    .keepalive_singletons(
+                        service_kind.clone(),
+                        instance.instance_id.clone(),
+                        instance.incarnation.clone(),
+                        singleton_claims,
                     )
                     .await?;
             }

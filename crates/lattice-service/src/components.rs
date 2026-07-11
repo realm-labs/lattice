@@ -6,7 +6,7 @@ use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ConfiguredComponentBuilder;
 use lattice_core::service_context::{ConfiguredComponent, ServiceContextBuilder};
-use lattice_placement::authority::PlacementAuthority;
+use lattice_placement::authority::{MAX_SINGLETON_RENEWAL_CLAIMS, PlacementAuthority};
 use lattice_placement::coordination::singleton::SingletonRouteResolver;
 use lattice_placement::error::PlacementError;
 use lattice_placement::registry::InstanceRecord;
@@ -195,12 +195,12 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
     async fn list_singletons(
         &self,
     ) -> Result<Vec<(PlacementVersion, SingletonPlacementRecord)>, PlacementError>;
-    async fn keepalive_singleton_owner_leases(
+    async fn singleton_owner_lease_claims(
         &self,
         service_kind: &ServiceKind,
         instance_id: &InstanceId,
         instance_incarnation: &InstanceIncarnation,
-    ) -> Result<usize, PlacementError>;
+    ) -> Result<Vec<SingletonPlacementRecord>, PlacementError>;
     async fn placement_route_resolver(
         &self,
         service_kind: ServiceKind,
@@ -297,23 +297,27 @@ where
         self.store.list_singletons().await
     }
 
-    async fn keepalive_singleton_owner_leases(
+    async fn singleton_owner_lease_claims(
         &self,
         service_kind: &ServiceKind,
         instance_id: &InstanceId,
         instance_incarnation: &InstanceIncarnation,
-    ) -> Result<usize, PlacementError> {
-        let mut kept_alive = 0;
+    ) -> Result<Vec<SingletonPlacementRecord>, PlacementError> {
+        let mut claims = Vec::new();
         for (_version, record) in self.store.list_singletons().await? {
             if &record.service_kind == service_kind
                 && &record.owner == instance_id
                 && &record.owner_incarnation == instance_incarnation
             {
-                self.store.keepalive_instance_lease(record.lease_id).await?;
-                kept_alive += 1;
+                if claims.len() == MAX_SINGLETON_RENEWAL_CLAIMS {
+                    return Err(PlacementError::SingletonRenewalLimitExceeded {
+                        limit: MAX_SINGLETON_RENEWAL_CLAIMS,
+                    });
+                }
+                claims.push(record);
             }
         }
-        Ok(kept_alive)
+        Ok(claims)
     }
 
     async fn placement_route_resolver(
@@ -547,7 +551,7 @@ mod singleton_renewal_tests {
     use super::{ErasedPlacementStore, PlacementStoreHandle};
 
     #[tokio::test]
-    async fn singleton_renewal_ignores_records_from_a_previous_owner_boot() {
+    async fn singleton_claim_discovery_ignores_records_from_a_previous_owner_boot() {
         let store =
             InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/service-singleton-renewal"));
         let current_lease = store.grant_instance_lease().await.unwrap();
@@ -581,18 +585,17 @@ mod singleton_renewal_tests {
         }
         let handle = PlacementStoreHandle::new(store.clone());
 
-        assert_eq!(
-            handle
-                .keepalive_singleton_owner_leases(
-                    &service_kind!("World"),
-                    &InstanceId::new("world-a"),
-                    &InstanceIncarnation::new("world-a-current-boot"),
-                )
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(store.instance_lease_keepalive_count(current_lease), Some(1));
+        let claims = handle
+            .singleton_owner_lease_claims(
+                &service_kind!("World"),
+                &InstanceId::new("world-a"),
+                &InstanceIncarnation::new("world-a-current-boot"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].scope, "current");
+        assert_eq!(store.instance_lease_keepalive_count(current_lease), Some(0));
         assert_eq!(store.instance_lease_keepalive_count(stale_lease), Some(0));
     }
 }

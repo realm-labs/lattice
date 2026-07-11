@@ -254,6 +254,47 @@ async fn coordinator_mtls_registers_and_renews_only_the_current_boot_incarnation
         store.instance_lease_keepalive_count(registered.lease_id),
         Some(1)
     );
+    let singleton = authority
+        .activate_singleton(singleton_request())
+        .await
+        .expect("current boot creates its singleton owner record");
+    assert_eq!(
+        store.instance_lease_keepalive_count(singleton.lease_id),
+        Some(0)
+    );
+    assert!(matches!(
+        authority
+            .keepalive_singletons(
+                registered.service_kind.clone(),
+                registered.instance_id.clone(),
+                registered.incarnation.clone(),
+                vec![singleton.clone(), singleton.clone()],
+            )
+            .await,
+        Err(PlacementError::PlacementAuthorityRpc {
+            code: Code::FailedPrecondition
+        })
+    ));
+    assert_eq!(
+        store.instance_lease_keepalive_count(singleton.lease_id),
+        Some(0)
+    );
+    assert_eq!(
+        authority
+            .keepalive_singletons(
+                registered.service_kind.clone(),
+                registered.instance_id.clone(),
+                registered.incarnation.clone(),
+                vec![singleton.clone()],
+            )
+            .await
+            .expect("current boot renews an exactly matching singleton claim"),
+        1
+    );
+    assert_eq!(
+        store.instance_lease_keepalive_count(singleton.lease_id),
+        Some(1)
+    );
 
     let stale_channel = connect_tls(
         server.address,
@@ -292,6 +333,23 @@ async fn coordinator_mtls_registers_and_renews_only_the_current_boot_incarnation
             code: Code::PermissionDenied
         })
     ));
+    assert!(matches!(
+        stale
+            .keepalive_singletons(
+                ServiceKind::new(TARGET_SERVICE),
+                InstanceId::new(TARGET_INSTANCE),
+                InstanceIncarnation::new("world-a-old-boot"),
+                vec![singleton.clone()],
+            )
+            .await,
+        Err(PlacementError::PlacementAuthorityRpc {
+            code: Code::PermissionDenied
+        })
+    ));
+    assert_eq!(
+        store.instance_lease_keepalive_count(singleton.lease_id),
+        Some(1)
+    );
     assert_eq!(
         store.instance_lease_keepalive_count(registered.lease_id),
         Some(1)
