@@ -46,6 +46,27 @@ pub trait SingletonClaimReader: Send + Sync + 'static {
     ) -> Result<Vec<SingletonPlacementRecord>, PlacementError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceAdminPlacementSnapshot {
+    pub instances: Vec<InstanceRecord>,
+    pub actors: Vec<ActorPlacementRecord>,
+    pub virtual_shards: Vec<VirtualShardPlacementRecord>,
+    pub singletons: Vec<SingletonPlacementRecord>,
+}
+
+#[async_trait]
+pub trait AdminPlacementReader: Send + Sync + 'static {
+    async fn service_admin_snapshot(
+        &self,
+        service_kind: &ServiceKind,
+        local_instance_id: &InstanceId,
+    ) -> Result<ServiceAdminPlacementSnapshot, PlacementError>;
+    async fn admin_instance(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError>;
+}
+
 #[async_trait]
 impl<T> SingletonClaimReader for T
 where
@@ -416,6 +437,54 @@ impl TonicPlacementReader {
         decode_service_snapshot(reply, service_kind, instance_id, max_entries)
     }
 
+    pub async fn list_service_instances(
+        &self,
+        service_kind: &ServiceKind,
+        max_entries: std::num::NonZeroUsize,
+    ) -> Result<Vec<InstanceRecord>, PlacementError> {
+        if max_entries.get() > MAX_PLACEMENT_SNAPSHOT_ENTRIES {
+            return Err(PlacementError::PlacementReadLimitExceeded {
+                limit: MAX_PLACEMENT_SNAPSHOT_ENTRIES,
+            });
+        }
+        let mut request = Request::new(proto::ListServiceInstancesRequest {
+            service_kind: service_kind.as_str().to_string(),
+            max_entries: u32::try_from(max_entries.get()).map_err(|_| {
+                PlacementError::PlacementReadLimitExceeded {
+                    limit: MAX_PLACEMENT_SNAPSHOT_ENTRIES,
+                }
+            })?,
+        });
+        request.set_timeout(self.request_timeout);
+        let mut client = self.client.clone();
+        let reply =
+            tokio::time::timeout(self.request_timeout, client.list_service_instances(request))
+                .await
+                .map_err(|_| PlacementError::PlacementAuthorityTimeout)?
+                .map_err(authority_status)?
+                .into_inner();
+        if reply.instances.len() > max_entries.get() {
+            return Err(PlacementError::PlacementReadLimitExceeded {
+                limit: max_entries.get(),
+            });
+        }
+        let mut instance_ids = HashSet::new();
+        reply
+            .instances
+            .into_iter()
+            .map(|record| {
+                let expected = InstanceId::new(record.instance_id.clone());
+                let record = decode_instance_record(record, &expected)?;
+                if &record.service_kind != service_kind
+                    || !instance_ids.insert(record.instance_id.clone())
+                {
+                    return invalid_reply("instances");
+                }
+                Ok(record)
+            })
+            .collect()
+    }
+
     pub async fn open_ownership_view(
         &self,
         service_kind: &ServiceKind,
@@ -567,6 +636,49 @@ impl SingletonClaimReader for TonicPlacementReader {
             }
         }
         Ok(claims)
+    }
+}
+
+#[async_trait]
+impl AdminPlacementReader for TonicPlacementReader {
+    async fn service_admin_snapshot(
+        &self,
+        service_kind: &ServiceKind,
+        local_instance_id: &InstanceId,
+    ) -> Result<ServiceAdminPlacementSnapshot, PlacementError> {
+        let max_entries = std::num::NonZeroUsize::new(MAX_PLACEMENT_SNAPSHOT_ENTRIES)
+            .expect("snapshot limit is nonzero");
+        let (instances, snapshot) = tokio::try_join!(
+            self.list_service_instances(service_kind, max_entries),
+            self.get_service_placement_snapshot(service_kind, local_instance_id, max_entries),
+        )?;
+        let mut actors = Vec::new();
+        let mut virtual_shards = Vec::new();
+        let mut singletons = Vec::new();
+        for record in snapshot.records {
+            match record {
+                ServicePlacementSnapshotRecord::Actor { record, .. } => actors.push(record),
+                ServicePlacementSnapshotRecord::VirtualShard { record, .. } => {
+                    virtual_shards.push(record);
+                }
+                ServicePlacementSnapshotRecord::Singleton { record, .. } => {
+                    singletons.push(record);
+                }
+            }
+        }
+        Ok(ServiceAdminPlacementSnapshot {
+            instances,
+            actors,
+            virtual_shards,
+            singletons,
+        })
+    }
+
+    async fn admin_instance(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        self.get_instance(instance_id).await
     }
 }
 
@@ -2072,6 +2184,13 @@ mod tests {
             &self,
             _request: Request<proto::GetServicePlacementSnapshotRequest>,
         ) -> Result<Response<Self::WatchServicePlacementStream>, Status> {
+            Err(Status::unimplemented("test authority"))
+        }
+
+        async fn list_service_instances(
+            &self,
+            _request: Request<proto::ListServiceInstancesRequest>,
+        ) -> Result<Response<proto::ListServiceInstancesReply>, Status> {
             Err(Status::unimplemented("test authority"))
         }
 

@@ -469,6 +469,31 @@ impl PlacementStore for InMemoryPlacementStore {
             .collect())
     }
 
+    async fn list_instances_bounded(
+        &self,
+        service_kind: &ServiceKind,
+        max_entries: std::num::NonZeroUsize,
+    ) -> Result<Vec<InstanceRecord>, PlacementError> {
+        let records = self
+            .inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .instances
+            .iter()
+            .filter(|(key, record)| {
+                key.prefix == self.prefix && &record.service_kind == service_kind
+            })
+            .take(max_entries.get().saturating_add(1))
+            .map(|(_, record)| record.clone())
+            .collect::<Vec<_>>();
+        if records.len() > max_entries.get() {
+            return Err(PlacementError::PlacementReadLimitExceeded {
+                limit: max_entries.get(),
+            });
+        }
+        Ok(records)
+    }
+
     async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError> {
         Ok(self
             .inner

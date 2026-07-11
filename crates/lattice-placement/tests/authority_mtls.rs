@@ -7,8 +7,8 @@ use lattice_core::id::{ActorId, RouteKey};
 use lattice_core::instance::{InstanceCapacity, InstanceId, InstanceIncarnation};
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_placement::authority::{
-    PlacementAuthority, SingletonClaimReader, TonicPlacementAuthority, TonicPlacementReader,
-    TonicPlacementRoutingStore,
+    AdminPlacementReader, PlacementAuthority, SingletonClaimReader, TonicPlacementAuthority,
+    TonicPlacementReader, TonicPlacementRoutingStore,
 };
 use lattice_placement::control::PlacementCoordinatorService;
 use lattice_placement::control::proto;
@@ -197,6 +197,27 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
         .await
         .expect("a current authenticated peer may read a coherent cross-service snapshot");
     assert_eq!(snapshot.records.len(), 2);
+    let admin_snapshot = cross_service_reader
+        .service_admin_snapshot(
+            &ServiceKind::new(TARGET_SERVICE),
+            &InstanceId::new(TARGET_INSTANCE),
+        )
+        .await
+        .expect("semantic admin snapshot uses bounded instance and placement reads");
+    assert_eq!(admin_snapshot.instances.len(), 2);
+    assert_eq!(admin_snapshot.actors.len(), 1);
+    assert_eq!(admin_snapshot.singletons.len(), 1);
+    assert!(matches!(
+        cross_service_reader
+            .list_service_instances(
+                &ServiceKind::new(TARGET_SERVICE),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .await,
+        Err(PlacementError::PlacementAuthorityRpc {
+            code: Code::ResourceExhausted
+        })
+    ));
     assert_eq!(
         cross_service_reader
             .singleton_owner_lease_claims(
@@ -665,6 +686,14 @@ async fn assert_all_methods_rejected_without_mutation(
                 NonZeroUsize::new(8).unwrap(),
             ),
             "unverified identity must not read a placement snapshot",
+        )
+        .await,
+        bounded_error(
+            reader.list_service_instances(
+                &ServiceKind::new(TARGET_SERVICE),
+                NonZeroUsize::new(8).unwrap(),
+            ),
+            "unverified identity must not list service instances",
         )
         .await,
     ] {

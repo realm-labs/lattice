@@ -20,7 +20,9 @@ use lattice_actor::traits::Actor;
 
 use crate::actors::registration::{ErasedLogicActor, RegisteredActor};
 use crate::assembly::builder::LatticeServiceBuilder;
-use crate::components::{ErasedPlacementStore, ErasedSingletonClaimReader};
+use crate::components::{
+    ErasedAdminPlacementReader, ErasedPlacementStore, ErasedSingletonClaimReader,
+};
 use crate::config::{DirectLinkConfig, InstanceConfig};
 use crate::direct_links::DirectLinkServiceRuntime;
 use crate::error::LatticeServiceError;
@@ -42,6 +44,7 @@ pub struct LatticeService {
     logic_actors: Vec<Arc<dyn ErasedLogicActor>>,
     placement_store: Box<dyn ErasedPlacementStore>,
     singleton_claim_reader: Option<Box<dyn ErasedSingletonClaimReader>>,
+    admin_placement_reader: Option<Box<dyn ErasedAdminPlacementReader>>,
     placement_authority: Arc<dyn PlacementAuthority>,
     placement_watch_tasks: Vec<PlacementWatchTask>,
     admin_http: Option<AdminHttpServer>,
@@ -89,6 +92,7 @@ impl LatticeService {
             logic_actors: parts.logic_actors,
             placement_store: parts.placement_store,
             singleton_claim_reader: parts.singleton_claim_reader,
+            admin_placement_reader: parts.admin_placement_reader,
             placement_authority: parts.placement_authority,
             placement_watch_tasks: parts.placement_watch_tasks,
             admin_http: parts.admin_http,
@@ -159,6 +163,7 @@ impl LatticeService {
             logic_actors,
             placement_store,
             singleton_claim_reader,
+            admin_placement_reader,
             placement_authority,
             placement_watch_tasks,
             admin_http,
@@ -212,6 +217,7 @@ impl LatticeService {
             admin_http,
             &service_context,
             placement_store.as_ref(),
+            admin_placement_reader.map(Arc::from),
             placement_authority.clone(),
             &service_kind,
             &instance.instance_id,
@@ -404,6 +410,7 @@ pub(crate) struct LatticeServiceParts {
     pub logic_actors: Vec<Arc<dyn ErasedLogicActor>>,
     pub placement_store: Box<dyn ErasedPlacementStore>,
     pub singleton_claim_reader: Option<Box<dyn ErasedSingletonClaimReader>>,
+    pub admin_placement_reader: Option<Box<dyn ErasedAdminPlacementReader>>,
     pub placement_authority: Arc<dyn PlacementAuthority>,
     pub placement_watch_tasks: Vec<PlacementWatchTask>,
     pub admin_http: Option<AdminHttpServer>,

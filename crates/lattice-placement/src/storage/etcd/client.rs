@@ -197,6 +197,11 @@ pub(crate) trait EtcdKv: Clone + Send + Sync + 'static {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, PlacementVersion, EtcdValue)>, PlacementError>;
+    async fn list_prefix_bounded(
+        &self,
+        prefix: &str,
+        max_entries: NonZeroUsize,
+    ) -> Result<Vec<(String, PlacementVersion, EtcdValue)>, PlacementError>;
     async fn compare_and_put(
         &self,
         key: String,
@@ -653,6 +658,43 @@ impl EtcdKv for RealEtcdClient {
             .get(prefix, Some(GetOptions::new().with_prefix()))
             .await
             .map_err(etcd_error)?;
+        response
+            .kvs()
+            .iter()
+            .map(|kv| {
+                Ok((
+                    String::from_utf8(kv.key().to_vec()).map_err(codec_error)?,
+                    placement_version(kv.mod_revision())?,
+                    decode_etcd_value(kv.value())?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn list_prefix_bounded(
+        &self,
+        prefix: &str,
+        max_entries: NonZeroUsize,
+    ) -> Result<Vec<(String, PlacementVersion, EtcdValue)>, PlacementError> {
+        self.refresh_authentication().await?;
+        let limit = i64::try_from(max_entries.get().saturating_add(1)).map_err(|_| {
+            PlacementError::PlacementReadLimitExceeded {
+                limit: max_entries.get(),
+            }
+        })?;
+        let mut client = self.client.clone();
+        let response = client
+            .get(
+                prefix,
+                Some(GetOptions::new().with_prefix().with_limit(limit)),
+            )
+            .await
+            .map_err(etcd_error)?;
+        if response.kvs().len() > max_entries.get() {
+            return Err(PlacementError::PlacementReadLimitExceeded {
+                limit: max_entries.get(),
+            });
+        }
         response
             .kvs()
             .iter()
@@ -2216,6 +2258,35 @@ impl EtcdKv for InMemoryEtcdClient {
             .collect())
     }
 
+    async fn list_prefix_bounded(
+        &self,
+        prefix: &str,
+        max_entries: NonZeroUsize,
+    ) -> Result<Vec<(String, PlacementVersion, EtcdValue)>, PlacementError> {
+        let entries = self
+            .inner
+            .lock()
+            .expect("in-memory etcd mutex poisoned")
+            .values
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .take(max_entries.get().saturating_add(1))
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    placement_version_from_revision(entry.revision),
+                    entry.value.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if entries.len() > max_entries.get() {
+            return Err(PlacementError::PlacementReadLimitExceeded {
+                limit: max_entries.get(),
+            });
+        }
+        Ok(entries)
+    }
+
     async fn compare_and_put(
         &self,
         key: String,
@@ -2527,6 +2598,14 @@ pub mod test_support {
             prefix: &str,
         ) -> Result<Vec<(String, PlacementVersion, EtcdValue)>, PlacementError> {
             self.inner.list_prefix(prefix).await
+        }
+
+        async fn list_prefix_bounded(
+            &self,
+            prefix: &str,
+            max_entries: NonZeroUsize,
+        ) -> Result<Vec<(String, PlacementVersion, EtcdValue)>, PlacementError> {
+            self.inner.list_prefix_bounded(prefix, max_entries).await
         }
 
         async fn compare_and_put(

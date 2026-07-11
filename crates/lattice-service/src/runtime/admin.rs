@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::info;
 
-use crate::components::ErasedPlacementStore;
+use crate::components::{ErasedAdminPlacementReader, ErasedPlacementStore};
 use crate::error::LatticeServiceError;
 use crate::framework::context::ServiceContextExt;
 use crate::framework::placement::DynPlacementStore;
@@ -31,6 +31,7 @@ pub(crate) async fn start_admin_http_server(
     admin_http: Option<AdminHttpServer>,
     service_context: &ServiceContext,
     placement_store: &dyn ErasedPlacementStore,
+    admin_placement_reader: Option<Arc<dyn ErasedAdminPlacementReader>>,
     placement_authority: Arc<dyn PlacementAuthority>,
     service_kind: &ServiceKind,
     instance_id: &lattice_core::instance::InstanceId,
@@ -38,17 +39,28 @@ pub(crate) async fn start_admin_http_server(
     let Some(admin_http) = admin_http else {
         return Ok((None, None));
     };
-    let snapshot = build_admin_snapshot(
-        placement_store,
-        service_kind,
-        instance_id,
-        admin_http.actor_kinds,
-    )
-    .await?;
+    let snapshot = if let Some(reader) = admin_placement_reader.as_ref() {
+        build_semantic_admin_snapshot(
+            reader.as_ref(),
+            service_kind,
+            instance_id,
+            admin_http.actor_kinds,
+        )
+        .await?
+    } else {
+        build_admin_snapshot(
+            placement_store,
+            service_kind,
+            instance_id,
+            admin_http.actor_kinds,
+        )
+        .await?
+    };
     let router = AdminHttpAdapter::new(admin_http.auth, snapshot)
         .with_mutation_handler(ServiceAdminMutations {
             service_kind: service_kind.clone(),
             placement_store: service_context.placement_store(),
+            admin_placement_reader,
             placement_authority,
         })
         .router();
@@ -72,6 +84,7 @@ pub(crate) async fn start_admin_http_server(
 struct ServiceAdminMutations {
     service_kind: ServiceKind,
     placement_store: Arc<dyn DynPlacementStore>,
+    admin_placement_reader: Option<Arc<dyn ErasedAdminPlacementReader>>,
     placement_authority: Arc<dyn PlacementAuthority>,
 }
 
@@ -90,17 +103,18 @@ impl AdminMutationHandler for ServiceAdminMutations {
         &self,
         instance_id: lattice_core::instance::InstanceId,
     ) -> Result<AdminMutationReply, AdminApiError> {
-        let record = self
-            .placement_store
-            .get_instance(&instance_id)
-            .await
-            .map_err(|error| AdminApiError::MutationFailed {
-                message: error.to_string(),
-            })?
-            .filter(|record| record.service_kind == self.service_kind)
-            .ok_or_else(|| AdminApiError::MutationFailed {
-                message: format!("instance {instance_id} was not found"),
-            })?;
+        let record = if let Some(reader) = self.admin_placement_reader.as_ref() {
+            reader.admin_instance(&instance_id).await
+        } else {
+            self.placement_store.get_instance(&instance_id).await
+        }
+        .map_err(|error| AdminApiError::MutationFailed {
+            message: error.to_string(),
+        })?
+        .filter(|record| record.service_kind == self.service_kind)
+        .ok_or_else(|| AdminApiError::MutationFailed {
+            message: format!("instance {instance_id} was not found"),
+        })?;
         let report = self
             .placement_authority
             .drain_instance(
@@ -145,6 +159,26 @@ impl AdminMutationHandler for ServiceAdminMutations {
             operation: "migrate_actor",
         })
     }
+}
+
+async fn build_semantic_admin_snapshot(
+    reader: &dyn ErasedAdminPlacementReader,
+    service_kind: &ServiceKind,
+    instance_id: &lattice_core::instance::InstanceId,
+    actor_kinds: Vec<ActorKind>,
+) -> Result<AdminSnapshot, LatticeServiceError> {
+    let snapshot = reader
+        .service_admin_snapshot(service_kind, instance_id)
+        .await?;
+    Ok(AdminSnapshot::from_placement_records(
+        service_kind.clone(),
+        instance_id.clone(),
+        actor_kinds,
+        snapshot.instances,
+        snapshot.actors,
+        snapshot.virtual_shards,
+        snapshot.singletons,
+    ))
 }
 
 async fn build_admin_snapshot(

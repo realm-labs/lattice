@@ -115,6 +115,17 @@ impl LatticeServiceBuilder {
         } else {
             None
         };
+        let admin_placement_reader = if let Some(component) = self.admin_placement_reader {
+            debug!(
+                service.kind = self.service_kind.as_str(),
+                component.target = "admin_placement_reader",
+                component.type = component.type_name(),
+                "building service component"
+            );
+            Some(component.build(&component_context).await?)
+        } else {
+            None
+        };
         match (self.cluster_event_bus, self.local_event_bus) {
             (None, None) => {
                 build_service_component(
@@ -377,6 +388,7 @@ impl LatticeServiceBuilder {
             placement_store,
             placement_authority,
             singleton_claim_reader,
+            admin_placement_reader,
             placement_watch_tasks,
             admin_http,
             instance_lease_keepalive_interval: self.instance_lease_keepalive_interval,

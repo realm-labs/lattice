@@ -903,6 +903,11 @@ pub trait PlacementReadStore: Clone + Send + Sync + 'static {
         &self,
         service_kind: &ServiceKind,
     ) -> Result<Vec<InstanceRecord>, PlacementError>;
+    async fn list_instances_bounded(
+        &self,
+        service_kind: &ServiceKind,
+        max_entries: NonZeroUsize,
+    ) -> Result<Vec<InstanceRecord>, PlacementError>;
     async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError>;
     async fn get_actor(
         &self,
@@ -966,6 +971,13 @@ where
         service_kind: &ServiceKind,
     ) -> Result<Vec<InstanceRecord>, PlacementError> {
         PlacementStore::list_instances(self, service_kind).await
+    }
+    async fn list_instances_bounded(
+        &self,
+        service_kind: &ServiceKind,
+        max_entries: NonZeroUsize,
+    ) -> Result<Vec<InstanceRecord>, PlacementError> {
+        PlacementStore::list_instances_bounded(self, service_kind, max_entries).await
     }
     async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError> {
         PlacementStore::list_all_instances(self).await
@@ -1063,6 +1075,15 @@ where
         service_kind: &ServiceKind,
     ) -> Result<Vec<InstanceRecord>, PlacementError> {
         self.inner.list_instances(service_kind).await
+    }
+    async fn list_instances_bounded(
+        &self,
+        service_kind: &ServiceKind,
+        max_entries: NonZeroUsize,
+    ) -> Result<Vec<InstanceRecord>, PlacementError> {
+        self.inner
+            .list_instances_bounded(service_kind, max_entries)
+            .await
     }
     async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError> {
         self.inner.list_all_instances().await
@@ -1178,6 +1199,11 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
     async fn list_instances(
         &self,
         service_kind: &ServiceKind,
+    ) -> Result<Vec<InstanceRecord>, PlacementError>;
+    async fn list_instances_bounded(
+        &self,
+        service_kind: &ServiceKind,
+        max_entries: NonZeroUsize,
     ) -> Result<Vec<InstanceRecord>, PlacementError>;
     async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError>;
     async fn get_actor(

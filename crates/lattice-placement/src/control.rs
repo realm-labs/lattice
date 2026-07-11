@@ -548,6 +548,36 @@ where
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    async fn list_service_instances(
+        &self,
+        request: Request<proto::ListServiceInstancesRequest>,
+    ) -> Result<Response<proto::ListServiceInstancesReply>, Status> {
+        self.authenticate_current_peer(&request).await?;
+        let request = request.into_inner();
+        if !canonical_identity_segment(&request.service_kind) {
+            return Err(Status::invalid_argument(
+                "instance-list service identity is not canonical",
+            ));
+        }
+        let max_entries = usize::try_from(request.max_entries)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .filter(|limit| limit.get() <= MAX_PLACEMENT_SNAPSHOT_ENTRIES)
+            .ok_or_else(|| Status::invalid_argument("instance-list limit is out of range"))?;
+        let instances = self
+            .coordinator
+            .store
+            .list_instances_bounded(&ServiceKind::new(request.service_kind), max_entries)
+            .await
+            .map_err(status_from_placement)?
+            .iter()
+            .map(instance_record_to_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Response::new(proto::ListServiceInstancesReply {
+            instances,
+        }))
+    }
+
     async fn drain_instance(
         &self,
         request: Request<proto::DrainInstanceRequest>,

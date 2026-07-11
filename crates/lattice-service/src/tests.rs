@@ -58,7 +58,8 @@ use lattice_eventbus::local::{EventBus, LocalEventBus};
 use lattice_eventbus::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
 use lattice_ops::ops_config::AdminHttpConfig;
 use lattice_placement::authority::{
-    DevelopmentInProcessPlacementAuthority, PlacementAuthority, SingletonClaimReader,
+    AdminPlacementReader, DevelopmentInProcessPlacementAuthority, PlacementAuthority,
+    ServiceAdminPlacementSnapshot, SingletonClaimReader,
 };
 use lattice_placement::control::proto::logic_control_client::LogicControlClient;
 use lattice_placement::control::{TonicLogicControl, actor_id_to_proto, proto};
@@ -120,6 +121,36 @@ struct CountingRoutingStore {
 #[derive(Clone)]
 struct CountingClaimReader {
     calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct CountingAdminReader {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl AdminPlacementReader for CountingAdminReader {
+    async fn service_admin_snapshot(
+        &self,
+        _service_kind: &ServiceKind,
+        _local_instance_id: &InstanceId,
+    ) -> Result<ServiceAdminPlacementSnapshot, PlacementError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ServiceAdminPlacementSnapshot {
+            instances: Vec::new(),
+            actors: Vec::new(),
+            virtual_shards: Vec::new(),
+            singletons: Vec::new(),
+        })
+    }
+
+    async fn admin_instance(
+        &self,
+        _instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    }
 }
 
 #[async_trait]

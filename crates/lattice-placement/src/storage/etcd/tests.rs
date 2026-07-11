@@ -533,6 +533,37 @@ async fn etcd_store_compare_and_put_uses_versions() {
 }
 
 #[tokio::test]
+async fn etcd_service_instance_list_enforces_its_backend_limit() {
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/bounded-instances"),
+        InMemoryEtcdClient::new(),
+    );
+    store
+        .upsert_instance(instance_record("world-a", InstanceState::Ready))
+        .await
+        .unwrap();
+    store
+        .upsert_instance(instance_record("world-b", InstanceState::Ready))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .list_instances_bounded(&service_kind!("World"), NonZeroUsize::new(1).unwrap())
+            .await,
+        Err(PlacementError::PlacementReadLimitExceeded { limit: 1 })
+    );
+    assert_eq!(
+        store
+            .list_instances_bounded(&service_kind!("World"), NonZeroUsize::new(2).unwrap())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn etcd_store_persists_virtual_shards_with_versions() {
     let store = EtcdPlacementStore::new(
         PlacementPrefix::new("/lattice/test"),

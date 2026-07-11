@@ -317,6 +317,50 @@ async fn service_starts_admin_http_as_managed_listener() {
     task.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn service_admin_selects_the_separate_semantic_reader() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = admin_probe.local_addr().unwrap();
+    drop(admin_probe);
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/admin-reader"));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
+        .admin_placement_reader::<CountingAdminReader, _>(CountingAdminReader {
+            calls: calls.clone(),
+        })
+        .admin_http(AdminHttpConfig {
+            bind: Some(admin_addr),
+            bearer_token: None,
+        })
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
 async fn read_admin_http(admin_addr: std::net::SocketAddr, path: &str) -> String {
     write_admin_http(admin_addr, "GET", path, "").await
 }

@@ -20,7 +20,17 @@ service PlacementCoordinator {
   rpc GetSingleton(GetSingletonRequest) returns (GetSingletonReply);
   rpc GetServicePlacementSnapshot(GetServicePlacementSnapshotRequest) returns (GetServicePlacementSnapshotReply);
   rpc WatchServicePlacement(GetServicePlacementSnapshotRequest) returns (stream ServicePlacementWatchResponse);
+  rpc ListServiceInstances(ListServiceInstancesRequest) returns (ListServiceInstancesReply);
   rpc DrainInstance(DrainInstanceRequest) returns (DrainInstanceReply);
+}
+
+message ListServiceInstancesRequest {
+  string service_kind = 1;
+  uint32 max_entries = 2;
+}
+
+message ListServiceInstancesReply {
+  repeated InstanceRecord instances = 1;
 }
 
 message GetInstanceRequest {

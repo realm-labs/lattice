@@ -799,6 +799,21 @@ where
         collect_instances(&self.prefix, self.client.list_prefix(&prefix).await?)
     }
 
+    async fn list_instances_bounded(
+        &self,
+        service_kind: &ServiceKind,
+        max_entries: std::num::NonZeroUsize,
+    ) -> Result<Vec<InstanceRecord>, PlacementError> {
+        validate_service_kind(service_kind)?;
+        let prefix = instance_service_prefix(&self.prefix, service_kind);
+        collect_instances(
+            &self.prefix,
+            self.client
+                .list_prefix_bounded(&prefix, max_entries)
+                .await?,
+        )
+    }
+
     async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError> {
         let prefix = instance_namespace_prefix(&self.prefix);
         collect_instances(&self.prefix, self.client.list_prefix(&prefix).await?)

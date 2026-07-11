@@ -7,7 +7,8 @@ use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ConfiguredComponentBuilder;
 use lattice_core::service_context::{ConfiguredComponent, ServiceContextBuilder};
 use lattice_placement::authority::{
-    MAX_SINGLETON_RENEWAL_CLAIMS, PlacementAuthority, SingletonClaimReader,
+    AdminPlacementReader, MAX_SINGLETON_RENEWAL_CLAIMS, PlacementAuthority,
+    ServiceAdminPlacementSnapshot, SingletonClaimReader,
 };
 use lattice_placement::coordination::singleton::SingletonRouteResolver;
 use lattice_placement::error::PlacementError;
@@ -279,6 +280,111 @@ pub(crate) trait ErasedSingletonClaimReaderComponent: Send + Sync {
         self: Box<Self>,
         ctx: &ServiceComponentContext,
     ) -> Result<Box<dyn ErasedSingletonClaimReader>, LatticeServiceError>;
+}
+
+#[async_trait]
+pub(crate) trait ErasedAdminPlacementReader: std::fmt::Debug + Send + Sync {
+    async fn service_admin_snapshot(
+        &self,
+        service_kind: &ServiceKind,
+        local_instance_id: &InstanceId,
+    ) -> Result<ServiceAdminPlacementSnapshot, PlacementError>;
+    async fn admin_instance(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError>;
+}
+
+#[async_trait]
+pub(crate) trait ErasedAdminPlacementReaderComponent: Send + Sync {
+    fn type_name(&self) -> &'static str;
+
+    async fn build(
+        self: Box<Self>,
+        ctx: &ServiceComponentContext,
+    ) -> Result<Box<dyn ErasedAdminPlacementReader>, LatticeServiceError>;
+}
+
+pub(crate) struct AdminPlacementReaderHandle<T>
+where
+    T: AdminPlacementReader,
+{
+    reader: T,
+}
+
+impl<T> std::fmt::Debug for AdminPlacementReaderHandle<T>
+where
+    T: AdminPlacementReader,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdminPlacementReaderHandle")
+            .field("reader_type", &std::any::type_name::<T>())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl<T> ErasedAdminPlacementReader for AdminPlacementReaderHandle<T>
+where
+    T: AdminPlacementReader,
+{
+    async fn service_admin_snapshot(
+        &self,
+        service_kind: &ServiceKind,
+        local_instance_id: &InstanceId,
+    ) -> Result<ServiceAdminPlacementSnapshot, PlacementError> {
+        self.reader
+            .service_admin_snapshot(service_kind, local_instance_id)
+            .await
+    }
+
+    async fn admin_instance(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        self.reader.admin_instance(instance_id).await
+    }
+}
+
+pub(crate) struct AdminPlacementReaderRegistration<T>
+where
+    T: AdminPlacementReader,
+{
+    component: Box<dyn ServiceComponent<T>>,
+}
+
+impl<T> AdminPlacementReaderRegistration<T>
+where
+    T: AdminPlacementReader,
+{
+    pub(crate) fn new<C>(component: C) -> Self
+    where
+        C: IntoServiceComponent<T>,
+    {
+        Self {
+            component: Box::new(component.into_service_component()),
+        }
+    }
+}
+
+#[async_trait]
+impl<T> ErasedAdminPlacementReaderComponent for AdminPlacementReaderRegistration<T>
+where
+    T: AdminPlacementReader,
+{
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
+    }
+
+    async fn build(
+        self: Box<Self>,
+        ctx: &ServiceComponentContext,
+    ) -> Result<Box<dyn ErasedAdminPlacementReader>, LatticeServiceError> {
+        Ok(Box::new(AdminPlacementReaderHandle {
+            reader: self.component.build(ctx).await?,
+        }))
+    }
 }
 
 pub(crate) struct SingletonClaimReaderHandle<T>
