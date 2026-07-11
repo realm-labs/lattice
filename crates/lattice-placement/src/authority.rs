@@ -23,9 +23,11 @@ use crate::error::PlacementError;
 use crate::registry::{InstanceRecord, InstanceState};
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, EpochFloorRecord, LeaseId, OwnershipEpochFloorProof,
-    OwnershipProofContext, OwnershipRecordBinding, OwnershipViewRecord, OwnershipViewSnapshot,
-    PlacementRevision, PlacementState, PlacementStore, PlacementVersion, SingletonKey,
-    SingletonPlacementRecord, VirtualShardPlacementRecord,
+    OwnershipProofContext, OwnershipRecordBinding, OwnershipView, OwnershipViewRecord,
+    OwnershipViewSnapshot, OwnershipWatch, OwnershipWatchBatch, OwnershipWatchError,
+    OwnershipWatchEvent, OwnershipWatchMessage, OwnershipWatchUpdate, PlacementRevision,
+    PlacementState, PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
+    VirtualShardPlacementRecord,
 };
 
 pub const DEFAULT_PLACEMENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -249,6 +251,83 @@ impl TonicPlacementReader {
         .map_err(authority_status)?
         .into_inner();
         decode_service_snapshot(reply, service_kind, instance_id, max_entries)
+    }
+
+    pub async fn open_ownership_view(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        max_entries: std::num::NonZeroUsize,
+    ) -> Result<OwnershipView, crate::storage::OwnershipViewError> {
+        if max_entries.get() > MAX_PLACEMENT_SNAPSHOT_ENTRIES {
+            return Err(crate::storage::OwnershipViewError::CapacityExceeded {
+                max_entries: MAX_PLACEMENT_SNAPSHOT_ENTRIES,
+            });
+        }
+        let mut request = Request::new(proto::GetServicePlacementSnapshotRequest {
+            service_kind: service_kind.as_str().to_string(),
+            instance_id: instance_id.as_str().to_string(),
+            max_entries: u32::try_from(max_entries.get()).map_err(|_| {
+                crate::storage::OwnershipViewError::CapacityExceeded {
+                    max_entries: MAX_PLACEMENT_SNAPSHOT_ENTRIES,
+                }
+            })?,
+        });
+        request.set_timeout(self.request_timeout);
+        let mut client = self.client.clone();
+        let mut stream = tokio::time::timeout(
+            self.request_timeout,
+            client.watch_service_placement(request),
+        )
+        .await
+        .map_err(|_| remote_view_backend("placement watch RPC timed out"))?
+        .map_err(remote_view_status)?
+        .into_inner();
+        let first = tokio::time::timeout(self.request_timeout, stream.message())
+            .await
+            .map_err(|_| remote_view_backend("placement watch snapshot timed out"))?
+            .map_err(remote_view_status)?
+            .ok_or_else(|| remote_view_protocol("placement watch omitted its snapshot"))?;
+        let snapshot = match first.update {
+            Some(proto::service_placement_watch_response::Update::Snapshot(snapshot)) => {
+                decode_service_snapshot(snapshot, service_kind, instance_id, max_entries)
+                    .map_err(|error| remote_view_protocol(error.to_string()))?
+                    .into_ownership_view_snapshot()
+            }
+            _ => {
+                return Err(remote_view_protocol(
+                    "placement watch did not start with a snapshot",
+                ));
+            }
+        };
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let expected_service = service_kind.clone();
+        let expected_instance = instance_id.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let message = match stream.message().await {
+                    Ok(Some(message)) => match decode_watch_update(
+                        message,
+                        &expected_service,
+                        &expected_instance,
+                        max_entries,
+                    ) {
+                        Ok(update) => OwnershipWatchMessage::Update(update),
+                        Err(error) => OwnershipWatchMessage::Failed(error),
+                    },
+                    Ok(None) => OwnershipWatchMessage::Failed(OwnershipWatchError::Closed),
+                    Err(status) => OwnershipWatchMessage::Failed(remote_watch_status(status)),
+                };
+                let terminal = matches!(message, OwnershipWatchMessage::Failed(_));
+                if tx.send(message).is_err() || terminal {
+                    return;
+                }
+            }
+        });
+        Ok(OwnershipView {
+            snapshot,
+            watch: OwnershipWatch::new_cancellable(rx, task.abort_handle()),
+        })
     }
 
     async fn call_get_instance(
@@ -1117,17 +1196,42 @@ fn decode_snapshot_proof(
     record_revision: PlacementRevision,
     binding: OwnershipRecordBinding,
 ) -> Result<OwnershipEpochFloorProof, PlacementError> {
-    if proof.observed_revision != snapshot_revision.0
+    decode_floor_proof(
+        proof,
+        proto::OwnershipProofContext::Snapshot,
+        snapshot_revision,
+        record_revision,
+        binding,
+    )
+}
+
+fn decode_floor_proof(
+    proof: proto::SnapshotEpochFloorProof,
+    expected_context: proto::OwnershipProofContext,
+    observed_revision: PlacementRevision,
+    record_revision: PlacementRevision,
+    binding: OwnershipRecordBinding,
+) -> Result<OwnershipEpochFloorProof, PlacementError> {
+    if proof.observed_revision != observed_revision.0
         || proof.record_version != record_revision.0
         || proof.record_version == 0
         || proof.floor_version == 0
         || proof.floor_epoch == 0
+        || proto::OwnershipProofContext::try_from(proof.context)
+            .ok()
+            .filter(|context| *context == expected_context)
+            .is_none()
     {
         return invalid_reply("record.proof");
     }
     let proof = OwnershipEpochFloorProof::new(
-        OwnershipProofContext::Snapshot,
-        snapshot_revision,
+        match expected_context {
+            proto::OwnershipProofContext::Snapshot => OwnershipProofContext::Snapshot,
+            proto::OwnershipProofContext::Upsert => OwnershipProofContext::Upsert,
+            proto::OwnershipProofContext::Delete => OwnershipProofContext::Delete,
+            proto::OwnershipProofContext::Unspecified => return invalid_reply("record.proof"),
+        },
+        observed_revision,
         PlacementVersion::from_modification_revision(proof.record_version),
         binding.clone(),
         PlacementVersion::from_modification_revision(proof.floor_version),
@@ -1138,9 +1242,15 @@ fn decode_snapshot_proof(
         None,
     )
     .map_err(|_| invalid_reply_error("record.proof"))?;
-    proof
-        .validate_snapshot(snapshot_revision, record_revision, &binding)
-        .map_err(|_| invalid_reply_error("record.proof"))?;
+    let validation = match expected_context {
+        proto::OwnershipProofContext::Snapshot => {
+            proof.validate_snapshot(observed_revision, record_revision, &binding)
+        }
+        proto::OwnershipProofContext::Upsert => proof.validate_upsert(observed_revision, &binding),
+        proto::OwnershipProofContext::Delete => proof.validate_delete(observed_revision, &binding),
+        proto::OwnershipProofContext::Unspecified => return invalid_reply("record.proof"),
+    };
+    validation.map_err(|_| invalid_reply_error("record.proof"))?;
     Ok(proof)
 }
 
@@ -1223,6 +1333,265 @@ fn decode_snapshot_singleton(
         lease_id: decode_lease(reply.lease_id)?,
         state: decode_state(&reply.state)?,
     })
+}
+
+fn decode_watch_update(
+    response: proto::ServicePlacementWatchResponse,
+    expected_service: &ServiceKind,
+    expected_instance: &InstanceId,
+    max_entries: std::num::NonZeroUsize,
+) -> Result<OwnershipWatchUpdate, OwnershipWatchError> {
+    use proto::service_placement_watch_response::Update;
+
+    match response.update {
+        Some(Update::ProgressRevision(revision)) if revision > 0 => {
+            Ok(OwnershipWatchUpdate::Progress {
+                revision: PlacementRevision(revision),
+            })
+        }
+        Some(Update::Batch(batch)) => {
+            if batch.revision == 0 {
+                return Err(remote_watch_protocol("watch batch revision is invalid"));
+            }
+            if batch.events.len() > max_entries.get().saturating_add(1) {
+                return Err(OwnershipWatchError::BatchCapacityExceeded {
+                    max_events: max_entries.get().saturating_add(1),
+                });
+            }
+            let revision = PlacementRevision(batch.revision);
+            let events = batch
+                .events
+                .into_iter()
+                .map(|event| {
+                    decode_watch_event(event, expected_service, expected_instance, revision)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(OwnershipWatchUpdate::Batch(OwnershipWatchBatch {
+                revision,
+                events,
+            }))
+        }
+        Some(Update::Snapshot(_)) => Err(remote_watch_protocol(
+            "placement watch repeated its initial snapshot",
+        )),
+        Some(Update::Failure(failure)) => Err(decode_watch_failure(failure)),
+        Some(Update::ProgressRevision(_)) | None => {
+            Err(remote_watch_protocol("placement watch update is invalid"))
+        }
+    }
+}
+
+fn decode_watch_failure(failure: proto::ServicePlacementWatchFailure) -> OwnershipWatchError {
+    use proto::ServicePlacementWatchFailureKind as Kind;
+
+    let bound = usize::try_from(failure.bound).unwrap_or(usize::MAX);
+    match Kind::try_from(failure.kind).unwrap_or(Kind::Unspecified) {
+        Kind::Lagged => OwnershipWatchError::Lagged {
+            skipped: failure.bound,
+        },
+        Kind::Closed => OwnershipWatchError::Closed,
+        Kind::Backend => OwnershipWatchError::Backend {
+            message: "remote placement watch backend failed".to_string(),
+        },
+        Kind::Compacted => OwnershipWatchError::Compacted {
+            requested_revision: PlacementRevision(failure.requested_revision),
+            compact_revision: PlacementRevision(failure.compact_revision),
+        },
+        Kind::Canceled => OwnershipWatchError::Canceled {
+            reason: "remote placement watch was canceled".to_string(),
+        },
+        Kind::Protocol | Kind::Unspecified => {
+            remote_watch_protocol("remote placement watch protocol failed")
+        }
+        Kind::Capacity => OwnershipWatchError::CapacityExceeded { max_entries: bound },
+        Kind::BatchCapacity => OwnershipWatchError::BatchCapacityExceeded { max_events: bound },
+        Kind::StartupBacklog => OwnershipWatchError::StartupBacklogExceeded { max_updates: bound },
+        Kind::Proof => OwnershipWatchError::Protocol {
+            message: "remote placement watch proof failed".to_string(),
+        },
+    }
+}
+
+fn decode_watch_event(
+    event: proto::ServicePlacementWatchEvent,
+    expected_service: &ServiceKind,
+    expected_instance: &InstanceId,
+    batch_revision: PlacementRevision,
+) -> Result<OwnershipWatchEvent, OwnershipWatchError> {
+    use proto::service_placement_watch_event::Event;
+
+    match event
+        .event
+        .ok_or_else(|| remote_watch_protocol("placement watch event is missing"))?
+    {
+        Event::InstanceUpserted(record) => {
+            let record = decode_instance_record(record, expected_instance)
+                .map_err(|error| remote_watch_protocol(error.to_string()))?;
+            if &record.service_kind != expected_service {
+                return Err(remote_watch_protocol(
+                    "placement watch instance service is invalid",
+                ));
+            }
+            Ok(OwnershipWatchEvent::InstanceUpserted { record })
+        }
+        Event::InstanceDeleted(record) => {
+            let record = decode_instance_record(record, expected_instance)
+                .map_err(|error| remote_watch_protocol(error.to_string()))?;
+            if &record.service_kind != expected_service {
+                return Err(remote_watch_protocol(
+                    "placement watch instance service is invalid",
+                ));
+            }
+            Ok(OwnershipWatchEvent::InstanceDeleted { record })
+        }
+        Event::PlacementUpserted(record) => {
+            decode_watch_placement(record, expected_service, batch_revision, false)
+        }
+        Event::PlacementDeleted(record) => {
+            decode_watch_placement(record, expected_service, batch_revision, true)
+        }
+    }
+}
+
+fn decode_watch_placement(
+    entry: proto::ServicePlacementRecord,
+    expected_service: &ServiceKind,
+    batch_revision: PlacementRevision,
+    deleted: bool,
+) -> Result<OwnershipWatchEvent, OwnershipWatchError> {
+    use proto::service_placement_record::Record;
+
+    if entry.revision == 0 || entry.revision > batch_revision.0 {
+        return Err(remote_watch_protocol(
+            "placement watch record revision is invalid",
+        ));
+    }
+    let record_revision = PlacementRevision(entry.revision);
+    let proof = entry
+        .proof
+        .ok_or_else(|| remote_watch_protocol("placement watch proof is missing"))?;
+    let context = if deleted {
+        proto::OwnershipProofContext::Delete
+    } else {
+        proto::OwnershipProofContext::Upsert
+    };
+    match entry
+        .record
+        .ok_or_else(|| remote_watch_protocol("placement watch record is missing"))?
+    {
+        Record::Actor(record) => {
+            let record = decode_snapshot_actor(record, expected_service)
+                .map_err(|error| remote_watch_protocol(error.to_string()))?;
+            let binding = OwnershipRecordBinding::Actor(record.clone());
+            let proof =
+                decode_floor_proof(proof, context, batch_revision, record_revision, binding)
+                    .map_err(|error| remote_watch_protocol(error.to_string()))?;
+            let key = ActorPlacementKey {
+                service_kind: record.service_kind.clone(),
+                actor_kind: record.actor_kind.clone(),
+                actor_id: record.actor_id.clone(),
+            };
+            Ok(if deleted {
+                OwnershipWatchEvent::ActorDeleted {
+                    key,
+                    previous_record: record,
+                    proof,
+                }
+            } else {
+                OwnershipWatchEvent::ActorUpserted { key, record, proof }
+            })
+        }
+        Record::VirtualShard(record) => {
+            let record = decode_snapshot_virtual_shard(record, expected_service)
+                .map_err(|error| remote_watch_protocol(error.to_string()))?;
+            let binding = OwnershipRecordBinding::VirtualShard(record.clone());
+            let proof =
+                decode_floor_proof(proof, context, batch_revision, record_revision, binding)
+                    .map_err(|error| remote_watch_protocol(error.to_string()))?;
+            let key = crate::storage::VirtualShardPlacementKey {
+                service_kind: record.service_kind.clone(),
+                actor_kind: record.actor_kind.clone(),
+                shard_id: record.shard_id,
+            };
+            Ok(if deleted {
+                OwnershipWatchEvent::VirtualShardDeleted {
+                    key,
+                    previous_record: record,
+                    proof,
+                }
+            } else {
+                OwnershipWatchEvent::VirtualShardUpserted { key, record, proof }
+            })
+        }
+        Record::Singleton(record) => {
+            let record = decode_snapshot_singleton(record, expected_service)
+                .map_err(|error| remote_watch_protocol(error.to_string()))?;
+            let binding = OwnershipRecordBinding::Singleton(record.clone());
+            let proof =
+                decode_floor_proof(proof, context, batch_revision, record_revision, binding)
+                    .map_err(|error| remote_watch_protocol(error.to_string()))?;
+            let key = SingletonKey {
+                service_kind: record.service_kind.clone(),
+                singleton_kind: record.singleton_kind.clone(),
+                scope: record.scope.clone(),
+            };
+            Ok(if deleted {
+                OwnershipWatchEvent::SingletonDeleted {
+                    key,
+                    previous_record: record,
+                    proof,
+                }
+            } else {
+                OwnershipWatchEvent::SingletonUpserted { key, record, proof }
+            })
+        }
+    }
+}
+
+fn remote_view_backend(message: impl Into<String>) -> crate::storage::OwnershipViewError {
+    crate::storage::OwnershipViewError::Backend {
+        message: message.into(),
+    }
+}
+
+fn remote_view_protocol(message: impl Into<String>) -> crate::storage::OwnershipViewError {
+    crate::storage::OwnershipViewError::Protocol {
+        message: message.into(),
+    }
+}
+
+fn remote_view_status(status: Status) -> crate::storage::OwnershipViewError {
+    match status.code() {
+        Code::ResourceExhausted => crate::storage::OwnershipViewError::CapacityExceeded {
+            max_entries: MAX_PLACEMENT_SNAPSHOT_ENTRIES,
+        },
+        _ => remote_view_backend(format!("placement watch RPC failed: {:?}", status.code())),
+    }
+}
+
+fn remote_watch_protocol(message: impl Into<String>) -> OwnershipWatchError {
+    OwnershipWatchError::Protocol {
+        message: message.into(),
+    }
+}
+
+fn remote_watch_status(status: Status) -> OwnershipWatchError {
+    match status.code() {
+        Code::ResourceExhausted => OwnershipWatchError::CapacityExceeded {
+            max_entries: MAX_PLACEMENT_SNAPSHOT_ENTRIES,
+        },
+        Code::OutOfRange => OwnershipWatchError::Compacted {
+            requested_revision: PlacementRevision(0),
+            compact_revision: PlacementRevision(0),
+        },
+        Code::DataLoss => remote_watch_protocol("remote placement watch proof is invalid"),
+        Code::Cancelled => OwnershipWatchError::Canceled {
+            reason: "remote placement watch was canceled".to_string(),
+        },
+        _ => OwnershipWatchError::Backend {
+            message: format!("remote placement watch failed: {:?}", status.code()),
+        },
+    }
 }
 
 fn decode_actor_reply(
@@ -1427,6 +1796,10 @@ mod tests {
 
     #[tonic::async_trait]
     impl proto::placement_coordinator_server::PlacementCoordinator for SlowAndRejectingAuthority {
+        type WatchServicePlacementStream = tokio_stream::wrappers::ReceiverStream<
+            Result<proto::ServicePlacementWatchResponse, Status>,
+        >;
+
         async fn register_instance(
             &self,
             _request: Request<proto::RegisterInstanceRequest>,
@@ -1495,6 +1868,13 @@ mod tests {
             &self,
             _request: Request<proto::GetServicePlacementSnapshotRequest>,
         ) -> Result<Response<proto::GetServicePlacementSnapshotReply>, Status> {
+            Err(Status::unimplemented("test authority"))
+        }
+
+        async fn watch_service_placement(
+            &self,
+            _request: Request<proto::GetServicePlacementSnapshotRequest>,
+        ) -> Result<Response<Self::WatchServicePlacementStream>, Status> {
             Err(Status::unimplemented("test authority"))
         }
 
@@ -1779,6 +2159,7 @@ mod tests {
                 record_version: 1,
                 floor_version: 1,
                 floor_epoch: 1,
+                context: proto::OwnershipProofContext::Snapshot as i32,
             }),
         };
         let reply = proto::GetServicePlacementSnapshotReply {
@@ -1832,6 +2213,33 @@ mod tests {
             Err(PlacementError::InvalidPlacementAuthorityReply {
                 field: "record.proof"
             })
+        );
+    }
+
+    #[test]
+    fn remote_watch_preserves_structured_compaction_failure() {
+        let error = decode_watch_update(
+            proto::ServicePlacementWatchResponse {
+                update: Some(proto::service_placement_watch_response::Update::Failure(
+                    proto::ServicePlacementWatchFailure {
+                        kind: proto::ServicePlacementWatchFailureKind::Compacted as i32,
+                        requested_revision: 11,
+                        compact_revision: 17,
+                        bound: 0,
+                    },
+                )),
+            },
+            &service_kind!("World"),
+            &InstanceId::new("world-a"),
+            std::num::NonZeroUsize::new(8).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            OwnershipWatchError::Compacted {
+                requested_revision: PlacementRevision(11),
+                compact_revision: PlacementRevision(17),
+            }
         );
     }
 

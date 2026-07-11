@@ -19,6 +19,7 @@ service PlacementCoordinator {
   rpc GetActor(GetActorRequest) returns (GetActorReply);
   rpc GetSingleton(GetSingletonRequest) returns (GetSingletonReply);
   rpc GetServicePlacementSnapshot(GetServicePlacementSnapshotRequest) returns (GetServicePlacementSnapshotReply);
+  rpc WatchServicePlacement(GetServicePlacementSnapshotRequest) returns (stream ServicePlacementWatchResponse);
   rpc DrainInstance(DrainInstanceRequest) returns (DrainInstanceReply);
 }
 
@@ -101,6 +102,58 @@ message SnapshotEpochFloorProof {
   uint64 record_version = 2;
   uint64 floor_version = 3;
   uint64 floor_epoch = 4;
+  OwnershipProofContext context = 5;
+}
+
+enum OwnershipProofContext {
+  OWNERSHIP_PROOF_CONTEXT_UNSPECIFIED = 0;
+  OWNERSHIP_PROOF_CONTEXT_SNAPSHOT = 1;
+  OWNERSHIP_PROOF_CONTEXT_UPSERT = 2;
+  OWNERSHIP_PROOF_CONTEXT_DELETE = 3;
+}
+
+message ServicePlacementWatchResponse {
+  oneof update {
+    GetServicePlacementSnapshotReply snapshot = 1;
+    ServicePlacementWatchBatch batch = 2;
+    uint64 progress_revision = 3;
+    ServicePlacementWatchFailure failure = 4;
+  }
+}
+
+message ServicePlacementWatchFailure {
+  ServicePlacementWatchFailureKind kind = 1;
+  uint64 requested_revision = 2;
+  uint64 compact_revision = 3;
+  uint64 bound = 4;
+}
+
+enum ServicePlacementWatchFailureKind {
+  SERVICE_PLACEMENT_WATCH_FAILURE_KIND_UNSPECIFIED = 0;
+  SERVICE_PLACEMENT_WATCH_FAILURE_KIND_LAGGED = 1;
+  SERVICE_PLACEMENT_WATCH_FAILURE_KIND_CLOSED = 2;
+  SERVICE_PLACEMENT_WATCH_FAILURE_KIND_BACKEND = 3;
+  SERVICE_PLACEMENT_WATCH_FAILURE_KIND_COMPACTED = 4;
+  SERVICE_PLACEMENT_WATCH_FAILURE_KIND_CANCELED = 5;
+  SERVICE_PLACEMENT_WATCH_FAILURE_KIND_PROTOCOL = 6;
+  SERVICE_PLACEMENT_WATCH_FAILURE_KIND_CAPACITY = 7;
+  SERVICE_PLACEMENT_WATCH_FAILURE_KIND_BATCH_CAPACITY = 8;
+  SERVICE_PLACEMENT_WATCH_FAILURE_KIND_STARTUP_BACKLOG = 9;
+  SERVICE_PLACEMENT_WATCH_FAILURE_KIND_PROOF = 10;
+}
+
+message ServicePlacementWatchBatch {
+  uint64 revision = 1;
+  repeated ServicePlacementWatchEvent events = 2;
+}
+
+message ServicePlacementWatchEvent {
+  oneof event {
+    InstanceRecord instance_upserted = 1;
+    InstanceRecord instance_deleted = 2;
+    ServicePlacementRecord placement_upserted = 3;
+    ServicePlacementRecord placement_deleted = 4;
+  }
 }
 
 message VirtualShardPlacement {

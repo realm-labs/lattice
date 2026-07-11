@@ -216,6 +216,34 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
             code: Code::ResourceExhausted
         })
     ));
+    let mut remote_view = cross_service_reader
+        .open_ownership_view(
+            &ServiceKind::new(TARGET_SERVICE),
+            &InstanceId::new(TARGET_INSTANCE),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .await
+        .expect("a current authenticated peer opens one no-gap ownership stream");
+    let snapshot_revision = remote_view.snapshot.revision;
+    cross_service_authority
+        .activate_actor(ActivateActorRequest {
+            service_kind: ServiceKind::new(TARGET_SERVICE),
+            actor_kind: ActorKind::new("World"),
+            actor_id: ActorId::U64(8),
+        })
+        .await
+        .expect("a mutation after the remote snapshot is streamed");
+    let batch = tokio::time::timeout(REJECTION_DEADLINE, remote_view.watch.next())
+        .await
+        .expect("remote ownership watch update is bounded")
+        .expect("remote ownership watch remains valid");
+    assert!(batch.revision > snapshot_revision);
+    assert!(batch.events.iter().any(|event| matches!(
+        event,
+        lattice_placement::storage::OwnershipWatchEvent::ActorUpserted { record, .. }
+            if record.actor_id == ActorId::U64(8)
+    )));
+    drop(remote_view);
     assert!(
         cross_service_reader
             .get_singleton(&singleton_key())
@@ -267,7 +295,7 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
         .await
         .expect("the exact authenticated workload may drain itself");
     assert_eq!(report.drained_instance, InstanceId::new(TARGET_INSTANCE));
-    assert_eq!(report.migrated_actors, 1);
+    assert_eq!(report.migrated_actors, 2);
     assert_eq!(report.migrated_virtual_shards, 0);
     assert_eq!(target_record(&store).await.state, InstanceState::Draining);
 
@@ -560,6 +588,17 @@ async fn assert_all_methods_rejected_without_mutation(
             other => panic!("expected a typed authority RPC rejection, got {other:?}"),
         }
     }
+    assert!(
+        reader
+            .open_ownership_view(
+                &ServiceKind::new(TARGET_SERVICE),
+                &InstanceId::new(TARGET_INSTANCE),
+                NonZeroUsize::new(8).unwrap(),
+            )
+            .await
+            .is_err(),
+        "unverified identity must not open a placement watch"
+    );
     assert_eq!(placement_revision(store).await, revision_before);
     assert!(store.get_actor(&actor_key()).await.unwrap().is_none());
     assert!(

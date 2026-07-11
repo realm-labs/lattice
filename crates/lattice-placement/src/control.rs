@@ -9,6 +9,7 @@ use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_rpc::security::{
     MtlsPeerIdentityExtractor, PeerIdentity, RpcSecurityError, ServiceIdentityConfig,
 };
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::authority::{
@@ -33,7 +34,8 @@ use crate::registry::InstanceRecord;
 use crate::sharding::VirtualShardId;
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, OwnershipViewError, OwnershipViewRecord,
-    PlacementState, PlacementStore, SingletonKey, SingletonPlacementRecord,
+    OwnershipViewSnapshot, OwnershipWatchBatch, OwnershipWatchError, OwnershipWatchEvent,
+    OwnershipWatchUpdate, PlacementState, PlacementStore, SingletonKey, SingletonPlacementRecord,
     VirtualShardPlacementRecord,
 };
 
@@ -201,6 +203,9 @@ where
     S: PlacementStore,
     L: CoordinatorLogicControl + SingletonControl,
 {
+    type WatchServicePlacementStream =
+        ReceiverStream<Result<proto::ServicePlacementWatchResponse, Status>>;
+
     async fn register_instance(
         &self,
         request: Request<proto::RegisterInstanceRequest>,
@@ -485,50 +490,62 @@ where
         request: Request<proto::GetServicePlacementSnapshotRequest>,
     ) -> Result<Response<proto::GetServicePlacementSnapshotReply>, Status> {
         self.authenticate_current_peer(&request).await?;
-        let request = request.into_inner();
-        if !canonical_identity_segment(&request.service_kind)
-            || !canonical_identity_segment(&request.instance_id)
-        {
-            return Err(Status::invalid_argument(
-                "snapshot identity is not canonical",
-            ));
-        }
-        let max_entries = usize::try_from(request.max_entries)
-            .ok()
-            .and_then(NonZeroUsize::new)
-            .filter(|limit| limit.get() <= MAX_PLACEMENT_SNAPSHOT_ENTRIES)
-            .ok_or_else(|| Status::invalid_argument("snapshot entry limit is out of range"))?;
+        let (service_kind, instance_id, max_entries) = snapshot_request(request.into_inner())?;
         let view = self
             .coordinator
             .store
-            .open_ownership_view(
-                &ServiceKind::new(request.service_kind),
-                &lattice_core::instance::InstanceId::new(request.instance_id),
-                max_entries,
-            )
+            .open_ownership_view(&service_kind, &instance_id, max_entries)
             .await
             .map_err(snapshot_status)?;
-        let records = view
-            .snapshot
-            .records
-            .into_iter()
-            .map(service_snapshot_record_to_proto)
-            .collect::<Vec<_>>();
-        if records.len() > max_entries.get() {
-            return Err(Status::resource_exhausted(
-                "snapshot exceeded its entry limit",
-            ));
-        }
-        Ok(Response::new(proto::GetServicePlacementSnapshotReply {
-            revision: view.snapshot.revision.0,
-            local_instance: view
-                .snapshot
-                .local_instance
-                .as_ref()
-                .map(instance_record_to_proto)
-                .transpose()?,
-            records,
+        Ok(Response::new(ownership_snapshot_to_proto(
+            view.snapshot,
+            max_entries,
+        )?))
+    }
+
+    async fn watch_service_placement(
+        &self,
+        request: Request<proto::GetServicePlacementSnapshotRequest>,
+    ) -> Result<Response<Self::WatchServicePlacementStream>, Status> {
+        self.authenticate_current_peer(&request).await?;
+        let (service_kind, instance_id, max_entries) = snapshot_request(request.into_inner())?;
+        let mut view = self
+            .coordinator
+            .store
+            .open_ownership_view(&service_kind, &instance_id, max_entries)
+            .await
+            .map_err(snapshot_status)?;
+        let snapshot = ownership_snapshot_to_proto(view.snapshot, max_entries)?;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(Ok(proto::ServicePlacementWatchResponse {
+            update: Some(proto::service_placement_watch_response::Update::Snapshot(
+                snapshot,
+            )),
         }))
+        .await
+        .map_err(|_| Status::cancelled("placement watch receiver closed"))?;
+        tokio::spawn(async move {
+            loop {
+                let update = match view.watch.next_update().await {
+                    Ok(update) => match ownership_watch_update_to_proto(update) {
+                        Ok(update) => Ok(update),
+                        Err(status) => Err(status),
+                    },
+                    Err(error) => Ok(ownership_watch_failure_to_proto(error)),
+                };
+                let terminal = update.as_ref().is_err_and(|_| true)
+                    || update.as_ref().is_ok_and(|message| {
+                        matches!(
+                            message.update,
+                            Some(proto::service_placement_watch_response::Update::Failure(_))
+                        )
+                    });
+                if tx.send(update).await.is_err() || terminal {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn drain_instance(
@@ -994,6 +1011,231 @@ fn singleton_placement_to_proto(
     }
 }
 
+fn snapshot_request(
+    request: proto::GetServicePlacementSnapshotRequest,
+) -> Result<
+    (
+        ServiceKind,
+        lattice_core::instance::InstanceId,
+        NonZeroUsize,
+    ),
+    Status,
+> {
+    if !canonical_identity_segment(&request.service_kind)
+        || !canonical_identity_segment(&request.instance_id)
+    {
+        return Err(Status::invalid_argument(
+            "snapshot identity is not canonical",
+        ));
+    }
+    let max_entries = usize::try_from(request.max_entries)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .filter(|limit| limit.get() <= MAX_PLACEMENT_SNAPSHOT_ENTRIES)
+        .ok_or_else(|| Status::invalid_argument("snapshot entry limit is out of range"))?;
+    Ok((
+        ServiceKind::new(request.service_kind),
+        lattice_core::instance::InstanceId::new(request.instance_id),
+        max_entries,
+    ))
+}
+
+fn ownership_snapshot_to_proto(
+    snapshot: OwnershipViewSnapshot,
+    max_entries: NonZeroUsize,
+) -> Result<proto::GetServicePlacementSnapshotReply, Status> {
+    let records = snapshot
+        .records
+        .into_iter()
+        .map(service_snapshot_record_to_proto)
+        .collect::<Vec<_>>();
+    if records.len() > max_entries.get() {
+        return Err(Status::resource_exhausted(
+            "snapshot exceeded its entry limit",
+        ));
+    }
+    Ok(proto::GetServicePlacementSnapshotReply {
+        revision: snapshot.revision.0,
+        local_instance: snapshot
+            .local_instance
+            .as_ref()
+            .map(instance_record_to_proto)
+            .transpose()?,
+        records,
+    })
+}
+
+fn ownership_watch_update_to_proto(
+    update: OwnershipWatchUpdate,
+) -> Result<proto::ServicePlacementWatchResponse, Status> {
+    use proto::service_placement_watch_response::Update;
+
+    let update = match update {
+        OwnershipWatchUpdate::Batch(batch) => Update::Batch(ownership_watch_batch_to_proto(batch)?),
+        OwnershipWatchUpdate::Progress { revision } => Update::ProgressRevision(revision.0),
+    };
+    Ok(proto::ServicePlacementWatchResponse {
+        update: Some(update),
+    })
+}
+
+fn ownership_watch_failure_to_proto(
+    error: OwnershipWatchError,
+) -> proto::ServicePlacementWatchResponse {
+    use proto::ServicePlacementWatchFailureKind as Kind;
+    use proto::service_placement_watch_response::Update;
+
+    let (kind, requested_revision, compact_revision, bound) = match error {
+        OwnershipWatchError::Lagged { skipped } => (Kind::Lagged, 0, 0, skipped),
+        OwnershipWatchError::Closed => (Kind::Closed, 0, 0, 0),
+        OwnershipWatchError::Backend { .. } => (Kind::Backend, 0, 0, 0),
+        OwnershipWatchError::Compacted {
+            requested_revision,
+            compact_revision,
+        } => (Kind::Compacted, requested_revision.0, compact_revision.0, 0),
+        OwnershipWatchError::Canceled { .. } => (Kind::Canceled, 0, 0, 0),
+        OwnershipWatchError::Protocol { .. } => (Kind::Protocol, 0, 0, 0),
+        OwnershipWatchError::CapacityExceeded { max_entries } => (
+            Kind::Capacity,
+            0,
+            0,
+            u64::try_from(max_entries).unwrap_or(u64::MAX),
+        ),
+        OwnershipWatchError::BatchCapacityExceeded { max_events } => (
+            Kind::BatchCapacity,
+            0,
+            0,
+            u64::try_from(max_events).unwrap_or(u64::MAX),
+        ),
+        OwnershipWatchError::StartupBacklogExceeded { max_updates } => (
+            Kind::StartupBacklog,
+            0,
+            0,
+            u64::try_from(max_updates).unwrap_or(u64::MAX),
+        ),
+        OwnershipWatchError::Proof { .. } => (Kind::Proof, 0, 0, 0),
+    };
+    proto::ServicePlacementWatchResponse {
+        update: Some(Update::Failure(proto::ServicePlacementWatchFailure {
+            kind: kind as i32,
+            requested_revision,
+            compact_revision,
+            bound,
+        })),
+    }
+}
+
+fn ownership_watch_batch_to_proto(
+    batch: OwnershipWatchBatch,
+) -> Result<proto::ServicePlacementWatchBatch, Status> {
+    Ok(proto::ServicePlacementWatchBatch {
+        revision: batch.revision.0,
+        events: batch
+            .events
+            .into_iter()
+            .map(ownership_watch_event_to_proto)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn ownership_watch_event_to_proto(
+    event: OwnershipWatchEvent,
+) -> Result<proto::ServicePlacementWatchEvent, Status> {
+    use proto::service_placement_watch_event::Event;
+
+    let event = match event {
+        OwnershipWatchEvent::InstanceUpserted { record } => {
+            Event::InstanceUpserted(instance_record_to_proto(&record)?)
+        }
+        OwnershipWatchEvent::InstanceDeleted { record } => {
+            Event::InstanceDeleted(instance_record_to_proto(&record)?)
+        }
+        OwnershipWatchEvent::ActorUpserted { record, proof, .. } => Event::PlacementUpserted(
+            watch_actor_record_to_proto(record, proof, proto::OwnershipProofContext::Upsert),
+        ),
+        OwnershipWatchEvent::ActorDeleted {
+            previous_record,
+            proof,
+            ..
+        } => Event::PlacementDeleted(watch_actor_record_to_proto(
+            previous_record,
+            proof,
+            proto::OwnershipProofContext::Delete,
+        )),
+        OwnershipWatchEvent::VirtualShardUpserted { record, proof, .. } => {
+            Event::PlacementUpserted(watch_virtual_shard_record_to_proto(
+                record,
+                proof,
+                proto::OwnershipProofContext::Upsert,
+            ))
+        }
+        OwnershipWatchEvent::VirtualShardDeleted {
+            previous_record,
+            proof,
+            ..
+        } => Event::PlacementDeleted(watch_virtual_shard_record_to_proto(
+            previous_record,
+            proof,
+            proto::OwnershipProofContext::Delete,
+        )),
+        OwnershipWatchEvent::SingletonUpserted { record, proof, .. } => Event::PlacementUpserted(
+            watch_singleton_record_to_proto(record, proof, proto::OwnershipProofContext::Upsert),
+        ),
+        OwnershipWatchEvent::SingletonDeleted {
+            previous_record,
+            proof,
+            ..
+        } => Event::PlacementDeleted(watch_singleton_record_to_proto(
+            previous_record,
+            proof,
+            proto::OwnershipProofContext::Delete,
+        )),
+    };
+    Ok(proto::ServicePlacementWatchEvent { event: Some(event) })
+}
+
+fn watch_actor_record_to_proto(
+    record: ActorPlacementRecord,
+    proof: crate::storage::OwnershipEpochFloorProof,
+    context: proto::OwnershipProofContext,
+) -> proto::ServicePlacementRecord {
+    proto::ServicePlacementRecord {
+        revision: proof.record_revision().0,
+        record: Some(proto::service_placement_record::Record::Actor(
+            actor_placement_to_proto(record),
+        )),
+        proof: Some(ownership_proof_to_proto(&proof, context)),
+    }
+}
+
+fn watch_virtual_shard_record_to_proto(
+    record: VirtualShardPlacementRecord,
+    proof: crate::storage::OwnershipEpochFloorProof,
+    context: proto::OwnershipProofContext,
+) -> proto::ServicePlacementRecord {
+    proto::ServicePlacementRecord {
+        revision: proof.record_revision().0,
+        record: Some(proto::service_placement_record::Record::VirtualShard(
+            virtual_shard_placement_to_proto(record),
+        )),
+        proof: Some(ownership_proof_to_proto(&proof, context)),
+    }
+}
+
+fn watch_singleton_record_to_proto(
+    record: SingletonPlacementRecord,
+    proof: crate::storage::OwnershipEpochFloorProof,
+    context: proto::OwnershipProofContext,
+) -> proto::ServicePlacementRecord {
+    proto::ServicePlacementRecord {
+        revision: proof.record_revision().0,
+        record: Some(proto::service_placement_record::Record::Singleton(
+            singleton_placement_to_proto(record),
+        )),
+        proof: Some(ownership_proof_to_proto(&proof, context)),
+    }
+}
+
 fn service_snapshot_record_to_proto(record: OwnershipViewRecord) -> proto::ServicePlacementRecord {
     use proto::service_placement_record::Record;
 
@@ -1005,7 +1247,10 @@ fn service_snapshot_record_to_proto(record: OwnershipViewRecord) -> proto::Servi
         } => proto::ServicePlacementRecord {
             revision: revision.0,
             record: Some(Record::Actor(actor_placement_to_proto(record))),
-            proof: Some(snapshot_proof_to_proto(&proof)),
+            proof: Some(ownership_proof_to_proto(
+                &proof,
+                proto::OwnershipProofContext::Snapshot,
+            )),
         },
         OwnershipViewRecord::VirtualShard {
             revision,
@@ -1016,7 +1261,10 @@ fn service_snapshot_record_to_proto(record: OwnershipViewRecord) -> proto::Servi
             record: Some(Record::VirtualShard(virtual_shard_placement_to_proto(
                 record,
             ))),
-            proof: Some(snapshot_proof_to_proto(&proof)),
+            proof: Some(ownership_proof_to_proto(
+                &proof,
+                proto::OwnershipProofContext::Snapshot,
+            )),
         },
         OwnershipViewRecord::Singleton {
             revision,
@@ -1025,19 +1273,24 @@ fn service_snapshot_record_to_proto(record: OwnershipViewRecord) -> proto::Servi
         } => proto::ServicePlacementRecord {
             revision: revision.0,
             record: Some(Record::Singleton(singleton_placement_to_proto(record))),
-            proof: Some(snapshot_proof_to_proto(&proof)),
+            proof: Some(ownership_proof_to_proto(
+                &proof,
+                proto::OwnershipProofContext::Snapshot,
+            )),
         },
     }
 }
 
-fn snapshot_proof_to_proto(
+fn ownership_proof_to_proto(
     proof: &crate::storage::OwnershipEpochFloorProof,
+    context: proto::OwnershipProofContext,
 ) -> proto::SnapshotEpochFloorProof {
     proto::SnapshotEpochFloorProof {
         observed_revision: proof.observed_revision().0,
         record_version: proof.record_version().modification_revision(),
         floor_version: proof.floor_version().modification_revision(),
         floor_epoch: proof.floor_epoch().0,
+        context: context as i32,
     }
 }
 
