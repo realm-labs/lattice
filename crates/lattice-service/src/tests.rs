@@ -72,7 +72,7 @@ use lattice_placement::sharding::VirtualShardMapper;
 use lattice_placement::storage::memory::InMemoryPlacementStore;
 use lattice_placement::storage::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementState,
-    PlacementStore, SingletonKey,
+    PlacementStore, ReadOnlyPlacementStore, SingletonKey,
 };
 use lattice_rpc::client::TonicEndpointChannelPoolConfig;
 use lattice_rpc::error::RpcError;

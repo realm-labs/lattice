@@ -20,7 +20,7 @@ use lattice_ops::ops_config::AdminHttpConfig;
 use lattice_placement::authority::{DevelopmentInProcessPlacementAuthority, PlacementAuthority};
 use lattice_placement::routing::placement::PlacementWatchStarter;
 use lattice_placement::routing::rpc::RpcRetryPolicy;
-use lattice_placement::storage::PlacementStore;
+use lattice_placement::storage::{PlacementReadStore, PlacementStore};
 use lattice_rpc::client::TonicEndpointChannelPoolConfig;
 use lattice_rpc::security::{RpcSecurityPolicy, RpcServerSecurity, RpcTransportSecurity};
 use tokio::net::TcpListener;
@@ -182,7 +182,7 @@ impl LatticeServiceBuilder {
 
     pub fn placement_store<T, C>(mut self, store: C) -> Self
     where
-        T: PlacementStore,
+        T: PlacementReadStore,
         C: IntoServiceComponent<T>,
     {
         if self.placement_store.is_some() {

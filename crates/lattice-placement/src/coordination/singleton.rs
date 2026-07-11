@@ -249,7 +249,7 @@ impl<S> SingletonRouteResolver<S> {
 #[async_trait]
 impl<S> RouteResolver for SingletonRouteResolver<S>
 where
-    S: PlacementStore,
+    S: crate::storage::PlacementReadStore,
 {
     async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
         let cache_key = request.cache_key();

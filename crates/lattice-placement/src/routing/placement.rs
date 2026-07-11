@@ -12,7 +12,7 @@ use crate::error::PlacementError;
 use crate::registry::InstanceState;
 use crate::routing::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::routing::resolver::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
-use crate::storage::{ActorPlacementKey, PlacementState, PlacementStore, PlacementWatchEvent};
+use crate::storage::{ActorPlacementKey, PlacementReadStore, PlacementState, PlacementWatchEvent};
 
 #[derive(Clone)]
 pub struct ExplicitRouteResolver<S> {
@@ -58,7 +58,7 @@ impl<S> ExplicitRouteResolver<S> {
 
 impl<S> ExplicitRouteResolver<S>
 where
-    S: PlacementStore,
+    S: PlacementReadStore,
 {
     pub async fn watch_cache_updates(&self) -> Result<PlacementWatchTask, PlacementError> {
         let mut watch = self.store.watch(self.store.prefix().clone()).await?;
@@ -82,7 +82,7 @@ pub trait PlacementWatchStarter: Clone + Send + Sync + 'static {
 #[async_trait]
 impl<S> PlacementWatchStarter for ExplicitRouteResolver<S>
 where
-    S: PlacementStore,
+    S: PlacementReadStore,
 {
     async fn start_placement_watch(&self) -> Result<PlacementWatchTask, PlacementError> {
         self.watch_cache_updates().await
@@ -119,7 +119,7 @@ impl Drop for PlacementWatchTask {
 #[async_trait]
 impl<S> RouteResolver for ExplicitRouteResolver<S>
 where
-    S: PlacementStore,
+    S: PlacementReadStore,
 {
     async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
         if request.service_kind != self.service_kind {
@@ -211,7 +211,7 @@ async fn refresh_cache_from_watch_event<S>(
     cache: &Arc<LocalRouteCache>,
     event: PlacementWatchEvent,
 ) where
-    S: PlacementStore,
+    S: PlacementReadStore,
 {
     let record = match event {
         PlacementWatchEvent::InstanceUpdated { record } if &record.service_kind == service_kind => {

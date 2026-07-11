@@ -850,6 +850,253 @@ impl PlacementPrefix {
 }
 
 #[async_trait]
+pub trait PlacementReadStore: Clone + Send + Sync + 'static {
+    async fn get_instance(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError>;
+    async fn get_service_instance(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        Ok(self
+            .get_instance(instance_id)
+            .await?
+            .filter(|record| &record.service_kind == service_kind))
+    }
+    async fn list_instances(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<InstanceRecord>, PlacementError>;
+    async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError>;
+    async fn get_actor(
+        &self,
+        key: &ActorPlacementKey,
+    ) -> Result<Option<(PlacementVersion, ActorPlacementRecord)>, PlacementError>;
+    async fn list_actors(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, ActorPlacementRecord)>, PlacementError>;
+    async fn get_virtual_shard(
+        &self,
+        key: &VirtualShardPlacementKey,
+    ) -> Result<Option<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
+    async fn list_virtual_shards(
+        &self,
+        service_kind: &ServiceKind,
+        actor_kind: &ActorKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
+    async fn list_virtual_shards_for_service(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError>;
+    async fn get_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError>;
+    async fn list_singletons(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, SingletonPlacementRecord)>, PlacementError>;
+    async fn open_ownership_view(
+        &self,
+        _service_kind: &ServiceKind,
+        _instance_id: &InstanceId,
+        _max_entries: NonZeroUsize,
+    ) -> Result<OwnershipView, OwnershipViewError> {
+        Err(OwnershipViewError::Unsupported)
+    }
+    async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError>;
+    fn prefix(&self) -> &PlacementPrefix;
+}
+
+#[async_trait]
+impl<T> PlacementReadStore for T
+where
+    T: PlacementStore,
+{
+    async fn get_instance(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        PlacementStore::get_instance(self, instance_id).await
+    }
+    async fn get_service_instance(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        PlacementStore::get_service_instance(self, service_kind, instance_id).await
+    }
+    async fn list_instances(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<InstanceRecord>, PlacementError> {
+        PlacementStore::list_instances(self, service_kind).await
+    }
+    async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError> {
+        PlacementStore::list_all_instances(self).await
+    }
+    async fn get_actor(
+        &self,
+        key: &ActorPlacementKey,
+    ) -> Result<Option<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
+        PlacementStore::get_actor(self, key).await
+    }
+    async fn list_actors(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
+        PlacementStore::list_actors(self).await
+    }
+    async fn get_virtual_shard(
+        &self,
+        key: &VirtualShardPlacementKey,
+    ) -> Result<Option<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        PlacementStore::get_virtual_shard(self, key).await
+    }
+    async fn list_virtual_shards(
+        &self,
+        service_kind: &ServiceKind,
+        actor_kind: &ActorKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        PlacementStore::list_virtual_shards(self, service_kind, actor_kind).await
+    }
+    async fn list_virtual_shards_for_service(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        PlacementStore::list_virtual_shards_for_service(self, service_kind).await
+    }
+    async fn get_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        PlacementStore::get_singleton(self, key).await
+    }
+    async fn list_singletons(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        PlacementStore::list_singletons(self).await
+    }
+    async fn open_ownership_view(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        max_entries: NonZeroUsize,
+    ) -> Result<OwnershipView, OwnershipViewError> {
+        PlacementStore::open_ownership_view(self, service_kind, instance_id, max_entries).await
+    }
+    async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError> {
+        PlacementStore::watch(self, prefix).await
+    }
+    fn prefix(&self) -> &PlacementPrefix {
+        PlacementStore::prefix(self)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadOnlyPlacementStore<T> {
+    inner: T,
+}
+
+impl<T> ReadOnlyPlacementStore<T> {
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl<T> PlacementReadStore for ReadOnlyPlacementStore<T>
+where
+    T: PlacementReadStore,
+{
+    async fn get_instance(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        self.inner.get_instance(instance_id).await
+    }
+    async fn get_service_instance(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        self.inner
+            .get_service_instance(service_kind, instance_id)
+            .await
+    }
+    async fn list_instances(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<InstanceRecord>, PlacementError> {
+        self.inner.list_instances(service_kind).await
+    }
+    async fn list_all_instances(&self) -> Result<Vec<InstanceRecord>, PlacementError> {
+        self.inner.list_all_instances().await
+    }
+    async fn get_actor(
+        &self,
+        key: &ActorPlacementKey,
+    ) -> Result<Option<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
+        self.inner.get_actor(key).await
+    }
+    async fn list_actors(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
+        self.inner.list_actors().await
+    }
+    async fn get_virtual_shard(
+        &self,
+        key: &VirtualShardPlacementKey,
+    ) -> Result<Option<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        self.inner.get_virtual_shard(key).await
+    }
+    async fn list_virtual_shards(
+        &self,
+        service_kind: &ServiceKind,
+        actor_kind: &ActorKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        self.inner
+            .list_virtual_shards(service_kind, actor_kind)
+            .await
+    }
+    async fn list_virtual_shards_for_service(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<Vec<(PlacementVersion, VirtualShardPlacementRecord)>, PlacementError> {
+        self.inner
+            .list_virtual_shards_for_service(service_kind)
+            .await
+    }
+    async fn get_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        self.inner.get_singleton(key).await
+    }
+    async fn list_singletons(
+        &self,
+    ) -> Result<Vec<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        self.inner.list_singletons().await
+    }
+    async fn open_ownership_view(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        max_entries: NonZeroUsize,
+    ) -> Result<OwnershipView, OwnershipViewError> {
+        self.inner
+            .open_ownership_view(service_kind, instance_id, max_entries)
+            .await
+    }
+    async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError> {
+        self.inner.watch(prefix).await
+    }
+    fn prefix(&self) -> &PlacementPrefix {
+        self.inner.prefix()
+    }
+}
+
+#[async_trait]
 pub trait PlacementStore: Clone + Send + Sync + 'static {
     /// Creates one leased `Starting` instance record only when its key is absent.
     /// Implementations must revoke any newly allocated lease if creation loses.

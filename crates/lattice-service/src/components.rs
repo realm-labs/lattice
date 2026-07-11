@@ -15,7 +15,7 @@ use lattice_placement::routing::placement::{
     PlacementRouteResolver, PlacementWatchStarter, PlacementWatchTask,
 };
 use lattice_placement::storage::{
-    ActorPlacementRecord, PlacementStore, PlacementVersion, SingletonPlacementRecord,
+    ActorPlacementRecord, PlacementReadStore, PlacementVersion, SingletonPlacementRecord,
     VirtualShardPlacementRecord,
 };
 
@@ -238,14 +238,14 @@ pub(crate) trait ErasedPlacementStoreComponent: Send + Sync {
 
 pub(crate) struct PlacementStoreHandle<T>
 where
-    T: PlacementStore,
+    T: PlacementReadStore,
 {
     store: T,
 }
 
 impl<T> std::fmt::Debug for PlacementStoreHandle<T>
 where
-    T: PlacementStore,
+    T: PlacementReadStore,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -257,7 +257,7 @@ where
 
 impl<T> PlacementStoreHandle<T>
 where
-    T: PlacementStore,
+    T: PlacementReadStore,
 {
     fn new(store: T) -> Self {
         Self { store }
@@ -267,7 +267,7 @@ where
 #[async_trait]
 impl<T> ErasedPlacementStore for PlacementStoreHandle<T>
 where
-    T: PlacementStore,
+    T: PlacementReadStore,
 {
     async fn list_instances(
         &self,
@@ -365,14 +365,14 @@ where
 
 pub(crate) struct PlacementStoreRegistration<T>
 where
-    T: PlacementStore,
+    T: PlacementReadStore,
 {
     component: Box<dyn ServiceComponent<T>>,
 }
 
 impl<T> PlacementStoreRegistration<T>
 where
-    T: PlacementStore,
+    T: PlacementReadStore,
 {
     pub(crate) fn new<C>(component: C) -> Self
     where
@@ -387,7 +387,7 @@ where
 #[async_trait]
 impl<T> ErasedPlacementStoreComponent for PlacementStoreRegistration<T>
 where
-    T: PlacementStore,
+    T: PlacementReadStore,
 {
     fn target_name(&self) -> &'static str {
         "placement_store"
