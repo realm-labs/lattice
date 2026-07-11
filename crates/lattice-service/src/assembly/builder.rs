@@ -18,7 +18,7 @@ use lattice_direct_link::stream::DirectLinkActorBinding;
 use lattice_eventbus::local::EventBus;
 use lattice_ops::ops_config::AdminHttpConfig;
 use lattice_placement::authority::{DevelopmentInProcessPlacementAuthority, PlacementAuthority};
-use lattice_placement::routing::placement::PlacementWatchStarter;
+use lattice_placement::routing::placement::{PlacementRoutingStore, PlacementWatchStarter};
 use lattice_placement::routing::rpc::RpcRetryPolicy;
 use lattice_placement::storage::{PlacementReadStore, PlacementStore};
 use lattice_rpc::client::TonicEndpointChannelPoolConfig;
@@ -32,8 +32,9 @@ use crate::assembly::placement_watch::{ErasedPlacementWatchStarter, PlacementWat
 use crate::clients::{ErasedRpcClientBinding, RpcClientRegistration};
 use crate::clients::{RpcClientBinding, RpcServiceBinding};
 use crate::components::{
-    ErasedPlacementAuthorityComponent, ErasedPlacementStoreComponent, ErasedServiceComponent,
-    IntoServiceComponent, PlacementAuthorityRegistration, PlacementStoreRegistration,
+    ErasedPlacementAuthorityComponent, ErasedPlacementRoutingStoreComponent,
+    ErasedPlacementStoreComponent, ErasedServiceComponent, IntoServiceComponent,
+    PlacementAuthorityRegistration, PlacementRoutingStoreRegistration, PlacementStoreRegistration,
     ServiceComponentRegistration,
 };
 use crate::config::{DirectLinkConfig, InstanceConfig};
@@ -51,6 +52,7 @@ pub struct LatticeServiceBuilder {
     pub(crate) direct_link_bindings: Vec<Box<dyn ErasedDirectLinkBinding>>,
     pub(crate) config: Option<ConfigSource>,
     pub(crate) placement_store: Option<Box<dyn ErasedPlacementStoreComponent>>,
+    pub(crate) placement_routing_store: Option<Box<dyn ErasedPlacementRoutingStoreComponent>>,
     pub(crate) placement_authority: Option<Box<dyn ErasedPlacementAuthorityComponent>>,
     pub(crate) cluster_event_bus: Option<Box<dyn ErasedServiceComponent>>,
     pub(crate) local_event_bus: Option<Box<dyn ErasedServiceComponent>>,
@@ -92,6 +94,10 @@ impl fmt::Debug for LatticeServiceBuilder {
             .field("has_config", &self.config.is_some())
             .field("has_placement_store", &self.placement_store.is_some())
             .field(
+                "has_placement_routing_store",
+                &self.placement_routing_store.is_some(),
+            )
+            .field(
                 "has_placement_authority",
                 &self.placement_authority.is_some(),
             )
@@ -124,6 +130,7 @@ impl LatticeServiceBuilder {
             direct_link_bindings: Vec::new(),
             config: None,
             placement_store: None,
+            placement_routing_store: None,
             placement_authority: None,
             cluster_event_bus: None,
             local_event_bus: None,
@@ -190,6 +197,21 @@ impl LatticeServiceBuilder {
                 .get_or_insert("placement_store");
         } else {
             self.placement_store = Some(Box::new(PlacementStoreRegistration::<T>::new(store)));
+        }
+        self
+    }
+
+    pub fn placement_routing_store<T, C>(mut self, store: C) -> Self
+    where
+        T: PlacementRoutingStore,
+        C: IntoServiceComponent<T>,
+    {
+        if self.placement_routing_store.is_some() {
+            self.duplicate_framework_component
+                .get_or_insert("placement_routing_store");
+        } else {
+            self.placement_routing_store =
+                Some(Box::new(PlacementRoutingStoreRegistration::<T>::new(store)));
         }
         self
     }

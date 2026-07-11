@@ -12,7 +12,7 @@ use lattice_placement::error::PlacementError;
 use lattice_placement::registry::InstanceRecord;
 use lattice_placement::routing::cache::RouteCacheConfig;
 use lattice_placement::routing::placement::{
-    PlacementRouteResolver, PlacementWatchStarter, PlacementWatchTask,
+    PlacementRouteResolver, PlacementRoutingStore, PlacementWatchStarter, PlacementWatchTask,
 };
 use lattice_placement::storage::{
     ActorPlacementRecord, PlacementReadStore, PlacementVersion, SingletonPlacementRecord,
@@ -222,6 +222,147 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
         ),
         PlacementError,
     >;
+}
+
+#[async_trait]
+pub(crate) trait ErasedPlacementRoutingStore: std::fmt::Debug + Send + Sync {
+    async fn placement_route_resolver(
+        &self,
+        service_kind: ServiceKind,
+        authority: Arc<dyn PlacementAuthority>,
+    ) -> Result<
+        (
+            lattice_placement::routing::resolver::BoxRouteResolver,
+            PlacementWatchTask,
+        ),
+        PlacementError,
+    >;
+    async fn singleton_route_resolver(
+        &self,
+        authority: Arc<dyn PlacementAuthority>,
+    ) -> Result<
+        (
+            lattice_placement::routing::resolver::BoxRouteResolver,
+            PlacementWatchTask,
+        ),
+        PlacementError,
+    >;
+}
+
+#[async_trait]
+pub(crate) trait ErasedPlacementRoutingStoreComponent: Send + Sync {
+    fn type_name(&self) -> &'static str;
+
+    async fn build(
+        self: Box<Self>,
+        ctx: &ServiceComponentContext,
+    ) -> Result<Box<dyn ErasedPlacementRoutingStore>, LatticeServiceError>;
+}
+
+pub(crate) struct PlacementRoutingStoreHandle<T>
+where
+    T: PlacementRoutingStore,
+{
+    store: T,
+}
+
+impl<T> std::fmt::Debug for PlacementRoutingStoreHandle<T>
+where
+    T: PlacementRoutingStore,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PlacementRoutingStoreHandle")
+            .field("store_type", &std::any::type_name::<T>())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl<T> ErasedPlacementRoutingStore for PlacementRoutingStoreHandle<T>
+where
+    T: PlacementRoutingStore,
+{
+    async fn placement_route_resolver(
+        &self,
+        service_kind: ServiceKind,
+        authority: Arc<dyn PlacementAuthority>,
+    ) -> Result<
+        (
+            lattice_placement::routing::resolver::BoxRouteResolver,
+            PlacementWatchTask,
+        ),
+        PlacementError,
+    > {
+        let resolver = PlacementRouteResolver::new(
+            service_kind,
+            self.store.clone(),
+            authority,
+            RouteCacheConfig::default(),
+        );
+        let watch = resolver.start_placement_watch().await?;
+        Ok((
+            lattice_placement::routing::resolver::BoxRouteResolver::new(resolver),
+            watch,
+        ))
+    }
+
+    async fn singleton_route_resolver(
+        &self,
+        authority: Arc<dyn PlacementAuthority>,
+    ) -> Result<
+        (
+            lattice_placement::routing::resolver::BoxRouteResolver,
+            PlacementWatchTask,
+        ),
+        PlacementError,
+    > {
+        let resolver =
+            SingletonRouteResolver::new(self.store.clone(), authority, RouteCacheConfig::default());
+        Ok((
+            lattice_placement::routing::resolver::BoxRouteResolver::new(resolver),
+            PlacementWatchTask::noop(),
+        ))
+    }
+}
+
+pub(crate) struct PlacementRoutingStoreRegistration<T>
+where
+    T: PlacementRoutingStore,
+{
+    component: Box<dyn ServiceComponent<T>>,
+}
+
+impl<T> PlacementRoutingStoreRegistration<T>
+where
+    T: PlacementRoutingStore,
+{
+    pub(crate) fn new<C>(component: C) -> Self
+    where
+        C: IntoServiceComponent<T>,
+    {
+        Self {
+            component: Box::new(component.into_service_component()),
+        }
+    }
+}
+
+#[async_trait]
+impl<T> ErasedPlacementRoutingStoreComponent for PlacementRoutingStoreRegistration<T>
+where
+    T: PlacementRoutingStore,
+{
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
+    }
+
+    async fn build(
+        self: Box<Self>,
+        ctx: &ServiceComponentContext,
+    ) -> Result<Box<dyn ErasedPlacementRoutingStore>, LatticeServiceError> {
+        let store = self.component.build(ctx).await?;
+        Ok(Box::new(PlacementRoutingStoreHandle { store }))
+    }
 }
 
 #[async_trait]

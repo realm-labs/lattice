@@ -982,6 +982,38 @@ async fn register_client_builds_default_placement_core_from_store() {
 }
 
 #[tokio::test]
+async fn service_assembly_selects_the_separate_routing_store() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/routing-assembly"));
+    let watch_starts = Arc::new(AtomicUsize::new(0));
+    let routing_store = CountingRoutingStore {
+        inner: store.clone(),
+        watch_starts: watch_starts.clone(),
+    };
+    let service = LatticeService::builder(service_kind!("Player"))
+        .instance_id(InstanceId::new("player-1"))
+        .listen(listener)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
+        .placement_routing_store::<CountingRoutingStore, _>(routing_store)
+        .register_client::<FakePlacementClientBinding>()
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(watch_starts.load(Ordering::SeqCst), 1);
+    assert_eq!(service.placement_watch_count(), 1);
+}
+
+#[tokio::test]
 async fn register_client_passes_rpc_client_transport_config() {
     OBSERVED_RPC_CLIENT_STRIPES.store(0, Ordering::SeqCst);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

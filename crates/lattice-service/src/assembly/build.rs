@@ -93,6 +93,17 @@ impl LatticeServiceBuilder {
             self.service_kind.as_str(),
         )
         .await?;
+        let placement_routing_store = if let Some(component) = self.placement_routing_store {
+            debug!(
+                service.kind = self.service_kind.as_str(),
+                component.target = "placement_routing_store",
+                component.type = component.type_name(),
+                "building service component"
+            );
+            Some(component.build(&component_context).await?)
+        } else {
+            None
+        };
         match (self.cluster_event_bus, self.local_event_bus) {
             (None, None) => {
                 build_service_component(
@@ -170,14 +181,32 @@ impl LatticeServiceBuilder {
             );
             let (default_resolver, watch_task) = match binding.placement() {
                 RpcClientPlacement::Actor => {
-                    placement_store
-                        .placement_route_resolver(client_service_kind, placement_authority.clone())
-                        .await?
+                    if let Some(routing_store) = placement_routing_store.as_ref() {
+                        routing_store
+                            .placement_route_resolver(
+                                client_service_kind,
+                                placement_authority.clone(),
+                            )
+                            .await?
+                    } else {
+                        placement_store
+                            .placement_route_resolver(
+                                client_service_kind,
+                                placement_authority.clone(),
+                            )
+                            .await?
+                    }
                 }
                 RpcClientPlacement::Singleton => {
-                    placement_store
-                        .singleton_route_resolver(placement_authority.clone())
-                        .await?
+                    if let Some(routing_store) = placement_routing_store.as_ref() {
+                        routing_store
+                            .singleton_route_resolver(placement_authority.clone())
+                            .await?
+                    } else {
+                        placement_store
+                            .singleton_route_resolver(placement_authority.clone())
+                            .await?
+                    }
                 }
             };
             placement_watch_tasks.push(watch_task);

@@ -65,14 +65,15 @@ use lattice_placement::endpoint::{EndpointLease, EndpointPool};
 use lattice_placement::error::PlacementError;
 use lattice_placement::registry::{InstanceRecord, InstanceState};
 use lattice_placement::routing::cache::RouteCacheConfig;
-use lattice_placement::routing::placement::ExplicitRouteResolver;
+use lattice_placement::routing::placement::{ExplicitRouteResolver, PlacementRoutingStore};
 use lattice_placement::routing::resolver::{BoxRouteResolver, ResolveRequest, RouteResolver};
 use lattice_placement::routing::rpc::{EndpointRpcTransport, ResolvingRpcCore};
 use lattice_placement::sharding::VirtualShardMapper;
 use lattice_placement::storage::memory::InMemoryPlacementStore;
 use lattice_placement::storage::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementPrefix, PlacementState,
-    PlacementStore, ReadOnlyPlacementStore, SingletonKey,
+    PlacementStore, PlacementVersion, PlacementWatch, ReadOnlyPlacementStore, SingletonKey,
+    SingletonPlacementRecord,
 };
 use lattice_rpc::client::TonicEndpointChannelPoolConfig;
 use lattice_rpc::error::RpcError;
@@ -106,6 +107,44 @@ fn development_service_builder(
     )));
     LatticeService::builder(service_kind)
         .dangerously_use_in_process_placement(store, TonicLogicControl)
+}
+
+#[derive(Clone)]
+struct CountingRoutingStore {
+    inner: InMemoryPlacementStore,
+    watch_starts: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl PlacementRoutingStore for CountingRoutingStore {
+    async fn get_routing_instance(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        PlacementStore::get_instance(&self.inner, instance_id).await
+    }
+
+    async fn get_routing_actor(
+        &self,
+        key: &ActorPlacementKey,
+    ) -> Result<Option<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
+        PlacementStore::get_actor(&self.inner, key).await
+    }
+
+    async fn get_routing_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        PlacementStore::get_singleton(&self.inner, key).await
+    }
+
+    async fn watch_routing(
+        &self,
+        _service_kind: &ServiceKind,
+    ) -> Result<PlacementWatch, PlacementError> {
+        self.watch_starts.fetch_add(1, Ordering::SeqCst);
+        PlacementStore::watch(&self.inner, PlacementStore::prefix(&self.inner).clone()).await
+    }
 }
 
 #[derive(Clone)]
