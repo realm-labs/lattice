@@ -1,11 +1,17 @@
+use std::fmt;
+use std::net::IpAddr;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use http::Uri;
 use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_core::service_context::ConfiguredComponent;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 use tokio::sync::broadcast;
 
 use crate::error::PlacementError;
@@ -54,7 +60,15 @@ impl<C> EtcdPlacementStore<C> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+const MAX_ETCD_USERNAME_BYTES: usize = 256;
+const MAX_ETCD_PASSWORD_BYTES: usize = 1_024;
+const MAX_ETCD_CA_BYTES: usize = 1_048_576;
+const ETCD_CREDENTIAL_FILE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_ETCD_TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const MIN_ETCD_TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_ETCD_TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(240);
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EtcdPlacementStoreConfig {
     pub key_prefix: String,
     pub endpoints: Vec<String>,
@@ -63,24 +77,448 @@ pub struct EtcdPlacementStoreConfig {
     pub activation_lock_ttl_secs: i64,
 }
 
+impl fmt::Debug for EtcdPlacementStoreConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EtcdPlacementStoreConfig")
+            .field("key_prefix", &self.key_prefix)
+            .field("endpoint_count", &self.endpoints.len())
+            .field("instance_lease_ttl_secs", &self.instance_lease_ttl_secs)
+            .field("activation_lock_ttl_secs", &self.activation_lock_ttl_secs)
+            .finish()
+    }
+}
+
+/// Password authentication for an etcd connection.
+///
+/// Password bytes are loaded from a bounded absolute-path file at connection
+/// time, so they never enter the general bootstrap configuration tree.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EtcdPasswordAuthentication {
+    username: String,
+    password_file: PathBuf,
+}
+
+impl fmt::Debug for EtcdPasswordAuthentication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EtcdPasswordAuthentication")
+            .field("credentials", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl EtcdPasswordAuthentication {
+    pub fn new(username: impl Into<String>, password_file: impl Into<PathBuf>) -> Self {
+        Self {
+            username: username.into(),
+            password_file: password_file.into(),
+        }
+    }
+
+    async fn into_loaded_credentials(
+        self,
+        endpoints: &[String],
+        allow_plaintext_loopback: bool,
+    ) -> Result<LoadedEtcdCredentials, PlacementError> {
+        validate_authenticated_endpoints(endpoints, allow_plaintext_loopback)?;
+        if self.username.trim().is_empty()
+            || self.username.len() > MAX_ETCD_USERNAME_BYTES
+            || self.password_file.as_os_str().is_empty()
+            || !self.password_file.is_absolute()
+        {
+            return Err(PlacementError::InvalidEtcdAuthentication);
+        }
+        let password = read_etcd_password(self.password_file).await?;
+        Ok(LoadedEtcdCredentials {
+            username: self.username,
+            password,
+            use_tls_roots: endpoints_use_https(endpoints)?,
+            token_refresh_interval: DEFAULT_ETCD_TOKEN_REFRESH_INTERVAL,
+            ca_certificate: None,
+        })
+    }
+}
+
+struct LoadedEtcdCredentials {
+    username: String,
+    password: String,
+    use_tls_roots: bool,
+    token_refresh_interval: Duration,
+    ca_certificate: Option<Vec<u8>>,
+}
+
+/// Connection-only settings kept separate from the source-compatible store
+/// layout. The deliberately dangerous plaintext switch exists for isolated
+/// loopback integration tests and cannot authorize a non-loopback endpoint.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EtcdConnectionOptions {
+    authentication: Option<EtcdPasswordAuthentication>,
+    dangerously_allow_plaintext_loopback_authentication: bool,
+    token_refresh_interval: Duration,
+    ca_file: Option<PathBuf>,
+}
+
+impl fmt::Debug for EtcdConnectionOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EtcdConnectionOptions")
+            .field("authentication_configured", &self.authentication.is_some())
+            .field(
+                "plaintext_loopback_authentication",
+                &self.dangerously_allow_plaintext_loopback_authentication,
+            )
+            .field("token_refresh_interval", &self.token_refresh_interval)
+            .field("custom_ca_configured", &self.ca_file.is_some())
+            .finish()
+    }
+}
+
+impl EtcdConnectionOptions {
+    pub fn dangerously_unauthenticated() -> Self {
+        Self {
+            authentication: None,
+            dangerously_allow_plaintext_loopback_authentication: false,
+            token_refresh_interval: DEFAULT_ETCD_TOKEN_REFRESH_INTERVAL,
+            ca_file: None,
+        }
+    }
+
+    pub fn password_file(authentication: EtcdPasswordAuthentication) -> Self {
+        Self {
+            authentication: Some(authentication),
+            dangerously_allow_plaintext_loopback_authentication: false,
+            token_refresh_interval: DEFAULT_ETCD_TOKEN_REFRESH_INTERVAL,
+            ca_file: None,
+        }
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.authentication.is_some()
+    }
+
+    /// Permits password authentication over plaintext only when every etcd
+    /// endpoint is an explicit loopback HTTP URL.
+    pub fn dangerously_allow_plaintext_loopback_authentication(mut self) -> Self {
+        self.dangerously_allow_plaintext_loopback_authentication = true;
+        self
+    }
+
+    pub fn with_token_refresh_interval(mut self, interval: Duration) -> Self {
+        self.token_refresh_interval = interval;
+        self
+    }
+
+    pub fn with_ca_file(mut self, ca_file: impl Into<PathBuf>) -> Self {
+        self.ca_file = Some(ca_file.into());
+        self
+    }
+
+    async fn into_loaded_credentials(
+        self,
+        endpoints: &[String],
+    ) -> Result<Option<LoadedEtcdCredentials>, PlacementError> {
+        validate_no_endpoint_userinfo(endpoints)?;
+        if self.authentication.is_none() {
+            if self.dangerously_allow_plaintext_loopback_authentication
+                || self.token_refresh_interval != DEFAULT_ETCD_TOKEN_REFRESH_INTERVAL
+                || self.ca_file.is_some()
+            {
+                return Err(PlacementError::InvalidEtcdAuthentication);
+            }
+            validate_dangerously_unauthenticated_endpoints(endpoints)?;
+            return Ok(None);
+        }
+        if self.token_refresh_interval < MIN_ETCD_TOKEN_REFRESH_INTERVAL
+            || self.token_refresh_interval > MAX_ETCD_TOKEN_REFRESH_INTERVAL
+        {
+            return Err(PlacementError::InvalidEtcdAuthentication);
+        }
+        let ca_certificate = match self.ca_file {
+            Some(path) => {
+                if !endpoints_use_https(endpoints)? || !path.is_absolute() {
+                    return Err(PlacementError::InvalidEtcdAuthentication);
+                }
+                Some(read_etcd_ca(path).await?)
+            }
+            None => None,
+        };
+        match self.authentication {
+            Some(authentication) => authentication
+                .into_loaded_credentials(
+                    endpoints,
+                    self.dangerously_allow_plaintext_loopback_authentication,
+                )
+                .await
+                .map(|mut credentials| {
+                    credentials.token_refresh_interval = self.token_refresh_interval;
+                    credentials.ca_certificate = ca_certificate;
+                    Some(credentials)
+                }),
+            None => unreachable!("unauthenticated options returned before credential loading"),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EtcdConnectionSection {
+    authentication: EtcdPasswordAuthentication,
+    #[serde(default = "default_etcd_token_refresh_interval_secs")]
+    token_refresh_interval_secs: u64,
+    #[serde(default)]
+    ca_file: Option<PathBuf>,
+}
+
+impl From<EtcdConnectionSection> for EtcdConnectionOptions {
+    fn from(section: EtcdConnectionSection) -> Self {
+        Self {
+            authentication: Some(section.authentication),
+            dangerously_allow_plaintext_loopback_authentication: false,
+            token_refresh_interval: Duration::from_secs(section.token_refresh_interval_secs),
+            ca_file: section.ca_file,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EtcdPlacementStoreSection {
+    key_prefix: String,
+    endpoints: Vec<String>,
+    #[serde(default = "default_instance_lease_ttl_secs")]
+    instance_lease_ttl_secs: i64,
+    activation_lock_ttl_secs: i64,
+    connection: EtcdConnectionSection,
+}
+
+impl EtcdPlacementStoreSection {
+    fn into_parts(self) -> (EtcdPlacementStoreConfig, EtcdConnectionOptions) {
+        (
+            EtcdPlacementStoreConfig {
+                key_prefix: self.key_prefix,
+                endpoints: self.endpoints,
+                instance_lease_ttl_secs: self.instance_lease_ttl_secs,
+                activation_lock_ttl_secs: self.activation_lock_ttl_secs,
+            },
+            self.connection.into(),
+        )
+    }
+}
+
 impl EtcdPlacementStore<RealEtcdClient> {
     pub fn from_config() -> ConfiguredComponent<Self> {
-        ConfiguredComponent::from_section("placement_store", Self::connect)
+        ConfiguredComponent::from_section(
+            "placement_store",
+            |section: EtcdPlacementStoreSection| async move {
+                let (config, connection) = section.into_parts();
+                Self::connect_with_connection_options(config, connection).await
+            },
+        )
     }
 
-    pub async fn connect(config: EtcdPlacementStoreConfig) -> Result<Self, PlacementError> {
-        let client = RealEtcdClient::connect(
-            config.endpoints,
-            InstanceLeaseTtl::new(config.instance_lease_ttl_secs),
-            ActivationLockTtl::new(config.activation_lock_ttl_secs),
+    pub async fn dangerously_connect_unauthenticated(
+        config: EtcdPlacementStoreConfig,
+    ) -> Result<Self, PlacementError> {
+        Self::connect_with_connection_options(
+            config,
+            EtcdConnectionOptions::dangerously_unauthenticated(),
         )
-        .await?;
+        .await
+    }
+
+    pub async fn connect_with_connection_options(
+        config: EtcdPlacementStoreConfig,
+        connection: EtcdConnectionOptions,
+    ) -> Result<Self, PlacementError> {
+        let credentials = connection
+            .into_loaded_credentials(&config.endpoints)
+            .await?;
+        let instance_lease_ttl = InstanceLeaseTtl::new(config.instance_lease_ttl_secs);
+        let activation_lock_ttl = ActivationLockTtl::new(config.activation_lock_ttl_secs);
+        let client = match credentials {
+            Some(credentials) => {
+                RealEtcdClient::connect_authenticated(
+                    config.endpoints,
+                    instance_lease_ttl,
+                    activation_lock_ttl,
+                    credentials,
+                )
+                .await?
+            }
+            None => {
+                RealEtcdClient::connect(config.endpoints, instance_lease_ttl, activation_lock_ttl)
+                    .await?
+            }
+        };
         Ok(Self::new(PlacementPrefix::new(config.key_prefix), client))
     }
+}
 
-    pub async fn from_options(config: EtcdPlacementStoreConfig) -> Result<Self, PlacementError> {
-        Self::connect(config).await
+fn validate_no_endpoint_userinfo(endpoints: &[String]) -> Result<(), PlacementError> {
+    if endpoints.iter().any(|endpoint| {
+        endpoint
+            .split_once("://")
+            .map(|(_, remainder)| {
+                remainder
+                    .split('/')
+                    .next()
+                    .unwrap_or_default()
+                    .contains('@')
+            })
+            .unwrap_or(false)
+    }) {
+        return Err(PlacementError::EtcdEndpointUserinfoUnsupported);
     }
+    Ok(())
+}
+
+fn validate_authenticated_endpoints(
+    endpoints: &[String],
+    allow_plaintext_loopback: bool,
+) -> Result<(), PlacementError> {
+    validate_no_endpoint_userinfo(endpoints)?;
+    if endpoints.is_empty() {
+        return Err(PlacementError::InvalidEtcdEndpoint);
+    }
+    let https = endpoints_use_https(endpoints)?;
+    if https {
+        return Ok(());
+    }
+    if !allow_plaintext_loopback {
+        return Err(PlacementError::InsecureEtcdAuthenticationTransport);
+    }
+    for endpoint in endpoints {
+        let uri = endpoint
+            .parse::<Uri>()
+            .map_err(|_| PlacementError::InvalidEtcdEndpoint)?;
+        if uri.scheme_str() != Some("http") || !is_loopback_uri(&uri) {
+            return Err(PlacementError::InsecureEtcdAuthenticationTransport);
+        }
+    }
+    Ok(())
+}
+
+fn validate_dangerously_unauthenticated_endpoints(
+    endpoints: &[String],
+) -> Result<(), PlacementError> {
+    if endpoints.is_empty() {
+        return Err(PlacementError::InvalidEtcdEndpoint);
+    }
+    for endpoint in endpoints {
+        let uri = endpoint
+            .parse::<Uri>()
+            .map_err(|_| PlacementError::InvalidEtcdEndpoint)?;
+        if uri.scheme_str() != Some("http") || !is_loopback_uri(&uri) {
+            return Err(PlacementError::InsecureEtcdUnauthenticatedTransport);
+        }
+    }
+    Ok(())
+}
+
+fn endpoints_use_https(endpoints: &[String]) -> Result<bool, PlacementError> {
+    let mut expected_https = None;
+    for endpoint in endpoints {
+        let uri = endpoint
+            .parse::<Uri>()
+            .map_err(|_| PlacementError::InvalidEtcdEndpoint)?;
+        let scheme = uri
+            .scheme_str()
+            .ok_or(PlacementError::InvalidEtcdEndpoint)?;
+        let is_https = match scheme {
+            "http" => false,
+            "https" => true,
+            _ => return Err(PlacementError::InvalidEtcdEndpoint),
+        };
+        match expected_https {
+            Some(expected) if expected != is_https => {
+                return Err(PlacementError::InsecureEtcdAuthenticationTransport);
+            }
+            None => expected_https = Some(is_https),
+            _ => {}
+        }
+    }
+    Ok(expected_https == Some(true))
+}
+
+fn is_loopback_uri(uri: &Uri) -> bool {
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+async fn read_etcd_password(path: PathBuf) -> Result<String, PlacementError> {
+    let result = tokio::time::timeout(ETCD_CREDENTIAL_FILE_TIMEOUT, async move {
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(etcd_password_file_error)?;
+        let metadata = file.metadata().await.map_err(etcd_password_file_error)?;
+        if !metadata.is_file() {
+            return Err(PlacementError::InvalidEtcdAuthentication);
+        }
+        let max_file_bytes = MAX_ETCD_PASSWORD_BYTES + 2;
+        let mut bytes = Vec::with_capacity(max_file_bytes.min(256));
+        file.take((max_file_bytes + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(etcd_password_file_error)?;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        if bytes.is_empty() || bytes.len() > MAX_ETCD_PASSWORD_BYTES || bytes.contains(&b'\0') {
+            return Err(PlacementError::InvalidEtcdAuthentication);
+        }
+        String::from_utf8(bytes).map_err(|_| PlacementError::InvalidEtcdAuthentication)
+    })
+    .await;
+    result.unwrap_or(Err(PlacementError::EtcdPasswordFile {
+        kind: std::io::ErrorKind::TimedOut,
+    }))
+}
+
+async fn read_etcd_ca(path: PathBuf) -> Result<Vec<u8>, PlacementError> {
+    let result = tokio::time::timeout(ETCD_CREDENTIAL_FILE_TIMEOUT, async move {
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(etcd_tls_ca_file_error)?;
+        let metadata = file.metadata().await.map_err(etcd_tls_ca_file_error)?;
+        if !metadata.is_file() {
+            return Err(PlacementError::InvalidEtcdAuthentication);
+        }
+        let mut bytes = Vec::with_capacity(MAX_ETCD_CA_BYTES.min(4_096));
+        file.take((MAX_ETCD_CA_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(etcd_tls_ca_file_error)?;
+        if bytes.is_empty() || bytes.len() > MAX_ETCD_CA_BYTES {
+            return Err(PlacementError::InvalidEtcdAuthentication);
+        }
+        Ok(bytes)
+    })
+    .await;
+    result.unwrap_or(Err(PlacementError::EtcdTlsCaFile {
+        kind: std::io::ErrorKind::TimedOut,
+    }))
+}
+
+fn etcd_password_file_error(error: std::io::Error) -> PlacementError {
+    PlacementError::EtcdPasswordFile { kind: error.kind() }
+}
+
+fn etcd_tls_ca_file_error(error: std::io::Error) -> PlacementError {
+    PlacementError::EtcdTlsCaFile { kind: error.kind() }
+}
+
+const fn default_etcd_token_refresh_interval_secs() -> u64 {
+    DEFAULT_ETCD_TOKEN_REFRESH_INTERVAL.as_secs()
 }
 
 #[cfg(test)]

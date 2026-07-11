@@ -52,7 +52,7 @@ impl EtcdBenchmarkConfig {
     }
 
     pub async fn connect_store(&self) -> BenchmarkResult<EtcdBenchmarkPlacementStore> {
-        EtcdPlacementStore::connect(EtcdPlacementStoreConfig {
+        EtcdPlacementStore::dangerously_connect_unauthenticated(EtcdPlacementStoreConfig {
             key_prefix: self.key_prefix.clone(),
             endpoints: self.endpoints.clone(),
             instance_lease_ttl_secs: self.instance_lease_ttl_secs,

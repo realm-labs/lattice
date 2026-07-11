@@ -103,6 +103,33 @@ optional static bootstrap config
 
 Instances register themselves at startup. Coordinators create and update runtime placement keys.
 
+Authenticated production connections keep secret bytes out of the bootstrap tree. The source-compatible `EtcdPlacementStoreConfig` still contains only the prefix, endpoints, and TTLs; `EtcdConnectionOptions` separately selects an `EtcdPasswordAuthentication` whose password comes from an absolute regular file. The file read is timeout- and size-bounded, accepts one trailing LF or CRLF, and rejects empty, overlong, invalid-UTF-8, or NUL-bearing values. Connection sections reject unknown fields, and store/connection/client `Debug` output never includes endpoints, usernames, password paths, passwords, or tokens. Endpoint URL userinfo is rejected.
+
+```toml
+[placement_store]
+key_prefix = "/lattice/prod"
+endpoints = ["https://etcd.internal.example:2379"]
+instance_lease_ttl_secs = 30
+activation_lock_ttl_secs = 30
+
+[placement_store.connection]
+token_refresh_interval_secs = 30
+# Optional for a private CA; platform roots remain enabled.
+ca_file = "/run/secrets/lattice-etcd-ca.pem"
+
+[placement_store.connection.authentication]
+username = "placement-authority"
+password_file = "/run/secrets/lattice-etcd-password"
+```
+
+Password authentication requires explicit HTTPS endpoints and the platform trust roots. An optional absolute-path CA file is read with the same timeout and regular-file rules and a 1 MiB limit. `from_config()` requires the authenticated connection section and fails startup when it is missing, partial, or contains unknown fields. Plaintext authentication exists only through a conspicuously named programmatic escape restricted to explicit loopback URLs for disposable integration tests; it cannot be enabled by the serialized connection section. The separately named `dangerously_connect_unauthenticated` API is likewise only for deliberate local development.
+
+Production etcd must use its signed JWT token mode; the server's stateful `simple` token is suitable only for disposable development. The configured refresh interval must remain shorter than the server JWT TTL with enough allowance for clock skew and the 10-second authentication deadline; the client cannot introspect or enforce a remote server's TTL setting. Authenticated clients refresh one shared connection token at a configurable 1–240 second interval (30 seconds by default), single-flight concurrent refreshes, retain a canceled or failed attempt behind a separate one-second retry backoff, and attach the token to KV, watch, lease-grant, lease-keepalive, and background ownership-proof RPCs. Endpoint connect and Authenticate are each deadline-bounded. The disposable TLS test uses JWT tokens and proves refresh after token expiry for a live ownership watch.
+
+The standalone coordinator accepts `LATTICE_ETCD_USERNAME` and `LATTICE_ETCD_PASSWORD_FILE` together, plus optional `LATTICE_ETCD_CA_FILE` and `LATTICE_ETCD_TOKEN_REFRESH_INTERVAL_SECS`. It otherwise fails closed unless `LATTICE_DANGEROUSLY_ALLOW_UNAUTHENTICATED_ETCD=true` is supplied exactly. That explicitly dangerous mode accepts loopback HTTP endpoints only.
+
+The required deployment RBAC split must be provisioned in etcd; a caller-supplied profile label is not an authorization boundary. The authority identity receives `READWRITE` only for its cluster prefix. An ordinary runtime identity receives `READ` for the cluster prefix (the current ownership adapter watches the whole `/logic/` range) and, while direct liveness remains, `WRITE` for exactly its own `/logic/instances/{service_kind}/{instance_id}` key rather than an instances prefix. A static exact-key credential still does not prove process incarnation. Moreover, etcd does not key-authorize either `LeaseGrant` or `LeaseKeepAlive`: real-server coverage proves a runtime identity can allocate leases without a key write and can renew a known foreign lease even though it cannot mutate the attached key. Direct runtime Lease capability must therefore move behind a bounded, identity- and incarnation-bound liveness authority. Runtime identities receive no placement, lock, leader, floor, retirement, generation, or seal write range. The repository's disposable real-etcd test provisions these roles and proves runtime reads and watches, exact-key liveness, denial of peer-instance/actor/floor mutations, atomic denial of a mixed actor/floor transaction, anonymous and bad-credential rejection, immediate denial after an already-connected legacy writer's range is revoked, success/failure/cancellation-bounded token refresh, and TLS rejection for an untrusted CA or wrong host. Production role provisioning and credential lifecycle remain deployment responsibilities. Authority `WRITE` still includes deletion, so its credential must stay outside service processes behind the semantic placement API; RBAC alone does not authorize tombstone reclamation.
+
 ### 12.1 Instance Registry
 
 Each service process registers an `InstanceRecord`:

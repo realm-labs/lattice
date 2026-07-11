@@ -3,6 +3,8 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lattice_config::bootstrap::BootstrapConfig;
+use lattice_config::format::ConfigFormat;
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceCapacity;
@@ -2723,6 +2725,429 @@ fn etcd_store_builds_from_config() {
         EtcdPlacementStore::from_config().section(),
         "placement_store"
     );
+}
+
+#[test]
+fn etcd_connection_config_is_backward_compatible_fail_closed_and_redacted() {
+    let legacy = serde_json::json!({
+        "key_prefix": "/lattice/test",
+        "endpoints": ["http://127.0.0.1:2379"],
+        "activation_lock_ttl_secs": 30
+    });
+    let legacy_store: EtcdPlacementStoreConfig = serde_json::from_value(legacy.clone())
+        .expect("explicit development config remains source-compatible");
+    assert_eq!(legacy_store.instance_lease_ttl_secs, 30);
+    assert!(
+        serde_json::from_value::<EtcdPlacementStoreSection>(legacy).is_err(),
+        "deployable configured components must not downgrade to anonymous etcd"
+    );
+
+    let authenticated: EtcdPlacementStoreSection = serde_json::from_value(serde_json::json!({
+        "key_prefix": "/lattice/test",
+        "endpoints": ["https://etcd.example.test:2379"],
+        "instance_lease_ttl_secs": 30,
+        "activation_lock_ttl_secs": 30,
+        "connection": {
+            "authentication": {
+                "username": "runtime-user-sentinel",
+                "password_file": "/run/secrets/etcd-password-sentinel"
+            }
+        }
+    }))
+    .expect("authenticated placement-store section must decode");
+    let (_, authenticated_connection) = authenticated.into_parts();
+    assert!(authenticated_connection.is_authenticated());
+
+    for malformed in [
+        serde_json::json!({
+            "key_prefix": "/lattice/test",
+            "endpoints": ["https://etcd.example.test:2379"],
+            "activation_lock_ttl_secs": 30,
+            "connection": {
+                "authentication": {
+                    "username": "runtime",
+                    "password_file": "/run/secrets/password"
+                }
+            },
+            "conection": {}
+        }),
+        serde_json::json!({
+            "key_prefix": "/lattice/test",
+            "endpoints": ["https://etcd.example.test:2379"],
+            "activation_lock_ttl_secs": 30,
+            "connection": {
+                "authentication": {
+                    "username": "runtime",
+                    "password_file": "/run/secrets/password"
+                },
+                "authentcation": {}
+            }
+        }),
+        serde_json::json!({
+            "key_prefix": "/lattice/test",
+            "endpoints": ["https://etcd.example.test:2379"],
+            "activation_lock_ttl_secs": 30,
+            "connection": {
+                "authentication": {
+                    "username": "runtime",
+                    "password_file": "/run/secrets/password",
+                    "password_flie": "/run/secrets/password"
+                }
+            }
+        }),
+        serde_json::json!({
+            "key_prefix": "/lattice/test",
+            "endpoints": ["https://etcd.example.test:2379"],
+            "activation_lock_ttl_secs": 30,
+            "connection": {
+                "authentication": {
+                    "username": "runtime",
+                    "password_file": "/run/secrets/password"
+                },
+                "token_refresh_interval_secs": 30,
+                "token_refesh_interval_secs": 30
+            }
+        }),
+    ] {
+        assert!(
+            serde_json::from_value::<EtcdPlacementStoreSection>(malformed).is_err(),
+            "connection typos must not silently downgrade to anonymous access"
+        );
+    }
+
+    let authentication = EtcdPasswordAuthentication::new(
+        "runtime-user-sentinel",
+        "/run/secrets/etcd-password-sentinel",
+    );
+    let rendered_authentication = format!("{authentication:?}");
+    let rendered_connection = format!(
+        "{:?}",
+        EtcdConnectionOptions::password_file(authentication)
+            .with_ca_file("/run/secrets/etcd-ca-sentinel"),
+    );
+    let rendered_store = format!(
+        "{:?}",
+        EtcdPlacementStoreConfig {
+            key_prefix: "/lattice/test".to_string(),
+            endpoints: vec!["https://endpoint-secret@etcd.example.test:2379".to_string()],
+            instance_lease_ttl_secs: 30,
+            activation_lock_ttl_secs: 30,
+        }
+    );
+    for rendered in [rendered_authentication, rendered_connection, rendered_store] {
+        assert!(!rendered.contains("runtime-user-sentinel"));
+        assert!(!rendered.contains("etcd-password-sentinel"));
+        assert!(!rendered.contains("etcd-ca-sentinel"));
+        assert!(!rendered.contains("endpoint-secret"));
+    }
+}
+
+#[tokio::test]
+async fn configured_etcd_entrypoint_rejects_missing_and_unknown_authentication() {
+    for placement_store in [
+        serde_json::json!({
+            "key_prefix": "/lattice/test",
+            "endpoints": ["http://127.0.0.1:2379"],
+            "activation_lock_ttl_secs": 30
+        }),
+        serde_json::json!({
+            "key_prefix": "/lattice/test",
+            "endpoints": ["https://etcd.example.test:2379"],
+            "activation_lock_ttl_secs": 30,
+            "connection": {}
+        }),
+        serde_json::json!({
+            "key_prefix": "/lattice/test",
+            "endpoints": ["https://etcd.example.test:2379"],
+            "activation_lock_ttl_secs": 30,
+            "connection": {
+                "authentication": {
+                    "username": "runtime"
+                }
+            }
+        }),
+        serde_json::json!({
+            "key_prefix": "/lattice/test",
+            "endpoints": ["https://etcd.example.test:2379"],
+            "activation_lock_ttl_secs": 30,
+            "connection": {
+                "authentication": {
+                    "password_file": "/run/secrets/password"
+                }
+            }
+        }),
+        serde_json::json!({
+            "key_prefix": "/lattice/test",
+            "endpoints": ["https://etcd.example.test:2379"],
+            "activation_lock_ttl_secs": 30,
+            "connection": {
+                "authentication": {
+                    "username": "runtime",
+                    "password_file": "/run/secrets/password"
+                },
+                "token_refesh_interval_secs": 30
+            }
+        }),
+    ] {
+        let config = BootstrapConfig::parse(
+            &serde_json::json!({ "placement_store": placement_store }).to_string(),
+            ConfigFormat::Json,
+        )
+        .unwrap();
+        assert!(
+            EtcdPlacementStore::<RealEtcdClient>::from_config()
+                .build(&config)
+                .await
+                .is_err(),
+            "the public configured-component entrypoint must reject authentication downgrade"
+        );
+    }
+}
+
+#[tokio::test]
+async fn etcd_authentication_bounds_secrets_and_rejects_insecure_endpoints_before_connect() {
+    let secrets = tempfile::tempdir().unwrap();
+    let password_file = secrets.path().join("etcd-password");
+    std::fs::write(&password_file, b"password-secret-sentinel\r\n").unwrap();
+    assert_eq!(
+        read_etcd_password(password_file.clone()).await.unwrap(),
+        "password-secret-sentinel"
+    );
+
+    let empty_file = secrets.path().join("empty");
+    std::fs::write(&empty_file, []).unwrap();
+    assert_eq!(
+        read_etcd_password(empty_file).await,
+        Err(PlacementError::InvalidEtcdAuthentication)
+    );
+
+    let oversized_file = secrets.path().join("oversized");
+    std::fs::write(&oversized_file, vec![b'x'; MAX_ETCD_PASSWORD_BYTES + 3]).unwrap();
+    assert_eq!(
+        read_etcd_password(oversized_file).await,
+        Err(PlacementError::InvalidEtcdAuthentication)
+    );
+
+    let nul_file = secrets.path().join("nul");
+    std::fs::write(&nul_file, b"password\0suffix").unwrap();
+    assert_eq!(
+        read_etcd_password(nul_file).await,
+        Err(PlacementError::InvalidEtcdAuthentication)
+    );
+    assert_eq!(
+        read_etcd_password(secrets.path().to_path_buf()).await,
+        Err(PlacementError::InvalidEtcdAuthentication)
+    );
+
+    let authentication = || {
+        EtcdConnectionOptions::password_file(EtcdPasswordAuthentication::new(
+            "runtime",
+            password_file.clone(),
+        ))
+    };
+    for invalid_username in [String::new(), "x".repeat(MAX_ETCD_USERNAME_BYTES + 1)] {
+        assert_eq!(
+            EtcdConnectionOptions::password_file(EtcdPasswordAuthentication::new(
+                invalid_username,
+                password_file.clone(),
+            ))
+            .into_loaded_credentials(&["https://etcd.example.test:2379".to_string()])
+            .await
+            .err()
+            .unwrap(),
+            PlacementError::InvalidEtcdAuthentication
+        );
+    }
+    assert_eq!(
+        authentication()
+            .into_loaded_credentials(&[])
+            .await
+            .err()
+            .unwrap(),
+        PlacementError::InvalidEtcdEndpoint
+    );
+    for invalid_refresh_interval in [Duration::ZERO, Duration::from_secs(241)] {
+        assert_eq!(
+            authentication()
+                .with_token_refresh_interval(invalid_refresh_interval)
+                .into_loaded_credentials(&["https://etcd.example.test:2379".to_string()])
+                .await
+                .err()
+                .unwrap(),
+            PlacementError::InvalidEtcdAuthentication
+        );
+    }
+    assert_eq!(
+        authentication()
+            .into_loaded_credentials(&["http://etcd.example.test:2379".to_string()])
+            .await
+            .err()
+            .unwrap(),
+        PlacementError::InsecureEtcdAuthenticationTransport
+    );
+    assert_eq!(
+        authentication()
+            .into_loaded_credentials(&[
+                "https://etcd-a.example.test:2379".to_string(),
+                "http://127.0.0.1:2379".to_string(),
+            ])
+            .await
+            .err()
+            .unwrap(),
+        PlacementError::InsecureEtcdAuthenticationTransport
+    );
+    assert_eq!(
+        authentication()
+            .dangerously_allow_plaintext_loopback_authentication()
+            .into_loaded_credentials(&["http://192.0.2.1:2379".to_string()])
+            .await
+            .err()
+            .unwrap(),
+        PlacementError::InsecureEtcdAuthenticationTransport
+    );
+    assert!(
+        authentication()
+            .dangerously_allow_plaintext_loopback_authentication()
+            .into_loaded_credentials(&["http://127.0.0.1:2379".to_string()])
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        authentication()
+            .into_loaded_credentials(&["https://etcd.example.test:2379".to_string()])
+            .await
+            .unwrap()
+            .unwrap()
+            .use_tls_roots
+    );
+    let ca_file = secrets.path().join("etcd-ca");
+    std::fs::write(&ca_file, b"test-ca-pem").unwrap();
+    let loaded = authentication()
+        .with_ca_file(ca_file)
+        .into_loaded_credentials(&["https://etcd.example.test:2379".to_string()])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.ca_certificate, Some(b"test-ca-pem".to_vec()));
+    let empty_ca_file = secrets.path().join("empty-ca");
+    std::fs::write(&empty_ca_file, []).unwrap();
+    assert_eq!(
+        authentication()
+            .with_ca_file(empty_ca_file)
+            .into_loaded_credentials(&["https://etcd.example.test:2379".to_string()])
+            .await
+            .err()
+            .unwrap(),
+        PlacementError::InvalidEtcdAuthentication
+    );
+    let oversized_ca_file = secrets.path().join("oversized-ca");
+    std::fs::write(&oversized_ca_file, vec![b'x'; MAX_ETCD_CA_BYTES + 1]).unwrap();
+    assert_eq!(
+        authentication()
+            .with_ca_file(oversized_ca_file)
+            .into_loaded_credentials(&["https://etcd.example.test:2379".to_string()])
+            .await
+            .err()
+            .unwrap(),
+        PlacementError::InvalidEtcdAuthentication
+    );
+    for invalid_ca in [secrets.path().to_path_buf(), "relative-ca".into()] {
+        assert_eq!(
+            authentication()
+                .with_ca_file(invalid_ca)
+                .into_loaded_credentials(&["https://etcd.example.test:2379".to_string()])
+                .await
+                .err()
+                .unwrap(),
+            PlacementError::InvalidEtcdAuthentication
+        );
+    }
+    assert_eq!(
+        EtcdConnectionOptions::dangerously_unauthenticated()
+            .with_ca_file("/run/secrets/ignored-ca")
+            .into_loaded_credentials(&["https://etcd.example.test:2379".to_string()])
+            .await
+            .err()
+            .unwrap(),
+        PlacementError::InvalidEtcdAuthentication,
+        "connection-only authentication settings must not be silently ignored"
+    );
+    assert_eq!(
+        EtcdConnectionOptions::dangerously_unauthenticated()
+            .into_loaded_credentials(&["http://etcd.example.test:2379".to_string()])
+            .await
+            .err()
+            .unwrap(),
+        PlacementError::InsecureEtcdUnauthenticatedTransport,
+        "the explicit unauthenticated development escape must remain loopback-only"
+    );
+    assert!(
+        EtcdConnectionOptions::dangerously_unauthenticated()
+            .into_loaded_credentials(&["http://localhost:2379".to_string()])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        EtcdConnectionOptions::dangerously_unauthenticated()
+            .with_token_refresh_interval(Duration::from_secs(2))
+            .into_loaded_credentials(&["http://localhost:2379".to_string()])
+            .await
+            .err()
+            .unwrap(),
+        PlacementError::InvalidEtcdAuthentication
+    );
+    assert_eq!(
+        EtcdConnectionOptions::dangerously_unauthenticated()
+            .into_loaded_credentials(&["http://user:password@127.0.0.1:2379".to_string()])
+            .await
+            .err()
+            .unwrap(),
+        PlacementError::EtcdEndpointUserinfoUnsupported
+    );
+    assert_eq!(
+        EtcdConnectionOptions::password_file(EtcdPasswordAuthentication::new(
+            "runtime",
+            "relative-password-file",
+        ))
+        .into_loaded_credentials(&["https://etcd.example.test:2379".to_string()])
+        .await
+        .err()
+        .unwrap(),
+        PlacementError::InvalidEtcdAuthentication
+    );
+}
+
+#[tokio::test]
+async fn authenticated_etcd_connect_errors_do_not_expose_credentials() {
+    let secrets = tempfile::tempdir().unwrap();
+    let password_file = secrets.path().join("password-secret-path-sentinel");
+    std::fs::write(&password_file, b"password-value-sentinel").unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        EtcdPlacementStore::connect_with_connection_options(
+            EtcdPlacementStoreConfig {
+                key_prefix: "/lattice/test".to_string(),
+                endpoints: vec!["http://127.0.0.1:0".to_string()],
+                instance_lease_ttl_secs: 30,
+                activation_lock_ttl_secs: 30,
+            },
+            EtcdConnectionOptions::password_file(EtcdPasswordAuthentication::new(
+                "username-sentinel",
+                password_file,
+            ))
+            .dangerously_allow_plaintext_loopback_authentication(),
+        ),
+    )
+    .await
+    .expect("failed authenticated connection must be timeout bounded");
+    let error = result.unwrap_err();
+    assert_eq!(error, PlacementError::AuthenticatedEtcdConnect);
+    let rendered = format!("{error:?} {error}");
+    assert!(!rendered.contains("username-sentinel"));
+    assert!(!rendered.contains("password-value-sentinel"));
+    assert!(!rendered.contains("password-secret-path-sentinel"));
 }
 
 #[test]

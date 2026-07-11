@@ -8,7 +8,9 @@ use lattice_placement::control::TonicLogicControl;
 use lattice_placement::control::proto::placement_coordinator_server::PlacementCoordinatorServer;
 use lattice_placement::coordination::actor::PlacementCoordinator;
 use lattice_placement::error::PlacementError;
-use lattice_placement::storage::etcd::{EtcdPlacementStore, EtcdPlacementStoreConfig};
+use lattice_placement::storage::etcd::{
+    EtcdConnectionOptions, EtcdPasswordAuthentication, EtcdPlacementStore, EtcdPlacementStoreConfig,
+};
 use lattice_placement::storage::{CoordinatorLeadership, PlacementStore};
 use tonic::transport::Server;
 
@@ -27,12 +29,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|endpoint| !endpoint.is_empty())
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    let store = EtcdPlacementStore::from_options(EtcdPlacementStoreConfig {
-        key_prefix: key_prefix.clone(),
-        endpoints,
-        instance_lease_ttl_secs: env_i64("LATTICE_INSTANCE_LEASE_TTL_SECS", 30),
-        activation_lock_ttl_secs: env_i64("LATTICE_ACTIVATION_LOCK_TTL_SECS", 30),
-    })
+    let store = EtcdPlacementStore::connect_with_connection_options(
+        EtcdPlacementStoreConfig {
+            key_prefix: key_prefix.clone(),
+            endpoints,
+            instance_lease_ttl_secs: env_i64("LATTICE_INSTANCE_LEASE_TTL_SECS", 30),
+            activation_lock_ttl_secs: env_i64("LATTICE_ACTIVATION_LOCK_TTL_SECS", 30),
+        },
+        etcd_connection_options_from_env()?,
+    )
     .await?;
     let leadership = campaign_until_leader(
         store.clone(),
@@ -114,6 +119,57 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn etcd_connection_options_from_env() -> Result<EtcdConnectionOptions, PlacementError> {
+    etcd_connection_options(
+        optional_env("LATTICE_ETCD_USERNAME")?,
+        optional_env("LATTICE_ETCD_PASSWORD_FILE")?,
+        optional_env("LATTICE_ETCD_CA_FILE")?,
+        optional_env("LATTICE_ETCD_TOKEN_REFRESH_INTERVAL_SECS")?,
+        optional_env("LATTICE_DANGEROUSLY_ALLOW_UNAUTHENTICATED_ETCD")?,
+    )
+}
+
+fn etcd_connection_options(
+    username: Option<String>,
+    password_file: Option<String>,
+    ca_file: Option<String>,
+    token_refresh_interval_secs: Option<String>,
+    dangerously_allow_unauthenticated: Option<String>,
+) -> Result<EtcdConnectionOptions, PlacementError> {
+    let mut options = match (
+        username,
+        password_file,
+        dangerously_allow_unauthenticated.as_deref(),
+    ) {
+        (None, None, Some("true")) => Ok(EtcdConnectionOptions::dangerously_unauthenticated()),
+        (Some(username), Some(password_file), None) => Ok(EtcdConnectionOptions::password_file(
+            EtcdPasswordAuthentication::new(username, password_file),
+        )),
+        _ => Err(PlacementError::InvalidEtcdAuthentication),
+    }?;
+    if !options.is_authenticated() && (ca_file.is_some() || token_refresh_interval_secs.is_some()) {
+        return Err(PlacementError::InvalidEtcdAuthentication);
+    }
+    if let Some(ca_file) = ca_file {
+        options = options.with_ca_file(ca_file);
+    }
+    if let Some(interval) = token_refresh_interval_secs {
+        let seconds = interval
+            .parse::<u64>()
+            .map_err(|_| PlacementError::InvalidEtcdAuthentication)?;
+        options = options.with_token_refresh_interval(Duration::from_secs(seconds));
+    }
+    Ok(options)
+}
+
+fn optional_env(name: &str) -> Result<Option<String>, PlacementError> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(PlacementError::InvalidEtcdAuthentication),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +206,84 @@ mod tests {
         .unwrap();
 
         assert_eq!(leadership.candidate_id, InstanceId::new("coordinator-b"));
+    }
+
+    #[test]
+    fn coordinator_etcd_credentials_require_both_environment_values() {
+        let options = |username, password_file, dangerous| {
+            etcd_connection_options(username, password_file, None, None, dangerous)
+        };
+        assert_eq!(
+            options(None, None, None).unwrap_err(),
+            PlacementError::InvalidEtcdAuthentication
+        );
+        assert!(
+            !options(None, None, Some("true".to_string()))
+                .unwrap()
+                .is_authenticated()
+        );
+        assert!(
+            options(
+                Some("authority".to_string()),
+                Some("/run/secrets/etcd-password".to_string()),
+                None,
+            )
+            .unwrap()
+            .is_authenticated()
+        );
+        assert_eq!(
+            options(Some("authority".to_string()), None, None).unwrap_err(),
+            PlacementError::InvalidEtcdAuthentication
+        );
+        assert_eq!(
+            options(None, Some("/run/secrets/etcd-password".to_string()), None,).unwrap_err(),
+            PlacementError::InvalidEtcdAuthentication
+        );
+        assert_eq!(
+            options(None, None, Some("false".to_string())).unwrap_err(),
+            PlacementError::InvalidEtcdAuthentication
+        );
+        assert_eq!(
+            options(
+                Some("authority".to_string()),
+                Some("/run/secrets/etcd-password".to_string()),
+                Some("true".to_string()),
+            )
+            .unwrap_err(),
+            PlacementError::InvalidEtcdAuthentication
+        );
+        assert!(
+            etcd_connection_options(
+                Some("authority".to_string()),
+                Some("/run/secrets/etcd-password".to_string()),
+                Some("/run/secrets/etcd-ca.pem".to_string()),
+                Some("15".to_string()),
+                None,
+            )
+            .unwrap()
+            .is_authenticated()
+        );
+        assert_eq!(
+            etcd_connection_options(
+                None,
+                None,
+                Some("/run/secrets/etcd-ca.pem".to_string()),
+                None,
+                Some("true".to_string()),
+            )
+            .unwrap_err(),
+            PlacementError::InvalidEtcdAuthentication
+        );
+        assert_eq!(
+            etcd_connection_options(
+                Some("authority".to_string()),
+                Some("/run/secrets/etcd-password".to_string()),
+                None,
+                Some("not-a-duration".to_string()),
+                None,
+            )
+            .unwrap_err(),
+            PlacementError::InvalidEtcdAuthentication
+        );
     }
 }

@@ -1,14 +1,22 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use etcd_client::{
-    Client, Compare, CompareOp, EventType, GetOptions, Txn, TxnOp, TxnOpResponse, WatchOptions,
+    BalancedChannelBuilder, Certificate, Channel as EtcdChannel, Client, Compare, CompareOp,
+    ConnectOptions, EventType, GetOptions, TlsOptions, Txn, TxnOp, TxnOpResponse, WatchOptions,
 };
-use tokio::sync::broadcast;
+use http::{HeaderValue, Request, Response, Uri};
+use tokio::sync::{Mutex as AsyncMutex, broadcast};
+use tonic::body::Body;
+use tonic::transport::{Channel as TonicChannel, Endpoint, channel::Change};
+use tower::util::BoxCloneSyncService;
+use tower::{BoxError, Service, ServiceBuilder};
 
 use crate::error::PlacementError;
 use crate::storage::etcd::codec::{
@@ -21,6 +29,9 @@ use crate::storage::{
 };
 
 const WATCH_CAPACITY: usize = 128;
+const AUTHENTICATED_ETCD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const ETCD_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
+const ETCD_AUTHENTICATION_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
 // Keep proof reads below etcd's default `--max-txn-ops=128`. A server with a
 // stricter configured limit rejects the request and the ownership view fails
 // closed rather than falling back to an unproven latest-value read.
@@ -251,11 +262,104 @@ impl EtcdWatch {
     }
 }
 
+type EtcdAuthToken = Arc<RwLock<Option<HeaderValue>>>;
+
+#[derive(Clone)]
+struct AuthenticatedTokenService {
+    inner: TonicChannel,
+    token: EtcdAuthToken,
+}
+
+impl Service<Request<Body>> for AuthenticatedTokenService {
+    type Response = Response<Body>;
+    type Error = tonic::transport::Error;
+    type Future = <TonicChannel as Service<Request<Body>>>::Future;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, mut request: Request<Body>) -> Self::Future {
+        // etcd-client 0.19 intentionally omits its authentication token from
+        // every Lease RPC. Etcd 3.6 rejects those anonymous requests. Keep one
+        // separately refreshed token at the underlying HTTP service boundary
+        // so KV/watch and Lease calls share the same authenticated identity.
+        // Authenticate itself must remain token-free so an expired token never
+        // prevents credential refresh.
+        if request.uri().path() != "/etcdserverpb.Auth/Authenticate" {
+            let token = self
+                .token
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(token) = token.as_ref() {
+                request.headers_mut().insert("token", token.clone());
+            }
+        }
+        self.inner.call(request)
+    }
+}
+
+#[derive(Clone)]
+struct AuthenticatedEtcdChannelBuilder {
+    auth_token: EtcdAuthToken,
+}
+
+impl BalancedChannelBuilder for AuthenticatedEtcdChannelBuilder {
+    type Error = tonic::transport::Error;
+
+    fn balanced_channel(
+        self,
+        buffer_size: usize,
+    ) -> Result<
+        (
+            EtcdChannel,
+            tokio::sync::mpsc::Sender<Change<Uri, Endpoint>>,
+        ),
+        Self::Error,
+    > {
+        let (channel, updater) = TonicChannel::balance_channel(buffer_size);
+        let service = ServiceBuilder::new()
+            .map_err(|error: tonic::transport::Error| -> BoxError { Box::new(error) })
+            .service(AuthenticatedTokenService {
+                inner: channel,
+                token: self.auth_token,
+            });
+        Ok((
+            EtcdChannel::Custom(BoxCloneSyncService::new(service)),
+            updater,
+        ))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EtcdAuthenticationAttemptOutcome {
+    Pending,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Copy)]
+struct EtcdAuthenticationAttempt {
+    completed_at: Instant,
+    outcome: EtcdAuthenticationAttemptOutcome,
+}
+
+struct EtcdAuthenticationState {
+    username: String,
+    password: String,
+    token: EtcdAuthToken,
+    refresh_interval: Duration,
+    refresh_lock: AsyncMutex<()>,
+    last_attempt: StdMutex<Option<EtcdAuthenticationAttempt>>,
+    attempt_count: AtomicU64,
+}
+
 #[derive(Clone)]
 pub struct RealEtcdClient {
     client: Client,
     instance_lease_ttl: InstanceLeaseTtl,
     activation_lock_ttl: ActivationLockTtl,
+    authentication: Option<Arc<EtcdAuthenticationState>>,
     #[cfg(test)]
     ownership_view_gap: Option<Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
@@ -275,24 +379,201 @@ impl fmt::Debug for RealEtcdClient {
 }
 
 impl RealEtcdClient {
-    pub async fn connect(
+    pub(crate) async fn connect(
         endpoints: Vec<String>,
         instance_lease_ttl: InstanceLeaseTtl,
         activation_lock_ttl: ActivationLockTtl,
     ) -> Result<Self, PlacementError> {
         let client = Client::connect(endpoints, None).await.map_err(etcd_error)?;
-        Ok(Self {
+        Ok(Self::from_client(
             client,
             instance_lease_ttl,
             activation_lock_ttl,
+            None,
+        ))
+    }
+
+    pub(super) async fn connect_authenticated(
+        endpoints: Vec<String>,
+        instance_lease_ttl: InstanceLeaseTtl,
+        activation_lock_ttl: ActivationLockTtl,
+        credentials: super::LoadedEtcdCredentials,
+    ) -> Result<Self, PlacementError> {
+        let super::LoadedEtcdCredentials {
+            username,
+            password,
+            use_tls_roots,
+            token_refresh_interval,
+            ca_certificate,
+        } = credentials;
+        let auth_token = Arc::new(RwLock::new(None));
+        let mut options =
+            ConnectOptions::new().with_connect_timeout(AUTHENTICATED_ETCD_CONNECT_TIMEOUT);
+        if use_tls_roots {
+            let mut tls = TlsOptions::new().with_enabled_roots();
+            if let Some(ca_certificate) = ca_certificate {
+                tls = tls.ca_certificate(Certificate::from_pem(ca_certificate));
+            }
+            options = options.with_tls(tls);
+        }
+        let client = Client::connect_with_balanced_channel(
+            endpoints,
+            Some(options),
+            AuthenticatedEtcdChannelBuilder {
+                auth_token: auth_token.clone(),
+            },
+        )
+        .await
+        .map_err(|_| PlacementError::AuthenticatedEtcdConnect)?;
+        let client = Self::from_client(
+            client,
+            instance_lease_ttl,
+            activation_lock_ttl,
+            Some(Arc::new(EtcdAuthenticationState {
+                username,
+                password,
+                token: auth_token,
+                refresh_interval: token_refresh_interval,
+                refresh_lock: AsyncMutex::new(()),
+                last_attempt: StdMutex::new(None),
+                attempt_count: AtomicU64::new(0),
+            })),
+        );
+        client
+            .refresh_authentication()
+            .await
+            .map_err(|_| PlacementError::AuthenticatedEtcdConnect)?;
+        Ok(client)
+    }
+
+    fn from_client(
+        client: Client,
+        instance_lease_ttl: InstanceLeaseTtl,
+        activation_lock_ttl: ActivationLockTtl,
+        authentication: Option<Arc<EtcdAuthenticationState>>,
+    ) -> Self {
+        Self {
+            client,
+            instance_lease_ttl,
+            activation_lock_ttl,
+            authentication,
             #[cfg(test)]
             ownership_view_gap: None,
             #[cfg(test)]
             ownership_snapshot_proof_gap: None,
             #[cfg(test)]
             ownership_watch_proof_gap: Arc::new(std::sync::Mutex::new(None)),
-        })
+        }
     }
+
+    async fn refresh_authentication(&self) -> Result<(), PlacementError> {
+        refresh_etcd_authentication(&self.client, self.authentication.as_deref()).await
+    }
+
+    #[cfg(test)]
+    fn authentication_attempt_count_for_test(&self) -> u64 {
+        self.authentication
+            .as_ref()
+            .map(|authentication| authentication.attempt_count.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+}
+
+async fn refresh_etcd_authentication(
+    client: &Client,
+    authentication: Option<&EtcdAuthenticationState>,
+) -> Result<(), PlacementError> {
+    let Some(authentication) = authentication else {
+        return Ok(());
+    };
+    if let Some(result) = cached_authentication_attempt(authentication, false) {
+        return result;
+    }
+    let _refresh_guard = authentication.refresh_lock.lock().await;
+    if let Some(result) = cached_authentication_attempt(authentication, true) {
+        return result;
+    }
+    authentication.attempt_count.fetch_add(1, Ordering::SeqCst);
+    record_authentication_attempt(authentication, EtcdAuthenticationAttemptOutcome::Pending);
+    let refreshed_token = match tokio::time::timeout(
+        ETCD_AUTHENTICATION_TIMEOUT,
+        client.auth_client().authenticate(
+            authentication.username.clone(),
+            authentication.password.clone(),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(response)) => HeaderValue::from_str(response.token())
+            .map_err(|_| PlacementError::EtcdAuthenticationFailed),
+        Ok(Err(_)) | Err(_) => Err(PlacementError::EtcdAuthenticationFailed),
+    };
+    match refreshed_token {
+        Ok(mut token) => {
+            token.set_sensitive(true);
+            *authentication
+                .token
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token);
+            record_authentication_attempt(
+                authentication,
+                EtcdAuthenticationAttemptOutcome::Succeeded,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            *authentication
+                .token
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            record_authentication_attempt(authentication, EtcdAuthenticationAttemptOutcome::Failed);
+            Err(error)
+        }
+    }
+}
+
+fn cached_authentication_attempt(
+    authentication: &EtcdAuthenticationState,
+    pending_is_failure: bool,
+) -> Option<Result<(), PlacementError>> {
+    let attempt = authentication
+        .last_attempt
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .copied()?;
+    let elapsed = attempt.completed_at.elapsed();
+    match attempt.outcome {
+        EtcdAuthenticationAttemptOutcome::Succeeded
+            if elapsed < authentication.refresh_interval =>
+        {
+            Some(Ok(()))
+        }
+        EtcdAuthenticationAttemptOutcome::Failed
+            if elapsed < ETCD_AUTHENTICATION_FAILURE_BACKOFF =>
+        {
+            Some(Err(PlacementError::EtcdAuthenticationFailed))
+        }
+        EtcdAuthenticationAttemptOutcome::Pending
+            if pending_is_failure && elapsed < ETCD_AUTHENTICATION_FAILURE_BACKOFF =>
+        {
+            Some(Err(PlacementError::EtcdAuthenticationFailed))
+        }
+        _ => None,
+    }
+}
+
+fn record_authentication_attempt(
+    authentication: &EtcdAuthenticationState,
+    outcome: EtcdAuthenticationAttemptOutcome,
+) {
+    *authentication
+        .last_attempt
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EtcdAuthenticationAttempt {
+        completed_at: Instant::now(),
+        outcome,
+    });
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -336,6 +617,7 @@ impl ActivationLockTtl {
 #[async_trait]
 impl EtcdKv for RealEtcdClient {
     async fn put(&self, key: String, value: EtcdValue) -> Result<(), PlacementError> {
+        self.refresh_authentication().await?;
         let mut client = self.client.clone();
         client
             .put(key, encode_etcd_value(&value)?, put_options_for(&value)?)
@@ -348,6 +630,7 @@ impl EtcdKv for RealEtcdClient {
         &self,
         key: &str,
     ) -> Result<Option<(PlacementVersion, EtcdValue)>, PlacementError> {
+        self.refresh_authentication().await?;
         let mut client = self.client.clone();
         let response = client.get(key, None).await.map_err(etcd_error)?;
         let Some(kv) = response.kvs().first() else {
@@ -363,6 +646,7 @@ impl EtcdKv for RealEtcdClient {
         &self,
         prefix: &str,
     ) -> Result<Vec<(String, PlacementVersion, EtcdValue)>, PlacementError> {
+        self.refresh_authentication().await?;
         let mut client = self.client.clone();
         let response = client
             .get(prefix, Some(GetOptions::new().with_prefix()))
@@ -387,6 +671,7 @@ impl EtcdKv for RealEtcdClient {
         expected: Option<PlacementVersion>,
         value: EtcdValue,
     ) -> Result<PlacementVersion, PlacementError> {
+        self.refresh_authentication().await?;
         let compare = match expected {
             Some(version) => Compare::mod_revision(
                 key.as_bytes(),
@@ -417,6 +702,7 @@ impl EtcdKv for RealEtcdClient {
         &self,
         request: EtcdEpochReservationRequest,
     ) -> Result<PlacementVersion, PlacementError> {
+        self.refresh_authentication().await?;
         let EtcdEpochReservationRequest {
             record_key,
             expected_record,
@@ -460,6 +746,7 @@ impl EtcdKv for RealEtcdClient {
         &self,
         request: EtcdEpochCommitRequest,
     ) -> Result<PlacementVersion, PlacementError> {
+        self.refresh_authentication().await?;
         let EtcdEpochCommitRequest {
             record_key,
             expected_record,
@@ -498,6 +785,7 @@ impl EtcdKv for RealEtcdClient {
         &self,
         request: EtcdLegacyEpochPutRequest,
     ) -> Result<PlacementVersion, PlacementError> {
+        self.refresh_authentication().await?;
         let EtcdLegacyEpochPutRequest {
             record_key,
             expected_record,
@@ -532,6 +820,7 @@ impl EtcdKv for RealEtcdClient {
     }
 
     async fn delete(&self, key: &str) -> Result<(), PlacementError> {
+        self.refresh_authentication().await?;
         let mut client = self.client.clone();
         client.delete(key, None).await.map_err(etcd_error)?;
         Ok(())
@@ -542,6 +831,7 @@ impl EtcdKv for RealEtcdClient {
         key: String,
         expected: EtcdValue,
     ) -> Result<(), PlacementError> {
+        self.refresh_authentication().await?;
         let expected = encode_etcd_value(&expected)?;
         let txn = Txn::new()
             .when(vec![Compare::value(
@@ -560,6 +850,7 @@ impl EtcdKv for RealEtcdClient {
     }
 
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
+        self.refresh_authentication().await?;
         let mut client = self.client.clone();
         let response = client
             .lease_grant(self.instance_lease_ttl.as_secs(), None)
@@ -569,6 +860,7 @@ impl EtcdKv for RealEtcdClient {
     }
 
     async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
+        self.refresh_authentication().await?;
         let lease_id = i64::try_from(lease_id.0).map_err(codec_error)?;
         let mut client = self.client.clone();
         let (mut keeper, mut stream) = client
@@ -581,6 +873,7 @@ impl EtcdKv for RealEtcdClient {
     }
 
     async fn next_lease_id(&self) -> Result<LeaseId, PlacementError> {
+        self.refresh_authentication().await?;
         let mut client = self.client.clone();
         let response = client
             .lease_grant(self.activation_lock_ttl.as_secs(), None)
@@ -594,6 +887,9 @@ impl EtcdKv for RealEtcdClient {
         ranges: EtcdOwnershipRanges,
         max_entries: NonZeroUsize,
     ) -> Result<EtcdOwnershipView, OwnershipViewError> {
+        self.refresh_authentication()
+            .await
+            .map_err(view_backend_error)?;
         let limit = max_entries
             .get()
             .checked_add(1)
@@ -679,9 +975,15 @@ impl EtcdKv for RealEtcdClient {
             gap.wait().await;
         }
 
-        let live_records =
-            prove_snapshot_entries(&mut client, &ranges, revision, &mut entries, max_entries)
-                .await?;
+        let live_records = prove_snapshot_entries(
+            &mut client,
+            self.authentication.as_deref(),
+            &ranges,
+            revision,
+            &mut entries,
+            max_entries,
+        )
+        .await?;
 
         #[cfg(test)]
         if let Some(gap) = &self.ownership_view_gap {
@@ -700,6 +1002,7 @@ impl EtcdKv for RealEtcdClient {
             .ok_or_else(|| view_protocol_error("etcd ownership revision exhausted"))?;
         let watch = start_real_ownership_watch(
             self.client.clone(),
+            self.authentication.clone(),
             ranges,
             start_revision,
             max_entries,
@@ -715,6 +1018,7 @@ impl EtcdKv for RealEtcdClient {
     }
 
     async fn watch_prefix(&self, prefix: &str) -> Result<EtcdWatch, PlacementError> {
+        self.refresh_authentication().await?;
         let mut client = self.client.clone();
         let mut stream = client
             .watch(prefix, Some(WatchOptions::new().with_prefix()))
@@ -899,6 +1203,7 @@ fn floor_key_for_record(
 
 async fn prove_snapshot_entries(
     client: &mut Client,
+    authentication: Option<&EtcdAuthenticationState>,
     ranges: &EtcdOwnershipRanges,
     observed_revision: PlacementRevision,
     entries: &mut [EtcdOwnershipSnapshotEntry],
@@ -931,6 +1236,9 @@ async fn prove_snapshot_entries(
         });
     }
 
+    refresh_etcd_authentication(client, authentication)
+        .await
+        .map_err(ownership_view_authentication_error)?;
     let proofs = read_floor_proofs(client, observed_revision, &requests)
         .await
         .map_err(FloorProofReadError::into_view_error)?;
@@ -1105,6 +1413,7 @@ async fn read_floor_proofs(
 
 async fn prove_watch_update(
     client: &mut Client,
+    authentication: Option<&EtcdAuthenticationState>,
     ranges: &EtcdOwnershipRanges,
     max_entries: NonZeroUsize,
     live_records: &mut ProvenEtcdOwnershipRecords,
@@ -1137,6 +1446,9 @@ async fn prove_watch_update(
         return Ok(());
     }
 
+    refresh_etcd_authentication(client, authentication)
+        .await
+        .map_err(ownership_watch_authentication_error)?;
     let proofs = read_floor_proofs(client, batch.revision, &requests)
         .await
         .map_err(FloorProofReadError::into_watch_error)?;
@@ -1237,12 +1549,16 @@ async fn prove_watch_update(
 
 async fn start_real_ownership_watch(
     mut client: Client,
+    authentication: Option<Arc<EtcdAuthenticationState>>,
     ranges: EtcdOwnershipRanges,
     start_revision: i64,
     max_entries: NonZeroUsize,
     mut live_records: ProvenEtcdOwnershipRecords,
     #[cfg(test)] proof_gap: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
 ) -> Result<EtcdOwnershipWatch, OwnershipViewError> {
+    refresh_etcd_authentication(&client, authentication.as_deref())
+        .await
+        .map_err(ownership_view_authentication_error)?;
     let requested_revision = view_revision(start_revision)?;
     let mut stream = client
         .watch(
@@ -1301,8 +1617,12 @@ async fn start_real_ownership_watch(
     // fails closed instead of returning an already-lagged receiver.
     let mut high_water = PlacementRevision(requested_revision.0.saturating_sub(1));
     let mut startup_updates = Vec::new();
-    let barrier_revision =
-        current_linearizable_revision(&mut client, &ranges.local_instance_key).await?;
+    let barrier_revision = current_linearizable_revision(
+        &mut client,
+        authentication.as_deref(),
+        &ranges.local_instance_key,
+    )
+    .await?;
     if barrier_revision == high_water {
         push_startup_update(
             &mut startup_updates,
@@ -1355,6 +1675,7 @@ async fn start_real_ownership_watch(
                 }
                 prove_watch_update(
                     &mut client,
+                    authentication.as_deref(),
                     &ranges,
                     max_entries,
                     &mut live_records,
@@ -1430,6 +1751,7 @@ async fn start_real_ownership_watch(
                         }
                         if let Err(error) = prove_watch_update(
                             &mut client,
+                            authentication.as_deref(),
                             &ranges,
                             max_entries,
                             &mut live_records,
@@ -1470,8 +1792,12 @@ fn startup_progress_reaches_barrier(
 
 async fn current_linearizable_revision(
     client: &mut Client,
+    authentication: Option<&EtcdAuthenticationState>,
     key: &str,
 ) -> Result<PlacementRevision, OwnershipViewError> {
+    refresh_etcd_authentication(client, authentication)
+        .await
+        .map_err(ownership_view_authentication_error)?;
     client
         .get(key, Some(GetOptions::new().with_limit(1)))
         .await
@@ -1479,6 +1805,18 @@ async fn current_linearizable_revision(
         .header()
         .ok_or_else(|| view_protocol_error("etcd ownership barrier read omitted its header"))
         .and_then(|header| view_revision(header.revision()))
+}
+
+fn ownership_view_authentication_error(error: PlacementError) -> OwnershipViewError {
+    OwnershipViewError::Backend {
+        message: error.to_string(),
+    }
+}
+
+fn ownership_watch_authentication_error(error: PlacementError) -> OwnershipWatchError {
+    OwnershipWatchError::Backend {
+        message: error.to_string(),
+    }
 }
 
 fn decode_watch_response(
@@ -2712,5 +3050,7 @@ fn ownership_event_key(event: &EtcdOwnershipWatchEvent) -> &str {
     }
 }
 
+#[cfg(test)]
+mod auth_real_tests;
 #[cfg(test)]
 mod real_tests;

@@ -373,6 +373,15 @@ fn status_from_placement(error: PlacementError) -> Status {
         }
         PlacementError::PlacementWatchClosed
         | PlacementError::Etcd { .. }
+        | PlacementError::InvalidEtcdAuthentication
+        | PlacementError::EtcdPasswordFile { .. }
+        | PlacementError::EtcdTlsCaFile { .. }
+        | PlacementError::AuthenticatedEtcdConnect
+        | PlacementError::EtcdAuthenticationFailed
+        | PlacementError::InvalidEtcdEndpoint
+        | PlacementError::InsecureEtcdAuthenticationTransport
+        | PlacementError::InsecureEtcdUnauthenticatedTransport
+        | PlacementError::EtcdEndpointUserinfoUnsupported
         | PlacementError::PlacementCodec { .. }
         | PlacementError::InstanceLeaseNotFound { .. }
         | PlacementError::DuplicateAssigner { .. }

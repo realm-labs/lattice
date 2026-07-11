@@ -359,9 +359,19 @@ instance_id = "world-0"
 advertised_endpoint = "http://world-0.world:18080"
 control_endpoint = "http://world-0.world:18081"
 
-[etcd]
-endpoints = ["http://etcd:2379"]
+[placement_store]
+endpoints = ["https://etcd.internal.example:2379"]
 key_prefix = "/lattice/prod"
+instance_lease_ttl_secs = 30
+activation_lock_ttl_secs = 30
+
+[placement_store.connection]
+token_refresh_interval_secs = 30
+ca_file = "/run/secrets/lattice-etcd-ca.pem"
+
+[placement_store.connection.authentication]
+username = "world-runtime-world-0"
+password_file = "/run/secrets/lattice-etcd-password"
 
 [event_bus.nats]
 url = "nats://nats:4222"

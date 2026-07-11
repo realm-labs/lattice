@@ -296,7 +296,7 @@ Merge rules:
 Composite sources merge in order.
 Later sources override earlier sources.
 Recommended order: default file -> environment file -> env override.
-Env keys map to sections with a prefix and delimiter, for example LATTICE_ETCD__ENDPOINTS.
+Env keys map to sections with a prefix and delimiter, for example LATTICE__PLACEMENT_STORE__ENDPOINTS.
 Final config keeps source/version metadata for admin inspect.
 ```
 
@@ -320,7 +320,7 @@ Explicit config must also be supported for tests and non-file deployments:
 
 ```rust
 .placement_store(
-    EtcdPlacementStore::<RealEtcdClient>::from_options(EtcdPlacementStoreConfig {
+    EtcdPlacementStore::<RealEtcdClient>::dangerously_connect_unauthenticated(EtcdPlacementStoreConfig {
         endpoints: vec!["http://127.0.0.1:2379".into()],
         key_prefix: "/lattice/dev".into(),
         instance_lease_ttl_secs: 30,
@@ -329,6 +329,33 @@ Explicit config must also be supported for tests and non-file deployments:
     .await?,
 )
 ```
+
+The unauthenticated form above is for local development. A production authority supplies password-file authentication separately so secret bytes never enter `BootstrapConfig` or a command line:
+
+```rust
+.placement_store(
+    EtcdPlacementStore::<RealEtcdClient>::connect_with_connection_options(
+        EtcdPlacementStoreConfig {
+            endpoints: vec!["https://etcd.internal.example:2379".into()],
+            key_prefix: "/lattice/prod".into(),
+            instance_lease_ttl_secs: 30,
+            activation_lock_ttl_secs: 30,
+        },
+        EtcdConnectionOptions::password_file(EtcdPasswordAuthentication::new(
+            "placement-authority",
+            "/run/secrets/lattice-etcd-password",
+        ))
+        .with_ca_file("/run/secrets/lattice-etcd-ca.pem"),
+    )
+    .await?,
+)
+```
+
+`EtcdPlacementStore::from_config()` accepts only an authenticated connection section and fails startup when it is absent, partial, or misspelled. For `ConfigSource::env("LATTICE")`, the nested authentication keys are `LATTICE__PLACEMENT_STORE__CONNECTION__AUTHENTICATION__USERNAME` and `LATTICE__PLACEMENT_STORE__CONNECTION__AUTHENTICATION__PASSWORD_FILE`; optional connection keys include `LATTICE__PLACEMENT_STORE__CONNECTION__CA_FILE` and `LATTICE__PLACEMENT_STORE__CONNECTION__TOKEN_REFRESH_INTERVAL_SECS`. Password and CA files must be absolute; do not put a password itself in an environment variable or configuration value.
+
+The standalone `lattice-coordinator` binary has a separate environment-only bootstrap. It requires `LATTICE_ETCD_USERNAME` and `LATTICE_ETCD_PASSWORD_FILE` together and accepts optional `LATTICE_ETCD_CA_FILE` and `LATTICE_ETCD_TOKEN_REFRESH_INTERVAL_SECS`. Omitting either credential fails startup; the only unauthenticated escape is the exact `LATTICE_DANGEROUSLY_ALLOW_UNAUTHENTICATED_ETCD=true` setting, and that escape accepts loopback HTTP endpoints only.
+
+These options authenticate the placement store only. `lattice-config-etcd` has an independent connection and must receive its own least-privilege credential support before it can share an auth-enabled etcd cluster; until then, deploy it against a separate cluster rather than reusing placement authority credentials.
 
 ### 22.3 ConfigStore
 

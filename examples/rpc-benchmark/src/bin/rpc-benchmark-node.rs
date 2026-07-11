@@ -40,13 +40,16 @@ struct Args {
 async fn main() -> BenchmarkResult<()> {
     let args = Args::parse();
     let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let placement_store = EtcdPlacementStore::<RealEtcdClient>::connect(EtcdPlacementStoreConfig {
-        key_prefix: args.key_prefix,
-        endpoints: parse_csv(&args.etcd_endpoints),
-        instance_lease_ttl_secs: 30,
-        activation_lock_ttl_secs: 10,
-    })
-    .await?;
+    let placement_store =
+        EtcdPlacementStore::<RealEtcdClient>::dangerously_connect_unauthenticated(
+            EtcdPlacementStoreConfig {
+                key_prefix: args.key_prefix,
+                endpoints: parse_csv(&args.etcd_endpoints),
+                instance_lease_ttl_secs: 30,
+                activation_lock_ttl_secs: 10,
+            },
+        )
+        .await?;
     let (ready_tx, ready_rx) = oneshot::channel();
     let mut builder = LatticeService::builder(BENCH_SERVICE)
         .instance(InstanceConfig::new(InstanceId::new(format!(

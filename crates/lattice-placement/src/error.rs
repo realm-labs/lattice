@@ -64,6 +64,24 @@ pub enum PlacementError {
     PlacementWatchClosed,
     #[error("etcd placement store error: {message}")]
     Etcd { message: String },
+    #[error("invalid etcd authentication configuration")]
+    InvalidEtcdAuthentication,
+    #[error("failed to read etcd password file: {kind:?}")]
+    EtcdPasswordFile { kind: std::io::ErrorKind },
+    #[error("failed to read etcd TLS CA file: {kind:?}")]
+    EtcdTlsCaFile { kind: std::io::ErrorKind },
+    #[error("authenticated etcd connection failed")]
+    AuthenticatedEtcdConnect,
+    #[error("etcd authentication failed")]
+    EtcdAuthenticationFailed,
+    #[error("invalid etcd endpoint")]
+    InvalidEtcdEndpoint,
+    #[error("authenticated etcd endpoints must all use HTTPS")]
+    InsecureEtcdAuthenticationTransport,
+    #[error("the dangerous unauthenticated etcd escape accepts loopback HTTP endpoints only")]
+    InsecureEtcdUnauthenticatedTransport,
+    #[error("userinfo in etcd endpoint URLs is unsupported; configure authentication separately")]
+    EtcdEndpointUserinfoUnsupported,
     #[error("placement codec error: {message}")]
     PlacementCodec { message: String },
     #[error("logic control error: {message}")]
