@@ -26,6 +26,47 @@ impl fmt::Display for InstanceId {
     }
 }
 
+/// Identifies one process boot for a reusable configured [`InstanceId`].
+///
+/// This value is public fencing identity rather than a secret. Production
+/// workload certificates bind it into their SPIFFE URI SAN.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InstanceIncarnation(String);
+
+impl InstanceIncarnation {
+    pub const MAX_BYTES: usize = 128;
+
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn generate() -> Self {
+        Self(uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_canonical(&self) -> bool {
+        !self.0.is_empty()
+            && self.0.len() <= Self::MAX_BYTES
+            && self.0 != "."
+            && self.0 != ".."
+            && self
+                .0
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    }
+}
+
+impl fmt::Display for InstanceIncarnation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceConfig {
     pub instance_id: InstanceId,

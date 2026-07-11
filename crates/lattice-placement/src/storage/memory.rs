@@ -374,6 +374,21 @@ impl PlacementStore for InMemoryPlacementStore {
             .cloned())
     }
 
+    async fn get_service_instance(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("placement store mutex poisoned")
+            .instances
+            .get(&self.prefixed_instance_key(instance_id))
+            .filter(|record| &record.service_kind == service_kind)
+            .cloned())
+    }
+
     async fn list_instances(
         &self,
         service_kind: &ServiceKind,

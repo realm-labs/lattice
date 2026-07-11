@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::ServiceKind;
 use lattice_eventbus::local::EventSubscriptionHandle;
 use lattice_placement::authority::PlacementAuthority;
@@ -83,6 +83,7 @@ impl ShutdownLeaseController for InMemoryShutdownLeaseController {
 pub struct GracefulShutdown<A, LC> {
     service_kind: ServiceKind,
     instance_id: InstanceId,
+    instance_incarnation: InstanceIncarnation,
     expected_lease_id: LeaseId,
     authority: A,
     lease_controller: LC,
@@ -95,6 +96,7 @@ impl<A, LC> GracefulShutdown<A, LC> {
     pub fn new(
         service_kind: ServiceKind,
         instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
         expected_lease_id: LeaseId,
         authority: A,
         lease_controller: LC,
@@ -103,6 +105,7 @@ impl<A, LC> GracefulShutdown<A, LC> {
         Self {
             service_kind,
             instance_id,
+            instance_incarnation,
             expected_lease_id,
             authority,
             lease_controller,
@@ -150,6 +153,7 @@ where
             .drain_instance(
                 self.service_kind.clone(),
                 self.instance_id.clone(),
+                self.instance_incarnation.clone(),
                 self.expected_lease_id,
             )
             .await?;

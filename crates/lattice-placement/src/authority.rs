@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::ServiceKind;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
@@ -46,6 +46,7 @@ pub trait PlacementAuthority: Send + Sync + 'static {
         &self,
         service_kind: ServiceKind,
         instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
         expected_lease_id: LeaseId,
     ) -> Result<DrainReport, PlacementError>;
 }
@@ -121,10 +122,16 @@ where
         &self,
         service_kind: ServiceKind,
         instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
         expected_lease_id: LeaseId,
     ) -> Result<DrainReport, PlacementError> {
         self.coordinator
-            .drain_instance(service_kind, instance_id, expected_lease_id)
+            .drain_instance(
+                service_kind,
+                instance_id,
+                instance_incarnation,
+                expected_lease_id,
+            )
             .await
     }
 }
@@ -226,12 +233,14 @@ impl PlacementAuthority for TonicPlacementAuthority {
         &self,
         service_kind: ServiceKind,
         instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
         expected_lease_id: LeaseId,
     ) -> Result<DrainReport, PlacementError> {
         let mut rpc_request = Request::new(proto::DrainInstanceRequest {
             service_kind: service_kind.as_str().to_string(),
             instance_id: instance_id.as_str().to_string(),
             expected_lease_id: expected_lease_id.0,
+            instance_incarnation: instance_incarnation.as_str().to_string(),
         });
         rpc_request.set_timeout(self.request_timeout);
         let mut client = self.client.clone();
@@ -240,7 +249,13 @@ impl PlacementAuthority for TonicPlacementAuthority {
             .map_err(|_| PlacementError::PlacementAuthorityTimeout)?
             .map_err(authority_status)?
             .into_inner();
-        decode_drain_reply(reply, &service_kind, &instance_id, expected_lease_id)
+        decode_drain_reply(
+            reply,
+            &service_kind,
+            &instance_id,
+            &instance_incarnation,
+            expected_lease_id,
+        )
     }
 }
 
@@ -329,6 +344,7 @@ fn decode_drain_reply(
     reply: proto::DrainInstanceReply,
     expected_service: &ServiceKind,
     expected_instance: &InstanceId,
+    expected_incarnation: &InstanceIncarnation,
     expected_lease_id: LeaseId,
 ) -> Result<DrainReport, PlacementError> {
     require_equal(
@@ -344,6 +360,11 @@ fn decode_drain_reply(
     if reply.drained_lease_id != expected_lease_id.0 {
         return invalid_reply("drained_lease_id");
     }
+    require_equal(
+        reply.drained_instance_incarnation.as_str(),
+        expected_incarnation.as_str(),
+        "drained_instance_incarnation",
+    )?;
     let outcome = proto::DrainInstanceOutcome::try_from(reply.outcome)
         .map_err(|_| invalid_reply_error("outcome"))?;
     if outcome == proto::DrainInstanceOutcome::NoReadyReplacement {
@@ -361,6 +382,7 @@ fn decode_drain_reply(
         .map_err(|_| invalid_reply_error("migrated_virtual_shards"))?;
     Ok(DrainReport {
         drained_instance: expected_instance.clone(),
+        drained_incarnation: expected_incarnation.clone(),
         migrated_actors,
         migrated_virtual_shards,
     })
@@ -570,18 +592,22 @@ mod tests {
 
         let service = service_kind!("World");
         let instance = InstanceId::new("world-a");
+        let incarnation = InstanceIncarnation::new("world-a-boot");
         let drain = proto::DrainInstanceReply {
             service_kind: "World".to_string(),
             drained_instance_id: "world-a".to_string(),
+            drained_instance_incarnation: incarnation.as_str().to_string(),
             migrated_actors: 3,
             migrated_virtual_shards: 4,
             drained_lease_id: 5,
             outcome: proto::DrainInstanceOutcome::Completed as i32,
         };
         assert_eq!(
-            decode_drain_reply(drain.clone(), &service, &instance, LeaseId(5)).unwrap(),
+            decode_drain_reply(drain.clone(), &service, &instance, &incarnation, LeaseId(5),)
+                .unwrap(),
             DrainReport {
                 drained_instance: instance.clone(),
+                drained_incarnation: incarnation.clone(),
                 migrated_actors: 3,
                 migrated_virtual_shards: 4,
             }
@@ -589,7 +615,8 @@ mod tests {
         let mut invalid_drain = drain.clone();
         invalid_drain.drained_instance_id = "world-b".to_string();
         assert_eq!(
-            decode_drain_reply(invalid_drain, &service, &instance, LeaseId(5)).unwrap_err(),
+            decode_drain_reply(invalid_drain, &service, &instance, &incarnation, LeaseId(5),)
+                .unwrap_err(),
             PlacementError::InvalidPlacementAuthorityReply {
                 field: "drained_instance_id"
             }
@@ -597,7 +624,8 @@ mod tests {
         let mut invalid_drain = drain;
         invalid_drain.drained_lease_id = 6;
         assert_eq!(
-            decode_drain_reply(invalid_drain, &service, &instance, LeaseId(5)).unwrap_err(),
+            decode_drain_reply(invalid_drain, &service, &instance, &incarnation, LeaseId(5),)
+                .unwrap_err(),
             PlacementError::InvalidPlacementAuthorityReply {
                 field: "drained_lease_id"
             }
@@ -605,21 +633,34 @@ mod tests {
         let no_replacement = proto::DrainInstanceReply {
             service_kind: "World".to_string(),
             drained_instance_id: "world-a".to_string(),
+            drained_instance_incarnation: incarnation.as_str().to_string(),
             migrated_actors: 0,
             migrated_virtual_shards: 0,
             drained_lease_id: 5,
             outcome: proto::DrainInstanceOutcome::NoReadyReplacement as i32,
         };
         assert_eq!(
-            decode_drain_reply(no_replacement.clone(), &service, &instance, LeaseId(5))
-                .unwrap_err(),
+            decode_drain_reply(
+                no_replacement.clone(),
+                &service,
+                &instance,
+                &incarnation,
+                LeaseId(5),
+            )
+            .unwrap_err(),
             PlacementError::NoReadyInstances
         );
         let mut invalid_no_replacement = no_replacement;
         invalid_no_replacement.migrated_actors = 1;
         assert_eq!(
-            decode_drain_reply(invalid_no_replacement, &service, &instance, LeaseId(5))
-                .unwrap_err(),
+            decode_drain_reply(
+                invalid_no_replacement,
+                &service,
+                &instance,
+                &incarnation,
+                LeaseId(5),
+            )
+            .unwrap_err(),
             PlacementError::InvalidPlacementAuthorityReply { field: "outcome" }
         );
     }
@@ -677,6 +718,7 @@ mod tests {
                 .drain_instance(
                     service_kind!("World"),
                     InstanceId::new("world-a"),
+                    InstanceIncarnation::new("world-a-boot"),
                     LeaseId(1),
                 )
                 .await

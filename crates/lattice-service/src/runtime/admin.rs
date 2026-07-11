@@ -106,6 +106,7 @@ impl AdminMutationHandler for ServiceAdminMutations {
             .drain_instance(
                 self.service_kind.clone(),
                 instance_id.clone(),
+                record.incarnation,
                 record.lease_id,
             )
             .await

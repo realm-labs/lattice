@@ -11,6 +11,24 @@ async fn build_requires_listener() {
 }
 
 #[tokio::test]
+async fn build_rejects_a_noncanonical_boot_incarnation_before_components_start() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let result = development_service_builder(service_kind!("World"))
+        .instance(
+            crate::config::InstanceConfig::new(InstanceId::new("world-1"))
+                .with_incarnation(InstanceIncarnation::new("../stale")),
+        )
+        .listen(listener)
+        .build()
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LatticeServiceError::InvalidInstanceIncarnation)
+    ));
+}
+
+#[tokio::test]
 async fn build_requires_explicit_placement_authority() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));

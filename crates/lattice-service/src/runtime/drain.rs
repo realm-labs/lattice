@@ -55,6 +55,7 @@ pub(crate) async fn drain_placement(
         .drain_instance(
             service_kind.clone(),
             instance.instance_id.clone(),
+            instance.incarnation.clone(),
             expected_lease_id,
         )
         .await
@@ -112,6 +113,7 @@ pub(crate) async fn publish_instance_record(
     let record = InstanceRecord {
         service_kind: service_kind.clone(),
         instance_id: instance.instance_id.clone(),
+        incarnation: instance.incarnation.clone(),
         lease_id,
         advertised_endpoint: endpoint.clone(),
         control_endpoint: endpoint,

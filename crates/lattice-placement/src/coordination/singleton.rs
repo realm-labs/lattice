@@ -321,7 +321,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    use lattice_core::instance::InstanceCapacity;
+    use lattice_core::instance::{InstanceCapacity, InstanceIncarnation};
     use lattice_core::{actor_kind, service_kind};
 
     use super::*;
@@ -596,6 +596,7 @@ mod tests {
         InstanceRecord {
             service_kind: service_kind!("Control"),
             instance_id: InstanceId::new(instance_id),
+            incarnation: InstanceIncarnation::new(format!("{instance_id}-boot")),
             lease_id: LeaseId(1),
             advertised_endpoint: format!("http://{instance_id}.control:18080")
                 .parse()

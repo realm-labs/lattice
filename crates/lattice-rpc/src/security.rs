@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use http::Uri;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::ServiceKind;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 use tonic::{Request, Status};
@@ -189,6 +189,7 @@ impl RpcTlsIdentity {
 pub struct PeerIdentity {
     pub service_kind: ServiceKind,
     pub instance_id: InstanceId,
+    pub incarnation: Option<InstanceIncarnation>,
     pub spiffe_id: String,
 }
 
@@ -201,6 +202,21 @@ impl PeerIdentity {
         Self {
             service_kind,
             instance_id,
+            incarnation: None,
+            spiffe_id: spiffe_id.into(),
+        }
+    }
+
+    pub fn new_incarnated(
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        incarnation: InstanceIncarnation,
+        spiffe_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            service_kind,
+            instance_id,
+            incarnation: Some(incarnation),
             spiffe_id: spiffe_id.into(),
         }
     }
@@ -296,21 +312,31 @@ impl MtlsPeerIdentityExtractor {
         let instance_id = segments
             .next()
             .ok_or(RpcSecurityError::MalformedPeerSpiffeIdentity)?;
+        let incarnation_label = segments
+            .next()
+            .ok_or(RpcSecurityError::MalformedPeerSpiffeIdentity)?;
+        let incarnation = segments
+            .next()
+            .ok_or(RpcSecurityError::MalformedPeerSpiffeIdentity)?;
+        let incarnation = InstanceIncarnation::new(incarnation);
         if segments.next().is_some()
             || !valid_spiffe_trust_domain(trust_domain)
             || service_label != "svc"
             || instance_label != "instance"
+            || incarnation_label != "incarnation"
             || !valid_spiffe_path_segment(service_kind)
             || !valid_spiffe_path_segment(instance_id)
+            || !incarnation.is_canonical()
         {
             return Err(RpcSecurityError::MalformedPeerSpiffeIdentity);
         }
         if trust_domain != self.trust_domain {
             return Err(RpcSecurityError::PeerTrustDomainMismatch);
         }
-        Ok(PeerIdentity::new(
+        Ok(PeerIdentity::new_incarnated(
             ServiceKind::new(service_kind),
             InstanceId::new(instance_id),
+            incarnation,
             spiffe_id,
         ))
     }
@@ -583,16 +609,19 @@ mod mtls_tests {
     #[test]
     fn extractor_reads_one_strict_spiffe_uri_from_generated_leaf() {
         let extractor = extractor("lattice.test").unwrap();
-        let certificate =
-            certificate_with_sans(&["spiffe://lattice.test/svc/World/instance/world-a"], true);
+        let certificate = certificate_with_sans(
+            &["spiffe://lattice.test/svc/World/instance/world-a/incarnation/boot-a"],
+            true,
+        );
 
         let peer = extractor.extract_leaf_certificate(&certificate).unwrap();
 
         assert_eq!(peer.service_kind, ServiceKind::new("World"));
         assert_eq!(peer.instance_id, InstanceId::new("world-a"));
+        assert_eq!(peer.incarnation, Some(InstanceIncarnation::new("boot-a")));
         assert_eq!(
             peer.spiffe_id,
-            "spiffe://lattice.test/svc/World/instance/world-a"
+            "spiffe://lattice.test/svc/World/instance/world-a/incarnation/boot-a"
         );
     }
 
@@ -609,8 +638,8 @@ mod mtls_tests {
             extractor
                 .extract_leaf_certificate(&certificate_with_sans(
                     &[
-                        "spiffe://lattice.test/svc/World/instance/world-a",
-                        "spiffe://lattice.test/svc/World/instance/world-b",
+                        "spiffe://lattice.test/svc/World/instance/world-a/incarnation/boot-a",
+                        "spiffe://lattice.test/svc/World/instance/world-b/incarnation/boot-b",
                     ],
                     false,
                 ))
@@ -620,7 +649,7 @@ mod mtls_tests {
         assert_eq!(
             extractor
                 .extract_leaf_certificate(&certificate_with_sans(
-                    &["spiffe://other.test/svc/World/instance/world-a"],
+                    &["spiffe://other.test/svc/World/instance/world-a/incarnation/boot-a"],
                     false,
                 ))
                 .unwrap_err(),
@@ -632,18 +661,20 @@ mod mtls_tests {
     fn extractor_rejects_noncanonical_or_unbounded_spiffe_paths() {
         let extractor = extractor("lattice.test").unwrap();
         let oversized = format!(
-            "spiffe://lattice.test/svc/{}/instance/world-a",
+            "spiffe://lattice.test/svc/{}/instance/world-a/incarnation/boot-a",
             "a".repeat(MAX_SPIFFE_ID_BYTES)
         );
         let malformed = [
             "SPIFFE://lattice.test/svc/World/instance/world-a",
             "https://lattice.test/svc/World/instance/world-a",
             "spiffe://lattice.test/service/World/instance/world-a",
-            "spiffe://lattice.test/svc/World/instance/world-a/extra",
-            "spiffe://lattice.test/svc//instance/world-a",
-            "spiffe://lattice.test/svc/../instance/world-a",
-            "spiffe://lattice.test/svc/%57orld/instance/world-a",
-            "spiffe://lattice.test/svc/World/instance/world-a?admin=true",
+            "spiffe://lattice.test/svc/World/instance/world-a",
+            "spiffe://lattice.test/svc/World/instance/world-a/incarnation/boot-a/extra",
+            "spiffe://lattice.test/svc//instance/world-a/incarnation/boot-a",
+            "spiffe://lattice.test/svc/../instance/world-a/incarnation/boot-a",
+            "spiffe://lattice.test/svc/%57orld/instance/world-a/incarnation/boot-a",
+            "spiffe://lattice.test/svc/World/instance/world-a/incarnation/..",
+            "spiffe://lattice.test/svc/World/instance/world-a/incarnation/boot-a?admin=true",
             oversized.as_str(),
         ];
 
@@ -665,14 +696,14 @@ mod mtls_tests {
         spoofed.extensions_mut().insert(PeerIdentity::new(
             ServiceKind::new("World"),
             InstanceId::new("world-a"),
-            "spiffe://lattice.test/svc/World/instance/world-a",
+            "spiffe://lattice.test/svc/World/instance/world-a/incarnation/boot-a",
         ));
         let missing = extractor.authenticate(&spoofed).unwrap_err();
         assert_eq!(missing.code(), Code::Unauthenticated);
 
         let wrong_domain = extractor
             .extract_leaf_certificate(&certificate_with_sans(
-                &["spiffe://attacker.example/svc/World/instance/stolen-secret"],
+                &["spiffe://attacker.example/svc/World/instance/stolen-secret/incarnation/boot-a"],
                 false,
             ))
             .unwrap_err();

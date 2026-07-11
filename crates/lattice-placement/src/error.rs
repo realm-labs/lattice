@@ -1,5 +1,5 @@
 use lattice_core::actor_ref::Epoch;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 
 use crate::registry::InstanceState;
 use crate::storage::{LeaseId, PlacementVersion};
@@ -59,6 +59,12 @@ pub enum PlacementError {
         instance_id: InstanceId,
         expected: LeaseId,
         actual: LeaseId,
+    },
+    #[error("instance {instance_id} incarnation changed from expected {expected} to {actual}")]
+    InstanceIncarnationMismatch {
+        instance_id: InstanceId,
+        expected: InstanceIncarnation,
+        actual: InstanceIncarnation,
     },
     #[error("coordinator leadership has been lost")]
     CoordinatorLeadershipLost,

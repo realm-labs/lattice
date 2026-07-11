@@ -9,6 +9,8 @@ pub enum LatticeServiceError {
     MissingListener,
     #[error("lattice service instance config is not configured")]
     MissingInstanceConfig,
+    #[error("lattice service instance incarnation is not one canonical bounded path segment")]
+    InvalidInstanceIncarnation,
     #[error("lattice service has no RPC services registered")]
     NoRpcServices,
     #[error("duplicate actor registration for {actor_kind}")]

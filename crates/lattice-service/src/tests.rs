@@ -38,7 +38,7 @@ use lattice_core::direct_link::runtime::{
 use lattice_core::direct_link::stream::DirectLinkMessage;
 use lattice_core::direct_link::target::DirectLinkEndpoint;
 use lattice_core::id::{ActorId, RouteKey};
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_core::service_context::ConfiguredComponent;
 use lattice_core::trace::TraceContext;

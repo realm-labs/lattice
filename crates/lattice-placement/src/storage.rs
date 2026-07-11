@@ -876,6 +876,16 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
         &self,
         instance_id: &InstanceId,
     ) -> Result<Option<InstanceRecord>, PlacementError>;
+    async fn get_service_instance(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        Ok(self
+            .get_instance(instance_id)
+            .await?
+            .filter(|record| &record.service_kind == service_kind))
+    }
     async fn list_instances(
         &self,
         service_kind: &ServiceKind,

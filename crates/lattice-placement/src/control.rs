@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceIncarnation;
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_rpc::security::{
     MtlsPeerIdentityExtractor, PeerIdentity, RpcSecurityError, ServiceIdentityConfig,
@@ -117,6 +118,47 @@ impl<S, L> PlacementCoordinatorService<S, L> {
     }
 }
 
+impl<S, L> PlacementCoordinatorService<S, L>
+where
+    S: PlacementStore,
+{
+    async fn authenticate_current_peer<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<PeerIdentity>, Status> {
+        let peer = self.admission.authenticate(request)?;
+        let Some(peer) = peer else {
+            return Ok(None);
+        };
+        let Some(incarnation) = peer.incarnation.as_ref() else {
+            return Err(Status::permission_denied(
+                "authenticated workload has no boot incarnation",
+            ));
+        };
+        let record = self
+            .coordinator
+            .store
+            .get_service_instance(&peer.service_kind, &peer.instance_id)
+            .await
+            .map_err(|_| Status::unavailable("workload liveness lookup failed"))?
+            .filter(|record| {
+                &record.incarnation == incarnation
+                    && record.state == crate::registry::InstanceState::Ready
+            })
+            .ok_or_else(|| {
+                Status::permission_denied(
+                    "authenticated workload is not the current ready instance incarnation",
+                )
+            })?;
+        if record.lease_id.0 == 0 {
+            return Err(Status::permission_denied(
+                "authenticated workload has no live instance lease",
+            ));
+        }
+        Ok(Some(peer))
+    }
+}
+
 #[derive(Debug, Clone)]
 enum PlacementCoordinatorAdmission {
     Authenticated(MtlsPeerIdentityExtractor),
@@ -148,7 +190,7 @@ where
         &self,
         request: Request<proto::ActivateActorRequest>,
     ) -> Result<Response<proto::ActorPlacementReply>, Status> {
-        self.admission.authenticate(&request)?;
+        self.authenticate_current_peer(&request).await?;
         let request = request.into_inner();
         if request.epoch != 0 {
             return Err(Status::invalid_argument(
@@ -175,7 +217,7 @@ where
         &self,
         request: Request<proto::ActivateSingletonRequest>,
     ) -> Result<Response<proto::SingletonPlacementReply>, Status> {
-        self.admission.authenticate(&request)?;
+        self.authenticate_current_peer(&request).await?;
         let request = request.into_inner();
         if request.epoch != 0 {
             return Err(Status::invalid_argument(
@@ -198,15 +240,18 @@ where
         &self,
         request: Request<proto::DrainInstanceRequest>,
     ) -> Result<Response<proto::DrainInstanceReply>, Status> {
-        let peer = self.admission.authenticate(&request)?;
+        let peer = self.authenticate_current_peer(&request).await?;
         let request = request.into_inner();
         if request.expected_lease_id == 0 {
             return Err(Status::invalid_argument("expected_lease_id is required"));
         }
         let service_kind = ServiceKind::new(request.service_kind);
         let instance_id = lattice_core::instance::InstanceId::new(request.instance_id);
+        let instance_incarnation = instance_incarnation_from_proto(request.instance_incarnation)?;
         if peer.is_some_and(|peer| {
-            peer.service_kind != service_kind || peer.instance_id != instance_id
+            peer.service_kind != service_kind
+                || peer.instance_id != instance_id
+                || peer.incarnation.as_ref() != Some(&instance_incarnation)
         }) {
             return Err(Status::permission_denied(
                 "authenticated workload identity cannot drain the requested instance",
@@ -215,13 +260,19 @@ where
         let expected_lease_id = crate::storage::LeaseId(request.expected_lease_id);
         let report = self
             .coordinator
-            .drain_instance(service_kind.clone(), instance_id.clone(), expected_lease_id)
+            .drain_instance(
+                service_kind.clone(),
+                instance_id.clone(),
+                instance_incarnation.clone(),
+                expected_lease_id,
+            )
             .await;
         let reply = match report {
             Ok(report) => drain_report_to_proto(service_kind.clone(), expected_lease_id, report)?,
             Err(PlacementError::NoReadyInstances) => proto::DrainInstanceReply {
                 service_kind: service_kind.as_str().to_string(),
                 drained_instance_id: instance_id.as_str().to_string(),
+                drained_instance_incarnation: instance_incarnation.as_str().to_string(),
                 migrated_actors: 0,
                 migrated_virtual_shards: 0,
                 drained_lease_id: expected_lease_id.0,
@@ -435,6 +486,7 @@ fn drain_report_to_proto(
     Ok(proto::DrainInstanceReply {
         service_kind: service_kind.as_str().to_string(),
         drained_instance_id: report.drained_instance.as_str().to_string(),
+        drained_instance_incarnation: report.drained_incarnation.as_str().to_string(),
         migrated_actors: u64::try_from(report.migrated_actors)
             .map_err(|_| Status::internal("drain actor count exceeds protocol range"))?,
         migrated_virtual_shards: u64::try_from(report.migrated_virtual_shards)
@@ -442,6 +494,16 @@ fn drain_report_to_proto(
         drained_lease_id: drained_lease_id.0,
         outcome: proto::DrainInstanceOutcome::Completed as i32,
     })
+}
+
+fn instance_incarnation_from_proto(value: String) -> Result<InstanceIncarnation, Status> {
+    let incarnation = InstanceIncarnation::new(value);
+    if !incarnation.is_canonical() {
+        return Err(Status::invalid_argument(
+            "instance_incarnation is required and must be one canonical path segment",
+        ));
+    }
+    Ok(incarnation)
 }
 
 fn singleton_placement_to_proto(
@@ -489,6 +551,7 @@ fn status_from_placement(error: PlacementError) -> Status {
         | PlacementError::EpochFloorUnproven { .. }
         | PlacementError::EpochReservationMismatch
         | PlacementError::InstanceLeaseMismatch { .. }
+        | PlacementError::InstanceIncarnationMismatch { .. }
         | PlacementError::CoordinatorLeadershipLost => {
             Status::failed_precondition(error.to_string())
         }
@@ -710,6 +773,7 @@ mod tests {
                 .drain_instance(
                     service_kind!("Other"),
                     InstanceId::new("world-a"),
+                    InstanceIncarnation::new("world-a-boot"),
                     LeaseId(1),
                 )
                 .await
@@ -733,6 +797,7 @@ mod tests {
                 .drain_instance(
                     service_kind!("World"),
                     InstanceId::new("world-a"),
+                    InstanceIncarnation::new("world-a-boot"),
                     LeaseId(2),
                 )
                 .await
@@ -756,6 +821,31 @@ mod tests {
                 .drain_instance(
                     service_kind!("World"),
                     InstanceId::new("world-a"),
+                    InstanceIncarnation::new("stale-world-a-boot"),
+                    LeaseId(1),
+                )
+                .await
+                .unwrap_err(),
+            PlacementError::PlacementAuthorityRpc {
+                code: tonic::Code::FailedPrecondition
+            }
+        );
+        assert_eq!(
+            store
+                .get_instance(&InstanceId::new("world-a"))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            InstanceState::Ready
+        );
+
+        assert_eq!(
+            client
+                .drain_instance(
+                    service_kind!("World"),
+                    InstanceId::new("world-a"),
+                    InstanceIncarnation::new("world-a-boot"),
                     LeaseId(1),
                 )
                 .await
@@ -831,6 +921,7 @@ mod tests {
             .drain_instance(
                 service_kind!("World"),
                 InstanceId::new("world-a"),
+                InstanceIncarnation::new("world-a-boot"),
                 LeaseId(1),
             )
             .await
@@ -840,6 +931,7 @@ mod tests {
             report,
             DrainReport {
                 drained_instance: InstanceId::new("world-a"),
+                drained_incarnation: InstanceIncarnation::new("world-a-boot"),
                 migrated_actors: 1,
                 migrated_virtual_shards: 1,
             }
@@ -868,6 +960,7 @@ mod tests {
         InstanceRecord {
             service_kind: service_kind!("World"),
             instance_id: InstanceId::new(instance_id),
+            incarnation: InstanceIncarnation::new(format!("{instance_id}-boot")),
             lease_id,
             advertised_endpoint: endpoint(instance_id, 18080),
             control_endpoint: endpoint(instance_id, 18081),

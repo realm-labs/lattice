@@ -7,7 +7,7 @@ use lattice_config::bootstrap::BootstrapConfig;
 use lattice_config::format::ConfigFormat;
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
-use lattice_core::instance::InstanceCapacity;
+use lattice_core::instance::{InstanceCapacity, InstanceIncarnation};
 use lattice_core::{actor_kind, service_kind};
 
 use super::*;
@@ -3187,6 +3187,22 @@ fn etcd_value_codec_round_trips_placement_metadata() {
 }
 
 #[test]
+fn etcd_instance_codec_rejects_legacy_records_without_boot_incarnation() {
+    let value = EtcdValue::Instance(Box::new(instance_record("world-a", InstanceState::Ready)));
+    let encoded = encode_etcd_value(&value).unwrap();
+    let mut json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    json.get_mut("Instance")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap()
+        .remove("incarnation");
+
+    assert!(matches!(
+        decode_etcd_value(&serde_json::to_vec(&json).unwrap()),
+        Err(PlacementError::PlacementCodec { .. })
+    ));
+}
+
+#[test]
 fn etcd_instance_records_are_written_with_their_instance_lease() {
     let instance = EtcdValue::Instance(Box::new(instance_record("world-a", InstanceState::Ready)));
 
@@ -3344,6 +3360,7 @@ fn instance_record(instance_id: &str, state: InstanceState) -> InstanceRecord {
     InstanceRecord {
         service_kind: service_kind!("World"),
         instance_id: InstanceId::new(instance_id),
+        incarnation: InstanceIncarnation::new(format!("{instance_id}-boot")),
         lease_id: LeaseId(1),
         advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
         control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),

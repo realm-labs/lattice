@@ -176,6 +176,7 @@ async fn service_starts_admin_http_as_managed_listener() {
     let replacement = InstanceRecord {
         service_kind: service_kind!("World"),
         instance_id: InstanceId::new("world-2"),
+        incarnation: InstanceIncarnation::new("world-2-boot"),
         lease_id: store_for_assert.grant_instance_lease().await.unwrap(),
         advertised_endpoint: "http://127.0.0.1:19002".parse().unwrap(),
         control_endpoint: "http://127.0.0.1:19002".parse().unwrap(),
@@ -627,6 +628,7 @@ async fn stale_service_shutdown_cannot_overwrite_replacement_incarnation() {
         .unwrap();
     let replacement_lease = store.grant_instance_lease().await.unwrap();
     let replacement = InstanceRecord {
+        incarnation: InstanceIncarnation::new("world-1-replacement-boot"),
         lease_id: replacement_lease,
         version: "replacement".to_string(),
         state: InstanceState::Ready,
@@ -638,13 +640,13 @@ async fn stale_service_shutdown_cannot_overwrite_replacement_incarnation() {
     let error = task.await.unwrap().unwrap_err();
     assert!(matches!(
         error,
-        LatticeServiceError::Placement(PlacementError::InstanceLeaseMismatch {
+        LatticeServiceError::Placement(PlacementError::InstanceIncarnationMismatch {
             instance_id,
             expected,
             actual,
         }) if instance_id == InstanceId::new("world-1")
-            && expected == old_record.lease_id
-            && actual == replacement_lease
+            && expected == old_record.incarnation.clone()
+            && actual == replacement.incarnation.clone()
     ));
     assert_eq!(
         store
@@ -739,8 +741,23 @@ impl PlacementAuthority for ReplacementDuringDrainAuthority {
         &self,
         service_kind: ServiceKind,
         instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
         expected_lease_id: LeaseId,
     ) -> Result<lattice_placement::coordination::reports::DrainReport, PlacementError> {
+        let record = self
+            .store
+            .get_instance(&instance_id)
+            .await?
+            .ok_or_else(|| PlacementError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            })?;
+        if record.incarnation != instance_incarnation {
+            return Err(PlacementError::InstanceIncarnationMismatch {
+                instance_id,
+                expected: instance_incarnation,
+                actual: record.incarnation,
+            });
+        }
         let current = self
             .store
             .compare_and_set_instance_state(
@@ -753,6 +770,7 @@ impl PlacementAuthority for ReplacementDuringDrainAuthority {
         let replacement_lease = self.store.grant_instance_lease().await?;
         self.store
             .upsert_instance(InstanceRecord {
+                incarnation: InstanceIncarnation::new("world-1-replacement-boot"),
                 lease_id: replacement_lease,
                 version: "replacement".to_string(),
                 state: InstanceState::Ready,
@@ -761,6 +779,7 @@ impl PlacementAuthority for ReplacementDuringDrainAuthority {
             .await?;
         Ok(lattice_placement::coordination::reports::DrainReport {
             drained_instance: instance_id,
+            drained_incarnation: instance_incarnation,
             migrated_actors: 0,
             migrated_virtual_shards: 0,
         })
@@ -1193,6 +1212,7 @@ fn placement_instance(instance_id: &str) -> InstanceRecord {
     InstanceRecord {
         service_kind: service_kind!("World"),
         instance_id: InstanceId::new(instance_id),
+        incarnation: InstanceIncarnation::new(format!("{instance_id}-boot")),
         lease_id: LeaseId(1),
         advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
         control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),

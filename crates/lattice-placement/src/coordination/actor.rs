@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use lattice_core::id::ActorId;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::{ActorKind, ServiceKind};
 use tracing::Instrument;
 
@@ -168,6 +168,7 @@ where
         &self,
         service_kind: ServiceKind,
         instance_id: InstanceId,
+        expected_incarnation: InstanceIncarnation,
         expected_lease_id: LeaseId,
     ) -> Result<DrainReport, PlacementError> {
         let span = tracing::info_span!(
@@ -177,6 +178,20 @@ where
             instance.id = instance_id.as_str()
         );
         async {
+            let current = self
+                .store
+                .get_service_instance(&service_kind, &instance_id)
+                .await?
+                .ok_or_else(|| PlacementError::InstanceNotFound {
+                    instance_id: instance_id.clone(),
+                })?;
+            if current.incarnation != expected_incarnation {
+                return Err(PlacementError::InstanceIncarnationMismatch {
+                    instance_id: instance_id.clone(),
+                    expected: expected_incarnation,
+                    actual: current.incarnation,
+                });
+            }
             self.store
                 .compare_and_set_instance_state(
                     &service_kind,
@@ -254,6 +269,7 @@ where
 
             Ok(DrainReport {
                 drained_instance: instance_id,
+                drained_incarnation: current.incarnation,
                 migrated_actors,
                 migrated_virtual_shards,
             })

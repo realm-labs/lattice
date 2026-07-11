@@ -2,12 +2,13 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use lattice_core::direct_link::target::DirectLinkEndpoint;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_direct_link::transport::DirectLinkListenConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceConfig {
     pub instance_id: InstanceId,
+    pub incarnation: InstanceIncarnation,
     pub advertised_endpoint: Option<http::Uri>,
 }
 
@@ -15,8 +16,14 @@ impl InstanceConfig {
     pub fn new(instance_id: InstanceId) -> Self {
         Self {
             instance_id,
+            incarnation: InstanceIncarnation::generate(),
             advertised_endpoint: None,
         }
+    }
+
+    pub fn with_incarnation(mut self, incarnation: InstanceIncarnation) -> Self {
+        self.incarnation = incarnation;
+        self
     }
 
     pub fn with_advertised_endpoint(mut self, endpoint: http::Uri) -> Self {
@@ -170,6 +177,22 @@ fn validate_bind_policy(uri: &http::Uri, policy: DirectLinkBindPolicy) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_config_generates_a_new_boot_incarnation_and_allows_explicit_certificate_binding() {
+        let first = InstanceConfig::new(InstanceId::new("world-a"));
+        let second = InstanceConfig::new(InstanceId::new("world-a"));
+        assert_ne!(first.incarnation, second.incarnation);
+        assert_eq!(first.incarnation.as_str().len(), 32);
+
+        let explicit = InstanceIncarnation::new("certificate-boot-a");
+        assert_eq!(
+            InstanceConfig::new(InstanceId::new("world-a"))
+                .with_incarnation(explicit.clone())
+                .incarnation,
+            explicit
+        );
+    }
 
     #[test]
     fn direct_link_bind_policy_allows_loopback_by_default() {

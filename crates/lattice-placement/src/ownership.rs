@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::{ActorId, RouteKey};
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::{ActorKind, ServiceKind};
 
 use crate::registry::{InstanceRecord, InstanceState};
@@ -66,6 +66,11 @@ pub enum OwnershipSnapshotError {
     InstanceMismatch {
         expected: InstanceId,
         actual: InstanceId,
+    },
+    #[error("local ownership snapshot expected incarnation {expected}, got {actual}")]
+    InstanceIncarnationMismatch {
+        expected: InstanceIncarnation,
+        actual: InstanceIncarnation,
     },
     #[error("local ownership snapshot has no active instance lease")]
     MissingInstanceLease,
@@ -290,6 +295,7 @@ pub struct LocalOwnershipGate {
 struct LocalOwnershipInner {
     service_kind: ServiceKind,
     instance_id: InstanceId,
+    instance_incarnation: InstanceIncarnation,
     max_entries: NonZeroUsize,
     state: RwLock<LocalOwnershipState>,
 }
@@ -312,9 +318,10 @@ enum SnapshotAvailability {
     Unavailable(OwnershipFenceReason),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalInstanceAuthority {
     lease_id: LeaseId,
+    incarnation: InstanceIncarnation,
     state: InstanceState,
 }
 
@@ -432,10 +439,15 @@ impl OwnershipAuthorityFloor {
 }
 
 impl LocalOwnershipSnapshot {
-    pub fn new(service_kind: ServiceKind, instance_id: InstanceId) -> Self {
+    pub fn new(
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
+    ) -> Self {
         Self::with_config(
             service_kind,
             instance_id,
+            instance_incarnation,
             LocalOwnershipSnapshotConfig::default(),
         )
     }
@@ -443,12 +455,14 @@ impl LocalOwnershipSnapshot {
     pub fn with_config(
         service_kind: ServiceKind,
         instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
         config: LocalOwnershipSnapshotConfig,
     ) -> Self {
         Self {
             inner: Arc::new(LocalOwnershipInner {
                 service_kind,
                 instance_id,
+                instance_incarnation,
                 max_entries: config.max_entries,
                 state: RwLock::new(LocalOwnershipState {
                     generation: 0,
@@ -479,10 +493,10 @@ impl LocalOwnershipSnapshot {
     ) -> Result<(), OwnershipSnapshotError> {
         self.validate_instance_identity(&record)?;
         let mut state = self.inner.write_state();
-        let lease_changed = state
-            .instance
-            .is_some_and(|instance| instance.lease_id != record.lease_id);
-        if lease_changed {
+        let authority_changed = state.instance.as_ref().is_some_and(|instance| {
+            instance.lease_id != record.lease_id || instance.incarnation != record.incarnation
+        });
+        if authority_changed {
             state.fence_local_placements_for_lifecycle();
             state.valid_owner_leases.clear();
             state.availability =
@@ -490,13 +504,14 @@ impl LocalOwnershipSnapshot {
         }
         state.instance = Some(LocalInstanceAuthority {
             lease_id: record.lease_id,
+            incarnation: record.incarnation,
             state: record.state,
         });
         if lease_valid {
             state.valid_owner_leases.insert(record.lease_id);
         } else {
             state.valid_owner_leases.remove(&record.lease_id);
-            if !lease_changed {
+            if !authority_changed {
                 state.availability =
                     SnapshotAvailability::Unavailable(OwnershipFenceReason::LeaseLost);
             }
@@ -542,6 +557,7 @@ impl LocalOwnershipSnapshot {
         if !valid
             && state
                 .instance
+                .as_ref()
                 .is_some_and(|instance| instance.lease_id == lease_id)
         {
             state.availability = SnapshotAvailability::Unavailable(OwnershipFenceReason::LeaseLost);
@@ -559,6 +575,7 @@ impl LocalOwnershipSnapshot {
         let mut state = self.inner.write_state();
         let current_lease = state
             .instance
+            .as_ref()
             .map(|instance| instance.lease_id)
             .ok_or(OwnershipSnapshotError::MissingInstanceLease)?;
         state.availability = SnapshotAvailability::Unavailable(OwnershipFenceReason::Resyncing);
@@ -595,6 +612,7 @@ impl LocalOwnershipSnapshot {
         let mut state = self.inner.write_state();
         let current_lease = state
             .instance
+            .as_ref()
             .map(|instance| instance.lease_id)
             .ok_or(OwnershipSnapshotError::MissingInstanceLease)?;
         if current_lease != token.lease_id {
@@ -895,6 +913,12 @@ impl LocalOwnershipSnapshot {
                 actual: record.instance_id.clone(),
             });
         }
+        if record.incarnation != self.inner.instance_incarnation {
+            return Err(OwnershipSnapshotError::InstanceIncarnationMismatch {
+                expected: self.inner.instance_incarnation.clone(),
+                actual: record.incarnation.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -1094,9 +1118,9 @@ impl LocalOwnershipSnapshot {
                 if record.service_kind == self.inner.service_kind
                     && record.instance_id == self.inner.instance_id =>
             {
-                state
-                    .instance
-                    .is_some_and(|current| current.lease_id != record.lease_id)
+                state.instance.as_ref().is_some_and(|current| {
+                    current.lease_id != record.lease_id || current.incarnation != record.incarnation
+                })
             }
             _ => false,
         });
@@ -1273,12 +1297,19 @@ impl LocalOwnershipSnapshot {
         state: &mut LocalOwnershipState,
         record: &InstanceRecord,
     ) -> bool {
-        if state
-            .instance
-            .is_some_and(|instance| instance.lease_id == record.lease_id)
-        {
+        if record.incarnation != self.inner.instance_incarnation {
+            state.instance = None;
+            state.fence_local_placements_for_lifecycle();
+            state.valid_owner_leases.clear();
+            state.availability = SnapshotAvailability::Unavailable(OwnershipFenceReason::LeaseLost);
+            return true;
+        }
+        if state.instance.as_ref().is_some_and(|instance| {
+            instance.lease_id == record.lease_id && instance.incarnation == record.incarnation
+        }) {
             state.instance = Some(LocalInstanceAuthority {
                 lease_id: record.lease_id,
+                incarnation: record.incarnation.clone(),
                 state: record.state,
             });
             // Preserve explicit keepalive validity for the current lease. A
@@ -1290,6 +1321,7 @@ impl LocalOwnershipSnapshot {
         state.valid_owner_leases.clear();
         state.instance = Some(LocalInstanceAuthority {
             lease_id: record.lease_id,
+            incarnation: record.incarnation.clone(),
             state: record.state,
         });
         state.availability = SnapshotAvailability::Unavailable(OwnershipFenceReason::Initializing);
@@ -1793,7 +1825,7 @@ impl OwnershipGate for LocalOwnershipGate {
                 None,
             ));
         }
-        let instance = state.instance.ok_or_else(|| {
+        let instance = state.instance.as_ref().ok_or_else(|| {
             rejection(
                 OwnershipRejectionKind::Fenced,
                 OwnershipRejectionReason::LocalInstanceMissing,
@@ -2132,7 +2164,7 @@ fn rejection(
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::instance::InstanceCapacity;
+    use lattice_core::instance::{InstanceCapacity, InstanceIncarnation};
     use lattice_core::{actor_kind, service_kind};
 
     use super::*;
@@ -2187,7 +2219,11 @@ mod tests {
         let actor = actor_kind!("World");
         let route_key = RouteKey::U64(7);
         let placement = OwnershipPlacement::Explicit;
-        let snapshot = LocalOwnershipSnapshot::new(service.clone(), InstanceId::new("world-a"));
+        let snapshot = LocalOwnershipSnapshot::new(
+            service.clone(),
+            InstanceId::new("world-a"),
+            InstanceIncarnation::new("world-a-boot"),
+        );
         let gate = snapshot.gate();
 
         let cold = gate
@@ -2696,6 +2732,7 @@ mod tests {
         let bounded = LocalOwnershipSnapshot::with_config(
             service_kind!("World"),
             InstanceId::new("world-a"),
+            InstanceIncarnation::new("world-a-boot"),
             LocalOwnershipSnapshotConfig::try_new(1).unwrap(),
         );
         install_ready_instance(&bounded, INSTANCE_LEASE);
@@ -3107,6 +3144,7 @@ mod tests {
         let snapshot = LocalOwnershipSnapshot::with_config(
             service_kind!("World"),
             InstanceId::new("world-a"),
+            InstanceIncarnation::new("world-a-boot"),
             LocalOwnershipSnapshotConfig::try_new(1).unwrap(),
         );
         install_ready_instance(&snapshot, INSTANCE_LEASE);
@@ -3283,7 +3321,10 @@ mod tests {
         let state = snapshot.inner.read_state();
         assert_eq!(state.actors.len(), 1);
         assert!(state.valid_owner_leases.contains(&INSTANCE_LEASE));
-        assert_eq!(state.instance.unwrap().state, InstanceState::Draining);
+        assert_eq!(
+            state.instance.as_ref().unwrap().state,
+            InstanceState::Draining
+        );
         drop(state);
 
         let service = service_kind!("World");
@@ -3319,7 +3360,7 @@ mod tests {
         assert_eq!(state.actors.len(), 1);
         assert_lifecycle_fenced(state.actors.values().next().unwrap());
         assert!(state.valid_owner_leases.is_empty());
-        assert_eq!(state.instance.unwrap().lease_id, new_lease);
+        assert_eq!(state.instance.as_ref().unwrap().lease_id, new_lease);
         assert_eq!(
             state.availability,
             SnapshotAvailability::Unavailable(OwnershipFenceReason::Initializing)
@@ -4260,6 +4301,45 @@ mod tests {
     }
 
     #[test]
+    fn instance_incarnation_change_fences_even_if_a_backend_reuses_the_lease_id() {
+        let (snapshot, gate) = ready_snapshot(1);
+        let actor = actor_record(1, "world-a", 1, INSTANCE_LEASE, PlacementState::Running);
+        snapshot
+            .apply_actor(OwnershipRevision(1), actor.clone())
+            .unwrap();
+        let grant = gate
+            .authorize(request(
+                &service_kind!("World"),
+                &actor_kind!("World"),
+                &actor_kind!("World"),
+                &RouteKey::U64(1),
+                Some(Epoch(1)),
+                &OwnershipPlacement::Explicit,
+            ))
+            .unwrap();
+
+        let mut replacement =
+            instance_record("World", "world-a", INSTANCE_LEASE, InstanceState::Ready);
+        replacement.incarnation = InstanceIncarnation::new("world-a-replacement-boot");
+        snapshot
+            .apply_watch_batch(watch_batch(
+                2,
+                vec![OwnershipWatchEvent::InstanceUpserted {
+                    record: replacement,
+                }],
+            ))
+            .unwrap();
+
+        assert!(!gate.is_current(&grant));
+        let state = snapshot.inner.read_state();
+        assert_lifecycle_fenced(&state.actors[&actor_key(&actor)]);
+        assert_eq!(
+            state.availability,
+            SnapshotAvailability::Unavailable(OwnershipFenceReason::LeaseLost)
+        );
+    }
+
+    #[test]
     fn instance_reincarnation_preserves_floors_and_global_revision() {
         let (snapshot, gate) = ready_snapshot(3);
         let actor = actor_record(1, "world-a", 5, INSTANCE_LEASE, PlacementState::Running);
@@ -4401,7 +4481,7 @@ mod tests {
         ));
         let state = atomic_actor.inner.read_state();
         assert_eq!(state.revision, Some(OwnershipRevision(10)));
-        assert_eq!(state.instance.unwrap().lease_id, INSTANCE_LEASE);
+        assert_eq!(state.instance.as_ref().unwrap().lease_id, INSTANCE_LEASE);
         assert_present_local(state.actors.values().next().unwrap());
         drop(state);
 
@@ -4428,7 +4508,7 @@ mod tests {
         ));
         let state = atomic_shard.inner.read_state();
         assert_eq!(state.revision, Some(OwnershipRevision(10)));
-        assert_eq!(state.instance.unwrap().lease_id, INSTANCE_LEASE);
+        assert_eq!(state.instance.as_ref().unwrap().lease_id, INSTANCE_LEASE);
         assert_present_local(state.virtual_shards.values().next().unwrap());
         drop(state);
 
@@ -4455,7 +4535,7 @@ mod tests {
         ));
         let state = atomic_singleton.inner.read_state();
         assert_eq!(state.revision, Some(OwnershipRevision(10)));
-        assert_eq!(state.instance.unwrap().lease_id, INSTANCE_LEASE);
+        assert_eq!(state.instance.as_ref().unwrap().lease_id, INSTANCE_LEASE);
         assert_present_local(state.singletons.values().next().unwrap());
     }
 
@@ -4860,6 +4940,7 @@ mod tests {
         let snapshot = LocalOwnershipSnapshot::with_config(
             service_kind!("World"),
             InstanceId::new("world-a"),
+            InstanceIncarnation::new("world-a-boot"),
             LocalOwnershipSnapshotConfig::try_new(max_entries).unwrap(),
         );
         install_ready_instance(&snapshot, INSTANCE_LEASE);
@@ -4886,6 +4967,7 @@ mod tests {
         InstanceRecord {
             service_kind: ServiceKind::new(service),
             instance_id: InstanceId::new(instance),
+            incarnation: InstanceIncarnation::new(format!("{instance}-boot")),
             lease_id,
             advertised_endpoint: "http://127.0.0.1:18080".parse().unwrap(),
             control_endpoint: "http://127.0.0.1:18081".parse().unwrap(),

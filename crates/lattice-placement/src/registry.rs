@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use http::Uri;
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::ServiceKind;
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,7 @@ pub enum InstanceState {
 pub struct InstanceRecord {
     pub service_kind: ServiceKind,
     pub instance_id: InstanceId,
+    pub incarnation: InstanceIncarnation,
     pub lease_id: LeaseId,
     #[serde(with = "uri_serde")]
     pub advertised_endpoint: Uri,

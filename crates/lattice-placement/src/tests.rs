@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use lattice_core::actor_ref::{ActorRef, Epoch};
 use lattice_core::id::{ActorId, RouteKey};
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::ActorKind;
 use lattice_core::{actor_kind, service_kind};
 use lattice_rpc::error::RpcError;
@@ -1099,6 +1099,7 @@ fn instance_record(instance_id: &str, state: InstanceState) -> InstanceRecord {
     InstanceRecord {
         service_kind: service_kind!("World"),
         instance_id: InstanceId::new(instance_id),
+        incarnation: InstanceIncarnation::new(format!("{instance_id}-boot")),
         lease_id: LeaseId(1),
         advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
         control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),

@@ -13,7 +13,7 @@ use etcd_client::{
 };
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
-use lattice_core::instance::{InstanceCapacity, InstanceId};
+use lattice_core::instance::{InstanceCapacity, InstanceId, InstanceIncarnation};
 use lattice_core::{actor_kind, service_kind};
 use tonic::Code;
 
@@ -592,9 +592,11 @@ fn actor_record(actor_id: u64, owner: &str, lease_id: LeaseId) -> ActorPlacement
 }
 
 fn instance_record(instance_id: InstanceId, lease_id: LeaseId) -> InstanceRecord {
+    let incarnation = InstanceIncarnation::new(format!("{}-boot", instance_id.as_str()));
     InstanceRecord {
         service_kind: service_kind!("World"),
         instance_id,
+        incarnation,
         lease_id,
         advertised_endpoint: "http://127.0.0.1:50051".parse().unwrap(),
         control_endpoint: "http://127.0.0.1:50052".parse().unwrap(),

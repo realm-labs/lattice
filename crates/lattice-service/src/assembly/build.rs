@@ -36,6 +36,9 @@ impl LatticeServiceBuilder {
         let instance = self
             .instance
             .ok_or(LatticeServiceError::MissingInstanceConfig)?;
+        if !instance.incarnation.is_canonical() {
+            return Err(LatticeServiceError::InvalidInstanceIncarnation);
+        }
         let bootstrap_config = match self.config {
             Some(source) => source.load().map_err(|error| LatticeServiceError::Config {
                 message: error.to_string(),

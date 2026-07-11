@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::RouteKey;
-use lattice_core::instance::InstanceCapacity;
+use lattice_core::instance::{InstanceCapacity, InstanceIncarnation};
 use lattice_core::{actor_kind, service_kind};
 
 use super::*;
@@ -1097,16 +1097,17 @@ async fn coordinator_drain_marks_instance_draining_and_migrates_owned_actors() {
         .await
         .unwrap();
 
-    let owner_lease = store
+    let owner = store
         .get_instance(&InstanceId::new("world-a"))
         .await
         .unwrap()
-        .unwrap()
-        .lease_id;
+        .unwrap();
+    let owner_lease = owner.lease_id;
     let report = coordinator
         .drain_instance(
             service_kind!("World"),
             InstanceId::new("world-a"),
+            owner.incarnation.clone(),
             owner_lease,
         )
         .await
@@ -1132,6 +1133,7 @@ async fn coordinator_drain_marks_instance_draining_and_migrates_owned_actors() {
         report,
         DrainReport {
             drained_instance: InstanceId::new("world-a"),
+            drained_incarnation: owner.incarnation,
             migrated_actors: 1,
             migrated_virtual_shards: 1,
         }
@@ -1250,6 +1252,7 @@ async fn register_instance(
     let record = InstanceRecord {
         service_kind: service_kind!("World"),
         instance_id: InstanceId::new(instance_id),
+        incarnation: InstanceIncarnation::new(format!("{instance_id}-boot")),
         lease_id,
         advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
         control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),

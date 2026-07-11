@@ -718,6 +718,25 @@ where
         Ok(None)
     }
 
+    async fn get_service_instance(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        validate_service_kind(service_kind)?;
+        validate_instance_id(instance_id)?;
+        let key = instance_key(&self.prefix, service_kind, instance_id);
+        let Some((_version, value)) = self.client.get(&key).await? else {
+            return Ok(None);
+        };
+        validate_etcd_value_key(&self.prefix, &key, &value)
+            .map_err(placement_key_validation_error)?;
+        match value {
+            EtcdValue::Instance(record) => Ok(Some(*record)),
+            _ => Err(unexpected_etcd_value("instance", &key)),
+        }
+    }
+
     async fn list_instances(
         &self,
         service_kind: &ServiceKind,
@@ -1788,7 +1807,13 @@ fn validate_placement_epoch_key(key: &PlacementEpochKey) -> Result<(), Placement
 
 fn validate_instance_record(record: &InstanceRecord) -> Result<(), PlacementError> {
     validate_service_kind(&record.service_kind)?;
-    validate_instance_id(&record.instance_id)
+    validate_instance_id(&record.instance_id)?;
+    if !record.incarnation.is_canonical() {
+        return Err(PlacementError::PlacementCodec {
+            message: "instance incarnation must be one canonical bounded path segment".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_actor_record(record: &ActorPlacementRecord) -> Result<(), PlacementError> {

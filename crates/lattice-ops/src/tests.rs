@@ -9,7 +9,7 @@ use axum::http::HeaderMap;
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceCapacity;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::trace::TraceContext;
 use lattice_core::{actor_kind, service_kind};
 use lattice_eventbus::local::{EventBus, LocalEventBus};
@@ -129,6 +129,7 @@ async fn graceful_shutdown_drains_before_releasing_lease_and_cancels_runtime_wor
     let shutdown = GracefulShutdown::new(
         service_kind!("World"),
         InstanceId::new("world-a"),
+        InstanceIncarnation::new("world-a-boot"),
         LeaseId(1),
         authority,
         lease_controller.clone(),
@@ -468,6 +469,7 @@ fn instance_record(instance_id: &str) -> InstanceRecord {
     InstanceRecord {
         service_kind: service_kind!("World"),
         instance_id: InstanceId::new(instance_id),
+        incarnation: InstanceIncarnation::new(format!("{instance_id}-boot")),
         lease_id: LeaseId(1),
         advertised_endpoint: format!("http://{instance_id}.world:18080").parse().unwrap(),
         control_endpoint: format!("http://{instance_id}.world:18081").parse().unwrap(),

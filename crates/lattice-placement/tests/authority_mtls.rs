@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use lattice_core::id::ActorId;
-use lattice_core::instance::{InstanceCapacity, InstanceId};
+use lattice_core::instance::{InstanceCapacity, InstanceId, InstanceIncarnation};
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_placement::authority::{PlacementAuthority, TonicPlacementAuthority};
 use lattice_placement::control::PlacementCoordinatorService;
@@ -37,6 +37,7 @@ use tonic::transport::{
 const TRUST_DOMAIN: &str = "lattice.test";
 const TARGET_SERVICE: &str = "World";
 const TARGET_INSTANCE: &str = "world-a";
+const TARGET_INCARNATION: &str = "world-a-new-boot";
 const TARGET_LEASE: LeaseId = LeaseId(101);
 const REJECTION_DEADLINE: Duration = Duration::from_secs(1);
 const TRANSPORT_REJECTION_CODES: &[Code] = &[
@@ -135,7 +136,23 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
     )
     .await
     .expect("a different trusted workload completes TLS");
-    assert_rpc_rejected_without_mutation(wrong_identity, &[Code::PermissionDenied], &store).await;
+    assert_all_methods_rejected_without_mutation(wrong_identity, &[Code::PermissionDenied], &store)
+        .await;
+
+    let stale_incarnation = connect_tls(
+        server.address,
+        &pki.ca_pem,
+        Some(&pki.stale_incarnation_client),
+        "localhost",
+    )
+    .await
+    .expect("a stale certificate for the reused instance still completes TLS");
+    assert_all_methods_rejected_without_mutation(
+        stale_incarnation,
+        &[Code::PermissionDenied],
+        &store,
+    )
+    .await;
 
     let cross_service = connect_tls(
         server.address,
@@ -170,6 +187,7 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
         .drain_instance(
             ServiceKind::new(TARGET_SERVICE),
             InstanceId::new(TARGET_INSTANCE),
+            InstanceIncarnation::new(TARGET_INCARNATION),
             TARGET_LEASE,
         )
         .await
@@ -242,6 +260,7 @@ async fn assert_all_methods_rejected_without_mutation(
             authority.drain_instance(
                 ServiceKind::new(TARGET_SERVICE),
                 InstanceId::new(TARGET_INSTANCE),
+                InstanceIncarnation::new(TARGET_INCARNATION),
                 TARGET_LEASE,
             ),
             "unverified identity must not drain an instance",
@@ -273,6 +292,7 @@ async fn drain_error(channel: Channel) -> PlacementError {
         TonicPlacementAuthority::new(channel).drain_instance(
             ServiceKind::new(TARGET_SERVICE),
             InstanceId::new(TARGET_INSTANCE),
+            InstanceIncarnation::new(TARGET_INCARNATION),
             TARGET_LEASE,
         ),
         "an unverified or mismatched workload must not drain an instance",
@@ -288,6 +308,7 @@ async fn drain_status(channel: Channel) -> tonic::Status {
             service_kind: TARGET_SERVICE.to_string(),
             instance_id: TARGET_INSTANCE.to_string(),
             expected_lease_id: TARGET_LEASE.0,
+            instance_incarnation: TARGET_INCARNATION.to_string(),
         }),
     )
     .await
@@ -346,6 +367,10 @@ fn singleton_key() -> SingletonKey {
 async fn assert_target_ready(store: &InMemoryPlacementStore) {
     let record = target_record(store).await;
     assert_eq!(record.service_kind, ServiceKind::new(TARGET_SERVICE));
+    assert_eq!(
+        record.incarnation,
+        InstanceIncarnation::new(TARGET_INCARNATION)
+    );
     assert_eq!(record.lease_id, TARGET_LEASE);
     assert_eq!(record.state, InstanceState::Ready);
 }
@@ -373,15 +398,21 @@ async fn target_record(store: &InMemoryPlacementStore) -> InstanceRecord {
 
 async fn ready_store() -> InMemoryPlacementStore {
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/authority-mtls"));
-    for (service_kind, instance_id, lease_id) in [
-        (TARGET_SERVICE, TARGET_INSTANCE, TARGET_LEASE),
-        (TARGET_SERVICE, "world-b", LeaseId(102)),
-        ("Player", "player-a", LeaseId(103)),
+    for (service_kind, instance_id, incarnation, lease_id) in [
+        (
+            TARGET_SERVICE,
+            TARGET_INSTANCE,
+            TARGET_INCARNATION,
+            TARGET_LEASE,
+        ),
+        (TARGET_SERVICE, "world-b", "world-b-boot", LeaseId(102)),
+        ("Player", "player-a", "player-a-boot", LeaseId(103)),
     ] {
         store
             .upsert_instance(InstanceRecord {
                 service_kind: ServiceKind::new(service_kind),
                 instance_id: InstanceId::new(instance_id),
+                incarnation: InstanceIncarnation::new(incarnation),
                 lease_id,
                 advertised_endpoint: "http://127.0.0.1:50051".parse().unwrap(),
                 control_endpoint: "http://127.0.0.1:50052".parse().unwrap(),
@@ -492,6 +523,7 @@ struct TestPki {
     valid_client: PemIdentity,
     cross_service_client: PemIdentity,
     wrong_identity_client: PemIdentity,
+    stale_incarnation_client: PemIdentity,
     wrong_trust_domain_client: PemIdentity,
     malformed_client: PemIdentity,
     untrusted_client: PemIdentity,
@@ -507,24 +539,28 @@ impl TestPki {
             server: server_identity(&ca),
             valid_client: workload_identity(
                 &ca,
-                "spiffe://lattice.test/svc/World/instance/world-a",
+                "spiffe://lattice.test/svc/World/instance/world-a/incarnation/world-a-new-boot",
             ),
             cross_service_client: workload_identity(
                 &ca,
-                "spiffe://lattice.test/svc/Player/instance/player-a",
+                "spiffe://lattice.test/svc/Player/instance/player-a/incarnation/player-a-boot",
             ),
             wrong_identity_client: workload_identity(
                 &ca,
-                "spiffe://lattice.test/svc/World/instance/world-other",
+                "spiffe://lattice.test/svc/World/instance/world-other/incarnation/world-other-boot",
+            ),
+            stale_incarnation_client: workload_identity(
+                &ca,
+                "spiffe://lattice.test/svc/World/instance/world-a/incarnation/world-a-old-boot",
             ),
             wrong_trust_domain_client: workload_identity(
                 &ca,
-                "spiffe://other.test/svc/World/instance/world-a",
+                "spiffe://other.test/svc/World/instance/world-a/incarnation/world-a-new-boot",
             ),
             malformed_client: workload_identity(&ca, "spiffe://lattice.test/svc/World/instance"),
             untrusted_client: workload_identity(
                 &untrusted_ca,
-                "spiffe://lattice.test/svc/World/instance/world-a",
+                "spiffe://lattice.test/svc/World/instance/world-a/incarnation/world-a-new-boot",
             ),
         }
     }

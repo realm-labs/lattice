@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use lattice_core::actor_ref::Epoch;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::{ActorKind, ServiceKind};
 
 use crate::sharding::VirtualShardId;
@@ -9,6 +9,7 @@ use crate::sharding::VirtualShardId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrainReport {
     pub drained_instance: InstanceId,
+    pub drained_incarnation: InstanceIncarnation,
     pub migrated_actors: usize,
     pub migrated_virtual_shards: usize,
 }

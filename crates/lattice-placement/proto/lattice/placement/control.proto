@@ -79,6 +79,7 @@ message DrainInstanceRequest {
   string service_kind = 1;
   string instance_id = 2;
   uint64 expected_lease_id = 3;
+  string instance_incarnation = 4;
 }
 
 message DrainInstanceReply {
@@ -88,6 +89,7 @@ message DrainInstanceReply {
   uint64 migrated_virtual_shards = 4;
   uint64 drained_lease_id = 5;
   DrainInstanceOutcome outcome = 6;
+  string drained_instance_incarnation = 7;
 }
 
 enum DrainInstanceOutcome {

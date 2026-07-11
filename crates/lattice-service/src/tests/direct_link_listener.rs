@@ -388,6 +388,7 @@ async fn service_context_installs_direct_link_runtime_handle_for_connect() {
         .upsert_instance(InstanceRecord {
             service_kind: service_kind!("World"),
             instance_id: InstanceId::new("world-1"),
+            incarnation: InstanceIncarnation::new("world-1-boot"),
             lease_id: LeaseId(1),
             advertised_endpoint: "http://127.0.0.1:18080".parse().unwrap(),
             control_endpoint: "http://127.0.0.1:18081".parse().unwrap(),
@@ -518,6 +519,7 @@ async fn direct_link_resolution_rejects_actor_instance_lease_mismatch() {
         .upsert_instance(InstanceRecord {
             service_kind: service_kind!("World"),
             instance_id: InstanceId::new("world-1"),
+            incarnation: InstanceIncarnation::new("world-1-boot"),
             lease_id: LeaseId(1),
             advertised_endpoint: "http://127.0.0.1:18080".parse().unwrap(),
             control_endpoint: "http://127.0.0.1:18081".parse().unwrap(),
