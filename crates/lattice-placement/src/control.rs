@@ -2,6 +2,9 @@ use async_trait::async_trait;
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
 use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_rpc::security::{
+    MtlsPeerIdentityExtractor, PeerIdentity, RpcSecurityError, ServiceIdentityConfig,
+};
 use tonic::{Request, Response, Status};
 
 use crate::control::proto::logic_control_client::LogicControlClient;
@@ -57,10 +60,36 @@ pub struct LogicControlService<H> {
 pub struct PlacementCoordinatorService<S, L> {
     coordinator: PlacementCoordinator<S, L>,
     singleton_coordinator: SingletonCoordinator<S, L>,
+    admission: PlacementCoordinatorAdmission,
 }
 
 impl<S, L> PlacementCoordinatorService<S, L> {
-    pub fn new(coordinator: PlacementCoordinator<S, L>) -> Self
+    /// Builds a coordinator service that accepts only verified mTLS workload identities.
+    pub fn authenticated(
+        coordinator: PlacementCoordinator<S, L>,
+        identity: ServiceIdentityConfig,
+    ) -> Result<Self, RpcSecurityError>
+    where
+        S: Clone,
+        L: Clone,
+    {
+        let (store, logic) = coordinator.parts();
+        Ok(Self {
+            coordinator,
+            singleton_coordinator: SingletonCoordinator::from_store(store, logic),
+            admission: PlacementCoordinatorAdmission::Authenticated(
+                MtlsPeerIdentityExtractor::try_new(identity)?,
+            ),
+        })
+    }
+
+    /// Development-only plaintext coordinator admission.
+    ///
+    /// The peer socket must be loopback. Production deployments must use
+    /// [`Self::authenticated`] together with tonic server mTLS.
+    pub fn dangerously_allow_unauthenticated_loopback(
+        coordinator: PlacementCoordinator<S, L>,
+    ) -> Self
     where
         S: Clone,
         L: Clone,
@@ -69,16 +98,41 @@ impl<S, L> PlacementCoordinatorService<S, L> {
         Self {
             coordinator,
             singleton_coordinator: SingletonCoordinator::from_store(store, logic),
+            admission: PlacementCoordinatorAdmission::DangerousLoopback,
         }
     }
 
-    pub fn with_singleton_coordinator(
+    pub fn authenticated_with_singleton_coordinator(
         coordinator: PlacementCoordinator<S, L>,
         singleton_coordinator: SingletonCoordinator<S, L>,
-    ) -> Self {
-        Self {
+        identity: ServiceIdentityConfig,
+    ) -> Result<Self, RpcSecurityError> {
+        Ok(Self {
             coordinator,
             singleton_coordinator,
+            admission: PlacementCoordinatorAdmission::Authenticated(
+                MtlsPeerIdentityExtractor::try_new(identity)?,
+            ),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PlacementCoordinatorAdmission {
+    Authenticated(MtlsPeerIdentityExtractor),
+    DangerousLoopback,
+}
+
+impl PlacementCoordinatorAdmission {
+    fn authenticate<T>(&self, request: &Request<T>) -> Result<Option<PeerIdentity>, Status> {
+        match self {
+            Self::Authenticated(extractor) => extractor.authenticate(request).map(Some),
+            Self::DangerousLoopback => match request.remote_addr() {
+                Some(address) if address.ip().is_loopback() => Ok(None),
+                _ => Err(Status::unauthenticated(
+                    "unauthenticated coordinator access is restricted to loopback development",
+                )),
+            },
         }
     }
 }
@@ -94,6 +148,7 @@ where
         &self,
         request: Request<proto::ActivateActorRequest>,
     ) -> Result<Response<proto::ActorPlacementReply>, Status> {
+        self.admission.authenticate(&request)?;
         let request = request.into_inner();
         if request.epoch != 0 {
             return Err(Status::invalid_argument(
@@ -120,6 +175,7 @@ where
         &self,
         request: Request<proto::ActivateSingletonRequest>,
     ) -> Result<Response<proto::SingletonPlacementReply>, Status> {
+        self.admission.authenticate(&request)?;
         let request = request.into_inner();
         if request.epoch != 0 {
             return Err(Status::invalid_argument(
@@ -142,12 +198,20 @@ where
         &self,
         request: Request<proto::DrainInstanceRequest>,
     ) -> Result<Response<proto::DrainInstanceReply>, Status> {
+        let peer = self.admission.authenticate(&request)?;
         let request = request.into_inner();
         if request.expected_lease_id == 0 {
             return Err(Status::invalid_argument("expected_lease_id is required"));
         }
         let service_kind = ServiceKind::new(request.service_kind);
         let instance_id = lattice_core::instance::InstanceId::new(request.instance_id);
+        if peer.is_some_and(|peer| {
+            peer.service_kind != service_kind || peer.instance_id != instance_id
+        }) {
+            return Err(Status::permission_denied(
+                "authenticated workload identity cannot drain the requested instance",
+            ));
+        }
         let expected_lease_id = crate::storage::LeaseId(request.expected_lease_id);
         let report = self
             .coordinator
@@ -502,7 +566,9 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server = Server::builder()
             .add_service(PlacementCoordinatorServer::new(
-                PlacementCoordinatorService::new(coordinator),
+                PlacementCoordinatorService::dangerously_allow_unauthenticated_loopback(
+                    coordinator,
+                ),
             ))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                 let _ = shutdown_rx.await;
@@ -575,7 +641,9 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server = Server::builder()
             .add_service(PlacementCoordinatorServer::new(
-                PlacementCoordinatorService::new(coordinator),
+                PlacementCoordinatorService::dangerously_allow_unauthenticated_loopback(
+                    coordinator,
+                ),
             ))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                 let _ = shutdown_rx.await;
@@ -622,7 +690,9 @@ mod tests {
         let task = tokio::spawn(
             Server::builder()
                 .add_service(PlacementCoordinatorServer::new(
-                    PlacementCoordinatorService::new(coordinator),
+                    PlacementCoordinatorService::dangerously_allow_unauthenticated_loopback(
+                        coordinator,
+                    ),
                 ))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = shutdown_rx.await;
@@ -734,7 +804,9 @@ mod tests {
         let task = tokio::spawn(
             Server::builder()
                 .add_service(PlacementCoordinatorServer::new(
-                    PlacementCoordinatorService::new(coordinator),
+                    PlacementCoordinatorService::dangerously_allow_unauthenticated_loopback(
+                        coordinator,
+                    ),
                 ))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = shutdown_rx.await;

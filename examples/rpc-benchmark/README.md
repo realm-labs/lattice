@@ -74,8 +74,8 @@ baseline. It starts multiple `rpc-benchmark-node` child processes on
 single-hop routed RPC workload from the driver process.
 
 Start a disposable local etcd and a coordinator that uses the same explicit
-placement namespace as the driver. The dangerous unauthenticated setting is
-accepted only for loopback development:
+placement namespace as the driver. The independent dangerous unauthenticated
+etcd and coordinator settings are accepted only for loopback development:
 
 ```bash
 cargo build -p rpc-benchmark --bins --release
@@ -87,6 +87,7 @@ LATTICE_CLUSTER_PREFIX="$LATTICE_BENCH_PREFIX" \
 LATTICE_ETCD_ENDPOINTS=http://127.0.0.1:2379 \
 LATTICE_COORDINATOR_ADDR=127.0.0.1:50080 \
 LATTICE_DANGEROUSLY_ALLOW_UNAUTHENTICATED_ETCD=true \
+LATTICE_DANGEROUSLY_ALLOW_UNAUTHENTICATED_COORDINATOR=true \
 target/release/lattice-coordinator &
 COORDINATOR_PID=$!
 

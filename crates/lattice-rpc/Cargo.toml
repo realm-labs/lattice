@@ -16,6 +16,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 trybuild.workspace = true
