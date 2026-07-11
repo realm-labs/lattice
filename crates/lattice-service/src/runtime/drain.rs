@@ -6,6 +6,7 @@ use lattice_core::direct_link::target::DirectLinkEndpoint;
 use lattice_core::instance::InstanceCapacity;
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ServiceContext;
+use lattice_placement::authority::PlacementAuthority;
 use lattice_placement::error::PlacementError;
 use lattice_placement::registry::{InstanceRecord, InstanceState};
 use lattice_placement::storage::LeaseId;
@@ -45,12 +46,17 @@ pub(crate) async fn drain_runtime_actors(logic_actors: &[Arc<dyn ErasedLogicActo
 }
 
 pub(crate) async fn drain_placement(
-    placement_store: &dyn ErasedPlacementStore,
+    placement_authority: &dyn PlacementAuthority,
     service_kind: &ServiceKind,
     instance: &InstanceConfig,
+    expected_lease_id: LeaseId,
 ) -> Result<(), LatticeServiceError> {
-    match placement_store
-        .drain_instance(service_kind.clone(), instance.instance_id.clone())
+    match placement_authority
+        .drain_instance(
+            service_kind.clone(),
+            instance.instance_id.clone(),
+            expected_lease_id,
+        )
         .await
     {
         Ok(report) => {
@@ -121,6 +127,24 @@ pub(crate) async fn publish_instance_record(
             .unwrap_or_default(),
     };
     placement_store.upsert_instance(record).await?;
+    Ok(())
+}
+
+pub(crate) async fn transition_instance_state(
+    placement_store: &dyn ErasedPlacementStore,
+    service_kind: &ServiceKind,
+    instance: &InstanceConfig,
+    expected_lease_id: LeaseId,
+    state: InstanceState,
+) -> Result<(), LatticeServiceError> {
+    placement_store
+        .compare_and_set_instance_state(
+            service_kind,
+            &instance.instance_id,
+            expected_lease_id,
+            state,
+        )
+        .await?;
     Ok(())
 }
 

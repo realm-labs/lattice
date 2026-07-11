@@ -252,6 +252,7 @@ Bootstrap config is read at process startup to build:
 
 ```text
 placement_store
+placement_authority
 event_bus
 config_store
 telemetry
@@ -307,6 +308,7 @@ let service = LatticeService::builder(WORLD_SERVICE)
     .instance(InstanceConfig::from_env()?)
     .config(ConfigSource::file("config/world-service.toml"))
     .placement_store(EtcdPlacementStore::from_config())
+    .placement_authority(TonicPlacementAuthority::new(authority_channel))
     .cluster_event_bus(NatsEventBus::from_config())
     .telemetry(TelemetryConfig::from_config())
     .admin_http(AdminHttpConfig::from_config())
@@ -330,7 +332,13 @@ Explicit config must also be supported for tests and non-file deployments:
 )
 ```
 
-The unauthenticated form above is for local development. A production authority supplies password-file authentication separately so secret bytes never enter `BootstrapConfig` or a command line:
+The unauthenticated form above is for local development and still requires an explicitly configured semantic authority. The single-process shortcut is intentionally conspicuous:
+
+```rust
+.dangerously_use_in_process_placement(in_memory_store, TonicLogicControl)
+```
+
+Production service processes use a least-privilege runtime placement credential for reads/watches and the still-direct exact-instance liveness key. They do not receive the placement-authority credential. Password-file authentication keeps secret bytes out of `BootstrapConfig` and command lines:
 
 ```rust
 .placement_store(
@@ -342,18 +350,21 @@ The unauthenticated form above is for local development. A production authority 
             activation_lock_ttl_secs: 30,
         },
         EtcdConnectionOptions::password_file(EtcdPasswordAuthentication::new(
-            "placement-authority",
-            "/run/secrets/lattice-etcd-password",
+            "world-runtime-world-a",
+            "/run/secrets/lattice-runtime-etcd-password",
         ))
         .with_ca_file("/run/secrets/lattice-etcd-ca.pem"),
     )
     .await?,
 )
+.placement_authority(TonicPlacementAuthority::new(authority_channel))
 ```
 
 `EtcdPlacementStore::from_config()` accepts only an authenticated connection section and fails startup when it is absent, partial, or misspelled. For `ConfigSource::env("LATTICE")`, the nested authentication keys are `LATTICE__PLACEMENT_STORE__CONNECTION__AUTHENTICATION__USERNAME` and `LATTICE__PLACEMENT_STORE__CONNECTION__AUTHENTICATION__PASSWORD_FILE`; optional connection keys include `LATTICE__PLACEMENT_STORE__CONNECTION__CA_FILE` and `LATTICE__PLACEMENT_STORE__CONNECTION__TOKEN_REFRESH_INTERVAL_SECS`. Password and CA files must be absolute; do not put a password itself in an environment variable or configuration value.
 
 The standalone `lattice-coordinator` binary has a separate environment-only bootstrap. It requires `LATTICE_ETCD_USERNAME` and `LATTICE_ETCD_PASSWORD_FILE` together and accepts optional `LATTICE_ETCD_CA_FILE` and `LATTICE_ETCD_TOKEN_REFRESH_INTERVAL_SECS`. Omitting either credential fails startup; the only unauthenticated escape is the exact `LATTICE_DANGEROUSLY_ALLOW_UNAUTHENTICATED_ETCD=true` setting, and that escape accepts loopback HTTP endpoints only.
+
+Both `placement_store` and `placement_authority` are mandatory service components; the builder has no implicit in-memory placement fallback. `TonicPlacementAuthority` accepts a caller-built channel, applies a bounded per-call deadline, and exposes only actor activation, singleton activation, and drain. The current standalone coordinator RPC server does not yet authenticate the channel's transport identity, so an externally reachable production authority endpoint remains blocked on the Phase 3 transport-identity work.
 
 These options authenticate the placement store only. `lattice-config-etcd` has an independent connection and must receive its own least-privilege credential support before it can share an auth-enabled etcd cluster; until then, deploy it against a separate cluster rather than reusing placement authority credentials.
 

@@ -20,7 +20,7 @@ async fn service_keeps_instance_lease_alive_while_running() {
         .listen(listener)
         .ready_signal(ready_tx)
         .instance_lease_keepalive_interval(Duration::from_millis(10))
-        .placement_store::<InMemoryPlacementStore, _>(store_for_service)
+        .dangerously_use_in_process_placement(store_for_service, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(TestFactory)

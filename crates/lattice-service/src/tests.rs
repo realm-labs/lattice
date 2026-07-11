@@ -39,7 +39,7 @@ use lattice_core::direct_link::stream::DirectLinkMessage;
 use lattice_core::direct_link::target::DirectLinkEndpoint;
 use lattice_core::id::{ActorId, RouteKey};
 use lattice_core::instance::InstanceId;
-use lattice_core::kind::ActorKind;
+use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_core::service_context::ConfiguredComponent;
 use lattice_core::trace::TraceContext;
 use lattice_core::{actor_kind, service_kind};
@@ -57,11 +57,12 @@ use lattice_direct_link::transport::{
 use lattice_eventbus::local::{EventBus, LocalEventBus};
 use lattice_eventbus::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
 use lattice_ops::ops_config::AdminHttpConfig;
+use lattice_placement::authority::{DevelopmentInProcessPlacementAuthority, PlacementAuthority};
 use lattice_placement::control::proto::logic_control_client::LogicControlClient;
-use lattice_placement::control::{actor_id_to_proto, proto};
-use lattice_placement::coordination::actor::PlacementCoordinator;
+use lattice_placement::control::{TonicLogicControl, actor_id_to_proto, proto};
 use lattice_placement::coordination::logic::NoopLogicControl;
 use lattice_placement::endpoint::{EndpointLease, EndpointPool};
+use lattice_placement::error::PlacementError;
 use lattice_placement::registry::{InstanceRecord, InstanceState};
 use lattice_placement::routing::cache::RouteCacheConfig;
 use lattice_placement::routing::placement::ExplicitRouteResolver;
@@ -95,6 +96,17 @@ use crate::context::ServiceBuildContext;
 use crate::error::LatticeServiceError;
 use crate::framework::context::ServiceContextExt;
 use crate::runtime::service::LatticeService;
+
+fn development_service_builder(
+    service_kind: ServiceKind,
+) -> crate::assembly::builder::LatticeServiceBuilder {
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new(format!(
+        "/lattice/{}/service-test",
+        service_kind.as_str()
+    )));
+    LatticeService::builder(service_kind)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
+}
 
 #[derive(Clone)]
 struct TestFactory;

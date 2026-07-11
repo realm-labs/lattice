@@ -26,6 +26,8 @@ pub enum BenchmarkError {
     InvalidActorId { actual: ActorId },
     #[error("rpc failed: {message}")]
     Rpc { message: String },
+    #[error("invalid placement authority endpoint: {message}")]
+    InvalidPlacementAuthorityEndpoint { message: String },
     #[error("{operation} timed out after {timeout:?}")]
     Timeout {
         operation: &'static str,

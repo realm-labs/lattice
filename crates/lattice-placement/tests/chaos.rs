@@ -8,10 +8,11 @@ use lattice_core::instance::InstanceCapacity;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ActorKind;
 use lattice_core::{actor_kind, service_kind};
+use lattice_placement::authority::DevelopmentInProcessPlacementAuthority;
 use lattice_placement::coordination::actor::{ActivateActorRequest, PlacementCoordinator};
 use lattice_placement::coordination::logic::NoopLogicControl;
 use lattice_placement::coordination::reports::FailoverReport;
-use lattice_placement::coordination::singleton::{SingletonCoordinator, SingletonRouteResolver};
+use lattice_placement::coordination::singleton::SingletonRouteResolver;
 use lattice_placement::endpoint::{EndpointLease, EndpointPool};
 use lattice_placement::error::PlacementError;
 use lattice_placement::registry::{InstanceRecord, InstanceState};
@@ -172,14 +173,14 @@ async fn stale_owner_recovery_after_lease_expiry_is_fenced_and_retried() {
         actor_id: ActorId::U64(7),
     };
     store
-        .compare_and_put_actor(key.clone(), None, actor_record(7, "world-a", 3, LeaseId(9)))
+        .compare_and_put_actor(key.clone(), None, actor_record(7, "world-a", 3, LeaseId(1)))
         .await
         .unwrap();
     let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
     let resolver = ExplicitRouteResolver::new(
         service_kind!("World"),
         store.clone(),
-        coordinator.clone(),
+        DevelopmentInProcessPlacementAuthority::from_coordinator(coordinator.clone()).shared(),
         Default::default(),
     );
     let resolve_request = ResolveRequest {
@@ -405,13 +406,13 @@ async fn singleton_failover_during_long_job_fences_old_owner_and_retries() {
         .compare_and_put_singleton(
             singleton_key.clone(),
             None,
-            singleton_record("global", "world-a", 5, LeaseId(11)),
+            singleton_record("global", "world-a", 5, LeaseId(1)),
         )
         .await
         .unwrap();
-    let singleton_coordinator =
-        SingletonCoordinator::new(service_kind!("World"), store.clone(), NoopLogicControl);
-    let resolver = SingletonRouteResolver::new(singleton_coordinator, Default::default());
+    let authority =
+        DevelopmentInProcessPlacementAuthority::new(store.clone(), NoopLogicControl).shared();
+    let resolver = SingletonRouteResolver::new(store.clone(), authority, Default::default());
     let transport = LongSingletonJobTransport::new(store.clone(), singleton_key);
     let calls = transport.calls.clone();
     let core = ResolvingRpcCore::new(
@@ -474,12 +475,16 @@ async fn rolling_update_with_mixed_versions_drains_old_owner_to_ready_new_versio
     let resolver = ExplicitRouteResolver::new(
         service_kind!("World"),
         store.clone(),
-        coordinator.clone(),
+        DevelopmentInProcessPlacementAuthority::from_coordinator(coordinator.clone()).shared(),
         Default::default(),
     );
 
     let report = coordinator
-        .drain_instance(service_kind!("World"), InstanceId::new("world-a"))
+        .drain_instance(
+            service_kind!("World"),
+            InstanceId::new("world-a"),
+            old_owner.lease_id,
+        )
         .await
         .unwrap();
     let old_instance = store

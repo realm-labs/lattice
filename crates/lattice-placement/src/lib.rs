@@ -1,3 +1,4 @@
+pub mod authority;
 pub mod control;
 pub mod coordination;
 pub mod endpoint;

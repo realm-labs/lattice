@@ -3195,6 +3195,53 @@ fn etcd_instance_records_are_written_with_their_instance_lease() {
     assert!(options.is_some());
 }
 
+#[tokio::test]
+async fn etcd_instance_state_compare_rejects_stale_lease_without_mutation() {
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/instance-state-cas"),
+        InMemoryEtcdClient::new(),
+    );
+    let record = instance_record("world-a", InstanceState::Ready);
+    store.upsert_instance(record.clone()).await.unwrap();
+
+    assert_eq!(
+        store
+            .compare_and_set_instance_state(
+                &record.service_kind,
+                &record.instance_id,
+                LeaseId(2),
+                InstanceState::Draining,
+            )
+            .await
+            .unwrap_err(),
+        PlacementError::InstanceLeaseMismatch {
+            instance_id: record.instance_id.clone(),
+            expected: LeaseId(2),
+            actual: record.lease_id,
+        }
+    );
+    assert_eq!(
+        store
+            .get_instance(&record.instance_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        InstanceState::Ready
+    );
+
+    let updated = store
+        .compare_and_set_instance_state(
+            &record.service_kind,
+            &record.instance_id,
+            record.lease_id,
+            InstanceState::Draining,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.state, InstanceState::Draining);
+}
+
 #[test]
 fn etcd_actor_records_remain_durable_for_epoch_preserving_failover() {
     let actor = EtcdValue::Actor(Box::new(actor_record(7, "world-a", 3, LeaseId(5))));

@@ -6,14 +6,12 @@ use crate::components::{
 };
 use crate::error::LatticeServiceError;
 
-pub(crate) async fn build_placement_store_or_default(
-    configured: Option<Box<dyn ErasedPlacementStoreComponent>>,
-    default: Box<dyn ErasedPlacementStoreComponent>,
+pub(crate) async fn build_placement_store(
+    component: Box<dyn ErasedPlacementStoreComponent>,
     component_context: &ServiceComponentContext,
     service_context: &mut lattice_core::service_context::ServiceContextBuilder,
     service_kind: &str,
 ) -> Result<Box<dyn ErasedPlacementStore>, LatticeServiceError> {
-    let component = configured.unwrap_or(default);
     debug!(
         service.kind = service_kind,
         component.target = component.target_name(),

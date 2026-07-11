@@ -11,6 +11,7 @@ service LogicControl {
 service PlacementCoordinator {
   rpc ActivateActor(ActivateActorRequest) returns (ActorPlacementReply);
   rpc ActivateSingleton(ActivateSingletonRequest) returns (SingletonPlacementReply);
+  rpc DrainInstance(DrainInstanceRequest) returns (DrainInstanceReply);
 }
 
 message ActivateActorRequest {
@@ -61,6 +62,7 @@ message ActorPlacementReply {
   uint64 epoch = 4;
   uint64 lease_id = 5;
   string state = 6;
+  string service_kind = 7;
 }
 
 message SingletonPlacementReply {
@@ -71,4 +73,25 @@ message SingletonPlacementReply {
   uint64 epoch = 5;
   uint64 lease_id = 6;
   string state = 7;
+}
+
+message DrainInstanceRequest {
+  string service_kind = 1;
+  string instance_id = 2;
+  uint64 expected_lease_id = 3;
+}
+
+message DrainInstanceReply {
+  string service_kind = 1;
+  string drained_instance_id = 2;
+  uint64 migrated_actors = 3;
+  uint64 migrated_virtual_shards = 4;
+  uint64 drained_lease_id = 5;
+  DrainInstanceOutcome outcome = 6;
+}
+
+enum DrainInstanceOutcome {
+  DRAIN_INSTANCE_OUTCOME_UNSPECIFIED = 0;
+  DRAIN_INSTANCE_OUTCOME_COMPLETED = 1;
+  DRAIN_INSTANCE_OUTCOME_NO_READY_REPLACEMENT = 2;
 }

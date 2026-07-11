@@ -12,7 +12,7 @@ use crate::coordination::logic::{
     LogicControl as CoordinatorLogicControl, VirtualShardMigrationControl,
 };
 use crate::coordination::reports::{
-    PrepareVirtualShardMigrationRequest, VirtualShardMigrationOutcome,
+    DrainReport, PrepareVirtualShardMigrationRequest, VirtualShardMigrationOutcome,
 };
 use crate::coordination::singleton::{
     ActivateSingletonRequest as CoordinatorActivateSingletonRequest, SingletonControl,
@@ -95,6 +95,11 @@ where
         request: Request<proto::ActivateActorRequest>,
     ) -> Result<Response<proto::ActorPlacementReply>, Status> {
         let request = request.into_inner();
+        if request.epoch != 0 {
+            return Err(Status::invalid_argument(
+                "coordinator activation requests must not supply a target epoch",
+            ));
+        }
         let record = self
             .coordinator
             .activate_actor(CoordinatorActivateActorRequest {
@@ -116,6 +121,11 @@ where
         request: Request<proto::ActivateSingletonRequest>,
     ) -> Result<Response<proto::SingletonPlacementReply>, Status> {
         let request = request.into_inner();
+        if request.epoch != 0 {
+            return Err(Status::invalid_argument(
+                "coordinator activation requests must not supply a target epoch",
+            ));
+        }
         let record = self
             .singleton_coordinator
             .activate_singleton(CoordinatorActivateSingletonRequest {
@@ -126,6 +136,36 @@ where
             .await
             .map_err(status_from_placement)?;
         Ok(Response::new(singleton_placement_to_proto(record)))
+    }
+
+    async fn drain_instance(
+        &self,
+        request: Request<proto::DrainInstanceRequest>,
+    ) -> Result<Response<proto::DrainInstanceReply>, Status> {
+        let request = request.into_inner();
+        if request.expected_lease_id == 0 {
+            return Err(Status::invalid_argument("expected_lease_id is required"));
+        }
+        let service_kind = ServiceKind::new(request.service_kind);
+        let instance_id = lattice_core::instance::InstanceId::new(request.instance_id);
+        let expected_lease_id = crate::storage::LeaseId(request.expected_lease_id);
+        let report = self
+            .coordinator
+            .drain_instance(service_kind.clone(), instance_id.clone(), expected_lease_id)
+            .await;
+        let reply = match report {
+            Ok(report) => drain_report_to_proto(service_kind.clone(), expected_lease_id, report)?,
+            Err(PlacementError::NoReadyInstances) => proto::DrainInstanceReply {
+                service_kind: service_kind.as_str().to_string(),
+                drained_instance_id: instance_id.as_str().to_string(),
+                migrated_actors: 0,
+                migrated_virtual_shards: 0,
+                drained_lease_id: expected_lease_id.0,
+                outcome: proto::DrainInstanceOutcome::NoReadyReplacement as i32,
+            },
+            Err(error) => return Err(status_from_placement(error)),
+        };
+        Ok(Response::new(reply))
     }
 }
 
@@ -313,6 +353,7 @@ pub fn service_kind_from_request(request: &proto::ActivateActorRequest) -> Servi
 
 fn actor_placement_to_proto(record: ActorPlacementRecord) -> proto::ActorPlacementReply {
     proto::ActorPlacementReply {
+        service_kind: record.service_kind.as_str().to_string(),
         actor_kind: record.actor_kind.as_str().to_string(),
         actor_id: Some(actor_id_to_proto(&record.actor_id)),
         owner_instance_id: record.owner.as_str().to_string(),
@@ -320,6 +361,23 @@ fn actor_placement_to_proto(record: ActorPlacementRecord) -> proto::ActorPlaceme
         lease_id: record.lease_id.0,
         state: placement_state_name(record.state).to_string(),
     }
+}
+
+fn drain_report_to_proto(
+    service_kind: ServiceKind,
+    drained_lease_id: crate::storage::LeaseId,
+    report: DrainReport,
+) -> Result<proto::DrainInstanceReply, Status> {
+    Ok(proto::DrainInstanceReply {
+        service_kind: service_kind.as_str().to_string(),
+        drained_instance_id: report.drained_instance.as_str().to_string(),
+        migrated_actors: u64::try_from(report.migrated_actors)
+            .map_err(|_| Status::internal("drain actor count exceeds protocol range"))?,
+        migrated_virtual_shards: u64::try_from(report.migrated_virtual_shards)
+            .map_err(|_| Status::internal("drain virtual-shard count exceeds protocol range"))?,
+        drained_lease_id: drained_lease_id.0,
+        outcome: proto::DrainInstanceOutcome::Completed as i32,
+    })
 }
 
 fn singleton_placement_to_proto(
@@ -348,9 +406,10 @@ fn placement_state_name(state: PlacementState) -> &'static str {
 
 fn status_from_placement(error: PlacementError) -> Status {
     match error {
-        PlacementError::InstanceNotFound { .. }
-        | PlacementError::NoRoute
-        | PlacementError::NoReadyInstances => Status::not_found(error.to_string()),
+        PlacementError::InstanceNotFound { .. } | PlacementError::NoRoute => {
+            Status::not_found(error.to_string())
+        }
+        PlacementError::NoReadyInstances => Status::resource_exhausted(error.to_string()),
         PlacementError::InstanceNotReady { .. }
         | PlacementError::ActivationLockHeld
         | PlacementError::ActivationLockLost
@@ -365,6 +424,7 @@ fn status_from_placement(error: PlacementError) -> Status {
         | PlacementError::EpochFloorCorrupt { .. }
         | PlacementError::EpochFloorUnproven { .. }
         | PlacementError::EpochReservationMismatch
+        | PlacementError::InstanceLeaseMismatch { .. }
         | PlacementError::CoordinatorLeadershipLost => {
             Status::failed_precondition(error.to_string())
         }
@@ -386,7 +446,13 @@ fn status_from_placement(error: PlacementError) -> Status {
         | PlacementError::InstanceLeaseNotFound { .. }
         | PlacementError::DuplicateAssigner { .. }
         | PlacementError::EpochReservationsUnsupported
-        | PlacementError::LogicControl { .. } => Status::internal(error.to_string()),
+        | PlacementError::LogicControl { .. }
+        | PlacementError::InvalidPlacementAuthorityTimeout
+        | PlacementError::PlacementAuthorityTimeout
+        | PlacementError::PlacementAuthorityRpc { .. }
+        | PlacementError::InvalidPlacementAuthorityReply { .. } => {
+            Status::internal(error.to_string())
+        }
     }
 }
 
@@ -398,6 +464,7 @@ fn logic_error(error: impl std::fmt::Display) -> PlacementError {
 
 #[cfg(test)]
 mod tests {
+    use crate::authority::{PlacementAuthority, TonicPlacementAuthority};
     use lattice_core::instance::InstanceCapacity;
     use lattice_core::instance::InstanceId;
     use lattice_core::service_kind;
@@ -412,7 +479,9 @@ mod tests {
     use crate::coordination::logic::NoopLogicControl;
     use crate::registry::{InstanceRecord, InstanceState};
     use crate::storage::memory::InMemoryPlacementStore;
-    use crate::storage::{LeaseId, PlacementPrefix};
+    use crate::storage::{
+        LeaseId, PlacementPrefix, VirtualShardPlacementKey, VirtualShardPlacementRecord,
+    };
 
     #[tokio::test]
     async fn coordinator_rpc_activates_actor_and_returns_owner_record() {
@@ -440,28 +509,54 @@ mod tests {
             });
         let task = tokio::spawn(server);
 
-        let mut client = PlacementCoordinatorClient::connect(format!("http://{addr}"))
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
             .await
             .unwrap();
+        let mut raw_client = PlacementCoordinatorClient::new(channel.clone());
+        let client = TonicPlacementAuthority::new(channel);
         let response = client
-            .activate_actor(proto::ActivateActorRequest {
-                service_kind: "World".to_string(),
-                actor_kind: "World".to_string(),
-                actor_id: Some(actor_id_to_proto(&ActorId::U64(7))),
-                epoch: 0,
+            .activate_actor(CoordinatorActivateActorRequest {
+                service_kind: service_kind!("World"),
+                actor_kind: ActorKind::new("World"),
+                actor_id: ActorId::U64(7),
             })
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
 
-        assert_eq!(response.owner_instance_id, "world-a");
-        assert_eq!(response.epoch, 1);
-        assert_eq!(response.lease_id, owner_lease.0);
+        assert_eq!(response.service_kind, service_kind!("World"));
+        assert_eq!(response.owner, InstanceId::new("world-a"));
+        assert_eq!(response.epoch, Epoch(1));
+        assert_eq!(response.lease_id, owner_lease);
         assert_eq!(store.instance_lease_keepalive_count(owner_lease), Some(1));
-        assert_eq!(response.state, "running");
+        assert_eq!(response.state, PlacementState::Running);
+        assert_eq!(response.actor_id, ActorId::U64(7));
         assert_eq!(
-            actor_id_from_proto(response.actor_id.unwrap()).unwrap(),
-            ActorId::U64(7)
+            raw_client
+                .activate_actor(proto::ActivateActorRequest {
+                    service_kind: "World".to_string(),
+                    actor_kind: "World".to_string(),
+                    actor_id: Some(actor_id_to_proto(&ActorId::U64(8))),
+                    epoch: 99,
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            raw_client
+                .activate_singleton(proto::ActivateSingletonRequest {
+                    service_kind: "World".to_string(),
+                    singleton_kind: "SeasonManager".to_string(),
+                    scope: "global".to_string(),
+                    epoch: 99,
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
         );
         shutdown_tx.send(()).unwrap();
         task.await.unwrap().unwrap();
@@ -474,7 +569,7 @@ mod tests {
             .upsert_instance(instance_record("world-a", InstanceState::Ready))
             .await
             .unwrap();
-        let coordinator = PlacementCoordinator::new(store, NoopLogicControl);
+        let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -487,27 +582,204 @@ mod tests {
             });
         let task = tokio::spawn(server);
 
-        let mut client = PlacementCoordinatorClient::connect(format!("http://{addr}"))
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
             .await
             .unwrap();
+        let client = TonicPlacementAuthority::new(channel);
         let response = client
-            .activate_singleton(proto::ActivateSingletonRequest {
-                service_kind: "World".to_string(),
-                singleton_kind: "SeasonManager".to_string(),
+            .activate_singleton(CoordinatorActivateSingletonRequest {
+                service_kind: service_kind!("World"),
+                singleton_kind: ActorKind::new("SeasonManager"),
                 scope: "global".to_string(),
-                epoch: 0,
             })
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
 
-        assert_eq!(response.service_kind, "World");
-        assert_eq!(response.singleton_kind, "SeasonManager");
+        assert_eq!(response.service_kind, service_kind!("World"));
+        assert_eq!(response.singleton_kind, ActorKind::new("SeasonManager"));
         assert_eq!(response.scope, "global");
-        assert_eq!(response.owner_instance_id, "world-a");
-        assert_eq!(response.epoch, 1);
-        assert_eq!(response.lease_id, 2);
-        assert_eq!(response.state, "running");
+        assert_eq!(response.owner, InstanceId::new("world-a"));
+        assert_eq!(response.epoch, Epoch(1));
+        assert_eq!(response.lease_id, LeaseId(2));
+        assert_eq!(response.state, PlacementState::Running);
+        shutdown_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn coordinator_rpc_drain_maps_no_replacement_for_graceful_shutdown() {
+        let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test-drain"));
+        store
+            .upsert_instance(instance_record("world-a", InstanceState::Ready))
+            .await
+            .unwrap();
+        let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(
+            Server::builder()
+                .add_service(PlacementCoordinatorServer::new(
+                    PlacementCoordinatorService::new(coordinator),
+                ))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = shutdown_rx.await;
+                }),
+        );
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = TonicPlacementAuthority::new(channel);
+
+        assert_eq!(
+            client
+                .drain_instance(
+                    service_kind!("Other"),
+                    InstanceId::new("world-a"),
+                    LeaseId(1),
+                )
+                .await
+                .unwrap_err(),
+            PlacementError::PlacementAuthorityRpc {
+                code: tonic::Code::NotFound
+            }
+        );
+        assert_eq!(
+            store
+                .get_instance(&InstanceId::new("world-a"))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            InstanceState::Ready
+        );
+
+        assert_eq!(
+            client
+                .drain_instance(
+                    service_kind!("World"),
+                    InstanceId::new("world-a"),
+                    LeaseId(2),
+                )
+                .await
+                .unwrap_err(),
+            PlacementError::PlacementAuthorityRpc {
+                code: tonic::Code::FailedPrecondition
+            }
+        );
+        assert_eq!(
+            store
+                .get_instance(&InstanceId::new("world-a"))
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            InstanceState::Ready
+        );
+
+        assert_eq!(
+            client
+                .drain_instance(
+                    service_kind!("World"),
+                    InstanceId::new("world-a"),
+                    LeaseId(1),
+                )
+                .await
+                .unwrap_err(),
+            PlacementError::NoReadyInstances
+        );
+
+        shutdown_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn coordinator_rpc_drain_round_trips_identity_and_counts() {
+        let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test-drain-ok"));
+        store
+            .upsert_instance(instance_record("world-a", InstanceState::Ready))
+            .await
+            .unwrap();
+        store
+            .upsert_instance(instance_record("world-b", InstanceState::Ready))
+            .await
+            .unwrap();
+        let shard_key = VirtualShardPlacementKey {
+            service_kind: service_kind!("World"),
+            actor_kind: ActorKind::new("World"),
+            shard_id: VirtualShardId(3),
+        };
+        store
+            .compare_and_put_virtual_shard(
+                shard_key.clone(),
+                None,
+                VirtualShardPlacementRecord {
+                    service_kind: service_kind!("World"),
+                    actor_kind: ActorKind::new("World"),
+                    shard_id: VirtualShardId(3),
+                    owner: InstanceId::new("world-a"),
+                    epoch: Epoch(1),
+                },
+            )
+            .await
+            .unwrap();
+        let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(
+            Server::builder()
+                .add_service(PlacementCoordinatorServer::new(
+                    PlacementCoordinatorService::new(coordinator),
+                ))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = shutdown_rx.await;
+                }),
+        );
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let client = TonicPlacementAuthority::new(channel);
+        client
+            .activate_actor(CoordinatorActivateActorRequest {
+                service_kind: service_kind!("World"),
+                actor_kind: ActorKind::new("World"),
+                actor_id: ActorId::U64(9),
+            })
+            .await
+            .unwrap();
+
+        let report = client
+            .drain_instance(
+                service_kind!("World"),
+                InstanceId::new("world-a"),
+                LeaseId(1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report,
+            DrainReport {
+                drained_instance: InstanceId::new("world-a"),
+                migrated_actors: 1,
+                migrated_virtual_shards: 1,
+            }
+        );
+        let migrated_shard = store
+            .get_virtual_shard(&shard_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(migrated_shard.owner, InstanceId::new("world-b"));
+        assert_eq!(migrated_shard.epoch, Epoch(2));
         shutdown_tx.send(()).unwrap();
         task.await.unwrap().unwrap();
     }

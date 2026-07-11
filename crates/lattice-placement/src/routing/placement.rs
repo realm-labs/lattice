@@ -6,36 +6,46 @@ use lattice_core::id::{ActorId, RouteKey};
 use lattice_core::kind::ServiceKind;
 use lattice_rpc::types::RouteTarget;
 
-use crate::coordination::actor::{ActivateActorRequest, PlacementCoordinator};
-use crate::coordination::logic::LogicControl;
+use crate::authority::PlacementAuthority;
+use crate::coordination::actor::ActivateActorRequest;
 use crate::error::PlacementError;
 use crate::registry::InstanceState;
 use crate::routing::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::routing::resolver::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
 use crate::storage::{ActorPlacementKey, PlacementState, PlacementStore, PlacementWatchEvent};
 
-#[derive(Debug, Clone)]
-pub struct ExplicitRouteResolver<S, L> {
+#[derive(Clone)]
+pub struct ExplicitRouteResolver<S> {
     service_kind: ServiceKind,
     store: S,
-    coordinator: PlacementCoordinator<S, L>,
+    authority: Arc<dyn PlacementAuthority>,
     cache: Arc<LocalRouteCache>,
     placement_lookups: Arc<AtomicU64>,
 }
 
-pub type PlacementRouteResolver<S, L> = ExplicitRouteResolver<S, L>;
+pub type PlacementRouteResolver<S> = ExplicitRouteResolver<S>;
 
-impl<S, L> ExplicitRouteResolver<S, L> {
+impl<S> std::fmt::Debug for ExplicitRouteResolver<S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExplicitRouteResolver")
+            .field("service_kind", &self.service_kind)
+            .field("placement_lookups", &self.placement_lookups())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> ExplicitRouteResolver<S> {
     pub fn new(
         service_kind: ServiceKind,
         store: S,
-        coordinator: PlacementCoordinator<S, L>,
+        authority: Arc<dyn PlacementAuthority>,
         cache_config: RouteCacheConfig,
     ) -> Self {
         Self {
             service_kind,
             store,
-            coordinator,
+            authority,
             cache: Arc::new(LocalRouteCache::new(cache_config)),
             placement_lookups: Arc::new(AtomicU64::new(0)),
         }
@@ -46,7 +56,7 @@ impl<S, L> ExplicitRouteResolver<S, L> {
     }
 }
 
-impl<S, L> ExplicitRouteResolver<S, L>
+impl<S> ExplicitRouteResolver<S>
 where
     S: PlacementStore,
 {
@@ -70,10 +80,9 @@ pub trait PlacementWatchStarter: Clone + Send + Sync + 'static {
 }
 
 #[async_trait]
-impl<S, L> PlacementWatchStarter for ExplicitRouteResolver<S, L>
+impl<S> PlacementWatchStarter for ExplicitRouteResolver<S>
 where
     S: PlacementStore,
-    L: Clone + Send + Sync + 'static,
 {
     async fn start_placement_watch(&self) -> Result<PlacementWatchTask, PlacementError> {
         self.watch_cache_updates().await
@@ -108,12 +117,14 @@ impl Drop for PlacementWatchTask {
 }
 
 #[async_trait]
-impl<S, L> RouteResolver for ExplicitRouteResolver<S, L>
+impl<S> RouteResolver for ExplicitRouteResolver<S>
 where
     S: PlacementStore,
-    L: LogicControl,
 {
     async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
+        if request.service_kind != self.service_kind {
+            return Err(PlacementError::NoRoute);
+        }
         let key = request.cache_key();
         match self.cache.get(&key) {
             CacheLookup::Fresh(target) | CacheLookup::Stale(target) => {
@@ -132,15 +143,22 @@ where
         let record = match self.store.get_actor(&placement_key).await? {
             Some((_, record)) => record,
             None => {
-                self.coordinator
+                self.authority
                     .activate_actor(ActivateActorRequest {
                         service_kind: self.service_kind.clone(),
-                        actor_kind: request.actor_kind,
-                        actor_id,
+                        actor_kind: placement_key.actor_kind.clone(),
+                        actor_id: placement_key.actor_id.clone(),
                     })
                     .await?
             }
         };
+        if record.service_kind != placement_key.service_kind
+            || record.actor_kind != placement_key.actor_kind
+            || record.actor_id != placement_key.actor_id
+            || record.state != PlacementState::Running
+        {
+            return Err(PlacementError::NoRoute);
+        }
         let instance = self
             .store
             .get_instance(&record.owner)
@@ -148,6 +166,12 @@ where
             .ok_or_else(|| PlacementError::InstanceNotFound {
                 instance_id: record.owner.clone(),
             })?;
+        if instance.service_kind != self.service_kind
+            || instance.state != InstanceState::Ready
+            || instance.lease_id != record.lease_id
+        {
+            return Err(PlacementError::NoRoute);
+        }
         let target = RouteTarget {
             service_kind: self.service_kind.clone(),
             instance_id: instance.instance_id,
@@ -189,8 +213,17 @@ async fn refresh_cache_from_watch_event<S>(
 ) where
     S: PlacementStore,
 {
-    let PlacementWatchEvent::ActorUpdated { record, .. } = event else {
-        return;
+    let record = match event {
+        PlacementWatchEvent::InstanceUpdated { record } if &record.service_kind == service_kind => {
+            cache.invalidate_instance(&record.instance_id);
+            return;
+        }
+        PlacementWatchEvent::ActorUpdated { record, .. }
+            if &record.service_kind == service_kind =>
+        {
+            record
+        }
+        _ => return,
     };
     let cache_key = RouteCacheKey::new(
         service_kind.clone(),
@@ -204,12 +237,18 @@ async fn refresh_cache_from_watch_event<S>(
     }
 
     let target = match store.get_instance(&record.owner).await {
-        Ok(Some(instance)) if instance.state == InstanceState::Ready => RouteTarget {
-            service_kind: service_kind.clone(),
-            instance_id: instance.instance_id,
-            advertised_endpoint: instance.advertised_endpoint,
-            owner_epoch: Some(record.epoch),
-        },
+        Ok(Some(instance))
+            if &instance.service_kind == service_kind
+                && instance.state == InstanceState::Ready
+                && instance.lease_id == record.lease_id =>
+        {
+            RouteTarget {
+                service_kind: service_kind.clone(),
+                instance_id: instance.instance_id,
+                advertised_endpoint: instance.advertised_endpoint,
+                owner_epoch: Some(record.epoch),
+            }
+        }
         _ => {
             cache.invalidate(&cache_key);
             return;

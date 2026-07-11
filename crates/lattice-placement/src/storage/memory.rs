@@ -10,7 +10,7 @@ use lattice_core::kind::{ActorKind, ServiceKind};
 use tokio::sync::broadcast;
 
 use crate::error::PlacementError;
-use crate::registry::InstanceRecord;
+use crate::registry::{InstanceRecord, InstanceState};
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, EpochFloorRecord, LeaseId,
     OwnershipEpochFloorProof, OwnershipProofContext, OwnershipProofError, OwnershipRecordBinding,
@@ -314,6 +314,51 @@ impl PlacementStore for InMemoryPlacementStore {
             },
         );
         Ok(())
+    }
+
+    async fn compare_and_set_instance_state(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        expected_lease_id: LeaseId,
+        state: InstanceState,
+    ) -> Result<InstanceRecord, PlacementError> {
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let key = self.prefixed_instance_key(instance_id);
+        let mut record = inner
+            .instances
+            .get(&key)
+            .cloned()
+            .filter(|record| &record.service_kind == service_kind)
+            .ok_or_else(|| PlacementError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            })?;
+        if record.lease_id != expected_lease_id {
+            return Err(PlacementError::InstanceLeaseMismatch {
+                instance_id: instance_id.clone(),
+                expected: expected_lease_id,
+                actual: record.lease_id,
+            });
+        }
+        record.state = state;
+        let revision = inner.next_placement_revision();
+        inner.instances.insert(key, record.clone());
+        inner.notify(
+            &self.prefix,
+            PlacementWatchEvent::InstanceUpdated {
+                record: record.clone(),
+            },
+        );
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::InstanceUpserted {
+                    record: record.clone(),
+                }],
+            },
+        );
+        Ok(record)
     }
 
     async fn get_instance(

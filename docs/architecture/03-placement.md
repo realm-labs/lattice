@@ -128,6 +128,12 @@ Production etcd must use its signed JWT token mode; the server's stateful `simpl
 
 The standalone coordinator accepts `LATTICE_ETCD_USERNAME` and `LATTICE_ETCD_PASSWORD_FILE` together, plus optional `LATTICE_ETCD_CA_FILE` and `LATTICE_ETCD_TOKEN_REFRESH_INTERVAL_SECS`. It otherwise fails closed unless `LATTICE_DANGEROUSLY_ALLOW_UNAUTHENTICATED_ETCD=true` is supplied exactly. That explicitly dangerous mode accepts loopback HTTP endpoints only.
 
+Every `LatticeService` build must now receive both an explicit placement store and an explicit semantic `PlacementAuthority`. There is no private in-memory fallback; omitting either side fails startup. The operator remains responsible for configuring the read store against the same placement namespace used by the authority. Production code supplies a `TonicPlacementAuthority` built from its configured channel. The convenience `dangerously_use_in_process_placement` and its `DevelopmentInProcessPlacementAuthority` are intentionally named development escapes for single-process examples and tests; they hand a writable store to the service process and are not a production topology.
+
+The semantic authority surface currently contains `ActivateActor`, `ActivateSingleton`, and `DrainInstance`. Calls have a five-second default deadline and reject zero or greater-than-sixty-second configured deadlines. Replies are accepted only when every requested identity is echoed exactly, owner/epoch/lease fields are valid, activation state is `Running`, and drain counts fit the local platform. Normal shutdown drain carries the runtime's expected instance lease; the authority atomically changes state only if service, instance, and lease still match, so a stale process cannot drain a replacement that reused its instance ID. The service performs no blind pre-drain state write, and its later `Ready` and `Stopping` transitions also compare the expected lease. Admin drain first reads the current lease and submits the same fenced operation. Missing targets are RPC errors, while a valid drain with no replacement is an explicit identity-, lease-, and count-validated successful-reply outcome. Generic transport or proxy `RESOURCE_EXHAUSTED` errors remain failures and are never interpreted as graceful shutdown. Explicit-actor route resolution then additionally requires a `Ready` owner whose instance lease exactly matches the placement record. Direct Link target resolution enforces the same state and lease lineage. Singleton records intentionally use a separate owner lease, so singleton routing requires a `Running` record and `Ready` instance; the later dedicated singleton lifecycle work must prove renewal, expiry, and reincarnation rather than equating that lease with the instance lease.
+
+This API boundary is necessary but not yet a complete production security boundary. The standalone coordinator RPC server does not yet authenticate a transport identity, and runtime instance/singleton liveness still uses direct etcd lease operations. Until the transport-identity and identity-/incarnation-bound liveness work is complete, the authority endpoint must not be treated as sufficient evidence for tombstone reclamation.
+
 The required deployment RBAC split must be provisioned in etcd; a caller-supplied profile label is not an authorization boundary. The authority identity receives `READWRITE` only for its cluster prefix. An ordinary runtime identity receives `READ` for the cluster prefix (the current ownership adapter watches the whole `/logic/` range) and, while direct liveness remains, `WRITE` for exactly its own `/logic/instances/{service_kind}/{instance_id}` key rather than an instances prefix. A static exact-key credential still does not prove process incarnation. Moreover, etcd does not key-authorize either `LeaseGrant` or `LeaseKeepAlive`: real-server coverage proves a runtime identity can allocate leases without a key write and can renew a known foreign lease even though it cannot mutate the attached key. Direct runtime Lease capability must therefore move behind a bounded, identity- and incarnation-bound liveness authority. Runtime identities receive no placement, lock, leader, floor, retirement, generation, or seal write range. The repository's disposable real-etcd test provisions these roles and proves runtime reads and watches, exact-key liveness, denial of peer-instance/actor/floor mutations, atomic denial of a mixed actor/floor transaction, anonymous and bad-credential rejection, immediate denial after an already-connected legacy writer's range is revoked, success/failure/cancellation-bounded token refresh, and TLS rejection for an untrusted CA or wrong host. Production role provisioning and credential lifecycle remain deployment responsibilities. Authority `WRITE` still includes deletion, so its credential must stay outside service processes behind the semantic placement API; RBAC alone does not authorize tombstone reclamation.
 
 ### 12.1 Instance Registry
@@ -207,6 +213,8 @@ Backend final-cardinality accounting does not by itself authorize the local view
 
 The lattice public API must not itself be a raw-etcd escape hatch. The arbitrary-key transport trait, key/value codec (including the `EpochFloor` variant), ownership adapter records, epoch transaction request types, and generic client-retaining store constructor are crate-private. External crates receive the typed placement-store surface, and compile-fail coverage proves that a `RealEtcdClient` cannot be used to call raw `delete` or construct a store while retaining the client. Integration fault injection uses a narrow hidden test client that can schedule typed mutation failures but exposes no key put/delete API. This type boundary is necessary but not sufficient: a process that still holds a direct etcd credential with protected-prefix `WRITE` can use another etcd library, so credential/RBAC separation and removal of ordinary-service local coordinators are still required before a reclamation capability can be issued.
 
+The placement view installed in `ServiceContext` is read/watch-only. It exposes no lease grant/keepalive, instance upsert, activation, drain, compare-and-put, or lock methods; compile-fail tests cover the public boundary. Service lifecycle code still holds a private liveness handle for direct instance and singleton lease maintenance, which is the next authority cutover rather than an application-facing writer escape.
+
 This guarantee begins only after an identity has a floor written by a hardened writer or an upgrade backfill. Before rollout, stop every writer that does not maintain floors and prevent its credentials or protocol from writing the hardened namespace. Atomically CAS-backfill each live placement record and its floor at one modification revision, and reject any floor attached to a lease. An identity whose record was already deleted has no reconstructable last epoch; deployment must seed it from an authoritative source or prohibit its reuse. Floors cannot later be deleted as ordinary cleanup. Mixed old/new placement writers are not a supported rolling-upgrade mode.
 
 ### 12.5 Singleton Owner
@@ -264,13 +272,15 @@ Resolve flows:
 
 ```text
 explicit actor:
-  cache -> placement record -> if missing call Coordinator.ActivateActor -> cache target
+  cache -> placement record -> if missing call PlacementAuthority.ActivateActor
+  -> require Running record + Ready instance + matching lease -> cache target
 
 virtual shard:
   hash actor_id to shard -> shard assignment -> instance record -> cache target
 
 singleton:
-  singleton owner record -> if missing call ActivateSingleton -> cache target
+  singleton owner record -> if missing call PlacementAuthority.ActivateSingleton
+  -> require Running record + Ready instance -> cache target
 ```
 
 ---
@@ -290,6 +300,10 @@ RebalanceVirtualShards
 InspectPlacement
 ```
 
+`DrainInstance` requires the expected current instance lease. Administrative
+callers resolve that lease immediately before the request; the backend state
+transition is compare-and-set, not a read followed by a blind upsert.
+
 Instance selection should consider:
 
 ```text
@@ -303,6 +317,8 @@ drain state
 ```
 
 Coordinator is not in the normal business RPC path.
+
+Ordinary services do not construct a local coordinator for route misses, Direct Link opens, admin drain, or shutdown drain. Those mutations cross the semantic authority interface. Only the explicitly named development adapter restores the old in-process topology.
 
 ---
 

@@ -1514,6 +1514,7 @@ let movement_stream = DirectLinkStream::new("movement-stream")
 
 LatticeService::builder(BATTLE_SERVICE)
     .instance(instance)
+    .dangerously_use_in_process_placement(local_store, TonicLogicControl)
     .direct_links(
         DirectLinkConfig::enabled("0.0.0.0:0")
             .max_frame_size(256 * 1024)

@@ -26,6 +26,7 @@ use lattice_ops::telemetry::{
     InMemoryTelemetryExporter, MetricSample, OpenTelemetryPipeline, TelemetryRecorder,
     TelemetryResource, TraceSpan, TraceSpanKind,
 };
+use lattice_placement::control::TonicLogicControl;
 use lattice_placement::storage::PlacementPrefix;
 use lattice_placement::storage::memory::InMemoryPlacementStore;
 use lattice_rpc::types::Rpc;
@@ -197,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .instance_id(InstanceId::new("world-a"))
         .listen(listener)
         .ready_signal(ready_tx)
-        .placement_store::<InMemoryPlacementStore, _>(placement_store)
+        .dangerously_use_in_process_placement(placement_store, TonicLogicControl)
         .register_client::<generated::world_rpc::Binding>()
         .register_actor(
             ActorRegistration::builder(WORLD_ACTOR)

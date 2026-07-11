@@ -1,15 +1,15 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use lattice_config::bootstrap::BootstrapConfig;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ConfiguredComponentBuilder;
 use lattice_core::service_context::{ConfiguredComponent, ServiceContextBuilder};
-use lattice_placement::control::TonicLogicControl;
-use lattice_placement::coordination::actor::PlacementCoordinator;
-use lattice_placement::coordination::reports::DrainReport;
+use lattice_placement::authority::PlacementAuthority;
 use lattice_placement::coordination::singleton::SingletonRouteResolver;
 use lattice_placement::error::PlacementError;
-use lattice_placement::registry::InstanceRecord;
+use lattice_placement::registry::{InstanceRecord, InstanceState};
 use lattice_placement::routing::cache::RouteCacheConfig;
 use lattice_placement::routing::placement::{
     PlacementRouteResolver, PlacementWatchStarter, PlacementWatchTask,
@@ -144,11 +144,53 @@ pub(crate) trait ErasedServiceComponent: Send + Sync {
     ) -> Result<(), LatticeServiceError>;
 }
 
+pub(crate) trait ErasedPlacementAuthorityComponent: Send + Sync {
+    fn type_name(&self) -> &'static str;
+
+    fn build(self: Box<Self>) -> Arc<dyn PlacementAuthority>;
+}
+
+pub(crate) struct PlacementAuthorityRegistration<A>
+where
+    A: PlacementAuthority,
+{
+    authority: A,
+}
+
+impl<A> PlacementAuthorityRegistration<A>
+where
+    A: PlacementAuthority,
+{
+    pub(crate) fn new(authority: A) -> Self {
+        Self { authority }
+    }
+}
+
+impl<A> ErasedPlacementAuthorityComponent for PlacementAuthorityRegistration<A>
+where
+    A: PlacementAuthority,
+{
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<A>()
+    }
+
+    fn build(self: Box<Self>) -> Arc<dyn PlacementAuthority> {
+        Arc::new(self.authority)
+    }
+}
+
 #[async_trait]
 pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
     async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError>;
+    async fn compare_and_set_instance_state(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        expected_lease_id: LeaseId,
+        state: InstanceState,
+    ) -> Result<InstanceRecord, PlacementError>;
     async fn list_instances(
         &self,
         service_kind: &ServiceKind,
@@ -168,14 +210,10 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
         service_kind: &ServiceKind,
         instance_id: &InstanceId,
     ) -> Result<usize, PlacementError>;
-    async fn drain_instance(
-        &self,
-        service_kind: ServiceKind,
-        instance_id: InstanceId,
-    ) -> Result<DrainReport, PlacementError>;
     async fn placement_route_resolver(
         &self,
         service_kind: ServiceKind,
+        authority: Arc<dyn PlacementAuthority>,
     ) -> Result<
         (
             lattice_placement::routing::resolver::BoxRouteResolver,
@@ -185,6 +223,7 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
     >;
     async fn singleton_route_resolver(
         &self,
+        authority: Arc<dyn PlacementAuthority>,
     ) -> Result<
         (
             lattice_placement::routing::resolver::BoxRouteResolver,
@@ -251,6 +290,18 @@ where
         self.store.upsert_instance(record).await
     }
 
+    async fn compare_and_set_instance_state(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        expected_lease_id: LeaseId,
+        state: InstanceState,
+    ) -> Result<InstanceRecord, PlacementError> {
+        self.store
+            .compare_and_set_instance_state(service_kind, instance_id, expected_lease_id, state)
+            .await
+    }
+
     async fn list_instances(
         &self,
         service_kind: &ServiceKind,
@@ -294,19 +345,10 @@ where
         Ok(kept_alive)
     }
 
-    async fn drain_instance(
-        &self,
-        service_kind: ServiceKind,
-        instance_id: InstanceId,
-    ) -> Result<DrainReport, PlacementError> {
-        PlacementCoordinator::new(self.store.clone(), TonicLogicControl)
-            .drain_instance(service_kind, instance_id)
-            .await
-    }
-
     async fn placement_route_resolver(
         &self,
         service_kind: ServiceKind,
+        authority: Arc<dyn PlacementAuthority>,
     ) -> Result<
         (
             lattice_placement::routing::resolver::BoxRouteResolver,
@@ -314,11 +356,10 @@ where
         ),
         PlacementError,
     > {
-        let coordinator = PlacementCoordinator::new(self.store.clone(), TonicLogicControl);
         let resolver = PlacementRouteResolver::new(
             service_kind,
             self.store.clone(),
-            coordinator,
+            authority,
             RouteCacheConfig::default(),
         );
         let watch = resolver.start_placement_watch().await?;
@@ -330,6 +371,7 @@ where
 
     async fn singleton_route_resolver(
         &self,
+        authority: Arc<dyn PlacementAuthority>,
     ) -> Result<
         (
             lattice_placement::routing::resolver::BoxRouteResolver,
@@ -337,12 +379,8 @@ where
         ),
         PlacementError,
     > {
-        let coordinator =
-            lattice_placement::coordination::singleton::SingletonCoordinator::from_store(
-                self.store.clone(),
-                TonicLogicControl,
-            );
-        let resolver = SingletonRouteResolver::new(coordinator, RouteCacheConfig::default());
+        let resolver =
+            SingletonRouteResolver::new(self.store.clone(), authority, RouteCacheConfig::default());
         Ok((
             lattice_placement::routing::resolver::BoxRouteResolver::new(resolver),
             PlacementWatchTask::noop(),

@@ -15,7 +15,7 @@ async fn direct_link_listener_enforces_connection_limit() {
         .listen(listener)
         .ready_signal(ready_tx)
         .direct_links(DirectLinkConfig::enabled("127.0.0.1:0").max_connections(1))
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(DirectLinkTestFactory {
@@ -85,7 +85,7 @@ async fn direct_link_config_applies_active_link_limit_to_session_manager() {
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .direct_links(DirectLinkConfig::enabled("127.0.0.1:0").max_active_links(1))
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(DirectLinkTestFactory {
@@ -142,7 +142,7 @@ async fn direct_link_runtime_rejects_open_links_for_other_service_kind() {
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(TestFactory)
@@ -204,7 +204,7 @@ async fn direct_link_config_applies_rate_limits_to_session_manager() {
                 .max_open_links_per_second(1)
                 .max_messages_per_second(1),
         )
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(DirectLinkTestFactory {
@@ -286,7 +286,7 @@ async fn direct_link_listener_idle_maintenance_closes_stale_links() {
             DirectLinkConfig::enabled("127.0.0.1:0")
                 .maintenance_interval(Duration::from_millis(10)),
         )
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(DirectLinkLifecycleFactory {
@@ -385,7 +385,7 @@ async fn direct_link_listener_writes_heartbeat_frames_for_open_links() {
         .direct_links(
             DirectLinkConfig::enabled("127.0.0.1:0").maintenance_interval(Duration::from_millis(5)),
         )
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(DirectLinkLifecycleFactory {
@@ -497,7 +497,7 @@ async fn service_shutdown_closes_active_direct_links_with_node_draining() {
         .listen(listener)
         .ready_signal(ready_tx)
         .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(DirectLinkLifecycleFactory {
@@ -585,7 +585,7 @@ async fn actor_idle_passivation_closes_active_direct_links_with_target_passivate
         .listen(listener)
         .ready_signal(ready_tx)
         .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(AutoPassivatingDirectLinkFactory {

@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
+use lattice_placement::authority::{DevelopmentInProcessPlacementAuthority, PlacementAuthority};
 use lattice_placement::control::TonicLogicControl;
-use lattice_placement::coordination::actor::PlacementCoordinator;
 use lattice_placement::endpoint::EndpointPool;
 use lattice_placement::routing::cache::RouteCacheConfig;
 use lattice_placement::routing::placement::PlacementRouteResolver;
@@ -14,11 +16,11 @@ use crate::generated::GeneratedTonicEndpointTransport;
 use crate::{GATEWAY_SERVICE, PLAYER_SERVICE, WORLD_SERVICE};
 
 pub type DemoRpcCore = ResolvingRpcCore<
-    PlacementRouteResolver<InMemoryPlacementStore, TonicLogicControl>,
+    PlacementRouteResolver<InMemoryPlacementStore>,
     GeneratedTonicEndpointTransport,
 >;
 pub type DemoActorRefRpcCore = ResolvingActorRefRpcCore<
-    PlacementRouteResolver<InMemoryPlacementStore, TonicLogicControl>,
+    PlacementRouteResolver<InMemoryPlacementStore>,
     GeneratedTonicEndpointTransport,
 >;
 
@@ -39,12 +41,12 @@ pub fn actor_ref_core(
     source_instance: InstanceId,
     store: InMemoryPlacementStore,
 ) -> DemoActorRefRpcCore {
-    let coordinator = PlacementCoordinator::new(store.clone(), TonicLogicControl);
+    let authority = development_authority(store.clone());
     DemoActorRefRpcCore::new(
         PlacementRouteResolver::new(
             GATEWAY_SERVICE,
             store,
-            coordinator,
+            authority,
             RouteCacheConfig::default(),
         ),
         EndpointPool::new(),
@@ -59,11 +61,11 @@ fn rpc_core(
     source_instance: InstanceId,
     store: InMemoryPlacementStore,
 ) -> DemoRpcCore {
-    let coordinator = PlacementCoordinator::new(store.clone(), TonicLogicControl);
+    let authority = development_authority(store.clone());
     let resolver = PlacementRouteResolver::new(
         service_kind.clone(),
         store,
-        coordinator,
+        authority,
         RouteCacheConfig::default(),
     );
     DemoRpcCore::new(
@@ -73,4 +75,11 @@ fn rpc_core(
         RpcClientContextFactory::new(source_service, source_instance),
         GeneratedTonicEndpointTransport::new(),
     )
+}
+
+fn development_authority(store: InMemoryPlacementStore) -> Arc<dyn PlacementAuthority> {
+    Arc::new(DevelopmentInProcessPlacementAuthority::new(
+        store,
+        TonicLogicControl,
+    ))
 }

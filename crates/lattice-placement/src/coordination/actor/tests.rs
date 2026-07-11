@@ -10,11 +10,13 @@ use lattice_core::instance::InstanceCapacity;
 use lattice_core::{actor_kind, service_kind};
 
 use super::*;
+use crate::authority::DevelopmentInProcessPlacementAuthority;
 use crate::coordination::logic::{NoopLogicControl, VirtualShardMigrationControl};
 use crate::coordination::reports::{
     PrepareVirtualShardMigrationRequest, RebalanceVirtualShardsReport,
     RebalanceVirtualShardsRequest, VirtualShardMigrationOutcome, VirtualShardMovementPolicy,
 };
+use crate::coordination::singleton::SingletonControl;
 use crate::registry::InstanceRecord;
 use crate::registry::InstanceState;
 use crate::routing::cache::RouteCacheConfig;
@@ -45,6 +47,18 @@ impl LogicControl for CountingLogicControl {
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
         }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SingletonControl for CountingLogicControl {
+    async fn activate_singleton(
+        &self,
+        _instance: &InstanceRecord,
+        _key: &SingletonKey,
+        _epoch: Epoch,
+    ) -> Result<(), PlacementError> {
         Ok(())
     }
 }
@@ -308,7 +322,7 @@ async fn explicit_route_resolver_activates_missing_owner_and_uses_cache() {
     let resolver = ExplicitRouteResolver::new(
         service_kind!("World"),
         store,
-        coordinator,
+        DevelopmentInProcessPlacementAuthority::from_coordinator(coordinator).shared(),
         RouteCacheConfig::default(),
     );
     let request = ResolveRequest {
@@ -316,6 +330,17 @@ async fn explicit_route_resolver_activates_missing_owner_and_uses_cache() {
         actor_kind: actor_kind!("World"),
         route_key: RouteKey::U64(7),
     };
+
+    assert_eq!(
+        resolver
+            .resolve(ResolveRequest {
+                service_kind: service_kind!("Other"),
+                ..request.clone()
+            })
+            .await,
+        Err(PlacementError::NoRoute)
+    );
+    assert_eq!(resolver.placement_lookups(), 0);
 
     let first = resolver.resolve(request.clone()).await.unwrap();
     let second = resolver.resolve(request).await.unwrap();
@@ -357,7 +382,7 @@ async fn placement_route_resolver_reads_existing_store_record_without_activation
     let resolver = PlacementRouteResolver::new(
         service_kind!("World"),
         store,
-        coordinator,
+        DevelopmentInProcessPlacementAuthority::from_coordinator(coordinator).shared(),
         RouteCacheConfig::default(),
     );
 
@@ -374,6 +399,99 @@ async fn placement_route_resolver_reads_existing_store_record_without_activation
     assert_eq!(target.owner_epoch, Some(Epoch(3)));
     assert_eq!(resolver.placement_lookups(), 1);
     assert_eq!(logic.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn placement_route_resolver_rejects_nonrunning_nonready_and_reincarnated_owner_records() {
+    let store = ready_store().await;
+    let instance = store
+        .get_instance(&InstanceId::new("world-a"))
+        .await
+        .unwrap()
+        .unwrap();
+    let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(7),
+    };
+    let version = store
+        .compare_and_put_actor(
+            key.clone(),
+            None,
+            ActorPlacementRecord {
+                service_kind: key.service_kind.clone(),
+                actor_kind: key.actor_kind.clone(),
+                actor_id: key.actor_id.clone(),
+                owner: instance.instance_id.clone(),
+                epoch: Epoch(1),
+                lease_id: instance.lease_id,
+                state: PlacementState::Draining,
+            },
+        )
+        .await
+        .unwrap();
+    let authority =
+        DevelopmentInProcessPlacementAuthority::new(store.clone(), NoopLogicControl).shared();
+    let resolver = PlacementRouteResolver::new(
+        service_kind!("World"),
+        store.clone(),
+        authority,
+        RouteCacheConfig::default(),
+    );
+    let request = ResolveRequest {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        route_key: RouteKey::U64(7),
+    };
+
+    assert_eq!(
+        resolver.resolve(request.clone()).await.unwrap_err(),
+        PlacementError::NoRoute
+    );
+    let version = store
+        .compare_and_put_actor(
+            key.clone(),
+            Some(version),
+            ActorPlacementRecord {
+                service_kind: key.service_kind.clone(),
+                actor_kind: key.actor_kind.clone(),
+                actor_id: key.actor_id.clone(),
+                owner: instance.instance_id.clone(),
+                epoch: Epoch(2),
+                lease_id: LeaseId(instance.lease_id.0 + 100),
+                state: PlacementState::Running,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resolver.resolve(request.clone()).await.unwrap_err(),
+        PlacementError::NoRoute
+    );
+
+    let mut not_ready = instance.clone();
+    not_ready.state = InstanceState::Draining;
+    store.upsert_instance(not_ready).await.unwrap();
+    store
+        .compare_and_put_actor(
+            key.clone(),
+            Some(version),
+            ActorPlacementRecord {
+                service_kind: key.service_kind,
+                actor_kind: key.actor_kind,
+                actor_id: key.actor_id,
+                owner: instance.instance_id,
+                epoch: Epoch(3),
+                lease_id: instance.lease_id,
+                state: PlacementState::Running,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resolver.resolve(request).await.unwrap_err(),
+        PlacementError::NoRoute
+    );
 }
 
 #[tokio::test]
@@ -451,7 +569,7 @@ async fn explicit_route_resolver_refreshes_cache_from_placement_watch() {
     let resolver = ExplicitRouteResolver::new(
         service_kind!("World"),
         store,
-        coordinator.clone(),
+        DevelopmentInProcessPlacementAuthority::from_coordinator(coordinator.clone()).shared(),
         RouteCacheConfig::default(),
     );
     let watch_task = resolver.watch_cache_updates().await.unwrap();
@@ -487,6 +605,153 @@ async fn explicit_route_resolver_refreshes_cache_from_placement_watch() {
 
     watch_task.cancel();
     panic!("placement watch did not refresh route cache");
+}
+
+#[tokio::test]
+async fn explicit_route_watch_invalidates_a_reincarnated_owner_record() {
+    let store = ready_store_with_replacement().await;
+    let owner_a = store
+        .get_instance(&InstanceId::new("world-a"))
+        .await
+        .unwrap()
+        .unwrap();
+    let owner_b = store
+        .get_instance(&InstanceId::new("world-b"))
+        .await
+        .unwrap()
+        .unwrap();
+    let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(17),
+    };
+    let version = store
+        .compare_and_put_actor(
+            key.clone(),
+            None,
+            ActorPlacementRecord {
+                service_kind: key.service_kind.clone(),
+                actor_kind: key.actor_kind.clone(),
+                actor_id: key.actor_id.clone(),
+                owner: owner_a.instance_id,
+                epoch: Epoch(1),
+                lease_id: owner_a.lease_id,
+                state: PlacementState::Running,
+            },
+        )
+        .await
+        .unwrap();
+    let authority =
+        DevelopmentInProcessPlacementAuthority::new(store.clone(), NoopLogicControl).shared();
+    let resolver = ExplicitRouteResolver::new(
+        service_kind!("World"),
+        store.clone(),
+        authority,
+        RouteCacheConfig::default(),
+    );
+    let watch = resolver.watch_cache_updates().await.unwrap();
+    let request = ResolveRequest {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        route_key: RouteKey::U64(17),
+    };
+    assert_eq!(
+        resolver.resolve(request.clone()).await.unwrap().instance_id,
+        InstanceId::new("world-a")
+    );
+    let initial_lookups = resolver.placement_lookups();
+
+    store
+        .compare_and_put_actor(
+            key.clone(),
+            Some(version),
+            ActorPlacementRecord {
+                service_kind: key.service_kind,
+                actor_kind: key.actor_kind,
+                actor_id: key.actor_id,
+                owner: owner_b.instance_id,
+                epoch: Epoch(2),
+                lease_id: owner_a.lease_id,
+                state: PlacementState::Running,
+            },
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        if resolver.resolve(request.clone()).await == Err(PlacementError::NoRoute) {
+            assert!(resolver.placement_lookups() > initial_lookups);
+            watch.cancel();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    watch.cancel();
+    panic!("lease-mismatched watch record remained in the route cache");
+}
+
+#[tokio::test]
+async fn explicit_route_watch_invalidates_cache_on_instance_reincarnation() {
+    let store = ready_store().await;
+    let mut owner = store
+        .get_instance(&InstanceId::new("world-a"))
+        .await
+        .unwrap()
+        .unwrap();
+    let key = ActorPlacementKey {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        actor_id: ActorId::U64(18),
+    };
+    store
+        .compare_and_put_actor(
+            key.clone(),
+            None,
+            ActorPlacementRecord {
+                service_kind: key.service_kind.clone(),
+                actor_kind: key.actor_kind.clone(),
+                actor_id: key.actor_id.clone(),
+                owner: owner.instance_id.clone(),
+                epoch: Epoch(1),
+                lease_id: owner.lease_id,
+                state: PlacementState::Running,
+            },
+        )
+        .await
+        .unwrap();
+    let resolver = ExplicitRouteResolver::new(
+        service_kind!("World"),
+        store.clone(),
+        DevelopmentInProcessPlacementAuthority::new(store.clone(), NoopLogicControl).shared(),
+        RouteCacheConfig::default(),
+    );
+    let watch = resolver.watch_cache_updates().await.unwrap();
+    let request = ResolveRequest {
+        service_kind: service_kind!("World"),
+        actor_kind: actor_kind!("World"),
+        route_key: RouteKey::U64(18),
+    };
+    resolver.resolve(request.clone()).await.unwrap();
+    let initial_lookups = resolver.placement_lookups();
+
+    let replacement_lease = store.grant_instance_lease().await.unwrap();
+    store
+        .keepalive_instance_lease(replacement_lease)
+        .await
+        .unwrap();
+    owner.lease_id = replacement_lease;
+    store.upsert_instance(owner).await.unwrap();
+
+    for _ in 0..50 {
+        if resolver.resolve(request.clone()).await == Err(PlacementError::NoRoute) {
+            assert!(resolver.placement_lookups() > initial_lookups);
+            watch.cancel();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    watch.cancel();
+    panic!("instance reincarnation did not invalidate the explicit route cache");
 }
 
 #[tokio::test]
@@ -832,8 +1097,18 @@ async fn coordinator_drain_marks_instance_draining_and_migrates_owned_actors() {
         .await
         .unwrap();
 
+    let owner_lease = store
+        .get_instance(&InstanceId::new("world-a"))
+        .await
+        .unwrap()
+        .unwrap()
+        .lease_id;
     let report = coordinator
-        .drain_instance(service_kind!("World"), InstanceId::new("world-a"))
+        .drain_instance(
+            service_kind!("World"),
+            InstanceId::new("world-a"),
+            owner_lease,
+        )
         .await
         .unwrap();
     let drained = store

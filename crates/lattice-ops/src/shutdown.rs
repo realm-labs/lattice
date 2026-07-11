@@ -5,10 +5,9 @@ use async_trait::async_trait;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_eventbus::local::EventSubscriptionHandle;
-use lattice_placement::coordination::actor::PlacementCoordinator;
-use lattice_placement::coordination::logic::LogicControl;
+use lattice_placement::authority::PlacementAuthority;
 use lattice_placement::coordination::reports::DrainReport;
-use lattice_placement::storage::PlacementStore;
+use lattice_placement::storage::LeaseId;
 use tokio::sync::Mutex;
 
 use crate::error::OpsError;
@@ -81,28 +80,31 @@ impl ShutdownLeaseController for InMemoryShutdownLeaseController {
 }
 
 #[derive(Debug, Clone)]
-pub struct GracefulShutdown<S, L, LC> {
+pub struct GracefulShutdown<A, LC> {
     service_kind: ServiceKind,
     instance_id: InstanceId,
-    coordinator: PlacementCoordinator<S, L>,
+    expected_lease_id: LeaseId,
+    authority: A,
     lease_controller: LC,
     scheduler: ServiceScheduler,
     subscriptions: Arc<Mutex<Vec<EventSubscriptionHandle>>>,
     ready: Arc<AtomicBool>,
 }
 
-impl<S, L, LC> GracefulShutdown<S, L, LC> {
+impl<A, LC> GracefulShutdown<A, LC> {
     pub fn new(
         service_kind: ServiceKind,
         instance_id: InstanceId,
-        coordinator: PlacementCoordinator<S, L>,
+        expected_lease_id: LeaseId,
+        authority: A,
         lease_controller: LC,
         scheduler: ServiceScheduler,
     ) -> Self {
         Self {
             service_kind,
             instance_id,
-            coordinator,
+            expected_lease_id,
+            authority,
             lease_controller,
             scheduler,
             subscriptions: Arc::new(Mutex::new(Vec::new())),
@@ -119,10 +121,9 @@ impl<S, L, LC> GracefulShutdown<S, L, LC> {
     }
 }
 
-impl<S, L, LC> GracefulShutdown<S, L, LC>
+impl<A, LC> GracefulShutdown<A, LC>
 where
-    S: PlacementStore,
-    L: LogicControl,
+    A: PlacementAuthority,
     LC: ShutdownLeaseController,
 {
     pub async fn shutdown(
@@ -145,8 +146,12 @@ where
         stages.push(ShutdownStage::SubscriptionsCancelled);
 
         let drain = self
-            .coordinator
-            .drain_instance(self.service_kind.clone(), self.instance_id.clone())
+            .authority
+            .drain_instance(
+                self.service_kind.clone(),
+                self.instance_id.clone(),
+                self.expected_lease_id,
+            )
             .await?;
         stages.push(ShutdownStage::Drained);
 

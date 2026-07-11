@@ -1,6 +1,6 @@
 # Distributed Login Example
 
-This example runs a small lattice deployment as separate processes:
+This crate demonstrates a small lattice login flow:
 
 - `player-service` hosts lazy `PlayerActor` instances.
 - `world-service` hosts a pre-started `WorldActor`.
@@ -25,32 +25,21 @@ Message ids are registered in `build.rs`:
 
 ## Run
 
-Open four terminals from the repository root.
+The verified runnable topology is the integration test. It starts the gateway,
+world, and player services in one process so they deliberately share the same
+in-memory placement store and development authority:
 
 ```bash
-cargo run -p distributed-login --bin player-service -- \
-  --addr 127.0.0.1:19082
+cargo test -p distributed-login --test distributed_flow -- --nocapture
 ```
 
-```bash
-cargo run -p distributed-login --bin world-service -- \
-  --addr 127.0.0.1:19081 \
-  --player-endpoint http://127.0.0.1:19082
-```
-
-```bash
-cargo run -p distributed-login --bin gateway -- \
-  --addr 127.0.0.1:19080 \
-  --push-addr 127.0.0.1:19083 \
-  --world-endpoint http://127.0.0.1:19081 \
-  --player-endpoint http://127.0.0.1:19082
-```
-
-```bash
-cargo run -p distributed-login --bin client -- login --gateway 127.0.0.1:19080 --world-id 1 --player-id 42 --session-id client-42
-cargo run -p distributed-login --bin client -- world-ping --gateway 127.0.0.1:19080 --world-id 1
-cargo run -p distributed-login --bin client -- player-ping --gateway 127.0.0.1:19080 --player-id 42
-```
+The individual binaries are component launchers, not a working distributed
+deployment: each currently creates a private in-memory placement namespace.
+Running them as separate processes would require a shared etcd read/liveness
+store plus a coordinator-backed `TonicPlacementAuthority`, matching the
+multi-process benchmark topology. The old four-terminal commands and endpoint
+flags were removed from this README because they did not share placement state
+and were not accepted by the binaries.
 
 The login command routes to `WorldActor`, which records a session and calls `PlayerRpc.InitSession`.
 The gateway injects a serializable `ActorRef` for the local `GatewaySessionActor` into the login request before forwarding it.

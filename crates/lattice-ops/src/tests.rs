@@ -14,7 +14,7 @@ use lattice_core::trace::TraceContext;
 use lattice_core::{actor_kind, service_kind};
 use lattice_eventbus::local::{EventBus, LocalEventBus};
 use lattice_eventbus::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
-use lattice_placement::coordination::actor::PlacementCoordinator;
+use lattice_placement::authority::DevelopmentInProcessPlacementAuthority;
 use lattice_placement::coordination::logic::NoopLogicControl;
 use lattice_placement::registry::{InstanceRecord, InstanceState};
 use lattice_placement::sharding::VirtualShardId;
@@ -97,7 +97,7 @@ async fn graceful_shutdown_drains_before_releasing_lease_and_cancels_runtime_wor
         )
         .await
         .unwrap();
-    let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+    let authority = DevelopmentInProcessPlacementAuthority::new(store.clone(), NoopLogicControl);
     let scheduler = ServiceScheduler::new();
     let ticks = Arc::new(AtomicUsize::new(0));
     let ticks_clone = ticks.clone();
@@ -129,7 +129,8 @@ async fn graceful_shutdown_drains_before_releasing_lease_and_cancels_runtime_wor
     let shutdown = GracefulShutdown::new(
         service_kind!("World"),
         InstanceId::new("world-a"),
-        coordinator,
+        LeaseId(1),
+        authority,
         lease_controller.clone(),
         scheduler,
     );

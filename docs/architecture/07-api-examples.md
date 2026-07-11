@@ -93,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
         .instance(instance)
         .config(ConfigSource::file("config/world-service.toml"))
         .placement_store(EtcdPlacementStore::from_config())
+        .placement_authority(TonicPlacementAuthority::new(authority_channel))
         .cluster_event_bus(NatsEventBus::from_config())
         .local_event_bus(LocalEventBus::default())
         .config_store(lattice_config_etcd::EtcdConfigStore::from_config())
@@ -226,6 +227,7 @@ Services that accept direct links must register both the actor and the stream bi
 
 ```rust
 LatticeService::builder(BATTLE_SERVICE)
+    .dangerously_use_in_process_placement(local_store, TonicLogicControl)
     .direct_links(
         DirectLinkConfig::enabled("0.0.0.0:9001")
             .max_frame_size(256 * 1024)

@@ -6,8 +6,8 @@ use clap::Parser;
 use lattice_core::instance::InstanceId;
 use rpc_benchmark::error::BenchmarkResult;
 use rpc_benchmark::multiprocess::{
-    EtcdBenchmarkConfig, build_bench_client_from_etcd, default_multi_process_prefix, parse_csv,
-    wait_for_ready_files, wait_for_ready_instances,
+    EtcdBenchmarkConfig, build_bench_client_from_etcd, parse_csv, wait_for_ready_files,
+    wait_for_ready_instances,
 };
 use rpc_benchmark::topology::BenchmarkConfig;
 use rpc_benchmark::workload::{WorkloadConfig, run_routed_rpc_fanout_with_client};
@@ -33,8 +33,11 @@ struct Args {
     request_dedup: bool,
     #[arg(long, default_value = "http://127.0.0.1:2379")]
     etcd_endpoints: String,
+    #[arg(long, default_value = "http://127.0.0.1:50080")]
+    coordinator_endpoint: String,
+    /// Placement namespace shared with the separately started coordinator.
     #[arg(long)]
-    key_prefix: Option<String>,
+    key_prefix: String,
     #[arg(long)]
     node_exe: Option<PathBuf>,
     #[arg(long, default_value_t = 15)]
@@ -54,8 +57,8 @@ async fn main() -> BenchmarkResult<()> {
         request_dedup: args.request_dedup,
         payload_bytes: args.payload_bytes,
     };
-    let key_prefix = args.key_prefix.unwrap_or_else(default_multi_process_prefix);
-    let etcd = EtcdBenchmarkConfig::new(parse_csv(&args.etcd_endpoints), key_prefix.clone());
+    let etcd = EtcdBenchmarkConfig::new(parse_csv(&args.etcd_endpoints), args.key_prefix)
+        .with_coordinator_endpoint(args.coordinator_endpoint);
     let node_exe = args.node_exe.unwrap_or_else(default_node_exe);
     let ready_dir =
         std::env::temp_dir().join(format!("lattice-rpc-benchmark-{}", std::process::id()));
@@ -118,6 +121,8 @@ fn spawn_node(
         .arg(&etcd.key_prefix)
         .arg("--etcd-endpoints")
         .arg(etcd.endpoints.join(","))
+        .arg("--coordinator-endpoint")
+        .arg(&etcd.coordinator_endpoint)
         .arg("--channel-stripes")
         .arg(config.channel_stripes.to_string())
         .arg("--rpc-retry")

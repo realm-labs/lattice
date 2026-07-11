@@ -11,20 +11,16 @@ use lattice_core::kind::ActorKind;
 use lattice_core::service_context::ServiceContext;
 use lattice_eventbus::local::LocalEventBus;
 use lattice_ops::scheduler::ServiceScheduler;
-use lattice_placement::storage::PlacementPrefix;
-use lattice_placement::storage::memory::InMemoryPlacementStore;
 use tracing::{debug, info};
 
 use crate::assembly::admin::build_admin_http;
 use crate::assembly::builder::LatticeServiceBuilder;
 use crate::assembly::components::{
-    build_framework_component_or_default, build_placement_store_or_default, build_service_component,
+    build_framework_component_or_default, build_placement_store, build_service_component,
 };
 use crate::assembly::placement_watch::start_placement_watchers;
 use crate::clients::RpcClientPlacement;
-use crate::components::{
-    PlacementStoreRegistration, ServiceComponentContext, ServiceComponentRegistration,
-};
+use crate::components::{ServiceComponentContext, ServiceComponentRegistration};
 use crate::context::ServiceBuildContext;
 use crate::control::ServiceLogicControlHandler;
 use crate::direct_links::{
@@ -61,6 +57,23 @@ impl LatticeServiceBuilder {
                 type_name: type_name.to_string(),
             });
         }
+        let placement_authority = self.placement_authority.ok_or_else(|| {
+            LatticeServiceError::MissingServiceComponent {
+                component: "placement_authority".to_string(),
+            }
+        })?;
+        debug!(
+            service.kind = self.service_kind.as_str(),
+            component.target = "placement_authority",
+            component.type = placement_authority.type_name(),
+            "building service component"
+        );
+        let placement_authority = placement_authority.build();
+        let placement_store =
+            self.placement_store
+                .ok_or_else(|| LatticeServiceError::MissingServiceComponent {
+                    component: "placement_store".to_string(),
+                })?;
         let mut service_context =
             ServiceContext::builder(self.service_kind.clone(), instance.instance_id.clone());
         let admin_actor_kinds = self
@@ -70,14 +83,8 @@ impl LatticeServiceBuilder {
             .collect();
         let admin_http = build_admin_http(self.admin_http, admin_actor_kinds).await?;
         let placement_watchers = self.placement_watchers;
-        let placement_store = build_placement_store_or_default(
-            self.placement_store,
-            Box::new(PlacementStoreRegistration::<InMemoryPlacementStore>::new(
-                InMemoryPlacementStore::new(PlacementPrefix::new(format!(
-                    "/lattice/{}/placement",
-                    self.service_kind.as_str()
-                ))),
-            )),
+        let placement_store = build_placement_store(
+            placement_store,
             &component_context,
             &mut service_context,
             self.service_kind.as_str(),
@@ -161,10 +168,14 @@ impl LatticeServiceBuilder {
             let (default_resolver, watch_task) = match binding.placement() {
                 RpcClientPlacement::Actor => {
                     placement_store
-                        .placement_route_resolver(client_service_kind)
+                        .placement_route_resolver(client_service_kind, placement_authority.clone())
                         .await?
                 }
-                RpcClientPlacement::Singleton => placement_store.singleton_route_resolver().await?,
+                RpcClientPlacement::Singleton => {
+                    placement_store
+                        .singleton_route_resolver(placement_authority.clone())
+                        .await?
+                }
             };
             placement_watch_tasks.push(watch_task);
             let context_factory = self
@@ -241,8 +252,12 @@ impl LatticeServiceBuilder {
             );
             registration.register(&mut context)?;
         }
-        let direct_link_runtime =
-            build_direct_link_runtime(self.direct_link_bindings, &context, direct_link_enabled)?;
+        let direct_link_runtime = build_direct_link_runtime(
+            self.direct_link_bindings,
+            &context,
+            direct_link_enabled,
+            placement_authority.clone(),
+        )?;
         if let (Some(runtime), Some(direct_link_config)) =
             (direct_link_runtime.as_ref(), self.direct_link.as_ref())
         {
@@ -317,6 +332,7 @@ impl LatticeServiceBuilder {
             actors,
             logic_actors,
             placement_store,
+            placement_authority,
             placement_watch_tasks,
             admin_http,
             instance_lease_keepalive_interval: self.instance_lease_keepalive_interval,

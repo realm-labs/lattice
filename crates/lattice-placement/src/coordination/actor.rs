@@ -168,6 +168,7 @@ where
         &self,
         service_kind: ServiceKind,
         instance_id: InstanceId,
+        expected_lease_id: LeaseId,
     ) -> Result<DrainReport, PlacementError> {
         let span = tracing::info_span!(
             "placement.drain",
@@ -176,15 +177,14 @@ where
             instance.id = instance_id.as_str()
         );
         async {
-            let mut instance = self
-                .store
-                .get_instance(&instance_id)
-                .await?
-                .ok_or_else(|| PlacementError::InstanceNotFound {
-                    instance_id: instance_id.clone(),
-                })?;
-            instance.state = InstanceState::Draining;
-            self.store.upsert_instance(instance).await?;
+            self.store
+                .compare_and_set_instance_state(
+                    &service_kind,
+                    &instance_id,
+                    expected_lease_id,
+                    InstanceState::Draining,
+                )
+                .await?;
 
             let replacement = self
                 .store
@@ -198,7 +198,10 @@ where
                 .ok_or(PlacementError::NoReadyInstances)?;
             let mut migrated_actors = 0;
             for (version, record) in self.store.list_actors().await? {
-                if record.service_kind != service_kind || record.owner != instance_id {
+                if record.service_kind != service_kind
+                    || record.owner != instance_id
+                    || record.lease_id != expected_lease_id
+                {
                     continue;
                 }
                 let key = ActorPlacementKey {

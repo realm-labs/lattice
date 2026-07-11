@@ -7,6 +7,7 @@ use lattice_ops::admin::{
     AdminActorTarget, AdminApiError, AdminAuth, AdminHttpAdapter, AdminMutationHandler,
     AdminMutationReply, AdminSnapshot,
 };
+use lattice_placement::authority::PlacementAuthority;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::info;
@@ -30,6 +31,7 @@ pub(crate) async fn start_admin_http_server(
     admin_http: Option<AdminHttpServer>,
     service_context: &ServiceContext,
     placement_store: &dyn ErasedPlacementStore,
+    placement_authority: Arc<dyn PlacementAuthority>,
     service_kind: &ServiceKind,
     instance_id: &lattice_core::instance::InstanceId,
 ) -> Result<(Option<AdminShutdownSignal>, Option<AdminHttpTask>), LatticeServiceError> {
@@ -47,6 +49,7 @@ pub(crate) async fn start_admin_http_server(
         .with_mutation_handler(ServiceAdminMutations {
             service_kind: service_kind.clone(),
             placement_store: service_context.placement_store(),
+            placement_authority,
         })
         .router();
     let local_addr = admin_http.listener.local_addr().ok();
@@ -69,6 +72,7 @@ pub(crate) async fn start_admin_http_server(
 struct ServiceAdminMutations {
     service_kind: ServiceKind,
     placement_store: Arc<dyn DynPlacementStore>,
+    placement_authority: Arc<dyn PlacementAuthority>,
 }
 
 impl std::fmt::Debug for ServiceAdminMutations {
@@ -86,9 +90,24 @@ impl AdminMutationHandler for ServiceAdminMutations {
         &self,
         instance_id: lattice_core::instance::InstanceId,
     ) -> Result<AdminMutationReply, AdminApiError> {
-        let report = self
+        let record = self
             .placement_store
-            .drain_instance(self.service_kind.clone(), instance_id.clone())
+            .get_instance(&instance_id)
+            .await
+            .map_err(|error| AdminApiError::MutationFailed {
+                message: error.to_string(),
+            })?
+            .filter(|record| record.service_kind == self.service_kind)
+            .ok_or_else(|| AdminApiError::MutationFailed {
+                message: format!("instance {instance_id} was not found"),
+            })?;
+        let report = self
+            .placement_authority
+            .drain_instance(
+                self.service_kind.clone(),
+                instance_id.clone(),
+                record.lease_id,
+            )
             .await
             .map_err(|error| AdminApiError::MutationFailed {
                 message: error.to_string(),

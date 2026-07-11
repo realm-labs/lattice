@@ -1,0 +1,5 @@
+error[E0599]: no method named `compare_and_put_actor` found for struct `Arc<dyn DynPlacementStore>` in the current scope
+  --> tests/ui/service_context_placement_cas.rs:10:23
+   |
+10 |     let _ = placement.compare_and_put_actor(key, None, record).await;
+   |                       ^^^^^^^^^^^^^^^^^^^^^ method not found in `Arc<dyn DynPlacementStore>`

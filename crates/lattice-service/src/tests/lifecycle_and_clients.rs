@@ -29,7 +29,7 @@ async fn service_shutdown_cancels_context_event_subscriptions() {
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .ready_signal(ready_tx)
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .cluster_event_bus::<LocalEventBus, _>(bus.clone())
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
@@ -86,7 +86,7 @@ async fn service_context_scheduler_stops_on_shutdown() {
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .ready_signal(ready_tx)
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(TestFactory)
@@ -141,7 +141,7 @@ async fn service_starts_admin_http_as_managed_listener() {
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .ready_signal(ready_tx)
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .admin_http(AdminHttpConfig {
             bind: Some(admin_addr),
             bearer_token: None,
@@ -185,6 +185,12 @@ async fn service_starts_admin_http_as_managed_listener() {
         labels: Default::default(),
     };
     store_for_assert.upsert_instance(replacement).await.unwrap();
+    let owner_lease = store_for_assert
+        .get_instance(&InstanceId::new("world-1"))
+        .await
+        .unwrap()
+        .unwrap()
+        .lease_id;
     let actor_key = ActorPlacementKey {
         service_kind: service_kind!("World"),
         actor_kind: actor_kind!("World"),
@@ -200,7 +206,7 @@ async fn service_starts_admin_http_as_managed_listener() {
                 actor_id: ActorId::U64(42),
                 owner: InstanceId::new("world-1"),
                 epoch: Epoch(1),
-                lease_id: LeaseId(99),
+                lease_id: owner_lease,
                 state: PlacementState::Running,
             },
         )
@@ -255,7 +261,7 @@ async fn service_exposes_tonic_logic_control_activation() {
     let observed_instance = Arc::new(tokio::sync::Mutex::new(None));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let service = LatticeService::builder(service_kind!("World"))
+    let service = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-control"))
         .listen(listener)
         .ready_signal(ready_tx)
@@ -301,7 +307,7 @@ async fn service_shutdown_drains_runtime_actor_registries() {
     let reasons = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let service = LatticeService::builder(service_kind!("World"))
+    let service = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-control"))
         .listen(listener)
         .ready_signal(ready_tx)
@@ -349,7 +355,7 @@ async fn service_shutdown_stops_accepting_rpc_before_actor_drain_finishes() {
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let service = LatticeService::builder(service_kind!("World"))
+    let service = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-drain-rpc"))
         .listen(listener)
         .ready_signal(ready_tx)
@@ -448,7 +454,7 @@ async fn logic_control_closes_direct_links_for_migrating_actors() {
         .listen(listener)
         .ready_signal(ready_tx)
         .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .shard_migration(ShardMigrationPolicy::PassivateRunningActors)
@@ -559,7 +565,7 @@ async fn service_shutdown_migrates_owned_placement_records() {
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .ready_signal(ready_tx)
-        .placement_store::<InMemoryPlacementStore, _>(store.clone())
+        .dangerously_use_in_process_placement(store.clone(), TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(TestFactory)
@@ -586,12 +592,188 @@ async fn service_shutdown_migrates_owned_placement_records() {
 }
 
 #[tokio::test]
+async fn stale_service_shutdown_cannot_overwrite_replacement_incarnation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .dangerously_use_in_process_placement(store.clone(), TonicLogicControl)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+
+    let old_record = store
+        .get_instance(&InstanceId::new("world-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    let replacement_lease = store.grant_instance_lease().await.unwrap();
+    let replacement = InstanceRecord {
+        lease_id: replacement_lease,
+        version: "replacement".to_string(),
+        state: InstanceState::Ready,
+        ..old_record.clone()
+    };
+    store.upsert_instance(replacement.clone()).await.unwrap();
+
+    shutdown_tx.send(()).unwrap();
+    let error = task.await.unwrap().unwrap_err();
+    assert!(matches!(
+        error,
+        LatticeServiceError::Placement(PlacementError::InstanceLeaseMismatch {
+            instance_id,
+            expected,
+            actual,
+        }) if instance_id == InstanceId::new("world-1")
+            && expected == old_record.lease_id
+            && actual == replacement_lease
+    ));
+    assert_eq!(
+        store
+            .get_instance(&InstanceId::new("world-1"))
+            .await
+            .unwrap(),
+        Some(replacement)
+    );
+}
+
+#[tokio::test]
+async fn stopping_transition_cannot_overwrite_replacement_after_successful_drain() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let authority = ReplacementDuringDrainAuthority {
+        store: store.clone(),
+    };
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .placement_store::<InMemoryPlacementStore, _>(store.clone())
+        .placement_authority(authority)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+    let old_lease = store
+        .get_instance(&InstanceId::new("world-1"))
+        .await
+        .unwrap()
+        .unwrap()
+        .lease_id;
+
+    shutdown_tx.send(()).unwrap();
+    let error = task.await.unwrap().unwrap_err();
+    let replacement = store
+        .get_instance(&InstanceId::new("world-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replacement.state, InstanceState::Ready);
+    assert_eq!(replacement.version, "replacement");
+    assert_ne!(replacement.lease_id, old_lease);
+    assert!(matches!(
+        error,
+        LatticeServiceError::Placement(PlacementError::InstanceLeaseMismatch {
+            expected,
+            actual,
+            ..
+        }) if expected == old_lease && actual == replacement.lease_id
+    ));
+}
+
+#[derive(Clone)]
+struct ReplacementDuringDrainAuthority {
+    store: InMemoryPlacementStore,
+}
+
+#[async_trait]
+impl PlacementAuthority for ReplacementDuringDrainAuthority {
+    async fn activate_actor(
+        &self,
+        _request: lattice_placement::coordination::actor::ActivateActorRequest,
+    ) -> Result<ActorPlacementRecord, PlacementError> {
+        Err(PlacementError::NoRoute)
+    }
+
+    async fn activate_singleton(
+        &self,
+        _request: lattice_placement::coordination::singleton::ActivateSingletonRequest,
+    ) -> Result<lattice_placement::storage::SingletonPlacementRecord, PlacementError> {
+        Err(PlacementError::NoRoute)
+    }
+
+    async fn drain_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        expected_lease_id: LeaseId,
+    ) -> Result<lattice_placement::coordination::reports::DrainReport, PlacementError> {
+        let current = self
+            .store
+            .compare_and_set_instance_state(
+                &service_kind,
+                &instance_id,
+                expected_lease_id,
+                InstanceState::Draining,
+            )
+            .await?;
+        let replacement_lease = self.store.grant_instance_lease().await?;
+        self.store
+            .upsert_instance(InstanceRecord {
+                lease_id: replacement_lease,
+                version: "replacement".to_string(),
+                state: InstanceState::Ready,
+                ..current
+            })
+            .await?;
+        Ok(lattice_placement::coordination::reports::DrainReport {
+            drained_instance: instance_id,
+            migrated_actors: 0,
+            migrated_virtual_shards: 0,
+        })
+    }
+}
+
+#[tokio::test]
 async fn service_exposes_tonic_logic_control_singleton_activation() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let observed_instance = Arc::new(tokio::sync::Mutex::new(None));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let service = LatticeService::builder(service_kind!("World"))
+    let service = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-control"))
         .listen(listener)
         .ready_signal(ready_tx)
@@ -634,7 +816,7 @@ async fn service_exposes_tonic_logic_control_singleton_activation() {
 #[tokio::test]
 async fn register_client_builds_typed_client_from_context_core() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let service = LatticeService::builder(service_kind!("Player"))
+    let service = development_service_builder(service_kind!("Player"))
         .instance_id(InstanceId::new("player-1"))
         .listen(listener)
         .extension::<FakeRpcCore, _>(FakeRpcCore)
@@ -660,7 +842,7 @@ async fn register_client_builds_typed_client_from_context_core() {
 #[tokio::test]
 async fn register_client_builds_default_placement_core_from_store() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let service = LatticeService::builder(service_kind!("Player"))
+    let service = development_service_builder(service_kind!("Player"))
         .instance_id(InstanceId::new("player-1"))
         .listen(listener)
         .register_client::<FakePlacementClientBinding>()
@@ -692,7 +874,7 @@ async fn register_client_builds_default_placement_core_from_store() {
 async fn register_client_passes_rpc_client_transport_config() {
     OBSERVED_RPC_CLIENT_STRIPES.store(0, Ordering::SeqCst);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let service = LatticeService::builder(service_kind!("Player"))
+    let service = development_service_builder(service_kind!("Player"))
         .instance_id(InstanceId::new("player-1"))
         .listen(listener)
         .rpc_client_transport(TonicEndpointChannelPoolConfig::try_new(8).unwrap())
@@ -730,7 +912,7 @@ async fn register_client_builds_default_singleton_core_from_store() {
         .listen(listener)
         .ready_signal(ready_tx)
         .instance_lease_keepalive_interval(Duration::from_millis(10))
-        .placement_store::<InMemoryPlacementStore, _>(store.clone())
+        .dangerously_use_in_process_placement(store.clone(), TonicLogicControl)
         .register_client::<FakeSingletonClientBinding>()
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
@@ -812,7 +994,7 @@ async fn register_client_builds_default_singleton_core_from_store() {
 #[tokio::test]
 async fn register_client_fails_when_core_is_missing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let result = LatticeService::builder(service_kind!("Player"))
+    let result = development_service_builder(service_kind!("Player"))
         .instance_id(InstanceId::new("player-1"))
         .listen(listener)
         .register_client::<FakeRpcClientBinding>()
@@ -838,7 +1020,7 @@ async fn register_client_fails_when_core_is_missing() {
 async fn duplicate_extension_type_fails_at_build() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-    let result = LatticeService::builder(service_kind!("World"))
+    let result = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .extension::<ExampleComponent, _>(ExampleComponent {
@@ -859,7 +1041,7 @@ async fn duplicate_extension_type_fails_at_build() {
 #[tokio::test]
 async fn framework_accessors_are_trait_based_even_with_same_concrete_type() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let service = LatticeService::builder(service_kind!("World"))
+    let service = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .cluster_event_bus::<LocalEventBus, _>(LocalEventBus::default())
@@ -888,7 +1070,7 @@ async fn framework_accessors_are_trait_based_even_with_same_concrete_type() {
 async fn service_context_reaches_actor_factory_and_handler() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let observed_instance = Arc::new(tokio::sync::Mutex::new(None));
-    let service = LatticeService::builder(service_kind!("World"))
+    let service = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-ctx"))
         .listen(listener)
         .register_actor(
@@ -951,11 +1133,12 @@ async fn service_build_starts_registered_placement_watch_for_route_cache_refresh
         .compare_and_put_actor(key.clone(), None, first_record)
         .await
         .unwrap();
-    let coordinator = PlacementCoordinator::new(store.clone(), NoopLogicControl);
+    let authority =
+        DevelopmentInProcessPlacementAuthority::new(store.clone(), NoopLogicControl).shared();
     let resolver = ExplicitRouteResolver::new(
         service_kind!("World"),
         store.clone(),
-        coordinator,
+        authority,
         RouteCacheConfig::default(),
     );
     let request = ResolveRequest {
@@ -970,6 +1153,7 @@ async fn service_build_starts_registered_placement_watch_for_route_cache_refresh
     let _service = LatticeService::builder(service_kind!("Player"))
         .instance_id(InstanceId::new("player-1"))
         .listen(listener)
+        .dangerously_use_in_process_placement(store.clone(), TonicLogicControl)
         .placement_watch(resolver.clone())
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
@@ -988,7 +1172,7 @@ async fn service_build_starts_registered_placement_watch_for_route_cache_refresh
         .compare_and_put_actor(
             key,
             Some(version),
-            placement_actor_record(7, "world-b", 2, 2),
+            placement_actor_record(7, "world-b", 2, 1),
         )
         .await
         .unwrap();
@@ -1026,7 +1210,7 @@ async fn prepare_virtual_shard_migration_with_policy(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let service = LatticeService::builder(service_kind!("World"))
+    let service = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-migration"))
         .listen(listener)
         .ready_signal(ready_tx)

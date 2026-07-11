@@ -12,7 +12,7 @@ use lattice_service::runtime::service::LatticeService;
 use rpc_benchmark::actors::{BenchActor, BenchActorFactory};
 use rpc_benchmark::error::BenchmarkResult;
 use rpc_benchmark::generated::bench_rpc;
-use rpc_benchmark::multiprocess::parse_csv;
+use rpc_benchmark::multiprocess::{parse_csv, placement_authority};
 use rpc_benchmark::{BENCH_ACTOR, BENCH_SERVICE};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -26,6 +26,8 @@ struct Args {
     key_prefix: String,
     #[arg(long, default_value = "http://127.0.0.1:2379")]
     etcd_endpoints: String,
+    #[arg(long, default_value = "http://127.0.0.1:50080")]
+    coordinator_endpoint: String,
     #[arg(long, default_value_t = 4)]
     channel_stripes: usize,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -51,6 +53,7 @@ async fn main() -> BenchmarkResult<()> {
         )
         .await?;
     let (ready_tx, ready_rx) = oneshot::channel();
+    let placement_authority = placement_authority(&args.coordinator_endpoint)?;
     let mut builder = LatticeService::builder(BENCH_SERVICE)
         .instance(InstanceConfig::new(InstanceId::new(format!(
             "bench-{}",
@@ -63,6 +66,7 @@ async fn main() -> BenchmarkResult<()> {
                 .expect("channel_stripes is provided by benchmark driver"),
         )
         .placement_store::<EtcdPlacementStore<RealEtcdClient>, _>(placement_store)
+        .placement_authority(placement_authority)
         .register_actor(
             ActorRegistration::builder(BENCH_ACTOR)
                 .factory(BenchActorFactory)

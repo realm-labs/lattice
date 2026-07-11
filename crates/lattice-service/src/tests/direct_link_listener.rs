@@ -12,7 +12,7 @@ async fn direct_link_listener_publishes_endpoint_and_stops_with_service() {
         .listen(listener)
         .ready_signal(ready_tx)
         .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(TestFactory)
@@ -70,7 +70,7 @@ async fn direct_link_listener_routes_message_frames_to_registered_actor() {
         .listen(listener)
         .ready_signal(ready_tx)
         .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(DirectLinkTestFactory {
@@ -206,7 +206,7 @@ async fn direct_link_listener_demultiplexes_multiple_links_on_one_connection() {
         .listen(listener)
         .ready_signal(ready_tx)
         .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(DirectLinkTestFactory {
@@ -350,7 +350,7 @@ async fn service_context_installs_direct_link_runtime_handle_for_connect() {
         .instance_id(InstanceId::new("gateway-1"))
         .listen(listener)
         .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
-        .placement_store::<InMemoryPlacementStore, _>(store.clone())
+        .dangerously_use_in_process_placement(store.clone(), TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("GatewaySession"))
                 .factory(TestFactory)
@@ -412,7 +412,7 @@ async fn service_context_installs_direct_link_runtime_handle_for_connect() {
                 actor_id: ActorId::U64(7),
                 owner: InstanceId::new("world-1"),
                 epoch: Epoch(3),
-                lease_id: LeaseId(2),
+                lease_id: LeaseId(1),
                 state: PlacementState::Running,
             },
         )
@@ -484,6 +484,97 @@ async fn service_context_installs_direct_link_runtime_handle_for_connect() {
         frame.message_id,
         descriptor.message_id_for::<DirectLinkTestPayload>()
     );
+}
+
+#[tokio::test]
+async fn direct_link_resolution_rejects_actor_instance_lease_mismatch() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new(
+        "/lattice/test-direct-link-lease-lineage",
+    ));
+    let service = LatticeService::builder(service_kind!("Gateway"))
+        .instance_id(InstanceId::new("gateway-1"))
+        .listen(listener)
+        .direct_links(DirectLinkConfig::enabled("127.0.0.1:0"))
+        .dangerously_use_in_process_placement(store.clone(), TonicLogicControl)
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("GatewaySession"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("GatewaySession"),
+            "GatewayRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert(
+        "direct_link_endpoint".to_string(),
+        "tcp://127.0.0.1:1".to_string(),
+    );
+    store
+        .upsert_instance(InstanceRecord {
+            service_kind: service_kind!("World"),
+            instance_id: InstanceId::new("world-1"),
+            lease_id: LeaseId(1),
+            advertised_endpoint: "http://127.0.0.1:18080".parse().unwrap(),
+            control_endpoint: "http://127.0.0.1:18081".parse().unwrap(),
+            version: "test".to_string(),
+            state: InstanceState::Ready,
+            capacity: lattice_core::instance::InstanceCapacity::default(),
+            labels,
+        })
+        .await
+        .unwrap();
+    store
+        .compare_and_put_actor(
+            ActorPlacementKey {
+                service_kind: service_kind!("World"),
+                actor_kind: actor_kind!("World"),
+                actor_id: ActorId::U64(7),
+            },
+            None,
+            ActorPlacementRecord {
+                service_kind: service_kind!("World"),
+                actor_kind: actor_kind!("World"),
+                actor_id: ActorId::U64(7),
+                owner: InstanceId::new("world-1"),
+                epoch: Epoch(3),
+                lease_id: LeaseId(2),
+                state: PlacementState::Running,
+            },
+        )
+        .await
+        .unwrap();
+
+    let manager = DirectLinkManager::new(
+        service.context().clone(),
+        Some(direct_actor_ref(
+            service_kind!("Gateway"),
+            actor_kind!("GatewaySession"),
+            ActorId::U64(99),
+            "http://127.0.0.1:18080".parse().unwrap(),
+        )),
+    );
+    let error = manager
+        .connect(
+            ActorRef::routed(
+                service_kind!("World"),
+                actor_kind!("World"),
+                ActorId::U64(7),
+            ),
+            DirectLinkStream::new("movement").message::<DirectLinkTestPayload>(),
+            DirectLinkOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        lattice_core::direct_link::errors::LinkError::ActorUnavailable
+    ));
 }
 
 #[tokio::test]

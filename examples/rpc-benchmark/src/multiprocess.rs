@@ -1,13 +1,12 @@
 use std::path::Path;
 use std::process::Child;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_kind;
-use lattice_placement::control::TonicLogicControl;
-use lattice_placement::coordination::actor::PlacementCoordinator;
+use lattice_placement::authority::TonicPlacementAuthority;
 use lattice_placement::endpoint::EndpointPool;
 use lattice_placement::registry::InstanceState;
 use lattice_placement::routing::cache::RouteCacheConfig;
@@ -23,6 +22,7 @@ use lattice_rpc::metadata::RpcClientContextFactory;
 use lattice_rpc::security::RpcTransportSecurity;
 use tokio::fs;
 use tokio::time::sleep;
+use tonic::transport::Channel;
 
 use crate::BENCH_SERVICE;
 use crate::error::{BenchmarkError, BenchmarkResult};
@@ -37,6 +37,7 @@ pub const BENCH_DRIVER_SERVICE: ServiceKind = service_kind!("BenchDriver");
 pub struct EtcdBenchmarkConfig {
     pub endpoints: Vec<String>,
     pub key_prefix: String,
+    pub coordinator_endpoint: String,
     pub instance_lease_ttl_secs: i64,
     pub activation_lock_ttl_secs: i64,
 }
@@ -46,9 +47,15 @@ impl EtcdBenchmarkConfig {
         Self {
             endpoints,
             key_prefix: key_prefix.into(),
+            coordinator_endpoint: "http://127.0.0.1:50080".to_string(),
             instance_lease_ttl_secs: 30,
             activation_lock_ttl_secs: 10,
         }
+    }
+
+    pub fn with_coordinator_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.coordinator_endpoint = endpoint.into();
+        self
     }
 
     pub async fn connect_store(&self) -> BenchmarkResult<EtcdBenchmarkPlacementStore> {
@@ -72,11 +79,11 @@ pub async fn build_bench_client_from_etcd(
     lattice_placement::routing::placement::PlacementWatchTask,
 )> {
     let store = etcd.connect_store().await?;
-    let coordinator = PlacementCoordinator::new(store.clone(), TonicLogicControl);
+    let authority = placement_authority(&etcd.coordinator_endpoint)?;
     let resolver = PlacementRouteResolver::new(
         BENCH_SERVICE,
         store,
-        coordinator,
+        Arc::new(authority),
         RouteCacheConfig::default(),
     );
     let watch = resolver.start_placement_watch().await?;
@@ -95,6 +102,15 @@ pub async fn build_bench_client_from_etcd(
     )
     .with_retry_policy(config.rpc_retry_policy());
     Ok((Arc::new(bench_rpc::Client::new(core)), watch))
+}
+
+pub fn placement_authority(endpoint: &str) -> BenchmarkResult<TonicPlacementAuthority> {
+    let channel = Channel::from_shared(endpoint.to_string())
+        .map_err(|error| BenchmarkError::InvalidPlacementAuthorityEndpoint {
+            message: error.to_string(),
+        })?
+        .connect_lazy();
+    Ok(TonicPlacementAuthority::new(channel))
 }
 
 pub async fn wait_for_ready_files(
@@ -150,10 +166,6 @@ pub async fn wait_for_ready_instances(
     }
 }
 
-pub fn default_multi_process_prefix() -> String {
-    format!("/lattice/rpc-benchmark/multiprocess/{}", run_id())
-}
-
 pub fn parse_csv(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -176,11 +188,4 @@ fn fail_if_any_child_exited(children: &mut [Child]) -> BenchmarkResult<()> {
         }
     }
     Ok(())
-}
-
-fn run_id() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default()
 }

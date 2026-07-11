@@ -2,12 +2,78 @@ use super::*;
 
 #[tokio::test]
 async fn build_requires_listener() {
-    let result = LatticeService::builder(service_kind!("World"))
+    let result = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-1"))
         .build()
         .await;
 
     assert!(matches!(result, Err(LatticeServiceError::MissingListener)));
+}
+
+#[tokio::test]
+async fn build_requires_explicit_placement_authority() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+
+    let result = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .placement_store::<InMemoryPlacementStore, _>(store)
+        .build()
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LatticeServiceError::MissingServiceComponent { component })
+            if component == "placement_authority"
+    ));
+}
+
+#[tokio::test]
+async fn build_requires_explicit_placement_store() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/test"));
+    let authority = DevelopmentInProcessPlacementAuthority::new(store, TonicLogicControl);
+
+    let result = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .placement_authority(authority)
+        .build()
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LatticeServiceError::MissingServiceComponent { component })
+            if component == "placement_store"
+    ));
+}
+
+#[tokio::test]
+async fn duplicate_placement_authority_fails_before_component_build() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/first"));
+    let second_store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/second"));
+
+    let result = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .placement_authority(DevelopmentInProcessPlacementAuthority::new(
+            first_store,
+            TonicLogicControl,
+        ))
+        .placement_authority(DevelopmentInProcessPlacementAuthority::new(
+            second_store,
+            TonicLogicControl,
+        ))
+        .build()
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LatticeServiceError::DuplicateServiceComponent { component })
+            if component == "placement_authority"
+    ));
 }
 
 #[tokio::test]
@@ -19,7 +85,7 @@ async fn duplicate_actor_registration_fails() {
             .build()
     };
 
-    let result = LatticeService::builder(service_kind!("World"))
+    let result = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .register_actor(registration())
@@ -37,7 +103,7 @@ async fn duplicate_actor_registration_fails() {
 async fn rpc_without_matching_actor_registration_fails() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-    let result = LatticeService::builder(service_kind!("World"))
+    let result = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
@@ -57,7 +123,7 @@ async fn rpc_without_matching_actor_registration_fails() {
 async fn actor_type_mismatch_fails() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-    let result = LatticeService::builder(service_kind!("World"))
+    let result = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .register_actor(
@@ -82,7 +148,7 @@ async fn actor_type_mismatch_fails() {
 async fn duplicate_rpc_service_registration_fails() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-    let result = LatticeService::builder(service_kind!("World"))
+    let result = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .register_actor(
@@ -111,7 +177,7 @@ async fn duplicate_rpc_service_registration_fails() {
 async fn builder_propagates_rpc_security_to_service_bindings() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-    let _service = LatticeService::builder(service_kind!("World"))
+    let _service = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .rpc_security(
@@ -182,7 +248,7 @@ async fn factory_activation_failure_does_not_leave_zombie_actor() {
 #[tokio::test]
 async fn build_loads_config_and_stores_components_in_service_context() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let service = LatticeService::builder(service_kind!("World"))
+    let service = development_service_builder(service_kind!("World"))
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .config(ConfigSource::inline(
@@ -233,7 +299,7 @@ async fn service_lifecycle_writes_starting_ready_draining_stopping() {
         .instance_id(InstanceId::new("world-1"))
         .listen(listener)
         .ready_signal(ready_tx)
-        .placement_store::<InMemoryPlacementStore, _>(store)
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(actor_kind!("World"))
                 .factory(TestFactory)

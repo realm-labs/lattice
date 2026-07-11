@@ -25,6 +25,7 @@ use lattice_direct_link::inbound::{DirectLinkInboundRouter, DirectLinkInboundRou
 use lattice_direct_link::session::{DirectLinkSessionManager, OpenLinkValidationPolicy};
 use lattice_direct_link::stream::DirectLinkActorBinding;
 use lattice_direct_link::transport::TcpDirectLinkTransport;
+use lattice_placement::authority::PlacementAuthority;
 use lattice_placement::coordination::actor::ActivateActorRequest;
 use lattice_placement::registry::InstanceState;
 use lattice_placement::storage::{ActorPlacementKey, PlacementState};
@@ -39,6 +40,7 @@ pub struct DirectLinkServiceRuntime {
     inbound_router: Arc<DirectLinkInboundRouter>,
     endpoint_pool: PooledDirectLinkEndpointPool<TcpDirectLinkTransport>,
     placement_store: Option<Arc<dyn DynPlacementStore>>,
+    placement_authority: Arc<dyn PlacementAuthority>,
 }
 
 impl fmt::Debug for DirectLinkServiceRuntime {
@@ -49,6 +51,7 @@ impl fmt::Debug for DirectLinkServiceRuntime {
             .field("inbound_router", &self.inbound_router)
             .field("endpoint_pool", &self.endpoint_pool)
             .field("has_placement_store", &self.placement_store.is_some())
+            .field("has_placement_authority", &true)
             .finish()
     }
 }
@@ -215,7 +218,8 @@ impl DirectLinkServiceRuntime {
             .map_err(|error| LinkError::Protocol(error.to_string()))?
         {
             Some((_version, placement)) => placement,
-            None => placement_store
+            None => self
+                .placement_authority
                 .activate_actor(ActivateActorRequest {
                     service_kind: actor_ref.service_kind.clone(),
                     actor_kind: actor_ref.actor_kind.clone(),
@@ -224,7 +228,11 @@ impl DirectLinkServiceRuntime {
                 .await
                 .map_err(|error| LinkError::Protocol(error.to_string()))?,
         };
-        if placement.state != PlacementState::Running {
+        if placement.service_kind != key.service_kind
+            || placement.actor_kind != key.actor_kind
+            || placement.actor_id != key.actor_id
+            || placement.state != PlacementState::Running
+        {
             return Err(LinkError::ActorUnavailable);
         }
         let Some(instance) = placement_store
@@ -234,7 +242,11 @@ impl DirectLinkServiceRuntime {
         else {
             return Err(LinkError::ActorUnavailable);
         };
-        if instance.state != InstanceState::Ready {
+        if instance.service_kind != actor_ref.service_kind || instance.state != InstanceState::Ready
+        {
+            return Err(LinkError::ActorUnavailable);
+        }
+        if placement.lease_id != instance.lease_id {
             return Err(LinkError::ActorUnavailable);
         }
         let endpoint = instance
@@ -399,6 +411,7 @@ pub(crate) fn build_direct_link_runtime(
     bindings: Vec<Box<dyn ErasedDirectLinkBinding>>,
     context: &ServiceBuildContext,
     enable_outbound: bool,
+    placement_authority: Arc<dyn PlacementAuthority>,
 ) -> Result<Option<DirectLinkServiceRuntime>, LatticeServiceError> {
     if bindings.is_empty() && !enable_outbound {
         return Ok(None);
@@ -430,5 +443,6 @@ pub(crate) fn build_direct_link_runtime(
             .service_context()
             .extension::<PlacementStoreComponent>()
             .map(|component| component.inner()),
+        placement_authority,
     }))
 }

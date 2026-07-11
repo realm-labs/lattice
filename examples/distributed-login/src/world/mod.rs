@@ -3,6 +3,7 @@ mod actor;
 use std::net::SocketAddr;
 
 use lattice_core::instance::InstanceId;
+use lattice_placement::control::TonicLogicControl;
 use lattice_placement::storage::memory::InMemoryPlacementStore;
 use lattice_service::actors::registration::ActorRegistration;
 use lattice_service::runtime::service::LatticeService;
@@ -27,7 +28,7 @@ pub async fn run_world_service(
     }
 
     builder
-        .placement_store::<InMemoryPlacementStore, _>(placement_store)
+        .dangerously_use_in_process_placement(placement_store, TonicLogicControl)
         .register_client::<player_rpc::Binding>()
         .register_actor(
             ActorRegistration::builder(WORLD_ACTOR)

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ServiceContext;
+use lattice_placement::authority::PlacementAuthority;
 use lattice_placement::registry::InstanceState;
 use lattice_placement::routing::placement::PlacementWatchTask;
 use tokio::net::TcpListener;
@@ -27,7 +28,7 @@ use crate::runtime::admin::{AdminHttpServer, start_admin_http_server};
 use crate::runtime::direct_link_listener::{ManagedDirectLinkListener, start_direct_link_listener};
 use crate::runtime::drain::{
     cancel_event_subscriptions, drain_direct_links, drain_placement, drain_runtime_actors,
-    publish_instance_record, shutdown_service_scheduler,
+    publish_instance_record, shutdown_service_scheduler, transition_instance_state,
 };
 use crate::runtime::shutdown::default_shutdown_signal;
 
@@ -40,6 +41,7 @@ pub struct LatticeService {
     actors: HashMap<lattice_core::kind::ActorKind, Box<dyn Any + Send>>,
     logic_actors: Vec<Arc<dyn ErasedLogicActor>>,
     placement_store: Box<dyn ErasedPlacementStore>,
+    placement_authority: Arc<dyn PlacementAuthority>,
     placement_watch_tasks: Vec<PlacementWatchTask>,
     admin_http: Option<AdminHttpServer>,
     instance_lease_keepalive_interval: Duration,
@@ -58,6 +60,7 @@ impl std::fmt::Debug for LatticeService {
             .field("actor_count", &self.actors.len())
             .field("logic_actor_count", &self.logic_actors.len())
             .field("placement_watch_tasks", &self.placement_watch_tasks.len())
+            .field("has_placement_authority", &true)
             .field("admin_http", &self.admin_http)
             .field(
                 "instance_lease_keepalive_interval",
@@ -84,6 +87,7 @@ impl LatticeService {
             actors: parts.actors,
             logic_actors: parts.logic_actors,
             placement_store: parts.placement_store,
+            placement_authority: parts.placement_authority,
             placement_watch_tasks: parts.placement_watch_tasks,
             admin_http: parts.admin_http,
             instance_lease_keepalive_interval: parts.instance_lease_keepalive_interval,
@@ -152,6 +156,7 @@ impl LatticeService {
             actors: _,
             logic_actors,
             placement_store,
+            placement_authority,
             placement_watch_tasks,
             admin_http,
             instance_lease_keepalive_interval,
@@ -178,14 +183,12 @@ impl LatticeService {
             lease_id,
         )
         .await?;
-        publish_instance_record(
+        transition_instance_state(
             placement_store.as_ref(),
             &service_kind,
             &instance,
-            local_addr,
-            direct_link_endpoint.as_ref(),
-            InstanceState::Ready,
             lease_id,
+            InstanceState::Ready,
         )
         .await?;
         if let Some(ready) = ready {
@@ -209,6 +212,7 @@ impl LatticeService {
             admin_http,
             &service_context,
             placement_store.as_ref(),
+            placement_authority.clone(),
             &service_kind,
             &instance.instance_id,
         )
@@ -224,16 +228,6 @@ impl LatticeService {
         };
         let lifecycle_shutdown = async {
             shutdown.await;
-            let result = publish_instance_record(
-                placement_store.as_ref(),
-                &service_kind,
-                &instance,
-                local_addr,
-                direct_link_endpoint.as_ref(),
-                InstanceState::Draining,
-                lease_id,
-            )
-            .await;
             let _ = server_shutdown_tx.send(());
             if let Some(direct_link_shutdown_tx) = direct_link_shutdown_tx {
                 let _ = direct_link_shutdown_tx.send(());
@@ -246,8 +240,13 @@ impl LatticeService {
                 direct_links.drained = drained_direct_links,
                 "drained direct links"
             );
-            let placement_drain =
-                drain_placement(placement_store.as_ref(), &service_kind, &instance).await;
+            let placement_drain = drain_placement(
+                placement_authority.as_ref(),
+                &service_kind,
+                &instance,
+                lease_id,
+            )
+            .await;
             let cancelled_subscriptions = cancel_event_subscriptions(&service_context).await;
             debug!(
                 service.kind = service_kind.as_str(),
@@ -266,7 +265,6 @@ impl LatticeService {
             if let Some(admin_shutdown_tx) = admin_shutdown_tx {
                 let _ = admin_shutdown_tx.send(());
             }
-            result?;
             placement_drain
         };
         tokio::pin!(keepalive);
@@ -334,14 +332,12 @@ impl LatticeService {
                         }
                     }
                 }
-                publish_instance_record(
+                transition_instance_state(
                     placement_store.as_ref(),
                     &service_kind,
                     &instance,
-                    local_addr,
-                    direct_link_endpoint.as_ref(),
-                    InstanceState::Stopping,
                     lease_id,
+                    InstanceState::Stopping,
                 )
                 .await?;
                 info!(
@@ -378,6 +374,7 @@ pub(crate) struct LatticeServiceParts {
     pub actors: HashMap<lattice_core::kind::ActorKind, Box<dyn Any + Send>>,
     pub logic_actors: Vec<Arc<dyn ErasedLogicActor>>,
     pub placement_store: Box<dyn ErasedPlacementStore>,
+    pub placement_authority: Arc<dyn PlacementAuthority>,
     pub placement_watch_tasks: Vec<PlacementWatchTask>,
     pub admin_http: Option<AdminHttpServer>,
     pub instance_lease_keepalive_interval: Duration,

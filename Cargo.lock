@@ -1347,6 +1347,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "trybuild",
 ]
 
 [[package]]

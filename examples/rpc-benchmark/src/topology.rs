@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lattice_core::instance::InstanceId;
 use lattice_core::service_context::ServiceContext;
+use lattice_placement::control::TonicLogicControl;
 use lattice_placement::routing::rpc::RpcRetryPolicy;
 use lattice_placement::storage::PlacementPrefix;
 use lattice_placement::storage::memory::InMemoryPlacementStore;
@@ -183,7 +184,7 @@ async fn start_bench_node(
         .ready_signal(ready_tx)
         .rpc_client_transport(config.rpc_client_transport())
         .rpc_retry_policy(config.rpc_retry_policy())
-        .placement_store::<InMemoryPlacementStore, _>(placement_store)
+        .dangerously_use_in_process_placement(placement_store, TonicLogicControl)
         .register_client::<bench_rpc::Binding>()
         .register_actor(
             ActorRegistration::builder(BENCH_ACTOR)
@@ -213,7 +214,7 @@ async fn start_chain_node(
         .ready_signal(ready_tx)
         .rpc_client_transport(config.rpc_client_transport())
         .rpc_retry_policy(config.rpc_retry_policy())
-        .placement_store::<InMemoryPlacementStore, _>(placement_store)
+        .dangerously_use_in_process_placement(placement_store, TonicLogicControl)
         .register_client::<chain_rpc::Binding>()
         .register_client::<worker_rpc::Binding>()
         .register_actor(
@@ -244,7 +245,7 @@ async fn start_worker_node(
         .ready_signal(ready_tx)
         .rpc_client_transport(config.rpc_client_transport())
         .rpc_retry_policy(config.rpc_retry_policy())
-        .placement_store::<InMemoryPlacementStore, _>(placement_store)
+        .dangerously_use_in_process_placement(placement_store, TonicLogicControl)
         .register_actor(
             ActorRegistration::builder(WORKER_ACTOR)
                 .factory(WorkerActorFactory)

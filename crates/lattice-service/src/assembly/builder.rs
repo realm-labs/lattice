@@ -17,6 +17,7 @@ use lattice_direct_link::delivery::DirectLinkDispatch;
 use lattice_direct_link::stream::DirectLinkActorBinding;
 use lattice_eventbus::local::EventBus;
 use lattice_ops::ops_config::AdminHttpConfig;
+use lattice_placement::authority::{DevelopmentInProcessPlacementAuthority, PlacementAuthority};
 use lattice_placement::routing::placement::PlacementWatchStarter;
 use lattice_placement::routing::rpc::RpcRetryPolicy;
 use lattice_placement::storage::PlacementStore;
@@ -31,8 +32,9 @@ use crate::assembly::placement_watch::{ErasedPlacementWatchStarter, PlacementWat
 use crate::clients::{ErasedRpcClientBinding, RpcClientRegistration};
 use crate::clients::{RpcClientBinding, RpcServiceBinding};
 use crate::components::{
-    ErasedPlacementStoreComponent, ErasedServiceComponent, IntoServiceComponent,
-    PlacementStoreRegistration, ServiceComponentRegistration,
+    ErasedPlacementAuthorityComponent, ErasedPlacementStoreComponent, ErasedServiceComponent,
+    IntoServiceComponent, PlacementAuthorityRegistration, PlacementStoreRegistration,
+    ServiceComponentRegistration,
 };
 use crate::config::{DirectLinkConfig, InstanceConfig};
 use crate::direct_links::{DirectLinkBindingRegistration, ErasedDirectLinkBinding};
@@ -49,6 +51,7 @@ pub struct LatticeServiceBuilder {
     pub(crate) direct_link_bindings: Vec<Box<dyn ErasedDirectLinkBinding>>,
     pub(crate) config: Option<ConfigSource>,
     pub(crate) placement_store: Option<Box<dyn ErasedPlacementStoreComponent>>,
+    pub(crate) placement_authority: Option<Box<dyn ErasedPlacementAuthorityComponent>>,
     pub(crate) cluster_event_bus: Option<Box<dyn ErasedServiceComponent>>,
     pub(crate) local_event_bus: Option<Box<dyn ErasedServiceComponent>>,
     pub(crate) config_store: Option<Box<dyn ErasedServiceComponent>>,
@@ -88,6 +91,10 @@ impl fmt::Debug for LatticeServiceBuilder {
             )
             .field("has_config", &self.config.is_some())
             .field("has_placement_store", &self.placement_store.is_some())
+            .field(
+                "has_placement_authority",
+                &self.placement_authority.is_some(),
+            )
             .field("has_cluster_event_bus", &self.cluster_event_bus.is_some())
             .field("has_local_event_bus", &self.local_event_bus.is_some())
             .field("has_config_store", &self.config_store.is_some())
@@ -117,6 +124,7 @@ impl LatticeServiceBuilder {
             direct_link_bindings: Vec::new(),
             config: None,
             placement_store: None,
+            placement_authority: None,
             cluster_event_bus: None,
             local_event_bus: None,
             config_store: None,
@@ -184,6 +192,35 @@ impl LatticeServiceBuilder {
             self.placement_store = Some(Box::new(PlacementStoreRegistration::<T>::new(store)));
         }
         self
+    }
+
+    pub fn placement_authority<A>(mut self, authority: A) -> Self
+    where
+        A: PlacementAuthority,
+    {
+        if self.placement_authority.is_some() {
+            self.duplicate_framework_component
+                .get_or_insert("placement_authority");
+        } else {
+            self.placement_authority =
+                Some(Box::new(PlacementAuthorityRegistration::new(authority)));
+        }
+        self
+    }
+
+    /// Configures an in-process writable placement authority for development.
+    ///
+    /// Production services must use [`Self::placement_authority`] with a remote
+    /// semantic authority so they never receive placement-writer credentials.
+    pub fn dangerously_use_in_process_placement<S, L>(self, store: S, logic: L) -> Self
+    where
+        S: PlacementStore,
+        L: Clone,
+        DevelopmentInProcessPlacementAuthority<S, L>: PlacementAuthority,
+    {
+        let authority = DevelopmentInProcessPlacementAuthority::new(store.clone(), logic);
+        self.placement_store::<S, _>(store)
+            .placement_authority(authority)
     }
 
     pub fn cluster_event_bus<T, C>(mut self, event_bus: C) -> Self

@@ -54,6 +54,12 @@ pub enum PlacementError {
     ActivationLockLost,
     #[error("instance lease {lease_id:?} was not found")]
     InstanceLeaseNotFound { lease_id: LeaseId },
+    #[error("instance {instance_id} lease changed from expected {expected:?} to {actual:?}")]
+    InstanceLeaseMismatch {
+        instance_id: InstanceId,
+        expected: LeaseId,
+        actual: LeaseId,
+    },
     #[error("coordinator leadership has been lost")]
     CoordinatorLeadershipLost,
     #[error("singleton activation lock is already held")]
@@ -86,4 +92,12 @@ pub enum PlacementError {
     PlacementCodec { message: String },
     #[error("logic control error: {message}")]
     LogicControl { message: String },
+    #[error("placement authority RPC timeout must be in the range 1ns..=60s")]
+    InvalidPlacementAuthorityTimeout,
+    #[error("placement authority RPC timed out")]
+    PlacementAuthorityTimeout,
+    #[error("placement authority RPC failed with status {code:?}")]
+    PlacementAuthorityRpc { code: tonic::Code },
+    #[error("placement authority reply field {field} is invalid")]
+    InvalidPlacementAuthorityReply { field: &'static str },
 }

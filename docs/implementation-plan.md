@@ -1077,6 +1077,7 @@ async fn main() -> anyhow::Result<()> {
         .instance(InstanceConfig::from_env()?)
         .config(ConfigSource::file("config/world-service.toml"))
         .placement_store(EtcdPlacementStore::from_config())
+        .placement_authority(TonicPlacementAuthority::new(authority_channel))
         .cluster_event_bus(NatsEventBus::from_config())
         .telemetry(TelemetryConfig::from_config())
         .admin_http(AdminHttpConfig::from_config())

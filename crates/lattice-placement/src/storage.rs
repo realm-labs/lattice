@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::error::PlacementError;
-use crate::registry::InstanceRecord;
+use crate::registry::{InstanceRecord, InstanceState};
 use crate::sharding::VirtualShardId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -865,6 +865,13 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
         leadership: &CoordinatorLeadership,
     ) -> Result<(), PlacementError>;
     async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError>;
+    async fn compare_and_set_instance_state(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        expected_lease_id: LeaseId,
+        state: InstanceState,
+    ) -> Result<InstanceRecord, PlacementError>;
     async fn get_instance(
         &self,
         instance_id: &InstanceId,

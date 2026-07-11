@@ -1,0 +1,5 @@
+error[E0599]: no method named `activate_actor` found for struct `Arc<dyn DynPlacementStore>` in the current scope
+ --> tests/ui/service_context_placement_activate.rs:9:23
+  |
+9 |     let _ = placement.activate_actor(request).await;
+  |                       ^^^^^^^^^^^^^^ method not found in `Arc<dyn DynPlacementStore>`

@@ -15,7 +15,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::broadcast;
 
 use crate::error::PlacementError;
-use crate::registry::InstanceRecord;
+use crate::registry::{InstanceRecord, InstanceState};
 #[cfg(test)]
 use crate::storage::etcd::client::InMemoryEtcdClient;
 use crate::storage::etcd::client::{
@@ -657,6 +657,47 @@ where
                 EtcdValue::Instance(Box::new(record)),
             )
             .await
+    }
+
+    async fn compare_and_set_instance_state(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        expected_lease_id: LeaseId,
+        state: InstanceState,
+    ) -> Result<InstanceRecord, PlacementError> {
+        validate_service_kind(service_kind)?;
+        validate_instance_id(instance_id)?;
+        let key = instance_key(&self.prefix, service_kind, instance_id);
+        let Some((version, value)) = self.client.get(&key).await? else {
+            return Err(PlacementError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            });
+        };
+        validate_etcd_value_key(&self.prefix, &key, &value)
+            .map_err(placement_key_validation_error)?;
+        let EtcdValue::Instance(record) = value else {
+            return Err(PlacementError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            });
+        };
+        let mut record = *record;
+        if record.lease_id != expected_lease_id {
+            return Err(PlacementError::InstanceLeaseMismatch {
+                instance_id: instance_id.clone(),
+                expected: expected_lease_id,
+                actual: record.lease_id,
+            });
+        }
+        record.state = state;
+        self.client
+            .compare_and_put(
+                key,
+                Some(version),
+                EtcdValue::Instance(Box::new(record.clone())),
+            )
+            .await?;
+        Ok(record)
     }
 
     async fn get_instance(

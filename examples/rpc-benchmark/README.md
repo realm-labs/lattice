@@ -73,21 +73,38 @@ baseline. It starts multiple `rpc-benchmark-node` child processes on
 `127.0.0.1:0`, uses etcd as the shared placement store, then runs the same
 single-hop routed RPC workload from the driver process.
 
-Start etcd locally, then build and run:
+Start a disposable local etcd and a coordinator that uses the same explicit
+placement namespace as the driver. The dangerous unauthenticated setting is
+accepted only for loopback development:
 
 ```bash
 cargo build -p rpc-benchmark --bins --release
+cargo build -p lattice-placement --bin lattice-coordinator --release
+
+export LATTICE_BENCH_PREFIX=/lattice/rpc-benchmark/manual
+
+LATTICE_CLUSTER_PREFIX="$LATTICE_BENCH_PREFIX" \
+LATTICE_ETCD_ENDPOINTS=http://127.0.0.1:2379 \
+LATTICE_COORDINATOR_ADDR=127.0.0.1:50080 \
+LATTICE_DANGEROUSLY_ALLOW_UNAUTHENTICATED_ETCD=true \
+target/release/lattice-coordinator &
+COORDINATOR_PID=$!
 
 target/release/rpc-benchmark-driver \
   --etcd-endpoints http://127.0.0.1:2379 \
+  --coordinator-endpoint http://127.0.0.1:50080 \
+  --key-prefix "$LATTICE_BENCH_PREFIX" \
   --nodes 2 \
   --actors 256 \
   --concurrency 64 \
   --requests 10000 \
   --channel-stripes 4
+
+kill "$COORDINATOR_PID"
 ```
 
-The driver uses a unique placement key prefix by default. Override it with
-`--key-prefix` when you want stable keys for inspection. The current
-multi-process driver covers the single-hop `BenchRpc.Ping` path; the in-process
-Criterion target still covers both single-hop and chained RPC scenarios.
+`--key-prefix` is required because the driver, nodes, and coordinator must use
+exactly the same placement namespace. The driver does not start or configure a
+coordinator implicitly. The current multi-process driver covers the single-hop
+`BenchRpc.Ping` path; the in-process Criterion target still covers both
+single-hop and chained RPC scenarios.

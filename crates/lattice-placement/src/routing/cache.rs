@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use lattice_core::instance::InstanceId;
 use lattice_rpc::types::RouteTarget;
 
 use crate::routing::resolver::RouteCacheKey;
@@ -65,6 +66,11 @@ impl LocalRouteCache {
 
     pub fn invalidate(&self, key: &RouteCacheKey) {
         self.entries.remove(key);
+    }
+
+    pub fn invalidate_instance(&self, instance_id: &InstanceId) {
+        self.entries
+            .retain(|_, entry| &entry.target.instance_id != instance_id);
     }
 }
 

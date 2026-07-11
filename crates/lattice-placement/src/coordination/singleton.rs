@@ -7,6 +7,7 @@ use lattice_core::instance::InstanceId;
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_rpc::types::RouteTarget;
 
+use crate::authority::PlacementAuthority;
 use crate::error::PlacementError;
 use crate::registry::{InstanceRecord, InstanceState};
 use crate::routing::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
@@ -214,26 +215,39 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SingletonRouteResolver<S, C> {
-    coordinator: SingletonCoordinator<S, C>,
+#[derive(Clone)]
+pub struct SingletonRouteResolver<S> {
+    store: S,
+    authority: Arc<dyn PlacementAuthority>,
     cache: Arc<LocalRouteCache>,
 }
 
-impl<S, C> SingletonRouteResolver<S, C> {
-    pub fn new(coordinator: SingletonCoordinator<S, C>, cache_config: RouteCacheConfig) -> Self {
+impl<S> std::fmt::Debug for SingletonRouteResolver<S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SingletonRouteResolver")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> SingletonRouteResolver<S> {
+    pub fn new(
+        store: S,
+        authority: Arc<dyn PlacementAuthority>,
+        cache_config: RouteCacheConfig,
+    ) -> Self {
         Self {
-            coordinator,
+            store,
+            authority,
             cache: Arc::new(LocalRouteCache::new(cache_config)),
         }
     }
 }
 
 #[async_trait]
-impl<S, C> RouteResolver for SingletonRouteResolver<S, C>
+impl<S> RouteResolver for SingletonRouteResolver<S>
 where
     S: PlacementStore,
-    C: SingletonControl,
 {
     async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
         let cache_key = request.cache_key();
@@ -248,22 +262,44 @@ where
             RouteKey::Str(scope) => scope,
             other => format!("{other:?}"),
         };
-        let record = self
-            .coordinator
-            .activate_singleton(ActivateSingletonRequest {
-                service_kind: request.service_kind.clone(),
-                singleton_kind: request.actor_kind,
-                scope,
-            })
-            .await?;
+        let singleton_key = SingletonKey {
+            service_kind: request.service_kind.clone(),
+            singleton_kind: request.actor_kind.clone(),
+            scope: scope.clone(),
+        };
+        let record = match self.store.get_singleton(&singleton_key).await? {
+            Some((_version, record)) => record,
+            None => {
+                self.authority
+                    .activate_singleton(ActivateSingletonRequest {
+                        service_kind: singleton_key.service_kind.clone(),
+                        singleton_kind: singleton_key.singleton_kind.clone(),
+                        scope: singleton_key.scope.clone(),
+                    })
+                    .await?
+            }
+        };
+        if record.service_kind != singleton_key.service_kind
+            || record.singleton_kind != singleton_key.singleton_kind
+            || record.scope != singleton_key.scope
+            || record.state != PlacementState::Running
+        {
+            return Err(PlacementError::NoRoute);
+        }
         let instance = self
-            .coordinator
             .store
             .get_instance(&record.owner)
             .await?
             .ok_or_else(|| PlacementError::InstanceNotFound {
                 instance_id: record.owner.clone(),
             })?;
+        // Singleton records intentionally use a dedicated owner lease rather
+        // than the instance lease. Record presence proves that lease has not
+        // expired; incarnation-bound renewal is enforced by the later
+        // singleton lifecycle cutover.
+        if instance.service_kind != request.service_kind || instance.state != InstanceState::Ready {
+            return Err(PlacementError::NoRoute);
+        }
         let target = RouteTarget {
             service_kind: request.service_kind,
             instance_id: instance.instance_id,
@@ -289,6 +325,8 @@ mod tests {
     use lattice_core::{actor_kind, service_kind};
 
     use super::*;
+    use crate::authority::DevelopmentInProcessPlacementAuthority;
+    use crate::coordination::logic::NoopLogicControl;
     use crate::registry::InstanceState;
     use crate::storage::memory::InMemoryPlacementStore;
     use crate::storage::{LeaseId, PlacementPrefix};
@@ -450,9 +488,9 @@ mod tests {
     #[tokio::test]
     async fn singleton_route_resolver_returns_owner_epoch_for_generated_client() {
         let store = ready_store().await;
-        let coordinator =
-            SingletonCoordinator::new(service_kind!("Control"), store, NoopSingletonControl);
-        let resolver = SingletonRouteResolver::new(coordinator, RouteCacheConfig::default());
+        let authority =
+            DevelopmentInProcessPlacementAuthority::new(store.clone(), NoopLogicControl).shared();
+        let resolver = SingletonRouteResolver::new(store, authority, RouteCacheConfig::default());
 
         let target = resolver
             .resolve(ResolveRequest {
@@ -465,6 +503,84 @@ mod tests {
 
         assert_eq!(target.instance_id, InstanceId::new("control-a"));
         assert_eq!(target.owner_epoch, Some(Epoch(1)));
+    }
+
+    #[tokio::test]
+    async fn singleton_route_resolver_rejects_nonrunning_and_nonready_but_accepts_dedicated_lease()
+    {
+        let store = ready_store().await;
+        let instance = store
+            .get_instance(&InstanceId::new("control-a"))
+            .await
+            .unwrap()
+            .unwrap();
+        let key = SingletonKey {
+            service_kind: service_kind!("Control"),
+            singleton_kind: actor_kind!("SeasonManager"),
+            scope: "global".to_string(),
+        };
+        let version = store
+            .compare_and_put_singleton(
+                key.clone(),
+                None,
+                SingletonPlacementRecord {
+                    service_kind: key.service_kind.clone(),
+                    singleton_kind: key.singleton_kind.clone(),
+                    scope: key.scope.clone(),
+                    owner: instance.instance_id.clone(),
+                    epoch: Epoch(1),
+                    lease_id: instance.lease_id,
+                    state: PlacementState::Draining,
+                },
+            )
+            .await
+            .unwrap();
+        let authority =
+            DevelopmentInProcessPlacementAuthority::new(store.clone(), NoopLogicControl).shared();
+        let resolver = SingletonRouteResolver::new(
+            store.clone(),
+            authority.clone(),
+            RouteCacheConfig::default(),
+        );
+        let request = ResolveRequest {
+            service_kind: service_kind!("Control"),
+            actor_kind: actor_kind!("SeasonManager"),
+            route_key: RouteKey::Str("global".to_string()),
+        };
+        assert_eq!(
+            resolver.resolve(request.clone()).await.unwrap_err(),
+            PlacementError::NoRoute
+        );
+
+        store
+            .compare_and_put_singleton(
+                key.clone(),
+                Some(version),
+                SingletonPlacementRecord {
+                    service_kind: key.service_kind.clone(),
+                    singleton_kind: key.singleton_kind.clone(),
+                    scope: key.scope.clone(),
+                    owner: instance.instance_id.clone(),
+                    epoch: Epoch(2),
+                    lease_id: LeaseId(instance.lease_id.0 + 100),
+                    state: PlacementState::Running,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolver.resolve(request.clone()).await.unwrap().instance_id,
+            instance.instance_id
+        );
+
+        let mut not_ready = instance.clone();
+        not_ready.state = InstanceState::Draining;
+        store.upsert_instance(not_ready).await.unwrap();
+        let resolver = SingletonRouteResolver::new(store, authority, RouteCacheConfig::default());
+        assert_eq!(
+            resolver.resolve(request).await.unwrap_err(),
+            PlacementError::NoRoute
+        );
     }
 
     async fn ready_store() -> InMemoryPlacementStore {
