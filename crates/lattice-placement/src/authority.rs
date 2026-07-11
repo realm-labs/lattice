@@ -37,6 +37,37 @@ pub const MAX_SINGLETON_RENEWAL_CLAIMS: usize = 4_096;
 pub const MAX_PLACEMENT_SNAPSHOT_ENTRIES: usize = 4_096;
 
 #[async_trait]
+pub trait OwnershipViewReader: Send + Sync + 'static {
+    async fn open_ownership_view(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        max_entries: std::num::NonZeroUsize,
+    ) -> Result<OwnershipView, crate::storage::OwnershipViewError>;
+}
+
+#[async_trait]
+impl<T> OwnershipViewReader for T
+where
+    T: crate::storage::PlacementReadStore,
+{
+    async fn open_ownership_view(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        max_entries: std::num::NonZeroUsize,
+    ) -> Result<OwnershipView, crate::storage::OwnershipViewError> {
+        crate::storage::PlacementReadStore::open_ownership_view(
+            self,
+            service_kind,
+            instance_id,
+            max_entries,
+        )
+        .await
+    }
+}
+
+#[async_trait]
 pub trait SingletonClaimReader: Send + Sync + 'static {
     async fn singleton_owner_lease_claims(
         &self,
@@ -602,6 +633,19 @@ impl TonicPlacementReader {
             .map_err(|_| PlacementError::PlacementAuthorityTimeout)?
             .map(|response| response.into_inner())
             .map_err(authority_status)
+    }
+}
+
+#[async_trait]
+impl OwnershipViewReader for TonicPlacementReader {
+    async fn open_ownership_view(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        max_entries: std::num::NonZeroUsize,
+    ) -> Result<OwnershipView, crate::storage::OwnershipViewError> {
+        TonicPlacementReader::open_ownership_view(self, service_kind, instance_id, max_entries)
+            .await
     }
 }
 

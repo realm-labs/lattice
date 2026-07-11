@@ -11,6 +11,7 @@ use lattice_core::kind::ActorKind;
 use lattice_core::service_context::ServiceContext;
 use lattice_eventbus::local::LocalEventBus;
 use lattice_ops::scheduler::ServiceScheduler;
+use lattice_placement::ownership::{LocalOwnershipSnapshot, LocalOwnershipSnapshotConfig};
 use tracing::{debug, info};
 
 use crate::assembly::admin::build_admin_http;
@@ -126,6 +127,33 @@ impl LatticeServiceBuilder {
         } else {
             None
         };
+        let (ownership_view_reader, local_ownership_snapshot) =
+            if let Some(component) = self.ownership_view_reader {
+                debug!(
+                    service.kind = self.service_kind.as_str(),
+                    component.target = "ownership_view_reader",
+                    component.type = component.type_name(),
+                    "building service component"
+                );
+                let reader = component.build(&component_context).await?;
+                let snapshot = LocalOwnershipSnapshot::with_config(
+                    self.service_kind.clone(),
+                    instance.instance_id.clone(),
+                    instance.incarnation.clone(),
+                    LocalOwnershipSnapshotConfig::try_new(
+                        lattice_placement::authority::MAX_PLACEMENT_SNAPSHOT_ENTRIES,
+                    )
+                    .expect("ownership capacity is nonzero"),
+                );
+                service_context
+                    .insert_extension(snapshot.gate())
+                    .map_err(|component| LatticeServiceError::DuplicateServiceComponent {
+                        component: component.to_string(),
+                    })?;
+                (Some(reader), Some(snapshot))
+            } else {
+                (None, None)
+            };
         match (self.cluster_event_bus, self.local_event_bus) {
             (None, None) => {
                 build_service_component(
@@ -389,6 +417,8 @@ impl LatticeServiceBuilder {
             placement_authority,
             singleton_claim_reader,
             admin_placement_reader,
+            ownership_view_reader,
+            local_ownership_snapshot,
             placement_watch_tasks,
             admin_http,
             instance_lease_keepalive_interval: self.instance_lease_keepalive_interval,

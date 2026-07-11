@@ -18,8 +18,8 @@ use lattice_direct_link::stream::DirectLinkActorBinding;
 use lattice_eventbus::local::EventBus;
 use lattice_ops::ops_config::AdminHttpConfig;
 use lattice_placement::authority::{
-    AdminPlacementReader, DevelopmentInProcessPlacementAuthority, PlacementAuthority,
-    SingletonClaimReader,
+    AdminPlacementReader, DevelopmentInProcessPlacementAuthority, OwnershipViewReader,
+    PlacementAuthority, SingletonClaimReader,
 };
 use lattice_placement::routing::placement::{PlacementRoutingStore, PlacementWatchStarter};
 use lattice_placement::routing::rpc::RpcRetryPolicy;
@@ -36,10 +36,11 @@ use crate::clients::{ErasedRpcClientBinding, RpcClientRegistration};
 use crate::clients::{RpcClientBinding, RpcServiceBinding};
 use crate::components::{
     AdminPlacementReaderRegistration, ErasedAdminPlacementReaderComponent,
-    ErasedPlacementAuthorityComponent, ErasedPlacementRoutingStoreComponent,
-    ErasedPlacementStoreComponent, ErasedServiceComponent, ErasedSingletonClaimReaderComponent,
-    IntoServiceComponent, PlacementAuthorityRegistration, PlacementRoutingStoreRegistration,
-    PlacementStoreRegistration, ServiceComponentRegistration, SingletonClaimReaderRegistration,
+    ErasedOwnershipViewReaderComponent, ErasedPlacementAuthorityComponent,
+    ErasedPlacementRoutingStoreComponent, ErasedPlacementStoreComponent, ErasedServiceComponent,
+    ErasedSingletonClaimReaderComponent, IntoServiceComponent, OwnershipViewReaderRegistration,
+    PlacementAuthorityRegistration, PlacementRoutingStoreRegistration, PlacementStoreRegistration,
+    ServiceComponentRegistration, SingletonClaimReaderRegistration,
 };
 use crate::config::{DirectLinkConfig, InstanceConfig};
 use crate::direct_links::{DirectLinkBindingRegistration, ErasedDirectLinkBinding};
@@ -59,6 +60,7 @@ pub struct LatticeServiceBuilder {
     pub(crate) placement_routing_store: Option<Box<dyn ErasedPlacementRoutingStoreComponent>>,
     pub(crate) singleton_claim_reader: Option<Box<dyn ErasedSingletonClaimReaderComponent>>,
     pub(crate) admin_placement_reader: Option<Box<dyn ErasedAdminPlacementReaderComponent>>,
+    pub(crate) ownership_view_reader: Option<Box<dyn ErasedOwnershipViewReaderComponent>>,
     pub(crate) placement_authority: Option<Box<dyn ErasedPlacementAuthorityComponent>>,
     pub(crate) cluster_event_bus: Option<Box<dyn ErasedServiceComponent>>,
     pub(crate) local_event_bus: Option<Box<dyn ErasedServiceComponent>>,
@@ -112,6 +114,10 @@ impl fmt::Debug for LatticeServiceBuilder {
                 &self.admin_placement_reader.is_some(),
             )
             .field(
+                "has_ownership_view_reader",
+                &self.ownership_view_reader.is_some(),
+            )
+            .field(
                 "has_placement_authority",
                 &self.placement_authority.is_some(),
             )
@@ -147,6 +153,7 @@ impl LatticeServiceBuilder {
             placement_routing_store: None,
             singleton_claim_reader: None,
             admin_placement_reader: None,
+            ownership_view_reader: None,
             placement_authority: None,
             cluster_event_bus: None,
             local_event_bus: None,
@@ -258,6 +265,21 @@ impl LatticeServiceBuilder {
         } else {
             self.admin_placement_reader =
                 Some(Box::new(AdminPlacementReaderRegistration::<T>::new(reader)));
+        }
+        self
+    }
+
+    pub fn ownership_view_reader<T, C>(mut self, reader: C) -> Self
+    where
+        T: OwnershipViewReader,
+        C: IntoServiceComponent<T>,
+    {
+        if self.ownership_view_reader.is_some() {
+            self.duplicate_framework_component
+                .get_or_insert("ownership_view_reader");
+        } else {
+            self.ownership_view_reader =
+                Some(Box::new(OwnershipViewReaderRegistration::<T>::new(reader)));
         }
         self
     }

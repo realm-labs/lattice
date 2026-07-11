@@ -11,9 +11,9 @@ use crate::registry::{InstanceRecord, InstanceState};
 use crate::sharding::VirtualShardMapper;
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, LeaseId, OwnershipEpochFloorProof,
-    OwnershipProofError, OwnershipRecordBinding, OwnershipWatchBatch, OwnershipWatchEvent,
-    PlacementRevision, PlacementState, SingletonKey, SingletonPlacementRecord,
-    VirtualShardPlacementKey, VirtualShardPlacementRecord,
+    OwnershipProofError, OwnershipRecordBinding, OwnershipViewRecord, OwnershipViewSnapshot,
+    OwnershipWatchBatch, OwnershipWatchEvent, PlacementRevision, PlacementState, SingletonKey,
+    SingletonPlacementRecord, VirtualShardPlacementKey, VirtualShardPlacementRecord,
 };
 
 const DEFAULT_MAX_OWNERSHIP_ENTRIES: usize = 65_536;
@@ -74,6 +74,8 @@ pub enum OwnershipSnapshotError {
     },
     #[error("local ownership snapshot has no active instance lease")]
     MissingInstanceLease,
+    #[error("coherent ownership view omitted the local instance record")]
+    MissingLocalInstanceRecord,
     #[error("local ownership snapshot lease changed from {expected:?} to {actual:?}")]
     StaleLease { expected: LeaseId, actual: LeaseId },
     #[error(
@@ -489,6 +491,56 @@ impl LocalOwnershipSnapshot {
         LocalOwnershipGate {
             inner: self.inner.clone(),
         }
+    }
+
+    /// Installs one coherent backend view before its no-gap watch is consumed.
+    ///
+    /// The caller must only set `lease_valid` from local keepalive authority;
+    /// presence in the registry snapshot alone is not liveness evidence.
+    pub fn replace_from_view_snapshot(
+        &self,
+        snapshot: OwnershipViewSnapshot,
+        lease_valid: bool,
+    ) -> Result<(), OwnershipSnapshotError> {
+        let instance = snapshot
+            .local_instance
+            .ok_or(OwnershipSnapshotError::MissingLocalInstanceRecord)?;
+        let lease_id = instance.lease_id;
+        self.install_local_instance(instance, lease_valid)?;
+        let token = self.begin_resync(lease_id)?;
+        self.replace_from_resync(
+            token,
+            OwnershipRevision(snapshot.revision.0),
+            snapshot.records.into_iter().map(|record| match record {
+                OwnershipViewRecord::Actor {
+                    revision,
+                    record,
+                    proof,
+                } => OwnershipSnapshotRecord::Actor {
+                    version: OwnershipRevision(revision.0),
+                    record,
+                    proof,
+                },
+                OwnershipViewRecord::VirtualShard {
+                    revision,
+                    record,
+                    proof,
+                } => OwnershipSnapshotRecord::VirtualShard {
+                    version: OwnershipRevision(revision.0),
+                    record,
+                    proof,
+                },
+                OwnershipViewRecord::Singleton {
+                    revision,
+                    record,
+                    proof,
+                } => OwnershipSnapshotRecord::Singleton {
+                    version: OwnershipRevision(revision.0),
+                    record,
+                    proof,
+                },
+            }),
+        )
     }
 
     pub fn install_local_instance(

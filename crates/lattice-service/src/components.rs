@@ -7,7 +7,7 @@ use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ConfiguredComponentBuilder;
 use lattice_core::service_context::{ConfiguredComponent, ServiceContextBuilder};
 use lattice_placement::authority::{
-    AdminPlacementReader, MAX_SINGLETON_RENEWAL_CLAIMS, PlacementAuthority,
+    AdminPlacementReader, MAX_SINGLETON_RENEWAL_CLAIMS, OwnershipViewReader, PlacementAuthority,
     ServiceAdminPlacementSnapshot, SingletonClaimReader,
 };
 use lattice_placement::coordination::singleton::SingletonRouteResolver;
@@ -18,8 +18,8 @@ use lattice_placement::routing::placement::{
     PlacementRouteResolver, PlacementRoutingStore, PlacementWatchStarter, PlacementWatchTask,
 };
 use lattice_placement::storage::{
-    ActorPlacementRecord, PlacementReadStore, PlacementVersion, SingletonPlacementRecord,
-    VirtualShardPlacementRecord,
+    ActorPlacementRecord, OwnershipView, OwnershipViewError, PlacementReadStore, PlacementVersion,
+    SingletonPlacementRecord, VirtualShardPlacementRecord,
 };
 
 use crate::error::LatticeServiceError;
@@ -260,6 +260,82 @@ pub(crate) trait ErasedPlacementRoutingStoreComponent: Send + Sync {
         self: Box<Self>,
         ctx: &ServiceComponentContext,
     ) -> Result<Box<dyn ErasedPlacementRoutingStore>, LatticeServiceError>;
+}
+
+#[async_trait]
+pub(crate) trait ErasedOwnershipViewReader: std::fmt::Debug + Send + Sync {
+    async fn open_ownership_view(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        max_entries: std::num::NonZeroUsize,
+    ) -> Result<OwnershipView, OwnershipViewError>;
+}
+
+#[async_trait]
+pub(crate) trait ErasedOwnershipViewReaderComponent: Send + Sync {
+    fn type_name(&self) -> &'static str;
+    async fn build(
+        self: Box<Self>,
+        ctx: &ServiceComponentContext,
+    ) -> Result<Box<dyn ErasedOwnershipViewReader>, LatticeServiceError>;
+}
+
+pub(crate) struct OwnershipViewReaderHandle<T: OwnershipViewReader> {
+    reader: T,
+}
+
+impl<T: OwnershipViewReader> std::fmt::Debug for OwnershipViewReaderHandle<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnershipViewReaderHandle")
+            .field("reader_type", &std::any::type_name::<T>())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl<T: OwnershipViewReader> ErasedOwnershipViewReader for OwnershipViewReaderHandle<T> {
+    async fn open_ownership_view(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        max_entries: std::num::NonZeroUsize,
+    ) -> Result<OwnershipView, OwnershipViewError> {
+        self.reader
+            .open_ownership_view(service_kind, instance_id, max_entries)
+            .await
+    }
+}
+
+pub(crate) struct OwnershipViewReaderRegistration<T: OwnershipViewReader> {
+    component: Box<dyn ServiceComponent<T>>,
+}
+
+impl<T: OwnershipViewReader> OwnershipViewReaderRegistration<T> {
+    pub(crate) fn new<C: IntoServiceComponent<T>>(component: C) -> Self {
+        Self {
+            component: Box::new(component.into_service_component()),
+        }
+    }
+}
+
+#[async_trait]
+impl<T: OwnershipViewReader> ErasedOwnershipViewReaderComponent
+    for OwnershipViewReaderRegistration<T>
+{
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
+    }
+
+    async fn build(
+        self: Box<Self>,
+        ctx: &ServiceComponentContext,
+    ) -> Result<Box<dyn ErasedOwnershipViewReader>, LatticeServiceError> {
+        Ok(Box::new(OwnershipViewReaderHandle {
+            reader: self.component.build(ctx).await?,
+        }))
+    }
 }
 
 #[async_trait]

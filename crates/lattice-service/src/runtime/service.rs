@@ -8,6 +8,7 @@ use std::time::Duration;
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ServiceContext;
 use lattice_placement::authority::PlacementAuthority;
+use lattice_placement::ownership::{LocalOwnershipSnapshot, OwnershipFenceReason};
 use lattice_placement::registry::InstanceState;
 use lattice_placement::routing::placement::PlacementWatchTask;
 use tokio::net::TcpListener;
@@ -21,7 +22,8 @@ use lattice_actor::traits::Actor;
 use crate::actors::registration::{ErasedLogicActor, RegisteredActor};
 use crate::assembly::builder::LatticeServiceBuilder;
 use crate::components::{
-    ErasedAdminPlacementReader, ErasedPlacementStore, ErasedSingletonClaimReader,
+    ErasedAdminPlacementReader, ErasedOwnershipViewReader, ErasedPlacementStore,
+    ErasedSingletonClaimReader,
 };
 use crate::config::{DirectLinkConfig, InstanceConfig};
 use crate::direct_links::DirectLinkServiceRuntime;
@@ -45,6 +47,8 @@ pub struct LatticeService {
     placement_store: Box<dyn ErasedPlacementStore>,
     singleton_claim_reader: Option<Box<dyn ErasedSingletonClaimReader>>,
     admin_placement_reader: Option<Box<dyn ErasedAdminPlacementReader>>,
+    ownership_view_reader: Option<Box<dyn ErasedOwnershipViewReader>>,
+    local_ownership_snapshot: Option<LocalOwnershipSnapshot>,
     placement_authority: Arc<dyn PlacementAuthority>,
     placement_watch_tasks: Vec<PlacementWatchTask>,
     admin_http: Option<AdminHttpServer>,
@@ -93,6 +97,8 @@ impl LatticeService {
             placement_store: parts.placement_store,
             singleton_claim_reader: parts.singleton_claim_reader,
             admin_placement_reader: parts.admin_placement_reader,
+            ownership_view_reader: parts.ownership_view_reader,
+            local_ownership_snapshot: parts.local_ownership_snapshot,
             placement_authority: parts.placement_authority,
             placement_watch_tasks: parts.placement_watch_tasks,
             admin_http: parts.admin_http,
@@ -164,6 +170,8 @@ impl LatticeService {
             placement_store,
             singleton_claim_reader,
             admin_placement_reader,
+            ownership_view_reader,
+            local_ownership_snapshot,
             placement_authority,
             placement_watch_tasks,
             admin_http,
@@ -196,6 +204,57 @@ impl LatticeService {
             InstanceState::Ready,
         )
         .await?;
+        let mut ownership_view = if let (Some(reader), Some(snapshot)) = (
+            ownership_view_reader.as_ref(),
+            local_ownership_snapshot.as_ref(),
+        ) {
+            let view = match reader
+                .open_ownership_view(
+                    &service_kind,
+                    &instance.instance_id,
+                    std::num::NonZeroUsize::new(
+                        lattice_placement::authority::MAX_PLACEMENT_SNAPSHOT_ENTRIES,
+                    )
+                    .expect("ownership capacity is nonzero"),
+                )
+                .await
+            {
+                Ok(view) => view,
+                Err(error) => {
+                    snapshot.fence(OwnershipFenceReason::WatchLost);
+                    let _ = transition_instance_state(
+                        placement_authority.as_ref(),
+                        &service_kind,
+                        &instance,
+                        lease_id,
+                        InstanceState::Stopping,
+                    )
+                    .await;
+                    return Err(LatticeServiceError::ComponentBuild {
+                        slot: "ownership_view_reader".to_string(),
+                        message: error.to_string(),
+                    });
+                }
+            };
+            if let Err(error) = snapshot.replace_from_view_snapshot(view.snapshot, true) {
+                snapshot.fence(OwnershipFenceReason::WatchLost);
+                let _ = transition_instance_state(
+                    placement_authority.as_ref(),
+                    &service_kind,
+                    &instance,
+                    lease_id,
+                    InstanceState::Stopping,
+                )
+                .await;
+                return Err(LatticeServiceError::ComponentBuild {
+                    slot: "ownership_view_reader".to_string(),
+                    message: error.to_string(),
+                });
+            }
+            Some(view.watch)
+        } else {
+            None
+        };
         if let Some(ready) = ready {
             let _ = ready.send(local_addr);
         }
@@ -226,14 +285,20 @@ impl LatticeService {
         let keepalive = async {
             loop {
                 tokio::time::sleep(instance_lease_keepalive_interval).await;
-                placement_authority
+                if let Err(error) = placement_authority
                     .keepalive_instance(
                         service_kind.clone(),
                         instance.instance_id.clone(),
                         instance.incarnation.clone(),
                         lease_id,
                     )
-                    .await?;
+                    .await
+                {
+                    if let Some(snapshot) = local_ownership_snapshot.as_ref() {
+                        let _ = snapshot.set_owner_lease_valid(lease_id, false);
+                    }
+                    return Err(error.into());
+                }
                 let singleton_claims = if let Some(reader) = singleton_claim_reader.as_ref() {
                     reader
                         .singleton_owner_lease_claims(
@@ -241,7 +306,7 @@ impl LatticeService {
                             &instance.instance_id,
                             &instance.incarnation,
                         )
-                        .await?
+                        .await
                 } else {
                     placement_store
                         .singleton_owner_lease_claims(
@@ -249,16 +314,58 @@ impl LatticeService {
                             &instance.instance_id,
                             &instance.incarnation,
                         )
-                        .await?
+                        .await
                 };
-                placement_authority
+                let singleton_claims = match singleton_claims {
+                    Ok(claims) => claims,
+                    Err(error) => {
+                        if let Some(snapshot) = local_ownership_snapshot.as_ref() {
+                            snapshot.fence(OwnershipFenceReason::Manual);
+                        }
+                        return Err(error.into());
+                    }
+                };
+                if let Err(error) = placement_authority
                     .keepalive_singletons(
                         service_kind.clone(),
                         instance.instance_id.clone(),
                         instance.incarnation.clone(),
                         singleton_claims,
                     )
-                    .await?;
+                    .await
+                {
+                    if let Some(snapshot) = local_ownership_snapshot.as_ref() {
+                        snapshot.fence(OwnershipFenceReason::Manual);
+                    }
+                    return Err(error.into());
+                }
+            }
+        };
+        let ownership_watch = async {
+            let Some(watch) = ownership_view.as_mut() else {
+                return std::future::pending::<Result<(), LatticeServiceError>>().await;
+            };
+            loop {
+                match watch.next().await {
+                    Ok(batch) => local_ownership_snapshot
+                        .as_ref()
+                        .expect("ownership snapshot accompanies its watch")
+                        .apply_watch_batch(batch)
+                        .map_err(|error| LatticeServiceError::ComponentBuild {
+                            slot: "ownership_view_reader".to_string(),
+                            message: error.to_string(),
+                        })?,
+                    Err(error) => {
+                        local_ownership_snapshot
+                            .as_ref()
+                            .expect("ownership snapshot accompanies its watch")
+                            .fence(OwnershipFenceReason::WatchLost);
+                        return Err(LatticeServiceError::ComponentBuild {
+                            slot: "ownership_view_reader".to_string(),
+                            message: error.to_string(),
+                        });
+                    }
+                };
             }
         };
         let lifecycle_shutdown = async {
@@ -303,6 +410,7 @@ impl LatticeService {
             placement_drain
         };
         tokio::pin!(keepalive);
+        tokio::pin!(ownership_watch);
         tokio::pin!(lifecycle_shutdown);
         let serve =
             router.serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
@@ -326,6 +434,9 @@ impl LatticeService {
                 result = &mut keepalive => {
                     break ServiceExit::Keepalive(result);
                 }
+                result = &mut ownership_watch => {
+                    break ServiceExit::OwnershipWatch(result);
+                }
                 result = &mut serve, if serve_result.is_none() => {
                     if lifecycle_done {
                         break ServiceExit::Server(result);
@@ -341,6 +452,7 @@ impl LatticeService {
         let serve_result = match service_exit {
             ServiceExit::Server(result) => result,
             ServiceExit::Keepalive(result) => return result,
+            ServiceExit::OwnershipWatch(result) => return result,
         };
 
         match serve_result {
@@ -398,6 +510,7 @@ impl LatticeService {
 enum ServiceExit {
     Server(Result<(), tonic::transport::Error>),
     Keepalive(Result<(), LatticeServiceError>),
+    OwnershipWatch(Result<(), LatticeServiceError>),
 }
 
 pub(crate) struct LatticeServiceParts {
@@ -411,6 +524,8 @@ pub(crate) struct LatticeServiceParts {
     pub placement_store: Box<dyn ErasedPlacementStore>,
     pub singleton_claim_reader: Option<Box<dyn ErasedSingletonClaimReader>>,
     pub admin_placement_reader: Option<Box<dyn ErasedAdminPlacementReader>>,
+    pub ownership_view_reader: Option<Box<dyn ErasedOwnershipViewReader>>,
+    pub local_ownership_snapshot: Option<LocalOwnershipSnapshot>,
     pub placement_authority: Arc<dyn PlacementAuthority>,
     pub placement_watch_tasks: Vec<PlacementWatchTask>,
     pub admin_http: Option<AdminHttpServer>,

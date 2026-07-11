@@ -44,6 +44,107 @@ async fn service_runs_with_a_read_only_placement_capability() {
 }
 
 #[tokio::test]
+async fn service_ownership_view_reader_installs_a_ready_local_gate() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/ownership-reader"));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .dangerously_use_in_process_placement(store.clone(), TonicLogicControl)
+        .ownership_view_reader::<InMemoryPlacementStore, _>(store.clone())
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+    let gate = service
+        .context()
+        .extension::<LocalOwnershipGate>()
+        .expect("semantic ownership reader installs the local gate")
+        .clone();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+
+    let service_kind = service_kind!("World");
+    let actor_kind = actor_kind!("World");
+    let route_key = RouteKey::U64(7);
+    let rejection = gate
+        .authorize(OwnershipRequest {
+            expected_service: &service_kind,
+            expected_actor_kind: &actor_kind,
+            route_actor_kind: &actor_kind,
+            route_key: &route_key,
+            route_epoch: Some(Epoch(1)),
+            placement: &OwnershipPlacement::Explicit,
+        })
+        .unwrap_err();
+    assert_eq!(rejection.reason, OwnershipRejectionReason::PlacementMissing);
+
+    let instance = PlacementStore::get_instance(&store, &InstanceId::new("world-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    let key = ActorPlacementKey {
+        service_kind: service_kind.clone(),
+        actor_kind: actor_kind.clone(),
+        actor_id: ActorId::U64(7),
+    };
+    let reservation = store.reserve_actor_epoch(key, None, None).await.unwrap();
+    let epoch = reservation.epoch();
+    store
+        .commit_actor_epoch(
+            reservation,
+            ActorPlacementRecord {
+                service_kind: service_kind.clone(),
+                actor_kind: actor_kind.clone(),
+                actor_id: ActorId::U64(7),
+                owner: InstanceId::new("world-1"),
+                epoch,
+                lease_id: instance.lease_id,
+                state: PlacementState::Running,
+            },
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if gate
+                .authorize(OwnershipRequest {
+                    expected_service: &service_kind,
+                    expected_actor_kind: &actor_kind,
+                    route_actor_kind: &actor_kind,
+                    route_key: &route_key,
+                    route_epoch: Some(epoch),
+                    placement: &OwnershipPlacement::Explicit,
+                })
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn service_renewal_selects_the_separate_singleton_claim_reader() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/claim-reader"));

@@ -66,6 +66,10 @@ use lattice_placement::control::{TonicLogicControl, actor_id_to_proto, proto};
 use lattice_placement::coordination::logic::NoopLogicControl;
 use lattice_placement::endpoint::{EndpointLease, EndpointPool};
 use lattice_placement::error::PlacementError;
+use lattice_placement::ownership::{
+    LocalOwnershipGate, OwnershipGate, OwnershipPlacement, OwnershipRejectionReason,
+    OwnershipRequest,
+};
 use lattice_placement::registry::{InstanceRecord, InstanceState};
 use lattice_placement::routing::cache::RouteCacheConfig;
 use lattice_placement::routing::placement::{ExplicitRouteResolver, PlacementRoutingStore};
