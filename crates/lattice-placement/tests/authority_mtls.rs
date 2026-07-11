@@ -7,7 +7,8 @@ use lattice_core::id::{ActorId, RouteKey};
 use lattice_core::instance::{InstanceCapacity, InstanceId, InstanceIncarnation};
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_placement::authority::{
-    PlacementAuthority, TonicPlacementAuthority, TonicPlacementReader, TonicPlacementRoutingStore,
+    PlacementAuthority, SingletonClaimReader, TonicPlacementAuthority, TonicPlacementReader,
+    TonicPlacementRoutingStore,
 };
 use lattice_placement::control::PlacementCoordinatorService;
 use lattice_placement::control::proto;
@@ -196,6 +197,29 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
         .await
         .expect("a current authenticated peer may read a coherent cross-service snapshot");
     assert_eq!(snapshot.records.len(), 2);
+    assert_eq!(
+        cross_service_reader
+            .singleton_owner_lease_claims(
+                &ServiceKind::new(TARGET_SERVICE),
+                &InstanceId::new(TARGET_INSTANCE),
+                &InstanceIncarnation::new(TARGET_INCARNATION),
+            )
+            .await
+            .expect("semantic snapshot discovers current-boot singleton claims")
+            .len(),
+        1
+    );
+    assert!(
+        cross_service_reader
+            .singleton_owner_lease_claims(
+                &ServiceKind::new(TARGET_SERVICE),
+                &InstanceId::new(TARGET_INSTANCE),
+                &InstanceIncarnation::new("world-a-old-boot"),
+            )
+            .await
+            .expect("prior boot is filtered without a direct store scan")
+            .is_empty()
+    );
     assert_eq!(
         snapshot
             .clone()

@@ -57,7 +57,9 @@ use lattice_direct_link::transport::{
 use lattice_eventbus::local::{EventBus, LocalEventBus};
 use lattice_eventbus::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
 use lattice_ops::ops_config::AdminHttpConfig;
-use lattice_placement::authority::{DevelopmentInProcessPlacementAuthority, PlacementAuthority};
+use lattice_placement::authority::{
+    DevelopmentInProcessPlacementAuthority, PlacementAuthority, SingletonClaimReader,
+};
 use lattice_placement::control::proto::logic_control_client::LogicControlClient;
 use lattice_placement::control::{TonicLogicControl, actor_id_to_proto, proto};
 use lattice_placement::coordination::logic::NoopLogicControl;
@@ -113,6 +115,24 @@ fn development_service_builder(
 struct CountingRoutingStore {
     inner: InMemoryPlacementStore,
     watch_starts: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct CountingClaimReader {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl SingletonClaimReader for CountingClaimReader {
+    async fn singleton_owner_lease_claims(
+        &self,
+        _service_kind: &ServiceKind,
+        _instance_id: &InstanceId,
+        _instance_incarnation: &InstanceIncarnation,
+    ) -> Result<Vec<SingletonPlacementRecord>, PlacementError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait]

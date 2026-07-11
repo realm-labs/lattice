@@ -36,6 +36,45 @@ pub const MAX_PLACEMENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_SINGLETON_RENEWAL_CLAIMS: usize = 4_096;
 pub const MAX_PLACEMENT_SNAPSHOT_ENTRIES: usize = 4_096;
 
+#[async_trait]
+pub trait SingletonClaimReader: Send + Sync + 'static {
+    async fn singleton_owner_lease_claims(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        instance_incarnation: &InstanceIncarnation,
+    ) -> Result<Vec<SingletonPlacementRecord>, PlacementError>;
+}
+
+#[async_trait]
+impl<T> SingletonClaimReader for T
+where
+    T: PlacementStore,
+{
+    async fn singleton_owner_lease_claims(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        instance_incarnation: &InstanceIncarnation,
+    ) -> Result<Vec<SingletonPlacementRecord>, PlacementError> {
+        let mut claims = Vec::new();
+        for (_version, record) in PlacementStore::list_singletons(self).await? {
+            if &record.service_kind == service_kind
+                && &record.owner == instance_id
+                && &record.owner_incarnation == instance_incarnation
+            {
+                if claims.len() == MAX_SINGLETON_RENEWAL_CLAIMS {
+                    return Err(PlacementError::SingletonRenewalLimitExceeded {
+                        limit: MAX_SINGLETON_RENEWAL_CLAIMS,
+                    });
+                }
+                claims.push(record);
+            }
+        }
+        Ok(claims)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServicePlacementSnapshot {
     pub revision: PlacementRevision,
@@ -494,6 +533,40 @@ impl TonicPlacementReader {
             .map_err(|_| PlacementError::PlacementAuthorityTimeout)?
             .map(|response| response.into_inner())
             .map_err(authority_status)
+    }
+}
+
+#[async_trait]
+impl SingletonClaimReader for TonicPlacementReader {
+    async fn singleton_owner_lease_claims(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        instance_incarnation: &InstanceIncarnation,
+    ) -> Result<Vec<SingletonPlacementRecord>, PlacementError> {
+        let snapshot = self
+            .get_service_placement_snapshot(
+                service_kind,
+                instance_id,
+                std::num::NonZeroUsize::new(MAX_PLACEMENT_SNAPSHOT_ENTRIES)
+                    .expect("snapshot limit is nonzero"),
+            )
+            .await?;
+        let mut claims = Vec::new();
+        for record in snapshot.records {
+            let ServicePlacementSnapshotRecord::Singleton { record, .. } = record else {
+                continue;
+            };
+            if &record.owner == instance_id && &record.owner_incarnation == instance_incarnation {
+                if claims.len() == MAX_SINGLETON_RENEWAL_CLAIMS {
+                    return Err(PlacementError::SingletonRenewalLimitExceeded {
+                        limit: MAX_SINGLETON_RENEWAL_CLAIMS,
+                    });
+                }
+                claims.push(record);
+            }
+        }
+        Ok(claims)
     }
 }
 

@@ -6,7 +6,9 @@ use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ConfiguredComponentBuilder;
 use lattice_core::service_context::{ConfiguredComponent, ServiceContextBuilder};
-use lattice_placement::authority::{MAX_SINGLETON_RENEWAL_CLAIMS, PlacementAuthority};
+use lattice_placement::authority::{
+    MAX_SINGLETON_RENEWAL_CLAIMS, PlacementAuthority, SingletonClaimReader,
+};
 use lattice_placement::coordination::singleton::SingletonRouteResolver;
 use lattice_placement::error::PlacementError;
 use lattice_placement::registry::InstanceRecord;
@@ -257,6 +259,102 @@ pub(crate) trait ErasedPlacementRoutingStoreComponent: Send + Sync {
         self: Box<Self>,
         ctx: &ServiceComponentContext,
     ) -> Result<Box<dyn ErasedPlacementRoutingStore>, LatticeServiceError>;
+}
+
+#[async_trait]
+pub(crate) trait ErasedSingletonClaimReader: std::fmt::Debug + Send + Sync {
+    async fn singleton_owner_lease_claims(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        instance_incarnation: &InstanceIncarnation,
+    ) -> Result<Vec<SingletonPlacementRecord>, PlacementError>;
+}
+
+#[async_trait]
+pub(crate) trait ErasedSingletonClaimReaderComponent: Send + Sync {
+    fn type_name(&self) -> &'static str;
+
+    async fn build(
+        self: Box<Self>,
+        ctx: &ServiceComponentContext,
+    ) -> Result<Box<dyn ErasedSingletonClaimReader>, LatticeServiceError>;
+}
+
+pub(crate) struct SingletonClaimReaderHandle<T>
+where
+    T: SingletonClaimReader,
+{
+    reader: T,
+}
+
+impl<T> std::fmt::Debug for SingletonClaimReaderHandle<T>
+where
+    T: SingletonClaimReader,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SingletonClaimReaderHandle")
+            .field("reader_type", &std::any::type_name::<T>())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl<T> ErasedSingletonClaimReader for SingletonClaimReaderHandle<T>
+where
+    T: SingletonClaimReader,
+{
+    async fn singleton_owner_lease_claims(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        instance_incarnation: &InstanceIncarnation,
+    ) -> Result<Vec<SingletonPlacementRecord>, PlacementError> {
+        self.reader
+            .singleton_owner_lease_claims(service_kind, instance_id, instance_incarnation)
+            .await
+    }
+}
+
+pub(crate) struct SingletonClaimReaderRegistration<T>
+where
+    T: SingletonClaimReader,
+{
+    component: Box<dyn ServiceComponent<T>>,
+}
+
+impl<T> SingletonClaimReaderRegistration<T>
+where
+    T: SingletonClaimReader,
+{
+    pub(crate) fn new<C>(component: C) -> Self
+    where
+        C: IntoServiceComponent<T>,
+    {
+        Self {
+            component: Box::new(component.into_service_component()),
+        }
+    }
+}
+
+#[async_trait]
+impl<T> ErasedSingletonClaimReaderComponent for SingletonClaimReaderRegistration<T>
+where
+    T: SingletonClaimReader,
+{
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
+    }
+
+    async fn build(
+        self: Box<Self>,
+        ctx: &ServiceComponentContext,
+    ) -> Result<Box<dyn ErasedSingletonClaimReader>, LatticeServiceError> {
+        Ok(Box::new(SingletonClaimReaderHandle {
+            reader: self.component.build(ctx).await?,
+        }))
+    }
 }
 
 pub(crate) struct PlacementRoutingStoreHandle<T>

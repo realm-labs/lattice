@@ -20,7 +20,7 @@ use lattice_actor::traits::Actor;
 
 use crate::actors::registration::{ErasedLogicActor, RegisteredActor};
 use crate::assembly::builder::LatticeServiceBuilder;
-use crate::components::ErasedPlacementStore;
+use crate::components::{ErasedPlacementStore, ErasedSingletonClaimReader};
 use crate::config::{DirectLinkConfig, InstanceConfig};
 use crate::direct_links::DirectLinkServiceRuntime;
 use crate::error::LatticeServiceError;
@@ -41,6 +41,7 @@ pub struct LatticeService {
     actors: HashMap<lattice_core::kind::ActorKind, Box<dyn Any + Send>>,
     logic_actors: Vec<Arc<dyn ErasedLogicActor>>,
     placement_store: Box<dyn ErasedPlacementStore>,
+    singleton_claim_reader: Option<Box<dyn ErasedSingletonClaimReader>>,
     placement_authority: Arc<dyn PlacementAuthority>,
     placement_watch_tasks: Vec<PlacementWatchTask>,
     admin_http: Option<AdminHttpServer>,
@@ -87,6 +88,7 @@ impl LatticeService {
             actors: parts.actors,
             logic_actors: parts.logic_actors,
             placement_store: parts.placement_store,
+            singleton_claim_reader: parts.singleton_claim_reader,
             placement_authority: parts.placement_authority,
             placement_watch_tasks: parts.placement_watch_tasks,
             admin_http: parts.admin_http,
@@ -156,6 +158,7 @@ impl LatticeService {
             actors: _,
             logic_actors,
             placement_store,
+            singleton_claim_reader,
             placement_authority,
             placement_watch_tasks,
             admin_http,
@@ -225,13 +228,23 @@ impl LatticeService {
                         lease_id,
                     )
                     .await?;
-                let singleton_claims = placement_store
-                    .singleton_owner_lease_claims(
-                        &service_kind,
-                        &instance.instance_id,
-                        &instance.incarnation,
-                    )
-                    .await?;
+                let singleton_claims = if let Some(reader) = singleton_claim_reader.as_ref() {
+                    reader
+                        .singleton_owner_lease_claims(
+                            &service_kind,
+                            &instance.instance_id,
+                            &instance.incarnation,
+                        )
+                        .await?
+                } else {
+                    placement_store
+                        .singleton_owner_lease_claims(
+                            &service_kind,
+                            &instance.instance_id,
+                            &instance.incarnation,
+                        )
+                        .await?
+                };
                 placement_authority
                     .keepalive_singletons(
                         service_kind.clone(),
@@ -390,6 +403,7 @@ pub(crate) struct LatticeServiceParts {
     pub actors: HashMap<lattice_core::kind::ActorKind, Box<dyn Any + Send>>,
     pub logic_actors: Vec<Arc<dyn ErasedLogicActor>>,
     pub placement_store: Box<dyn ErasedPlacementStore>,
+    pub singleton_claim_reader: Option<Box<dyn ErasedSingletonClaimReader>>,
     pub placement_authority: Arc<dyn PlacementAuthority>,
     pub placement_watch_tasks: Vec<PlacementWatchTask>,
     pub admin_http: Option<AdminHttpServer>,

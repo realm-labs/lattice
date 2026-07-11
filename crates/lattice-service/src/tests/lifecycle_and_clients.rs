@@ -44,6 +44,50 @@ async fn service_runs_with_a_read_only_placement_capability() {
 }
 
 #[tokio::test]
+async fn service_renewal_selects_the_separate_singleton_claim_reader() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store = InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/claim-reader"));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let service = LatticeService::builder(service_kind!("World"))
+        .instance_id(InstanceId::new("world-1"))
+        .listen(listener)
+        .ready_signal(ready_tx)
+        .instance_lease_keepalive_interval(Duration::from_millis(5))
+        .dangerously_use_in_process_placement(store, TonicLogicControl)
+        .singleton_claim_reader::<CountingClaimReader, _>(CountingClaimReader {
+            calls: calls.clone(),
+        })
+        .register_actor(
+            ActorRegistration::builder(actor_kind!("World"))
+                .factory(TestFactory)
+                .build(),
+        )
+        .register_sharded_rpc(FakeRpcBinding::<TestActor>::new(
+            actor_kind!("World"),
+            "WorldRpc",
+        ))
+        .build()
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(service.run_until_shutdown_signal(async {
+        let _ = shutdown_rx.await;
+    }));
+    ready_rx.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn shutdown_signal_helper_returns_on_first_trigger() {
     let (trigger_tx, trigger_rx) = tokio::sync::oneshot::channel();
     trigger_tx.send(()).unwrap();

@@ -17,7 +17,9 @@ use lattice_direct_link::delivery::DirectLinkDispatch;
 use lattice_direct_link::stream::DirectLinkActorBinding;
 use lattice_eventbus::local::EventBus;
 use lattice_ops::ops_config::AdminHttpConfig;
-use lattice_placement::authority::{DevelopmentInProcessPlacementAuthority, PlacementAuthority};
+use lattice_placement::authority::{
+    DevelopmentInProcessPlacementAuthority, PlacementAuthority, SingletonClaimReader,
+};
 use lattice_placement::routing::placement::{PlacementRoutingStore, PlacementWatchStarter};
 use lattice_placement::routing::rpc::RpcRetryPolicy;
 use lattice_placement::storage::{PlacementReadStore, PlacementStore};
@@ -33,9 +35,9 @@ use crate::clients::{ErasedRpcClientBinding, RpcClientRegistration};
 use crate::clients::{RpcClientBinding, RpcServiceBinding};
 use crate::components::{
     ErasedPlacementAuthorityComponent, ErasedPlacementRoutingStoreComponent,
-    ErasedPlacementStoreComponent, ErasedServiceComponent, IntoServiceComponent,
-    PlacementAuthorityRegistration, PlacementRoutingStoreRegistration, PlacementStoreRegistration,
-    ServiceComponentRegistration,
+    ErasedPlacementStoreComponent, ErasedServiceComponent, ErasedSingletonClaimReaderComponent,
+    IntoServiceComponent, PlacementAuthorityRegistration, PlacementRoutingStoreRegistration,
+    PlacementStoreRegistration, ServiceComponentRegistration, SingletonClaimReaderRegistration,
 };
 use crate::config::{DirectLinkConfig, InstanceConfig};
 use crate::direct_links::{DirectLinkBindingRegistration, ErasedDirectLinkBinding};
@@ -53,6 +55,7 @@ pub struct LatticeServiceBuilder {
     pub(crate) config: Option<ConfigSource>,
     pub(crate) placement_store: Option<Box<dyn ErasedPlacementStoreComponent>>,
     pub(crate) placement_routing_store: Option<Box<dyn ErasedPlacementRoutingStoreComponent>>,
+    pub(crate) singleton_claim_reader: Option<Box<dyn ErasedSingletonClaimReaderComponent>>,
     pub(crate) placement_authority: Option<Box<dyn ErasedPlacementAuthorityComponent>>,
     pub(crate) cluster_event_bus: Option<Box<dyn ErasedServiceComponent>>,
     pub(crate) local_event_bus: Option<Box<dyn ErasedServiceComponent>>,
@@ -98,6 +101,10 @@ impl fmt::Debug for LatticeServiceBuilder {
                 &self.placement_routing_store.is_some(),
             )
             .field(
+                "has_singleton_claim_reader",
+                &self.singleton_claim_reader.is_some(),
+            )
+            .field(
                 "has_placement_authority",
                 &self.placement_authority.is_some(),
             )
@@ -131,6 +138,7 @@ impl LatticeServiceBuilder {
             config: None,
             placement_store: None,
             placement_routing_store: None,
+            singleton_claim_reader: None,
             placement_authority: None,
             cluster_event_bus: None,
             local_event_bus: None,
@@ -212,6 +220,21 @@ impl LatticeServiceBuilder {
         } else {
             self.placement_routing_store =
                 Some(Box::new(PlacementRoutingStoreRegistration::<T>::new(store)));
+        }
+        self
+    }
+
+    pub fn singleton_claim_reader<T, C>(mut self, reader: C) -> Self
+    where
+        T: SingletonClaimReader,
+        C: IntoServiceComponent<T>,
+    {
+        if self.singleton_claim_reader.is_some() {
+            self.duplicate_framework_component
+                .get_or_insert("singleton_claim_reader");
+        } else {
+            self.singleton_claim_reader =
+                Some(Box::new(SingletonClaimReaderRegistration::<T>::new(reader)));
         }
         self
     }
