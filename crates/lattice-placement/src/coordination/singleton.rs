@@ -11,6 +11,7 @@ use crate::authority::PlacementAuthority;
 use crate::error::PlacementError;
 use crate::registry::{InstanceRecord, InstanceState};
 use crate::routing::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
+use crate::routing::placement::PlacementRoutingStore;
 use crate::routing::resolver::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
 use crate::storage::{
     LeaseId, PlacementState, PlacementStore, SingletonKey, SingletonPlacementRecord,
@@ -249,7 +250,7 @@ impl<S> SingletonRouteResolver<S> {
 #[async_trait]
 impl<S> RouteResolver for SingletonRouteResolver<S>
 where
-    S: crate::storage::PlacementReadStore,
+    S: PlacementRoutingStore,
 {
     async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
         let cache_key = request.cache_key();
@@ -269,7 +270,7 @@ where
             singleton_kind: request.actor_kind.clone(),
             scope: scope.clone(),
         };
-        let record = match self.store.get_singleton(&singleton_key).await? {
+        let record = match self.store.get_routing_singleton(&singleton_key).await? {
             Some((_version, record)) => record,
             None => {
                 self.authority
@@ -290,7 +291,7 @@ where
         }
         let instance = self
             .store
-            .get_instance(&record.owner)
+            .get_routing_instance(&record.owner)
             .await?
             .ok_or_else(|| PlacementError::InstanceNotFound {
                 instance_id: record.owner.clone(),

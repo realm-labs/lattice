@@ -3,11 +3,11 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use lattice_core::id::ActorId;
+use lattice_core::id::{ActorId, RouteKey};
 use lattice_core::instance::{InstanceCapacity, InstanceId, InstanceIncarnation};
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_placement::authority::{
-    PlacementAuthority, TonicPlacementAuthority, TonicPlacementReader,
+    PlacementAuthority, TonicPlacementAuthority, TonicPlacementReader, TonicPlacementRoutingStore,
 };
 use lattice_placement::control::PlacementCoordinatorService;
 use lattice_placement::control::proto;
@@ -16,8 +16,12 @@ use lattice_placement::control::proto::placement_coordinator_server::PlacementCo
 use lattice_placement::coordination::actor::{ActivateActorRequest, PlacementCoordinator};
 use lattice_placement::coordination::logic::NoopLogicControl;
 use lattice_placement::coordination::singleton::ActivateSingletonRequest;
+use lattice_placement::coordination::singleton::SingletonRouteResolver;
 use lattice_placement::error::PlacementError;
 use lattice_placement::registry::{InstanceRecord, InstanceState};
+use lattice_placement::routing::cache::RouteCacheConfig;
+use lattice_placement::routing::placement::{ExplicitRouteResolver, PlacementRoutingStore};
+use lattice_placement::routing::resolver::{ResolveRequest, RouteResolver};
 use lattice_placement::storage::memory::InMemoryPlacementStore;
 use lattice_placement::storage::{
     ActorPlacementKey, LeaseId, PlacementPrefix, PlacementRevision, PlacementStore, SingletonKey,
@@ -244,6 +248,66 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
             if record.actor_id == ActorId::U64(8)
     )));
     drop(remote_view);
+    let routing_store = TonicPlacementRoutingStore::new(
+        cross_service_reader.clone(),
+        ServiceKind::new(TARGET_SERVICE),
+        InstanceId::new(TARGET_INSTANCE),
+        NonZeroUsize::new(8).unwrap(),
+    )
+    .unwrap();
+    let resolver = ExplicitRouteResolver::new(
+        ServiceKind::new(TARGET_SERVICE),
+        routing_store.clone(),
+        std::sync::Arc::new(cross_service_authority.clone()),
+        RouteCacheConfig::default(),
+    );
+    let target = resolver
+        .resolve(ResolveRequest {
+            service_kind: ServiceKind::new(TARGET_SERVICE),
+            actor_kind: ActorKind::new("World"),
+            route_key: RouteKey::U64(8),
+        })
+        .await
+        .expect("route resolution uses semantic point reads");
+    assert_eq!(target.instance_id, InstanceId::new(TARGET_INSTANCE));
+    let singleton_resolver = SingletonRouteResolver::new(
+        routing_store.clone(),
+        std::sync::Arc::new(cross_service_authority.clone()),
+        RouteCacheConfig::default(),
+    );
+    let singleton_target = singleton_resolver
+        .resolve(ResolveRequest {
+            service_kind: ServiceKind::new(TARGET_SERVICE),
+            actor_kind: ActorKind::new("SeasonManager"),
+            route_key: RouteKey::Str("global".to_string()),
+        })
+        .await
+        .expect("singleton resolution uses semantic point reads");
+    assert_eq!(
+        singleton_target.instance_id,
+        InstanceId::new(TARGET_INSTANCE)
+    );
+    let mut routing_watch = routing_store
+        .watch_routing(&ServiceKind::new(TARGET_SERVICE))
+        .await
+        .expect("route-cache watch uses the semantic ownership stream");
+    cross_service_authority
+        .activate_actor(ActivateActorRequest {
+            service_kind: ServiceKind::new(TARGET_SERVICE),
+            actor_kind: ActorKind::new("World"),
+            actor_id: ActorId::U64(9),
+        })
+        .await
+        .expect("new placement reaches semantic routing watch");
+    assert!(matches!(
+        tokio::time::timeout(REJECTION_DEADLINE, routing_watch.next())
+            .await
+            .expect("routing watch is bounded")
+            .expect("routing watch remains live"),
+        lattice_placement::storage::PlacementWatchEvent::ActorUpdated { record, .. }
+            if record.actor_id == ActorId::U64(9)
+    ));
+    drop(routing_watch);
     assert!(
         cross_service_reader
             .get_singleton(&singleton_key())
@@ -295,7 +359,7 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
         .await
         .expect("the exact authenticated workload may drain itself");
     assert_eq!(report.drained_instance, InstanceId::new(TARGET_INSTANCE));
-    assert_eq!(report.migrated_actors, 2);
+    assert_eq!(report.migrated_actors, 3);
     assert_eq!(report.migrated_virtual_shards, 0);
     assert_eq!(target_record(&store).await.state, InstanceState::Draining);
 

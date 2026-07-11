@@ -21,13 +21,14 @@ use crate::coordination::singleton::{
 };
 use crate::error::PlacementError;
 use crate::registry::{InstanceRecord, InstanceState};
+use crate::routing::placement::PlacementRoutingStore;
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, EpochFloorRecord, LeaseId, OwnershipEpochFloorProof,
     OwnershipProofContext, OwnershipRecordBinding, OwnershipView, OwnershipViewRecord,
     OwnershipViewSnapshot, OwnershipWatch, OwnershipWatchBatch, OwnershipWatchError,
     OwnershipWatchEvent, OwnershipWatchMessage, OwnershipWatchUpdate, PlacementRevision,
-    PlacementState, PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
-    VirtualShardPlacementRecord,
+    PlacementState, PlacementStore, PlacementVersion, PlacementWatch, PlacementWatchEvent,
+    SingletonKey, SingletonPlacementRecord, VirtualShardPlacementRecord,
 };
 
 pub const DEFAULT_PLACEMENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -111,6 +112,129 @@ pub enum ServicePlacementSnapshotRecord {
 pub struct TonicPlacementReader {
     client: PlacementCoordinatorClient<Channel>,
     request_timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct TonicPlacementRoutingStore {
+    reader: TonicPlacementReader,
+    service_kind: ServiceKind,
+    local_instance_id: InstanceId,
+    max_entries: std::num::NonZeroUsize,
+}
+
+impl TonicPlacementRoutingStore {
+    pub fn new(
+        reader: TonicPlacementReader,
+        service_kind: ServiceKind,
+        local_instance_id: InstanceId,
+        max_entries: std::num::NonZeroUsize,
+    ) -> Result<Self, PlacementError> {
+        if max_entries.get() > MAX_PLACEMENT_SNAPSHOT_ENTRIES {
+            return Err(PlacementError::PlacementReadLimitExceeded {
+                limit: MAX_PLACEMENT_SNAPSHOT_ENTRIES,
+            });
+        }
+        Ok(Self {
+            reader,
+            service_kind,
+            local_instance_id,
+            max_entries,
+        })
+    }
+}
+
+#[async_trait]
+impl PlacementRoutingStore for TonicPlacementRoutingStore {
+    async fn get_routing_instance(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        self.reader.get_instance(instance_id).await
+    }
+
+    async fn get_routing_actor(
+        &self,
+        key: &ActorPlacementKey,
+    ) -> Result<Option<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
+        self.reader.get_actor(key).await
+    }
+
+    async fn get_routing_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        self.reader.get_singleton(key).await
+    }
+
+    async fn watch_routing(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<PlacementWatch, PlacementError> {
+        if service_kind != &self.service_kind {
+            return Err(PlacementError::NoRoute);
+        }
+        let mut view = self
+            .reader
+            .open_ownership_view(
+                &self.service_kind,
+                &self.local_instance_id,
+                self.max_entries,
+            )
+            .await
+            .map_err(|error| PlacementError::LogicControl {
+                message: format!("remote placement watch failed: {error}"),
+            })?;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let task = tokio::spawn(async move {
+            while let Ok(batch) = view.watch.next().await {
+                for event in batch.events {
+                    if tx.send(routing_watch_event(event)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(PlacementWatch::new_cancellable(rx, task.abort_handle()))
+    }
+}
+
+fn routing_watch_event(event: OwnershipWatchEvent) -> PlacementWatchEvent {
+    match event {
+        OwnershipWatchEvent::InstanceUpserted { record }
+        | OwnershipWatchEvent::InstanceDeleted { record } => {
+            PlacementWatchEvent::InstanceUpdated { record }
+        }
+        OwnershipWatchEvent::ActorUpserted { key, record, proof }
+        | OwnershipWatchEvent::ActorDeleted {
+            key,
+            previous_record: record,
+            proof,
+        } => PlacementWatchEvent::ActorUpdated {
+            key,
+            version: proof.record_version(),
+            record,
+        },
+        OwnershipWatchEvent::VirtualShardUpserted { key, record, proof }
+        | OwnershipWatchEvent::VirtualShardDeleted {
+            key,
+            previous_record: record,
+            proof,
+        } => PlacementWatchEvent::VirtualShardUpdated {
+            key,
+            version: proof.record_version(),
+            record,
+        },
+        OwnershipWatchEvent::SingletonUpserted { key, record, proof }
+        | OwnershipWatchEvent::SingletonDeleted {
+            key,
+            previous_record: record,
+            proof,
+        } => PlacementWatchEvent::SingletonUpdated {
+            key,
+            version: proof.record_version(),
+            record,
+        },
+    }
 }
 
 impl std::fmt::Debug for TonicPlacementReader {

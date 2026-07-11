@@ -9,10 +9,67 @@ use lattice_rpc::types::RouteTarget;
 use crate::authority::PlacementAuthority;
 use crate::coordination::actor::ActivateActorRequest;
 use crate::error::PlacementError;
-use crate::registry::InstanceState;
+use crate::registry::{InstanceRecord, InstanceState};
 use crate::routing::cache::{CacheLookup, LocalRouteCache, RouteCacheConfig};
 use crate::routing::resolver::{InvalidateReason, ResolveRequest, RouteCacheKey, RouteResolver};
 use crate::storage::{ActorPlacementKey, PlacementReadStore, PlacementState, PlacementWatchEvent};
+use crate::storage::{
+    ActorPlacementRecord, PlacementVersion, PlacementWatch, SingletonKey, SingletonPlacementRecord,
+};
+
+#[async_trait]
+pub trait PlacementRoutingStore: Clone + Send + Sync + 'static {
+    async fn get_routing_instance(
+        &self,
+        instance_id: &lattice_core::instance::InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError>;
+    async fn get_routing_actor(
+        &self,
+        key: &ActorPlacementKey,
+    ) -> Result<Option<(PlacementVersion, ActorPlacementRecord)>, PlacementError>;
+    async fn get_routing_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError>;
+    async fn watch_routing(
+        &self,
+        service_kind: &ServiceKind,
+    ) -> Result<PlacementWatch, PlacementError>;
+}
+
+#[async_trait]
+impl<T> PlacementRoutingStore for T
+where
+    T: PlacementReadStore,
+{
+    async fn get_routing_instance(
+        &self,
+        instance_id: &lattice_core::instance::InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        PlacementReadStore::get_instance(self, instance_id).await
+    }
+
+    async fn get_routing_actor(
+        &self,
+        key: &ActorPlacementKey,
+    ) -> Result<Option<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
+        PlacementReadStore::get_actor(self, key).await
+    }
+
+    async fn get_routing_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        PlacementReadStore::get_singleton(self, key).await
+    }
+
+    async fn watch_routing(
+        &self,
+        _service_kind: &ServiceKind,
+    ) -> Result<PlacementWatch, PlacementError> {
+        PlacementReadStore::watch(self, PlacementReadStore::prefix(self).clone()).await
+    }
+}
 
 #[derive(Clone)]
 pub struct ExplicitRouteResolver<S> {
@@ -58,10 +115,10 @@ impl<S> ExplicitRouteResolver<S> {
 
 impl<S> ExplicitRouteResolver<S>
 where
-    S: PlacementReadStore,
+    S: PlacementRoutingStore,
 {
     pub async fn watch_cache_updates(&self) -> Result<PlacementWatchTask, PlacementError> {
-        let mut watch = self.store.watch(self.store.prefix().clone()).await?;
+        let mut watch = self.store.watch_routing(&self.service_kind).await?;
         let store = self.store.clone();
         let cache = self.cache.clone();
         let service_kind = self.service_kind.clone();
@@ -82,7 +139,7 @@ pub trait PlacementWatchStarter: Clone + Send + Sync + 'static {
 #[async_trait]
 impl<S> PlacementWatchStarter for ExplicitRouteResolver<S>
 where
-    S: PlacementReadStore,
+    S: PlacementRoutingStore,
 {
     async fn start_placement_watch(&self) -> Result<PlacementWatchTask, PlacementError> {
         self.watch_cache_updates().await
@@ -119,7 +176,7 @@ impl Drop for PlacementWatchTask {
 #[async_trait]
 impl<S> RouteResolver for ExplicitRouteResolver<S>
 where
-    S: PlacementReadStore,
+    S: PlacementRoutingStore,
 {
     async fn resolve(&self, request: ResolveRequest) -> Result<RouteTarget, PlacementError> {
         if request.service_kind != self.service_kind {
@@ -140,7 +197,7 @@ where
             actor_kind: request.actor_kind.clone(),
             actor_id: actor_id.clone(),
         };
-        let record = match self.store.get_actor(&placement_key).await? {
+        let record = match self.store.get_routing_actor(&placement_key).await? {
             Some((_, record)) => record,
             None => {
                 self.authority
@@ -161,7 +218,7 @@ where
         }
         let instance = self
             .store
-            .get_instance(&record.owner)
+            .get_routing_instance(&record.owner)
             .await?
             .ok_or_else(|| PlacementError::InstanceNotFound {
                 instance_id: record.owner.clone(),
@@ -211,7 +268,7 @@ async fn refresh_cache_from_watch_event<S>(
     cache: &Arc<LocalRouteCache>,
     event: PlacementWatchEvent,
 ) where
-    S: PlacementReadStore,
+    S: PlacementRoutingStore,
 {
     let record = match event {
         PlacementWatchEvent::InstanceUpdated { record } if &record.service_kind == service_kind => {
@@ -236,7 +293,7 @@ async fn refresh_cache_from_watch_event<S>(
         return;
     }
 
-    let target = match store.get_instance(&record.owner).await {
+    let target = match store.get_routing_instance(&record.owner).await {
         Ok(Some(instance))
             if &instance.service_kind == service_kind
                 && instance.state == InstanceState::Ready

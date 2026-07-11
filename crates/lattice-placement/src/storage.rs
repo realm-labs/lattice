@@ -828,6 +828,7 @@ pub enum OwnershipViewError {
 #[derive(Debug)]
 pub struct PlacementWatch {
     rx: broadcast::Receiver<PlacementWatchEvent>,
+    abort_handle: Option<tokio::task::AbortHandle>,
 }
 
 impl PlacementWatch {
@@ -844,7 +845,28 @@ impl PlacementWatch {
     }
 
     pub(crate) fn new(rx: broadcast::Receiver<PlacementWatchEvent>) -> Self {
-        Self { rx }
+        Self {
+            rx,
+            abort_handle: None,
+        }
+    }
+
+    pub(crate) fn new_cancellable(
+        rx: broadcast::Receiver<PlacementWatchEvent>,
+        abort_handle: tokio::task::AbortHandle,
+    ) -> Self {
+        Self {
+            rx,
+            abort_handle: Some(abort_handle),
+        }
+    }
+}
+
+impl Drop for PlacementWatch {
+    fn drop(&mut self) {
+        if let Some(abort_handle) = self.abort_handle.take() {
+            abort_handle.abort();
+        }
     }
 }
 
