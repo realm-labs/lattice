@@ -1546,6 +1546,9 @@ fn singleton_record_for_real_test(
         singleton_kind: actor_kind!("SeasonManager"),
         scope: scope.to_string(),
         owner: InstanceId::new(owner),
+        owner_incarnation: lattice_core::instance::InstanceIncarnation::new(format!(
+            "{owner}-boot"
+        )),
         epoch: Epoch(epoch),
         lease_id,
         state: PlacementState::Running,

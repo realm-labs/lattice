@@ -348,6 +348,7 @@ where
                     .await?;
                 let reassigned = SingletonPlacementRecord {
                     owner: replacement.instance_id.clone(),
+                    owner_incarnation: replacement.incarnation.clone(),
                     epoch: reservation.epoch(),
                     lease_id,
                     state: PlacementState::Running,

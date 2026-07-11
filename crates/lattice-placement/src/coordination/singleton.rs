@@ -148,6 +148,7 @@ where
             .await?;
         let record = SingletonPlacementRecord {
             owner: instance.instance_id.clone(),
+            owner_incarnation: instance.incarnation.clone(),
             epoch: reservation.epoch(),
             lease_id,
             state: PlacementState::Running,
@@ -188,6 +189,7 @@ where
             singleton_kind: key.singleton_kind.clone(),
             scope: key.scope.clone(),
             owner: instance.instance_id.clone(),
+            owner_incarnation: instance.incarnation.clone(),
             epoch: reservation.epoch(),
             lease_id,
             state: PlacementState::Running,
@@ -293,11 +295,12 @@ where
             .ok_or_else(|| PlacementError::InstanceNotFound {
                 instance_id: record.owner.clone(),
             })?;
-        // Singleton records intentionally use a dedicated owner lease rather
-        // than the instance lease. Record presence proves that lease has not
-        // expired; incarnation-bound renewal is enforced by the later
-        // singleton lifecycle cutover.
-        if instance.service_kind != request.service_kind || instance.state != InstanceState::Ready {
+        // Singleton records use a dedicated owner lease, but ownership is also
+        // bound to the exact service boot that received that lease.
+        if instance.service_kind != request.service_kind
+            || instance.incarnation != record.owner_incarnation
+            || instance.state != InstanceState::Ready
+        {
             return Err(PlacementError::NoRoute);
         }
         let target = RouteTarget {
@@ -528,6 +531,7 @@ mod tests {
                     singleton_kind: key.singleton_kind.clone(),
                     scope: key.scope.clone(),
                     owner: instance.instance_id.clone(),
+                    owner_incarnation: instance.incarnation.clone(),
                     epoch: Epoch(1),
                     lease_id: instance.lease_id,
                     state: PlacementState::Draining,
@@ -561,6 +565,7 @@ mod tests {
                     singleton_kind: key.singleton_kind.clone(),
                     scope: key.scope.clone(),
                     owner: instance.instance_id.clone(),
+                    owner_incarnation: instance.incarnation.clone(),
                     epoch: Epoch(2),
                     lease_id: LeaseId(instance.lease_id.0 + 100),
                     state: PlacementState::Running,
@@ -571,6 +576,22 @@ mod tests {
         assert_eq!(
             resolver.resolve(request.clone()).await.unwrap().instance_id,
             instance.instance_id
+        );
+
+        let mut replacement = instance.clone();
+        replacement.incarnation = InstanceIncarnation::new("control-a-replacement-boot");
+        store.upsert_instance(replacement).await.unwrap();
+        let replacement_resolver = SingletonRouteResolver::new(
+            store.clone(),
+            authority.clone(),
+            RouteCacheConfig::default(),
+        );
+        assert_eq!(
+            replacement_resolver
+                .resolve(request.clone())
+                .await
+                .unwrap_err(),
+            PlacementError::NoRoute
         );
 
         let mut not_ready = instance.clone();

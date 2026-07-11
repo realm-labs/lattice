@@ -162,6 +162,7 @@ async fn etcd_store_rejects_path_delimiters_and_identity_mismatches_before_io() 
         singleton_kind: actor_kind!("SeasonManager"),
         scope: "global".to_string(),
         owner: InstanceId::new("world-a"),
+        owner_incarnation: InstanceIncarnation::new("world-a-boot"),
         epoch: Epoch(1),
         lease_id: LeaseId(1),
         state: PlacementState::Running,
@@ -3234,6 +3235,27 @@ fn etcd_instance_codec_rejects_legacy_records_without_boot_incarnation() {
 }
 
 #[test]
+fn etcd_singleton_codec_rejects_legacy_records_without_owner_incarnation() {
+    let value = EtcdValue::Singleton(Box::new(singleton_record(
+        "global",
+        "world-a",
+        1,
+        LeaseId(7),
+    )));
+    let encoded = encode_etcd_value(&value).unwrap();
+    let mut json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    json.get_mut("Singleton")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap()
+        .remove("owner_incarnation");
+
+    assert!(matches!(
+        decode_etcd_value(&serde_json::to_vec(&json).unwrap()),
+        Err(PlacementError::PlacementCodec { .. })
+    ));
+}
+
+#[test]
 fn etcd_instance_records_are_written_with_their_instance_lease() {
     let instance = EtcdValue::Instance(Box::new(instance_record("world-a", InstanceState::Ready)));
 
@@ -3455,6 +3477,7 @@ fn singleton_record(
         singleton_kind: actor_kind!("SeasonManager"),
         scope: scope.to_string(),
         owner: InstanceId::new(owner),
+        owner_incarnation: InstanceIncarnation::new(format!("{owner}-boot")),
         epoch: Epoch(epoch),
         lease_id,
         state: PlacementState::Running,

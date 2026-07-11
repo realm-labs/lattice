@@ -338,7 +338,7 @@ The unauthenticated form above is for local development and still requires an ex
 .dangerously_use_in_process_placement(in_memory_store, TonicLogicControl)
 ```
 
-Production service processes use a least-privilege runtime placement credential for reads/watches and the still-direct singleton-owner renewal path. Instance registration, lease allocation/renewal, and lifecycle transitions cross the authenticated semantic placement authority. The read connection nevertheless retains direct etcd `LeaseGrant`/`LeaseKeepAlive` protocol access until reads/watches move behind a semantic proxy or equivalent enforcement boundary, so type-level call-site separation is not yet sufficient for reclamation. Service processes do not receive the placement-authority credential. Password-file authentication keeps secret bytes out of `BootstrapConfig` and command lines:
+Production service processes use a least-privilege runtime placement credential for reads/watches and the still-direct singleton-owner renewal path. Singleton renewal is filtered by service, owner instance ID, and the persisted owner boot incarnation; a replacement boot does not renew its predecessor's records. Instance registration, lease allocation/renewal, and lifecycle transitions cross the authenticated semantic placement authority. The read connection nevertheless retains direct etcd `LeaseGrant`/`LeaseKeepAlive` protocol access until singleton renewal and reads/watches move behind a semantic proxy or equivalent enforcement boundary, so type-level call-site separation is not yet sufficient for reclamation. Service processes do not receive the placement-authority credential. Password-file authentication keeps secret bytes out of `BootstrapConfig` and command lines:
 
 ```rust
 .placement_store(

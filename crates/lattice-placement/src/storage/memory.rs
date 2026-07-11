@@ -1034,7 +1034,9 @@ impl PlacementStore for InMemoryPlacementStore {
             floor.as_ref().map(|(token, floor)| (*token, floor.epoch)),
         )?;
         let authority_changed = current.as_ref().is_some_and(|(_token, record)| {
-            record.owner != value.owner || record.lease_id != value.lease_id
+            record.owner != value.owner
+                || record.owner_incarnation != value.owner_incarnation
+                || record.lease_id != value.lease_id
         });
         let reactivating = current.as_ref().is_some_and(|(_token, record)| {
             record.state == crate::storage::PlacementState::Stopped

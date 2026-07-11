@@ -747,6 +747,7 @@ fn singleton_placement_to_proto(
         singleton_kind: record.singleton_kind.as_str().to_string(),
         scope: record.scope,
         owner_instance_id: record.owner.as_str().to_string(),
+        owner_incarnation: record.owner_incarnation.as_str().to_string(),
         epoch: record.epoch.0,
         lease_id: record.lease_id.0,
         state: placement_state_name(record.state).to_string(),

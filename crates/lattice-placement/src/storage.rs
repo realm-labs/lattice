@@ -298,6 +298,7 @@ pub struct SingletonPlacementRecord {
     pub singleton_kind: ActorKind,
     pub scope: String,
     pub owner: InstanceId,
+    pub owner_incarnation: InstanceIncarnation,
     pub epoch: Epoch,
     pub lease_id: LeaseId,
     pub state: PlacementState,

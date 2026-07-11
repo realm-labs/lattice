@@ -240,6 +240,7 @@ fn admin_snapshot_builds_views_from_live_placement_records() {
             singleton_kind: actor_kind!("SeasonManager"),
             scope: "default".to_string(),
             owner: InstanceId::new("world-a"),
+            owner_incarnation: InstanceIncarnation::new("world-a-boot"),
             epoch: Epoch(6),
             lease_id: LeaseId(7),
             state: PlacementState::Running,

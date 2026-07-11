@@ -1245,7 +1245,9 @@ where
             floor.as_ref().map(|(token, record)| (*token, record.epoch)),
         )?;
         let authority_changed = current.as_ref().is_some_and(|(_, record)| {
-            record.owner != value.owner || record.lease_id != value.lease_id
+            record.owner != value.owner
+                || record.owner_incarnation != value.owner_incarnation
+                || record.lease_id != value.lease_id
         });
         let reactivating = current.as_ref().is_some_and(|(_, record)| {
             record.state == crate::storage::PlacementState::Stopped
@@ -1887,7 +1889,13 @@ fn validate_virtual_shard_record(
 fn validate_singleton_record(record: &SingletonPlacementRecord) -> Result<(), PlacementError> {
     validate_service_kind(&record.service_kind)?;
     validate_actor_kind(&record.singleton_kind)?;
-    validate_instance_id(&record.owner)
+    validate_instance_id(&record.owner)?;
+    if !record.owner_incarnation.is_canonical() {
+        return Err(PlacementError::PlacementCodec {
+            message: "singleton owner incarnation must be canonical and bounded".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_etcd_value_identity(value: &EtcdValue) -> Result<(), PlacementError> {

@@ -568,6 +568,10 @@ fn decode_singleton_reply(
     )?;
     require_equal(reply.scope.as_str(), expected.scope.as_str(), "scope")?;
     let owner = decode_instance_id(reply.owner_instance_id, "owner_instance_id")?;
+    let owner_incarnation = InstanceIncarnation::new(reply.owner_incarnation);
+    if !owner_incarnation.is_canonical() {
+        return invalid_reply("owner_incarnation");
+    }
     let epoch = decode_epoch(reply.epoch)?;
     let lease_id = decode_lease(reply.lease_id)?;
     let state = decode_state(&reply.state)?;
@@ -579,6 +583,7 @@ fn decode_singleton_reply(
         singleton_kind: expected.singleton_kind.clone(),
         scope: expected.scope.clone(),
         owner,
+        owner_incarnation,
         epoch,
         lease_id,
         state,
@@ -844,6 +849,7 @@ mod tests {
             singleton_kind: "SeasonManager".to_string(),
             scope: "global".to_string(),
             owner_instance_id: "world-a".to_string(),
+            owner_incarnation: "world-a-boot".to_string(),
             epoch: 2,
             lease_id: 4,
             state: "running".to_string(),

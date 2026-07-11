@@ -1190,6 +1190,7 @@ async fn lease_expiry_reconciler_observes_missing_instance_and_fails_over() {
                 singleton_kind: actor_kind!("SeasonManager"),
                 scope: "global".to_string(),
                 owner: InstanceId::new("world-a"),
+                owner_incarnation: InstanceIncarnation::new("world-a-boot"),
                 epoch: Epoch(5),
                 lease_id: LeaseId(11),
                 state: PlacementState::Running,

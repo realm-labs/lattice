@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lattice_config::bootstrap::BootstrapConfig;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ConfiguredComponentBuilder;
 use lattice_core::service_context::{ConfiguredComponent, ServiceContextBuilder};
@@ -199,6 +199,7 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
         &self,
         service_kind: &ServiceKind,
         instance_id: &InstanceId,
+        instance_incarnation: &InstanceIncarnation,
     ) -> Result<usize, PlacementError>;
     async fn placement_route_resolver(
         &self,
@@ -300,10 +301,14 @@ where
         &self,
         service_kind: &ServiceKind,
         instance_id: &InstanceId,
+        instance_incarnation: &InstanceIncarnation,
     ) -> Result<usize, PlacementError> {
         let mut kept_alive = 0;
         for (_version, record) in self.store.list_singletons().await? {
-            if &record.service_kind == service_kind && &record.owner == instance_id {
+            if &record.service_kind == service_kind
+                && &record.owner == instance_id
+                && &record.owner_incarnation == instance_incarnation
+            {
                 self.store.keepalive_instance_lease(record.lease_id).await?;
                 kept_alive += 1;
             }
@@ -526,5 +531,68 @@ where
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod singleton_renewal_tests {
+    use lattice_core::actor_ref::Epoch;
+    use lattice_core::instance::{InstanceId, InstanceIncarnation};
+    use lattice_core::{actor_kind, service_kind};
+    use lattice_placement::storage::memory::InMemoryPlacementStore;
+    use lattice_placement::storage::{
+        PlacementPrefix, PlacementState, PlacementStore, SingletonKey, SingletonPlacementRecord,
+    };
+
+    use super::{ErasedPlacementStore, PlacementStoreHandle};
+
+    #[tokio::test]
+    async fn singleton_renewal_ignores_records_from_a_previous_owner_boot() {
+        let store =
+            InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/service-singleton-renewal"));
+        let current_lease = store.grant_instance_lease().await.unwrap();
+        let stale_lease = store.grant_instance_lease().await.unwrap();
+        for (scope, incarnation, lease_id) in [
+            ("current", "world-a-current-boot", current_lease),
+            ("stale", "world-a-previous-boot", stale_lease),
+        ] {
+            let key = SingletonKey {
+                service_kind: service_kind!("World"),
+                singleton_kind: actor_kind!("SeasonManager"),
+                scope: scope.to_string(),
+            };
+            store
+                .compare_and_put_singleton(
+                    key.clone(),
+                    None,
+                    SingletonPlacementRecord {
+                        service_kind: key.service_kind,
+                        singleton_kind: key.singleton_kind,
+                        scope: key.scope,
+                        owner: InstanceId::new("world-a"),
+                        owner_incarnation: InstanceIncarnation::new(incarnation),
+                        epoch: Epoch(1),
+                        lease_id,
+                        state: PlacementState::Running,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let handle = PlacementStoreHandle::new(store.clone());
+
+        assert_eq!(
+            handle
+                .keepalive_singleton_owner_leases(
+                    &service_kind!("World"),
+                    &InstanceId::new("world-a"),
+                    &InstanceIncarnation::new("world-a-current-boot"),
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.instance_lease_keepalive_count(current_lease), Some(1));
+        assert_eq!(store.instance_lease_keepalive_count(stale_lease), Some(0));
     }
 }

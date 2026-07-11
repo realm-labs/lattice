@@ -111,6 +111,7 @@ message SingletonPlacementReply {
   uint64 epoch = 5;
   uint64 lease_id = 6;
   string state = 7;
+  string owner_incarnation = 8;
 }
 
 message DrainInstanceRequest {

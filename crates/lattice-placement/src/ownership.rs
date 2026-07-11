@@ -201,6 +201,7 @@ pub enum OwnershipRejectionReason {
     },
     PlacementMissing,
     OwnerMismatch,
+    OwnerIncarnationMismatch,
     PlacementNotRunning {
         state: PlacementState,
     },
@@ -409,6 +410,7 @@ impl<T: Clone> StoreObservation<T> {
 struct OwnershipAuthorityFloor {
     epoch: Epoch,
     owner: InstanceId,
+    owner_incarnation: Option<InstanceIncarnation>,
     lease_id: Option<LeaseId>,
 }
 
@@ -417,6 +419,7 @@ impl OwnershipAuthorityFloor {
         Self {
             epoch: record.epoch,
             owner: record.owner.clone(),
+            owner_incarnation: None,
             lease_id: Some(record.lease_id),
         }
     }
@@ -425,6 +428,7 @@ impl OwnershipAuthorityFloor {
         Self {
             epoch: record.epoch,
             owner: record.owner.clone(),
+            owner_incarnation: None,
             lease_id: None,
         }
     }
@@ -433,6 +437,7 @@ impl OwnershipAuthorityFloor {
         Self {
             epoch: record.epoch,
             owner: record.owner.clone(),
+            owner_incarnation: Some(record.owner_incarnation.clone()),
             lease_id: Some(record.lease_id),
         }
     }
@@ -1880,6 +1885,20 @@ impl OwnershipGate for LocalOwnershipGate {
                 Some(authority.owner),
             ));
         }
+        if authority
+            .owner_incarnation
+            .as_ref()
+            .is_some_and(|incarnation| incarnation != &self.inner.instance_incarnation)
+        {
+            return Err(rejection(
+                OwnershipRejectionKind::Fenced,
+                OwnershipRejectionReason::OwnerIncarnationMismatch,
+                Some(key),
+                request.route_epoch,
+                Some(authority.epoch),
+                Some(authority.owner),
+            ));
+        }
         if let Some(placement_state) = authority.state
             && placement_state != PlacementState::Running
         {
@@ -2075,6 +2094,7 @@ impl LocalOwnershipState {
                 .and_then(|entry| entry.observation.local_record())
                 .map(|record| LocalAuthority {
                     owner: record.owner.clone(),
+                    owner_incarnation: None,
                     epoch: record.epoch,
                     lease_id: Some(record.lease_id),
                     state: Some(record.state),
@@ -2085,6 +2105,7 @@ impl LocalOwnershipState {
                 .and_then(|entry| entry.observation.local_record())
                 .map(|record| LocalAuthority {
                     owner: record.owner.clone(),
+                    owner_incarnation: None,
                     epoch: record.epoch,
                     lease_id: None,
                     state: None,
@@ -2095,6 +2116,7 @@ impl LocalOwnershipState {
                 .and_then(|entry| entry.observation.local_record())
                 .map(|record| LocalAuthority {
                     owner: record.owner.clone(),
+                    owner_incarnation: Some(record.owner_incarnation.clone()),
                     epoch: record.epoch,
                     lease_id: Some(record.lease_id),
                     state: Some(record.state),
@@ -2106,6 +2128,7 @@ impl LocalOwnershipState {
 #[derive(Debug)]
 struct LocalAuthority {
     owner: InstanceId,
+    owner_incarnation: Option<InstanceIncarnation>,
     epoch: Epoch,
     lease_id: Option<LeaseId>,
     state: Option<PlacementState>,
@@ -2531,6 +2554,7 @@ mod tests {
                     singleton_kind: actor.clone(),
                     scope: "global".to_string(),
                     owner: InstanceId::new("world-a"),
+                    owner_incarnation: InstanceIncarnation::new("world-a-boot"),
                     epoch: Epoch(9),
                     lease_id: singleton_lease,
                     state: PlacementState::Running,
@@ -2584,6 +2608,45 @@ mod tests {
         assert_eq!(
             invalid_route.reason,
             OwnershipRejectionReason::InvalidSingletonRoute
+        );
+    }
+
+    #[test]
+    fn singleton_gate_rejects_a_record_from_a_previous_owner_boot() {
+        let (snapshot, gate) = ready_snapshot(4);
+        let singleton_lease = LeaseId(22);
+        snapshot
+            .set_owner_lease_valid(singleton_lease, true)
+            .unwrap();
+        snapshot
+            .apply_singleton(
+                OwnershipRevision(1),
+                SingletonPlacementRecord {
+                    service_kind: service_kind!("World"),
+                    singleton_kind: actor_kind!("Season"),
+                    scope: "global".to_string(),
+                    owner: InstanceId::new("world-a"),
+                    owner_incarnation: InstanceIncarnation::new("world-a-previous-boot"),
+                    epoch: Epoch(10),
+                    lease_id: singleton_lease,
+                    state: PlacementState::Running,
+                },
+            )
+            .unwrap();
+
+        let rejection = gate
+            .authorize(request(
+                &service_kind!("World"),
+                &actor_kind!("Season"),
+                &actor_kind!("Season"),
+                &RouteKey::Str("global".to_string()),
+                Some(Epoch(10)),
+                &OwnershipPlacement::Singleton,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            rejection.reason,
+            OwnershipRejectionReason::OwnerIncarnationMismatch
         );
     }
 
@@ -2803,6 +2866,7 @@ mod tests {
             singleton_kind: actor_kind!("Season"),
             scope: "global".to_string(),
             owner: InstanceId::new("world-a"),
+            owner_incarnation: InstanceIncarnation::new("world-a-boot"),
             epoch: Epoch(5),
             lease_id: INSTANCE_LEASE,
             state: PlacementState::Running,
@@ -2904,6 +2968,7 @@ mod tests {
             singleton_kind: actor_kind!("Season"),
             scope: "global".to_string(),
             owner: InstanceId::new("world-a"),
+            owner_incarnation: InstanceIncarnation::new("world-a-boot"),
             epoch: Epoch(1),
             lease_id: INSTANCE_LEASE,
             state: PlacementState::Running,
@@ -5197,6 +5262,7 @@ mod tests {
             singleton_kind: actor_kind!("Season"),
             scope: scope.to_string(),
             owner: InstanceId::new(owner),
+            owner_incarnation: InstanceIncarnation::new(format!("{owner}-boot")),
             epoch: Epoch(epoch),
             lease_id,
             state,

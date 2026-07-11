@@ -226,7 +226,11 @@ impl LatticeService {
                     )
                     .await?;
                 placement_store
-                    .keepalive_singleton_owner_leases(&service_kind, &instance.instance_id)
+                    .keepalive_singleton_owner_leases(
+                        &service_kind,
+                        &instance.instance_id,
+                        &instance.incarnation,
+                    )
                     .await?;
             }
         };

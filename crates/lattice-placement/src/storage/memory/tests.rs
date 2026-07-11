@@ -1531,9 +1531,24 @@ async fn legacy_writes_preserve_state_epochs_and_require_advances_for_new_author
         .unwrap();
     let equal_singleton_conflict = SingletonPlacementRecord {
         owner: InstanceId::new("world-b"),
+        owner_incarnation: InstanceIncarnation::new("world-b-boot"),
         lease_id: LeaseId(20),
+        ..draining_singleton.clone()
+    };
+    let reincarnated_same_owner = SingletonPlacementRecord {
+        owner_incarnation: InstanceIncarnation::new("world-a-replacement-boot"),
         ..draining_singleton
     };
+    assert_eq!(
+        store
+            .compare_and_put_singleton(
+                singleton_key.clone(),
+                Some(draining_singleton_token),
+                reincarnated_same_owner,
+            )
+            .await,
+        Err(PlacementError::EpochAuthorityConflict { epoch: Epoch(3) })
+    );
     assert_eq!(
         store
             .compare_and_put_singleton(
@@ -1705,6 +1720,7 @@ fn singleton_record(
         singleton_kind: actor_kind!("Season"),
         scope: scope.to_string(),
         owner: InstanceId::new(owner),
+        owner_incarnation: InstanceIncarnation::new(format!("{owner}-boot")),
         epoch: Epoch(epoch),
         lease_id,
         state,
