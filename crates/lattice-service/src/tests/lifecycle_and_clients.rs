@@ -724,6 +724,43 @@ struct ReplacementDuringDrainAuthority {
 
 #[async_trait]
 impl PlacementAuthority for ReplacementDuringDrainAuthority {
+    async fn register_instance(
+        &self,
+        record: InstanceRecord,
+    ) -> Result<InstanceRecord, PlacementError> {
+        self.store.register_instance(record).await
+    }
+
+    async fn keepalive_instance(
+        &self,
+        _service_kind: ServiceKind,
+        _instance_id: InstanceId,
+        _instance_incarnation: InstanceIncarnation,
+        expected_lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
+        self.store.keepalive_instance_lease(expected_lease_id).await
+    }
+
+    async fn transition_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
+        expected_lease_id: LeaseId,
+        state: InstanceState,
+    ) -> Result<(), PlacementError> {
+        self.store
+            .compare_and_set_instance_state(
+                &service_kind,
+                &instance_id,
+                &instance_incarnation,
+                expected_lease_id,
+                state,
+            )
+            .await
+            .map(|_| ())
+    }
+
     async fn activate_actor(
         &self,
         _request: lattice_placement::coordination::actor::ActivateActorRequest,

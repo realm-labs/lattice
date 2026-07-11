@@ -850,6 +850,12 @@ impl PlacementPrefix {
 
 #[async_trait]
 pub trait PlacementStore: Clone + Send + Sync + 'static {
+    /// Creates one leased `Starting` instance record only when its key is absent.
+    /// Implementations must revoke any newly allocated lease if creation loses.
+    async fn register_instance(
+        &self,
+        record: InstanceRecord,
+    ) -> Result<InstanceRecord, PlacementError>;
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
     async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
     async fn campaign_coordinator_leader(
@@ -1020,6 +1026,21 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
     }
     async fn watch(&self, prefix: PlacementPrefix) -> Result<PlacementWatch, PlacementError>;
     fn prefix(&self) -> &PlacementPrefix;
+}
+
+pub(crate) fn valid_instance_state_transition(
+    current: InstanceState,
+    requested: InstanceState,
+) -> bool {
+    current == requested
+        || matches!(
+            (current, requested),
+            (InstanceState::Starting, InstanceState::Ready)
+                | (InstanceState::Ready, InstanceState::Draining)
+                | (InstanceState::Ready, InstanceState::Stopping)
+                | (InstanceState::Draining, InstanceState::Stopping)
+                | (InstanceState::Stopping, InstanceState::Dead)
+        )
 }
 
 pub mod etcd;

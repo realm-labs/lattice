@@ -228,6 +228,7 @@ pub(crate) trait EtcdKv: Clone + Send + Sync + 'static {
     ) -> Result<(), PlacementError>;
     async fn delete(&self, key: &str) -> Result<(), PlacementError>;
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
+    async fn revoke_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
     async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
     async fn next_lease_id(&self) -> Result<LeaseId, PlacementError>;
     async fn open_ownership_view(
@@ -857,6 +858,14 @@ impl EtcdKv for RealEtcdClient {
             .await
             .map_err(etcd_error)?;
         lease_id(response.id())
+    }
+
+    async fn revoke_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
+        self.refresh_authentication().await?;
+        let lease_id = i64::try_from(lease_id.0).map_err(codec_error)?;
+        let mut client = self.client.clone();
+        client.lease_revoke(lease_id).await.map_err(etcd_error)?;
+        Ok(())
     }
 
     async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
@@ -2150,6 +2159,14 @@ impl InMemoryEtcdClient {
         keys.sort();
         keys
     }
+
+    #[cfg(test)]
+    pub(crate) fn instance_lease_count(&self) -> usize {
+        self.instance_leases
+            .lock()
+            .expect("in-memory etcd leases mutex poisoned")
+            .len()
+    }
 }
 
 #[async_trait]
@@ -2308,6 +2325,14 @@ impl EtcdKv for InMemoryEtcdClient {
             .expect("in-memory etcd leases mutex poisoned")
             .insert(lease_id, 0);
         Ok(lease_id)
+    }
+
+    async fn revoke_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
+        self.instance_leases
+            .lock()
+            .expect("in-memory etcd leases mutex poisoned")
+            .remove(&lease_id);
+        Ok(())
     }
 
     async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
@@ -2552,6 +2577,10 @@ pub mod test_support {
 
         async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
             self.inner.grant_instance_lease().await
+        }
+
+        async fn revoke_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
+            self.inner.revoke_instance_lease(lease_id).await
         }
 
         async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {

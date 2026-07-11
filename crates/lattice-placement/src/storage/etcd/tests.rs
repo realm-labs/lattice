@@ -2647,6 +2647,37 @@ async fn etcd_store_grants_and_keeps_instance_leases_alive() {
 }
 
 #[tokio::test]
+async fn etcd_instance_registration_is_create_only_and_reclaims_a_losing_lease() {
+    let client = InMemoryEtcdClient::new();
+    let store = EtcdPlacementStore::new(
+        PlacementPrefix::new("/lattice/instance-registration"),
+        client.clone(),
+    );
+    let mut record = instance_record("world-a", InstanceState::Starting);
+    record.lease_id = LeaseId(0);
+    let registered = store.register_instance(record.clone()).await.unwrap();
+    assert_ne!(registered.lease_id, LeaseId(0));
+    assert_eq!(client.instance_lease_count(), 1);
+
+    record.incarnation = InstanceIncarnation::new("replacement-boot");
+    assert_eq!(
+        store.register_instance(record).await.unwrap_err(),
+        PlacementError::InstanceAlreadyRegistered {
+            instance_id: InstanceId::new("world-a")
+        }
+    );
+    assert_eq!(client.instance_lease_count(), 1);
+    assert_eq!(
+        store
+            .get_service_instance(&service_kind!("World"), &InstanceId::new("world-a"))
+            .await
+            .unwrap()
+            .unwrap(),
+        registered
+    );
+}
+
+#[tokio::test]
 async fn etcd_store_elects_one_coordinator_leader_until_resign() {
     let store = EtcdPlacementStore::new(
         PlacementPrefix::new("/lattice/test"),

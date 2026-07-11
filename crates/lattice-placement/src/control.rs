@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
+use lattice_core::instance::InstanceCapacity;
 use lattice_core::instance::InstanceIncarnation;
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_rpc::security::{
@@ -122,9 +123,10 @@ impl<S, L> PlacementCoordinatorService<S, L>
 where
     S: PlacementStore,
 {
-    async fn authenticate_current_peer<T>(
+    async fn authenticate_current_instance<T>(
         &self,
         request: &Request<T>,
+        require_ready: bool,
     ) -> Result<Option<PeerIdentity>, Status> {
         let peer = self.admission.authenticate(request)?;
         let Some(peer) = peer else {
@@ -143,11 +145,11 @@ where
             .map_err(|_| Status::unavailable("workload liveness lookup failed"))?
             .filter(|record| {
                 &record.incarnation == incarnation
-                    && record.state == crate::registry::InstanceState::Ready
+                    && (!require_ready || record.state == crate::registry::InstanceState::Ready)
             })
             .ok_or_else(|| {
                 Status::permission_denied(
-                    "authenticated workload is not the current ready instance incarnation",
+                    "authenticated workload is not the current admitted instance incarnation",
                 )
             })?;
         if record.lease_id.0 == 0 {
@@ -156,6 +158,13 @@ where
             ));
         }
         Ok(Some(peer))
+    }
+
+    async fn authenticate_current_peer<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<PeerIdentity>, Status> {
+        self.authenticate_current_instance(request, true).await
     }
 }
 
@@ -186,6 +195,90 @@ where
     S: PlacementStore,
     L: CoordinatorLogicControl + SingletonControl,
 {
+    async fn register_instance(
+        &self,
+        request: Request<proto::RegisterInstanceRequest>,
+    ) -> Result<Response<proto::InstanceLivenessReply>, Status> {
+        let peer = self.admission.authenticate(&request)?;
+        let request = request.into_inner();
+        let record = registration_from_proto(request)?;
+        if peer.is_some_and(|peer| {
+            peer.service_kind != record.service_kind
+                || peer.instance_id != record.instance_id
+                || peer.incarnation.as_ref() != Some(&record.incarnation)
+        }) {
+            return Err(Status::permission_denied(
+                "authenticated workload identity cannot register the requested instance",
+            ));
+        }
+        let record = self
+            .coordinator
+            .store
+            .register_instance(record)
+            .await
+            .map_err(status_from_placement)?;
+        Ok(Response::new(instance_liveness_to_proto(&record)))
+    }
+
+    async fn keepalive_instance(
+        &self,
+        request: Request<proto::InstanceLivenessRequest>,
+    ) -> Result<Response<proto::InstanceLivenessReply>, Status> {
+        let peer = self.authenticate_current_instance(&request, false).await?;
+        let (service_kind, instance_id, incarnation, lease_id) =
+            liveness_identity_from_proto(request.into_inner())?;
+        require_peer_instance(peer, &service_kind, &instance_id, &incarnation)?;
+        let record = self
+            .coordinator
+            .store
+            .get_service_instance(&service_kind, &instance_id)
+            .await
+            .map_err(status_from_placement)?
+            .ok_or_else(|| Status::not_found("instance is not registered"))?;
+        if record.incarnation != incarnation || record.lease_id != lease_id {
+            return Err(Status::failed_precondition("instance authority changed"));
+        }
+        self.coordinator
+            .store
+            .keepalive_instance_lease(lease_id)
+            .await
+            .map_err(status_from_placement)?;
+        Ok(Response::new(instance_liveness_to_proto(&record)))
+    }
+
+    async fn transition_instance(
+        &self,
+        request: Request<proto::TransitionInstanceRequest>,
+    ) -> Result<Response<proto::InstanceLivenessReply>, Status> {
+        let peer = self.authenticate_current_instance(&request, false).await?;
+        let request = request.into_inner();
+        let state = match request.state.as_str() {
+            "Ready" => crate::registry::InstanceState::Ready,
+            "Stopping" => crate::registry::InstanceState::Stopping,
+            _ => return Err(Status::invalid_argument("unsupported instance transition")),
+        };
+        let (service_kind, instance_id, incarnation, lease_id) = liveness_identity_from_fields(
+            request.service_kind,
+            request.instance_id,
+            request.instance_incarnation,
+            request.expected_lease_id,
+        )?;
+        require_peer_instance(peer, &service_kind, &instance_id, &incarnation)?;
+        let record = self
+            .coordinator
+            .store
+            .compare_and_set_instance_state(
+                &service_kind,
+                &instance_id,
+                &incarnation,
+                lease_id,
+                state,
+            )
+            .await
+            .map_err(status_from_placement)?;
+        Ok(Response::new(instance_liveness_to_proto(&record)))
+    }
+
     async fn activate_actor(
         &self,
         request: Request<proto::ActivateActorRequest>,
@@ -496,6 +589,146 @@ fn drain_report_to_proto(
     })
 }
 
+fn registration_from_proto(
+    request: proto::RegisterInstanceRequest,
+) -> Result<crate::registry::InstanceRecord, Status> {
+    const MAX_ENDPOINT_BYTES: usize = 2_048;
+    const MAX_VERSION_BYTES: usize = 256;
+    const MAX_LABELS: usize = 64;
+    const MAX_LABEL_KEY_BYTES: usize = 128;
+    const MAX_LABEL_VALUE_BYTES: usize = 1_024;
+    let service_kind = ServiceKind::new(request.service_kind);
+    let instance_id = lattice_core::instance::InstanceId::new(request.instance_id);
+    let incarnation = instance_incarnation_from_proto(request.instance_incarnation)?;
+    if !canonical_identity_segment(service_kind.as_str())
+        || !canonical_identity_segment(instance_id.as_str())
+        || request.advertised_endpoint.len() > MAX_ENDPOINT_BYTES
+        || request.control_endpoint.len() > MAX_ENDPOINT_BYTES
+        || request.version.is_empty()
+        || request.version.len() > MAX_VERSION_BYTES
+        || request.labels.len() > MAX_LABELS
+        || request.labels.iter().any(|(key, value)| {
+            key.is_empty() || key.len() > MAX_LABEL_KEY_BYTES || value.len() > MAX_LABEL_VALUE_BYTES
+        })
+    {
+        return Err(Status::invalid_argument(
+            "instance registration metadata exceeds its bounds",
+        ));
+    }
+    let advertised_endpoint = request
+        .advertised_endpoint
+        .parse()
+        .map_err(|_| Status::invalid_argument("advertised endpoint is invalid"))?;
+    let control_endpoint = request
+        .control_endpoint
+        .parse()
+        .map_err(|_| Status::invalid_argument("control endpoint is invalid"))?;
+    Ok(crate::registry::InstanceRecord {
+        service_kind,
+        instance_id,
+        incarnation,
+        lease_id: crate::storage::LeaseId(0),
+        advertised_endpoint,
+        control_endpoint,
+        version: request.version,
+        state: crate::registry::InstanceState::Starting,
+        capacity: InstanceCapacity {
+            max_actors: request.max_actors,
+            max_connections: request.max_connections,
+        },
+        labels: request.labels.into_iter().collect(),
+    })
+}
+
+fn liveness_identity_from_proto(
+    request: proto::InstanceLivenessRequest,
+) -> Result<
+    (
+        ServiceKind,
+        lattice_core::instance::InstanceId,
+        InstanceIncarnation,
+        crate::storage::LeaseId,
+    ),
+    Status,
+> {
+    liveness_identity_from_fields(
+        request.service_kind,
+        request.instance_id,
+        request.instance_incarnation,
+        request.expected_lease_id,
+    )
+}
+
+fn liveness_identity_from_fields(
+    service_kind: String,
+    instance_id: String,
+    incarnation: String,
+    lease_id: u64,
+) -> Result<
+    (
+        ServiceKind,
+        lattice_core::instance::InstanceId,
+        InstanceIncarnation,
+        crate::storage::LeaseId,
+    ),
+    Status,
+> {
+    if lease_id == 0 {
+        return Err(Status::invalid_argument("expected_lease_id is required"));
+    }
+    if !canonical_identity_segment(&service_kind) || !canonical_identity_segment(&instance_id) {
+        return Err(Status::invalid_argument(
+            "instance identity is not canonical",
+        ));
+    }
+    Ok((
+        ServiceKind::new(service_kind),
+        lattice_core::instance::InstanceId::new(instance_id),
+        instance_incarnation_from_proto(incarnation)?,
+        crate::storage::LeaseId(lease_id),
+    ))
+}
+
+fn canonical_identity_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+fn require_peer_instance(
+    peer: Option<PeerIdentity>,
+    service_kind: &ServiceKind,
+    instance_id: &lattice_core::instance::InstanceId,
+    incarnation: &InstanceIncarnation,
+) -> Result<(), Status> {
+    if peer.is_some_and(|peer| {
+        &peer.service_kind != service_kind
+            || &peer.instance_id != instance_id
+            || peer.incarnation.as_ref() != Some(incarnation)
+    }) {
+        return Err(Status::permission_denied(
+            "authenticated workload identity cannot manage the requested instance",
+        ));
+    }
+    Ok(())
+}
+
+fn instance_liveness_to_proto(
+    record: &crate::registry::InstanceRecord,
+) -> proto::InstanceLivenessReply {
+    proto::InstanceLivenessReply {
+        service_kind: record.service_kind.as_str().to_string(),
+        instance_id: record.instance_id.as_str().to_string(),
+        instance_incarnation: record.incarnation.as_str().to_string(),
+        lease_id: record.lease_id.0,
+        state: format!("{:?}", record.state),
+    }
+}
+
 fn instance_incarnation_from_proto(value: String) -> Result<InstanceIncarnation, Status> {
     let incarnation = InstanceIncarnation::new(value);
     if !incarnation.is_canonical() {
@@ -535,6 +768,9 @@ fn status_from_placement(error: PlacementError) -> Status {
         PlacementError::InstanceNotFound { .. } | PlacementError::NoRoute => {
             Status::not_found(error.to_string())
         }
+        PlacementError::InstanceAlreadyRegistered { .. } => {
+            Status::already_exists("instance is already registered")
+        }
         PlacementError::NoReadyInstances => Status::resource_exhausted(error.to_string()),
         PlacementError::InstanceNotReady { .. }
         | PlacementError::ActivationLockHeld
@@ -552,6 +788,7 @@ fn status_from_placement(error: PlacementError) -> Status {
         | PlacementError::EpochReservationMismatch
         | PlacementError::InstanceLeaseMismatch { .. }
         | PlacementError::InstanceIncarnationMismatch { .. }
+        | PlacementError::InvalidInstanceStateTransition { .. }
         | PlacementError::CoordinatorLeadershipLost => {
             Status::failed_precondition(error.to_string())
         }

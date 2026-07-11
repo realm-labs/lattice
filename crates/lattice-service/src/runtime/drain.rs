@@ -13,7 +13,6 @@ use lattice_placement::storage::LeaseId;
 use tracing::debug;
 
 use crate::actors::registration::ErasedLogicActor;
-use crate::components::ErasedPlacementStore;
 use crate::config::InstanceConfig;
 use crate::direct_links::DirectLinkServiceRuntime;
 use crate::error::LatticeServiceError;
@@ -98,14 +97,13 @@ pub(crate) async fn drain_direct_links(
 }
 
 pub(crate) async fn publish_instance_record(
-    placement_store: &dyn ErasedPlacementStore,
+    placement_authority: &dyn PlacementAuthority,
     service_kind: &ServiceKind,
     instance: &InstanceConfig,
     local_addr: SocketAddr,
     direct_link_endpoint: Option<&DirectLinkEndpoint>,
     state: InstanceState,
-    lease_id: LeaseId,
-) -> Result<(), LatticeServiceError> {
+) -> Result<LeaseId, LatticeServiceError> {
     let endpoint = instance
         .advertised_endpoint
         .clone()
@@ -114,7 +112,7 @@ pub(crate) async fn publish_instance_record(
         service_kind: service_kind.clone(),
         instance_id: instance.instance_id.clone(),
         incarnation: instance.incarnation.clone(),
-        lease_id,
+        lease_id: LeaseId(0),
         advertised_endpoint: endpoint.clone(),
         control_endpoint: endpoint,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -128,22 +126,22 @@ pub(crate) async fn publish_instance_record(
             })
             .unwrap_or_default(),
     };
-    placement_store.upsert_instance(record).await?;
-    Ok(())
+    let record = placement_authority.register_instance(record).await?;
+    Ok(record.lease_id)
 }
 
 pub(crate) async fn transition_instance_state(
-    placement_store: &dyn ErasedPlacementStore,
+    placement_authority: &dyn PlacementAuthority,
     service_kind: &ServiceKind,
     instance: &InstanceConfig,
     expected_lease_id: LeaseId,
     state: InstanceState,
 ) -> Result<(), LatticeServiceError> {
-    placement_store
-        .compare_and_set_instance_state(
-            service_kind,
-            &instance.instance_id,
-            &instance.incarnation,
+    placement_authority
+        .transition_instance(
+            service_kind.clone(),
+            instance.instance_id.clone(),
+            instance.incarnation.clone(),
             expected_lease_id,
             state,
         )

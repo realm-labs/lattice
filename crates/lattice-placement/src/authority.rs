@@ -19,6 +19,7 @@ use crate::coordination::singleton::{
     ActivateSingletonRequest, SingletonControl, SingletonCoordinator,
 };
 use crate::error::PlacementError;
+use crate::registry::{InstanceRecord, InstanceState};
 use crate::storage::{
     ActorPlacementRecord, LeaseId, PlacementState, PlacementStore, SingletonPlacementRecord,
 };
@@ -32,6 +33,28 @@ pub const MAX_PLACEMENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(60);
 /// or leadership mutation API.
 #[async_trait]
 pub trait PlacementAuthority: Send + Sync + 'static {
+    async fn register_instance(
+        &self,
+        record: InstanceRecord,
+    ) -> Result<InstanceRecord, PlacementError>;
+
+    async fn keepalive_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
+        expected_lease_id: LeaseId,
+    ) -> Result<(), PlacementError>;
+
+    async fn transition_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
+        expected_lease_id: LeaseId,
+        state: InstanceState,
+    ) -> Result<(), PlacementError>;
+
     async fn activate_actor(
         &self,
         request: ActivateActorRequest,
@@ -104,6 +127,56 @@ where
     S: PlacementStore,
     L: LogicControl + SingletonControl,
 {
+    async fn register_instance(
+        &self,
+        record: InstanceRecord,
+    ) -> Result<InstanceRecord, PlacementError> {
+        self.coordinator.store.register_instance(record).await
+    }
+
+    async fn keepalive_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
+        expected_lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
+        let record = self
+            .coordinator
+            .store
+            .get_service_instance(&service_kind, &instance_id)
+            .await?
+            .ok_or_else(|| PlacementError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            })?;
+        require_instance_authority(&record, &instance_incarnation, expected_lease_id)?;
+        self.coordinator
+            .store
+            .keepalive_instance_lease(expected_lease_id)
+            .await
+    }
+
+    async fn transition_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
+        expected_lease_id: LeaseId,
+        state: InstanceState,
+    ) -> Result<(), PlacementError> {
+        self.coordinator
+            .store
+            .compare_and_set_instance_state(
+                &service_kind,
+                &instance_id,
+                &instance_incarnation,
+                expected_lease_id,
+                state,
+            )
+            .await
+            .map(|_| ())
+    }
+
     async fn activate_actor(
         &self,
         request: ActivateActorRequest,
@@ -179,6 +252,111 @@ impl TonicPlacementAuthority {
 
 #[async_trait]
 impl PlacementAuthority for TonicPlacementAuthority {
+    async fn register_instance(
+        &self,
+        record: InstanceRecord,
+    ) -> Result<InstanceRecord, PlacementError> {
+        if record.state != InstanceState::Starting || record.lease_id.0 != 0 {
+            return Err(PlacementError::PlacementCodec {
+                message: "instance registration requires Starting state and no caller lease"
+                    .to_string(),
+            });
+        }
+        let mut rpc_request = Request::new(proto::RegisterInstanceRequest {
+            service_kind: record.service_kind.as_str().to_string(),
+            instance_id: record.instance_id.as_str().to_string(),
+            instance_incarnation: record.incarnation.as_str().to_string(),
+            advertised_endpoint: record.advertised_endpoint.to_string(),
+            control_endpoint: record.control_endpoint.to_string(),
+            version: record.version.clone(),
+            max_actors: record.capacity.max_actors,
+            max_connections: record.capacity.max_connections,
+            labels: record.labels.clone().into_iter().collect(),
+        });
+        rpc_request.set_timeout(self.request_timeout);
+        let mut client = self.client.clone();
+        let reply =
+            tokio::time::timeout(self.request_timeout, client.register_instance(rpc_request))
+                .await
+                .map_err(|_| PlacementError::PlacementAuthorityTimeout)?
+                .map_err(authority_status)?
+                .into_inner();
+        let (lease_id, state) = decode_instance_liveness_reply(&reply, &record)?;
+        if state != InstanceState::Starting {
+            return invalid_reply("state");
+        }
+        Ok(InstanceRecord {
+            lease_id,
+            state,
+            ..record
+        })
+    }
+
+    async fn keepalive_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
+        expected_lease_id: LeaseId,
+    ) -> Result<(), PlacementError> {
+        let mut request = Request::new(proto::InstanceLivenessRequest {
+            service_kind: service_kind.as_str().to_string(),
+            instance_id: instance_id.as_str().to_string(),
+            instance_incarnation: instance_incarnation.as_str().to_string(),
+            expected_lease_id: expected_lease_id.0,
+        });
+        request.set_timeout(self.request_timeout);
+        let mut client = self.client.clone();
+        let reply = tokio::time::timeout(self.request_timeout, client.keepalive_instance(request))
+            .await
+            .map_err(|_| PlacementError::PlacementAuthorityTimeout)?
+            .map_err(authority_status)?
+            .into_inner();
+        validate_liveness_identity(
+            &reply,
+            &service_kind,
+            &instance_id,
+            &instance_incarnation,
+            expected_lease_id,
+        )
+    }
+
+    async fn transition_instance(
+        &self,
+        service_kind: ServiceKind,
+        instance_id: InstanceId,
+        instance_incarnation: InstanceIncarnation,
+        expected_lease_id: LeaseId,
+        state: InstanceState,
+    ) -> Result<(), PlacementError> {
+        let mut request = Request::new(proto::TransitionInstanceRequest {
+            service_kind: service_kind.as_str().to_string(),
+            instance_id: instance_id.as_str().to_string(),
+            instance_incarnation: instance_incarnation.as_str().to_string(),
+            expected_lease_id: expected_lease_id.0,
+            state: format!("{state:?}"),
+        });
+        request.set_timeout(self.request_timeout);
+        let mut client = self.client.clone();
+        let reply = tokio::time::timeout(self.request_timeout, client.transition_instance(request))
+            .await
+            .map_err(|_| PlacementError::PlacementAuthorityTimeout)?
+            .map_err(authority_status)?
+            .into_inner();
+        validate_liveness_identity(
+            &reply,
+            &service_kind,
+            &instance_id,
+            &instance_incarnation,
+            expected_lease_id,
+        )?;
+        let actual_state = decode_instance_state(&reply.state)?;
+        if actual_state != state {
+            return invalid_reply("state");
+        }
+        Ok(())
+    }
+
     async fn activate_actor(
         &self,
         request: ActivateActorRequest,
@@ -266,6 +444,73 @@ fn authority_status(status: Status) -> PlacementError {
         PlacementError::PlacementAuthorityRpc {
             code: status.code(),
         }
+    }
+}
+
+fn require_instance_authority(
+    record: &InstanceRecord,
+    expected_incarnation: &InstanceIncarnation,
+    expected_lease_id: LeaseId,
+) -> Result<(), PlacementError> {
+    if &record.incarnation != expected_incarnation {
+        return Err(PlacementError::InstanceIncarnationMismatch {
+            instance_id: record.instance_id.clone(),
+            expected: expected_incarnation.clone(),
+            actual: record.incarnation.clone(),
+        });
+    }
+    if record.lease_id != expected_lease_id {
+        return Err(PlacementError::InstanceLeaseMismatch {
+            instance_id: record.instance_id.clone(),
+            expected: expected_lease_id,
+            actual: record.lease_id,
+        });
+    }
+    Ok(())
+}
+
+fn decode_instance_liveness_reply(
+    reply: &proto::InstanceLivenessReply,
+    expected: &InstanceRecord,
+) -> Result<(LeaseId, InstanceState), PlacementError> {
+    let lease_id = decode_lease(reply.lease_id)?;
+    validate_liveness_identity(
+        reply,
+        &expected.service_kind,
+        &expected.instance_id,
+        &expected.incarnation,
+        lease_id,
+    )?;
+    Ok((lease_id, decode_instance_state(&reply.state)?))
+}
+
+fn validate_liveness_identity(
+    reply: &proto::InstanceLivenessReply,
+    service_kind: &ServiceKind,
+    instance_id: &InstanceId,
+    incarnation: &InstanceIncarnation,
+    lease_id: LeaseId,
+) -> Result<(), PlacementError> {
+    require_equal(&reply.service_kind, service_kind.as_str(), "service_kind")?;
+    require_equal(&reply.instance_id, instance_id.as_str(), "instance_id")?;
+    require_equal(
+        &reply.instance_incarnation,
+        incarnation.as_str(),
+        "instance_incarnation",
+    )?;
+    if reply.lease_id != lease_id.0 {
+        return invalid_reply("lease_id");
+    }
+    Ok(())
+}
+
+fn decode_instance_state(value: &str) -> Result<InstanceState, PlacementError> {
+    match value {
+        "Starting" => Ok(InstanceState::Starting),
+        "Ready" => Ok(InstanceState::Ready),
+        "Draining" => Ok(InstanceState::Draining),
+        "Stopping" => Ok(InstanceState::Stopping),
+        _ => invalid_reply("state"),
     }
 }
 
@@ -466,6 +711,27 @@ mod tests {
 
     #[tonic::async_trait]
     impl proto::placement_coordinator_server::PlacementCoordinator for SlowAndRejectingAuthority {
+        async fn register_instance(
+            &self,
+            _request: Request<proto::RegisterInstanceRequest>,
+        ) -> Result<Response<proto::InstanceLivenessReply>, Status> {
+            Err(Status::unimplemented("test authority"))
+        }
+
+        async fn keepalive_instance(
+            &self,
+            _request: Request<proto::InstanceLivenessRequest>,
+        ) -> Result<Response<proto::InstanceLivenessReply>, Status> {
+            Err(Status::unimplemented("test authority"))
+        }
+
+        async fn transition_instance(
+            &self,
+            _request: Request<proto::TransitionInstanceRequest>,
+        ) -> Result<Response<proto::InstanceLivenessReply>, Status> {
+            Err(Status::unimplemented("test authority"))
+        }
+
         async fn activate_actor(
             &self,
             _request: Request<proto::ActivateActorRequest>,

@@ -171,20 +171,17 @@ impl LatticeService {
         let direct_link_endpoint = direct_link_listener
             .as_ref()
             .map(ManagedDirectLinkListener::endpoint);
-        let lease_id = placement_store.grant_instance_lease().await?;
-        placement_store.keepalive_instance_lease(lease_id).await?;
-        publish_instance_record(
-            placement_store.as_ref(),
+        let lease_id = publish_instance_record(
+            placement_authority.as_ref(),
             &service_kind,
             &instance,
             local_addr,
             direct_link_endpoint.as_ref(),
             InstanceState::Starting,
-            lease_id,
         )
         .await?;
         transition_instance_state(
-            placement_store.as_ref(),
+            placement_authority.as_ref(),
             &service_kind,
             &instance,
             lease_id,
@@ -220,7 +217,14 @@ impl LatticeService {
         let keepalive = async {
             loop {
                 tokio::time::sleep(instance_lease_keepalive_interval).await;
-                placement_store.keepalive_instance_lease(lease_id).await?;
+                placement_authority
+                    .keepalive_instance(
+                        service_kind.clone(),
+                        instance.instance_id.clone(),
+                        instance.incarnation.clone(),
+                        lease_id,
+                    )
+                    .await?;
                 placement_store
                     .keepalive_singleton_owner_leases(&service_kind, &instance.instance_id)
                     .await?;
@@ -333,7 +337,7 @@ impl LatticeService {
                     }
                 }
                 transition_instance_state(
-                    placement_store.as_ref(),
+                    placement_authority.as_ref(),
                     &service_kind,
                     &instance,
                     lease_id,

@@ -2,20 +2,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lattice_config::bootstrap::BootstrapConfig;
-use lattice_core::instance::{InstanceId, InstanceIncarnation};
+use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ConfiguredComponentBuilder;
 use lattice_core::service_context::{ConfiguredComponent, ServiceContextBuilder};
 use lattice_placement::authority::PlacementAuthority;
 use lattice_placement::coordination::singleton::SingletonRouteResolver;
 use lattice_placement::error::PlacementError;
-use lattice_placement::registry::{InstanceRecord, InstanceState};
+use lattice_placement::registry::InstanceRecord;
 use lattice_placement::routing::cache::RouteCacheConfig;
 use lattice_placement::routing::placement::{
     PlacementRouteResolver, PlacementWatchStarter, PlacementWatchTask,
 };
 use lattice_placement::storage::{
-    ActorPlacementRecord, LeaseId, PlacementStore, PlacementVersion, SingletonPlacementRecord,
+    ActorPlacementRecord, PlacementStore, PlacementVersion, SingletonPlacementRecord,
     VirtualShardPlacementRecord,
 };
 
@@ -181,17 +181,6 @@ where
 
 #[async_trait]
 pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
-    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError>;
-    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError>;
-    async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError>;
-    async fn compare_and_set_instance_state(
-        &self,
-        service_kind: &ServiceKind,
-        instance_id: &InstanceId,
-        expected_incarnation: &InstanceIncarnation,
-        expected_lease_id: LeaseId,
-        state: InstanceState,
-    ) -> Result<InstanceRecord, PlacementError>;
     async fn list_instances(
         &self,
         service_kind: &ServiceKind,
@@ -279,37 +268,6 @@ impl<T> ErasedPlacementStore for PlacementStoreHandle<T>
 where
     T: PlacementStore,
 {
-    async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
-        self.store.grant_instance_lease().await
-    }
-
-    async fn keepalive_instance_lease(&self, lease_id: LeaseId) -> Result<(), PlacementError> {
-        self.store.keepalive_instance_lease(lease_id).await
-    }
-
-    async fn upsert_instance(&self, record: InstanceRecord) -> Result<(), PlacementError> {
-        self.store.upsert_instance(record).await
-    }
-
-    async fn compare_and_set_instance_state(
-        &self,
-        service_kind: &ServiceKind,
-        instance_id: &InstanceId,
-        expected_incarnation: &InstanceIncarnation,
-        expected_lease_id: LeaseId,
-        state: InstanceState,
-    ) -> Result<InstanceRecord, PlacementError> {
-        self.store
-            .compare_and_set_instance_state(
-                service_kind,
-                instance_id,
-                expected_incarnation,
-                expected_lease_id,
-                state,
-            )
-            .await
-    }
-
     async fn list_instances(
         &self,
         service_kind: &ServiceKind,

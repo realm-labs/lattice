@@ -34,6 +34,7 @@ use crate::storage::etcd::codec::{
     virtual_shard_epoch_floor_service_prefix, vshard_actor_prefix, vshard_key,
     vshard_service_prefix,
 };
+use crate::storage::valid_instance_state_transition;
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, EpochFloorRecord, LeaseId,
     OwnershipEpochFloorProof, OwnershipProofContext, OwnershipProofError, OwnershipRecordBinding,
@@ -574,6 +575,43 @@ impl<C> PlacementStore for EtcdPlacementStore<C>
 where
     C: EtcdKv,
 {
+    async fn register_instance(
+        &self,
+        mut record: InstanceRecord,
+    ) -> Result<InstanceRecord, PlacementError> {
+        validate_instance_record(&record)?;
+        if record.state != InstanceState::Starting || record.lease_id.0 != 0 {
+            return Err(PlacementError::PlacementCodec {
+                message: "instance registration requires Starting state and no caller lease"
+                    .to_string(),
+            });
+        }
+        let lease_id = self.client.grant_instance_lease().await?;
+        record.lease_id = lease_id;
+        let result = self
+            .client
+            .compare_and_put(
+                instance_key(&self.prefix, &record.service_kind, &record.instance_id),
+                None,
+                EtcdValue::Instance(Box::new(record.clone())),
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(record),
+            Err(error) => {
+                self.client.revoke_instance_lease(lease_id).await?;
+                match error {
+                    PlacementError::CompareAndPutFailed => {
+                        Err(PlacementError::InstanceAlreadyRegistered {
+                            instance_id: record.instance_id,
+                        })
+                    }
+                    error => Err(error),
+                }
+            }
+        }
+    }
+
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
         self.client.grant_instance_lease().await
     }
@@ -695,6 +733,13 @@ where
                 instance_id: instance_id.clone(),
                 expected: expected_lease_id,
                 actual: record.lease_id,
+            });
+        }
+        if !valid_instance_state_transition(record.state, state) {
+            return Err(PlacementError::InvalidInstanceStateTransition {
+                instance_id: instance_id.clone(),
+                current: record.state,
+                requested: state,
             });
         }
         record.state = state;

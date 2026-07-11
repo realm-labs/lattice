@@ -11,6 +11,7 @@ use tokio::sync::broadcast;
 
 use crate::error::PlacementError;
 use crate::registry::{InstanceRecord, InstanceState};
+use crate::storage::valid_instance_state_transition;
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, CoordinatorLeadership, EpochFloorRecord, LeaseId,
     OwnershipEpochFloorProof, OwnershipProofContext, OwnershipProofError, OwnershipRecordBinding,
@@ -231,6 +232,53 @@ impl InMemoryPlacementStore {
 
 #[async_trait]
 impl PlacementStore for InMemoryPlacementStore {
+    async fn register_instance(
+        &self,
+        mut record: InstanceRecord,
+    ) -> Result<InstanceRecord, PlacementError> {
+        if record.state != InstanceState::Starting || record.lease_id.0 != 0 {
+            return Err(PlacementError::PlacementCodec {
+                message: "instance registration requires Starting state and no caller lease"
+                    .to_string(),
+            });
+        }
+        if !record.incarnation.is_canonical()
+            || !canonical_instance_segment(record.service_kind.as_str())
+            || !canonical_instance_segment(record.instance_id.as_str())
+        {
+            return Err(PlacementError::PlacementCodec {
+                message: "instance registration identity must be canonical and bounded".to_string(),
+            });
+        }
+        let mut inner = self.inner.lock().expect("placement store mutex poisoned");
+        let key = self.prefixed_instance_key(&record.instance_id);
+        if inner.instances.contains_key(&key) {
+            return Err(PlacementError::InstanceAlreadyRegistered {
+                instance_id: record.instance_id,
+            });
+        }
+        record.lease_id = LeaseId(self.next_lease_id.fetch_add(1, Ordering::SeqCst));
+        inner.instance_leases.insert(record.lease_id, 0);
+        let revision = inner.next_placement_revision();
+        inner.instances.insert(key, record.clone());
+        inner.notify(
+            &self.prefix,
+            PlacementWatchEvent::InstanceUpdated {
+                record: record.clone(),
+            },
+        );
+        inner.notify_ownership(
+            &self.prefix,
+            OwnershipWatchBatch {
+                revision,
+                events: vec![OwnershipWatchEvent::InstanceUpserted {
+                    record: record.clone(),
+                }],
+            },
+        );
+        Ok(record)
+    }
+
     async fn grant_instance_lease(&self) -> Result<LeaseId, PlacementError> {
         let mut inner = self.inner.lock().expect("placement store mutex poisoned");
         let lease_id = LeaseId(self.next_lease_id.fetch_add(1, Ordering::SeqCst));
@@ -346,6 +394,13 @@ impl PlacementStore for InMemoryPlacementStore {
                 instance_id: instance_id.clone(),
                 expected: expected_lease_id,
                 actual: record.lease_id,
+            });
+        }
+        if !valid_instance_state_transition(record.state, state) {
+            return Err(PlacementError::InvalidInstanceStateTransition {
+                instance_id: instance_id.clone(),
+                current: record.state,
+                requested: state,
             });
         }
         record.state = state;
@@ -1237,6 +1292,16 @@ impl PlacementStore for InMemoryPlacementStore {
 
 fn placement_token(revision: PlacementRevision) -> PlacementVersion {
     PlacementVersion::from_modification_revision(revision.0)
+}
+
+fn canonical_instance_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 fn reserve_memory_epoch(

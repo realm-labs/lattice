@@ -66,6 +66,14 @@ pub enum PlacementError {
         expected: InstanceIncarnation,
         actual: InstanceIncarnation,
     },
+    #[error("instance {instance_id} is already registered")]
+    InstanceAlreadyRegistered { instance_id: InstanceId },
+    #[error("instance {instance_id} cannot transition from {current:?} to {requested:?}")]
+    InvalidInstanceStateTransition {
+        instance_id: InstanceId,
+        current: crate::registry::InstanceState,
+        requested: crate::registry::InstanceState,
+    },
     #[error("coordinator leadership has been lost")]
     CoordinatorLeadershipLost,
     #[error("singleton activation lock is already held")]

@@ -62,6 +62,23 @@ async fn instance_state_compare_rejects_reused_lease_from_another_incarnation() 
             .state,
         InstanceState::Ready
     );
+    assert_eq!(
+        store
+            .compare_and_set_instance_state(
+                &record.service_kind,
+                &record.instance_id,
+                &record.incarnation,
+                record.lease_id,
+                InstanceState::Starting,
+            )
+            .await
+            .unwrap_err(),
+        PlacementError::InvalidInstanceStateTransition {
+            instance_id: record.instance_id,
+            current: InstanceState::Ready,
+            requested: InstanceState::Starting,
+        }
+    );
 }
 
 #[tokio::test]

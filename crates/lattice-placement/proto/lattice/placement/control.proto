@@ -9,9 +9,47 @@ service LogicControl {
 }
 
 service PlacementCoordinator {
+  rpc RegisterInstance(RegisterInstanceRequest) returns (InstanceLivenessReply);
+  rpc KeepaliveInstance(InstanceLivenessRequest) returns (InstanceLivenessReply);
+  rpc TransitionInstance(TransitionInstanceRequest) returns (InstanceLivenessReply);
   rpc ActivateActor(ActivateActorRequest) returns (ActorPlacementReply);
   rpc ActivateSingleton(ActivateSingletonRequest) returns (SingletonPlacementReply);
   rpc DrainInstance(DrainInstanceRequest) returns (DrainInstanceReply);
+}
+
+message RegisterInstanceRequest {
+  string service_kind = 1;
+  string instance_id = 2;
+  string instance_incarnation = 3;
+  string advertised_endpoint = 4;
+  string control_endpoint = 5;
+  string version = 6;
+  optional uint64 max_actors = 7;
+  optional uint64 max_connections = 8;
+  map<string, string> labels = 9;
+}
+
+message InstanceLivenessRequest {
+  string service_kind = 1;
+  string instance_id = 2;
+  string instance_incarnation = 3;
+  uint64 expected_lease_id = 4;
+}
+
+message TransitionInstanceRequest {
+  string service_kind = 1;
+  string instance_id = 2;
+  string instance_incarnation = 3;
+  uint64 expected_lease_id = 4;
+  string state = 5;
+}
+
+message InstanceLivenessReply {
+  string service_kind = 1;
+  string instance_id = 2;
+  string instance_incarnation = 3;
+  uint64 lease_id = 4;
+  string state = 5;
 }
 
 message ActivateActorRequest {

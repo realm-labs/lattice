@@ -200,6 +200,124 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
     server.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinator_mtls_registers_and_renews_only_the_current_boot_incarnation() {
+    let pki = TestPki::generate();
+    let store =
+        InMemoryPlacementStore::new(PlacementPrefix::new("/lattice/authority-mtls-liveness"));
+    let server = TestAuthorityServer::start(&pki, store.clone()).await;
+    let channel = connect_tls(
+        server.address,
+        &pki.ca_pem,
+        Some(&pki.valid_client),
+        "localhost",
+    )
+    .await
+    .expect("current workload completes mutual TLS");
+    let authority = TonicPlacementAuthority::new(channel);
+    let registered = authority
+        .register_instance(InstanceRecord {
+            service_kind: ServiceKind::new(TARGET_SERVICE),
+            instance_id: InstanceId::new(TARGET_INSTANCE),
+            incarnation: InstanceIncarnation::new(TARGET_INCARNATION),
+            lease_id: LeaseId(0),
+            advertised_endpoint: "http://127.0.0.1:50051".parse().unwrap(),
+            control_endpoint: "http://127.0.0.1:50052".parse().unwrap(),
+            version: "authority-mtls-test".to_string(),
+            state: InstanceState::Starting,
+            capacity: InstanceCapacity::default(),
+            labels: BTreeMap::new(),
+        })
+        .await
+        .expect("current boot registers through semantic authority");
+    assert_ne!(registered.lease_id, LeaseId(0));
+    authority
+        .transition_instance(
+            registered.service_kind.clone(),
+            registered.instance_id.clone(),
+            registered.incarnation.clone(),
+            registered.lease_id,
+            InstanceState::Ready,
+        )
+        .await
+        .expect("current boot transitions to Ready");
+    authority
+        .keepalive_instance(
+            registered.service_kind.clone(),
+            registered.instance_id.clone(),
+            registered.incarnation.clone(),
+            registered.lease_id,
+        )
+        .await
+        .expect("current boot renews its authority-issued lease");
+    assert_eq!(
+        store.instance_lease_keepalive_count(registered.lease_id),
+        Some(1)
+    );
+
+    let stale_channel = connect_tls(
+        server.address,
+        &pki.ca_pem,
+        Some(&pki.stale_incarnation_client),
+        "localhost",
+    )
+    .await
+    .expect("stale workload completes mutual TLS");
+    let stale = TonicPlacementAuthority::new(stale_channel);
+    let revision_before = placement_revision(&store).await;
+    let stale_registration = stale
+        .register_instance(InstanceRecord {
+            incarnation: InstanceIncarnation::new("world-a-old-boot"),
+            lease_id: LeaseId(0),
+            state: InstanceState::Starting,
+            ..registered.clone()
+        })
+        .await;
+    assert!(matches!(
+        stale_registration,
+        Err(PlacementError::PlacementAuthorityRpc {
+            code: Code::AlreadyExists
+        })
+    ));
+    assert!(matches!(
+        stale
+            .keepalive_instance(
+                ServiceKind::new(TARGET_SERVICE),
+                InstanceId::new(TARGET_INSTANCE),
+                InstanceIncarnation::new("world-a-old-boot"),
+                registered.lease_id,
+            )
+            .await,
+        Err(PlacementError::PlacementAuthorityRpc {
+            code: Code::PermissionDenied
+        })
+    ));
+    assert_eq!(
+        store.instance_lease_keepalive_count(registered.lease_id),
+        Some(1)
+    );
+    assert!(matches!(
+        stale
+            .transition_instance(
+                ServiceKind::new(TARGET_SERVICE),
+                InstanceId::new(TARGET_INSTANCE),
+                InstanceIncarnation::new("world-a-old-boot"),
+                registered.lease_id,
+                InstanceState::Stopping,
+            )
+            .await,
+        Err(PlacementError::PlacementAuthorityRpc {
+            code: Code::PermissionDenied
+        })
+    ));
+    assert_eq!(placement_revision(&store).await, revision_before);
+    let current = target_record(&store).await;
+    assert_eq!(current.incarnation, registered.incarnation);
+    assert_eq!(current.state, InstanceState::Ready);
+
+    server.shutdown().await;
+}
+
 async fn assert_transport_rejected_without_mutation(
     result: Result<Channel, tonic::transport::Error>,
     allowed_codes: &[Code],
