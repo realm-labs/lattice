@@ -18,6 +18,7 @@ service PlacementCoordinator {
   rpc GetInstance(GetInstanceRequest) returns (GetInstanceReply);
   rpc GetActor(GetActorRequest) returns (GetActorReply);
   rpc GetSingleton(GetSingletonRequest) returns (GetSingletonReply);
+  rpc GetServicePlacementSnapshot(GetServicePlacementSnapshotRequest) returns (GetServicePlacementSnapshotReply);
   rpc DrainInstance(DrainInstanceRequest) returns (DrainInstanceReply);
 }
 
@@ -71,6 +72,35 @@ message GetSingletonReply {
 message VersionedSingletonPlacement {
   uint64 version = 1;
   SingletonPlacementReply placement = 2;
+}
+
+message GetServicePlacementSnapshotRequest {
+  string service_kind = 1;
+  string instance_id = 2;
+  uint32 max_entries = 3;
+}
+
+message GetServicePlacementSnapshotReply {
+  uint64 revision = 1;
+  optional InstanceRecord local_instance = 2;
+  repeated ServicePlacementRecord records = 3;
+}
+
+message ServicePlacementRecord {
+  uint64 revision = 1;
+  oneof record {
+    ActorPlacementReply actor = 2;
+    VirtualShardPlacement virtual_shard = 3;
+    SingletonPlacementReply singleton = 4;
+  }
+}
+
+message VirtualShardPlacement {
+  string service_kind = 1;
+  string actor_kind = 2;
+  uint32 shard_id = 3;
+  string owner_instance_id = 4;
+  uint64 epoch = 5;
 }
 
 message SingletonLeaseClaim {

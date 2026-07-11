@@ -183,6 +183,31 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
             .expect("a current authenticated peer may read cross-service actor placement")
             .is_some()
     );
+    let snapshot = cross_service_reader
+        .get_service_placement_snapshot(
+            &ServiceKind::new(TARGET_SERVICE),
+            &InstanceId::new(TARGET_INSTANCE),
+            NonZeroUsize::new(8).unwrap(),
+        )
+        .await
+        .expect("a current authenticated peer may read a coherent cross-service snapshot");
+    assert_eq!(snapshot.records.len(), 2);
+    assert_eq!(
+        snapshot.local_instance.unwrap().incarnation,
+        InstanceIncarnation::new(TARGET_INCARNATION)
+    );
+    assert!(matches!(
+        cross_service_reader
+            .get_service_placement_snapshot(
+                &ServiceKind::new(TARGET_SERVICE),
+                &InstanceId::new(TARGET_INSTANCE),
+                NonZeroUsize::new(1).unwrap(),
+            )
+            .await,
+        Err(PlacementError::PlacementAuthorityRpc {
+            code: Code::ResourceExhausted
+        })
+    ));
     assert!(
         cross_service_reader
             .get_singleton(&singleton_key())
@@ -507,6 +532,15 @@ async fn assert_all_methods_rejected_without_mutation(
         bounded_error(
             reader.get_singleton(&singleton_key()),
             "unverified identity must not read a singleton",
+        )
+        .await,
+        bounded_error(
+            reader.get_service_placement_snapshot(
+                &ServiceKind::new(TARGET_SERVICE),
+                &InstanceId::new(TARGET_INSTANCE),
+                NonZeroUsize::new(8).unwrap(),
+            ),
+            "unverified identity must not read a placement snapshot",
         )
         .await,
     ] {

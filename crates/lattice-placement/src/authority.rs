@@ -22,13 +22,38 @@ use crate::coordination::singleton::{
 use crate::error::PlacementError;
 use crate::registry::{InstanceRecord, InstanceState};
 use crate::storage::{
-    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementState, PlacementStore,
-    PlacementVersion, SingletonKey, SingletonPlacementRecord,
+    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementRevision, PlacementState,
+    PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
+    VirtualShardPlacementRecord,
 };
 
 pub const DEFAULT_PLACEMENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_PLACEMENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_SINGLETON_RENEWAL_CLAIMS: usize = 4_096;
+pub const MAX_PLACEMENT_SNAPSHOT_ENTRIES: usize = 4_096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServicePlacementSnapshot {
+    pub revision: PlacementRevision,
+    pub local_instance: Option<InstanceRecord>,
+    pub records: Vec<ServicePlacementSnapshotRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServicePlacementSnapshotRecord {
+    Actor {
+        revision: PlacementRevision,
+        record: ActorPlacementRecord,
+    },
+    VirtualShard {
+        revision: PlacementRevision,
+        record: VirtualShardPlacementRecord,
+    },
+    Singleton {
+        revision: PlacementRevision,
+        record: SingletonPlacementRecord,
+    },
+}
 
 /// Bounded semantic point-read client for runtime placement lookups.
 ///
@@ -145,6 +170,39 @@ impl TonicPlacementReader {
                 ))
             })
             .transpose()
+    }
+
+    pub async fn get_service_placement_snapshot(
+        &self,
+        service_kind: &ServiceKind,
+        instance_id: &InstanceId,
+        max_entries: std::num::NonZeroUsize,
+    ) -> Result<ServicePlacementSnapshot, PlacementError> {
+        if max_entries.get() > MAX_PLACEMENT_SNAPSHOT_ENTRIES {
+            return Err(PlacementError::PlacementReadLimitExceeded {
+                limit: MAX_PLACEMENT_SNAPSHOT_ENTRIES,
+            });
+        }
+        let mut request = Request::new(proto::GetServicePlacementSnapshotRequest {
+            service_kind: service_kind.as_str().to_string(),
+            instance_id: instance_id.as_str().to_string(),
+            max_entries: u32::try_from(max_entries.get()).map_err(|_| {
+                PlacementError::PlacementReadLimitExceeded {
+                    limit: MAX_PLACEMENT_SNAPSHOT_ENTRIES,
+                }
+            })?,
+        });
+        request.set_timeout(self.request_timeout);
+        let mut client = self.client.clone();
+        let reply = tokio::time::timeout(
+            self.request_timeout,
+            client.get_service_placement_snapshot(request),
+        )
+        .await
+        .map_err(|_| PlacementError::PlacementAuthorityTimeout)?
+        .map_err(authority_status)?
+        .into_inner();
+        decode_service_snapshot(reply, service_kind, instance_id, max_entries)
     }
 
     async fn call_get_instance(
@@ -893,6 +951,168 @@ fn decode_version(value: u64) -> Result<PlacementVersion, PlacementError> {
     Ok(PlacementVersion::from_modification_revision(value))
 }
 
+fn decode_service_snapshot(
+    reply: proto::GetServicePlacementSnapshotReply,
+    expected_service: &ServiceKind,
+    expected_instance: &InstanceId,
+    max_entries: std::num::NonZeroUsize,
+) -> Result<ServicePlacementSnapshot, PlacementError> {
+    use proto::service_placement_record::Record;
+
+    if reply.records.len() > max_entries.get() {
+        return Err(PlacementError::PlacementReadLimitExceeded {
+            limit: max_entries.get(),
+        });
+    }
+    let snapshot_revision = PlacementRevision(reply.revision);
+    let local_instance = reply
+        .local_instance
+        .map(|record| decode_instance_record(record, expected_instance))
+        .transpose()?;
+    if local_instance
+        .as_ref()
+        .is_some_and(|record| &record.service_kind != expected_service)
+    {
+        return invalid_reply("local_instance.service_kind");
+    }
+
+    let mut actor_keys = HashSet::new();
+    let mut shard_keys = HashSet::new();
+    let mut singleton_keys = HashSet::new();
+    let mut records = Vec::with_capacity(reply.records.len());
+    for entry in reply.records {
+        if entry.revision == 0 || entry.revision > reply.revision {
+            return invalid_reply("record.revision");
+        }
+        let revision = PlacementRevision(entry.revision);
+        let record = match entry.record.ok_or_else(|| invalid_reply_error("record"))? {
+            Record::Actor(record) => {
+                let record = decode_snapshot_actor(record, expected_service)?;
+                let key = ActorPlacementKey {
+                    service_kind: record.service_kind.clone(),
+                    actor_kind: record.actor_kind.clone(),
+                    actor_id: record.actor_id.clone(),
+                };
+                if !actor_keys.insert(key) {
+                    return invalid_reply("record.duplicate");
+                }
+                ServicePlacementSnapshotRecord::Actor { revision, record }
+            }
+            Record::VirtualShard(record) => {
+                let record = decode_snapshot_virtual_shard(record, expected_service)?;
+                let key = crate::storage::VirtualShardPlacementKey {
+                    service_kind: record.service_kind.clone(),
+                    actor_kind: record.actor_kind.clone(),
+                    shard_id: record.shard_id,
+                };
+                if !shard_keys.insert(key) {
+                    return invalid_reply("record.duplicate");
+                }
+                ServicePlacementSnapshotRecord::VirtualShard { revision, record }
+            }
+            Record::Singleton(record) => {
+                let record = decode_snapshot_singleton(record, expected_service)?;
+                let key = SingletonKey {
+                    service_kind: record.service_kind.clone(),
+                    singleton_kind: record.singleton_kind.clone(),
+                    scope: record.scope.clone(),
+                };
+                if !singleton_keys.insert(key) {
+                    return invalid_reply("record.duplicate");
+                }
+                ServicePlacementSnapshotRecord::Singleton { revision, record }
+            }
+        };
+        records.push(record);
+    }
+    Ok(ServicePlacementSnapshot {
+        revision: snapshot_revision,
+        local_instance,
+        records,
+    })
+}
+
+fn decode_snapshot_actor(
+    reply: proto::ActorPlacementReply,
+    expected_service: &ServiceKind,
+) -> Result<ActorPlacementRecord, PlacementError> {
+    require_equal(
+        &reply.service_kind,
+        expected_service.as_str(),
+        "service_kind",
+    )?;
+    if !valid_identity_segment(&reply.actor_kind) {
+        return invalid_reply("actor_kind");
+    }
+    let actor_id = decode_actor_id(reply.actor_id, "actor_id")?;
+    if matches!(&actor_id, ActorId::Str(value) if value.len() > 4_096)
+        || matches!(&actor_id, ActorId::Bytes(value) if value.len() > 4_096)
+    {
+        return invalid_reply("actor_id");
+    }
+    Ok(ActorPlacementRecord {
+        service_kind: expected_service.clone(),
+        actor_kind: lattice_core::kind::ActorKind::new(reply.actor_kind),
+        actor_id,
+        owner: decode_instance_id(reply.owner_instance_id, "owner_instance_id")?,
+        epoch: decode_epoch(reply.epoch)?,
+        lease_id: decode_lease(reply.lease_id)?,
+        state: decode_state(&reply.state)?,
+    })
+}
+
+fn decode_snapshot_virtual_shard(
+    reply: proto::VirtualShardPlacement,
+    expected_service: &ServiceKind,
+) -> Result<VirtualShardPlacementRecord, PlacementError> {
+    require_equal(
+        &reply.service_kind,
+        expected_service.as_str(),
+        "service_kind",
+    )?;
+    if !valid_identity_segment(&reply.actor_kind) {
+        return invalid_reply("actor_kind");
+    }
+    Ok(VirtualShardPlacementRecord {
+        service_kind: expected_service.clone(),
+        actor_kind: lattice_core::kind::ActorKind::new(reply.actor_kind),
+        shard_id: crate::sharding::VirtualShardId(reply.shard_id),
+        owner: decode_instance_id(reply.owner_instance_id, "owner_instance_id")?,
+        epoch: decode_epoch(reply.epoch)?,
+    })
+}
+
+fn decode_snapshot_singleton(
+    reply: proto::SingletonPlacementReply,
+    expected_service: &ServiceKind,
+) -> Result<SingletonPlacementRecord, PlacementError> {
+    require_equal(
+        &reply.service_kind,
+        expected_service.as_str(),
+        "service_kind",
+    )?;
+    if !valid_identity_segment(&reply.singleton_kind)
+        || reply.scope.is_empty()
+        || reply.scope.len() > 256
+    {
+        return invalid_reply("singleton_key");
+    }
+    let owner_incarnation = InstanceIncarnation::new(reply.owner_incarnation);
+    if !owner_incarnation.is_canonical() {
+        return invalid_reply("owner_incarnation");
+    }
+    Ok(SingletonPlacementRecord {
+        service_kind: expected_service.clone(),
+        singleton_kind: lattice_core::kind::ActorKind::new(reply.singleton_kind),
+        scope: reply.scope,
+        owner: decode_instance_id(reply.owner_instance_id, "owner_instance_id")?,
+        owner_incarnation,
+        epoch: decode_epoch(reply.epoch)?,
+        lease_id: decode_lease(reply.lease_id)?,
+        state: decode_state(&reply.state)?,
+    })
+}
+
 fn decode_actor_reply(
     reply: proto::ActorPlacementReply,
     expected_service: &ServiceKind,
@@ -1159,6 +1379,13 @@ mod tests {
             Err(Status::unimplemented("test authority"))
         }
 
+        async fn get_service_placement_snapshot(
+            &self,
+            _request: Request<proto::GetServicePlacementSnapshotRequest>,
+        ) -> Result<Response<proto::GetServicePlacementSnapshotReply>, Status> {
+            Err(Status::unimplemented("test authority"))
+        }
+
         async fn drain_instance(
             &self,
             _request: Request<proto::DrainInstanceRequest>,
@@ -1182,6 +1409,20 @@ mod tests {
             )
             .unwrap_err(),
             PlacementError::InvalidPlacementAuthorityTimeout
+        );
+        let reader =
+            TonicPlacementReader::new(Channel::from_static("http://127.0.0.1:1").connect_lazy());
+        assert_eq!(
+            reader
+                .get_service_placement_snapshot(
+                    &service_kind!("World"),
+                    &InstanceId::new("world-a"),
+                    std::num::NonZeroUsize::new(MAX_PLACEMENT_SNAPSHOT_ENTRIES + 1).unwrap(),
+                )
+                .await,
+            Err(PlacementError::PlacementReadLimitExceeded {
+                limit: MAX_PLACEMENT_SNAPSHOT_ENTRIES
+            })
         );
     }
 
@@ -1402,6 +1643,58 @@ mod tests {
             decode_instance_record(oversized, &InstanceId::new("world-a")),
             Err(PlacementError::InvalidPlacementAuthorityReply {
                 field: "instance_metadata"
+            })
+        );
+    }
+
+    #[test]
+    fn service_snapshot_reply_rejects_duplicate_keys_and_future_record_revisions() {
+        let actor = || proto::ServicePlacementRecord {
+            revision: 1,
+            record: Some(proto::service_placement_record::Record::Actor(
+                proto::ActorPlacementReply {
+                    service_kind: "World".to_string(),
+                    actor_kind: "World".to_string(),
+                    actor_id: Some(actor_id_to_proto(&ActorId::U64(7))),
+                    owner_instance_id: "world-a".to_string(),
+                    epoch: 1,
+                    lease_id: 2,
+                    state: "running".to_string(),
+                },
+            )),
+        };
+        let reply = proto::GetServicePlacementSnapshotReply {
+            revision: 2,
+            local_instance: None,
+            records: vec![actor(), actor()],
+        };
+        assert_eq!(
+            decode_service_snapshot(
+                reply,
+                &service_kind!("World"),
+                &InstanceId::new("world-a"),
+                std::num::NonZeroUsize::new(8).unwrap(),
+            ),
+            Err(PlacementError::InvalidPlacementAuthorityReply {
+                field: "record.duplicate"
+            })
+        );
+
+        let mut future = actor();
+        future.revision = 3;
+        assert_eq!(
+            decode_service_snapshot(
+                proto::GetServicePlacementSnapshotReply {
+                    revision: 2,
+                    local_instance: None,
+                    records: vec![future],
+                },
+                &service_kind!("World"),
+                &InstanceId::new("world-a"),
+                std::num::NonZeroUsize::new(8).unwrap(),
+            ),
+            Err(PlacementError::InvalidPlacementAuthorityReply {
+                field: "record.revision"
             })
         );
     }

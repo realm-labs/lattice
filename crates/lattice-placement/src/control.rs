@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use async_trait::async_trait;
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
@@ -9,7 +11,9 @@ use lattice_rpc::security::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::authority::{MAX_SINGLETON_RENEWAL_CLAIMS, keepalive_singleton_claims};
+use crate::authority::{
+    MAX_PLACEMENT_SNAPSHOT_ENTRIES, MAX_SINGLETON_RENEWAL_CLAIMS, keepalive_singleton_claims,
+};
 use crate::control::proto::logic_control_client::LogicControlClient;
 use crate::coordination::actor::{
     ActivateActorRequest as CoordinatorActivateActorRequest, PlacementCoordinator,
@@ -28,8 +32,9 @@ use crate::error::PlacementError;
 use crate::registry::InstanceRecord;
 use crate::sharding::VirtualShardId;
 use crate::storage::{
-    ActorPlacementKey, ActorPlacementRecord, PlacementState, PlacementStore, SingletonKey,
-    SingletonPlacementRecord,
+    ActorPlacementKey, ActorPlacementRecord, OwnershipViewError, OwnershipViewRecord,
+    PlacementState, PlacementStore, SingletonKey, SingletonPlacementRecord,
+    VirtualShardPlacementRecord,
 };
 
 pub mod proto {
@@ -473,6 +478,57 @@ where
                 placement: Some(singleton_placement_to_proto(record)),
             });
         Ok(Response::new(proto::GetSingletonReply { record }))
+    }
+
+    async fn get_service_placement_snapshot(
+        &self,
+        request: Request<proto::GetServicePlacementSnapshotRequest>,
+    ) -> Result<Response<proto::GetServicePlacementSnapshotReply>, Status> {
+        self.authenticate_current_peer(&request).await?;
+        let request = request.into_inner();
+        if !canonical_identity_segment(&request.service_kind)
+            || !canonical_identity_segment(&request.instance_id)
+        {
+            return Err(Status::invalid_argument(
+                "snapshot identity is not canonical",
+            ));
+        }
+        let max_entries = usize::try_from(request.max_entries)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .filter(|limit| limit.get() <= MAX_PLACEMENT_SNAPSHOT_ENTRIES)
+            .ok_or_else(|| Status::invalid_argument("snapshot entry limit is out of range"))?;
+        let view = self
+            .coordinator
+            .store
+            .open_ownership_view(
+                &ServiceKind::new(request.service_kind),
+                &lattice_core::instance::InstanceId::new(request.instance_id),
+                max_entries,
+            )
+            .await
+            .map_err(snapshot_status)?;
+        let records = view
+            .snapshot
+            .records
+            .into_iter()
+            .map(service_snapshot_record_to_proto)
+            .collect::<Vec<_>>();
+        if records.len() > max_entries.get() {
+            return Err(Status::resource_exhausted(
+                "snapshot exceeded its entry limit",
+            ));
+        }
+        Ok(Response::new(proto::GetServicePlacementSnapshotReply {
+            revision: view.snapshot.revision.0,
+            local_instance: view
+                .snapshot
+                .local_instance
+                .as_ref()
+                .map(instance_record_to_proto)
+                .transpose()?,
+            records,
+        }))
     }
 
     async fn drain_instance(
@@ -938,6 +994,60 @@ fn singleton_placement_to_proto(
     }
 }
 
+fn service_snapshot_record_to_proto(record: OwnershipViewRecord) -> proto::ServicePlacementRecord {
+    use proto::service_placement_record::Record;
+
+    match record {
+        OwnershipViewRecord::Actor {
+            revision, record, ..
+        } => proto::ServicePlacementRecord {
+            revision: revision.0,
+            record: Some(Record::Actor(actor_placement_to_proto(record))),
+        },
+        OwnershipViewRecord::VirtualShard {
+            revision, record, ..
+        } => proto::ServicePlacementRecord {
+            revision: revision.0,
+            record: Some(Record::VirtualShard(virtual_shard_placement_to_proto(
+                record,
+            ))),
+        },
+        OwnershipViewRecord::Singleton {
+            revision, record, ..
+        } => proto::ServicePlacementRecord {
+            revision: revision.0,
+            record: Some(Record::Singleton(singleton_placement_to_proto(record))),
+        },
+    }
+}
+
+fn virtual_shard_placement_to_proto(
+    record: VirtualShardPlacementRecord,
+) -> proto::VirtualShardPlacement {
+    proto::VirtualShardPlacement {
+        service_kind: record.service_kind.as_str().to_string(),
+        actor_kind: record.actor_kind.as_str().to_string(),
+        shard_id: record.shard_id.0,
+        owner_instance_id: record.owner.as_str().to_string(),
+        epoch: record.epoch.0,
+    }
+}
+
+fn snapshot_status(error: OwnershipViewError) -> Status {
+    match error {
+        OwnershipViewError::CapacityExceeded { .. } => {
+            Status::resource_exhausted("snapshot exceeded its entry limit")
+        }
+        OwnershipViewError::Unsupported => Status::unimplemented("snapshot backend is unsupported"),
+        OwnershipViewError::Backend { .. } | OwnershipViewError::WatchStart { .. } => {
+            Status::unavailable("snapshot backend is unavailable")
+        }
+        OwnershipViewError::Protocol { .. } | OwnershipViewError::Proof { .. } => {
+            Status::data_loss("snapshot ownership proof is invalid")
+        }
+    }
+}
+
 fn singleton_claim_from_proto(
     claim: proto::SingletonLeaseClaim,
 ) -> Result<SingletonPlacementRecord, Status> {
@@ -985,7 +1095,9 @@ fn status_from_placement(error: PlacementError) -> Status {
         PlacementError::InstanceAlreadyRegistered { .. } => {
             Status::already_exists("instance is already registered")
         }
-        PlacementError::NoReadyInstances | PlacementError::SingletonRenewalLimitExceeded { .. } => {
+        PlacementError::NoReadyInstances
+        | PlacementError::SingletonRenewalLimitExceeded { .. }
+        | PlacementError::PlacementReadLimitExceeded { .. } => {
             Status::resource_exhausted(error.to_string())
         }
         PlacementError::InstanceNotReady { .. }

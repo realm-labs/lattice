@@ -76,6 +76,8 @@ pub enum PlacementError {
     },
     #[error("singleton renewal batch exceeds limit {limit}")]
     SingletonRenewalLimitExceeded { limit: usize },
+    #[error("placement read exceeds limit {limit}")]
+    PlacementReadLimitExceeded { limit: usize },
     #[error("singleton renewal claim is stale, duplicated, or not owned by this boot")]
     InvalidSingletonRenewalClaim,
     #[error("coordinator leadership has been lost")]
