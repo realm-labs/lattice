@@ -22,13 +22,173 @@ use crate::coordination::singleton::{
 use crate::error::PlacementError;
 use crate::registry::{InstanceRecord, InstanceState};
 use crate::storage::{
-    ActorPlacementRecord, LeaseId, PlacementState, PlacementStore, SingletonKey,
-    SingletonPlacementRecord,
+    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementState, PlacementStore,
+    PlacementVersion, SingletonKey, SingletonPlacementRecord,
 };
 
 pub const DEFAULT_PLACEMENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_PLACEMENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_SINGLETON_RENEWAL_CLAIMS: usize = 4_096;
+
+/// Bounded semantic point-read client for runtime placement lookups.
+///
+/// This client never receives a backend handle. List and watch operations are
+/// intentionally absent until their bounded streaming protocol is implemented.
+#[derive(Clone)]
+pub struct TonicPlacementReader {
+    client: PlacementCoordinatorClient<Channel>,
+    request_timeout: Duration,
+}
+
+impl std::fmt::Debug for TonicPlacementReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TonicPlacementReader")
+            .field("request_timeout", &self.request_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TonicPlacementReader {
+    pub fn new(channel: Channel) -> Self {
+        Self {
+            client: PlacementCoordinatorClient::new(channel),
+            request_timeout: DEFAULT_PLACEMENT_AUTHORITY_TIMEOUT,
+        }
+    }
+
+    pub fn with_timeout(
+        channel: Channel,
+        request_timeout: Duration,
+    ) -> Result<Self, PlacementError> {
+        if request_timeout.is_zero() || request_timeout > MAX_PLACEMENT_AUTHORITY_TIMEOUT {
+            return Err(PlacementError::InvalidPlacementAuthorityTimeout);
+        }
+        Ok(Self {
+            client: PlacementCoordinatorClient::new(channel),
+            request_timeout,
+        })
+    }
+
+    pub async fn get_instance(
+        &self,
+        instance_id: &InstanceId,
+    ) -> Result<Option<InstanceRecord>, PlacementError> {
+        let reply = self
+            .call_get_instance(proto::GetInstanceRequest {
+                instance_id: instance_id.as_str().to_string(),
+            })
+            .await?;
+        reply
+            .record
+            .map(|record| decode_instance_record(record, instance_id))
+            .transpose()
+    }
+
+    pub async fn get_actor(
+        &self,
+        key: &ActorPlacementKey,
+    ) -> Result<Option<(PlacementVersion, ActorPlacementRecord)>, PlacementError> {
+        let reply = self
+            .call_get_actor(proto::GetActorRequest {
+                service_kind: key.service_kind.as_str().to_string(),
+                actor_kind: key.actor_kind.as_str().to_string(),
+                actor_id: Some(actor_id_to_proto(&key.actor_id)),
+            })
+            .await?;
+        reply
+            .record
+            .map(|versioned| {
+                let placement = versioned
+                    .placement
+                    .ok_or_else(|| invalid_reply_error("placement"))?;
+                Ok((
+                    decode_version(versioned.version)?,
+                    decode_actor_reply(
+                        placement,
+                        &key.service_kind,
+                        &key.actor_kind,
+                        &key.actor_id,
+                    )?,
+                ))
+            })
+            .transpose()
+    }
+
+    pub async fn get_singleton(
+        &self,
+        key: &SingletonKey,
+    ) -> Result<Option<(PlacementVersion, SingletonPlacementRecord)>, PlacementError> {
+        let reply = self
+            .call_get_singleton(proto::GetSingletonRequest {
+                service_kind: key.service_kind.as_str().to_string(),
+                singleton_kind: key.singleton_kind.as_str().to_string(),
+                scope: key.scope.clone(),
+            })
+            .await?;
+        reply
+            .record
+            .map(|versioned| {
+                let placement = versioned
+                    .placement
+                    .ok_or_else(|| invalid_reply_error("placement"))?;
+                Ok((
+                    decode_version(versioned.version)?,
+                    decode_singleton_reply(
+                        placement,
+                        &ActivateSingletonRequest {
+                            service_kind: key.service_kind.clone(),
+                            singleton_kind: key.singleton_kind.clone(),
+                            scope: key.scope.clone(),
+                        },
+                    )?,
+                ))
+            })
+            .transpose()
+    }
+
+    async fn call_get_instance(
+        &self,
+        request: proto::GetInstanceRequest,
+    ) -> Result<proto::GetInstanceReply, PlacementError> {
+        let mut request = Request::new(request);
+        request.set_timeout(self.request_timeout);
+        let mut client = self.client.clone();
+        tokio::time::timeout(self.request_timeout, client.get_instance(request))
+            .await
+            .map_err(|_| PlacementError::PlacementAuthorityTimeout)?
+            .map(|response| response.into_inner())
+            .map_err(authority_status)
+    }
+
+    async fn call_get_actor(
+        &self,
+        request: proto::GetActorRequest,
+    ) -> Result<proto::GetActorReply, PlacementError> {
+        let mut request = Request::new(request);
+        request.set_timeout(self.request_timeout);
+        let mut client = self.client.clone();
+        tokio::time::timeout(self.request_timeout, client.get_actor(request))
+            .await
+            .map_err(|_| PlacementError::PlacementAuthorityTimeout)?
+            .map(|response| response.into_inner())
+            .map_err(authority_status)
+    }
+
+    async fn call_get_singleton(
+        &self,
+        request: proto::GetSingletonRequest,
+    ) -> Result<proto::GetSingletonReply, PlacementError> {
+        let mut request = Request::new(request);
+        request.set_timeout(self.request_timeout);
+        let mut client = self.client.clone();
+        tokio::time::timeout(self.request_timeout, client.get_singleton(request))
+            .await
+            .map_err(|_| PlacementError::PlacementAuthorityTimeout)?
+            .map(|response| response.into_inner())
+            .map_err(authority_status)
+    }
+}
 
 /// The semantic placement mutation boundary used by ordinary runtime clients.
 ///
@@ -653,6 +813,86 @@ fn decode_instance_state(value: &str) -> Result<InstanceState, PlacementError> {
     }
 }
 
+fn decode_instance_record(
+    record: proto::InstanceRecord,
+    expected_instance_id: &InstanceId,
+) -> Result<InstanceRecord, PlacementError> {
+    const MAX_ENDPOINT_BYTES: usize = 2_048;
+    const MAX_VERSION_BYTES: usize = 256;
+    const MAX_LABELS: usize = 64;
+    const MAX_LABEL_KEY_BYTES: usize = 128;
+    const MAX_LABEL_VALUE_BYTES: usize = 1_024;
+    let instance_id = decode_instance_id(record.instance_id, "instance_id")?;
+    if &instance_id != expected_instance_id {
+        return invalid_reply("instance_id");
+    }
+    let incarnation = InstanceIncarnation::new(record.instance_incarnation);
+    if !incarnation.is_canonical() {
+        return invalid_reply("instance_incarnation");
+    }
+    let lease_id = decode_lease(record.lease_id)?;
+    let advertised_endpoint = record
+        .advertised_endpoint
+        .parse()
+        .map_err(|_| invalid_reply_error("advertised_endpoint"))?;
+    let control_endpoint = record
+        .control_endpoint
+        .parse()
+        .map_err(|_| invalid_reply_error("control_endpoint"))?;
+    if !valid_identity_segment(&record.service_kind)
+        || record.advertised_endpoint.len() > MAX_ENDPOINT_BYTES
+        || record.control_endpoint.len() > MAX_ENDPOINT_BYTES
+        || record.version.is_empty()
+        || record.version.len() > MAX_VERSION_BYTES
+        || record.labels.len() > MAX_LABELS
+        || record.labels.iter().any(|(key, value)| {
+            key.is_empty() || key.len() > MAX_LABEL_KEY_BYTES || value.len() > MAX_LABEL_VALUE_BYTES
+        })
+    {
+        return invalid_reply("instance_metadata");
+    }
+    let state = match record.state.as_str() {
+        "Starting" => InstanceState::Starting,
+        "Ready" => InstanceState::Ready,
+        "Draining" => InstanceState::Draining,
+        "Stopping" => InstanceState::Stopping,
+        "Dead" => InstanceState::Dead,
+        _ => return invalid_reply("state"),
+    };
+    Ok(InstanceRecord {
+        service_kind: ServiceKind::new(record.service_kind),
+        instance_id,
+        incarnation,
+        lease_id,
+        advertised_endpoint,
+        control_endpoint,
+        version: record.version,
+        state,
+        capacity: lattice_core::instance::InstanceCapacity {
+            max_actors: record.max_actors,
+            max_connections: record.max_connections,
+        },
+        labels: record.labels.into_iter().collect(),
+    })
+}
+
+fn valid_identity_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+fn decode_version(value: u64) -> Result<PlacementVersion, PlacementError> {
+    if value == 0 {
+        return invalid_reply("version");
+    }
+    Ok(PlacementVersion::from_modification_revision(value))
+}
+
 fn decode_actor_reply(
     reply: proto::ActorPlacementReply,
     expected_service: &ServiceKind,
@@ -898,6 +1138,27 @@ mod tests {
             Err(Status::permission_denied("rejected"))
         }
 
+        async fn get_instance(
+            &self,
+            _request: Request<proto::GetInstanceRequest>,
+        ) -> Result<Response<proto::GetInstanceReply>, Status> {
+            Err(Status::unimplemented("test authority"))
+        }
+
+        async fn get_actor(
+            &self,
+            _request: Request<proto::GetActorRequest>,
+        ) -> Result<Response<proto::GetActorReply>, Status> {
+            Err(Status::unimplemented("test authority"))
+        }
+
+        async fn get_singleton(
+            &self,
+            _request: Request<proto::GetSingletonRequest>,
+        ) -> Result<Response<proto::GetSingletonReply>, Status> {
+            Err(Status::unimplemented("test authority"))
+        }
+
         async fn drain_instance(
             &self,
             _request: Request<proto::DrainInstanceRequest>,
@@ -1110,6 +1371,38 @@ mod tests {
             )
             .unwrap_err(),
             PlacementError::InvalidPlacementAuthorityReply { field: "outcome" }
+        );
+    }
+
+    #[test]
+    fn point_read_instance_reply_validation_rejects_mismatched_and_oversized_records() {
+        let valid = || proto::InstanceRecord {
+            service_kind: "World".to_string(),
+            instance_id: "world-a".to_string(),
+            instance_incarnation: "world-a-boot".to_string(),
+            lease_id: 7,
+            advertised_endpoint: "http://127.0.0.1:50051".to_string(),
+            control_endpoint: "http://127.0.0.1:50052".to_string(),
+            version: "test".to_string(),
+            state: "Ready".to_string(),
+            max_actors: None,
+            max_connections: None,
+            labels: Default::default(),
+        };
+        assert!(decode_instance_record(valid(), &InstanceId::new("world-a")).is_ok());
+        assert_eq!(
+            decode_instance_record(valid(), &InstanceId::new("world-b")),
+            Err(PlacementError::InvalidPlacementAuthorityReply {
+                field: "instance_id"
+            })
+        );
+        let mut oversized = valid();
+        oversized.version = "x".repeat(257);
+        assert_eq!(
+            decode_instance_record(oversized, &InstanceId::new("world-a")),
+            Err(PlacementError::InvalidPlacementAuthorityReply {
+                field: "instance_metadata"
+            })
         );
     }
 

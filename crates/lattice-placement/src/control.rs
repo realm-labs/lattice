@@ -375,6 +375,106 @@ where
         Ok(Response::new(singleton_placement_to_proto(record)))
     }
 
+    async fn get_instance(
+        &self,
+        request: Request<proto::GetInstanceRequest>,
+    ) -> Result<Response<proto::GetInstanceReply>, Status> {
+        self.authenticate_current_peer(&request).await?;
+        let request = request.into_inner();
+        if !canonical_identity_segment(&request.instance_id) {
+            return Err(Status::invalid_argument(
+                "instance identity is not canonical",
+            ));
+        }
+        let record = self
+            .coordinator
+            .store
+            .get_instance(&lattice_core::instance::InstanceId::new(
+                request.instance_id,
+            ))
+            .await
+            .map_err(status_from_placement)?;
+        Ok(Response::new(proto::GetInstanceReply {
+            record: record.as_ref().map(instance_record_to_proto).transpose()?,
+        }))
+    }
+
+    async fn get_actor(
+        &self,
+        request: Request<proto::GetActorRequest>,
+    ) -> Result<Response<proto::GetActorReply>, Status> {
+        self.authenticate_current_peer(&request).await?;
+        let request = request.into_inner();
+        if !canonical_identity_segment(&request.service_kind)
+            || !canonical_identity_segment(&request.actor_kind)
+        {
+            return Err(Status::invalid_argument("actor identity is not canonical"));
+        }
+        let actor_id = actor_id_from_proto(
+            request
+                .actor_id
+                .ok_or_else(|| Status::invalid_argument("actor_id is required"))?,
+        )?;
+        let actor_id_bytes = match &actor_id {
+            ActorId::Str(value) => value.len(),
+            ActorId::Bytes(value) => value.len(),
+            ActorId::U64(_) | ActorId::I64(_) => 8,
+        };
+        if actor_id_bytes > 4_096 {
+            return Err(Status::invalid_argument("actor identity exceeds its bound"));
+        }
+        let key = ActorPlacementKey {
+            service_kind: ServiceKind::new(request.service_kind),
+            actor_kind: ActorKind::new(request.actor_kind),
+            actor_id,
+        };
+        let record = self
+            .coordinator
+            .store
+            .get_actor(&key)
+            .await
+            .map_err(status_from_placement)?
+            .map(|(version, record)| proto::VersionedActorPlacement {
+                version: version.modification_revision(),
+                placement: Some(actor_placement_to_proto(record)),
+            });
+        Ok(Response::new(proto::GetActorReply { record }))
+    }
+
+    async fn get_singleton(
+        &self,
+        request: Request<proto::GetSingletonRequest>,
+    ) -> Result<Response<proto::GetSingletonReply>, Status> {
+        const MAX_SCOPE_BYTES: usize = 256;
+        self.authenticate_current_peer(&request).await?;
+        let request = request.into_inner();
+        if !canonical_identity_segment(&request.service_kind)
+            || !canonical_identity_segment(&request.singleton_kind)
+            || request.scope.is_empty()
+            || request.scope.len() > MAX_SCOPE_BYTES
+        {
+            return Err(Status::invalid_argument(
+                "singleton identity is not canonical",
+            ));
+        }
+        let key = SingletonKey {
+            service_kind: ServiceKind::new(request.service_kind),
+            singleton_kind: ActorKind::new(request.singleton_kind),
+            scope: request.scope,
+        };
+        let record = self
+            .coordinator
+            .store
+            .get_singleton(&key)
+            .await
+            .map_err(status_from_placement)?
+            .map(|(version, record)| proto::VersionedSingletonPlacement {
+                version: version.modification_revision(),
+                placement: Some(singleton_placement_to_proto(record)),
+            });
+        Ok(Response::new(proto::GetSingletonReply { record }))
+    }
+
     async fn drain_instance(
         &self,
         request: Request<proto::DrainInstanceRequest>,
@@ -775,6 +875,44 @@ fn instance_liveness_to_proto(
     }
 }
 
+fn instance_record_to_proto(
+    record: &crate::registry::InstanceRecord,
+) -> Result<proto::InstanceRecord, Status> {
+    const MAX_ENDPOINT_BYTES: usize = 2_048;
+    const MAX_VERSION_BYTES: usize = 256;
+    const MAX_LABELS: usize = 64;
+    const MAX_LABEL_KEY_BYTES: usize = 128;
+    const MAX_LABEL_VALUE_BYTES: usize = 1_024;
+    let advertised_endpoint = record.advertised_endpoint.to_string();
+    let control_endpoint = record.control_endpoint.to_string();
+    if advertised_endpoint.len() > MAX_ENDPOINT_BYTES
+        || control_endpoint.len() > MAX_ENDPOINT_BYTES
+        || record.version.is_empty()
+        || record.version.len() > MAX_VERSION_BYTES
+        || record.labels.len() > MAX_LABELS
+        || record.labels.iter().any(|(key, value)| {
+            key.is_empty() || key.len() > MAX_LABEL_KEY_BYTES || value.len() > MAX_LABEL_VALUE_BYTES
+        })
+    {
+        return Err(Status::data_loss(
+            "stored instance metadata exceeds proxy bounds",
+        ));
+    }
+    Ok(proto::InstanceRecord {
+        service_kind: record.service_kind.as_str().to_string(),
+        instance_id: record.instance_id.as_str().to_string(),
+        instance_incarnation: record.incarnation.as_str().to_string(),
+        lease_id: record.lease_id.0,
+        advertised_endpoint,
+        control_endpoint,
+        version: record.version.clone(),
+        state: format!("{:?}", record.state),
+        max_actors: record.capacity.max_actors,
+        max_connections: record.capacity.max_connections,
+        labels: record.labels.clone().into_iter().collect(),
+    })
+}
+
 fn instance_incarnation_from_proto(value: String) -> Result<InstanceIncarnation, Status> {
     let incarnation = InstanceIncarnation::new(value);
     if !incarnation.is_canonical() {
@@ -1002,6 +1140,31 @@ mod tests {
                 .unwrap_err()
                 .code(),
             tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            raw_client
+                .get_actor(proto::GetActorRequest {
+                    service_kind: "World".to_string(),
+                    actor_kind: "World".to_string(),
+                    actor_id: Some(actor_id_to_proto(&ActorId::Bytes(vec![0; 4_097]))),
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut corrupt = instance_record_with_lease("world-a", InstanceState::Ready, owner_lease);
+        corrupt.version = "x".repeat(257);
+        store.upsert_instance(corrupt).await.unwrap();
+        assert_eq!(
+            raw_client
+                .get_instance(proto::GetInstanceRequest {
+                    instance_id: "world-a".to_string(),
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::DataLoss
         );
         shutdown_tx.send(()).unwrap();
         task.await.unwrap().unwrap();

@@ -15,7 +15,62 @@ service PlacementCoordinator {
   rpc KeepaliveSingletons(KeepaliveSingletonsRequest) returns (KeepaliveSingletonsReply);
   rpc ActivateActor(ActivateActorRequest) returns (ActorPlacementReply);
   rpc ActivateSingleton(ActivateSingletonRequest) returns (SingletonPlacementReply);
+  rpc GetInstance(GetInstanceRequest) returns (GetInstanceReply);
+  rpc GetActor(GetActorRequest) returns (GetActorReply);
+  rpc GetSingleton(GetSingletonRequest) returns (GetSingletonReply);
   rpc DrainInstance(DrainInstanceRequest) returns (DrainInstanceReply);
+}
+
+message GetInstanceRequest {
+  string instance_id = 1;
+}
+
+message GetInstanceReply {
+  optional InstanceRecord record = 1;
+}
+
+message InstanceRecord {
+  string service_kind = 1;
+  string instance_id = 2;
+  string instance_incarnation = 3;
+  uint64 lease_id = 4;
+  string advertised_endpoint = 5;
+  string control_endpoint = 6;
+  string version = 7;
+  string state = 8;
+  optional uint64 max_actors = 9;
+  optional uint64 max_connections = 10;
+  map<string, string> labels = 11;
+}
+
+message GetActorRequest {
+  string service_kind = 1;
+  string actor_kind = 2;
+  ActorId actor_id = 3;
+}
+
+message GetActorReply {
+  optional VersionedActorPlacement record = 1;
+}
+
+message VersionedActorPlacement {
+  uint64 version = 1;
+  ActorPlacementReply placement = 2;
+}
+
+message GetSingletonRequest {
+  string service_kind = 1;
+  string singleton_kind = 2;
+  string scope = 3;
+}
+
+message GetSingletonReply {
+  optional VersionedSingletonPlacement record = 1;
+}
+
+message VersionedSingletonPlacement {
+  uint64 version = 1;
+  SingletonPlacementReply placement = 2;
 }
 
 message SingletonLeaseClaim {

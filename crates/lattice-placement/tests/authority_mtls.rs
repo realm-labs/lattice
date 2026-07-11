@@ -6,7 +6,9 @@ use std::time::Duration;
 use lattice_core::id::ActorId;
 use lattice_core::instance::{InstanceCapacity, InstanceId, InstanceIncarnation};
 use lattice_core::kind::{ActorKind, ServiceKind};
-use lattice_placement::authority::{PlacementAuthority, TonicPlacementAuthority};
+use lattice_placement::authority::{
+    PlacementAuthority, TonicPlacementAuthority, TonicPlacementReader,
+};
 use lattice_placement::control::PlacementCoordinatorService;
 use lattice_placement::control::proto;
 use lattice_placement::control::proto::placement_coordinator_client::PlacementCoordinatorClient;
@@ -162,6 +164,7 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
     )
     .await
     .expect("a trusted workload from another service completes mutual TLS");
+    let cross_service_reader = TonicPlacementReader::new(cross_service.clone());
     let cross_service_authority = TonicPlacementAuthority::new(cross_service.clone());
     let actor = cross_service_authority
         .activate_actor(actor_request())
@@ -173,6 +176,20 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
         .await
         .expect("an authenticated workload may request cross-service singleton activation");
     assert_eq!(singleton.owner, InstanceId::new(TARGET_INSTANCE));
+    assert!(
+        cross_service_reader
+            .get_actor(&actor_key())
+            .await
+            .expect("a current authenticated peer may read cross-service actor placement")
+            .is_some()
+    );
+    assert!(
+        cross_service_reader
+            .get_singleton(&singleton_key())
+            .await
+            .expect("a current authenticated peer may read cross-service singleton placement")
+            .is_some()
+    );
     assert_rpc_rejected_without_mutation(cross_service, &[Code::PermissionDenied], &store).await;
 
     let exact_identity = connect_tls(
@@ -183,6 +200,30 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
     )
     .await
     .expect("the trusted workload completes mutual TLS");
+    let reader = TonicPlacementReader::new(exact_identity.clone());
+    assert_eq!(
+        reader
+            .get_instance(&InstanceId::new(TARGET_INSTANCE))
+            .await
+            .expect("the current workload may read an instance")
+            .expect("target instance exists")
+            .incarnation,
+        InstanceIncarnation::new(TARGET_INCARNATION)
+    );
+    assert!(
+        reader
+            .get_actor(&actor_key())
+            .await
+            .expect("the current workload may read an actor")
+            .is_some()
+    );
+    assert!(
+        reader
+            .get_singleton(&singleton_key())
+            .await
+            .expect("the current workload may read a singleton")
+            .is_some()
+    );
     let report = TonicPlacementAuthority::new(exact_identity)
         .drain_instance(
             ServiceKind::new(TARGET_SERVICE),
@@ -214,6 +255,7 @@ async fn coordinator_mtls_registers_and_renews_only_the_current_boot_incarnation
     )
     .await
     .expect("current workload completes mutual TLS");
+    let reader = TonicPlacementReader::new(channel.clone());
     let authority = TonicPlacementAuthority::new(channel);
     let registered = authority
         .register_instance(InstanceRecord {
@@ -250,6 +292,15 @@ async fn coordinator_mtls_registers_and_renews_only_the_current_boot_incarnation
         )
         .await
         .expect("current boot renews its authority-issued lease");
+    assert_eq!(
+        reader
+            .get_instance(&registered.instance_id)
+            .await
+            .expect("current boot reads through the semantic proxy")
+            .expect("registered instance remains present")
+            .state,
+        InstanceState::Ready
+    );
     assert_eq!(
         store.instance_lease_keepalive_count(registered.lease_id),
         Some(1)
@@ -420,6 +471,7 @@ async fn assert_all_methods_rejected_without_mutation(
     store: &InMemoryPlacementStore,
 ) {
     let revision_before = placement_revision(store).await;
+    let reader = TonicPlacementReader::new(channel.clone());
     let authority = TonicPlacementAuthority::new(channel);
     for error in [
         bounded_error(
@@ -440,6 +492,21 @@ async fn assert_all_methods_rejected_without_mutation(
                 TARGET_LEASE,
             ),
             "unverified identity must not drain an instance",
+        )
+        .await,
+        bounded_error(
+            reader.get_instance(&InstanceId::new(TARGET_INSTANCE)),
+            "unverified identity must not read an instance",
+        )
+        .await,
+        bounded_error(
+            reader.get_actor(&actor_key()),
+            "unverified identity must not read an actor",
+        )
+        .await,
+        bounded_error(
+            reader.get_singleton(&singleton_key()),
+            "unverified identity must not read a singleton",
         )
         .await,
     ] {
