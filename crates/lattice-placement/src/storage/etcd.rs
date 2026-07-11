@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use http::Uri;
 use lattice_core::id::ActorId;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::{ActorKind, ServiceKind};
 use lattice_core::service_context::ConfiguredComponent;
 use serde::{Deserialize, Serialize};
@@ -663,6 +663,7 @@ where
         &self,
         service_kind: &ServiceKind,
         instance_id: &InstanceId,
+        expected_incarnation: &InstanceIncarnation,
         expected_lease_id: LeaseId,
         state: InstanceState,
     ) -> Result<InstanceRecord, PlacementError> {
@@ -682,6 +683,13 @@ where
             });
         };
         let mut record = *record;
+        if &record.incarnation != expected_incarnation {
+            return Err(PlacementError::InstanceIncarnationMismatch {
+                instance_id: instance_id.clone(),
+                expected: expected_incarnation.clone(),
+                actual: record.incarnation,
+            });
+        }
         if record.lease_id != expected_lease_id {
             return Err(PlacementError::InstanceLeaseMismatch {
                 instance_id: instance_id.clone(),

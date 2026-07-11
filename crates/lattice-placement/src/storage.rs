@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use async_trait::async_trait;
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::{ActorKind, ServiceKind};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -869,6 +869,7 @@ pub trait PlacementStore: Clone + Send + Sync + 'static {
         &self,
         service_kind: &ServiceKind,
         instance_id: &InstanceId,
+        expected_incarnation: &InstanceIncarnation,
         expected_lease_id: LeaseId,
         state: InstanceState,
     ) -> Result<InstanceRecord, PlacementError>;

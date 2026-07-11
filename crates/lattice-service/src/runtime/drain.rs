@@ -143,6 +143,7 @@ pub(crate) async fn transition_instance_state(
         .compare_and_set_instance_state(
             service_kind,
             &instance.instance_id,
+            &instance.incarnation,
             expected_lease_id,
             state,
         )

@@ -626,10 +626,11 @@ async fn stale_service_shutdown_cannot_overwrite_replacement_incarnation() {
         .await
         .unwrap()
         .unwrap();
-    let replacement_lease = store.grant_instance_lease().await.unwrap();
     let replacement = InstanceRecord {
         incarnation: InstanceIncarnation::new("world-1-replacement-boot"),
-        lease_id: replacement_lease,
+        // Model a broken backend or restored lease namespace reusing the same
+        // numeric lease. Incarnation must remain an independent CAS guard.
+        lease_id: old_record.lease_id,
         version: "replacement".to_string(),
         state: InstanceState::Ready,
         ..old_record.clone()
@@ -689,12 +690,12 @@ async fn stopping_transition_cannot_overwrite_replacement_after_successful_drain
         let _ = shutdown_rx.await;
     }));
     ready_rx.await.unwrap();
-    let old_lease = store
+    let old_record = store
         .get_instance(&InstanceId::new("world-1"))
         .await
         .unwrap()
-        .unwrap()
-        .lease_id;
+        .unwrap();
+    let old_lease = old_record.lease_id;
 
     shutdown_tx.send(()).unwrap();
     let error = task.await.unwrap().unwrap_err();
@@ -708,11 +709,11 @@ async fn stopping_transition_cannot_overwrite_replacement_after_successful_drain
     assert_ne!(replacement.lease_id, old_lease);
     assert!(matches!(
         error,
-        LatticeServiceError::Placement(PlacementError::InstanceLeaseMismatch {
+        LatticeServiceError::Placement(PlacementError::InstanceIncarnationMismatch {
             expected,
             actual,
             ..
-        }) if expected == old_lease && actual == replacement.lease_id
+        }) if expected == old_record.incarnation && actual == replacement.incarnation
     ));
 }
 
@@ -763,6 +764,7 @@ impl PlacementAuthority for ReplacementDuringDrainAuthority {
             .compare_and_set_instance_state(
                 &service_kind,
                 &instance_id,
+                &instance_incarnation,
                 expected_lease_id,
                 InstanceState::Draining,
             )

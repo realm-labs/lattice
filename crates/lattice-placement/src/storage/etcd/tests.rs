@@ -3212,7 +3212,7 @@ fn etcd_instance_records_are_written_with_their_instance_lease() {
 }
 
 #[tokio::test]
-async fn etcd_instance_state_compare_rejects_stale_lease_without_mutation() {
+async fn etcd_instance_state_compare_rejects_stale_incarnation_and_lease_without_mutation() {
     let store = EtcdPlacementStore::new(
         PlacementPrefix::new("/lattice/instance-state-cas"),
         InMemoryEtcdClient::new(),
@@ -3225,6 +3225,25 @@ async fn etcd_instance_state_compare_rejects_stale_lease_without_mutation() {
             .compare_and_set_instance_state(
                 &record.service_kind,
                 &record.instance_id,
+                &InstanceIncarnation::new("stale-world-a-boot"),
+                record.lease_id,
+                InstanceState::Draining,
+            )
+            .await
+            .unwrap_err(),
+        PlacementError::InstanceIncarnationMismatch {
+            instance_id: record.instance_id.clone(),
+            expected: InstanceIncarnation::new("stale-world-a-boot"),
+            actual: record.incarnation.clone(),
+        }
+    );
+
+    assert_eq!(
+        store
+            .compare_and_set_instance_state(
+                &record.service_kind,
+                &record.instance_id,
+                &record.incarnation,
                 LeaseId(2),
                 InstanceState::Draining,
             )
@@ -3250,6 +3269,7 @@ async fn etcd_instance_state_compare_rejects_stale_lease_without_mutation() {
         .compare_and_set_instance_state(
             &record.service_kind,
             &record.instance_id,
+            &record.incarnation,
             record.lease_id,
             InstanceState::Draining,
         )

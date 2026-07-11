@@ -196,6 +196,7 @@ where
                 .compare_and_set_instance_state(
                     &service_kind,
                     &instance_id,
+                    &expected_incarnation,
                     expected_lease_id,
                     InstanceState::Draining,
                 )

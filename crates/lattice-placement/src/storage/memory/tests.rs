@@ -2,11 +2,12 @@ use std::num::NonZeroUsize;
 
 use lattice_core::actor_ref::Epoch;
 use lattice_core::id::ActorId;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceCapacity, InstanceId, InstanceIncarnation};
 use lattice_core::{actor_kind, service_kind};
 
 use super::InMemoryPlacementStore;
 use crate::error::PlacementError;
+use crate::registry::{InstanceRecord, InstanceState};
 use crate::sharding::VirtualShardId;
 use crate::storage::{
     ActorPlacementKey, ActorPlacementRecord, EpochFloorRecord, LeaseId, OwnershipProofError,
@@ -17,6 +18,51 @@ use crate::storage::{
 };
 
 const PREFIX: &str = "/lattice/memory-epoch-tests";
+
+#[tokio::test]
+async fn instance_state_compare_rejects_reused_lease_from_another_incarnation() {
+    let store = store();
+    let record = InstanceRecord {
+        service_kind: service_kind!("World"),
+        instance_id: InstanceId::new("world-a"),
+        incarnation: InstanceIncarnation::new("current-boot"),
+        lease_id: LeaseId(7),
+        advertised_endpoint: "http://127.0.0.1:18080".parse().unwrap(),
+        control_endpoint: "http://127.0.0.1:18081".parse().unwrap(),
+        version: "test".to_string(),
+        state: InstanceState::Ready,
+        capacity: InstanceCapacity::default(),
+        labels: Default::default(),
+    };
+    store.upsert_instance(record.clone()).await.unwrap();
+
+    assert_eq!(
+        store
+            .compare_and_set_instance_state(
+                &record.service_kind,
+                &record.instance_id,
+                &InstanceIncarnation::new("stale-boot"),
+                record.lease_id,
+                InstanceState::Draining,
+            )
+            .await
+            .unwrap_err(),
+        PlacementError::InstanceIncarnationMismatch {
+            instance_id: record.instance_id.clone(),
+            expected: InstanceIncarnation::new("stale-boot"),
+            actual: record.incarnation.clone(),
+        }
+    );
+    assert_eq!(
+        store
+            .get_service_instance(&record.service_kind, &record.instance_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        InstanceState::Ready
+    );
+}
 
 #[tokio::test]
 async fn ownership_views_capture_exact_snapshot_upsert_and_delete_proofs_for_every_family() {

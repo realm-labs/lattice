@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lattice_config::bootstrap::BootstrapConfig;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ConfiguredComponentBuilder;
 use lattice_core::service_context::{ConfiguredComponent, ServiceContextBuilder};
@@ -188,6 +188,7 @@ pub(crate) trait ErasedPlacementStore: std::fmt::Debug + Send + Sync {
         &self,
         service_kind: &ServiceKind,
         instance_id: &InstanceId,
+        expected_incarnation: &InstanceIncarnation,
         expected_lease_id: LeaseId,
         state: InstanceState,
     ) -> Result<InstanceRecord, PlacementError>;
@@ -294,11 +295,18 @@ where
         &self,
         service_kind: &ServiceKind,
         instance_id: &InstanceId,
+        expected_incarnation: &InstanceIncarnation,
         expected_lease_id: LeaseId,
         state: InstanceState,
     ) -> Result<InstanceRecord, PlacementError> {
         self.store
-            .compare_and_set_instance_state(service_kind, instance_id, expected_lease_id, state)
+            .compare_and_set_instance_state(
+                service_kind,
+                instance_id,
+                expected_incarnation,
+                expected_lease_id,
+                state,
+            )
             .await
     }
 

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use lattice_core::actor_ref::Epoch;
-use lattice_core::instance::InstanceId;
+use lattice_core::instance::{InstanceId, InstanceIncarnation};
 use lattice_core::kind::{ActorKind, ServiceKind};
 use tokio::sync::broadcast;
 
@@ -320,6 +320,7 @@ impl PlacementStore for InMemoryPlacementStore {
         &self,
         service_kind: &ServiceKind,
         instance_id: &InstanceId,
+        expected_incarnation: &InstanceIncarnation,
         expected_lease_id: LeaseId,
         state: InstanceState,
     ) -> Result<InstanceRecord, PlacementError> {
@@ -333,6 +334,13 @@ impl PlacementStore for InMemoryPlacementStore {
             .ok_or_else(|| PlacementError::InstanceNotFound {
                 instance_id: instance_id.clone(),
             })?;
+        if &record.incarnation != expected_incarnation {
+            return Err(PlacementError::InstanceIncarnationMismatch {
+                instance_id: instance_id.clone(),
+                expected: expected_incarnation.clone(),
+                actual: record.incarnation,
+            });
+        }
         if record.lease_id != expected_lease_id {
             return Err(PlacementError::InstanceLeaseMismatch {
                 instance_id: instance_id.clone(),
