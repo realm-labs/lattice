@@ -566,6 +566,18 @@ impl OwnershipEpochFloorProof {
         PlacementRevision(self.record_version.modification_revision())
     }
 
+    pub(crate) const fn record_version(&self) -> PlacementVersion {
+        self.record_version
+    }
+
+    pub(crate) const fn floor_version(&self) -> PlacementVersion {
+        self.floor_version
+    }
+
+    pub(crate) const fn floor_epoch(&self) -> Epoch {
+        self.floor.epoch
+    }
+
     pub(crate) fn validate_snapshot(
         &self,
         snapshot_revision: PlacementRevision,

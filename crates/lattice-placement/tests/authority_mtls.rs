@@ -193,6 +193,14 @@ async fn coordinator_mtls_admission_fences_every_unverified_identity_before_muta
         .expect("a current authenticated peer may read a coherent cross-service snapshot");
     assert_eq!(snapshot.records.len(), 2);
     assert_eq!(
+        snapshot
+            .clone()
+            .into_ownership_view_snapshot()
+            .records
+            .len(),
+        2
+    );
+    assert_eq!(
         snapshot.local_instance.unwrap().incarnation,
         InstanceIncarnation::new(TARGET_INCARNATION)
     );

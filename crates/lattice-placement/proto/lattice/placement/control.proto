@@ -93,6 +93,14 @@ message ServicePlacementRecord {
     VirtualShardPlacement virtual_shard = 3;
     SingletonPlacementReply singleton = 4;
   }
+  SnapshotEpochFloorProof proof = 5;
+}
+
+message SnapshotEpochFloorProof {
+  uint64 observed_revision = 1;
+  uint64 record_version = 2;
+  uint64 floor_version = 3;
+  uint64 floor_epoch = 4;
 }
 
 message VirtualShardPlacement {

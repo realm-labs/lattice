@@ -999,25 +999,45 @@ fn service_snapshot_record_to_proto(record: OwnershipViewRecord) -> proto::Servi
 
     match record {
         OwnershipViewRecord::Actor {
-            revision, record, ..
+            revision,
+            record,
+            proof,
         } => proto::ServicePlacementRecord {
             revision: revision.0,
             record: Some(Record::Actor(actor_placement_to_proto(record))),
+            proof: Some(snapshot_proof_to_proto(&proof)),
         },
         OwnershipViewRecord::VirtualShard {
-            revision, record, ..
+            revision,
+            record,
+            proof,
         } => proto::ServicePlacementRecord {
             revision: revision.0,
             record: Some(Record::VirtualShard(virtual_shard_placement_to_proto(
                 record,
             ))),
+            proof: Some(snapshot_proof_to_proto(&proof)),
         },
         OwnershipViewRecord::Singleton {
-            revision, record, ..
+            revision,
+            record,
+            proof,
         } => proto::ServicePlacementRecord {
             revision: revision.0,
             record: Some(Record::Singleton(singleton_placement_to_proto(record))),
+            proof: Some(snapshot_proof_to_proto(&proof)),
         },
+    }
+}
+
+fn snapshot_proof_to_proto(
+    proof: &crate::storage::OwnershipEpochFloorProof,
+) -> proto::SnapshotEpochFloorProof {
+    proto::SnapshotEpochFloorProof {
+        observed_revision: proof.observed_revision().0,
+        record_version: proof.record_version().modification_revision(),
+        floor_version: proof.floor_version().modification_revision(),
+        floor_epoch: proof.floor_epoch().0,
     }
 }
 

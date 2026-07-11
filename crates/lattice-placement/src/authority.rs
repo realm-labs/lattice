@@ -22,9 +22,10 @@ use crate::coordination::singleton::{
 use crate::error::PlacementError;
 use crate::registry::{InstanceRecord, InstanceState};
 use crate::storage::{
-    ActorPlacementKey, ActorPlacementRecord, LeaseId, PlacementRevision, PlacementState,
-    PlacementStore, PlacementVersion, SingletonKey, SingletonPlacementRecord,
-    VirtualShardPlacementRecord,
+    ActorPlacementKey, ActorPlacementRecord, EpochFloorRecord, LeaseId, OwnershipEpochFloorProof,
+    OwnershipProofContext, OwnershipRecordBinding, OwnershipViewRecord, OwnershipViewSnapshot,
+    PlacementRevision, PlacementState, PlacementStore, PlacementVersion, SingletonKey,
+    SingletonPlacementRecord, VirtualShardPlacementRecord,
 };
 
 pub const DEFAULT_PLACEMENT_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,25 +40,70 @@ pub struct ServicePlacementSnapshot {
     pub records: Vec<ServicePlacementSnapshotRecord>,
 }
 
+impl ServicePlacementSnapshot {
+    pub fn into_ownership_view_snapshot(self) -> OwnershipViewSnapshot {
+        OwnershipViewSnapshot {
+            revision: self.revision,
+            local_instance: self.local_instance,
+            records: self
+                .records
+                .into_iter()
+                .map(|record| match record {
+                    ServicePlacementSnapshotRecord::Actor {
+                        revision,
+                        record,
+                        proof,
+                    } => OwnershipViewRecord::Actor {
+                        revision,
+                        record,
+                        proof,
+                    },
+                    ServicePlacementSnapshotRecord::VirtualShard {
+                        revision,
+                        record,
+                        proof,
+                    } => OwnershipViewRecord::VirtualShard {
+                        revision,
+                        record,
+                        proof,
+                    },
+                    ServicePlacementSnapshotRecord::Singleton {
+                        revision,
+                        record,
+                        proof,
+                    } => OwnershipViewRecord::Singleton {
+                        revision,
+                        record,
+                        proof,
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServicePlacementSnapshotRecord {
     Actor {
         revision: PlacementRevision,
         record: ActorPlacementRecord,
+        proof: OwnershipEpochFloorProof,
     },
     VirtualShard {
         revision: PlacementRevision,
         record: VirtualShardPlacementRecord,
+        proof: OwnershipEpochFloorProof,
     },
     Singleton {
         revision: PlacementRevision,
         record: SingletonPlacementRecord,
+        proof: OwnershipEpochFloorProof,
     },
 }
 
-/// Bounded semantic point-read client for runtime placement lookups.
+/// Bounded semantic read client for runtime placement lookups and snapshots.
 ///
-/// This client never receives a backend handle. List and watch operations are
+/// This client never receives a backend handle. Watch operations are
 /// intentionally absent until their bounded streaming protocol is implemented.
 #[derive(Clone)]
 pub struct TonicPlacementReader {
@@ -985,6 +1031,9 @@ fn decode_service_snapshot(
             return invalid_reply("record.revision");
         }
         let revision = PlacementRevision(entry.revision);
+        let proof = entry
+            .proof
+            .ok_or_else(|| invalid_reply_error("record.proof"))?;
         let record = match entry.record.ok_or_else(|| invalid_reply_error("record"))? {
             Record::Actor(record) => {
                 let record = decode_snapshot_actor(record, expected_service)?;
@@ -996,7 +1045,17 @@ fn decode_service_snapshot(
                 if !actor_keys.insert(key) {
                     return invalid_reply("record.duplicate");
                 }
-                ServicePlacementSnapshotRecord::Actor { revision, record }
+                let proof = decode_snapshot_proof(
+                    proof,
+                    snapshot_revision,
+                    revision,
+                    OwnershipRecordBinding::Actor(record.clone()),
+                )?;
+                ServicePlacementSnapshotRecord::Actor {
+                    revision,
+                    record,
+                    proof,
+                }
             }
             Record::VirtualShard(record) => {
                 let record = decode_snapshot_virtual_shard(record, expected_service)?;
@@ -1008,7 +1067,17 @@ fn decode_service_snapshot(
                 if !shard_keys.insert(key) {
                     return invalid_reply("record.duplicate");
                 }
-                ServicePlacementSnapshotRecord::VirtualShard { revision, record }
+                let proof = decode_snapshot_proof(
+                    proof,
+                    snapshot_revision,
+                    revision,
+                    OwnershipRecordBinding::VirtualShard(record.clone()),
+                )?;
+                ServicePlacementSnapshotRecord::VirtualShard {
+                    revision,
+                    record,
+                    proof,
+                }
             }
             Record::Singleton(record) => {
                 let record = decode_snapshot_singleton(record, expected_service)?;
@@ -1020,7 +1089,17 @@ fn decode_service_snapshot(
                 if !singleton_keys.insert(key) {
                     return invalid_reply("record.duplicate");
                 }
-                ServicePlacementSnapshotRecord::Singleton { revision, record }
+                let proof = decode_snapshot_proof(
+                    proof,
+                    snapshot_revision,
+                    revision,
+                    OwnershipRecordBinding::Singleton(record.clone()),
+                )?;
+                ServicePlacementSnapshotRecord::Singleton {
+                    revision,
+                    record,
+                    proof,
+                }
             }
         };
         records.push(record);
@@ -1030,6 +1109,39 @@ fn decode_service_snapshot(
         local_instance,
         records,
     })
+}
+
+fn decode_snapshot_proof(
+    proof: proto::SnapshotEpochFloorProof,
+    snapshot_revision: PlacementRevision,
+    record_revision: PlacementRevision,
+    binding: OwnershipRecordBinding,
+) -> Result<OwnershipEpochFloorProof, PlacementError> {
+    if proof.observed_revision != snapshot_revision.0
+        || proof.record_version != record_revision.0
+        || proof.record_version == 0
+        || proof.floor_version == 0
+        || proof.floor_epoch == 0
+    {
+        return invalid_reply("record.proof");
+    }
+    let proof = OwnershipEpochFloorProof::new(
+        OwnershipProofContext::Snapshot,
+        snapshot_revision,
+        PlacementVersion::from_modification_revision(proof.record_version),
+        binding.clone(),
+        PlacementVersion::from_modification_revision(proof.floor_version),
+        EpochFloorRecord {
+            key: binding.epoch_key(),
+            epoch: Epoch(proof.floor_epoch),
+        },
+        None,
+    )
+    .map_err(|_| invalid_reply_error("record.proof"))?;
+    proof
+        .validate_snapshot(snapshot_revision, record_revision, &binding)
+        .map_err(|_| invalid_reply_error("record.proof"))?;
+    Ok(proof)
 }
 
 fn decode_snapshot_actor(
@@ -1662,6 +1774,12 @@ mod tests {
                     state: "running".to_string(),
                 },
             )),
+            proof: Some(proto::SnapshotEpochFloorProof {
+                observed_revision: 2,
+                record_version: 1,
+                floor_version: 1,
+                floor_epoch: 1,
+            }),
         };
         let reply = proto::GetServicePlacementSnapshotReply {
             revision: 2,
@@ -1695,6 +1813,24 @@ mod tests {
             ),
             Err(PlacementError::InvalidPlacementAuthorityReply {
                 field: "record.revision"
+            })
+        );
+
+        let mut tampered = actor();
+        tampered.proof.as_mut().unwrap().floor_epoch = 2;
+        assert_eq!(
+            decode_service_snapshot(
+                proto::GetServicePlacementSnapshotReply {
+                    revision: 2,
+                    local_instance: None,
+                    records: vec![tampered],
+                },
+                &service_kind!("World"),
+                &InstanceId::new("world-a"),
+                std::num::NonZeroUsize::new(8).unwrap(),
+            ),
+            Err(PlacementError::InvalidPlacementAuthorityReply {
+                field: "record.proof"
             })
         );
     }
