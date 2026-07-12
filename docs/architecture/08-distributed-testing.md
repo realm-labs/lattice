@@ -72,7 +72,7 @@ Ask correlation ID
 
 ## 3. Deterministic Cluster Simulator
 
-The workspace provides a dedicated simulation/test-support crate, tentatively `lattice-sim`, containing:
+The workspace provides the dedicated `lattice-sim` simulation/test-support crate, containing:
 
 ```text
 SimClock             monotonic virtual time and scheduled deadlines
@@ -223,6 +223,11 @@ shutdown_after_fence_before_task_join
 
 Failpoint behavior is test-only and cannot be enabled by unauthenticated production traffic. Each critical boundary is exercised against the relevant fault set:
 
+The stable names live in `lattice-core::failpoint::Failpoint` behind the `test-failpoints` feature.
+Production remoting, placement, watch, and shutdown code calls this shared catalogue at all 17
+boundaries; `lattice-sim` consumes the enum and machine-checks both source presence and the required
+failpoint/fault-target matrix.
+
 ```text
 Coordinator crash/re-election
 source or target crash
@@ -246,6 +251,7 @@ Docker is authoritative evidence for production adapters and environmental behav
 real process boot/pause/kill/restart
 real TCP/TLS framing, identity and reconnect
 real single-member/HA etcd transactions, watches and leases
+independent production Coordinator process election, lease loss and higher-term takeover
 container network partition/delay/loss
 CPU, memory and file-descriptor pressure
 drain, shutdown, cleanup and long-running resource behavior
@@ -266,16 +272,14 @@ Docker containers share the host kernel and clock and introduce nondeterministic
 
 ### 7.2 Repository Shape
 
-Target layout:
+Repository layout:
 
 ```text
 tests/distributed/
   compose.yaml
   Dockerfile.runner
   images.lock
-  scenarios/
-  certificates/
-  testctl/
+  k8s/
 scripts/
   test-docker.sh
 target/test-artifacts/<run-id>/
@@ -283,7 +287,7 @@ target/test-artifacts/<run-id>/
 
 `Dockerfile.runner` pins the Rust toolchain and installs all test-only utilities. External images such as etcd and network-fault helpers are pinned by immutable digest in `images.lock`; `latest` tags are forbidden for acceptance evidence. TLS certificates are generated inside the isolated test environment or loaded from non-secret test fixtures, never by host tooling.
 
-The thin host entrypoint checks Docker/Compose availability, assigns a unique Compose project/run ID, invokes the requested profile, collects the exit code, and always runs `down --volumes --remove-orphans`. It must not require host cargo, rustc, etcdctl, openssl, curl, Python packages, or a pre-existing lattice binary.
+The thin host entrypoint checks Docker/Compose availability, assigns a unique Compose project/run ID, invokes the requested profile, collects the exit code, and always runs `down --volumes --remove-orphans --rmi local`. It must not require host cargo, rustc, etcdctl, openssl, curl, Python packages, or a pre-existing lattice binary.
 
 ### 7.3 Compose Profiles
 
@@ -298,21 +302,25 @@ model:
   runner only; bounded exhaustive small-cluster exploration and invariant catalogue
 
 e2e:
-  runner, disposable etcd, Coordinator, 3 logic nodes and optional Gateway
-  real TCP/TLS, readiness probes, normal lifecycle and protocol scenarios
+  runner, disposable etcd, concrete-actor server, claimed entity owner and Gateway client
+  real child ActorRef ask/watch/stop, Gateway-to-EntityRef routing, TCP/TLS and normal lifecycle
 
 chaos:
   e2e topology plus dedicated fault orchestration/network proxy
   pause/resume/kill/restart, partitions, delay/loss and failpoint scenarios
 
 soak:
-  larger topology, long seeded workload/fault schedule, resource sampling
+  long deterministic seed sequence, rolling replay trace and FD/RSS/thread growth sampling
 
 k8s:
   disposable local Kubernetes cluster for probes, preStop, rollout, eviction and Service/DNS only
 ```
 
 An additional HA-etcd profile runs a disposable three-member etcd cluster for lease/store failover scenarios. Ordinary PR tests may use one disposable etcd container; final storage/leadership evidence includes the HA profile.
+
+`e2e-ha-etcd` identifies the elected member through structured `etcdctl` JSON, stops that exact
+leader, waits for a different surviving leader, reruns schema/lease/slot/claim acceptance on the
+quorum, restores health, and exercises persisted Coordinator handoff and Singleton forward recovery.
 
 Containers share only an isolated per-run network and named test volumes. Fixed host ports are unnecessary by default. Services use health/readiness protocols, not fixed sleeps. Every container has CPU/memory/file-descriptor limits representative enough to expose unbounded growth, while performance benchmarks use a separate documented profile without chaos throttling.
 
@@ -367,7 +375,17 @@ network/fault schedule
 test result/JUnit summary
 ```
 
-Artifacts are copied to the host-mounted run directory before teardown. Secrets, business payloads, private keys and bearer tokens are redacted. Cleanup is idempotent and removes containers, networks and disposable volumes for the run even after timeout or interruption; failed cleanup is itself a test failure.
+The chaos schedule includes pause/unpause, `tc netem` delay and packet loss, network detach/reattach,
+kill/start, and restart at the same address with new incarnations. Soak writes one rolling trace plus
+the final replay trace rather than an unbounded trace file per successful seed, and samples process
+resources every second with explicit growth ceilings.
+
+Artifacts are copied to the host-mounted run directory before teardown. Secrets, business payloads, private keys and bearer tokens are redacted. Cleanup is idempotent and removes containers, networks, disposable volumes and project-local runner/probe images for the run even after timeout or interruption; failed cleanup is itself a test failure.
+
+The HA profile runs two independent production `CoordinatorLeader` processes against the
+three-member etcd cluster. Its structured oracle stops the elected Coordinator, requires a peer to
+publish a higher leadership term with its exact boot incarnation, restarts the old process, and
+checks that the restarted candidate cannot displace the current leader.
 
 ### 7.7 Kubernetes Boundary
 
@@ -384,6 +402,11 @@ resource requests/limits and disruption policy
 ```
 
 Kubernetes evidence complements but never replaces simulation invariants or Docker TCP/TLS/etcd acceptance.
+The profile builds the workspace-owned `k8s-probe` binary in a pinned image, loads it into the
+disposable kind cluster, and drives its HTTP startup/readiness/liveness endpoints. The preStop hook
+publishes a drain request and waits for the process to acknowledge it by closing readiness before
+Kubernetes sends termination; the same image is exercised through rollout, PDB-governed eviction,
+and Service/DNS discovery.
 
 ## 8. Real Multi-Process Scenario Matrix
 

@@ -1,0 +1,283 @@
+name: lattice-distributed
+
+x-runner: &runner
+  build:
+    context: ../..
+    dockerfile: tests/distributed/Dockerfile.runner
+  working_dir: /workspace
+  volumes:
+    - ../..:/workspace:ro
+    - ../../target/test-artifacts/${LATTICE_RUN_ID:-local}:/artifacts
+    - cargo-home:/cargo-home
+    - cargo-target:/cargo-target
+  environment:
+    LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+    LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
+  labels:
+    io.lattice.test-run: ${LATTICE_RUN_ID:-local}
+  networks: [testnet]
+  init: true
+  cpus: 4
+  mem_limit: 4g
+  ulimits:
+    nofile:
+      soft: 4096
+      hard: 4096
+
+x-etcd: &etcd
+  image: quay.io/coreos/etcd:v3.5.17@sha256:a055da833a7c013b836ed0822e8ec1f99b059658be255ad8d0fcd31b635ae3d6
+  networks: [testnet]
+  labels:
+    io.lattice.test-run: ${LATTICE_RUN_ID:-local}
+  healthcheck:
+    interval: 2s
+    timeout: 2s
+    retries: 30
+  cpus: 1
+  mem_limit: 512m
+  ulimits:
+    nofile:
+      soft: 1024
+      hard: 1024
+
+services:
+  runner-quality:
+    <<: *runner
+    profiles: [quality]
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "testctl", "--", "run", "quality", "--artifacts", "/artifacts"]
+
+  runner-sim:
+    <<: *runner
+    profiles: [sim]
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "testctl", "--", "run", "sim", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
+
+  runner-model:
+    <<: *runner
+    profiles: [model]
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "testctl", "--", "run", "model", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
+
+  runner-e2e:
+    <<: *runner
+    profiles: [e2e]
+    depends_on:
+      fixture-server: {condition: service_healthy}
+      entity-owner: {condition: service_healthy}
+      etcd-single: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
+      LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
+    networks:
+      testnet:
+        aliases: [aaa-client, aaa-monitor]
+    command:
+      - sh
+      - -c
+      - >-
+        cargo run -p lattice-sim --bin distributed-node -- client --reference /artifacts/server-ref.json &&
+        cargo run -p lattice-sim --bin distributed-node -- gateway --reference /artifacts/entity-ref.json &&
+        cargo run -p lattice-sim --bin testctl -- run e2e --seed ${LATTICE_TEST_SEED:-1} --artifacts /artifacts
+
+  fixture-server:
+    <<: *runner
+    profiles: [e2e, chaos]
+    cap_add: [NET_ADMIN]
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "server", "--reference", "/artifacts/server-ref.json"]
+    healthcheck:
+      test: ["CMD", "test", "-s", "/artifacts/server-ref.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 120
+
+  entity-owner:
+    <<: *runner
+    profiles: [e2e]
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "entity-owner", "--reference", "/artifacts/entity-ref.json"]
+    healthcheck:
+      test: ["CMD", "test", "-s", "/artifacts/entity-ref.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 120
+
+  etcd-single:
+    <<: *etcd
+    profiles: [e2e]
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd-single
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd-single:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd-single:2380
+      - --initial-cluster=etcd-single=http://etcd-single:2380
+      - --initial-cluster-state=new
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+    volumes: [etcd-single-data:/etcd-data]
+
+  etcd1:
+    <<: *etcd
+    profiles: [e2e-ha-etcd]
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd1:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd1:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+    volumes: [etcd1-data:/etcd-data]
+
+  etcd2:
+    <<: *etcd
+    profiles: [e2e-ha-etcd]
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd2
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd2:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd2:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+    volumes: [etcd2-data:/etcd-data]
+
+  etcd3:
+    <<: *etcd
+    profiles: [e2e-ha-etcd]
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd3
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd3:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd3:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+    volumes: [etcd3-data:/etcd-data]
+
+  coordinator-a:
+    <<: *runner
+    profiles: [e2e-ha-etcd]
+    depends_on:
+      etcd1: {condition: service_healthy}
+      etcd2: {condition: service_healthy}
+      etcd3: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_ETCD_ENDPOINTS: http://etcd1:2379,http://etcd2:2379,http://etcd3:2379
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "coordinator", "--node-id", "coordinator-a", "--port", "29101", "--reference", "/artifacts/coordinator-a.json"]
+
+  coordinator-b:
+    <<: *runner
+    profiles: [e2e-ha-etcd]
+    depends_on:
+      etcd1: {condition: service_healthy}
+      etcd2: {condition: service_healthy}
+      etcd3: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_ETCD_ENDPOINTS: http://etcd1:2379,http://etcd2:2379,http://etcd3:2379
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "coordinator", "--node-id", "coordinator-b", "--port", "29102", "--reference", "/artifacts/coordinator-b.json"]
+
+  runner-e2e-ha-etcd:
+    <<: *runner
+    profiles: [e2e-ha-etcd]
+    depends_on:
+      etcd1: {condition: service_healthy}
+      etcd2: {condition: service_healthy}
+      etcd3: {condition: service_healthy}
+      coordinator-a: {condition: service_started}
+      coordinator-b: {condition: service_started}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
+      LATTICE_ETCD_ENDPOINTS: http://etcd1:2379,http://etcd2:2379,http://etcd3:2379
+    volumes:
+      - ../..:/workspace:ro
+      - ../../target/test-artifacts/${LATTICE_RUN_ID:-local}:/artifacts
+      - cargo-home:/cargo-home
+      - cargo-target:/cargo-target
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "testctl", "--", "run", "e2e-ha-etcd", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
+
+  runner-chaos:
+    <<: *runner
+    profiles: [chaos]
+    depends_on:
+      fixture-server: {condition: service_healthy}
+    volumes:
+      - ../..:/workspace:ro
+      - ../../target/test-artifacts/${LATTICE_RUN_ID:-local}:/artifacts
+      - cargo-home:/cargo-home
+      - cargo-target:/cargo-target
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
+      LATTICE_DOCKER_NETWORK: ${LATTICE_DOCKER_NETWORK:-bridge}
+    networks:
+      testnet:
+        aliases: [aaa-client, aaa-monitor]
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "testctl", "--", "run", "chaos", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
+
+  runner-soak:
+    <<: *runner
+    profiles: [soak]
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "testctl", "--", "run", "soak", "--seed", "${LATTICE_TEST_SEED:-1}", "--duration-seconds", "${LATTICE_SOAK_SECONDS:-14400}", "--artifacts", "/artifacts"]
+
+  runner-k8s:
+    <<: *runner
+    profiles: [k8s]
+    volumes:
+      - ../..:/workspace:ro
+      - ../../target/test-artifacts/${LATTICE_RUN_ID:-local}:/artifacts
+      - cargo-home:/cargo-home
+      - cargo-target:/cargo-target
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
+      KIND_EXPERIMENTAL_DOCKER_NETWORK: ${LATTICE_DOCKER_NETWORK:-bridge}
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "testctl", "--", "run", "k8s", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
+
+  runner-replay:
+    <<: *runner
+    profiles: [replay]
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "testctl", "--", "replay", "--artifact", "${LATTICE_REPLAY_ARTIFACT:-/artifacts/trace-1.json}"]
+
+networks:
+  testnet:
+    labels:
+      io.lattice.test-run: ${LATTICE_RUN_ID:-local}
+
+volumes:
+  cargo-home:
+    labels:
+      io.lattice.test-run: ${LATTICE_RUN_ID:-local}
+  cargo-target:
+    labels:
+      io.lattice.test-run: ${LATTICE_RUN_ID:-local}
+  etcd-single-data:
+    labels:
+      io.lattice.test-run: ${LATTICE_RUN_ID:-local}
+  etcd1-data:
+    labels:
+      io.lattice.test-run: ${LATTICE_RUN_ID:-local}
+  etcd2-data:
+    labels:
+      io.lattice.test-run: ${LATTICE_RUN_ID:-local}
+  etcd3-data:
+    labels:
+      io.lattice.test-run: ${LATTICE_RUN_ID:-local}

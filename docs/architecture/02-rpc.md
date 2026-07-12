@@ -1,6 +1,6 @@
 # 02. Actor Remoting and Messaging
 
-> The filename is retained temporarily for link compatibility. The target architecture is actor remoting, not gRPC.
+> The historical filename is retained for documentation-link stability. The architecture is actor remoting, not gRPC.
 > Back to: [architecture index](README.md)
 
 ---

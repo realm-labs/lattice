@@ -225,9 +225,22 @@ impl<A: Actor> ActorContext<A> {
             child_ref.as_ref().map(ActorRef::erase),
             self.service.clone(),
         );
+        let directory = self.service.extension::<crate::ActivationDirectory>();
+        if let Some(directory) = &directory
+            && let Err(error) = directory.register(&handle)
+        {
+            let _ = handle.try_stop_internal(StopReason::StartFailed);
+            return Err(ActorError::new(error.to_string()));
+        }
         let slot = Arc::new(ChildSlot::new(handle.clone()));
-        self.children
-            .insert(key, Box::new(ChildSlotStopper(slot.clone())));
+        self.children.insert(
+            key,
+            Box::new(ChildSlotStopper {
+                slot: slot.clone(),
+                directory,
+                reference: child_ref.map(|reference| reference.erase()),
+            }),
+        );
         self.spawn_supervision_task(slot, options, None::<fn() -> C>);
         Ok(handle)
     }
@@ -265,9 +278,22 @@ impl<A: Actor> ActorContext<A> {
             child_ref.as_ref().map(ActorRef::erase),
             self.service.clone(),
         );
+        let directory = self.service.extension::<crate::ActivationDirectory>();
+        if let Some(directory) = &directory
+            && let Err(error) = directory.register(&handle)
+        {
+            let _ = handle.try_stop_internal(StopReason::StartFailed);
+            return Err(ActorError::new(error.to_string()));
+        }
         let slot = Arc::new(ChildSlot::new(handle.clone()));
-        self.children
-            .insert(key, Box::new(ChildSlotStopper(slot.clone())));
+        self.children.insert(
+            key,
+            Box::new(ChildSlotStopper {
+                slot: slot.clone(),
+                directory,
+                reference: child_ref.map(|reference| reference.erase()),
+            }),
+        );
         self.spawn_supervision_task(slot, options, Some(factory));
         Ok(handle)
     }
@@ -348,6 +374,12 @@ impl<A: Actor> ActorContext<A> {
                             child_ref.as_ref().map(ActorRef::erase),
                             service.clone(),
                         );
+                        if let Some(directory) = service.extension::<crate::ActivationDirectory>()
+                            && directory.register(&replacement).is_err()
+                        {
+                            let _ = replacement.try_stop_internal(StopReason::StartFailed);
+                            break;
+                        }
                         terminations = replacement.subscribe_terminated();
                         slot.replace(replacement);
                     }
@@ -415,11 +447,24 @@ impl<C: Actor> ChildSlot<C> {
     }
 }
 
-struct ChildSlotStopper<C: Actor>(Arc<ChildSlot<C>>);
+struct ChildSlotStopper<C: Actor> {
+    slot: Arc<ChildSlot<C>>,
+    directory: Option<Arc<crate::ActivationDirectory>>,
+    reference: Option<ActorRef<()>>,
+}
 
 impl<C: Actor> ChildStop for ChildSlotStopper<C> {
     fn stop(self: Box<Self>, reason: StopReason) {
-        if let Some(handle) = self.0.current.lock().expect("child slot poisoned").take() {
+        if let (Some(directory), Some(reference)) = (&self.directory, &self.reference) {
+            directory.remove(reference);
+        }
+        if let Some(handle) = self
+            .slot
+            .current
+            .lock()
+            .expect("child slot poisoned")
+            .take()
+        {
             let _ = handle.try_stop_internal(reason);
         }
     }

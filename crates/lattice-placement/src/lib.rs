@@ -28,7 +28,8 @@ pub use region::{
     RouteDecision, ShardHome, ShardRegion,
 };
 pub use runtime::{
-    CoordinatorHandle, CoordinatorLeader, CoordinatorLeaderConfig, CoordinatorRuntimeError,
+    CoordinatorHandle, CoordinatorInspection, CoordinatorLeader, CoordinatorLeaderConfig,
+    CoordinatorRuntimeError, ManualRelocationRequest,
 };
 pub use session::{
     LogicCoordinatorConfig, LogicCoordinatorHandle, LogicCoordinatorSession, LogicPlacementEffect,

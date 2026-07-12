@@ -132,6 +132,11 @@ where
                     continue;
                 }
                 let correlation = ask_correlation(&frame);
+                if frame.kind == FrameKind::ControlEnvelope {
+                    lattice_core::failpoint::hit(
+                        lattice_core::failpoint::Failpoint::ControlAfterOutboxBeforeSocketWrite,
+                    );
+                }
                 let result = writer.write_frame_with_commit(&frame, || {
                     if let Some(correlation) = correlation {
                         messaging.mark_socket_write_started(correlation);
@@ -275,6 +280,9 @@ where
                                         envelope.payload.clone(),
                                     )
                                     .await?;
+                                lattice_core::failpoint::hit(
+                                    lattice_core::failpoint::Failpoint::ControlAfterRemoteApplyBeforeAck,
+                                );
                                 let ack = association.commit_control(envelope);
                                 writer.write_frame(&control_ack_frame(ack)).await?;
                             }

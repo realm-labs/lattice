@@ -428,6 +428,13 @@ Entity activation is serialized per `(EntityType, EntityId)` at the owning shard
 
 The local registry prevents duplicate local activation and maps actor references to mailboxes. It is not a distributed placement store.
 
+Every registry in one service shares a bounded `ActivationDirectory` through `ServiceContext`.
+Root and child spawns register the exact `(ActorPath, ActivationId, protocol)` and typed local handle;
+remote protocol dispatch resolves through this directory, so heterogeneous child actor types remain
+addressable without flattening child paths into root registry keys. Stop, passivation, parent
+termination, and supervision replacement remove or replace the exact entry. Capacity exhaustion
+rejects registration rather than creating an untracked remote activation.
+
 ### 8.3 Lazy Activation
 
 If a request reaches the owner instance and the local actor is not running, the runtime may ask the registered factory/loader to create it. If creation fails, no zombie actor remains and later requests can retry activation.

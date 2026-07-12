@@ -1,0 +1,13 @@
+FROM rust:1.97.0-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a AS build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libssl-dev pkg-config protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY . .
+RUN cargo build --release -p lattice-sim --bin k8s-probe
+
+FROM rust:1.97.0-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a
+COPY --from=build /workspace/target/release/k8s-probe /usr/local/bin/k8s-probe
+ENTRYPOINT ["/usr/local/bin/k8s-probe"]

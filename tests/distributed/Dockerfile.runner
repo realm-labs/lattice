@@ -1,0 +1,27 @@
+FROM rust:1.97.0-bookworm@sha256:7d0723df719e7f213b69dc7c8c595985c3f4b060cfbee4f7bc0e347a86fe3b6a
+
+RUN rustup component add clippy rustfmt
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl docker.io git iproute2 jq libssl-dev pkg-config protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      arm64) KIND_SHA=7ea2de9d2d190022ed4a8a4e3ac0636c8a455e460b9a13ccf19f15d07f4f00eb; KUBECTL_SHA=58f82f9fe796c375c5c4b8439850b0f3f4d401a52434052f2df46035a8789e25 ;; \
+      amd64) KIND_SHA=517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889; KUBECTL_SHA=a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989 ;; \
+      *) exit 1 ;; \
+    esac \
+    && curl -fsSLo /usr/local/bin/kind "https://github.com/kubernetes-sigs/kind/releases/download/v0.30.0/kind-linux-${TARGETARCH}" \
+    && echo "$KIND_SHA  /usr/local/bin/kind" | sha256sum -c - \
+    && curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.35.0/bin/linux/${TARGETARCH}/kubectl" \
+    && echo "$KUBECTL_SHA  /usr/local/bin/kubectl" | sha256sum -c - \
+    && chmod +x /usr/local/bin/kind /usr/local/bin/kubectl
+
+WORKDIR /workspace
+ENV CARGO_HOME=/cargo-home \
+    CARGO_TARGET_DIR=/cargo-target \
+    RUST_BACKTRACE=1
+
+CMD ["cargo", "run", "-p", "lattice-sim", "--bin", "testctl", "--", "run", "sim", "--artifacts", "/artifacts"]

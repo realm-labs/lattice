@@ -192,6 +192,9 @@ where
     if handshake.lane != LaneKind::Control {
         return Ok(Vec::new());
     }
+    lattice_core::failpoint::hit(
+        lattice_core::failpoint::Failpoint::AssociationAfterHandshakeBeforeCatalogue,
+    );
     connection
         .write_frame(&catalogue_frame(local_catalogue))
         .await?;
@@ -217,6 +220,9 @@ where
     if handshake.lane != LaneKind::Control {
         return Ok((handshake, Vec::new()));
     }
+    lattice_core::failpoint::hit(
+        lattice_core::failpoint::Failpoint::AssociationAfterHandshakeBeforeCatalogue,
+    );
     let peer = decode_catalogue_frame(&connection.read_frame().await?, maximum_protocols)?;
     connection
         .write_frame(&catalogue_frame(local_catalogue))

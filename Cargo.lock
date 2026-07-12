@@ -1484,6 +1484,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-sim"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "clap",
+ "lattice-actor",
+ "lattice-core",
+ "lattice-placement",
+ "lattice-remoting",
+ "lattice-service",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "trybuild",
+]
+
+[[package]]
 name = "lattice-telemetry-otlp"
 version = "0.1.0"
 dependencies = [
@@ -2231,6 +2250,7 @@ dependencies = [
  "lattice-remoting",
  "lattice-service",
  "prost",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

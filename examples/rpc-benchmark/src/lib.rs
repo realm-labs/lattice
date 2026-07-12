@@ -1,3 +1,4 @@
+pub mod matrix;
 pub mod metrics;
 
 use std::sync::Arc;

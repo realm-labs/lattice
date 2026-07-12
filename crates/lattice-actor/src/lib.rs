@@ -1,4 +1,5 @@
 pub mod context;
+pub mod directory;
 pub mod error;
 pub mod handle;
 pub mod host;
@@ -10,6 +11,7 @@ pub mod runtime;
 pub mod traits;
 pub mod watch;
 
+pub use directory::{ActivationDirectory, ActivationDirectoryError};
 pub use host::{ActorHost, HostRegistryError, ProtocolHostRegistry};
 pub use protocol::{
     __protocol_id, ActorProtocol, DecodeError, DispatchError, DispatchMode, DispatchReply,

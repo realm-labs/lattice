@@ -1,6 +1,6 @@
 # lattice Unified Actor Remoting Execution Plan
 
-> Status: architecture reset in progress
+> Status: hard-switch implementation complete; long release soak deferred by the five-minute development-test limit
 > Decision: remove framework gRPC and reuse/refactor Direct Link transport internals as `lattice-remoting`
 > Model: ActorRef + EntityRef/ShardRegion + SingletonRef/SingletonProxy, inspired by Akka/Pekko
 > Coordination: etcd-backed Coordinator without Gossip
@@ -560,7 +560,7 @@ Status: `[x]` complete in `b9fb89e`.
 
 ### Macro Batch 2 Evidence (2026-07-12)
 
-Status: `[x]` implementation complete; conventional commit pending at this tracker update.
+Status: `[x]` complete in `4be18f0`.
 
 - Association reliable control now drives Coordinator sessions, revisioned bounded snapshots,
   per-slot claim grants, logical resolution, subscribed-session handoff barriers and DeathWatch.
@@ -582,6 +582,39 @@ Status: `[x]` implementation complete; conventional commit pending at this track
   suites pass on the host. Full workspace tests exposed and fixed explicit rustls provider selection;
   the complete suite is rerun at the commit boundary. Real etcd/HA and pinned Docker evidence remains
   part of macro batch 3 rather than being claimed here.
+
+### Macro Batch 3 Evidence (2026-07-12)
+
+Status: `[x]` implementation and bounded acceptance complete; the four-hour release soak is deferred
+under the explicit five-minute development-test limit.
+
+- Production reducers, deterministic scheduling/network/etcd/process models, bounded exploration,
+  trace shrinking, all 17 named production failpoints, and the required fault matrix are implemented
+  in `lattice-sim` and share production transition logic.
+- Pinned Docker runs from source fingerprint
+  `51833e3832ad955c7a704c98715fe4823d3a4c46ad5acb31dadfa2b725c630be` passed:
+  `quality` (`20260712t125250z-68084`), `e2e` (`20260712t125250z-68085`), `chaos`
+  (`20260712t125250z-68087`), `sim` (`20260712t125903z-74892`), `model`
+  (`20260712t125903z-74893`), and Kubernetes
+  (`20260712t125903z-74895`). Replay of the seed-20260712 trace passed in
+  `20260712t130418z-82048`.
+- HA etcd run `20260712t141007z-25645` (source fingerprint
+  `204b24cd40cc3f5fb4cbeefd31f3ed1b44e4eebcd6dd5c5ae3d467155d7e9543`) adds two
+  independent production `CoordinatorLeader` processes: after etcd quorum failover, stopping the
+  term-1 Coordinator caused the peer to acquire term 2, and restarting the old process did not
+  displace the current leader.
+- The real-process profiles cover plaintext TCP, mutual TLS, exact child ActorRef ask/watch/stop,
+  Gateway-to-EntityRef-to-remote-Shard reply, leader loss with surviving etcd quorum, Coordinator
+  handoff, Singleton recovery, pause, delay, packet loss, network detach, restart, stale-reference
+  rejection, probes, DNS, rolling replacement, preStop drain, PDB eviction, and cleanup.
+- Every Docker profile cleanup removes project-local images as well as labeled containers, networks,
+  and volumes so completed runs do not retain multi-gigabyte runner images.
+- A 30-second bounded-resource soak passed with seed 17 in `20260712t120231z-96913`; the attempted
+  four-hour seed-20260712 run was stopped when the five-minute test limit was introduced and is not
+  claimed as release evidence.
+- The release benchmark records 661,989 remote admissions/s, 19 allocations/message, stable FDs,
+  and the full local/remote/shard/allocation/rebalance/handoff/reconnect matrix in
+  `docs/baselines/post-hard-switch.md`.
 
 ### Phase 0: Architecture Reset
 
@@ -642,154 +675,155 @@ Status: `[x]` complete within macro batch 1.
 
 ### Phase 2: Unified Remoting Association
 
-Status: `[ ]` in progress.
+Status: `[x]` complete within macro batches 1-3.
 
 - [x] Complete the moved `lattice-remoting` transport, frame and association modules without retaining a compatibility facade.
 - [x] Replace OpenLink JSON protocol with versioned binary association handshake.
-- [ ] Implement exactly one logical Association per local/remote NodeIncarnation pair with lazy single-flight establishment and a bounded node-level Association registry.
+- [x] Implement exactly one logical Association per local/remote NodeIncarnation pair with lazy single-flight establishment and a bounded node-level Association registry.
 - [x] Give each Association one fixed control connection, one fixed interactive connection and configurable 1..4 bulk stripes, defaulting to one bulk stripe.
 - [x] Bind every physical connection to AssociationId, exact peer incarnations, lane kind and stripe index; resolve simultaneous dials and duplicate attachments deterministically.
 - [x] Define actor sender identity as path+ActivationId and non-actor sender identity as boot-scoped SenderId; add stable sender/recipient bulk striping, bounded per-lane queues, frame batching/vectored-write opportunities and no business-visible stream/session API.
-- [ ] Add plaintext TCP and optional TLS-TCP with complete configuration validation.
-- [ ] Add heartbeat, reconnect, incarnation quarantine, idle data-connection close, frame/payload bounds and graceful supervised join; control failure immediately stops all new data admission and no v1 data lane continues independently.
+- [x] Add plaintext TCP and optional TLS-TCP with complete configuration validation.
+- [x] Add heartbeat, reconnect, incarnation quarantine, idle data-connection close, frame/payload bounds and graceful supervised join; control failure immediately stops all new data admission and no v1 data lane continues independently.
 - [x] Add one Association-level reliable control stream with association epoch, control sequence, command ID, cumulative Ack, bounded replay, idempotent receive, incarnation reset and reconciliation fallback; never replay uncertain business frames.
 - [x] Remove public link/session/stream/open APIs from the new crate.
-- [ ] Add real socket tests for handshake, old incarnation, simultaneous connection, duplicate lane, stable stripe ordering, control non-starvation under bulk load, reliable-control replay/dedup/gap recovery, per-ProtocolId mismatch isolation, partial-lane failure, association cap, overload, malformed frame, heartbeat timeout and TLS.
-- [ ] Phase 2 checklist and available directional evidence complete within macro batch 1; compilation is not required at this boundary.
+- [x] Add real socket tests for handshake, old incarnation, simultaneous connection, duplicate lane, stable stripe ordering, control non-starvation under bulk load, reliable-control replay/dedup/gap recovery, per-ProtocolId mismatch isolation, partial-lane failure, association cap, overload, malformed frame, heartbeat timeout and TLS.
+- [x] Phase 2 checklist and available directional evidence complete within macro batch 1; compilation is not required at this boundary.
 
 ### Phase 3: Remote ActorRef Tell and Ask
 
-Status: `[ ]` in progress.
+Status: `[x]` complete within macro batches 1-3.
 
 - [x] Implement Tell, Ask, Reply and Failure frames using opaque codec payloads.
 - [x] Route concrete ActorRef directly to its node association and exact path/ActivationId.
 - [x] Add boot-unique bounded pending ask correlation, monotonic caller deadlines, wire timeout budgets, caller cancellation and `UnknownResult` at the first socket-write boundary.
-- [ ] Check ask expiry before admission, Region buffering, socket write, remote mailbox admission and Handler start; never claim Handler cancellation rolls back effects.
+- [x] Check ask expiry before admission, Region buffering, socket write, remote mailbox admission and Handler start; never claim Handler cancellation rolls back effects.
 - [x] Keep expected business errors inside typed Reply and map runtime failures to stable bounded/redacted `RemoteFailureCode` frames.
 - [x] Map mailbox full/closed, unknown message, decode failure, authorization failure and stale activation to structured failures.
-- [ ] Preserve per-sender/target tell ordering only on its stable bulk stripe within one Association/home epoch; document and test the lack of ordering across tell/ask lanes.
+- [x] Preserve per-sender/target tell ordering only on its stable bulk stripe within one Association/home epoch; document and test the lack of ordering across tell/ask lanes.
 - [x] Prove tell returns after local admission and never waits for handler completion.
-- [ ] Add disconnect-before/after-dispatch, stale ref, queue full, deadline and codec failure tests.
-- [ ] Phase 3 checklist and available directional evidence complete within macro batch 1; compilation is not required at this boundary.
+- [x] Add disconnect-before/after-dispatch, stale ref, queue full, deadline and codec failure tests.
+- [x] Phase 3 checklist and available directional evidence complete within macro batch 1; compilation is not required at this boundary.
 
 ### Phase 4: Coordinator Over Remoting
 
-Status: `[ ]` not started.
+Status: `[x]` complete within macro batch 2.
 
-- [ ] Replace tonic `PlacementCoordinator`/`LogicControl` services with internal remoting control messages.
-- [ ] Implement etcd leader bootstrap, protocol generation and current leader reconnect.
-- [ ] Implement instance registration/heartbeat and Coordinator-owned etcd leases.
-- [ ] Implement subscription-filtered bounded SnapshotBegin/Chunk/End staging with chunk/count/byte/deadline limits, BLAKE3 validation, atomic install, ordered revision deltas and resync over reliable control delivery.
-- [ ] Bind every mutation to current leadership term and exact node incarnation.
-- [ ] Implement term/generation/sequence/TTL claim grants, renewal cadence, local monotonic deadlines and safety margin so Coordinator outage continues known homes only until expiry.
-- [ ] Add bounded latest-value NodeLoadReport/ShardLoad inputs with boot-scoped sample sequence, sample age, per-node/per-shard cardinality limits, fresh-report requirement after reconnect/leader change, no reliable replay, and no per-sample etcd writes.
-- [ ] Add leader failover, stale leader, event gap, lease expiry and reconnect tests with real etcd.
-- [ ] Phase 4 checklist and available directional evidence complete within macro batch 2; full workspace compilation is not required at this boundary.
+- [x] Replace tonic `PlacementCoordinator`/`LogicControl` services with internal remoting control messages.
+- [x] Implement etcd leader bootstrap, protocol generation and current leader reconnect.
+- [x] Implement instance registration/heartbeat and Coordinator-owned etcd leases.
+- [x] Implement subscription-filtered bounded SnapshotBegin/Chunk/End staging with chunk/count/byte/deadline limits, BLAKE3 validation, atomic install, ordered revision deltas and resync over reliable control delivery.
+- [x] Bind every mutation to current leadership term and exact node incarnation.
+- [x] Implement term/generation/sequence/TTL claim grants, renewal cadence, local monotonic deadlines and safety margin so Coordinator outage continues known homes only until expiry.
+- [x] Add bounded latest-value NodeLoadReport/ShardLoad inputs with boot-scoped sample sequence, sample age, per-node/per-shard cardinality limits, fresh-report requirement after reconnect/leader change, no reliable replay, and no per-sample etcd writes.
+- [x] Add leader failover, stale leader, event gap, lease expiry and reconnect tests with real etcd.
+- [x] Phase 4 checklist and available directional evidence complete within macro batch 2; full workspace compilation is not required at this boundary.
 
 ### Phase 5: Shard Allocation, Rebalancing, and ShardRegion
 
-Status: `[ ]` not started.
+Status: `[x]` complete within macro batch 2.
 
-- [ ] Add `ShardedActor::Key`, bounded canonical EntityId encoding and immutable entity config with explicit Xxh3V1 seed/hash, stable fingerprint, validated shard count, and fingerprinted allocation-strategy ID/version/hard constraints.
-- [ ] Add persistent bounded shard-home records for memory and etcd backends.
-- [ ] Implement Region host/proxy, home cache, single-flight lookup and bounded buffers.
-- [ ] Make local Shard the only component allowed to load/deliver sharded entities.
-- [ ] Implement Coordinator-backed claim grant installation/renewal/loss and immediate local fencing.
-- [ ] Implement the frozen subscribed Region-session revision barrier for the affected entity type plus StateDelta/AppliedRevision, DrainShard/ShardDrained, ClaimGranted and ShardReady handoff; exclude unrelated nodes and handle concurrent join/subscription/leave through snapshot and membership fencing.
-- [ ] Implement one internal PlacementSlot authority engine shared by Shard and Singleton for assignment generation, claims, drain, fencing, and replacement eligibility while preserving their distinct routing/lifecycle behavior.
-- [ ] Add the pure ShardAllocationStrategy contract, immutable PlacementView, AllocationDecision, RebalanceProposal, RebalanceTrigger and RebalanceLimits; strategies never mutate authority.
-- [ ] Implement deterministic WeightedLeastLoad with capacity normalization, unit fallback weight, eligibility filtering, stable tie-breaking, freshness checks, hysteresis, minimum residence, node-join stability and cooldown.
-- [ ] Persist term/revision/policy-fenced RebalancePlan records and per-move progress/PlacementSlot active-move linkage; enforce one move per shard, one automatic plan per entity type, target-capacity reservations, and per-round/cluster/entity/source/target bounds.
-- [ ] Implement recovery > drain > manual > automatic trigger priority, pending automatic-move preemption/reservation release, forward-only behavior after handoff, automatic pause during degraded/reconciliation/stale-input states, and Singleton exclusion from periodic balancing.
-- [ ] Recover plans after leader failover: cancel invalid pending moves and resume already-started handoffs forward from PlacementSlot truth.
-- [ ] Make StopFailed block voluntary drain but never override claim fencing; surface StateLossPossible and test crash-safe owner replacement.
-- [ ] Add local passivation with no Coordinator/etcd mutation.
-- [ ] Add routing, buffering, allocation, automatic/manual rebalance, migration, crash, claim loss, drain, leader recovery and unauthorized-load tests.
-- [ ] Phase 5 checklist and available directional evidence complete within macro batch 2; full workspace compilation is not required at this boundary.
+- [x] Add `ShardedActor::Key`, bounded canonical EntityId encoding and immutable entity config with explicit Xxh3V1 seed/hash, stable fingerprint, validated shard count, and fingerprinted allocation-strategy ID/version/hard constraints.
+- [x] Add persistent bounded shard-home records for memory and etcd backends.
+- [x] Implement Region host/proxy, home cache, single-flight lookup and bounded buffers.
+- [x] Make local Shard the only component allowed to load/deliver sharded entities.
+- [x] Implement Coordinator-backed claim grant installation/renewal/loss and immediate local fencing.
+- [x] Implement the frozen subscribed Region-session revision barrier for the affected entity type plus StateDelta/AppliedRevision, DrainShard/ShardDrained, ClaimGranted and ShardReady handoff; exclude unrelated nodes and handle concurrent join/subscription/leave through snapshot and membership fencing.
+- [x] Implement one internal PlacementSlot authority engine shared by Shard and Singleton for assignment generation, claims, drain, fencing, and replacement eligibility while preserving their distinct routing/lifecycle behavior.
+- [x] Add the pure ShardAllocationStrategy contract, immutable PlacementView, AllocationDecision, RebalanceProposal, RebalanceTrigger and RebalanceLimits; strategies never mutate authority.
+- [x] Implement deterministic WeightedLeastLoad with capacity normalization, unit fallback weight, eligibility filtering, stable tie-breaking, freshness checks, hysteresis, minimum residence, node-join stability and cooldown.
+- [x] Persist term/revision/policy-fenced RebalancePlan records and per-move progress/PlacementSlot active-move linkage; enforce one move per shard, one automatic plan per entity type, target-capacity reservations, and per-round/cluster/entity/source/target bounds.
+- [x] Implement recovery > drain > manual > automatic trigger priority, pending automatic-move preemption/reservation release, forward-only behavior after handoff, automatic pause during degraded/reconciliation/stale-input states, and Singleton exclusion from periodic balancing.
+- [x] Recover plans after leader failover: cancel invalid pending moves and resume already-started handoffs forward from PlacementSlot truth.
+- [x] Make StopFailed block voluntary drain but never override claim fencing; surface StateLossPossible and test crash-safe owner replacement.
+- [x] Add local passivation with no Coordinator/etcd mutation.
+- [x] Add routing, buffering, allocation, automatic/manual rebalance, migration, crash, claim loss, drain, leader recovery and unauthorized-load tests.
+- [x] Phase 5 checklist and available directional evidence complete within macro batch 2; full workspace compilation is not required at this boundary.
 
 ### Phase 6: Remote DeathWatch
 
-Status: `[ ]` not started.
+Status: `[x]` complete within macro batch 2.
 
-- [ ] Implement bounded Watch/WatchAck/Unwatch/Terminated control protocol.
-- [ ] Support arbitrary concrete ActorRef paths and exact ActivationId validation.
-- [ ] Implement activation-scoped ActorRef `watch` and resolve-without-activate EntityRef/SingletonRef `watch_current`, returning NotActive/Unavailable and requiring a new watch after replacement.
-- [ ] Re-register watches after association reconnect and terminate changed activations.
-- [ ] Synthesize node-down terminations from Coordinator incarnation removal.
-- [ ] Delete owner+epoch and unbounded-channel remote watch implementation.
-- [ ] Add local/remote stop, passivation, handoff, reconnect, path reuse, node loss and overflow tests.
-- [ ] Phase 6 checklist and available directional evidence complete within macro batch 2; full workspace compilation is not required at this boundary.
+- [x] Implement bounded Watch/WatchAck/Unwatch/Terminated control protocol.
+- [x] Support arbitrary concrete ActorRef paths and exact ActivationId validation.
+- [x] Implement activation-scoped ActorRef `watch` and resolve-without-activate EntityRef/SingletonRef `watch_current`, returning NotActive/Unavailable and requiring a new watch after replacement.
+- [x] Re-register watches after association reconnect and terminate changed activations.
+- [x] Synthesize node-down terminations from Coordinator incarnation removal.
+- [x] Delete owner+epoch and unbounded-channel remote watch implementation.
+- [x] Add local/remote stop, passivation, handoff, reconnect, path reuse, node loss and overflow tests.
+- [x] Phase 6 checklist and available directional evidence complete within macro batch 2; full workspace compilation is not required at this boundary.
 
 ### Phase 7: Cluster Singleton
 
-Status: `[ ]` not started.
+Status: `[x]` complete within macro batch 2.
 
-- [ ] Add fixed Singleton registration and duplicate configuration validation.
-- [ ] Add Coordinator-backed owner record, activation epoch and claim.
-- [ ] Implement SingletonManager/Proxy over the unified remoting association.
-- [ ] Delegate Singleton assignment/claim/drain/fencing to the shared PlacementSlot authority engine; do not build a second ownership algorithm.
-- [ ] Support tell/ask/watch_current and bounded unavailable-owner buffering.
-- [ ] Fence and stop on claim loss before publishing a replacement.
-- [ ] Remove dynamic scoped singleton and direct singleton registry RPC.
-- [ ] Add election, owner crash, leader failover, claim loss, buffering and watch tests.
-- [ ] Phase 7 checklist and available directional evidence complete within macro batch 2; full workspace compilation is not required at this boundary.
+- [x] Add fixed Singleton registration and duplicate configuration validation.
+- [x] Add Coordinator-backed owner record, activation epoch and claim.
+- [x] Implement SingletonManager/Proxy over the unified remoting association.
+- [x] Delegate Singleton assignment/claim/drain/fencing to the shared PlacementSlot authority engine; do not build a second ownership algorithm.
+- [x] Support tell/ask/watch_current and bounded unavailable-owner buffering.
+- [x] Fence and stop on claim loss before publishing a replacement.
+- [x] Remove dynamic scoped singleton and direct singleton registry RPC.
+- [x] Add election, owner crash, leader failover, claim loss, buffering and watch tests.
+- [x] Phase 7 checklist and available directional evidence complete within macro batch 2; full workspace compilation is not required at this boundary.
 
 ### Phase 8: Legacy Absence Verification and Storage Cutover
 
-Status: `[ ]` not started; completes in macro batch 3 after source/API deletion in macro batch 1.
+Status: `[x]` complete within macro batch 3 after source/API deletion in macro batch 1.
 
 Legacy source/API deletion is intentionally front-loaded into macro batch 1 even though it breaks the
 workspace. Phase 8 does not perform that deletion again; it proves absence, migrates storage/deployment,
 and removes any residue discovered while macro batch 2 restored the distributed runtime.
 
-- [ ] Verify `lattice-rpc`, framework tonic adapters, public Direct Link, Explicit Placement, per-actor floors/tombstones and old control services are absent from source, Cargo features, generated code and public docs.
-- [ ] Replace admin placement views with nodes, associations, paths, entity types, shards, singletons and watches.
-- [ ] Add schema-generation preflight and refuse mixed old/new processes.
-- [ ] Perform full-stop legacy key cleanup only after old credentials are revoked.
-- [ ] Add compile-fail/API absence tests and update all examples/benchmarks.
-- [ ] Phase 8 storage cutover and absence evidence complete within final macro batch 3.
+- [x] Verify `lattice-rpc`, framework tonic adapters, public Direct Link, Explicit Placement, per-actor floors/tombstones and old control services are absent from source, Cargo features, generated code and public docs.
+- [x] Replace admin placement views with nodes, associations, paths, entity types, shards, singletons and watches.
+- [x] Add schema-generation preflight and refuse mixed old/new processes.
+- [x] Perform full-stop legacy key cleanup only after old credentials are revoked.
+- [x] Add compile-fail/API absence tests and update all examples/benchmarks.
+- [x] Phase 8 storage cutover and absence evidence complete within final macro batch 3.
 
 ### Phase 9: Deterministic and Docker Distributed Test Infrastructure
 
-Status: `[ ]` not started.
+Status: `[x]` complete within macro batch 3.
 
-- [ ] Add `lattice-sim` test support with explicit reducer/effect adapters for Association control, Coordinator session, PlacementSlot, ShardRegion/handoff, RebalancePlan, Singleton, DeathWatch and service lifecycle; production and simulation must share transition logic.
-- [ ] Implement SimClock, deterministic scheduler, SimNetwork, SimEtcd revisions/watches/leases/compaction, SimProcess lifecycle, FaultInjector, TraceJournal, InvariantChecker, LivenessChecker and bounded StateExplorer.
-- [ ] Make every generated/random schedule seed-replayable and record configuration, event sequence, last valid state and one-command replay instructions; add trace shrinking/minimization where practical.
-- [ ] Encode ownership, incarnation/generation/claim, revision, messaging/watch, lifecycle and resource invariants and check them after every simulated transition; encode liveness only after a declared stable period.
-- [ ] Add stable test-only failpoints at every critical persistence/send boundary for control replay, snapshot install, plan persistence/reservation, handoff/claim/ready publication, watch terminal delivery and shutdown.
-- [ ] Track the failpoint × Coordinator/source/target/store/network/queue fault matrix as data and fail acceptance when required combinations lack evidence.
-- [ ] Add `tests/distributed` Docker runner/Compose topology with pinned toolchain and external image digests, isolated per-run network/volumes, no fixed host ports, health/readiness probes and no host dependency beyond Docker Engine/Compose.
-- [ ] Keep Compose responsible for stable topology/infrastructure and implement dynamic scenario behavior in programmatic `testctl`; prohibit long sleep-driven Compose/shell scenarios.
-- [ ] Route protocol-sequence/virtual-time/exact-boundary faults through simulator/failpoints and process/socket/packet/resource faults through Docker; container scheduling is never the deterministic protocol oracle.
-- [ ] Provide `quality`, `sim`, `model`, `e2e`, `e2e-ha-etcd`, `chaos`, `k8s`, `soak` and `replay` Docker commands/profiles. Real profiles cover TCP/TLS, disposable single/three-member etcd, multiple Coordinator/logic/Gateway processes, pause/kill/restart and partitions.
-- [ ] Add project-label-scoped chaos orchestration. If Docker socket access is used, restrict it to trusted code/dedicated CI and verify current run labels before every destructive action.
-- [ ] Persist image/source/config/seed manifests, structured/minimized traces, container logs, redacted Coordinator/etcd/admin state, resource samples, fault schedule and JUnit results under `target/test-artifacts/<run-id>` before teardown.
-- [ ] Guarantee idempotent `down --volumes --remove-orphans` cleanup after success, failure, timeout or interruption; leaked test resources are a test failure.
-- [ ] Prohibit fixed sleeps and human-log parsing as primary state oracles; wait through bounded structured readiness/admin/trace predicates.
-- [ ] Add PR/main/nightly/release test tiers and retain the first artifact for any retry; flaky retry cannot silently turn a failure green.
-- [ ] Phase 9 Docker/simulation infrastructure and executable invariant evidence complete within final macro batch 3.
+- [x] Add `lattice-sim` test support with explicit reducer/effect adapters for Association control, Coordinator session, PlacementSlot, ShardRegion/handoff, RebalancePlan, Singleton, DeathWatch and service lifecycle; production and simulation must share transition logic.
+- [x] Implement SimClock, deterministic scheduler, SimNetwork, SimEtcd revisions/watches/leases/compaction, SimProcess lifecycle, FaultInjector, TraceJournal, InvariantChecker, LivenessChecker and bounded StateExplorer.
+- [x] Make every generated/random schedule seed-replayable and record configuration, event sequence, last valid state and one-command replay instructions; add trace shrinking/minimization where practical.
+- [x] Encode ownership, incarnation/generation/claim, revision, messaging/watch, lifecycle and resource invariants and check them after every simulated transition; encode liveness only after a declared stable period.
+- [x] Add stable test-only failpoints at every critical persistence/send boundary for control replay, snapshot install, plan persistence/reservation, handoff/claim/ready publication, watch terminal delivery and shutdown.
+- [x] Track the failpoint × Coordinator/source/target/store/network/queue fault matrix as data and fail acceptance when required combinations lack evidence.
+- [x] Add `tests/distributed` Docker runner/Compose topology with pinned toolchain and external image digests, isolated per-run network/volumes, no fixed host ports, health/readiness probes and no host dependency beyond Docker Engine/Compose.
+- [x] Keep Compose responsible for stable topology/infrastructure and implement dynamic scenario behavior in programmatic `testctl`; prohibit long sleep-driven Compose/shell scenarios.
+- [x] Route protocol-sequence/virtual-time/exact-boundary faults through simulator/failpoints and process/socket/packet/resource faults through Docker; container scheduling is never the deterministic protocol oracle.
+- [x] Provide `quality`, `sim`, `model`, `e2e`, `e2e-ha-etcd`, `chaos`, `k8s`, `soak` and `replay` Docker commands/profiles. Real profiles cover TCP/TLS, disposable single/three-member etcd, multiple Coordinator/logic/Gateway processes, pause/kill/restart and partitions.
+- [x] Add project-label-scoped chaos orchestration. If Docker socket access is used, restrict it to trusted code/dedicated CI and verify current run labels before every destructive action.
+- [x] Persist image/source/config/seed manifests, structured/minimized traces, container logs, redacted Coordinator/etcd/admin state, resource samples, fault schedule and JUnit results under `target/test-artifacts/<run-id>` before teardown.
+- [x] Guarantee idempotent `down --volumes --remove-orphans` cleanup after success, failure, timeout or interruption; leaked test resources are a test failure.
+- [x] Prohibit fixed sleeps and human-log parsing as primary state oracles; wait through bounded structured readiness/admin/trace predicates.
+- [x] Add PR/main/nightly/release test tiers and retain the first artifact for any retry; flaky retry cannot silently turn a failure green.
+- [x] Phase 9 Docker/simulation infrastructure and executable invariant evidence complete within final macro batch 3.
 
 ### Phase 10: Production Hardening and End-to-End Acceptance
 
-Status: `[ ]` not started.
+Status: `[x]` implementation and bounded acceptance complete; four-hour release soak remains open.
 
-- [ ] Supervise every listener, association, lane, Coordinator subscription, claim, Shard, Singleton and actor task.
-- [ ] Bound all connections, frames, queues, pending asks, watches, buffers, maps and shutdown joins.
-- [ ] Make CorrelationId boot-unique and pending-ask state bounded; keep business idempotency keys/dedup business-owned and never imply cancellation rollback.
-- [ ] Add live/partial admin inspection and low-cardinality metrics.
-- [ ] Add rebalance inspect/explain, pause/resume, evaluate-now, idempotent manual relocation, pending-move cancellation and audited plan history; never expose a claim-fencing bypass.
-- [ ] Complete Gateway failure isolation and edge admission control.
-- [ ] Add multi-process Gateway -> EntityRef ask -> remote Shard -> Actor -> Reply coverage.
-- [ ] Add arbitrary child ActorRef serialization/tell/ask/watch across nodes.
-- [ ] Add Coordinator outage, handoff, crash, reconnect, TLS/plaintext and abuse scenarios.
-- [ ] Add a disposable local-Kubernetes deployment profile for readiness/liveness/startup probes, preStop drain, termination grace, rolling replacement, Pod eviction and Service/DNS only; do not use it as a substitute for protocol simulation/Docker acceptance.
-- [ ] Benchmark local actor, concrete remote ref, stable shard, unknown home, allocation evaluation, rebalance planning, handoff and reconnect.
-- [ ] Compare remoting bulk-tell throughput, allocations and connection/FD usage against the preserved pooled Direct Link baseline and document the accepted regression budget.
-- [ ] Prove remote hot paths do not access etcd or Coordinator.
-- [ ] Run full workspace verification and audit every checked item.
-- [ ] Run final acceptance through the pinned Docker profiles; direct host cargo checks are an optional developer fast path, not substitute evidence.
-- [ ] Phase 10 verification and final conventional commit complete.
+- [x] Supervise every listener, association, lane, Coordinator subscription, claim, Shard, Singleton and actor task.
+- [x] Bound all connections, frames, queues, pending asks, watches, buffers, maps and shutdown joins.
+- [x] Make CorrelationId boot-unique and pending-ask state bounded; keep business idempotency keys/dedup business-owned and never imply cancellation rollback.
+- [x] Add live/partial admin inspection and low-cardinality metrics.
+- [x] Add rebalance inspect/explain, pause/resume, evaluate-now, idempotent manual relocation, pending-move cancellation and audited plan history; never expose a claim-fencing bypass.
+- [x] Complete Gateway failure isolation and edge admission control.
+- [x] Add multi-process Gateway -> EntityRef ask -> remote Shard -> Actor -> Reply coverage.
+- [x] Add arbitrary child ActorRef serialization/tell/ask/watch across nodes.
+- [x] Add Coordinator outage, handoff, crash, reconnect, TLS/plaintext and abuse scenarios.
+- [x] Add a disposable local-Kubernetes deployment profile for readiness/liveness/startup probes, preStop drain, termination grace, rolling replacement, Pod eviction and Service/DNS only; do not use it as a substitute for protocol simulation/Docker acceptance.
+- [x] Benchmark local actor, concrete remote ref, stable shard, unknown home, allocation evaluation, rebalance planning, handoff and reconnect.
+- [x] Compare remoting bulk-tell throughput, allocations and connection/FD usage against the preserved pooled Direct Link baseline and document the accepted regression budget.
+- [x] Prove remote hot paths do not access etcd or Coordinator.
+- [x] Run full workspace verification and audit every checked item.
+- [x] Run final acceptance through the pinned Docker profiles; direct host cargo checks are an optional developer fast path, not substitute evidence.
+- [ ] Retain a successful four-hour release soak; deferred under the five-minute development-test limit.
+- [x] Phase 10 bounded verification and final conventional commit complete.
 
 ---
 
@@ -908,27 +942,28 @@ Direct host cargo commands remain optional developer shortcuts and are not final
 
 ## 10. Global Completion Criteria
 
-- [ ] Arbitrary live Actor paths can produce serializable exact-activation ActorRef values.
-- [ ] Concrete ActorRef, EntityRef and SingletonRef support the documented tell/ask plus activation-scoped watch/watch_current semantics.
-- [ ] Reused node addresses and actor paths cannot receive stale messages or watches.
-- [ ] One bounded TCP/TLS remoting system carries every internal cluster message.
-- [ ] State-bearing control commands survive reconnect through bounded sequenced replay/idempotent reconciliation without replaying uncertain business messages.
-- [ ] Framework-owned gRPC and public Direct Link APIs are deleted.
-- [ ] Coordinator is the only placement/membership etcd authority.
-- [ ] Shard and Singleton ownership is bounded, lease-fenced and leadership-generation-fenced.
-- [ ] Shard and Singleton reuse one placement-slot authority engine while retaining distinct reference, routing and lifecycle semantics.
-- [ ] Shard allocation/rebalancing is pluggable, capacity/load-aware, deterministic under one view, persisted before execution, bounded at every scope, and recovered safely across leader failover.
-- [ ] Explicit Placement, per-actor floors and placement tombstones are deleted.
-- [ ] Passivation writes no placement metadata and framework recovery claims no actor-state persistence.
-- [ ] Association loss, queue pressure, handoff and Coordinator outage have bounded explicit outcomes.
-- [ ] Every runtime task and collection is supervised, bounded and deadline-controlled.
-- [ ] Hot-path remote messaging performs no etcd read and no Coordinator hop.
-- [ ] Distributed control reducers are shared by production/simulation and every documented safety invariant has executable per-transition coverage or an explicit real-process oracle.
-- [ ] Required failpoint/fault combinations, bounded state exploration, deterministic seed replay and trace minimization/reproduction pass.
-- [ ] Pinned Docker quality/sim/model/e2e/e2e-ha-etcd/chaos/k8s profiles pass without a host Rust/etcd/TLS/Kubernetes test toolchain; nightly/release soak evidence is retained.
-- [ ] Every Docker failure emits replayable redacted artifacts and cleanup leaves no labeled container, network or disposable volume behind.
-- [ ] Architecture docs, examples and benchmarks match the unified remoting system.
-- [ ] `cargo fmt --all -- --check` passes.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes.
-- [ ] `cargo test --workspace --all-targets` passes.
-- [ ] The hard switch is delivered in approximately three (at most four) large English conventional commits; intermediate red commits document their broken frontier, and final behavior has audited executable coverage.
+- [x] Arbitrary live Actor paths can produce serializable exact-activation ActorRef values.
+- [x] Concrete ActorRef, EntityRef and SingletonRef support the documented tell/ask plus activation-scoped watch/watch_current semantics.
+- [x] Reused node addresses and actor paths cannot receive stale messages or watches.
+- [x] One bounded TCP/TLS remoting system carries every internal cluster message.
+- [x] State-bearing control commands survive reconnect through bounded sequenced replay/idempotent reconciliation without replaying uncertain business messages.
+- [x] Framework-owned gRPC and public Direct Link APIs are deleted.
+- [x] Coordinator is the only placement/membership etcd authority.
+- [x] Shard and Singleton ownership is bounded, lease-fenced and leadership-generation-fenced.
+- [x] Shard and Singleton reuse one placement-slot authority engine while retaining distinct reference, routing and lifecycle semantics.
+- [x] Shard allocation/rebalancing is pluggable, capacity/load-aware, deterministic under one view, persisted before execution, bounded at every scope, and recovered safely across leader failover.
+- [x] Explicit Placement, per-actor floors and placement tombstones are deleted.
+- [x] Passivation writes no placement metadata and framework recovery claims no actor-state persistence.
+- [x] Association loss, queue pressure, handoff and Coordinator outage have bounded explicit outcomes.
+- [x] Every runtime task and collection is supervised, bounded and deadline-controlled.
+- [x] Hot-path remote messaging performs no etcd read and no Coordinator hop.
+- [x] Distributed control reducers are shared by production/simulation and every documented safety invariant has executable per-transition coverage or an explicit real-process oracle.
+- [x] Required failpoint/fault combinations, bounded state exploration, deterministic seed replay and trace minimization/reproduction pass.
+- [x] Pinned Docker quality/sim/model/e2e/e2e-ha-etcd/chaos/k8s and short-soak profiles pass without a host Rust/etcd/TLS/Kubernetes test toolchain.
+- [ ] Nightly/release four-hour soak evidence is retained; deferred under the five-minute development-test limit.
+- [x] Every Docker failure emits replayable redacted artifacts and cleanup leaves no labeled container, network or disposable volume behind.
+- [x] Architecture docs, examples and benchmarks match the unified remoting system.
+- [x] `cargo fmt --all -- --check` passes.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` passes.
+- [x] `cargo test --workspace --all-targets` passes.
+- [x] The hard switch is delivered in approximately three (at most four) large English conventional commits; intermediate red commits document their broken frontier, and final behavior has audited executable coverage.

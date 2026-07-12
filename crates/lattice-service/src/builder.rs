@@ -23,10 +23,13 @@ use crate::backend::{LogicalRouter, ServiceInboundDispatch, ServiceRecipientBack
 use crate::config::NodeConfig;
 use crate::control::ServiceControlDispatch;
 use crate::error::ServiceError;
+use crate::lifecycle::{ServiceLifecycle, ServiceLifecycleEvent, ServiceLifecycleState};
 use crate::supervisor::TaskSupervisor;
 
 pub struct LatticeServiceBuilder {
     config: NodeConfig,
+    associations: Arc<AssociationManager>,
+    messaging: Arc<OutboundMessaging>,
     hosts: ProtocolHostRegistry,
     protocols: BTreeMap<u64, lattice_remoting::protocol::ProtocolFingerprint>,
     logical: Option<Arc<dyn LogicalRouter>>,
@@ -54,6 +57,18 @@ struct CoordinatorRuntimeAssembly {
 impl LatticeServiceBuilder {
     pub fn new(config: NodeConfig) -> Result<Self, ServiceError> {
         config.validate().map_err(ServiceError::Config)?;
+        let associations = Arc::new(
+            AssociationManager::new(
+                config.address.clone(),
+                config.incarnation,
+                config.remoting.clone(),
+            )
+            .map_err(ServiceError::Association)?,
+        );
+        let messaging = Arc::new(
+            OutboundMessaging::new(config.remoting.max_pending_asks)
+                .map_err(ServiceError::Messaging)?,
+        );
         Ok(Self {
             hosts: ProtocolHostRegistry::new(config.maximum_actor_protocols)
                 .map_err(ServiceError::Host)?,
@@ -65,7 +80,17 @@ impl LatticeServiceBuilder {
             control_scope: None,
             coordinator_runtime: None,
             endpoint_security: None,
+            associations,
+            messaging,
         })
+    }
+
+    pub fn association_manager(&self) -> Arc<AssociationManager> {
+        self.associations.clone()
+    }
+
+    pub fn outbound_messaging(&self) -> Arc<OutboundMessaging> {
+        self.messaging.clone()
     }
 
     pub fn register_actor<A: Actor>(
@@ -138,18 +163,8 @@ impl LatticeServiceBuilder {
     }
 
     pub fn build(self) -> Result<LatticeService, ServiceError> {
-        let associations = Arc::new(
-            AssociationManager::new(
-                self.config.address.clone(),
-                self.config.incarnation,
-                self.config.remoting.clone(),
-            )
-            .map_err(ServiceError::Association)?,
-        );
-        let messaging = Arc::new(
-            OutboundMessaging::new(self.config.remoting.max_pending_asks)
-                .map_err(ServiceError::Messaging)?,
-        );
+        let associations = self.associations;
+        let messaging = self.messaging;
         let hosts = Arc::new(self.hosts);
         let logical = self.logical;
         let supervisor = Arc::new(TaskSupervisor::new(self.config.maximum_supervised_tasks)?);
@@ -223,6 +238,7 @@ impl LatticeServiceBuilder {
             coordinator_runtime: std::sync::Mutex::new(self.coordinator_runtime),
             coordinator_shutdown: std::sync::Mutex::new(None),
             coordinator_handle: std::sync::Mutex::new(None),
+            lifecycle: Arc::new(std::sync::Mutex::new(ServiceLifecycle::default())),
         })
     }
 }
@@ -240,6 +256,7 @@ pub struct LatticeService {
     coordinator_runtime: std::sync::Mutex<Option<CoordinatorRuntimeAssembly>>,
     coordinator_shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
     coordinator_handle: std::sync::Mutex<Option<CoordinatorHandle>>,
+    lifecycle: Arc<std::sync::Mutex<ServiceLifecycle>>,
 }
 
 impl LatticeService {
@@ -284,8 +301,27 @@ impl LatticeService {
             .clone()
     }
 
+    pub fn lifecycle_state(&self) -> ServiceLifecycleState {
+        self.lifecycle
+            .lock()
+            .expect("service lifecycle poisoned")
+            .state()
+    }
+
     pub async fn start(&self) -> Result<(), ServiceError> {
-        self.endpoint.bind().await.map_err(ServiceError::Endpoint)?;
+        if let Err(error) = self.endpoint.bind().await {
+            let _ = self
+                .lifecycle
+                .lock()
+                .expect("service lifecycle poisoned")
+                .transition(ServiceLifecycleEvent::StartupFailed);
+            return Err(ServiceError::Endpoint(error));
+        }
+        self.lifecycle
+            .lock()
+            .expect("service lifecycle poisoned")
+            .transition(ServiceLifecycleEvent::RemotingReady)
+            .map_err(ServiceError::Lifecycle)?;
         if let Some(runtime) = self
             .coordinator_runtime
             .lock()
@@ -307,8 +343,10 @@ impl LatticeService {
             .lock()
             .expect("service logic runtime poisoned")
             .take();
+        let has_logic_runtime = runtime.is_some();
         if let Some(runtime) = runtime {
             let (shutdown, shutdown_rx) = watch::channel(false);
+            let mut readiness_shutdown = shutdown_rx.clone();
             *self
                 .logic_shutdown
                 .lock()
@@ -320,6 +358,28 @@ impl LatticeService {
                 handle,
                 router,
             } = runtime;
+            let readiness_handle = handle.clone();
+            let lifecycle = self.lifecycle.clone();
+            self.supervisor.spawn(async move {
+                let changed = readiness_handle.change_notifier();
+                loop {
+                    if readiness_handle.ready() {
+                        let mut lifecycle = lifecycle.lock().expect("service lifecycle poisoned");
+                        if lifecycle.state() == ServiceLifecycleState::Joining {
+                            let _ = lifecycle.transition(ServiceLifecycleEvent::SnapshotInstalled);
+                        }
+                        break;
+                    }
+                    tokio::select! {
+                        _ = changed.notified() => {}
+                        result = readiness_shutdown.changed() => {
+                            if result.is_err() || *readiness_shutdown.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })?;
             self.supervisor.spawn(async move {
                 let _ = session.run(controls, shutdown_rx).await;
             })?;
@@ -359,6 +419,13 @@ impl LatticeService {
                 }
             })?;
         }
+        if !has_logic_runtime {
+            self.lifecycle
+                .lock()
+                .expect("service lifecycle poisoned")
+                .transition(ServiceLifecycleEvent::SnapshotInstalled)
+                .map_err(ServiceError::Lifecycle)?;
+        }
         Ok(())
     }
 
@@ -370,6 +437,16 @@ impl LatticeService {
     }
 
     pub async fn shutdown(&self) -> Result<(), ServiceError> {
+        {
+            let mut lifecycle = self.lifecycle.lock().expect("service lifecycle poisoned");
+            if lifecycle.state() != ServiceLifecycleState::Terminated
+                && lifecycle.state() != ServiceLifecycleState::Stopping
+            {
+                lifecycle
+                    .transition(ServiceLifecycleEvent::ForceStop)
+                    .map_err(ServiceError::Lifecycle)?;
+            }
+        }
         if let Some(shutdown) = self
             .logic_shutdown
             .lock()
@@ -390,6 +467,14 @@ impl LatticeService {
             .shutdown()
             .await
             .map_err(ServiceError::Endpoint)?;
-        self.supervisor.shutdown(self.config.shutdown_timeout).await
+        self.supervisor
+            .shutdown(self.config.shutdown_timeout)
+            .await?;
+        self.lifecycle
+            .lock()
+            .expect("service lifecycle poisoned")
+            .transition(ServiceLifecycleEvent::ShutdownComplete)
+            .map_err(ServiceError::Lifecycle)?;
+        Ok(())
     }
 }

@@ -1,0 +1,34 @@
+error[E0432]: unresolved import `lattice_direct_link`
+ --> tests/ui/removed_apis.rs:1:5
+  |
+1 | use lattice_direct_link::DirectLink;
+  |     ^^^^^^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `lattice_direct_link`
+  |
+  = help: if you wanted to use a crate named `lattice_direct_link`, use `cargo add lattice_direct_link` to add it to your `Cargo.toml`
+
+error[E0432]: unresolved import `lattice_rpc`
+ --> tests/ui/removed_apis.rs:2:5
+  |
+2 | use lattice_rpc::PlacementCoordinatorClient;
+  |     ^^^^^^^^^^^ use of unresolved module or unlinked crate `lattice_rpc`
+  |
+help: there is a crate or module with a similar name
+  |
+2 - use lattice_rpc::PlacementCoordinatorClient;
+2 + use lattice_sim::PlacementCoordinatorClient;
+  |
+
+error[E0432]: unresolved imports `lattice_placement::ActorEpochFloor`, `lattice_placement::ExplicitPlacement`, `lattice_placement::PlacementTombstone`
+ --> tests/ui/removed_apis.rs:3:25
+  |
+3 | use lattice_placement::{ActorEpochFloor, ExplicitPlacement, PlacementTombstone};
+  |                         ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^ no `PlacementTombstone` in the root
+  |                         |                |
+  |                         |                no `ExplicitPlacement` in the root
+  |                         no `ActorEpochFloor` in the root
+  |
+help: a similar name exists in the module
+  |
+3 - use lattice_placement::{ActorEpochFloor, ExplicitPlacement, PlacementTombstone};
+3 + use lattice_placement::{ActorEpochFloor, ExplicitPlacement, PlacementStore};
+  |

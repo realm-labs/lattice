@@ -105,6 +105,7 @@ pub struct PlanCommand {
     pub operation_id: String,
     pub entity_type: Option<String>,
     pub plan_id: Option<String>,
+    pub shard_id: Option<u32>,
 }
 
 #[async_trait]
@@ -114,6 +115,106 @@ pub trait AdminMutationHandler: Send + Sync + 'static {
     async fn evaluate_now(&self, command: PlanCommand) -> Result<(), AdminApiError>;
     async fn relocate_shard(&self, command: ManualRelocation) -> Result<(), AdminApiError>;
     async fn cancel_pending_move(&self, command: PlanCommand) -> Result<(), AdminApiError>;
+}
+
+#[derive(Clone)]
+pub struct CoordinatorAdminHandler {
+    coordinator: lattice_placement::CoordinatorHandle,
+}
+
+impl CoordinatorAdminHandler {
+    pub fn new(coordinator: lattice_placement::CoordinatorHandle) -> Self {
+        Self { coordinator }
+    }
+}
+
+#[async_trait]
+impl AdminMutationHandler for CoordinatorAdminHandler {
+    async fn pause_automatic_rebalance(&self, command: PlanCommand) -> Result<(), AdminApiError> {
+        self.coordinator
+            .set_automatic_paused(
+                command.operation_id,
+                parse_entity_type(command.entity_type)?,
+                true,
+            )
+            .await
+            .map_err(map_coordinator_error)
+    }
+
+    async fn resume_automatic_rebalance(&self, command: PlanCommand) -> Result<(), AdminApiError> {
+        self.coordinator
+            .set_automatic_paused(
+                command.operation_id,
+                parse_entity_type(command.entity_type)?,
+                false,
+            )
+            .await
+            .map_err(map_coordinator_error)
+    }
+
+    async fn evaluate_now(&self, command: PlanCommand) -> Result<(), AdminApiError> {
+        let entity_type = parse_entity_type(command.entity_type)?.ok_or(AdminApiError::Invalid)?;
+        self.coordinator
+            .evaluate_rebalance(entity_type, lattice_placement::RebalanceTrigger::Automatic)
+            .await
+            .map(|_| ())
+            .map_err(map_coordinator_error)
+    }
+
+    async fn relocate_shard(&self, command: ManualRelocation) -> Result<(), AdminApiError> {
+        self.coordinator
+            .relocate_shard(lattice_placement::ManualRelocationRequest {
+                operation_id: command.operation_id,
+                entity_type: lattice_core::actor_ref::EntityType::new(command.entity_type)
+                    .map_err(|_| AdminApiError::Invalid)?,
+                shard_id: lattice_placement::ShardId::new(command.shard_id),
+                expected_generation: lattice_placement::AssignmentGeneration::new(
+                    command.expected_generation,
+                )
+                .map_err(|_| AdminApiError::Invalid)?,
+                target_node_id: command.target_node_id,
+            })
+            .await
+            .map(|_| ())
+            .map_err(map_coordinator_error)
+    }
+
+    async fn cancel_pending_move(&self, command: PlanCommand) -> Result<(), AdminApiError> {
+        let plan_id = command
+            .plan_id
+            .as_deref()
+            .and_then(|value| u128::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+            .ok_or(AdminApiError::Invalid)?;
+        let shard_id = command.shard_id.ok_or(AdminApiError::Invalid)?;
+        self.coordinator
+            .cancel_pending(plan_id, lattice_placement::ShardId::new(shard_id))
+            .await
+            .map_err(map_coordinator_error)
+    }
+}
+
+fn parse_entity_type(
+    value: Option<String>,
+) -> Result<Option<lattice_core::actor_ref::EntityType>, AdminApiError> {
+    value
+        .map(|value| {
+            lattice_core::actor_ref::EntityType::new(value).map_err(|_| AdminApiError::Invalid)
+        })
+        .transpose()
+}
+
+fn map_coordinator_error(error: lattice_placement::CoordinatorRuntimeError) -> AdminApiError {
+    match error {
+        lattice_placement::CoordinatorRuntimeError::InvalidAdminOperation
+        | lattice_placement::CoordinatorRuntimeError::UnknownEntityConfig
+        | lattice_placement::CoordinatorRuntimeError::UnknownPlan
+        | lattice_placement::CoordinatorRuntimeError::UnknownSlot => AdminApiError::Invalid,
+        lattice_placement::CoordinatorRuntimeError::IdempotencyConflict
+        | lattice_placement::CoordinatorRuntimeError::StaleProposal
+        | lattice_placement::CoordinatorRuntimeError::PlanConflict
+        | lattice_placement::CoordinatorRuntimeError::IneligibleTarget => AdminApiError::Conflict,
+        _ => AdminApiError::Unavailable,
+    }
 }
 
 #[derive(Clone)]

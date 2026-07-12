@@ -454,6 +454,38 @@ impl PlacementStore for EtcdPlacementStore {
         )
         .await
     }
+
+    async fn delete_plan(
+        &self,
+        plan_id: u128,
+        expected_revision: Revision,
+    ) -> Result<(), StorageError> {
+        let key = self.key(&format!("rebalances/{plan_id:032x}"));
+        let Some((bytes, mod_revision)) = self.read_raw(&key).await? else {
+            return Err(StorageError::CompareFailed);
+        };
+        if decode::<StoredPlan>(&bytes)?.revision != expected_revision {
+            return Err(StorageError::CompareFailed);
+        }
+        let mut client = self.client.clone();
+        let response = client
+            .txn(
+                Txn::new()
+                    .when([Compare::mod_revision(
+                        key.clone(),
+                        CompareOp::Equal,
+                        mod_revision,
+                    )])
+                    .and_then([TxnOp::delete(key, None)]),
+            )
+            .await
+            .map_err(map_etcd)?;
+        if response.succeeded() {
+            Ok(())
+        } else {
+            Err(StorageError::CompareFailed)
+        }
+    }
 }
 
 #[async_trait]

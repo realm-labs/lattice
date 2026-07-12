@@ -597,11 +597,17 @@ lattice-eventbus / lattice-scheduler / lattice-config / lattice-gateway / lattic
   focused integration and operational concerns
 ```
 
-`lattice-rpc` and the public Direct Link API are migration sources, not target public abstractions. They are removed after the full-stop protocol cutover.
+`lattice-rpc` and the public Direct Link API were migration sources and are absent after the completed
+full-stop protocol cutover. `etcd-client` may still carry its own transitive tonic implementation;
+lattice exposes no framework gRPC service or business transport through it.
 
 ## 8. Verification Architecture
 
 Distributed correctness is tested at four layers: pure state-machine reducers, deterministic seeded cluster simulation, real Docker multi-process/TCP/TLS/etcd scenarios, and chaos/soak runs. Authoritative control components expose explicit state/event/effect transitions so production executors and the simulator share one transition algorithm.
+
+The Logic service lifecycle is one of those production reducers. Service start/shutdown executes its
+`Booting -> Joining -> Ready/Degraded -> Draining/Stopping -> Terminated` transitions, and
+`lattice-sim::ServiceLifecycleAdapter` invokes that same reducer rather than a test-only model.
 
 The test oracle checks ownership, generation, lifecycle, ordering and resource invariants after every simulated transition. Real scenarios use structured readiness/admin/trace state rather than fixed sleeps or human log parsing. Every randomized failure records a replay seed and causal trace.
 

@@ -1,0 +1,35 @@
+[package]
+name = "lattice-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+lattice-core = { workspace = true, features = ["test-failpoints"] }
+lattice-actor.workspace = true
+lattice-placement.workspace = true
+lattice-remoting.workspace = true
+lattice-service.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+trybuild.workspace = true
+
+[[bin]]
+name = "testctl"
+path = "src/bin/testctl.rs"
+
+[[bin]]
+name = "distributed-node"
+path = "src/bin/distributed_node.rs"
+
+[[bin]]
+name = "k8s-probe"
+path = "src/bin/k8s_probe.rs"

@@ -16,6 +16,8 @@ pub enum ServiceError {
     Watch(#[source] lattice_remoting::WatchError),
     #[error("service reliable control dispatch construction failed")]
     Control(#[source] lattice_remoting::ControlDispatchError),
+    #[error("service lifecycle transition failed")]
+    Lifecycle(#[source] crate::lifecycle::ServiceLifecycleError),
     #[error("service supervised task capacity reached")]
     TaskCapacity,
     #[error("service shutdown exceeded its deadline")]

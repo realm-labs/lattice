@@ -222,19 +222,32 @@ impl RemotingEndpoint {
 
     pub async fn shutdown(&self) -> Result<(), EndpointError> {
         let _ = self.shutdown_tx.send(true);
+        lattice_core::failpoint::hit(
+            lattice_core::failpoint::Failpoint::ShutdownAfterFenceBeforeTaskJoin,
+        );
         let tasks = {
             let mut tasks = self.tasks.lock().expect("endpoint task list poisoned");
             std::mem::take(&mut *tasks)
         };
-        for task in tasks {
-            match tokio::time::timeout(self.config.shutdown_timeout, task).await {
+        let deadline = tokio::time::Instant::now() + self.config.shutdown_timeout;
+        let mut timed_out = false;
+        for mut task in tasks {
+            match tokio::time::timeout_at(deadline, &mut task).await {
                 Ok(Ok(result)) => result?,
                 Ok(Err(error)) if error.is_cancelled() => {}
                 Ok(Err(error)) => return Err(EndpointError::Join(error)),
-                Err(_) => return Err(EndpointError::ShutdownTimeout),
+                Err(_) => {
+                    timed_out = true;
+                    task.abort();
+                    let _ = task.await;
+                }
             }
         }
-        Ok(())
+        if timed_out {
+            Err(EndpointError::ShutdownTimeout)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn disconnect_association(

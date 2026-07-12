@@ -146,6 +146,14 @@ impl<A: Actor> ActorRegistry<A> {
         }) {
             return None;
         }
+        if let Some(directory) = self
+            .config
+            .service
+            .extension::<crate::ActivationDirectory>()
+            && let Some(handle) = directory.resolve(actor_ref)
+        {
+            return Some(handle);
+        }
         self.entries.iter().find_map(|entry| match entry.value() {
             RegistryEntry::Running(handle)
                 if !is_terminal(handle.lifecycle_state())
@@ -161,7 +169,17 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub async fn remove(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
         match self.entries.remove(actor_id).map(|(_, entry)| entry) {
-            Some(RegistryEntry::Running(handle)) => Some(handle),
+            Some(RegistryEntry::Running(handle)) => {
+                if let Some(directory) = self
+                    .config
+                    .service
+                    .extension::<crate::ActivationDirectory>()
+                    && let Some(reference) = handle.actor_ref()
+                {
+                    directory.remove(&reference.erase());
+                }
+                Some(handle)
+            }
             Some(RegistryEntry::Activating(activation)) => {
                 activation.publish(Err(ActorActivationError::ActivationFailed(
                     ActorError::new("actor registry entry removed during activation"),
@@ -213,7 +231,9 @@ impl<A: Actor> ActorRegistry<A> {
         match self.entries.entry(actor_id.clone()) {
             Entry::Occupied(_) => Err(ActorActivationError::AlreadyExists),
             Entry::Vacant(entry) => {
-                let handle = self.spawn_actor(actor_id, actor);
+                let handle = self
+                    .spawn_actor(actor_id, actor)
+                    .map_err(ActorActivationError::ActivationFailed)?;
                 entry.insert(RegistryEntry::Running(handle.clone()));
                 Ok(handle)
             }
@@ -259,10 +279,14 @@ impl<A: Actor> ActorRegistry<A> {
                         "actor registry entry removed during activation",
                     )));
                 }
-                let handle = self.spawn_actor(actor_id.clone(), actor);
-                self.entries
-                    .insert(actor_id, RegistryEntry::Running(handle.clone()));
-                Ok(handle)
+                match self.spawn_actor(actor_id.clone(), actor) {
+                    Ok(handle) => {
+                        self.entries
+                            .insert(actor_id, RegistryEntry::Running(handle.clone()));
+                        Ok(handle)
+                    }
+                    Err(error) => Err(ActorActivationError::ActivationFailed(error)),
+                }
             }
             Err(error) => {
                 self.entries.remove_if(&actor_id, |_, entry| {
@@ -351,26 +375,45 @@ impl<A: Actor> ActorRegistry<A> {
     }
 
     fn remove_stopped_running_entry(&self, actor_id: &ActorId) {
-        self.entries.remove_if(actor_id, |_, entry| {
+        let removed = self.entries.remove_if(actor_id, |_, entry| {
             matches!(
                 entry,
                 RegistryEntry::Running(handle)
                     if is_terminal(handle.lifecycle_state())
             )
         });
+        if let Some((_, RegistryEntry::Running(handle))) = removed
+            && let Some(directory) = self
+                .config
+                .service
+                .extension::<crate::ActivationDirectory>()
+            && let Some(reference) = handle.actor_ref()
+        {
+            directory.remove(&reference.erase());
+        }
     }
 
-    fn spawn_actor(&self, actor_id: ActorId, actor: A) -> ActorHandle<A> {
+    fn spawn_actor(&self, actor_id: ActorId, actor: A) -> Result<ActorHandle<A>, ActorError> {
         let self_ref = self
             .actor_ref_for(actor_id.clone())
             .map(|actor_ref| actor_ref.erase());
-        spawn_actor_with_self_ref(
+        let handle = spawn_actor_with_self_ref(
             actor,
             self.config.mailbox,
             self.config.passivation,
             self_ref,
             self.config.service.clone(),
-        )
+        );
+        if let Some(directory) = self
+            .config
+            .service
+            .extension::<crate::ActivationDirectory>()
+            && let Err(error) = directory.register(&handle)
+        {
+            let _ = handle.try_stop_internal(StopReason::StartFailed);
+            return Err(ActorError::new(error.to_string()));
+        }
+        Ok(handle)
     }
 
     fn actor_ref_for(&self, actor_id: ActorId) -> Option<ActorRef<A>> {

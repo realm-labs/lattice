@@ -209,6 +209,9 @@ impl WatchRegistry {
             },
             target.clone(),
         );
+        lattice_core::failpoint::hit(
+            lattice_core::failpoint::Failpoint::WatchAfterInstallBeforeAck,
+        );
         Ok(WatchCommand::WatchAck { watch_id, target })
     }
 
@@ -250,6 +253,9 @@ impl WatchRegistry {
         let Some(watches) = self.target_watches.remove(&target.actor_path.to_string()) else {
             return Vec::new();
         };
+        lattice_core::failpoint::hit(
+            lattice_core::failpoint::Failpoint::WatchAfterTerminatedBeforeAck,
+        );
         watches
             .into_iter()
             .filter(|(_, watched)| watched == target)

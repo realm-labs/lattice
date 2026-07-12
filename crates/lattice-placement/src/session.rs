@@ -123,6 +123,20 @@ pub struct LogicCoordinatorHandle {
 }
 
 impl LogicCoordinatorHandle {
+    pub fn ready(&self) -> bool {
+        self.state
+            .lock()
+            .expect("logic placement state poisoned")
+            .ready()
+    }
+
+    pub fn change_notifier(&self) -> Arc<Notify> {
+        self.state
+            .lock()
+            .expect("logic placement state poisoned")
+            .change_notifier()
+    }
+
     pub async fn complete_drain(
         &self,
         slot: PlacementSlotKey,
@@ -405,6 +419,9 @@ impl LogicCoordinatorSession {
                             .ok_or(LogicSessionError::SnapshotRequired)?
                             .finish(end, self.now())
                             .map_err(LogicSessionError::Coordinator)?;
+                        lattice_core::failpoint::hit(
+                            lattice_core::failpoint::Failpoint::SnapshotAfterStageBeforeInstall,
+                        );
                         let revision = install.revision;
                         let slots = decode_slots(&install.records)?;
                         self.install_snapshot_slots(slots)?;

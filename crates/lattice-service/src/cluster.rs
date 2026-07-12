@@ -2177,8 +2177,8 @@ mod tests {
             incarnation: owner_incarnation,
         };
         let source_endpoint = endpoint(
-            source_identity,
-            source_associations,
+            source_identity.clone(),
+            source_associations.clone(),
             source_messaging,
             source_router.clone(),
             source_control,
@@ -2190,8 +2190,13 @@ mod tests {
             owner_router,
             owner_control,
         );
+        source_endpoint.bind().await.unwrap();
         owner_endpoint.bind().await.unwrap();
-        source_endpoint.connect_peer(owner_identity).await.unwrap();
+        if source_associations.should_dial(&owner_identity.address, owner_identity.incarnation) {
+            source_endpoint.connect_peer(owner_identity).await.unwrap();
+        } else {
+            owner_endpoint.connect_peer(source_identity).await.unwrap();
+        }
         let reference = entity_config.entity_ref::<()>(cluster_id.clone(), entity_id);
         assert!(
             source_router

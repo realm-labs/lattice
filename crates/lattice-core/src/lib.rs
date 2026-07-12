@@ -1,4 +1,5 @@
 pub mod actor_ref;
+pub mod failpoint;
 pub mod id;
 pub mod instance;
 pub mod kind;

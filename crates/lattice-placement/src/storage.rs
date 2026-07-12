@@ -29,6 +29,12 @@ pub trait PlacementStore: Send + Sync + 'static {
         plan: RebalancePlan,
         revision: Revision,
     ) -> Result<(), StorageError>;
+
+    async fn delete_plan(
+        &self,
+        plan_id: u128,
+        expected_revision: Revision,
+    ) -> Result<(), StorageError>;
 }
 
 #[async_trait]
@@ -320,6 +326,19 @@ impl PlacementStore for InMemoryPlacementStore {
             return Err(StorageError::CompareFailed);
         }
         state.plans.insert(plan.plan_id, (revision, plan));
+        Ok(())
+    }
+
+    async fn delete_plan(
+        &self,
+        plan_id: u128,
+        expected_revision: Revision,
+    ) -> Result<(), StorageError> {
+        let mut state = self.inner.lock().expect("placement memory store poisoned");
+        if state.plans.get(&plan_id).map(|(revision, _)| *revision) != Some(expected_revision) {
+            return Err(StorageError::CompareFailed);
+        }
+        state.plans.remove(&plan_id);
         Ok(())
     }
 }

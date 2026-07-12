@@ -16,6 +16,7 @@ lattice-placement.workspace = true
 lattice-remoting.workspace = true
 lattice-service.workspace = true
 prost.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
