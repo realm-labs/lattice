@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::wildcard_imports))]
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::IpAddr;
@@ -6,7 +8,9 @@ use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use lattice_sim::{Scenario, ScenarioConfig, TraceJournal};
+use lattice_sim::scenario::Scenario;
+use lattice_sim::scenario::ScenarioConfig;
+use lattice_sim::trace::TraceJournal;
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
@@ -127,18 +131,21 @@ fn run_profile(
     let timer = Instant::now();
     let mut resource_samples = vec![resource_sample(timer.elapsed())];
     let result = match profile {
-        Profile::Quality => commands(&[
-            &["fmt", "--all", "--", "--check"],
-            &[
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--",
-                "-D",
-                "warnings",
-            ],
-            &["test", "--workspace", "--all-targets"],
-        ]),
+        Profile::Quality => (|| {
+            command("scripts/check-structure.sh", &[])?;
+            commands(&[
+                &["fmt", "--all", "--", "--check"],
+                &[
+                    "clippy",
+                    "--workspace",
+                    "--all-targets",
+                    "--",
+                    "-D",
+                    "warnings",
+                ],
+                &["test", "--workspace", "--all-targets"],
+            ])
+        })(),
         Profile::Sim => simulate(seed, artifacts),
         Profile::Model => cargo(&[
             "test",

@@ -10,11 +10,15 @@ use crate::association::{Association, LaneKind};
 use crate::control::{
     ControlApply, ControlDispatch, control_ack_frame, decode_control_ack, decode_control_envelope,
 };
-use crate::messaging::{
-    AskError, InboundDispatch, OutboundMessaging, RemoteFailure, ask_correlation, decode_ask,
-    decode_entity_ask, decode_entity_tell, decode_failure, decode_reply, decode_singleton_ask,
-    decode_singleton_tell, decode_tell, failure_code, failure_frame, reply_frame,
+use crate::messaging::codec::{
+    ask_correlation, decode_ask, decode_entity_ask, decode_entity_tell, decode_failure,
+    decode_reply, decode_singleton_ask, decode_singleton_tell, decode_tell, failure_frame,
+    reply_frame,
 };
+use crate::messaging::error::{AskError, RemoteFailureCode, RemoteMessageError};
+use crate::messaging::inbound::{InboundDispatch, failure_code};
+use crate::messaging::outbound::OutboundMessaging;
+use crate::messaging::target::RemoteFailure;
 use crate::transport::{FramedReader, FramedWriter, RemotingIo};
 use crate::wire::{Frame, FrameKind, WireError};
 
@@ -172,7 +176,7 @@ where
                         if asks.len() == config.maximum_concurrent_inbound_asks {
                             writer.write_frame(&failure_frame(&RemoteFailure {
                                 correlation_id: ask.correlation_id,
-                                code: crate::messaging::RemoteFailureCode::MailboxFull,
+                                code: RemoteFailureCode::MailboxFull,
                                 safe_detail: None,
                             })).await?;
                         } else {
@@ -180,8 +184,8 @@ where
                             asks.spawn(async move {
                                 let deadline = Instant::now()
                                     .checked_add(ask.timeout_budget)
-                                    .ok_or(crate::messaging::RemoteMessageError::DeadlineExceeded)?;
-                                Ok::<_, crate::messaging::RemoteMessageError>(match dispatch
+                                    .ok_or(RemoteMessageError::DeadlineExceeded)?;
+                                Ok::<_, RemoteMessageError>(match dispatch
                                     .ask(ask.target, ask.message_id, ask.payload, deadline)
                                     .await
                                 {
@@ -200,7 +204,7 @@ where
                         if asks.len() == config.maximum_concurrent_inbound_asks {
                             writer.write_frame(&failure_frame(&RemoteFailure {
                                 correlation_id: ask.correlation_id,
-                                code: crate::messaging::RemoteFailureCode::MailboxFull,
+                                code: RemoteFailureCode::MailboxFull,
                                 safe_detail: None,
                             })).await?;
                         } else {
@@ -208,8 +212,8 @@ where
                             asks.spawn(async move {
                                 let deadline = Instant::now()
                                     .checked_add(ask.timeout_budget)
-                                    .ok_or(crate::messaging::RemoteMessageError::DeadlineExceeded)?;
-                                Ok::<_, crate::messaging::RemoteMessageError>(match dispatch
+                                    .ok_or(RemoteMessageError::DeadlineExceeded)?;
+                                Ok::<_, RemoteMessageError>(match dispatch
                                     .ask_entity(ask.target, ask.message_id, ask.payload, deadline)
                                     .await
                                 {
@@ -228,7 +232,7 @@ where
                         if asks.len() == config.maximum_concurrent_inbound_asks {
                             writer.write_frame(&failure_frame(&RemoteFailure {
                                 correlation_id: ask.correlation_id,
-                                code: crate::messaging::RemoteFailureCode::MailboxFull,
+                                code: RemoteFailureCode::MailboxFull,
                                 safe_detail: None,
                             })).await?;
                         } else {
@@ -236,8 +240,8 @@ where
                             asks.spawn(async move {
                                 let deadline = Instant::now()
                                     .checked_add(ask.timeout_budget)
-                                    .ok_or(crate::messaging::RemoteMessageError::DeadlineExceeded)?;
-                                Ok::<_, crate::messaging::RemoteMessageError>(match dispatch
+                                    .ok_or(RemoteMessageError::DeadlineExceeded)?;
+                                Ok::<_, RemoteMessageError>(match dispatch
                                     .ask_singleton(ask.target, ask.message_id, ask.payload, deadline)
                                     .await
                                 {
@@ -369,7 +373,7 @@ pub enum LaneError {
     #[error("inbound ask task failed")]
     Join(#[source] tokio::task::JoinError),
     #[error("inbound actor dispatch failed")]
-    Dispatch(#[from] crate::messaging::RemoteMessageError),
+    Dispatch(#[from] RemoteMessageError),
     #[error("reliable control dispatch failed")]
     ControlDispatch(#[from] crate::control::ControlDispatchError),
     #[error("reliable control state rejected a frame")]
@@ -391,7 +395,8 @@ mod tests {
     use super::*;
     use crate::association::{AssociationKey, LaneAttachment};
     use crate::config::RemotingConfig;
-    use crate::messaging::{ExactActorTarget, RemoteMessageError, SenderIdentity};
+    use crate::messaging::error::RemoteMessageError;
+    use crate::messaging::target::{ExactActorTarget, SenderIdentity};
     use crate::protocol::{ProtocolDescriptor, ProtocolFingerprint};
     use async_trait::async_trait;
     use lattice_core::actor_ref::{

@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::wildcard_imports))]
+
 use std::path::Path;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

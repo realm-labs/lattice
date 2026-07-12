@@ -26,9 +26,3 @@ error[E0432]: unresolved imports `lattice_placement::ActorEpochFloor`, `lattice_
   |                         |                |
   |                         |                no `ExplicitPlacement` in the root
   |                         no `ActorEpochFloor` in the root
-  |
-help: a similar name exists in the module
-  |
-3 - use lattice_placement::{ActorEpochFloor, ExplicitPlacement, PlacementTombstone};
-3 + use lattice_placement::{ActorEpochFloor, ExplicitPlacement, PlacementStore};
-  |

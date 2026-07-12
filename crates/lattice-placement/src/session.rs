@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lattice_remoting::{AssociationManager, AssociationState, ControlDispatchError};
+use lattice_remoting::association::AssociationManager;
+use lattice_remoting::association::AssociationState;
+use lattice_remoting::control::ControlDispatchError;
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::Instant;
@@ -96,7 +98,7 @@ impl LogicPlacementState {
 
 pub struct LogicCoordinatorSession {
     hello: NodeHello,
-    coordinator: lattice_remoting::AssociationKey,
+    coordinator: lattice_remoting::association::AssociationKey,
     associations: Arc<AssociationManager>,
     config: LogicCoordinatorConfig,
     state: Arc<Mutex<LogicPlacementState>>,
@@ -115,7 +117,7 @@ struct LocalAuthorityEvent {
 
 #[derive(Clone)]
 pub struct LogicCoordinatorHandle {
-    coordinator: lattice_remoting::AssociationKey,
+    coordinator: lattice_remoting::association::AssociationKey,
     associations: Arc<AssociationManager>,
     maximum_control_payload: usize,
     state: Arc<Mutex<LogicPlacementState>>,
@@ -230,7 +232,7 @@ impl LogicCoordinatorHandle {
 impl LogicCoordinatorSession {
     pub fn new(
         hello: NodeHello,
-        coordinator: lattice_remoting::AssociationKey,
+        coordinator: lattice_remoting::association::AssociationKey,
         associations: Arc<AssociationManager>,
         config: LogicCoordinatorConfig,
         effect_capacity: usize,
@@ -283,7 +285,7 @@ impl LogicCoordinatorSession {
         }
     }
 
-    pub fn coordinator_key(&self) -> &lattice_remoting::AssociationKey {
+    pub fn coordinator_key(&self) -> &lattice_remoting::association::AssociationKey {
         &self.coordinator
     }
 
@@ -633,7 +635,7 @@ impl LogicCoordinatorSession {
 
     fn require_coordinator(
         &self,
-        association: &lattice_remoting::AssociationKey,
+        association: &lattice_remoting::association::AssociationKey,
     ) -> Result<(), LogicSessionError> {
         if association != &self.coordinator {
             return Err(LogicSessionError::UnauthorizedCommand);

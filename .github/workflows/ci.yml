@@ -42,6 +42,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Structure
+        run: scripts/check-structure.sh
+
       - name: Format
         run: cargo fmt --all -- --check
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lattice_actor::BoundRecipient;
+use lattice_actor::recipient::BoundRecipient;
 use lattice_actor::traits::{Actor, Message};
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;

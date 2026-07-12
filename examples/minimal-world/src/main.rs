@@ -1,20 +1,25 @@
+#![cfg_attr(not(test), deny(clippy::wildcard_imports))]
+
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::mailbox::MailboxConfig;
+use lattice_actor::protocol::ProstCodec;
+use lattice_actor::protocol::WireSchema;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::traits::{Actor, Handler, Message};
-use lattice_actor::{ProstCodec, WireSchema, actor_protocol};
 use lattice_config::source::ConfigSource;
 use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId, RecipientRef};
 use lattice_core::id::ActorId;
 use lattice_core::{actor_kind, service_kind};
-use lattice_remoting::RemotingConfig;
-use lattice_service::{LatticeService, NodeConfig};
+use lattice_remoting::config::RemotingConfig;
+use lattice_service::builder::LatticeService;
+use lattice_service::config::NodeConfig;
 use serde::Deserialize;
 
 pub mod world {

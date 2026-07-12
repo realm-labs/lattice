@@ -2,12 +2,20 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_actor::ProtocolHostRegistry;
-use lattice_remoting::{
-    Association, AssociationKey, AssociationManager, CommandId, ControlDispatch,
-    ControlDispatchError, ControlGap, TerminatedReason, WatchCommand, WatchRegistry,
-    decode_watch_command, encode_watch_command, is_watch_control,
-};
+use lattice_actor::host::ProtocolHostRegistry;
+use lattice_remoting::association::Association;
+use lattice_remoting::association::AssociationKey;
+use lattice_remoting::association::AssociationManager;
+use lattice_remoting::control::CommandId;
+use lattice_remoting::control::ControlDispatch;
+use lattice_remoting::control::ControlDispatchError;
+use lattice_remoting::control::ControlGap;
+use lattice_remoting::watch::TerminatedReason;
+use lattice_remoting::watch::WatchCommand;
+use lattice_remoting::watch::WatchRegistry;
+use lattice_remoting::watch::decode_watch_command;
+use lattice_remoting::watch::encode_watch_command;
+use lattice_remoting::watch::is_watch_control;
 
 use crate::supervisor::TaskSupervisor;
 
@@ -60,7 +68,7 @@ impl ServiceControlDispatch {
 
     fn supervise_termination(
         &self,
-        target: lattice_remoting::ExactActorTarget,
+        target: lattice_remoting::messaging::target::ExactActorTarget,
         mut terminated: tokio::sync::broadcast::Receiver<lattice_actor::watch::ActorTerminated>,
     ) -> Result<(), ControlDispatchError> {
         let watches = self.watches.clone();

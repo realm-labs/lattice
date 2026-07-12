@@ -3,16 +3,29 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_actor::{ProtocolHostRegistry, RecipientBackend};
+use lattice_actor::host::ProtocolHostRegistry;
+use lattice_actor::recipient::RecipientBackend;
 use lattice_core::actor_ref::{ActorRef, EntityRef, RecipientRef, SingletonRef};
-use lattice_placement::PlacementSlotKey;
+use lattice_placement::types::PlacementSlotKey;
+use lattice_remoting::association::AssociationId;
+use lattice_remoting::association::AssociationManager;
+use lattice_remoting::messaging::error::AskError;
+use lattice_remoting::messaging::error::RemoteFailureCode;
+use lattice_remoting::messaging::error::RemoteMessageError;
+use lattice_remoting::messaging::error::TellError;
+use lattice_remoting::messaging::inbound::InboundDispatch;
+use lattice_remoting::messaging::outbound::OutboundMessaging;
+use lattice_remoting::messaging::target::ExactActorTarget;
+use lattice_remoting::messaging::target::LogicalEntityTarget;
+use lattice_remoting::messaging::target::LogicalSingletonTarget;
+use lattice_remoting::messaging::target::SenderIdentity;
 use lattice_remoting::protocol::ProtocolFingerprint;
-use lattice_remoting::{
-    AskError, AssociationId, AssociationManager, ExactActorTarget, InboundDispatch,
-    LogicalEntityTarget, LogicalSingletonTarget, OutboundMessaging, RemoteFailureCode,
-    RemoteMessageError, SenderIdentity, TellError, TerminatedReason, WatchCommand, WatchError,
-    WatchId, WatchRegistry, encode_watch_command,
-};
+use lattice_remoting::watch::TerminatedReason;
+use lattice_remoting::watch::WatchCommand;
+use lattice_remoting::watch::WatchError;
+use lattice_remoting::watch::WatchId;
+use lattice_remoting::watch::WatchRegistry;
+use lattice_remoting::watch::encode_watch_command;
 
 #[async_trait]
 pub trait LogicalRouter: Send + Sync + 'static {
@@ -211,8 +224,10 @@ impl ServiceRecipientBackend {
     fn association(
         &self,
         reference: &ActorRef<()>,
-    ) -> Result<Arc<lattice_remoting::Association>, lattice_remoting::association::AssociationError>
-    {
+    ) -> Result<
+        Arc<lattice_remoting::association::Association>,
+        lattice_remoting::association::AssociationError,
+    > {
         self.associations.get_or_create(
             reference.cluster_id().clone(),
             reference.node_address().clone(),

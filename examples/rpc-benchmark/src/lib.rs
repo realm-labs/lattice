@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::wildcard_imports))]
+
 pub mod matrix;
 pub mod metrics;
 
@@ -8,11 +10,14 @@ use bytes::Bytes;
 use lattice_core::actor_ref::{
     ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
 };
+use lattice_remoting::association::Association;
+use lattice_remoting::association::AssociationKey;
+use lattice_remoting::association::LaneAttachment;
+use lattice_remoting::association::LaneKind;
+use lattice_remoting::config::RemotingConfig;
+use lattice_remoting::messaging::outbound::OutboundMessaging;
+use lattice_remoting::messaging::target::SenderIdentity;
 use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
-use lattice_remoting::{
-    Association, AssociationKey, LaneAttachment, LaneKind, OutboundMessaging, RemotingConfig,
-    SenderIdentity,
-};
 use metrics::WorkloadReport;
 
 pub const BENCH_PROTOCOL_ID: u64 = 0x6265_6e63_6800_0001;
@@ -148,7 +153,7 @@ impl RemotingTopology {
                         successes += 1;
                         break;
                     }
-                    Err(lattice_remoting::TellError::Association(
+                    Err(lattice_remoting::messaging::error::TellError::Association(
                         lattice_remoting::association::AssociationError::QueueFull,
                     )) => tokio::task::yield_now().await,
                     Err(error) => return Err(Box::new(error)),

@@ -225,7 +225,9 @@ impl<A: Actor> ActorContext<A> {
             child_ref.as_ref().map(ActorRef::erase),
             self.service.clone(),
         );
-        let directory = self.service.extension::<crate::ActivationDirectory>();
+        let directory = self
+            .service
+            .extension::<crate::directory::ActivationDirectory>();
         if let Some(directory) = &directory
             && let Err(error) = directory.register(&handle)
         {
@@ -278,7 +280,9 @@ impl<A: Actor> ActorContext<A> {
             child_ref.as_ref().map(ActorRef::erase),
             self.service.clone(),
         );
-        let directory = self.service.extension::<crate::ActivationDirectory>();
+        let directory = self
+            .service
+            .extension::<crate::directory::ActivationDirectory>();
         if let Some(directory) = &directory
             && let Err(error) = directory.register(&handle)
         {
@@ -374,7 +378,8 @@ impl<A: Actor> ActorContext<A> {
                             child_ref.as_ref().map(ActorRef::erase),
                             service.clone(),
                         );
-                        if let Some(directory) = service.extension::<crate::ActivationDirectory>()
+                        if let Some(directory) =
+                            service.extension::<crate::directory::ActivationDirectory>()
                             && directory.register(&replacement).is_err()
                         {
                             let _ = replacement.try_stop_internal(StopReason::StartFailed);
@@ -449,7 +454,7 @@ impl<C: Actor> ChildSlot<C> {
 
 struct ChildSlotStopper<C: Actor> {
     slot: Arc<ChildSlot<C>>,
-    directory: Option<Arc<crate::ActivationDirectory>>,
+    directory: Option<Arc<crate::directory::ActivationDirectory>>,
     reference: Option<ActorRef<()>>,
 }
 

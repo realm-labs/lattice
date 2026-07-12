@@ -3,20 +3,31 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lattice_actor::host::ActorHost;
+use lattice_actor::host::ProtocolHostRegistry;
+use lattice_actor::protocol::ActorProtocol;
+use lattice_actor::recipient::BoundRecipient;
+use lattice_actor::recipient::RecipientBackend;
 use lattice_actor::traits::Actor;
-use lattice_actor::{
-    ActorHost, ActorProtocol, BoundRecipient, ProtocolHostRegistry, RecipientBackend,
-};
 use lattice_core::actor_ref::RecipientRef;
+use lattice_placement::authority::AuthorityEffect;
 use lattice_placement::control::{PlacementControlEvent, PlacementControlRouter};
-use lattice_placement::{
-    AuthorityEffect, CoordinatorHandle, CoordinatorLeader, CoordinatorStore,
-    LogicCoordinatorHandle, LogicCoordinatorSession, LogicPlacementEffect,
-};
-use lattice_remoting::{
-    Association, AssociationManager, ControlDispatch, EndpointSecurity, NodeIdentity,
-    OutboundMessaging, ProtocolDescriptor, RejectControlDispatch, RemotingEndpoint, WatchRegistry,
-};
+use lattice_placement::runtime::CoordinatorHandle;
+use lattice_placement::runtime::CoordinatorLeader;
+use lattice_placement::session::LogicCoordinatorHandle;
+use lattice_placement::session::LogicCoordinatorSession;
+use lattice_placement::session::LogicPlacementEffect;
+use lattice_placement::storage::CoordinatorStore;
+use lattice_remoting::association::Association;
+use lattice_remoting::association::AssociationManager;
+use lattice_remoting::control::ControlDispatch;
+use lattice_remoting::control::RejectControlDispatch;
+use lattice_remoting::endpoint::EndpointSecurity;
+use lattice_remoting::endpoint::RemotingEndpoint;
+use lattice_remoting::handshake::NodeIdentity;
+use lattice_remoting::messaging::outbound::OutboundMessaging;
+use lattice_remoting::protocol::ProtocolDescriptor;
+use lattice_remoting::watch::WatchRegistry;
 use tokio::sync::{mpsc, watch};
 
 use crate::backend::{LogicalRouter, ServiceInboundDispatch, ServiceRecipientBackend};
@@ -35,7 +46,7 @@ pub struct LatticeServiceBuilder {
     logical: Option<Arc<dyn LogicalRouter>>,
     control_dispatch: Arc<dyn ControlDispatch>,
     logic_runtime: Option<LogicRuntimeAssembly>,
-    control_scope: Option<lattice_remoting::AssociationKey>,
+    control_scope: Option<lattice_remoting::association::AssociationKey>,
     coordinator_runtime: Option<CoordinatorRuntimeAssembly>,
     endpoint_security: Option<EndpointSecurity>,
 }
@@ -286,8 +297,8 @@ impl LatticeService {
 
     pub fn watch_status(
         &self,
-        watch_id: lattice_remoting::WatchId,
-    ) -> lattice_remoting::WatchStatus {
+        watch_id: lattice_remoting::watch::WatchId,
+    ) -> lattice_remoting::watch::WatchStatus {
         self.watches
             .lock()
             .expect("watch registry poisoned")
@@ -404,10 +415,11 @@ impl LatticeService {
                         AuthorityEffect::PublishReady => handle.publish_ready(&slot),
                         AuthorityEffect::PublishDrained => handle.publish_drained(&slot),
                         AuthorityEffect::PublishStopFailed => handle.publish_stop_failed(&slot),
-                        AuthorityEffect::StopSlot => router
-                            .stop_fenced_slot(slot)
-                            .await
-                            .map_err(|_| lattice_placement::LogicSessionError::ControlClosed),
+                        AuthorityEffect::StopSlot => {
+                            router.stop_fenced_slot(slot).await.map_err(|_| {
+                                lattice_placement::session::LogicSessionError::ControlClosed
+                            })
+                        }
                         AuthorityEffect::FenceAdmission
                         | AuthorityEffect::OpenAdmission
                         | AuthorityEffect::StartSlot

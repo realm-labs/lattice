@@ -3,19 +3,29 @@ use std::collections::BTreeSet;
 use lattice_core::actor_ref::{
     ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
 };
-use lattice_placement::{
-    AssignmentGeneration, HandoffEffect, HandoffEvent, HandoffMachine, HandoffPhase, NodeKey,
-    PlacementSlotKey, Revision, ShardId,
-};
-use lattice_remoting::{
-    AssociationId, CommandId, ControlApply, ControlEnvelope, ExactActorTarget, ReliableControl,
-    WatchRegistry, WatchStatus,
-};
+use lattice_core::failpoint::Failpoint;
+use lattice_placement::handoff::HandoffEffect;
+use lattice_placement::handoff::HandoffEvent;
+use lattice_placement::handoff::HandoffMachine;
+use lattice_placement::handoff::HandoffPhase;
+use lattice_placement::types::AssignmentGeneration;
+use lattice_placement::types::NodeKey;
+use lattice_placement::types::PlacementSlotKey;
+use lattice_placement::types::Revision;
+use lattice_placement::types::ShardId;
+use lattice_remoting::association::AssociationId;
+use lattice_remoting::control::CommandId;
+use lattice_remoting::control::ControlApply;
+use lattice_remoting::control::ControlEnvelope;
+use lattice_remoting::control::ReliableControl;
+use lattice_remoting::messaging::target::ExactActorTarget;
+use lattice_remoting::watch::WatchRegistry;
+use lattice_remoting::watch::WatchStatus;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::clock::{SimClock, SimScheduler};
-use crate::fault::{FailAction, Failpoint, FaultInjector};
+use crate::fault::{FailAction, FaultInjector};
 use crate::trace::{TraceEvent, TraceJournal};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +68,7 @@ pub struct Scenario {
     handoff: HandoffMachine,
     control: ReliableControl,
     watches: WatchRegistry,
-    watch_id: lattice_remoting::WatchId,
+    watch_id: lattice_remoting::watch::WatchId,
 }
 
 impl Scenario {
@@ -345,11 +355,11 @@ pub enum ScenarioError {
     #[error("scenario observed an unexpected voluntary stop failure")]
     UnexpectedStopFailure,
     #[error(transparent)]
-    Handoff(#[from] lattice_placement::HandoffError),
+    Handoff(#[from] lattice_placement::handoff::HandoffError),
     #[error(transparent)]
     Control(#[from] lattice_remoting::control::ReliableControlError),
     #[error(transparent)]
-    Watch(#[from] lattice_remoting::WatchError),
+    Watch(#[from] lattice_remoting::watch::WatchError),
     #[error(transparent)]
     Invariant(#[from] InvariantViolation),
 }
@@ -359,10 +369,14 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    use crate::{
-        Explorable, Failpoint, FaultMatrix, FaultTarget, ProcessState, SimEtcd, SimNetwork,
-        SimProcess, StateExplorer,
-    };
+    use crate::explorer::Explorable;
+    use crate::explorer::StateExplorer;
+    use crate::fault::FaultMatrix;
+    use crate::fault::FaultTarget;
+    use crate::network::SimNetwork;
+    use crate::process::ProcessState;
+    use crate::process::SimProcess;
+    use crate::store::SimEtcd;
 
     fn run(seed: u64) -> Scenario {
         let mut scenario = Scenario::standard(ScenarioConfig {
@@ -488,7 +502,7 @@ mod tests {
         etcd.compact(2);
         assert!(matches!(
             etcd.watch_from(1).as_slice(),
-            [crate::SimWatchEvent::Compacted { compacted: 2, .. }]
+            [crate::store::SimWatchEvent::Compacted { compacted: 2, .. }]
         ));
     }
 

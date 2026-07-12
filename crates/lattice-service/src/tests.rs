@@ -4,17 +4,24 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
+use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
+use lattice_actor::protocol::DecodeError;
+use lattice_actor::protocol::EncodeError;
+use lattice_actor::protocol::WireCodec;
+use lattice_actor::protocol::WireSchema;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::traits::{Actor, Handler, Message, StopReason};
-use lattice_actor::{DecodeError, EncodeError, WireCodec, WireSchema, actor_protocol};
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId, RecipientRef};
 use lattice_core::id::ActorId;
-use lattice_remoting::{NodeIdentity, RemotingConfig, WatchStatus};
+use lattice_remoting::config::RemotingConfig;
+use lattice_remoting::handshake::NodeIdentity;
+use lattice_remoting::watch::WatchStatus;
 
-use crate::{LatticeService, NodeConfig};
+use crate::builder::LatticeService;
+use crate::config::NodeConfig;
 
 const PROTOCOL_ID: u64 = 0x7465_7374_0000_0001;
 

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use lattice_core::failpoint::Failpoint;
+use lattice_core::failpoint::Failpoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailAction {

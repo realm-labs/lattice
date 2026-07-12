@@ -11,14 +11,32 @@ use lattice_actor::registry::{ActorRegistry, ActorRegistryConfig};
 use lattice_actor::traits::{Actor, Handler, Message, StopReason};
 use lattice_core::actor_ref::{EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId};
 use lattice_core::{actor_kind, id::ActorId};
+use lattice_placement::allocation::AllocationRequest;
+use lattice_placement::allocation::PlacementView;
+use lattice_placement::allocation::RebalanceLimits;
+use lattice_placement::allocation::RebalanceTrigger;
+use lattice_placement::allocation::ShardAllocationStrategy;
+use lattice_placement::allocation::WeightedLeastLoad;
 use lattice_placement::allocation::{LoadSample, PlacedShard, PlacementNode};
-use lattice_placement::{
-    AllocationRequest, AssignmentGeneration, BufferedMessageMode, CoordinatorTerm, EntityConfig,
-    HandoffEvent, HandoffMachine, MonotonicTime, NodeKey, PlacementSlotKey, PlacementSlotState,
-    PlacementView, RebalanceLimits, RebalanceTrigger, RegionConfig, Revision,
-    ShardAllocationStrategy, ShardHome, ShardId, ShardRegion, WeightedLeastLoad,
-};
-use lattice_remoting::{AssociationId, CommandId, ControlApply, ReliableControl};
+use lattice_placement::handoff::HandoffEvent;
+use lattice_placement::handoff::HandoffMachine;
+use lattice_placement::region::BufferedMessageMode;
+use lattice_placement::region::EntityConfig;
+use lattice_placement::region::RegionConfig;
+use lattice_placement::region::ShardHome;
+use lattice_placement::region::ShardRegion;
+use lattice_placement::types::AssignmentGeneration;
+use lattice_placement::types::CoordinatorTerm;
+use lattice_placement::types::MonotonicTime;
+use lattice_placement::types::NodeKey;
+use lattice_placement::types::PlacementSlotKey;
+use lattice_placement::types::PlacementSlotState;
+use lattice_placement::types::Revision;
+use lattice_placement::types::ShardId;
+use lattice_remoting::association::AssociationId;
+use lattice_remoting::control::CommandId;
+use lattice_remoting::control::ControlApply;
+use lattice_remoting::control::ReliableControl;
 
 #[derive(Debug, Clone)]
 pub struct MatrixMeasurement {

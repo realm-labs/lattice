@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
-use lattice_remoting::RemotingConfig;
+use lattice_remoting::config::RemotingConfig;
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -56,5 +56,5 @@ pub enum NodeConfigError {
     #[error("node limits and shutdown timeout must be nonzero")]
     ZeroLimit,
     #[error("remoting configuration is invalid")]
-    Remoting(#[source] lattice_remoting::RemotingConfigError),
+    Remoting(#[source] lattice_remoting::config::RemotingConfigError),
 }

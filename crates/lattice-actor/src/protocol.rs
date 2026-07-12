@@ -515,11 +515,11 @@ macro_rules! actor_protocol {
 
         impl $name {
             $visibility fn build() -> Result<
-                $crate::ActorProtocol<$actor>,
-                $crate::ProtocolBuildError,
+                $crate::protocol::ActorProtocol<$actor>,
+                $crate::protocol::ProtocolBuildError,
             > {
-                let builder = $crate::ActorProtocol::<$actor>::builder(
-                    $crate::__protocol_id($protocol_id)?,
+                let builder = $crate::protocol::ActorProtocol::<$actor>::builder(
+                    $crate::protocol::__protocol_id($protocol_id)?,
                     $protocol_name,
                 );
                 $crate::actor_protocol!(@apply builder; $($bindings)*).build()

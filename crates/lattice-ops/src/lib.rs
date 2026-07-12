@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::wildcard_imports))]
+
 pub mod admin;
 pub mod error;
 pub mod operation;

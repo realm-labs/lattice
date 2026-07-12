@@ -1,8 +1,10 @@
 use bytes::Bytes;
 use lattice_core::actor_ref::{EntityType, NodeIncarnation, SingletonKind};
-use lattice_remoting::{
-    AssociationKey, CommandId, ControlDispatch, ControlDispatchError, ControlGap,
-};
+use lattice_remoting::association::AssociationKey;
+use lattice_remoting::control::CommandId;
+use lattice_remoting::control::ControlDispatch;
+use lattice_remoting::control::ControlDispatchError;
+use lattice_remoting::control::ControlGap;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

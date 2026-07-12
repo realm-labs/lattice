@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::wildcard_imports))]
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,14 +8,17 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use clap::{Parser, ValueEnum};
+use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
+use lattice_actor::directory::ActivationDirectory;
 use lattice_actor::error::ActorError;
+use lattice_actor::protocol::DecodeError;
+use lattice_actor::protocol::EncodeError;
+use lattice_actor::protocol::WireCodec;
+use lattice_actor::protocol::WireSchema;
 use lattice_actor::registry::{ActorCreateContext, ActorLoader};
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::traits::{Actor, Handler, Message};
-use lattice_actor::{
-    ActivationDirectory, DecodeError, EncodeError, WireCodec, WireSchema, actor_protocol,
-};
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{
     ActorRef, ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation, ProtocolId,
@@ -27,21 +32,39 @@ use lattice_placement::control::{
     DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
     encode_control_command,
 };
+use lattice_placement::coordinator::NodeHello;
+use lattice_placement::coordinator::SnapshotLimits;
+use lattice_placement::coordinator::SnapshotRecord;
 use lattice_placement::coordinator::build_snapshot;
+use lattice_placement::region::EntityConfig;
+use lattice_placement::runtime::CoordinatorLeader;
+use lattice_placement::runtime::CoordinatorLeaderConfig;
+use lattice_placement::runtime::CoordinatorRuntimeError;
+use lattice_placement::session::LogicCoordinatorConfig;
+use lattice_placement::session::LogicCoordinatorSession;
 use lattice_placement::storage::etcd::{EtcdPlacementConfig, EtcdPlacementStore};
-use lattice_placement::{
-    AssignmentGeneration, ClaimGrant, CoordinatorLeader, CoordinatorLeaderConfig,
-    CoordinatorRuntimeError, CoordinatorTerm, EntityConfig, GrantSequence, LogicCoordinatorConfig,
-    LogicCoordinatorSession, NodeHello, NodeKey, PlacementSlot, PlacementSlotKey,
-    PlacementSlotState, Revision, SnapshotLimits, SnapshotRecord,
-};
-use lattice_remoting::WatchStatus;
-use lattice_remoting::{
-    AssociationKey, CommandId, ControlDispatch, LaneAttachment, LaneKind, NodeIdentity,
-};
-use lattice_remoting::{AssociationManager, RemotingConfig};
+use lattice_placement::types::AssignmentGeneration;
+use lattice_placement::types::ClaimGrant;
+use lattice_placement::types::CoordinatorTerm;
+use lattice_placement::types::GrantSequence;
+use lattice_placement::types::NodeKey;
+use lattice_placement::types::PlacementSlot;
+use lattice_placement::types::PlacementSlotKey;
+use lattice_placement::types::PlacementSlotState;
+use lattice_placement::types::Revision;
+use lattice_remoting::association::AssociationKey;
+use lattice_remoting::association::AssociationManager;
+use lattice_remoting::association::LaneAttachment;
+use lattice_remoting::association::LaneKind;
+use lattice_remoting::config::RemotingConfig;
+use lattice_remoting::control::CommandId;
+use lattice_remoting::control::ControlDispatch;
+use lattice_remoting::handshake::NodeIdentity;
+use lattice_remoting::watch::WatchStatus;
+use lattice_service::builder::LatticeService;
+use lattice_service::builder::LatticeServiceBuilder;
 use lattice_service::cluster::{ClusterLogicalRouter, LogicalBufferConfig};
-use lattice_service::{LatticeService, LatticeServiceBuilder, NodeConfig};
+use lattice_service::config::NodeConfig;
 use serde::{Deserialize, Serialize};
 
 const PROTOCOL_ID: u64 = 0x7369_6d00_0000_0001;
@@ -358,7 +381,7 @@ async fn coordinator(
                     }
                     Err(CoordinatorRuntimeError::NotLeader)
                     | Err(CoordinatorRuntimeError::Storage(
-                        lattice_placement::StorageError::CompareFailed,
+                        lattice_placement::storage::StorageError::CompareFailed,
                     )) => {}
                     Err(error) => return Err(error.into()),
                 }

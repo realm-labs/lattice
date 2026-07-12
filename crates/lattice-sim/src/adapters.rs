@@ -1,19 +1,36 @@
 use bytes::Bytes;
 use lattice_core::actor_ref::{ActorRef, EntityId, NodeIncarnation};
-use lattice_placement::{
-    AuthorityEffect, AuthorityEvent, BufferedMessage, BufferedMessageMode, CoordinatorDelta,
-    CoordinatorSession, HandoffEffect, HandoffEvent, HandoffMachine, MonotonicTime,
-    PlacementAuthority, RebalancePlan, RouteDecision, ShardHome, ShardId, ShardRegion,
-    SingletonManager,
-};
-use lattice_remoting::{
-    AssociationId, CommandId, ControlApply, ControlEnvelope, ExactActorTarget, ReliableControl,
-    WatchCommand, WatchId, WatchRegistry,
-};
-use lattice_service::{
-    ServiceLifecycle, ServiceLifecycleEffect, ServiceLifecycleError, ServiceLifecycleEvent,
-    ServiceLifecycleState,
-};
+use lattice_placement::authority::AuthorityEffect;
+use lattice_placement::authority::AuthorityEvent;
+use lattice_placement::authority::PlacementAuthority;
+use lattice_placement::coordinator::CoordinatorDelta;
+use lattice_placement::coordinator::CoordinatorSession;
+use lattice_placement::handoff::HandoffEffect;
+use lattice_placement::handoff::HandoffEvent;
+use lattice_placement::handoff::HandoffMachine;
+use lattice_placement::plan::RebalancePlan;
+use lattice_placement::region::BufferedMessage;
+use lattice_placement::region::BufferedMessageMode;
+use lattice_placement::region::RouteDecision;
+use lattice_placement::region::ShardHome;
+use lattice_placement::region::ShardRegion;
+use lattice_placement::singleton::SingletonManager;
+use lattice_placement::types::MonotonicTime;
+use lattice_placement::types::ShardId;
+use lattice_remoting::association::AssociationId;
+use lattice_remoting::control::CommandId;
+use lattice_remoting::control::ControlApply;
+use lattice_remoting::control::ControlEnvelope;
+use lattice_remoting::control::ReliableControl;
+use lattice_remoting::messaging::target::ExactActorTarget;
+use lattice_remoting::watch::WatchCommand;
+use lattice_remoting::watch::WatchId;
+use lattice_remoting::watch::WatchRegistry;
+use lattice_service::lifecycle::ServiceLifecycle;
+use lattice_service::lifecycle::ServiceLifecycleEffect;
+use lattice_service::lifecycle::ServiceLifecycleError;
+use lattice_service::lifecycle::ServiceLifecycleEvent;
+use lattice_service::lifecycle::ServiceLifecycleState;
 
 pub struct ControlAdapter {
     reducer: ReliableControl,
@@ -105,7 +122,7 @@ impl RegionAdapter {
         mode: BufferedMessageMode,
         payload: Bytes,
         now: MonotonicTime,
-    ) -> Result<RouteDecision, lattice_placement::RegionError> {
+    ) -> Result<RouteDecision, lattice_placement::region::RegionError> {
         self.reducer
             .route(entity_id, message_id, mode, payload, now)
     }
@@ -114,7 +131,7 @@ impl RegionAdapter {
         &mut self,
         shard_id: ShardId,
         home: ShardHome,
-    ) -> Result<Vec<BufferedMessage>, lattice_placement::RegionError> {
+    ) -> Result<Vec<BufferedMessage>, lattice_placement::region::RegionError> {
         self.reducer.apply_home(shard_id, home)
     }
 }
@@ -131,7 +148,7 @@ impl HandoffAdapter {
     pub fn step(
         &mut self,
         event: HandoffEvent,
-    ) -> Result<Vec<HandoffEffect>, lattice_placement::HandoffError> {
+    ) -> Result<Vec<HandoffEffect>, lattice_placement::handoff::HandoffError> {
         self.reducer.transition(event)
     }
 
@@ -152,13 +169,16 @@ impl PlanAdapter {
     pub fn begin(
         &mut self,
         shard_id: ShardId,
-        generation: lattice_placement::AssignmentGeneration,
+        generation: lattice_placement::types::AssignmentGeneration,
         active_move: Option<u128>,
-    ) -> Result<(), lattice_placement::PlanError> {
+    ) -> Result<(), lattice_placement::plan::PlanError> {
         self.reducer.begin_move(shard_id, generation, active_move)
     }
 
-    pub fn complete(&mut self, shard_id: ShardId) -> Result<(), lattice_placement::PlanError> {
+    pub fn complete(
+        &mut self,
+        shard_id: ShardId,
+    ) -> Result<(), lattice_placement::plan::PlanError> {
         self.reducer.complete_move(shard_id)
     }
 
@@ -179,7 +199,7 @@ impl SingletonAdapter {
     pub fn step(
         &mut self,
         event: AuthorityEvent,
-    ) -> Result<Vec<AuthorityEffect>, lattice_placement::SingletonError> {
+    ) -> Result<Vec<AuthorityEffect>, lattice_placement::singleton::SingletonError> {
         self.reducer.transition(event)
     }
 
@@ -219,7 +239,7 @@ impl WatchAdapter {
         &mut self,
         association: AssociationId,
         target: &ActorRef<A>,
-    ) -> Result<(WatchId, WatchCommand), lattice_remoting::WatchError> {
+    ) -> Result<(WatchId, WatchCommand), lattice_remoting::watch::WatchError> {
         self.reducer.watch(association, target)
     }
 

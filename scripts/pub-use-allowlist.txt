@@ -1,0 +1,2 @@
+# Tab-separated columns: relative path, exact declaration line, justification.
+# Keep this file empty unless a public re-export is required by the API design.

@@ -5,10 +5,16 @@ use lattice_core::actor_ref::{ConfigFingerprint, EntityType, NodeAddress, NodeIn
 use lattice_placement::coordinator::LeaderRecord;
 use lattice_placement::storage::etcd::{EtcdPlacementConfig, EtcdPlacementStore};
 use lattice_placement::storage::{CoordinatorStore, PlacementStore, StorageError};
-use lattice_placement::{
-    AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, NodeKey, PlacementSlot,
-    PlacementSlotKey, PlacementSlotState, Revision, ShardId,
-};
+use lattice_placement::types::AssignmentGeneration;
+use lattice_placement::types::ClaimGrant;
+use lattice_placement::types::CoordinatorTerm;
+use lattice_placement::types::GrantSequence;
+use lattice_placement::types::NodeKey;
+use lattice_placement::types::PlacementSlot;
+use lattice_placement::types::PlacementSlotKey;
+use lattice_placement::types::PlacementSlotState;
+use lattice_placement::types::Revision;
+use lattice_placement::types::ShardId;
 
 fn endpoints() -> Option<Vec<String>> {
     std::env::var("LATTICE_ETCD_ENDPOINTS")

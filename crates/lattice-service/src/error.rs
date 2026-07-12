@@ -5,17 +5,17 @@ pub enum ServiceError {
     #[error("node configuration is invalid")]
     Config(#[source] crate::config::NodeConfigError),
     #[error("actor host registration failed")]
-    Host(#[source] lattice_actor::HostRegistryError),
+    Host(#[source] lattice_actor::host::HostRegistryError),
     #[error("association manager construction failed")]
     Association(#[source] lattice_remoting::association::AssociationError),
     #[error("remote messaging construction failed")]
-    Messaging(#[source] lattice_remoting::RemoteMessageError),
+    Messaging(#[source] lattice_remoting::messaging::error::RemoteMessageError),
     #[error("remoting endpoint failed")]
-    Endpoint(#[source] lattice_remoting::EndpointError),
+    Endpoint(#[source] lattice_remoting::endpoint::EndpointError),
     #[error("watch registry construction failed")]
-    Watch(#[source] lattice_remoting::WatchError),
+    Watch(#[source] lattice_remoting::watch::WatchError),
     #[error("service reliable control dispatch construction failed")]
-    Control(#[source] lattice_remoting::ControlDispatchError),
+    Control(#[source] lattice_remoting::control::ControlDispatchError),
     #[error("service lifecycle transition failed")]
     Lifecycle(#[source] crate::lifecycle::ServiceLifecycleError),
     #[error("service supervised task capacity reached")]

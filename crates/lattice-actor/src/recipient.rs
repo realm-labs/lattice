@@ -4,8 +4,11 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_core::actor_ref::{ActorRef, EntityRef, RecipientRef, SingletonRef};
+use lattice_remoting::messaging::error::AskError;
+use lattice_remoting::messaging::error::TellError;
 use lattice_remoting::protocol::ProtocolFingerprint;
-use lattice_remoting::{AskError, TellError, WatchError, WatchId};
+use lattice_remoting::watch::WatchError;
+use lattice_remoting::watch::WatchId;
 use thiserror::Error;
 
 use crate::protocol::{ActorProtocol, DispatchError, DispatchMode};

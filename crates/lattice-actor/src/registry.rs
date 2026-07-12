@@ -149,7 +149,7 @@ impl<A: Actor> ActorRegistry<A> {
         if let Some(directory) = self
             .config
             .service
-            .extension::<crate::ActivationDirectory>()
+            .extension::<crate::directory::ActivationDirectory>()
             && let Some(handle) = directory.resolve(actor_ref)
         {
             return Some(handle);
@@ -173,7 +173,7 @@ impl<A: Actor> ActorRegistry<A> {
                 if let Some(directory) = self
                     .config
                     .service
-                    .extension::<crate::ActivationDirectory>()
+                    .extension::<crate::directory::ActivationDirectory>()
                     && let Some(reference) = handle.actor_ref()
                 {
                     directory.remove(&reference.erase());
@@ -386,7 +386,7 @@ impl<A: Actor> ActorRegistry<A> {
             && let Some(directory) = self
                 .config
                 .service
-                .extension::<crate::ActivationDirectory>()
+                .extension::<crate::directory::ActivationDirectory>()
             && let Some(reference) = handle.actor_ref()
         {
             directory.remove(&reference.erase());
@@ -407,7 +407,7 @@ impl<A: Actor> ActorRegistry<A> {
         if let Some(directory) = self
             .config
             .service
-            .extension::<crate::ActivationDirectory>()
+            .extension::<crate::directory::ActivationDirectory>()
             && let Err(error) = directory.register(&handle)
         {
             let _ = handle.try_stop_internal(StopReason::StartFailed);

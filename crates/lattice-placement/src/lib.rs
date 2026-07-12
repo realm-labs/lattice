@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::wildcard_imports))]
+
 pub mod allocation;
 pub mod authority;
 pub mod control;
@@ -11,37 +13,6 @@ pub mod singleton;
 pub mod storage;
 pub mod types;
 
-pub use allocation::{
-    AllocationDecision, AllocationError, AllocationRequest, PlacementView, RebalanceLimits,
-    RebalanceProposal, RebalanceTrigger, ShardAllocationStrategy, WeightedLeastLoad,
-};
-pub use authority::{AuthorityEffect, AuthorityError, AuthorityEvent, PlacementAuthority};
-pub use coordinator::{
-    CoordinatorDelta, CoordinatorSession, LeaderRecord, LoadTable, NodeHello, NodeLoadReport,
-    ShardLoadReport, SingletonConfig, SnapshotBegin, SnapshotChunk, SnapshotEnd, SnapshotLimits,
-    SnapshotRecord, SnapshotStager,
-};
-pub use handoff::{HandoffEffect, HandoffError, HandoffEvent, HandoffMachine, HandoffPhase};
-pub use plan::{MoveProgress, PlanError, PlanStatus, RebalanceMove, RebalancePlan};
-pub use region::{
-    BufferedMessage, BufferedMessageMode, EntityConfig, HandoffBarrier, RegionConfig, RegionError,
-    RouteDecision, ShardHome, ShardRegion,
-};
-pub use runtime::{
-    CoordinatorHandle, CoordinatorInspection, CoordinatorLeader, CoordinatorLeaderConfig,
-    CoordinatorRuntimeError, ManualRelocationRequest,
-};
-pub use session::{
-    LogicCoordinatorConfig, LogicCoordinatorHandle, LogicCoordinatorSession, LogicPlacementEffect,
-    LogicPlacementState, LogicSessionError,
-};
-pub use singleton::{SingletonBufferedMessage, SingletonError, SingletonManager, SingletonProxy};
-pub use storage::{CoordinatorStore, InMemoryPlacementStore, PlacementStore, StorageError};
-pub use types::{
-    AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, MonotonicTime, NodeKey,
-    PlacementSlot, PlacementSlotKey, PlacementSlotState, Revision, ShardId,
-};
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -52,8 +23,10 @@ mod tests {
         ProtocolId,
     };
 
-    use super::*;
-    use crate::allocation::{LoadSample, PlacedShard, PlacementNode};
+    use crate::allocation::*;
+    use crate::authority::*;
+    use crate::region::*;
+    use crate::types::*;
 
     fn node(name: &str, incarnation: u128, port: u16) -> NodeKey {
         NodeKey {
@@ -196,17 +169,11 @@ mod tests {
         let mut slot = running_slot(node("a", 1, 1001));
         slot.barrier_sessions
             .insert(NodeIncarnation::new(2).unwrap());
-        assert_eq!(
-            slot.validate(),
-            Err(types::PlacementTypeError::InvalidSlotState)
-        );
+        assert_eq!(slot.validate(), Err(PlacementTypeError::InvalidSlotState));
 
         slot.barrier_sessions.clear();
         slot.active_move = Some(7);
-        assert_eq!(
-            slot.validate(),
-            Err(types::PlacementTypeError::InvalidSlotState)
-        );
+        assert_eq!(slot.validate(), Err(PlacementTypeError::InvalidSlotState));
 
         slot.state = PlacementSlotState::Stopping;
         assert!(slot.validate().is_ok());

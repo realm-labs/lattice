@@ -7,19 +7,20 @@ use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::association::{
-    Association, AssociationError, AssociationManager, LaneAttachment, LaneKind,
+    Association, AssociationError, AssociationId, AssociationManager, LaneAttachment, LaneKind,
 };
 use crate::config::RemotingConfig;
 use crate::control::{ControlDispatch, RejectControlDispatch};
 use crate::handshake::{FeatureBits, Handshake, HandshakeValidator, NodeIdentity};
-use crate::lane::{BidirectionalLaneConfig, run_bidirectional_lane};
-use crate::messaging::{InboundDispatch, OutboundMessaging};
+use crate::lane::{BidirectionalLaneConfig, LaneExit, run_bidirectional_lane};
+use crate::messaging::inbound::InboundDispatch;
+use crate::messaging::outbound::OutboundMessaging;
 use crate::protocol::ProtocolDescriptor;
 use crate::transport::{
     FramedConnection, NegotiationError, bind_tcp, connect_tcp, connect_tls, negotiate_inbound,
     negotiate_outbound, verify_peer_certificate_identity,
 };
-use crate::wire::{FrameCodec, WireError};
+use crate::wire::{Frame, FrameCodec, WireError};
 
 pub struct RemotingEndpoint {
     local: NodeIdentity,
@@ -31,7 +32,7 @@ pub struct RemotingEndpoint {
     catalogue: Vec<ProtocolDescriptor>,
     connections: Arc<Semaphore>,
     shutdown_tx: watch::Sender<bool>,
-    disconnect_tx: broadcast::Sender<crate::AssociationId>,
+    disconnect_tx: broadcast::Sender<AssociationId>,
     tasks: Mutex<Vec<JoinHandle<Result<(), EndpointError>>>>,
     security: Option<EndpointSecurity>,
     connect_lock: tokio::sync::Mutex<()>,
@@ -252,7 +253,7 @@ impl RemotingEndpoint {
 
     pub fn disconnect_association(
         &self,
-        association_id: crate::AssociationId,
+        association_id: AssociationId,
     ) -> Result<(), EndpointError> {
         self.disconnect_tx
             .send(association_id)
@@ -533,10 +534,10 @@ impl RemotingEndpoint {
         association: Arc<Association>,
         lane: LaneKind,
         nonce: u128,
-        receiver: &mut tokio::sync::mpsc::Receiver<crate::Frame>,
+        receiver: &mut tokio::sync::mpsc::Receiver<Frame>,
         stream: EndpointStream,
         shutdown: &mut watch::Receiver<bool>,
-    ) -> Result<crate::LaneExit, crate::lane::LaneError> {
+    ) -> Result<LaneExit, crate::lane::LaneError> {
         let association_id = association.id();
         let mut disconnect = self.disconnect_tx.subscribe();
         let result = tokio::select! {
@@ -553,7 +554,7 @@ impl RemotingEndpoint {
                 shutdown,
             ) => result,
             () = wait_for_disconnect(&mut disconnect, association_id) => {
-                Ok(crate::LaneExit::RemoteClose)
+                Ok(LaneExit::RemoteClose)
             }
         };
         association.detach(lane, nonce);
@@ -622,8 +623,8 @@ pub enum EndpointError {
 }
 
 async fn wait_for_disconnect(
-    receiver: &mut broadcast::Receiver<crate::AssociationId>,
-    association_id: crate::AssociationId,
+    receiver: &mut broadcast::Receiver<AssociationId>,
+    association_id: AssociationId,
 ) {
     loop {
         match receiver.recv().await {
@@ -645,9 +646,11 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
-    use crate::messaging::{ExactActorTarget, RemoteMessageError, SenderIdentity};
+    use crate::association::AssociationKey;
+    use crate::control::{CommandId, ControlDispatchError, ControlGap};
+    use crate::messaging::error::RemoteMessageError;
+    use crate::messaging::target::{ExactActorTarget, SenderIdentity};
     use crate::protocol::ProtocolFingerprint;
-    use crate::{CommandId, ControlDispatchError};
 
     struct EchoDispatch;
 
@@ -660,7 +663,7 @@ mod tests {
     impl ControlDispatch for RecordingControl {
         async fn apply(
             &self,
-            _association: crate::AssociationKey,
+            _association: AssociationKey,
             _command_id: CommandId,
             payload: Bytes,
         ) -> Result<(), ControlDispatchError> {
@@ -673,8 +676,8 @@ mod tests {
 
         async fn reconcile(
             &self,
-            _association: crate::AssociationKey,
-            _gap: Option<crate::ControlGap>,
+            _association: AssociationKey,
+            _gap: Option<ControlGap>,
         ) -> Result<(), ControlDispatchError> {
             Ok(())
         }

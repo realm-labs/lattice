@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::wildcard_imports))]
+
 pub mod context;
 pub mod directory;
 pub mod error;
@@ -10,14 +12,6 @@ pub mod registry;
 pub mod runtime;
 pub mod traits;
 pub mod watch;
-
-pub use directory::{ActivationDirectory, ActivationDirectoryError};
-pub use host::{ActorHost, HostRegistryError, ProtocolHostRegistry};
-pub use protocol::{
-    __protocol_id, ActorProtocol, DecodeError, DispatchError, DispatchMode, DispatchReply,
-    EncodeError, ProstCodec, ProtocolBuildError, WireCodec, WireSchema,
-};
-pub use recipient::{BoundRecipient, RecipientBackend, RecipientError};
 
 #[cfg(test)]
 mod tests;

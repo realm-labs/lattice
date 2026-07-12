@@ -7,7 +7,7 @@ use lattice_core::actor_ref::{ActorRef, EntityRef, NodeIncarnation, SingletonRef
 use thiserror::Error;
 
 use crate::association::AssociationId;
-use crate::messaging::ExactActorTarget;
+use crate::messaging::target::ExactActorTarget;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,

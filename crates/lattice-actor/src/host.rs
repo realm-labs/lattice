@@ -5,7 +5,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_core::actor_ref::{ActorRef, ProtocolId};
-use lattice_remoting::{ExactActorTarget, InboundDispatch, RemoteMessageError};
+use lattice_remoting::messaging::error::RemoteMessageError;
+use lattice_remoting::messaging::inbound::InboundDispatch;
+use lattice_remoting::messaging::target::ExactActorTarget;
 use thiserror::Error;
 
 use crate::protocol::{ActorProtocol, DispatchError, DispatchMode, DispatchReply};
