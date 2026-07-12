@@ -3,7 +3,7 @@ use prost::Message;
 use thiserror::Error;
 
 pub const TRANSPORT_MAJOR: u16 = 1;
-pub const TRANSPORT_MINOR: u16 = 0;
+pub const TRANSPORT_MINOR: u16 = 1;
 const HEADER_LEN: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,6 +34,8 @@ pub enum FrameKind {
     EntityAsk = 23,
     SingletonTell = 24,
     SingletonAsk = 25,
+    BootstrapRequest = 26,
+    BootstrapResponse = 27,
 }
 
 impl TryFrom<u16> for FrameKind {
@@ -66,6 +68,8 @@ impl TryFrom<u16> for FrameKind {
             23 => Ok(Self::EntityAsk),
             24 => Ok(Self::SingletonTell),
             25 => Ok(Self::SingletonAsk),
+            26 => Ok(Self::BootstrapRequest),
+            27 => Ok(Self::BootstrapResponse),
             _ => Err(WireError::UnknownFrameKind(value)),
         }
     }

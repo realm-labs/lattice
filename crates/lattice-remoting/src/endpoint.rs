@@ -9,6 +9,10 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::association::{
     Association, AssociationError, AssociationId, AssociationManager, LaneAttachment, LaneKind,
 };
+use crate::bootstrap::{
+    AcceptBootstrap, BootstrapError, BootstrapHandler, BootstrapProbeTarget,
+    BootstrapRejectionCode, BootstrapRequest, BootstrapResponse, BootstrapResult, BootstrapRoute,
+};
 use crate::config::RemotingConfig;
 use crate::control::{ControlDispatch, RejectControlDispatch};
 use crate::handshake::{FeatureBits, Handshake, HandshakeValidator, NodeIdentity};
@@ -17,8 +21,8 @@ use crate::messaging::inbound::InboundDispatch;
 use crate::messaging::outbound::OutboundMessaging;
 use crate::protocol::ProtocolDescriptor;
 use crate::transport::{
-    FramedConnection, NegotiationError, bind_tcp, connect_tcp, connect_tls, negotiate_inbound,
-    negotiate_outbound, verify_peer_certificate_identity,
+    FramedConnection, NegotiationError, bind_tcp, connect_tcp, connect_tls, connect_tls_candidate,
+    negotiate_inbound_from_frame, negotiate_outbound, verify_peer_certificate_identity,
 };
 use crate::wire::{Frame, FrameCodec, WireError};
 
@@ -36,6 +40,7 @@ pub struct RemotingEndpoint {
     tasks: Mutex<Vec<JoinHandle<Result<(), EndpointError>>>>,
     security: Option<EndpointSecurity>,
     connect_lock: tokio::sync::Mutex<()>,
+    bootstrap_handler: std::sync::RwLock<Arc<dyn BootstrapHandler>>,
 }
 
 #[derive(Clone)]
@@ -181,11 +186,19 @@ impl RemotingEndpoint {
             tasks: Mutex::new(Vec::new()),
             security,
             connect_lock: tokio::sync::Mutex::new(()),
+            bootstrap_handler: std::sync::RwLock::new(Arc::new(AcceptBootstrap)),
         })
     }
 
     pub fn local_identity(&self) -> &NodeIdentity {
         &self.local
+    }
+
+    pub fn install_bootstrap_handler(&self, handler: Arc<dyn BootstrapHandler>) {
+        *self
+            .bootstrap_handler
+            .write()
+            .expect("bootstrap handler lock poisoned") = handler;
     }
 
     pub async fn bind(self: &Arc<Self>) -> Result<(), EndpointError> {
@@ -219,6 +232,88 @@ impl RemotingEndpoint {
                 .await?;
         }
         Ok(association)
+    }
+
+    pub async fn probe_candidate(
+        self: &Arc<Self>,
+        target: BootstrapProbeTarget,
+    ) -> Result<BootstrapResponse, EndpointError> {
+        if target
+            .expected_node_id
+            .as_ref()
+            .is_some_and(String::is_empty)
+            || target
+                .tls_server_name
+                .as_ref()
+                .is_some_and(String::is_empty)
+        {
+            return Err(EndpointError::InvalidBootstrapTarget);
+        }
+        let permit = self
+            .connections
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| EndpointError::ConnectionLimit)?;
+        let result = tokio::time::timeout(
+            self.config.connect_timeout,
+            self.probe_candidate_inner(target),
+        )
+        .await
+        .map_err(|_| EndpointError::ConnectTimeout)?;
+        drop(permit);
+        result
+    }
+
+    async fn probe_candidate_inner(
+        &self,
+        target: BootstrapProbeTarget,
+    ) -> Result<BootstrapResponse, EndpointError> {
+        let codec = FrameCodec::new(self.config.max_frame_size)?;
+        let (mut connection, peer_certificate) = match &self.security {
+            Some(security) => {
+                let server_name = target
+                    .tls_server_name
+                    .clone()
+                    .unwrap_or_else(|| security.server_name.clone());
+                let (connection, certificate) = connect_tls_candidate(
+                    &target.address,
+                    server_name,
+                    security.client.clone(),
+                    codec,
+                )
+                .await?;
+                (
+                    FramedConnection::new(
+                        EndpointStream::TlsClient(connection.into_inner()),
+                        FrameCodec::new(self.config.max_frame_size)?,
+                    ),
+                    Some(certificate),
+                )
+            }
+            None => (
+                FramedConnection::new(
+                    EndpointStream::Plain(connect_tcp(&target.address, codec).await?.into_inner()),
+                    FrameCodec::new(self.config.max_frame_size)?,
+                ),
+                None,
+            ),
+        };
+        let request = BootstrapRequest::new(
+            self.local.clone(),
+            self.local.cluster_id.clone(),
+            target.expected_node_id,
+        );
+        connection.write_frame(&request.to_frame()).await?;
+        connection.flush().await?;
+        let response = BootstrapResponse::from_frame(&connection.read_frame().await?)?;
+        response.validate_for(&request)?;
+        if let (Some(certificate), Some(remote)) =
+            (peer_certificate.as_deref(), response.remote_identity())
+        {
+            verify_peer_certificate_identity(certificate, remote)?;
+        }
+        connection.close().await?;
+        Ok(response)
     }
 
     pub async fn shutdown(&self) -> Result<(), EndpointError> {
@@ -466,8 +561,15 @@ impl RemotingEndpoint {
         };
         let mut connection =
             FramedConnection::new(stream, FrameCodec::new(self.config.max_frame_size)?);
-        let (handshake, peer_catalogue) = negotiate_inbound(
+        let first_frame = connection.read_frame().await?;
+        if first_frame.kind == crate::wire::FrameKind::BootstrapRequest {
+            return self
+                .accept_bootstrap(connection, peer_certificate.as_deref(), first_frame)
+                .await;
+        }
+        let (handshake, peer_catalogue) = negotiate_inbound_from_frame(
             &mut connection,
+            first_frame,
             &validator,
             &self.catalogue,
             self.config.max_protocols_per_peer,
@@ -521,6 +623,86 @@ impl RemotingEndpoint {
         association.return_lane_receiver(handshake.lane, receiver)?;
         result?;
         Ok(())
+    }
+
+    async fn accept_bootstrap(
+        self: Arc<Self>,
+        mut connection: FramedConnection<EndpointStream>,
+        peer_certificate: Option<&[u8]>,
+        first_frame: Frame,
+    ) -> Result<(), EndpointError> {
+        let request = BootstrapRequest::from_frame(&first_frame)?;
+        let mut response = if let Some(code) = request.rejection(&self.local) {
+            BootstrapResponse::rejected(request.nonce, code)
+        } else if peer_certificate.is_some_and(|certificate| {
+            verify_peer_certificate_identity(certificate, &request.local).is_err()
+        }) {
+            BootstrapResponse::rejected(
+                request.nonce,
+                BootstrapRejectionCode::AuthenticationFailure,
+            )
+        } else {
+            self.bootstrap_response(&request)
+        };
+        if response.validate_for(&request).is_err() {
+            response = BootstrapResponse::new(
+                request.nonce,
+                BootstrapResult::RetryAfter {
+                    delay: std::time::Duration::from_secs(1),
+                    reason: "bootstrap route is temporarily unavailable".to_string(),
+                },
+            );
+        }
+        let reverse_peer = match &response.result {
+            BootstrapResult::ReverseDial { .. } => Some(request.local.clone()),
+            _ => None,
+        };
+        connection.write_frame(&response.to_frame()).await?;
+        connection.flush().await?;
+        connection.close().await?;
+        if let Some(peer) = reverse_peer {
+            let endpoint = self.clone();
+            self.spawn(async move {
+                let _result = endpoint.connect_peer(peer).await;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn bootstrap_response(&self, request: &BootstrapRequest) -> BootstrapResponse {
+        let route = self
+            .bootstrap_handler
+            .read()
+            .expect("bootstrap handler lock poisoned")
+            .route(request);
+        let result = match route {
+            BootstrapRoute::Accept { leader } => {
+                if self
+                    .associations
+                    .should_dial(&request.local.address, request.local.incarnation)
+                {
+                    BootstrapResult::ReverseDial {
+                        remote: self.local.clone(),
+                        leader,
+                    }
+                } else {
+                    BootstrapResult::Identity {
+                        remote: self.local.clone(),
+                        leader,
+                    }
+                }
+            }
+            BootstrapRoute::Redirect { leader } => BootstrapResult::Redirect {
+                remote: self.local.clone(),
+                leader,
+            },
+            BootstrapRoute::RetryAfter { delay, reason } => {
+                BootstrapResult::RetryAfter { delay, reason }
+            }
+            BootstrapRoute::Reject { code } => BootstrapResult::Rejected { code },
+        };
+        BootstrapResponse::new(request.nonce, result)
     }
 
     fn lanes(&self) -> impl Iterator<Item = LaneKind> {
@@ -620,6 +802,10 @@ pub enum EndpointError {
     ShutdownTimeout,
     #[error("association endpoint has no active connections")]
     NoActiveConnections,
+    #[error("association endpoint bootstrap protocol failed")]
+    Bootstrap(#[from] BootstrapError),
+    #[error("bootstrap probe target is invalid")]
+    InvalidBootstrapTarget,
 }
 
 async fn wait_for_disconnect(

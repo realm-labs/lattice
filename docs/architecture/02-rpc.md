@@ -262,6 +262,19 @@ If bulk tell throughput is insufficient, optimize association scheduling, encodi
 
 ### 4.3 Establishment
 
+Discovery supplies only an untrusted candidate address. Before the normal Association handshake, a
+dedicated bootstrap socket verifies the TLS chain and candidate hostname, exchanges a bounded
+nonce-bound bootstrap request/response, validates cluster and required transport features, and binds
+the returned node ID/incarnation to the peer certificate. Plaintext probing is permitted only under
+the configured trusted-network policy. Failed probes close without inserting an Association.
+
+An ordinary member may redirect the probe to its authenticated Coordinator leader view; leader
+election returns a bounded retry delay. Once the exact identity is known, normal Association setup
+uses the deterministic address/incarnation dial direction. The non-dialing side may request a reverse
+dial bound to the exact authenticated probing identity. A successful probe alone cannot replace an
+existing incarnation; the authoritative member reconciliation path must first fence and close the
+old Association.
+
 Associations are lazy and single-flight:
 
 ```text
@@ -355,7 +368,7 @@ The configured FD budget must cover at least `listener sockets + active_associat
 magic | major | minor | kind | flags | header_len | payload_len | header | payload
 ```
 
-Frame kinds include handshake, heartbeat, tell, ask, reply, failure, watch, unwatch, terminated, Coordinator control, backpressure, and close. Headers carry only routing and protocol metadata; payload bytes are interpreted by the registered actor protocol.
+Frame kinds include bootstrap request/response, handshake, heartbeat, tell, ask, reply, failure, watch, unwatch, terminated, Coordinator control, backpressure, and close. Bootstrap frames are accepted only on probe sockets before Association creation and cannot carry business or placement traffic. Headers carry only routing and protocol metadata; payload bytes are interpreted by the registered actor protocol.
 
 Remoting protocol version negotiation is explicit. Unknown mandatory transport features close the Association. Business protocol compatibility follows the per-ProtocolId fingerprint rule above: a mismatch rejects that protocol without expanding into an Association-wide failure. The legacy gRPC-to-remoting framework migration remains full-stop.
 

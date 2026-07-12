@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
 pub mod association;
+pub mod bootstrap;
 pub mod config;
 pub mod control;
 pub mod endpoint;

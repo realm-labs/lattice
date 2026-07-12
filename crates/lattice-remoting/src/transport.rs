@@ -211,7 +211,28 @@ pub async fn negotiate_inbound<S>(
 where
     S: RemotingIo,
 {
-    let handshake = Handshake::from_frame(&connection.read_frame().await?)?;
+    let frame = connection.read_frame().await?;
+    negotiate_inbound_from_frame(
+        connection,
+        frame,
+        validator,
+        local_catalogue,
+        maximum_protocols,
+    )
+    .await
+}
+
+pub async fn negotiate_inbound_from_frame<S>(
+    connection: &mut FramedConnection<S>,
+    first_frame: Frame,
+    validator: &HandshakeValidator,
+    local_catalogue: &[ProtocolDescriptor],
+    maximum_protocols: usize,
+) -> Result<(Handshake, Vec<ProtocolDescriptor>), NegotiationError>
+where
+    S: RemotingIo,
+{
+    let handshake = Handshake::from_frame(&first_frame)?;
     let negotiated_maximum = validator.validate(&handshake)?;
     connection
         .write_frame(&HandshakeAck::for_handshake(&handshake, negotiated_maximum).to_frame())
@@ -282,6 +303,36 @@ pub async fn connect_tls(
         .ok_or(WireError::Tls("peer certificate missing"))?;
     verify_peer_certificate_identity(leaf.as_ref(), expected_peer)?;
     Ok(FramedConnection::new(stream, codec))
+}
+
+pub async fn connect_tls_candidate(
+    address: &lattice_core::actor_ref::NodeAddress,
+    server_name: String,
+    config: std::sync::Arc<ClientConfig>,
+    codec: FrameCodec,
+) -> Result<
+    (
+        FramedConnection<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+        Vec<u8>,
+    ),
+    WireError,
+> {
+    let tcp = tokio::net::TcpStream::connect((address.host(), address.port())).await?;
+    tcp.set_nodelay(true)?;
+    let server_name =
+        ServerName::try_from(server_name).map_err(|_| WireError::Tls("invalid server name"))?;
+    let stream = TlsConnector::from(config)
+        .connect(server_name, tcp)
+        .await
+        .map_err(|_| WireError::Tls("client handshake failed"))?;
+    let certificate = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certificates| certificates.first())
+        .map(|certificate| certificate.as_ref().to_vec())
+        .ok_or(WireError::Tls("peer certificate missing"))?;
+    Ok((FramedConnection::new(stream, codec), certificate))
 }
 
 pub async fn accept_tls(

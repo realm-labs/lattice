@@ -1,6 +1,6 @@
 # Lattice Cluster Discovery and Member Lifecycle Execution Plan
 
-> Status: implementation in progress; Batch A complete
+> Status: implementation in progress; Batches A-B complete
 > Authority model: Coordinator + etcd; discovery is bootstrap-only
 > Compatibility policy: hard switch; no mixed-version cluster support
 > Behavioral references: Apache Pekko discovery and cluster lifecycle, without Gossip or SBR
@@ -76,11 +76,11 @@ resolution.
 ### 0.2 Current Execution Pointer
 
 ```text
-Overall status: in progress; discovery foundation is complete
-Current batch: Batch B - bootstrap remoting
-Completed batches: Batch A
+Overall status: in progress; discovery and authenticated bootstrap remoting are complete
+Current batch: Batch C - membership state and storage
+Completed batches: Batch A, Batch B
 Known broken frontier: none; the workspace compiles with all targets and features
-First implementation action: add bootstrap frame kinds, feature negotiation and bounded codecs
+First implementation action: replace persisted bare NodeHello membership with revisioned MemberRecord
 Final completion condition: every invariant and acceptance item in Sections 10 and 11 passes
 ```
 
@@ -99,6 +99,25 @@ Batch A evidence (2026-07-12):
 - `cargo test -p lattice-discovery -p lattice-discovery-k8s`, focused clippy with `-D warnings`,
   `scripts/check-structure.sh`, shared core/config tests, formatting, diff checks and
   `cargo check --workspace --all-targets --all-features` pass.
+
+Batch B evidence (2026-07-12):
+
+- Hard-switched the transport minor version and mandatory feature set, adding bounded
+  `BootstrapRequest`/`BootstrapResponse` frames with nonce echo, exact identities, leader metadata,
+  redirects, reverse dial, bounded retry and stable rejection codes. There is no old-handshake
+  fallback.
+- TCP/TLS listeners branch on the first frame before Association negotiation. Probe sockets reject
+  business frames, close after one response and never insert an Association.
+- TLS probes validate the chain and candidate hostname before identity is known, then require the
+  returned node ID/incarnation to match the lattice certificate URI. A certificate for a replacement
+  incarnation is rejected even when CA and DNS checks pass.
+- Real-socket tests cover TCP and mutual TLS identity discovery, cluster/expected-node/feature
+  rejection, concurrent probes, authenticated leader redirect, election retry, reverse dial,
+  pre-Association business-frame rejection and endpoint reuse. The endpoint-reuse test proves a
+  valid probe cannot retarget an old Association; explicit authoritative incarnation replacement
+  closes it before a replacement can be created.
+- All remoting tests, focused clippy with `-D warnings`, service tests, structure/format/diff checks
+  and `cargo check --workspace --all-targets --all-features` pass.
 
 ## 1. Goal
 

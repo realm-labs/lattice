@@ -13,8 +13,13 @@ impl FeatureBits {
     pub const RELIABLE_CONTROL: Self = Self(1 << 0);
     pub const PROTOCOL_CATALOGUE: Self = Self(1 << 1);
     pub const MULTI_LANE: Self = Self(1 << 2);
-    pub const REQUIRED_V1: Self =
-        Self(Self::RELIABLE_CONTROL.0 | Self::PROTOCOL_CATALOGUE.0 | Self::MULTI_LANE.0);
+    pub const BOOTSTRAP_PROBE: Self = Self(1 << 3);
+    pub const REQUIRED_V1: Self = Self(
+        Self::RELIABLE_CONTROL.0
+            | Self::PROTOCOL_CATALOGUE.0
+            | Self::MULTI_LANE.0
+            | Self::BOOTSTRAP_PROBE.0,
+    );
 
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
