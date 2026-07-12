@@ -148,6 +148,11 @@ Composite sources merge in order; later values override earlier values. Final co
 
 ## 7. Coordinator Bootstrap and etcd Credentials
 
+Bootstrap candidates come from the static, ConfigStore, DNS, and Kubernetes EndpointSlice providers
+defined in [Cluster Discovery Providers](../cluster-discovery.md). These providers expose addresses
+only. The authenticated bootstrap probe and Coordinator admission establish exact identity and
+membership; provider data is never a routing or placement authority.
+
 Coordinator-eligible processes receive authenticated etcd configuration and the authority to participate in leader election. Ordinary runtime and Gateway nodes receive only a narrow bootstrap client that can locate the leader and establish an authorized remoting association.
 
 ```rust

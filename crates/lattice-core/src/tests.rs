@@ -77,6 +77,15 @@ fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
 }
 
 #[test]
+fn node_address_supports_canonical_ipv6_literals() {
+    let address = NodeAddress::new("2001:db8::1", 7447).unwrap();
+
+    assert_eq!(address.host(), "2001:db8::1");
+    assert_eq!(address.to_string(), "[2001:db8::1]:7447");
+    assert!(NodeAddress::new("[2001:db8::1]", 7447).is_err());
+}
+
+#[test]
 fn trace_context_reports_empty_and_span_kind_names() {
     let empty = TraceContext::default();
     let trace = TraceContext {

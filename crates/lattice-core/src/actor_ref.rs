@@ -1,5 +1,6 @@
 use std::fmt;
 use std::marker::PhantomData;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -63,7 +64,14 @@ pub struct NodeAddress {
 impl NodeAddress {
     pub fn new(host: impl Into<String>, port: u16) -> Result<Self, ReferenceError> {
         let host = validate_token(host.into(), "node host", MAX_NODE_HOST_BYTES)?;
-        if port == 0 || host.contains(['/', ':']) || host.chars().any(char::is_whitespace) {
+        let is_ip = host.parse::<IpAddr>().is_ok();
+        if port == 0
+            || host.contains('/')
+            || (!is_ip && host.contains(':'))
+            || host.starts_with('[')
+            || host.ends_with(']')
+            || host.chars().any(char::is_whitespace)
+        {
             return Err(ReferenceError::NonCanonical {
                 field: "node address",
             });
@@ -82,7 +90,11 @@ impl NodeAddress {
 
 impl fmt::Display for NodeAddress {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}:{}", self.host, self.port)
+        if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
+            write!(formatter, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(formatter, "{}:{}", self.host, self.port)
+        }
     }
 }
 

@@ -4,6 +4,8 @@ members = [
     "crates/lattice-config",
     "crates/lattice-config-etcd",
     "crates/lattice-core",
+    "crates/lattice-discovery",
+    "crates/lattice-discovery-k8s",
     "crates/lattice-codegen",
     "crates/lattice-remoting",
     "crates/lattice-gateway",
@@ -26,6 +28,7 @@ license = "MIT"
 repository = "https://github.com/realm-labs/lattice"
 
 [workspace.dependencies]
+async-stream = "0.3.6"
 async-trait = "0.1.89"
 async-nats = "0.49.1"
 axum = "0.8.9"
@@ -37,10 +40,13 @@ criterion = { version = "0.5.1", features = ["async_tokio"] }
 dashmap = "6.1.0"
 etcd-client = { version = "0.19.0", features = ["tls-roots"] }
 futures-util = "0.3.31"
+hickory-resolver = "0.26.1"
 http = "1.4.2"
 lattice-config = { path = "crates/lattice-config" }
 lattice-config-etcd = { path = "crates/lattice-config-etcd" }
 lattice-core = { path = "crates/lattice-core" }
+lattice-discovery = { path = "crates/lattice-discovery" }
+lattice-discovery-k8s = { path = "crates/lattice-discovery-k8s" }
 lattice-actor = { path = "crates/lattice-actor" }
 lattice-codegen = { path = "crates/lattice-codegen" }
 lattice-remoting = { path = "crates/lattice-remoting" }
@@ -58,13 +64,15 @@ prost = "0.14.4"
 prost-build = "0.14.4"
 prost-reflect = "0.16.4"
 prost-types = "0.14.4"
+k8s-openapi = { version = "0.28.0", features = ["v1_35"] }
+kube = { version = "4.0.0", default-features = false, features = ["client", "runtime", "ring", "rustls-tls"] }
 rcgen = "0.14.8"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml = "0.9.34"
 tempfile = "3.23.0"
 thiserror = "2.0.18"
-tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tokio-rustls = "0.26.4"
 toml = "1.1.2"

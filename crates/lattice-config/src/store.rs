@@ -43,6 +43,10 @@ impl ConfigWatch {
         Self { rx }
     }
 
+    pub fn current(&self) -> Option<serde_json::Value> {
+        self.rx.borrow().clone()
+    }
+
     pub async fn changed(&mut self) -> Result<Option<serde_json::Value>, ConfigStoreError> {
         self.rx
             .changed()

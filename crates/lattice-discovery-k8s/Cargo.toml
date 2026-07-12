@@ -1,0 +1,18 @@
+[package]
+name = "lattice-discovery-k8s"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+lattice-core.workspace = true
+lattice-discovery.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+

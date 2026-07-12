@@ -1,6 +1,6 @@
 # Lattice Cluster Discovery and Member Lifecycle Execution Plan
 
-> Status: planned, not implemented
+> Status: implementation in progress; Batch A complete
 > Authority model: Coordinator + etcd; discovery is bootstrap-only
 > Compatibility policy: hard switch; no mixed-version cluster support
 > Behavioral references: Apache Pekko discovery and cluster lifecycle, without Gossip or SBR
@@ -76,13 +76,29 @@ resolution.
 ### 0.2 Current Execution Pointer
 
 ```text
-Overall status: planned; implementation has not started
-Current batch: Batch A - discovery foundation
-Completed batches: none
-Known broken frontier: none; the pre-discovery workspace baseline is expected to pass
-First implementation action: add the two discovery crates and the provider contract
+Overall status: in progress; discovery foundation is complete
+Current batch: Batch B - bootstrap remoting
+Completed batches: Batch A
+Known broken frontier: none; the workspace compiles with all targets and features
+First implementation action: add bootstrap frame kinds, feature negotiation and bounded codecs
 Final completion condition: every invariant and acceptance item in Sections 10 and 11 passes
 ```
+
+Batch A evidence (2026-07-12):
+
+- Added `lattice-discovery` and the dependency-isolated `lattice-discovery-k8s` crate without public
+  re-exports or wildcard imports.
+- Static, ConfigStore, DNS and EndpointSlice providers emit validated strictly increasing replacement
+  snapshots. ConfigStore closes the get/watch race and reconnects after watch loss; DNS clamps TTLs
+  and retains targets on resolver failure; the Kubernetes watcher relists after resource-version
+  expiry and reconnects after stream termination.
+- Aggregation deduplicates canonical IPv4/IPv6/FQDN addresses, retains all source metadata, rejects
+  conflicting expected node IDs, selects the lowest priority and rotates equal-priority targets.
+- Provider configuration, DNS TLS-name retention and namespace-scoped EndpointSlice RBAC are
+  documented in `docs/cluster-discovery.md`.
+- `cargo test -p lattice-discovery -p lattice-discovery-k8s`, focused clippy with `-D warnings`,
+  `scripts/check-structure.sh`, shared core/config tests, formatting, diff checks and
+  `cargo check --workspace --all-targets --all-features` pass.
 
 ## 1. Goal
 
