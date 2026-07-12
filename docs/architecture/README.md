@@ -4,7 +4,8 @@
 > Purpose: architecture reference for lattice.
 > Scope: room/instance games, open-world zone services, stateful services such as Player/Guild/Inventory, and cluster-singleton control-plane services.
 > Non-goals: the first version does not implement seamless cross-machine realtime combat, a strongly consistent distributed ECS, or exactly-once semantics.
-> Active implementation plan: [../production-hardening-plan.md](../production-hardening-plan.md).
+> Implemented hard-switch baseline: [../production-hardening-plan.md](../production-hardening-plan.md).
+> Active cluster discovery and lifecycle plan: [../cluster-discovery-lifecycle-plan.md](../cluster-discovery-lifecycle-plan.md).
 > Historical implementation record: [../implementation-plan.md](../implementation-plan.md).
 
 These documents describe the complete target model, not a disposable minimal v1. Implementation may land in dependency order, but target capabilities are simplified through shared internal mechanisms and narrow fault domains rather than omitted in ways that require later identity, wire, or ownership redesign.
@@ -30,6 +31,7 @@ These documents describe the complete target model, not a disposable minimal v1.
 ```text
 Keep architecture design under docs/architecture/ by topic.
 Keep docs/architecture.md as an index only so it does not grow again.
-Keep the active execution plan in docs/production-hardening-plan.md.
+Keep the hard-switch baseline in docs/production-hardening-plan.md.
+Keep the active discovery/lifecycle execution plan in docs/cluster-discovery-lifecycle-plan.md.
 Keep docs/implementation-plan.md as historical evidence only; do not execute it as the target design.
 ```

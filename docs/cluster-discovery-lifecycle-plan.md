@@ -7,6 +7,83 @@
 
 ---
 
+## 0. Goal Prompt
+
+```text
+Your goal is to fully execute docs/cluster-discovery-lifecycle-plan.md.
+
+Read this document completely before changing code. Treat it as the primary execution plan for
+cluster discovery and member lifecycle. Use docs/architecture/ as the architecture reference, with
+particular attention to 00-overview.md, 02-rpc.md, 03-placement.md,
+04-eventbus-scheduler-config.md, 05-gateway-ops.md, and 08-distributed-testing.md. Treat
+docs/production-hardening-plan.md as the implemented hard-switch baseline that this plan extends,
+not as a replacement target. The local Apache Pekko source tree is a behavioral reference only; do
+not copy its source or import its Gossip/SBR architecture.
+
+Start from the Current Execution Pointer and execute the batches in dependency order. Batches are
+implementation and acceptance groupings, not permission to ship partial production modes. Update
+the pointer after each batch and whenever the known broken frontier changes materially.
+
+This is an intentional wire, storage, and public-API hard switch. Do not add deprecated aliases,
+compatibility facades, old/new handshake fallback, mixed membership formats, dual writes, or
+discovery-backed routing. Intermediate worktrees may fail to compile while one cross-crate batch is
+in progress, but every completed batch must have a coherent boundary and the final workspace must
+pass all quality and acceptance gates.
+
+The highest-priority invariant is that discovery can reveal only a candidate endpoint. A node becomes
+an authoritative Up member only through Coordinator admission for its exact NodeIncarnation, and a
+stale ActorRef, Association, discovery record, address, or certificate identity must never retarget a
+replacement incarnation.
+
+Implement the complete target architecture rather than a static-seed-only first version that needs a
+later bootstrap or membership redesign. Static, ConfigStore, DNS, and Kubernetes EndpointSlice
+providers, authenticated identity probing, dynamic Coordinator sessions, revisioned member state,
+join/degraded/reconcile behavior, graceful leave, force removal, peer reconciliation, deterministic
+simulation, Docker multi-process tests, and kind acceptance are all required parts of this plan.
+
+Keep every Rust file below 1200 physical lines, do not add public re-exports, and deny non-test
+wildcard imports. Build Docker test images with the lattice test label and apply the scoped retention
+and disk-watermark cleanup policy in this document after every Docker/kind run, including failed
+runs. Never use an unscoped Docker prune command.
+
+Aim to finish in four large English conventional commits: discovery foundation, bootstrap/remoting,
+membership/service composition, then operations/acceptance. A fifth commit is acceptable only for a
+genuinely independent Kubernetes dependency or generated-wire boundary. Run focused checks during
+each batch and require structure, fmt, clippy, workspace tests, Docker quality, distributed Docker,
+and kind acceptance before marking the plan complete.
+```
+
+### 0.1 Execution Policy
+
+```text
+Primary plan: docs/cluster-discovery-lifecycle-plan.md
+Architecture authority: docs/architecture/
+Implemented baseline: docs/production-hardening-plan.md
+Compatibility layers and mixed-version mode: forbidden
+Discovery as membership or business-routing authority: forbidden
+Compilation inside an active cross-crate batch: optional
+Compilation and all acceptance gates at final completion: mandatory
+Target commit count: 4, exceptionally 5
+Tracker update: after every completed batch or material broken-frontier change
+Docker cleanup: mandatory after every Docker/kind run, including failure paths
+```
+
+When this plan and an architecture document appear inconsistent, preserve the architecture's identity,
+fencing, bounded-resource and delivery-safety invariants. Record the conflict in the Current Execution
+Pointer and update both documents in the same change before implementing behavior that depends on the
+resolution.
+
+### 0.2 Current Execution Pointer
+
+```text
+Overall status: planned; implementation has not started
+Current batch: Batch A - discovery foundation
+Completed batches: none
+Known broken frontier: none; the pre-discovery workspace baseline is expected to pass
+First implementation action: add the two discovery crates and the provider contract
+Final completion condition: every invariant and acceptance item in Sections 10 and 11 passes
+```
+
 ## 1. Goal
 
 Implement automatic cluster bootstrap and an explicit member lifecycle so a node can discover and
