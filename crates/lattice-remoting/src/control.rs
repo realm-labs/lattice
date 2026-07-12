@@ -1,9 +1,12 @@
 use std::collections::{HashSet, VecDeque};
 
+use async_trait::async_trait;
 use bytes::Bytes;
+use prost::Message;
 use thiserror::Error;
 
-use crate::association::AssociationId;
+use crate::association::{AssociationId, AssociationKey};
+use crate::wire::{Frame, FrameKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CommandId(u128);
@@ -42,12 +45,143 @@ pub struct ControlGap {
     pub received: u64,
 }
 
+pub fn control_envelope_frame(envelope: &ControlEnvelope) -> Frame {
+    Frame::encode_message(
+        FrameKind::ControlEnvelope,
+        &ControlEnvelopeWire {
+            association_epoch: envelope.association_epoch.get().to_be_bytes().to_vec(),
+            sequence: envelope.sequence,
+            command_id: envelope.command_id.get().to_be_bytes().to_vec(),
+            payload: envelope.payload.to_vec(),
+        },
+    )
+}
+
+pub fn decode_control_envelope(frame: &Frame) -> Result<ControlEnvelope, ReliableControlError> {
+    if frame.kind != FrameKind::ControlEnvelope {
+        return Err(ReliableControlError::WrongFrameKind);
+    }
+    let wire = frame
+        .decode_message::<ControlEnvelopeWire>()
+        .map_err(|_| ReliableControlError::InvalidWire)?;
+    Ok(ControlEnvelope {
+        association_epoch: AssociationId::new(parse_u128(&wire.association_epoch)?)
+            .ok_or(ReliableControlError::InvalidWire)?,
+        sequence: (wire.sequence != 0)
+            .then_some(wire.sequence)
+            .ok_or(ReliableControlError::InvalidWire)?,
+        command_id: CommandId::new(parse_u128(&wire.command_id)?)
+            .ok_or(ReliableControlError::InvalidWire)?,
+        payload: Bytes::from(wire.payload),
+    })
+}
+
+pub fn control_ack_frame(ack: ControlAck) -> Frame {
+    Frame::encode_message(
+        FrameKind::ControlAck,
+        &ControlAckWire {
+            association_epoch: ack.association_epoch.get().to_be_bytes().to_vec(),
+            cumulative_sequence: ack.cumulative_sequence,
+        },
+    )
+}
+
+pub fn decode_control_ack(frame: &Frame) -> Result<ControlAck, ReliableControlError> {
+    if frame.kind != FrameKind::ControlAck {
+        return Err(ReliableControlError::WrongFrameKind);
+    }
+    let wire = frame
+        .decode_message::<ControlAckWire>()
+        .map_err(|_| ReliableControlError::InvalidWire)?;
+    Ok(ControlAck {
+        association_epoch: AssociationId::new(parse_u128(&wire.association_epoch)?)
+            .ok_or(ReliableControlError::InvalidWire)?,
+        cumulative_sequence: wire.cumulative_sequence,
+    })
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ControlEnvelopeWire {
+    #[prost(bytes = "vec", tag = "1")]
+    association_epoch: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    sequence: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    command_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ControlAckWire {
+    #[prost(bytes = "vec", tag = "1")]
+    association_epoch: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    cumulative_sequence: u64,
+}
+
+fn parse_u128(bytes: &[u8]) -> Result<u128, ReliableControlError> {
+    bytes
+        .try_into()
+        .map(u128::from_be_bytes)
+        .map_err(|_| ReliableControlError::InvalidWire)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlApply {
     Apply(ControlEnvelope),
     Duplicate(ControlAck),
     Gap(ControlGap),
     ReconcileEpoch,
+}
+
+#[async_trait]
+pub trait ControlDispatch: Send + Sync + 'static {
+    async fn apply(
+        &self,
+        association: AssociationKey,
+        command_id: CommandId,
+        payload: Bytes,
+    ) -> Result<(), ControlDispatchError>;
+
+    async fn reconcile(
+        &self,
+        association: AssociationKey,
+        gap: Option<ControlGap>,
+    ) -> Result<(), ControlDispatchError>;
+}
+
+#[derive(Debug, Default)]
+pub struct RejectControlDispatch;
+
+#[async_trait]
+impl ControlDispatch for RejectControlDispatch {
+    async fn apply(
+        &self,
+        _association: AssociationKey,
+        _command_id: CommandId,
+        _payload: Bytes,
+    ) -> Result<(), ControlDispatchError> {
+        Err(ControlDispatchError::Unsupported)
+    }
+
+    async fn reconcile(
+        &self,
+        _association: AssociationKey,
+        _gap: Option<ControlGap>,
+    ) -> Result<(), ControlDispatchError> {
+        Err(ControlDispatchError::Unsupported)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ControlDispatchError {
+    #[error("this endpoint has no consumer for reliable control commands")]
+    Unsupported,
+    #[error("reliable control command is invalid")]
+    InvalidCommand,
+    #[error("reliable control consumer is unavailable")]
+    Unavailable,
 }
 
 #[derive(Debug)]
@@ -127,7 +261,39 @@ impl ReliableControl {
         Ok(())
     }
 
+    pub fn rollback_last(&mut self, command_id: CommandId) -> bool {
+        let Some(last) = self.outbox.back() else {
+            return false;
+        };
+        if last.command_id != command_id
+            || last.sequence.saturating_add(1) != self.next_outbound_sequence
+        {
+            return false;
+        }
+        if let Some(last) = self.outbox.pop_back() {
+            self.outbox_bytes = self.outbox_bytes.saturating_sub(last.payload.len());
+            self.next_outbound_sequence = last.sequence;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn receive(&mut self, envelope: ControlEnvelope) -> ControlApply {
+        let is_next_sequence = envelope.sequence == self.next_inbound_sequence;
+        let decision = self.preview(&envelope);
+        if matches!(decision, ControlApply::Apply(_))
+            || matches!(
+                decision,
+                ControlApply::Duplicate(_) if is_next_sequence
+            )
+        {
+            self.commit(envelope);
+        }
+        decision
+    }
+
+    pub fn preview(&self, envelope: &ControlEnvelope) -> ControlApply {
         if envelope.association_epoch != self.epoch {
             return ControlApply::ReconcileEpoch;
         }
@@ -140,10 +306,19 @@ impl ReliableControl {
                 received: envelope.sequence,
             });
         }
-        self.next_inbound_sequence = self.next_inbound_sequence.saturating_add(1);
         if self.applied.contains(&envelope.command_id) {
-            return ControlApply::Duplicate(self.current_ack());
+            return ControlApply::Duplicate(ControlAck {
+                association_epoch: self.epoch,
+                cumulative_sequence: envelope.sequence,
+            });
         }
+        ControlApply::Apply(envelope.clone())
+    }
+
+    pub fn commit(&mut self, envelope: ControlEnvelope) -> ControlAck {
+        debug_assert_eq!(envelope.association_epoch, self.epoch);
+        debug_assert_eq!(envelope.sequence, self.next_inbound_sequence);
+        self.next_inbound_sequence = self.next_inbound_sequence.saturating_add(1);
         self.applied.insert(envelope.command_id);
         self.applied_order.push_back(envelope.command_id);
         while self.applied_order.len() > self.max_frames {
@@ -151,7 +326,7 @@ impl ReliableControl {
                 self.applied.remove(&expired);
             }
         }
-        ControlApply::Apply(envelope)
+        self.current_ack()
     }
 
     pub fn current_ack(&self) -> ControlAck {
@@ -186,6 +361,10 @@ pub enum ReliableControlError {
     SequenceExhausted,
     #[error("control acknowledgement belongs to another association epoch")]
     WrongEpoch,
+    #[error("reliable control used the wrong frame kind")]
+    WrongFrameKind,
+    #[error("reliable control frame is invalid")]
+    InvalidWire,
 }
 
 #[cfg(test)]

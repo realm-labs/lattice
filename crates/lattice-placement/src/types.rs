@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use lattice_core::actor_ref::{
@@ -56,7 +57,7 @@ impl ShardId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MonotonicTime(u64);
 
 impl MonotonicTime {
@@ -125,6 +126,8 @@ pub struct PlacementSlot {
     pub revision: Revision,
     pub state: PlacementSlotState,
     pub active_move: Option<u128>,
+    #[serde(default)]
+    pub barrier_sessions: BTreeSet<NodeIncarnation>,
 }
 
 impl PlacementSlot {
@@ -134,6 +137,19 @@ impl PlacementSlot {
         }
         if let Some(target) = &self.target {
             target.validate()?;
+        }
+        if (!self.barrier_sessions.is_empty() && self.active_move.is_none())
+            || (self.active_move.is_some()
+                && !matches!(
+                    self.state,
+                    PlacementSlotState::BeginHandoff
+                        | PlacementSlotState::Stopping
+                        | PlacementSlotState::StopFailed
+                        | PlacementSlotState::Fenced
+                        | PlacementSlotState::Allocating
+                ))
+        {
+            return Err(PlacementTypeError::InvalidSlotState);
         }
         match self.state {
             PlacementSlotState::Unallocated if self.owner.is_some() => {
@@ -155,7 +171,7 @@ impl PlacementSlot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimGrant {
     pub slot: PlacementSlotKey,
     pub owner: NodeKey,

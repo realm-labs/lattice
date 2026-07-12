@@ -38,16 +38,19 @@ impl TaskSupervisor {
     pub async fn shutdown(&self, timeout: Duration) -> Result<(), ServiceError> {
         let tasks =
             std::mem::take(&mut *self.tasks.lock().expect("service task supervisor poisoned"));
-        let join = async move {
-            for task in tasks {
-                task.abort();
-                if task.await.is_err() {
-                    // Cancellation is the expected managed shutdown path.
-                }
+        let deadline = tokio::time::Instant::now() + timeout;
+        for mut task in tasks {
+            let now = tokio::time::Instant::now();
+            if now < deadline && tokio::time::timeout_at(deadline, &mut task).await.is_ok() {
+                continue;
             }
-        };
-        tokio::time::timeout(timeout, join)
-            .await
-            .map_err(|_| ServiceError::ShutdownTimeout)
+            task.abort();
+            let _ = task.await;
+        }
+        if tokio::time::Instant::now() > deadline {
+            Err(ServiceError::ShutdownTimeout)
+        } else {
+            Ok(())
+        }
     }
 }

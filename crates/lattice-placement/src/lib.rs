@@ -1,8 +1,12 @@
 pub mod allocation;
 pub mod authority;
+pub mod control;
 pub mod coordinator;
+pub mod handoff;
 pub mod plan;
 pub mod region;
+pub mod runtime;
+pub mod session;
 pub mod singleton;
 pub mod storage;
 pub mod types;
@@ -14,15 +18,24 @@ pub use allocation::{
 pub use authority::{AuthorityEffect, AuthorityError, AuthorityEvent, PlacementAuthority};
 pub use coordinator::{
     CoordinatorDelta, CoordinatorSession, LeaderRecord, LoadTable, NodeHello, NodeLoadReport,
-    ShardLoadReport, SnapshotBegin, SnapshotChunk, SnapshotEnd, SnapshotLimits, SnapshotRecord,
-    SnapshotStager,
+    ShardLoadReport, SingletonConfig, SnapshotBegin, SnapshotChunk, SnapshotEnd, SnapshotLimits,
+    SnapshotRecord, SnapshotStager,
 };
+pub use handoff::{HandoffEffect, HandoffError, HandoffEvent, HandoffMachine, HandoffPhase};
 pub use plan::{MoveProgress, PlanError, PlanStatus, RebalanceMove, RebalancePlan};
 pub use region::{
-    BufferedMessage, EntityConfig, HandoffBarrier, RegionConfig, RegionError, RouteDecision,
-    ShardHome, ShardRegion,
+    BufferedMessage, BufferedMessageMode, EntityConfig, HandoffBarrier, RegionConfig, RegionError,
+    RouteDecision, ShardHome, ShardRegion,
 };
-pub use singleton::{SingletonError, SingletonManager, SingletonProxy};
+pub use runtime::{
+    CoordinatorHandle, CoordinatorLeader, CoordinatorLeaderConfig, CoordinatorRuntimeError,
+};
+pub use session::{
+    LogicCoordinatorConfig, LogicCoordinatorHandle, LogicCoordinatorSession, LogicPlacementEffect,
+    LogicPlacementState, LogicSessionError,
+};
+pub use singleton::{SingletonBufferedMessage, SingletonError, SingletonManager, SingletonProxy};
+pub use storage::{CoordinatorStore, InMemoryPlacementStore, PlacementStore, StorageError};
 pub use types::{
     AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, MonotonicTime, NodeKey,
     PlacementSlot, PlacementSlotKey, PlacementSlotState, Revision, ShardId,
@@ -63,6 +76,7 @@ mod tests {
             revision: Revision::new(9).unwrap(),
             state: PlacementSlotState::Running,
             active_move: None,
+            barrier_sessions: Default::default(),
         }
     }
 
@@ -174,5 +188,26 @@ mod tests {
         assert!(barrier.apply_revision(unrelated, revision).is_err());
         barrier.apply_revision(subscribed, revision).unwrap();
         assert!(barrier.is_complete());
+    }
+
+    #[test]
+    fn persisted_slot_rejects_orphaned_handoff_metadata() {
+        let mut slot = running_slot(node("a", 1, 1001));
+        slot.barrier_sessions
+            .insert(NodeIncarnation::new(2).unwrap());
+        assert_eq!(
+            slot.validate(),
+            Err(types::PlacementTypeError::InvalidSlotState)
+        );
+
+        slot.barrier_sessions.clear();
+        slot.active_move = Some(7);
+        assert_eq!(
+            slot.validate(),
+            Err(types::PlacementTypeError::InvalidSlotState)
+        );
+
+        slot.state = PlacementSlotState::Stopping;
+        assert!(slot.validate().is_ok());
     }
 }

@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_core::actor_ref::{
-    ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+    ActivationId, ActorPath, ActorRef, ClusterId, ConfigFingerprint, EntityId, EntityRef,
+    EntityType, NodeAddress, NodeIncarnation, ProtocolId, SingletonKind, SingletonRef,
 };
 use prost::Message;
 use thiserror::Error;
@@ -44,7 +45,7 @@ impl SenderIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ExactActorTarget {
     pub cluster_id: ClusterId,
     pub node_address: NodeAddress,
@@ -125,11 +126,43 @@ impl CorrelationId {
 }
 
 pub fn ask_correlation(frame: &Frame) -> Option<CorrelationId> {
-    if frame.kind != FrameKind::Ask {
-        return None;
+    let bytes = match frame.kind {
+        FrameKind::Ask => frame.decode_message::<AskWire>().ok()?.correlation_id,
+        FrameKind::EntityAsk => frame.decode_message::<EntityAskWire>().ok()?.correlation_id,
+        FrameKind::SingletonAsk => {
+            frame
+                .decode_message::<SingletonAskWire>()
+                .ok()?
+                .correlation_id
+        }
+        _ => return None,
+    };
+    CorrelationId::from_bytes(&bytes)
+}
+
+fn set_logical_ask_correlation(
+    frame: &mut Frame,
+    correlation: CorrelationId,
+) -> Result<(), AskError> {
+    match frame.kind {
+        FrameKind::EntityAsk => {
+            let mut wire = frame
+                .decode_message::<EntityAskWire>()
+                .map_err(|_| AskError::Protocol(RemoteMessageError::InvalidPayload))?;
+            wire.correlation_id = correlation.to_bytes().to_vec();
+            *frame = Frame::encode_message(FrameKind::EntityAsk, &wire);
+            Ok(())
+        }
+        FrameKind::SingletonAsk => {
+            let mut wire = frame
+                .decode_message::<SingletonAskWire>()
+                .map_err(|_| AskError::Protocol(RemoteMessageError::InvalidPayload))?;
+            wire.correlation_id = correlation.to_bytes().to_vec();
+            *frame = Frame::encode_message(FrameKind::SingletonAsk, &wire);
+            Ok(())
+        }
+        _ => Err(AskError::Protocol(RemoteMessageError::InvalidPayload)),
     }
-    let ask = frame.decode_message::<AskWire>().ok()?;
-    CorrelationId::from_bytes(&ask.correlation_id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +175,54 @@ pub struct InboundTell {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundAsk {
     pub target: ExactActorTarget,
+    pub correlation_id: CorrelationId,
+    pub timeout_budget: Duration,
+    pub message_id: u64,
+    pub payload: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalEntityTarget {
+    pub reference: EntityRef<()>,
+    pub owner_address: NodeAddress,
+    pub owner_incarnation: NodeIncarnation,
+    pub assignment_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalSingletonTarget {
+    pub reference: SingletonRef<()>,
+    pub owner_address: NodeAddress,
+    pub owner_incarnation: NodeIncarnation,
+    pub assignment_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundEntityTell {
+    pub target: LogicalEntityTarget,
+    pub message_id: u64,
+    pub payload: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundEntityAsk {
+    pub target: LogicalEntityTarget,
+    pub correlation_id: CorrelationId,
+    pub timeout_budget: Duration,
+    pub message_id: u64,
+    pub payload: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundSingletonTell {
+    pub target: LogicalSingletonTarget,
+    pub message_id: u64,
+    pub payload: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundSingletonAsk {
+    pub target: LogicalSingletonTarget,
     pub correlation_id: CorrelationId,
     pub timeout_budget: Duration,
     pub message_id: u64,
@@ -187,6 +268,80 @@ pub fn decode_ask(frame: &Frame) -> Result<InboundAsk, RemoteMessageError> {
     Ok(InboundAsk {
         target: target_from_wire(wire.target.ok_or(RemoteMessageError::InvalidPayload)?)?,
         correlation_id,
+        timeout_budget: Duration::from_nanos(wire.timeout_nanos),
+        message_id: wire.message_id,
+        payload: Bytes::from(wire.payload),
+    })
+}
+
+pub fn decode_entity_tell(frame: &Frame) -> Result<InboundEntityTell, RemoteMessageError> {
+    if frame.kind != FrameKind::EntityTell {
+        return Err(RemoteMessageError::InvalidPayload);
+    }
+    let wire = frame
+        .decode_message::<EntityTellWire>()
+        .map_err(|_| RemoteMessageError::InvalidPayload)?;
+    if wire.message_id == 0 {
+        return Err(RemoteMessageError::InvalidPayload);
+    }
+    Ok(InboundEntityTell {
+        target: entity_target_from_wire(wire.target.ok_or(RemoteMessageError::InvalidPayload)?)?,
+        message_id: wire.message_id,
+        payload: Bytes::from(wire.payload),
+    })
+}
+
+pub fn decode_entity_ask(frame: &Frame) -> Result<InboundEntityAsk, RemoteMessageError> {
+    if frame.kind != FrameKind::EntityAsk {
+        return Err(RemoteMessageError::InvalidPayload);
+    }
+    let wire = frame
+        .decode_message::<EntityAskWire>()
+        .map_err(|_| RemoteMessageError::InvalidPayload)?;
+    if wire.message_id == 0 || wire.timeout_nanos == 0 {
+        return Err(RemoteMessageError::InvalidPayload);
+    }
+    Ok(InboundEntityAsk {
+        target: entity_target_from_wire(wire.target.ok_or(RemoteMessageError::InvalidPayload)?)?,
+        correlation_id: CorrelationId::from_bytes(&wire.correlation_id)
+            .ok_or(RemoteMessageError::InvalidPayload)?,
+        timeout_budget: Duration::from_nanos(wire.timeout_nanos),
+        message_id: wire.message_id,
+        payload: Bytes::from(wire.payload),
+    })
+}
+
+pub fn decode_singleton_tell(frame: &Frame) -> Result<InboundSingletonTell, RemoteMessageError> {
+    if frame.kind != FrameKind::SingletonTell {
+        return Err(RemoteMessageError::InvalidPayload);
+    }
+    let wire = frame
+        .decode_message::<SingletonTellWire>()
+        .map_err(|_| RemoteMessageError::InvalidPayload)?;
+    if wire.message_id == 0 {
+        return Err(RemoteMessageError::InvalidPayload);
+    }
+    Ok(InboundSingletonTell {
+        target: singleton_target_from_wire(wire.target.ok_or(RemoteMessageError::InvalidPayload)?)?,
+        message_id: wire.message_id,
+        payload: Bytes::from(wire.payload),
+    })
+}
+
+pub fn decode_singleton_ask(frame: &Frame) -> Result<InboundSingletonAsk, RemoteMessageError> {
+    if frame.kind != FrameKind::SingletonAsk {
+        return Err(RemoteMessageError::InvalidPayload);
+    }
+    let wire = frame
+        .decode_message::<SingletonAskWire>()
+        .map_err(|_| RemoteMessageError::InvalidPayload)?;
+    if wire.message_id == 0 || wire.timeout_nanos == 0 {
+        return Err(RemoteMessageError::InvalidPayload);
+    }
+    Ok(InboundSingletonAsk {
+        target: singleton_target_from_wire(wire.target.ok_or(RemoteMessageError::InvalidPayload)?)?,
+        correlation_id: CorrelationId::from_bytes(&wire.correlation_id)
+            .ok_or(RemoteMessageError::InvalidPayload)?,
         timeout_budget: Duration::from_nanos(wire.timeout_nanos),
         message_id: wire.message_id,
         payload: Bytes::from(wire.payload),
@@ -318,6 +473,86 @@ impl OutboundMessaging {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn tell_entity<A>(
+        &self,
+        association: &Association,
+        sender: &SenderIdentity,
+        target: &EntityRef<A>,
+        owner_address: NodeAddress,
+        owner_incarnation: NodeIncarnation,
+        assignment_generation: u64,
+        expected_fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<usize, TellError> {
+        check_protocol(association, target.protocol_id(), expected_fingerprint)
+            .map_err(TellError::Protocol)?;
+        let target = LogicalEntityTarget {
+            reference: target.erase(),
+            owner_address,
+            owner_incarnation,
+            assignment_generation,
+        };
+        let sender_bytes = sender.stable_bytes();
+        let recipient_bytes = entity_logical_bytes(&target);
+        association
+            .try_admit_bulk(
+                &sender_bytes,
+                &recipient_bytes,
+                Frame::encode_message(
+                    FrameKind::EntityTell,
+                    &EntityTellWire {
+                        sender: sender_bytes.clone(),
+                        target: Some(entity_target_to_wire(&target)),
+                        message_id,
+                        payload: payload.to_vec(),
+                    },
+                ),
+            )
+            .map_err(TellError::Association)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn tell_singleton<A>(
+        &self,
+        association: &Association,
+        sender: &SenderIdentity,
+        target: &SingletonRef<A>,
+        owner_address: NodeAddress,
+        owner_incarnation: NodeIncarnation,
+        assignment_generation: u64,
+        expected_fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<usize, TellError> {
+        check_protocol(association, target.protocol_id(), expected_fingerprint)
+            .map_err(TellError::Protocol)?;
+        let target = LogicalSingletonTarget {
+            reference: target.erase(),
+            owner_address,
+            owner_incarnation,
+            assignment_generation,
+        };
+        let sender_bytes = sender.stable_bytes();
+        let recipient_bytes = singleton_logical_bytes(&target);
+        association
+            .try_admit_bulk(
+                &sender_bytes,
+                &recipient_bytes,
+                Frame::encode_message(
+                    FrameKind::SingletonTell,
+                    &SingletonTellWire {
+                        sender: sender_bytes.clone(),
+                        target: Some(singleton_target_to_wire(&target)),
+                        message_id,
+                        payload: payload.to_vec(),
+                    },
+                ),
+            )
+            .map_err(TellError::Association)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn ask<A>(
         &self,
         association: &Association,
@@ -376,6 +611,134 @@ impl OutboundMessaging {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ask_entity<A>(
+        &self,
+        association: &Association,
+        sender: &SenderIdentity,
+        target: &EntityRef<A>,
+        owner_address: NodeAddress,
+        owner_incarnation: NodeIncarnation,
+        assignment_generation: u64,
+        expected_fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, AskError> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(AskError::DeadlineExceeded)?;
+        check_protocol(association, target.protocol_id(), expected_fingerprint)
+            .map_err(AskError::Protocol)?;
+        let logical = LogicalEntityTarget {
+            reference: target.erase(),
+            owner_address,
+            owner_incarnation,
+            assignment_generation,
+        };
+        self.enqueue_logical_ask(
+            association,
+            deadline,
+            Frame::encode_message(
+                FrameKind::EntityAsk,
+                &EntityAskWire {
+                    sender: sender.stable_bytes(),
+                    target: Some(entity_target_to_wire(&logical)),
+                    correlation_id: Vec::new(),
+                    timeout_nanos: duration_nanos(remaining),
+                    message_id,
+                    payload: payload.to_vec(),
+                },
+            ),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ask_singleton<A>(
+        &self,
+        association: &Association,
+        sender: &SenderIdentity,
+        target: &SingletonRef<A>,
+        owner_address: NodeAddress,
+        owner_incarnation: NodeIncarnation,
+        assignment_generation: u64,
+        expected_fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, AskError> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(AskError::DeadlineExceeded)?;
+        check_protocol(association, target.protocol_id(), expected_fingerprint)
+            .map_err(AskError::Protocol)?;
+        let logical = LogicalSingletonTarget {
+            reference: target.erase(),
+            owner_address,
+            owner_incarnation,
+            assignment_generation,
+        };
+        self.enqueue_logical_ask(
+            association,
+            deadline,
+            Frame::encode_message(
+                FrameKind::SingletonAsk,
+                &SingletonAskWire {
+                    sender: sender.stable_bytes(),
+                    target: Some(singleton_target_to_wire(&logical)),
+                    correlation_id: Vec::new(),
+                    timeout_nanos: duration_nanos(remaining),
+                    message_id,
+                    payload: payload.to_vec(),
+                },
+            ),
+        )
+        .await
+    }
+
+    async fn enqueue_logical_ask(
+        &self,
+        association: &Association,
+        deadline: Instant,
+        mut frame: Frame,
+    ) -> Result<Bytes, AskError> {
+        let correlation = self.next_correlation()?;
+        set_logical_ask_correlation(&mut frame, correlation)?;
+        let (completion, receiver) = oneshot::channel();
+        {
+            let mut entries = self.pending.entries.lock().expect("pending asks poisoned");
+            if entries.len() == self.pending.maximum {
+                return Err(AskError::PendingLimit);
+            }
+            entries.insert(
+                correlation,
+                PendingAsk {
+                    association_id: association.id(),
+                    commitment: Commitment::Queued,
+                    deadline,
+                    completion,
+                },
+            );
+        }
+        let mut guard = PendingGuard {
+            id: correlation,
+            pending: self.pending.clone(),
+            armed: true,
+        };
+        association
+            .try_admit_interactive(frame)
+            .map_err(AskError::from)?;
+        let timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(timeout);
+        let result = tokio::select! {
+            result = receiver => result.unwrap_or(Err(AskError::AssociationLostBeforeWrite)),
+            () = &mut timeout => Err(AskError::DeadlineExceeded),
+        };
+        guard.disarm_and_remove();
+        result
+    }
+
     pub fn mark_socket_write_started(&self, correlation: CorrelationId) -> bool {
         let mut entries = self.pending.entries.lock().expect("pending asks poisoned");
         let Some(pending) = entries.get_mut(&correlation) else {
@@ -386,13 +749,13 @@ impl OutboundMessaging {
     }
 
     pub fn prepare_ask_for_socket_write(&self, frame: &mut Frame) -> bool {
-        if frame.kind != FrameKind::Ask {
+        if !matches!(
+            frame.kind,
+            FrameKind::Ask | FrameKind::EntityAsk | FrameKind::SingletonAsk
+        ) {
             return true;
         }
-        let Ok(mut ask) = frame.decode_message::<AskWire>() else {
-            return false;
-        };
-        let Some(correlation) = CorrelationId::from_bytes(&ask.correlation_id) else {
+        let Some(correlation) = ask_correlation(frame) else {
             return false;
         };
         let deadline = {
@@ -410,9 +773,7 @@ impl OutboundMessaging {
             self.complete_failure(correlation, AskError::DeadlineExceeded);
             return false;
         }
-        ask.timeout_nanos = duration_nanos(remaining);
-        *frame = Frame::encode_message(FrameKind::Ask, &ask);
-        true
+        rewrite_timeout_budget(frame, duration_nanos(remaining))
     }
 
     pub fn complete_reply(&self, correlation: CorrelationId, payload: Bytes) -> bool {
@@ -523,6 +884,57 @@ fn duration_nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+fn rewrite_timeout_budget(frame: &mut Frame, timeout_nanos: u64) -> bool {
+    match frame.kind {
+        FrameKind::Ask => frame
+            .decode_message::<AskWire>()
+            .ok()
+            .is_some_and(|mut wire| {
+                wire.timeout_nanos = timeout_nanos;
+                *frame = Frame::encode_message(FrameKind::Ask, &wire);
+                true
+            }),
+        FrameKind::EntityAsk => {
+            frame
+                .decode_message::<EntityAskWire>()
+                .ok()
+                .is_some_and(|mut wire| {
+                    wire.timeout_nanos = timeout_nanos;
+                    *frame = Frame::encode_message(FrameKind::EntityAsk, &wire);
+                    true
+                })
+        }
+        FrameKind::SingletonAsk => {
+            frame
+                .decode_message::<SingletonAskWire>()
+                .ok()
+                .is_some_and(|mut wire| {
+                    wire.timeout_nanos = timeout_nanos;
+                    *frame = Frame::encode_message(FrameKind::SingletonAsk, &wire);
+                    true
+                })
+        }
+        _ => false,
+    }
+}
+
+fn entity_logical_bytes(target: &LogicalEntityTarget) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(target.reference.entity_type().as_str().as_bytes());
+    bytes.extend_from_slice(target.reference.entity_id().as_bytes());
+    bytes.extend_from_slice(&target.owner_incarnation.get().to_be_bytes());
+    bytes.extend_from_slice(&target.assignment_generation.to_be_bytes());
+    bytes
+}
+
+fn singleton_logical_bytes(target: &LogicalSingletonTarget) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(target.reference.singleton_kind().as_str().as_bytes());
+    bytes.extend_from_slice(&target.owner_incarnation.get().to_be_bytes());
+    bytes.extend_from_slice(&target.assignment_generation.to_be_bytes());
+    bytes
+}
+
 #[derive(Clone, PartialEq, Message)]
 struct ExactActorTargetWire {
     #[prost(string, tag = "1")]
@@ -559,6 +971,104 @@ struct AskWire {
     sender: Vec<u8>,
     #[prost(message, optional, tag = "2")]
     target: Option<ExactActorTargetWire>,
+    #[prost(bytes = "vec", tag = "3")]
+    correlation_id: Vec<u8>,
+    #[prost(uint64, tag = "4")]
+    timeout_nanos: u64,
+    #[prost(uint64, tag = "5")]
+    message_id: u64,
+    #[prost(bytes = "vec", tag = "6")]
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct EntityTargetWire {
+    #[prost(string, tag = "1")]
+    cluster_id: String,
+    #[prost(string, tag = "2")]
+    owner_host: String,
+    #[prost(uint32, tag = "3")]
+    owner_port: u32,
+    #[prost(bytes = "vec", tag = "4")]
+    owner_incarnation: Vec<u8>,
+    #[prost(string, tag = "5")]
+    entity_type: String,
+    #[prost(bytes = "vec", tag = "6")]
+    entity_id: Vec<u8>,
+    #[prost(uint64, tag = "7")]
+    protocol_id: u64,
+    #[prost(bytes = "vec", tag = "8")]
+    config_fingerprint: Vec<u8>,
+    #[prost(uint64, tag = "9")]
+    assignment_generation: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct EntityTellWire {
+    #[prost(bytes = "vec", tag = "1")]
+    sender: Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    target: Option<EntityTargetWire>,
+    #[prost(uint64, tag = "3")]
+    message_id: u64,
+    #[prost(bytes = "vec", tag = "4")]
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct EntityAskWire {
+    #[prost(bytes = "vec", tag = "1")]
+    sender: Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    target: Option<EntityTargetWire>,
+    #[prost(bytes = "vec", tag = "3")]
+    correlation_id: Vec<u8>,
+    #[prost(uint64, tag = "4")]
+    timeout_nanos: u64,
+    #[prost(uint64, tag = "5")]
+    message_id: u64,
+    #[prost(bytes = "vec", tag = "6")]
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SingletonTargetWire {
+    #[prost(string, tag = "1")]
+    cluster_id: String,
+    #[prost(string, tag = "2")]
+    owner_host: String,
+    #[prost(uint32, tag = "3")]
+    owner_port: u32,
+    #[prost(bytes = "vec", tag = "4")]
+    owner_incarnation: Vec<u8>,
+    #[prost(string, tag = "5")]
+    singleton_kind: String,
+    #[prost(uint64, tag = "6")]
+    protocol_id: u64,
+    #[prost(bytes = "vec", tag = "7")]
+    config_fingerprint: Vec<u8>,
+    #[prost(uint64, tag = "8")]
+    assignment_generation: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SingletonTellWire {
+    #[prost(bytes = "vec", tag = "1")]
+    sender: Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    target: Option<SingletonTargetWire>,
+    #[prost(uint64, tag = "3")]
+    message_id: u64,
+    #[prost(bytes = "vec", tag = "4")]
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SingletonAskWire {
+    #[prost(bytes = "vec", tag = "1")]
+    sender: Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    target: Option<SingletonTargetWire>,
     #[prost(bytes = "vec", tag = "3")]
     correlation_id: Vec<u8>,
     #[prost(uint64, tag = "4")]
@@ -623,6 +1133,96 @@ fn target_from_wire(wire: ExactActorTargetWire) -> Result<ExactActorTarget, Remo
     })
 }
 
+fn entity_target_to_wire(target: &LogicalEntityTarget) -> EntityTargetWire {
+    EntityTargetWire {
+        cluster_id: target.reference.cluster_id().as_str().to_owned(),
+        owner_host: target.owner_address.host().to_owned(),
+        owner_port: u32::from(target.owner_address.port()),
+        owner_incarnation: target.owner_incarnation.get().to_be_bytes().to_vec(),
+        entity_type: target.reference.entity_type().as_str().to_owned(),
+        entity_id: target.reference.entity_id().as_bytes().to_vec(),
+        protocol_id: target.reference.protocol_id().get(),
+        config_fingerprint: target.reference.config_fingerprint().as_bytes().to_vec(),
+        assignment_generation: target.assignment_generation,
+    }
+}
+
+fn entity_target_from_wire(
+    wire: EntityTargetWire,
+) -> Result<LogicalEntityTarget, RemoteMessageError> {
+    let owner_incarnation = parse_incarnation(&wire.owner_incarnation)?;
+    let owner_port =
+        u16::try_from(wire.owner_port).map_err(|_| RemoteMessageError::InvalidPayload)?;
+    let fingerprint: [u8; 32] = wire
+        .config_fingerprint
+        .try_into()
+        .map_err(|_| RemoteMessageError::InvalidPayload)?;
+    if wire.assignment_generation == 0 {
+        return Err(RemoteMessageError::InvalidPayload);
+    }
+    Ok(LogicalEntityTarget {
+        reference: EntityRef::new(
+            ClusterId::new(wire.cluster_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
+            EntityType::new(wire.entity_type).map_err(|_| RemoteMessageError::InvalidPayload)?,
+            EntityId::new(wire.entity_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
+            ProtocolId::new(wire.protocol_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
+            ConfigFingerprint::new(fingerprint),
+        ),
+        owner_address: NodeAddress::new(wire.owner_host, owner_port)
+            .map_err(|_| RemoteMessageError::InvalidPayload)?,
+        owner_incarnation,
+        assignment_generation: wire.assignment_generation,
+    })
+}
+
+fn singleton_target_to_wire(target: &LogicalSingletonTarget) -> SingletonTargetWire {
+    SingletonTargetWire {
+        cluster_id: target.reference.cluster_id().as_str().to_owned(),
+        owner_host: target.owner_address.host().to_owned(),
+        owner_port: u32::from(target.owner_address.port()),
+        owner_incarnation: target.owner_incarnation.get().to_be_bytes().to_vec(),
+        singleton_kind: target.reference.singleton_kind().as_str().to_owned(),
+        protocol_id: target.reference.protocol_id().get(),
+        config_fingerprint: target.reference.config_fingerprint().as_bytes().to_vec(),
+        assignment_generation: target.assignment_generation,
+    }
+}
+
+fn singleton_target_from_wire(
+    wire: SingletonTargetWire,
+) -> Result<LogicalSingletonTarget, RemoteMessageError> {
+    let owner_incarnation = parse_incarnation(&wire.owner_incarnation)?;
+    let owner_port =
+        u16::try_from(wire.owner_port).map_err(|_| RemoteMessageError::InvalidPayload)?;
+    let fingerprint: [u8; 32] = wire
+        .config_fingerprint
+        .try_into()
+        .map_err(|_| RemoteMessageError::InvalidPayload)?;
+    if wire.assignment_generation == 0 {
+        return Err(RemoteMessageError::InvalidPayload);
+    }
+    Ok(LogicalSingletonTarget {
+        reference: SingletonRef::new(
+            ClusterId::new(wire.cluster_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
+            SingletonKind::new(wire.singleton_kind)
+                .map_err(|_| RemoteMessageError::InvalidPayload)?,
+            ProtocolId::new(wire.protocol_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
+            ConfigFingerprint::new(fingerprint),
+        ),
+        owner_address: NodeAddress::new(wire.owner_host, owner_port)
+            .map_err(|_| RemoteMessageError::InvalidPayload)?,
+        owner_incarnation,
+        assignment_generation: wire.assignment_generation,
+    })
+}
+
+fn parse_incarnation(bytes: &[u8]) -> Result<NodeIncarnation, RemoteMessageError> {
+    let bytes: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| RemoteMessageError::InvalidPayload)?;
+    NodeIncarnation::new(u128::from_be_bytes(bytes)).map_err(|_| RemoteMessageError::InvalidPayload)
+}
+
 #[async_trait]
 pub trait InboundDispatch: Send + Sync + 'static {
     async fn tell(
@@ -639,6 +1239,44 @@ pub trait InboundDispatch: Send + Sync + 'static {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError>;
+
+    async fn tell_entity(
+        &self,
+        _target: LogicalEntityTarget,
+        _message_id: u64,
+        _payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        Err(RemoteMessageError::Unauthorized)
+    }
+
+    async fn ask_entity(
+        &self,
+        _target: LogicalEntityTarget,
+        _message_id: u64,
+        _payload: Bytes,
+        _deadline: Instant,
+    ) -> Result<Bytes, RemoteMessageError> {
+        Err(RemoteMessageError::Unauthorized)
+    }
+
+    async fn tell_singleton(
+        &self,
+        _target: LogicalSingletonTarget,
+        _message_id: u64,
+        _payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        Err(RemoteMessageError::Unauthorized)
+    }
+
+    async fn ask_singleton(
+        &self,
+        _target: LogicalSingletonTarget,
+        _message_id: u64,
+        _payload: Bytes,
+        _deadline: Instant,
+    ) -> Result<Bytes, RemoteMessageError> {
+        Err(RemoteMessageError::Unauthorized)
+    }
 }
 
 pub async fn serve_inbound_connection<S, D>(
@@ -708,17 +1346,19 @@ where
 pub(crate) fn failure_code(error: &RemoteMessageError) -> RemoteFailureCode {
     match error {
         RemoteMessageError::StaleActivation => RemoteFailureCode::StaleActivation,
+        RemoteMessageError::StaleAuthority => RemoteFailureCode::StaleActivation,
         RemoteMessageError::UnsupportedProtocol | RemoteMessageError::UnknownMessage => {
             RemoteFailureCode::UnknownMessage
         }
         RemoteMessageError::ProtocolFingerprintMismatch => RemoteFailureCode::ProtocolMismatch,
         RemoteMessageError::MailboxRejected => RemoteFailureCode::MailboxFull,
+        RemoteMessageError::BufferFull => RemoteFailureCode::MailboxFull,
         RemoteMessageError::InvalidPayload => RemoteFailureCode::DecodeFailed,
         RemoteMessageError::DeadlineExceeded => RemoteFailureCode::DeadlineExceeded,
         RemoteMessageError::Unauthorized => RemoteFailureCode::Unauthorized,
-        RemoteMessageError::ZeroPendingLimit | RemoteMessageError::HandlerFailed => {
-            RemoteFailureCode::HandlerFailed
-        }
+        RemoteMessageError::ShardUnavailable
+        | RemoteMessageError::ZeroPendingLimit
+        | RemoteMessageError::HandlerFailed => RemoteFailureCode::HandlerFailed,
     }
 }
 
@@ -815,6 +1455,12 @@ pub enum RemoteMessageError {
     UnknownMessage,
     #[error("target actor activation is stale or absent")]
     StaleActivation,
+    #[error("logical target owner or assignment generation is stale")]
+    StaleAuthority,
+    #[error("logical target has no currently authorized owner")]
+    ShardUnavailable,
+    #[error("logical routing buffer reached its configured bound")]
+    BufferFull,
     #[error("target actor mailbox rejected the message")]
     MailboxRejected,
     #[error("message payload is invalid")]

@@ -236,6 +236,17 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
         {
             return Err(AllocationError::ConcurrencyLimit);
         }
+        let proposal_limit = limits
+            .moves_per_round
+            .min(limits.concurrent_cluster - view.active_cluster_moves)
+            .min(
+                limits.concurrent_entity
+                    - view
+                        .active_entity_moves
+                        .get(entity_type)
+                        .copied()
+                        .unwrap_or(0),
+            );
         if trigger == RebalanceTrigger::Automatic {
             self.require_automatic_inputs(view)?;
         }
@@ -250,7 +261,7 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
         let mut source_counts = BTreeMap::<NodeKey, usize>::new();
         let mut target_counts = BTreeMap::<NodeKey, usize>::new();
         for shard in shards {
-            if moves.len() == limits.moves_per_round {
+            if moves.len() == proposal_limit {
                 break;
             }
             if !trigger_selects_source(&trigger, &shard.owner) {
@@ -261,13 +272,12 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
             {
                 continue;
             }
-            let source = view
-                .nodes
-                .iter()
-                .find(|node| node.key == shard.owner)
-                .ok_or(AllocationError::InvalidView)?;
+            let source = view.nodes.iter().find(|node| node.key == shard.owner);
+            if source.is_none() && !matches!(trigger, RebalanceTrigger::Recovery { .. }) {
+                return Err(AllocationError::InvalidView);
+            }
             let target = eligible_nodes(view, entity_type, required_protocol)
-                .filter(|node| node.key != source.key)
+                .filter(|node| node.key != shard.owner)
                 .filter(|node| trigger_allows_target(&trigger, &node.key))
                 .filter(|node| {
                     elapsed(view.now, node.joined_at) >= self.node_join_stability_millis
@@ -282,24 +292,29 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
             let Some(target) = target else {
                 continue;
             };
-            if existing_count(view, &view.active_source_moves, &source.key)
-                + source_counts.get(&source.key).copied().unwrap_or(0)
+            if existing_count(view, &view.active_source_moves, &shard.owner)
+                + source_counts.get(&shard.owner).copied().unwrap_or(0)
                 >= limits.concurrent_source
             {
                 continue;
             }
             if !bypasses_improvement(&trigger)
-                && !self.improves(source, target, shard.weight(), &totals)
+                && !self.improves(
+                    source.ok_or(AllocationError::InvalidView)?,
+                    target,
+                    shard.weight(),
+                    &totals,
+                )
             {
                 continue;
             }
-            *source_counts.entry(source.key.clone()).or_default() += 1;
+            *source_counts.entry(shard.owner.clone()).or_default() += 1;
             *target_counts.entry(target.key.clone()).or_default() += 1;
             moves.push(ProposedMove {
                 entity_type: entity_type.clone(),
                 shard_id: shard.shard_id,
                 expected_generation: shard.generation,
-                source: source.key.clone(),
+                source: shard.owner.clone(),
                 target: target.key.clone(),
                 estimated_weight: shard.weight(),
             });
@@ -505,4 +520,232 @@ pub enum AllocationError {
     StaleLoad,
     #[error("automatic rebalance cooldown has not elapsed")]
     Cooldown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
+
+    fn node(id: &str, incarnation: u128) -> NodeKey {
+        NodeKey {
+            node_id: id.to_owned(),
+            address: NodeAddress::new("127.0.0.1", 27000 + incarnation as u16).unwrap(),
+            incarnation: NodeIncarnation::new(incarnation).unwrap(),
+        }
+    }
+
+    fn automatic_view() -> (EntityType, ProtocolId, NodeKey, NodeKey, PlacementView) {
+        let entity = EntityType::new("automatic-policy").unwrap();
+        let protocol = ProtocolId::new(91).unwrap();
+        let source = node("source", 1);
+        let target = node("target", 2);
+        let placement_node = |key: NodeKey, weight| PlacementNode {
+            key: key.clone(),
+            ready: true,
+            eligible_entity_types: [entity.clone()].into_iter().collect(),
+            protocols: [protocol].into_iter().collect(),
+            capacity_units: 10,
+            joined_at: MonotonicTime::from_millis(0),
+            load: Some(LoadSample {
+                boot_incarnation: key.incarnation,
+                sequence: 1,
+                observed_at: MonotonicTime::from_millis(100_000),
+                weight,
+            }),
+            reserved_weight: 0,
+            draining: false,
+        };
+        let view = PlacementView {
+            coordinator_term: CoordinatorTerm::new(1).unwrap(),
+            revision: Revision::new(1).unwrap(),
+            now: MonotonicTime::from_millis(100_000),
+            reconciled: true,
+            degraded: false,
+            nodes: vec![
+                placement_node(source.clone(), 100),
+                placement_node(target.clone(), 0),
+            ],
+            shards: vec![PlacedShard {
+                entity_type: entity.clone(),
+                shard_id: ShardId::new(1),
+                owner: source.clone(),
+                generation: AssignmentGeneration::new(1).unwrap(),
+                measured_weight: Some(20),
+                assigned_at: MonotonicTime::from_millis(0),
+                active_move: false,
+            }],
+            active_cluster_moves: 0,
+            active_entity_moves: BTreeMap::new(),
+            active_source_moves: BTreeMap::new(),
+            active_target_moves: BTreeMap::new(),
+            last_automatic_move_at: None,
+        };
+        (entity, protocol, source, target, view)
+    }
+
+    fn limits() -> RebalanceLimits {
+        RebalanceLimits {
+            moves_per_round: 4,
+            concurrent_cluster: 4,
+            concurrent_entity: 4,
+            concurrent_source: 4,
+            concurrent_target: 4,
+        }
+    }
+
+    #[test]
+    fn automatic_policy_requires_stable_fresh_inputs_and_hysteresis() {
+        let strategy = WeightedLeastLoad::default();
+        let (entity, protocol, _source, _target, view) = automatic_view();
+        assert_eq!(
+            strategy
+                .rebalance(
+                    &entity,
+                    protocol,
+                    RebalanceTrigger::Automatic,
+                    &view,
+                    limits()
+                )
+                .unwrap()
+                .moves
+                .len(),
+            1
+        );
+
+        let mut stale = view.clone();
+        stale.nodes[1].load.as_mut().unwrap().observed_at = MonotonicTime::from_millis(1);
+        assert_eq!(
+            strategy
+                .rebalance(
+                    &entity,
+                    protocol,
+                    RebalanceTrigger::Automatic,
+                    &stale,
+                    limits()
+                )
+                .unwrap_err(),
+            AllocationError::StaleLoad
+        );
+
+        let mut cooldown = view.clone();
+        cooldown.last_automatic_move_at = Some(MonotonicTime::from_millis(99_999));
+        assert_eq!(
+            strategy
+                .rebalance(
+                    &entity,
+                    protocol,
+                    RebalanceTrigger::Automatic,
+                    &cooldown,
+                    limits()
+                )
+                .unwrap_err(),
+            AllocationError::Cooldown
+        );
+
+        let mut recent_assignment = view.clone();
+        recent_assignment.shards[0].assigned_at = MonotonicTime::from_millis(99_999);
+        assert!(
+            strategy
+                .rebalance(
+                    &entity,
+                    protocol,
+                    RebalanceTrigger::Automatic,
+                    &recent_assignment,
+                    limits(),
+                )
+                .unwrap()
+                .moves
+                .is_empty()
+        );
+
+        let mut recent_join = view.clone();
+        recent_join.nodes[1].joined_at = MonotonicTime::from_millis(99_999);
+        assert!(
+            strategy
+                .rebalance(
+                    &entity,
+                    protocol,
+                    RebalanceTrigger::Automatic,
+                    &recent_join,
+                    limits()
+                )
+                .unwrap()
+                .moves
+                .is_empty()
+        );
+
+        let mut below_hysteresis = view;
+        below_hysteresis.nodes[0].load.as_mut().unwrap().weight = 10;
+        below_hysteresis.nodes[1].load.as_mut().unwrap().weight = 9;
+        below_hysteresis.shards[0].measured_weight = Some(1);
+        assert!(
+            strategy
+                .rebalance(
+                    &entity,
+                    protocol,
+                    RebalanceTrigger::Automatic,
+                    &below_hysteresis,
+                    limits(),
+                )
+                .unwrap()
+                .moves
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn proposal_respects_remaining_cluster_entity_source_and_target_limits() {
+        let strategy = WeightedLeastLoad::default();
+        let (entity, protocol, source, target, mut view) = automatic_view();
+        let mut second = view.shards[0].clone();
+        second.shard_id = ShardId::new(2);
+        view.shards.push(second);
+        view.active_cluster_moves = 1;
+        view.active_entity_moves.insert(entity.clone(), 1);
+        let bounded = RebalanceLimits {
+            moves_per_round: 4,
+            concurrent_cluster: 2,
+            concurrent_entity: 2,
+            concurrent_source: 2,
+            concurrent_target: 2,
+        };
+        assert_eq!(
+            strategy
+                .rebalance(
+                    &entity,
+                    protocol,
+                    RebalanceTrigger::Automatic,
+                    &view,
+                    bounded
+                )
+                .unwrap()
+                .moves
+                .len(),
+            1
+        );
+
+        view.active_cluster_moves = 0;
+        view.active_entity_moves.clear();
+        view.active_source_moves.insert(source, 1);
+        view.active_target_moves.insert(target, 1);
+        let one_each = RebalanceLimits {
+            concurrent_source: 1,
+            concurrent_target: 1,
+            ..bounded
+        };
+        assert!(
+            strategy
+                .rebalance(
+                    &entity,
+                    protocol,
+                    RebalanceTrigger::Automatic,
+                    &view,
+                    one_each
+                )
+                .unwrap()
+                .moves
+                .is_empty()
+        );
+    }
 }

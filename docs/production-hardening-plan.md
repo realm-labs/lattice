@@ -539,7 +539,7 @@ independently reviewable migration boundary and the total remains at most four.
 
 ### Macro Batch 1 Evidence (2026-07-12)
 
-Status: `[x]` implementation complete; conventional commit pending at this tracker update.
+Status: `[x]` complete in `b9fb89e`.
 
 - The old benchmark/storage/API baseline is captured at commit
   `d66f56831de832fab71d7357476b9b237cbba5d5`.
@@ -558,11 +558,36 @@ Status: `[x]` implementation complete; conventional commit pending at this track
   control consumers, Coordinator sessions, logical routers, DeathWatch, TLS endpoint policy, idle
   lane lifecycle, and partial-lane recovery can be exercised as one distributed runtime.
 
+### Macro Batch 2 Evidence (2026-07-12)
+
+Status: `[x]` implementation complete; conventional commit pending at this tracker update.
+
+- Association reliable control now drives Coordinator sessions, revisioned bounded snapshots,
+  per-slot claim grants, logical resolution, subscribed-session handoff barriers and DeathWatch.
+- Coordinator-owned generation-2 memory/etcd storage implements canonical keys, schema preflight,
+  leadership, member/claim leases, exact claim CAS, slots and persisted bounded rebalance plans.
+- ShardRegion and SingletonProxy provide bounded tell/ask buffering, single-flight resolution,
+  exact owner/config/generation/claim validation and load only through an admitted local authority.
+- WeightedLeastLoad is pluggable and deterministic; automatic/manual/drain/recovery triggers,
+  freshness, hysteresis, residence, join stability, cooldown, reservations, priority and every
+  proposal/execution concurrency scope are implemented. Persisted handoffs recover forward after
+  leader loss, including Singleton owner failure from authoritative slot/barrier metadata.
+- Remote watch uses the shared reliable control stream, exact activation identity, reconnect
+  reinstall, resolve-without-activate logical watch, supervised termination and Coordinator
+  node-removal synthesis with one terminal result per WatchId.
+- Service assembly supervises logic/Coordinator sessions, placement effects, actor drain/stop,
+  endpoint TLS policy and bounded shutdown. Real TCP/TLS tests cover exact actor and logical asks,
+  mutual certificate identity and exact remote watch termination.
+- `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, and the affected crate
+  suites pass on the host. Full workspace tests exposed and fixed explicit rustls provider selection;
+  the complete suite is rerun at the commit boundary. Real etcd/HA and pinned Docker evidence remains
+  part of macro batch 3 rather than being claimed here.
+
 ### Phase 0: Architecture Reset
 
 Status: `[x]` complete; evidence is folded into macro batch 1.
 
-Current Execution Pointer:
+Previous Execution Pointer (macro batch 2 complete):
 
 ```text
 Begin hard-switch macro batch 2 from the green exact-activation/remoting boundary. Complete the shared
@@ -571,6 +596,18 @@ etcd leases/storage generation, ShardRegion and subscribed-session handoff, plug
 rebalancing execution/recovery, remote DeathWatch, Singleton, logical routing, and complete service
 assembly. Close the remaining Phase 2/3 integrated-runtime acceptance gaps while doing this; do not
 introduce a second transport, compatibility mode, direct etcd hot path, or old placement abstraction.
+```
+
+Current Execution Pointer:
+
+```text
+Begin hard-switch macro batch 3 from the distributed runtime boundary. Finish storage cutover and
+admin/operations, deterministic production-reducer simulation, stable named failpoints and their
+required fault matrix, pinned Docker quality/sim/model/e2e/HA-etcd/chaos/Kubernetes/soak/replay
+profiles, real multi-process lifecycle and resource evidence, benchmark comparison, legacy absence
+checks, examples/docs and global acceptance. Do not replace deterministic protocol simulation with
+container timing, and do not claim final completion until every required profile and host quality
+gate passes with replayable artifacts and cleanup evidence.
 ```
 
 - [x] Decide to remove framework gRPC and public Direct Link.

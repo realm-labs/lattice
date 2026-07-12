@@ -3,18 +3,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 use lattice_core::actor_ref::{EntityType, NodeIncarnation, SingletonKind};
 use lattice_remoting::protocol::ProtocolDescriptor;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::region::EntityConfig;
 use crate::types::{CoordinatorTerm, MonotonicTime, NodeKey, Revision, ShardId};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SingletonConfig {
+    pub kind: SingletonKind,
+    pub protocol_id: lattice_core::actor_ref::ProtocolId,
+    pub config_fingerprint: lattice_core::actor_ref::ConfigFingerprint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaderRecord {
     pub node: NodeKey,
     pub protocol_generation: u64,
     pub term: CoordinatorTerm,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeHello {
     pub node: NodeKey,
     pub roles: BTreeSet<String>,
@@ -24,6 +33,8 @@ pub struct NodeHello {
     pub singleton_eligibility: BTreeSet<SingletonKind>,
     pub used_singletons: BTreeSet<SingletonKind>,
     pub protocols: Vec<ProtocolDescriptor>,
+    pub entity_configs: Vec<EntityConfig>,
+    pub singleton_configs: Vec<SingletonConfig>,
 }
 
 impl NodeHello {
@@ -38,6 +49,8 @@ impl NodeHello {
             || self.singleton_eligibility.len() > limits.maximum_singletons
             || self.used_singletons.len() > limits.maximum_singletons
             || self.protocols.len() > limits.maximum_protocols
+            || self.entity_configs.len() > limits.maximum_entity_types
+            || self.singleton_configs.len() > limits.maximum_singletons
             || self
                 .roles
                 .iter()
@@ -51,6 +64,21 @@ impl NodeHello {
             .iter()
             .any(|protocol| !ids.insert(protocol.protocol_id.get()))
         {
+            return Err(CoordinatorError::InvalidHello);
+        }
+        let mut entity_types = BTreeSet::new();
+        if self.entity_configs.iter().any(|config| {
+            config.validate().is_err()
+                || !entity_types.insert(config.entity_type.clone())
+                || !self.hosted_entity_types.contains(&config.entity_type)
+        }) {
+            return Err(CoordinatorError::InvalidHello);
+        }
+        let mut singleton_kinds = BTreeSet::new();
+        if self.singleton_configs.iter().any(|config| {
+            !singleton_kinds.insert(config.kind.clone())
+                || !self.singleton_eligibility.contains(&config.kind)
+        }) {
             return Err(CoordinatorError::InvalidHello);
         }
         Ok(())
@@ -120,13 +148,13 @@ impl SnapshotLimits {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     pub key: String,
     pub value: Bytes,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotBegin {
     pub snapshot_id: u128,
     pub revision: Revision,
@@ -136,20 +164,20 @@ pub struct SnapshotBegin {
     pub digest: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotChunk {
     pub snapshot_id: u128,
     pub index: usize,
     pub records: Vec<SnapshotRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotEnd {
     pub snapshot_id: u128,
     pub revision: Revision,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotInstall {
     pub revision: Revision,
     pub records: Vec<SnapshotRecord>,
@@ -321,7 +349,7 @@ fn snapshot_digest(records: &[SnapshotRecord]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordinatorDelta {
     pub revision: Revision,
     pub records: Vec<SnapshotRecord>,
@@ -368,7 +396,7 @@ impl CoordinatorSession {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeLoadReport {
     pub node: NodeKey,
     pub sequence: u64,
@@ -376,7 +404,7 @@ pub struct NodeLoadReport {
     pub total_weight: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardLoadReport {
     pub node: NodeKey,
     pub entity_type: EntityType,
@@ -459,6 +487,20 @@ impl LoadTable {
     pub fn clear_for_leader_change(&mut self) {
         self.nodes.clear();
         self.shards.clear();
+    }
+
+    pub fn node(&self, incarnation: NodeIncarnation) -> Option<&NodeLoadReport> {
+        self.nodes.get(&incarnation)
+    }
+
+    pub fn shard(
+        &self,
+        incarnation: NodeIncarnation,
+        entity_type: &EntityType,
+        shard_id: ShardId,
+    ) -> Option<&ShardLoadReport> {
+        self.shards
+            .get(&(incarnation, entity_type.clone(), shard_id))
     }
 }
 

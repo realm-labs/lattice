@@ -10,7 +10,9 @@ async-trait.workspace = true
 bytes.workspace = true
 lattice-actor.workspace = true
 lattice-core.workspace = true
+lattice-placement.workspace = true
 lattice-remoting.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -18,5 +20,4 @@ tracing.workspace = true
 [dev-dependencies]
 prost.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 trybuild.workspace = true

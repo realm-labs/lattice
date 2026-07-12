@@ -5,10 +5,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_actor::{ProtocolHostRegistry, RecipientBackend};
 use lattice_core::actor_ref::{ActorRef, EntityRef, RecipientRef, SingletonRef};
+use lattice_placement::PlacementSlotKey;
 use lattice_remoting::protocol::ProtocolFingerprint;
 use lattice_remoting::{
-    AskError, AssociationManager, InboundDispatch, OutboundMessaging, RemoteFailureCode,
-    RemoteMessageError, SenderIdentity, TellError, WatchError, WatchId, WatchRegistry,
+    AskError, AssociationId, AssociationManager, ExactActorTarget, InboundDispatch,
+    LogicalEntityTarget, LogicalSingletonTarget, OutboundMessaging, RemoteFailureCode,
+    RemoteMessageError, SenderIdentity, TellError, TerminatedReason, WatchCommand, WatchError,
+    WatchId, WatchRegistry, encode_watch_command,
 };
 
 #[async_trait]
@@ -56,6 +59,133 @@ pub trait LogicalRouter: Send + Sync + 'static {
         &self,
         target: SingletonRef<()>,
     ) -> Result<Option<ActorRef<()>>, WatchError>;
+
+    async fn drain_slot(&self, _slot: PlacementSlotKey) -> Result<bool, RemoteMessageError> {
+        Err(RemoteMessageError::Unauthorized)
+    }
+
+    async fn stop_fenced_slot(&self, _slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
+        Err(RemoteMessageError::Unauthorized)
+    }
+
+    async fn receive_entity_tell(
+        &self,
+        _target: LogicalEntityTarget,
+        _message_id: u64,
+        _payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        Err(RemoteMessageError::Unauthorized)
+    }
+
+    async fn receive_entity_ask(
+        &self,
+        _target: LogicalEntityTarget,
+        _message_id: u64,
+        _payload: Bytes,
+        _deadline: Instant,
+    ) -> Result<Bytes, RemoteMessageError> {
+        Err(RemoteMessageError::Unauthorized)
+    }
+
+    async fn receive_singleton_tell(
+        &self,
+        _target: LogicalSingletonTarget,
+        _message_id: u64,
+        _payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        Err(RemoteMessageError::Unauthorized)
+    }
+
+    async fn receive_singleton_ask(
+        &self,
+        _target: LogicalSingletonTarget,
+        _message_id: u64,
+        _payload: Bytes,
+        _deadline: Instant,
+    ) -> Result<Bytes, RemoteMessageError> {
+        Err(RemoteMessageError::Unauthorized)
+    }
+}
+
+pub(crate) struct ServiceInboundDispatch {
+    pub hosts: Arc<ProtocolHostRegistry>,
+    pub logical: Option<Arc<dyn LogicalRouter>>,
+}
+
+#[async_trait]
+impl InboundDispatch for ServiceInboundDispatch {
+    async fn tell(
+        &self,
+        target: ExactActorTarget,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        self.hosts.tell(target, message_id, payload).await
+    }
+
+    async fn ask(
+        &self,
+        target: ExactActorTarget,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, RemoteMessageError> {
+        self.hosts.ask(target, message_id, payload, deadline).await
+    }
+
+    async fn tell_entity(
+        &self,
+        target: LogicalEntityTarget,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        self.logical
+            .as_ref()
+            .ok_or(RemoteMessageError::Unauthorized)?
+            .receive_entity_tell(target, message_id, payload)
+            .await
+    }
+
+    async fn ask_entity(
+        &self,
+        target: LogicalEntityTarget,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, RemoteMessageError> {
+        self.logical
+            .as_ref()
+            .ok_or(RemoteMessageError::Unauthorized)?
+            .receive_entity_ask(target, message_id, payload, deadline)
+            .await
+    }
+
+    async fn tell_singleton(
+        &self,
+        target: LogicalSingletonTarget,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        self.logical
+            .as_ref()
+            .ok_or(RemoteMessageError::Unauthorized)?
+            .receive_singleton_tell(target, message_id, payload)
+            .await
+    }
+
+    async fn ask_singleton(
+        &self,
+        target: LogicalSingletonTarget,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, RemoteMessageError> {
+        self.logical
+            .as_ref()
+            .ok_or(RemoteMessageError::Unauthorized)?
+            .receive_singleton_ask(target, message_id, payload, deadline)
+            .await
+    }
 }
 
 pub(crate) struct ServiceRecipientBackend {
@@ -65,7 +195,9 @@ pub(crate) struct ServiceRecipientBackend {
     pub hosts: Arc<ProtocolHostRegistry>,
     pub associations: Arc<AssociationManager>,
     pub messaging: Arc<OutboundMessaging>,
-    pub watches: Mutex<WatchRegistry>,
+    pub watches: Arc<Mutex<WatchRegistry>>,
+    pub maximum_control_payload: usize,
+    pub supervisor: Arc<crate::supervisor::TaskSupervisor>,
     pub logical: Option<Arc<dyn LogicalRouter>>,
 }
 
@@ -195,17 +327,100 @@ impl RecipientBackend for ServiceRecipientBackend {
 
     async fn watch_actor(&self, target: ActorRef<()>) -> Result<WatchId, WatchError> {
         if self.is_local(&target) {
-            return Err(WatchError::InvalidCommand);
+            let association_id = AssociationId::new(self.local_incarnation.get())
+                .ok_or(WatchError::InvalidCommand)?;
+            let (watch_id, command) = self
+                .watches
+                .lock()
+                .expect("watch registry poisoned")
+                .watch(association_id, &target)?;
+            let WatchCommand::Watch { target, .. } = command else {
+                return Err(WatchError::InvalidCommand);
+            };
+            let terminated = self.hosts.subscribe_terminated(&target);
+            let response = self
+                .watches
+                .lock()
+                .expect("watch registry poisoned")
+                .receive_watch(association_id, watch_id, target.clone(), |candidate| {
+                    self.hosts.is_current(candidate)
+                })?;
+            return match response {
+                WatchCommand::WatchAck { watch_id, target } => {
+                    self.watches
+                        .lock()
+                        .expect("watch registry poisoned")
+                        .receive_ack(watch_id, &target);
+                    if let Some(mut terminated) = terminated {
+                        let watches = self.watches.clone();
+                        self.supervisor
+                            .spawn(async move {
+                                let Ok(event) = terminated.recv().await else {
+                                    return;
+                                };
+                                let reason = match event.reason {
+                                    lattice_actor::watch::TerminatedReason::Stopped => {
+                                        TerminatedReason::Stopped
+                                    }
+                                    lattice_actor::watch::TerminatedReason::Passivated => {
+                                        TerminatedReason::Passivated
+                                    }
+                                    lattice_actor::watch::TerminatedReason::Migrated => {
+                                        TerminatedReason::Handoff
+                                    }
+                                    lattice_actor::watch::TerminatedReason::Fenced => {
+                                        TerminatedReason::ClaimLost
+                                    }
+                                    lattice_actor::watch::TerminatedReason::NodeDown => {
+                                        TerminatedReason::NodeDown
+                                    }
+                                };
+                                let commands = watches
+                                    .lock()
+                                    .expect("watch registry poisoned")
+                                    .target_terminated(&target, reason);
+                                for (_, command) in commands {
+                                    if let WatchCommand::Terminated {
+                                        watch_id, target, ..
+                                    } = command
+                                    {
+                                        watches
+                                            .lock()
+                                            .expect("watch registry poisoned")
+                                            .receive_terminated(watch_id, &target);
+                                    }
+                                }
+                            })
+                            .map_err(|_| WatchError::TargetCapacity)?;
+                    }
+                    Ok(watch_id)
+                }
+                WatchCommand::Terminated {
+                    watch_id, target, ..
+                } => {
+                    self.watches
+                        .lock()
+                        .expect("watch registry poisoned")
+                        .receive_terminated(watch_id, &target);
+                    Ok(watch_id)
+                }
+                WatchCommand::Watch { .. } | WatchCommand::Unwatch { .. } => {
+                    Err(WatchError::InvalidCommand)
+                }
+            };
         }
         let association = self
             .association(&target)
             .map_err(|_| WatchError::InvalidCommand)?;
-        let (watch_id, _command) = self
+        let (watch_id, command) = self
             .watches
             .lock()
             .expect("watch registry poisoned")
             .watch(association.id(), &target)?;
-        // The command is admitted to reliable control by the association runtime.
+        let payload = encode_watch_command(&command, self.maximum_control_payload)?;
+        association
+            .admit_control_command(payload)
+            .map_err(|_| WatchError::InvalidCommand)?;
         Ok(watch_id)
     }
 
@@ -235,29 +450,42 @@ impl RecipientBackend for ServiceRecipientBackend {
     }
 
     async fn unwatch(&self, watch_id: WatchId) -> Result<(), WatchError> {
-        self.watches
+        let (association_id, command) = self
+            .watches
             .lock()
             .expect("watch registry poisoned")
             .unwatch(watch_id)
+            .ok_or(WatchError::InvalidCommand)?;
+        let association = self
+            .associations
+            .get_by_id(association_id)
+            .ok_or(WatchError::InvalidCommand)?;
+        association
+            .admit_control_command(encode_watch_command(
+                &command,
+                self.maximum_control_payload,
+            )?)
             .map(|_| ())
-            .ok_or(WatchError::InvalidCommand)
+            .map_err(|_| WatchError::InvalidCommand)
     }
 }
 
 fn map_remote_ask(error: RemoteMessageError) -> AskError {
     let code = match error {
         RemoteMessageError::StaleActivation => RemoteFailureCode::StaleActivation,
+        RemoteMessageError::StaleAuthority => RemoteFailureCode::StaleActivation,
         RemoteMessageError::UnknownMessage | RemoteMessageError::UnsupportedProtocol => {
             RemoteFailureCode::UnknownMessage
         }
         RemoteMessageError::ProtocolFingerprintMismatch => RemoteFailureCode::ProtocolMismatch,
         RemoteMessageError::MailboxRejected => RemoteFailureCode::MailboxFull,
+        RemoteMessageError::BufferFull => RemoteFailureCode::MailboxFull,
         RemoteMessageError::InvalidPayload => RemoteFailureCode::DecodeFailed,
         RemoteMessageError::DeadlineExceeded => RemoteFailureCode::DeadlineExceeded,
         RemoteMessageError::Unauthorized => RemoteFailureCode::Unauthorized,
-        RemoteMessageError::HandlerFailed | RemoteMessageError::ZeroPendingLimit => {
-            RemoteFailureCode::HandlerFailed
-        }
+        RemoteMessageError::ShardUnavailable
+        | RemoteMessageError::HandlerFailed
+        | RemoteMessageError::ZeroPendingLimit => RemoteFailureCode::HandlerFailed,
     };
     AskError::Remote(code)
 }

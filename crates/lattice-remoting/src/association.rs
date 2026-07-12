@@ -7,6 +7,9 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::config::RemotingConfig;
+use crate::control::{
+    CommandId, ControlAck, ControlApply, ControlEnvelope, ReliableControl, control_envelope_frame,
+};
 use crate::protocol::{
     CatalogueDecision, CatalogueError, ProtocolCatalogue, ProtocolDescriptor, ProtocolFingerprint,
 };
@@ -92,7 +95,9 @@ pub struct Association {
     bulk: Vec<mpsc::Sender<Frame>>,
     receivers: Mutex<AssociationReceiverSlots>,
     queued_bytes: AtomicUsize,
+    node_queued_bytes: Arc<AtomicUsize>,
     peer_catalogue: Mutex<ProtocolCatalogue>,
+    reliable_control: Mutex<ReliableControl>,
 }
 
 impl Association {
@@ -105,8 +110,19 @@ impl Association {
         id: AssociationId,
         config: RemotingConfig,
     ) -> Result<Self, AssociationError> {
+        Self::new_with_id_and_budget(key, id, config, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn new_with_id_and_budget(
+        key: AssociationKey,
+        id: AssociationId,
+        config: RemotingConfig,
+        node_queued_bytes: Arc<AtomicUsize>,
+    ) -> Result<Self, AssociationError> {
         config.validate().map_err(AssociationError::InvalidConfig)?;
         let max_protocols_per_peer = config.max_protocols_per_peer;
+        let max_control_outbox_frames = config.max_control_outbox_frames;
+        let max_control_outbox_bytes = config.max_control_outbox_bytes;
         let (control, control_rx) = mpsc::channel(config.control_queue_frames);
         let (interactive, interactive_rx) = mpsc::channel(config.interactive_queue_frames);
         let mut bulk = Vec::with_capacity(config.bulk_stripes);
@@ -133,9 +149,14 @@ impl Association {
                 bulk: bulk_rx.into_iter().map(Some).collect(),
             }),
             queued_bytes: AtomicUsize::new(0),
+            node_queued_bytes,
             peer_catalogue: Mutex::new(
                 ProtocolCatalogue::new(max_protocols_per_peer)
                     .expect("validated protocol catalogue limit"),
+            ),
+            reliable_control: Mutex::new(
+                ReliableControl::new(id, max_control_outbox_frames, max_control_outbox_bytes)
+                    .expect("validated reliable control limits"),
             ),
         })
     }
@@ -264,6 +285,82 @@ impl Association {
         self.try_admit(&self.control, frame)
     }
 
+    pub fn admit_control_command(
+        &self,
+        payload: bytes::Bytes,
+    ) -> Result<CommandId, AssociationError> {
+        let command_id = CommandId::generate();
+        let envelope = self
+            .reliable_control
+            .lock()
+            .expect("reliable control state poisoned")
+            .enqueue(command_id, payload)
+            .map_err(AssociationError::ReliableControl)?;
+        if self.state() == AssociationState::Active
+            && let Err(error) = self.try_admit_control(control_envelope_frame(&envelope))
+        {
+            self.reliable_control
+                .lock()
+                .expect("reliable control state poisoned")
+                .rollback_last(command_id);
+            return Err(error);
+        }
+        Ok(command_id)
+    }
+
+    pub fn admit_ephemeral_control(&self, payload: bytes::Bytes) -> Result<(), AssociationError> {
+        self.try_admit_control(Frame {
+            kind: crate::wire::FrameKind::CoordinatorEvent,
+            payload,
+        })
+    }
+
+    pub fn replay_control_frames(&self) -> Vec<Frame> {
+        self.reliable_control
+            .lock()
+            .expect("reliable control state poisoned")
+            .replay()
+            .map(control_envelope_frame)
+            .collect()
+    }
+
+    pub fn control_outbox_len(&self) -> usize {
+        self.reliable_control
+            .lock()
+            .expect("reliable control state poisoned")
+            .replay()
+            .len()
+    }
+
+    pub fn preview_control(&self, envelope: &ControlEnvelope) -> ControlApply {
+        self.reliable_control
+            .lock()
+            .expect("reliable control state poisoned")
+            .preview(envelope)
+    }
+
+    pub fn commit_control(&self, envelope: ControlEnvelope) -> ControlAck {
+        self.reliable_control
+            .lock()
+            .expect("reliable control state poisoned")
+            .commit(envelope)
+    }
+
+    pub fn acknowledge_control(&self, ack: ControlAck) -> Result<(), AssociationError> {
+        self.reliable_control
+            .lock()
+            .expect("reliable control state poisoned")
+            .acknowledge(ack)
+            .map_err(AssociationError::ReliableControl)
+    }
+
+    pub fn current_control_ack(&self) -> ControlAck {
+        self.reliable_control
+            .lock()
+            .expect("reliable control state poisoned")
+            .current_ack()
+    }
+
     pub fn install_peer_catalogue<I>(&self, descriptors: I) -> Result<(), AssociationError>
     where
         I: IntoIterator<Item = ProtocolDescriptor>,
@@ -308,6 +405,11 @@ impl Association {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(bytes))
             });
+        let _ =
+            self.node_queued_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_sub(bytes))
+                });
     }
 
     pub fn begin_close(&self) {
@@ -352,8 +454,23 @@ impl Association {
                 let next = current.checked_add(bytes)?;
                 (next <= self.config.max_outbound_bytes_per_association).then_some(next)
             })
-            .map(|_| ())
-            .map_err(|_| AssociationError::ByteBudgetExceeded)
+            .map_err(|_| AssociationError::ByteBudgetExceeded)?;
+        if self
+            .node_queued_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                let next = current.checked_add(bytes)?;
+                (next <= self.config.max_outbound_bytes_per_node).then_some(next)
+            })
+            .is_err()
+        {
+            let _ =
+                self.queued_bytes
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        Some(current.saturating_sub(bytes))
+                    });
+            return Err(AssociationError::NodeByteBudgetExceeded);
+        }
+        Ok(())
     }
 
     fn has_complete_lane_group(&self, lanes: &HashMap<LaneKind, u128>) -> bool {
@@ -378,6 +495,7 @@ pub struct AssociationManager {
     config: RemotingConfig,
     associations: Mutex<HashMap<AssociationKey, Arc<Association>>>,
     remote_incarnations: Mutex<HashMap<NodeAddress, NodeIncarnation>>,
+    queued_bytes: Arc<AtomicUsize>,
 }
 
 impl AssociationManager {
@@ -393,6 +511,7 @@ impl AssociationManager {
             config,
             associations: Mutex::new(HashMap::new()),
             remote_incarnations: Mutex::new(HashMap::new()),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -433,7 +552,12 @@ impl AssociationManager {
         if associations.len() == self.config.max_associations {
             return Err(AssociationError::AssociationLimit);
         }
-        let association = Arc::new(Association::new(key.clone(), self.config.clone())?);
+        let association = Arc::new(Association::new_with_id_and_budget(
+            key.clone(),
+            AssociationId::generate(),
+            self.config.clone(),
+            self.queued_bytes.clone(),
+        )?);
         associations.insert(key, association.clone());
         Ok(association)
     }
@@ -480,10 +604,11 @@ impl AssociationManager {
         if associations.len() == self.config.max_associations {
             return Err(AssociationError::AssociationLimit);
         }
-        let association = Arc::new(Association::new_with_id(
+        let association = Arc::new(Association::new_with_id_and_budget(
             key.clone(),
             association_id,
             self.config.clone(),
+            self.queued_bytes.clone(),
         )?);
         associations.insert(key, association.clone());
         Ok(association)
@@ -512,6 +637,37 @@ impl AssociationManager {
         } else {
             false
         }
+    }
+
+    pub fn get(&self, key: &AssociationKey) -> Option<Arc<Association>> {
+        self.associations
+            .lock()
+            .expect("association registry poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    pub fn get_exact(
+        &self,
+        cluster_id: &ClusterId,
+        remote_address: &NodeAddress,
+        remote_incarnation: NodeIncarnation,
+    ) -> Option<Arc<Association>> {
+        self.get(&AssociationKey {
+            cluster_id: cluster_id.clone(),
+            local_incarnation: self.local_incarnation,
+            remote_address: remote_address.clone(),
+            remote_incarnation,
+        })
+    }
+
+    pub fn get_by_id(&self, id: AssociationId) -> Option<Arc<Association>> {
+        self.associations
+            .lock()
+            .expect("association registry poisoned")
+            .values()
+            .find(|association| association.id() == id)
+            .cloned()
     }
 
     pub fn replace_remote_incarnation(
@@ -583,6 +739,8 @@ pub enum AssociationError {
     QueueFull,
     #[error("association outbound byte budget is exhausted")]
     ByteBudgetExceeded,
+    #[error("node-wide outbound byte budget is exhausted")]
+    NodeByteBudgetExceeded,
     #[error("remote address is bound to another unreconciled or old incarnation")]
     OldOrUnreconciledIncarnation,
     #[error("incoming lanes name a conflicting AssociationId for the same peer incarnation")]
@@ -591,6 +749,8 @@ pub enum AssociationError {
     LaneReceiverConflict,
     #[error("peer protocol catalogue is invalid")]
     Catalogue(#[source] CatalogueError),
+    #[error("association reliable control rejected the command")]
+    ReliableControl(#[source] crate::control::ReliableControlError),
 }
 
 #[cfg(test)]
@@ -678,5 +838,72 @@ mod tests {
             ),
             Err(AssociationError::OldOrUnreconciledIncarnation)
         ));
+    }
+
+    #[test]
+    fn node_byte_budget_is_shared_across_associations() {
+        let config = RemotingConfig {
+            max_associations: 2,
+            max_outbound_bytes_per_association: 12,
+            max_outbound_bytes_per_node: 12,
+            ..RemotingConfig::default()
+        };
+        let manager = AssociationManager::new(
+            NodeAddress::new("local", 25519).unwrap(),
+            NodeIncarnation::new(1).unwrap(),
+            config,
+        )
+        .unwrap();
+        let cluster = ClusterId::new("test").unwrap();
+        let first = manager
+            .get_or_create(
+                cluster.clone(),
+                NodeAddress::new("first", 25520).unwrap(),
+                NodeIncarnation::new(2).unwrap(),
+            )
+            .unwrap();
+        let second = manager
+            .get_or_create(
+                cluster,
+                NodeAddress::new("second", 25521).unwrap(),
+                NodeIncarnation::new(3).unwrap(),
+            )
+            .unwrap();
+        for association in [&first, &second] {
+            for (lane, nonce) in [
+                (LaneKind::Control, 1),
+                (LaneKind::Interactive, 2),
+                (LaneKind::Bulk(0), 3),
+            ] {
+                association
+                    .attach(LaneAttachment {
+                        association_id: association.id(),
+                        key: association.key().clone(),
+                        lane,
+                        connection_nonce: nonce,
+                    })
+                    .unwrap();
+            }
+        }
+        first
+            .try_admit_interactive(Frame {
+                kind: crate::wire::FrameKind::Backpressure,
+                payload: bytes::Bytes::from_static(b"12345678"),
+            })
+            .unwrap();
+        assert!(matches!(
+            second.try_admit_interactive(Frame {
+                kind: crate::wire::FrameKind::Backpressure,
+                payload: bytes::Bytes::from_static(b"12345678"),
+            }),
+            Err(AssociationError::NodeByteBudgetExceeded)
+        ));
+        first.release_queued_bytes(8);
+        second
+            .try_admit_interactive(Frame {
+                kind: crate::wire::FrameKind::Backpressure,
+                payload: bytes::Bytes::from_static(b"12345678"),
+            })
+            .unwrap();
     }
 }

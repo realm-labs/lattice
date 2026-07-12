@@ -7,9 +7,13 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::association::{Association, LaneKind};
+use crate::control::{
+    ControlApply, ControlDispatch, control_ack_frame, decode_control_ack, decode_control_envelope,
+};
 use crate::messaging::{
     AskError, InboundDispatch, OutboundMessaging, RemoteFailure, ask_correlation, decode_ask,
-    decode_failure, decode_reply, decode_tell, failure_code, failure_frame, reply_frame,
+    decode_entity_ask, decode_entity_tell, decode_failure, decode_reply, decode_singleton_ask,
+    decode_singleton_tell, decode_tell, failure_code, failure_frame, reply_frame,
 };
 use crate::transport::{FramedReader, FramedWriter, RemotingIo};
 use crate::wire::{Frame, FrameKind, WireError};
@@ -20,6 +24,7 @@ pub struct BidirectionalLaneConfig {
     pub maximum_concurrent_inbound_asks: usize,
     pub heartbeat_interval: Duration,
     pub heartbeat_miss_limit: u32,
+    pub idle_data_connection_timeout: Duration,
 }
 
 impl BidirectionalLaneConfig {
@@ -27,7 +32,10 @@ impl BidirectionalLaneConfig {
         if self.maximum_frame_size < 8 || self.maximum_concurrent_inbound_asks == 0 {
             return Err(LaneError::InvalidLimit);
         }
-        if self.heartbeat_interval.is_zero() || self.heartbeat_miss_limit == 0 {
+        if self.heartbeat_interval.is_zero()
+            || self.heartbeat_miss_limit == 0
+            || self.idle_data_connection_timeout.is_zero()
+        {
             return Err(LaneError::InvalidHeartbeat);
         }
         Ok(self)
@@ -43,6 +51,7 @@ pub async fn run_bidirectional_lane<S>(
     stream: S,
     messaging: Arc<OutboundMessaging>,
     dispatch: Arc<dyn InboundDispatch>,
+    control_dispatch: Arc<dyn ControlDispatch>,
     config: BidirectionalLaneConfig,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<LaneExit, LaneError>
@@ -57,6 +66,7 @@ where
         stream,
         &messaging,
         dispatch,
+        control_dispatch,
         config,
         shutdown,
     )
@@ -76,6 +86,7 @@ async fn run_bidirectional_lane_inner<S>(
     stream: S,
     messaging: &OutboundMessaging,
     dispatch: Arc<dyn InboundDispatch>,
+    control_dispatch: Arc<dyn ControlDispatch>,
     config: BidirectionalLaneConfig,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<LaneExit, LaneError>
@@ -90,6 +101,10 @@ where
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_received = Instant::now();
+    let mut last_activity = Instant::now();
+    let mut idle = tokio::time::interval(config.idle_data_connection_timeout);
+    idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    idle.reset();
 
     loop {
         tokio::select! {
@@ -124,14 +139,28 @@ where
                 }).await;
                 association.release_queued_bytes(reserved_bytes);
                 result?;
+                last_activity = Instant::now();
             }
             inbound = reader.read_frame() => {
                 let frame = inbound?;
                 last_received = Instant::now();
+                last_activity = last_received;
                 match frame.kind {
                     FrameKind::Tell if matches!(lane, LaneKind::Bulk(_)) => {
                         let tell = decode_tell(&frame)?;
                         let _ = dispatch.tell(tell.target, tell.message_id, tell.payload).await;
+                    }
+                    FrameKind::EntityTell if matches!(lane, LaneKind::Bulk(_)) => {
+                        let tell = decode_entity_tell(&frame)?;
+                        let _ = dispatch
+                            .tell_entity(tell.target, tell.message_id, tell.payload)
+                            .await;
+                    }
+                    FrameKind::SingletonTell if matches!(lane, LaneKind::Bulk(_)) => {
+                        let tell = decode_singleton_tell(&frame)?;
+                        let _ = dispatch
+                            .tell_singleton(tell.target, tell.message_id, tell.payload)
+                            .await;
                     }
                     FrameKind::Ask if lane == LaneKind::Interactive => {
                         let ask = decode_ask(&frame)?;
@@ -149,6 +178,62 @@ where
                                     .ok_or(crate::messaging::RemoteMessageError::DeadlineExceeded)?;
                                 Ok::<_, crate::messaging::RemoteMessageError>(match dispatch
                                     .ask(ask.target, ask.message_id, ask.payload, deadline)
+                                    .await
+                                {
+                                    Ok(payload) => reply_frame(ask.correlation_id, payload),
+                                    Err(error) => failure_frame(&RemoteFailure {
+                                        correlation_id: ask.correlation_id,
+                                        code: failure_code(&error),
+                                        safe_detail: None,
+                                    }),
+                                })
+                            });
+                        }
+                    }
+                    FrameKind::EntityAsk if lane == LaneKind::Interactive => {
+                        let ask = decode_entity_ask(&frame)?;
+                        if asks.len() == config.maximum_concurrent_inbound_asks {
+                            writer.write_frame(&failure_frame(&RemoteFailure {
+                                correlation_id: ask.correlation_id,
+                                code: crate::messaging::RemoteFailureCode::MailboxFull,
+                                safe_detail: None,
+                            })).await?;
+                        } else {
+                            let dispatch = dispatch.clone();
+                            asks.spawn(async move {
+                                let deadline = Instant::now()
+                                    .checked_add(ask.timeout_budget)
+                                    .ok_or(crate::messaging::RemoteMessageError::DeadlineExceeded)?;
+                                Ok::<_, crate::messaging::RemoteMessageError>(match dispatch
+                                    .ask_entity(ask.target, ask.message_id, ask.payload, deadline)
+                                    .await
+                                {
+                                    Ok(payload) => reply_frame(ask.correlation_id, payload),
+                                    Err(error) => failure_frame(&RemoteFailure {
+                                        correlation_id: ask.correlation_id,
+                                        code: failure_code(&error),
+                                        safe_detail: None,
+                                    }),
+                                })
+                            });
+                        }
+                    }
+                    FrameKind::SingletonAsk if lane == LaneKind::Interactive => {
+                        let ask = decode_singleton_ask(&frame)?;
+                        if asks.len() == config.maximum_concurrent_inbound_asks {
+                            writer.write_frame(&failure_frame(&RemoteFailure {
+                                correlation_id: ask.correlation_id,
+                                code: crate::messaging::RemoteFailureCode::MailboxFull,
+                                safe_detail: None,
+                            })).await?;
+                        } else {
+                            let dispatch = dispatch.clone();
+                            asks.spawn(async move {
+                                let deadline = Instant::now()
+                                    .checked_add(ask.timeout_budget)
+                                    .ok_or(crate::messaging::RemoteMessageError::DeadlineExceeded)?;
+                                Ok::<_, crate::messaging::RemoteMessageError>(match dispatch
+                                    .ask_singleton(ask.target, ask.message_id, ask.payload, deadline)
                                     .await
                                 {
                                     Ok(payload) => reply_frame(ask.correlation_id, payload),
@@ -179,6 +264,54 @@ where
                         }).await?;
                     }
                     FrameKind::HeartbeatAck if lane == LaneKind::Control => {}
+                    FrameKind::ControlEnvelope if lane == LaneKind::Control => {
+                        let envelope = decode_control_envelope(&frame)?;
+                        match association.preview_control(&envelope) {
+                            ControlApply::Apply(_) => {
+                                control_dispatch
+                                    .apply(
+                                        association.key().clone(),
+                                        envelope.command_id,
+                                        envelope.payload.clone(),
+                                    )
+                                    .await?;
+                                let ack = association.commit_control(envelope);
+                                writer.write_frame(&control_ack_frame(ack)).await?;
+                            }
+                            ControlApply::Duplicate(anticipated) => {
+                                let ack = if association.current_control_ack().cumulative_sequence
+                                    < anticipated.cumulative_sequence
+                                {
+                                    association.commit_control(envelope)
+                                } else {
+                                    anticipated
+                                };
+                                writer.write_frame(&control_ack_frame(ack)).await?;
+                            }
+                            ControlApply::Gap(gap) => {
+                                control_dispatch
+                                    .reconcile(association.key().clone(), Some(gap))
+                                    .await?;
+                            }
+                            ControlApply::ReconcileEpoch => {
+                                control_dispatch
+                                    .reconcile(association.key().clone(), None)
+                                    .await?;
+                            }
+                        }
+                    }
+                    FrameKind::ControlAck if lane == LaneKind::Control => {
+                        association.acknowledge_control(decode_control_ack(&frame)?)?;
+                    }
+                    FrameKind::CoordinatorEvent if lane == LaneKind::Control => {
+                        control_dispatch
+                            .apply(
+                                association.key().clone(),
+                                crate::control::CommandId::generate(),
+                                frame.payload,
+                            )
+                            .await?;
+                    }
                     FrameKind::Backpressure => {}
                     FrameKind::Close => return Ok(LaneExit::RemoteClose),
                     kind => return Err(LaneError::UnexpectedFrame { lane, kind }),
@@ -195,6 +328,14 @@ where
                     payload: Bytes::new(),
                 }).await?;
             }
+            _ = idle.tick(), if lane != LaneKind::Control => {
+                if Instant::now().duration_since(last_activity)
+                    >= config.idle_data_connection_timeout
+                {
+                    writer.flush().await?;
+                    return Ok(LaneExit::Idle);
+                }
+            }
         }
     }
 }
@@ -204,6 +345,7 @@ pub enum LaneExit {
     Shutdown,
     QueueClosed,
     RemoteClose,
+    Idle,
 }
 
 #[derive(Debug, Error)]
@@ -220,6 +362,12 @@ pub enum LaneError {
     Join(#[source] tokio::task::JoinError),
     #[error("inbound actor dispatch failed")]
     Dispatch(#[from] crate::messaging::RemoteMessageError),
+    #[error("reliable control dispatch failed")]
+    ControlDispatch(#[from] crate::control::ControlDispatchError),
+    #[error("reliable control state rejected a frame")]
+    ReliableControl(#[from] crate::control::ReliableControlError),
+    #[error("association rejected a reliable control acknowledgement")]
+    Association(#[from] crate::association::AssociationError),
     #[error("lane socket failed")]
     Wire(#[source] WireError),
 }
@@ -350,11 +498,13 @@ mod tests {
                     stream,
                     messaging,
                     Arc::new(EchoDispatch),
+                    Arc::new(crate::control::RejectControlDispatch),
                     BidirectionalLaneConfig {
                         maximum_frame_size: 4096,
                         maximum_concurrent_inbound_asks: 8,
                         heartbeat_interval: Duration::from_millis(100),
                         heartbeat_miss_limit: 10,
+                        idle_data_connection_timeout: Duration::from_secs(60),
                     },
                     &mut server_shutdown,
                 )
@@ -375,11 +525,13 @@ mod tests {
                     stream,
                     messaging,
                     Arc::new(EchoDispatch),
+                    Arc::new(crate::control::RejectControlDispatch),
                     BidirectionalLaneConfig {
                         maximum_frame_size: 4096,
                         maximum_concurrent_inbound_asks: 8,
                         heartbeat_interval: Duration::from_millis(100),
                         heartbeat_miss_limit: 10,
+                        idle_data_connection_timeout: Duration::from_secs(60),
                     },
                     &mut client_shutdown,
                 )

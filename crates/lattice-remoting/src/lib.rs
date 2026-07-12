@@ -16,18 +16,22 @@ pub use association::{
 };
 pub use config::{RemotingConfig, RemotingConfigError};
 pub use control::{
-    CommandId, ControlAck, ControlApply, ControlEnvelope, ControlGap, ReliableControl,
+    CommandId, ControlAck, ControlApply, ControlDispatch, ControlDispatchError, ControlEnvelope,
+    ControlGap, RejectControlDispatch, ReliableControl, control_ack_frame, control_envelope_frame,
+    decode_control_ack, decode_control_envelope,
 };
-pub use endpoint::{EndpointError, RemotingEndpoint};
+pub use endpoint::{EndpointError, EndpointSecurity, RemotingEndpoint};
 pub use handshake::{
     FeatureBits, Handshake, HandshakeAck, HandshakeError, HandshakeValidator, NodeIdentity,
 };
 pub use lane::{BidirectionalLaneConfig, LaneExit, run_bidirectional_lane};
 pub use messaging::{
     AskError, CorrelationId, ExactActorTarget, InboundAsk, InboundConnectionError, InboundDispatch,
-    InboundTell, OutboundMessaging, RemoteFailure, RemoteFailureCode, RemoteMessageError,
-    SenderIdentity, TellError, ask_correlation, decode_ask, decode_failure, decode_reply,
-    decode_tell, failure_frame, reply_frame, serve_inbound_connection,
+    InboundEntityAsk, InboundEntityTell, InboundSingletonAsk, InboundSingletonTell, InboundTell,
+    LogicalEntityTarget, LogicalSingletonTarget, OutboundMessaging, RemoteFailure,
+    RemoteFailureCode, RemoteMessageError, SenderIdentity, TellError, ask_correlation, decode_ask,
+    decode_entity_ask, decode_entity_tell, decode_failure, decode_reply, decode_singleton_ask,
+    decode_singleton_tell, decode_tell, failure_frame, reply_frame, serve_inbound_connection,
 };
 pub use protocol::{
     CatalogueDecision, ProtocolCatalogue, ProtocolDescriptor, ProtocolFingerprint, catalogue_frame,
@@ -38,5 +42,6 @@ pub use transport::{
 };
 pub use watch::{
     CurrentActivationResolver, TerminatedReason, WatchCommand, WatchError, WatchId, WatchRegistry,
+    WatchStatus, decode_watch_command, encode_watch_command, is_watch_control,
 };
 pub use wire::{Frame, FrameCodec, FrameKind, WireError};

@@ -2,13 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use lattice_core::actor_ref::{ActorRef, EntityRef, NodeIncarnation, SingletonRef};
 use thiserror::Error;
 
 use crate::association::AssociationId;
 use crate::messaging::ExactActorTarget;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct WatchId {
     watcher_boot: u128,
     sequence: u64,
@@ -27,7 +30,7 @@ impl WatchId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TerminatedReason {
     Stopped,
     Passivated,
@@ -37,7 +40,7 @@ pub enum TerminatedReason {
     ActivationChanged,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WatchCommand {
     Watch {
         watch_id: WatchId,
@@ -55,6 +58,66 @@ pub enum WatchCommand {
         target: ExactActorTarget,
         reason: TerminatedReason,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchStatus {
+    Pending,
+    Active,
+    Terminated,
+    Unknown,
+}
+
+const WATCH_CONTROL_MAGIC: &[u8; 4] = b"LWCH";
+pub const WATCH_CONTROL_GENERATION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WatchControlEnvelope {
+    generation: u32,
+    command: WatchCommand,
+}
+
+pub fn is_watch_control(payload: &[u8]) -> bool {
+    payload.starts_with(WATCH_CONTROL_MAGIC)
+}
+
+pub fn encode_watch_command(
+    command: &WatchCommand,
+    maximum_payload: usize,
+) -> Result<Bytes, WatchError> {
+    if maximum_payload <= WATCH_CONTROL_MAGIC.len() {
+        return Err(WatchError::ZeroLimit);
+    }
+    let encoded = serde_json::to_vec(&WatchControlEnvelope {
+        generation: WATCH_CONTROL_GENERATION,
+        command: command.clone(),
+    })
+    .map_err(|_| WatchError::InvalidCommand)?;
+    if encoded.len().saturating_add(WATCH_CONTROL_MAGIC.len()) > maximum_payload {
+        return Err(WatchError::PayloadTooLarge);
+    }
+    let mut payload = Vec::with_capacity(WATCH_CONTROL_MAGIC.len() + encoded.len());
+    payload.extend_from_slice(WATCH_CONTROL_MAGIC);
+    payload.extend_from_slice(&encoded);
+    Ok(Bytes::from(payload))
+}
+
+pub fn decode_watch_command(
+    payload: &[u8],
+    maximum_payload: usize,
+) -> Result<WatchCommand, WatchError> {
+    if maximum_payload <= WATCH_CONTROL_MAGIC.len() || payload.len() > maximum_payload {
+        return Err(WatchError::PayloadTooLarge);
+    }
+    let encoded = payload
+        .strip_prefix(WATCH_CONTROL_MAGIC)
+        .ok_or(WatchError::InvalidCommand)?;
+    let envelope: WatchControlEnvelope =
+        serde_json::from_slice(encoded).map_err(|_| WatchError::InvalidCommand)?;
+    if envelope.generation != WATCH_CONTROL_GENERATION {
+        return Err(WatchError::GenerationMismatch);
+    }
+    Ok(envelope.command)
 }
 
 #[derive(Debug, Clone)]
@@ -160,10 +223,10 @@ impl WatchRegistry {
         true
     }
 
-    pub fn unwatch(&mut self, watch_id: WatchId) -> Option<WatchCommand> {
+    pub fn unwatch(&mut self, watch_id: WatchId) -> Option<(AssociationId, WatchCommand)> {
         self.desired
             .remove(&watch_id)
-            .map(|_| WatchCommand::Unwatch { watch_id })
+            .map(|desired| (desired.association_id, WatchCommand::Unwatch { watch_id }))
     }
 
     pub fn receive_unwatch(&mut self, association_id: AssociationId, watch_id: WatchId) -> bool {
@@ -214,15 +277,7 @@ impl WatchRegistry {
             return false;
         }
         self.desired.remove(&watch_id);
-        self.terminal_delivered.insert(watch_id);
-        while self.terminal_delivered.len() > self.maximum_desired {
-            if let Some(oldest) = self.terminal_delivered.pop_first()
-                && oldest == watch_id
-            {
-                self.terminal_delivered.insert(oldest);
-                break;
-            }
-        }
+        self.remember_terminal(watch_id);
         true
     }
 
@@ -247,12 +302,54 @@ impl WatchRegistry {
             })
             .collect::<Vec<_>>();
         ids.into_iter()
-            .filter_map(|id| self.desired.remove(&id).map(|desired| (id, desired.target)))
+            .filter_map(|id| {
+                let desired = self.desired.remove(&id)?;
+                self.remember_terminal(id);
+                Some((id, desired.target))
+            })
             .collect()
+    }
+
+    fn remember_terminal(&mut self, watch_id: WatchId) {
+        self.terminal_delivered.insert(watch_id);
+        while self.terminal_delivered.len() > self.maximum_desired {
+            if let Some(oldest) = self.terminal_delivered.pop_first()
+                && oldest == watch_id
+            {
+                self.terminal_delivered.insert(oldest);
+                break;
+            }
+        }
     }
 
     pub fn target_count(&self) -> usize {
         self.target_watches.values().map(BTreeMap::len).sum()
+    }
+
+    pub fn desired_count(&self) -> usize {
+        self.desired.len()
+    }
+
+    pub fn is_acknowledged(&self, watch_id: WatchId) -> bool {
+        self.desired
+            .get(&watch_id)
+            .is_some_and(|watch| watch.acknowledged)
+    }
+
+    pub fn terminal_was_delivered(&self, watch_id: WatchId) -> bool {
+        self.terminal_delivered.contains(&watch_id)
+    }
+
+    pub fn status(&self, watch_id: WatchId) -> WatchStatus {
+        if self.terminal_delivered.contains(&watch_id) {
+            WatchStatus::Terminated
+        } else {
+            match self.desired.get(&watch_id) {
+                Some(watch) if watch.acknowledged => WatchStatus::Active,
+                Some(_) => WatchStatus::Pending,
+                None => WatchStatus::Unknown,
+            }
+        }
     }
 }
 
@@ -285,6 +382,10 @@ pub enum WatchError {
     Unavailable,
     #[error("watch command is invalid for current state")]
     InvalidCommand,
+    #[error("watch control command exceeds its payload bound")]
+    PayloadTooLarge,
+    #[error("watch control schema generation differs")]
+    GenerationMismatch,
 }
 
 #[cfg(test)]
@@ -340,5 +441,34 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn watch_control_codec_is_bounded_and_generation_tagged() {
+        let target = actor(1);
+        let command = WatchCommand::Watch {
+            watch_id: WatchId::new(7, 9).unwrap(),
+            target: ExactActorTarget::from(&target),
+        };
+        let encoded = encode_watch_command(&command, 4096).unwrap();
+        assert!(is_watch_control(&encoded));
+        assert_eq!(decode_watch_command(&encoded, 4096).unwrap(), command);
+        assert_eq!(
+            decode_watch_command(&encoded, 4).unwrap_err(),
+            WatchError::PayloadTooLarge
+        );
+    }
+
+    #[test]
+    fn coordinator_node_down_is_terminal_once_for_exact_incarnation() {
+        let association = AssociationId::new(9).unwrap();
+        let target = actor(1);
+        let mut registry = WatchRegistry::new(8, 8).unwrap();
+        let (watch_id, _) = registry.watch(association, &target).unwrap();
+        registry.receive_ack(watch_id, &ExactActorTarget::from(&target));
+
+        assert_eq!(registry.node_down(target.node_incarnation()).len(), 1);
+        assert_eq!(registry.status(watch_id), WatchStatus::Terminated);
+        assert!(registry.node_down(target.node_incarnation()).is_empty());
     }
 }

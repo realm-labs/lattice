@@ -7,12 +7,12 @@ use bytes::BytesMut;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
-use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_actor::traits::{Actor, Handler, Message, StopReason};
 use lattice_actor::{DecodeError, EncodeError, WireCodec, WireSchema, actor_protocol};
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId, RecipientRef};
 use lattice_core::id::ActorId;
-use lattice_remoting::{NodeIdentity, RemotingConfig};
+use lattice_remoting::{NodeIdentity, RemotingConfig, WatchStatus};
 
 use crate::{LatticeService, NodeConfig};
 
@@ -192,6 +192,28 @@ async fn typed_recipient_asks_exact_remote_activation_over_tcp() {
         .await
         .unwrap();
     assert_eq!(reply, Pong(42));
+    let watch_id = recipient.watch().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if client.watch_status(watch_id) == WatchStatus::Active {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.stop(StopReason::Requested).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if client.watch_status(watch_id) == WatchStatus::Terminated {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     client.shutdown().await.unwrap();
     server.shutdown().await.unwrap();
 }

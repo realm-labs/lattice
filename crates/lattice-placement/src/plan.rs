@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use lattice_core::actor_ref::EntityType;
+use lattice_core::actor_ref::{EntityType, NodeIncarnation};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -33,6 +33,8 @@ pub struct RebalanceMove {
     pub target: NodeKey,
     pub estimated_weight: u64,
     pub progress: MoveProgress,
+    pub barrier_revision: Option<Revision>,
+    pub barrier_sessions: BTreeSet<NodeIncarnation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +44,7 @@ pub struct RebalancePlan {
     pub reason: PlanReason,
     pub coordinator_term: CoordinatorTerm,
     pub base_revision: Revision,
+    pub revision: Revision,
     pub policy_id: String,
     pub policy_version: u32,
     pub status: PlanStatus,
@@ -90,6 +93,7 @@ impl RebalancePlan {
             reason: PlanReason::from(&proposal.trigger),
             coordinator_term,
             base_revision: proposal.base_revision,
+            revision: Revision::new(1).expect("one is a valid plan revision"),
             policy_id: proposal.policy_id.to_owned(),
             policy_version: proposal.policy_version,
             status: PlanStatus::Planned,
@@ -103,6 +107,8 @@ impl RebalancePlan {
                     target: movement.target,
                     estimated_weight: movement.estimated_weight,
                     progress: MoveProgress::Pending,
+                    barrier_revision: None,
+                    barrier_sessions: BTreeSet::new(),
                 })
                 .collect(),
         })
@@ -131,6 +137,25 @@ impl RebalancePlan {
             return Err(PlanError::StaleGeneration);
         }
         movement.progress = MoveProgress::Handoff;
+        Ok(())
+    }
+
+    pub fn install_barrier(
+        &mut self,
+        shard_id: ShardId,
+        revision: Revision,
+        sessions: BTreeSet<NodeIncarnation>,
+    ) -> Result<(), PlanError> {
+        let movement = self
+            .moves
+            .iter_mut()
+            .find(|movement| movement.shard_id == shard_id)
+            .ok_or(PlanError::UnknownShard)?;
+        if movement.progress != MoveProgress::Handoff || movement.barrier_revision.is_some() {
+            return Err(PlanError::IllegalProgress);
+        }
+        movement.barrier_revision = Some(revision);
+        movement.barrier_sessions = sessions;
         Ok(())
     }
 

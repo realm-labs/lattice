@@ -1,20 +1,23 @@
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use thiserror::Error;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Semaphore, broadcast, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::association::{
     Association, AssociationError, AssociationManager, LaneAttachment, LaneKind,
 };
 use crate::config::RemotingConfig;
+use crate::control::{ControlDispatch, RejectControlDispatch};
 use crate::handshake::{FeatureBits, Handshake, HandshakeValidator, NodeIdentity};
 use crate::lane::{BidirectionalLaneConfig, run_bidirectional_lane};
 use crate::messaging::{InboundDispatch, OutboundMessaging};
 use crate::protocol::ProtocolDescriptor;
 use crate::transport::{
-    FramedConnection, NegotiationError, bind_tcp, connect_tcp, negotiate_inbound,
-    negotiate_outbound,
+    FramedConnection, NegotiationError, bind_tcp, connect_tcp, connect_tls, negotiate_inbound,
+    negotiate_outbound, verify_peer_certificate_identity,
 };
 use crate::wire::{FrameCodec, WireError};
 
@@ -24,10 +27,77 @@ pub struct RemotingEndpoint {
     associations: Arc<AssociationManager>,
     messaging: Arc<OutboundMessaging>,
     dispatch: Arc<dyn InboundDispatch>,
+    control_dispatch: Arc<dyn ControlDispatch>,
     catalogue: Vec<ProtocolDescriptor>,
     connections: Arc<Semaphore>,
     shutdown_tx: watch::Sender<bool>,
+    disconnect_tx: broadcast::Sender<crate::AssociationId>,
     tasks: Mutex<Vec<JoinHandle<Result<(), EndpointError>>>>,
+    security: Option<EndpointSecurity>,
+    connect_lock: tokio::sync::Mutex<()>,
+}
+
+#[derive(Clone)]
+pub struct EndpointSecurity {
+    pub client: Arc<tokio_rustls::rustls::ClientConfig>,
+    pub server: Arc<tokio_rustls::rustls::ServerConfig>,
+    pub server_name: String,
+}
+
+enum EndpointStream {
+    Plain(tokio::net::TcpStream),
+    TlsClient(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
+    TlsServer(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
+}
+
+impl tokio::io::AsyncRead for EndpointStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::TlsClient(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::TlsServer(stream) => Pin::new(stream).poll_read(context, buffer),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for EndpointStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(context, buffer),
+            Self::TlsClient(stream) => Pin::new(stream).poll_write(context, buffer),
+            Self::TlsServer(stream) => Pin::new(stream).poll_write(context, buffer),
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(context),
+            Self::TlsClient(stream) => Pin::new(stream).poll_flush(context),
+            Self::TlsServer(stream) => Pin::new(stream).poll_flush(context),
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::TlsClient(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::TlsServer(stream) => Pin::new(stream).poll_shutdown(context),
+        }
+    }
 }
 
 impl RemotingEndpoint {
@@ -39,22 +109,77 @@ impl RemotingEndpoint {
         dispatch: Arc<dyn InboundDispatch>,
         catalogue: Vec<ProtocolDescriptor>,
     ) -> Result<Self, EndpointError> {
+        Self::new_with_control(
+            local,
+            config,
+            associations,
+            messaging,
+            dispatch,
+            Arc::new(RejectControlDispatch),
+            catalogue,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_control(
+        local: NodeIdentity,
+        config: RemotingConfig,
+        associations: Arc<AssociationManager>,
+        messaging: Arc<OutboundMessaging>,
+        dispatch: Arc<dyn InboundDispatch>,
+        control_dispatch: Arc<dyn ControlDispatch>,
+        catalogue: Vec<ProtocolDescriptor>,
+    ) -> Result<Self, EndpointError> {
+        Self::new_with_control_and_security(
+            local,
+            config,
+            associations,
+            messaging,
+            dispatch,
+            control_dispatch,
+            catalogue,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_control_and_security(
+        local: NodeIdentity,
+        config: RemotingConfig,
+        associations: Arc<AssociationManager>,
+        messaging: Arc<OutboundMessaging>,
+        dispatch: Arc<dyn InboundDispatch>,
+        control_dispatch: Arc<dyn ControlDispatch>,
+        catalogue: Vec<ProtocolDescriptor>,
+        security: Option<EndpointSecurity>,
+    ) -> Result<Self, EndpointError> {
         config.validate().map_err(AssociationError::InvalidConfig)?;
+        if security
+            .as_ref()
+            .is_some_and(|security| security.server_name.is_empty())
+        {
+            return Err(EndpointError::InvalidSecurity);
+        }
         if catalogue.len() > config.max_protocols_per_peer {
             return Err(EndpointError::ProtocolLimit);
         }
         let connection_limit = config.required_socket_budget().saturating_sub(1);
         let (shutdown_tx, _) = watch::channel(false);
+        let (disconnect_tx, _) = broadcast::channel(config.max_associations);
         Ok(Self {
             local,
             config,
             associations,
             messaging,
             dispatch,
+            control_dispatch,
             catalogue,
             connections: Arc::new(Semaphore::new(connection_limit)),
             shutdown_tx,
+            disconnect_tx,
             tasks: Mutex::new(Vec::new()),
+            security,
+            connect_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -73,6 +198,7 @@ impl RemotingEndpoint {
         self: &Arc<Self>,
         peer: NodeIdentity,
     ) -> Result<Arc<Association>, EndpointError> {
+        let _connection_guard = self.connect_lock.lock().await;
         if !self
             .associations
             .should_dial(&peer.address, peer.incarnation)
@@ -84,6 +210,9 @@ impl RemotingEndpoint {
             peer.address.clone(),
             peer.incarnation,
         )?;
+        if association.state() == crate::association::AssociationState::Active {
+            return Ok(association);
+        }
         for lane in self.lanes() {
             self.connect_lane(association.clone(), peer.clone(), lane)
                 .await?;
@@ -106,6 +235,16 @@ impl RemotingEndpoint {
             }
         }
         Ok(())
+    }
+
+    pub fn disconnect_association(
+        &self,
+        association_id: crate::AssociationId,
+    ) -> Result<(), EndpointError> {
+        self.disconnect_tx
+            .send(association_id)
+            .map(|_| ())
+            .map_err(|_| EndpointError::NoActiveConnections)
     }
 
     async fn connect_lane(
@@ -131,18 +270,16 @@ impl RemotingEndpoint {
             let mut backoff = endpoint.config.reconnect_backoff_min;
             loop {
                 let (stream, nonce) = current.take().expect("lane connection is installed");
-                let result = run_bidirectional_lane(
-                    association.clone(),
-                    lane,
-                    nonce,
-                    &mut receiver,
-                    stream,
-                    endpoint.messaging.clone(),
-                    endpoint.dispatch.clone(),
-                    endpoint.lane_config(),
-                    &mut shutdown,
-                )
-                .await;
+                let result = endpoint
+                    .run_lane_connection(
+                        association.clone(),
+                        lane,
+                        nonce,
+                        &mut receiver,
+                        stream,
+                        &mut shutdown,
+                    )
+                    .await;
                 if *shutdown.borrow() {
                     return Ok(());
                 }
@@ -181,12 +318,37 @@ impl RemotingEndpoint {
         association: &Association,
         peer: &NodeIdentity,
         lane: LaneKind,
-    ) -> Result<(tokio::net::TcpStream, u128), EndpointError> {
+    ) -> Result<(EndpointStream, u128), EndpointError> {
         let codec = FrameCodec::new(self.config.max_frame_size)?;
-        let mut connection = tokio::time::timeout(
-            self.config.connect_timeout,
-            connect_tcp(&peer.address, codec),
-        )
+        let security = self.security.clone();
+        let address = peer.address.clone();
+        let expected_peer = peer.clone();
+        let mut connection = tokio::time::timeout(self.config.connect_timeout, async move {
+            match security {
+                Some(security) => connect_tls(
+                    &address,
+                    security.server_name,
+                    security.client,
+                    &expected_peer,
+                    codec,
+                )
+                .await
+                .map(|connection| {
+                    FramedConnection::new(
+                        EndpointStream::TlsClient(connection.into_inner()),
+                        FrameCodec::new(self.config.max_frame_size)
+                            .expect("validated endpoint frame size"),
+                    )
+                }),
+                None => connect_tcp(&address, codec).await.map(|connection| {
+                    FramedConnection::new(
+                        EndpointStream::Plain(connection.into_inner()),
+                        FrameCodec::new(self.config.max_frame_size)
+                            .expect("validated endpoint frame size"),
+                    )
+                }),
+            }
+        })
         .await
         .map_err(|_| EndpointError::ConnectTimeout)??;
         let nonce = uuid::Uuid::new_v4().as_u128();
@@ -215,6 +377,13 @@ impl RemotingEndpoint {
             lane,
             connection_nonce: nonce,
         })?;
+        if lane == LaneKind::Control
+            && association.state() == crate::association::AssociationState::Active
+        {
+            for frame in association.replay_control_frames() {
+                association.try_admit_control(frame)?;
+            }
+        }
         Ok((connection.into_inner(), nonce))
     }
 
@@ -234,7 +403,7 @@ impl RemotingEndpoint {
                 }
                 completed = connections.join_next(), if !connections.is_empty() => {
                     if let Some(result) = completed {
-                        result.map_err(EndpointError::Join)??;
+                        let _connection_result = result.map_err(EndpointError::Join)?;
                     }
                 }
                 accepted = listener.accept() => {
@@ -250,7 +419,7 @@ impl RemotingEndpoint {
             }
         }
         while let Some(result) = connections.join_next().await {
-            result.map_err(EndpointError::Join)??;
+            let _connection_result = result.map_err(EndpointError::Join)?;
         }
         Ok(())
     }
@@ -264,6 +433,23 @@ impl RemotingEndpoint {
             self.config.max_frame_size,
             self.config.bulk_stripes,
         )?;
+        stream.set_nodelay(true).map_err(WireError::Io)?;
+        let (stream, peer_certificate) = if let Some(security) = &self.security {
+            let stream = tokio_rustls::TlsAcceptor::from(security.server.clone())
+                .accept(stream)
+                .await
+                .map_err(|_| WireError::Tls("server handshake failed"))?;
+            let certificate = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|certificates| certificates.first())
+                .map(|certificate| certificate.as_ref().to_vec())
+                .ok_or(WireError::Tls("peer certificate missing"))?;
+            (EndpointStream::TlsServer(stream), Some(certificate))
+        } else {
+            (EndpointStream::Plain(stream), None)
+        };
         let mut connection =
             FramedConnection::new(stream, FrameCodec::new(self.config.max_frame_size)?);
         let (handshake, peer_catalogue) = negotiate_inbound(
@@ -273,6 +459,9 @@ impl RemotingEndpoint {
             self.config.max_protocols_per_peer,
         )
         .await?;
+        if let Some(certificate) = peer_certificate {
+            verify_peer_certificate_identity(&certificate, &handshake.source)?;
+        }
         if self
             .associations
             .should_dial(&handshake.source.address, handshake.source.incarnation)
@@ -294,22 +483,27 @@ impl RemotingEndpoint {
             lane: handshake.lane,
             connection_nonce: handshake.connection_nonce,
         })?;
+        if handshake.lane == LaneKind::Control
+            && association.state() == crate::association::AssociationState::Active
+        {
+            for frame in association.replay_control_frames() {
+                association.try_admit_control(frame)?;
+            }
+        }
         let mut receiver = association
             .take_lane_receiver(handshake.lane)
             .ok_or(EndpointError::LaneAlreadyRunning(handshake.lane))?;
         let mut shutdown = self.shutdown_tx.subscribe();
-        let result = run_bidirectional_lane(
-            association.clone(),
-            handshake.lane,
-            handshake.connection_nonce,
-            &mut receiver,
-            connection.into_inner(),
-            self.messaging.clone(),
-            self.dispatch.clone(),
-            self.lane_config(),
-            &mut shutdown,
-        )
-        .await;
+        let result = self
+            .run_lane_connection(
+                association.clone(),
+                handshake.lane,
+                handshake.connection_nonce,
+                &mut receiver,
+                connection.into_inner(),
+                &mut shutdown,
+            )
+            .await;
         association.return_lane_receiver(handshake.lane, receiver)?;
         result?;
         Ok(())
@@ -321,12 +515,46 @@ impl RemotingEndpoint {
             .chain((0..self.config.bulk_stripes).map(|index| LaneKind::Bulk(index as u8)))
     }
 
+    async fn run_lane_connection(
+        &self,
+        association: Arc<Association>,
+        lane: LaneKind,
+        nonce: u128,
+        receiver: &mut tokio::sync::mpsc::Receiver<crate::Frame>,
+        stream: EndpointStream,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<crate::LaneExit, crate::lane::LaneError> {
+        let association_id = association.id();
+        let mut disconnect = self.disconnect_tx.subscribe();
+        let result = tokio::select! {
+            result = run_bidirectional_lane(
+                association.clone(),
+                lane,
+                nonce,
+                receiver,
+                stream,
+                self.messaging.clone(),
+                self.dispatch.clone(),
+                self.control_dispatch.clone(),
+                self.lane_config(),
+                shutdown,
+            ) => result,
+            () = wait_for_disconnect(&mut disconnect, association_id) => {
+                Ok(crate::LaneExit::RemoteClose)
+            }
+        };
+        association.detach(lane, nonce);
+        self.messaging.fail_association(association_id);
+        result
+    }
+
     fn lane_config(&self) -> BidirectionalLaneConfig {
         BidirectionalLaneConfig {
             maximum_frame_size: self.config.max_frame_size,
             maximum_concurrent_inbound_asks: self.config.max_pending_asks,
             heartbeat_interval: self.config.heartbeat_interval,
             heartbeat_miss_limit: self.config.heartbeat_miss_limit,
+            idle_data_connection_timeout: self.config.idle_data_connection_timeout,
         }
     }
 
@@ -368,12 +596,30 @@ pub enum EndpointError {
     LaneAlreadyRunning(LaneKind),
     #[error("local actor protocol catalogue exceeds its configured bound")]
     ProtocolLimit,
+    #[error("endpoint TLS configuration is invalid")]
+    InvalidSecurity,
     #[error("association endpoint task cap reached")]
     TaskLimit,
     #[error("association endpoint task failed")]
     Join(#[source] tokio::task::JoinError),
     #[error("association endpoint shutdown timed out")]
     ShutdownTimeout,
+    #[error("association endpoint has no active connections")]
+    NoActiveConnections,
+}
+
+async fn wait_for_disconnect(
+    receiver: &mut broadcast::Receiver<crate::AssociationId>,
+    association_id: crate::AssociationId,
+) {
+    loop {
+        match receiver.recv().await {
+            Ok(received) if received == association_id => return,
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(_))
+            | Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -388,8 +634,38 @@ mod tests {
 
     use crate::messaging::{ExactActorTarget, RemoteMessageError, SenderIdentity};
     use crate::protocol::ProtocolFingerprint;
+    use crate::{CommandId, ControlDispatchError};
 
     struct EchoDispatch;
+
+    #[derive(Default)]
+    struct RecordingControl {
+        applied: Mutex<Vec<Bytes>>,
+    }
+
+    #[async_trait]
+    impl ControlDispatch for RecordingControl {
+        async fn apply(
+            &self,
+            _association: crate::AssociationKey,
+            _command_id: CommandId,
+            payload: Bytes,
+        ) -> Result<(), ControlDispatchError> {
+            self.applied
+                .lock()
+                .expect("recording control poisoned")
+                .push(payload);
+            Ok(())
+        }
+
+        async fn reconcile(
+            &self,
+            _association: crate::AssociationKey,
+            _gap: Option<crate::ControlGap>,
+        ) -> Result<(), ControlDispatchError> {
+            Ok(())
+        }
+    }
 
     #[async_trait]
     impl InboundDispatch for EchoDispatch {
@@ -417,6 +693,14 @@ mod tests {
     }
 
     fn endpoint(identity: NodeIdentity, protocol: ProtocolDescriptor) -> Arc<RemotingEndpoint> {
+        endpoint_with_control(identity, protocol, Arc::new(RejectControlDispatch))
+    }
+
+    fn endpoint_with_control(
+        identity: NodeIdentity,
+        protocol: ProtocolDescriptor,
+        control: Arc<dyn ControlDispatch>,
+    ) -> Arc<RemotingEndpoint> {
         let config = RemotingConfig {
             heartbeat_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(2),
@@ -431,12 +715,13 @@ mod tests {
             .unwrap(),
         );
         Arc::new(
-            RemotingEndpoint::new(
+            RemotingEndpoint::new_with_control(
                 identity,
                 config,
                 manager,
                 Arc::new(OutboundMessaging::new(32).unwrap()),
                 Arc::new(EchoDispatch),
+                control,
                 vec![protocol],
             )
             .unwrap(),
@@ -472,8 +757,10 @@ mod tests {
             protocol_id,
             fingerprint,
         };
+        let control = Arc::new(RecordingControl::default());
         let client = endpoint(client_identity.clone(), descriptor.clone());
-        let server = endpoint(server_identity.clone(), descriptor.clone());
+        let server =
+            endpoint_with_control(server_identity.clone(), descriptor.clone(), control.clone());
         server.bind().await.unwrap();
         let association = client.connect_peer(server_identity.clone()).await.unwrap();
         assert_eq!(
@@ -503,7 +790,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, Bytes::from_static(b"hello"));
-        server.shutdown().await.unwrap();
+        association
+            .admit_control_command(Bytes::from_static(b"before-reconnect"))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while association.control_outbox_len() != 0
+                || control
+                    .applied
+                    .lock()
+                    .expect("recording control poisoned")
+                    .len()
+                    != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.disconnect_association(association.id()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while association.state() != crate::association::AssociationState::Reconnecting {
                 tokio::task::yield_now().await;
@@ -511,8 +815,6 @@ mod tests {
         })
         .await
         .unwrap();
-        let replacement = endpoint(server_identity, descriptor);
-        replacement.bind().await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while association.state() != crate::association::AssociationState::Active {
                 tokio::task::yield_now().await;
@@ -534,7 +836,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, Bytes::from_static(b"again"));
+        association
+            .admit_control_command(Bytes::from_static(b"after-reconnect"))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while association.control_outbox_len() != 0
+                || control
+                    .applied
+                    .lock()
+                    .expect("recording control poisoned")
+                    .len()
+                    != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         client.shutdown().await.unwrap();
-        replacement.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
     }
 }

@@ -14,6 +14,8 @@ pub enum ServiceError {
     Endpoint(#[source] lattice_remoting::EndpointError),
     #[error("watch registry construction failed")]
     Watch(#[source] lattice_remoting::WatchError),
+    #[error("service reliable control dispatch construction failed")]
+    Control(#[source] lattice_remoting::ControlDispatchError),
     #[error("service supervised task capacity reached")]
     TaskCapacity,
     #[error("service shutdown exceeded its deadline")]

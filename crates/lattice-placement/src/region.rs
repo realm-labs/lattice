@@ -13,7 +13,7 @@ use crate::types::{
 
 pub const XXH3_V1_SEED: u64 = 0x4c41_5454_4943_4531;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityConfig {
     pub entity_type: EntityType,
     pub protocol_id: ProtocolId,
@@ -73,6 +73,21 @@ impl EntityConfig {
         self.fingerprint
     }
 
+    pub fn validate(&self) -> Result<(), RegionError> {
+        let rebuilt = Self::new(
+            self.entity_type.clone(),
+            self.protocol_id,
+            self.shard_count,
+            self.allocation_policy_id.clone(),
+            self.allocation_policy_version,
+            self.hard_constraints.clone(),
+        )?;
+        if rebuilt.fingerprint != self.fingerprint {
+            return Err(RegionError::InvalidConfig);
+        }
+        Ok(())
+    }
+
     pub fn shard_for(&self, entity_id: &EntityId) -> ShardId {
         ShardId::new(
             (xxh3_64_with_seed(entity_id.as_bytes(), XXH3_V1_SEED) % u64::from(self.shard_count))
@@ -106,9 +121,17 @@ pub struct ShardHome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferedMessage {
     pub entity_id: EntityId,
+    pub message_id: u64,
+    pub mode: BufferedMessageMode,
     pub payload: Bytes,
     pub admitted_at: MonotonicTime,
     pub expires_at: MonotonicTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferedMessageMode {
+    Tell,
+    Ask { deadline: MonotonicTime },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,9 +261,14 @@ impl ShardRegion {
     pub fn route(
         &mut self,
         entity_id: EntityId,
+        message_id: u64,
+        mode: BufferedMessageMode,
         payload: Bytes,
         now: MonotonicTime,
     ) -> Result<RouteDecision, RegionError> {
+        if message_id == 0 {
+            return Err(RegionError::InvalidMessage);
+        }
         let shard_id = self.entity.shard_for(&entity_id);
         if let Some(home) = self.homes.get(&shard_id)
             && home.state == PlacementSlotState::Running
@@ -264,11 +292,18 @@ impl ShardRegion {
         {
             return Err(RegionError::BufferFull);
         }
-        let expires_at = now
+        let residence_deadline = now
             .checked_add(std::time::Duration::from_millis(
                 self.config.maximum_buffer_age_millis,
             ))
             .ok_or(RegionError::InvalidTime)?;
+        let expires_at = match mode {
+            BufferedMessageMode::Tell => residence_deadline,
+            BufferedMessageMode::Ask { deadline } => deadline.min(residence_deadline),
+        };
+        if expires_at <= now {
+            return Err(RegionError::MessageExpired);
+        }
         self.buffered_messages += 1;
         self.buffered_bytes += payload.len();
         self.buffers
@@ -276,6 +311,8 @@ impl ShardRegion {
             .or_default()
             .push_back(BufferedMessage {
                 entity_id,
+                message_id,
+                mode,
                 payload,
                 admitted_at: now,
                 expires_at,
@@ -348,7 +385,7 @@ impl HandoffBarrier {
         session: NodeIncarnation,
         revision: Revision,
     ) -> Result<(), RegionError> {
-        if revision != self.revision || !self.required_sessions.contains(&session) {
+        if revision < self.revision || !self.required_sessions.contains(&session) {
             return Err(RegionError::UnexpectedBarrierMember);
         }
         self.applied_sessions.insert(session);
@@ -384,8 +421,113 @@ pub enum RegionError {
     BufferFull,
     #[error("Region time arithmetic overflowed")]
     InvalidTime,
+    #[error("Region message ID is zero")]
+    InvalidMessage,
+    #[error("Region message deadline elapsed before buffering")]
+    MessageExpired,
     #[error("Coordinator revision is stale or duplicated")]
     StaleRevision,
     #[error("handoff acknowledgement is from an unrelated session or revision")]
     UnexpectedBarrierMember,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lattice_core::actor_ref::{NodeAddress, ProtocolId};
+
+    fn entity() -> EntityConfig {
+        EntityConfig::new(
+            EntityType::new("buffer-test").unwrap(),
+            ProtocolId::new(7).unwrap(),
+            1,
+            "test",
+            1,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unknown_home_buffers_complete_delivery_intent_single_flight() {
+        let local = NodeIncarnation::new(1).unwrap();
+        let remote = NodeIncarnation::new(2).unwrap();
+        let mut region = ShardRegion::new(local, entity(), RegionConfig::default()).unwrap();
+        let entity_id = EntityId::new(b"entity".to_vec()).unwrap();
+        let deadline = MonotonicTime::from_millis(900);
+        assert_eq!(
+            region
+                .route(
+                    entity_id.clone(),
+                    41,
+                    BufferedMessageMode::Ask { deadline },
+                    Bytes::from_static(b"request"),
+                    MonotonicTime::from_millis(100),
+                )
+                .unwrap(),
+            RouteDecision::Buffered {
+                shard_id: ShardId::new(0),
+                start_lookup: true,
+            }
+        );
+        assert_eq!(
+            region
+                .route(
+                    entity_id,
+                    42,
+                    BufferedMessageMode::Tell,
+                    Bytes::from_static(b"tell"),
+                    MonotonicTime::from_millis(101),
+                )
+                .unwrap(),
+            RouteDecision::Buffered {
+                shard_id: ShardId::new(0),
+                start_lookup: false,
+            }
+        );
+        let flushed = region
+            .apply_home(
+                ShardId::new(0),
+                ShardHome {
+                    owner: NodeKey {
+                        node_id: "remote".to_owned(),
+                        address: NodeAddress::new("127.0.0.1", 2552).unwrap(),
+                        incarnation: remote,
+                    },
+                    generation: AssignmentGeneration::new(1).unwrap(),
+                    revision: Revision::new(1).unwrap(),
+                    state: PlacementSlotState::Running,
+                },
+            )
+            .unwrap();
+        assert_eq!(flushed.len(), 2);
+        assert_eq!(flushed[0].message_id, 41);
+        assert_eq!(flushed[0].mode, BufferedMessageMode::Ask { deadline });
+        assert_eq!(flushed[1].message_id, 42);
+        assert_eq!(flushed[1].mode, BufferedMessageMode::Tell);
+    }
+
+    #[test]
+    fn expired_ask_is_rejected_before_buffer_admission() {
+        let mut region = ShardRegion::new(
+            NodeIncarnation::new(1).unwrap(),
+            entity(),
+            RegionConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            region
+                .route(
+                    EntityId::new(b"expired".to_vec()).unwrap(),
+                    1,
+                    BufferedMessageMode::Ask {
+                        deadline: MonotonicTime::from_millis(10),
+                    },
+                    Bytes::from_static(b"request"),
+                    MonotonicTime::from_millis(10),
+                )
+                .unwrap_err(),
+            RegionError::MessageExpired
+        );
+    }
 }

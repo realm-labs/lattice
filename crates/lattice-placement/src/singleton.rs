@@ -7,6 +7,7 @@ use lattice_core::actor_ref::{
 use thiserror::Error;
 
 use crate::authority::{AuthorityEffect, AuthorityError, AuthorityEvent, PlacementAuthority};
+use crate::region::BufferedMessageMode;
 use crate::types::{MonotonicTime, NodeKey};
 
 pub struct SingletonManager {
@@ -58,10 +59,12 @@ impl Default for SingletonProxyConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ProxyMessage {
-    payload: Bytes,
-    expires_at: MonotonicTime,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingletonBufferedMessage {
+    pub message_id: u64,
+    pub mode: BufferedMessageMode,
+    pub payload: Bytes,
+    pub expires_at: MonotonicTime,
 }
 
 pub struct SingletonProxy {
@@ -70,7 +73,7 @@ pub struct SingletonProxy {
     fingerprint: ConfigFingerprint,
     config: SingletonProxyConfig,
     owner: Option<NodeKey>,
-    buffer: VecDeque<ProxyMessage>,
+    buffer: VecDeque<SingletonBufferedMessage>,
     buffered_bytes: usize,
 }
 
@@ -107,14 +110,11 @@ impl SingletonProxy {
         )
     }
 
-    pub fn update_owner(&mut self, owner: Option<NodeKey>) -> Vec<Bytes> {
+    pub fn update_owner(&mut self, owner: Option<NodeKey>) -> Vec<SingletonBufferedMessage> {
         self.owner = owner;
         if self.owner.is_some() {
             self.buffered_bytes = 0;
-            self.buffer
-                .drain(..)
-                .map(|message| message.payload)
-                .collect()
+            self.buffer.drain(..).collect()
         } else {
             Vec::new()
         }
@@ -122,9 +122,14 @@ impl SingletonProxy {
 
     pub fn route_or_buffer(
         &mut self,
+        message_id: u64,
+        mode: BufferedMessageMode,
         payload: Bytes,
         now: MonotonicTime,
     ) -> Result<Option<NodeKey>, SingletonError> {
+        if message_id == 0 {
+            return Err(SingletonError::InvalidMessage);
+        }
         if let Some(owner) = &self.owner {
             return Ok(Some(owner.clone()));
         }
@@ -143,13 +148,22 @@ impl SingletonProxy {
         {
             return Err(SingletonError::Unavailable);
         }
-        let expires_at = now
+        let residence_deadline = now
             .checked_add(std::time::Duration::from_millis(
                 self.config.maximum_buffer_age_millis,
             ))
             .ok_or(SingletonError::InvalidTime)?;
+        let expires_at = match mode {
+            BufferedMessageMode::Tell => residence_deadline,
+            BufferedMessageMode::Ask { deadline } => deadline.min(residence_deadline),
+        };
+        if expires_at <= now {
+            return Err(SingletonError::MessageExpired);
+        }
         self.buffered_bytes += payload.len();
-        self.buffer.push_back(ProxyMessage {
+        self.buffer.push_back(SingletonBufferedMessage {
+            message_id,
+            mode,
             payload,
             expires_at,
         });
@@ -167,4 +181,8 @@ pub enum SingletonError {
     Unavailable,
     #[error("singleton buffer deadline cannot be represented")]
     InvalidTime,
+    #[error("singleton buffered message ID is zero")]
+    InvalidMessage,
+    #[error("singleton message deadline elapsed before buffering")]
+    MessageExpired,
 }

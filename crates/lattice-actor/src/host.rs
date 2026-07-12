@@ -15,6 +15,11 @@ use crate::traits::Actor;
 #[async_trait]
 trait ErasedActorHost: Send + Sync {
     fn protocol_id(&self) -> ProtocolId;
+    fn is_current(&self, target: &ExactActorTarget) -> bool;
+    fn subscribe_terminated(
+        &self,
+        target: &ExactActorTarget,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::watch::ActorTerminated>>;
 
     async fn tell(
         &self,
@@ -65,6 +70,19 @@ impl<A: Actor> ActorHost<A> {
 impl<A: Actor> ErasedActorHost for ActorHost<A> {
     fn protocol_id(&self) -> ProtocolId {
         self.protocol.protocol_id()
+    }
+
+    fn is_current(&self, target: &ExactActorTarget) -> bool {
+        self.resolve(target).is_ok()
+    }
+
+    fn subscribe_terminated(
+        &self,
+        target: &ExactActorTarget,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::watch::ActorTerminated>> {
+        self.resolve(target)
+            .ok()
+            .map(|handle| handle.subscribe_terminated())
     }
 
     async fn tell(
@@ -139,6 +157,21 @@ impl ProtocolHostRegistry {
             return Err(HostRegistryError::DuplicateProtocol(protocol_id));
         }
         Ok(())
+    }
+
+    pub fn is_current(&self, target: &ExactActorTarget) -> bool {
+        self.hosts
+            .get(&target.protocol_id.get())
+            .is_some_and(|host| host.is_current(target))
+    }
+
+    pub fn subscribe_terminated(
+        &self,
+        target: &ExactActorTarget,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::watch::ActorTerminated>> {
+        self.hosts
+            .get(&target.protocol_id.get())
+            .and_then(|host| host.subscribe_terminated(target))
     }
 }
 

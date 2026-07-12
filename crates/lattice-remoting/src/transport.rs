@@ -341,6 +341,33 @@ mod tests {
     use bytes::Bytes;
     use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
     use rcgen::{CertificateParams, KeyPair, SanType};
+    use std::sync::Arc;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio_rustls::rustls::{
+        RootCertStore, client::WebPkiServerVerifier, server::WebPkiClientVerifier,
+    };
+
+    fn test_certificate(
+        identity: &NodeIdentity,
+    ) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let mut params = CertificateParams::new(vec!["lattice.test".to_owned()]).unwrap();
+        params.subject_alt_names.push(SanType::URI(
+            format!(
+                "spiffe://{}/node/{}/{:032x}",
+                identity.cluster_id.as_str(),
+                identity.node_id,
+                identity.incarnation.get()
+            )
+            .try_into()
+            .unwrap(),
+        ));
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        (
+            certificate.der().clone(),
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+    }
 
     #[tokio::test]
     async fn real_tcp_rejects_oversized_length_before_allocation() {
@@ -467,5 +494,85 @@ mod tests {
             verify_peer_certificate_identity(certificate.der(), &stale),
             Err(WireError::Tls(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn real_mutual_tls_socket_verifies_both_node_identities() {
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = listener.local_addr().unwrap();
+        let cluster_id = ClusterId::new("tls-test").unwrap();
+        let client_identity = NodeIdentity {
+            cluster_id: cluster_id.clone(),
+            node_id: "client".to_owned(),
+            address: NodeAddress::new("127.0.0.1", socket.port() - 1).unwrap(),
+            incarnation: NodeIncarnation::new(11).unwrap(),
+        };
+        let server_identity = NodeIdentity {
+            cluster_id,
+            node_id: "server".to_owned(),
+            address: NodeAddress::new("127.0.0.1", socket.port()).unwrap(),
+            incarnation: NodeIncarnation::new(12).unwrap(),
+        };
+        let (client_certificate, client_key) = test_certificate(&client_identity);
+        let (server_certificate, server_key) = test_certificate(&server_identity);
+        let mut client_roots = RootCertStore::empty();
+        client_roots.add(client_certificate.clone()).unwrap();
+        let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
+            .build()
+            .unwrap();
+        let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+        let server_config = Arc::new(
+            ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_client_cert_verifier(client_verifier)
+                .with_single_cert(vec![server_certificate.clone()], server_key)
+                .unwrap(),
+        );
+        let mut server_roots = RootCertStore::empty();
+        server_roots.add(server_certificate).unwrap();
+        let server_verifier = WebPkiServerVerifier::builder(Arc::new(server_roots))
+            .build()
+            .unwrap();
+        let client_config = Arc::new(
+            ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(server_verifier)
+                .with_client_auth_cert(vec![client_certificate], client_key)
+                .unwrap(),
+        );
+        let expected_client = client_identity.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut connection = accept_tls(
+                stream,
+                server_config,
+                &expected_client,
+                FrameCodec::new(4096).unwrap(),
+            )
+            .await
+            .unwrap();
+            let frame = connection.read_frame().await.unwrap();
+            connection.write_frame(&frame).await.unwrap();
+        });
+        let mut client = connect_tls(
+            &server_identity.address,
+            "lattice.test".to_owned(),
+            client_config,
+            &server_identity,
+            FrameCodec::new(4096).unwrap(),
+        )
+        .await
+        .unwrap();
+        let expected = Frame {
+            kind: FrameKind::Heartbeat,
+            payload: Bytes::from_static(b"tls"),
+        };
+        client.write_frame(&expected).await.unwrap();
+        assert_eq!(client.read_frame().await.unwrap(), expected);
+        server.await.unwrap();
     }
 }

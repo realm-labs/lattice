@@ -8,7 +8,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true
-bytes.workspace = true
+bytes = { workspace = true, features = ["serde"] }
 dashmap.workspace = true
 etcd-client.workspace = true
 http.workspace = true

@@ -30,6 +30,10 @@ pub enum FrameKind {
     Backpressure = 19,
     Close = 20,
     ProtocolError = 21,
+    EntityTell = 22,
+    EntityAsk = 23,
+    SingletonTell = 24,
+    SingletonAsk = 25,
 }
 
 impl TryFrom<u16> for FrameKind {
@@ -58,6 +62,10 @@ impl TryFrom<u16> for FrameKind {
             19 => Ok(Self::Backpressure),
             20 => Ok(Self::Close),
             21 => Ok(Self::ProtocolError),
+            22 => Ok(Self::EntityTell),
+            23 => Ok(Self::EntityAsk),
+            24 => Ok(Self::SingletonTell),
+            25 => Ok(Self::SingletonAsk),
             _ => Err(WireError::UnknownFrameKind(value)),
         }
     }
