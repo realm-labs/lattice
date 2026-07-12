@@ -15,5 +15,6 @@ The architecture has been split into [docs/architecture/](architecture/README.md
 | [architecture/05-gateway-ops.md](architecture/05-gateway-ops.md) | Gateway and operations |
 | [architecture/06-appendix.md](architecture/06-appendix.md) | Appendix |
 | [architecture/07-api-examples.md](architecture/07-api-examples.md) | Framework API examples |
+| [architecture/08-distributed-testing.md](architecture/08-distributed-testing.md) | Distributed testing, Docker harness, simulation, invariants, and chaos |
 | [production-hardening-plan.md](production-hardening-plan.md) | Active architecture migration and execution tracker |
 | [implementation-plan.md](implementation-plan.md) | Historical implementation record (superseded) |

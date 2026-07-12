@@ -23,6 +23,7 @@ These documents describe the complete target model, not a disposable minimal v1.
 | [05-gateway-ops.md](05-gateway-ops.md) | Gateway routing, security, observability, config, common call flows, and forbidden patterns |
 | [06-appendix.md](06-appendix.md) | Recommended defaults, tradeoffs, framework/business boundary, summary |
 | [07-api-examples.md](07-api-examples.md) | Target APIs for protocols, service bootstrap, ActorRef, EntityRef, SingletonRef, watch, Gateway, EventBus, config, and scheduler |
+| [08-distributed-testing.md](08-distributed-testing.md) | Deterministic simulation, invariants, Docker multi-process testing, fault injection, chaos, and release evidence |
 
 ## Maintenance Rules
 

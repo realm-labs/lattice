@@ -38,6 +38,10 @@ later structural rewrite. Multi-lane Associations, bounded protocol catalogues, 
 per-slot claims, handoff barriers, logical watch_current, and the full Singleton model remain required.
 Pluggable shard allocation, persisted bounded rebalancing plans, capacity/load-aware decisions, and
 automatic/manual/drain/recovery move triggers are also part of the complete placement model.
+Deterministic state-machine simulation, executable invariants and named failpoints are the correctness
+foundation; a Docker-based real multi-process harness, chaos profiles, and replayable test artifacts
+provide integration and acceptance evidence. Both are required architecture—not
+optional test polish after implementation.
 Control complexity by sharing internal mechanisms and narrowing fault domains, not by deleting target
 capabilities or deferring them outside this plan.
 
@@ -526,7 +530,7 @@ The target is three large commits. Checklist items from several phases may be co
    - remove the remaining old control/storage assumptions while fixing the workspace against the new public API;
    - targeted tests should run where practical, but full workspace green is not yet a commit requirement.
 3. `test(remoting)!: complete hard-switch acceptance and migration`
-   - finish storage-generation cutover, admin/ops, bounded-resource hardening, multi-process coverage and benchmarks;
+   - finish storage-generation cutover, admin/ops, bounded-resource hardening, deterministic simulation, Docker multi-process/chaos coverage and benchmarks;
    - delete every remaining compatibility residue and update all examples/docs;
    - finish only when full fmt, clippy, tests and global acceptance pass.
 
@@ -684,7 +688,28 @@ and removes any residue discovered while macro batch 2 restored the distributed 
 - [ ] Add compile-fail/API absence tests and update all examples/benchmarks.
 - [ ] Phase 8 storage cutover and absence evidence complete within final macro batch 3.
 
-### Phase 9: Production Hardening and End-to-End Acceptance
+### Phase 9: Deterministic and Docker Distributed Test Infrastructure
+
+Status: `[ ]` not started.
+
+- [ ] Add `lattice-sim` test support with explicit reducer/effect adapters for Association control, Coordinator session, PlacementSlot, ShardRegion/handoff, RebalancePlan, Singleton, DeathWatch and service lifecycle; production and simulation must share transition logic.
+- [ ] Implement SimClock, deterministic scheduler, SimNetwork, SimEtcd revisions/watches/leases/compaction, SimProcess lifecycle, FaultInjector, TraceJournal, InvariantChecker, LivenessChecker and bounded StateExplorer.
+- [ ] Make every generated/random schedule seed-replayable and record configuration, event sequence, last valid state and one-command replay instructions; add trace shrinking/minimization where practical.
+- [ ] Encode ownership, incarnation/generation/claim, revision, messaging/watch, lifecycle and resource invariants and check them after every simulated transition; encode liveness only after a declared stable period.
+- [ ] Add stable test-only failpoints at every critical persistence/send boundary for control replay, snapshot install, plan persistence/reservation, handoff/claim/ready publication, watch terminal delivery and shutdown.
+- [ ] Track the failpoint × Coordinator/source/target/store/network/queue fault matrix as data and fail acceptance when required combinations lack evidence.
+- [ ] Add `tests/distributed` Docker runner/Compose topology with pinned toolchain and external image digests, isolated per-run network/volumes, no fixed host ports, health/readiness probes and no host dependency beyond Docker Engine/Compose.
+- [ ] Keep Compose responsible for stable topology/infrastructure and implement dynamic scenario behavior in programmatic `testctl`; prohibit long sleep-driven Compose/shell scenarios.
+- [ ] Route protocol-sequence/virtual-time/exact-boundary faults through simulator/failpoints and process/socket/packet/resource faults through Docker; container scheduling is never the deterministic protocol oracle.
+- [ ] Provide `quality`, `sim`, `model`, `e2e`, `e2e-ha-etcd`, `chaos`, `k8s`, `soak` and `replay` Docker commands/profiles. Real profiles cover TCP/TLS, disposable single/three-member etcd, multiple Coordinator/logic/Gateway processes, pause/kill/restart and partitions.
+- [ ] Add project-label-scoped chaos orchestration. If Docker socket access is used, restrict it to trusted code/dedicated CI and verify current run labels before every destructive action.
+- [ ] Persist image/source/config/seed manifests, structured/minimized traces, container logs, redacted Coordinator/etcd/admin state, resource samples, fault schedule and JUnit results under `target/test-artifacts/<run-id>` before teardown.
+- [ ] Guarantee idempotent `down --volumes --remove-orphans` cleanup after success, failure, timeout or interruption; leaked test resources are a test failure.
+- [ ] Prohibit fixed sleeps and human-log parsing as primary state oracles; wait through bounded structured readiness/admin/trace predicates.
+- [ ] Add PR/main/nightly/release test tiers and retain the first artifact for any retry; flaky retry cannot silently turn a failure green.
+- [ ] Phase 9 Docker/simulation infrastructure and executable invariant evidence complete within final macro batch 3.
+
+### Phase 10: Production Hardening and End-to-End Acceptance
 
 Status: `[ ]` not started.
 
@@ -697,11 +722,13 @@ Status: `[ ]` not started.
 - [ ] Add multi-process Gateway -> EntityRef ask -> remote Shard -> Actor -> Reply coverage.
 - [ ] Add arbitrary child ActorRef serialization/tell/ask/watch across nodes.
 - [ ] Add Coordinator outage, handoff, crash, reconnect, TLS/plaintext and abuse scenarios.
+- [ ] Add a disposable local-Kubernetes deployment profile for readiness/liveness/startup probes, preStop drain, termination grace, rolling replacement, Pod eviction and Service/DNS only; do not use it as a substitute for protocol simulation/Docker acceptance.
 - [ ] Benchmark local actor, concrete remote ref, stable shard, unknown home, allocation evaluation, rebalance planning, handoff and reconnect.
 - [ ] Compare remoting bulk-tell throughput, allocations and connection/FD usage against the preserved pooled Direct Link baseline and document the accepted regression budget.
 - [ ] Prove remote hot paths do not access etcd or Coordinator.
 - [ ] Run full workspace verification and audit every checked item.
-- [ ] Phase 9 verification and final conventional commit complete.
+- [ ] Run final acceptance through the pinned Docker profiles; direct host cargo checks are an optional developer fast path, not substitute evidence.
+- [ ] Phase 10 verification and final conventional commit complete.
 
 ---
 
@@ -745,11 +772,24 @@ watch_current_inactive_does_not_activate_and_returns_not_active
 singleton_replacement_waits_for_old_claim_fencing
 framework_contains_no_gRPC_service_or_public_direct_link_api
 remote_hot_path_performs_no_etcd_read_or_coordinator_hop
+state_machine_reducer_rejects_illegal_transition_without_effects
+simulator_same_seed_reproduces_identical_trace_and_failure
+small_cluster_state_explorer_checks_invariants_after_every_transition
+simulator_trace_failure_shrinks_or_preserves_one_command_replay
+failpoint_matrix_covers_required_persistence_send_and_fault_pairs
+docker_e2e_runs_real_tcp_tls_and_disposable_etcd_without_host_toolchain
+docker_ha_etcd_and_coordinator_failover_reconcile_before_new_decisions
+docker_chaos_pause_kill_restart_partition_preserves_safety_invariants
+docker_same_address_restart_never_reuses_old_node_incarnation
+docker_soak_keeps_resources_within_bounds_and_emits_replayable_artifacts
+docker_cleanup_removes_project_containers_networks_and_volumes_on_failure
+kubernetes_pre_stop_drain_and_rolling_replacement_preserve_documented_lifecycle
 ```
 
 Tests for wire, identity and fencing claims must use real TCP/TLS connections. Coordinator storage
-acceptance must include a disposable real etcd server. Fake transports remain useful directional tests
-but are not final evidence.
+acceptance must include disposable single-member and HA etcd profiles. Deterministic simulated transports
+provide primary schedule/invariant evidence but cannot replace real adapters. Final integration evidence
+runs through pinned Docker profiles and requires no host test toolchain beyond Docker Engine/Compose.
 
 ---
 
@@ -773,6 +813,12 @@ Do not let ShardAllocationStrategy, load reports, or admin commands grant/revoke
 Do not start automatic rebalance from stale required load, during Coordinator degradation/reconciliation, or without bounded hysteresis/cooldown/concurrency.
 Do not roll back a move that has entered handoff to an ambiguous old owner; recover it forward from persisted PlacementSlot state.
 Do not include Singleton in periodic load balancing.
+Do not implement a test-only distributed transition algorithm that differs from production reducers/effects.
+Do not use unseeded randomness, fixed sleeps, host timing, or human log text as the primary distributed test oracle.
+Do not assert ordering outside the documented lane/epoch/control/revision/generation guarantees.
+Do not accept a randomized/chaos failure without seed, configuration, trace and replay artifacts.
+Do not require host Rust, etcd, TLS or fault-injection tools for final acceptance; use pinned Docker profiles.
+Do not let Docker chaos orchestration manipulate containers outside the current labeled test project.
 Do not introduce persistent actors, Gossip, Streams, remote deployment or ActorSelection in v1.
 ```
 
@@ -781,19 +827,21 @@ Do not introduce persistent actors, Gossip, Streams, remote deployment or ActorS
 ## 9. Verification Commands
 
 ```text
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-
-cargo test -p lattice-remoting
-cargo test -p lattice-actor remote
-cargo test -p lattice-placement coordinator
-cargo test -p lattice-service shard_region
-cargo test -p lattice-service singleton
+./scripts/test-docker.sh quality
+./scripts/test-docker.sh sim
+./scripts/test-docker.sh model
+./scripts/test-docker.sh e2e
+./scripts/test-docker.sh e2e-ha-etcd
+./scripts/test-docker.sh chaos
+./scripts/test-docker.sh k8s
+./scripts/test-docker.sh soak --duration 4h --seed <seed>
+./scripts/test-docker.sh replay --artifact <trace.json>
 ```
 
-Target names are introduced as phases land. Real-etcd commands require a dedicated disposable endpoint
-and fail explicitly when invoked without it.
+`quality` runs fmt, workspace clippy and workspace tests inside the pinned runner image. `sim` and
+`model` run reducer/property/seeded/exhaustive checks. Real profiles create and remove disposable
+TCP/TLS processes, etcd clusters, networks and volumes. `soak` is normally a nightly/release gate.
+Direct host cargo commands remain optional developer shortcuts and are not final acceptance evidence.
 
 ---
 
@@ -814,6 +862,10 @@ and fail explicitly when invoked without it.
 - [ ] Association loss, queue pressure, handoff and Coordinator outage have bounded explicit outcomes.
 - [ ] Every runtime task and collection is supervised, bounded and deadline-controlled.
 - [ ] Hot-path remote messaging performs no etcd read and no Coordinator hop.
+- [ ] Distributed control reducers are shared by production/simulation and every documented safety invariant has executable per-transition coverage or an explicit real-process oracle.
+- [ ] Required failpoint/fault combinations, bounded state exploration, deterministic seed replay and trace minimization/reproduction pass.
+- [ ] Pinned Docker quality/sim/model/e2e/e2e-ha-etcd/chaos/k8s profiles pass without a host Rust/etcd/TLS/Kubernetes test toolchain; nightly/release soak evidence is retained.
+- [ ] Every Docker failure emits replayable redacted artifacts and cleanup leaves no labeled container, network or disposable volume behind.
 - [ ] Architecture docs, examples and benchmarks match the unified remoting system.
 - [ ] `cargo fmt --all -- --check` passes.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes.

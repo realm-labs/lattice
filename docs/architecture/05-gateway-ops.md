@@ -83,6 +83,8 @@ Trace context propagates through Gateway bindings, actor envelopes, remoting fra
 
 Mutating cluster operations are sent to the Coordinator actor through remoting. The HTTP adapter must not mutate etcd directly. Operations are authorized, audited, bounded by deadlines, and safe to retry only when their command protocol declares idempotency.
 
+Inspection responses expose machine-readable lifecycle state, Coordinator term/revision, node incarnation, assignment generation, active plan/move IDs and partial/stale markers. The Docker distributed-test harness waits on these bounded predicates; fixed sleeps and human-log matching are not correctness oracles.
+
 Rebalance operations include inspect/explain, pause/resume automatic planning, trigger an immediate evaluation, submit an idempotent manual relocation, and cancel only plan moves that have not entered handoff. The API exposes why a proposal was accepted/rejected and which eligibility, freshness, hysteresis, cooldown, or concurrency rule applied; it never allows an operator to bypass claim fencing.
 
 ## 6. Configuration Example
