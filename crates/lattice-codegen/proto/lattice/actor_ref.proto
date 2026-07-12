@@ -2,33 +2,14 @@ syntax = "proto3";
 
 package lattice.actor;
 
+// Serializable identity of one exact actor activation. Logical EntityRef and
+// SingletonRef values use their own business-facing declarations.
 message ActorRef {
-  string service_kind = 1;
-  string actor_kind = 2;
-  ActorId actor_id = 3;
-  Target target = 4;
+  string cluster_id = 1;
+  string node_host = 2;
+  uint32 node_port = 3;
+  bytes node_incarnation = 4; // exactly 16 bytes, big endian
+  string actor_path = 5;
+  uint64 activation_sequence = 6;
+  uint64 protocol_id = 7;
 }
-
-message ActorId {
-  oneof kind {
-    string str = 1;
-    uint64 u64 = 2;
-    int64 i64 = 3;
-    bytes bytes = 4;
-  }
-}
-
-message Target {
-  oneof kind {
-    DirectTarget direct = 1;
-    RoutedTarget routed = 2;
-  }
-}
-
-message DirectTarget {
-  string instance_id = 1;
-  string endpoint = 2;
-  optional uint64 owner_epoch = 3;
-}
-
-message RoutedTarget {}

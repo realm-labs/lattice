@@ -18,12 +18,19 @@ use crate::mailbox::{ActorCommand, MailboxConfig, MailboxLane};
 use crate::traits::{Actor, ActorLifecycleState, PassivationReason, StopReason};
 use crate::watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason};
 use lattice_core::actor_ref::ActorRef;
-use lattice_core::direct_link::options::LinkCloseReason;
-use lattice_core::direct_link::runtime::DirectLinkLifecycleRuntimeHandle;
 use lattice_core::id::ActorId;
 use lattice_core::service_context::ServiceContext;
 
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_ACTIVATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_activation_id(
+    node_incarnation: lattice_core::actor_ref::NodeIncarnation,
+) -> lattice_core::actor_ref::ActivationId {
+    let sequence = NEXT_ACTIVATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    lattice_core::actor_ref::ActivationId::new(node_incarnation, sequence)
+        .expect("process activation sequence is nonzero")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorExecutionPolicy {
@@ -538,7 +545,15 @@ where
     let local_ref = LocalActorRef::new(NEXT_LOCAL_ACTOR_ID.fetch_add(1, Ordering::Relaxed));
     let (terminated_tx, _terminated_rx) = broadcast::channel(16);
     let (lifecycle_tx, _lifecycle_rx) = watch::channel(ActorLifecycleState::Empty);
-    let handle = ActorHandle::new(local_ref, terminated_tx, lifecycle_tx, normal_tx, system_tx);
+    let actor_ref = self_ref.as_ref().map(ActorRef::cast);
+    let handle = ActorHandle::new(
+        local_ref,
+        terminated_tx,
+        lifecycle_tx,
+        normal_tx,
+        system_tx,
+        actor_ref,
+    );
 
     ActorRuntimeParts {
         handle,
@@ -758,15 +773,6 @@ async fn run_actor<A>(
     }
 
     let reason = stop_reason.unwrap_or(StopReason::Requested);
-    if let Some((runtime, actor_ref, close_reason)) =
-        direct_link_close_request_for_stop(&ctx, reason)
-        && let Err(error) = runtime
-            .runtime()
-            .close_for_actor(actor_ref, close_reason)
-            .await
-    {
-        debug!(%error, "failed to close direct links for actor stop");
-    }
     handle.set_lifecycle_state(match reason {
         StopReason::Passivated(_) => ActorLifecycleState::Passivating,
         StopReason::Requested | StopReason::MailboxClosed | StopReason::StartFailed => {
@@ -811,35 +817,6 @@ async fn run_actor<A>(
         stop.reason = ?reason,
         "actor stopped"
     );
-}
-
-fn direct_link_close_request_for_stop<A>(
-    ctx: &ActorContext<A>,
-    reason: StopReason,
-) -> Option<(
-    Arc<DirectLinkLifecycleRuntimeHandle>,
-    ActorRef,
-    LinkCloseReason,
-)>
-where
-    A: Actor,
-{
-    let close_reason = match reason {
-        StopReason::Passivated(PassivationReason::BusinessIdle)
-        | StopReason::Passivated(PassivationReason::IdleTimeout) => {
-            LinkCloseReason::TargetPassivated
-        }
-        StopReason::Passivated(PassivationReason::Migrate) => LinkCloseReason::TargetMigrating,
-        StopReason::Passivated(PassivationReason::Drain) => LinkCloseReason::NodeDraining,
-        StopReason::Requested | StopReason::MailboxClosed | StopReason::StartFailed => {
-            return None;
-        }
-    };
-    let actor_ref = ctx.self_ref().cloned()?;
-    let runtime = ctx
-        .service()
-        .extension::<DirectLinkLifecycleRuntimeHandle>()?;
-    Some((runtime, actor_ref, close_reason))
 }
 
 async fn handle_command<A>(

@@ -1,5 +1,5 @@
 [package]
-name = "rpc-benchmark"
+name = "remoting-benchmark"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,18 +7,17 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
 clap.workspace = true
 lattice-actor.workspace = true
 lattice-core.workspace = true
 lattice-gateway.workspace = true
 lattice-placement.workspace = true
-lattice-rpc.workspace = true
+lattice-remoting.workspace = true
 lattice-service.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tonic.workspace = true
-tonic-prost.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
@@ -27,5 +26,6 @@ criterion.workspace = true
 lattice-codegen.workspace = true
 
 [[bench]]
-name = "rpc_benchmark"
+name = "remoting_benchmark"
+path = "benches/rpc_benchmark.rs"
 harness = false

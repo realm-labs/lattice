@@ -2,11 +2,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lattice_core::actor_ref::ActorRef;
+use lattice_actor::BoundRecipient;
+use lattice_actor::traits::{Actor, Message};
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_core::trace::TraceContext;
-use lattice_rpc::traits::{ActorRefRpcCore, RoutedRequest, RpcRequest, ShardedRpcCore};
 use prost::Message as ProstMessage;
 
 use crate::error::EventBusError;
@@ -26,24 +26,6 @@ pub struct ServiceEvents<B> {
     bus: B,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeliveryOptions {
-    guarantee: DeliveryGuarantee,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeliveryGuarantee {
-    AtLeastOnce,
-}
-
-impl DeliveryOptions {
-    pub fn at_least_once() -> Self {
-        Self {
-            guarantee: DeliveryGuarantee::AtLeastOnce,
-        }
-    }
-}
-
 impl<B> ServiceEvents<B>
 where
     B: EventBus,
@@ -52,106 +34,54 @@ where
         Self { bus }
     }
 
-    pub async fn subscribe_actor<Req, C>(
+    pub async fn subscribe_recipient<A, M>(
         &self,
         subscription: EventSubscription,
-        core: C,
-        options: DeliveryOptions,
+        recipient: BoundRecipient<A>,
     ) -> Result<EventSubscriptionHandle, EventBusError>
     where
-        Req: RoutedRequest + RpcRequest,
-        C: ShardedRpcCore,
+        A: Actor,
+        M: Message<Reply = ()> + ProstMessage + Default,
     {
-        match options.guarantee {
-            DeliveryGuarantee::AtLeastOnce => {}
-        }
-
         self.bus
             .subscribe(subscription, move |event: EventEnvelope| {
-                let core = core.clone();
+                let recipient = recipient.clone();
                 async move {
-                    let req = <Req as ProstMessage>::decode(event.payload.as_slice()).map_err(
-                        |error| EventBusError::Decode {
-                            message_type: std::any::type_name::<Req>(),
+                    let message = M::decode(event.payload.as_slice()).map_err(|error| {
+                        EventBusError::Decode {
+                            message_type: std::any::type_name::<M>(),
                             reason: error.to_string(),
-                        },
-                    )?;
-                    core.call(req)
+                        }
+                    })?;
+                    recipient
+                        .tell(message)
                         .await
-                        .map(|_| ())
-                        .map_err(EventBusError::from_rpc)
+                        .map_err(|error| EventBusError::ActorDelivery(error.to_string()))
                 }
             })
             .await
     }
 
-    pub async fn subscribe_actor_mapped<C, F, Req>(
+    pub async fn subscribe_mapped<A, M, F>(
         &self,
         subscription: EventSubscription,
-        core: C,
+        recipient: BoundRecipient<A>,
         map: F,
     ) -> Result<EventSubscriptionHandle, EventBusError>
     where
-        C: ShardedRpcCore,
-        F: Fn(EventEnvelope) -> Req + Send + Sync + 'static,
-        Req: RoutedRequest + RpcRequest,
+        A: Actor,
+        M: Message<Reply = ()>,
+        F: Fn(EventEnvelope) -> M + Send + Sync + 'static,
     {
         self.bus
             .subscribe(subscription, move |event: EventEnvelope| {
-                let core = core.clone();
-                let req = map(event);
+                let recipient = recipient.clone();
+                let message = map(event);
                 async move {
-                    core.call(req)
+                    recipient
+                        .tell(message)
                         .await
-                        .map(|_| ())
-                        .map_err(EventBusError::from_rpc)
-                }
-            })
-            .await
-    }
-
-    pub async fn subscribe_actor_routed<Req, C>(
-        &self,
-        subscription: EventSubscription,
-        target_service: ServiceKind,
-        core: C,
-        options: DeliveryOptions,
-    ) -> Result<EventSubscriptionHandle, EventBusError>
-    where
-        Req: RoutedRequest + RpcRequest,
-        C: ActorRefRpcCore,
-    {
-        match options.guarantee {
-            DeliveryGuarantee::AtLeastOnce => {}
-        }
-
-        self.bus
-            .subscribe(subscription, move |event: EventEnvelope| {
-                let target_service = target_service.clone();
-                let core = core.clone();
-                async move {
-                    let actor_kind =
-                        event
-                            .actor_kind
-                            .clone()
-                            .ok_or(EventBusError::MissingActorTarget {
-                                field: "actor_kind",
-                            })?;
-                    let actor_id = event
-                        .actor_id
-                        .clone()
-                        .ok_or(EventBusError::MissingActorTarget { field: "actor_id" })?;
-                    let req = <Req as ProstMessage>::decode(event.payload.as_slice()).map_err(
-                        |error| EventBusError::Decode {
-                            message_type: std::any::type_name::<Req>(),
-                            reason: error.to_string(),
-                        },
-                    )?;
-                    let actor_ref = ActorRef::routed(target_service, actor_kind, actor_id);
-                    core.call_ref(actor_ref, req)
-                        .await
-                        .map(|_| ())
-                        .map_err(EventBusError::from_rpc)
+                        .map_err(|error| EventBusError::ActorDelivery(error.to_string()))
                 }
             })
             .await
@@ -191,9 +121,8 @@ where
                 event_type: event_type.into(),
                 source_service: self.source_service.clone(),
                 source_instance: self.source_instance.clone(),
-                actor_kind: None,
-                actor_id: None,
-                request_id: None,
+                recipient: None,
+                correlation_id: None,
                 trace,
                 occurred_unix_ms: now_unix_ms(),
                 payload,

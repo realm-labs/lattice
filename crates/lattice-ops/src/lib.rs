@@ -6,6 +6,3 @@ pub mod outbox;
 pub mod scheduler;
 pub mod shutdown;
 pub mod telemetry;
-
-#[cfg(test)]
-mod tests;

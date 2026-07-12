@@ -1,14 +1,13 @@
-pub mod actors;
-pub mod assembly;
-pub mod clients;
-pub mod components;
+pub mod backend;
+pub mod builder;
 pub mod config;
-pub mod context;
-mod control;
-pub mod direct_links;
 pub mod error;
-pub mod framework;
-pub mod runtime;
+pub mod supervisor;
+
+pub use backend::LogicalRouter;
+pub use builder::{LatticeService, LatticeServiceBuilder};
+pub use config::NodeConfig;
+pub use error::ServiceError;
 
 #[cfg(test)]
 mod tests;

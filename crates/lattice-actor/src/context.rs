@@ -9,7 +9,6 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use lattice_core::actor_ref::ActorRef;
-use lattice_core::direct_link::runtime::DirectLinkManager;
 use lattice_core::service_context::ServiceContext;
 
 use crate::error::ActorError;
@@ -22,7 +21,7 @@ use crate::watch::{ActorTerminated, WatchId};
 
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
-    self_ref: Option<ActorRef>,
+    self_ref: Option<ActorRef<A>>,
     service: ServiceContext,
     lifecycle_request: Option<StopReason>,
     tasks: Vec<JoinHandle<()>>,
@@ -36,7 +35,13 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
         formatter
             .debug_struct("ActorContext")
             .field("handle", &self.handle)
-            .field("self_ref", &self.self_ref)
+            .field(
+                "self_ref",
+                &self
+                    .self_ref
+                    .as_ref()
+                    .map(|actor_ref| actor_ref.actor_path()),
+            )
             .field("service", &self.service)
             .field("lifecycle_request", &self.lifecycle_request)
             .field("task_count", &self.tasks.len())
@@ -50,12 +55,12 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
 impl<A: Actor> ActorContext<A> {
     pub(crate) fn new(
         handle: ActorHandle<A>,
-        self_ref: Option<ActorRef>,
+        self_ref: Option<ActorRef<()>>,
         service: ServiceContext,
     ) -> Self {
         Self {
             handle,
-            self_ref,
+            self_ref: self_ref.map(|actor_ref| actor_ref.cast()),
             service,
             lifecycle_request: None,
             tasks: Vec::new(),
@@ -65,7 +70,7 @@ impl<A: Actor> ActorContext<A> {
         }
     }
 
-    pub fn self_ref(&self) -> Option<&ActorRef> {
+    pub fn self_ref(&self) -> Option<&ActorRef<A>> {
         self.self_ref.as_ref()
     }
 
@@ -73,11 +78,7 @@ impl<A: Actor> ActorContext<A> {
         &self.service
     }
 
-    pub fn links(&self) -> DirectLinkManager {
-        DirectLinkManager::new(self.service.clone(), self.self_ref.clone())
-    }
-
-    pub fn require_self_ref(&self) -> Result<&ActorRef, ActorError> {
+    pub fn require_self_ref(&self) -> Result<&ActorRef<A>, ActorError> {
         self.self_ref
             .as_ref()
             .ok_or_else(|| ActorError::new("actor self ref is not available"))
@@ -216,8 +217,14 @@ impl<A: Actor> ActorContext<A> {
             child.key = key.as_str()
         );
         let _entered = span.enter();
-        let handle =
-            crate::runtime::spawn_actor_with_context(actor, options.mailbox, self.service.clone());
+        let child_ref = self.child_actor_ref::<C>(&key, options.protocol_id)?;
+        let handle = crate::runtime::spawn_actor_with_self_ref(
+            actor,
+            options.mailbox,
+            crate::runtime::PassivationPolicy::Disabled,
+            child_ref.as_ref().map(ActorRef::erase),
+            self.service.clone(),
+        );
         let slot = Arc::new(ChildSlot::new(handle.clone()));
         self.children
             .insert(key, Box::new(ChildSlotStopper(slot.clone())));
@@ -250,9 +257,12 @@ impl<A: Actor> ActorContext<A> {
             child.key = key.as_str()
         );
         let _entered = span.enter();
-        let handle = crate::runtime::spawn_actor_with_context(
+        let child_ref = self.child_actor_ref::<C>(&key, options.protocol_id)?;
+        let handle = crate::runtime::spawn_actor_with_self_ref(
             factory(),
             options.mailbox,
+            crate::runtime::PassivationPolicy::Disabled,
+            child_ref.as_ref().map(ActorRef::erase),
             self.service.clone(),
         );
         let slot = Arc::new(ChildSlot::new(handle.clone()));
@@ -325,14 +335,17 @@ impl<A: Actor> ActorContext<A> {
                 };
                 let mut terminations = child.subscribe_terminated();
                 let service = self.service.clone();
+                let child_ref = child.actor_ref().map(ActorRef::erase);
                 self.spawn_scoped(async move {
                     loop {
                         if terminations.recv().await.is_err() {
                             break;
                         }
-                        let replacement = crate::runtime::spawn_actor_with_context(
+                        let replacement = crate::runtime::spawn_actor_with_self_ref(
                             factory(),
                             options.mailbox,
+                            crate::runtime::PassivationPolicy::Disabled,
+                            child_ref.as_ref().map(ActorRef::erase),
                             service.clone(),
                         );
                         terminations = replacement.subscribe_terminated();
@@ -341,6 +354,34 @@ impl<A: Actor> ActorContext<A> {
                 });
             }
         }
+    }
+
+    fn child_actor_ref<C>(
+        &self,
+        key: &ChildActorKey,
+        protocol_id: Option<lattice_core::actor_ref::ProtocolId>,
+    ) -> Result<Option<ActorRef<C>>, ActorError>
+    where
+        C: Actor,
+    {
+        let Some(protocol_id) = protocol_id else {
+            return Ok(None);
+        };
+        let parent = self.require_self_ref()?;
+        let path = parent
+            .actor_path()
+            .child(key.as_str())
+            .map_err(|error| ActorError::new(error.to_string()))?;
+        ActorRef::new(
+            parent.cluster_id().clone(),
+            parent.node_address().clone(),
+            parent.node_incarnation(),
+            path,
+            crate::runtime::next_activation_id(parent.node_incarnation()),
+            protocol_id,
+        )
+        .map(Some)
+        .map_err(|error| ActorError::new(error.to_string()))
     }
 }
 

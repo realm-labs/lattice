@@ -41,7 +41,7 @@ impl GatewayRouteContext {
 pub struct GatewayRouteSpec {
     pub msg_id: u32,
     pub actor_kind: ActorKind,
-    pub method: &'static str,
+    pub protocol_name: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

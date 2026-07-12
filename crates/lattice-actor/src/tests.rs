@@ -362,9 +362,11 @@ async fn actor_handle_call_and_tell_deliver_typed_messages() {
 
     let reply = handle.call(Ping("one")).await.unwrap();
     handle.tell(Record::new("two")).await.unwrap();
+    let barrier = handle.call(Ping("barrier")).await.unwrap();
 
     assert_eq!(reply, "pong:one");
-    assert_eq!(*events.lock().await, vec!["one", "two"]);
+    assert_eq!(barrier, "pong:barrier");
+    assert_eq!(*events.lock().await, vec!["one", "two", "barrier"]);
 }
 
 #[test]

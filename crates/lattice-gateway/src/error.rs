@@ -1,5 +1,3 @@
-use lattice_rpc::error::RpcError;
-
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum GatewayError {
     #[error("client frame is too short")]
@@ -16,8 +14,8 @@ pub enum GatewayError {
     DecodePayload(String),
     #[error("missing gateway route context key {key}")]
     MissingRouteContextKey { key: String },
-    #[error("rpc failed: {0}")]
-    Rpc(RpcError),
+    #[error("actor recipient failed: {0}")]
+    Recipient(String),
     #[error("unknown gateway session {session_id}")]
     UnknownSession { session_id: String },
     #[error(

@@ -1,9 +1,5 @@
-use lattice_placement::error::PlacementError;
-
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
-    #[error("placement failed: {0}")]
-    Placement(#[from] PlacementError),
     #[error("duplicate operation {operation_id}")]
     DuplicateOperation { operation_id: String },
     #[error("unknown operation {operation_id}")]
@@ -16,4 +12,6 @@ pub enum OpsError {
     HighCardinalityMetricLabel { label: String },
     #[error("admin query failed: {message}")]
     Admin { message: String },
+    #[error("drain failed: {message}")]
+    Drain { message: String },
 }

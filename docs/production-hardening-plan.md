@@ -537,77 +537,101 @@ The target is three large commits. Checklist items from several phases may be co
 Do not split a macro batch merely to obtain a green commit. Split only when the resulting commit is an
 independently reviewable migration boundary and the total remains at most four.
 
+### Macro Batch 1 Evidence (2026-07-12)
+
+Status: `[x]` implementation complete; conventional commit pending at this tracker update.
+
+- The old benchmark/storage/API baseline is captured at commit
+  `d66f56831de832fab71d7357476b9b237cbba5d5`.
+- `lattice-rpc`, `lattice-direct-link`, framework service generation, Explicit Placement, actor
+  floors, activation locks, placement tombstones, and owner+epoch remote watch source are deleted.
+- Exact activation references, canonical paths, protobuf/other codec registration, bounded protocol
+  catalogues, multi-lane Associations, reconnect, typed local/remote tell/ask, and the first-write ask
+  uncertainty boundary are implemented without a compatibility facade.
+- Real TCP tests cover bounded framing, handshake identity/lane binding, catalogue exchange,
+  bidirectional ask/reply, complete lane-group establishment, exact service dispatch, and same-peer
+  reconnect. TLS certificate identity is covered at the transport adapter boundary.
+- `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, and
+  `cargo test --workspace --all-targets` pass on the host at this boundary. These are directional
+  checks; final acceptance still requires the pinned Docker `quality` profile.
+- Remaining Phase 2/3 acceptance gaps are deliberately carried into macro batch 2 where reliable
+  control consumers, Coordinator sessions, logical routers, DeathWatch, TLS endpoint policy, idle
+  lane lifecycle, and partial-lane recovery can be exercised as one distributed runtime.
+
 ### Phase 0: Architecture Reset
 
-Status: `[ ]` in progress.
+Status: `[x]` complete; evidence is folded into macro batch 1.
 
 Current Execution Pointer:
 
 ```text
-Capture the pre-change workspace/benchmark/storage/API baseline, record the permitted break set, then
-start hard-switch macro batch 1. Do not create a standalone documentation commit and do not wait for
-Phase 0 to become a green build boundary.
+Begin hard-switch macro batch 2 from the green exact-activation/remoting boundary. Complete the shared
+reliable-control consumers and reconciliation paths, Coordinator-over-remoting and Coordinator-owned
+etcd leases/storage generation, ShardRegion and subscribed-session handoff, pluggable persisted
+rebalancing execution/recovery, remote DeathWatch, Singleton, logical routing, and complete service
+assembly. Close the remaining Phase 2/3 integrated-runtime acceptance gaps while doing this; do not
+introduce a second transport, compatibility mode, direct etcd hot path, or old placement abstraction.
 ```
 
 - [x] Decide to remove framework gRPC and public Direct Link.
 - [x] Choose at-most-once tell/ask, concrete-activation watch, explicit u64 message IDs, optional TLS, Coordinator-only etcd ownership, fixed Singleton types, and arbitrary concrete Actor paths.
 - [x] Record the local Pekko reference baseline and current reusable Direct Link components.
 - [x] Update every architecture/API/example document to the unified remoting model.
-- [ ] Record the pre-change workspace and benchmark baseline.
-  - [ ] Preserve pooled Direct Link throughput, allocation, connection/FD, payload-size and backpressure results as the remoting comparison baseline.
-- [ ] Define named acceptance tests for every invariant.
-- [ ] Record all permitted API, wire, storage, crate and deployment breaks.
-- [ ] Phase 0 evidence recorded and folded into hard-switch macro commit 1; no standalone commit required.
+- [x] Record the pre-change workspace and benchmark baseline in `docs/baselines/pre-hard-switch.md`.
+  - [x] Preserve pooled Direct Link throughput, connection topology, payload-size and backpressure results as the remoting comparison baseline; the legacy benchmark had no allocator or observed-FD instrumentation, and that absence is recorded rather than replaced with invented measurements.
+- [x] Define named acceptance tests for every invariant in section 7.
+- [x] Record all permitted API, wire, storage, crate and deployment breaks in `docs/baselines/pre-hard-switch.md`.
+- [x] Phase 0 evidence recorded and folded into hard-switch macro commit 1; no standalone commit required.
 
 ### Phase 1: Hard Switch, Actor Identity, Paths, and Codec Registry
 
-Status: `[ ]` not started.
+Status: `[x]` complete within macro batch 1.
 
-- [ ] Move reusable `lattice-direct-link` transport internals into `lattice-remoting`, then delete the public Direct Link crate/API surface and manual endpoint/session/stream model.
-- [ ] Delete `lattice-rpc`, tonic service/client adapters, RPC codegen and framework direct tonic dependencies immediately after capturing the baseline.
-- [ ] Remove gRPC service definitions from `control.proto`; retain/move only internal non-gRPC control schemas needed by later macro batches.
-- [ ] Delete Explicit Placement types, records, locks, floors, per-actor tombstones/reclamation and their authority/watch APIs.
-- [ ] Add bounded canonical `ActorPath`, `NodeIncarnation`, and boot-unique `ActivationId`.
-- [ ] Give every local and child actor an exact path/activation registry entry.
-- [ ] Replace endpoint/owner-based ActorRef with typed concrete `ActorRef<A>`.
-- [ ] Add logical `EntityRef<A>` and `SingletonRef<A>` plus shared tell/ask recipient API and separate activation-scoped watch_current surface.
-- [ ] Add erased codec registry with explicit ProtocolId/message ID, request/reply codec/schema versions and dispatch closure.
-- [ ] Add canonical `actor_protocol!` generation of registrar/descriptor/BLAKE3 fingerprint plus the equivalent low-level ActorProtocol builder; allow external business tools to generate the Rust declaration.
-- [ ] Separate transport compatibility from bounded post-handshake business protocol catalogue negotiation; mismatch must disable only the affected ProtocolId and dependent hosting eligibility.
-- [ ] Reject duplicate IDs, unsupported messages, oversized payloads, reserved paths and stale activations.
-- [ ] Adapt local tell/ask/watch/watch_current to the new public reference API before adding networking.
-- [ ] Add path reuse, stale ref, codec diversity, ProtocolId/fingerprint/schema-version collision and local dispatch tests.
-- [ ] Phase 1 checklist and available directional evidence complete within macro batch 1; compilation is not required at this boundary.
+- [x] Move reusable `lattice-direct-link` transport internals into `lattice-remoting`, then delete the public Direct Link crate/API surface and manual endpoint/session/stream model.
+- [x] Delete the `lattice-rpc` source/API crate immediately after capturing the baseline; remaining tonic/codegen/control call sites are the current intentional broken frontier.
+- [x] Remove gRPC service definitions from `control.proto`; retain/move only internal non-gRPC control schemas needed by later macro batches.
+- [x] Delete Explicit Placement types, records, locks, floors, per-actor tombstones/reclamation and their authority/watch APIs.
+- [x] Add bounded canonical `ActorPath`, `NodeIncarnation`, and boot-unique `ActivationId`.
+- [x] Give every local and child actor an exact path/activation registry entry.
+- [x] Replace endpoint/owner-based ActorRef with typed concrete `ActorRef<A>`.
+- [x] Add logical `EntityRef<A>` and `SingletonRef<A>` plus shared tell/ask recipient API and separate activation-scoped watch_current surface.
+- [x] Add erased codec registry with explicit ProtocolId/message ID, request/reply codec/schema versions and dispatch closure.
+- [x] Add canonical `actor_protocol!` generation of registrar/descriptor/BLAKE3 fingerprint plus the equivalent low-level ActorProtocol builder; allow external business tools to generate the Rust declaration.
+- [x] Separate transport compatibility from bounded post-handshake business protocol catalogue negotiation; mismatch must disable only the affected ProtocolId and dependent hosting eligibility.
+- [x] Reject duplicate IDs, unsupported messages, oversized payloads, reserved paths and stale activations.
+- [x] Adapt local tell/ask/watch/watch_current to the new public reference API before adding networking.
+- [x] Add path reuse, stale ref, codec diversity, ProtocolId/fingerprint/schema-version collision and local dispatch tests.
+- [x] Phase 1 checklist and available directional evidence complete within macro batch 1; compilation is not required at this boundary.
 
 ### Phase 2: Unified Remoting Association
 
-Status: `[ ]` not started.
+Status: `[ ]` in progress.
 
-- [ ] Complete the moved `lattice-remoting` transport, frame and association modules without retaining a compatibility facade.
-- [ ] Replace OpenLink JSON protocol with versioned binary association handshake.
+- [x] Complete the moved `lattice-remoting` transport, frame and association modules without retaining a compatibility facade.
+- [x] Replace OpenLink JSON protocol with versioned binary association handshake.
 - [ ] Implement exactly one logical Association per local/remote NodeIncarnation pair with lazy single-flight establishment and a bounded node-level Association registry.
-- [ ] Give each Association one fixed control connection, one fixed interactive connection and configurable 1..4 bulk stripes, defaulting to one bulk stripe.
-- [ ] Bind every physical connection to AssociationId, exact peer incarnations, lane kind and stripe index; resolve simultaneous dials and duplicate attachments deterministically.
-- [ ] Define actor sender identity as path+ActivationId and non-actor sender identity as boot-scoped SenderId; add stable sender/recipient bulk striping, bounded per-lane queues, frame batching/vectored-write opportunities and no business-visible stream/session API.
+- [x] Give each Association one fixed control connection, one fixed interactive connection and configurable 1..4 bulk stripes, defaulting to one bulk stripe.
+- [x] Bind every physical connection to AssociationId, exact peer incarnations, lane kind and stripe index; resolve simultaneous dials and duplicate attachments deterministically.
+- [x] Define actor sender identity as path+ActivationId and non-actor sender identity as boot-scoped SenderId; add stable sender/recipient bulk striping, bounded per-lane queues, frame batching/vectored-write opportunities and no business-visible stream/session API.
 - [ ] Add plaintext TCP and optional TLS-TCP with complete configuration validation.
 - [ ] Add heartbeat, reconnect, incarnation quarantine, idle data-connection close, frame/payload bounds and graceful supervised join; control failure immediately stops all new data admission and no v1 data lane continues independently.
-- [ ] Add one Association-level reliable control stream with association epoch, control sequence, command ID, cumulative Ack, bounded replay, idempotent receive, incarnation reset and reconciliation fallback; never replay uncertain business frames.
-- [ ] Remove public link/session/stream/open APIs from the new crate.
+- [x] Add one Association-level reliable control stream with association epoch, control sequence, command ID, cumulative Ack, bounded replay, idempotent receive, incarnation reset and reconciliation fallback; never replay uncertain business frames.
+- [x] Remove public link/session/stream/open APIs from the new crate.
 - [ ] Add real socket tests for handshake, old incarnation, simultaneous connection, duplicate lane, stable stripe ordering, control non-starvation under bulk load, reliable-control replay/dedup/gap recovery, per-ProtocolId mismatch isolation, partial-lane failure, association cap, overload, malformed frame, heartbeat timeout and TLS.
 - [ ] Phase 2 checklist and available directional evidence complete within macro batch 1; compilation is not required at this boundary.
 
 ### Phase 3: Remote ActorRef Tell and Ask
 
-Status: `[ ]` not started.
+Status: `[ ]` in progress.
 
-- [ ] Implement Tell, Ask, Reply and Failure frames using opaque codec payloads.
-- [ ] Route concrete ActorRef directly to its node association and exact path/ActivationId.
-- [ ] Add boot-unique bounded pending ask correlation, monotonic caller deadlines, wire timeout budgets, caller cancellation and `UnknownResult` at the first socket-write boundary.
+- [x] Implement Tell, Ask, Reply and Failure frames using opaque codec payloads.
+- [x] Route concrete ActorRef directly to its node association and exact path/ActivationId.
+- [x] Add boot-unique bounded pending ask correlation, monotonic caller deadlines, wire timeout budgets, caller cancellation and `UnknownResult` at the first socket-write boundary.
 - [ ] Check ask expiry before admission, Region buffering, socket write, remote mailbox admission and Handler start; never claim Handler cancellation rolls back effects.
-- [ ] Keep expected business errors inside typed Reply and map runtime failures to stable bounded/redacted `RemoteFailureCode` frames.
-- [ ] Map mailbox full/closed, unknown message, decode failure, authorization failure and stale activation to structured failures.
+- [x] Keep expected business errors inside typed Reply and map runtime failures to stable bounded/redacted `RemoteFailureCode` frames.
+- [x] Map mailbox full/closed, unknown message, decode failure, authorization failure and stale activation to structured failures.
 - [ ] Preserve per-sender/target tell ordering only on its stable bulk stripe within one Association/home epoch; document and test the lack of ordering across tell/ask lanes.
-- [ ] Prove tell returns after local admission and never waits for handler completion.
+- [x] Prove tell returns after local admission and never waits for handler completion.
 - [ ] Add disconnect-before/after-dispatch, stale ref, queue full, deadline and codec failure tests.
 - [ ] Phase 3 checklist and available directional evidence complete within macro batch 1; compilation is not required at this boundary.
 

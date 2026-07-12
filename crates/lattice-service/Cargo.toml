@@ -7,21 +7,12 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-axum.workspace = true
-http.workspace = true
-lattice-config.workspace = true
+bytes.workspace = true
 lattice-actor.workspace = true
 lattice-core.workspace = true
-lattice-direct-link.workspace = true
-lattice-eventbus.workspace = true
-lattice-ops.workspace = true
-lattice-placement.workspace = true
-lattice-rpc.workspace = true
-serde_json.workspace = true
+lattice-remoting.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
-tonic.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

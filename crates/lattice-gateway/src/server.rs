@@ -1,4 +1,3 @@
-use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -9,10 +8,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
-use tonic::body::Body;
-use tonic::codegen::Service;
-use tonic::server::NamedService;
-use tonic::transport::Server;
 
 use crate::error::GatewayError;
 use crate::frame::{BinaryClientCodec, ClientCodec, ClientFrame};
@@ -147,31 +142,6 @@ where
             future: Box::pin(future),
         });
         self
-    }
-
-    pub fn background_tonic_service<S>(
-        self,
-        name: impl Into<String>,
-        listener: TcpListener,
-        service: S,
-    ) -> Self
-    where
-        S: Service<http::Request<Body>, Error = Infallible>
-            + NamedService
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        S::Response: axum::response::IntoResponse,
-        S::Future: Send + 'static,
-    {
-        self.background_task(name, async move {
-            Server::builder()
-                .add_service(service)
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .map_err(|error| GatewayError::Io(error.to_string()))
-        })
     }
 
     pub async fn run(self) -> Result<(), GatewayError> {

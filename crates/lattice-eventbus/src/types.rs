@@ -1,7 +1,6 @@
-use lattice_core::actor_ref::RequestId;
-use lattice_core::id::ActorId;
+use lattice_core::actor_ref::RecipientRef;
 use lattice_core::instance::InstanceId;
-use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_core::kind::ServiceKind;
 use lattice_core::trace::TraceContext;
 use serde::{Deserialize, Serialize};
 
@@ -40,9 +39,8 @@ pub struct EventEnvelope {
     pub event_type: String,
     pub source_service: ServiceKind,
     pub source_instance: InstanceId,
-    pub actor_kind: Option<ActorKind>,
-    pub actor_id: Option<ActorId>,
-    pub request_id: Option<RequestId>,
+    pub recipient: Option<RecipientRef<()>>,
+    pub correlation_id: Option<String>,
     pub trace: TraceContext,
     pub occurred_unix_ms: u64,
     pub payload: Vec<u8>,

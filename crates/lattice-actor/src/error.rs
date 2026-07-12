@@ -47,6 +47,8 @@ pub enum ActorCallError {
     MailboxClosed,
     #[error("actor dropped the response before replying")]
     ResponseDropped,
+    #[error("actor ask deadline elapsed before the handler started")]
+    DeadlineExceeded,
     #[error("actor handler failed: {0}")]
     Handler(ActorError),
 }
@@ -57,10 +59,6 @@ pub enum ActorTellError {
     MailboxFull,
     #[error("actor mailbox is closed")]
     MailboxClosed,
-    #[error("actor dropped the response before acknowledging tell")]
-    ResponseDropped,
-    #[error("actor handler failed: {0}")]
-    Handler(ActorError),
 }
 
 #[derive(Debug, Clone, Error)]

@@ -1,5 +1,0 @@
-error[E0599]: no method named `delete` found for reference `&RealEtcdClient` in the current scope
- --> tests/ui/raw_etcd_floor_delete.rs:4:20
-  |
-4 |     let _ = client.delete("/lattice/test/authority/epoch_floors/v1/actors/World/World/u64:7");
-  |                    ^^^^^^ method not found in `&RealEtcdClient`

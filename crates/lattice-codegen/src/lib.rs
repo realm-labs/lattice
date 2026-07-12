@@ -1,15 +1,12 @@
 pub mod builder;
-pub mod descriptor;
 pub mod error;
 pub mod render;
-pub mod route_key;
 pub mod spec;
 
-use std::path::PathBuf;
+pub use builder::{ActorProtocolCodegen, configure};
+pub use error::CodegenError;
+pub use spec::{ActorProtocolSpec, InteractionMode, ProtocolMessageSpec};
 
-pub fn proto_include() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("proto")
+pub fn proto_include() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("proto")
 }
-
-#[cfg(test)]
-mod tests;

@@ -1,65 +1,74 @@
 use std::marker::PhantomData;
 
+use async_trait::async_trait;
+use lattice_actor::traits::Message;
 use lattice_core::kind::ActorKind;
-use lattice_rpc::traits::{RpcRequest, ShardedRpcCore};
-use lattice_rpc::types::RoutedEnvelope;
 use prost::Message as ProstMessage;
 
 use crate::error::GatewayError;
 use crate::frame::ClientFrame;
-use crate::route::{GatewayRouteContext, GatewayRouteSpec, MessageRouter};
+use crate::route::{GatewayRouteContext, GatewayRouteSpec, MessageRouter, RouteDecision};
 
-#[derive(Clone)]
-pub struct ProstClientMessageBinding<Req> {
-    msg_id: u32,
-    actor_kind: ActorKind,
-    _marker: PhantomData<Req>,
+#[async_trait]
+pub trait GatewayRecipient<M>: Clone + Send + Sync + 'static
+where
+    M: Message,
+{
+    async fn ask(&self, route: RouteDecision, message: M) -> Result<M::Reply, GatewayError>;
 }
 
-impl<Req> std::fmt::Debug for ProstClientMessageBinding<Req> {
+#[derive(Clone)]
+pub struct ProstClientMessageBinding<M> {
+    msg_id: u32,
+    actor_kind: ActorKind,
+    protocol_name: &'static str,
+    _marker: PhantomData<fn() -> M>,
+}
+
+impl<M> std::fmt::Debug for ProstClientMessageBinding<M> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ProstClientMessageBinding")
             .field("msg_id", &self.msg_id)
             .field("actor_kind", &self.actor_kind)
+            .field("protocol_name", &self.protocol_name)
             .finish_non_exhaustive()
     }
 }
 
-impl<Req> ProstClientMessageBinding<Req> {
-    pub fn new(msg_id: u32, actor_kind: ActorKind) -> Self {
+impl<M> ProstClientMessageBinding<M> {
+    pub fn new(msg_id: u32, actor_kind: ActorKind, protocol_name: &'static str) -> Self {
         Self {
             msg_id,
             actor_kind,
+            protocol_name,
             _marker: PhantomData,
         }
     }
 
-    pub fn route_spec(&self) -> GatewayRouteSpec
-    where
-        Req: RpcRequest,
-    {
+    pub fn route_spec(&self) -> GatewayRouteSpec {
         GatewayRouteSpec {
             msg_id: self.msg_id,
             actor_kind: self.actor_kind.clone(),
-            method: <Req as RpcRequest>::METHOD,
+            protocol_name: self.protocol_name,
         }
     }
 }
 
-impl<Req> ProstClientMessageBinding<Req>
+impl<M> ProstClientMessageBinding<M>
 where
-    Req: RpcRequest,
+    M: Message + ProstMessage + Default,
+    M::Reply: ProstMessage,
 {
     pub async fn decode_and_forward<C, R>(
         &self,
         frame: ClientFrame,
-        core: C,
+        recipient: C,
         router: &mut R,
         context: &GatewayRouteContext,
     ) -> Result<ClientFrame, GatewayError>
     where
-        C: ShardedRpcCore,
+        C: GatewayRecipient<M>,
         R: MessageRouter,
     {
         if frame.msg_id != self.msg_id {
@@ -68,19 +77,10 @@ where
                 actual: frame.msg_id,
             });
         }
-
-        let route = self.route_spec();
-        let decision = router.route(context, &route)?;
-        let req = Req::decode(frame.payload.as_slice())
+        let decision = router.route(context, &self.route_spec())?;
+        let message = M::decode(frame.payload.as_slice())
             .map_err(|source| GatewayError::DecodePayload(source.to_string()))?;
-        let reply = core
-            .call_routed(RoutedEnvelope::new(
-                req,
-                decision.actor_kind,
-                decision.route_key,
-            ))
-            .await
-            .map_err(GatewayError::Rpc)?;
+        let reply = recipient.ask(decision, message).await?;
         Ok(ClientFrame {
             msg_id: self.msg_id,
             payload: reply.encode_to_vec(),

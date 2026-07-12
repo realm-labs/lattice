@@ -9,11 +9,10 @@ use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::registry::ActorRegistry;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistryConfig};
 use lattice_actor::traits::Actor;
-use lattice_core::actor_ref::{ActorRef, ActorRefTarget};
+use lattice_core::actor_kind;
+use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
 use lattice_core::id::ActorId;
-use lattice_core::instance::InstanceId;
 use lattice_core::service_context::ServiceContext;
-use lattice_core::{actor_kind, service_kind};
 use tokio::sync::{Semaphore, oneshot};
 
 struct SlowActor;
@@ -95,7 +94,7 @@ async fn remove_running_actor_allows_restart_with_same_id() {
 }
 
 struct SelfRefActor {
-    tx: Option<oneshot::Sender<ActorRef>>,
+    tx: Option<oneshot::Sender<ActorRef<SelfRefActor>>>,
 }
 
 #[async_trait]
@@ -103,23 +102,23 @@ impl Actor for SelfRefActor {
     type Error = ActorError;
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(ctx.require_self_ref()?.clone());
+            let _ = tx.send(ctx.require_self_ref()?.cast());
         }
         Ok(())
     }
 }
 
 #[tokio::test]
-async fn registry_injects_direct_actor_ref_into_context() {
-    let endpoint = "http://127.0.0.1:19090".parse().unwrap();
+async fn registry_injects_exact_actor_ref_into_context() {
+    let node_incarnation = NodeIncarnation::new(7).unwrap();
     let registry = ActorRegistry::<SelfRefActor>::new(
         actor_kind!("GatewaySession"),
         ActorRegistryConfig {
             actor_ref: Some(ActorRefConfig {
-                service_kind: service_kind!("Gateway"),
-                instance_id: InstanceId::new("gateway-1"),
-                endpoint,
-                owner_epoch: None,
+                cluster_id: ClusterId::new("test").unwrap(),
+                node_address: NodeAddress::new("127.0.0.1", 19090).unwrap(),
+                node_incarnation,
+                protocol_id: ProtocolId::new(11).unwrap(),
             }),
             ..ActorRegistryConfig::default()
         },
@@ -135,15 +134,26 @@ async fn registry_injects_direct_actor_ref_into_context() {
         .unwrap();
 
     let actor_ref = rx.await.unwrap();
-    assert_eq!(actor_ref.service_kind, service_kind!("Gateway"));
-    assert_eq!(actor_ref.actor_kind, actor_kind!("GatewaySession"));
-    assert_eq!(actor_ref.actor_id, ActorId::Str("session-1".to_string()));
-    assert!(matches!(
-        actor_ref.target,
-        ActorRefTarget::Direct {
-            instance_id,
-            owner_epoch: None,
-            ..
-        } if instance_id == InstanceId::new("gateway-1")
-    ));
+    assert_eq!(actor_ref.cluster_id().as_str(), "test");
+    assert_eq!(actor_ref.node_incarnation(), node_incarnation);
+    assert_eq!(actor_ref.protocol_id(), ProtocolId::new(11).unwrap());
+    assert!(actor_ref.actor_path().to_string().starts_with("/user/"));
+    assert!(registry.get_exact(&actor_ref).is_some());
+
+    let old = actor_ref.cast::<SelfRefActor>();
+    let actor_id = ActorId::Str("session-1".to_string());
+    let first = registry.remove(&actor_id).await.unwrap();
+    first
+        .stop(lattice_actor::traits::StopReason::Requested)
+        .await
+        .unwrap();
+    let replacement = registry
+        .start(actor_id, SelfRefActor { tx: None })
+        .await
+        .unwrap();
+    assert!(registry.get_exact(&old).is_none());
+    assert_ne!(
+        old.activation_id(),
+        replacement.actor_ref().unwrap().activation_id()
+    );
 }

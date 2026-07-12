@@ -14,14 +14,12 @@ lattice-eventbus.workspace = true
 lattice-gateway.workspace = true
 lattice-ops.workspace = true
 lattice-placement.workspace = true
-lattice-rpc.workspace = true
+lattice-remoting.workspace = true
 lattice-service.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tonic.workspace = true
-tonic-prost.workspace = true
 
 [build-dependencies]
 lattice-codegen.workspace = true

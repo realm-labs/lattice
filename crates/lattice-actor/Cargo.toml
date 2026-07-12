@@ -7,9 +7,13 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
 dashmap.workspace = true
 http.workspace = true
 lattice-core.workspace = true
+lattice-remoting.workspace = true
+prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

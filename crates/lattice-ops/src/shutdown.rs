@@ -1,17 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use lattice_core::instance::{InstanceId, InstanceIncarnation};
-use lattice_core::kind::ServiceKind;
-use lattice_eventbus::local::EventSubscriptionHandle;
-use lattice_placement::authority::PlacementAuthority;
-use lattice_placement::coordination::reports::DrainReport;
-use lattice_placement::storage::LeaseId;
 use tokio::sync::Mutex;
 
 use crate::error::OpsError;
-use crate::scheduler::ServiceScheduler;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownTrigger {
@@ -23,11 +17,19 @@ pub enum ShutdownTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownStage {
     ReadinessFalse,
-    LeaseKeptAlive,
-    SubscriptionsCancelled,
-    Drained,
-    SchedulerStopped,
-    LeaseReleased,
+    ExternalAdmissionStopped,
+    ShardsDrained,
+    SingletonsRelocated,
+    ActorsStopped,
+    AssociationsClosed,
+    MembershipReleased,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DrainReport {
+    pub shards_moved: usize,
+    pub singletons_moved: usize,
+    pub blocked_slots: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,135 +40,71 @@ pub struct GracefulShutdownReport {
 }
 
 #[async_trait]
-pub trait ShutdownLeaseController: Clone + Send + Sync + 'static {
-    async fn keep_alive_during_drain(&self, instance_id: &InstanceId) -> Result<(), OpsError>;
-    async fn release_after_drain(&self, instance_id: &InstanceId) -> Result<(), OpsError>;
+pub trait DrainController: Send + Sync + 'static {
+    async fn stop_external_admission(&self) -> Result<(), OpsError>;
+    async fn drain_shards(&self) -> Result<DrainReport, OpsError>;
+    async fn relocate_singletons(&self) -> Result<usize, OpsError>;
+    async fn stop_actors(&self) -> Result<(), OpsError>;
+    async fn close_associations(&self) -> Result<(), OpsError>;
+    async fn release_membership(&self) -> Result<(), OpsError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LeaseEvent {
-    KeepAlive(InstanceId),
-    Release(InstanceId),
+pub struct GracefulShutdown {
+    controller: Arc<dyn DrainController>,
+    ready: AtomicBool,
+    gate: Mutex<()>,
+    timeout: Duration,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct InMemoryShutdownLeaseController {
-    events: Arc<Mutex<Vec<LeaseEvent>>>,
-}
-
-impl InMemoryShutdownLeaseController {
-    pub async fn events(&self) -> Vec<LeaseEvent> {
-        self.events.lock().await.clone()
-    }
-}
-
-#[async_trait]
-impl ShutdownLeaseController for InMemoryShutdownLeaseController {
-    async fn keep_alive_during_drain(&self, instance_id: &InstanceId) -> Result<(), OpsError> {
-        self.events
-            .lock()
-            .await
-            .push(LeaseEvent::KeepAlive(instance_id.clone()));
-        Ok(())
-    }
-
-    async fn release_after_drain(&self, instance_id: &InstanceId) -> Result<(), OpsError> {
-        self.events
-            .lock()
-            .await
-            .push(LeaseEvent::Release(instance_id.clone()));
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct GracefulShutdown<A, LC> {
-    service_kind: ServiceKind,
-    instance_id: InstanceId,
-    instance_incarnation: InstanceIncarnation,
-    expected_lease_id: LeaseId,
-    authority: A,
-    lease_controller: LC,
-    scheduler: ServiceScheduler,
-    subscriptions: Arc<Mutex<Vec<EventSubscriptionHandle>>>,
-    ready: Arc<AtomicBool>,
-}
-
-impl<A, LC> GracefulShutdown<A, LC> {
-    pub fn new(
-        service_kind: ServiceKind,
-        instance_id: InstanceId,
-        instance_incarnation: InstanceIncarnation,
-        expected_lease_id: LeaseId,
-        authority: A,
-        lease_controller: LC,
-        scheduler: ServiceScheduler,
-    ) -> Self {
-        Self {
-            service_kind,
-            instance_id,
-            instance_incarnation,
-            expected_lease_id,
-            authority,
-            lease_controller,
-            scheduler,
-            subscriptions: Arc::new(Mutex::new(Vec::new())),
-            ready: Arc::new(AtomicBool::new(true)),
+impl GracefulShutdown {
+    pub fn new(controller: Arc<dyn DrainController>, timeout: Duration) -> Result<Self, OpsError> {
+        if timeout.is_zero() {
+            return Err(OpsError::Drain {
+                message: "shutdown timeout must be nonzero".to_owned(),
+            });
         }
-    }
-
-    pub async fn own_subscription(&self, handle: EventSubscriptionHandle) {
-        self.subscriptions.lock().await.push(handle);
+        Ok(Self {
+            controller,
+            ready: AtomicBool::new(true),
+            gate: Mutex::new(()),
+            timeout,
+        })
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::SeqCst)
+        self.ready.load(Ordering::Acquire)
     }
-}
 
-impl<A, LC> GracefulShutdown<A, LC>
-where
-    A: PlacementAuthority,
-    LC: ShutdownLeaseController,
-{
     pub async fn shutdown(
         &self,
         trigger: ShutdownTrigger,
     ) -> Result<GracefulShutdownReport, OpsError> {
-        let mut stages = Vec::new();
+        let _guard = self.gate.lock().await;
+        tokio::time::timeout(self.timeout, self.shutdown_inner(trigger))
+            .await
+            .map_err(|_| OpsError::Drain {
+                message: "shutdown deadline exceeded".to_owned(),
+            })?
+    }
 
-        self.ready.store(false, Ordering::SeqCst);
-        stages.push(ShutdownStage::ReadinessFalse);
-
-        self.lease_controller
-            .keep_alive_during_drain(&self.instance_id)
-            .await?;
-        stages.push(ShutdownStage::LeaseKeptAlive);
-
-        for subscription in self.subscriptions.lock().await.drain(..) {
-            subscription.cancel();
-        }
-        stages.push(ShutdownStage::SubscriptionsCancelled);
-
-        let drain = self
-            .authority
-            .drain_instance(
-                self.service_kind.clone(),
-                self.instance_id.clone(),
-                self.instance_incarnation.clone(),
-                self.expected_lease_id,
-            )
-            .await?;
-        stages.push(ShutdownStage::Drained);
-
-        self.scheduler.shutdown().await;
-        stages.push(ShutdownStage::SchedulerStopped);
-
-        self.lease_controller
-            .release_after_drain(&self.instance_id)
-            .await?;
-        stages.push(ShutdownStage::LeaseReleased);
-
+    async fn shutdown_inner(
+        &self,
+        trigger: ShutdownTrigger,
+    ) -> Result<GracefulShutdownReport, OpsError> {
+        self.ready.store(false, Ordering::Release);
+        let mut stages = vec![ShutdownStage::ReadinessFalse];
+        self.controller.stop_external_admission().await?;
+        stages.push(ShutdownStage::ExternalAdmissionStopped);
+        let mut drain = self.controller.drain_shards().await?;
+        stages.push(ShutdownStage::ShardsDrained);
+        drain.singletons_moved = self.controller.relocate_singletons().await?;
+        stages.push(ShutdownStage::SingletonsRelocated);
+        self.controller.stop_actors().await?;
+        stages.push(ShutdownStage::ActorsStopped);
+        self.controller.close_associations().await?;
+        stages.push(ShutdownStage::AssociationsClosed);
+        self.controller.release_membership().await?;
+        stages.push(ShutdownStage::MembershipReleased);
         Ok(GracefulShutdownReport {
             trigger,
             stages,

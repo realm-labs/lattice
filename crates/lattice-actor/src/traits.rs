@@ -1,43 +1,29 @@
 use async_trait::async_trait;
-use lattice_core::direct_link::messages::{
-    LinkBackpressure, LinkClosed, LinkDirectionClosed, LinkOpened, LinkProtocolError, Linked,
-};
 use std::error::Error as StdError;
 
 use crate::context::ActorContext;
 use crate::error::ActorStopError;
 use crate::mailbox::MailboxConfig;
+use lattice_core::actor_ref::{EntityId, ProtocolId};
+use thiserror::Error;
 
 pub trait Message: Send + 'static {
     type Reply: Send + 'static;
 }
 
-impl<T, M> Message for Linked<T, M>
-where
-    T: Send + 'static,
-    M: Send + 'static,
-{
-    type Reply = ();
+pub trait EntityKey: Clone + Send + Sync + 'static {
+    fn to_entity_id(&self) -> Result<EntityId, EntityKeyDecodeError>;
+    fn try_from_entity_id(entity_id: &EntityId) -> Result<Self, EntityKeyDecodeError>;
 }
 
-impl Message for LinkOpened {
-    type Reply = ();
+pub trait ShardedActor: Actor {
+    type Key: EntityKey;
 }
 
-impl Message for LinkDirectionClosed {
-    type Reply = ();
-}
-
-impl Message for LinkClosed {
-    type Reply = ();
-}
-
-impl Message for LinkBackpressure {
-    type Reply = ();
-}
-
-impl Message for LinkProtocolError {
-    type Reply = ();
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("entity key encoding is invalid: {reason}")]
+pub struct EntityKeyDecodeError {
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +120,7 @@ impl ChildActorKey {
 pub struct ChildActorOptions {
     pub mailbox: MailboxConfig,
     pub supervision: ChildSupervision,
+    pub protocol_id: Option<ProtocolId>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

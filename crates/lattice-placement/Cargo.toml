@@ -7,21 +7,23 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
 dashmap.workspace = true
 etcd-client.workspace = true
 http.workspace = true
 lattice-core.workspace = true
-lattice-rpc.workspace = true
+lattice-remoting.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 tokio-stream.workspace = true
-tonic.workspace = true
-tonic-prost.workspace = true
 tower.workspace = true
 tracing.workspace = true
+uuid.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
@@ -29,6 +31,3 @@ lattice-config.workspace = true
 rcgen.workspace = true
 tempfile.workspace = true
 trybuild.workspace = true
-
-[build-dependencies]
-tonic-prost-build.workspace = true

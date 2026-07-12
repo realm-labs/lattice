@@ -1,38 +1,63 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use axum::Json;
-use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
-use lattice_core::instance::InstanceId;
-use lattice_core::kind::{ActorKind, ServiceKind};
-use lattice_placement::registry::InstanceRecord;
-use lattice_placement::storage::{
-    ActorPlacementRecord, PlacementStore, SingletonPlacementRecord, VirtualShardPlacementRecord,
-};
+use axum::{Json, Router};
+use lattice_placement::{PlacementSlot, RebalancePlan};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tracing::{info, warn};
-
-use crate::error::OpsError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClusterSummary {
-    pub instance_count: usize,
-    pub actor_owner_count: usize,
+pub struct NodeView {
+    pub node_id: String,
+    pub address: String,
+    pub incarnation: String,
+    pub roles: Vec<String>,
+    pub ready: bool,
+    pub draining: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeSummary {
-    pub instance_id: InstanceId,
-    pub service_kind: ServiceKind,
-    pub actor_kinds: Vec<ActorKind>,
+pub struct AssociationView {
+    pub remote_node_id: String,
+    pub remote_address: String,
+    pub remote_incarnation: String,
+    pub association_id: String,
+    pub state: String,
+    pub attached_lanes: usize,
+    pub queued_frames: usize,
+    pub queued_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorPathView {
+    pub path: String,
+    pub activation_id: String,
+    pub protocol_id: u64,
+    pub mailbox_depth: usize,
+    pub lifecycle: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchView {
+    pub watch_id: String,
+    pub exact_path: String,
+    pub activation_id: String,
+    pub acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdminSnapshot {
+    pub partial: bool,
+    pub coordinator_term: Option<u64>,
+    pub coordinator_revision: Option<u64>,
+    pub nodes: Vec<NodeView>,
+    pub associations: Vec<AssociationView>,
+    pub actor_paths: Vec<ActorPathView>,
+    pub slots: Vec<PlacementSlot>,
+    pub watches: Vec<WatchView>,
+    pub rebalance_plans: Vec<RebalancePlan>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +76,7 @@ impl AdminAuth {
         }
     }
 
-    pub fn authorize(&self, headers: &HeaderMap) -> Result<(), AdminApiError> {
+    pub(crate) fn authorize(&self, headers: &HeaderMap) -> Result<(), AdminApiError> {
         let Some(expected) = &self.token else {
             return Ok(());
         };
@@ -66,748 +91,130 @@ impl AdminAuth {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub struct PageRequest {
-    #[serde(default)]
-    pub offset: usize,
-    #[serde(default = "default_page_limit")]
-    pub limit: usize,
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManualRelocation {
+    pub operation_id: String,
+    pub entity_type: String,
+    pub shard_id: u32,
+    pub expected_generation: u64,
+    pub target_node_id: String,
 }
 
-fn default_page_limit() -> usize {
-    100
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlanCommand {
+    pub operation_id: String,
+    pub entity_type: Option<String>,
+    pub plan_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Page<T> {
-    pub items: Vec<T>,
-    pub offset: usize,
-    pub limit: usize,
-    pub total: usize,
-    pub partial: bool,
+#[async_trait]
+pub trait AdminMutationHandler: Send + Sync + 'static {
+    async fn pause_automatic_rebalance(&self, command: PlanCommand) -> Result<(), AdminApiError>;
+    async fn resume_automatic_rebalance(&self, command: PlanCommand) -> Result<(), AdminApiError>;
+    async fn evaluate_now(&self, command: PlanCommand) -> Result<(), AdminApiError>;
+    async fn relocate_shard(&self, command: ManualRelocation) -> Result<(), AdminApiError>;
+    async fn cancel_pending_move(&self, command: PlanCommand) -> Result<(), AdminApiError>;
 }
 
-pub fn paginate<T: Clone>(items: &[T], request: PageRequest) -> Page<T> {
-    let limit = request.limit.clamp(1, 500);
-    let offset = request.offset.min(items.len());
-    let end = (offset + limit).min(items.len());
-    Page {
-        items: items[offset..end].to_vec(),
-        offset,
-        limit,
-        total: items.len(),
-        partial: end < items.len(),
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct InstanceView {
-    pub service_kind: ServiceKind,
-    pub instance_id: InstanceId,
-    pub state: String,
-    pub advertised_endpoint: String,
-    pub control_endpoint: String,
-    pub version: String,
-}
-
-impl From<InstanceRecord> for InstanceView {
-    fn from(record: InstanceRecord) -> Self {
-        Self {
-            service_kind: record.service_kind,
-            instance_id: record.instance_id,
-            state: format!("{:?}", record.state),
-            advertised_endpoint: record.advertised_endpoint.to_string(),
-            control_endpoint: record.control_endpoint.to_string(),
-            version: record.version,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct NodeInspectView {
-    pub instance_id: InstanceId,
-    pub reachable: bool,
-    pub summary: Option<NodeSummary>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct InspectionView {
-    pub name: String,
-    pub owner: Option<InstanceId>,
-    pub state: String,
-    pub details: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AdminSnapshot {
-    pub summary: ClusterSummary,
-    pub node_summary: Option<NodeSummary>,
-    pub instances: Vec<InstanceView>,
-    pub nodes: Vec<NodeInspectView>,
-    pub placements: Vec<InspectionView>,
-    pub virtual_shards: Vec<InspectionView>,
-    pub singletons: Vec<InspectionView>,
-    pub mailboxes: Vec<InspectionView>,
-    pub schedulers: Vec<InspectionView>,
-    pub event_subscriptions: Vec<InspectionView>,
-}
-
-impl AdminSnapshot {
-    pub fn new(summary: ClusterSummary, instances: Vec<InstanceView>) -> Self {
-        Self {
-            summary,
-            node_summary: None,
-            instances,
-            nodes: Vec::new(),
-            placements: Vec::new(),
-            virtual_shards: Vec::new(),
-            singletons: Vec::new(),
-            mailboxes: Vec::new(),
-            schedulers: Vec::new(),
-            event_subscriptions: Vec::new(),
-        }
-    }
-
-    pub fn from_placement_records(
-        service_kind: ServiceKind,
-        instance_id: InstanceId,
-        mut actor_kinds: Vec<ActorKind>,
-        instances: Vec<InstanceRecord>,
-        actors: Vec<ActorPlacementRecord>,
-        virtual_shards: Vec<VirtualShardPlacementRecord>,
-        singletons: Vec<SingletonPlacementRecord>,
-    ) -> Self {
-        actor_kinds.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        actor_kinds.dedup();
-        let actor_kind_set = actor_kinds
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>();
-        let actors = actors
-            .into_iter()
-            .filter(|record| actor_kind_set.contains(&record.actor_kind))
-            .collect::<Vec<_>>();
-        let service_kind_filter = service_kind.clone();
-        let mut snapshot = Self::new(
-            ClusterSummary {
-                instance_count: instances.len(),
-                actor_owner_count: actors.len(),
-            },
-            instances.into_iter().map(InstanceView::from).collect(),
-        );
-        snapshot.node_summary = Some(NodeSummary {
-            instance_id,
-            service_kind,
-            actor_kinds,
-        });
-        snapshot.placements = actors
-            .into_iter()
-            .map(|record| InspectionView {
-                name: format!("{}/{:?}", record.actor_kind.as_str(), record.actor_id),
-                owner: Some(record.owner),
-                state: format!("{:?}", record.state),
-                details: HashMap::from([
-                    ("epoch".to_string(), record.epoch.0.to_string()),
-                    ("lease_id".to_string(), record.lease_id.0.to_string()),
-                ]),
-            })
-            .collect();
-        let virtual_shard_service_filter = service_kind_filter.clone();
-        snapshot.virtual_shards = virtual_shards
-            .into_iter()
-            .filter(|record| record.service_kind == virtual_shard_service_filter)
-            .map(|record| InspectionView {
-                name: format!("{}/#{}", record.actor_kind.as_str(), record.shard_id.0),
-                owner: Some(record.owner),
-                state: "Assigned".to_string(),
-                details: HashMap::from([
-                    ("service_kind".to_string(), record.service_kind.to_string()),
-                    ("epoch".to_string(), record.epoch.0.to_string()),
-                ]),
-            })
-            .collect();
-        snapshot.singletons = singletons
-            .into_iter()
-            .filter(|record| record.service_kind == service_kind_filter)
-            .map(|record| InspectionView {
-                name: format!("{}/{}", record.singleton_kind.as_str(), record.scope),
-                owner: Some(record.owner),
-                state: format!("{:?}", record.state),
-                details: HashMap::from([
-                    ("service_kind".to_string(), record.service_kind.to_string()),
-                    ("epoch".to_string(), record.epoch.0.to_string()),
-                    ("lease_id".to_string(), record.lease_id.0.to_string()),
-                ]),
-            })
-            .collect();
-        snapshot
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AdminHttpState {
+#[derive(Clone)]
+struct AdminState {
     auth: AdminAuth,
-    snapshot: AdminSnapshot,
+    snapshot: Arc<dyn Fn() -> AdminSnapshot + Send + Sync>,
     mutations: Arc<dyn AdminMutationHandler>,
-    mutation_limiter: AdminMutationRateLimiter,
 }
 
-#[derive(Debug, Clone)]
 pub struct AdminHttpAdapter {
-    state: AdminHttpState,
+    state: AdminState,
 }
 
 impl AdminHttpAdapter {
-    pub fn new(auth: AdminAuth, snapshot: AdminSnapshot) -> Self {
+    pub fn new<S, M>(auth: AdminAuth, snapshot: S, mutations: M) -> Self
+    where
+        S: Fn() -> AdminSnapshot + Send + Sync + 'static,
+        M: AdminMutationHandler,
+    {
         Self {
-            state: AdminHttpState {
+            state: AdminState {
                 auth,
-                snapshot,
-                mutations: Arc::new(DisabledAdminMutationHandler),
-                mutation_limiter: AdminMutationRateLimiter::default(),
+                snapshot: Arc::new(snapshot),
+                mutations: Arc::new(mutations),
             },
         }
-    }
-
-    pub fn with_mutation_handler<H>(mut self, handler: H) -> Self
-    where
-        H: AdminMutationHandler,
-    {
-        self.state.mutations = Arc::new(handler);
-        self
-    }
-
-    pub fn with_mutation_rate_limit(mut self, max_per_minute: u32) -> Self {
-        self.state.mutation_limiter = AdminMutationRateLimiter::new(max_per_minute);
-        self
     }
 
     pub fn router(self) -> Router {
         Router::new()
-            .route("/healthz", get(admin_healthz))
-            .route("/readyz", get(admin_readyz))
-            .route("/metrics", get(admin_metrics))
-            .route("/admin/cluster/summary", get(admin_cluster_summary))
-            .route("/admin/node/summary", get(admin_node_summary))
-            .route("/admin/instances", get(admin_instances))
-            .route("/admin/nodes", get(admin_nodes))
-            .route("/admin/placements", get(admin_placements))
-            .route("/admin/vshards", get(admin_virtual_shards))
-            .route("/admin/singletons", get(admin_singletons))
-            .route("/admin/mailboxes", get(admin_mailboxes))
-            .route("/admin/node/mailboxes", get(admin_mailboxes))
-            .route("/admin/schedulers", get(admin_schedulers))
-            .route("/admin/node/schedulers", get(admin_schedulers))
-            .route("/admin/event-subscriptions", get(admin_event_subscriptions))
-            .route(
-                "/admin/node/event-subscriptions",
-                get(admin_event_subscriptions),
-            )
-            .route("/admin/instances/{id}/drain", post(admin_drain_instance))
-            .route(
-                "/admin/actors/{kind}/{id}/retry-stop",
-                post(admin_retry_actor_stop),
-            )
-            .route(
-                "/admin/actors/{kind}/{id}/force-stop",
-                post(admin_force_actor_stop),
-            )
-            .route(
-                "/admin/actors/{kind}/{id}/migrate",
-                post(admin_migrate_actor),
-            )
+            .route("/healthz", get(|| async { StatusCode::OK }))
+            .route("/readyz", get(|| async { StatusCode::OK }))
+            .route("/admin/snapshot", get(snapshot))
+            .route("/admin/rebalance/pause", post(pause))
+            .route("/admin/rebalance/resume", post(resume))
+            .route("/admin/rebalance/evaluate", post(evaluate))
+            .route("/admin/rebalance/relocate", post(relocate))
+            .route("/admin/rebalance/cancel-pending", post(cancel))
             .with_state(self.state)
     }
 }
 
-async fn admin_healthz() -> &'static str {
-    "ok\n"
-}
-
-async fn admin_readyz(State(state): State<AdminHttpState>) -> Result<&'static str, AdminApiError> {
-    if state.snapshot.node_summary.is_some() {
-        Ok("ready\n")
-    } else {
-        Err(AdminApiError::NotFound)
-    }
-}
-
-async fn admin_metrics(State(state): State<AdminHttpState>) -> String {
-    format!(
-        "lattice_admin_instances {}\nlattice_admin_actor_owners {}\n",
-        state.snapshot.summary.instance_count, state.snapshot.summary.actor_owner_count
-    )
-}
-
-async fn admin_cluster_summary(
-    State(state): State<AdminHttpState>,
+async fn snapshot(
+    State(state): State<AdminState>,
     headers: HeaderMap,
-) -> Result<Json<ClusterSummary>, AdminApiError> {
+) -> Result<Json<AdminSnapshot>, AdminApiError> {
     state.auth.authorize(&headers)?;
-    Ok(Json(state.snapshot.summary))
+    Ok(Json((state.snapshot)()))
 }
 
-async fn admin_node_summary(
-    State(state): State<AdminHttpState>,
-    headers: HeaderMap,
-) -> Result<Json<NodeSummary>, AdminApiError> {
-    state.auth.authorize(&headers)?;
-    state
-        .snapshot
-        .node_summary
-        .ok_or(AdminApiError::NotFound)
-        .map(Json)
-}
-
-async fn admin_instances(
-    State(state): State<AdminHttpState>,
-    headers: HeaderMap,
-    Query(page): Query<PageRequest>,
-) -> Result<Json<Page<InstanceView>>, AdminApiError> {
-    state.auth.authorize(&headers)?;
-    Ok(Json(paginate(&state.snapshot.instances, page)))
-}
-
-async fn admin_nodes(
-    State(state): State<AdminHttpState>,
-    headers: HeaderMap,
-    Query(page): Query<PageRequest>,
-) -> Result<Json<Page<NodeInspectView>>, AdminApiError> {
-    state.auth.authorize(&headers)?;
-    Ok(Json(paginate(&state.snapshot.nodes, page)))
-}
-
-macro_rules! admin_inspection_handler {
-    ($name:ident, $field:ident) => {
+macro_rules! command_handler {
+    ($name:ident, $method:ident) => {
         async fn $name(
-            State(state): State<AdminHttpState>,
+            State(state): State<AdminState>,
             headers: HeaderMap,
-            Query(page): Query<PageRequest>,
-        ) -> Result<Json<Page<InspectionView>>, AdminApiError> {
+            Json(command): Json<PlanCommand>,
+        ) -> Result<StatusCode, AdminApiError> {
             state.auth.authorize(&headers)?;
-            Ok(Json(paginate(&state.snapshot.$field, page)))
+            state.mutations.$method(command).await?;
+            Ok(StatusCode::ACCEPTED)
         }
     };
 }
 
-admin_inspection_handler!(admin_placements, placements);
-admin_inspection_handler!(admin_virtual_shards, virtual_shards);
-admin_inspection_handler!(admin_singletons, singletons);
-admin_inspection_handler!(admin_mailboxes, mailboxes);
-admin_inspection_handler!(admin_schedulers, schedulers);
-admin_inspection_handler!(admin_event_subscriptions, event_subscriptions);
+command_handler!(pause, pause_automatic_rebalance);
+command_handler!(resume, resume_automatic_rebalance);
+command_handler!(evaluate, evaluate_now);
+command_handler!(cancel, cancel_pending_move);
 
-async fn admin_drain_instance(
-    State(state): State<AdminHttpState>,
+async fn relocate(
+    State(state): State<AdminState>,
     headers: HeaderMap,
-    Path(instance_id): Path<String>,
-) -> Result<Json<AdminMutationReply>, AdminApiError> {
-    authorize_mutation(&state, &headers, "drain_instance").await?;
-    let instance_id = InstanceId::new(instance_id);
-    let reply = state.mutations.drain_instance(instance_id.clone()).await?;
-    audit_mutation("drain_instance", &instance_id.to_string(), &reply);
-    Ok(Json(reply))
+    Json(command): Json<ManualRelocation>,
+) -> Result<StatusCode, AdminApiError> {
+    state.auth.authorize(&headers)?;
+    state.mutations.relocate_shard(command).await?;
+    Ok(StatusCode::ACCEPTED)
 }
 
-async fn admin_retry_actor_stop(
-    State(state): State<AdminHttpState>,
-    headers: HeaderMap,
-    Path((kind, id)): Path<(String, String)>,
-) -> Result<Json<AdminMutationReply>, AdminApiError> {
-    authorize_mutation(&state, &headers, "retry_actor_stop").await?;
-    let target = AdminActorTarget::new(kind, id);
-    let reply = state.mutations.retry_actor_stop(target.clone()).await?;
-    audit_mutation("retry_actor_stop", &target.audit_key(), &reply);
-    Ok(Json(reply))
-}
-
-async fn admin_force_actor_stop(
-    State(state): State<AdminHttpState>,
-    headers: HeaderMap,
-    Path((kind, id)): Path<(String, String)>,
-) -> Result<Json<AdminMutationReply>, AdminApiError> {
-    authorize_mutation(&state, &headers, "force_actor_stop").await?;
-    let target = AdminActorTarget::new(kind, id);
-    let reply = state.mutations.force_actor_stop(target.clone()).await?;
-    audit_mutation("force_actor_stop", &target.audit_key(), &reply);
-    Ok(Json(reply))
-}
-
-async fn admin_migrate_actor(
-    State(state): State<AdminHttpState>,
-    headers: HeaderMap,
-    Path((kind, id)): Path<(String, String)>,
-) -> Result<Json<AdminMutationReply>, AdminApiError> {
-    authorize_mutation(&state, &headers, "migrate_actor").await?;
-    let target = AdminActorTarget::new(kind, id);
-    let reply = state.mutations.migrate_actor(target.clone()).await?;
-    audit_mutation("migrate_actor", &target.audit_key(), &reply);
-    Ok(Json(reply))
-}
-
-async fn authorize_mutation(
-    state: &AdminHttpState,
-    headers: &HeaderMap,
-    operation: &'static str,
-) -> Result<(), AdminApiError> {
-    state.auth.authorize(headers)?;
-    state.mutation_limiter.check(operation).await?;
-    Ok(())
-}
-
-fn audit_mutation(operation: &'static str, target: &str, reply: &AdminMutationReply) {
-    if reply.accepted {
-        info!(
-            admin.operation = operation,
-            admin.target = target,
-            "admin mutation accepted"
-        );
-    } else {
-        warn!(
-            admin.operation = operation,
-            admin.target = target,
-            admin.message = reply.message,
-            "admin mutation rejected"
-        );
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AdminMutationReply {
-    pub accepted: bool,
-    pub message: String,
-}
-
-impl AdminMutationReply {
-    pub fn accepted(message: impl Into<String>) -> Self {
-        Self {
-            accepted: true,
-            message: message.into(),
-        }
-    }
-
-    pub fn rejected(message: impl Into<String>) -> Self {
-        Self {
-            accepted: false,
-            message: message.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdminActorTarget {
-    pub actor_kind: ActorKind,
-    pub actor_id: String,
-}
-
-impl AdminActorTarget {
-    pub fn new(actor_kind: impl Into<String>, actor_id: impl Into<String>) -> Self {
-        Self {
-            actor_kind: ActorKind::new(actor_kind.into()),
-            actor_id: actor_id.into(),
-        }
-    }
-
-    fn audit_key(&self) -> String {
-        format!("{}/{}", self.actor_kind.as_str(), self.actor_id)
-    }
-}
-
-#[async_trait]
-pub trait AdminMutationHandler: Send + Sync + std::fmt::Debug + 'static {
-    async fn drain_instance(
-        &self,
-        instance_id: InstanceId,
-    ) -> Result<AdminMutationReply, AdminApiError>;
-
-    async fn retry_actor_stop(
-        &self,
-        target: AdminActorTarget,
-    ) -> Result<AdminMutationReply, AdminApiError>;
-
-    async fn force_actor_stop(
-        &self,
-        target: AdminActorTarget,
-    ) -> Result<AdminMutationReply, AdminApiError>;
-
-    async fn migrate_actor(
-        &self,
-        target: AdminActorTarget,
-    ) -> Result<AdminMutationReply, AdminApiError>;
-}
-
-#[derive(Debug)]
-pub struct DisabledAdminMutationHandler;
-
-#[async_trait]
-impl AdminMutationHandler for DisabledAdminMutationHandler {
-    async fn drain_instance(
-        &self,
-        _instance_id: InstanceId,
-    ) -> Result<AdminMutationReply, AdminApiError> {
-        Err(AdminApiError::MutationUnsupported {
-            operation: "drain_instance",
-        })
-    }
-
-    async fn retry_actor_stop(
-        &self,
-        _target: AdminActorTarget,
-    ) -> Result<AdminMutationReply, AdminApiError> {
-        Err(AdminApiError::MutationUnsupported {
-            operation: "retry_actor_stop",
-        })
-    }
-
-    async fn force_actor_stop(
-        &self,
-        _target: AdminActorTarget,
-    ) -> Result<AdminMutationReply, AdminApiError> {
-        Err(AdminApiError::MutationUnsupported {
-            operation: "force_actor_stop",
-        })
-    }
-
-    async fn migrate_actor(
-        &self,
-        _target: AdminActorTarget,
-    ) -> Result<AdminMutationReply, AdminApiError> {
-        Err(AdminApiError::MutationUnsupported {
-            operation: "migrate_actor",
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AdminMutationRateLimiter {
-    max_per_minute: u32,
-    state: Arc<Mutex<RateLimitState>>,
-}
-
-impl AdminMutationRateLimiter {
-    pub fn new(max_per_minute: u32) -> Self {
-        Self {
-            max_per_minute,
-            state: Arc::new(Mutex::new(RateLimitState::new())),
-        }
-    }
-
-    async fn check(&self, operation: &'static str) -> Result<(), AdminApiError> {
-        if self.max_per_minute == 0 {
-            return Err(AdminApiError::RateLimited { operation });
-        }
-        let mut state = self.state.lock().await;
-        if state.window_started.elapsed() >= Duration::from_secs(60) {
-            *state = RateLimitState::new();
-        }
-        if state.count >= self.max_per_minute {
-            return Err(AdminApiError::RateLimited { operation });
-        }
-        state.count += 1;
-        Ok(())
-    }
-}
-
-impl Default for AdminMutationRateLimiter {
-    fn default() -> Self {
-        Self::new(60)
-    }
-}
-
-#[derive(Debug)]
-struct RateLimitState {
-    window_started: Instant,
-    count: u32,
-}
-
-impl RateLimitState {
-    fn new() -> Self {
-        Self {
-            window_started: Instant::now(),
-            count: 0,
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AdminApiError {
-    #[error("admin request is unauthorized")]
+    #[error("admin authentication failed")]
     Unauthorized,
-    #[error("admin resource was not found")]
-    NotFound,
-    #[error("admin mutation {operation} is unsupported")]
-    MutationUnsupported { operation: &'static str },
-    #[error("admin mutation {operation} is rate limited")]
-    RateLimited { operation: &'static str },
-    #[error("admin mutation failed: {message}")]
-    MutationFailed { message: String },
+    #[error("admin command is invalid")]
+    Invalid,
+    #[error("admin operation ID was already applied")]
+    Duplicate,
+    #[error("admin command conflicts with current plan or generation")]
+    Conflict,
+    #[error("admin backend is unavailable")]
+    Unavailable,
 }
 
 impl axum::response::IntoResponse for AdminApiError {
     fn into_response(self) -> axum::response::Response {
-        match self {
-            AdminApiError::Unauthorized => {
-                (StatusCode::UNAUTHORIZED, self.to_string()).into_response()
-            }
-            AdminApiError::NotFound => (StatusCode::NOT_FOUND, self.to_string()).into_response(),
-            AdminApiError::MutationUnsupported { .. } => {
-                (StatusCode::NOT_IMPLEMENTED, self.to_string()).into_response()
-            }
-            AdminApiError::RateLimited { .. } => {
-                (StatusCode::TOO_MANY_REQUESTS, self.to_string()).into_response()
-            }
-            AdminApiError::MutationFailed { .. } => {
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()).into_response()
-            }
-        }
-    }
-}
-
-#[async_trait]
-pub trait NodeInspectorClient: Clone + Send + Sync + 'static {
-    async fn inspect_node(&self, instance: InstanceRecord) -> Result<NodeSummary, OpsError>;
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct HttpNodeInspectorClient {
-    admin_token: Option<String>,
-}
-
-impl HttpNodeInspectorClient {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_admin_token(token: impl Into<String>) -> Self {
-        Self {
-            admin_token: Some(token.into()),
-        }
-    }
-}
-
-#[async_trait]
-impl NodeInspectorClient for HttpNodeInspectorClient {
-    async fn inspect_node(&self, instance: InstanceRecord) -> Result<NodeSummary, OpsError> {
-        let endpoint = instance.control_endpoint;
-        let host = endpoint.host().ok_or_else(|| OpsError::Admin {
-            message: format!("control endpoint {endpoint} has no host"),
-        })?;
-        let port = endpoint.port_u16().unwrap_or(80);
-        let mut stream =
-            TcpStream::connect((host, port))
-                .await
-                .map_err(|error| OpsError::Admin {
-                    message: error.to_string(),
-                })?;
-        let token_header = self
-            .admin_token
-            .as_ref()
-            .map(|token| format!("x-lattice-admin-token: {token}\r\n"))
-            .unwrap_or_default();
-        let request = format!(
-            "GET /admin/node/summary HTTP/1.1\r\nHost: {host}\r\n{token_header}Connection: close\r\n\r\n"
-        );
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|error| OpsError::Admin {
-                message: error.to_string(),
-            })?;
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .await
-            .map_err(|error| OpsError::Admin {
-                message: error.to_string(),
-            })?;
-        let (head, body) = response
-            .split_once("\r\n\r\n")
-            .ok_or_else(|| OpsError::Admin {
-                message: "admin response is missing headers".to_string(),
-            })?;
-        if !head.starts_with("HTTP/1.1 200") {
-            return Err(OpsError::Admin {
-                message: head.lines().next().unwrap_or("HTTP error").to_string(),
-            });
-        }
-        serde_json::from_str(body).map_err(|error| OpsError::Admin {
-            message: error.to_string(),
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ClusterInspector<S> {
-    store: S,
-}
-
-impl<S> ClusterInspector<S>
-where
-    S: PlacementStore,
-{
-    pub fn new(store: S) -> Self {
-        Self { store }
-    }
-
-    pub async fn summarize(
-        &self,
-        service_kind: &ServiceKind,
-        actors: &[ActorPlacementRecord],
-    ) -> Result<ClusterSummary, OpsError> {
-        let instances = self.store.list_instances(service_kind).await?;
-        Ok(ClusterSummary {
-            instance_count: instances.len(),
-            actor_owner_count: actors.len(),
-        })
-    }
-
-    pub fn summarize_node(
-        &self,
-        instance: &InstanceRecord,
-        actors: &[ActorPlacementRecord],
-    ) -> NodeSummary {
-        let mut actor_kinds = actors
-            .iter()
-            .filter(|record| record.owner == instance.instance_id)
-            .map(|record| record.actor_kind.clone())
-            .collect::<Vec<_>>();
-        actor_kinds.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        actor_kinds.dedup();
-        NodeSummary {
-            instance_id: instance.instance_id.clone(),
-            service_kind: instance.service_kind.clone(),
-            actor_kinds,
-        }
-    }
-
-    pub async fn inspect_nodes<C>(
-        &self,
-        service_kind: &ServiceKind,
-        client: C,
-    ) -> Result<Vec<NodeInspectView>, OpsError>
-    where
-        C: NodeInspectorClient,
-    {
-        let instances = self.store.list_instances(service_kind).await?;
-        let mut views = Vec::with_capacity(instances.len());
-        for instance in instances {
-            let instance_id = instance.instance_id.clone();
-            match client.clone().inspect_node(instance).await {
-                Ok(summary) => views.push(NodeInspectView {
-                    instance_id,
-                    reachable: true,
-                    summary: Some(summary),
-                    error: None,
-                }),
-                Err(error) => views.push(NodeInspectView {
-                    instance_id,
-                    reachable: false,
-                    summary: None,
-                    error: Some(error.to_string()),
-                }),
-            }
-        }
-        Ok(views)
+        let status = match self {
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Invalid => StatusCode::BAD_REQUEST,
+            Self::Duplicate | Self::Conflict => StatusCode::CONFLICT,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        status.into_response()
     }
 }

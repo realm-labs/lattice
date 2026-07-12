@@ -1,4 +1,5 @@
 use std::any::type_name;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::sync::oneshot;
@@ -74,11 +75,57 @@ pub(crate) trait ActorEnvelope<A: Actor>: Send {
 pub(crate) struct EnvelopeMessage<M: Message> {
     msg: M,
     reply_tx: oneshot::Sender<Result<M::Reply, ActorCallError>>,
+    deadline: Option<Instant>,
 }
 
 impl<M: Message> EnvelopeMessage<M> {
     pub(crate) fn new(msg: M, reply_tx: oneshot::Sender<Result<M::Reply, ActorCallError>>) -> Self {
-        Self { msg, reply_tx }
+        Self {
+            msg,
+            reply_tx,
+            deadline: None,
+        }
+    }
+
+    pub(crate) fn with_deadline(
+        msg: M,
+        reply_tx: oneshot::Sender<Result<M::Reply, ActorCallError>>,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            msg,
+            reply_tx,
+            deadline: Some(deadline),
+        }
+    }
+}
+
+pub(crate) struct TellEnvelope<M: Message<Reply = ()>> {
+    msg: M,
+}
+
+impl<M: Message<Reply = ()>> TellEnvelope<M> {
+    pub(crate) fn new(msg: M) -> Self {
+        Self { msg }
+    }
+}
+
+#[async_trait]
+impl<A, M> ActorEnvelope<A> for TellEnvelope<M>
+where
+    A: Handler<M>,
+    M: Message<Reply = ()>,
+{
+    fn message_type(&self) -> &'static str {
+        type_name::<M>()
+    }
+
+    async fn handle(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>) {
+        if let Err(error) = actor.handle(ctx, self.msg).await {
+            warn!(message.type = type_name::<M>(), %error, "tell handler returned error");
+            actor.on_error::<M>(ctx, &error).await;
+            let _ = actor.handle_error(ctx, error).await;
+        }
     }
 }
 
@@ -93,6 +140,13 @@ where
     }
 
     async fn handle(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>) {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            let _ = self.reply_tx.send(Err(ActorCallError::DeadlineExceeded));
+            return;
+        }
         let result = match actor.handle(ctx, self.msg).await {
             Ok(reply) => Ok(reply),
             Err(error) => {

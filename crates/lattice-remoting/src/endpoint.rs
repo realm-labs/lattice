@@ -1,0 +1,540 @@
+use std::sync::{Arc, Mutex};
+
+use thiserror::Error;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::{JoinHandle, JoinSet};
+
+use crate::association::{
+    Association, AssociationError, AssociationManager, LaneAttachment, LaneKind,
+};
+use crate::config::RemotingConfig;
+use crate::handshake::{FeatureBits, Handshake, HandshakeValidator, NodeIdentity};
+use crate::lane::{BidirectionalLaneConfig, run_bidirectional_lane};
+use crate::messaging::{InboundDispatch, OutboundMessaging};
+use crate::protocol::ProtocolDescriptor;
+use crate::transport::{
+    FramedConnection, NegotiationError, bind_tcp, connect_tcp, negotiate_inbound,
+    negotiate_outbound,
+};
+use crate::wire::{FrameCodec, WireError};
+
+pub struct RemotingEndpoint {
+    local: NodeIdentity,
+    config: RemotingConfig,
+    associations: Arc<AssociationManager>,
+    messaging: Arc<OutboundMessaging>,
+    dispatch: Arc<dyn InboundDispatch>,
+    catalogue: Vec<ProtocolDescriptor>,
+    connections: Arc<Semaphore>,
+    shutdown_tx: watch::Sender<bool>,
+    tasks: Mutex<Vec<JoinHandle<Result<(), EndpointError>>>>,
+}
+
+impl RemotingEndpoint {
+    pub fn new(
+        local: NodeIdentity,
+        config: RemotingConfig,
+        associations: Arc<AssociationManager>,
+        messaging: Arc<OutboundMessaging>,
+        dispatch: Arc<dyn InboundDispatch>,
+        catalogue: Vec<ProtocolDescriptor>,
+    ) -> Result<Self, EndpointError> {
+        config.validate().map_err(AssociationError::InvalidConfig)?;
+        if catalogue.len() > config.max_protocols_per_peer {
+            return Err(EndpointError::ProtocolLimit);
+        }
+        let connection_limit = config.required_socket_budget().saturating_sub(1);
+        let (shutdown_tx, _) = watch::channel(false);
+        Ok(Self {
+            local,
+            config,
+            associations,
+            messaging,
+            dispatch,
+            catalogue,
+            connections: Arc::new(Semaphore::new(connection_limit)),
+            shutdown_tx,
+            tasks: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn local_identity(&self) -> &NodeIdentity {
+        &self.local
+    }
+
+    pub async fn bind(self: &Arc<Self>) -> Result<(), EndpointError> {
+        let listener = bind_tcp(&self.local.address).await?;
+        let endpoint = self.clone();
+        self.spawn(async move { endpoint.accept_loop(listener).await })?;
+        Ok(())
+    }
+
+    pub async fn connect_peer(
+        self: &Arc<Self>,
+        peer: NodeIdentity,
+    ) -> Result<Arc<Association>, EndpointError> {
+        if !self
+            .associations
+            .should_dial(&peer.address, peer.incarnation)
+        {
+            return Err(EndpointError::WrongDialDirection);
+        }
+        let association = self.associations.get_or_create(
+            peer.cluster_id.clone(),
+            peer.address.clone(),
+            peer.incarnation,
+        )?;
+        for lane in self.lanes() {
+            self.connect_lane(association.clone(), peer.clone(), lane)
+                .await?;
+        }
+        Ok(association)
+    }
+
+    pub async fn shutdown(&self) -> Result<(), EndpointError> {
+        let _ = self.shutdown_tx.send(true);
+        let tasks = {
+            let mut tasks = self.tasks.lock().expect("endpoint task list poisoned");
+            std::mem::take(&mut *tasks)
+        };
+        for task in tasks {
+            match tokio::time::timeout(self.config.shutdown_timeout, task).await {
+                Ok(Ok(result)) => result?,
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Err(error)) => return Err(EndpointError::Join(error)),
+                Err(_) => return Err(EndpointError::ShutdownTimeout),
+            }
+        }
+        Ok(())
+    }
+
+    async fn connect_lane(
+        self: &Arc<Self>,
+        association: Arc<Association>,
+        peer: NodeIdentity,
+        lane: LaneKind,
+    ) -> Result<(), EndpointError> {
+        let permit = self
+            .connections
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| EndpointError::ConnectionLimit)?;
+        let (stream, nonce) = self.open_outbound_lane(&association, &peer, lane).await?;
+        let mut receiver = association
+            .take_lane_receiver(lane)
+            .ok_or(EndpointError::LaneAlreadyRunning(lane))?;
+        let endpoint = self.clone();
+        let mut shutdown = self.shutdown_tx.subscribe();
+        self.spawn(async move {
+            let _permit = permit;
+            let mut current = Some((stream, nonce));
+            let mut backoff = endpoint.config.reconnect_backoff_min;
+            loop {
+                let (stream, nonce) = current.take().expect("lane connection is installed");
+                let result = run_bidirectional_lane(
+                    association.clone(),
+                    lane,
+                    nonce,
+                    &mut receiver,
+                    stream,
+                    endpoint.messaging.clone(),
+                    endpoint.dispatch.clone(),
+                    endpoint.lane_config(),
+                    &mut shutdown,
+                )
+                .await;
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+                if matches!(result, Ok(crate::lane::LaneExit::QueueClosed)) {
+                    return Ok(());
+                }
+                loop {
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return Ok(());
+                            }
+                        }
+                        () = tokio::time::sleep(backoff) => {}
+                    }
+                    match endpoint.open_outbound_lane(&association, &peer, lane).await {
+                        Ok(connection) => {
+                            current = Some(connection);
+                            backoff = endpoint.config.reconnect_backoff_min;
+                            break;
+                        }
+                        Err(_) => {
+                            backoff = backoff
+                                .saturating_mul(2)
+                                .min(endpoint.config.reconnect_backoff_max);
+                        }
+                    }
+                }
+            }
+        })?;
+        Ok(())
+    }
+
+    async fn open_outbound_lane(
+        &self,
+        association: &Association,
+        peer: &NodeIdentity,
+        lane: LaneKind,
+    ) -> Result<(tokio::net::TcpStream, u128), EndpointError> {
+        let codec = FrameCodec::new(self.config.max_frame_size)?;
+        let mut connection = tokio::time::timeout(
+            self.config.connect_timeout,
+            connect_tcp(&peer.address, codec),
+        )
+        .await
+        .map_err(|_| EndpointError::ConnectTimeout)??;
+        let nonce = uuid::Uuid::new_v4().as_u128();
+        let handshake = Handshake {
+            source: self.local.clone(),
+            expected_remote: peer.clone(),
+            association_id: association.id(),
+            lane,
+            connection_nonce: nonce,
+            maximum_frame_size: self.config.max_frame_size,
+            features: FeatureBits::REQUIRED_V1,
+        };
+        let peer_catalogue = negotiate_outbound(
+            &mut connection,
+            &handshake,
+            &self.catalogue,
+            self.config.max_protocols_per_peer,
+        )
+        .await?;
+        if lane == LaneKind::Control {
+            association.install_peer_catalogue(peer_catalogue)?;
+        }
+        association.attach(LaneAttachment {
+            association_id: association.id(),
+            key: association.key().clone(),
+            lane,
+            connection_nonce: nonce,
+        })?;
+        Ok((connection.into_inner(), nonce))
+    }
+
+    async fn accept_loop(
+        self: Arc<Self>,
+        listener: tokio::net::TcpListener,
+    ) -> Result<(), EndpointError> {
+        let mut shutdown = self.shutdown_tx.subscribe();
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(result) = completed {
+                        result.map_err(EndpointError::Join)??;
+                    }
+                }
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.map_err(WireError::Io)?;
+                    let permit = self.connections.clone().try_acquire_owned()
+                        .map_err(|_| EndpointError::ConnectionLimit)?;
+                    let endpoint = self.clone();
+                    connections.spawn(async move {
+                        let _permit = permit;
+                        endpoint.accept_connection(stream).await
+                    });
+                }
+            }
+        }
+        while let Some(result) = connections.join_next().await {
+            result.map_err(EndpointError::Join)??;
+        }
+        Ok(())
+    }
+
+    async fn accept_connection(
+        self: Arc<Self>,
+        stream: tokio::net::TcpStream,
+    ) -> Result<(), EndpointError> {
+        let validator = HandshakeValidator::new(
+            self.local.clone(),
+            self.config.max_frame_size,
+            self.config.bulk_stripes,
+        )?;
+        let mut connection =
+            FramedConnection::new(stream, FrameCodec::new(self.config.max_frame_size)?);
+        let (handshake, peer_catalogue) = negotiate_inbound(
+            &mut connection,
+            &validator,
+            &self.catalogue,
+            self.config.max_protocols_per_peer,
+        )
+        .await?;
+        if self
+            .associations
+            .should_dial(&handshake.source.address, handshake.source.incarnation)
+        {
+            return Err(EndpointError::WrongDialDirection);
+        }
+        let association = self.associations.get_or_accept(
+            handshake.source.cluster_id.clone(),
+            handshake.source.address.clone(),
+            handshake.source.incarnation,
+            handshake.association_id,
+        )?;
+        if handshake.lane == LaneKind::Control {
+            association.install_peer_catalogue(peer_catalogue)?;
+        }
+        association.attach(LaneAttachment {
+            association_id: handshake.association_id,
+            key: association.key().clone(),
+            lane: handshake.lane,
+            connection_nonce: handshake.connection_nonce,
+        })?;
+        let mut receiver = association
+            .take_lane_receiver(handshake.lane)
+            .ok_or(EndpointError::LaneAlreadyRunning(handshake.lane))?;
+        let mut shutdown = self.shutdown_tx.subscribe();
+        let result = run_bidirectional_lane(
+            association.clone(),
+            handshake.lane,
+            handshake.connection_nonce,
+            &mut receiver,
+            connection.into_inner(),
+            self.messaging.clone(),
+            self.dispatch.clone(),
+            self.lane_config(),
+            &mut shutdown,
+        )
+        .await;
+        association.return_lane_receiver(handshake.lane, receiver)?;
+        result?;
+        Ok(())
+    }
+
+    fn lanes(&self) -> impl Iterator<Item = LaneKind> {
+        [LaneKind::Control, LaneKind::Interactive]
+            .into_iter()
+            .chain((0..self.config.bulk_stripes).map(|index| LaneKind::Bulk(index as u8)))
+    }
+
+    fn lane_config(&self) -> BidirectionalLaneConfig {
+        BidirectionalLaneConfig {
+            maximum_frame_size: self.config.max_frame_size,
+            maximum_concurrent_inbound_asks: self.config.max_pending_asks,
+            heartbeat_interval: self.config.heartbeat_interval,
+            heartbeat_miss_limit: self.config.heartbeat_miss_limit,
+        }
+    }
+
+    fn spawn<F>(self: &Arc<Self>, future: F) -> Result<(), EndpointError>
+    where
+        F: Future<Output = Result<(), EndpointError>> + Send + 'static,
+    {
+        let mut tasks = self.tasks.lock().expect("endpoint task list poisoned");
+        tasks.retain(|task| !task.is_finished());
+        if tasks.len() >= self.config.required_socket_budget() {
+            return Err(EndpointError::TaskLimit);
+        }
+        tasks.push(tokio::spawn(future));
+        Ok(())
+    }
+}
+
+use std::future::Future;
+
+#[derive(Debug, Error)]
+pub enum EndpointError {
+    #[error("association endpoint failed")]
+    Association(#[from] AssociationError),
+    #[error("association endpoint wire failed")]
+    Wire(#[from] WireError),
+    #[error("association endpoint negotiation failed")]
+    Negotiation(#[from] NegotiationError),
+    #[error("association endpoint handshake failed")]
+    Handshake(#[from] crate::handshake::HandshakeError),
+    #[error("association lane failed")]
+    Lane(#[from] crate::lane::LaneError),
+    #[error("only the stable lower node identity may dial")]
+    WrongDialDirection,
+    #[error("association connection cap reached")]
+    ConnectionLimit,
+    #[error("association connection timed out")]
+    ConnectTimeout,
+    #[error("association lane {0:?} already owns its queue receiver")]
+    LaneAlreadyRunning(LaneKind),
+    #[error("local actor protocol catalogue exceeds its configured bound")]
+    ProtocolLimit,
+    #[error("association endpoint task cap reached")]
+    TaskLimit,
+    #[error("association endpoint task failed")]
+    Join(#[source] tokio::task::JoinError),
+    #[error("association endpoint shutdown timed out")]
+    ShutdownTimeout,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use lattice_core::actor_ref::{
+        ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+    };
+    use std::time::{Duration, Instant};
+
+    use crate::messaging::{ExactActorTarget, RemoteMessageError, SenderIdentity};
+    use crate::protocol::ProtocolFingerprint;
+
+    struct EchoDispatch;
+
+    #[async_trait]
+    impl InboundDispatch for EchoDispatch {
+        async fn tell(
+            &self,
+            _target: ExactActorTarget,
+            _message_id: u64,
+            _payload: Bytes,
+        ) -> Result<(), RemoteMessageError> {
+            Ok(())
+        }
+
+        async fn ask(
+            &self,
+            _target: ExactActorTarget,
+            _message_id: u64,
+            payload: Bytes,
+            deadline: Instant,
+        ) -> Result<Bytes, RemoteMessageError> {
+            if Instant::now() >= deadline {
+                return Err(RemoteMessageError::DeadlineExceeded);
+            }
+            Ok(payload)
+        }
+    }
+
+    fn endpoint(identity: NodeIdentity, protocol: ProtocolDescriptor) -> Arc<RemotingEndpoint> {
+        let config = RemotingConfig {
+            heartbeat_interval: Duration::from_millis(100),
+            shutdown_timeout: Duration::from_secs(2),
+            ..RemotingConfig::default()
+        };
+        let manager = Arc::new(
+            AssociationManager::new(
+                identity.address.clone(),
+                identity.incarnation,
+                config.clone(),
+            )
+            .unwrap(),
+        );
+        Arc::new(
+            RemotingEndpoint::new(
+                identity,
+                config,
+                manager,
+                Arc::new(OutboundMessaging::new(32).unwrap()),
+                Arc::new(EchoDispatch),
+                vec![protocol],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn real_tcp_endpoint_establishes_all_lanes_and_delivers_ask() {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let client_port = server_port.saturating_sub(1).max(1024);
+        let cluster_id = ClusterId::new("endpoint-test").unwrap();
+        let client_identity = NodeIdentity {
+            cluster_id: cluster_id.clone(),
+            node_id: "client".to_owned(),
+            address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+            incarnation: NodeIncarnation::new(1).unwrap(),
+        };
+        let server_identity = NodeIdentity {
+            cluster_id: cluster_id.clone(),
+            node_id: "server".to_owned(),
+            address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+            incarnation: NodeIncarnation::new(2).unwrap(),
+        };
+        assert!(
+            (&client_identity.address, client_identity.incarnation.get())
+                < (&server_identity.address, server_identity.incarnation.get())
+        );
+        let protocol_id = ProtocolId::new(7).unwrap();
+        let fingerprint = ProtocolFingerprint::digest(b"endpoint-test/v1");
+        let descriptor = ProtocolDescriptor {
+            protocol_id,
+            fingerprint,
+        };
+        let client = endpoint(client_identity.clone(), descriptor.clone());
+        let server = endpoint(server_identity.clone(), descriptor.clone());
+        server.bind().await.unwrap();
+        let association = client.connect_peer(server_identity.clone()).await.unwrap();
+        assert_eq!(
+            association.state(),
+            crate::association::AssociationState::Active
+        );
+        let target = ActorRef::<()>::new(
+            cluster_id,
+            server_identity.address.clone(),
+            server_identity.incarnation,
+            ActorPath::user(["user", "echo"]).unwrap(),
+            ActivationId::new(server_identity.incarnation, 1).unwrap(),
+            protocol_id,
+        )
+        .unwrap();
+        let reply = client
+            .messaging
+            .ask(
+                &association,
+                &SenderIdentity::Process(9),
+                &target,
+                fingerprint,
+                1,
+                Bytes::from_static(b"hello"),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, Bytes::from_static(b"hello"));
+        server.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while association.state() != crate::association::AssociationState::Reconnecting {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let replacement = endpoint(server_identity, descriptor);
+        replacement.bind().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while association.state() != crate::association::AssociationState::Active {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let reply = client
+            .messaging
+            .ask(
+                &association,
+                &SenderIdentity::Process(9),
+                &target,
+                fingerprint,
+                1,
+                Bytes::from_static(b"again"),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, Bytes::from_static(b"again"));
+        client.shutdown().await.unwrap();
+        replacement.shutdown().await.unwrap();
+    }
+}

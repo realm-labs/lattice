@@ -74,6 +74,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -172,6 +184,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "aws-lc-rs"
+version = "1.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4342d8937fc7e5dd9b1c60292261c0670c882a2cd1719cfc11b1af41731e32ad"
+dependencies = [
+ "aws-lc-sys",
+ "zeroize",
+]
+
+[[package]]
+name = "aws-lc-sys"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d9ceb1da931507a12f4fccea479dccd00da1943e1b4ae72d8e502d707361444"
+dependencies = [
+ "cc",
+ "cmake",
+ "dunce",
+ "fs_extra",
+ "pkg-config",
+]
+
+[[package]]
 name = "axum"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -251,6 +286,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
+name = "blake3"
+version = "1.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.0",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -287,6 +336,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e228eec9be7c17ccb640b59b36a5cd805ea2a564a4c5e162c2f659fea30d3b96"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -375,6 +426,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -385,6 +445,12 @@ name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-foundation"
@@ -612,17 +678,21 @@ dependencies = [
  "lattice-core",
  "lattice-gateway",
  "lattice-placement",
- "lattice-rpc",
+ "lattice-remoting",
  "lattice-service",
  "prost",
  "thiserror",
  "tokio",
  "tokio-stream",
- "tonic",
- "tonic-prost",
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "ed25519"
@@ -730,6 +800,12 @@ checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
 ]
+
+[[package]]
+name = "fs_extra"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "futures"
@@ -1195,6 +1271,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1210,9 +1296,13 @@ name = "lattice-actor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
+ "bytes",
  "dashmap",
  "http",
  "lattice-core",
+ "lattice-remoting",
+ "prost",
  "thiserror",
  "tokio",
  "tracing",
@@ -1223,13 +1313,13 @@ name = "lattice-codegen"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "prost-build",
  "prost-reflect",
  "prost-types",
  "serde",
  "tempfile",
  "thiserror",
  "toml",
- "tonic-prost-build",
 ]
 
 [[package]]
@@ -1268,27 +1358,11 @@ dependencies = [
  "lattice-config",
  "prost",
  "serde",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "lattice-direct-link"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "criterion",
- "http",
- "lattice-actor",
- "lattice-core",
- "prost",
- "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1298,9 +1372,10 @@ dependencies = [
  "async-nats",
  "async-trait",
  "futures-util",
+ "lattice-actor",
  "lattice-config",
  "lattice-core",
- "lattice-rpc",
+ "lattice-remoting",
  "prost",
  "serde",
  "serde_json",
@@ -1314,16 +1389,13 @@ name = "lattice-gateway"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum",
  "dashmap",
- "http",
+ "lattice-actor",
  "lattice-core",
- "lattice-rpc",
+ "lattice-remoting",
  "prost",
  "thiserror",
  "tokio",
- "tokio-stream",
- "tonic",
 ]
 
 [[package]]
@@ -1349,12 +1421,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "blake3",
+ "bytes",
  "dashmap",
  "etcd-client",
  "http",
  "lattice-config",
  "lattice-core",
- "lattice-rpc",
+ "lattice-remoting",
  "prost",
  "rcgen",
  "serde",
@@ -1363,30 +1437,29 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
  "tower",
  "tracing",
  "trybuild",
+ "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
-name = "lattice-rpc"
+name = "lattice-remoting"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "dashmap",
- "http",
- "lattice-actor",
+ "blake3",
+ "bytes",
  "lattice-core",
  "prost",
  "rcgen",
+ "serde",
  "thiserror",
  "tokio",
- "tonic",
+ "tokio-rustls",
  "tracing",
- "trybuild",
+ "uuid",
  "x509-parser",
 ]
 
@@ -1395,23 +1468,15 @@ name = "lattice-service"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum",
- "http",
+ "bytes",
  "lattice-actor",
- "lattice-config",
  "lattice-core",
- "lattice-direct-link",
- "lattice-eventbus",
- "lattice-ops",
- "lattice-placement",
- "lattice-rpc",
+ "lattice-remoting",
  "prost",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
- "tokio-stream",
- "tonic",
  "tracing",
  "trybuild",
 ]
@@ -1516,14 +1581,12 @@ dependencies = [
  "lattice-gateway",
  "lattice-ops",
  "lattice-placement",
- "lattice-rpc",
+ "lattice-remoting",
  "lattice-service",
  "prost",
  "serde",
  "serde_json",
  "tokio",
- "tonic",
- "tonic-prost",
 ]
 
 [[package]]
@@ -1814,6 +1877,12 @@ dependencies = [
  "der",
  "spki",
 ]
+
+[[package]]
+name = "pkg-config"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plotters"
@@ -2145,6 +2214,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "remoting-benchmark"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "clap",
+ "criterion",
+ "lattice-actor",
+ "lattice-codegen",
+ "lattice-core",
+ "lattice-gateway",
+ "lattice-placement",
+ "lattice-remoting",
+ "lattice-service",
+ "prost",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2190,27 +2279,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rpc-benchmark"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "clap",
- "criterion",
- "lattice-actor",
- "lattice-codegen",
- "lattice-core",
- "lattice-gateway",
- "lattice-placement",
- "lattice-rpc",
- "lattice-service",
- "prost",
- "thiserror",
- "tokio",
- "tonic",
- "tonic-prost",
-]
-
-[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2247,6 +2315,7 @@ version = "0.23.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
+ "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
@@ -2283,6 +2352,7 @@ version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
+ "aws-lc-rs",
  "ring",
  "rustls-pki-types",
  "untrusted",
@@ -3416,6 +3486,12 @@ dependencies = [
  "thiserror",
  "time",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d93c89cdc2d3a63c3ec48ffe926931bdc069eafa8e4402fe6d8f790c9d1e576"
 
 [[package]]
 name = "yasna"

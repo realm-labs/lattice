@@ -101,9 +101,12 @@ mod tests {
         .build_auth();
         let mut headers = HeaderMap::new();
 
-        assert_eq!(auth.authorize(&headers), Err(AdminApiError::Unauthorized));
+        assert!(matches!(
+            auth.authorize(&headers),
+            Err(AdminApiError::Unauthorized)
+        ));
         headers.insert("x-lattice-admin-token", "secret".parse().unwrap());
-        assert_eq!(auth.authorize(&headers), Ok(()));
+        assert!(auth.authorize(&headers).is_ok());
     }
 
     #[test]

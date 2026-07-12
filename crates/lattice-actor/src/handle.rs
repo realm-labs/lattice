@@ -1,6 +1,8 @@
 use std::fmt;
 use std::marker::PhantomData;
+use std::time::Instant;
 
+use lattice_core::actor_ref::ActorRef;
 use tokio::sync::{
     broadcast,
     mpsc::{self, error::TrySendError},
@@ -8,7 +10,7 @@ use tokio::sync::{
 };
 
 use crate::error::{ActorCallError, ActorTellError};
-use crate::mailbox::{ActorCommand, EnvelopeMessage, MailboxLane};
+use crate::mailbox::{ActorCommand, EnvelopeMessage, MailboxLane, TellEnvelope};
 use crate::traits::{Actor, ActorLifecycleState, Handler, Message, StopReason};
 use crate::watch::{ActorTerminated, LocalActorRef};
 
@@ -18,7 +20,8 @@ pub struct ActorHandle<A: Actor> {
     lifecycle_tx: watch::Sender<ActorLifecycleState>,
     normal_tx: mpsc::Sender<ActorCommand<A>>,
     system_tx: mpsc::Sender<ActorCommand<A>>,
-    _marker: PhantomData<A>,
+    actor_ref: Option<ActorRef<A>>,
+    _marker: PhantomData<fn() -> A>,
 }
 
 impl<A: Actor> fmt::Debug for ActorHandle<A> {
@@ -39,6 +42,7 @@ impl<A: Actor> Clone for ActorHandle<A> {
             lifecycle_tx: self.lifecycle_tx.clone(),
             normal_tx: self.normal_tx.clone(),
             system_tx: self.system_tx.clone(),
+            actor_ref: self.actor_ref.as_ref().map(ActorRef::cast),
             _marker: PhantomData,
         }
     }
@@ -51,6 +55,7 @@ impl<A: Actor> ActorHandle<A> {
         lifecycle_tx: watch::Sender<ActorLifecycleState>,
         normal_tx: mpsc::Sender<ActorCommand<A>>,
         system_tx: mpsc::Sender<ActorCommand<A>>,
+        actor_ref: Option<ActorRef<A>>,
     ) -> Self {
         Self {
             local_ref,
@@ -58,12 +63,17 @@ impl<A: Actor> ActorHandle<A> {
             lifecycle_tx,
             normal_tx,
             system_tx,
+            actor_ref,
             _marker: PhantomData,
         }
     }
 
     pub fn local_ref(&self) -> LocalActorRef {
         self.local_ref
+    }
+
+    pub fn actor_ref(&self) -> Option<&ActorRef<A>> {
+        self.actor_ref.as_ref()
     }
 
     pub fn lifecycle_state(&self) -> ActorLifecycleState {
@@ -78,12 +88,56 @@ impl<A: Actor> ActorHandle<A> {
         self.call_on_lane(msg, MailboxLane::Normal).await
     }
 
+    pub async fn call_before<M>(
+        &self,
+        msg: M,
+        deadline: Instant,
+    ) -> Result<M::Reply, ActorCallError>
+    where
+        A: Handler<M>,
+        M: Message,
+    {
+        if Instant::now() >= deadline {
+            return Err(ActorCallError::DeadlineExceeded);
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let command = ActorCommand::Envelope(Box::new(EnvelopeMessage::with_deadline(
+            msg, reply_tx, deadline,
+        )));
+        self.send_command(command, MailboxLane::Normal)?;
+        reply_rx
+            .await
+            .map_err(|_| ActorCallError::ResponseDropped)?
+    }
+
+    pub(crate) async fn call_before_owned<M>(
+        self,
+        msg: M,
+        deadline: Instant,
+    ) -> Result<M::Reply, ActorCallError>
+    where
+        A: Handler<M>,
+        M: Message,
+    {
+        if Instant::now() >= deadline {
+            return Err(ActorCallError::DeadlineExceeded);
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let command = ActorCommand::Envelope(Box::new(EnvelopeMessage::with_deadline(
+            msg, reply_tx, deadline,
+        )));
+        self.send_command(command, MailboxLane::Normal)?;
+        reply_rx
+            .await
+            .map_err(|_| ActorCallError::ResponseDropped)?
+    }
+
     pub async fn tell<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
         M: Message<Reply = ()>,
     {
-        self.call(msg).await.map_err(ActorTellError::from)
+        self.try_tell_on_lane(msg, MailboxLane::Normal)
     }
 
     pub fn try_tell<M>(&self, msg: M) -> Result<(), ActorTellError>
@@ -162,8 +216,7 @@ impl<A: Actor> ActorHandle<A> {
         A: Handler<M>,
         M: Message<Reply = ()>,
     {
-        let (reply_tx, _reply_rx) = oneshot::channel();
-        let command = ActorCommand::Envelope(Box::new(EnvelopeMessage::new(msg, reply_tx)));
+        let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg)));
         self.send_command(command, lane)
             .map_err(ActorTellError::from)
     }
@@ -199,8 +252,9 @@ impl From<ActorCallError> for ActorTellError {
         match value {
             ActorCallError::MailboxFull => Self::MailboxFull,
             ActorCallError::MailboxClosed => Self::MailboxClosed,
-            ActorCallError::ResponseDropped => Self::ResponseDropped,
-            ActorCallError::Handler(error) => Self::Handler(error),
+            ActorCallError::ResponseDropped
+            | ActorCallError::DeadlineExceeded
+            | ActorCallError::Handler(_) => Self::MailboxClosed,
         }
     }
 }

@@ -6,11 +6,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use http::Uri;
-use lattice_core::actor_ref::{ActorRef, Epoch};
+use lattice_core::actor_ref::{
+    ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+};
 use lattice_core::id::ActorId;
-use lattice_core::instance::InstanceId;
-use lattice_core::kind::{ActorKind, ServiceKind};
+use lattice_core::kind::ActorKind;
 use lattice_core::service_context::ServiceContext;
 use tokio::sync::{Semaphore, watch};
 
@@ -33,10 +33,10 @@ pub struct ActorRegistryConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorRefConfig {
-    pub service_kind: ServiceKind,
-    pub instance_id: InstanceId,
-    pub endpoint: Uri,
-    pub owner_epoch: Option<Epoch>,
+    pub cluster_id: ClusterId,
+    pub node_address: NodeAddress,
+    pub node_incarnation: NodeIncarnation,
+    pub protocol_id: ProtocolId,
 }
 
 impl Default for ActorRegistryConfig {
@@ -135,6 +135,28 @@ impl<A: Actor> ActorRegistry<A> {
             }
             Some(RegistryEntry::Activating(_)) | None => None,
         }
+    }
+
+    pub fn get_exact(&self, actor_ref: &ActorRef<A>) -> Option<ActorHandle<A>> {
+        if self.config.actor_ref.as_ref().is_none_or(|config| {
+            config.cluster_id != *actor_ref.cluster_id()
+                || config.node_address != *actor_ref.node_address()
+                || config.node_incarnation != actor_ref.node_incarnation()
+                || config.protocol_id != actor_ref.protocol_id()
+        }) {
+            return None;
+        }
+        self.entries.iter().find_map(|entry| match entry.value() {
+            RegistryEntry::Running(handle)
+                if !is_terminal(handle.lifecycle_state())
+                    && handle
+                        .actor_ref()
+                        .is_some_and(|current| current.same_activation(actor_ref)) =>
+            {
+                Some(handle.clone())
+            }
+            RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
+        })
     }
 
     pub async fn remove(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
@@ -339,7 +361,9 @@ impl<A: Actor> ActorRegistry<A> {
     }
 
     fn spawn_actor(&self, actor_id: ActorId, actor: A) -> ActorHandle<A> {
-        let self_ref = self.actor_ref_for(actor_id.clone());
+        let self_ref = self
+            .actor_ref_for(actor_id.clone())
+            .map(|actor_ref| actor_ref.erase());
         spawn_actor_with_self_ref(
             actor,
             self.config.mailbox,
@@ -349,17 +373,43 @@ impl<A: Actor> ActorRegistry<A> {
         )
     }
 
-    fn actor_ref_for(&self, actor_id: ActorId) -> Option<ActorRef> {
+    fn actor_ref_for(&self, actor_id: ActorId) -> Option<ActorRef<A>> {
         let config = self.config.actor_ref.as_ref()?;
-        Some(ActorRef::direct(
-            config.service_kind.clone(),
-            self.kind.clone(),
-            actor_id,
-            config.instance_id.clone(),
-            config.endpoint.clone(),
-            config.owner_epoch,
-        ))
+        let path = ActorPath::user([
+            "user".to_owned(),
+            encode_segment(self.kind.as_str().as_bytes()),
+            encode_actor_id(&actor_id),
+        ])
+        .expect("registry-generated actor path is canonical");
+        ActorRef::new(
+            config.cluster_id.clone(),
+            config.node_address.clone(),
+            config.node_incarnation,
+            path,
+            crate::runtime::next_activation_id(config.node_incarnation),
+            config.protocol_id,
+        )
+        .ok()
     }
+}
+
+fn encode_actor_id(actor_id: &ActorId) -> String {
+    match actor_id {
+        ActorId::Str(value) => format!("s-{}", encode_segment(value.as_bytes())),
+        ActorId::U64(value) => format!("u-{value}"),
+        ActorId::I64(value) => format!("i-{value}"),
+        ActorId::Bytes(value) => format!("b-{}", encode_segment(value)),
+    }
+}
+
+fn encode_segment(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(HEX[usize::from(byte >> 4)] as char);
+        output.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    output
 }
 
 fn is_terminal(state: ActorLifecycleState) -> bool {

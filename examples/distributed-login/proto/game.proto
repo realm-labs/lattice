@@ -2,35 +2,7 @@ syntax = "proto3";
 
 package game;
 
-import "lattice/options.proto";
 import "lattice/actor_ref.proto";
-
-service WorldRpc {
-  option (lattice.options.service_kind) = "World";
-  option (lattice.options.actor_kind) = "World";
-  option (lattice.options.default_route_key) = "world_id";
-
-  rpc Login(LoginRequest) returns (LoginAcceptedReply);
-  rpc WorldPing(WorldPingRequest) returns (WorldPingReply);
-}
-
-service PlayerRpc {
-  option (lattice.options.service_kind) = "Player";
-  option (lattice.options.actor_kind) = "Player";
-  option (lattice.options.default_route_key) = "player_id";
-
-  rpc InitSession(InitSessionRequest) returns (InitSessionReply);
-  rpc PlayerPing(PlayerPingRequest) returns (PlayerPingReply);
-}
-
-service GatewayPushRpc {
-  option (lattice.options.service_kind) = "Gateway";
-  option (lattice.options.actor_kind) = "GatewaySession";
-  option (lattice.options.default_route_key) = "session_id";
-
-  rpc PushToClient(PushToClientRequest) returns (PushToClientReply);
-}
-
 message LoginRequest {
   uint64 world_id = 1;
   uint64 player_id = 2;

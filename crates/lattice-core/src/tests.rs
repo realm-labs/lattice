@@ -1,6 +1,8 @@
-use crate::actor_ref::{ActorRef, ActorRefTarget, Epoch};
+use crate::actor_ref::{
+    ActivationId, ActorPath, ActorRef, ClusterId, ConfigFingerprint, EntityId, EntityRef,
+    EntityType, NodeAddress, NodeIncarnation, ProtocolId,
+};
 use crate::id::{ActorId, ActorKey, ActorKeyDecodeError, RouteKey};
-use crate::instance::InstanceId;
 use crate::kind::{ActorKind, ServiceKind};
 use crate::trace::TraceContext;
 use crate::trace::TraceSpanKind;
@@ -49,24 +51,29 @@ fn actor_key_converts_through_framework_ids() {
 }
 
 #[test]
-fn actor_ref_models_direct_and_routed_targets() {
-    let direct = ActorRef::direct(
-        service_kind!("Gateway"),
-        actor_kind!("GatewaySession"),
-        ActorId::Str("session-1".into()),
-        InstanceId::new("gateway-a"),
-        "http://127.0.0.1:19083".parse().unwrap(),
-        Some(Epoch(7)),
+fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
+    let node = NodeIncarnation::new(7).unwrap();
+    let protocol = ProtocolId::new(11).unwrap();
+    let actor = ActorRef::<()>::new(
+        ClusterId::new("test").unwrap(),
+        NodeAddress::new("127.0.0.1", 19083).unwrap(),
+        node,
+        ActorPath::user(["user", "session-1"]).unwrap(),
+        ActivationId::new(node, 1).unwrap(),
+        protocol,
+    )
+    .unwrap();
+    let entity = EntityRef::<()>::new(
+        ClusterId::new("test").unwrap(),
+        EntityType::new("world").unwrap(),
+        EntityId::new(42_u64.to_be_bytes()).unwrap(),
+        protocol,
+        ConfigFingerprint::new([3; 32]),
     );
-    let routed = ActorRef::routed(WORLD_SERVICE, WORLD_ACTOR, ActorId::U64(42));
 
-    assert!(matches!(direct.target, ActorRefTarget::Direct { .. }));
-    assert_eq!(
-        direct.actor_id.to_route_key(),
-        RouteKey::Str("session-1".into())
-    );
-    assert_eq!(routed.actor_id.to_route_key(), RouteKey::U64(42));
-    assert_eq!(routed.target, ActorRefTarget::Routed);
+    assert_eq!(actor.node_incarnation(), node);
+    assert_eq!(actor.actor_path().to_string(), "/user/session-1");
+    assert_eq!(entity.entity_id().as_bytes(), &42_u64.to_be_bytes());
 }
 
 #[test]
