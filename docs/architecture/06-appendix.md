@@ -23,8 +23,12 @@ maximum ask deadline: 30 s
 Coordinator snapshot chunk: 192 KiB; maximum assembled snapshot: 64 MiB / 5 s
 claim grant: 15 s TTL, renew every 5 s, 2 s local safety margin
 Coordinator leader recovery objective: less than claim TTL minus safety margin
+placement capacity: positive configured units per eligible shard-host node; default 100
 entity passivation: 10 min, configured per type
 ShardRegion buffer: 1024 messages per shard, 10000 messages / 64 MiB per region
+rebalance: 10 s evaluation, 5 s load report, 20 s load-sample max age, 10% minimum relative improvement
+rebalance stability: 2 min minimum shard residence, 30 s node-join stability, 30 s cooldown
+rebalance limits: 4 moves per round, 8 cluster-wide, 4 per entity type, 2 per source/target node
 drain deadline: 30-120 s by service class
 admin inspect timeout: 1-3 s per node
 ```
@@ -73,6 +77,7 @@ reference identity and remoting associations
 tell/ask correlation, deadlines, bounded buffering, codecs
 Coordinator protocol, membership, shards, claims, singletons, drain
 shared placement-slot authority and reliable control delivery
+allocation strategies, bounded load view, persisted rebalance plans and move limits
 EventBus, scheduler, config, Gateway adapters, inspection and telemetry abstractions
 ```
 

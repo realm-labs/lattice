@@ -182,6 +182,8 @@ Suitable values include feature flags, rate limits, scheduler switches, and vali
 
 Protocol fingerprints, actor definitions, shard counts, hash versions, remoting compatibility, and node identity require restart or an explicit cluster migration. Hot reload is allowed only for parameters whose consumers implement validation, atomic application, rollback/failure reporting, and inspection of the active version.
 
+Rebalance strategy ID/version and hard eligibility constraints follow the entity-type compatibility rules. Thresholds, sample-age limits, cooldowns, and concurrency limits may be revisioned operational configuration: a validated update affects only future proposals, while every active `RebalancePlan` retains the policy version and limits under which it was admitted.
+
 ## 9. Failure and Backpressure Rules
 
 ```text

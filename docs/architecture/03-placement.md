@@ -26,6 +26,7 @@ Recommended logical keys:
 /lattice/<cluster>/shard_claims/<entity_type>/<shard_id>
 /lattice/<cluster>/singletons/<singleton_kind>
 /lattice/<cluster>/singleton_claims/<singleton_kind>
+/lattice/<cluster>/rebalances/<plan_id>
 ```
 
 There are no per-entity placement keys and no concrete actor-path keys. Concrete `ActorRef` identity lives in remoting/runtime state; logical entity activation is local to its shard owner.
@@ -42,6 +43,7 @@ PlacementSlot {
   assignment_generation,
   state,
   optional_target,
+  optional_active_move: (plan_id, move_id),
   claim,
 }
 ```
@@ -55,10 +57,10 @@ Nodes register through their remoting Coordinator session. The Coordinator write
 A new leader:
 
 1. obtains a higher election term;
-2. reconstructs members, assignments, claims, and in-progress handoffs from etcd;
+2. reconstructs members, assignments, claims, active RebalancePlans, and in-progress handoffs from etcd;
 3. establishes remoting associations to live members;
 4. reconciles observed claim holders before issuing new assignments;
-5. resumes allocation only after reconciliation.
+5. resumes required recovery/drain work, then allocation and automatic rebalancing only after reconciliation and fresh-input checks.
 
 Coordinator leadership does not by itself grant permission to serve a shard or singleton. The leader persists a generation claim in etcd and sends the selected owner a bounded `ClaimGranted` control message. The owner may serve only while the matching grant remains valid according to its local monotonic deadline. Runtime nodes do not acquire or renew claims by connecting to etcd directly. Claim authority remains per placement slot; transport may batch renewals for many slots owned by one node without weakening per-slot generation or expiry checks.
 
@@ -89,8 +91,20 @@ EntityType::builder::<PlayerActor>("player")
     .max_buffered_messages_per_region(10_000)
     .max_buffered_bytes(64 * 1024 * 1024)
     .passivate_after(Duration::from_minutes(10))
+    .rebalance(
+        RebalancePolicy::weighted_least_load()
+            .interval(Duration::from_secs(10))
+            .min_relative_improvement(0.10)
+            .min_shard_residence(Duration::from_minutes(2))
+            .node_join_stability(Duration::from_secs(30))
+            .cooldown(Duration::from_secs(30))
+            .max_moves_per_round(4)
+            .max_concurrent_moves(8),
+    )
     .build()?;
 ```
+
+The strategy ID/version and hard eligibility constraints are part of the entity-type configuration fingerprint. Operational thresholds and concurrency limits may be updated only through validated revisioned Coordinator configuration; an update affects future proposals and never rewrites an active plan or bypasses its recorded policy version.
 
 The actor type fixes its business key:
 
@@ -131,12 +145,115 @@ Every node using or hosting an entity type has one local ShardRegion. It runs pr
 
 Initial guardrails are 1,024 buffered messages per shard, 10,000 per region, 64 MiB per region, and a message residence limit of `min(message deadline, 30 s)`.
 
-## 6. Handoff
+## 6. Allocation and Rebalancing
+
+Allocation decides the owner of an unassigned shard. Rebalancing decides whether an already active shard should move; it never changes ownership directly. Both produce validated placement decisions, while every actual move uses the handoff/claim state machine in section 7.
+
+### 6.1 Strategy Contract
+
+The Coordinator owns one strategy instance per entity type. Strategy code is pure with respect to cluster state: it receives an immutable bounded view, performs no etcd/network I/O, and returns a proposal that the Coordinator must validate before persistence.
+
+```rust
+pub trait ShardAllocationStrategy: Send + Sync + 'static {
+    fn allocate(
+        &self,
+        request: &AllocationRequest,
+        view: &PlacementView,
+    ) -> Result<AllocationDecision, AllocationError>;
+
+    fn rebalance(
+        &self,
+        trigger: RebalanceTrigger,
+        view: &PlacementView,
+        limits: &RebalanceLimits,
+    ) -> Result<RebalanceProposal, AllocationError>;
+}
+```
+
+```text
+PlacementView {
+  coordinator_term and state_revision
+  eligible nodes with incarnation, roles, zone, protocol support and configured capacity
+  latest bounded NodeLoad and per-shard ShardLoad samples with sequence and age
+  current shard owner/generation/residence time
+  active claims, handoffs, drains and rebalance moves
+}
+
+RebalanceProposal {
+  reason
+  base_revision
+  moves: [shard, expected_generation, source, target, estimated_improvement]
+}
+```
+
+For the same `PlacementView`, policy version, trigger, and limits, a strategy must return the same ordered proposal. The Coordinator revalidates that every source/generation still matches, every target is Ready and eligible, no shard is already moving, projected target capacity including pending reservations is available, limits remain available, and the proposal was calculated from an acceptable revision. A strategy failure or invalid proposal skips the round and emits telemetry; it never partially mutates placement.
+
+### 6.2 Load and Capacity Model
+
+`NodeHello` supplies relatively stable hard inputs: roles, zone/failure-domain attributes, supported protocols/entity types, and positive capacity units. Ready nodes periodically send bounded latest-value `NodeLoadReport` control messages containing a boot-scoped sample sequence, active shard/entity counts, mailbox pressure, and processing/CPU load summaries. Shards may additionally report a bounded EWMA weight; absent shard measurements use weight `1`. Load reports are ephemeral and are not replayed by reliable control delivery; reconnect or leader change requires a fresh higher-sequence sample.
+
+Load reports are advisory, not authority. They are kept in Coordinator memory, bounded by live nodes/shards, and are not written to etcd on every sample. A new leader waits for fresh samples before automatic optimization. Stale/missing load excludes a node as an automatic rebalance target unless the strategy explicitly falls back to configured capacity for necessary allocation/recovery. Reports cannot override role, protocol, drain, claim, or health eligibility.
+
+The built-in `WeightedLeastLoad` strategy minimizes normalized load:
+
+```text
+normalized_node_load = sum(hosted_shard_weights) / configured_capacity_units
+```
+
+It uses deterministic node/shard ordering for ties, considers the post-move source and target scores, and proposes a move only when the configured absolute/relative improvement threshold is met. Custom strategies may add zone affinity, pinning, data locality, or business costs, but return the same validated proposal type.
+
+### 6.3 Triggers and Priority
+
+Placement work has explicit reasons and priority:
+
+```text
+1. Recovery: dead, fenced, or ineligible owner; restore availability after old authority is invalid.
+2. Drain: evacuate a draining node.
+3. Manual: authenticated operator request, optionally constrained to source/target/shards.
+4. Automatic: periodic tick, stable node join, or material capacity/load change.
+```
+
+Recovery and drain bypass balance improvement and shard-residence thresholds but still obey fencing and bounded concurrency. Manual moves bypass improvement only when the command explicitly requests it. Automatic rebalancing requires a healthy reconciled Coordinator, fresh enough inputs, minimum shard residence, node-join stability delay, cluster cooldown, and improvement hysteresis. Coordinator degradation, leadership reconciliation, incompatible schema/protocols, or an active entity-type barrier pauses new automatic plans.
+
+### 6.4 Persisted Plan and Limits
+
+The Coordinator converts an accepted proposal into a persisted, term/revision-fenced plan before starting a move:
+
+```text
+RebalancePlan {
+  plan_id
+  entity_type
+  reason
+  coordinator_term
+  base_revision
+  policy_id and policy_version
+  status: Planned | Running | Completed | Cancelled | Failed
+  moves: [
+    shard_id
+    expected_generation
+    source_incarnation
+    target_incarnation
+    status: Pending | Handoff | Completed | Cancelled | Failed
+  ]
+}
+```
+
+Only one move may be active for a shard, and at most one automatic plan may be active per entity type. Pending moves reserve their estimated weight against target capacity so concurrent plans cannot overcommit a node. Limits apply independently to proposals and execution: maximum moves per round, and maximum concurrent moves per cluster, entity type, source node, and target node. The current leader measures cooldown and minimum residence with local monotonic timers derived from reconciled transition state, never from caller clocks. After leader failover, any interval whose elapsed duration cannot be proven is conservatively restarted from reconciliation time. Active plan count and retained completed-plan history are bounded; completed records are compacted according to an operational retention policy rather than used as placement truth.
+
+Higher-priority recovery/drain work may cancel or preempt lower-priority moves only while they remain `Pending`; their reservations are then released idempotently. A move that has entered `Handoff` owns the slot's `active_move` marker and must complete or recover forward before another plan may target that shard.
+
+A new Coordinator leader reconstructs plans and slot handoffs from etcd after claim reconciliation. It cancels stale `Pending` moves whose base assumptions no longer hold and idempotently resumes already persisted handoffs from their authoritative slot state. Cancellation stops only moves that have not crossed into handoff; once source invalidation/drain begins, the move is completed or recovered forward rather than rolled back to an ambiguous owner.
+
+### 6.5 Singleton Boundary
+
+Singletons reuse the shared placement move, drain, claim, and fencing machinery but do not participate in periodic load balancing. They move only for owner failure/ineligibility, node drain, configuration change, or an authenticated manual relocation, using singleton-specific eligibility and lifecycle rules.
+
+## 7. Handoff
 
 A controlled shard handoff uses the same node-level revision stream as normal assignment updates. Its barrier is complete for the affected entity type, not cluster-global: it contains the live node sessions whose `NodeHello` subscription says they host or proxy that entity type and therefore may cache its shard home. Nodes unrelated to the entity type cannot block the handoff.
 
 ```text
-Coordinator freezes the subscribed Region-session barrier set and persists BeginHandoff(next generation, target)
+Coordinator transactionally links optional plan/move ID and persists BeginHandoff(next generation, target)
   -> publishes StateDelta(handoff revision)
   -> every subscribed Region in the frozen barrier set invalidates home, buffers, and AppliedRevision(revision)
   -> a node joining later receives the Handoff state in its snapshot before becoming Ready
@@ -155,7 +272,7 @@ The first version does not transfer in-memory actor state. Reactivated entities 
 
 `Actor::stopping` failure blocks voluntary `ShardDrained` and therefore blocks graceful handoff while the old claim is valid. It is observable and follows a bounded retry/operator policy rather than becoming an invisible permanent state. It never overrides fencing: explicit claim loss or local grant expiry first stops all new mailbox admission, then performs best-effort shutdown and raises `StateLossPossible` if cleanup/save fails. After the old claim is independently invalid, single-owner safety permits a new owner even when the crashed/fenced actor could not save; business persistence must be crash-safe if that recovery is required.
 
-## 7. Claims, Failure, and Coordinator Outage
+## 8. Claims, Failure, and Coordinator Outage
 
 A shard owner may serve only while its locally installed grant matches the Coordinator's lease-backed claim, leadership term, assignment generation, grant sequence, and node incarnation.
 
@@ -175,24 +292,25 @@ During temporary Coordinator unavailability:
 - known active shard routes continue while the destination association and claim remain valid;
 - local owners continue serving already claimed shards;
 - no new assignment, relocation, or singleton failover is invented;
+- no automatic rebalance plan is created or advanced before leadership/claim reconciliation;
 - unknown shards and exhausted buffers fail with `CoordinatorUnavailable` or `ShardUnavailable`;
 - recovery reconciles claims before buffered traffic resumes.
 
 This keeps a short control-plane outage from stopping healthy known data paths without permitting split ownership. It is deliberately bounded: a known route stops when its local grant deadline expires even if the data connection is healthy. Production configuration must therefore satisfy `Coordinator leader recovery objective < claim TTL - safety margin`; increasing the TTL extends outage tolerance but also increases the worst-case crash-failover delay.
 
-## 8. Passivation
+## 9. Passivation
 
 Entity passivation is local lifecycle management, not a placement change. The shard keeps ownership; only the entity activation stops. The next message may activate a new instance.
 
 Passivation does not write etcd or increment shard generation. `EntityRef` remains usable, while every `watch_current(EntityRef)` bound to the old activation receives `Terminated`; observing a later activation requires a new watch.
 
-## 9. Cluster Singletons
+## 10. Cluster Singletons
 
 Singleton kinds are declared at service startup. A SingletonProxy tracks the Coordinator assignment and forwards through remoting. Singleton routing and lifecycle remain separate from sharding, while ownership delegates to the shared placement-slot engine and uses the same term/generation/sequence/TTL grant and local monotonic fencing rules as shard ownership.
 
 On failure, the Coordinator waits until the old claim is invalid, selects a compatible node, publishes the next generation, and activates the new singleton. The first version supports fixed singleton kinds only; it does not retain the old Explicit Placement model.
 
-## 10. Drain and Shutdown
+## 11. Drain and Shutdown
 
 Graceful drain proceeds in this order:
 
@@ -205,6 +323,6 @@ Graceful drain proceeds in this order:
 
 Forced shutdown relies on lease expiry and claim fencing. Operators must be able to observe which shards or singletons still block a drain.
 
-## 11. Migration Constraint
+## 12. Migration Constraint
 
 The old generated gRPC, Explicit Placement, and Direct Link protocols are not wire-compatible with this design. Cutover is full-stop: stop old nodes, migrate/clear incompatible framework metadata under an explicit schema-generation procedure, then start only new-protocol nodes. Mixed clusters are unsupported.

@@ -36,6 +36,8 @@ by EntityRef/SingletonRef. A reused node address or actor path must never receiv
 Implement the complete target architecture rather than replacing it with a minimal v1 that requires a
 later structural rewrite. Multi-lane Associations, bounded protocol catalogues, revisioned snapshots,
 per-slot claims, handoff barriers, logical watch_current, and the full Singleton model remain required.
+Pluggable shard allocation, persisted bounded rebalancing plans, capacity/load-aware decisions, and
+automatic/manual/drain/recovery move triggers are also part of the complete placement model.
 Control complexity by sharing internal mechanisms and narrowing fault domains, not by deleting target
 capabilities or deferring them outside this plan.
 
@@ -181,6 +183,8 @@ Watch observes a concrete activation, not a logical identity forever.
 - DeathWatch, Coordinator state, claims, handoff, drain, and Singleton control reuse one bounded Association-level reliable control stream with sequence, cumulative acknowledgement, replay, and idempotent application.
 - Transport handshake compatibility and business `ProtocolId` compatibility are separate fault domains. A mismatched business protocol disables that protocol and dependent hosting eligibility without closing unrelated traffic on a valid Association.
 - The handoff revision barrier is complete for live Region sessions subscribed to the affected entity type. Unrelated nodes do not join the barrier; new subscriptions install the Handoff snapshot slice before routing.
+- Shard allocation and rebalancing use a pure proposal strategy over an immutable bounded PlacementView. The Coordinator revalidates and persists every generation-conditional move before the shared handoff/claim engine changes authority.
+- Recovery, drain, manual relocation, and automatic optimization are distinct triggers. Automatic optimization requires fresh inputs, hysteresis, minimum residence, node-join stability, cooldown, target-capacity reservations and bounded cluster/entity/source/target concurrency; Singleton is excluded from periodic load balancing.
 - `StopFailed` may block a voluntary release while authority remains valid, but it is observable and bounded by retry/operator policy. External claim loss always fences admission and cannot be extended by lifecycle cleanup.
 
 ---
@@ -198,12 +202,14 @@ Relevant files:
 
 - `remote/.../artery/Association.scala`, `Handshake.scala`, `Control.scala`, and `OutboundEnvelope.scala`;
 - `remote/src/main/resources/reference.conf` for lanes, queue bounds, frame bounds and transport modes;
-- `cluster-sharding/.../ShardCoordinator.scala`, `ShardRegion.scala`, and `Shard.scala`;
+- `cluster-sharding/.../ShardCoordinator.scala`, including `ShardAllocationStrategy`, plus `internal/LeastShardAllocationStrategy.scala`, `ShardRegion.scala`, and `Shard.scala`;
 - `cluster-sharding/.../internal/DDataRememberEntitiesShardStore.scala` only as evidence that
   remembered entities are separate from ownership; lattice does not implement it in v1.
 
-lattice adapts the association, concrete activation reference, DeathWatch, ShardRegion handoff and
-Singleton concepts to Rust/Tokio and an external etcd-backed Coordinator. It does not implement Pekko
+lattice adapts the association, concrete activation reference, DeathWatch, allocation/rebalancing,
+ShardRegion handoff and Singleton concepts to Rust/Tokio and an external etcd-backed Coordinator. Its
+strategy returns persisted, generation-conditional move plans rather than directly selecting authority.
+It does not implement Pekko
 membership Gossip, remote deployment, Streams, persistence, or source-compatible APIs.
 
 ---
@@ -386,6 +392,35 @@ Unallocated | Allocating | Running | BeginHandoff | Stopping
 
 Shard and Singleton records are distinct `PlacementSlot` keys handled by one authority engine. That engine owns persistence, term/generation checks, claim grant/renew/loss, local deadline fencing, drain, and replacement eligibility. ShardRegion/Shard and SingletonProxy/SingletonManager keep their different routing and activation behavior.
 
+Allocation and rebalancing are Coordinator decision layers above that authority engine:
+
+```text
+ShardAllocationStrategy:
+  allocate(AllocationRequest, PlacementView) -> AllocationDecision
+  rebalance(RebalanceTrigger, PlacementView, RebalanceLimits) -> RebalanceProposal
+
+PlacementView:
+  Coordinator term/revision
+  eligible node incarnation/role/zone/protocol/capacity
+  bounded latest-value NodeLoad and ShardLoad samples with boot-scoped sequence and age
+  current assignments/generations/residence
+  active claims, handoffs, drains and plan moves
+
+RebalancePlan:
+  plan ID, entity type, reason, term, base revision, policy ID/version
+  generation-conditional source/target moves and persisted progress
+```
+
+- Built-in default is deterministic `WeightedLeastLoad`: hosted shard weight divided by configured capacity, with weight `1` when no per-shard measurement exists.
+- Load samples are ephemeral, not reliably replayed and not written to etcd per sample; reconnect or leader change requires fresh reports before automatic optimization.
+- Strategy code performs no network/etcd write and grants no authority. Coordinator revalidates source generation, target eligibility/readiness, input freshness, projected capacity including pending reservations, improvement, node-join stability, cooldown/residence and concurrency before persisting a plan.
+- Trigger priority is recovery, drain, authenticated manual relocation, then automatic optimization. Recovery/drain bypass improvement thresholds but never fencing or concurrency bounds.
+- Automatic planning pauses while leadership/claims are unreconciled, Coordinator is degraded, required load is stale, or the entity type has conflicting handoff state.
+- Limits cover moves per round and concurrent moves per cluster, entity type, source and target. Only one move may be active per shard and one automatic plan per entity type; pending moves reserve target capacity.
+- Higher-priority recovery/drain may cancel only pending automatic moves and release their reservations. A move that entered handoff must recover forward from persisted active-move/PlacementSlot state.
+- A new leader reconstructs plans after claim reconciliation, cancels invalid pending moves, and recovers already-started handoffs forward from persisted PlacementSlot state.
+- Singleton uses the shared move executor for recovery/drain/eligibility/manual relocation but never periodic load balancing.
+
 ShardRegion responsibilities:
 
 - host or proxy-only mode;
@@ -399,7 +434,7 @@ ShardRegion responsibilities:
 Handoff order:
 
 ```text
-persist BeginHandoff
+transactionally link optional plan/move ID and persist BeginHandoff
 -> freeze the live subscribed Region-session barrier set for the affected entity type and publish StateDelta(handoff revision)
 -> subscribed host/proxy Regions invalidate home, buffer, and AppliedRevision; unrelated nodes do not participate
 -> later joiners or new entity-type subscriptions install the Handoff snapshot slice before routing
@@ -487,7 +522,7 @@ The target is three large commits. Checklist items from several phases may be co
    - replace references, paths, protocol registration, local dispatch, Association, reliable control delivery, remote tell/ask, and all directly affected call sites;
    - compilation may remain broken at this commit while distributed owners and service assembly still target removed APIs.
 2. `feat(cluster)!: add coordinator sharding watch and singleton runtime`
-   - complete Coordinator remoting, filtered snapshots, per-slot grants, subscribed-Region handoff barrier, DeathWatch, shared placement authority, ShardRegion, Singleton and service/Gateway assembly;
+   - complete Coordinator remoting, filtered snapshots, per-slot grants, allocation/rebalancing plans, subscribed-Region handoff barrier, DeathWatch, shared placement authority, ShardRegion, Singleton and service/Gateway assembly;
    - remove the remaining old control/storage assumptions while fixing the workspace against the new public API;
    - targeted tests should run where practical, but full workspace green is not yet a commit requirement.
 3. `test(remoting)!: complete hard-switch acceptance and migration`
@@ -582,23 +617,29 @@ Status: `[ ]` not started.
 - [ ] Implement subscription-filtered bounded SnapshotBegin/Chunk/End staging with chunk/count/byte/deadline limits, BLAKE3 validation, atomic install, ordered revision deltas and resync over reliable control delivery.
 - [ ] Bind every mutation to current leadership term and exact node incarnation.
 - [ ] Implement term/generation/sequence/TTL claim grants, renewal cadence, local monotonic deadlines and safety margin so Coordinator outage continues known homes only until expiry.
+- [ ] Add bounded latest-value NodeLoadReport/ShardLoad inputs with boot-scoped sample sequence, sample age, per-node/per-shard cardinality limits, fresh-report requirement after reconnect/leader change, no reliable replay, and no per-sample etcd writes.
 - [ ] Add leader failover, stale leader, event gap, lease expiry and reconnect tests with real etcd.
 - [ ] Phase 4 checklist and available directional evidence complete within macro batch 2; full workspace compilation is not required at this boundary.
 
-### Phase 5: Shard and ShardRegion
+### Phase 5: Shard Allocation, Rebalancing, and ShardRegion
 
 Status: `[ ]` not started.
 
-- [ ] Add `ShardedActor::Key`, bounded canonical EntityId encoding and immutable entity config with explicit Xxh3V1 seed/hash, stable fingerprint and validated shard count.
+- [ ] Add `ShardedActor::Key`, bounded canonical EntityId encoding and immutable entity config with explicit Xxh3V1 seed/hash, stable fingerprint, validated shard count, and fingerprinted allocation-strategy ID/version/hard constraints.
 - [ ] Add persistent bounded shard-home records for memory and etcd backends.
 - [ ] Implement Region host/proxy, home cache, single-flight lookup and bounded buffers.
 - [ ] Make local Shard the only component allowed to load/deliver sharded entities.
 - [ ] Implement Coordinator-backed claim grant installation/renewal/loss and immediate local fencing.
 - [ ] Implement the frozen subscribed Region-session revision barrier for the affected entity type plus StateDelta/AppliedRevision, DrainShard/ShardDrained, ClaimGranted and ShardReady handoff; exclude unrelated nodes and handle concurrent join/subscription/leave through snapshot and membership fencing.
 - [ ] Implement one internal PlacementSlot authority engine shared by Shard and Singleton for assignment generation, claims, drain, fencing, and replacement eligibility while preserving their distinct routing/lifecycle behavior.
+- [ ] Add the pure ShardAllocationStrategy contract, immutable PlacementView, AllocationDecision, RebalanceProposal, RebalanceTrigger and RebalanceLimits; strategies never mutate authority.
+- [ ] Implement deterministic WeightedLeastLoad with capacity normalization, unit fallback weight, eligibility filtering, stable tie-breaking, freshness checks, hysteresis, minimum residence, node-join stability and cooldown.
+- [ ] Persist term/revision/policy-fenced RebalancePlan records and per-move progress/PlacementSlot active-move linkage; enforce one move per shard, one automatic plan per entity type, target-capacity reservations, and per-round/cluster/entity/source/target bounds.
+- [ ] Implement recovery > drain > manual > automatic trigger priority, pending automatic-move preemption/reservation release, forward-only behavior after handoff, automatic pause during degraded/reconciliation/stale-input states, and Singleton exclusion from periodic balancing.
+- [ ] Recover plans after leader failover: cancel invalid pending moves and resume already-started handoffs forward from PlacementSlot truth.
 - [ ] Make StopFailed block voluntary drain but never override claim fencing; surface StateLossPossible and test crash-safe owner replacement.
 - [ ] Add local passivation with no Coordinator/etcd mutation.
-- [ ] Add routing, buffering, migration, crash, claim loss, drain and unauthorized-load tests.
+- [ ] Add routing, buffering, allocation, automatic/manual rebalance, migration, crash, claim loss, drain, leader recovery and unauthorized-load tests.
 - [ ] Phase 5 checklist and available directional evidence complete within macro batch 2; full workspace compilation is not required at this boundary.
 
 ### Phase 6: Remote DeathWatch
@@ -651,11 +692,12 @@ Status: `[ ]` not started.
 - [ ] Bound all connections, frames, queues, pending asks, watches, buffers, maps and shutdown joins.
 - [ ] Make CorrelationId boot-unique and pending-ask state bounded; keep business idempotency keys/dedup business-owned and never imply cancellation rollback.
 - [ ] Add live/partial admin inspection and low-cardinality metrics.
+- [ ] Add rebalance inspect/explain, pause/resume, evaluate-now, idempotent manual relocation, pending-move cancellation and audited plan history; never expose a claim-fencing bypass.
 - [ ] Complete Gateway failure isolation and edge admission control.
 - [ ] Add multi-process Gateway -> EntityRef ask -> remote Shard -> Actor -> Reply coverage.
 - [ ] Add arbitrary child ActorRef serialization/tell/ask/watch across nodes.
 - [ ] Add Coordinator outage, handoff, crash, reconnect, TLS/plaintext and abuse scenarios.
-- [ ] Benchmark local actor, concrete remote ref, stable shard, unknown home, handoff and reconnect.
+- [ ] Benchmark local actor, concrete remote ref, stable shard, unknown home, allocation evaluation, rebalance planning, handoff and reconnect.
 - [ ] Compare remoting bulk-tell throughput, allocations and connection/FD usage against the preserved pooled Direct Link baseline and document the accepted regression budget.
 - [ ] Prove remote hot paths do not access etcd or Coordinator.
 - [ ] Run full workspace verification and audit every checked item.
@@ -683,6 +725,15 @@ snapshot_chunks_install_atomically_or_are_discarded
 coordinator_outage_serves_known_claims_until_deadline_then_fences
 claim_ttl_uses_local_monotonic_deadline_and_rejects_stale_term_or_sequence
 entity_key_and_xxh3_v1_have_cross_process_golden_vectors
+allocation_strategy_cannot_select_ineligible_or_stale_incarnation
+weighted_least_load_is_deterministic_and_capacity_normalized
+automatic_rebalance_requires_fresh_load_hysteresis_residence_and_cooldown
+rebalance_limits_bound_round_cluster_entity_source_and_target_moves
+rebalance_pending_moves_reserve_target_capacity_and_prevent_overcommit
+rebalance_plan_rejects_stale_base_revision_or_assignment_generation
+rebalance_leader_failover_cancels_pending_and_resumes_started_moves_forward
+recovery_and_drain_preempt_automatic_rebalance_without_bypassing_fencing
+singleton_is_excluded_from_periodic_rebalance
 shard_handoff_invalidates_regions_before_old_actor_stop
 handoff_revision_barrier_handles_concurrent_join_and_fenced_leave
 handoff_barrier_contains_only_subscribed_regions_for_entity_type
@@ -718,6 +769,10 @@ Do not implement separate Shard and Singleton ownership algorithms; share Placem
 Do not let one business ProtocolId mismatch close an otherwise transport-compatible Association.
 Do not replay tell/ask business frames through reliable control delivery.
 Do not include nodes unrelated to an entity type in that type's handoff revision barrier.
+Do not let ShardAllocationStrategy, load reports, or admin commands grant/revoke authority directly.
+Do not start automatic rebalance from stale required load, during Coordinator degradation/reconciliation, or without bounded hysteresis/cooldown/concurrency.
+Do not roll back a move that has entered handoff to an ambiguous old owner; recover it forward from persisted PlacementSlot state.
+Do not include Singleton in periodic load balancing.
 Do not introduce persistent actors, Gossip, Streams, remote deployment or ActorSelection in v1.
 ```
 
@@ -753,6 +808,7 @@ and fail explicitly when invoked without it.
 - [ ] Coordinator is the only placement/membership etcd authority.
 - [ ] Shard and Singleton ownership is bounded, lease-fenced and leadership-generation-fenced.
 - [ ] Shard and Singleton reuse one placement-slot authority engine while retaining distinct reference, routing and lifecycle semantics.
+- [ ] Shard allocation/rebalancing is pluggable, capacity/load-aware, deterministic under one view, persisted before execution, bounded at every scope, and recovered safely across leader failover.
 - [ ] Explicit Placement, per-actor floors and placement tombstones are deleted.
 - [ ] Passivation writes no placement metadata and framework recovery claims no actor-state persistence.
 - [ ] Association loss, queue pressure, handoff and Coordinator outage have bounded explicit outcomes.

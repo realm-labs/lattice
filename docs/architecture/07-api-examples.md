@@ -152,6 +152,17 @@ async fn main() -> anyhow::Result<()> {
                 .protocol(player_protocol)
                 .factory(PlayerActorFactory::new(app.clone()))
                 .passivate_after(Duration::from_secs(600))
+                .rebalance(
+                    RebalancePolicy::weighted_least_load()
+                        .interval(Duration::from_secs(10))
+                        .load_sample_max_age(Duration::from_secs(20))
+                        .min_relative_improvement(0.10)
+                        .min_shard_residence(Duration::from_secs(120))
+                        .node_join_stability(Duration::from_secs(30))
+                        .cooldown(Duration::from_secs(30))
+                        .max_moves_per_round(4)
+                        .max_concurrent_moves(8),
+                )
                 .build()?,
         )
         .register_singleton(

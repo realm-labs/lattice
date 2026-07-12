@@ -55,6 +55,7 @@ The implementation reuses suitable Direct Link internals—framing, pooling, str
 6. Bounded buffering, explicit deadlines, backpressure, and observable failure modes.
 7. Coordinator-driven placement and failover without a Coordinator hop on known data-plane routes.
 8. Kubernetes-friendly startup, drain, shutdown, and rolling replacement.
+9. Capacity/load-aware, bounded, explainable shard allocation and rebalancing that reuses the same fenced handoff path.
 
 ### 1.2 Non-Goals
 
@@ -88,6 +89,8 @@ No separate high-throughput Direct Link or stream transport for actor messages.
 | Shard | Placement unit containing many logical entities |
 | Coordinator | Elected control-plane actor assigning shards and singletons |
 | Claim | Lease-backed right to serve a shard or singleton generation |
+| Allocation strategy | Pure Coordinator-side policy that proposes initial owners and bounded shard moves from one immutable placement view |
+| RebalancePlan | Persisted, term/revision/policy-fenced set of generation-conditional shard moves executed through normal handoff |
 | DeathWatch | Lifecycle notification bound to one exact actor activation; logical refs expose resolve-without-activate `watch_current` |
 | EventBus | Pub/sub for broadcast and asynchronous integration; not point-to-point actor routing |
 
@@ -217,6 +220,7 @@ flowchart TB
     Proxies["SingletonProxy per used kind"]
     Managers["SingletonManager per hosted kind"]
     Authority["Shared placement-slot authority<br/>generation + claim + drain + fence"]
+    Rebalancer["Coordinator allocation/rebalance planner<br/>leader-active strategy + load view + persisted plans"]
     Singletons["Singleton activations"]
     EventAdapter["EventBus subscriptions"]
     Ops["Inspection and admin"]
@@ -231,6 +235,7 @@ flowchart TB
     Service --> Proxies
     Service --> Managers
     Service --> Authority
+    Service --> Rebalancer
     Service --> EventAdapter
     Service --> Ops
     UserGuardian --> Registry
@@ -243,11 +248,13 @@ flowchart TB
     CoordSession -. "assignment snapshot/delta" .-> Regions
     CoordSession -. "singleton assignment" .-> Proxies
     CoordSession -. "claim/grant/loss" .-> Authority
+    CoordSession -. "capacity/load reports" .-> Rebalancer
+    Rebalancer -. "validated placement moves" .-> Authority
     Authority -. "authorized slot state" .-> Shards
     Authority -. "authorized slot state" .-> Managers
 ```
 
-The service supervisor owns every long-lived component and join handle. No association, Region, claim renewal, subscription, scheduler, or actor task is detached from service shutdown.
+The service supervisor owns every long-lived component and join handle. The allocation/rebalance planner is instantiated only for Coordinator-eligible service roles and becomes active only on the reconciled leader. No association, Region, claim renewal, subscription, scheduler, or actor task is detached from service shutdown.
 
 ## 4. Message Flow
 
@@ -402,6 +409,32 @@ sequenceDiagram
 
 The Coordinator freezes the barrier from live sessions subscribed to the affected entity type: host and proxy Regions that may cache its shard home participate, while unrelated logic nodes cannot block the move. A node joining or adding the subscription during handoff installs the Handoff snapshot slice before routing. The revision barrier prevents participating Regions with a stale home from continuing to send tell messages to the old owner. Timeout alone is never proof that the old owner stopped; reassignment requires `ShardDrained` or independently proven claim/incarnation expiry.
 
+### 4.6 Allocation and Rebalancing
+
+```mermaid
+sequenceDiagram
+    participant Nodes as Eligible shard hosts
+    participant C as Coordinator
+    participant S as Allocation strategy
+    participant P as PlacementSlot authority
+
+    Nodes-->>C: latest-value bounded NodeLoadReport
+    C->>S: immutable PlacementView + trigger + limits
+    S-->>C: RebalanceProposal(base revision, moves)
+    C->>C: validate eligibility, generations, freshness, cooldown and limits
+    C->>C: persist RebalancePlan
+    loop bounded concurrent moves
+        C->>P: start validated move
+        P->>P: execute normal handoff/claim transition
+        P-->>C: move completed or failed
+        C->>C: persist plan progress
+    end
+```
+
+The strategy chooses proposals; it never grants authority. Initial allocation, failure recovery, drain, manual relocation, and automatic balancing are distinct reasons with priority `recovery > drain > manual > automatic`, but they converge on the same validated placement move and handoff state machine. The default `WeightedLeastLoad` strategy balances measured shard weight divided by configured node capacity, with deterministic tie-breaking, stale-sample rejection, hysteresis, minimum residence, node-join stability, cooldown, target-capacity reservations, and cluster/entity/source/target concurrency limits.
+
+Automatic balancing runs only while the Coordinator is leader, Ready, claim-reconciled, and supplied with sufficiently fresh inputs. Active plans are persisted and recovered across leader failover. Singleton moves reuse the move executor for failure, drain, eligibility change, or manual relocation but are excluded from periodic load balancing.
+
 ## 5. Lifecycles
 
 ### 5.1 Logic Service Lifecycle
@@ -510,6 +543,8 @@ stateDiagram-v2
 | Shard/singleton claim loss | Local Shard or SingletonManager | Fence admission before best-effort stop; stopping failure cannot preserve authority |
 | Node incarnation declared dead | Coordinator and DeathWatch | Invalidate routes/claims and terminate watches bound to that incarnation |
 | etcd unavailable | Coordinator | Stop new decisions; preserve no authority beyond existing bounded leases/terms |
+| Allocation strategy/load input failure | Coordinator rebalancer | Reject the proposal or skip the round; never partially mutate placement |
+| Rebalance move failure | Coordinator and PlacementSlot authority | Persist progress, preserve fencing, then complete/recover forward or fail visibly; never roll back to ambiguous dual ownership |
 
 ## 6. Core Invariants
 
@@ -525,6 +560,8 @@ Transport and business-protocol compatibility are separate: one mismatched Proto
 Every queue and temporary buffer is bounded.
 Only a valid claim holder may serve a shard or singleton generation.
 Shard and Singleton use one placement-slot authority engine for generation, claim, drain, and fencing while retaining distinct routing and lifecycle semantics.
+Allocation/rebalance strategies return proposals only; the Coordinator revalidates and persists every move before the existing handoff/claim state machine changes authority.
+Automatic rebalance is bounded by freshness, hysteresis, cooldown, minimum residence and concurrency limits, and stops while Coordinator state is degraded or unreconciled.
 Control commands use bounded sequenced delivery plus idempotent reconciliation; business tell/ask frames are never replayed by that mechanism.
 Control-connection loss stops new Association data admission in v1.
 Known shard routes continue during temporary Coordinator loss while their claims remain valid.

@@ -68,6 +68,7 @@ Operators need structured inspection for:
 - associations, reconnects, heartbeat state, lane depth, and dropped/rejected frames;
 - actor paths, activation counts, mailbox depth, supervision, and termination;
 - ShardRegions, ownership generations, claims, handoffs, buffers, and passivation;
+- allocation strategy/version, node capacity/load sample age, normalized load, active RebalancePlans, move limits, cooldown, and last decision reason;
 - singleton assignments, claims, and proxy buffers;
 - pending asks, deadlines, `UnknownResult`, and remote failures;
 - remote watches, orphan cleanup, and termination delivery.
@@ -78,9 +79,11 @@ Trace context propagates through Gateway bindings, actor envelopes, remoting fra
 
 ## 5. Admin Surface
 
-`lattice-ops` exposes Rust inspector/command traits. An authenticated HTTP adapter may provide health, readiness, metrics, cluster summary, members, associations, shards, singletons, mailboxes, watches, drain, and handoff commands.
+`lattice-ops` exposes Rust inspector/command traits. An authenticated HTTP adapter may provide health, readiness, metrics, cluster summary, members, associations, shards, singletons, mailboxes, watches, allocation/rebalance plans, drain, and handoff commands.
 
 Mutating cluster operations are sent to the Coordinator actor through remoting. The HTTP adapter must not mutate etcd directly. Operations are authorized, audited, bounded by deadlines, and safe to retry only when their command protocol declares idempotency.
+
+Rebalance operations include inspect/explain, pause/resume automatic planning, trigger an immediate evaluation, submit an idempotent manual relocation, and cancel only plan moves that have not entered handoff. The API exposes why a proposal was accepted/rejected and which eligibility, freshness, hysteresis, cooldown, or concurrency rule applied; it never allows an operator to bypass claim fencing.
 
 ## 6. Configuration Example
 
@@ -89,6 +92,10 @@ Mutating cluster operations are sent to the Coordinator actor through remoting. 
 cluster_id = "prod-game"
 node_id = "world-0"
 roles = ["logic", "world"]
+
+[node.placement]
+capacity_units = 100
+zone = "cn-east-1a"
 
 [remoting]
 listen = "0.0.0.0:25520"
@@ -122,6 +129,21 @@ snapshot_assembly_timeout_secs = 5
 claim_ttl_secs = 15
 claim_renew_interval_secs = 5
 claim_safety_margin_secs = 2
+
+[placement.rebalance]
+strategy = "weighted-least-load/v1"
+interval_secs = 10
+load_report_interval_secs = 5
+load_sample_max_age_secs = 20
+min_relative_improvement = 0.10
+min_shard_residence_secs = 120
+node_join_stability_secs = 30
+cooldown_secs = 30
+max_moves_per_round = 4
+max_concurrent_cluster = 8
+max_concurrent_entity_type = 4
+max_concurrent_source = 2
+max_concurrent_target = 2
 
 [sharding.player]
 shards = 256
@@ -171,6 +193,18 @@ Coordinator starts handoff
   -> regions update route and flush unexpired messages
 ```
 
+### Automatic shard rebalance
+
+```text
+eligible hosts report bounded latest-value load summaries
+  -> Coordinator builds immutable PlacementView
+  -> entity allocation strategy proposes generation-conditional moves
+  -> Coordinator validates freshness, eligibility, improvement and limits
+  -> persists RebalancePlan
+  -> each admitted move executes the normal shard handoff
+  -> plan progress remains inspectable and recoverable after leader failover
+```
+
 ### Singleton failover
 
 ```text
@@ -193,6 +227,8 @@ Do not expose remoting frames as a business API.
 Do not create a second gRPC path for internal actor commands.
 Do not address a replacement actor through a stale concrete ActorRef.
 Do not query or mutate etcd for every message.
+Do not let a load report or allocation strategy grant authority or bypass Coordinator validation.
+Do not start automatic rebalance while the Coordinator is degraded, unreconciled, or using stale required load inputs.
 Do not route normal data traffic through the Coordinator.
 Do not use EventBus for single-owner commands or immediate replies.
 Do not use unbounded association, proxy, shard, or mailbox buffers.
