@@ -1,6 +1,6 @@
 # 01. Actor Runtime
 
-> Rust core types, actor runtime, mailbox, ActorHandle, lifecycle, watch, and local child actors.  
+> Rust core types, actor runtime, mailbox, ActorHandle, lifecycle, watch, and child actors.
 > Back to: [architecture index](README.md)
 
 ---
@@ -21,11 +21,17 @@ pub struct ActorKind(std::borrow::Cow<'static, str>);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InstanceId(String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Epoch(pub u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeIncarnation(Uuid);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActivationId(Uuid);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RequestId(String);
+pub struct ActorPath(String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EntityId(Bytes);
 ```
 
 `ActorKind` and `ServiceKind` are opaque framework identifiers. They can be constructed from constants through macros:
@@ -37,35 +43,22 @@ pub const WORLD_ACTOR: ActorKind = actor_kind!("World");
 
 The names `World`, `Player`, or `Guild` may appear in examples and business crates, but not as built-in framework variants.
 
-### 6.2 RouteKey and ActorId
+### 6.2 Entity Keys
 
-`RouteKey` and `ActorId` are abstract values used by routing and placement. They are not business-specific enums.
+Business identifiers convert to canonical entity bytes only at the `EntityRef` boundary. They are not framework enums and concrete actors do not need entity IDs.
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum RouteKey {
-    Str(String),
-    U64(u64),
-    I64(i64),
-    Bytes(Vec<u8>),
+pub trait EntityKey: Clone + Send + Sync + 'static {
+    fn to_entity_id(&self) -> EntityId;
+    fn try_from_entity_id(entity_id: &EntityId) -> Result<Self, EntityKeyDecodeError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum ActorId {
-    Str(String),
-    U64(u64),
-    I64(i64),
-    Bytes(Vec<u8>),
-}
-
-pub trait ActorKey: Clone + Send + Sync + 'static {
-    fn to_route_key(&self) -> RouteKey;
-    fn to_actor_id(&self) -> ActorId;
-    fn try_from_actor_id(actor_id: &ActorId) -> Result<Self, ActorKeyDecodeError>;
+pub trait ShardedActor: Actor {
+    type Key: EntityKey;
 }
 ```
 
-`ActorKey` conversion is used at API boundaries: codegen, route resolution, activation, and event delivery. It should not become a manual step on every business call.
+`EntityId` is a bounded canonical byte string; every `EntityKey` implementation must produce identical bytes across processes and versions. `ActorPath` is canonical, hierarchical, length-bounded, and validated by the runtime. Child names are one escaped path segment. `ActivationId` is newly generated for every actor lifetime and is never derived from the path.
 
 ---
 
@@ -81,7 +74,7 @@ The public API does not expose a giant enum.
 System messages have priority over normal messages.
 Mailbox capacity and activation waiters are bounded.
 ActorHandle is local-only.
-Cross-process calls use generated clients or ActorRef.
+Cross-process messages use ActorRef, EntityRef, or SingletonRef through lattice-remoting.
 Async tasks are created through ActorContext so they can be cancelled or isolated during stop/passivation.
 ```
 
@@ -135,7 +128,7 @@ impl ActorRuntime {
 pub struct ActorSpawnOptions {
     pub mailbox: MailboxConfig,
     pub execution: Option<ActorExecutionPolicy>,
-    pub scheduler_key: Option<ActorId>,
+    pub scheduler_key: Option<SchedulerKey>,
 }
 ```
 
@@ -146,12 +139,12 @@ Final scheduling semantics:
 ```text
 TaskPerActor:
   One managed Tokio task owns one actor mailbox loop.
-  This is the default for explicit actors, local child actors, and early runtime implementation.
+  This is the default for user actors, child actors, and the early runtime implementation.
 
 KeyedWorkerPool:
   A fixed worker set owns many actor mailbox loops on lattice-managed worker runtimes.
   The scheduler_key maps deterministically to a worker.
-  If scheduler_key is not provided, the runtime falls back to the local actor id, which is acceptable only for local helper actors.
+  If scheduler_key is not provided, the runtime hashes the concrete ActorPath.
   This is useful for stable affinity, cache locality, and predictable distribution without claiming to be a full shard scheduler.
 
 DedicatedThreadPool:
@@ -175,7 +168,7 @@ CPU-heavy or blocking work must not run directly on Tokio worker threads; use a 
 ActorRegistry stores actor ownership independently from the concrete execution policy.
 Mailbox semantics are identical across execution policies.
 Changing execution policy must not change Handler<M> business code.
-Shared/placed actors should pass a stable scheduler_key derived from ActorId when using KeyedWorkerPool.
+Sharded entities should pass a stable scheduler_key derived from EntityId when using KeyedWorkerPool.
 ```
 
 Forbidden implementation shortcuts:
@@ -208,6 +201,11 @@ pub trait Actor: Sized + Send + 'static {
     }
 }
 
+pub trait WireSchema: Send + 'static {
+    const SCHEMA_ID: u64;
+    const SCHEMA_VERSION: u32;
+}
+
 pub trait Message: Send + 'static {
     type Reply: Send + 'static;
 }
@@ -225,33 +223,32 @@ where
 }
 ```
 
-`Actor::stopping` is where business code normally persists state. If it fails, the actor enters `StopFailed`; the runtime keeps ownership and blocks unload/release until retry or manual intervention.
+`Actor::stopping` is the final bounded save/cleanup hook; crash-safe business durability must not depend only on this hook. During a voluntary stop, failure enters `StopFailed`, keeps the activation registered, and blocks voluntary unload/claim release while the old claim remains valid. The runtime exposes the failure, retry state, deadline, and operator action instead of silently waiting forever. External shard/singleton claim loss is stronger: admission is fenced immediately and cleanup becomes best effort; `StopFailed` cannot extend distributed ownership or delay a replacement after the old claim is independently invalid.
 
-### 7.4 Rpc Wrapper
+### 7.4 Message Envelope Context
 
-RPC metadata is carried by framework metadata, not by business proto request fields.
+Business handlers receive their declared message type directly. Trace, auth, deadline, sender, correlation, and transport metadata live in the runtime envelope and are available through `ActorContext`; they are not added to every business message.
 
 ```rust
-#[derive(Debug, Clone)]
-pub struct Rpc<T> {
-    pub req: T,
-    pub ctx: RpcContext,
-}
+let trace = ctx.message_context().trace_context();
+let auth = ctx.message_context().auth_context();
+let deadline = ctx.message_context().deadline();
+let sender = ctx.message_context().sender();
 ```
 
-`RpcContext` is extracted from gRPC metadata by the generated adapter. Business handlers receive the typed request and context without defining `meta: Option<_>` in every proto message.
+Local and remote messages use the same envelope and handler path. Remoting performs codec dispatch before mailbox admission.
 
 ### 7.5 Handler Example
 
 ```rust
 #[async_trait::async_trait]
-impl Handler<Rpc<EnterWorldRequest>> for WorldActor {
+impl Handler<EnterWorld> for WorldActor {
     async fn handle(
         &mut self,
         ctx: &mut ActorContext<Self>,
-        msg: Rpc<EnterWorldRequest>,
+        msg: EnterWorld,
     ) -> Result<EnterWorldReply, ActorError> {
-        let player_id = PlayerId(msg.req.player_id);
+        let player_id = msg.player_id;
         self.players.insert(player_id, PlayerRuntimeState::default());
         ctx.notify_after(Duration::from_secs(1), WorldTick);
         Ok(EnterWorldReply { ok: true })
@@ -268,7 +265,7 @@ system mailbox:
   stop, passivate, watch notification, ownership lost, supervisor control
 
 normal mailbox:
-  RPC messages, local messages, events, timers
+  actor messages, local events, timers
 ```
 
 System messages are prioritized so shutdown, fencing, passivation, and supervision are not starved by gameplay traffic.
@@ -287,7 +284,7 @@ pub struct ActorHandle<A: Actor> {
 }
 
 impl<A: Actor> ActorHandle<A> {
-    pub async fn call<M>(&self, msg: M) -> Result<M::Reply, ActorCallError>
+    pub async fn ask<M>(&self, msg: M) -> Result<M::Reply, ActorAskError>
     where
         A: Handler<M>,
         M: Message;
@@ -299,7 +296,7 @@ impl<A: Actor> ActorHandle<A> {
 }
 ```
 
-`ActorHandle` must not cross RPC or EventBus boundaries. Cross-process references use `ActorRef`, `GatewaySessionRef`, or generated clients.
+`ActorHandle` must not cross remoting or EventBus boundaries. Cross-process messages carry `ActorRef`, `EntityRef`, or `SingletonRef`. A Gateway session is represented by an `ActorRef<GatewaySessionActor>`.
 
 ### 7.8 Stash and Deferred Messages
 
@@ -322,22 +319,21 @@ Raw `tokio::spawn` is discouraged for actor-owned work because it can leak after
 
 ### 7.10 High-Frequency Input
 
-High-frequency gameplay input should be coalesced, sampled, batched, or pushed through specialized stream handling. It should not create one distributed actor RPC per frame when latency and volume are incompatible with the actor model.
+High-frequency gameplay input should be coalesced, sampled, or batched into typed actor messages before delivery. Remote tells use the same remoting association's bounded bulk lane and normal mailbox path; there is no `DirectLinkStream`, `Linked<M>`, or parallel stream transport API. If one message per simulation frame is incompatible with latency or volume limits, change the business message granularity rather than bypassing ActorRef and mailbox semantics.
 
 ---
 
 ## 7.11 Actor Watch
 
-Watch lets one actor observe the termination of another actor's current incarnation.
+DeathWatch always observes one concrete activation. Logical references provide `watch_current` only as a resolve-without-activate convenience.
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WatchId(String);
 
 #[derive(Debug, Clone)]
-pub struct ActorTerminated {
-    pub target: ActorRef,
-    pub incarnation: ActorIncarnation,
+pub struct Terminated {
+    pub subject: WatchedSubject,
     pub reason: TerminatedReason,
 }
 
@@ -345,8 +341,9 @@ pub struct ActorTerminated {
 pub enum TerminatedReason {
     Stopped,
     Passivated,
-    Migrated,
-    Fenced,
+    Handoff,
+    StaleActivation,
+    ClaimLost,
     NodeDown,
 }
 ```
@@ -354,20 +351,24 @@ pub enum TerminatedReason {
 Rules:
 
 ```text
-Watch is bound to the target's current owner epoch/incarnation.
-Local watch can use the local registry directly.
-Cross-node watch is registered through ActorRef / LogicControl.
+Concrete ActorRef watch is bound to its node incarnation, actor path, and activation ID.
+Local concrete watch uses the local registry; remote watch uses lattice-remoting control frames.
+Watching a dead concrete activation produces Terminated and never follows a replacement at the same path.
+Watching an inactive EntityRef returns NotActive without activating it.
+Watching an unavailable SingletonRef returns Unavailable without allocating it.
+EntityRef/SingletonRef watch_current resolves and binds the current exact ActivationId.
 The watcher does not hold a remote ActorHandle.
 When the watcher stops or passivates, all watches are removed.
-When the target stops, passivates, migrates, is fenced, or the node is declared down, the watcher receives a typed notification.
-Notifications are best-effort plus owner/lease semantics; business logic must still be resilient.
+Concrete Terminated is sent when the activation stops or its node incarnation is declared down.
+A passivation, handoff or singleton failover terminates the old activation watch; a later activation requires a new watch.
+Business logic must remain resilient to delayed notification and concurrent in-flight messages.
 ```
 
 ---
 
 ## 7.12 Local Child Actors
 
-A local child actor is spawned by a parent actor inside the same process. It is not placed in etcd and cannot be routed to from other nodes.
+A child actor is spawned by a parent inside the same process and is not independently placed in etcd. Its concrete `ActorRef` is serializable and can be used by remote nodes while that exact activation lives.
 
 Use cases:
 
@@ -375,7 +376,7 @@ Use cases:
 Per-world helper actors.
 Short-lived workflow helpers.
 Local aggregation or throttling workers.
-Isolation for slow local tasks without exposing them as distributed actors.
+Isolation for slow local tasks while retaining normal concrete-reference semantics.
 ```
 
 Rules:
@@ -385,7 +386,8 @@ Children are owned by the parent actor.
 Children stop when the parent stops or passivates.
 Children are not migrated independently.
 Children may be restarted by a parent-defined supervision policy.
-Remote code cannot resolve a child actor through placement.
+Remote code cannot resolve or create a child through placement or wildcard path selection.
+Remote code can send to a child only after receiving its concrete ActorRef.
 ```
 
 Example:
@@ -393,7 +395,7 @@ Example:
 ```rust
 let child = ctx
     .spawn_child(
-        ChildActorKey::new("combat-loop"),
+        "combat-loop",
         CombatLoopActor::new(self.world_id),
         ChildActorOptions::default(),
     )
@@ -420,7 +422,7 @@ pub enum ActorLifecycleState {
 }
 ```
 
-Activation is serialized per `(ActorKind, ActorId)`. Concurrent requests wait on a bounded waiter list.
+Entity activation is serialized per `(EntityType, EntityId)` at the owning shard. Concrete spawn is serialized by the parent/path registry. Concurrent activation waiters are bounded and deadline-controlled.
 
 ### 8.2 ActorRegistry
 
@@ -432,16 +434,17 @@ If a request reaches the owner instance and the local actor is not running, the 
 
 ### 8.4 Passivation
 
-Passivation stops an idle actor and releases local resources. For placed actors, owner release depends on the placement protocol and stop result.
+Passivation stops an idle sharded entity activation and releases local resources without changing shard ownership. Concrete user actors normally stop rather than passivate.
 
 Rules:
 
 ```text
 Passivation is requested by policy, admin command, or business code.
 The current handler is allowed to finish before stop begins.
-New messages during passivation are rejected, redirected, or queued according to the placement state.
+New entity messages during passivation are serialized by the ShardRegion and may activate a replacement after the old activation has fully stopped.
 Actor::stopping is called for business save/cleanup.
-If stopping fails, enter StopFailed and keep ownership until retry or manual intervention.
+If voluntary stopping fails, enter StopFailed and keep the activation registered until the configured retry/operator policy resolves it while the old claim remains valid.
+If an external claim is lost, fence admission immediately and surface StateLossPossible when best-effort stopping fails.
 Scoped tasks and child actors are cancelled or stopped.
 ```
 
@@ -465,6 +468,7 @@ Recommended first-version decisions:
 Handler error: return error to caller; actor remains running unless policy says otherwise.
 Panic: stop or restart according to actor policy.
 Child failure: restart child, stop child, or stop parent.
-stopping failure: enter StopFailed; do not silently drop state.
+voluntary stopping failure: enter observable StopFailed and block voluntary release while authority remains valid.
+externally fenced stopping failure: never retain authority; raise StateLossPossible for recovery/ops.
 Repeated failures: surface through metrics/admin API and require operator action when configured.
 ```

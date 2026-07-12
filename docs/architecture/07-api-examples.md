@@ -1,114 +1,166 @@
 # 07. Framework API Examples
 
-> Public API sketches for business users. These examples constrain the shape of the framework APIs. `WorldId`, `WorldActor`, and `WorldRpcBinding` are business or codegen examples, not built-in lattice business types.  
+> Target API sketches for the remoting architecture. They intentionally describe the desired public shape and may not compile until the corresponding implementation phase lands.
 > Back to: [architecture index](README.md)
 
 ---
 
-## 34. API Design Principles
-
-Framework APIs should let business code:
-
-```text
-start a service by composing lattice runtime components
-register actor factories without exposing business DB schema to the framework
-write logic through Handler<M>
-call other actors/services through generated clients
-use EventBus, ConfigStore, ServiceScheduler, and generated clients from context
-pass ActorRef or GatewaySessionRef across process boundaries, never ActorHandle
-avoid exposing internal metadata, epoch, fencing, and route cache as request fields
-```
-
-Layering:
-
-```text
-business crate:
-  AppDeps, actor structs, repositories, business config, business clients
-
-generated crate:
-  proto types, RPC bindings, generated clients, generated adapters, gateway bindings
-
-lattice runtime:
-  actor runtime, placement, RPC core, event bus, scheduler, config, ops
-```
-
----
-
-## 35. Generating RPC Bindings
-
-Business crates generate proto types and lattice RPC glue from `build.rs`:
+## 1. Define an Actor and Typed Messages
 
 ```rust
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let includes = vec!["proto".into(), lattice_codegen::proto_include()];
+pub struct PlayerActor {
+    id: PlayerId,
+    profile: PlayerProfile,
+}
 
-    lattice_codegen::configure()
-        .gateway_route_ids([(100, "world.WorldRpc.EnterWorld")])
-        .compile_protos(&["proto/world.proto"], &includes)?;
+impl Actor for PlayerActor {}
 
-    Ok(())
+#[derive(LatticeWireSchema)]
+#[lattice(schema_id = 0x1001, schema_version = 1)]
+pub struct PositionUpdated {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(LatticeWireSchema)]
+#[lattice(schema_id = 0x1002, schema_version = 1)]
+pub struct GetProfile;
+
+#[derive(Clone, LatticeWireSchema)]
+#[lattice(schema_id = 0x1003, schema_version = 1)]
+pub struct PlayerProfile {
+    pub position: (f32, f32),
+}
+
+impl Message for PositionUpdated {
+    type Reply = ();
+}
+
+impl Message for GetProfile {
+    type Reply = PlayerProfile;
+}
+
+#[async_trait::async_trait]
+impl Handler<PositionUpdated> for PlayerActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        msg: PositionUpdated,
+    ) -> Result<(), ActorError> {
+        self.profile.position = (msg.x, msg.y);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<GetProfile> for PlayerActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _msg: GetProfile,
+    ) -> Result<PlayerProfile, ActorError> {
+        Ok(self.profile.clone())
+    }
 }
 ```
 
-Large protocols can generate the `gateway_route_ids` input from a business-owned message table, or load it from a validated file:
+Remote and local delivery enter the same `Handler<M>` implementation. There is no `Rpc<M>` business wrapper.
+
+## 2. Register the Remote Protocol
+
+Use one type-checked Rust declaration as the protocol source:
 
 ```rust
-lattice_codegen::configure()
-    .gateway_routes("proto/gateway-routes.toml")
-    .compile_protos(&["proto/world.proto"], &includes)?;
-```
+lattice::actor_protocol! {
+    pub PlayerProtocol for PlayerActor {
+        protocol_id: 0x504c_4159_4552_0001;
+        name: "player/v1";
 
-Runtime code includes both tonic/prost output and lattice bindings:
+        tell 1 => PositionUpdated {
+            codec: PostcardCodec::default(),
+        }
 
-```rust
-pub mod world {
-    tonic::include_proto!("world");
+        ask 2 => GetProfile {
+            request_codec: PostcardCodec::default(),
+            reply_codec: PostcardCodec::default(),
+        }
+    }
 }
 
-pub mod generated {
-    include!(concat!(env!("OUT_DIR"), "/lattice.generated.rs"));
+let player_protocol = PlayerProtocol::build()?;
+```
+
+A business IDL, YAML, spreadsheet, or internal protocol catalogue may generate this Rust declaration. lattice itself does not scan `Handler` implementations or load Rust types from runtime config.
+
+The following builder is the equivalent low-level form for tests, very small protocols, or custom generators:
+
+```rust
+let player_protocol = ActorProtocol::<PlayerActor>::builder(
+    ProtocolId::new(0x504c_4159_4552_0001),
+    "player/v1",
+)
+    .tell::<PositionUpdated>(
+        1,
+        PostcardCodec::default(),
+    )
+    .ask::<GetProfile>(
+        2,
+        PostcardCodec::default(),
+        PostcardCodec::default(),
+    )
+    .build()?;
+```
+
+Codec implementations are replaceable:
+
+```rust
+pub trait WireCodec<T>: Send + Sync + 'static {
+    const CODEC_ID: u64;
+    const CODEC_VERSION: u32;
+
+    fn encode(&self, value: &T, dst: &mut BytesMut) -> Result<(), EncodeError>;
+    fn decode(&self, src: &[u8]) -> Result<T, DecodeError>;
 }
 ```
 
----
+Protocol ID, message IDs, interaction modes, codec/schema versions, and the resulting fingerprint are stable compatibility contracts. A tell registration requires a unit reply and has no reply codec; an ask registration includes the associated reply codec. Macro and manual registration use identical validation and fingerprint calculation.
 
-## 36. Starting a Logic Service
+## 3. Start a Logic Service
 
 ```rust
-pub const WORLD_SERVICE: ServiceKind = service_kind!("World");
-pub const WORLD_ACTOR: ActorKind = actor_kind!("World");
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let app = AppDeps::from_env().await?;
-    let instance = InstanceConfig::from_env()?;
-    let _telemetry = lattice_telemetry_otlp::LatticeTelemetry::from_config(
-        WORLD_SERVICE,
-        instance.instance_id.clone(),
-        lattice_telemetry_otlp::TelemetryConfig::fmt_only(instance.version.clone()),
-    )
-    .install()?;
 
-    let service = LatticeService::builder(WORLD_SERVICE)
-        .instance(instance)
-        .config(ConfigSource::file("config/world-service.toml"))
-        .placement_store(EtcdPlacementStore::from_config())
-        .placement_authority(TonicPlacementAuthority::new(authority_channel))
-        .cluster_event_bus(NatsEventBus::from_config())
-        .local_event_bus(LocalEventBus::default())
-        .config_store(lattice_config_etcd::EtcdConfigStore::from_config())
-        .telemetry(TelemetryConfig::from_config())
-        .admin_http(AdminHttpConfig::from_config())
-        .rpc_retry_policy(RpcRetryPolicy::RouteCorrection)
-        .register_actor(
-            ActorRegistration::builder(WORLD_ACTOR)
-                .factory(WorldActorFactory::new(app.clone()))
-                .mailbox(MailboxConfig::bounded(4096))
-                .passivation(PassivationPolicy::IdleTimeout(Duration::from_secs(300)))
-                .build(),
+    let service = LatticeService::builder(NodeConfig::from_env()?)
+        .remoting(
+            RemotingConfig::builder()
+                .listen("0.0.0.0:25520".parse()?)
+                .advertise("player-0.player:25520".parse()?)
+                .bulk_stripes_per_association(1)
+                .max_active_associations(256)
+                .security(RemotingSecurity::from_config()?)
+                .build()?,
         )
-        .register_sharded_rpc(generated::world_rpc::Binding::for_explicit_actor::<WorldActor>(WORLD_ACTOR))
-        .register_client::<generated::player_rpc::Binding>()
+        .coordinator(CoordinatorBootstrap::from_config()?)
+        .event_bus(NatsEventBus::from_config()?)
+        .register_actor_protocol(player_protocol.clone())
+        .register_sharded_entity(
+            EntityType::builder::<PlayerActor>("player")
+                .shards(256)
+                .hash_version(ShardHashVersion::Xxh3V1)
+                .protocol(player_protocol)
+                .factory(PlayerActorFactory::new(app.clone()))
+                .passivate_after(Duration::from_secs(600))
+                .build()?,
+        )
+        .register_singleton(
+            SingletonType::builder::<MatchmakerActor>("matchmaker")
+                .protocol(matchmaker_protocol())
+                .factory(MatchmakerFactory::new(app))
+                .required_role("matchmaker")
+                .build()?,
+        )
         .build()
         .await?;
 
@@ -116,538 +168,188 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-`from_config()` reads the component section from the `BootstrapConfig` already loaded by `.config(...)` during `build()`. It does not read global static state.
+The Coordinator may run in dedicated processes or as an eligible role in the same service binary. Business nodes do not receive a general-purpose placement-store handle.
 
-A process may register multiple actor kinds and multiple generated gRPC services while sharing one `advertised_endpoint`.
-
-The default command path is generated gRPC RPC. Use it for actor commands that need owner routing, fencing, retries, request-id duplicate guards, route correction, or a definitive reply:
+## 4. Concrete `ActorRef`: Any Live Actor Path
 
 ```rust
-let accepted = ctx
-    .clients()
-    .get::<generated::world_rpc::Client>()?
-    .enter_world(generated::world_rpc::EnterWorld {
-        world_id,
-        player_id,
-    })
-    .await?;
-```
-
-Use Direct Actor Link only for explicit high-rate actor-to-actor streams where the business protocol accepts weaker semantics: fire-and-forget messages, no request/reply result, no request-id dedup, and reconnect decisions owned by business code.
-
-Unidirectional Direct Link flow:
-
-```rust
-let movement_stream = DirectLinkStream::new("movement")
-    .message::<game::PositionUpdate>()
-    .message::<game::StateDelta>();
-
-let link = ctx.links()
-    .connect(
-        battle_actor_ref,
-        movement_stream.clone(),
-        DirectLinkOptions {
-            backpressure: BackpressurePolicy::DropOldest { max_pending: 1024 },
-            ..DirectLinkOptions::unidirectional()
-        },
-    )
+let child: ActorRef<SessionWorker> = ctx
+    .spawn_child("session-worker", SessionWorker::new())
     .await?;
 
-link.tell(PositionUpdate {
-    entity_id,
-    x,
-    y,
-    tick,
-})
-.await?;
+// ActorRef is cloneable and serializable when its actor protocol is registered.
+parent_ref.tell(WorkerReady { worker: child.clone() }).await?;
+
+child.tell(Flush).await?;
+let stats = child.ask(GetStats, Deadline::after(Duration::from_secs(2))).await?;
+ctx.watch(child.clone()).await?;
 ```
 
-The target actor receives linked payloads through normal actor handlers:
+The serialized reference contains cluster ID, node address/incarnation, hierarchical actor path, activation ID, and `ProtocolId`. Protocol fingerprints are negotiated in the Association catalogue after transport establishment. A mismatch disables that `ProtocolId` for the peer without closing unrelated protocols on the Association. A replacement at the same path is a different actor; the old reference returns `StaleActivation` or produces `Terminated`.
+
+Remote code cannot create actors by choosing a path. It can only use a reference received through a typed message, lookup explicitly authorized by an application registry, or another framework-controlled API.
+
+## 5. `EntityRef`: Sharded Logical Identity
 
 ```rust
-impl Handler<Linked<game::PositionUpdate>> for BattleActor {
+impl ShardedActor for PlayerActor {
+    type Key = PlayerId;
+}
+
+impl EntityKey for PlayerId {
+    fn to_entity_id(&self) -> EntityId {
+        EntityId::from_bounded_bytes(self.0.to_be_bytes())
+    }
+
+    fn try_from_entity_id(entity_id: &EntityId) -> Result<Self, EntityKeyDecodeError> {
+        let bytes: [u8; 8] = entity_id
+            .as_bytes()
+            .try_into()
+            .map_err(|_| EntityKeyDecodeError::invalid_length(8, entity_id.len()))?;
+        Ok(PlayerId::new(u64::from_be_bytes(bytes)))
+    }
+}
+
+let player: EntityRef<PlayerActor> = ctx
+    .entity_ref::<PlayerActor>(PlayerId::new(42))?;
+
+player.tell(PositionUpdated { x: 12.0, y: 8.5 }).await?;
+
+let profile = player
+    .ask(GetProfile, Deadline::after(Duration::from_secs(3)))
+    .await?;
+
+let player_watch = ctx.watch_current(player.clone()).await?;
+```
+
+The caller never chooses an owner node. The local ShardRegion routes, activates, buffers during handoff within limits, and follows relocation.
+
+`watch_current` does not activate an inactive entity: it returns `WatchError::NotActive`. When it succeeds, it watches the current exact activation. Passivation or handoff emits `Terminated`; observing a later activation requires another `watch_current` call.
+
+## 6. `SingletonRef`: Fixed Cluster Singleton
+
+```rust
+let matchmaker: SingletonRef<MatchmakerActor> =
+    ctx.singleton_ref::<MatchmakerActor>("matchmaker")?;
+
+let ticket = matchmaker
+    .ask(JoinQueue { player_id }, Deadline::after(Duration::from_secs(5)))
+    .await?;
+
+let matchmaker_watch = ctx.watch_current(matchmaker.clone()).await?;
+```
+
+The local proxy follows Coordinator assignments. `watch_current` returns `WatchError::Unavailable` when no singleton activation exists. Failover terminates the old activation watch; the logical reference remains usable and the replacement must be watched explicitly.
+
+## 7. DeathWatch
+
+```rust
+impl Handler<Terminated> for SessionOwner {
     async fn handle(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        msg: Linked<game::PositionUpdate>,
+        event: Terminated,
     ) -> Result<(), ActorError> {
-        self.apply_position(msg.payload, msg.context.sequence);
+        match event.subject {
+            WatchedSubject::Actor(actor) => self.on_exact_activation_lost(actor),
+            WatchedSubject::EntityActivation { entity, activation } =>
+                self.on_entity_activation_lost(entity, activation),
+            WatchedSubject::SingletonActivation { kind, activation } =>
+                self.on_singleton_activation_lost(kind, activation),
+        }
         Ok(())
     }
 }
 ```
 
-Bidirectional Direct Link flow uses two logical streams over the same underlying link: one source-to-target stream and one target-to-source stream.
+Association loss may first make a remote node suspect. Concrete termination is emitted after the runtime's failure detector/membership decision establishes that the referenced incarnation cannot continue, avoiding a transient socket reset being treated as actor death.
+
+## 8. Ask Failure and Idempotency
 
 ```rust
-let input_stream = DirectLinkStream::new("gateway-input")
-    .message::<game::InputCommand>();
-let update_stream = DirectLinkStream::new("battle-update")
-    .message::<game::BattleUpdate>();
+impl Message for ReserveItem {
+    type Reply = Result<Reservation, ReserveItemError>;
+}
 
-let input_link = ctx.links()
-    .connect_bidirectional(
-        battle_actor_ref,
-        input_stream.clone(),
-        update_stream.clone(),
-        DirectLinkOptions {
-            backpressure: BackpressurePolicy::FailFast { max_pending: 512 },
-            ..DirectLinkOptions::bidirectional()
+match inventory
+    .ask(
+        ReserveItem {
+            operation_id,
+            item_id,
         },
+        Deadline::after(Duration::from_secs(3)),
     )
+    .await
+{
+    Ok(Ok(reservation)) => use_reservation(reservation),
+    Ok(Err(business_error)) => handle_expected_rejection(business_error),
+    Err(AskError::UnknownResult { .. }) => reconcile_by_operation_id(operation_id).await?,
+    Err(error) => return Err(error.into()),
+}
+```
+
+Expected domain failures are part of the typed reply. `AskError` is reserved for transport/runtime failures represented by stable `RemoteFailureCode` values. The runtime does not automatically retry a state-changing ask; the business operation ID makes reconciliation and an intentional retry safe.
+
+## 9. Gateway Binding
+
+```rust
+let routes = GatewayRoutes::builder()
+    .ask_entity::<PlayerActor, GetProfile>(
+        ClientMsgId(1001),
+        |frame, auth| PlayerId::try_from(auth.principal.clone()),
+        |frame| game_codec.decode::<GetProfile>(frame.payload),
+        RateClass::Interactive,
+    )
+    .ask_singleton::<MatchmakerActor, JoinQueue>(
+        ClientMsgId(2001),
+        "matchmaker",
+        |frame, auth| decode_join_queue(frame, auth),
+        RateClass::Interactive,
+    )
+    .build()?;
+
+LatticeGateway::builder(NodeConfig::from_env()?)
+    .remoting(RemotingConfig::from_config()?)
+    .coordinator(CoordinatorBootstrap::from_config()?)
+    .client_codec(GameClientCodec::new())
+    .routes(routes)
+    .build()
+    .await?
+    .run_until_shutdown()
+    .await
+```
+
+Code generation may create route tables and codec registrations, but generated code targets actor protocols and references, not tonic clients.
+
+## 10. EventBus, Scheduler, and Config
+
+```rust
+ctx.cluster_events()
+    .publish(PlayerEnteredWorld { player_id, world_id })
     .await?;
 
-input_link.tell(game::InputCommand { command_id, tick }).await?;
-```
-
-On the target actor, `LinkOpened` tells the actor which link is available. The target can obtain its target-to-source sender by link id and a named stream type:
-
-```rust
-impl Handler<LinkOpened> for BattleActor {
-    async fn handle(
-        &mut self,
-        ctx: &mut ActorContext<Self>,
-        opened: LinkOpened,
-    ) -> Result<(), ActorError> {
-        let updates = ctx.links()
-            .get::<BattleUpdateStream>(opened.link_id.clone())
-            .await?;
-
-        updates.tell(game::BattleUpdate {
-            tick: self.tick,
-            snapshot_id: self.snapshot_id,
-        }).await?;
-
-        Ok(())
-    }
-}
-```
-
-Services that accept direct links must register both the actor and the stream binding. This lets the framework validate message ids and handler coverage before startup:
-
-```rust
-LatticeService::builder(BATTLE_SERVICE)
-    .dangerously_use_in_process_placement(local_store, TonicLogicControl)
-    .direct_links(
-        DirectLinkConfig::enabled("0.0.0.0:9001")
-            .max_frame_size(256 * 1024)
-            .max_connections(4096)
-            .max_active_links(128_000)
-            .max_open_links_per_second(10_000)
-            .max_messages_per_second(250_000),
-    )
-    .register_actor(
-        ActorRegistration::builder(BATTLE_ACTOR)
-            .factory(BattleActorFactory::new(app.clone()))
-            .build(),
-    )
-    .register_direct_link(movement_stream.for_actor::<BattleActor>(BATTLE_ACTOR))
-    .register_direct_link(input_stream.for_actor::<BattleActor>(BATTLE_ACTOR))
-    .register_sharded_rpc(generated::battle_rpc::Binding::for_explicit_actor::<BattleActor>(BATTLE_ACTOR));
-```
-
-Generated RPC service bindings enable the lightweight request-id duplicate guard by default. Disable it explicitly only for endpoints where duplicate delivery is acceptable or handled elsewhere:
-
-```rust
-.register_sharded_rpc(
-    generated::world_rpc::Binding::for_explicit_actor::<WorldActor>(WORLD_ACTOR)
-        .request_dedup(false),
-)
-```
-
----
-
-## 37. InstanceConfig
-
-```rust
-let instance = InstanceConfig {
-    instance_id: InstanceId::new("world-0"),
-    advertised_endpoint: "http://world-0.world:18080".parse()?,
-    control_endpoint: "http://world-0.world:18081".parse()?,
-    version: env!("CARGO_PKG_VERSION").to_string(),
-    capacity: InstanceCapacity {
-        max_actors: Some(100_000),
-        max_connections: None,
-    },
-    labels: BTreeMap::from([
-        ("region".into(), "us-east".into()),
-        ("zone".into(), "a".into()),
-    ]),
-};
-```
-
-`InstanceConfig::from_env()` builds the same value from deployment environment, such as Kubernetes downward API, environment variables, or startup args.
-
----
-
-## 38. AppDeps
-
-`AppDeps` is owned by the business crate. It contains business dependencies, not framework runtime internals.
-
-```rust
-#[derive(Clone)]
-pub struct AppDeps {
-    pub world_repo: Arc<WorldRepository>,
-    pub item_repo: Arc<ItemRepository>,
-    pub http_client: reqwest::Client,
-    pub business_config: Arc<BusinessConfig>,
-}
-```
-
-Framework handles created by runtime, such as generated clients, schedulers, event publishers, and config stores, should be accessed through service or actor context, or explicitly composed into a business-owned client container.
-
----
-
-## 39. Actor Factory Registration
-
-```rust
-pub struct WorldActorFactory {
-    app: AppDeps,
-}
-
-impl WorldActorFactory {
-    pub fn new(app: AppDeps) -> Self {
-        Self { app }
-    }
-}
-
-#[async_trait::async_trait]
-impl ActorFactory for WorldActorFactory {
-    type Actor = WorldActor;
-    type Key = WorldId;
-
-    async fn create(
-        &self,
-        key: WorldId,
-        ctx: ActorCreateContext,
-    ) -> Result<WorldActor, ActorCreateError> {
-        let snapshot = self.app.world_repo.load(key).await?;
-
-        Ok(WorldActor {
-            world_id: key,
-            state: snapshot,
-        })
-    }
-}
-```
-
-If `create` fails, the runtime must not register a zombie actor. Activation waiters receive an error and later requests can retry.
-
-Factory input may use the business typed key when codegen has enough information to decode it from `ActorId`; otherwise the lower-level factory can accept `ActorId`.
-
----
-
-## 40. Actor and Handler
-
-```rust
-pub struct WorldActor {
-    pub world_id: WorldId,
-    pub state: WorldState,
-}
-
-#[async_trait::async_trait]
-impl Actor for WorldActor {
-    async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
-        ctx.notify_interval(Duration::from_millis(50), || WorldTick { delta_ms: 50 });
-        Ok(())
-    }
-
-    async fn stopping(
-        &mut self,
-        ctx: &mut ActorContext<Self>,
-        reason: StopReason,
-    ) -> Result<(), ActorStopError> {
-        self.save_to_business_db(reason).await?;
-        ctx.cancel_all_tasks();
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl Handler<Rpc<EnterWorldRequest>> for WorldActor {
-    async fn handle(
-        &mut self,
-        ctx: &mut ActorContext<Self>,
-        msg: Rpc<EnterWorldRequest>,
-    ) -> Result<EnterWorldReply, WorldError> {
-        let player_id = PlayerId(msg.req.player_id);
-        self.state.players.insert(player_id, PlayerRuntimeState::default());
-
-        if msg.req.logout_after_enter {
-            ctx.request_passivation(PassivationReason::BusinessIdle)?;
-        }
-
-        Ok(EnterWorldReply { ok: true })
-    }
-}
-```
-
-If `stopping` fails while saving state, the runtime enters `StopFailed`, keeps ownership, blocks unload/release, surfaces an alert, and waits for retry or manual intervention.
-
----
-
-## 41. Actor State Machine Pattern
-
-Business state machines should be explicit:
-
-```rust
-pub enum MatchState {
-    Loading,
-    WaitingPlayers,
-    Running { tick: u64 },
-    Ending,
-    Ended,
-}
-
-#[async_trait::async_trait]
-impl Handler<Rpc<StartMatchRequest>> for MatchActor {
-    async fn handle(
-        &mut self,
-        _ctx: &mut ActorContext<Self>,
-        msg: Rpc<StartMatchRequest>,
-    ) -> Result<StartMatchReply, MatchError> {
-        match &mut self.state {
-            MatchState::WaitingPlayers => {
-                self.state = MatchState::Running { tick: 0 };
-                Ok(StartMatchReply { accepted: true })
-            }
-            _ => Err(MatchError::InvalidState),
-        }
-    }
-}
-```
-
-Avoid relying on a hidden mailbox stash for state-machine transitions.
-
----
-
-## 42. RPC Binding and Client
-
-Generated binding shape:
-
-```rust
-pub struct WorldRpcBinding;
-
-impl ShardedRpcBinding for WorldRpcBinding {
-    type Service = WorldRpcServer<WorldRpcAdapter>;
-
-    fn service_kind() -> ServiceKind {
-        service_kind!("World")
-    }
-
-    fn register(server: &mut RpcServerBuilder, runtime: LogicRuntime) {
-        server.add_service(WorldRpcServer::new(WorldRpcAdapter::new(runtime)));
-    }
-}
-```
-
-Business call shape:
-
-```rust
-let profile = ctx
-    .clients()
-    .player()
-    .get_profile(GetProfileRequest {
-        player_id: player_id.0,
-    })
-    .await?;
-```
-
-The framework should make the common path short. Business crates can wrap generated clients into their own `AppClients`.
-
----
-
-## 43. ServiceContext
-
-```rust
-#[derive(Clone)]
-pub struct ServiceContext {
-    pub instance_id: InstanceId,
-    pub clients: ServiceClients,
-    pub cluster_events: ServiceEvents,
-    pub local_events: ServiceEvents,
-    pub config: ConfigStoreHandle,
-    pub scheduler: ServiceScheduler,
-}
-```
-
-Actor context may expose a narrowed view:
-
-```rust
-impl<A: Actor> ActorContext<A> {
-    pub fn clients(&self) -> &ServiceClients;
-    pub fn cluster_events(&self) -> &ActorEvents;
-    pub fn local_events(&self) -> &ActorEvents;
-    pub fn config(&self) -> &ConfigStoreHandle;
-    pub fn scheduler(&self) -> &ActorScheduler;
-}
-```
-
----
-
-## 44. Gateway Service
-
-```rust
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let gateway = LatticeGateway::builder()
-        .instance(InstanceConfig::from_env()?)
-        .config(ConfigSource::file("config/gateway.toml"))
-        .client_codec(GameClientCodec::new())
-        .route_table(GatewayRouteTable::from_config())
-        .register_binding(WorldGatewayBinding)
-        .register_binding(GuildGatewayBinding)
-        .rate_limiter(GovernorGatewayRateLimiter::from_config())
-        .cluster_event_bus(NatsEventBus::from_config())
-        .telemetry(TelemetryConfig::from_config())
-        .admin_http(AdminHttpConfig::from_config())
-        .build()
-        .await?;
-
-    gateway.run_until_shutdown().await
-}
-```
-
-Large businesses should use generated route tables or validated config, not hundreds of handwritten route entries.
-
----
-
-## 45. Placement Coordinator
-
-```rust
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let coordinator = PlacementCoordinator::builder()
-        .config(ConfigSource::file("config/coordinator.toml"))
-        .placement_store(EtcdPlacementStore::from_config())
-        .assigner(RendezvousShardAssigner::default())
-        .telemetry(TelemetryConfig::from_config())
-        .admin_http(AdminHttpConfig::from_config())
-        .build()
-        .await?;
-
-    coordinator.run_until_shutdown().await
-}
-```
-
-The Coordinator handles control-plane decisions only.
-
----
-
-## 46. EventBus, Config, and Scheduler Usage
-
-Typed event publish:
-
-```rust
-ctx.service()
-    .cluster_events()
-    .publish(WorldEvents::player_entered(PlayerEnteredWorld {
-        world_id: self.world_id.0,
-        player_id: player_id.0,
-    }))
-    .await?;
-```
-
-Typed service subscription:
-
-```rust
-service
-    .cluster_events()
-    .subscribe_typed(
-        SubjectFilter::new("game.guild.*"),
-        ConsumerGroup::new("world-cache"),
-        WorldCacheInvalidationHandler::new(),
-    )
-    .await?;
-```
-
-Actor subscription:
-
-```rust
-service
-    .cluster_events()
-    .subscribe_actor(
-        SubjectFilter::new("game.guild.created"),
-        EventActorRoute::by_key(|event: &GuildCreated| WorldId(event.world_id)),
-        DeliveryOptions::at_least_once(),
-    )
-    .await?;
-```
-
-Config watch:
-
-```rust
-let mut stream = service.config().watch(ConfigKey::new("gateway.rate_limit")).await?;
-while let Some(change) = stream.next().await {
-    service.gateway_rate_limits().apply(change.value)?;
-}
-```
-
-Actor scheduler:
-
-```rust
 ctx.scheduler()
-    .notify_after(Duration::from_secs(5), RetryPendingOperation { operation_id });
+    .tell_after(Duration::from_secs(5), ctx.self_ref(), RetrySave { operation_id });
+
+let mut changes = service.config().watch(ConfigKey::new("gateway.rate_limit")).await?;
+while let Some(change) = changes.next().await {
+    service.gateway_rate_limits().apply(change?)?;
+}
 ```
 
-Service scheduler:
+EventBus is for broadcast/integration. A scheduled actor message still uses the recipient reference and is cancelled with its lifecycle unless explicitly registered as a service task.
 
-```rust
-service
-    .scheduler()
-    .interval(Duration::from_secs(30), || async move {
-        refresh_local_cache().await
-    });
-```
-
----
-
-## 47. Minimal Business Layout
+## 11. Stable API Decisions
 
 ```text
-crates/
-  world-service/
-    src/main.rs
-    src/world_actor.rs
-    src/world_factory.rs
-    src/app_deps.rs
-
-  player-service/
-    src/main.rs
-    src/player_actor.rs
-    src/player_factory.rs
-
-  gateway/
-    src/main.rs
-    src/client_codec.rs
-
-proto/
-  world.proto
-  player.proto
-  gateway.proto
-
-config/
-  world-service.toml
-  player-service.toml
-  gateway.toml
-  coordinator.toml
-```
-
----
-
-## 48. API Decisions to Keep Stable
-
-```text
-ActorKind and ServiceKind are opaque string newtypes with actor_kind! and service_kind! helpers.
-ActorKey conversion is generated or implemented by business key types, not hand-coded on every RPC call.
-RpcContext is carried by gRPC metadata.
-ActorHandle is local-only.
-GatewaySessionRef is the cross-process handle for client push.
-Virtual shard assignment is a trait with default implementations.
-ConfigSource supports file, explicit format, env, inline, and composite sources.
-ConfigStore is a trait in lattice-config; etcd and Nacos-style backends are adapter crates or business implementations.
-from_config() reads component config during builder build.
-EventBus has both local and cluster implementations.
-subscribe_actor routes through owner resolution and actor mailbox.
-Scheduler is non-durable and lifecycle-bound.
+ActorHandle remains process-local; ActorRef is the serializable exact-activation reference.
+ActorRef, EntityRef, and SingletonRef are distinct typed values.
+All remote business delivery uses registered actor protocols over lattice-remoting.
+actor_protocol! is the canonical protocol source; ProtocolId and message IDs are explicit.
+Message codecs are format-neutral and fingerprints include codec/schema versions.
+Local and remote messages use the same Handler<M>.
+Tell is at-most-once; ask has deadline/UnknownResult semantics.
+All DeathWatch registrations are activation-scoped; EntityRef/SingletonRef use watch_current without activating a target.
+Reliable control delivery is Association-scoped and shared by DeathWatch, Coordinator, Shard, and Singleton protocols; it never replays uncertain business messages.
+Business code never manually opens or owns node transport links.
 ```

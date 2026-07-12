@@ -1,7 +1,9 @@
 # lattice Implementation Plan
 
-> Version: v0.1  
-> Based on: [architecture/README.md](architecture/README.md) and the architecture chapters.  
+> **Historical record — superseded.** This plan describes the completed generated-gRPC, Explicit Placement, and Direct Link architecture. It is retained for implementation provenance and must not be used as the current execution target. Use [production-hardening-plan.md](production-hardening-plan.md) and [architecture/README.md](architecture/README.md) for the unified actor-remoting migration.
+
+> Version: v0.1
+> Based on: [architecture/README.md](architecture/README.md) and the architecture chapters.
 > Goal: split the lattice architecture into phases that can be implemented, tested, and accepted incrementally.
 
 ---

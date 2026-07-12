@@ -4,6 +4,9 @@
 Your goal is to fully implement the lattice framework.
 
 Primary execution plan:
+- docs/production-hardening-plan.md
+
+Historical reference only (do not execute its old tracker):
 - docs/implementation-plan.md
 
 Architecture acceptance sources:
@@ -17,32 +20,33 @@ Architecture acceptance sources:
 - docs/architecture/06-appendix.md
 - docs/architecture/07-api-examples.md
 
-First, read docs/implementation-plan.md completely, including the "Codex Goal Execution Protocol" section.
-Then execute the plan through the "Current Progress Tracker" in docs/implementation-plan.md.
+First, read docs/production-hardening-plan.md completely, including its execution protocol.
+Then execute the Current Execution Pointer and its hard-switch macro batch through the tracker.
 
-Do not skip phases. Do not stop at documentation. Do not stop at API sketches.
-The implementation must use the Cargo workspace crate split defined in docs/architecture/00-overview.md and docs/implementation-plan.md. Do not implement lattice as one root crate with many internal modules.
-For each phase, complete the code implementation, examples, tests, and acceptance checklist before moving to the next phase.
+This is a hard switch, not an incremental compatibility migration. Do not stop at documentation or API sketches.
+Implement the complete architecture described by docs/architecture rather than substituting a minimal v1 that requires a later structural rewrite. Multi-lane Associations, bounded protocol catalogues, revisioned snapshots, per-slot claims, subscribed-Region handoff barriers, EntityRef/SingletonRef watch_current, and the full Singleton model are required. Manage complexity through shared reliable control delivery, a shared PlacementSlot authority engine, and narrow fault domains; do not delete or indefinitely defer these capabilities.
+The implementation must use the Cargo workspace crate split defined in docs/architecture/00-overview.md and docs/production-hardening-plan.md. Do not implement lattice as one root crate with many internal modules.
+Phases are dependency/checklist groupings and may overlap inside one macro batch; they are not commit or green-build boundaries.
 When resuming from an existing implementation, do not trust tracker checkmarks as proof of completion. Audit checked items in the current phase and earlier dependency phases against the codebase before continuing. A checked item is valid only if it has concrete framework implementation plus executable test or runnable example coverage, or an explicit documented rationale for why no code is required. If a checked item is not backed by implementation/coverage, change it back to `[ ]` or add a precise missing-work subitem, then work on the earliest missing item.
-Always choose the earliest unchecked item in the Current Progress Tracker unless it is explicitly blocked by an earlier missing dependency.
-Within a phase, work in small slices: choose one or a few checklist items, implement them end to end, verify them, then commit that slice before continuing.
-After each completed slice, update docs/implementation-plan.md:
+Follow the macro-batch grouping in the plan. Prefer a large cross-crate replacement over compatibility adapters, temporary fallback routing, dual writes, or small commits created only to keep the workspace green.
+Intermediate worktrees and commits may intentionally fail to compile, test, or run while removed APIs and crates are being replaced. Record the known broken frontier and continue; do not restore obsolete APIs merely to regain compilation.
+After each completed macro batch, update docs/production-hardening-plan.md:
 - mark completed tracker items with `[x]`;
 - add newly discovered missing work as `[ ]` items;
-- mark a phase status `[x]` only after every required checklist item in that phase is checked and phase acceptance tests pass.
-After each completed slice, create an English conventional commit message, such as "feat(actor): add bounded mailbox" or "test(rpc): cover metadata extraction".
+- mark a phase status `[x]` only after every required checklist/evidence item in that phase is complete.
+Aim for the three large English conventional commits named in the hard-switch plan; use a fourth only for a genuinely independent migration or generated-code boundary. Do not create per-phase or per-checklist commits.
 
 Final exit criteria:
 - Every phase status in the Current Progress Tracker is `[x]`.
-- Every deliverable, acceptance item, and suggested test in docs/implementation-plan.md is complete or covered by an explicit equivalent test.
-- Every item in the global acceptance checklist in docs/implementation-plan.md is satisfied.
+- Every deliverable, acceptance item, and suggested test in docs/production-hardening-plan.md is complete or covered by an explicit equivalent test.
+- Every item in the global completion criteria in docs/production-hardening-plan.md is satisfied.
 - Every architecture design under docs/architecture/ has a corresponding code implementation, example API, or executable test coverage.
-- examples/minimal-world runs and covers the final service bootstrap, actor registration, RPC, placement, event bus, scheduler, gateway, ops, and telemetry shape.
+- examples/minimal-world runs and covers service bootstrap, actor registration, remoting, sharding, singleton, EventBus, scheduler, Gateway, ops, and telemetry.
 - cargo fmt, cargo clippy, and cargo test pass.
 - No framework capability exists only in documentation.
 - Code remains readable and modular: no `super::super` imports, avoid unnecessary `pub use`, do not pile unrelated logic into one file, and do not let any single file exceed 1200 LOC without a documented reason.
-- The root crate is only a facade if needed; framework implementation lives in dedicated workspace crates such as lattice-core, lattice-actor, lattice-rpc, lattice-placement, lattice-eventbus, lattice-config, lattice-gateway, and lattice-ops.
+- The root crate is only a facade if needed; framework implementation lives in dedicated workspace crates such as lattice-core, lattice-actor, lattice-remoting, lattice-placement, lattice-service, lattice-eventbus, lattice-config, lattice-gateway, and lattice-ops.
 
 If an architecture item cannot be implemented immediately, do not skip it.
-First try to split it into smaller deliverables. If it still cannot move forward, record the blocker, missing context, and attempted approaches. Mark the goal blocked only after multiple consecutive rounds fail to make meaningful progress.
+Continue through other work in the same macro batch when that advances the broken frontier. Record blockers, missing context, and attempted approaches. Mark the goal blocked only after multiple consecutive rounds fail to make meaningful progress. Intermediate red commits are allowed; final completion still requires every verification and acceptance criterion to pass.
 ```

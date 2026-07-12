@@ -1,112 +1,94 @@
 # 06. Appendix
 
-> Defaults, tradeoffs, framework/business boundary, and summary.  
+> Defaults, design tradeoffs, and framework/business boundary.
 > Back to: [architecture index](README.md)
 
 ---
 
-## 29. Recommended Defaults
+## 1. Recommended Starting Defaults
 
 ```text
-mailbox capacity: 4096 for normal actors, configurable per actor kind
-activation waiter timeout: 5s
-route cache soft ttl: 5s
-route cache hard ttl: 30s
-NOT_OWNER retry: one retry with same request_id
-actor idle passivation: 300s for lightweight actors
-drain timeout: configurable, default 30s to 120s depending on service
-event subscriber retry: exponential backoff with jitter
-admin inspect timeout: 1s to 3s per node
-metrics labels: low-cardinality only
+normal actor mailbox: 4096 messages
+maximum remoting frame: 256 KiB
+physical connections per active Association: 1 control + 1 interactive + 1 bulk stripe
+configurable bulk stripes per Association: 1..4, increase only from benchmark evidence
+maximum active Associations per node: 256, configurable from the process FD budget
+maximum outbound bytes: 16 MiB per Association and 256 MiB per node
+reliable control outbox: 1024 frames per Association, bounded by the Association byte limit
+association handshake timeout: 3 s
+idle data-connection timeout: 60 s when no asks, watches, routes, or pending sends depend on it
+heartbeat interval: 2 s
+suspect after: 3 missed heartbeats
+maximum ask deadline: 30 s
+Coordinator snapshot chunk: 192 KiB; maximum assembled snapshot: 64 MiB / 5 s
+claim grant: 15 s TTL, renew every 5 s, 2 s local safety margin
+Coordinator leader recovery objective: less than claim TTL minus safety margin
+entity passivation: 10 min, configured per type
+ShardRegion buffer: 1024 messages per shard, 10000 messages / 64 MiB per region
+drain deadline: 30-120 s by service class
+admin inspect timeout: 1-3 s per node
 ```
 
-These are starting points, not hard requirements. Production services should tune them by actor kind and workload.
+These are guardrails, not performance promises. Tune them from measured payload size, mailbox latency, reconnect rate, and handoff duration.
 
----
+## 2. Why Three Reference Types
 
-## 30. Why Not Opaque Bytes as Internal RPC
+One universal “remote ref” would hide incompatible identity semantics.
 
-Opaque bytes are acceptable at the client protocol boundary, but not as the main internal service-to-service model.
+| Reference | Identity | Follows relocation or stop-and-respawn | Route |
+|---|---|---:|---|
+| `ActorRef<A>` | exact node incarnation, path, activation | No; an in-place supervision restart preserves the activation | direct association |
+| `EntityRef<A>` | entity type and entity ID | Yes | local ShardRegion |
+| `SingletonRef<A>` | configured singleton kind | Yes | local SingletonProxy |
 
-Typed RPC gives:
+Keeping these types distinct makes stale-reference behavior, buffering, watch behavior, and operational ownership visible in the API.
 
-```text
-compile-time request/reply types
-generated clients and adapters
-clear method ownership
-structured errors
-metadata injection outside business messages
-better tracing and metrics
-less duplicate decoding
-easier schema evolution
-```
+## 3. Why Typed Messages over Format-Neutral Frames
 
-Gateway can still receive opaque client frames. It decodes them once into typed proto requests and forwards typed gRPC to logic services.
+Wire payloads are necessarily bytes, but business code should not handle opaque buffers. A registered actor protocol provides stable IDs, codec selection, size validation, typed decode, handler coverage checks, typed ask replies, and schema fingerprints. This preserves Rust type safety without coupling all messages to Protobuf or a giant framework enum.
 
----
+## 4. Delivery Reality
 
-## 31. Why Not a Giant Enum
+`tell` is at-most-once. `ask` adds correlation and a deadline, not transactional certainty. A timeout or broken association can leave the caller unable to know whether the handler ran. Automatic retries would turn that uncertainty into duplicate state changes, so retry and deduplication are explicit business protocol decisions.
 
-A giant framework-level message enum would force every business message into one central type. That creates poor modularity and makes feature teams coordinate on one enum.
+Placement fencing prevents two claim generations from legitimately serving the same shard or singleton; it does not turn network delivery into exactly-once processing.
 
-lattice instead uses:
+State-bearing control commands are different from business messages. The Association control stream may retransmit a bounded sequenced command and the receiver applies it idempotently; this mechanism never retransmits an uncertain tell/ask frame.
 
-```text
-Message trait
-Handler<M>
-type-erased internal envelopes
-generated compile-time bounds
-business-owned message types
-```
+## 5. Why There Is No Direct Link API
 
-The runtime can erase types internally while public business code stays typed and modular.
+The old Direct Link model existed to bypass the gRPC command path for high-throughput fire-and-forget traffic. Unified remoting already provides persistent TCP/TLS associations, binary frames, independent bounded lanes, batching opportunities, fixed bounded connection groups/stripes, heartbeat, reconnect, and backpressure.
 
----
+Keeping a separate public link model would force business code to choose transport, open and close sessions, handle reconnect, register a second protocol, and reconcile different lifecycle/error semantics. lattice therefore keeps the reusable transport machinery inside `lattice-remoting` and exposes only typed recipient operations.
 
-## 32. Framework and Business Boundary
+Large files, media, voice, and UDP realtime synchronization may use an external purpose-built service. They are not Actor mailbox traffic and do not justify a second lattice actor transport.
+
+## 6. Framework and Business Boundary
 
 Framework owns:
 
 ```text
-actor runtime
-mailbox
-lifecycle
-route cache
-placement
-generated RPC runtime
-EventBus abstraction
-ConfigStore abstraction
-scheduler
-gateway forwarding
-admin/telemetry integration
+actor runtime, mailboxes, supervision, lifecycle, DeathWatch
+reference identity and remoting associations
+tell/ask correlation, deadlines, bounded buffering, codecs
+Coordinator protocol, membership, shards, claims, singletons, drain
+shared placement-slot authority and reliable control delivery
+EventBus, scheduler, config, Gateway adapters, inspection and telemetry abstractions
 ```
 
 Business owns:
 
 ```text
-business actor state
-business databases and repositories
-business transaction and consistency model
-business event definitions
-business protocol messages
-business auth rules
-business compensation/manual repair flows
-business-specific actor keys and route extractors
+actor state and repositories
+transaction, durability, save/load, idempotency, and compensation rules
+message and reply types plus codec/schema evolution
+authentication claims and domain authorization
+entity keys, passivation policy, and singleton definitions
+external client protocols and business workflows
 ```
 
-The framework must not require MySQL, Redis, or any business database. It may depend on placement/config/event abstractions and their adapters.
+The framework does not require a business database and does not persist actor state automatically.
 
----
+## 7. Summary
 
-## 33. Summary
-
-lattice should stay a framework, not a game implementation.
-
-```text
-Keep routing, placement, lifecycle, and observability in the framework.
-Keep domain state, persistence, and business workflows in business crates.
-Use typed RPC for commands.
-Use EventBus for asynchronous events.
-Use LocalEventBus for in-process decoupling.
-Use epochs, leases, request_id, and idempotency for distributed correctness.
-```
+Use concrete `ActorRef` for one live activation, `EntityRef` for a movable/passivated sharded identity, and `SingletonRef` for a failover-capable singleton. All three use one actor messaging and remoting runtime. Shard and Singleton keep separate public semantics while sharing placement authority; state-bearing protocols share reliable control delivery without replaying business traffic. etcd and the Coordinator establish control-plane truth; they stay out of healthy known message paths.
