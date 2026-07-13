@@ -1,5 +1,8 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
+#[path = "testctl/discovery.rs"]
+mod testctl_discovery;
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::IpAddr;
@@ -8,6 +11,7 @@ use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use lattice_sim::lifecycle::{LifecycleScenario, LifecycleScenarioConfig};
 use lattice_sim::scenario::Scenario;
 use lattice_sim::scenario::ScenarioConfig;
 use lattice_sim::trace::TraceJournal;
@@ -139,11 +143,12 @@ fn run_profile(
                     "clippy",
                     "--workspace",
                     "--all-targets",
+                    "--all-features",
                     "--",
                     "-D",
                     "warnings",
                 ],
-                &["test", "--workspace", "--all-targets"],
+                &["test", "--workspace", "--all-features"],
             ])
         })(),
         Profile::Sim => simulate(seed, artifacts),
@@ -153,35 +158,38 @@ fn run_profile(
             "lattice-sim",
             "bounded_state_explorer_checks_every_transition",
         ]),
-        Profile::E2e => commands(&[
-            &[
-                "test",
-                "-p",
-                "lattice-placement",
-                "--test",
-                "etcd_acceptance",
-                "--",
-                "--nocapture",
-            ],
-            &[
-                "test",
-                "-p",
-                "lattice-remoting",
-                "real_tcp_endpoint_establishes_all_lanes_and_delivers_ask",
-            ],
-            &[
-                "test",
-                "-p",
-                "lattice-remoting",
-                "real_mutual_tls_socket_verifies_both_node_identities",
-            ],
-            &[
-                "test",
-                "-p",
-                "lattice-service",
-                "remote_entity_ask_reaches_only_claimed_owner",
-            ],
-        ]),
+        Profile::E2e => (|| {
+            testctl_discovery::verify(artifacts)?;
+            commands(&[
+                &[
+                    "test",
+                    "-p",
+                    "lattice-placement",
+                    "--test",
+                    "etcd_acceptance",
+                    "--",
+                    "--nocapture",
+                ],
+                &[
+                    "test",
+                    "-p",
+                    "lattice-remoting",
+                    "real_tcp_endpoint_establishes_all_lanes_and_delivers_ask",
+                ],
+                &[
+                    "test",
+                    "-p",
+                    "lattice-remoting",
+                    "real_mutual_tls_socket_verifies_both_node_identities",
+                ],
+                &[
+                    "test",
+                    "-p",
+                    "lattice-service",
+                    "remote_entity_ask_reaches_only_claimed_owner",
+                ],
+            ])
+        })(),
         Profile::E2eHaEtcd => ha_etcd_real(artifacts),
         Profile::Chaos => (|| {
             chaos_real(artifacts)?;
@@ -198,6 +206,17 @@ fn run_profile(
             timer,
             &mut resource_samples,
         ),
+    };
+    let cleanup_result = if matches!(profile, Profile::E2eHaEtcd | Profile::Chaos | Profile::K8s)
+        && Path::new("/var/run/docker.sock").exists()
+    {
+        command("sh", &["scripts/docker-image-lifecycle.sh", "cleanup"])
+    } else {
+        Ok(())
+    };
+    let result = match (result, cleanup_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), cleanup) => cleanup,
     };
     resource_samples.push(resource_sample(timer.elapsed()));
     let success = result.is_ok();
@@ -250,6 +269,9 @@ fn profile_scenarios(profile: Profile) -> Vec<&'static str> {
             "tcp",
             "mutual-tls",
             "claimed-entity-ref",
+            "static-discovery-cluster-join",
+            "config-store-discovery-cluster-join",
+            "graceful-member-leave",
         ],
         Profile::E2eHaEtcd => vec!["etcd-leader-failover", "coordinator-plan-recovery"],
         Profile::Chaos => vec![
@@ -955,6 +977,17 @@ fn simulate_to(seed: u64, trace_path: &Path) -> Result<(), String> {
     scenario
         .trace
         .write_json(trace_path)
+        .map_err(|error| error.to_string())?;
+    let mut lifecycle = LifecycleScenario::standard(LifecycleScenarioConfig {
+        seed,
+        maximum_events: 64,
+    })
+    .map_err(|error| error.to_string())?;
+    lifecycle.schedule_acceptance();
+    lifecycle.run().map_err(|error| error.to_string())?;
+    lifecycle
+        .trace
+        .write_json(&trace_path.with_file_name(format!("lifecycle-trace-{seed}.json")))
         .map_err(|error| error.to_string())?;
     result
 }

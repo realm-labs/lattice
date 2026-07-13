@@ -63,6 +63,7 @@ impl JoinController {
         let mut discovery_closed = false;
         let mut initial_join = true;
         let mut backoff = RetryBackoff::new(self.config.clone());
+        let mut attempt = 0_u64;
         loop {
             if initial_join
                 && self
@@ -88,8 +89,23 @@ impl JoinController {
                     }
                     snapshot = snapshots.next() => {
                         match snapshot {
-                            Some(Ok(snapshot)) => latest = Some(snapshot),
-                            Some(Err(_)) => continue,
+                            Some(Ok(snapshot)) => {
+                                tracing::info!(
+                                    target: "lattice.cluster.discovery",
+                                    generation = snapshot.generation,
+                                    targets = snapshot.targets.len(),
+                                    "discovery replacement snapshot"
+                                );
+                                latest = Some(snapshot);
+                            }
+                            Some(Err(error)) => {
+                                tracing::warn!(
+                                    target: "lattice.cluster.discovery",
+                                    %error,
+                                    "discovery provider retained its last valid snapshot"
+                                );
+                                continue;
+                            }
                             None => discovery_closed = true,
                         }
                     }
@@ -98,8 +114,20 @@ impl JoinController {
             let Some(snapshot) = latest.clone() else {
                 continue;
             };
+            attempt = attempt.saturating_add(1);
+            let probe_started = tokio::time::Instant::now();
             match probe_snapshot(&self.endpoint, snapshot, self.config.probe_concurrency).await {
                 Ok(leader) => {
+                    tracing::info!(
+                        target: "lattice.cluster.join",
+                        attempt,
+                        latency_millis = probe_started.elapsed().as_millis() as u64,
+                        leader_node_id = %leader.identity.node_id,
+                        leader_incarnation = leader.identity.incarnation.get(),
+                        coordinator_term = leader.term,
+                        protocol_generation = leader.protocol_generation,
+                        "authenticated Coordinator bootstrap leader selected"
+                    );
                     if let Ok(association) =
                         establish_coordinator(&self.endpoint, &self.associations, &leader).await
                     {
@@ -117,6 +145,12 @@ impl JoinController {
                         }
                         loop {
                             if association.state() != AssociationState::Active {
+                                tracing::warn!(
+                                    target: "lattice.cluster.join",
+                                    leader_node_id = %leader.identity.node_id,
+                                    coordinator_term = leader.term,
+                                    "Coordinator association lost; reconciliation required"
+                                );
                                 let _ = events
                                     .send(JoinEvent::CoordinatorLost {
                                         leader: leader.clone(),
@@ -146,7 +180,15 @@ impl JoinController {
                         .await;
                     return;
                 }
-                Err(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "lattice.cluster.join",
+                        attempt,
+                        latency_millis = probe_started.elapsed().as_millis() as u64,
+                        %error,
+                        "cluster join attempt remains retryable"
+                    );
+                }
             }
             let delay = backoff.next_delay();
             tokio::select! {

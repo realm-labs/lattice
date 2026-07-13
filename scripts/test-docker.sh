@@ -14,23 +14,31 @@ export LATTICE_TEST_SEED=${LATTICE_TEST_SEED:-1}
 export LATTICE_DOCKER_NETWORK="${project}_testnet"
 artifacts="$root/target/test-artifacts/$run_id"
 mkdir -p "$artifacts"
+runner_image="lattice-test-runner:$run_id"
+probe_image="lattice-k8s-probe:$run_id"
+export LATTICE_RUNNER_IMAGE=$runner_image
+export LATTICE_CURRENT_IMAGE_TAGS="$runner_image $probe_image"
+
+"$root/scripts/docker-image-lifecycle.sh" preflight
 
 cleanup() {
   status=$?
   docker compose -f "$compose" -p "$project" --profile "$profile" logs --no-color >"$artifacts/containers.log" 2>&1 || true
-  docker compose -f "$compose" -p "$project" --profile "$profile" down --volumes --remove-orphans --rmi local >/dev/null 2>&1 || cleanup_failed=1
-  project_images=$(docker image ls --filter "reference=${project}-*" --format '{{.Repository}}:{{.Tag}}')
-  if [ -n "$project_images" ]; then
-    docker image rm -f $project_images >/dev/null 2>&1 || cleanup_failed=1
-  fi
+  docker compose -f "$compose" -p "$project" --profile "$profile" down --volumes --remove-orphans >/dev/null 2>&1 || cleanup_failed=1
   leaked_containers=$(docker ps -aq --filter "label=io.lattice.test-run=$run_id")
   leaked_networks=$(docker network ls -q --filter "label=io.lattice.test-run=$run_id")
   leaked_volumes=$(docker volume ls -q --filter "label=io.lattice.test-run=$run_id")
-  leaked_images=$(docker image ls --filter "reference=${project}-*" -q)
-  if [ -n "$leaked_containers$leaked_networks$leaked_volumes$leaked_images" ]; then
+  [ -z "$leaked_containers" ] || docker rm -f $leaked_containers >/dev/null 2>&1 || cleanup_failed=1
+  [ -z "$leaked_networks" ] || docker network rm $leaked_networks >/dev/null 2>&1 || cleanup_failed=1
+  [ -z "$leaked_volumes" ] || docker volume rm $leaked_volumes >/dev/null 2>&1 || cleanup_failed=1
+  leaked_containers=$(docker ps -aq --filter "label=io.lattice.test-run=$run_id")
+  leaked_networks=$(docker network ls -q --filter "label=io.lattice.test-run=$run_id")
+  leaked_volumes=$(docker volume ls -q --filter "label=io.lattice.test-run=$run_id")
+  if [ -n "$leaked_containers$leaked_networks$leaked_volumes" ]; then
     echo "Docker cleanup leaked labeled resources for project $project" >&2
     cleanup_failed=1
   fi
+  "$root/scripts/docker-image-lifecycle.sh" cleanup || cleanup_failed=1
   if [ "${cleanup_failed:-0}" -ne 0 ]; then
     echo "Docker cleanup failed for project $project" >&2
     exit 1

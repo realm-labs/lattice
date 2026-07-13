@@ -335,11 +335,11 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 .await?;
             existing = None;
         }
-        let (record, joined_at) = match existing {
+        let (record, joined_at, created) = match existing {
             Some(record)
                 if record.node.incarnation == hello.node.incarnation && record.hello == hello =>
             {
-                (record, self.now())
+                (record, self.now(), false)
             }
             Some(_) => return Err(CoordinatorRuntimeError::StaleMember),
             None => {
@@ -357,9 +357,15 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                     return Err(error.into());
                 }
                 self.revision = revision;
-                (record, self.now())
+                (record, self.now(), true)
             }
         };
+        if created {
+            self.publish_member_event(MemberEvent {
+                revision: record.revision,
+                change: MemberChange::Upsert(Box::new(record.clone())),
+            })?;
+        }
         self.sessions.insert(
             hello.node.incarnation,
             MemberSession {

@@ -1,9 +1,12 @@
 name: lattice-distributed
 
 x-runner: &runner
+  image: ${LATTICE_RUNNER_IMAGE:-lattice-test-runner:local}
   build:
     context: ../..
     dockerfile: tests/distributed/Dockerfile.runner
+    labels:
+      org.realm-labs.lattice.test: "true"
   working_dir: /workspace
   volumes:
     - ../..:/workspace:ro
@@ -13,6 +16,7 @@ x-runner: &runner
   environment:
     LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
     LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
+    LATTICE_CURRENT_IMAGE_TAGS: ${LATTICE_CURRENT_IMAGE_TAGS:-}
   labels:
     io.lattice.test-run: ${LATTICE_RUN_ID:-local}
   networks: [testnet]
@@ -63,6 +67,8 @@ services:
       fixture-server: {condition: service_healthy}
       entity-owner: {condition: service_healthy}
       etcd-single: {condition: service_healthy}
+      discovery-static-member: {condition: service_healthy}
+      discovery-config-member: {condition: service_healthy}
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
@@ -87,7 +93,7 @@ services:
       test: ["CMD", "test", "-s", "/artifacts/server-ref.json"]
       interval: 1s
       timeout: 1s
-      retries: 120
+      retries: 600
 
   entity-owner:
     <<: *runner
@@ -97,7 +103,7 @@ services:
       test: ["CMD", "test", "-s", "/artifacts/entity-ref.json"]
       interval: 1s
       timeout: 1s
-      retries: 120
+      retries: 600
 
   etcd-single:
     <<: *etcd
@@ -115,6 +121,45 @@ services:
     healthcheck:
       test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
     volumes: [etcd-single-data:/etcd-data]
+
+  discovery-coordinator:
+    <<: *runner
+    profiles: [e2e]
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "discovery-coordinator", "--node-id", "discovery-coordinator", "--port", "29200", "--reference", "/artifacts/discovery-coordinator.json"]
+    healthcheck:
+      test: ["CMD", "test", "-s", "/artifacts/discovery-coordinator.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
+
+  discovery-static-member:
+    <<: *runner
+    profiles: [e2e]
+    depends_on:
+      discovery-coordinator: {condition: service_healthy}
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "static-member", "--node-id", "static-member", "--port", "29201", "--reference", "/artifacts/discovery-static.json"]
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q '\"lifecycle\": \"Ready\"' /artifacts/discovery-static.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
+
+  discovery-config-member:
+    <<: *runner
+    profiles: [e2e]
+    depends_on:
+      discovery-coordinator: {condition: service_healthy}
+      discovery-static-member: {condition: service_healthy}
+      etcd-single: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "config-member", "--node-id", "config-member", "--port", "29202", "--reference", "/artifacts/discovery-config.json"]
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q '\"lifecycle\": \"Ready\"' /artifacts/discovery-config.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
 
   etcd1:
     <<: *etcd

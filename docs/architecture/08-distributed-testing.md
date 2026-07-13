@@ -406,7 +406,17 @@ The profile builds the workspace-owned `k8s-probe` binary in a pinned image, loa
 disposable kind cluster, and drives its HTTP startup/readiness/liveness endpoints. The preStop hook
 publishes a drain request and waits for the process to acknowledge it by closing readiness before
 Kubernetes sends termination; the same image is exercised through rollout, PDB-governed eviction,
-and Service/DNS discovery.
+Service/DNS discovery, and an in-cluster `KubernetesEndpointSliceDiscovery` watch. Namespace-scoped
+RBAC permits only list/watch of EndpointSlices; acceptance verifies the provider observes ready
+replacement endpoints during rollout and after eviction.
+
+All workspace-built test images carry immutable run/commit tags and the label
+`org.realm-labs.lattice.test=true`. `scripts/docker-image-lifecycle.sh` is the single cleanup policy
+used by the host wrapper, CI, testctl-controlled Docker/kind profiles, and kind teardown. It preserves
+running and current-run images, removes only unused labeled images older than 72 hours in CI or seven
+days for developers, starts oldest-first labeled cleanup at 80 percent disk use, and fails with an
+actionable diagnostic if usage remains at or above 90 percent. Unscoped Docker prune commands remain
+forbidden.
 
 ## 8. Real Multi-Process Scenario Matrix
 

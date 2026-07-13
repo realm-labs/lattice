@@ -17,8 +17,9 @@ fn framework_contains_no_legacy_transport_or_placement_surface() {
     collect_sources(&root.join("crates"), &mut files);
     collect_sources(&root.join("examples"), &mut files);
     for path in files {
-        if path.ends_with("lattice-sim/tests/legacy_absence.rs")
-            || path.to_string_lossy().contains("lattice-sim/tests/ui/")
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        if normalized.ends_with("lattice-sim/tests/legacy_absence.rs")
+            || normalized.contains("lattice-sim/tests/ui/")
         {
             continue;
         }

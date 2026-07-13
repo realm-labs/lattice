@@ -1,0 +1,76 @@
+{
+  "title": "Lattice cluster discovery and lifecycle",
+  "uid": "lattice-cluster-lifecycle",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["lattice", "cluster", "lifecycle"],
+  "time": {"from": "now-1h", "to": "now"},
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Discovery targets and stale age",
+      "targets": [
+        {"refId": "A", "expr": "lattice_discovery_targets{cluster=~\"$cluster\"}"},
+        {"refId": "B", "expr": "lattice_discovery_stale_seconds{cluster=~\"$cluster\"}"}
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Bootstrap attempts and rejections",
+      "targets": [
+        {"refId": "A", "expr": "sum by (result) (rate(lattice_bootstrap_attempts_total{cluster=~\"$cluster\"}[5m]))"},
+        {"refId": "B", "expr": "sum by (reason) (rate(lattice_bootstrap_rejections_total{cluster=~\"$cluster\"}[5m]))"}
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Lifecycle states",
+      "targets": [
+        {"refId": "A", "expr": "sum by (state) (lattice_member_lifecycle_state{cluster=~\"$cluster\"})"}
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Join and degraded duration",
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.95, sum by (le) (rate(lattice_join_duration_seconds_bucket{cluster=~\"$cluster\"}[10m])))"},
+        {"refId": "B", "expr": "lattice_degraded_duration_seconds{cluster=~\"$cluster\"}"}
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Reconciliation and snapshot restart",
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(lattice_reconciliation_total{cluster=~\"$cluster\"}[5m]))"},
+        {"refId": "B", "expr": "sum(rate(lattice_snapshot_restarts_total{cluster=~\"$cluster\"}[5m]))"}
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Drain, removal, and fencing",
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.95, sum by (le) (rate(lattice_drain_duration_seconds_bucket{cluster=~\"$cluster\"}[10m])))"},
+        {"refId": "B", "expr": "sum by (reason) (rate(lattice_member_removals_total{cluster=~\"$cluster\"}[5m]))"},
+        {"refId": "C", "expr": "sum(rate(lattice_stale_incarnation_rejections_total{cluster=~\"$cluster\"}[5m]))"},
+        {"refId": "D", "expr": "sum(rate(lattice_forced_shutdowns_total{cluster=~\"$cluster\"}[5m]))"}
+      ]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "type": "query",
+        "query": "label_values(lattice_member_lifecycle_state, cluster)",
+        "includeAll": true,
+        "allValue": ".*"
+      }
+    ]
+  }
+}

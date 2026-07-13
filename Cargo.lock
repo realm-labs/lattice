@@ -2147,8 +2147,13 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "futures-util",
  "lattice-actor",
+ "lattice-config",
+ "lattice-config-etcd",
  "lattice-core",
+ "lattice-discovery",
+ "lattice-discovery-k8s",
  "lattice-placement",
  "lattice-remoting",
  "lattice-service",
@@ -2156,6 +2161,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "trybuild",
 ]
 

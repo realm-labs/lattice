@@ -1,6 +1,6 @@
 # Lattice Cluster Discovery and Member Lifecycle Execution Plan
 
-> Status: implementation in progress; Batches A-C complete
+> Status: implementation complete; Batches A-E complete
 > Authority model: Coordinator + etcd; discovery is bootstrap-only
 > Compatibility policy: hard switch; no mixed-version cluster support
 > Behavioral references: Apache Pekko discovery and cluster lifecycle, without Gossip or SBR
@@ -76,12 +76,12 @@ resolution.
 ### 0.2 Current Execution Pointer
 
 ```text
-Overall status: in progress; discovery through service composition are complete
-Current batch: Batch E - acceptance and operations
-Completed batches: Batch A, Batch B, Batch C, Batch D
-Known broken frontier: none; the workspace compiles with all targets and features
-First implementation action: extend deterministic lifecycle simulation and Docker discovery scenarios
-Final completion condition: every invariant and acceptance item in Sections 10 and 11 passes
+Overall status: complete; the hard-switch cluster discovery and member lifecycle target is accepted
+Current batch: none
+Completed batches: Batch A, Batch B, Batch C, Batch D, Batch E
+Known broken frontier: none
+First implementation action: none; preserve the accepted hard-switch boundary in future changes
+Final completion condition: satisfied; every invariant and acceptance item in Sections 10 and 11 passes
 ```
 
 Batch A evidence (2026-07-12):
@@ -162,6 +162,31 @@ Batch D evidence (2026-07-12):
   Up record, complete graceful leave, and prove higher-term rollover follows Ready -> Degraded ->
   fresh snapshot/MemberUp -> Ready with one retained member incarnation. Placement/service tests,
   focused clippy with `-D warnings`, structure/format checks and workspace all-target checking pass.
+
+Batch E evidence (2026-07-13):
+
+- Docker e2e uses real static and etcd-backed ConfigStore providers against a dynamic Coordinator.
+  Both members become Ready only after their exact authoritative Up record is observed, then leave
+  sequentially without losing the remaining Coordinator session. A regression test covers the
+  Joining-delta publication required to keep existing sessions revision-contiguous.
+- Deterministic simulation drives the production lifecycle reducer and authoritative member
+  directory through candidate isolation, partition/Degraded, discovery outage, revision gaps,
+  stale reordered Up events, exact-incarnation replacement, drain and termination. Seeded traces
+  are replayable artifacts.
+- The kind probe runs the production EndpointSlice watcher with namespace-only list/watch RBAC.
+  Acceptance proves initial endpoint discovery, generation advancement and target replacement on
+  rollout, readiness/liveness, PodDisruptionBudget eviction behavior and bounded preStop shutdown.
+- Test images carry `org.realm-labs.lattice.test=true` and immutable run tags. Shared preflight and
+  teardown enforce the 80/90-percent disk watermarks and scoped 72-hour CI/7-day developer
+  retention while preserving running/current images; no unscoped prune is used.
+- Structured lifecycle/member/join diagnostics, the cluster lifecycle runbook, Grafana dashboard,
+  deployment/full-stop upgrade guidance and distributed-testing architecture documentation cover
+  stuck Joining, Degraded, drain timeout and force removal.
+- Structure, format, clippy for all targets/features, workspace tests and diff checks pass on the
+  host. Successful replayable profiles are Docker quality `20260713t025301z-1732`, simulation
+  `20260713t014343z-783`, model `20260713t014537z-1390`, distributed e2e
+  `20260713t030512z-554` and kind `20260713t024049z-1619`. Scoped post-run inspection found no
+  labeled test containers, networks or volumes.
 
 ## 1. Goal
 

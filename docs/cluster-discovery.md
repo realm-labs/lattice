@@ -113,3 +113,26 @@ roleRef:
 The workload sets `serviceAccountName: lattice-node`. It does not receive permission to write
 EndpointSlices or read Coordinator membership and placement keys.
 
+## Deployment and hard-switch upgrade
+
+The bootstrap feature bit, Coordinator generation-3 member schema, and revisioned lifecycle control
+messages are one full-stop boundary. Drain and stop every old node, revoke old placement credentials,
+perform the documented schema-generation preflight/cleanup, and then start only the new release.
+Mixed handshake versions, dual member formats, fallback routing, and rolling old/new membership are
+unsupported.
+
+Kubernetes workloads use a namespace-scoped ServiceAccount with only `list` and `watch` on
+`discovery.k8s.io/v1` EndpointSlices. Configure a named remoting Service port, a readiness probe that
+opens only in `Ready`, and a `preStop` hook that starts `leave`. Set
+`terminationGracePeriodSeconds` above `cluster.join.shutdown_timeout`; a Pod that exhausts that
+budget force-fences locally and is removed later through its exact member lease.
+
+Use immutable run/commit image tags for acceptance and label every workspace-built test image
+`org.realm-labs.lattice.test=true`. `scripts/docker-image-lifecycle.sh` enforces the shared 72-hour CI
+or seven-day developer retention policy and the 80/90-percent disk watermarks without touching
+unlabeled images.
+
+Operational diagnosis and force-removal procedure are in
+[the cluster lifecycle runbook](operations/cluster-lifecycle-runbook.md). The accompanying Grafana
+dashboard is stored at `docs/operations/dashboards/cluster-lifecycle.json`.
+

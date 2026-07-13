@@ -417,6 +417,95 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     coordinator.shutdown().await.unwrap();
 }
 
+async fn unused_address() -> NodeAddress {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    NodeAddress::new("127.0.0.1", port).unwrap()
+}
+
+#[tokio::test]
+async fn two_discovered_members_leave_sequentially_without_losing_coordinator_session() {
+    let coordinator_address = unused_address().await;
+    let first_address = unused_address().await;
+    let second_address = unused_address().await;
+    let cluster_id = ClusterId::new("service-multi-member-test").unwrap();
+    let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
+    let coordinator = coordinator_service(
+        store,
+        cluster_id.clone(),
+        "coordinator",
+        coordinator_address.clone(),
+        NodeIncarnation::new(301).unwrap(),
+        1,
+    )
+    .await;
+    coordinator.start().await.unwrap();
+    let discovery = || {
+        Arc::new(
+            StaticDiscovery::new(
+                "multi-member",
+                vec![StaticEndpoint {
+                    address: coordinator_address.clone(),
+                    expected_node_id: Some("coordinator".to_owned()),
+                    priority: 1,
+                }],
+            )
+            .unwrap(),
+        )
+    };
+    let member = |node_id: &str, address: NodeAddress, incarnation: u128| {
+        LatticeService::builder(node_config(
+            cluster_id.clone(),
+            node_id,
+            address,
+            NodeIncarnation::new(incarnation).unwrap(),
+        ))
+        .unwrap()
+        .cluster_discovery(discovery())
+        .join_config(ClusterJoinConfig {
+            retry_initial: Duration::from_millis(10),
+            retry_max: Duration::from_millis(100),
+            join_timeout: Some(Duration::from_secs(5)),
+            leave_timeout: Duration::from_secs(2),
+            shutdown_timeout: Duration::from_secs(3),
+            ..ClusterJoinConfig::default()
+        })
+        .member_event_capacity(64)
+        .build()
+        .unwrap()
+    };
+    let first = member("first", first_address, 401);
+    let second = member("second", second_address, 402);
+    first.start().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut lifecycle = first.subscribe_lifecycle();
+        while *lifecycle.borrow() != ServiceLifecycleState::Ready {
+            lifecycle.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    second.start().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut lifecycle = second.subscribe_lifecycle();
+        while *lifecycle.borrow() != ServiceLifecycleState::Ready {
+            lifecycle.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    first
+        .leave(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    second
+        .leave(tokio::time::Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    coordinator.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn coordinator_rollover_requires_reconciliation_before_ready() {
     let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -9,8 +9,13 @@ repository.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 lattice-core = { workspace = true, features = ["test-failpoints"] }
 lattice-actor.workspace = true
+lattice-config.workspace = true
+lattice-config-etcd.workspace = true
+lattice-discovery.workspace = true
+lattice-discovery-k8s.workspace = true
 lattice-placement.workspace = true
 lattice-remoting.workspace = true
 lattice-service.workspace = true
@@ -18,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 
 [dev-dependencies]
 trybuild.workspace = true

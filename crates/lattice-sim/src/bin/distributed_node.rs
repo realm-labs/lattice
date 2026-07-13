@@ -19,6 +19,9 @@ use lattice_actor::protocol::WireSchema;
 use lattice_actor::registry::{ActorCreateContext, ActorLoader};
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_config::store::ConfigStore;
+use lattice_config_etcd::config::EtcdConfigStoreConfig;
+use lattice_config_etcd::store::EtcdConfigStore;
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{
     ActorRef, ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation, ProtocolId,
@@ -28,10 +31,14 @@ use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ServiceContext;
+use lattice_discovery::config_store::ConfigStoreDiscovery;
+use lattice_discovery::provider::ClusterDiscovery;
+use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
 use lattice_placement::control::{
     DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
     encode_control_command,
 };
+use lattice_placement::coordinator::MemberStatus;
 use lattice_placement::coordinator::NodeHello;
 use lattice_placement::coordinator::SnapshotLimits;
 use lattice_placement::coordinator::SnapshotRecord;
@@ -42,6 +49,7 @@ use lattice_placement::runtime::CoordinatorLeaderConfig;
 use lattice_placement::runtime::CoordinatorRuntimeError;
 use lattice_placement::session::LogicCoordinatorConfig;
 use lattice_placement::session::LogicCoordinatorSession;
+use lattice_placement::storage::InMemoryPlacementStore;
 use lattice_placement::storage::etcd::{EtcdPlacementConfig, EtcdPlacementStore};
 use lattice_placement::types::AssignmentGeneration;
 use lattice_placement::types::ClaimGrant;
@@ -64,7 +72,9 @@ use lattice_remoting::watch::WatchStatus;
 use lattice_service::builder::LatticeService;
 use lattice_service::builder::LatticeServiceBuilder;
 use lattice_service::cluster::{ClusterLogicalRouter, LogicalBufferConfig};
+use lattice_service::config::ClusterJoinConfig;
 use lattice_service::config::NodeConfig;
+use lattice_service::lifecycle::ServiceLifecycleState;
 use serde::{Deserialize, Serialize};
 
 const PROTOCOL_ID: u64 = 0x7369_6d00_0000_0001;
@@ -91,6 +101,9 @@ enum Role {
     EntityOwner,
     Gateway,
     Coordinator,
+    DiscoveryCoordinator,
+    StaticMember,
+    ConfigMember,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +111,15 @@ struct CoordinatorLeadershipArtifact {
     node_id: String,
     term: u64,
     incarnation: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveryLifecycleArtifact {
+    node_id: String,
+    incarnation: u128,
+    provider: String,
+    lifecycle: String,
+    authoritative_up_members: Vec<(String, u128)>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,7 +329,199 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Role::EntityOwner => entity_owner(cli.reference).await,
         Role::Gateway => gateway(cli.reference).await,
         Role::Coordinator => coordinator(cli.reference, cli.node_id, cli.port).await,
+        Role::DiscoveryCoordinator => {
+            discovery_coordinator(cli.reference, cli.node_id, cli.port).await
+        }
+        Role::StaticMember => discovery_member(cli.reference, cli.node_id, cli.port, false).await,
+        Role::ConfigMember => discovery_member(cli.reference, cli.node_id, cli.port, true).await,
     }
+}
+
+async fn discovery_coordinator(
+    artifact: PathBuf,
+    node_id: String,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cluster = ClusterId::new("docker-discovery")?;
+    let address = NodeAddress::new(node_id.clone(), port)?;
+    let incarnation = NodeIncarnation::generate();
+    let builder =
+        LatticeService::builder(node_config(cluster, &node_id, address.clone(), incarnation))?;
+    let store = Arc::new(InMemoryPlacementStore::new(64, 64)?);
+    let leader = CoordinatorLeader::elect(
+        store,
+        builder.association_manager(),
+        NodeKey {
+            node_id: node_id.clone(),
+            address,
+            incarnation,
+        },
+        CoordinatorTerm::new(1)?,
+        3,
+        CoordinatorLeaderConfig {
+            renewal_interval: Duration::from_millis(100),
+            ..CoordinatorLeaderConfig::default()
+        },
+    )
+    .await?;
+    let (control, controls) = PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD)?;
+    let service = builder
+        .cluster_coordinator_runtime(Arc::new(control), leader, controls)
+        .build()?;
+    service.start().await?;
+    write_atomic(
+        artifact,
+        &serde_json::to_vec_pretty(&DiscoveryLifecycleArtifact {
+            node_id,
+            incarnation: incarnation.get(),
+            provider: "coordinator".to_owned(),
+            lifecycle: format!("{:?}", service.lifecycle_state()),
+            authoritative_up_members: Vec::new(),
+        })?,
+    )?;
+    tokio::signal::ctrl_c().await?;
+    service.shutdown().await?;
+    Ok(())
+}
+
+async fn discovery_member(
+    artifact: PathBuf,
+    node_id: String,
+    port: u16,
+    config_store: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let coordinator = NodeAddress::new("discovery-coordinator", 29200)?;
+    let discovery: Arc<dyn ClusterDiscovery> = if config_store {
+        let run_id = std::env::var("LATTICE_RUN_ID")?;
+        let endpoints = std::env::var("LATTICE_ETCD_ENDPOINTS")?
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        let store = EtcdConfigStore::connect(EtcdConfigStoreConfig {
+            key_prefix: format!("/lattice-discovery/{run_id}"),
+            endpoints,
+        })
+        .await?;
+        store
+            .put(
+                "/discovery/endpoints".to_owned(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "generation": 1,
+                    "endpoints": [{
+                        "host": coordinator.host(),
+                        "port": coordinator.port(),
+                        "node_id": "discovery-coordinator",
+                        "priority": 10
+                    }]
+                }),
+            )
+            .await?;
+        Arc::new(ConfigStoreDiscovery::new(store, "/discovery/endpoints")?)
+    } else {
+        Arc::new(StaticDiscovery::new(
+            "docker-static",
+            vec![StaticEndpoint {
+                address: coordinator,
+                expected_node_id: Some("discovery-coordinator".to_owned()),
+                priority: 10,
+            }],
+        )?)
+    };
+    let incarnation = NodeIncarnation::generate();
+    let advertised_host = if config_store {
+        "discovery-config-member"
+    } else {
+        "discovery-static-member"
+    };
+    let address = NodeAddress::new(advertised_host, port)?;
+    let join_config = ClusterJoinConfig {
+        retry_initial: Duration::from_millis(25),
+        retry_max: Duration::from_millis(250),
+        join_timeout: Some(Duration::from_secs(30)),
+        leave_timeout: Duration::from_secs(5),
+        shutdown_timeout: Duration::from_secs(8),
+        ..ClusterJoinConfig::default()
+    };
+    let service = LatticeService::builder(node_config(
+        ClusterId::new("docker-discovery")?,
+        &node_id,
+        address,
+        incarnation,
+    ))?
+    .cluster_discovery(discovery)
+    .join_config(join_config)
+    .member_event_capacity(64)
+    .build()?;
+    service.start().await?;
+    let mut lifecycle = service.subscribe_lifecycle();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while *lifecycle.borrow() != ServiceLifecycleState::Ready {
+            lifecycle.changed().await.map_err(|_| "lifecycle closed")?;
+        }
+        Ok::<(), &'static str>(())
+    })
+    .await??;
+    write_discovery_artifact(
+        &artifact,
+        &service,
+        &node_id,
+        incarnation,
+        if config_store {
+            "config-store"
+        } else {
+            "static"
+        },
+    )?;
+    let leave_marker = artifact.with_extension("leave");
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while !leave_marker.exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await?;
+    service
+        .leave(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await?;
+    write_discovery_artifact(
+        &artifact,
+        &service,
+        &node_id,
+        incarnation,
+        if config_store {
+            "config-store"
+        } else {
+            "static"
+        },
+    )?;
+    Ok(())
+}
+
+fn write_discovery_artifact(
+    artifact: &std::path::Path,
+    service: &LatticeService,
+    node_id: &str,
+    incarnation: NodeIncarnation,
+    provider: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let members = service
+        .member_snapshot()
+        .members
+        .into_iter()
+        .filter(|record| record.status == MemberStatus::Up)
+        .map(|record| (record.node.node_id, record.node.incarnation.get()))
+        .collect();
+    write_atomic(
+        artifact.to_path_buf(),
+        &serde_json::to_vec_pretty(&DiscoveryLifecycleArtifact {
+            node_id: node_id.to_owned(),
+            incarnation: incarnation.get(),
+            provider: provider.to_owned(),
+            lifecycle: format!("{:?}", service.lifecycle_state()),
+            authoritative_up_members: members,
+        })?,
+    )?;
+    Ok(())
 }
 
 async fn coordinator(

@@ -497,10 +497,19 @@ impl LatticeService {
 
     fn transition(&self, event: ServiceLifecycleEvent) -> Result<(), ServiceError> {
         let mut lifecycle = self.lifecycle.lock().expect("service lifecycle poisoned");
+        let previous = lifecycle.state();
         lifecycle
             .transition(event)
             .map_err(ServiceError::Lifecycle)?;
-        self.lifecycle_events.send_replace(lifecycle.state());
+        let next = lifecycle.state();
+        tracing::info!(
+            target: "lattice.cluster.lifecycle",
+            ?event,
+            ?previous,
+            ?next,
+            "member lifecycle transition"
+        );
+        self.lifecycle_events.send_replace(next);
         Ok(())
     }
 
@@ -602,14 +611,35 @@ impl LatticeService {
                     let (slot, effect) = match effect {
                         LogicPlacementEffect::MemberEvent(event) => {
                             if let MemberEvent {
-                                change: MemberChange::Removed { node, .. },
-                                ..
+                                revision,
+                                change: MemberChange::Removed { node, reason },
                             } = event.as_ref()
                             {
+                                tracing::info!(
+                                    target: "lattice.cluster.members",
+                                    node_id = %node.node_id,
+                                    incarnation = node.incarnation.get(),
+                                    revision = revision.get(),
+                                    ?reason,
+                                    "authoritative member removed"
+                                );
                                 watches
                                     .lock()
                                     .expect("watch registry poisoned")
                                     .node_down(node.incarnation);
+                            } else if let MemberEvent {
+                                revision,
+                                change: MemberChange::Upsert(record),
+                            } = event.as_ref()
+                            {
+                                tracing::info!(
+                                    target: "lattice.cluster.members",
+                                    node_id = %record.node.node_id,
+                                    incarnation = record.node.incarnation.get(),
+                                    revision = revision.get(),
+                                    status = ?record.status,
+                                    "authoritative member upserted"
+                                );
                             }
                             let _ = peers.apply(*event);
                             continue;
@@ -732,6 +762,11 @@ impl LatticeService {
             return Ok(());
         }
         if state != ServiceLifecycleState::Stopping {
+            tracing::warn!(
+                target: "lattice.cluster.lifecycle",
+                ?state,
+                "forced shutdown fences local cluster authority"
+            );
             self.transition(ServiceLifecycleEvent::ForceStop)?;
         }
         self.stop_components().await
