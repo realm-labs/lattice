@@ -12,6 +12,7 @@ use super::{
 pub(super) trait EntityRoute: Send + Sync {
     async fn tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: EntityRef<()>,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -27,6 +28,7 @@ pub(super) trait EntityRoute: Send + Sync {
     ) -> Result<Bytes, AskError>;
     async fn receive_tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: LogicalEntityTarget,
         message_id: u64,
         payload: Bytes,
@@ -223,6 +225,7 @@ where
 {
     async fn tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: EntityRef<()>,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -242,7 +245,9 @@ where
             assignment_generation: slot.assignment_generation.get(),
         };
         if owner == self.local_node {
-            return self.receive_tell(logical, message_id, payload).await;
+            return self
+                .receive_tell(sender, logical, message_id, payload)
+                .await;
         }
         let association = self
             .associations
@@ -252,10 +257,14 @@ where
                 owner.incarnation,
             )
             .ok_or(RemoteMessageError::StaleAuthority)?;
+        let sender = sender
+            .as_ref()
+            .map(SenderIdentity::from)
+            .unwrap_or_else(|| SenderIdentity::Process(self.local_node.incarnation.get()));
         self.messaging
             .tell_entity(
                 &association,
-                &SenderIdentity::Process(self.local_node.incarnation.get()),
+                &sender,
                 &logical.reference,
                 owner.address,
                 owner.incarnation,
@@ -326,14 +335,28 @@ where
 
     async fn receive_tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: LogicalEntityTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
+        if sender
+            .as_ref()
+            .is_some_and(|sender| sender.cluster_id() != target.reference.cluster_id())
+        {
+            return Err(RemoteMessageError::Unauthorized);
+        }
         let handle = self.activate(&target).await?;
         match self
             .protocol
-            .dispatch(handle, message_id, DispatchMode::Tell, payload, None)
+            .dispatch_with_sender(
+                handle,
+                message_id,
+                DispatchMode::Tell,
+                payload,
+                None,
+                sender,
+            )
             .await
             .map_err(map_dispatch)?
         {

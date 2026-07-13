@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lattice_actor::recipient::BoundRecipient;
+use lattice_actor::recipient::ActorSystem;
 use lattice_actor::traits::{Actor, Message};
+use lattice_core::actor_ref::ActorRef;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_core::trace::TraceContext;
@@ -37,15 +38,17 @@ where
     pub async fn subscribe_recipient<A, M>(
         &self,
         subscription: EventSubscription,
-        recipient: BoundRecipient<A>,
+        actor_system: ActorSystem,
+        recipient: ActorRef<A>,
     ) -> Result<EventSubscriptionHandle, EventBusError>
     where
         A: Actor,
-        M: Message<Reply = ()> + ProstMessage + Default,
+        M: Message + ProstMessage + Default,
     {
         self.bus
             .subscribe(subscription, move |event: EventEnvelope| {
-                let recipient = recipient.clone();
+                let actor_system = actor_system.clone();
+                let recipient: ActorRef<A> = recipient.cast();
                 async move {
                     let message = M::decode(event.payload.as_slice()).map_err(|error| {
                         EventBusError::Decode {
@@ -53,8 +56,8 @@ where
                             reason: error.to_string(),
                         }
                     })?;
-                    recipient
-                        .tell(message)
+                    actor_system
+                        .tell(&recipient, message)
                         .await
                         .map_err(|error| EventBusError::ActorDelivery(error.to_string()))
                 }
@@ -65,21 +68,23 @@ where
     pub async fn subscribe_mapped<A, M, F>(
         &self,
         subscription: EventSubscription,
-        recipient: BoundRecipient<A>,
+        actor_system: ActorSystem,
+        recipient: ActorRef<A>,
         map: F,
     ) -> Result<EventSubscriptionHandle, EventBusError>
     where
         A: Actor,
-        M: Message<Reply = ()>,
+        M: Message,
         F: Fn(EventEnvelope) -> M + Send + Sync + 'static,
     {
         self.bus
             .subscribe(subscription, move |event: EventEnvelope| {
-                let recipient = recipient.clone();
+                let actor_system = actor_system.clone();
+                let recipient: ActorRef<A> = recipient.cast();
                 let message = map(event);
                 async move {
-                    recipient
-                        .tell(message)
+                    actor_system
+                        .tell(&recipient, message)
                         .await
                         .map_err(|error| EventBusError::ActorDelivery(error.to_string()))
                 }

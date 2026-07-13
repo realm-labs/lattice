@@ -31,6 +31,7 @@ use lattice_remoting::watch::encode_watch_command;
 pub trait LogicalRouter: Send + Sync + 'static {
     async fn tell_entity(
         &self,
+        sender: Option<ActorRef<()>>,
         target: EntityRef<()>,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -48,6 +49,7 @@ pub trait LogicalRouter: Send + Sync + 'static {
 
     async fn tell_singleton(
         &self,
+        sender: Option<ActorRef<()>>,
         target: SingletonRef<()>,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -83,6 +85,7 @@ pub trait LogicalRouter: Send + Sync + 'static {
 
     async fn receive_entity_tell(
         &self,
+        _sender: Option<ActorRef<()>>,
         _target: LogicalEntityTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -102,6 +105,7 @@ pub trait LogicalRouter: Send + Sync + 'static {
 
     async fn receive_singleton_tell(
         &self,
+        _sender: Option<ActorRef<()>>,
         _target: LogicalSingletonTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -129,11 +133,12 @@ pub(crate) struct ServiceInboundDispatch {
 impl InboundDispatch for ServiceInboundDispatch {
     async fn tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        self.hosts.tell(target, message_id, payload).await
+        self.hosts.tell(sender, target, message_id, payload).await
     }
 
     async fn ask(
@@ -148,6 +153,7 @@ impl InboundDispatch for ServiceInboundDispatch {
 
     async fn tell_entity(
         &self,
+        sender: Option<ActorRef<()>>,
         target: LogicalEntityTarget,
         message_id: u64,
         payload: Bytes,
@@ -155,7 +161,7 @@ impl InboundDispatch for ServiceInboundDispatch {
         self.logical
             .as_ref()
             .ok_or(RemoteMessageError::Unauthorized)?
-            .receive_entity_tell(target, message_id, payload)
+            .receive_entity_tell(sender, target, message_id, payload)
             .await
     }
 
@@ -175,6 +181,7 @@ impl InboundDispatch for ServiceInboundDispatch {
 
     async fn tell_singleton(
         &self,
+        sender: Option<ActorRef<()>>,
         target: LogicalSingletonTarget,
         message_id: u64,
         payload: Bytes,
@@ -182,7 +189,7 @@ impl InboundDispatch for ServiceInboundDispatch {
         self.logical
             .as_ref()
             .ok_or(RemoteMessageError::Unauthorized)?
-            .receive_singleton_tell(target, message_id, payload)
+            .receive_singleton_tell(sender, target, message_id, payload)
             .await
     }
 
@@ -240,6 +247,7 @@ impl ServiceRecipientBackend {
 impl RecipientBackend for ServiceRecipientBackend {
     async fn tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: RecipientRef<()>,
         protocol_fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -248,17 +256,21 @@ impl RecipientBackend for ServiceRecipientBackend {
         match target {
             RecipientRef::Actor(reference) if self.is_local(&reference) => self
                 .hosts
-                .tell((&reference).into(), message_id, payload)
+                .tell(sender, (&reference).into(), message_id, payload)
                 .await
                 .map_err(TellError::Remote),
             RecipientRef::Actor(reference) => {
                 let association = self
                     .association(&reference)
                     .map_err(TellError::Association)?;
+                let sender = sender
+                    .as_ref()
+                    .map(SenderIdentity::from)
+                    .unwrap_or_else(|| SenderIdentity::Process(self.local_incarnation.get()));
                 self.messaging
                     .tell(
                         &association,
-                        &SenderIdentity::Process(self.local_incarnation.get()),
+                        &sender,
                         &reference,
                         protocol_fingerprint,
                         message_id,
@@ -270,14 +282,14 @@ impl RecipientBackend for ServiceRecipientBackend {
                 .logical
                 .as_ref()
                 .ok_or(TellError::Remote(RemoteMessageError::Unauthorized))?
-                .tell_entity(reference, protocol_fingerprint, message_id, payload)
+                .tell_entity(sender, reference, protocol_fingerprint, message_id, payload)
                 .await
                 .map_err(TellError::Remote),
             RecipientRef::Singleton(reference) => self
                 .logical
                 .as_ref()
                 .ok_or(TellError::Remote(RemoteMessageError::Unauthorized))?
-                .tell_singleton(reference, protocol_fingerprint, message_id, payload)
+                .tell_singleton(sender, reference, protocol_fingerprint, message_id, payload)
                 .await
                 .map_err(TellError::Remote),
         }

@@ -39,7 +39,7 @@ impl ActorStopError {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ActorCallError {
     #[error("actor mailbox is full")]
     MailboxFull,
@@ -47,10 +47,38 @@ pub enum ActorCallError {
     MailboxClosed,
     #[error("actor dropped the response before replying")]
     ResponseDropped,
-    #[error("actor ask deadline elapsed before the handler started")]
+    #[error("actor ask deadline elapsed before a response completed")]
     DeadlineExceeded,
     #[error("actor handler failed: {0}")]
     Handler(ActorError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ReplyError {
+    #[error("reply has already been completed or invalidated")]
+    AlreadyCompleted,
+    #[error("ask caller is no longer waiting for a response")]
+    ResponseDropped,
+    #[error("ask deadline elapsed before the response was sent")]
+    DeadlineExceeded,
+}
+
+impl From<ReplyError> for ActorError {
+    fn from(value: ReplyError) -> Self {
+        Self::new(value.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PipeToSelfError {
+    #[error("actor deferred-operation capacity {capacity} is exhausted")]
+    Capacity { capacity: usize },
+}
+
+impl From<PipeToSelfError> for ActorError {
+    fn from(value: PipeToSelfError) -> Self {
+        Self::new(value.to_string())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -59,6 +87,12 @@ pub enum ActorTellError {
     MailboxFull,
     #[error("actor mailbox is closed")]
     MailboxClosed,
+}
+
+impl From<ActorTellError> for ActorError {
+    fn from(value: ActorTellError) -> Self {
+        Self::new(value.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Error)]

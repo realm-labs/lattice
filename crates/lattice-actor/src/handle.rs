@@ -10,8 +10,8 @@ use tokio::sync::{
 };
 
 use crate::error::{ActorCallError, ActorTellError};
-use crate::mailbox::{ActorCommand, EnvelopeMessage, MailboxLane, TellEnvelope};
-use crate::traits::{Actor, ActorLifecycleState, Handler, Message, StopReason};
+use crate::mailbox::{ActorCommand, MailboxLane, RequestEnvelope, TellEnvelope};
+use crate::traits::{Actor, ActorLifecycleState, Handler, Message, Request, Responder, StopReason};
 use crate::watch::{ActorTerminated, LocalActorRef};
 
 pub struct ActorHandle<A: Actor> {
@@ -80,72 +80,74 @@ impl<A: Actor> ActorHandle<A> {
         *self.lifecycle_tx.borrow()
     }
 
-    pub async fn call<M>(&self, msg: M) -> Result<M::Reply, ActorCallError>
+    pub async fn ask<R>(&self, request: R) -> Result<R::Response, ActorCallError>
     where
-        A: Handler<M>,
-        M: Message,
+        A: Responder<R>,
+        R: Request,
     {
-        self.call_on_lane(msg, MailboxLane::Normal).await
+        self.ask_on_lane(request, MailboxLane::Normal).await
     }
 
-    pub async fn call_before<M>(
+    pub async fn ask_before<R>(
         &self,
-        msg: M,
+        request: R,
         deadline: Instant,
-    ) -> Result<M::Reply, ActorCallError>
+    ) -> Result<R::Response, ActorCallError>
     where
-        A: Handler<M>,
-        M: Message,
+        A: Responder<R>,
+        R: Request,
     {
         if Instant::now() >= deadline {
             return Err(ActorCallError::DeadlineExceeded);
         }
         let (reply_tx, reply_rx) = oneshot::channel();
-        let command = ActorCommand::Envelope(Box::new(EnvelopeMessage::with_deadline(
-            msg, reply_tx, deadline,
+        let command = ActorCommand::Envelope(Box::new(RequestEnvelope::with_deadline(
+            request, reply_tx, deadline,
         )));
         self.send_command(command, MailboxLane::Normal)?;
-        reply_rx
-            .await
-            .map_err(|_| ActorCallError::ResponseDropped)?
+        match tokio::time::timeout_at(deadline.into(), reply_rx).await {
+            Ok(result) => result.map_err(|_| ActorCallError::ResponseDropped)?,
+            Err(_) => Err(ActorCallError::DeadlineExceeded),
+        }
     }
 
-    pub(crate) async fn call_before_owned<M>(
+    pub(crate) async fn ask_before_owned<R>(
         self,
-        msg: M,
+        request: R,
         deadline: Instant,
-    ) -> Result<M::Reply, ActorCallError>
+    ) -> Result<R::Response, ActorCallError>
     where
-        A: Handler<M>,
-        M: Message,
+        A: Responder<R>,
+        R: Request,
     {
         if Instant::now() >= deadline {
             return Err(ActorCallError::DeadlineExceeded);
         }
         let (reply_tx, reply_rx) = oneshot::channel();
-        let command = ActorCommand::Envelope(Box::new(EnvelopeMessage::with_deadline(
-            msg, reply_tx, deadline,
+        let command = ActorCommand::Envelope(Box::new(RequestEnvelope::with_deadline(
+            request, reply_tx, deadline,
         )));
         self.send_command(command, MailboxLane::Normal)?;
-        reply_rx
-            .await
-            .map_err(|_| ActorCallError::ResponseDropped)?
+        match tokio::time::timeout_at(deadline.into(), reply_rx).await {
+            Ok(result) => result.map_err(|_| ActorCallError::ResponseDropped)?,
+            Err(_) => Err(ActorCallError::DeadlineExceeded),
+        }
     }
 
     pub async fn tell<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
-        M: Message<Reply = ()>,
+        M: Message,
     {
-        self.try_tell_on_lane(msg, MailboxLane::Normal)
+        self.try_tell_on_lane(msg, None, MailboxLane::Normal)
     }
 
     pub fn try_tell<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
-        M: Message<Reply = ()>,
+        M: Message,
     {
-        self.try_tell_on_lane(msg, MailboxLane::Normal)
+        self.try_tell_on_lane(msg, None, MailboxLane::Normal)
     }
 
     pub async fn stop(&self, reason: StopReason) -> Result<(), ActorTellError> {
@@ -159,9 +161,21 @@ impl<A: Actor> ActorHandle<A> {
     pub(crate) fn try_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
-        M: Message<Reply = ()>,
+        M: Message,
     {
-        self.try_tell_on_lane(msg, MailboxLane::Normal)
+        self.try_tell_on_lane(msg, None, MailboxLane::Normal)
+    }
+
+    pub(crate) async fn send_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError>
+    where
+        A: Handler<M>,
+        M: Message,
+    {
+        let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg, None)));
+        self.normal_tx
+            .send(command)
+            .await
+            .map_err(|_| ActorTellError::MailboxClosed)
     }
 
     pub(crate) fn subscribe_terminated(&self) -> broadcast::Receiver<ActorTerminated> {
@@ -184,39 +198,60 @@ impl<A: Actor> ActorHandle<A> {
     pub(crate) fn try_tell_for_test<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
-        M: Message<Reply = ()>,
+        M: Message,
     {
-        self.try_tell_on_lane(msg, MailboxLane::Normal)
+        self.try_tell_on_lane(msg, None, MailboxLane::Normal)
     }
 
     #[cfg(test)]
     pub(crate) fn try_tell_system_for_test<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
-        M: Message<Reply = ()>,
-    {
-        self.try_tell_on_lane(msg, MailboxLane::System)
-    }
-
-    async fn call_on_lane<M>(&self, msg: M, lane: MailboxLane) -> Result<M::Reply, ActorCallError>
-    where
-        A: Handler<M>,
         M: Message,
     {
+        self.try_tell_on_lane(msg, None, MailboxLane::System)
+    }
+
+    async fn ask_on_lane<R>(
+        &self,
+        request: R,
+        lane: MailboxLane,
+    ) -> Result<R::Response, ActorCallError>
+    where
+        A: Responder<R>,
+        R: Request,
+    {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let command = ActorCommand::Envelope(Box::new(EnvelopeMessage::new(msg, reply_tx)));
+        let command = ActorCommand::Envelope(Box::new(RequestEnvelope::new(request, reply_tx)));
         self.send_command(command, lane)?;
         reply_rx
             .await
             .map_err(|_| ActorCallError::ResponseDropped)?
     }
 
-    fn try_tell_on_lane<M>(&self, msg: M, lane: MailboxLane) -> Result<(), ActorTellError>
+    pub(crate) fn try_tell_from<M>(
+        &self,
+        msg: M,
+        sender: Option<ActorRef<()>>,
+    ) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
-        M: Message<Reply = ()>,
+        M: Message,
     {
-        let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg)));
+        self.try_tell_on_lane(msg, sender, MailboxLane::Normal)
+    }
+
+    fn try_tell_on_lane<M>(
+        &self,
+        msg: M,
+        sender: Option<ActorRef<()>>,
+        lane: MailboxLane,
+    ) -> Result<(), ActorTellError>
+    where
+        A: Handler<M>,
+        M: Message,
+    {
+        let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg, sender)));
         self.send_command(command, lane)
             .map_err(ActorTellError::from)
     }

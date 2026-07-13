@@ -6,28 +6,29 @@ use super::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SenderIdentity {
-    Actor {
-        path: ActorPath,
-        activation_id: ActivationId,
-    },
+    Actor(ActorRef<()>),
     Process(u128),
 }
 
 impl SenderIdentity {
     pub(super) fn stable_bytes(&self) -> Vec<u8> {
         match self {
-            Self::Actor {
-                path,
-                activation_id,
-            } => format!(
-                "a:{}:{}:{}",
-                activation_id.node_incarnation().get(),
-                activation_id.local_sequence(),
-                path
-            )
-            .into_bytes(),
+            Self::Actor(reference) => ExactActorTarget::from(reference).stable_bytes(),
             Self::Process(value) => value.to_be_bytes().to_vec(),
         }
+    }
+
+    pub(super) fn actor_ref(&self) -> Option<&ActorRef<()>> {
+        match self {
+            Self::Actor(reference) => Some(reference),
+            Self::Process(_) => None,
+        }
+    }
+}
+
+impl<A> From<&ActorRef<A>> for SenderIdentity {
+    fn from(value: &ActorRef<A>) -> Self {
+        Self::Actor(value.erase())
     }
 }
 
@@ -65,6 +66,17 @@ impl ExactActorTarget {
             self.protocol_id.get()
         )
         .into_bytes()
+    }
+
+    pub fn actor_ref<A>(&self) -> Result<ActorRef<A>, lattice_core::actor_ref::ReferenceError> {
+        ActorRef::new(
+            self.cluster_id.clone(),
+            self.node_address.clone(),
+            self.node_incarnation,
+            self.actor_path.clone(),
+            self.activation_id,
+            self.protocol_id,
+        )
     }
 }
 
@@ -113,6 +125,7 @@ impl CorrelationId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundTell {
+    pub sender: Option<ActorRef<()>>,
     pub target: ExactActorTarget,
     pub message_id: u64,
     pub payload: Bytes,
@@ -145,6 +158,7 @@ pub struct LogicalSingletonTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundEntityTell {
+    pub sender: Option<ActorRef<()>>,
     pub target: LogicalEntityTarget,
     pub message_id: u64,
     pub payload: Bytes,
@@ -161,6 +175,7 @@ pub struct InboundEntityAsk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundSingletonTell {
+    pub sender: Option<ActorRef<()>>,
     pub target: LogicalSingletonTarget,
     pub message_id: u64,
     pub payload: Bytes,

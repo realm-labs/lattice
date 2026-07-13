@@ -1,23 +1,27 @@
+use std::any::Any;
+use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_ref::{ActorRef, EntityRef, RecipientRef, SingletonRef};
-use lattice_remoting::messaging::error::AskError;
-use lattice_remoting::messaging::error::TellError;
+use lattice_core::actor_ref::{ActorRef, EntityRef, ProtocolId, RecipientRef, SingletonRef};
+use lattice_remoting::messaging::error::{AskError, TellError};
 use lattice_remoting::protocol::ProtocolFingerprint;
-use lattice_remoting::watch::WatchError;
-use lattice_remoting::watch::WatchId;
+use lattice_remoting::watch::{WatchError, WatchId};
 use thiserror::Error;
 
+use crate::error::ActorError;
 use crate::protocol::{ActorProtocol, DispatchError, DispatchMode};
-use crate::traits::{Actor, Message};
+use crate::traits::{Actor, Message, Request};
 
 #[async_trait]
+#[doc(hidden)]
 pub trait RecipientBackend: Send + Sync + 'static {
     async fn tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: RecipientRef<()>,
         protocol_fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -45,60 +49,79 @@ pub trait RecipientBackend: Send + Sync + 'static {
     async fn unwatch(&self, watch_id: WatchId) -> Result<(), WatchError>;
 }
 
-pub struct BoundRecipient<A: Actor> {
-    target: RecipientRef<A>,
-    protocol: Arc<ActorProtocol<A>>,
+/// Process-level actor messaging capability.
+///
+/// Applications normally access this through `LatticeService` or
+/// `ActorContext`; actor references themselves remain plain serializable data.
+#[derive(Clone)]
+pub struct ActorSystem {
     backend: Arc<dyn RecipientBackend>,
+    protocols: Arc<BTreeMap<u64, RegisteredActorProtocol>>,
 }
 
-impl<A: Actor> Clone for BoundRecipient<A> {
-    fn clone(&self) -> Self {
-        let target = match &self.target {
-            RecipientRef::Actor(reference) => RecipientRef::Actor(reference.cast()),
-            RecipientRef::Entity(reference) => RecipientRef::Entity(reference.cast()),
-            RecipientRef::Singleton(reference) => RecipientRef::Singleton(reference.cast()),
-        };
-        Self {
-            target,
-            protocol: self.protocol.clone(),
-            backend: self.backend.clone(),
-        }
+impl fmt::Debug for ActorSystem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorSystem")
+            .field("protocol_count", &self.protocols.len())
+            .finish_non_exhaustive()
     }
 }
 
-impl<A: Actor> BoundRecipient<A> {
+impl ActorSystem {
+    #[doc(hidden)]
     pub fn new(
-        target: RecipientRef<A>,
-        protocol: Arc<ActorProtocol<A>>,
         backend: Arc<dyn RecipientBackend>,
-    ) -> Result<Self, RecipientError> {
-        let target_protocol = match &target {
-            RecipientRef::Actor(reference) => reference.protocol_id(),
-            RecipientRef::Entity(reference) => reference.protocol_id(),
-            RecipientRef::Singleton(reference) => reference.protocol_id(),
-        };
-        if target_protocol != protocol.protocol_id() {
-            return Err(RecipientError::ProtocolMismatch);
+        protocols: impl IntoIterator<Item = RegisteredActorProtocol>,
+    ) -> Result<Self, ProtocolRegistrationError> {
+        let mut registered = BTreeMap::new();
+        for protocol in protocols {
+            let protocol_id = protocol.protocol_id().get();
+            if registered.insert(protocol_id, protocol).is_some() {
+                return Err(ProtocolRegistrationError::DuplicateProtocol(
+                    ProtocolId::new(protocol_id).expect("registered protocol IDs are nonzero"),
+                ));
+            }
         }
         Ok(Self {
-            target,
-            protocol,
             backend,
+            protocols: Arc::new(registered),
         })
     }
 
-    pub async fn tell<M>(&self, message: M) -> Result<(), RecipientError>
+    /// Sends a one-way message from process code. The receiver observes no
+    /// actor sender.
+    pub async fn tell<A, M>(
+        &self,
+        target: impl Into<RecipientRef<A>>,
+        message: M,
+    ) -> Result<(), RecipientError>
     where
-        M: Message<Reply = ()>,
+        A: Actor,
+        M: Message,
     {
-        let (message_id, payload) = self
-            .protocol
+        self.tell_with_sender(target.into(), message, None).await
+    }
+
+    pub(crate) async fn tell_with_sender<A, M>(
+        &self,
+        target: RecipientRef<A>,
+        message: M,
+        sender: Option<ActorRef<()>>,
+    ) -> Result<(), RecipientError>
+    where
+        A: Actor,
+        M: Message,
+    {
+        let protocol = self.protocol::<A>(target_protocol_id(&target))?;
+        let (message_id, payload) = protocol
             .encode_request(DispatchMode::Tell, &message)
             .map_err(RecipientError::Dispatch)?;
         self.backend
             .tell(
-                self.target.erase(),
-                self.protocol.fingerprint(),
+                sender,
+                target.erase(),
+                protocol.fingerprint(),
                 message_id,
                 payload,
             )
@@ -106,57 +129,67 @@ impl<A: Actor> BoundRecipient<A> {
             .map_err(RecipientError::Tell)
     }
 
-    pub async fn ask<M>(&self, message: M, deadline: Instant) -> Result<M::Reply, RecipientError>
+    /// Sends a typed request from process code and waits until `deadline` for
+    /// its typed response.
+    pub async fn ask<A, R>(
+        &self,
+        target: impl Into<RecipientRef<A>>,
+        request: R,
+        deadline: Instant,
+    ) -> Result<R::Response, RecipientError>
     where
-        M: Message,
+        A: Actor,
+        R: Request,
     {
         if Instant::now() >= deadline {
             return Err(RecipientError::Ask(AskError::DeadlineExceeded));
         }
-        let (message_id, payload) = self
-            .protocol
-            .encode_request(DispatchMode::Ask, &message)
+        let target = target.into();
+        let protocol = self.protocol::<A>(target_protocol_id(&target))?;
+        let (message_id, payload) = protocol
+            .encode_request(DispatchMode::Ask, &request)
             .map_err(RecipientError::Dispatch)?;
         let reply = self
             .backend
             .ask(
-                self.target.erase(),
-                self.protocol.fingerprint(),
+                target.erase(),
+                protocol.fingerprint(),
                 message_id,
                 payload,
                 deadline,
             )
             .await
             .map_err(RecipientError::Ask)?;
-        self.protocol
-            .decode_reply::<M>(message_id, &reply)
+        protocol
+            .decode_response::<R>(message_id, &reply)
             .map_err(RecipientError::Dispatch)
     }
 
-    pub async fn watch(&self) -> Result<WatchId, RecipientError> {
-        let RecipientRef::Actor(reference) = &self.target else {
-            return Err(RecipientError::UseWatchCurrent);
-        };
+    pub async fn watch<A>(&self, target: &ActorRef<A>) -> Result<WatchId, RecipientError> {
         self.backend
-            .watch_actor(reference.erase())
+            .watch_actor(target.erase())
             .await
             .map_err(RecipientError::Watch)
     }
 
-    pub async fn watch_current(&self) -> Result<WatchId, RecipientError> {
-        match &self.target {
-            RecipientRef::Actor(_) => Err(RecipientError::UseWatch),
-            RecipientRef::Entity(reference) => self
-                .backend
-                .watch_entity_current(reference.erase())
-                .await
-                .map_err(RecipientError::Watch),
-            RecipientRef::Singleton(reference) => self
-                .backend
-                .watch_singleton_current(reference.erase())
-                .await
-                .map_err(RecipientError::Watch),
-        }
+    pub async fn watch_entity_current<A>(
+        &self,
+        target: &EntityRef<A>,
+    ) -> Result<WatchId, RecipientError> {
+        self.backend
+            .watch_entity_current(target.erase())
+            .await
+            .map_err(RecipientError::Watch)
+    }
+
+    pub async fn watch_singleton_current<A>(
+        &self,
+        target: &SingletonRef<A>,
+    ) -> Result<WatchId, RecipientError> {
+        self.backend
+            .watch_singleton_current(target.erase())
+            .await
+            .map_err(RecipientError::Watch)
     }
 
     pub async fn unwatch(&self, watch_id: WatchId) -> Result<(), RecipientError> {
@@ -165,12 +198,92 @@ impl<A: Actor> BoundRecipient<A> {
             .await
             .map_err(RecipientError::Watch)
     }
+
+    fn protocol<A: Actor>(
+        &self,
+        protocol_id: ProtocolId,
+    ) -> Result<Arc<ActorProtocol<A>>, RecipientError> {
+        let registered = self.protocols.get(&protocol_id.get()).ok_or(
+            RecipientError::ProtocolNotRegistered {
+                protocol_id: protocol_id.get(),
+            },
+        )?;
+        registered
+            .protocol
+            .clone()
+            .downcast::<ActorProtocol<A>>()
+            .map_err(|_| RecipientError::ProtocolTypeMismatch {
+                protocol_id: protocol_id.get(),
+            })
+    }
+}
+
+fn target_protocol_id<A>(target: &RecipientRef<A>) -> ProtocolId {
+    match target {
+        RecipientRef::Actor(reference) => reference.protocol_id(),
+        RecipientRef::Entity(reference) => reference.protocol_id(),
+        RecipientRef::Singleton(reference) => reference.protocol_id(),
+    }
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct RegisteredActorProtocol {
+    protocol_id: ProtocolId,
+    fingerprint: ProtocolFingerprint,
+    protocol: Arc<dyn Any + Send + Sync>,
+}
+
+impl fmt::Debug for RegisteredActorProtocol {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegisteredActorProtocol")
+            .field("protocol_id", &self.protocol_id)
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RegisteredActorProtocol {
+    pub fn new<A: Actor>(protocol: Arc<ActorProtocol<A>>) -> Self {
+        Self {
+            protocol_id: protocol.protocol_id(),
+            fingerprint: protocol.fingerprint(),
+            protocol,
+        }
+    }
+
+    pub fn protocol_id(&self) -> ProtocolId {
+        self.protocol_id
+    }
+
+    pub fn fingerprint(&self) -> ProtocolFingerprint {
+        self.fingerprint
+    }
+
+    pub fn is_for<A: Actor>(&self) -> bool {
+        self.protocol.is::<ActorProtocol<A>>()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ProtocolRegistrationError {
+    #[error("actor protocol {0:?} is already registered")]
+    DuplicateProtocol(ProtocolId),
+    #[error("actor protocol {protocol_id} was registered for a different actor type")]
+    ProtocolTypeMismatch { protocol_id: u64 },
+    #[error("actor registry is already attached to an actor system")]
+    ActorSystemAlreadyInstalled,
 }
 
 #[derive(Debug, Error)]
 pub enum RecipientError {
-    #[error("recipient protocol ID differs from its ActorProtocol")]
-    ProtocolMismatch,
+    #[error("actor protocol {protocol_id} is not registered with this actor system")]
+    ProtocolNotRegistered { protocol_id: u64 },
+    #[error("actor protocol {protocol_id} is registered for a different actor type")]
+    ProtocolTypeMismatch { protocol_id: u64 },
+    #[error("actor context has no actor system")]
+    ActorSystemUnavailable,
     #[error("typed protocol dispatch failed")]
     Dispatch(#[source] DispatchError),
     #[error("tell admission failed")]
@@ -179,8 +292,10 @@ pub enum RecipientError {
     Ask(#[source] AskError),
     #[error("watch operation failed")]
     Watch(#[source] WatchError),
-    #[error("logical recipients require watch_current")]
-    UseWatchCurrent,
-    #[error("concrete ActorRef recipients require watch")]
-    UseWatch,
+}
+
+impl From<RecipientError> for ActorError {
+    fn from(error: RecipientError) -> Self {
+        Self::new(error.to_string())
+    }
 }

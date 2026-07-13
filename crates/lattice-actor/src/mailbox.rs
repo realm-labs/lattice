@@ -2,17 +2,22 @@ use std::any::type_name;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use lattice_core::actor_ref::ActorRef;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::context::ActorContext;
-use crate::error::{ActorCallError, ActorError};
-use crate::traits::{Actor, Handler, HandlerErrorAction, Message, StopReason};
+use crate::error::ActorCallError;
+use crate::reply::ReplyTo;
+use crate::traits::{
+    Actor, Handler, Message, Request, Responder, ResponderErrorAction, StopReason,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailboxConfig {
     normal_capacity: usize,
     system_capacity: usize,
+    deferred_capacity: usize,
 }
 
 impl MailboxConfig {
@@ -20,6 +25,7 @@ impl MailboxConfig {
         Self {
             normal_capacity: capacity,
             system_capacity: capacity,
+            deferred_capacity: capacity,
         }
     }
 
@@ -27,7 +33,13 @@ impl MailboxConfig {
         Self {
             normal_capacity,
             system_capacity,
+            deferred_capacity: normal_capacity,
         }
+    }
+
+    pub fn with_deferred_capacity(mut self, deferred_capacity: usize) -> Self {
+        self.deferred_capacity = deferred_capacity;
+        self
     }
 
     pub(crate) fn normal_capacity(&self) -> usize {
@@ -36,6 +48,10 @@ impl MailboxConfig {
 
     pub(crate) fn system_capacity(&self) -> usize {
         self.system_capacity
+    }
+
+    pub(crate) fn deferred_capacity(&self) -> usize {
+        self.deferred_capacity
     }
 }
 
@@ -72,65 +88,50 @@ pub(crate) trait ActorEnvelope<A: Actor>: Send {
     async fn handle(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>);
 }
 
-pub(crate) struct EnvelopeMessage<M: Message> {
-    msg: M,
-    reply_tx: oneshot::Sender<Result<M::Reply, ActorCallError>>,
+pub(crate) struct RequestEnvelope<R: Request> {
+    request: Option<R>,
+    reply_tx: Option<oneshot::Sender<Result<R::Response, ActorCallError>>>,
     deadline: Option<Instant>,
 }
 
-impl<M: Message> EnvelopeMessage<M> {
-    pub(crate) fn new(msg: M, reply_tx: oneshot::Sender<Result<M::Reply, ActorCallError>>) -> Self {
+impl<R: Request> RequestEnvelope<R> {
+    pub(crate) fn new(
+        request: R,
+        reply_tx: oneshot::Sender<Result<R::Response, ActorCallError>>,
+    ) -> Self {
         Self {
-            msg,
-            reply_tx,
+            request: Some(request),
+            reply_tx: Some(reply_tx),
             deadline: None,
         }
     }
 
     pub(crate) fn with_deadline(
-        msg: M,
-        reply_tx: oneshot::Sender<Result<M::Reply, ActorCallError>>,
+        request: R,
+        reply_tx: oneshot::Sender<Result<R::Response, ActorCallError>>,
         deadline: Instant,
     ) -> Self {
         Self {
-            msg,
-            reply_tx,
+            request: Some(request),
+            reply_tx: Some(reply_tx),
             deadline: Some(deadline),
         }
     }
 }
 
-pub(crate) struct TellEnvelope<M: Message<Reply = ()>> {
+pub(crate) struct TellEnvelope<M: Message> {
     msg: M,
+    sender: Option<ActorRef<()>>,
 }
 
-impl<M: Message<Reply = ()>> TellEnvelope<M> {
-    pub(crate) fn new(msg: M) -> Self {
-        Self { msg }
+impl<M: Message> TellEnvelope<M> {
+    pub(crate) fn new(msg: M, sender: Option<ActorRef<()>>) -> Self {
+        Self { msg, sender }
     }
 }
 
 #[async_trait]
 impl<A, M> ActorEnvelope<A> for TellEnvelope<M>
-where
-    A: Handler<M>,
-    M: Message<Reply = ()>,
-{
-    fn message_type(&self) -> &'static str {
-        type_name::<M>()
-    }
-
-    async fn handle(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>) {
-        if let Err(error) = actor.handle(ctx, self.msg).await {
-            warn!(message.type = type_name::<M>(), %error, "tell handler returned error");
-            actor.on_error::<M>(ctx, &error).await;
-            let _ = actor.handle_error(ctx, error).await;
-        }
-    }
-}
-
-#[async_trait]
-impl<A, M> ActorEnvelope<A> for EnvelopeMessage<M>
 where
     A: Handler<M>,
     M: Message,
@@ -140,41 +141,88 @@ where
     }
 
     async fn handle(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>) {
+        ctx.clear_sender();
+        if let Some(sender) = self.sender {
+            ctx.set_sender(sender);
+        }
+        if let Err(error) = actor.handle(ctx, self.msg).await {
+            warn!(message.type = type_name::<M>(), %error, "tell handler returned error");
+            actor.on_error::<M>(ctx, &error).await;
+        }
+        ctx.clear_sender();
+    }
+}
+
+#[async_trait]
+impl<A, R> ActorEnvelope<A> for RequestEnvelope<R>
+where
+    A: Responder<R>,
+    R: Request,
+{
+    fn message_type(&self) -> &'static str {
+        type_name::<R>()
+    }
+
+    async fn handle(mut self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>) {
+        ctx.clear_sender();
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            let _ = self.reply_tx.send(Err(ActorCallError::DeadlineExceeded));
+            if let Some(reply_tx) = self.reply_tx.take() {
+                let _ = reply_tx.send(Err(ActorCallError::DeadlineExceeded));
+            }
             return;
         }
-        let result = match actor.handle(ctx, self.msg).await {
-            Ok(reply) => Ok(reply),
+        let reply_tx = self
+            .reply_tx
+            .take()
+            .expect("request envelope reply sender is present");
+        let (reply_to, control) = ReplyTo::new(reply_tx, self.deadline);
+        if !ctx.register_pending_reply(control.clone()) {
+            control.cancel(ActorCallError::MailboxFull);
+            return;
+        }
+
+        let request = self
+            .request
+            .take()
+            .expect("request envelope message is present");
+        match actor.respond(ctx, request, reply_to).await {
+            Ok(()) => control.handler_succeeded(),
             Err(error) => {
                 warn!(
-                    message.type = type_name::<M>(),
+                    message.type = type_name::<R>(),
                     %error,
-                    "actor handler returned error"
+                    "actor responder returned error"
                 );
-                actor.on_error::<M>(ctx, &error).await;
-                match actor.handle_error(ctx, error).await {
-                    HandlerErrorAction::Reply(reply) => {
+                actor.on_error::<R>(ctx, &error).await;
+                match actor.respond_error(ctx, error).await {
+                    ResponderErrorAction::Respond(response) => {
                         debug!(
-                            message.type = type_name::<M>(),
-                            "actor handler error recovered"
+                            message.type = type_name::<R>(),
+                            "actor responder error recovered"
                         );
-                        Ok(reply)
+                        control.respond_after_error(response);
                     }
-                    HandlerErrorAction::Propagate(error) => {
+                    ResponderErrorAction::Propagate(error) => {
                         warn!(
-                            message.type = type_name::<M>(),
+                            message.type = type_name::<R>(),
                             %error,
-                            "actor handler error propagated"
+                            "actor responder error propagated"
                         );
-                        Err(ActorCallError::Handler(ActorError::from_error(error)))
+                        control.handler_failed(error);
                     }
                 }
             }
-        };
-        let _ = self.reply_tx.send(result);
+        }
+    }
+}
+
+impl<R: Request> Drop for RequestEnvelope<R> {
+    fn drop(&mut self) {
+        if let Some(reply_tx) = self.reply_tx.take() {
+            let _ = reply_tx.send(Err(ActorCallError::MailboxClosed));
+        }
     }
 }

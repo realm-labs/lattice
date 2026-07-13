@@ -48,7 +48,7 @@ The implementation reuses suitable Direct Link internals—framing, pooling, str
 ### 1.1 Goals
 
 1. One authoritative owner for each mutable actor state.
-2. Typed Rust messages and `Handler<M>` business code.
+2. Typed Rust `Message`/`Handler<M>` messages for both tells and asks.
 3. Serializable references to any live user actor or child actor.
 4. Stable logical references to sharded entities and cluster singletons.
 5. Akka-style `tell`, `ask`, and DeathWatch semantics over one remoting runtime.
@@ -312,7 +312,7 @@ Routing rules:
 1. Concrete `ActorRef` goes directly to the named node incarnation and exact activation; it never enters ShardRegion or Coordinator.
 2. `EntityRef` always enters the caller's local ShardRegion. The Region derives `shard_id` from the `entity_id`; it never extracts routing identity from the business payload.
 3. `SingletonRef` always enters the caller's local SingletonProxy.
-4. Local and remote delivery converge on the same bounded mailbox and `Handler<M>`.
+4. Local and remote delivery converge on the same bounded mailbox and typed `Handler<M>`.
 5. Known entity/singleton homes use only cached Coordinator state and direct remoting; they do not query etcd or hop through Coordinator.
 
 ### 4.2 Tell, Ask, Watch, and Event Delivery
@@ -326,7 +326,7 @@ Routing rules:
 | EventBus event | broker subscription → typed adapter → optional recipient send | Broker guarantee plus business idempotency; never an implicit ask |
 | Scheduler message | managed timer → recipient send | Uses the recipient semantics at trigger time |
 
-Tell and ask are protocol modes registered by `ActorProtocol`. A tell message has `Reply = ()`; an ask message has a registered reply codec, which may also encode `()` when handler-completion acknowledgement is desired.
+Tell and ask are protocol modes registered by `ActorProtocol` and distinct typed business interactions. A tell uses `Message` plus `Handler<M>` and has no response capability. Actor-originated tells carry an optional exact sender reference: `tell` uses the current actor, while `forward` preserves the incoming sender. An ask uses `Request` plus `Responder<R>`, registers the codec for `R::Response`, and receives a single-use `ReplyTo<R::Response>`; it does not use the envelope sender as a reply channel. Asynchronous work returns through a bounded `ActorContext::pipe_to_self` continuation so the final response can safely read current actor state.
 
 ### 4.3 Coordinator State Distribution
 
@@ -558,7 +558,7 @@ ActorRef identifies an exact activation, not merely a reusable path.
 EntityRef and SingletonRef identify logical destinations and survive reactivation.
 Concrete actor replacement never makes a stale ActorRef valid again.
 DeathWatch always binds one exact ActivationId; logical refs never create an actor merely to watch it.
-Remote messages are delivered through the same mailbox and Handler<M> path as local messages.
+Remote messages are delivered through the same mailbox and typed Handler path as local messages.
 Tell is at-most-once; ask has a deadline and may end with UnknownResult.
 ProtocolId and message IDs are explicit; fingerprints cover codec/schema versions and are negotiated per Association.
 Transport and business-protocol compatibility are separate: one mismatched ProtocolId cannot close an otherwise compatible Association.
@@ -581,7 +581,7 @@ lattice-core
   ids, paths, ActorRef/EntityRef/SingletonRef values, envelopes, errors
 
 lattice-actor
-  Actor, Handler<M>, ActorContext, mailboxes, supervision, lifecycle, local registry
+  Actor, Handler<M>, Message, ActorContext, mailboxes, supervision, lifecycle, local registry
 
 lattice-remoting
   codec registry, wire frames, TCP/TLS associations, tell/ask/watch transport

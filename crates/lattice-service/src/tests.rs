@@ -14,9 +14,10 @@ use lattice_actor::protocol::EncodeError;
 use lattice_actor::protocol::WireCodec;
 use lattice_actor::protocol::WireSchema;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
-use lattice_actor::traits::{Actor, Handler, Message, StopReason};
+use lattice_actor::reply::ReplyTo;
+use lattice_actor::traits::{Actor, Request, Responder, StopReason};
 use lattice_core::actor_kind;
-use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId, RecipientRef};
+use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
 use lattice_core::id::ActorId;
 use lattice_discovery::provider::{
     ClusterDiscovery, DiscoveryError, DiscoveryOrigin, DiscoverySnapshot, DiscoverySource,
@@ -45,8 +46,8 @@ struct Ping(u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pong(u64);
 
-impl Message for Ping {
-    type Reply = Pong;
+impl Request for Ping {
+    type Response = Pong;
 }
 
 impl WireSchema for Ping {
@@ -105,13 +106,15 @@ impl Actor for PingActor {
 }
 
 #[async_trait]
-impl Handler<Ping> for PingActor {
-    async fn handle(
+impl Responder<Ping> for PingActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        message: Ping,
-    ) -> Result<Pong, ActorError> {
-        Ok(Pong(message.0 + 1))
+        request: Ping,
+        reply_to: ReplyTo<Pong>,
+    ) -> Result<(), ActorError> {
+        let _ = reply_to.send(Pong(request.0 + 1));
+        Ok(())
     }
 }
 
@@ -227,7 +230,7 @@ async fn coordinator_service(
 }
 
 #[tokio::test]
-async fn typed_recipient_asks_exact_remote_activation_over_tcp() {
+async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_port = probe.local_addr().unwrap().port();
     drop(probe);
@@ -250,7 +253,7 @@ async fn typed_recipient_asks_exact_remote_activation_over_tcp() {
         },
     ));
     let handle = registry.start(ActorId::U64(1), PingActor).await.unwrap();
-    let target = handle.actor_ref().unwrap().cast();
+    let target: ActorRef<PingActor> = handle.actor_ref().unwrap().cast();
     let server = LatticeService::builder(node_config(
         cluster_id.clone(),
         "server",
@@ -269,6 +272,8 @@ async fn typed_recipient_asks_exact_remote_activation_over_tcp() {
         client_incarnation,
     ))
     .unwrap()
+    .register_protocol(protocol)
+    .unwrap()
     .build()
     .unwrap();
     server.start().await.unwrap();
@@ -281,15 +286,12 @@ async fn typed_recipient_asks_exact_remote_activation_over_tcp() {
         })
         .await
         .unwrap();
-    let recipient = client
-        .recipient(RecipientRef::Actor(target), protocol)
-        .unwrap();
-    let reply = recipient
-        .ask(Ping(41), Instant::now() + Duration::from_secs(1))
+    let reply = client
+        .ask(&target, Ping(41), Instant::now() + Duration::from_secs(1))
         .await
         .unwrap();
     assert_eq!(reply, Pong(42));
-    let watch_id = recipient.watch().await.unwrap();
+    let watch_id = client.watch(&target).await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if client.watch_status(watch_id) == WatchStatus::Active {

@@ -6,10 +6,11 @@ use std::sync::Arc;
 use lattice_actor::host::ActorHost;
 use lattice_actor::host::ProtocolHostRegistry;
 use lattice_actor::protocol::ActorProtocol;
-use lattice_actor::recipient::BoundRecipient;
-use lattice_actor::recipient::RecipientBackend;
-use lattice_actor::traits::Actor;
-use lattice_core::actor_ref::RecipientRef;
+use lattice_actor::recipient::{
+    ActorSystem, RecipientBackend, RecipientError, RegisteredActorProtocol,
+};
+use lattice_actor::traits::{Actor, Message, Request};
+use lattice_core::actor_ref::{ActorRef, EntityRef, RecipientRef, SingletonRef};
 use lattice_discovery::provider::ClusterDiscovery;
 use lattice_placement::authority::AuthorityEffect;
 use lattice_placement::control::{PlacementControlEvent, PlacementControlRouter};
@@ -46,12 +47,20 @@ use crate::error::ServiceError;
 use crate::lifecycle::{ServiceLifecycle, ServiceLifecycleEvent, ServiceLifecycleState};
 use crate::supervisor::TaskSupervisor;
 
+type ActorSystemInstaller = Box<
+    dyn Fn(&ActorSystem) -> Result<(), lattice_actor::recipient::ProtocolRegistrationError>
+        + Send
+        + Sync,
+>;
+
 pub struct LatticeServiceBuilder {
     config: NodeConfig,
     associations: Arc<AssociationManager>,
     messaging: Arc<OutboundMessaging>,
     hosts: ProtocolHostRegistry,
     protocols: BTreeMap<u64, lattice_remoting::protocol::ProtocolFingerprint>,
+    actor_protocols: BTreeMap<u64, RegisteredActorProtocol>,
+    actor_system_installers: Vec<ActorSystemInstaller>,
     logical: Option<Arc<dyn LogicalRouter>>,
     control_dispatch: Arc<dyn ControlDispatch>,
     logic_runtime: Option<LogicRuntimeAssembly>,
@@ -98,6 +107,8 @@ impl LatticeServiceBuilder {
                 .map_err(ServiceError::Host)?,
             config,
             protocols: BTreeMap::new(),
+            actor_protocols: BTreeMap::new(),
+            actor_system_installers: Vec::new(),
             logical: None,
             control_dispatch: Arc::new(RejectControlDispatch),
             logic_runtime: None,
@@ -125,12 +136,48 @@ impl LatticeServiceBuilder {
         registry: Arc<lattice_actor::registry::ActorRegistry<A>>,
         protocol: Arc<ActorProtocol<A>>,
     ) -> Result<Self, ServiceError> {
-        self.protocols
-            .insert(protocol.protocol_id().get(), protocol.fingerprint());
+        self.register_protocol_entry(protocol.clone())?;
+        let actor_registry = registry.clone();
+        self.actor_system_installers
+            .push(Box::new(move |actor_system| {
+                actor_registry
+                    .install_actor_system(actor_system.clone())
+                    .map_err(|_| {
+                        lattice_actor::recipient::ProtocolRegistrationError::ActorSystemAlreadyInstalled
+                    })
+            }));
         self.hosts
             .register(ActorHost::new(registry, protocol))
             .map_err(ServiceError::Host)?;
         Ok(self)
+    }
+
+    /// Registers a typed actor protocol for outbound use without hosting that
+    /// actor type in this process.
+    pub fn register_protocol<A: Actor>(
+        mut self,
+        protocol: Arc<ActorProtocol<A>>,
+    ) -> Result<Self, ServiceError> {
+        self.register_protocol_entry(protocol)?;
+        Ok(self)
+    }
+
+    fn register_protocol_entry<A: Actor>(
+        &mut self,
+        protocol: Arc<ActorProtocol<A>>,
+    ) -> Result<(), ServiceError> {
+        let protocol_id = protocol.protocol_id().get();
+        if self.actor_protocols.contains_key(&protocol_id) {
+            return Err(ServiceError::ProtocolRegistration(
+                lattice_actor::recipient::ProtocolRegistrationError::DuplicateProtocol(
+                    protocol.protocol_id(),
+                ),
+            ));
+        }
+        self.protocols.insert(protocol_id, protocol.fingerprint());
+        self.actor_protocols
+            .insert(protocol_id, RegisteredActorProtocol::new(protocol));
+        Ok(())
     }
 
     pub fn logical_router(mut self, router: Arc<dyn LogicalRouter>) -> Self {
@@ -286,6 +333,11 @@ impl LatticeServiceBuilder {
             supervisor: supervisor.clone(),
             logical: logical.clone(),
         });
+        let actor_system = ActorSystem::new(backend, self.actor_protocols.into_values())
+            .map_err(ServiceError::ProtocolRegistration)?;
+        for install in self.actor_system_installers {
+            install(&actor_system).map_err(ServiceError::ProtocolRegistration)?;
+        }
         let inbound = Arc::new(ServiceInboundDispatch {
             hosts: hosts.clone(),
             logical,
@@ -372,7 +424,7 @@ impl LatticeServiceBuilder {
             })
             .transpose()?;
         Ok(LatticeService {
-            backend,
+            actor_system,
             associations,
             messaging,
             endpoint,
@@ -398,7 +450,7 @@ impl LatticeServiceBuilder {
 }
 
 pub struct LatticeService {
-    backend: Arc<dyn RecipientBackend>,
+    actor_system: ActorSystem,
     associations: Arc<AssociationManager>,
     messaging: Arc<OutboundMessaging>,
     endpoint: Arc<RemotingEndpoint>,
@@ -426,12 +478,61 @@ impl LatticeService {
         LatticeServiceBuilder::new(config)
     }
 
-    pub fn recipient<A: Actor>(
+    pub fn actor_system(&self) -> &ActorSystem {
+        &self.actor_system
+    }
+
+    pub async fn tell<A, M>(
         &self,
-        target: RecipientRef<A>,
-        protocol: Arc<ActorProtocol<A>>,
-    ) -> Result<BoundRecipient<A>, lattice_actor::recipient::RecipientError> {
-        BoundRecipient::new(target, protocol, self.backend.clone())
+        target: impl Into<RecipientRef<A>>,
+        message: M,
+    ) -> Result<(), RecipientError>
+    where
+        A: Actor,
+        M: Message,
+    {
+        self.actor_system.tell(target, message).await
+    }
+
+    pub async fn ask<A, R>(
+        &self,
+        target: impl Into<RecipientRef<A>>,
+        request: R,
+        deadline: std::time::Instant,
+    ) -> Result<R::Response, RecipientError>
+    where
+        A: Actor,
+        R: Request,
+    {
+        self.actor_system.ask(target, request, deadline).await
+    }
+
+    pub async fn watch<A>(
+        &self,
+        target: &ActorRef<A>,
+    ) -> Result<lattice_remoting::watch::WatchId, RecipientError> {
+        self.actor_system.watch(target).await
+    }
+
+    pub async fn watch_entity_current<A>(
+        &self,
+        target: &EntityRef<A>,
+    ) -> Result<lattice_remoting::watch::WatchId, RecipientError> {
+        self.actor_system.watch_entity_current(target).await
+    }
+
+    pub async fn watch_singleton_current<A>(
+        &self,
+        target: &SingletonRef<A>,
+    ) -> Result<lattice_remoting::watch::WatchId, RecipientError> {
+        self.actor_system.watch_singleton_current(target).await
+    }
+
+    pub async fn unwatch(
+        &self,
+        watch_id: lattice_remoting::watch::WatchId,
+    ) -> Result<(), RecipientError> {
+        self.actor_system.unwatch(watch_id).await
     }
 
     pub fn associations(&self) -> &AssociationManager {

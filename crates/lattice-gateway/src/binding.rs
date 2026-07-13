@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use async_trait::async_trait;
-use lattice_actor::traits::Message;
+use lattice_actor::traits::Request;
 use lattice_core::kind::ActorKind;
 use prost::Message as ProstMessage;
 
@@ -12,9 +12,9 @@ use crate::route::{GatewayRouteContext, GatewayRouteSpec, MessageRouter, RouteDe
 #[async_trait]
 pub trait GatewayRecipient<M>: Clone + Send + Sync + 'static
 where
-    M: Message,
+    M: Request,
 {
-    async fn ask(&self, route: RouteDecision, message: M) -> Result<M::Reply, GatewayError>;
+    async fn ask(&self, route: RouteDecision, request: M) -> Result<M::Response, GatewayError>;
 }
 
 #[derive(Clone)]
@@ -57,8 +57,8 @@ impl<M> ProstClientMessageBinding<M> {
 
 impl<M> ProstClientMessageBinding<M>
 where
-    M: Message + ProstMessage + Default,
-    M::Reply: ProstMessage,
+    M: Request + ProstMessage + Default,
+    M::Response: ProstMessage,
 {
     pub async fn decode_and_forward<C, R>(
         &self,

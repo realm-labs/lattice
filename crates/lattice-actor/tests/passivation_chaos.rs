@@ -7,8 +7,9 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorCallError, ActorError, ActorStopError};
 use lattice_actor::registry::ActorRegistry;
 use lattice_actor::registry::ActorRegistryConfig;
+use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{
-    Actor, ActorLifecycleState, Handler, Message, PassivationReason, StopReason,
+    Actor, ActorLifecycleState, PassivationReason, Request, Responder, StopReason,
 };
 use lattice_core::actor_kind;
 use lattice_core::id::ActorId;
@@ -38,36 +39,40 @@ impl Actor for PassivatingActor {
 
 struct BeginPassivation;
 
-impl Message for BeginPassivation {
-    type Reply = ();
+impl Request for BeginPassivation {
+    type Response = ();
 }
 
 #[async_trait]
-impl Handler<BeginPassivation> for PassivatingActor {
-    async fn handle(
+impl Responder<BeginPassivation> for PassivatingActor {
+    async fn respond(
         &mut self,
         ctx: &mut ActorContext<Self>,
-        _msg: BeginPassivation,
+        _request: BeginPassivation,
+        reply_to: ReplyTo<()>,
     ) -> Result<(), ActorError> {
         ctx.request_passivation(PassivationReason::BusinessIdle)?;
+        let _ = reply_to.send(());
         Ok(())
     }
 }
 
 struct Ping;
 
-impl Message for Ping {
-    type Reply = ();
+impl Request for Ping {
+    type Response = ();
 }
 
 #[async_trait]
-impl Handler<Ping> for PassivatingActor {
-    async fn handle(
+impl Responder<Ping> for PassivatingActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        _msg: Ping,
+        _request: Ping,
+        reply_to: ReplyTo<()>,
     ) -> Result<(), ActorError> {
         self.handled_pings.fetch_add(1, Ordering::SeqCst);
+        let _ = reply_to.send(());
         Ok(())
     }
 }
@@ -94,7 +99,7 @@ async fn request_arriving_while_actor_is_passivating_is_not_processed_by_old_inc
         .unwrap();
     let mut lifecycle = handle.subscribe_lifecycle();
 
-    handle.call(BeginPassivation).await.unwrap();
+    handle.ask(BeginPassivation).await.unwrap();
     stop_entered.acquire().await.unwrap().forget();
     while *lifecycle.borrow() != ActorLifecycleState::Passivating {
         lifecycle.changed().await.unwrap();
@@ -102,7 +107,7 @@ async fn request_arriving_while_actor_is_passivating_is_not_processed_by_old_inc
 
     let mut blocked_call = tokio::spawn({
         let handle = handle.clone();
-        async move { handle.call(Ping).await }
+        async move { handle.ask(Ping).await }
     });
     assert!(
         timeout(Duration::from_millis(10), &mut blocked_call)
@@ -113,6 +118,6 @@ async fn request_arriving_while_actor_is_passivating_is_not_processed_by_old_inc
     release_stop.add_permits(1);
     let result = blocked_call.await.unwrap();
 
-    assert!(matches!(result, Err(ActorCallError::ResponseDropped)));
+    assert!(matches!(result, Err(ActorCallError::MailboxClosed)));
     assert_eq!(handled_pings.load(Ordering::SeqCst), 0);
 }

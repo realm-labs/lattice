@@ -59,16 +59,19 @@ pub struct SingletonRef<A: Actor> {
 ### 1.4 Common API
 
 ```rust
-recipient.tell(message).await?;
-let reply = recipient.ask(message, deadline).await?;
+ctx.tell(&actor_ref, message).await?;
+ctx.forward(&entity_ref, message).await?;
 
-let actor_watch = ctx.watch(actor_ref.clone()).await?;
-let entity_watch = ctx.watch_current(entity_ref.clone()).await?;
-let singleton_watch = ctx.watch_current(singleton_ref.clone()).await?;
-ctx.unwatch(actor_watch).await?;
+service.tell(&actor_ref, message).await?;
+let reply = service.ask(&singleton_ref, request, deadline).await?;
+
+let actor_watch = service.watch(&actor_ref).await?;
+let entity_watch = service.watch_entity_current(&entity_ref).await?;
+let singleton_watch = service.watch_singleton_current(&singleton_ref).await?;
+service.unwatch(actor_watch).await?;
 ```
 
-Tell and ask share a recipient surface. DeathWatch is deliberately explicit: `watch` targets the exact activation already encoded by `ActorRef`; `watch_current` resolves but never activates the current entity/singleton activation and returns `NotActive` or `Unavailable` when none exists.
+The three reference types are plain serializable identity values. `ActorContext` supplies actor-originated delivery and `LatticeService` supplies process-originated delivery; both resolve the target's registered protocol internally. There is no `BoundRecipient` or explicit bind step after deserialization. DeathWatch is deliberately explicit: `watch` targets the exact activation already encoded by `ActorRef`; logical watch methods resolve but never activate the current entity/singleton activation and return `NotActive` or `Unavailable` when none exists.
 
 ## 2. Actor Protocols and Codecs
 
@@ -98,7 +101,7 @@ lattice::actor_protocol! {
 let player_protocol = PlayerProtocol::build()?;
 ```
 
-The macro generates a typed registrar, immutable canonical descriptor, explicit `ProtocolId`, and `ProtocolFingerprint`. It verifies message ID/mode uniqueness and emits Rust bounds for `Handler<M>`, `Message::Reply`, and codecs.
+The macro generates a typed registrar, immutable canonical descriptor, explicit `ProtocolId`, and `ProtocolFingerprint`. It verifies message ID/mode uniqueness and emits Rust bounds for tell-side `Handler<M>` and ask-side `Responder<R>`/`R::Response` codecs.
 
 Large businesses may generate this macro declaration from an existing IDL, spreadsheet, YAML, or internal message catalogue. Such external input is business tooling; lattice consumes the generated Rust declaration. Runtime configuration cannot add Rust message types or change protocol IDs, message IDs, modes, codecs, or fingerprints.
 
@@ -138,22 +141,22 @@ pub fn tell<M>(
     message_codec: impl WireCodec<M>,
 ) -> Self
 where
-    M: Message<Reply = ()> + WireSchema,
+    M: Message + WireSchema,
     A: Handler<M>;
 
-pub fn ask<M>(
+pub fn ask<R>(
     self,
     message_id: u64,
-    message_codec: impl WireCodec<M>,
-    reply_codec: impl WireCodec<M::Reply>,
+    request_codec: impl WireCodec<R>,
+    response_codec: impl WireCodec<R::Response>,
 ) -> Self
 where
-    M: Message + WireSchema,
-    M::Reply: WireSchema,
-    A: Handler<M>;
+    R: Request + WireSchema,
+    R::Response: WireSchema,
+    A: Responder<R>;
 ```
 
-`ActorProtocol` explicitly declares the permitted interaction mode. A `tell` registration has no reply codec and permits fire-and-forget delivery only. An `ask` registration includes the associated reply codec and permits correlation, deadline, and handler-completion response. An ask message may still use `Reply = ()` with `UnitCodec` when only completion acknowledgement is required.
+`ActorProtocol` explicitly declares the permitted interaction mode. A `tell` registration has no response codec and permits fire-and-forget delivery only. Tell envelopes may carry the sending actor's exact `ActorRef`; `tell` replaces it with the current actor and `forward` preserves it across local or remote routing. An `ask` registration includes the associated response codec and dispatches to `Responder<R>` with a typed `ReplyTo<R::Response>`. Ask replies never depend on the tell sender field. The responder may reply immediately or use bounded `pipe_to_self` work to post a continuation back to the actor before replying.
 
 ### 2.3 Registration Rules
 
@@ -162,11 +165,11 @@ Rules:
 1. IDs are explicit and stable within an actor protocol.
 2. Ask request and reply codecs are registered independently; tell registers only its message codec.
 3. Local sends remain typed and do not serialize.
-4. Remote dispatch decodes before entering `Handler<M>`.
+4. Remote dispatch decodes before entering `Handler<M>` or `Responder<R>`.
 5. Unknown IDs, protocol fingerprint mismatch, and oversized payloads fail before mailbox admission.
 6. Internal control messages may use Prost, but business protocols are not tied to Protobuf.
 7. A message ID is registered exactly once as either tell or ask; duplicate IDs or conflicting modes fail protocol construction.
-8. `tell` registration requires `Message<Reply = ()>`; `ask` accepts any `Message`, including a unit reply.
+8. Tell requires `Message` and `Handler<M>`; ask requires `Request`, `Responder<R>`, and a wire schema and codec for `R::Response`.
 9. A received frame whose mode does not match the message registration is rejected as a protocol violation.
 10. Macro-generated and manually built protocols pass through the same validation and produce the same fingerprint.
 11. `ProtocolId` is an explicit stable `u64`; automatic IDs derived from Rust type names or declaration order are forbidden.
@@ -201,8 +204,8 @@ The writer crossing from queued to a socket write is the uncertainty boundary. F
 Expected domain failures belong in the typed reply and use its registered reply codec:
 
 ```rust
-impl Message for ReserveItem {
-    type Reply = Result<Reservation, ReserveItemError>;
+impl Request for ReserveItem {
+    type Response = Result<Reservation, ReserveItemError>;
 }
 ```
 

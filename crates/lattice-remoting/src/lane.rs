@@ -157,18 +157,20 @@ where
                 match frame.kind {
                     FrameKind::Tell if matches!(lane, LaneKind::Bulk(_)) => {
                         let tell = decode_tell(&frame)?;
-                        let _ = dispatch.tell(tell.target, tell.message_id, tell.payload).await;
+                        let _ = dispatch
+                            .tell(tell.sender, tell.target, tell.message_id, tell.payload)
+                            .await;
                     }
                     FrameKind::EntityTell if matches!(lane, LaneKind::Bulk(_)) => {
                         let tell = decode_entity_tell(&frame)?;
                         let _ = dispatch
-                            .tell_entity(tell.target, tell.message_id, tell.payload)
+                            .tell_entity(tell.sender, tell.target, tell.message_id, tell.payload)
                             .await;
                     }
                     FrameKind::SingletonTell if matches!(lane, LaneKind::Bulk(_)) => {
                         let tell = decode_singleton_tell(&frame)?;
                         let _ = dispatch
-                            .tell_singleton(tell.target, tell.message_id, tell.payload)
+                            .tell_singleton(tell.sender, tell.target, tell.message_id, tell.payload)
                             .await;
                     }
                     FrameKind::Ask if lane == LaneKind::Interactive => {
@@ -409,6 +411,7 @@ mod tests {
     impl InboundDispatch for EchoDispatch {
         async fn tell(
             &self,
+            _sender: Option<ActorRef<()>>,
             _target: ExactActorTarget,
             _message_id: u64,
             _payload: Bytes,

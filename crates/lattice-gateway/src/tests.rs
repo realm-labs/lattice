@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use lattice_actor::traits::Message;
+use lattice_actor::traits::Request;
 use lattice_core::actor_kind;
 use lattice_core::id::RouteKey;
 use prost::Message as ProstMessage;
@@ -20,8 +20,8 @@ struct Output {
     id: u64,
 }
 
-impl Message for Input {
-    type Reply = Output;
+impl Request for Input {
+    type Response = Output;
 }
 
 #[derive(Clone)]

@@ -11,7 +11,8 @@ use lattice_actor::error::ActorError;
 use lattice_actor::host::ProtocolHostRegistry;
 use lattice_actor::protocol::{DecodeError, EncodeError, WireCodec, WireSchema};
 use lattice_actor::registry::{ActorCreateContext, ActorRefConfig, ActorRegistryConfig};
-use lattice_actor::traits::{Handler, Message};
+use lattice_actor::reply::ReplyTo;
+use lattice_actor::traits::{Request, Responder};
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{ClusterId, EntityId, NodeAddress, NodeIncarnation, ProtocolId};
 use lattice_placement::control::{
@@ -48,8 +49,8 @@ struct GetValue(u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Value(u64);
 
-impl Message for GetValue {
-    type Reply = Value;
+impl Request for GetValue {
+    type Response = Value;
 }
 
 impl WireSchema for GetValue {
@@ -110,13 +111,15 @@ impl Actor for EntityActor {
 }
 
 #[async_trait]
-impl Handler<GetValue> for EntityActor {
-    async fn handle(
+impl Responder<GetValue> for EntityActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        message: GetValue,
-    ) -> Result<Value, ActorError> {
-        Ok(Value(self.value + message.0))
+        request: GetValue,
+        reply_to: ReplyTo<Value>,
+    ) -> Result<(), ActorError> {
+        let _ = reply_to.send(Value(self.value + request.0));
+        Ok(())
     }
 }
 
@@ -473,7 +476,7 @@ async fn stale_generation_never_reaches_entity_loader() {
         .await
         .unwrap();
     assert_eq!(
-        protocol.decode_reply::<GetValue>(1, &reply).unwrap(),
+        protocol.decode_response::<GetValue>(1, &reply).unwrap(),
         Value(42)
     );
     assert_eq!(loads.load(Ordering::SeqCst), 1);
@@ -752,7 +755,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         .await
         .unwrap();
     assert_eq!(
-        protocol.decode_reply::<GetValue>(1, &reply).unwrap(),
+        protocol.decode_response::<GetValue>(1, &reply).unwrap(),
         Value(42)
     );
     let current = source_router
@@ -789,7 +792,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         .await
         .unwrap();
     assert_eq!(
-        protocol.decode_reply::<GetValue>(1, &reply).unwrap(),
+        protocol.decode_response::<GetValue>(1, &reply).unwrap(),
         Value(43)
     );
     let current = source_router

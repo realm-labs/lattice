@@ -2,17 +2,19 @@ use std::any::type_name;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::Instrument;
 
-use lattice_core::actor_ref::ActorRef;
+use lattice_core::actor_ref::{ActorRef, RecipientRef};
 use lattice_core::service_context::ServiceContext;
 
-use crate::error::ActorError;
+use crate::error::{ActorCallError, ActorError, ActorTellError, PipeToSelfError};
 use crate::handle::ActorHandle;
+use crate::recipient::{ActorSystem, RecipientError};
+use crate::reply::{PendingReply, ReplyControl, ReplyTo};
 use crate::traits::{
     Actor, ChildActorKey, ChildActorOptions, ChildSupervision, Handler, Message, PassivationReason,
     StopReason,
@@ -22,12 +24,17 @@ use crate::watch::{ActorTerminated, WatchId};
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
     self_ref: Option<ActorRef<A>>,
+    actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
     lifecycle_request: Option<StopReason>,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: JoinSet<()>,
+    pipe_tasks: JoinSet<()>,
+    pending_replies: Vec<Box<dyn PendingReply>>,
+    deferred_capacity: usize,
     watches: HashMap<WatchId, JoinHandle<()>>,
     children: HashMap<ChildActorKey, Box<dyn ChildStop>>,
     next_watch_id: u64,
+    sender: Option<ActorRef<()>>,
 }
 
 impl<A: Actor> fmt::Debug for ActorContext<A> {
@@ -45,9 +52,13 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
             .field("service", &self.service)
             .field("lifecycle_request", &self.lifecycle_request)
             .field("task_count", &self.tasks.len())
+            .field("pipe_task_count", &self.pipe_tasks.len())
+            .field("pending_reply_count", &self.pending_replies.len())
+            .field("deferred_capacity", &self.deferred_capacity)
             .field("watch_count", &self.watches.len())
             .field("child_count", &self.children.len())
             .field("next_watch_id", &self.next_watch_id)
+            .field("has_sender", &self.sender.is_some())
             .finish()
     }
 }
@@ -56,22 +67,38 @@ impl<A: Actor> ActorContext<A> {
     pub(crate) fn new(
         handle: ActorHandle<A>,
         self_ref: Option<ActorRef<()>>,
+        actor_system: Option<Arc<OnceLock<ActorSystem>>>,
         service: ServiceContext,
+        deferred_capacity: usize,
     ) -> Self {
         Self {
             handle,
             self_ref: self_ref.map(|actor_ref| actor_ref.cast()),
+            actor_system,
             service,
             lifecycle_request: None,
-            tasks: Vec::new(),
+            tasks: JoinSet::new(),
+            pipe_tasks: JoinSet::new(),
+            pending_replies: Vec::new(),
+            deferred_capacity,
             watches: HashMap::new(),
             children: HashMap::new(),
             next_watch_id: 0,
+            sender: None,
         }
     }
 
+    /// Returns this actor's exact activation reference when one was assigned.
+    ///
+    /// Clone the reference before putting it in a message or retaining it. The
+    /// reference remains bound to this activation and becomes stale after the
+    /// actor stops or is replaced.
     pub fn self_ref(&self) -> Option<&ActorRef<A>> {
         self.self_ref.as_ref()
+    }
+
+    pub fn self_handle(&self) -> ActorHandle<A> {
+        self.handle.clone()
     }
 
     pub fn service(&self) -> &ServiceContext {
@@ -82,6 +109,110 @@ impl<A: Actor> ActorContext<A> {
         self.self_ref
             .as_ref()
             .ok_or_else(|| ActorError::new("actor self ref is not available"))
+    }
+
+    /// Returns the actor that sent the current one-way message.
+    ///
+    /// The value is message-scoped and read-only. Process-originated tells and
+    /// asks have no actor sender; asks reply through their typed `ReplyTo`.
+    pub fn sender(&self) -> Option<&ActorRef<()>> {
+        self.sender.as_ref()
+    }
+
+    /// Sends to a process-local handle with this actor as the envelope sender.
+    pub fn tell_local<B, M>(
+        &self,
+        target: &ActorHandle<B>,
+        message: M,
+    ) -> Result<(), ActorTellError>
+    where
+        B: Actor + Handler<M>,
+        M: Message,
+    {
+        let sender = self.self_ref.as_ref().map(ActorRef::erase);
+        target.try_tell_from(message, sender)
+    }
+
+    /// Forwards a one-way message while preserving the current envelope sender.
+    ///
+    /// If the current message has no actor sender, the forwarded message also
+    /// has no actor sender.
+    pub fn forward_local<B, M>(
+        &self,
+        target: &ActorHandle<B>,
+        message: M,
+    ) -> Result<(), ActorTellError>
+    where
+        B: Actor + Handler<M>,
+        M: Message,
+    {
+        target.try_tell_from(message, self.sender.as_ref().map(ActorRef::erase))
+    }
+
+    /// Sends to an exact or logical actor reference with this actor as sender.
+    pub async fn tell<B, M>(
+        &mut self,
+        target: impl Into<RecipientRef<B>>,
+        message: M,
+    ) -> Result<(), RecipientError>
+    where
+        B: Actor,
+        M: Message,
+    {
+        self.actor_system()?
+            .tell_with_sender(
+                target.into(),
+                message,
+                self.self_ref.as_ref().map(ActorRef::erase),
+            )
+            .await
+    }
+
+    /// Forwards to an exact or logical actor reference while preserving the
+    /// current envelope sender.
+    pub async fn forward<B, M>(
+        &mut self,
+        target: impl Into<RecipientRef<B>>,
+        message: M,
+    ) -> Result<(), RecipientError>
+    where
+        B: Actor,
+        M: Message,
+    {
+        self.actor_system()?
+            .tell_with_sender(
+                target.into(),
+                message,
+                self.sender.as_ref().map(ActorRef::erase),
+            )
+            .await
+    }
+
+    fn actor_system(&self) -> Result<&ActorSystem, RecipientError> {
+        self.actor_system
+            .as_ref()
+            .and_then(|actor_system| actor_system.get())
+            .ok_or(RecipientError::ActorSystemUnavailable)
+    }
+
+    pub(crate) fn set_sender(&mut self, sender: ActorRef<()>) {
+        self.sender = Some(sender);
+    }
+
+    pub(crate) fn clear_sender(&mut self) {
+        self.sender = None;
+    }
+
+    pub(crate) fn register_pending_reply<T>(&mut self, control: ReplyControl<T>) -> bool
+    where
+        T: Send + 'static,
+    {
+        self.reap_runtime_work();
+        if self.pending_replies.len() >= self.deferred_capacity {
+            return false;
+        }
+        self.pending_replies.push(Box::new(control));
+        true
     }
 
     pub fn request_stop(&mut self) {
@@ -96,7 +227,7 @@ impl<A: Actor> ActorContext<A> {
     pub fn notify_after<M>(&mut self, delay: Duration, msg: M)
     where
         A: Handler<M>,
-        M: Message<Reply = ()>,
+        M: Message,
     {
         let handle = self.handle.clone();
         let span = tracing::info_span!(
@@ -118,7 +249,7 @@ impl<A: Actor> ActorContext<A> {
     pub fn notify_interval<M, F>(&mut self, interval: Duration, mut make_msg: F)
     where
         A: Handler<M>,
-        M: Message<Reply = ()>,
+        M: Message,
         F: FnMut() -> M + Send + 'static,
     {
         let handle = self.handle.clone();
@@ -147,7 +278,68 @@ impl<A: Actor> ActorContext<A> {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.tasks.push(tokio::spawn(future));
+        Self::reap_tasks(&mut self.tasks, "scoped");
+        self.tasks.spawn(future);
+    }
+
+    /// Runs asynchronous work outside the actor turn, then posts its result
+    /// back as a one-way message. The continuation handles the message with
+    /// exclusive actor access and owns the original reply token.
+    pub fn pipe_to_self<T, Fut, Map, M>(
+        &mut self,
+        reply_to: ReplyTo<T>,
+        future: Fut,
+        map: Map,
+    ) -> Result<(), PipeToSelfError>
+    where
+        A: Handler<M>,
+        M: Message,
+        T: Send + 'static,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+        Map: FnOnce(Fut::Output, ReplyTo<T>) -> M + Send + 'static,
+    {
+        self.reap_runtime_work();
+        let control = reply_to.control();
+        if self.pipe_tasks.len() >= self.deferred_capacity {
+            control.cancel(ActorCallError::MailboxFull);
+            return Err(PipeToSelfError::Capacity {
+                capacity: self.deferred_capacity,
+            });
+        }
+
+        let handle = self.handle.clone();
+        let deadline = control.deadline();
+        self.pipe_tasks.spawn(async move {
+            let output = if let Some(deadline) = deadline {
+                match tokio::time::timeout_at(deadline.into(), future).await {
+                    Ok(output) => output,
+                    Err(_) => {
+                        control.cancel(ActorCallError::DeadlineExceeded);
+                        return;
+                    }
+                }
+            } else {
+                future.await
+            };
+
+            if control.is_complete() {
+                return;
+            }
+            let message = map(output, reply_to);
+            if let Some(deadline) = deadline {
+                match tokio::time::timeout_at(deadline.into(), handle.send_tell_internal(message))
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => control.cancel(ActorCallError::MailboxClosed),
+                    Err(_) => control.cancel(ActorCallError::DeadlineExceeded),
+                }
+            } else if handle.send_tell_internal(message).await.is_err() {
+                control.cancel(ActorCallError::MailboxClosed);
+            }
+        });
+        Ok(())
     }
 
     pub fn watch<B>(&mut self, target: &ActorHandle<B>) -> Result<WatchId, ActorError>
@@ -223,6 +415,7 @@ impl<A: Actor> ActorContext<A> {
             options.mailbox,
             crate::runtime::PassivationPolicy::Disabled,
             child_ref.as_ref().map(ActorRef::erase),
+            self.actor_system.clone(),
             self.service.clone(),
         );
         let directory = self
@@ -278,6 +471,7 @@ impl<A: Actor> ActorContext<A> {
             options.mailbox,
             crate::runtime::PassivationPolicy::Disabled,
             child_ref.as_ref().map(ActorRef::erase),
+            self.actor_system.clone(),
             self.service.clone(),
         );
         let directory = self
@@ -319,12 +513,25 @@ impl<A: Actor> ActorContext<A> {
     }
 
     pub fn cancel_all_tasks(&mut self) {
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
+        self.cancel_deferred_replies(ActorCallError::MailboxClosed);
+        self.tasks.abort_all();
         for (_watch_id, task) in self.watches.drain() {
             task.abort();
         }
+    }
+
+    pub(crate) fn cancel_deferred_replies(&mut self, error: ActorCallError) {
+        for pending in self.pending_replies.drain(..) {
+            pending.cancel(&error);
+        }
+        self.pipe_tasks.abort_all();
+    }
+
+    pub(crate) fn reap_runtime_work(&mut self) {
+        Self::reap_tasks(&mut self.tasks, "scoped");
+        Self::reap_tasks(&mut self.pipe_tasks, "pipe_to_self");
+        self.pending_replies
+            .retain(|pending| !pending.is_complete());
     }
 
     pub(crate) fn stop_all_children(&mut self, reason: StopReason) {
@@ -335,6 +542,16 @@ impl<A: Actor> ActorContext<A> {
 
     pub(crate) fn take_lifecycle_request(&mut self) -> Option<StopReason> {
         self.lifecycle_request.take()
+    }
+
+    fn reap_tasks(tasks: &mut JoinSet<()>, kind: &'static str) {
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                tracing::warn!(task.kind = kind, %error, "actor scoped task failed");
+            }
+        }
     }
 
     fn spawn_supervision_task<C, F>(
@@ -365,6 +582,7 @@ impl<A: Actor> ActorContext<A> {
                 };
                 let mut terminations = child.subscribe_terminated();
                 let service = self.service.clone();
+                let actor_system = self.actor_system.clone();
                 let child_ref = child.actor_ref().map(ActorRef::erase);
                 self.spawn_scoped(async move {
                     loop {
@@ -376,6 +594,7 @@ impl<A: Actor> ActorContext<A> {
                             options.mailbox,
                             crate::runtime::PassivationPolicy::Disabled,
                             child_ref.as_ref().map(ActorRef::erase),
+                            actor_system.clone(),
                             service.clone(),
                         );
                         if let Some(directory) =

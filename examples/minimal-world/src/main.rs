@@ -12,9 +12,10 @@ use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::protocol::ProstCodec;
 use lattice_actor::protocol::WireSchema;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
-use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_actor::reply::ReplyTo;
+use lattice_actor::traits::{Actor, Request, Responder};
 use lattice_config::source::ConfigSource;
-use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId, RecipientRef};
+use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
 use lattice_core::id::ActorId;
 use lattice_core::{actor_kind, service_kind};
 use lattice_remoting::config::RemotingConfig;
@@ -28,8 +29,8 @@ pub mod world {
 
 use world::{EnterWorldReply, EnterWorldRequest};
 
-impl Message for EnterWorldRequest {
-    type Reply = EnterWorldReply;
+impl Request for EnterWorldRequest {
+    type Response = EnterWorldReply;
 }
 
 impl WireSchema for EnterWorldRequest {
@@ -54,20 +55,22 @@ impl Actor for WorldActor {
 }
 
 #[async_trait]
-impl Handler<EnterWorldRequest> for WorldActor {
-    async fn handle(
+impl Responder<EnterWorldRequest> for WorldActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
         request: EnterWorldRequest,
-    ) -> Result<EnterWorldReply, ActorError> {
+        reply_to: ReplyTo<EnterWorldReply>,
+    ) -> Result<(), ActorError> {
         let ok = request.world_id == self.world_id;
         if ok {
             self.players.insert(request.player_id);
         }
-        Ok(EnterWorldReply {
+        let _ = reply_to.send(EnterWorldReply {
             ok,
             player_count: self.players.len() as u64,
-        })
+        });
+        Ok(())
     }
 }
 
@@ -119,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-    let actor_ref = handle
+    let actor_ref: ActorRef<WorldActor> = handle
         .actor_ref()
         .ok_or_else(|| std::io::Error::other("registry did not create an ActorRef"))?
         .cast();
@@ -135,11 +138,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         maximum_supervised_tasks: 1024,
         shutdown_timeout: Duration::from_secs(5),
     })?
-    .register_actor(registry, protocol.clone())?
+    .register_actor(registry, protocol)?
     .build()?;
-    let world = service.recipient(RecipientRef::Actor(actor_ref), protocol)?;
-    let reply = world
+    let reply = service
         .ask(
+            &actor_ref,
             EnterWorldRequest {
                 world_id: 1,
                 player_id: 1001,

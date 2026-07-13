@@ -54,9 +54,7 @@ impl MatrixMeasurement {
 struct BenchActor;
 struct BenchTell;
 
-impl Message for BenchTell {
-    type Reply = ();
-}
+impl Message for BenchTell {}
 
 #[async_trait]
 impl Actor for BenchActor {

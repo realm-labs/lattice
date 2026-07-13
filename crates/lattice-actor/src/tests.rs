@@ -11,13 +11,14 @@ use crate::error::{
 };
 use crate::mailbox::MailboxConfig;
 use crate::registry::{ActorRegistry, ActorRegistryConfig};
+use crate::reply::ReplyTo;
 use crate::runtime::{
     ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, PassivationPolicy,
     spawn_actor,
 };
 use crate::traits::{
-    Actor, ChildActorKey, ChildActorOptions, Handler, HandlerErrorAction, Message,
-    PassivationReason, StopReason,
+    Actor, ChildActorKey, ChildActorOptions, Handler, Message, PassivationReason, Request,
+    Responder, ResponderErrorAction, StopReason,
 };
 use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
@@ -27,8 +28,8 @@ use lattice_core::{actor_kind, service_kind};
 #[derive(Debug)]
 struct Ping(&'static str);
 
-impl Message for Ping {
-    type Reply = String;
+impl Request for Ping {
+    type Response = String;
 }
 
 #[derive(Debug)]
@@ -53,37 +54,56 @@ impl Record {
     }
 }
 
-impl Message for Record {
-    type Reply = ();
-}
+impl Message for Record {}
 
 #[derive(Debug)]
 struct StopAfterReply;
 
-impl Message for StopAfterReply {
-    type Reply = &'static str;
+impl Request for StopAfterReply {
+    type Response = &'static str;
 }
 
 #[derive(Debug)]
 struct Tick;
 
-impl Message for Tick {
-    type Reply = ();
+impl Message for Tick {}
+
+#[derive(Debug)]
+struct DeferredReply {
+    gate: Arc<Semaphore>,
+    entered: Arc<Semaphore>,
 }
+
+impl Request for DeferredReply {
+    type Response = &'static str;
+}
+
+struct DeferredReady {
+    reply_to: ReplyTo<&'static str>,
+}
+
+impl Message for DeferredReady {}
 
 #[derive(Debug)]
 struct ReadContextInstance;
 
-impl Message for ReadContextInstance {
-    type Reply = InstanceId;
+impl Request for ReadContextInstance {
+    type Response = InstanceId;
 }
 
 #[derive(Debug)]
 struct SpawnContextChild;
 
-impl Message for SpawnContextChild {
-    type Reply = InstanceId;
+impl Request for SpawnContextChild {
+    type Response = InstanceId;
 }
+
+struct ContextChildResolved {
+    result: Result<InstanceId, ActorCallError>,
+    reply_to: ReplyTo<InstanceId>,
+}
+
+impl Message for ContextChildResolved {}
 
 struct TestActor {
     events: Arc<Mutex<Vec<&'static str>>>,
@@ -94,9 +114,7 @@ struct TestActor {
 #[derive(Debug)]
 struct Fail;
 
-impl Message for Fail {
-    type Reply = ();
-}
+impl Message for Fail {}
 
 #[async_trait]
 impl Actor for TestActor {
@@ -125,14 +143,17 @@ impl Actor for TestActor {
 }
 
 #[async_trait]
-impl Handler<Ping> for TestActor {
-    async fn handle(
+impl Responder<Ping> for TestActor {
+    async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
-        msg: Ping,
-    ) -> Result<String, ActorError> {
-        self.events.lock().await.push(msg.0);
-        Ok(format!("pong:{}", msg.0))
+        ctx: &mut ActorContext<Self>,
+        request: Ping,
+        reply_to: ReplyTo<String>,
+    ) -> Result<(), ActorError> {
+        self.events.lock().await.push(request.0);
+        assert!(ctx.sender().is_none());
+        let _ = reply_to.send(format!("pong:{}", request.0));
+        Ok(())
     }
 }
 
@@ -152,15 +173,17 @@ impl Handler<Record> for TestActor {
 }
 
 #[async_trait]
-impl Handler<StopAfterReply> for TestActor {
-    async fn handle(
+impl Responder<StopAfterReply> for TestActor {
+    async fn respond(
         &mut self,
         ctx: &mut ActorContext<Self>,
-        _msg: StopAfterReply,
-    ) -> Result<&'static str, ActorError> {
+        _request: StopAfterReply,
+        reply_to: ReplyTo<&'static str>,
+    ) -> Result<(), ActorError> {
         self.events.lock().await.push("handled");
+        let _ = reply_to.send("reply-before-stop");
         ctx.request_passivation(PassivationReason::BusinessIdle)?;
-        Ok("reply-before-stop")
+        Ok(())
     }
 }
 
@@ -177,23 +200,26 @@ impl Handler<Tick> for TestActor {
 }
 
 #[async_trait]
-impl Handler<ReadContextInstance> for TestActor {
-    async fn handle(
+impl Responder<ReadContextInstance> for TestActor {
+    async fn respond(
         &mut self,
         ctx: &mut ActorContext<Self>,
-        _msg: ReadContextInstance,
-    ) -> Result<InstanceId, ActorError> {
-        Ok(ctx.service().instance_id().clone())
+        _request: ReadContextInstance,
+        reply_to: ReplyTo<InstanceId>,
+    ) -> Result<(), ActorError> {
+        let _ = reply_to.send(ctx.service().instance_id().clone());
+        Ok(())
     }
 }
 
 #[async_trait]
-impl Handler<SpawnContextChild> for TestActor {
-    async fn handle(
+impl Responder<SpawnContextChild> for TestActor {
+    async fn respond(
         &mut self,
         ctx: &mut ActorContext<Self>,
-        _msg: SpawnContextChild,
-    ) -> Result<InstanceId, ActorError> {
+        _request: SpawnContextChild,
+        reply_to: ReplyTo<InstanceId>,
+    ) -> Result<(), ActorError> {
         let child = TestActor {
             events: Arc::new(Mutex::new(Vec::new())),
             start_gate: None,
@@ -204,10 +230,27 @@ impl Handler<SpawnContextChild> for TestActor {
             child,
             ChildActorOptions::default(),
         )?;
-        handle
-            .call(ReadContextInstance)
-            .await
-            .map_err(|error| ActorError::new(error.to_string()))
+        ctx.pipe_to_self(
+            reply_to,
+            async move { handle.ask(ReadContextInstance).await },
+            |result, reply_to| ContextChildResolved { result, reply_to },
+        )?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<ContextChildResolved> for TestActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        message: ContextChildResolved,
+    ) -> Result<(), ActorError> {
+        match message.result {
+            Ok(instance) => message.reply_to.send(instance)?,
+            Err(error) => message.reply_to.fail_with(error)?,
+        }
+        Ok(())
     }
 }
 
@@ -229,6 +272,41 @@ where
 {
 }
 
+#[async_trait]
+impl Responder<DeferredReply> for TestActor {
+    async fn respond(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        request: DeferredReply,
+        reply_to: ReplyTo<&'static str>,
+    ) -> Result<(), ActorError> {
+        request.entered.add_permits(1);
+        ctx.pipe_to_self(
+            reply_to,
+            async move {
+                if let Ok(permit) = request.gate.acquire().await {
+                    permit.forget();
+                }
+            },
+            |(), reply_to| DeferredReady { reply_to },
+        )?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<DeferredReady> for TestActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        message: DeferredReady,
+    ) -> Result<(), ActorError> {
+        self.events.lock().await.push("deferred-ready");
+        let _ = message.reply_to.send("done");
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 enum BusinessActorError {
     #[error("business store is unavailable")]
@@ -247,7 +325,7 @@ impl Actor for BusinessErrorActor {
 
     async fn on_error<M>(&mut self, _ctx: &mut ActorContext<Self>, error: &BusinessActorError)
     where
-        M: Message,
+        M: Send + 'static,
     {
         let label = match error {
             BusinessActorError::StoreUnavailable => "store_unavailable",
@@ -259,14 +337,14 @@ impl Actor for BusinessErrorActor {
 
 struct LoadBusinessState;
 
-impl Message for LoadBusinessState {
-    type Reply = ();
+impl Request for LoadBusinessState {
+    type Response = ();
 }
 
 struct RecoverBusinessState;
 
-impl Message for RecoverBusinessState {
-    type Reply = &'static str;
+impl Request for RecoverBusinessState {
+    type Response = &'static str;
 }
 
 fn load_business_state() -> Result<(), BusinessActorError> {
@@ -274,11 +352,12 @@ fn load_business_state() -> Result<(), BusinessActorError> {
 }
 
 #[async_trait]
-impl Handler<LoadBusinessState> for BusinessErrorActor {
-    async fn handle(
+impl Responder<LoadBusinessState> for BusinessErrorActor {
+    async fn respond(
         &mut self,
         ctx: &mut ActorContext<Self>,
-        _msg: LoadBusinessState,
+        _request: LoadBusinessState,
+        _reply_to: ReplyTo<()>,
     ) -> Result<(), BusinessActorError> {
         ctx.request_passivation(PassivationReason::BusinessIdle)?;
         load_business_state()?;
@@ -287,32 +366,40 @@ impl Handler<LoadBusinessState> for BusinessErrorActor {
 }
 
 #[async_trait]
-impl Handler<RecoverBusinessState> for BusinessErrorActor {
-    async fn handle(
+impl Responder<RecoverBusinessState> for BusinessErrorActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        _msg: RecoverBusinessState,
-    ) -> Result<&'static str, BusinessActorError> {
+        _request: RecoverBusinessState,
+        reply_to: ReplyTo<&'static str>,
+    ) -> Result<(), BusinessActorError> {
         load_business_state()?;
-        Ok("loaded")
+        let _ = reply_to.send("loaded");
+        Ok(())
     }
 
-    async fn handle_error(
+    async fn respond_error(
         &mut self,
         _ctx: &mut ActorContext<Self>,
         error: BusinessActorError,
-    ) -> HandlerErrorAction<&'static str, BusinessActorError> {
+    ) -> ResponderErrorAction<&'static str, BusinessActorError> {
         match error {
-            BusinessActorError::StoreUnavailable => HandlerErrorAction::Reply("fallback"),
-            other => HandlerErrorAction::Propagate(other),
+            BusinessActorError::StoreUnavailable => ResponderErrorAction::Respond("fallback"),
+            other => ResponderErrorAction::Propagate(other),
         }
     }
 }
 
 #[test]
 fn handler_compile_time_bounds_are_typed() {
-    assert_handler_bound::<TestActor, Ping>();
     assert_handler_bound::<TestActor, Record>();
+    fn assert_responder_bound<A, R>()
+    where
+        A: Responder<R>,
+        R: Request,
+    {
+    }
+    assert_responder_bound::<TestActor, Ping>();
 }
 
 #[tokio::test]
@@ -324,7 +411,7 @@ async fn actor_handler_can_use_business_error_with_question_mark() {
         MailboxConfig::default(),
     );
 
-    let error = handle.call(LoadBusinessState).await.unwrap_err();
+    let error = handle.ask(LoadBusinessState).await.unwrap_err();
 
     match error {
         ActorCallError::Handler(error) => {
@@ -335,7 +422,7 @@ async fn actor_handler_can_use_business_error_with_question_mark() {
 }
 
 #[tokio::test]
-async fn actor_handler_error_hook_can_recover_reply() {
+async fn actor_handler_error_hook_can_recover_response() {
     let observed_errors = Arc::new(Mutex::new(Vec::new()));
     let handle = spawn_actor(
         BusinessErrorActor {
@@ -344,14 +431,14 @@ async fn actor_handler_error_hook_can_recover_reply() {
         MailboxConfig::default(),
     );
 
-    let reply = handle.call(RecoverBusinessState).await.unwrap();
+    let reply = handle.ask(RecoverBusinessState).await.unwrap();
 
     assert_eq!(reply, "fallback");
     assert_eq!(*observed_errors.lock().await, vec!["store_unavailable"]);
 }
 
 #[tokio::test]
-async fn actor_handle_call_and_tell_deliver_typed_messages() {
+async fn actor_handle_ask_and_tell_deliver_typed_messages() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let actor = TestActor {
         events: events.clone(),
@@ -360,13 +447,59 @@ async fn actor_handle_call_and_tell_deliver_typed_messages() {
     };
     let handle = spawn_actor(actor, MailboxConfig::bounded(8));
 
-    let reply = handle.call(Ping("one")).await.unwrap();
+    let reply = handle.ask(Ping("one")).await.unwrap();
     handle.tell(Record::new("two")).await.unwrap();
-    let barrier = handle.call(Ping("barrier")).await.unwrap();
+    let barrier = handle.ask(Ping("barrier")).await.unwrap();
 
     assert_eq!(reply, "pong:one");
     assert_eq!(barrier, "pong:barrier");
     assert_eq!(*events.lock().await, vec!["one", "two", "barrier"]);
+}
+
+#[tokio::test]
+async fn deferred_reply_does_not_block_the_actor_mailbox() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let handle = spawn_actor(
+        TestActor {
+            events,
+            start_gate: None,
+            stopped: None,
+        },
+        MailboxConfig::default(),
+    );
+    let reply_gate = Arc::new(Semaphore::new(0));
+    let deferred_gate = reply_gate.clone();
+    let entered = Arc::new(Semaphore::new(0));
+    let deferred_entered = entered.clone();
+    let ask_handle = handle.clone();
+    let ask = tokio::spawn(async move {
+        ask_handle
+            .ask(DeferredReply {
+                gate: deferred_gate,
+                entered: deferred_entered,
+            })
+            .await
+    });
+
+    entered.acquire().await.unwrap().forget();
+    let processed = Arc::new(Semaphore::new(0));
+    handle
+        .tell(Record::with_processed_signal(
+            "after-deferred",
+            processed.clone(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), processed.acquire())
+        .await
+        .expect("mailbox should accept the next message while the reply is pending")
+        .unwrap()
+        .forget();
+    assert!(!ask.is_finished());
+
+    // The deferred task owns the ask sender and can answer after the handler returned.
+    reply_gate.add_permits(1);
+    assert_eq!(ask.await.unwrap().unwrap(), "done");
 }
 
 #[test]
@@ -392,7 +525,7 @@ async fn actor_runtime_spawns_task_per_actor() {
         .spawn_actor(actor, ActorSpawnOptions::default())
         .await
         .unwrap();
-    let reply = handle.call(Ping("runtime")).await.unwrap();
+    let reply = handle.ask(Ping("runtime")).await.unwrap();
 
     assert_eq!(reply, "pong:runtime");
     assert_eq!(*events.lock().await, vec!["runtime"]);
@@ -409,7 +542,7 @@ async fn standalone_actor_receives_empty_service_context() {
         MailboxConfig::default(),
     );
 
-    let instance = handle.call(ReadContextInstance).await.unwrap();
+    let instance = handle.ask(ReadContextInstance).await.unwrap();
 
     assert_eq!(instance, InstanceId::new("local"));
 }
@@ -434,11 +567,11 @@ async fn actor_spawn_options_pass_service_context_to_handler_and_child() {
         .unwrap();
 
     assert_eq!(
-        handle.call(ReadContextInstance).await.unwrap(),
+        handle.ask(ReadContextInstance).await.unwrap(),
         InstanceId::new("world-service")
     );
     assert_eq!(
-        handle.call(SpawnContextChild).await.unwrap(),
+        handle.ask(SpawnContextChild).await.unwrap(),
         InstanceId::new("world-service")
     );
 }
@@ -535,7 +668,7 @@ async fn stop_uses_system_lane_and_closes_actor() {
     handle.stop(StopReason::Requested).await.unwrap();
     stopped.acquire().await.unwrap().forget();
 
-    let result = handle.call(Ping("after-stop")).await;
+    let result = handle.ask(Ping("after-stop")).await;
     assert!(matches!(result, Err(ActorCallError::MailboxClosed)));
 }
 
@@ -624,7 +757,7 @@ async fn scoped_task_is_cancelled_when_actor_stops() {
 }
 
 #[tokio::test]
-async fn business_passivation_happens_after_handler_reply() {
+async fn business_passivation_happens_after_handler_response() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let stopped = Arc::new(Semaphore::new(0));
     let actor = TestActor {
@@ -634,7 +767,7 @@ async fn business_passivation_happens_after_handler_reply() {
     };
     let handle = spawn_actor(actor, MailboxConfig::bounded(8));
 
-    let reply = handle.call(StopAfterReply).await.unwrap();
+    let reply = handle.ask(StopAfterReply).await.unwrap();
     stopped.acquire().await.unwrap().forget();
     let after_stop = handle.tell(Record::new("after-stop")).await;
 

@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
-use lattice_core::actor_ref::ProtocolId;
+use lattice_core::actor_ref::{ActorRef, ProtocolId};
 use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
 use thiserror::Error;
 
 use crate::error::ActorCallError;
 use crate::handle::ActorHandle;
-use crate::traits::{Actor, Handler, Message};
+use crate::traits::{Actor, Handler, Message, Request, Responder};
 
 pub trait WireSchema: Send + 'static {
     const SCHEMA_ID: u64;
@@ -119,8 +119,10 @@ pub enum DispatchReply {
 
 type DispatchFuture =
     Pin<Box<dyn Future<Output = Result<DispatchReply, DispatchError>> + Send + 'static>>;
-type DispatchFn<A> =
-    dyn Fn(ActorHandle<A>, Bytes, Option<Instant>) -> DispatchFuture + Send + Sync + 'static;
+type DispatchFn<A> = dyn Fn(ActorHandle<A>, Bytes, Option<Instant>, Option<ActorRef<()>>) -> DispatchFuture
+    + Send
+    + Sync
+    + 'static;
 type EncodeRequestFn = dyn Fn(&dyn Any) -> Result<Bytes, EncodeError> + Send + Sync;
 type DecodeReplyFn = dyn Fn(&[u8]) -> Result<Box<dyn Any + Send>, DecodeError> + Send + Sync;
 
@@ -204,6 +206,20 @@ impl<A: Actor> ActorProtocol<A> {
         payload: Bytes,
         deadline: Option<Instant>,
     ) -> Result<DispatchReply, DispatchError> {
+        self.dispatch_with_sender(handle, message_id, mode, payload, deadline, None)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn dispatch_with_sender(
+        &self,
+        handle: ActorHandle<A>,
+        message_id: u64,
+        mode: DispatchMode,
+        payload: Bytes,
+        deadline: Option<Instant>,
+        sender: Option<ActorRef<()>>,
+    ) -> Result<DispatchReply, DispatchError> {
         let binding = self
             .bindings
             .get(&message_id)
@@ -217,18 +233,18 @@ impl<A: Actor> ActorProtocol<A> {
                 maximum: binding.descriptor.max_payload,
             });
         }
-        (binding.dispatch)(handle, payload, deadline).await
+        (binding.dispatch)(handle, payload, deadline, sender).await
     }
 
-    pub fn encode_request<M: Message>(
+    pub fn encode_request<T: Send + 'static>(
         &self,
         mode: DispatchMode,
-        message: &M,
+        message: &T,
     ) -> Result<(u64, Bytes), DispatchError> {
         let binding = self
             .bindings
             .values()
-            .find(|binding| binding.request_type == TypeId::of::<M>())
+            .find(|binding| binding.request_type == TypeId::of::<T>())
             .ok_or(DispatchError::UnregisteredType)?;
         if binding.descriptor.mode != mode {
             return Err(DispatchError::ModeMismatch);
@@ -243,11 +259,11 @@ impl<A: Actor> ActorProtocol<A> {
         Ok((binding.descriptor.message_id, payload))
     }
 
-    pub fn decode_reply<M: Message>(
+    pub fn decode_response<R: Request>(
         &self,
         message_id: u64,
         payload: &[u8],
-    ) -> Result<M::Reply, DispatchError> {
+    ) -> Result<R::Response, DispatchError> {
         let binding = self
             .bindings
             .get(&message_id)
@@ -258,7 +274,7 @@ impl<A: Actor> ActorProtocol<A> {
             .ok_or(DispatchError::ModeMismatch)?;
         decode(payload)
             .map_err(DispatchError::Decode)?
-            .downcast::<M::Reply>()
+            .downcast::<R::Response>()
             .map(|reply| *reply)
             .map_err(|_| DispatchError::ReplyTypeMismatch)
     }
@@ -281,7 +297,7 @@ impl<A: Actor> ActorProtocolBuilder<A> {
     pub fn tell<M, C>(mut self, message_id: u64, codec: C) -> Self
     where
         A: Handler<M>,
-        M: Message<Reply = ()> + WireSchema,
+        M: Message + WireSchema,
         C: WireCodec<M>,
     {
         let codec = Arc::new(codec);
@@ -312,12 +328,12 @@ impl<A: Actor> ActorProtocolBuilder<A> {
                 })
             },
             decode_reply: None,
-            dispatch: Arc::new(move |handle, payload, _deadline| {
+            dispatch: Arc::new(move |handle, payload, _deadline, sender| {
                 let codec = codec.clone();
                 Box::pin(async move {
                     let message = codec.decode(&payload).map_err(DispatchError::Decode)?;
                     handle
-                        .try_tell(message)
+                        .try_tell_from(message, sender)
                         .map_err(|_| DispatchError::MailboxRejected)?;
                     Ok(DispatchReply::TellAccepted)
                 })
@@ -326,13 +342,13 @@ impl<A: Actor> ActorProtocolBuilder<A> {
         self
     }
 
-    pub fn ask<M, C, R>(mut self, message_id: u64, codec: C, reply_codec: R) -> Self
+    pub fn ask<Q, C, RC>(mut self, message_id: u64, codec: C, reply_codec: RC) -> Self
     where
-        A: Handler<M>,
-        M: Message + WireSchema,
-        M::Reply: WireSchema,
-        C: WireCodec<M>,
-        R: WireCodec<M::Reply>,
+        A: Responder<Q>,
+        Q: Request + WireSchema,
+        Q::Response: WireSchema,
+        C: WireCodec<Q>,
+        RC: WireCodec<Q::Response>,
     {
         let codec = Arc::new(codec);
         let reply_codec = Arc::new(reply_codec);
@@ -342,20 +358,20 @@ impl<A: Actor> ActorProtocolBuilder<A> {
                 mode: DispatchMode::Ask,
                 request_codec_id: C::CODEC_ID,
                 request_codec_version: C::CODEC_VERSION,
-                request_schema_id: M::SCHEMA_ID,
-                request_schema_version: M::SCHEMA_VERSION,
-                reply_codec_id: Some(R::CODEC_ID),
-                reply_codec_version: Some(R::CODEC_VERSION),
-                reply_schema_id: Some(M::Reply::SCHEMA_ID),
-                reply_schema_version: Some(M::Reply::SCHEMA_VERSION),
+                request_schema_id: Q::SCHEMA_ID,
+                request_schema_version: Q::SCHEMA_VERSION,
+                reply_codec_id: Some(RC::CODEC_ID),
+                reply_codec_version: Some(RC::CODEC_VERSION),
+                reply_schema_id: Some(Q::Response::SCHEMA_ID),
+                reply_schema_version: Some(Q::Response::SCHEMA_VERSION),
                 max_payload: self.max_payload,
             },
-            request_type: TypeId::of::<M>(),
+            request_type: TypeId::of::<Q>(),
             encode_request: {
                 let codec = codec.clone();
                 Arc::new(move |message| {
                     let message = message
-                        .downcast_ref::<M>()
+                        .downcast_ref::<Q>()
                         .ok_or_else(|| EncodeError::new("message type does not match binding"))?;
                     let mut output = BytesMut::new();
                     codec.encode(message, &mut output)?;
@@ -369,14 +385,14 @@ impl<A: Actor> ActorProtocolBuilder<A> {
                     Ok(Box::new(reply) as Box<dyn Any + Send>)
                 }))
             },
-            dispatch: Arc::new(move |handle, payload, deadline| {
+            dispatch: Arc::new(move |handle, payload, deadline, _sender| {
                 let codec = codec.clone();
                 let reply_codec = reply_codec.clone();
                 Box::pin(async move {
                     let message = codec.decode(&payload).map_err(DispatchError::Decode)?;
                     let deadline = deadline.ok_or(DispatchError::MissingDeadline)?;
                     let reply = handle
-                        .call_before_owned(message, deadline)
+                        .ask_before_owned(message, deadline)
                         .await
                         .map_err(DispatchError::Actor)?;
                     let mut output = BytesMut::new();
@@ -567,8 +583,17 @@ mod tests {
     use super::*;
     use crate::context::ActorContext;
     use crate::error::ActorError;
+    use crate::mailbox::MailboxConfig;
+    use crate::reply::ReplyTo;
+    use crate::runtime::spawn_actor;
+    use lattice_core::actor_ref::{
+        ActivationId, ActorPath, ClusterId, NodeAddress, NodeIncarnation,
+    };
+    use tokio::sync::oneshot;
 
-    struct TestActor;
+    struct TestActor {
+        observed_sender: Option<oneshot::Sender<Option<ActorRef<()>>>>,
+    }
 
     #[async_trait]
     impl Actor for TestActor {
@@ -578,9 +603,7 @@ mod tests {
     #[derive(Clone)]
     struct Tell(u64);
 
-    impl Message for Tell {
-        type Reply = ();
-    }
+    impl Message for Tell {}
 
     impl WireSchema for Tell {
         const SCHEMA_ID: u64 = 10;
@@ -590,8 +613,8 @@ mod tests {
     #[derive(Clone)]
     struct Ask(u64);
 
-    impl Message for Ask {
-        type Reply = u64;
+    impl Request for Ask {
+        type Response = u64;
     }
 
     impl WireSchema for Ask {
@@ -660,21 +683,26 @@ mod tests {
     impl Handler<Tell> for TestActor {
         async fn handle(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            ctx: &mut ActorContext<Self>,
             _msg: Tell,
         ) -> Result<(), Self::Error> {
+            if let Some(observed_sender) = self.observed_sender.take() {
+                let _ = observed_sender.send(ctx.sender().cloned());
+            }
             Ok(())
         }
     }
 
     #[async_trait]
-    impl Handler<Ask> for TestActor {
-        async fn handle(
+    impl Responder<Ask> for TestActor {
+        async fn respond(
             &mut self,
             _ctx: &mut ActorContext<Self>,
-            msg: Ask,
-        ) -> Result<u64, Self::Error> {
-            Ok(msg.0 + 1)
+            request: Ask,
+            reply_to: ReplyTo<u64>,
+        ) -> Result<(), Self::Error> {
+            let _ = reply_to.send(request.0 + 1);
+            Ok(())
         }
     }
 
@@ -711,5 +739,47 @@ mod tests {
             result,
             Err(ProtocolBuildError::DuplicateMessageId(1))
         ));
+    }
+
+    #[tokio::test]
+    async fn protocol_tell_dispatch_preserves_actor_sender_metadata() {
+        let (observed_tx, observed_rx) = oneshot::channel();
+        let handle = spawn_actor(
+            TestActor {
+                observed_sender: Some(observed_tx),
+            },
+            MailboxConfig::default(),
+        );
+        let incarnation = NodeIncarnation::new(9).unwrap();
+        let sender = ActorRef::new(
+            ClusterId::new("test").unwrap(),
+            NodeAddress::new("sender", 25521).unwrap(),
+            incarnation,
+            ActorPath::user(["user", "sender"]).unwrap(),
+            ActivationId::new(incarnation, 1).unwrap(),
+            ProtocolId::new(77).unwrap(),
+        )
+        .unwrap();
+        let protocol = TestProtocol::build().unwrap();
+
+        let result = protocol
+            .dispatch_with_sender(
+                handle,
+                1,
+                DispatchMode::Tell,
+                Bytes::copy_from_slice(&5_u64.to_be_bytes()),
+                None,
+                Some(sender.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, DispatchReply::TellAccepted));
+        assert!(
+            observed_rx
+                .await
+                .unwrap()
+                .is_some_and(|actual| actual.same_activation(&sender))
+        );
     }
 }

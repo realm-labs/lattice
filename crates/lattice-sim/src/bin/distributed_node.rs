@@ -18,14 +18,14 @@ use lattice_actor::protocol::WireCodec;
 use lattice_actor::protocol::WireSchema;
 use lattice_actor::registry::{ActorCreateContext, ActorLoader};
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
-use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_actor::reply::ReplyTo;
+use lattice_actor::traits::{Actor, Handler, Message, Request, Responder};
 use lattice_config::store::ConfigStore;
 use lattice_config_etcd::config::EtcdConfigStoreConfig;
 use lattice_config_etcd::store::EtcdConfigStore;
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{
     ActorRef, ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation, ProtocolId,
-    RecipientRef,
 };
 use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
@@ -131,17 +131,15 @@ struct Pong(u64);
 #[derive(Debug, Clone)]
 struct StopPing;
 
-impl Message for StopPing {
-    type Reply = ();
-}
+impl Message for StopPing {}
 
 impl WireSchema for StopPing {
     const SCHEMA_ID: u64 = 3;
     const SCHEMA_VERSION: u32 = 1;
 }
 
-impl Message for Ping {
-    type Reply = Pong;
+impl Request for Ping {
+    type Response = Pong;
 }
 
 impl WireSchema for Ping {
@@ -285,13 +283,15 @@ impl Actor for PingActor {
 }
 
 #[async_trait]
-impl Handler<Ping> for PingActor {
-    async fn handle(
+impl Responder<Ping> for PingActor {
+    async fn respond(
         &mut self,
         _context: &mut ActorContext<Self>,
-        message: Ping,
-    ) -> Result<Pong, ActorError> {
-        Ok(Pong(message.0 + 1))
+        request: Ping,
+        reply_to: ReplyTo<Pong>,
+    ) -> Result<(), ActorError> {
+        let _ = reply_to.send(Pong(request.0 + 1));
+        Ok(())
     }
 }
 
@@ -687,6 +687,7 @@ async fn client(
         client_address,
         client_incarnation,
     ))?
+    .register_protocol(protocol)?
     .build()?;
     service.start().await?;
     let connected = tokio::time::timeout(
@@ -704,9 +705,8 @@ async fn client(
         return Ok(());
     }
     connected??;
-    let recipient = service.recipient(RecipientRef::Actor(target), protocol.clone())?;
-    let reply = recipient
-        .ask(Ping(41), Instant::now() + Duration::from_secs(10))
+    let reply = service
+        .ask(&target, Ping(41), Instant::now() + Duration::from_secs(10))
         .await;
     if expect_failure {
         service.shutdown().await?;
@@ -722,16 +722,15 @@ async fn client(
     }
     let child_encoded = std::fs::read(reference.with_file_name("child-ref.json"))?;
     let child: ActorRef<PingActor> = serde_json::from_slice(&child_encoded)?;
-    let child_recipient = service.recipient(RecipientRef::Actor(child), protocol)?;
-    if child_recipient
-        .ask(Ping(99), Instant::now() + Duration::from_secs(10))
+    if service
+        .ask(&child, Ping(99), Instant::now() + Duration::from_secs(10))
         .await?
         != Pong(100)
     {
         return Err("unexpected distributed child reply".into());
     }
-    let watch_id = child_recipient.watch().await?;
-    child_recipient.tell(StopPing).await?;
+    let watch_id = service.watch(&child).await?;
+    service.tell(&child, StopPing).await?;
     let watch_deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if service.watch_status(watch_id) == WatchStatus::Terminated {
@@ -764,6 +763,7 @@ async fn monitor(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         address,
         incarnation,
     ))?
+    .register_protocol(protocol)?
     .build()?;
     service.start().await?;
     service
@@ -774,9 +774,8 @@ async fn monitor(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             incarnation: target.node_incarnation(),
         })
         .await?;
-    let recipient = service.recipient(RecipientRef::Actor(target), protocol)?;
-    if recipient
-        .ask(Ping(1), Instant::now() + Duration::from_secs(5))
+    if service
+        .ask(&target, Ping(1), Instant::now() + Duration::from_secs(5))
         .await?
         != Pong(2)
     {
@@ -805,8 +804,12 @@ async fn monitor(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         if command.stop {
             break;
         }
-        let result = recipient
-            .ask(Ping(applied), Instant::now() + Duration::from_secs(3))
+        let result = service
+            .ask(
+                &target,
+                Ping(applied),
+                Instant::now() + Duration::from_secs(3),
+            )
             .await;
         write_atomic(
             PathBuf::from(format!("/artifacts/monitor-result-{applied}.json")),
@@ -905,11 +908,13 @@ async fn gateway(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         return Err("gateway identity must be the stable association dialer".into());
     }
     service.connect_peer(owner_identity).await?;
-    let protocol = Arc::new(FixtureProtocol::build()?);
     let entity_type = fixture.reference.entity_type().as_str().to_owned();
-    let recipient = service.recipient(RecipientRef::Entity(fixture.reference), protocol)?;
-    let reply = recipient
-        .ask(Ping(41), Instant::now() + Duration::from_secs(10))
+    let reply = service
+        .ask(
+            &fixture.reference,
+            Ping(41),
+            Instant::now() + Duration::from_secs(10),
+        )
         .await?;
     if reply != Pong(42) {
         return Err("unexpected gateway EntityRef reply".into());

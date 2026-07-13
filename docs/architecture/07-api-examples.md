@@ -32,12 +32,10 @@ pub struct PlayerProfile {
     pub position: (f32, f32),
 }
 
-impl Message for PositionUpdated {
-    type Reply = ();
-}
+impl Message for PositionUpdated {}
 
-impl Message for GetProfile {
-    type Reply = PlayerProfile;
+impl Request for GetProfile {
+    type Response = PlayerProfile;
 }
 
 #[async_trait::async_trait]
@@ -53,18 +51,20 @@ impl Handler<PositionUpdated> for PlayerActor {
 }
 
 #[async_trait::async_trait]
-impl Handler<GetProfile> for PlayerActor {
-    async fn handle(
+impl Responder<GetProfile> for PlayerActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        _msg: GetProfile,
-    ) -> Result<PlayerProfile, ActorError> {
-        Ok(self.profile.clone())
+        _request: GetProfile,
+        reply_to: ReplyTo<PlayerProfile>,
+    ) -> Result<(), ActorError> {
+        reply_to.send(self.profile.clone())?;
+        Ok(())
     }
 }
 ```
 
-Remote and local delivery enter the same `Handler<M>` implementation. There is no `Rpc<M>` business wrapper.
+Remote and local tells enter `Handler<M>`; asks enter `Responder<R>` with a typed reply capability. There is no `Rpc<M>` business wrapper.
 
 ## 2. Register the Remote Protocol
 
@@ -188,17 +188,47 @@ let child: ActorRef<SessionWorker> = ctx
     .spawn_child("session-worker", SessionWorker::new())
     .await?;
 
-// ActorRef is cloneable and serializable when its actor protocol is registered.
-parent_ref.tell(WorkerReady { worker: child.clone() }).await?;
+// ActorRef is ordinary cloneable and serializable identity data.
+ctx.tell(&parent_ref, WorkerReady { worker: child.clone() }).await?;
 
-child.tell(Flush).await?;
-let stats = child.ask(GetStats, Deadline::after(Duration::from_secs(2))).await?;
-ctx.watch(child.clone()).await?;
+ctx.tell(&child, Flush).await?;
+let stats = service
+    .ask(&child, GetStats, Deadline::after(Duration::from_secs(2)))
+    .await?;
+service.watch(&child).await?;
 ```
 
 The serialized reference contains cluster ID, node address/incarnation, hierarchical actor path, activation ID, and `ProtocolId`. Protocol fingerprints are negotiated in the Association catalogue after transport establishment. A mismatch disables that `ProtocolId` for the peer without closing unrelated protocols on the Association. A replacement at the same path is a different actor; the old reference returns `StaleActivation` or produces `Terminated`.
 
 Remote code cannot create actors by choosing a path. It can only use a reference received through a typed message, lookup explicitly authorized by an application registry, or another framework-controlled API.
+
+An actor can publish its own exact activation reference and preserve an original sender when routing a tell:
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct SubscribeToTicks {
+    publisher: ActorRef<TickPublisher>,
+}
+
+ctx.tell(
+    &subscriber,
+    SubscribeToTicks {
+        publisher: ctx.require_self_ref()?.clone(),
+    },
+).await?;
+
+// Stamps this actor as sender.
+ctx.tell(&target, Tick).await?;
+
+// Preserves ctx.sender(), as in Akka/Pekko forwarding.
+ctx.forward(&target, Tick).await?;
+
+// Deserialization needs no backend-aware binding step.
+let publisher: ActorRef<TickPublisher> = serde_json::from_slice(encoded)?;
+service.tell(&publisher, Tick).await?;
+```
+
+The actor protocol must be registered once with the service, including on client-only nodes through `register_protocol`. After that, `ActorRef`, `EntityRef`, and `SingletonRef` values can be decoded and used directly. `ctx.sender()` is available only for the current tell and is `None` for process-originated tells and asks. Ask responses use the typed `ReplyTo` passed to `Responder<R>`. Retained `ActorRef`s identify one activation; use `EntityRef` or `SingletonRef` when the logical destination must survive activation replacement.
 
 ## 5. `EntityRef`: Sharded Logical Identity
 
@@ -278,8 +308,8 @@ Association loss may first make a remote node suspect. Concrete termination is e
 ## 8. Ask Failure and Idempotency
 
 ```rust
-impl Message for ReserveItem {
-    type Reply = Result<Reservation, ReserveItemError>;
+impl Request for ReserveItem {
+    type Response = Result<Reservation, ReserveItemError>;
 }
 
 match inventory
@@ -355,10 +385,11 @@ EventBus is for broadcast/integration. A scheduled actor message still uses the 
 ```text
 ActorHandle remains process-local; ActorRef is the serializable exact-activation reference.
 ActorRef, EntityRef, and SingletonRef are distinct typed values.
+References are sent through ActorContext or LatticeService directly; there is no public BoundRecipient or bind step.
 All remote business delivery uses registered actor protocols over lattice-remoting.
 actor_protocol! is the canonical protocol source; ProtocolId and message IDs are explicit.
 Message codecs are format-neutral and fingerprints include codec/schema versions.
-Local and remote messages use the same Handler<M>.
+Local and remote tells use `Handler<M>`; local and remote asks use `Responder<R>`.
 Tell is at-most-once; ask has deadline/UnknownResult semantics.
 All DeathWatch registrations are activation-scoped; EntityRef/SingletonRef use watch_current without activating a target.
 Reliable control delivery is Association-scoped and shared by DeathWatch, Coordinator, Shard, and Singleton protocols; it never replays uncertain business messages.

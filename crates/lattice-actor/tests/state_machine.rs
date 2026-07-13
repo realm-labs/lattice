@@ -4,8 +4,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
+use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
-use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_actor::traits::{Actor, Handler, Message, Request, Responder};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchState {
@@ -33,8 +34,8 @@ struct StartMatch {
     operation_id: u64,
 }
 
-impl Message for StartMatch {
-    type Reply = StartMatchReply;
+impl Request for StartMatch {
+    type Response = StartMatchReply;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -46,51 +47,50 @@ struct StartMatchReply {
 #[derive(Debug)]
 struct LoadingFinished;
 
-impl Message for LoadingFinished {
-    type Reply = ();
-}
+impl Message for LoadingFinished {}
 
 #[derive(Debug)]
 struct WorldTick;
 
-impl Message for WorldTick {
-    type Reply = ();
-}
+impl Message for WorldTick {}
 
 #[derive(Debug)]
 struct InspectState;
 
-impl Message for InspectState {
-    type Reply = (MatchState, Vec<u64>);
+impl Request for InspectState {
+    type Response = (MatchState, Vec<u64>);
 }
 
 #[async_trait]
-impl Handler<StartMatch> for MatchActor {
-    async fn handle(
+impl Responder<StartMatch> for MatchActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        msg: StartMatch,
-    ) -> Result<StartMatchReply, ActorError> {
-        match self.state {
+        request: StartMatch,
+        reply_to: ReplyTo<StartMatchReply>,
+    ) -> Result<(), ActorError> {
+        let reply = match self.state {
             MatchState::Loading => {
-                self.pending_starts.push_back(msg);
-                Ok(StartMatchReply {
+                self.pending_starts.push_back(request);
+                StartMatchReply {
                     accepted: false,
                     queued: true,
-                })
+                }
             }
             MatchState::WaitingPlayers => {
                 self.state = MatchState::Running { tick: 0 };
-                Ok(StartMatchReply {
+                StartMatchReply {
                     accepted: true,
                     queued: false,
-                })
+                }
             }
-            MatchState::Running { .. } => Ok(StartMatchReply {
+            MatchState::Running { .. } => StartMatchReply {
                 accepted: false,
                 queued: false,
-            }),
-        }
+            },
+        };
+        let _ = reply_to.send(reply);
+        Ok(())
     }
 }
 
@@ -125,19 +125,21 @@ impl Handler<WorldTick> for MatchActor {
 }
 
 #[async_trait]
-impl Handler<InspectState> for MatchActor {
-    async fn handle(
+impl Responder<InspectState> for MatchActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        _msg: InspectState,
-    ) -> Result<(MatchState, Vec<u64>), ActorError> {
-        Ok((
+        _request: InspectState,
+        reply_to: ReplyTo<(MatchState, Vec<u64>)>,
+    ) -> Result<(), ActorError> {
+        let _ = reply_to.send((
             self.state,
             self.pending_starts
                 .iter()
                 .map(|start| start.operation_id)
-                .collect(),
-        ))
+                .collect::<Vec<_>>(),
+        ));
+        Ok(())
     }
 }
 
@@ -155,7 +157,7 @@ async fn business_actor_models_state_machine_with_typed_messages_and_timer() {
         .await
         .unwrap();
 
-    let reply = handle.call(StartMatch { operation_id: 7 }).await.unwrap();
+    let reply = handle.ask(StartMatch { operation_id: 7 }).await.unwrap();
     assert_eq!(
         reply,
         StartMatchReply {
@@ -164,13 +166,13 @@ async fn business_actor_models_state_machine_with_typed_messages_and_timer() {
         }
     );
     assert_eq!(
-        handle.call(InspectState).await.unwrap(),
+        handle.ask(InspectState).await.unwrap(),
         (MatchState::Loading, vec![7])
     );
 
     let (state, pending) = tokio::time::timeout(Duration::from_millis(250), async {
         loop {
-            let snapshot = handle.call(InspectState).await.unwrap();
+            let snapshot = handle.ask(InspectState).await.unwrap();
             if matches!(snapshot.0, MatchState::Running { tick } if tick >= 1) {
                 return snapshot;
             }

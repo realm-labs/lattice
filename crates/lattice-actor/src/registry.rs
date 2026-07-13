@@ -1,6 +1,6 @@
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,6 +17,7 @@ use tokio::sync::{Semaphore, watch};
 use crate::error::{ActorActivationError, ActorError};
 use crate::handle::ActorHandle;
 use crate::mailbox::MailboxConfig;
+use crate::recipient::ActorSystem;
 use crate::runtime::{PassivationPolicy, ShardMigrationPolicy, spawn_actor_with_self_ref};
 use crate::traits::{Actor, ActorLifecycleState, PassivationReason, StopReason};
 
@@ -57,6 +58,7 @@ pub struct ActorRegistry<A: Actor> {
     kind: ActorKind,
     config: ActorRegistryConfig,
     entries: Arc<DashMap<ActorId, RegistryEntry<A>>>,
+    actor_system: Arc<OnceLock<ActorSystem>>,
 }
 
 impl<A: Actor> fmt::Debug for ActorRegistry<A> {
@@ -99,7 +101,13 @@ impl<A: Actor> ActorRegistry<A> {
             kind,
             config,
             entries: Arc::new(DashMap::new()),
+            actor_system: Arc::new(OnceLock::new()),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn install_actor_system(&self, actor_system: ActorSystem) -> Result<(), ActorSystem> {
+        self.actor_system.set(actor_system)
     }
 
     pub fn kind(&self) -> &ActorKind {
@@ -402,6 +410,7 @@ impl<A: Actor> ActorRegistry<A> {
             self.config.mailbox,
             self.config.passivation,
             self_ref,
+            Some(self.actor_system.clone()),
             self.config.service.clone(),
         );
         if let Some(directory) = self

@@ -69,6 +69,7 @@ struct RecordingDispatch {
 impl InboundDispatch for RecordingDispatch {
     async fn tell(
         &self,
+        _sender: Option<ActorRef<()>>,
         target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -129,6 +130,7 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
                 target: Some(target_to_wire(&exact)),
                 message_id: 1,
                 payload: b"tell".to_vec(),
+                sender_actor: None,
             },
         ))
         .await
@@ -162,6 +164,51 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
         .unwrap();
     server.await.unwrap();
     assert_eq!(dispatch.tells.load(AtomicOrdering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn outbound_tell_preserves_an_exact_actor_sender() {
+    let protocol_id = ProtocolId::new(7).unwrap();
+    let fingerprint = ProtocolFingerprint::digest(b"test/v1");
+    let association = active_association(protocol_id, fingerprint);
+    let mut receivers = association.take_receivers().unwrap();
+    let messaging = OutboundMessaging::new(4).unwrap();
+    let recipient = target(protocol_id);
+    let sender: ActorRef<()> = ActorRef::new(
+        ClusterId::new("test").unwrap(),
+        NodeAddress::new("sender", 25521).unwrap(),
+        NodeIncarnation::new(3).unwrap(),
+        ActorPath::user(["user", "sender"]).unwrap(),
+        ActivationId::new(NodeIncarnation::new(3).unwrap(), 9).unwrap(),
+        protocol_id,
+    )
+    .unwrap();
+    let sender_identity = SenderIdentity::from(&sender);
+    let stripe = crate::association::stable_stripe(
+        &sender_identity.stable_bytes(),
+        &ExactActorTarget::from(&recipient).stable_bytes(),
+        receivers.bulk.len(),
+    );
+
+    messaging
+        .tell(
+            &association,
+            &sender_identity,
+            &recipient,
+            fingerprint,
+            1,
+            Bytes::from_static(b"tell"),
+        )
+        .unwrap();
+
+    let frame = receivers.bulk[stripe].recv().await.unwrap();
+    let decoded = decode_tell(&frame).unwrap();
+    assert!(
+        decoded
+            .sender
+            .as_ref()
+            .is_some_and(|actual| actual.same_activation(&sender))
+    );
 }
 
 #[tokio::test]

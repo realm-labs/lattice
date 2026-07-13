@@ -1,7 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use lattice_core::actor_ref::{
-    ClusterId, ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation,
+    ActorRef, ClusterId, ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation,
 };
 use lattice_remoting::config::RemotingConfig;
 use lattice_remoting::endpoint::RemotingEndpoint;
@@ -79,6 +79,7 @@ struct NoActors;
 impl InboundDispatch for NoActors {
     async fn tell(
         &self,
+        _sender: Option<ActorRef<()>>,
         _target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,

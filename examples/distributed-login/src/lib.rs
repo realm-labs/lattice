@@ -11,9 +11,10 @@ use lattice_actor::error::ActorError;
 use lattice_actor::protocol::ProstCodec;
 use lattice_actor::protocol::WireSchema;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
-use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_actor::reply::ReplyTo;
+use lattice_actor::traits::{Actor, Request, Responder};
 use lattice_core::actor_kind;
-use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId, RecipientRef};
+use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
 use lattice_core::id::ActorId;
 use lattice_remoting::config::RemotingConfig;
 use lattice_service::builder::LatticeService;
@@ -34,10 +35,10 @@ use game::{InitSessionReply, InitSessionRequest, LoginAcceptedReply, LoginReques
 pub const WORLD_PROTOCOL_ID: u64 = 0x6761_6d65_0000_0001;
 pub const PLAYER_PROTOCOL_ID: u64 = 0x6761_6d65_0000_0002;
 
-macro_rules! message_schema {
+macro_rules! request_schema {
     ($message:ty, $reply:ty, $message_id:expr, $reply_id:expr) => {
-        impl Message for $message {
-            type Reply = $reply;
+        impl Request for $message {
+            type Response = $reply;
         }
         impl WireSchema for $message {
             const SCHEMA_ID: u64 = $message_id;
@@ -50,13 +51,13 @@ macro_rules! message_schema {
     };
 }
 
-message_schema!(
+request_schema!(
     LoginRequest,
     LoginAcceptedReply,
     0x6761_6d65_0000_0101,
     0x6761_6d65_0000_0102
 );
-message_schema!(
+request_schema!(
     InitSessionRequest,
     InitSessionReply,
     0x6761_6d65_0000_0201,
@@ -75,20 +76,22 @@ impl Actor for WorldActor {
 }
 
 #[async_trait]
-impl Handler<LoginRequest> for WorldActor {
-    async fn handle(
+impl Responder<LoginRequest> for WorldActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
         request: LoginRequest,
-    ) -> Result<LoginAcceptedReply, ActorError> {
+        reply_to: ReplyTo<LoginAcceptedReply>,
+    ) -> Result<(), ActorError> {
         let accepted = request.world_id == self.world_id && !request.token.is_empty();
         if accepted {
             self.sessions += 1;
         }
-        Ok(LoginAcceptedReply {
+        let _ = reply_to.send(LoginAcceptedReply {
             accepted,
             message: if accepted { "accepted" } else { "rejected" }.to_owned(),
-        })
+        });
+        Ok(())
     }
 }
 
@@ -104,21 +107,23 @@ impl Actor for PlayerActor {
 }
 
 #[async_trait]
-impl Handler<InitSessionRequest> for PlayerActor {
-    async fn handle(
+impl Responder<InitSessionRequest> for PlayerActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
         request: InitSessionRequest,
-    ) -> Result<InitSessionReply, ActorError> {
+        reply_to: ReplyTo<InitSessionReply>,
+    ) -> Result<(), ActorError> {
         let ok = request.player_id == self.player_id && !request.session_id.is_empty();
         if ok {
             self.sessions += 1;
         }
-        Ok(InitSessionReply {
+        let _ = reply_to.send(InitSessionReply {
             ok,
             player_id: self.player_id,
             message: if ok { "initialized" } else { "rejected" }.to_owned(),
-        })
+        });
+        Ok(())
     }
 }
 
@@ -170,7 +175,7 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn std::error::Error>
             },
         )
         .await?;
-    let actor_ref = handle
+    let actor_ref: ActorRef<WorldActor> = handle
         .actor_ref()
         .ok_or_else(|| std::io::Error::other("missing exact World ActorRef"))?
         .cast();
@@ -186,11 +191,11 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn std::error::Error>
         maximum_supervised_tasks: 1024,
         shutdown_timeout: Duration::from_secs(5),
     })?
-    .register_actor(registry, protocol.clone())?
+    .register_actor(registry, protocol)?
     .build()?;
-    let recipient = service.recipient(RecipientRef::Actor(actor_ref), protocol)?;
-    let reply = recipient
+    let reply = service
         .ask(
+            &actor_ref,
             LoginRequest {
                 world_id: 7,
                 player_id: 42,

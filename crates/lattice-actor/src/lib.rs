@@ -9,6 +9,7 @@ pub mod mailbox;
 pub mod protocol;
 pub mod recipient;
 pub mod registry;
+pub mod reply;
 pub mod runtime;
 pub mod traits;
 pub mod watch;

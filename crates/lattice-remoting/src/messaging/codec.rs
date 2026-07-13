@@ -5,9 +5,9 @@ use super::target::{
     LogicalSingletonTarget, RemoteFailure,
 };
 use super::{
-    ActivationId, ActorPath, Bytes, ClusterId, ConfigFingerprint, Duration, EntityId, EntityRef,
-    EntityType, Frame, FrameKind, Message, NodeAddress, NodeIncarnation, ProtocolId, SingletonKind,
-    SingletonRef,
+    ActivationId, ActorPath, ActorRef, Bytes, ClusterId, ConfigFingerprint, Duration, EntityId,
+    EntityRef, EntityType, Frame, FrameKind, Message, NodeAddress, NodeIncarnation, ProtocolId,
+    SingletonKind, SingletonRef,
 };
 
 pub fn ask_correlation(frame: &Frame) -> Option<CorrelationId> {
@@ -61,6 +61,7 @@ pub fn decode_tell(frame: &Frame) -> Result<InboundTell, RemoteMessageError> {
         return Err(RemoteMessageError::InvalidPayload);
     }
     Ok(InboundTell {
+        sender: decode_sender(wire.sender_actor)?,
         target: target_from_wire(wire.target.ok_or(RemoteMessageError::InvalidPayload)?)?,
         message_id: wire.message_id,
         payload: Bytes::from(wire.payload),
@@ -99,6 +100,7 @@ pub fn decode_entity_tell(frame: &Frame) -> Result<InboundEntityTell, RemoteMess
         return Err(RemoteMessageError::InvalidPayload);
     }
     Ok(InboundEntityTell {
+        sender: decode_sender(wire.sender_actor)?,
         target: entity_target_from_wire(wire.target.ok_or(RemoteMessageError::InvalidPayload)?)?,
         message_id: wire.message_id,
         payload: Bytes::from(wire.payload),
@@ -136,6 +138,7 @@ pub fn decode_singleton_tell(frame: &Frame) -> Result<InboundSingletonTell, Remo
         return Err(RemoteMessageError::InvalidPayload);
     }
     Ok(InboundSingletonTell {
+        sender: decode_sender(wire.sender_actor)?,
         target: singleton_target_from_wire(wire.target.ok_or(RemoteMessageError::InvalidPayload)?)?,
         message_id: wire.message_id,
         payload: Bytes::from(wire.payload),
@@ -246,6 +249,8 @@ pub(super) struct TellWire {
     pub(super) message_id: u64,
     #[prost(bytes = "vec", tag = "4")]
     pub(super) payload: Vec<u8>,
+    #[prost(message, optional, tag = "5")]
+    pub(super) sender_actor: Option<ExactActorTargetWire>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -296,6 +301,8 @@ pub(super) struct EntityTellWire {
     pub(super) message_id: u64,
     #[prost(bytes = "vec", tag = "4")]
     pub(super) payload: Vec<u8>,
+    #[prost(message, optional, tag = "5")]
+    pub(super) sender_actor: Option<ExactActorTargetWire>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -344,6 +351,8 @@ pub(super) struct SingletonTellWire {
     pub(super) message_id: u64,
     #[prost(bytes = "vec", tag = "4")]
     pub(super) payload: Vec<u8>,
+    #[prost(message, optional, tag = "5")]
+    pub(super) sender_actor: Option<ExactActorTargetWire>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -416,6 +425,20 @@ pub(super) fn target_from_wire(
         protocol_id: ProtocolId::new(wire.protocol_id)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
     })
+}
+
+fn decode_sender(
+    sender: Option<ExactActorTargetWire>,
+) -> Result<Option<ActorRef<()>>, RemoteMessageError> {
+    sender
+        .map(target_from_wire)
+        .transpose()?
+        .map(|target| {
+            target
+                .actor_ref()
+                .map_err(|_| RemoteMessageError::InvalidPayload)
+        })
+        .transpose()
 }
 
 pub(super) fn entity_target_to_wire(target: &LogicalEntityTarget) -> EntityTargetWire {

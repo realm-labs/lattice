@@ -4,12 +4,15 @@ use super::codec::{
 use super::error::{AskError, InboundConnectionError, RemoteFailureCode, RemoteMessageError};
 use super::outbound::OutboundMessaging;
 use super::target::{ExactActorTarget, LogicalEntityTarget, LogicalSingletonTarget, RemoteFailure};
-use super::{Arc, Bytes, Frame, FrameKind, FramedConnection, Instant, RemotingIo, async_trait};
+use super::{
+    ActorRef, Arc, Bytes, Frame, FrameKind, FramedConnection, Instant, RemotingIo, async_trait,
+};
 
 #[async_trait]
 pub trait InboundDispatch: Send + Sync + 'static {
     async fn tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
@@ -25,6 +28,7 @@ pub trait InboundDispatch: Send + Sync + 'static {
 
     async fn tell_entity(
         &self,
+        _sender: Option<ActorRef<()>>,
         _target: LogicalEntityTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -44,6 +48,7 @@ pub trait InboundDispatch: Send + Sync + 'static {
 
     async fn tell_singleton(
         &self,
+        _sender: Option<ActorRef<()>>,
         _target: LogicalSingletonTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -77,7 +82,7 @@ where
             FrameKind::Tell => {
                 let tell = decode_tell(&frame)?;
                 let _ = dispatch
-                    .tell(tell.target, tell.message_id, tell.payload)
+                    .tell(tell.sender, tell.target, tell.message_id, tell.payload)
                     .await;
             }
             FrameKind::Ask => {

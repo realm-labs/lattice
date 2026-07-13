@@ -25,6 +25,7 @@ trait ErasedActorHost: Send + Sync {
 
     async fn tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
@@ -89,14 +90,28 @@ impl<A: Actor> ErasedActorHost for ActorHost<A> {
 
     async fn tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
+        if sender
+            .as_ref()
+            .is_some_and(|sender| sender.cluster_id() != &target.cluster_id)
+        {
+            return Err(RemoteMessageError::Unauthorized);
+        }
         let handle = self.resolve(&target)?;
         match self
             .protocol
-            .dispatch(handle, message_id, DispatchMode::Tell, payload, None)
+            .dispatch_with_sender(
+                handle,
+                message_id,
+                DispatchMode::Tell,
+                payload,
+                None,
+                sender,
+            )
             .await
             .map_err(map_dispatch)?
         {
@@ -181,6 +196,7 @@ impl ProtocolHostRegistry {
 impl InboundDispatch for ProtocolHostRegistry {
     async fn tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
@@ -188,7 +204,7 @@ impl InboundDispatch for ProtocolHostRegistry {
         self.hosts
             .get(&target.protocol_id.get())
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
-            .tell(target, message_id, payload)
+            .tell(sender, target, message_id, payload)
             .await
     }
 

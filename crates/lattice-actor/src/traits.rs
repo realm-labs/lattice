@@ -4,11 +4,16 @@ use std::error::Error as StdError;
 use crate::context::ActorContext;
 use crate::error::ActorStopError;
 use crate::mailbox::MailboxConfig;
+use crate::reply::ReplyTo;
 use lattice_core::actor_ref::{EntityId, ProtocolId};
 use thiserror::Error;
 
-pub trait Message: Send + 'static {
-    type Reply: Send + 'static;
+/// A one-way message handled without a reply channel.
+pub trait Message: Send + 'static {}
+
+/// A request whose caller waits for a typed response.
+pub trait Request: Send + 'static {
+    type Response: Send + 'static;
 }
 
 pub trait EntityKey: Clone + Send + Sync + 'static {
@@ -27,8 +32,8 @@ pub struct EntityKeyDecodeError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HandlerErrorAction<Reply, Error> {
-    Reply(Reply),
+pub enum ResponderErrorAction<Response, Error> {
+    Respond(Response),
     Propagate(Error),
 }
 
@@ -50,7 +55,7 @@ pub trait Actor: Sized + Send + 'static {
 
     async fn on_error<M>(&mut self, _ctx: &mut ActorContext<Self>, _error: &Self::Error)
     where
-        M: Message,
+        M: Send + 'static,
     {
     }
 }
@@ -60,18 +65,27 @@ pub trait Handler<M>: Actor
 where
     M: Message,
 {
-    async fn handle(
+    async fn handle(&mut self, ctx: &mut ActorContext<Self>, msg: M) -> Result<(), Self::Error>;
+}
+
+#[async_trait]
+pub trait Responder<R>: Actor
+where
+    R: Request,
+{
+    async fn respond(
         &mut self,
         ctx: &mut ActorContext<Self>,
-        msg: M,
-    ) -> Result<M::Reply, Self::Error>;
+        request: R,
+        reply_to: ReplyTo<R::Response>,
+    ) -> Result<(), Self::Error>;
 
-    async fn handle_error(
+    async fn respond_error(
         &mut self,
         _ctx: &mut ActorContext<Self>,
         error: Self::Error,
-    ) -> HandlerErrorAction<M::Reply, Self::Error> {
-        HandlerErrorAction::Propagate(error)
+    ) -> ResponderErrorAction<R::Response, Self::Error> {
+        ResponderErrorAction::Propagate(error)
     }
 }
 

@@ -68,7 +68,7 @@ pub trait ShardedActor: Actor {
 
 ```text
 Actors are single-threaded state owners.
-Business logic is typed through Handler<M>.
+One-way messages use `Handler<M>`; request/reply messages use `Responder<R>`.
 The runtime uses type-erased envelopes internally.
 The public API does not expose a giant enum.
 System messages have priority over normal messages.
@@ -167,7 +167,7 @@ ServiceContext creates service-scoped tasks through the service runtime.
 CPU-heavy or blocking work must not run directly on Tokio worker threads; use a blocking pool, dedicated worker, or external compute service.
 ActorRegistry stores actor ownership independently from the concrete execution policy.
 Mailbox semantics are identical across execution policies.
-Changing execution policy must not change Handler<M> business code.
+Changing execution policy must not change `Handler<M>` business code.
 Sharded entities should pass a stable scheduler_key derived from EntityId when using KeyedWorkerPool.
 ```
 
@@ -177,7 +177,7 @@ Forbidden implementation shortcuts:
 Do not expose tokio::spawn as the actor spawn API.
 Do not make ActorHandle depend on Tokio JoinHandle.
 Do not let each actor kind invent its own scheduling path.
-Do not encode execution policy into business Handler<M> bounds.
+Do not encode execution policy into business `Handler<M>` bounds.
 Do not add KeyedWorkerPool/DedicatedThreadPool behavior before TaskPerActor semantics are tested.
 ```
 
@@ -206,8 +206,23 @@ pub trait WireSchema: Send + 'static {
     const SCHEMA_VERSION: u32;
 }
 
-pub trait Message: Send + 'static {
-    type Reply: Send + 'static;
+pub trait Message: Send + 'static {}
+
+pub trait Request: Send + 'static {
+    type Response: Send + 'static;
+}
+
+#[async_trait::async_trait]
+pub trait Responder<R>: Actor
+where
+    R: Request,
+{
+    async fn respond(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        request: R,
+        reply_to: ReplyTo<R::Response>,
+    ) -> Result<(), ActorError>;
 }
 
 #[async_trait::async_trait]
@@ -219,7 +234,7 @@ where
         &mut self,
         ctx: &mut ActorContext<Self>,
         msg: M,
-    ) -> Result<M::Reply, ActorError>;
+    ) -> Result<(), ActorError>;
 }
 ```
 
@@ -227,34 +242,97 @@ where
 
 ### 7.4 Message Envelope Context
 
-Business handlers receive their declared message type directly. Trace, auth, deadline, sender, correlation, and transport metadata live in the runtime envelope and are available through `ActorContext`; they are not added to every business message.
+Business handlers receive their declared message type directly. A tell sent by an actor exposes that exact activation through `ActorContext`; process-originated tells have no actor sender.
 
 ```rust
-let trace = ctx.message_context().trace_context();
-let auth = ctx.message_context().auth_context();
-let deadline = ctx.message_context().deadline();
-let sender = ctx.message_context().sender();
+let sender: Option<&ActorRef<()>> = ctx.sender();
 ```
 
-Local and remote messages use the same envelope and handler path. Remoting performs codec dispatch before mailbox admission.
+The sender is message-scoped and read-only; the runtime replaces it before each tell and clears it after the turn. Clone the `ActorRef` only when the actor intentionally needs to retain the exact sending activation.
 
-### 7.5 Handler Example
+`ctx.tell(&actor_ref, message).await` stamps `ctx.self_ref()` as the sender. `ctx.forward(&actor_ref, message).await` preserves the current envelope sender instead, including `None`. Both methods also accept `EntityRef` and `SingletonRef` directly; there is no public binding or bound-recipient type. Local-only `ActorHandle` delivery uses `tell_local` and `forward_local`. Local and remote tells use the same envelope and handler path, and remoting carries an optional exact `ActorRef` after codec dispatch.
+
+Passing `ctx.self_ref().cloned()` in a serializable business message lets another actor retain the reference and send later. `ActorRef<T>` deserializes as ordinary identity data; the receiving context resolves its registered `ProtocolId` when sending, so no bind step is required. Because an `ActorRef` identifies one activation, it becomes stale after stop, restart, passivation, or relocation. Long-lived routing to a sharded or singleton identity should retain an `EntityRef` or `SingletonRef` instead.
+
+An ask does not install a dynamically typed sender in the context. `Responder<R>` receives a typed, single-use `ReplyTo<R::Response>` by value. It may answer immediately or move the token into a continuation message. This keeps reply ownership explicit and prevents tell handlers from accidentally acquiring reply semantics.
+
+### 7.5 Handler Examples
 
 ```rust
 #[async_trait::async_trait]
-impl Handler<EnterWorld> for WorldActor {
-    async fn handle(
+impl Responder<EnterWorld> for WorldActor {
+    async fn respond(
         &mut self,
         ctx: &mut ActorContext<Self>,
-        msg: EnterWorld,
-    ) -> Result<EnterWorldReply, ActorError> {
-        let player_id = msg.player_id;
+        request: EnterWorld,
+        reply_to: ReplyTo<EnterWorldReply>,
+    ) -> Result<(), ActorError> {
+        let player_id = request.player_id;
         self.players.insert(player_id, PlayerRuntimeState::default());
         ctx.notify_after(Duration::from_secs(1), WorldTick);
-        Ok(EnterWorldReply { ok: true })
+        reply_to.send(EnterWorldReply { ok: true })?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<WorldTick> for WorldActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _message: WorldTick,
+    ) -> Result<(), ActorError> {
+        self.advance_simulation();
+        Ok(())
     }
 }
 ```
+
+For asynchronous I/O, the responder launches bounded work and maps its output to a one-way continuation. The continuation is a later actor turn, so it can combine the query result with current actor state before replying:
+
+```rust
+struct ProfileLoaded {
+    result: Result<DbProfile, DbError>,
+    reply_to: ReplyTo<GetPlayerViewResponse>,
+}
+
+impl Message for ProfileLoaded {}
+
+#[async_trait::async_trait]
+impl Responder<GetPlayerView> for WorldActor {
+    async fn respond(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        request: GetPlayerView,
+        reply_to: ReplyTo<GetPlayerViewResponse>,
+    ) -> Result<(), ActorError> {
+        let db = self.db.clone();
+        ctx.pipe_to_self(
+            reply_to,
+            async move { db.load_profile(request.player_id).await },
+            |result, reply_to| ProfileLoaded { result, reply_to },
+        )?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<ProfileLoaded> for WorldActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        loaded: ProfileLoaded,
+    ) -> Result<(), ActorError> {
+        match loaded.result {
+            Ok(profile) => loaded.reply_to.send(self.build_view(profile))?,
+            Err(error) => loaded.reply_to.fail(error)?,
+        }
+        Ok(())
+    }
+}
+```
+
+`pipe_to_self` is bounded by the mailbox's deferred capacity, observes the ask deadline, and is cancelled when the actor stops or passivates. Other messages may interleave before the continuation, which is precisely why it observes current rather than captured actor state.
 
 ### 7.6 Mailbox
 
@@ -270,7 +348,7 @@ normal mailbox:
 
 System messages are prioritized so shutdown, fencing, passivation, and supervision are not starved by gameplay traffic.
 
-Mailbox capacity is explicit. When full, the caller receives a clear backpressure error or timeout. The framework does not expose an unbounded business-visible stash.
+Mailbox and deferred-operation capacities are explicit. When either is full, the caller receives a clear backpressure error or timeout. The framework does not expose an unbounded business-visible stash.
 
 ### 7.7 ActorHandle
 
@@ -284,15 +362,15 @@ pub struct ActorHandle<A: Actor> {
 }
 
 impl<A: Actor> ActorHandle<A> {
-    pub async fn ask<M>(&self, msg: M) -> Result<M::Reply, ActorAskError>
+    pub async fn ask<R>(&self, request: R) -> Result<R::Response, ActorCallError>
     where
-        A: Handler<M>,
-        M: Message;
+        A: Responder<R>,
+        R: Request;
 
     pub async fn tell<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
-        M: Message<Reply = ()>;
+        M: Message;
 }
 ```
 
@@ -310,7 +388,8 @@ Actor handlers should not block realtime actor execution with unbounded slow I/O
 
 ```text
 Small bounded I/O in handler when latency is acceptable.
-ActorContext scoped task for cancellable background work.
+ActorContext `pipe_to_self` for bounded request work that must return to actor state.
+ActorContext scoped task for cancellable background work that has no caller reply.
 Dedicated service-level worker for heavy or shared I/O.
 Business pending state plus retry/compensation for cross-service workflows.
 ```

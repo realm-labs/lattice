@@ -71,6 +71,9 @@ impl OutboundMessaging {
             target: Some(target_to_wire(&target)),
             message_id,
             payload: payload.to_vec(),
+            sender_actor: sender
+                .actor_ref()
+                .map(|reference| target_to_wire(&ExactActorTarget::from(reference))),
         };
         association
             .try_admit_bulk(
@@ -115,6 +118,9 @@ impl OutboundMessaging {
                         target: Some(entity_target_to_wire(&target)),
                         message_id,
                         payload: payload.to_vec(),
+                        sender_actor: sender
+                            .actor_ref()
+                            .map(|reference| target_to_wire(&ExactActorTarget::from(reference))),
                     },
                 ),
             )
@@ -155,6 +161,9 @@ impl OutboundMessaging {
                         target: Some(singleton_target_to_wire(&target)),
                         message_id,
                         payload: payload.to_vec(),
+                        sender_actor: sender
+                            .actor_ref()
+                            .map(|reference| target_to_wire(&ExactActorTarget::from(reference))),
                     },
                 ),
             )

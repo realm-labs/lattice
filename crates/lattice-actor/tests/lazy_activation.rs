@@ -9,7 +9,8 @@ use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::registry::{
     ActorCreateContext, ActorLoader, ActorRegistry, ActorRegistryConfig,
 };
-use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_actor::reply::ReplyTo;
+use lattice_actor::traits::{Actor, Request, Responder};
 use lattice_core::actor_kind;
 use lattice_core::id::ActorId;
 use tokio::sync::Semaphore;
@@ -17,8 +18,8 @@ use tokio::sync::Semaphore;
 #[derive(Debug)]
 struct Ping;
 
-impl Message for Ping {
-    type Reply = &'static str;
+impl Request for Ping {
+    type Response = &'static str;
 }
 
 struct LazyActor;
@@ -29,13 +30,15 @@ impl Actor for LazyActor {
 }
 
 #[async_trait]
-impl Handler<Ping> for LazyActor {
-    async fn handle(
+impl Responder<Ping> for LazyActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        _msg: Ping,
-    ) -> Result<&'static str, ActorError> {
-        Ok("pong")
+        _request: Ping,
+        reply_to: ReplyTo<&'static str>,
+    ) -> Result<(), ActorError> {
+        let _ = reply_to.send("pong");
+        Ok(())
     }
 }
 
@@ -92,10 +95,10 @@ async fn concurrent_lazy_activation_starts_one_local_actor() {
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     release.add_permits(1);
     let first = tasks.pop().unwrap().await.unwrap().unwrap();
-    assert_eq!(first.call(Ping).await.unwrap(), "pong");
+    assert_eq!(first.ask(Ping).await.unwrap(), "pong");
     for task in tasks {
         let handle = task.await.unwrap().unwrap();
-        assert_eq!(handle.call(Ping).await.unwrap(), "pong");
+        assert_eq!(handle.ask(Ping).await.unwrap(), "pong");
     }
 
     assert_eq!(loads.load(Ordering::SeqCst), 1);
@@ -119,6 +122,6 @@ async fn loader_failure_is_explicit_and_allows_retry() {
         first,
         Err(ActorActivationError::ActivationFailed(_))
     ));
-    assert_eq!(second.call(Ping).await.unwrap(), "pong");
+    assert_eq!(second.ask(Ping).await.unwrap(), "pong");
     assert_eq!(loads.load(Ordering::SeqCst), 2);
 }

@@ -573,6 +573,7 @@ impl<A> SingletonRef<A> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(bound = "")]
+#[doc(hidden)]
 pub enum RecipientRef<A = ()> {
     Actor(ActorRef<A>),
     Entity(EntityRef<A>),
@@ -586,6 +587,42 @@ impl<A> RecipientRef<A> {
             Self::Entity(reference) => RecipientRef::Entity(reference.erase()),
             Self::Singleton(reference) => RecipientRef::Singleton(reference.erase()),
         }
+    }
+}
+
+impl<A> From<ActorRef<A>> for RecipientRef<A> {
+    fn from(reference: ActorRef<A>) -> Self {
+        Self::Actor(reference)
+    }
+}
+
+impl<A> From<&ActorRef<A>> for RecipientRef<A> {
+    fn from(reference: &ActorRef<A>) -> Self {
+        Self::Actor(reference.cast())
+    }
+}
+
+impl<A> From<EntityRef<A>> for RecipientRef<A> {
+    fn from(reference: EntityRef<A>) -> Self {
+        Self::Entity(reference)
+    }
+}
+
+impl<A> From<&EntityRef<A>> for RecipientRef<A> {
+    fn from(reference: &EntityRef<A>) -> Self {
+        Self::Entity(reference.cast())
+    }
+}
+
+impl<A> From<SingletonRef<A>> for RecipientRef<A> {
+    fn from(reference: SingletonRef<A>) -> Self {
+        Self::Singleton(reference)
+    }
+}
+
+impl<A> From<&SingletonRef<A>> for RecipientRef<A> {
+    fn from(reference: &SingletonRef<A>) -> Self {
+        Self::Singleton(reference.cast())
     }
 }
 

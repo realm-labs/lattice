@@ -138,6 +138,7 @@ impl ClusterLogicalRouter {
 impl LogicalRouter for ClusterLogicalRouter {
     async fn tell_entity(
         &self,
+        sender: Option<ActorRef<()>>,
         target: EntityRef<()>,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -146,7 +147,7 @@ impl LogicalRouter for ClusterLogicalRouter {
         self.entities
             .get(target.entity_type())
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
-            .tell(target, fingerprint, message_id, payload)
+            .tell(sender, target, fingerprint, message_id, payload)
             .await
     }
 
@@ -167,6 +168,7 @@ impl LogicalRouter for ClusterLogicalRouter {
 
     async fn tell_singleton(
         &self,
+        sender: Option<ActorRef<()>>,
         target: SingletonRef<()>,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
@@ -175,7 +177,7 @@ impl LogicalRouter for ClusterLogicalRouter {
         self.singletons
             .get(target.singleton_kind())
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
-            .tell(target, fingerprint, message_id, payload)
+            .tell(sender, target, fingerprint, message_id, payload)
             .await
     }
 
@@ -244,6 +246,7 @@ impl LogicalRouter for ClusterLogicalRouter {
 
     async fn receive_entity_tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: LogicalEntityTarget,
         message_id: u64,
         payload: Bytes,
@@ -251,7 +254,7 @@ impl LogicalRouter for ClusterLogicalRouter {
         self.entities
             .get(target.reference.entity_type())
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
-            .receive_tell(target, message_id, payload)
+            .receive_tell(sender, target, message_id, payload)
             .await
     }
 
@@ -276,6 +279,7 @@ impl LogicalRouter for ClusterLogicalRouter {
 
     async fn receive_singleton_tell(
         &self,
+        sender: Option<ActorRef<()>>,
         target: LogicalSingletonTarget,
         message_id: u64,
         payload: Bytes,
@@ -283,7 +287,7 @@ impl LogicalRouter for ClusterLogicalRouter {
         self.singletons
             .get(target.reference.singleton_kind())
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
-            .receive_tell(target, message_id, payload)
+            .receive_tell(sender, target, message_id, payload)
             .await
     }
 

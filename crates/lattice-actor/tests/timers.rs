@@ -4,8 +4,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorError, ActorStopError};
+use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
-use lattice_actor::traits::{Actor, Handler, Message, StopReason};
+use lattice_actor::traits::{Actor, Handler, Message, Request, Responder, StopReason};
 use tokio::sync::{Mutex, Semaphore};
 
 struct WorldActor {
@@ -38,15 +39,13 @@ struct WorldTick {
     delta_ms: u64,
 }
 
-impl Message for WorldTick {
-    type Reply = ();
-}
+impl Message for WorldTick {}
 
 #[derive(Debug)]
 struct InspectTicks;
 
-impl Message for InspectTicks {
-    type Reply = u64;
+impl Request for InspectTicks {
+    type Response = u64;
 }
 
 #[async_trait]
@@ -67,13 +66,15 @@ impl Handler<WorldTick> for WorldActor {
 }
 
 #[async_trait]
-impl Handler<InspectTicks> for WorldActor {
-    async fn handle(
+impl Responder<InspectTicks> for WorldActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        _msg: InspectTicks,
-    ) -> Result<u64, ActorError> {
-        Ok(*self.ticks.lock().await)
+        _request: InspectTicks,
+        reply_to: ReplyTo<u64>,
+    ) -> Result<(), ActorError> {
+        let _ = reply_to.send(*self.ticks.lock().await);
+        Ok(())
     }
 }
 

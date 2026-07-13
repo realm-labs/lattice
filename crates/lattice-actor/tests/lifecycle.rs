@@ -6,10 +6,11 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorCallError, ActorError, ActorStopError};
 use lattice_actor::handle::ActorHandle;
 use lattice_actor::mailbox::MailboxConfig;
+use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions, PassivationPolicy, spawn_actor};
 use lattice_actor::traits::{
     Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
-    Message, PassivationReason, StopReason,
+    Message, PassivationReason, Request, Responder, StopReason,
 };
 use lattice_actor::watch::{ActorTerminated, TerminatedReason};
 use lattice_core::service_context::ServiceContext;
@@ -239,9 +240,7 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
     #[derive(Debug)]
     struct StopChild;
 
-    impl Message for StopChild {
-        type Reply = ();
-    }
+    impl Message for StopChild {}
 
     struct ParentActor {
         child: Option<ActorHandle<ChildActor>>,
@@ -322,9 +321,7 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
     #[derive(Debug)]
     struct StopChild;
 
-    impl Message for StopChild {
-        type Reply = ();
-    }
+    impl Message for StopChild {}
 
     struct ParentActor {
         child: Option<ActorHandle<ChildActor>>,
@@ -392,15 +389,15 @@ async fn handler_error_returns_to_caller_and_actor_remains_running() {
     #[derive(Debug)]
     struct Ping(&'static str);
 
-    impl Message for Ping {
-        type Reply = String;
+    impl Request for Ping {
+        type Response = String;
     }
 
     #[derive(Debug)]
     struct Fail;
 
-    impl Message for Fail {
-        type Reply = ();
+    impl Request for Fail {
+        type Response = ();
     }
 
     struct TestActor;
@@ -411,22 +408,25 @@ async fn handler_error_returns_to_caller_and_actor_remains_running() {
     }
 
     #[async_trait]
-    impl Handler<Ping> for TestActor {
-        async fn handle(
+    impl Responder<Ping> for TestActor {
+        async fn respond(
             &mut self,
             _ctx: &mut ActorContext<Self>,
-            msg: Ping,
-        ) -> Result<String, ActorError> {
-            Ok(format!("pong:{}", msg.0))
+            request: Ping,
+            reply_to: ReplyTo<String>,
+        ) -> Result<(), ActorError> {
+            let _ = reply_to.send(format!("pong:{}", request.0));
+            Ok(())
         }
     }
 
     #[async_trait]
-    impl Handler<Fail> for TestActor {
-        async fn handle(
+    impl Responder<Fail> for TestActor {
+        async fn respond(
             &mut self,
             _ctx: &mut ActorContext<Self>,
-            _msg: Fail,
+            _request: Fail,
+            _reply_to: ReplyTo<()>,
         ) -> Result<(), ActorError> {
             Err(ActorError::new("handler failed"))
         }
@@ -434,8 +434,8 @@ async fn handler_error_returns_to_caller_and_actor_remains_running() {
 
     let handle = spawn_actor(TestActor, MailboxConfig::bounded(8));
 
-    let error = handle.call(Fail).await;
-    let reply = handle.call(Ping("after-error")).await.unwrap();
+    let error = handle.ask(Fail).await;
+    let reply = handle.ask(Ping("after-error")).await.unwrap();
 
     assert!(matches!(error, Err(ActorCallError::Handler(_))));
     assert_eq!(reply, "pong:after-error");

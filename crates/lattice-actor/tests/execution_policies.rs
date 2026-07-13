@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorError, ActorSpawnError};
 use lattice_actor::mailbox::MailboxConfig;
+use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorExecutionPolicy, ActorScheduler, PassivationPolicy};
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
-use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_actor::traits::{Actor, Request, Responder};
 use lattice_core::id::ActorId;
 use lattice_core::service_context::ServiceContext;
 use tokio::sync::Mutex;
@@ -14,14 +15,14 @@ use tokio::sync::Mutex;
 #[derive(Debug)]
 struct Ping(&'static str);
 
-impl Message for Ping {
-    type Reply = String;
+impl Request for Ping {
+    type Response = String;
 }
 
 struct CurrentThread;
 
-impl Message for CurrentThread {
-    type Reply = String;
+impl Request for CurrentThread {
+    type Response = String;
 }
 
 struct TestActor {
@@ -41,36 +42,42 @@ impl Actor for OtherActor {
 }
 
 #[async_trait]
-impl Handler<Ping> for TestActor {
-    async fn handle(
+impl Responder<Ping> for TestActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        msg: Ping,
-    ) -> Result<String, ActorError> {
-        self.events.lock().await.push(msg.0);
-        Ok(format!("pong:{}", msg.0))
+        request: Ping,
+        reply_to: ReplyTo<String>,
+    ) -> Result<(), ActorError> {
+        self.events.lock().await.push(request.0);
+        let _ = reply_to.send(format!("pong:{}", request.0));
+        Ok(())
     }
 }
 
 #[async_trait]
-impl Handler<CurrentThread> for TestActor {
-    async fn handle(
+impl Responder<CurrentThread> for TestActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        _msg: CurrentThread,
-    ) -> Result<String, ActorError> {
-        Ok(format!("{:?}", std::thread::current().id()))
+        _request: CurrentThread,
+        reply_to: ReplyTo<String>,
+    ) -> Result<(), ActorError> {
+        let _ = reply_to.send(format!("{:?}", std::thread::current().id()));
+        Ok(())
     }
 }
 
 #[async_trait]
-impl Handler<CurrentThread> for OtherActor {
-    async fn handle(
+impl Responder<CurrentThread> for OtherActor {
+    async fn respond(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        _msg: CurrentThread,
-    ) -> Result<String, ActorError> {
-        Ok(format!("{:?}", std::thread::current().id()))
+        _request: CurrentThread,
+        reply_to: ReplyTo<String>,
+    ) -> Result<(), ActorError> {
+        let _ = reply_to.send(format!("{:?}", std::thread::current().id()));
+        Ok(())
     }
 }
 
@@ -95,7 +102,7 @@ async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
         .await
         .unwrap();
 
-    let reply = handle.call(Ping("dedicated")).await.unwrap();
+    let reply = handle.ask(Ping("dedicated")).await.unwrap();
 
     assert_eq!(reply, "pong:dedicated");
     assert_eq!(*events.lock().await, vec!["dedicated"]);
@@ -122,7 +129,7 @@ async fn keyed_worker_pool_execution_policy_runs_actor_with_same_mailbox_semanti
         .await
         .unwrap();
 
-    let reply = handle.call(Ping("shard-worker")).await.unwrap();
+    let reply = handle.ask(Ping("shard-worker")).await.unwrap();
 
     assert_eq!(reply, "pong:shard-worker");
     assert_eq!(*events.lock().await, vec!["shard-worker"]);
@@ -209,8 +216,8 @@ async fn dedicated_thread_pool_reuses_configured_worker_threads() {
         .unwrap();
 
     assert_eq!(
-        first.call(CurrentThread).await.unwrap(),
-        second.call(CurrentThread).await.unwrap()
+        first.ask(CurrentThread).await.unwrap(),
+        second.ask(CurrentThread).await.unwrap()
     );
 }
 
@@ -249,8 +256,8 @@ async fn dedicated_thread_pool_is_scoped_by_actor_type() {
         .unwrap();
 
     assert_ne!(
-        first.call(CurrentThread).await.unwrap(),
-        second.call(CurrentThread).await.unwrap()
+        first.ask(CurrentThread).await.unwrap(),
+        second.ask(CurrentThread).await.unwrap()
     );
 }
 
@@ -291,8 +298,8 @@ async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
         .unwrap();
 
     assert_eq!(
-        first.call(CurrentThread).await.unwrap(),
-        second.call(CurrentThread).await.unwrap()
+        first.ask(CurrentThread).await.unwrap(),
+        second.ask(CurrentThread).await.unwrap()
     );
 }
 

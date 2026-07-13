@@ -44,9 +44,7 @@ pub struct ActorTerminated {
     pub reason: TerminatedReason,
 }
 
-impl Message for ActorTerminated {
-    type Reply = ();
-}
+impl Message for ActorTerminated {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminatedReason {

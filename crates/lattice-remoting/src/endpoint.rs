@@ -873,6 +873,7 @@ mod tests {
     impl InboundDispatch for EchoDispatch {
         async fn tell(
             &self,
+            _sender: Option<ActorRef<()>>,
             _target: ExactActorTarget,
             _message_id: u64,
             _payload: Bytes,
