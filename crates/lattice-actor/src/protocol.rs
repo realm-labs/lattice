@@ -15,14 +15,20 @@ use crate::error::ActorCallError;
 use crate::handle::ActorHandle;
 use crate::traits::{Actor, Handler, Message, Request, Responder};
 
-pub trait WireSchema: Send + 'static {
-    const SCHEMA_ID: u64;
-    const SCHEMA_VERSION: u32;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CodecDescriptor {
+    pub id: u64,
+    pub version: u32,
+}
+
+impl CodecDescriptor {
+    pub const fn new(id: u64, version: u32) -> Self {
+        Self { id, version }
+    }
 }
 
 pub trait WireCodec<T>: Send + Sync + 'static {
-    const CODEC_ID: u64;
-    const CODEC_VERSION: u32;
+    const DESCRIPTOR: CodecDescriptor;
 
     fn encode(&self, value: &T, output: &mut BytesMut) -> Result<(), EncodeError>;
     fn decode(&self, input: &[u8]) -> Result<T, DecodeError>;
@@ -38,8 +44,7 @@ impl<T> WireCodec<T> for ProstCodec
 where
     T: prost::Message + Default + Send + Sync + 'static,
 {
-    const CODEC_ID: u64 = 0x7072_6f73_7400_0001;
-    const CODEC_VERSION: u32 = 1;
+    const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(0x7072_6f73_7400_0001, 1);
 
     fn encode(&self, value: &T, output: &mut BytesMut) -> Result<(), EncodeError> {
         prost::Message::encode(value, output).map_err(|error| EncodeError::new(error.to_string()))
@@ -50,14 +55,8 @@ where
     }
 }
 
-impl WireSchema for () {
-    const SCHEMA_ID: u64 = 1;
-    const SCHEMA_VERSION: u32 = 1;
-}
-
 impl WireCodec<()> for UnitCodec {
-    const CODEC_ID: u64 = 1;
-    const CODEC_VERSION: u32 = 1;
+    const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(1, 1);
 
     fn encode(&self, _value: &(), _output: &mut BytesMut) -> Result<(), EncodeError> {
         Ok(())
@@ -150,14 +149,10 @@ impl<A: Actor> Clone for Binding<A> {
 struct MessageDescriptor {
     message_id: u64,
     mode: DispatchMode,
-    request_codec_id: u64,
-    request_codec_version: u32,
-    request_schema_id: u64,
+    request_codec: CodecDescriptor,
     request_schema_version: u32,
-    reply_codec_id: Option<u64>,
-    reply_codec_version: Option<u32>,
-    reply_schema_id: Option<u64>,
-    reply_schema_version: Option<u32>,
+    response_codec: Option<CodecDescriptor>,
+    response_schema_version: Option<u32>,
     max_payload: usize,
 }
 
@@ -294,10 +289,10 @@ impl<A: Actor> ActorProtocolBuilder<A> {
         self
     }
 
-    pub fn tell<M, C>(mut self, message_id: u64, codec: C) -> Self
+    pub fn tell<M, C>(mut self, message_id: u64, schema_version: u32, codec: C) -> Self
     where
         A: Handler<M>,
-        M: Message + WireSchema,
+        M: Message,
         C: WireCodec<M>,
     {
         let codec = Arc::new(codec);
@@ -305,14 +300,10 @@ impl<A: Actor> ActorProtocolBuilder<A> {
             descriptor: MessageDescriptor {
                 message_id,
                 mode: DispatchMode::Tell,
-                request_codec_id: C::CODEC_ID,
-                request_codec_version: C::CODEC_VERSION,
-                request_schema_id: M::SCHEMA_ID,
-                request_schema_version: M::SCHEMA_VERSION,
-                reply_codec_id: None,
-                reply_codec_version: None,
-                reply_schema_id: None,
-                reply_schema_version: None,
+                request_codec: C::DESCRIPTOR,
+                request_schema_version: schema_version,
+                response_codec: None,
+                response_schema_version: None,
                 max_payload: self.max_payload,
             },
             request_type: TypeId::of::<M>(),
@@ -342,11 +333,17 @@ impl<A: Actor> ActorProtocolBuilder<A> {
         self
     }
 
-    pub fn ask<Q, C, RC>(mut self, message_id: u64, codec: C, reply_codec: RC) -> Self
+    pub fn ask<Q, C, RC>(
+        mut self,
+        message_id: u64,
+        request_schema_version: u32,
+        response_schema_version: u32,
+        codec: C,
+        reply_codec: RC,
+    ) -> Self
     where
         A: Responder<Q>,
-        Q: Request + WireSchema,
-        Q::Response: WireSchema,
+        Q: Request,
         C: WireCodec<Q>,
         RC: WireCodec<Q::Response>,
     {
@@ -356,14 +353,10 @@ impl<A: Actor> ActorProtocolBuilder<A> {
             descriptor: MessageDescriptor {
                 message_id,
                 mode: DispatchMode::Ask,
-                request_codec_id: C::CODEC_ID,
-                request_codec_version: C::CODEC_VERSION,
-                request_schema_id: Q::SCHEMA_ID,
-                request_schema_version: Q::SCHEMA_VERSION,
-                reply_codec_id: Some(RC::CODEC_ID),
-                reply_codec_version: Some(RC::CODEC_VERSION),
-                reply_schema_id: Some(Q::Response::SCHEMA_ID),
-                reply_schema_version: Some(Q::Response::SCHEMA_VERSION),
+                request_codec: C::DESCRIPTOR,
+                request_schema_version,
+                response_codec: Some(RC::DESCRIPTOR),
+                response_schema_version: Some(response_schema_version),
                 max_payload: self.max_payload,
             },
             request_type: TypeId::of::<Q>(),
@@ -421,6 +414,11 @@ impl<A: Actor> ActorProtocolBuilder<A> {
                 return Err(ProtocolBuildError::ReservedMessageId);
             }
             let message_id = binding.descriptor.message_id;
+            if binding.descriptor.request_schema_version == 0
+                || binding.descriptor.response_schema_version == Some(0)
+            {
+                return Err(ProtocolBuildError::ZeroSchemaVersion(message_id));
+            }
             if !request_types.insert(binding.request_type) {
                 return Err(ProtocolBuildError::DuplicateMessageType);
             }
@@ -457,15 +455,16 @@ fn canonical_descriptor<A: Actor>(
             DispatchMode::Tell => 0,
             DispatchMode::Ask => 1,
         });
+        let response_codec = descriptor
+            .response_codec
+            .unwrap_or(CodecDescriptor::new(0, 0));
         for value in [
-            descriptor.request_codec_id,
-            u64::from(descriptor.request_codec_version),
-            descriptor.request_schema_id,
+            descriptor.request_codec.id,
+            u64::from(descriptor.request_codec.version),
             u64::from(descriptor.request_schema_version),
-            descriptor.reply_codec_id.unwrap_or(0),
-            u64::from(descriptor.reply_codec_version.unwrap_or(0)),
-            descriptor.reply_schema_id.unwrap_or(0),
-            u64::from(descriptor.reply_schema_version.unwrap_or(0)),
+            response_codec.id,
+            u64::from(response_codec.version),
+            u64::from(descriptor.response_schema_version.unwrap_or(0)),
             descriptor.max_payload as u64,
         ] {
             output.extend_from_slice(&value.to_be_bytes());
@@ -510,6 +509,8 @@ pub enum ProtocolBuildError {
     Empty,
     #[error("message ID zero is reserved")]
     ReservedMessageId,
+    #[error("schema version zero is reserved for message ID {0}")]
+    ZeroSchemaVersion(u64),
     #[error("duplicate message ID {0}")]
     DuplicateMessageId(u64),
     #[error("one Rust message type is registered more than once")]
@@ -547,25 +548,34 @@ macro_rules! actor_protocol {
 
     (@apply $builder:expr;
         tell $message_id:literal => $message:ty {
+            schema_version: $schema_version:expr,
             codec: $codec:expr $(,)?
         }
         $($remaining:tt)*
     ) => {
         $crate::actor_protocol!(@apply
-            $builder.tell::<$message, _>($message_id, $codec);
+            $builder.tell::<$message, _>($message_id, $schema_version, $codec);
             $($remaining)*
         )
     };
 
     (@apply $builder:expr;
         ask $message_id:literal => $message:ty {
+            request_schema_version: $request_schema_version:expr,
+            response_schema_version: $response_schema_version:expr,
             request_codec: $request_codec:expr,
-            reply_codec: $reply_codec:expr $(,)?
+            response_codec: $response_codec:expr $(,)?
         }
         $($remaining:tt)*
     ) => {
         $crate::actor_protocol!(@apply
-            $builder.ask::<$message, _, _>($message_id, $request_codec, $reply_codec);
+            $builder.ask::<$message, _, _>(
+                $message_id,
+                $request_schema_version,
+                $response_schema_version,
+                $request_codec,
+                $response_codec,
+            );
             $($remaining)*
         )
     };
@@ -605,11 +615,6 @@ mod tests {
 
     impl Message for Tell {}
 
-    impl WireSchema for Tell {
-        const SCHEMA_ID: u64 = 10;
-        const SCHEMA_VERSION: u32 = 1;
-    }
-
     #[derive(Clone)]
     struct Ask(u64);
 
@@ -617,22 +622,11 @@ mod tests {
         type Response = u64;
     }
 
-    impl WireSchema for Ask {
-        const SCHEMA_ID: u64 = 11;
-        const SCHEMA_VERSION: u32 = 1;
-    }
-
-    impl WireSchema for u64 {
-        const SCHEMA_ID: u64 = 12;
-        const SCHEMA_VERSION: u32 = 1;
-    }
-
     #[derive(Clone, Copy)]
     struct U64Codec;
 
     impl WireCodec<Tell> for U64Codec {
-        const CODEC_ID: u64 = 20;
-        const CODEC_VERSION: u32 = 1;
+        const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(20, 1);
 
         fn encode(&self, value: &Tell, output: &mut BytesMut) -> Result<(), EncodeError> {
             output.extend_from_slice(&value.0.to_be_bytes());
@@ -645,8 +639,7 @@ mod tests {
     }
 
     impl WireCodec<Ask> for U64Codec {
-        const CODEC_ID: u64 = 20;
-        const CODEC_VERSION: u32 = 1;
+        const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(20, 1);
 
         fn encode(&self, value: &Ask, output: &mut BytesMut) -> Result<(), EncodeError> {
             output.extend_from_slice(&value.0.to_be_bytes());
@@ -659,8 +652,7 @@ mod tests {
     }
 
     impl WireCodec<u64> for U64Codec {
-        const CODEC_ID: u64 = 20;
-        const CODEC_VERSION: u32 = 1;
+        const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(20, 1);
 
         fn encode(&self, value: &u64, output: &mut BytesMut) -> Result<(), EncodeError> {
             output.extend_from_slice(&value.to_be_bytes());
@@ -710,10 +702,15 @@ mod tests {
         TestProtocol for TestActor {
             protocol_id: 77;
             name: "test/v1";
-            tell 1 => Tell { codec: U64Codec }
+            tell 1 => Tell {
+                schema_version: 1,
+                codec: U64Codec,
+            }
             ask 2 => Ask {
+                request_schema_version: 1,
+                response_schema_version: 1,
                 request_codec: U64Codec,
-                reply_codec: U64Codec,
+                response_codec: U64Codec,
             }
         }
     }
@@ -722,8 +719,8 @@ mod tests {
     fn macro_and_builder_produce_the_same_fingerprint() {
         let generated = TestProtocol::build().unwrap();
         let manual = ActorProtocol::<TestActor>::builder(ProtocolId::new(77).unwrap(), "test/v1")
-            .tell::<Tell, _>(1, U64Codec)
-            .ask::<Ask, _, _>(2, U64Codec, U64Codec)
+            .tell::<Tell, _>(1, 1, U64Codec)
+            .ask::<Ask, _, _>(2, 1, 1, U64Codec, U64Codec)
             .build()
             .unwrap();
         assert_eq!(generated.fingerprint(), manual.fingerprint());
@@ -732,12 +729,45 @@ mod tests {
     #[test]
     fn duplicate_message_ids_fail_construction() {
         let result = ActorProtocol::<TestActor>::builder(ProtocolId::new(77).unwrap(), "test/v1")
-            .tell::<Tell, _>(1, U64Codec)
-            .ask::<Ask, _, _>(1, U64Codec, U64Codec)
+            .tell::<Tell, _>(1, 1, U64Codec)
+            .ask::<Ask, _, _>(1, 1, 1, U64Codec, U64Codec)
             .build();
         assert!(matches!(
             result,
             Err(ProtocolBuildError::DuplicateMessageId(1))
+        ));
+    }
+
+    #[test]
+    fn request_and_response_schema_versions_change_the_fingerprint() {
+        let build = |request_schema_version, response_schema_version| {
+            ActorProtocol::<TestActor>::builder(ProtocolId::new(77).unwrap(), "test/v1")
+                .ask::<Ask, _, _>(
+                    1,
+                    request_schema_version,
+                    response_schema_version,
+                    U64Codec,
+                    U64Codec,
+                )
+                .build()
+                .unwrap()
+                .fingerprint()
+        };
+
+        let baseline = build(1, 1);
+        assert_ne!(baseline, build(2, 1));
+        assert_ne!(baseline, build(1, 2));
+    }
+
+    #[test]
+    fn zero_schema_version_fails_construction() {
+        let result = ActorProtocol::<TestActor>::builder(ProtocolId::new(77).unwrap(), "test/v1")
+            .tell::<Tell, _>(1, 0, U64Codec)
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(ProtocolBuildError::ZeroSchemaVersion(1))
         ));
     }
 

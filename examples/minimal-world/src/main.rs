@@ -10,7 +10,6 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::protocol::ProstCodec;
-use lattice_actor::protocol::WireSchema;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, Request, Responder};
@@ -31,16 +30,6 @@ use world::{EnterWorldReply, EnterWorldRequest};
 
 impl Request for EnterWorldRequest {
     type Response = EnterWorldReply;
-}
-
-impl WireSchema for EnterWorldRequest {
-    const SCHEMA_ID: u64 = 0x776f_726c_6400_0001;
-    const SCHEMA_VERSION: u32 = 1;
-}
-
-impl WireSchema for EnterWorldReply {
-    const SCHEMA_ID: u64 = 0x776f_726c_6400_0002;
-    const SCHEMA_VERSION: u32 = 1;
 }
 
 #[derive(Debug)]
@@ -79,8 +68,10 @@ actor_protocol! {
         protocol_id: 0x776f_726c_6400_0001;
         name: "minimal-world/v1";
         ask 1 => EnterWorldRequest {
+            request_schema_version: 1,
+            response_schema_version: 1,
             request_codec: ProstCodec,
-            reply_codec: ProstCodec,
+            response_codec: ProstCodec,
         }
     }
 }

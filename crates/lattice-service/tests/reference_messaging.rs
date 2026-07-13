@@ -7,7 +7,7 @@ use bytes::BytesMut;
 use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
-use lattice_actor::protocol::{DecodeError, EncodeError, WireCodec, WireSchema};
+use lattice_actor::protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec};
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::traits::{Actor, Handler, Message, StopReason};
 use lattice_core::actor_kind;
@@ -32,27 +32,16 @@ struct SendTo {
 
 impl Message for SendTo {}
 
-impl WireSchema for SendTo {
-    const SCHEMA_ID: u64 = 1;
-    const SCHEMA_VERSION: u32 = 1;
-}
-
 #[derive(Debug)]
 struct Delivered;
 
 impl Message for Delivered {}
 
-impl WireSchema for Delivered {
-    const SCHEMA_ID: u64 = 2;
-    const SCHEMA_VERSION: u32 = 1;
-}
-
 #[derive(Clone, Copy)]
 struct SendToCodec;
 
 impl WireCodec<SendTo> for SendToCodec {
-    const CODEC_ID: u64 = 1;
-    const CODEC_VERSION: u32 = 1;
+    const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(1, 1);
 
     fn encode(&self, value: &SendTo, output: &mut BytesMut) -> Result<(), EncodeError> {
         let encoded =
@@ -70,8 +59,7 @@ impl WireCodec<SendTo> for SendToCodec {
 struct DeliveredCodec;
 
 impl WireCodec<Delivered> for DeliveredCodec {
-    const CODEC_ID: u64 = 2;
-    const CODEC_VERSION: u32 = 1;
+    const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(2, 1);
 
     fn encode(&self, _value: &Delivered, _output: &mut BytesMut) -> Result<(), EncodeError> {
         Ok(())
@@ -134,6 +122,7 @@ actor_protocol! {
         protocol_id: SOURCE_PROTOCOL_ID;
         name: "reference/source/v1";
         tell 1 => SendTo {
+            schema_version: 1,
             codec: SendToCodec,
         }
     }
@@ -144,6 +133,7 @@ actor_protocol! {
         protocol_id: SINK_PROTOCOL_ID;
         name: "reference/sink/v1";
         tell 1 => Delivered {
+            schema_version: 1,
             codec: DeliveredCodec,
         }
     }

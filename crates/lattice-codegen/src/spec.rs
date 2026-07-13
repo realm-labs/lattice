@@ -13,8 +13,10 @@ pub struct ProtocolMessageSpec {
     pub message_id: u64,
     pub message_type: String,
     pub mode: InteractionMode,
+    pub request_schema_version: u32,
+    pub response_schema_version: Option<u32>,
     pub request_codec: String,
-    pub reply_codec: Option<String>,
+    pub response_codec: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,21 +52,31 @@ impl ActorProtocolSpec {
                     "message IDs must be explicit, nonzero, and unique".to_owned(),
                 ));
             }
-            if message.message_type.is_empty() || message.request_codec.is_empty() {
+            if message.message_type.is_empty()
+                || message.request_codec.is_empty()
+                || message.request_schema_version == 0
+            {
                 return Err(CodegenError::InvalidSpec(
-                    "message type and request codec are required".to_owned(),
+                    "message type, request codec, and request schema version are required"
+                        .to_owned(),
                 ));
             }
-            match (message.mode, message.reply_codec.as_deref()) {
-                (InteractionMode::Tell, None) | (InteractionMode::Ask, Some(_)) => {}
-                (InteractionMode::Tell, Some(_)) => {
+            match (
+                message.mode,
+                message.response_schema_version,
+                message.response_codec.as_deref(),
+            ) {
+                (InteractionMode::Tell, None, None)
+                | (InteractionMode::Ask, Some(1..), Some(_)) => {}
+                (InteractionMode::Tell, _, _) => {
                     return Err(CodegenError::InvalidSpec(
-                        "tell registration cannot declare a reply codec".to_owned(),
+                        "tell registration cannot declare a response schema or codec".to_owned(),
                     ));
                 }
-                (InteractionMode::Ask, None) => {
+                (InteractionMode::Ask, _, _) => {
                     return Err(CodegenError::InvalidSpec(
-                        "ask registration requires a reply codec".to_owned(),
+                        "ask registration requires a nonzero response schema version and codec"
+                            .to_owned(),
                     ));
                 }
             }

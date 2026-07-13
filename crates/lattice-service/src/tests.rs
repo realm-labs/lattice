@@ -9,10 +9,10 @@ use futures_util::Stream;
 use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
+use lattice_actor::protocol::CodecDescriptor;
 use lattice_actor::protocol::DecodeError;
 use lattice_actor::protocol::EncodeError;
 use lattice_actor::protocol::WireCodec;
-use lattice_actor::protocol::WireSchema;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, Request, Responder, StopReason};
@@ -50,22 +50,11 @@ impl Request for Ping {
     type Response = Pong;
 }
 
-impl WireSchema for Ping {
-    const SCHEMA_ID: u64 = 1;
-    const SCHEMA_VERSION: u32 = 1;
-}
-
-impl WireSchema for Pong {
-    const SCHEMA_ID: u64 = 2;
-    const SCHEMA_VERSION: u32 = 1;
-}
-
 #[derive(Clone, Copy)]
 struct PingCodec;
 
 impl WireCodec<Ping> for PingCodec {
-    const CODEC_ID: u64 = 1;
-    const CODEC_VERSION: u32 = 1;
+    const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(1, 1);
 
     fn encode(&self, value: &Ping, output: &mut BytesMut) -> Result<(), EncodeError> {
         output.extend_from_slice(&value.0.to_be_bytes());
@@ -83,8 +72,7 @@ impl WireCodec<Ping> for PingCodec {
 struct PongCodec;
 
 impl WireCodec<Pong> for PongCodec {
-    const CODEC_ID: u64 = 1;
-    const CODEC_VERSION: u32 = 1;
+    const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(1, 1);
 
     fn encode(&self, value: &Pong, output: &mut BytesMut) -> Result<(), EncodeError> {
         output.extend_from_slice(&value.0.to_be_bytes());
@@ -123,8 +111,10 @@ actor_protocol! {
         protocol_id: PROTOCOL_ID;
         name: "service-test/ping/v1";
         ask 1 => Ping {
+            request_schema_version: 1,
+            response_schema_version: 1,
             request_codec: PingCodec,
-            reply_codec: PongCodec,
+            response_codec: PongCodec,
         }
     }
 }

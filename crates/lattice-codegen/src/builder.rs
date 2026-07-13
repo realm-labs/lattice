@@ -79,8 +79,10 @@ mod tests {
                 message_id: 1,
                 message_type: "GetProfile".to_owned(),
                 mode: InteractionMode::Ask,
+                request_schema_version: 1,
+                response_schema_version: Some(1),
                 request_codec: "PostcardCodec".to_owned(),
-                reply_codec: Some("PostcardCodec".to_owned()),
+                response_codec: Some("PostcardCodec".to_owned()),
             }],
         };
         let generated = render_actor_protocol(&spec).unwrap();

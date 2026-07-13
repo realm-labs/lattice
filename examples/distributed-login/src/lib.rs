@@ -9,7 +9,6 @@ use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::protocol::ProstCodec;
-use lattice_actor::protocol::WireSchema;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, Request, Responder};
@@ -35,34 +34,16 @@ use game::{InitSessionReply, InitSessionRequest, LoginAcceptedReply, LoginReques
 pub const WORLD_PROTOCOL_ID: u64 = 0x6761_6d65_0000_0001;
 pub const PLAYER_PROTOCOL_ID: u64 = 0x6761_6d65_0000_0002;
 
-macro_rules! request_schema {
-    ($message:ty, $reply:ty, $message_id:expr, $reply_id:expr) => {
+macro_rules! request_type {
+    ($message:ty, $reply:ty) => {
         impl Request for $message {
             type Response = $reply;
-        }
-        impl WireSchema for $message {
-            const SCHEMA_ID: u64 = $message_id;
-            const SCHEMA_VERSION: u32 = 1;
-        }
-        impl WireSchema for $reply {
-            const SCHEMA_ID: u64 = $reply_id;
-            const SCHEMA_VERSION: u32 = 1;
         }
     };
 }
 
-request_schema!(
-    LoginRequest,
-    LoginAcceptedReply,
-    0x6761_6d65_0000_0101,
-    0x6761_6d65_0000_0102
-);
-request_schema!(
-    InitSessionRequest,
-    InitSessionReply,
-    0x6761_6d65_0000_0201,
-    0x6761_6d65_0000_0202
-);
+request_type!(LoginRequest, LoginAcceptedReply);
+request_type!(InitSessionRequest, InitSessionReply);
 
 #[derive(Debug)]
 pub struct WorldActor {
@@ -132,8 +113,10 @@ actor_protocol! {
         protocol_id: WORLD_PROTOCOL_ID;
         name: "distributed-login/world/v1";
         ask 1 => LoginRequest {
+            request_schema_version: 1,
+            response_schema_version: 1,
             request_codec: ProstCodec,
-            reply_codec: ProstCodec,
+            response_codec: ProstCodec,
         }
     }
 }
@@ -143,8 +126,10 @@ actor_protocol! {
         protocol_id: PLAYER_PROTOCOL_ID;
         name: "distributed-login/player/v1";
         ask 1 => InitSessionRequest {
+            request_schema_version: 1,
+            response_schema_version: 1,
             request_codec: ProstCodec,
-            reply_codec: ProstCodec,
+            response_codec: ProstCodec,
         }
     }
 }

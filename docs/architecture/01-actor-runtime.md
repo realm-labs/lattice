@@ -201,11 +201,6 @@ pub trait Actor: Sized + Send + 'static {
     }
 }
 
-pub trait WireSchema: Send + 'static {
-    const SCHEMA_ID: u64;
-    const SCHEMA_VERSION: u32;
-}
-
 pub trait Message: Send + 'static {}
 
 pub trait Request: Send + 'static {

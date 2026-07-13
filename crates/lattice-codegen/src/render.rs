@@ -20,22 +20,29 @@ pub fn render_actor_protocol(spec: &ActorProtocolSpec) -> Result<String, Codegen
             InteractionMode::Tell => {
                 writeln!(
                     rust,
-                    "        tell {} => {} {{ codec: {} }}",
-                    message.message_id, message.message_type, message.request_codec
+                    "        tell {} => {} {{ schema_version: {}, codec: {} }}",
+                    message.message_id,
+                    message.message_type,
+                    message.request_schema_version,
+                    message.request_codec
                 )
                 .unwrap();
             }
             InteractionMode::Ask => {
                 writeln!(
                     rust,
-                    "        ask {} => {} {{ request_codec: {}, reply_codec: {} }}",
+                    "        ask {} => {} {{ request_schema_version: {}, response_schema_version: {}, request_codec: {}, response_codec: {} }}",
                     message.message_id,
                     message.message_type,
+                    message.request_schema_version,
+                    message
+                        .response_schema_version
+                        .expect("validated response schema version"),
                     message.request_codec,
                     message
-                        .reply_codec
+                        .response_codec
                         .as_deref()
-                        .expect("validated reply codec")
+                        .expect("validated response codec")
                 )
                 .unwrap();
             }

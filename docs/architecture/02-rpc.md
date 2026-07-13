@@ -88,12 +88,15 @@ lattice::actor_protocol! {
         name: "player/v1";
 
         tell 1 => PositionUpdated {
+            schema_version: 1,
             codec: PostcardCodec::default(),
         }
 
         ask 2 => GetProfile {
+            request_schema_version: 1,
+            response_schema_version: 1,
             request_codec: PostcardCodec::default(),
-            reply_codec: PostcardCodec::default(),
+            response_codec: PostcardCodec::default(),
         }
     }
 }
@@ -110,9 +113,13 @@ Large businesses may generate this macro declaration from an existing IDL, sprea
 The builder remains public for tests, very small protocols, and custom generators. The canonical macro expands to equivalent typed calls:
 
 ```rust
+pub struct CodecDescriptor {
+    pub id: u64,
+    pub version: u32,
+}
+
 pub trait WireCodec<T>: Send + Sync + 'static {
-    const CODEC_ID: u64;
-    const CODEC_VERSION: u32;
+    const DESCRIPTOR: CodecDescriptor;
 
     fn encode(&self, value: &T, dst: &mut BytesMut) -> Result<(), EncodeError>;
     fn decode(&self, src: &[u8]) -> Result<T, DecodeError>;
@@ -122,12 +129,15 @@ ActorProtocol::<PlayerActor>::builder(
     ProtocolId::new(0x504c_4159_4552_0001),
     "player/v1",
 )
-    .tell::<PositionUpdated>(
+    .tell::<PositionUpdated, _>(
+        1,
         1,
         PostcardCodec::default(),
     )
-    .ask::<GetProfile>(
+    .ask::<GetProfile, _, _>(
         2,
+        1,
+        1,
         PostcardCodec::default(),
         PostcardCodec::default(),
     )
@@ -138,21 +148,23 @@ ActorProtocol::<PlayerActor>::builder(
 pub fn tell<M>(
     self,
     message_id: u64,
+    schema_version: u32,
     message_codec: impl WireCodec<M>,
 ) -> Self
 where
-    M: Message + WireSchema,
+    M: Message,
     A: Handler<M>;
 
 pub fn ask<R>(
     self,
     message_id: u64,
+    request_schema_version: u32,
+    response_schema_version: u32,
     request_codec: impl WireCodec<R>,
     response_codec: impl WireCodec<R::Response>,
 ) -> Self
 where
-    R: Request + WireSchema,
-    R::Response: WireSchema,
+    R: Request,
     A: Responder<R>;
 ```
 
@@ -169,12 +181,12 @@ Rules:
 5. Unknown IDs, protocol fingerprint mismatch, and oversized payloads fail before mailbox admission.
 6. Internal control messages may use Prost, but business protocols are not tied to Protobuf.
 7. A message ID is registered exactly once as either tell or ask; duplicate IDs or conflicting modes fail protocol construction.
-8. Tell requires `Message` and `Handler<M>`; ask requires `Request`, `Responder<R>`, and a wire schema and codec for `R::Response`.
+8. Tell requires `Message` and `Handler<M>`; ask requires `Request`, `Responder<R>`, and a codec for `R::Response`.
 9. A received frame whose mode does not match the message registration is rejected as a protocol violation.
 10. Macro-generated and manually built protocols pass through the same validation and produce the same fingerprint.
 11. `ProtocolId` is an explicit stable `u64`; automatic IDs derived from Rust type names or declaration order are forbidden.
-12. Every request/reply type implements `WireSchema { SCHEMA_ID, SCHEMA_VERSION }`; every codec exposes stable `CODEC_ID` and `CODEC_VERSION`.
-13. The fingerprint is BLAKE3 over the canonical descriptor fields: protocol ID/name, ordered message IDs/modes, codec IDs/versions, and request/reply schema IDs/versions.
+12. Every registration declares its request schema version and, for asks, response schema version; every codec exposes a stable `CodecDescriptor { id, version }`.
+13. The fingerprint is BLAKE3 over the canonical descriptor fields: protocol ID/name, ordered message IDs/modes, codec descriptors, and request/response schema versions.
 14. After the transport Association is established, a bounded control exchange advertises the supported `(ProtocolId, ProtocolFingerprint)` catalogue. References carry only `ProtocolId`; frames carry protocol and message IDs.
 
 V1 requires an exact fingerprint for a given ProtocolId. A compatible rolling business-protocol upgrade registers old and new major protocols under distinct explicit ProtocolIds and keeps both during the rollout. Reusing one ProtocolId with a changed fingerprint is rejected; silent additive compatibility guesses are forbidden.

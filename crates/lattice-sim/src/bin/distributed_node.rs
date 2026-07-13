@@ -12,10 +12,10 @@ use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
 use lattice_actor::directory::ActivationDirectory;
 use lattice_actor::error::ActorError;
+use lattice_actor::protocol::CodecDescriptor;
 use lattice_actor::protocol::DecodeError;
 use lattice_actor::protocol::EncodeError;
 use lattice_actor::protocol::WireCodec;
-use lattice_actor::protocol::WireSchema;
 use lattice_actor::registry::{ActorCreateContext, ActorLoader};
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::reply::ReplyTo;
@@ -133,31 +133,15 @@ struct StopPing;
 
 impl Message for StopPing {}
 
-impl WireSchema for StopPing {
-    const SCHEMA_ID: u64 = 3;
-    const SCHEMA_VERSION: u32 = 1;
-}
-
 impl Request for Ping {
     type Response = Pong;
-}
-
-impl WireSchema for Ping {
-    const SCHEMA_ID: u64 = 1;
-    const SCHEMA_VERSION: u32 = 1;
-}
-
-impl WireSchema for Pong {
-    const SCHEMA_ID: u64 = 2;
-    const SCHEMA_VERSION: u32 = 1;
 }
 
 #[derive(Clone, Copy)]
 struct PingCodec;
 
 impl WireCodec<Ping> for PingCodec {
-    const CODEC_ID: u64 = 1;
-    const CODEC_VERSION: u32 = 1;
+    const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(1, 1);
 
     fn encode(&self, value: &Ping, output: &mut BytesMut) -> Result<(), EncodeError> {
         output.extend_from_slice(&value.0.to_be_bytes());
@@ -178,8 +162,7 @@ struct PongCodec;
 struct EmptyCodec;
 
 impl WireCodec<StopPing> for EmptyCodec {
-    const CODEC_ID: u64 = 1;
-    const CODEC_VERSION: u32 = 1;
+    const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(1, 1);
 
     fn encode(&self, _value: &StopPing, _output: &mut BytesMut) -> Result<(), EncodeError> {
         Ok(())
@@ -195,8 +178,7 @@ impl WireCodec<StopPing> for EmptyCodec {
 }
 
 impl WireCodec<Pong> for PongCodec {
-    const CODEC_ID: u64 = 1;
-    const CODEC_VERSION: u32 = 1;
+    const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(1, 1);
 
     fn encode(&self, value: &Pong, output: &mut BytesMut) -> Result<(), EncodeError> {
         output.extend_from_slice(&value.0.to_be_bytes());
@@ -312,10 +294,15 @@ actor_protocol! {
         protocol_id: PROTOCOL_ID;
         name: "distributed-fixture/ping/v1";
         ask 1 => Ping {
+            request_schema_version: 1,
+            response_schema_version: 1,
             request_codec: PingCodec,
-            reply_codec: PongCodec,
+            response_codec: PongCodec,
         }
-        tell 2 => StopPing { codec: EmptyCodec }
+        tell 2 => StopPing {
+            schema_version: 1,
+            codec: EmptyCodec,
+        }
     }
 }
 

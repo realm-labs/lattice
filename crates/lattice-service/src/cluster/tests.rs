@@ -9,7 +9,7 @@ use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::host::ProtocolHostRegistry;
-use lattice_actor::protocol::{DecodeError, EncodeError, WireCodec, WireSchema};
+use lattice_actor::protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec};
 use lattice_actor::registry::{ActorCreateContext, ActorRefConfig, ActorRegistryConfig};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Request, Responder};
@@ -53,22 +53,11 @@ impl Request for GetValue {
     type Response = Value;
 }
 
-impl WireSchema for GetValue {
-    const SCHEMA_ID: u64 = 1;
-    const SCHEMA_VERSION: u32 = 1;
-}
-
-impl WireSchema for Value {
-    const SCHEMA_ID: u64 = 2;
-    const SCHEMA_VERSION: u32 = 1;
-}
-
 #[derive(Clone, Copy)]
 struct GetCodec;
 
 impl WireCodec<GetValue> for GetCodec {
-    const CODEC_ID: u64 = 1;
-    const CODEC_VERSION: u32 = 1;
+    const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(1, 1);
 
     fn encode(&self, value: &GetValue, output: &mut BytesMut) -> Result<(), EncodeError> {
         output.extend_from_slice(&value.0.to_be_bytes());
@@ -86,8 +75,7 @@ impl WireCodec<GetValue> for GetCodec {
 struct ValueCodec;
 
 impl WireCodec<Value> for ValueCodec {
-    const CODEC_ID: u64 = 1;
-    const CODEC_VERSION: u32 = 1;
+    const DESCRIPTOR: CodecDescriptor = CodecDescriptor::new(1, 1);
 
     fn encode(&self, value: &Value, output: &mut BytesMut) -> Result<(), EncodeError> {
         output.extend_from_slice(&value.0.to_be_bytes());
@@ -128,8 +116,10 @@ actor_protocol! {
         protocol_id: TEST_PROTOCOL_ID;
         name: "cluster-router-test/v1";
         ask 1 => GetValue {
+            request_schema_version: 1,
+            response_schema_version: 1,
             request_codec: GetCodec,
-            reply_codec: ValueCodec,
+            response_codec: ValueCodec,
         }
     }
 }

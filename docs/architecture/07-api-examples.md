@@ -15,19 +15,14 @@ pub struct PlayerActor {
 
 impl Actor for PlayerActor {}
 
-#[derive(LatticeWireSchema)]
-#[lattice(schema_id = 0x1001, schema_version = 1)]
 pub struct PositionUpdated {
     pub x: f32,
     pub y: f32,
 }
 
-#[derive(LatticeWireSchema)]
-#[lattice(schema_id = 0x1002, schema_version = 1)]
 pub struct GetProfile;
 
-#[derive(Clone, LatticeWireSchema)]
-#[lattice(schema_id = 0x1003, schema_version = 1)]
+#[derive(Clone)]
 pub struct PlayerProfile {
     pub position: (f32, f32),
 }
@@ -77,12 +72,15 @@ lattice::actor_protocol! {
         name: "player/v1";
 
         tell 1 => PositionUpdated {
+            schema_version: 1,
             codec: PostcardCodec::default(),
         }
 
         ask 2 => GetProfile {
+            request_schema_version: 1,
+            response_schema_version: 1,
             request_codec: PostcardCodec::default(),
-            reply_codec: PostcardCodec::default(),
+            response_codec: PostcardCodec::default(),
         }
     }
 }
@@ -99,12 +97,15 @@ let player_protocol = ActorProtocol::<PlayerActor>::builder(
     ProtocolId::new(0x504c_4159_4552_0001),
     "player/v1",
 )
-    .tell::<PositionUpdated>(
+    .tell::<PositionUpdated, _>(
+        1,
         1,
         PostcardCodec::default(),
     )
-    .ask::<GetProfile>(
+    .ask::<GetProfile, _, _>(
         2,
+        1,
+        1,
         PostcardCodec::default(),
         PostcardCodec::default(),
     )
@@ -114,16 +115,20 @@ let player_protocol = ActorProtocol::<PlayerActor>::builder(
 Codec implementations are replaceable:
 
 ```rust
+pub struct CodecDescriptor {
+    pub id: u64,
+    pub version: u32,
+}
+
 pub trait WireCodec<T>: Send + Sync + 'static {
-    const CODEC_ID: u64;
-    const CODEC_VERSION: u32;
+    const DESCRIPTOR: CodecDescriptor;
 
     fn encode(&self, value: &T, dst: &mut BytesMut) -> Result<(), EncodeError>;
     fn decode(&self, src: &[u8]) -> Result<T, DecodeError>;
 }
 ```
 
-Protocol ID, message IDs, interaction modes, codec/schema versions, and the resulting fingerprint are stable compatibility contracts. A tell registration requires a unit reply and has no reply codec; an ask registration includes the associated reply codec. Macro and manual registration use identical validation and fingerprint calculation.
+Protocol ID, message IDs, interaction modes, codec/schema versions, and the resulting fingerprint are stable compatibility contracts. A tell registration has no response codec; an ask registration includes the associated response codec. Macro and manual registration use identical validation and fingerprint calculation.
 
 ## 3. Start a Logic Service
 
