@@ -5,11 +5,11 @@ use etcd_client::{Client, Compare, CompareOp, ConnectOptions, GetOptions, PutOpt
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{CoordinatorStore, PlacementStore, StorageError};
-use crate::coordinator::{LeaderRecord, NodeHello};
+use crate::coordinator::{LeaderRecord, MemberRecord};
 use crate::plan::RebalancePlan;
 use crate::types::{ClaimGrant, PlacementSlot, PlacementSlotKey, Revision};
 
-pub const STORAGE_SCHEMA_GENERATION: u64 = 2;
+pub const STORAGE_SCHEMA_GENERATION: u64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct EtcdPlacementConfig {
@@ -204,25 +204,80 @@ impl EtcdPlacementStore {
         self.get_json("coordinator/leader").await
     }
 
-    pub async fn register_member(
-        &self,
-        hello: &NodeHello,
-        lease_id: i64,
-    ) -> Result<(), StorageError> {
-        let suffix = format!("members/{}", hello.node.node_id);
+    pub async fn get_member(&self, node_id: &str) -> Result<Option<MemberRecord>, StorageError> {
+        self.get_json(&format!("members/{node_id}")).await
+    }
+
+    pub async fn create_member(&self, member: &MemberRecord) -> Result<(), StorageError> {
+        validate_member_record(member)?;
+        let suffix = format!("members/{}", member.node.node_id);
         let key = self.key(&suffix);
         let current = self.read_raw(&key).await?;
         if let Some((bytes, _)) = &current {
-            let member: NodeHello = decode(bytes)?;
-            if member.node.incarnation != hello.node.incarnation {
+            let current: MemberRecord = decode(bytes)?;
+            if current.node.incarnation != member.node.incarnation {
                 return Err(StorageError::IncarnationConflict);
             }
+            return Err(StorageError::CompareFailed);
         }
-        self.put_leased_cas(&key, hello, lease_id, current.map(|(_, revision)| revision))
+        self.put_leased_cas(&key, member, member.lease_id, None)
             .await
     }
 
-    pub async fn list_members(&self) -> Result<Vec<NodeHello>, StorageError> {
+    pub async fn compare_and_put_member(
+        &self,
+        expected: &MemberRecord,
+        member: &MemberRecord,
+    ) -> Result<(), StorageError> {
+        validate_member_record(member)?;
+        if expected.node.node_id != member.node.node_id
+            || expected.node.incarnation != member.node.incarnation
+        {
+            return Err(StorageError::CompareFailed);
+        }
+        let key = self.key(&format!("members/{}", member.node.node_id));
+        let Some((bytes, mod_revision)) = self.read_raw(&key).await? else {
+            return Err(StorageError::CompareFailed);
+        };
+        if decode::<MemberRecord>(&bytes)? != *expected {
+            return Err(StorageError::CompareFailed);
+        }
+        self.put_leased_cas(&key, member, member.lease_id, Some(mod_revision))
+            .await
+    }
+
+    pub async fn compare_and_delete_member(
+        &self,
+        expected: &MemberRecord,
+    ) -> Result<(), StorageError> {
+        let key = self.key(&format!("members/{}", expected.node.node_id));
+        let Some((bytes, mod_revision)) = self.read_raw(&key).await? else {
+            return Err(StorageError::CompareFailed);
+        };
+        if decode::<MemberRecord>(&bytes)? != *expected {
+            return Err(StorageError::CompareFailed);
+        }
+        let mut client = self.client.clone();
+        let response = client
+            .txn(
+                Txn::new()
+                    .when([Compare::mod_revision(
+                        key.clone(),
+                        CompareOp::Equal,
+                        mod_revision,
+                    )])
+                    .and_then([TxnOp::delete(key, None)]),
+            )
+            .await
+            .map_err(map_etcd)?;
+        if response.succeeded() {
+            Ok(())
+        } else {
+            Err(StorageError::CompareFailed)
+        }
+    }
+
+    pub async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError> {
         self.list_json("members/").await
     }
 
@@ -518,11 +573,27 @@ impl CoordinatorStore for EtcdPlacementStore {
         EtcdPlacementStore::get_leader(self).await
     }
 
-    async fn register_member(&self, hello: &NodeHello, lease_id: i64) -> Result<(), StorageError> {
-        EtcdPlacementStore::register_member(self, hello, lease_id).await
+    async fn get_member(&self, node_id: &str) -> Result<Option<MemberRecord>, StorageError> {
+        EtcdPlacementStore::get_member(self, node_id).await
     }
 
-    async fn list_members(&self) -> Result<Vec<NodeHello>, StorageError> {
+    async fn create_member(&self, member: &MemberRecord) -> Result<(), StorageError> {
+        EtcdPlacementStore::create_member(self, member).await
+    }
+
+    async fn compare_and_put_member(
+        &self,
+        expected: &MemberRecord,
+        member: &MemberRecord,
+    ) -> Result<(), StorageError> {
+        EtcdPlacementStore::compare_and_put_member(self, expected, member).await
+    }
+
+    async fn compare_and_delete_member(&self, expected: &MemberRecord) -> Result<(), StorageError> {
+        EtcdPlacementStore::compare_and_delete_member(self, expected).await
+    }
+
+    async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError> {
         EtcdPlacementStore::list_members(self).await
     }
 
@@ -575,6 +646,13 @@ impl CoordinatorStore for EtcdPlacementStore {
 struct StoredPlan {
     revision: Revision,
     plan: RebalancePlan,
+}
+
+fn validate_member_record(member: &MemberRecord) -> Result<(), StorageError> {
+    if member.node != member.hello.node || member.lease_id == 0 || member.node.validate().is_err() {
+        return Err(StorageError::InvalidRecord);
+    }
+    Ok(())
 }
 
 fn validate_prefix(prefix: &str) -> Result<(), StorageError> {

@@ -52,7 +52,29 @@ The shared engine owns assignment persistence, term/generation validation, claim
 
 ## 3. Membership and Coordinator Leadership
 
-Nodes register through their remoting Coordinator session. The Coordinator writes and renews lease-backed membership containing node ID, incarnation, remoting endpoint, roles, capacity, protocol capabilities, and drain state. The Coordinator leader record is also lease-backed and fenced by an election term.
+Nodes register through their remoting Coordinator session. `NodeHello` is a bounded session
+advertisement; persisted generation-3 membership is a `MemberRecord` containing the exact `NodeKey`,
+the validated hello, `Joining | Up | Leaving`, Coordinator revision and member lease ID. Removed is
+an ordered event with the exact node incarnation and graceful, failure, force, or incarnation-replaced
+reason; it is not an active stored status. The Coordinator leader record is also lease-backed and
+fenced by an election term.
+
+Registration persists `Joining` and sends a full snapshot. The node replies with
+`JoinReady(snapshot_revision)` from the same Association. Only an exact revision match may CAS the
+record to `Up`; the resulting revisioned member delta and exact `MemberUp` acknowledgement open
+service admission. Replayed hello/join-ready commands from that session are idempotent. Allocation,
+handoff barriers, and singleton selection exclude every member not in `Up`.
+
+The full snapshot includes all active `MemberRecord` values. A logic session validates the complete
+digest, decodes members and placement slices, and emits one atomic member-snapshot effect before
+`JoinReady`. Service routing installs that replacement snapshot and then accepts only strictly
+increasing `MemberEvent` revisions; discovery candidates never enter this directory.
+
+Graceful drain CASes `Up -> Leaving`, moves placement through the normal persisted handoff path, and
+sends `DrainReady` only when no slot remains owned. `DrainComplete` deletes the exact record and
+revokes its lease. Heartbeat expiry and administrative force removal use the same exact-record CAS
+removal path; force removal includes an operation ID and expected incarnation so it cannot remove a
+replacement process.
 
 A new leader:
 

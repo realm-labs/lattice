@@ -1,9 +1,9 @@
 use super::membership::plan_priority;
 use super::{
     AppliedAdminOperation, BTreeMap, CoordinatorInspection, CoordinatorLeader,
-    CoordinatorOperation, CoordinatorRuntimeError, CoordinatorStore, ManualRelocationRequest,
-    MoveProgress, NodeKey, PlacementSlotKey, PlacementSlotState, PlanReason, PlanStatus,
-    RebalancePlan, RebalanceProposal, RebalanceTrigger,
+    CoordinatorOperation, CoordinatorRuntimeError, CoordinatorStore, ForceRemoveRequest,
+    ManualRelocationRequest, MoveProgress, NodeKey, PlacementSlotKey, PlacementSlotState,
+    PlanReason, PlanStatus, RebalancePlan, RebalanceProposal, RebalanceTrigger,
 };
 
 impl<S: CoordinatorStore> CoordinatorLeader<S> {
@@ -49,6 +49,13 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 completion,
             } => {
                 let result = self.manual_relocate(request).await;
+                let _ = completion.send(result);
+            }
+            CoordinatorOperation::ForceRemove {
+                request,
+                completion,
+            } => {
+                let result = self.force_remove(request).await;
                 let _ = completion.send(result);
             }
             CoordinatorOperation::Inspect { completion } => {
@@ -123,7 +130,10 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         let target = self
             .sessions
             .values()
-            .find(|session| session.hello.node.node_id == request.target_node_id)
+            .find(|session| {
+                session.record.status == crate::coordinator::MemberStatus::Up
+                    && session.hello.node.node_id == request.target_node_id
+            })
             .map(|session| session.hello.node.clone())
             .ok_or(CoordinatorRuntimeError::IneligibleTarget)?;
         let config = self
@@ -158,6 +168,40 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         let plan_id = self.submit_rebalance(proposal, request.entity_type).await?;
         self.record_admin_operation(request.operation_id, fingerprint, Some(plan_id))?;
         Ok(plan_id)
+    }
+
+    pub(super) async fn force_remove(
+        &mut self,
+        request: ForceRemoveRequest,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let fingerprint = format!(
+            "force-remove:{}:{:032x}",
+            request.node_id,
+            request.expected_incarnation.get()
+        );
+        if self
+            .prior_admin_operation(&request.operation_id, &fingerprint)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if self.applied_admin_operations.len() == self.config.maximum_operations {
+            return Err(CoordinatorRuntimeError::OperationCapacity);
+        }
+        let member = self
+            .store
+            .get_member(&request.node_id)
+            .await?
+            .ok_or(CoordinatorRuntimeError::StaleMember)?;
+        if member.node.incarnation != request.expected_incarnation {
+            return Err(CoordinatorRuntimeError::StaleMember);
+        }
+        self.remove_member(
+            member,
+            crate::coordinator::MemberRemovalReason::ForceRemoved,
+        )
+        .await?;
+        self.record_admin_operation(request.operation_id, fingerprint, None)
     }
 
     pub(super) async fn inspect(&self) -> Result<CoordinatorInspection, CoordinatorRuntimeError> {
@@ -373,7 +417,8 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 .sessions
                 .get(&movement.target.incarnation)
                 .filter(|session| {
-                    session.hello.node == movement.target
+                    session.record.status == crate::coordinator::MemberStatus::Up
+                        && session.hello.node == movement.target
                         && session
                             .hello
                             .hosted_entity_types

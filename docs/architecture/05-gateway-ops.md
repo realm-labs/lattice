@@ -168,6 +168,17 @@ bind = "0.0.0.0:19090"
 
 Only the Coordinator consumes general placement-store configuration. Other nodes use bootstrap access solely to locate and authenticate the Coordinator leader.
 
+Cluster nodes configure candidate providers through `cluster_discovery` and a bounded
+`ClusterJoinConfig`. Static, ConfigStore, DNS and Kubernetes EndpointSlice records are reachability
+hints only. The authenticated Coordinator snapshot and revisioned member deltas populate the local
+member directory; discovery and direct store reads are never used for business routing.
+
+`LatticeService` exposes lifecycle and member snapshots plus bounded watches. `leave(deadline)`
+closes admission, coordinates placement drain, completes exact-incarnation membership removal and
+then stops remoting. `shutdown()` spends the configured leave budget and force-stops on expiry;
+`force_shutdown()` immediately fences local work. The low-level `connect_peer(NodeIdentity)` API is
+diagnostic transport access and cannot admit a member or make a service Ready.
+
 ## 7. Common Call Flows
 
 ### Exact actor activation

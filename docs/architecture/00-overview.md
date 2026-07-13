@@ -145,8 +145,11 @@ flowchart LR
     Clients -->|"external protocol"| GatewayA
     Broker <-->|"domain events"| EventsA
     Etcd <-->|"election, records, leases"| Coordinator
-    Etcd -. "leader bootstrap record<br/>read only" .-> SessionA
-    Etcd -. "leader bootstrap record<br/>read only" .-> SessionB
+    Discovery["candidate discovery<br/>static / ConfigStore / DNS / EndpointSlice"]
+    Discovery -. "untrusted endpoint candidates" .-> RemotingA
+    Discovery -. "untrusted endpoint candidates" .-> RemotingB
+    RemotingA -. "authenticated bootstrap probe<br/>leader redirect" .-> Coordinator
+    RemotingB -. "authenticated bootstrap probe<br/>leader redirect" .-> Coordinator
     Coordinator <-->|"logical control stream over remoting"| SessionA
     Coordinator <-->|"logical control stream over remoting"| SessionB
     RemotingA <-->|"one logical association<br/>fixed bounded TCP lane group"| RemotingB
@@ -330,12 +333,14 @@ Tell and ask are protocol modes registered by `ActorProtocol`. A tell message ha
 ```mermaid
 sequenceDiagram
     participant N as Logic node
-    participant E as etcd bootstrap
+    participant D as Candidate discovery
     participant C as Coordinator leader
+    participant E as independent etcd
     participant R as Local Regions and Proxies
 
-    N->>E: read current leader record only
-    N->>C: remoting handshake + NodeHello
+    N->>D: consume replacement endpoint snapshot
+    N->>C: authenticated bootstrap probe + leader validation
+    N->>C: exact-incarnation Association + NodeHello
     C->>E: create/renew member record and lease
     C-->>N: sequenced SnapshotBegin + bounded SnapshotChunks + SnapshotEnd
     N->>N: validate count, bytes, digest and revision

@@ -1,6 +1,6 @@
 # Lattice Cluster Discovery and Member Lifecycle Execution Plan
 
-> Status: implementation in progress; Batches A-B complete
+> Status: implementation in progress; Batches A-C complete
 > Authority model: Coordinator + etcd; discovery is bootstrap-only
 > Compatibility policy: hard switch; no mixed-version cluster support
 > Behavioral references: Apache Pekko discovery and cluster lifecycle, without Gossip or SBR
@@ -76,11 +76,11 @@ resolution.
 ### 0.2 Current Execution Pointer
 
 ```text
-Overall status: in progress; discovery and authenticated bootstrap remoting are complete
-Current batch: Batch C - membership state and storage
-Completed batches: Batch A, Batch B
+Overall status: in progress; discovery through service composition are complete
+Current batch: Batch E - acceptance and operations
+Completed batches: Batch A, Batch B, Batch C, Batch D
 Known broken frontier: none; the workspace compiles with all targets and features
-First implementation action: replace persisted bare NodeHello membership with revisioned MemberRecord
+First implementation action: extend deterministic lifecycle simulation and Docker discovery scenarios
 Final completion condition: every invariant and acceptance item in Sections 10 and 11 passes
 ```
 
@@ -118,6 +118,50 @@ Batch B evidence (2026-07-12):
   closes it before a replacement can be created.
 - All remoting tests, focused clippy with `-D warnings`, service tests, structure/format/diff checks
   and `cargo check --workspace --all-targets --all-features` pass.
+
+Batch C evidence (2026-07-12):
+
+- Hard-switched Coordinator storage and control schemas to generation 3. Persisted membership is an
+  exact `MemberRecord` with `Joining | Up | Leaving`, Coordinator revision and lease; `Removed` is a
+  revisioned event with the exact `NodeKey` and removal reason.
+- Memory and etcd stores implement exact-record create/update/delete CAS. A live node ID blocks a
+  different incarnation, stale status/revision commands fail, and an expired/revoked record permits
+  a new incarnation without dual reads or writes.
+- Coordinator admission persists Joining, records the snapshot revision per Association, and accepts
+  `JoinReady` only for that exact revision and incarnation. Placement selection filters on Up, and
+  readiness opens only after the revisioned Up delta plus exact `MemberUp` acknowledgement.
+- Graceful drain CASes Up to Leaving and emits DrainReady after placement evacuation; heartbeat,
+  graceful, force and expired-incarnation replacement removal share one fenced recovery path.
+  Force-remove operation IDs are bounded/idempotent and expected-incarnation mismatches are rejected.
+- Dynamic subscription changes update the persisted hello through the same revisioned member CAS.
+  Tests cover idempotent join/drain/force removal, one incarnation per node ID, exact CAS, live reuse
+  rejection, expired-incarnation replacement, real logic-session admission and etcd member CAS.
+- Placement/service tests, focused clippy with `-D warnings`, structure/format/diff checks and
+  `cargo check --workspace --all-targets --all-features` pass.
+
+Batch D evidence (2026-07-12):
+
+- `LatticeServiceBuilder` accepts an implementation of `ClusterDiscovery`, validated bounded join
+  policy and member-event capacity without depending on the Kubernetes provider crate. Discovery
+  services construct the Coordinator session only after an exact authenticated leader probe and
+  deterministic Association establishment.
+- The supervised controller bounds concurrent probes, orders leader candidates by term and protocol
+  generation, rejects same-term conflicts, supports reverse dial and recovers its bounded control
+  receiver after session failure so a higher-term leader can install a fresh snapshot.
+- Coordinator and ordinary member endpoints install a production bootstrap view. Leaders accept
+  with their exact identity/term/generation, members redirect to that view, and unavailable election
+  state returns bounded RetryAfter.
+- Full placement snapshots publish member records atomically. The service directory is keyed by
+  exact `(node_id, incarnation)`, accepts strictly increasing deltas, exposes bounded subscriptions,
+  and is the only input to lazy ordinary-peer connection. Removed records close the exact
+  Association and notify DeathWatch without retargeting a replacement incarnation.
+- Lifecycle/member watches, exact-authoritative `connect_member`, idempotent leave,
+  DrainReady/DrainComplete, graceful shutdown budgeting and force shutdown are supervised.
+  Diagnostic `connect_peer` remains transport-only and cannot make a service Ready.
+- Real-socket tests reach Ready from static discovery without a manual peer call, install the exact
+  Up record, complete graceful leave, and prove higher-term rollover follows Ready -> Degraded ->
+  fresh snapshot/MemberUp -> Ready with one retained member incarnation. Placement/service tests,
+  focused clippy with `-D warnings`, structure/format checks and workspace all-target checking pass.
 
 ## 1. Goal
 

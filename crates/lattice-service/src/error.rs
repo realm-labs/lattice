@@ -4,6 +4,16 @@ use thiserror::Error;
 pub enum ServiceError {
     #[error("node configuration is invalid")]
     Config(#[source] crate::config::NodeConfigError),
+    #[error("cluster join configuration is invalid")]
+    JoinConfig(#[source] crate::config::ClusterJoinConfigError),
+    #[error("cluster join controller construction failed")]
+    Join(#[source] crate::cluster::join::JoinError),
+    #[error("authoritative member directory construction failed")]
+    MemberDirectory(#[source] crate::cluster::members::MemberDirectoryError),
+    #[error("placement control router construction failed")]
+    PlacementControl(#[source] lattice_placement::control::PlacementControlError),
+    #[error("discovery joining and a preassembled logic runtime cannot both be configured")]
+    ConflictingClusterRuntime,
     #[error("actor host registration failed")]
     Host(#[source] lattice_actor::host::HostRegistryError),
     #[error("association manager construction failed")]
@@ -24,4 +34,8 @@ pub enum ServiceError {
     ShutdownTimeout,
     #[error("a supervised service task failed")]
     TaskFailed,
+    #[error("service has no active Coordinator session")]
+    CoordinatorUnavailable,
+    #[error("graceful member leave exceeded its deadline")]
+    LeaveTimeout,
 }

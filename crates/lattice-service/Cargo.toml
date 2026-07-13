@@ -8,14 +8,17 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
 lattice-actor.workspace = true
 lattice-core.workspace = true
+lattice-discovery.workspace = true
 lattice-placement.workspace = true
 lattice-remoting.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 prost.workspace = true

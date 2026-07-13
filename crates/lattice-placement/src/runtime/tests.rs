@@ -60,6 +60,19 @@ fn attach_test_session(
     key
 }
 
+async fn register_up(
+    leader: &mut CoordinatorLeader<InMemoryPlacementStore>,
+    hello: NodeHello,
+    association: lattice_remoting::association::AssociationKey,
+) {
+    let incarnation = hello.node.incarnation;
+    leader.register(hello, association.clone()).await.unwrap();
+    leader
+        .mark_member_up(incarnation, leader.revision, &association)
+        .await
+        .unwrap();
+}
+
 struct NoActors;
 
 #[async_trait]
@@ -105,6 +118,21 @@ fn node(
             incarnation,
         },
     )
+}
+
+fn empty_hello(node: NodeKey) -> NodeHello {
+    NodeHello {
+        node,
+        roles: Default::default(),
+        capacity_units: 1,
+        hosted_entity_types: Default::default(),
+        proxied_entity_types: Default::default(),
+        singleton_eligibility: Default::default(),
+        used_singletons: Default::default(),
+        protocols: Vec::new(),
+        entity_configs: Vec::new(),
+        singleton_configs: Vec::new(),
+    }
 }
 
 #[tokio::test]
@@ -356,14 +384,8 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
         entity_configs: vec![entity_config.clone()],
         singleton_configs: Vec::new(),
     };
-    leader
-        .register(hello(source.clone()), source_key)
-        .await
-        .unwrap();
-    leader
-        .register(hello(target.clone()), target_key)
-        .await
-        .unwrap();
+    register_up(&mut leader, hello(source.clone()), source_key).await;
+    register_up(&mut leader, hello(target.clone()), target_key).await;
     let relocation = ManualRelocationRequest {
         operation_id: "manual-1".to_owned(),
         entity_type: entity_type.clone(),
@@ -505,42 +527,40 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
         protocol_id,
         fingerprint: lattice_remoting::protocol::ProtocolFingerprint::new([8; 32]),
     };
-    leader
-        .register(
-            NodeHello {
-                node: proxy,
-                roles: Default::default(),
-                capacity_units: 1,
-                hosted_entity_types: Default::default(),
-                proxied_entity_types: [entity_type.clone()].into_iter().collect(),
-                singleton_eligibility: Default::default(),
-                used_singletons: [singleton_kind.clone()].into_iter().collect(),
-                protocols: vec![descriptor.clone()],
-                entity_configs: Vec::new(),
-                singleton_configs: Vec::new(),
-            },
-            proxy_key,
-        )
-        .await
-        .unwrap();
-    leader
-        .register(
-            NodeHello {
-                node: host.clone(),
-                roles: Default::default(),
-                capacity_units: 10,
-                hosted_entity_types: [entity_type.clone()].into_iter().collect(),
-                proxied_entity_types: Default::default(),
-                singleton_eligibility: [singleton_kind.clone()].into_iter().collect(),
-                used_singletons: Default::default(),
-                protocols: vec![descriptor],
-                entity_configs: vec![entity_config],
-                singleton_configs: vec![singleton_config],
-            },
-            host_key,
-        )
-        .await
-        .unwrap();
+    register_up(
+        &mut leader,
+        NodeHello {
+            node: proxy,
+            roles: Default::default(),
+            capacity_units: 1,
+            hosted_entity_types: Default::default(),
+            proxied_entity_types: [entity_type.clone()].into_iter().collect(),
+            singleton_eligibility: Default::default(),
+            used_singletons: [singleton_kind.clone()].into_iter().collect(),
+            protocols: vec![descriptor.clone()],
+            entity_configs: Vec::new(),
+            singleton_configs: Vec::new(),
+        },
+        proxy_key,
+    )
+    .await;
+    register_up(
+        &mut leader,
+        NodeHello {
+            node: host.clone(),
+            roles: Default::default(),
+            capacity_units: 10,
+            hosted_entity_types: [entity_type.clone()].into_iter().collect(),
+            proxied_entity_types: Default::default(),
+            singleton_eligibility: [singleton_kind.clone()].into_iter().collect(),
+            used_singletons: Default::default(),
+            protocols: vec![descriptor],
+            entity_configs: vec![entity_config],
+            singleton_configs: vec![singleton_config],
+        },
+        host_key,
+    )
+    .await;
     leader
         .ensure_shard_allocated(entity_type.clone(), ShardId::new(3))
         .await
@@ -860,14 +880,8 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
         entity_configs: Vec::new(),
         singleton_configs: vec![singleton_config.clone()],
     };
-    leader
-        .register(hello(source.clone()), source_key)
-        .await
-        .unwrap();
-    leader
-        .register(hello(target.clone()), target_key)
-        .await
-        .unwrap();
+    register_up(&mut leader, hello(source.clone()), source_key).await;
+    register_up(&mut leader, hello(target.clone()), target_key).await;
     leader
         .ensure_singleton_allocated(kind.clone())
         .await
@@ -927,4 +941,201 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
     assert_eq!(active.state, PlacementSlotState::Running);
     assert!(active.active_move.is_none());
     assert!(active.barrier_sessions.is_empty());
+}
+
+#[tokio::test]
+async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
+    let cluster = ClusterId::new("member-lifecycle").unwrap();
+    let (coordinator, coordinator_identity) = node(&cluster, "coordinator", 30100, 100);
+    let (joining, _) = node(&cluster, "joining", 30101, 101);
+    let (forced, _) = node(&cluster, "forced", 30102, 102);
+    let (old_reused, _) = node(&cluster, "reused", 30103, 103);
+    let (new_reused, _) = node(&cluster, "reused", 30104, 104);
+    let config = RemotingConfig::default();
+    let associations = Arc::new(
+        AssociationManager::new(coordinator.address.clone(), coordinator.incarnation, config)
+            .unwrap(),
+    );
+    let joining_key = attach_test_session(
+        &associations,
+        &cluster,
+        coordinator_identity.incarnation,
+        &joining,
+        1000,
+    );
+    let forced_key = attach_test_session(
+        &associations,
+        &cluster,
+        coordinator_identity.incarnation,
+        &forced,
+        2000,
+    );
+    let old_reused_key = attach_test_session(
+        &associations,
+        &cluster,
+        coordinator_identity.incarnation,
+        &old_reused,
+        3000,
+    );
+    let new_reused_key = attach_test_session(
+        &associations,
+        &cluster,
+        coordinator_identity.incarnation,
+        &new_reused,
+        4000,
+    );
+    let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
+    let mut leader = CoordinatorLeader::elect(
+        store.clone(),
+        associations,
+        coordinator,
+        CoordinatorTerm::new(1).unwrap(),
+        3,
+        CoordinatorLeaderConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    leader
+        .register(empty_hello(joining.clone()), joining_key.clone())
+        .await
+        .unwrap();
+    let joining_revision = leader.revision;
+    assert_eq!(
+        store.get_member("joining").await.unwrap().unwrap().status,
+        MemberStatus::Joining
+    );
+    assert!(matches!(
+        leader
+            .mark_member_up(
+                joining.incarnation,
+                joining_revision.next().unwrap(),
+                &joining_key,
+            )
+            .await,
+        Err(CoordinatorRuntimeError::StaleMember)
+    ));
+    leader
+        .mark_member_up(joining.incarnation, joining_revision, &joining_key)
+        .await
+        .unwrap();
+    let up = store.get_member("joining").await.unwrap().unwrap();
+    assert_eq!(up.status, MemberStatus::Up);
+    leader
+        .mark_member_up(joining.incarnation, joining_revision, &joining_key)
+        .await
+        .unwrap();
+
+    assert!(
+        leader
+            .begin_member_drain(
+                joining.incarnation,
+                "drain-1".to_string(),
+                NodeIncarnation::new(999).unwrap(),
+            )
+            .await
+            .is_err()
+    );
+    leader
+        .begin_member_drain(
+            joining.incarnation,
+            "drain-1".to_string(),
+            joining.incarnation,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_member("joining").await.unwrap().unwrap().status,
+        MemberStatus::Leaving
+    );
+    assert!(
+        leader
+            .complete_member_drain(joining.incarnation, "other", joining.incarnation)
+            .await
+            .is_err()
+    );
+    leader
+        .complete_member_drain(joining.incarnation, "drain-1", joining.incarnation)
+        .await
+        .unwrap();
+    assert!(store.get_member("joining").await.unwrap().is_none());
+
+    register_up(&mut leader, empty_hello(forced.clone()), forced_key).await;
+    let request = ForceRemoveRequest {
+        operation_id: "force-1".to_string(),
+        node_id: forced.node_id.clone(),
+        expected_incarnation: forced.incarnation,
+    };
+    assert!(
+        leader
+            .force_remove(ForceRemoveRequest {
+                expected_incarnation: NodeIncarnation::new(999).unwrap(),
+                ..request.clone()
+            })
+            .await
+            .is_err()
+    );
+    leader.force_remove(request.clone()).await.unwrap();
+    leader.force_remove(request).await.unwrap();
+    assert!(store.get_member("forced").await.unwrap().is_none());
+
+    register_up(&mut leader, empty_hello(old_reused.clone()), old_reused_key).await;
+    assert!(
+        leader
+            .register(empty_hello(new_reused.clone()), new_reused_key.clone())
+            .await
+            .is_err()
+    );
+    leader
+        .sessions
+        .get_mut(&old_reused.incarnation)
+        .unwrap()
+        .last_heartbeat = Instant::now() - Duration::from_secs(60);
+    leader
+        .register(empty_hello(new_reused.clone()), new_reused_key)
+        .await
+        .unwrap();
+    let current = store.get_member("reused").await.unwrap().unwrap();
+    assert_eq!(current.node, new_reused);
+    assert_eq!(current.status, MemberStatus::Joining);
+}
+
+#[tokio::test]
+async fn member_store_allows_one_incarnation_and_exact_record_cas_only() {
+    let store = InMemoryPlacementStore::new(8, 8).unwrap();
+    store.ensure_schema_generation().await.unwrap();
+    let first_lease = store.grant_lease(Duration::from_secs(5)).await.unwrap();
+    let second_lease = store.grant_lease(Duration::from_secs(5)).await.unwrap();
+    let cluster = ClusterId::new("member-store").unwrap();
+    let (first, _) = node(&cluster, "same-id", 30200, 1);
+    let (second, _) = node(&cluster, "same-id", 30201, 2);
+    let joining = MemberRecord {
+        node: first.clone(),
+        hello: empty_hello(first),
+        status: MemberStatus::Joining,
+        revision: Revision::new(1).unwrap(),
+        lease_id: first_lease,
+    };
+    let replacement = MemberRecord {
+        node: second.clone(),
+        hello: empty_hello(second),
+        status: MemberStatus::Joining,
+        revision: Revision::new(2).unwrap(),
+        lease_id: second_lease,
+    };
+    store.create_member(&joining).await.unwrap();
+    assert!(matches!(
+        store.create_member(&replacement).await,
+        Err(StorageError::IncarnationConflict)
+    ));
+    let mut up = joining.clone();
+    up.status = MemberStatus::Up;
+    up.revision = Revision::new(2).unwrap();
+    store.compare_and_put_member(&joining, &up).await.unwrap();
+    assert!(matches!(
+        store.compare_and_delete_member(&joining).await,
+        Err(StorageError::CompareFailed)
+    ));
+    store.compare_and_delete_member(&up).await.unwrap();
+    store.create_member(&replacement).await.unwrap();
 }

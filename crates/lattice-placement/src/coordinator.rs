@@ -37,6 +37,55 @@ pub struct NodeHello {
     pub singleton_configs: Vec<SingletonConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemberStatus {
+    Joining,
+    Up,
+    Leaving,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberRecord {
+    pub node: NodeKey,
+    pub hello: NodeHello,
+    pub status: MemberStatus,
+    pub revision: Revision,
+    pub lease_id: i64,
+}
+
+impl MemberRecord {
+    pub fn validate(&self, limits: &SessionLimits) -> Result<(), CoordinatorError> {
+        self.hello.validate(limits)?;
+        if self.node != self.hello.node || self.lease_id == 0 {
+            return Err(CoordinatorError::InvalidMember);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemberRemovalReason {
+    GracefulLeave,
+    FailureDetected,
+    ForceRemoved,
+    IncarnationReplaced,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemberChange {
+    Upsert(Box<MemberRecord>),
+    Removed {
+        node: NodeKey,
+        reason: MemberRemovalReason,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberEvent {
+    pub revision: Revision,
+    pub change: MemberChange,
+}
+
 impl NodeHello {
     pub fn validate(&self, limits: &SessionLimits) -> Result<(), CoordinatorError> {
         self.node
@@ -391,6 +440,45 @@ impl CoordinatorSession {
         Ok(())
     }
 
+    pub fn apply_member_event(&mut self, event: MemberEvent) -> Result<(), CoordinatorError> {
+        let current = self.revision.ok_or(CoordinatorError::SnapshotRequired)?;
+        if event.revision.get() != current.get().saturating_add(1) {
+            self.ready = false;
+            return Err(CoordinatorError::RevisionGap);
+        }
+        match event.change {
+            MemberChange::Upsert(member) => {
+                let key = format!("member/{}", member.node.node_id);
+                let value =
+                    serde_json::to_vec(&member).map_err(|_| CoordinatorError::MemberCodec)?;
+                self.records.insert(key, Bytes::from(value));
+            }
+            MemberChange::Removed { node, .. } => {
+                let key = format!("member/{}", node.node_id);
+                let remove = self
+                    .records
+                    .get(&key)
+                    .and_then(|value| serde_json::from_slice::<MemberRecord>(value).ok())
+                    .is_some_and(|member| member.node == node);
+                if remove {
+                    self.records.remove(&key);
+                }
+            }
+        }
+        self.revision = Some(event.revision);
+        Ok(())
+    }
+
+    pub fn revision(&self) -> Option<Revision> {
+        self.revision
+    }
+
+    pub fn records(&self) -> impl ExactSizeIterator<Item = (&str, &Bytes)> {
+        self.records
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+    }
+
     pub fn ready(&self) -> bool {
         self.ready
     }
@@ -510,6 +598,10 @@ pub enum CoordinatorError {
     InvalidLimits,
     #[error("node registration is invalid or over its bounds")]
     InvalidHello,
+    #[error("member record is invalid")]
+    InvalidMember,
+    #[error("member record codec failed")]
+    MemberCodec,
     #[error("snapshot exceeds its configured bounds")]
     SnapshotLimit,
     #[error("snapshot chunks are missing, duplicated, out of order, or expired")]

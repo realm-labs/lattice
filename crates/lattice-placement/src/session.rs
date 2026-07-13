@@ -15,7 +15,8 @@ use crate::control::{
     PlacementControlEventKind, encode_control_command,
 };
 use crate::coordinator::{
-    CoordinatorDelta, CoordinatorSession, NodeHello, SnapshotLimits, SnapshotStager,
+    CoordinatorDelta, CoordinatorSession, MemberEvent, MemberRecord, MemberStatus, NodeHello,
+    SnapshotLimits, SnapshotStager,
 };
 use crate::types::{MonotonicTime, NodeKey, PlacementSlot, PlacementSlotKey};
 
@@ -65,7 +66,15 @@ pub enum LogicPlacementEffect {
         slot: PlacementSlotKey,
         effect: AuthorityEffect,
     },
-    NodeDown(lattice_core::actor_ref::NodeIncarnation),
+    MemberEvent(Box<MemberEvent>),
+    MemberSnapshot {
+        revision: crate::types::Revision,
+        members: Vec<MemberRecord>,
+    },
+    DrainReady {
+        operation_id: String,
+        incarnation: lattice_core::actor_ref::NodeIncarnation,
+    },
 }
 
 pub struct LogicPlacementState {
@@ -73,6 +82,7 @@ pub struct LogicPlacementState {
     session: CoordinatorSession,
     slots: BTreeMap<PlacementSlotKey, PlacementSlot>,
     authorities: BTreeMap<PlacementSlotKey, PlacementAuthority>,
+    member_up: bool,
     changed: Arc<Notify>,
 }
 
@@ -88,7 +98,7 @@ impl LogicPlacementState {
     }
 
     pub fn ready(&self) -> bool {
-        self.session.ready()
+        self.session.ready() && self.member_up
     }
 
     pub fn change_notifier(&self) -> Arc<Notify> {
@@ -176,12 +186,50 @@ impl LogicCoordinatorHandle {
         self.send_ephemeral(PlacementControlCommand::ShardLoad(report))
     }
 
+    pub fn begin_drain(&self, operation_id: String) -> Result<(), LogicSessionError> {
+        let incarnation = self
+            .state
+            .lock()
+            .expect("logic placement state poisoned")
+            .local_node
+            .incarnation;
+        self.send_reliable(PlacementControlCommand::BeginDrain {
+            operation_id,
+            expected_incarnation: incarnation,
+        })
+    }
+
+    pub fn complete_member_drain(&self, operation_id: String) -> Result<(), LogicSessionError> {
+        let incarnation = self
+            .state
+            .lock()
+            .expect("logic placement state poisoned")
+            .local_node
+            .incarnation;
+        self.send_reliable(PlacementControlCommand::DrainComplete {
+            operation_id,
+            expected_incarnation: incarnation,
+        })
+    }
+
     fn send_ephemeral(&self, command: PlacementControlCommand) -> Result<(), LogicSessionError> {
         let association = self
             .associations
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
         association.admit_ephemeral_control(
+            encode_control_command(&command, self.maximum_control_payload)
+                .map_err(LogicSessionError::Control)?,
+        )?;
+        Ok(())
+    }
+
+    fn send_reliable(&self, command: PlacementControlCommand) -> Result<(), LogicSessionError> {
+        let association = self
+            .associations
+            .get(&self.coordinator)
+            .ok_or(LogicSessionError::AssociationUnavailable)?;
+        association.admit_control_command(
             encode_control_command(&command, self.maximum_control_payload)
                 .map_err(LogicSessionError::Control)?,
         )?;
@@ -258,6 +306,7 @@ impl LogicCoordinatorSession {
                     session: CoordinatorSession::default(),
                     slots: BTreeMap::new(),
                     authorities: BTreeMap::new(),
+                    member_up: false,
                     changed: Arc::new(Notify::new()),
                 })),
                 stager: None,
@@ -316,9 +365,29 @@ impl LogicCoordinatorSession {
     }
 
     pub async fn run(
+        self,
+        controls: mpsc::Receiver<PlacementControlEvent>,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<(), LogicSessionError> {
+        self.run_recoverable(controls, shutdown).await.0
+    }
+
+    pub async fn run_recoverable(
         mut self,
         mut controls: mpsc::Receiver<PlacementControlEvent>,
         mut shutdown: watch::Receiver<bool>,
+    ) -> (
+        Result<(), LogicSessionError>,
+        mpsc::Receiver<PlacementControlEvent>,
+    ) {
+        let result = self.run_loop(&mut controls, &mut shutdown).await;
+        (result, controls)
+    }
+
+    async fn run_loop(
+        &mut self,
+        controls: &mut mpsc::Receiver<PlacementControlEvent>,
+        shutdown: &mut watch::Receiver<bool>,
     ) -> Result<(), LogicSessionError> {
         self.send_hello()?;
         let mut tick = tokio::time::interval(self.config.tick_interval);
@@ -390,6 +459,10 @@ impl LogicCoordinatorSession {
         match event {
             PlacementControlEventKind::Reconcile { association, .. } => {
                 self.require_coordinator(&association)?;
+                self.state
+                    .lock()
+                    .expect("logic placement state poisoned")
+                    .member_up = false;
                 self.send_hello()
             }
             PlacementControlEventKind::Command(inbound) => {
@@ -426,6 +499,7 @@ impl LogicCoordinatorSession {
                         );
                         let revision = install.revision;
                         let slots = decode_slots(&install.records)?;
+                        let members = decode_members(&install.records)?;
                         self.install_snapshot_slots(slots)?;
                         self.state
                             .lock()
@@ -433,9 +507,16 @@ impl LogicCoordinatorSession {
                             .session
                             .install(install)
                             .map_err(LogicSessionError::Coordinator)?;
-                        self.send(PlacementControlCommand::AppliedRevision(revision))
+                        self.effects
+                            .try_send(LogicPlacementEffect::MemberSnapshot { revision, members })
+                            .map_err(|_| LogicSessionError::EffectBackpressure)?;
+                        self.send(PlacementControlCommand::JoinReady {
+                            snapshot_revision: revision,
+                        })
                     }
                     PlacementControlCommand::StateDelta(delta) => self.apply_delta(delta),
+                    PlacementControlCommand::MemberDelta(event) => self.apply_member_event(event),
+                    PlacementControlCommand::MemberUp(member) => self.apply_member_up(member),
                     PlacementControlCommand::ClaimGranted(grant) => {
                         let effects = {
                             let mut state =
@@ -452,10 +533,26 @@ impl LogicCoordinatorSession {
                         };
                         self.publish_effects(grant.slot, effects)
                     }
-                    PlacementControlCommand::NodeRemoved(incarnation) => self
-                        .effects
-                        .try_send(LogicPlacementEffect::NodeDown(incarnation))
-                        .map_err(|_| LogicSessionError::EffectBackpressure),
+                    PlacementControlCommand::DrainReady {
+                        operation_id,
+                        expected_incarnation,
+                    } => {
+                        let local = self
+                            .state
+                            .lock()
+                            .expect("logic placement state poisoned")
+                            .local_node
+                            .incarnation;
+                        if expected_incarnation != local {
+                            return Err(LogicSessionError::StaleGeneration);
+                        }
+                        self.effects
+                            .try_send(LogicPlacementEffect::DrainReady {
+                                operation_id,
+                                incarnation: expected_incarnation,
+                            })
+                            .map_err(|_| LogicSessionError::EffectBackpressure)
+                    }
                     PlacementControlCommand::DrainSlot {
                         slot: key,
                         generation,
@@ -481,6 +578,7 @@ impl LogicCoordinatorSession {
                         self.publish_effects(key, effects)
                     }
                     PlacementControlCommand::NodeHello(_)
+                    | PlacementControlCommand::JoinReady { .. }
                     | PlacementControlCommand::NodeHeartbeat { .. }
                     | PlacementControlCommand::SubscribeEntity(_)
                     | PlacementControlCommand::SubscribeSingleton(_)
@@ -492,8 +590,9 @@ impl LogicCoordinatorSession {
                     | PlacementControlCommand::SlotDrained { .. }
                     | PlacementControlCommand::SlotStopFailed { .. }
                     | PlacementControlCommand::SlotReady { .. }
-                    | PlacementControlCommand::BeginDrain
-                    | PlacementControlCommand::DrainComplete => {
+                    | PlacementControlCommand::BeginDrain { .. }
+                    | PlacementControlCommand::DrainComplete { .. }
+                    | PlacementControlCommand::ForceRemove { .. } => {
                         Err(LogicSessionError::UnauthorizedCommand)
                     }
                 }
@@ -512,6 +611,37 @@ impl LogicCoordinatorSession {
         }
         self.install_slots(slots)?;
         self.send(PlacementControlCommand::AppliedRevision(delta.revision))
+    }
+
+    fn apply_member_event(&self, event: MemberEvent) -> Result<(), LogicSessionError> {
+        self.state
+            .lock()
+            .expect("logic placement state poisoned")
+            .session
+            .apply_member_event(event.clone())
+            .map_err(LogicSessionError::Coordinator)?;
+        self.effects
+            .try_send(LogicPlacementEffect::MemberEvent(Box::new(event)))
+            .map_err(|_| LogicSessionError::EffectBackpressure)?;
+        self.state
+            .lock()
+            .expect("logic placement state poisoned")
+            .changed
+            .notify_waiters();
+        Ok(())
+    }
+
+    fn apply_member_up(&self, member: MemberRecord) -> Result<(), LogicSessionError> {
+        let mut state = self.state.lock().expect("logic placement state poisoned");
+        if member.status != MemberStatus::Up
+            || member.node != state.local_node
+            || state.session.revision() != Some(member.revision)
+        {
+            return Err(LogicSessionError::StaleGeneration);
+        }
+        state.member_up = true;
+        state.changed.notify_waiters();
+        Ok(())
     }
 
     fn install_snapshot_slots(
@@ -666,6 +796,30 @@ fn decode_slots(
         }
     }
     Ok(slots)
+}
+
+fn decode_members(
+    records: &[crate::coordinator::SnapshotRecord],
+) -> Result<Vec<MemberRecord>, LogicSessionError> {
+    let mut members = BTreeMap::new();
+    for record in records {
+        if !record.key.starts_with("member/") {
+            continue;
+        }
+        let member: MemberRecord =
+            serde_json::from_slice(&record.value).map_err(|_| LogicSessionError::Codec)?;
+        if member.node != member.hello.node
+            || members
+                .insert(
+                    (member.node.node_id.clone(), member.node.incarnation),
+                    member,
+                )
+                .is_some()
+        {
+            return Err(LogicSessionError::Codec);
+        }
+    }
+    Ok(members.into_values().collect())
 }
 
 fn session_dispatch_error(error: &LogicSessionError) -> ControlDispatchError {

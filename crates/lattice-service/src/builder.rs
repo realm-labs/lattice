@@ -10,16 +10,21 @@ use lattice_actor::recipient::BoundRecipient;
 use lattice_actor::recipient::RecipientBackend;
 use lattice_actor::traits::Actor;
 use lattice_core::actor_ref::RecipientRef;
+use lattice_discovery::provider::ClusterDiscovery;
 use lattice_placement::authority::AuthorityEffect;
 use lattice_placement::control::{PlacementControlEvent, PlacementControlRouter};
+use lattice_placement::coordinator::{MemberChange, MemberEvent, NodeHello};
 use lattice_placement::runtime::CoordinatorHandle;
 use lattice_placement::runtime::CoordinatorLeader;
+use lattice_placement::session::LogicCoordinatorConfig;
 use lattice_placement::session::LogicCoordinatorHandle;
 use lattice_placement::session::LogicCoordinatorSession;
 use lattice_placement::session::LogicPlacementEffect;
 use lattice_placement::storage::CoordinatorStore;
+use lattice_placement::types::NodeKey;
 use lattice_remoting::association::Association;
 use lattice_remoting::association::AssociationManager;
+use lattice_remoting::bootstrap::BootstrapLeader;
 use lattice_remoting::control::ControlDispatch;
 use lattice_remoting::control::RejectControlDispatch;
 use lattice_remoting::endpoint::EndpointSecurity;
@@ -31,7 +36,11 @@ use lattice_remoting::watch::WatchRegistry;
 use tokio::sync::{mpsc, watch};
 
 use crate::backend::{LogicalRouter, ServiceInboundDispatch, ServiceRecipientBackend};
-use crate::config::NodeConfig;
+use crate::cluster::join::{BootstrapView, JoinController};
+use crate::cluster::members::{MemberDirectory, MemberSnapshot};
+use crate::cluster::peers::PeerReconciler;
+use crate::cluster::runtime::LogicJoinRuntime;
+use crate::config::{ClusterJoinConfig, NodeConfig};
 use crate::control::ServiceControlDispatch;
 use crate::error::ServiceError;
 use crate::lifecycle::{ServiceLifecycle, ServiceLifecycleEvent, ServiceLifecycleState};
@@ -49,6 +58,9 @@ pub struct LatticeServiceBuilder {
     control_scope: Option<lattice_remoting::association::AssociationKey>,
     coordinator_runtime: Option<CoordinatorRuntimeAssembly>,
     endpoint_security: Option<EndpointSecurity>,
+    discovery: Option<Arc<dyn ClusterDiscovery>>,
+    join_config: ClusterJoinConfig,
+    member_event_capacity: usize,
 }
 
 struct LogicRuntimeAssembly {
@@ -63,6 +75,7 @@ struct CoordinatorRuntimeAssembly {
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
     shutdown: watch::Sender<bool>,
     handle: CoordinatorHandle,
+    bootstrap_leader: BootstrapLeader,
 }
 
 impl LatticeServiceBuilder {
@@ -91,6 +104,9 @@ impl LatticeServiceBuilder {
             control_scope: None,
             coordinator_runtime: None,
             endpoint_security: None,
+            discovery: None,
+            join_config: ClusterJoinConfig::default(),
+            member_event_capacity: 256,
             associations,
             messaging,
         })
@@ -132,6 +148,21 @@ impl LatticeServiceBuilder {
         self
     }
 
+    pub fn cluster_discovery(mut self, discovery: Arc<dyn ClusterDiscovery>) -> Self {
+        self.discovery = Some(discovery);
+        self
+    }
+
+    pub fn join_config(mut self, config: ClusterJoinConfig) -> Self {
+        self.join_config = config;
+        self
+    }
+
+    pub fn member_event_capacity(mut self, capacity: usize) -> Self {
+        self.member_event_capacity = capacity;
+        self
+    }
+
     pub fn cluster_logic_runtime(
         mut self,
         router: Arc<dyn LogicalRouter>,
@@ -161,6 +192,7 @@ impl LatticeServiceBuilder {
         controls: mpsc::Receiver<PlacementControlEvent>,
     ) -> Self {
         let handle = leader.handle();
+        let record = leader.leader().clone();
         let (shutdown, shutdown_rx) = watch::channel(false);
         self.control_dispatch = dispatch;
         self.coordinator_runtime = Some(CoordinatorRuntimeAssembly {
@@ -169,11 +201,70 @@ impl LatticeServiceBuilder {
             }),
             shutdown,
             handle,
+            bootstrap_leader: BootstrapLeader {
+                identity: NodeIdentity {
+                    cluster_id: self.config.cluster_id.clone(),
+                    node_id: record.node.node_id,
+                    address: record.node.address,
+                    incarnation: record.node.incarnation,
+                },
+                term: record.term.get(),
+                protocol_generation: record.protocol_generation,
+            },
         });
         self
     }
 
-    pub fn build(self) -> Result<LatticeService, ServiceError> {
+    pub fn build(mut self) -> Result<LatticeService, ServiceError> {
+        self.join_config
+            .validate()
+            .map_err(ServiceError::JoinConfig)?;
+        let members = Arc::new(
+            MemberDirectory::new(self.member_event_capacity)
+                .map_err(ServiceError::MemberDirectory)?,
+        );
+        let auto_join = if let Some(discovery) = self.discovery.take() {
+            if self.logic_runtime.is_some() {
+                return Err(ServiceError::ConflictingClusterRuntime);
+            }
+            let (dispatch, controls) = PlacementControlRouter::bounded(
+                self.member_event_capacity,
+                lattice_placement::control::DEFAULT_MAX_CONTROL_PAYLOAD,
+            )
+            .map_err(ServiceError::PlacementControl)?;
+            self.control_dispatch = Arc::new(dispatch);
+            let protocols = self
+                .protocols
+                .iter()
+                .map(|(protocol_id, fingerprint)| ProtocolDescriptor {
+                    protocol_id: lattice_core::actor_ref::ProtocolId::new(*protocol_id)
+                        .expect("registered actor protocols have nonzero IDs"),
+                    fingerprint: *fingerprint,
+                })
+                .collect();
+            Some((
+                discovery,
+                controls,
+                NodeHello {
+                    node: NodeKey {
+                        node_id: self.config.node_id.clone(),
+                        address: self.config.address.clone(),
+                        incarnation: self.config.incarnation,
+                    },
+                    roles: self.config.roles.clone(),
+                    capacity_units: 1,
+                    hosted_entity_types: Default::default(),
+                    proxied_entity_types: Default::default(),
+                    singleton_eligibility: Default::default(),
+                    used_singletons: Default::default(),
+                    protocols,
+                    entity_configs: Vec::new(),
+                    singleton_configs: Vec::new(),
+                },
+            ))
+        } else {
+            None
+        };
         let associations = self.associations;
         let messaging = self.messaging;
         let hosts = Arc::new(self.hosts);
@@ -211,14 +302,15 @@ impl LatticeServiceBuilder {
             )
             .map_err(ServiceError::Control)?,
         );
+        let local_identity = NodeIdentity {
+            cluster_id: self.config.cluster_id.clone(),
+            node_id: self.config.node_id.clone(),
+            address: self.config.address.clone(),
+            incarnation: self.config.incarnation,
+        };
         let endpoint = Arc::new(
             RemotingEndpoint::new_with_control_and_security(
-                NodeIdentity {
-                    cluster_id: self.config.cluster_id.clone(),
-                    node_id: self.config.node_id.clone(),
-                    address: self.config.address.clone(),
-                    incarnation: self.config.incarnation,
-                },
+                local_identity.clone(),
                 self.config.remoting.clone(),
                 associations.clone(),
                 messaging.clone(),
@@ -236,38 +328,97 @@ impl LatticeServiceBuilder {
             )
             .map_err(ServiceError::Endpoint)?,
         );
+        let bootstrap_view = Arc::new(BootstrapView::new(local_identity));
+        if let Some(runtime) = self.coordinator_runtime.as_ref() {
+            bootstrap_view.install(runtime.bootstrap_leader.clone());
+        }
+        endpoint.install_bootstrap_handler(bootstrap_view.clone());
+        let peers = Arc::new(PeerReconciler::new(
+            self.config.cluster_id.clone(),
+            endpoint.clone(),
+            associations.clone(),
+            members.clone(),
+        ));
+        let lifecycle = Arc::new(std::sync::Mutex::new(ServiceLifecycle::default()));
+        let (lifecycle_events, _) = watch::channel(ServiceLifecycleState::Booting);
+        let logic_handle = Arc::new(std::sync::Mutex::new(None));
+        let (drain_ready, _) = watch::channel(None);
+        let join_runtime = auto_join
+            .map(|(discovery, controls, hello)| {
+                let controller = JoinController::new(
+                    discovery,
+                    endpoint.clone(),
+                    associations.clone(),
+                    self.join_config.clone(),
+                )
+                .map_err(ServiceError::Join)?;
+                Ok(LogicJoinRuntime {
+                    controller: Arc::new(controller),
+                    hello,
+                    associations: associations.clone(),
+                    controls: Some(controls),
+                    config: LogicCoordinatorConfig::default(),
+                    effect_capacity: self.member_event_capacity,
+                    router: None,
+                    members: members.clone(),
+                    peers: peers.clone(),
+                    watches: watches.clone(),
+                    lifecycle: lifecycle.clone(),
+                    lifecycle_events: lifecycle_events.clone(),
+                    logic_handle: logic_handle.clone(),
+                    drain_ready: drain_ready.clone(),
+                    bootstrap_view: bootstrap_view.clone(),
+                })
+            })
+            .transpose()?;
         Ok(LatticeService {
-            config: self.config,
             backend,
             associations,
             messaging,
             endpoint,
             supervisor,
             logic_runtime: std::sync::Mutex::new(self.logic_runtime),
+            join_runtime: std::sync::Mutex::new(join_runtime),
             logic_shutdown: std::sync::Mutex::new(None),
+            join_shutdown: std::sync::Mutex::new(None),
+            logic_handle,
             watches,
             coordinator_runtime: std::sync::Mutex::new(self.coordinator_runtime),
             coordinator_shutdown: std::sync::Mutex::new(None),
             coordinator_handle: std::sync::Mutex::new(None),
-            lifecycle: Arc::new(std::sync::Mutex::new(ServiceLifecycle::default())),
+            lifecycle,
+            lifecycle_events,
+            members,
+            peers,
+            drain_ready,
+            drain_operation: std::sync::Mutex::new(None),
+            join_config: self.join_config,
         })
     }
 }
 
 pub struct LatticeService {
-    config: NodeConfig,
     backend: Arc<dyn RecipientBackend>,
     associations: Arc<AssociationManager>,
     messaging: Arc<OutboundMessaging>,
     endpoint: Arc<RemotingEndpoint>,
     supervisor: Arc<TaskSupervisor>,
     logic_runtime: std::sync::Mutex<Option<LogicRuntimeAssembly>>,
+    join_runtime: std::sync::Mutex<Option<LogicJoinRuntime>>,
     logic_shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
+    join_shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
+    logic_handle: Arc<std::sync::Mutex<Option<LogicCoordinatorHandle>>>,
     watches: Arc<std::sync::Mutex<WatchRegistry>>,
     coordinator_runtime: std::sync::Mutex<Option<CoordinatorRuntimeAssembly>>,
     coordinator_shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
     coordinator_handle: std::sync::Mutex<Option<CoordinatorHandle>>,
     lifecycle: Arc<std::sync::Mutex<ServiceLifecycle>>,
+    lifecycle_events: watch::Sender<ServiceLifecycleState>,
+    members: Arc<MemberDirectory>,
+    peers: Arc<PeerReconciler>,
+    drain_ready: watch::Sender<Option<String>>,
+    drain_operation: std::sync::Mutex<Option<String>>,
+    join_config: ClusterJoinConfig,
 }
 
 impl LatticeService {
@@ -319,6 +470,40 @@ impl LatticeService {
             .state()
     }
 
+    pub fn subscribe_lifecycle(&self) -> watch::Receiver<ServiceLifecycleState> {
+        self.lifecycle_events.subscribe()
+    }
+
+    pub fn member_snapshot(&self) -> MemberSnapshot {
+        self.members.snapshot()
+    }
+
+    pub fn subscribe_members(&self) -> tokio::sync::broadcast::Receiver<MemberEvent> {
+        self.members.subscribe()
+    }
+
+    pub async fn connect_member(&self, node: &NodeKey) -> Result<Arc<Association>, ServiceError> {
+        match self.peers.connect(node).await {
+            Ok(association) => Ok(association),
+            Err(crate::cluster::peers::PeerError::Endpoint(error)) => {
+                Err(ServiceError::Endpoint(error))
+            }
+            Err(crate::cluster::peers::PeerError::NotAuthoritativeUp)
+            | Err(crate::cluster::peers::PeerError::Directory(_)) => {
+                Err(ServiceError::CoordinatorUnavailable)
+            }
+        }
+    }
+
+    fn transition(&self, event: ServiceLifecycleEvent) -> Result<(), ServiceError> {
+        let mut lifecycle = self.lifecycle.lock().expect("service lifecycle poisoned");
+        lifecycle
+            .transition(event)
+            .map_err(ServiceError::Lifecycle)?;
+        self.lifecycle_events.send_replace(lifecycle.state());
+        Ok(())
+    }
+
     pub async fn start(&self) -> Result<(), ServiceError> {
         if let Err(error) = self.endpoint.bind().await {
             let _ = self
@@ -326,13 +511,11 @@ impl LatticeService {
                 .lock()
                 .expect("service lifecycle poisoned")
                 .transition(ServiceLifecycleEvent::StartupFailed);
+            self.lifecycle_events
+                .send_replace(ServiceLifecycleState::Terminated);
             return Err(ServiceError::Endpoint(error));
         }
-        self.lifecycle
-            .lock()
-            .expect("service lifecycle poisoned")
-            .transition(ServiceLifecycleEvent::RemotingReady)
-            .map_err(ServiceError::Lifecycle)?;
+        self.transition(ServiceLifecycleEvent::RemotingReady)?;
         if let Some(runtime) = self
             .coordinator_runtime
             .lock()
@@ -348,6 +531,20 @@ impl LatticeService {
                 .lock()
                 .expect("service Coordinator handle poisoned") = Some(runtime.handle);
             self.supervisor.spawn(runtime.future)?;
+        }
+        let join_runtime = self
+            .join_runtime
+            .lock()
+            .expect("service join runtime poisoned")
+            .take();
+        let has_join_runtime = join_runtime.is_some();
+        if let Some(runtime) = join_runtime {
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            *self
+                .join_shutdown
+                .lock()
+                .expect("service join shutdown poisoned") = Some(shutdown);
+            self.supervisor.spawn(runtime.run(shutdown_rx))?;
         }
         let runtime = self
             .logic_runtime
@@ -371,6 +568,7 @@ impl LatticeService {
             } = runtime;
             let readiness_handle = handle.clone();
             let lifecycle = self.lifecycle.clone();
+            let lifecycle_events = self.lifecycle_events.clone();
             self.supervisor.spawn(async move {
                 let changed = readiness_handle.change_notifier();
                 loop {
@@ -378,6 +576,7 @@ impl LatticeService {
                         let mut lifecycle = lifecycle.lock().expect("service lifecycle poisoned");
                         if lifecycle.state() == ServiceLifecycleState::Joining {
                             let _ = lifecycle.transition(ServiceLifecycleEvent::SnapshotInstalled);
+                            lifecycle_events.send_replace(lifecycle.state());
                         }
                         break;
                     }
@@ -395,14 +594,40 @@ impl LatticeService {
                 let _ = session.run(controls, shutdown_rx).await;
             })?;
             let watches = self.watches.clone();
+            let members = self.members.clone();
+            let peers = self.peers.clone();
+            let drain_ready = self.drain_ready.clone();
             self.supervisor.spawn(async move {
                 while let Some(effect) = effects.recv().await {
                     let (slot, effect) = match effect {
-                        LogicPlacementEffect::NodeDown(incarnation) => {
-                            watches
-                                .lock()
-                                .expect("watch registry poisoned")
-                                .node_down(incarnation);
+                        LogicPlacementEffect::MemberEvent(event) => {
+                            if let MemberEvent {
+                                change: MemberChange::Removed { node, .. },
+                                ..
+                            } = event.as_ref()
+                            {
+                                watches
+                                    .lock()
+                                    .expect("watch registry poisoned")
+                                    .node_down(node.incarnation);
+                            }
+                            let _ = peers.apply(*event);
+                            continue;
+                        }
+                        LogicPlacementEffect::MemberSnapshot {
+                            revision,
+                            members: snapshot,
+                        } => {
+                            let _ = members.install_snapshot(revision, snapshot);
+                            continue;
+                        }
+                        LogicPlacementEffect::DrainReady {
+                            operation_id,
+                            incarnation: _,
+                        } => {
+                            if handle.complete_member_drain(operation_id.clone()).is_ok() {
+                                drain_ready.send_replace(Some(operation_id));
+                            }
                             continue;
                         }
                         LogicPlacementEffect::Authority { slot, effect } => (slot, effect),
@@ -431,12 +656,8 @@ impl LatticeService {
                 }
             })?;
         }
-        if !has_logic_runtime {
-            self.lifecycle
-                .lock()
-                .expect("service lifecycle poisoned")
-                .transition(ServiceLifecycleEvent::SnapshotInstalled)
-                .map_err(ServiceError::Lifecycle)?;
+        if !has_logic_runtime && !has_join_runtime {
+            self.transition(ServiceLifecycleEvent::SnapshotInstalled)?;
         }
         Ok(())
     }
@@ -448,16 +669,82 @@ impl LatticeService {
             .map_err(ServiceError::Endpoint)
     }
 
-    pub async fn shutdown(&self) -> Result<(), ServiceError> {
-        {
-            let mut lifecycle = self.lifecycle.lock().expect("service lifecycle poisoned");
-            if lifecycle.state() != ServiceLifecycleState::Terminated
-                && lifecycle.state() != ServiceLifecycleState::Stopping
-            {
-                lifecycle
-                    .transition(ServiceLifecycleEvent::ForceStop)
-                    .map_err(ServiceError::Lifecycle)?;
+    pub async fn leave(&self, deadline: tokio::time::Instant) -> Result<(), ServiceError> {
+        match self.lifecycle_state() {
+            ServiceLifecycleState::Terminated => return Ok(()),
+            ServiceLifecycleState::Booting | ServiceLifecycleState::Joining => {
+                return self.force_shutdown().await;
             }
+            ServiceLifecycleState::Stopping => return self.stop_components().await,
+            ServiceLifecycleState::Ready | ServiceLifecycleState::Degraded => {
+                self.transition(ServiceLifecycleEvent::BeginDrain)?;
+            }
+            ServiceLifecycleState::Draining => {}
+        }
+        let operation_id = {
+            let mut operation = self
+                .drain_operation
+                .lock()
+                .expect("service drain operation poisoned");
+            operation
+                .get_or_insert_with(|| format!("leave-{}", uuid::Uuid::new_v4()))
+                .clone()
+        };
+        let handle = self
+            .logic_handle
+            .lock()
+            .expect("logic handle poisoned")
+            .clone()
+            .ok_or(ServiceError::CoordinatorUnavailable)?;
+        handle
+            .begin_drain(operation_id.clone())
+            .map_err(|_| ServiceError::CoordinatorUnavailable)?;
+        let mut ready = self.drain_ready.subscribe();
+        loop {
+            if ready.borrow().as_ref() == Some(&operation_id) {
+                self.transition(ServiceLifecycleEvent::DrainComplete)?;
+                return self.stop_components().await;
+            }
+            tokio::time::timeout_at(deadline, ready.changed())
+                .await
+                .map_err(|_| ServiceError::LeaveTimeout)?
+                .map_err(|_| ServiceError::CoordinatorUnavailable)?;
+        }
+    }
+
+    pub async fn shutdown(&self) -> Result<(), ServiceError> {
+        let deadline = tokio::time::Instant::now() + self.join_config.leave_timeout;
+        if self
+            .join_shutdown
+            .lock()
+            .expect("service join shutdown poisoned")
+            .is_some()
+            && self.leave(deadline).await.is_ok()
+        {
+            return Ok(());
+        }
+        self.force_shutdown().await
+    }
+
+    pub async fn force_shutdown(&self) -> Result<(), ServiceError> {
+        let state = self.lifecycle_state();
+        if state == ServiceLifecycleState::Terminated {
+            return Ok(());
+        }
+        if state != ServiceLifecycleState::Stopping {
+            self.transition(ServiceLifecycleEvent::ForceStop)?;
+        }
+        self.stop_components().await
+    }
+
+    async fn stop_components(&self) -> Result<(), ServiceError> {
+        if let Some(shutdown) = self
+            .join_shutdown
+            .lock()
+            .expect("service join shutdown poisoned")
+            .take()
+        {
+            let _ = shutdown.send(true);
         }
         if let Some(shutdown) = self
             .logic_shutdown
@@ -480,13 +767,11 @@ impl LatticeService {
             .await
             .map_err(ServiceError::Endpoint)?;
         self.supervisor
-            .shutdown(self.config.shutdown_timeout)
+            .shutdown(self.join_config.shutdown_timeout)
             .await?;
-        self.lifecycle
-            .lock()
-            .expect("service lifecycle poisoned")
-            .transition(ServiceLifecycleEvent::ShutdownComplete)
-            .map_err(ServiceError::Lifecycle)?;
+        if self.lifecycle_state() == ServiceLifecycleState::Stopping {
+            self.transition(ServiceLifecycleEvent::ShutdownComplete)?;
+        }
         Ok(())
     }
 }

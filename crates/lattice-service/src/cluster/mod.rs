@@ -35,7 +35,11 @@ use crate::backend::LogicalRouter;
 
 mod buffer;
 mod entity;
+pub mod join;
+pub mod members;
+pub mod peers;
 mod router;
+pub(crate) mod runtime;
 mod singleton;
 
 use buffer::RouteBuffer;

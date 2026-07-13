@@ -118,7 +118,8 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         self.sessions
             .values()
             .filter(|session| {
-                !session.draining
+                session.record.status == crate::coordinator::MemberStatus::Up
+                    && !session.draining
                     && exclude != Some(&session.hello.node)
                     && session.hello.singleton_eligibility.contains(kind)
                     && session.hello.singleton_configs.contains(config)
@@ -281,6 +282,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         let nodes = self
             .sessions
             .values()
+            .filter(|session| session.record.status == crate::coordinator::MemberStatus::Up)
             .map(|session| PlacementNode {
                 key: session.hello.node.clone(),
                 ready: true,

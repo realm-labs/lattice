@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use etcd_client::Client;
 use lattice_core::actor_ref::{ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation};
-use lattice_placement::coordinator::LeaderRecord;
+use lattice_placement::coordinator::{LeaderRecord, MemberRecord, MemberStatus, NodeHello};
 use lattice_placement::storage::etcd::{EtcdPlacementConfig, EtcdPlacementStore};
 use lattice_placement::storage::{CoordinatorStore, PlacementStore, StorageError};
 use lattice_placement::types::AssignmentGeneration;
@@ -56,6 +56,42 @@ async fn real_etcd_schema_leases_leadership_slots_and_exact_claim_cas() {
     };
     assert!(store.campaign_leader(&leader, leader_lease).await.unwrap());
     assert_eq!(store.get_leader().await.unwrap(), Some(leader));
+
+    let member_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
+    let member_node = node("member", 7, 29007);
+    let hello = NodeHello {
+        node: member_node.clone(),
+        roles: Default::default(),
+        capacity_units: 1,
+        hosted_entity_types: Default::default(),
+        proxied_entity_types: Default::default(),
+        singleton_eligibility: Default::default(),
+        used_singletons: Default::default(),
+        protocols: Vec::new(),
+        entity_configs: Vec::new(),
+        singleton_configs: Vec::new(),
+    };
+    let joining = MemberRecord {
+        node: member_node,
+        hello,
+        status: MemberStatus::Joining,
+        revision: Revision::new(1).unwrap(),
+        lease_id: member_lease,
+    };
+    store.create_member(&joining).await.unwrap();
+    assert_eq!(
+        store.get_member("member").await.unwrap(),
+        Some(joining.clone())
+    );
+    let mut up = joining.clone();
+    up.status = MemberStatus::Up;
+    up.revision = Revision::new(2).unwrap();
+    store.compare_and_put_member(&joining, &up).await.unwrap();
+    assert!(matches!(
+        store.compare_and_delete_member(&joining).await,
+        Err(StorageError::CompareFailed)
+    ));
+    store.compare_and_delete_member(&up).await.unwrap();
 
     let key = PlacementSlotKey::Shard {
         entity_type: EntityType::new("etcd-acceptance").unwrap(),

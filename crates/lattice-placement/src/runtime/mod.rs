@@ -20,8 +20,9 @@ use crate::control::{
     encode_control_command,
 };
 use crate::coordinator::{
-    LeaderRecord, LoadTable, NodeHello, SessionLimits, SingletonConfig, SnapshotLimits,
-    SnapshotRecord, build_snapshot,
+    LeaderRecord, LoadTable, MemberChange, MemberEvent, MemberRecord, MemberRemovalReason,
+    MemberStatus, NodeHello, SessionLimits, SingletonConfig, SnapshotLimits, SnapshotRecord,
+    build_snapshot,
 };
 use crate::handoff::{HandoffEffect, HandoffEvent, HandoffMachine, HandoffPhase};
 use crate::plan::{MoveProgress, PlanError, PlanReason, PlanStatus, RebalancePlan};
@@ -117,12 +118,16 @@ impl CoordinatorLeaderConfig {
 
 struct MemberSession {
     hello: NodeHello,
+    record: MemberRecord,
     association: lattice_remoting::association::AssociationKey,
     lease_id: i64,
     heartbeat_sequence: u64,
     last_heartbeat: Instant,
     applied_revision: Option<Revision>,
+    snapshot_revision: Option<Revision>,
     draining: bool,
+    drain_operation: Option<String>,
+    drain_ready: bool,
     joined_at: crate::types::MonotonicTime,
 }
 
@@ -138,6 +143,13 @@ pub struct ManualRelocationRequest {
     pub shard_id: crate::types::ShardId,
     pub expected_generation: crate::types::AssignmentGeneration,
     pub target_node_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForceRemoveRequest {
+    pub operation_id: String,
+    pub node_id: String,
+    pub expected_incarnation: NodeIncarnation,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +192,10 @@ enum CoordinatorOperation {
     ManualRelocate {
         request: ManualRelocationRequest,
         completion: tokio::sync::oneshot::Sender<Result<u128, CoordinatorRuntimeError>>,
+    },
+    ForceRemove {
+        request: ForceRemoveRequest,
+        completion: tokio::sync::oneshot::Sender<Result<(), CoordinatorRuntimeError>>,
     },
     Inspect {
         completion:
@@ -288,6 +304,23 @@ impl CoordinatorHandle {
             .map_err(|_| CoordinatorRuntimeError::OperationClosed)?
     }
 
+    pub async fn force_remove(
+        &self,
+        request: ForceRemoveRequest,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let (completion, result) = tokio::sync::oneshot::channel();
+        self.operations
+            .send(CoordinatorOperation::ForceRemove {
+                request,
+                completion,
+            })
+            .await
+            .map_err(|_| CoordinatorRuntimeError::OperationClosed)?;
+        result
+            .await
+            .map_err(|_| CoordinatorRuntimeError::OperationClosed)?
+    }
+
     pub async fn inspect(&self) -> Result<CoordinatorInspection, CoordinatorRuntimeError> {
         let (completion, result) = tokio::sync::oneshot::channel();
         self.operations
@@ -359,9 +392,11 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             return Err(CoordinatorRuntimeError::NotLeader);
         }
         let slots = store.list_slots().await?;
+        let members = store.list_members().await?;
         let revision = slots
             .iter()
             .map(|slot| slot.revision)
+            .chain(members.iter().map(|member| member.revision))
             .max()
             .unwrap_or(Revision::new(1).expect("one is a valid revision"));
         let loads = LoadTable::new(config.maximum_node_loads, config.maximum_shard_loads)
@@ -473,6 +508,10 @@ pub enum CoordinatorRuntimeError {
     UnauthorizedCommand,
     #[error("Coordinator session is not registered")]
     UnknownSession,
+    #[error("Coordinator member transition is stale or invalid")]
+    StaleMember,
+    #[error("Coordinator drain operation is not ready")]
+    DrainNotReady,
     #[error("Coordinator association is unavailable")]
     AssociationUnavailable,
     #[error("Coordinator claim sequence exhausted")]

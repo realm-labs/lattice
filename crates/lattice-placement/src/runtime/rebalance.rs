@@ -173,6 +173,9 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             ),
         };
         for session in self.sessions.values() {
+            if session.record.status != crate::coordinator::MemberStatus::Up {
+                continue;
+            }
             let include = match &slot.key {
                 PlacementSlotKey::Shard { entity_type, .. } => {
                     session.hello.subscribes_to(entity_type)

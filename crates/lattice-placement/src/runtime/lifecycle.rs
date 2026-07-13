@@ -1,8 +1,8 @@
 use super::membership::{control_dispatch_error, send_control};
 use super::{
     CoordinatorLeader, CoordinatorRuntimeError, CoordinatorStore, HandoffEvent, HandoffMachine,
-    HandoffPhase, Instant, MoveProgress, PlacementControlCommand, PlacementControlEvent,
-    PlacementSlotKey, PlacementSlotState, PlanStatus, RebalanceTrigger, mpsc, watch,
+    Instant, MoveProgress, PlacementControlCommand, PlacementControlEvent, PlacementSlotKey,
+    PlacementSlotState, PlanStatus, RebalanceTrigger, mpsc, watch,
 };
 
 impl<S: CoordinatorStore> CoordinatorLeader<S> {
@@ -282,86 +282,26 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .iter()
             .filter_map(|(incarnation, session)| {
                 (now.duration_since(session.last_heartbeat) > self.config.member_heartbeat_timeout)
-                    .then_some((*incarnation, session.lease_id, session.hello.node.clone()))
+                    .then_some((*incarnation, session.record.clone()))
             })
             .collect::<Vec<_>>();
-        for (incarnation, lease_id, node) in expired {
-            self.store.revoke_lease(lease_id).await?;
-            self.sessions.remove(&incarnation);
-            for session in self.sessions.values() {
-                let association = self
-                    .associations
-                    .get(&session.association)
-                    .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-                send_control(
-                    &association,
-                    PlacementControlCommand::NodeRemoved(incarnation),
-                    &self.config,
-                )?;
-            }
-            let expired_claims = self
-                .claims
-                .iter()
-                .filter_map(|(key, claim)| {
-                    (claim.grant.owner.incarnation == incarnation).then_some((
-                        key.clone(),
-                        claim.lease_id,
-                        claim.grant.clone(),
-                    ))
-                })
-                .collect::<Vec<_>>();
-            for (key, claim_lease, grant) in expired_claims {
-                self.store.delete_claim(&grant).await?;
-                self.store.revoke_lease(claim_lease).await?;
-                self.claims.remove(&key);
-            }
-            let barriers = self
-                .handoffs
-                .iter()
-                .filter_map(|(key, handoff)| {
-                    (handoff.phase == HandoffPhase::Invalidating
-                        && handoff.required_sessions().contains(&incarnation))
-                    .then_some(key.clone())
-                })
-                .collect::<Vec<_>>();
-            for key in barriers {
-                self.transition_handoff(key, HandoffEvent::FenceSession(incarnation))
-                    .await?;
-            }
-            let owned_slots = self
-                .store
-                .list_slots()
-                .await?
-                .into_iter()
-                .filter(|slot| slot.owner.as_ref() == Some(&node))
-                .collect::<Vec<_>>();
-            let entity_types = owned_slots
-                .iter()
-                .filter_map(|slot| match slot.key {
-                    PlacementSlotKey::Shard {
-                        ref entity_type, ..
-                    } => Some(entity_type.clone()),
-                    PlacementSlotKey::Singleton(_) => None,
-                })
-                .collect::<std::collections::BTreeSet<_>>();
-            for entity_type in entity_types {
-                let _ = self
-                    .evaluate_rebalance(
-                        entity_type,
-                        RebalanceTrigger::Recovery {
-                            owner: node.clone(),
-                        },
-                    )
-                    .await;
-            }
-            for slot in owned_slots {
-                if matches!(slot.key, PlacementSlotKey::Singleton(_)) {
-                    match self.begin_singleton_recovery(slot).await {
-                        Ok(()) | Err(CoordinatorRuntimeError::IneligibleTarget) => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-            }
+        for (_incarnation, member) in expired {
+            self.remove_member(
+                member,
+                crate::coordinator::MemberRemovalReason::FailureDetected,
+            )
+            .await?;
+        }
+        let leaving = self
+            .sessions
+            .iter()
+            .filter_map(|(incarnation, session)| {
+                (session.record.status == crate::coordinator::MemberStatus::Leaving)
+                    .then_some(*incarnation)
+            })
+            .collect::<Vec<_>>();
+        for incarnation in leaving {
+            self.maybe_send_drain_ready(incarnation).await?;
         }
         for session in self.sessions.values() {
             self.store.keep_lease_alive(session.lease_id).await?;

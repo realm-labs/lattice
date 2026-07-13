@@ -2124,8 +2124,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures-util",
  "lattice-actor",
  "lattice-core",
+ "lattice-discovery",
  "lattice-placement",
  "lattice-remoting",
  "prost",
@@ -2135,6 +2137,7 @@ dependencies = [
  "tokio",
  "tracing",
  "trybuild",
+ "uuid",
 ]
 
 [[package]]

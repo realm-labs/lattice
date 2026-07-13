@@ -11,12 +11,12 @@ use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::coordinator::{
-    CoordinatorDelta, NodeHello, NodeLoadReport, ShardLoadReport, SnapshotBegin, SnapshotChunk,
-    SnapshotEnd,
+    CoordinatorDelta, MemberEvent, MemberRecord, NodeHello, NodeLoadReport, ShardLoadReport,
+    SnapshotBegin, SnapshotChunk, SnapshotEnd,
 };
 use crate::types::{AssignmentGeneration, ClaimGrant, Revision, ShardId};
 
-pub const PLACEMENT_CONTROL_GENERATION: u64 = 2;
+pub const PLACEMENT_CONTROL_GENERATION: u64 = 3;
 pub const DEFAULT_MAX_CONTROL_PAYLOAD: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,7 +26,11 @@ pub enum PlacementControlCommand {
         incarnation: NodeIncarnation,
         sequence: u64,
     },
-    NodeRemoved(NodeIncarnation),
+    JoinReady {
+        snapshot_revision: Revision,
+    },
+    MemberUp(MemberRecord),
+    MemberDelta(MemberEvent),
     SubscribeEntity(EntityType),
     SubscribeSingleton(SingletonKind),
     SnapshotBegin(SnapshotBegin),
@@ -63,8 +67,23 @@ pub enum PlacementControlCommand {
         slot: crate::types::PlacementSlotKey,
         generation: AssignmentGeneration,
     },
-    BeginDrain,
-    DrainComplete,
+    BeginDrain {
+        operation_id: String,
+        expected_incarnation: NodeIncarnation,
+    },
+    DrainReady {
+        operation_id: String,
+        expected_incarnation: NodeIncarnation,
+    },
+    DrainComplete {
+        operation_id: String,
+        expected_incarnation: NodeIncarnation,
+    },
+    ForceRemove {
+        operation_id: String,
+        node_id: String,
+        expected_incarnation: NodeIncarnation,
+    },
 }
 
 pub fn encode_control_command(
@@ -236,7 +255,10 @@ mod tests {
 
     #[test]
     fn control_generation_round_trips_and_rejects_oversize() {
-        let command = PlacementControlCommand::BeginDrain;
+        let command = PlacementControlCommand::BeginDrain {
+            operation_id: "drain-1".to_string(),
+            expected_incarnation: NodeIncarnation::new(1).unwrap(),
+        };
         let payload = encode_control_command(&command, 1024).unwrap();
         assert_eq!(decode_control_command(&payload, 1024).unwrap(), command);
         assert_eq!(

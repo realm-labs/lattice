@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::coordinator::{LeaderRecord, NodeHello};
+use crate::coordinator::{LeaderRecord, MemberRecord};
 use crate::plan::RebalancePlan;
 use crate::types::{ClaimGrant, PlacementSlot, PlacementSlotKey, Revision};
 
@@ -49,8 +49,15 @@ pub trait CoordinatorStore: PlacementStore {
         lease_id: i64,
     ) -> Result<bool, StorageError>;
     async fn get_leader(&self) -> Result<Option<LeaderRecord>, StorageError>;
-    async fn register_member(&self, hello: &NodeHello, lease_id: i64) -> Result<(), StorageError>;
-    async fn list_members(&self) -> Result<Vec<NodeHello>, StorageError>;
+    async fn get_member(&self, node_id: &str) -> Result<Option<MemberRecord>, StorageError>;
+    async fn create_member(&self, member: &MemberRecord) -> Result<(), StorageError>;
+    async fn compare_and_put_member(
+        &self,
+        expected: &MemberRecord,
+        member: &MemberRecord,
+    ) -> Result<(), StorageError>;
+    async fn compare_and_delete_member(&self, expected: &MemberRecord) -> Result<(), StorageError>;
+    async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError>;
     async fn put_claim(&self, grant: &ClaimGrant, lease_id: i64) -> Result<(), StorageError>;
     async fn get_claim(&self, key: &PlacementSlotKey) -> Result<Option<ClaimGrant>, StorageError>;
     async fn delete_claim(&self, expected: &ClaimGrant) -> Result<(), StorageError>;
@@ -74,7 +81,7 @@ struct MemoryState {
     leases: BTreeMap<i64, bool>,
     leader: Option<(i64, LeaderRecord)>,
     leader_term: u64,
-    members: BTreeMap<String, (i64, NodeHello)>,
+    members: BTreeMap<String, MemberRecord>,
     claims: BTreeMap<PlacementSlotKey, (i64, ClaimGrant)>,
 }
 
@@ -126,7 +133,9 @@ impl CoordinatorStore for InMemoryPlacementStore {
         {
             state.leader = None;
         }
-        state.members.retain(|_, (lease, _)| *lease != lease_id);
+        state
+            .members
+            .retain(|_, member| member.lease_id != lease_id);
         state.claims.retain(|_, (lease, _)| *lease != lease_id);
         Ok(())
     }
@@ -162,32 +171,72 @@ impl CoordinatorStore for InMemoryPlacementStore {
             .map(|(_, leader)| leader.clone()))
     }
 
-    async fn register_member(&self, hello: &NodeHello, lease_id: i64) -> Result<(), StorageError> {
+    async fn get_member(&self, node_id: &str) -> Result<Option<MemberRecord>, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("placement memory store poisoned")
+            .members
+            .get(node_id)
+            .cloned())
+    }
+
+    async fn create_member(&self, member: &MemberRecord) -> Result<(), StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
-        if !state.leases.contains_key(&lease_id) {
+        validate_member_record(member)?;
+        if !state.leases.contains_key(&member.lease_id) {
             return Err(StorageError::Unavailable);
         }
-        if state
-            .members
-            .get(&hello.node.node_id)
-            .is_some_and(|(_, current)| current.node.incarnation != hello.node.incarnation)
-        {
-            return Err(StorageError::IncarnationConflict);
+        if let Some(current) = state.members.get(&member.node.node_id) {
+            return if current.node.incarnation == member.node.incarnation {
+                Err(StorageError::CompareFailed)
+            } else {
+                Err(StorageError::IncarnationConflict)
+            };
         }
         state
             .members
-            .insert(hello.node.node_id.clone(), (lease_id, hello.clone()));
+            .insert(member.node.node_id.clone(), member.clone());
         Ok(())
     }
 
-    async fn list_members(&self) -> Result<Vec<NodeHello>, StorageError> {
+    async fn compare_and_put_member(
+        &self,
+        expected: &MemberRecord,
+        member: &MemberRecord,
+    ) -> Result<(), StorageError> {
+        validate_member_record(member)?;
+        let mut state = self.inner.lock().expect("placement memory store poisoned");
+        if expected.node.node_id != member.node.node_id
+            || expected.node.incarnation != member.node.incarnation
+            || state.members.get(&expected.node.node_id) != Some(expected)
+            || !state.leases.contains_key(&member.lease_id)
+        {
+            return Err(StorageError::CompareFailed);
+        }
+        state
+            .members
+            .insert(member.node.node_id.clone(), member.clone());
+        Ok(())
+    }
+
+    async fn compare_and_delete_member(&self, expected: &MemberRecord) -> Result<(), StorageError> {
+        let mut state = self.inner.lock().expect("placement memory store poisoned");
+        if state.members.get(&expected.node.node_id) != Some(expected) {
+            return Err(StorageError::CompareFailed);
+        }
+        state.members.remove(&expected.node.node_id);
+        Ok(())
+    }
+
+    async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError> {
         Ok(self
             .inner
             .lock()
             .expect("placement memory store poisoned")
             .members
             .values()
-            .map(|(_, hello)| hello.clone())
+            .cloned()
             .collect())
     }
 
@@ -255,6 +304,13 @@ impl CoordinatorStore for InMemoryPlacementStore {
             .map(|(_, plan)| plan.clone())
             .collect())
     }
+}
+
+fn validate_member_record(member: &MemberRecord) -> Result<(), StorageError> {
+    if member.node != member.hello.node || member.lease_id == 0 || member.node.validate().is_err() {
+        return Err(StorageError::InvalidRecord);
+    }
+    Ok(())
 }
 
 impl InMemoryPlacementStore {
