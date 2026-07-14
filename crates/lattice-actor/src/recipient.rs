@@ -278,6 +278,13 @@ pub enum ProtocolRegistrationError {
     ProtocolTypeMismatch { protocol_id: u64 },
     #[error("actor registry is already attached to an actor system")]
     ActorSystemAlreadyInstalled,
+    #[error(
+        "actor registry protocol ID {registry_protocol_id:?} does not match binding protocol ID {binding_protocol_id}"
+    )]
+    RegistryProtocolMismatch {
+        registry_protocol_id: Option<u64>,
+        binding_protocol_id: u64,
+    },
 }
 
 #[derive(Debug, Error)]

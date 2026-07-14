@@ -18,6 +18,8 @@ pub enum ServiceError {
     Host(#[source] lattice_actor::host::HostRegistryError),
     #[error("actor protocol registration failed")]
     ProtocolRegistration(#[source] lattice_actor::recipient::ProtocolRegistrationError),
+    #[error("actor protocol construction failed")]
+    ProtocolBuild(#[source] lattice_actor::protocol::ProtocolBuildError),
     #[error("association manager construction failed")]
     Association(#[source] lattice_remoting::association::AssociationError),
     #[error("remote messaging construction failed")]

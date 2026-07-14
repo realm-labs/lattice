@@ -7,11 +7,13 @@ use bytes::BytesMut;
 use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
-use lattice_actor::protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec};
+use lattice_actor::protocol::{
+    ActorProtocolBinding, CodecDescriptor, DecodeError, EncodeError, Protocol, WireCodec,
+};
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::traits::{Actor, Handler, Message, StopReason};
 use lattice_core::actor_kind;
-use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
+use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation};
 use lattice_core::id::ActorId;
 use lattice_core::kind::ActorKind;
 use lattice_remoting::config::RemotingConfig;
@@ -139,24 +141,24 @@ actor_protocol! {
     }
 }
 
-fn registry<A: Actor>(
+fn registry<A: Actor, P: Protocol>(
     kind: ActorKind,
-    protocol_id: u64,
     cluster_id: &ClusterId,
     address: &NodeAddress,
     incarnation: NodeIncarnation,
+    protocol: &ActorProtocolBinding<A, P>,
 ) -> Arc<ActorRegistry<A>> {
-    Arc::new(ActorRegistry::new(
+    Arc::new(ActorRegistry::new_bound(
         kind,
         ActorRegistryConfig {
             actor_ref: Some(ActorRefConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: address.clone(),
                 node_incarnation: incarnation,
-                protocol_id: ProtocolId::new(protocol_id).unwrap(),
             }),
             ..ActorRegistryConfig::default()
         },
+        protocol,
     ))
 }
 
@@ -167,19 +169,19 @@ async fn deserialized_actor_ref_sends_without_binding() {
     let incarnation = NodeIncarnation::new(1).unwrap();
     let source_protocol = Arc::new(SourceProtocol::bind::<SourceActor>().unwrap());
     let sink_protocol = Arc::new(SinkProtocol::bind::<SinkActor>().unwrap());
-    let source_registry = registry::<SourceActor>(
+    let source_registry = registry(
         actor_kind!("ReferenceSource"),
-        SOURCE_PROTOCOL_ID,
         &cluster_id,
         &address,
         incarnation,
+        source_protocol.as_ref(),
     );
-    let sink_registry = registry::<SinkActor>(
+    let sink_registry = registry(
         actor_kind!("ReferenceSink"),
-        SINK_PROTOCOL_ID,
         &cluster_id,
         &address,
         incarnation,
+        sink_protocol.as_ref(),
     );
     let (observed_tx, observed_rx) = oneshot::channel();
     let sink_handle = sink_registry
@@ -195,9 +197,8 @@ async fn deserialized_actor_ref_sends_without_binding() {
         .start(ActorId::U64(1), SourceActor)
         .await
         .unwrap();
-    let sink_ref: ActorRef<SinkProtocol> = sink_handle.actor_ref().unwrap().try_typed().unwrap();
-    let source_ref: ActorRef<SourceProtocol> =
-        source_handle.actor_ref().unwrap().try_typed().unwrap();
+    let sink_ref: ActorRef<SinkProtocol> = sink_handle.typed_actor_ref().unwrap().unwrap();
+    let source_ref: ActorRef<SourceProtocol> = source_handle.typed_actor_ref().unwrap().unwrap();
     let decoded_sink: ActorRef<SinkProtocol> =
         serde_json::from_slice(&serde_json::to_vec(&sink_ref).unwrap()).unwrap();
 

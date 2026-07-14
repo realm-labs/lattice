@@ -14,7 +14,7 @@ use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, Request, Responder};
 use lattice_config::source::ConfigSource;
-use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
+use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation};
 use lattice_core::id::ActorId;
 use lattice_core::{actor_kind, service_kind};
 use lattice_remoting::config::RemotingConfig;
@@ -91,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = NodeAddress::new("127.0.0.1", 25520)?;
     let incarnation = NodeIncarnation::generate();
     let protocol = Arc::new(WorldProtocol::bind::<WorldActor>()?);
-    let registry = Arc::new(ActorRegistry::new(
+    let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("World"),
         ActorRegistryConfig {
             mailbox: MailboxConfig::bounded(config.mailbox_capacity),
@@ -99,10 +99,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cluster_id: cluster_id.clone(),
                 node_address: address.clone(),
                 node_incarnation: incarnation,
-                protocol_id: ProtocolId::new(0x776f_726c_6400_0001)?,
             }),
             ..ActorRegistryConfig::default()
         },
+        protocol.as_ref(),
     ));
     let handle = registry
         .start(
@@ -114,9 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     let actor_ref: ActorRef<WorldProtocol> = handle
-        .actor_ref()
-        .ok_or_else(|| std::io::Error::other("registry did not create an ActorRef"))?
-        .try_typed()?;
+        .typed_actor_ref()?
+        .ok_or_else(|| std::io::Error::other("registry did not create an ActorRef"))?;
     let service = LatticeService::builder(NodeConfig {
         cluster_id,
         node_id: "world-a".to_owned(),

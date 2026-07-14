@@ -2,13 +2,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorActivationError;
 use lattice_actor::error::ActorError;
 use lattice_actor::mailbox::MailboxConfig;
+use lattice_actor::protocol::ProstCodec;
 use lattice_actor::registry::ActorRegistry;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistryConfig};
-use lattice_actor::traits::Actor;
+use lattice_actor::traits::{Actor, Handler, Message};
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
 use lattice_core::id::ActorId;
@@ -97,6 +99,33 @@ struct SelfRefActor {
     tx: Option<oneshot::Sender<ActorRef>>,
 }
 
+#[derive(Clone, PartialEq, prost::Message)]
+struct Probe {}
+
+impl Message for Probe {}
+
+#[async_trait]
+impl Handler<Probe> for SelfRefActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _message: Probe,
+    ) -> Result<(), ActorError> {
+        Ok(())
+    }
+}
+
+actor_protocol! {
+    SelfRefProtocol {
+        protocol_id: 11;
+        name: "registry/self-ref/v1";
+        tell 1 => Probe {
+            schema_version: 1,
+            codec: ProstCodec,
+        }
+    }
+}
+
 #[async_trait]
 impl Actor for SelfRefActor {
     type Error = ActorError;
@@ -111,17 +140,18 @@ impl Actor for SelfRefActor {
 #[tokio::test]
 async fn registry_injects_exact_actor_ref_into_context() {
     let node_incarnation = NodeIncarnation::new(7).unwrap();
-    let registry = ActorRegistry::<SelfRefActor>::new(
+    let protocol = SelfRefProtocol::bind::<SelfRefActor>().unwrap();
+    let registry = ActorRegistry::<SelfRefActor>::new_bound(
         actor_kind!("GatewaySession"),
         ActorRegistryConfig {
             actor_ref: Some(ActorRefConfig {
                 cluster_id: ClusterId::new("test").unwrap(),
                 node_address: NodeAddress::new("127.0.0.1", 19090).unwrap(),
                 node_incarnation,
-                protocol_id: ProtocolId::new(11).unwrap(),
             }),
             ..ActorRegistryConfig::default()
         },
+        &protocol,
     );
     let (tx, rx) = oneshot::channel();
 
@@ -139,6 +169,14 @@ async fn registry_injects_exact_actor_ref_into_context() {
     assert_eq!(actor_ref.protocol_id(), ProtocolId::new(11).unwrap());
     assert!(actor_ref.actor_path().to_string().starts_with("/user/"));
     assert!(registry.get_exact(&actor_ref).is_some());
+
+    let typed = registry
+        .get_running(&ActorId::Str("session-1".to_owned()))
+        .unwrap()
+        .typed_actor_ref::<SelfRefProtocol>()
+        .unwrap()
+        .unwrap();
+    assert!(typed.same_activation(&actor_ref));
 
     let old = actor_ref.clone();
     let actor_id = ActorId::Str("session-1".to_string());

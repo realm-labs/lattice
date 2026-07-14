@@ -2,7 +2,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::time::Instant;
 
-use lattice_core::actor_ref::ActorRef;
+use lattice_core::actor_ref::{ActorRef, ProtocolTag, ReferenceError};
 use tokio::sync::{
     broadcast,
     mpsc::{self, error::TrySendError},
@@ -74,6 +74,16 @@ impl<A: Actor> ActorHandle<A> {
 
     pub fn actor_ref(&self) -> Option<&ActorRef> {
         self.actor_ref.as_ref()
+    }
+
+    /// Returns this activation's exact reference typed by a protocol marker.
+    /// The embedded protocol ID is checked before the typed reference is
+    /// returned.
+    pub fn typed_actor_ref<P: ProtocolTag>(&self) -> Result<Option<ActorRef<P>>, ReferenceError> {
+        self.actor_ref
+            .as_ref()
+            .map(ActorRef::try_typed::<P>)
+            .transpose()
     }
 
     pub fn lifecycle_state(&self) -> ActorLifecycleState {

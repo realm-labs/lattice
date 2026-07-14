@@ -613,18 +613,18 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         InstanceId::new("distributed-fixture"),
     );
     service_context.insert_extension(ActivationDirectory::new(64)?)?;
-    let registry = Arc::new(ActorRegistry::new(
+    let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("DistributedFixture"),
         ActorRegistryConfig {
             actor_ref: Some(ActorRefConfig {
                 cluster_id: cluster.clone(),
                 node_address: address.clone(),
                 node_incarnation: incarnation,
-                protocol_id: ProtocolId::new(PROTOCOL_ID)?,
             }),
             service: service_context.build(),
             ..ActorRegistryConfig::default()
         },
+        protocol.as_ref(),
     ));
     let child_reference = reference.with_file_name("child-ref.json");
     let handle = registry
@@ -635,8 +635,7 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-    let target: ActorRef<FixtureProtocol> =
-        handle.actor_ref().ok_or("missing actor ref")?.try_typed()?;
+    let target: ActorRef<FixtureProtocol> = handle.typed_actor_ref()?.ok_or("missing actor ref")?;
     let service =
         LatticeService::builder(node_config(cluster, "fixture-server", address, incarnation))?
             .register_actor(registry, protocol)?
@@ -668,14 +667,13 @@ async fn client(
     let cluster = ClusterId::new("docker-e2e")?;
     let client_address = NodeAddress::new("aaa-client", 25521)?;
     let client_incarnation = NodeIncarnation::new(200)?;
-    let protocol = Arc::new(FixtureProtocol::build()?);
     let service = LatticeService::builder(node_config(
         cluster.clone(),
         "aaa-client",
         client_address,
         client_incarnation,
     ))?
-    .register_protocol(protocol)?
+    .use_protocol::<FixtureProtocol>()?
     .build()?;
     service.start().await?;
     let connected = tokio::time::timeout(
@@ -744,14 +742,13 @@ async fn monitor(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let cluster = ClusterId::new("docker-e2e")?;
     let address = NodeAddress::new("aaa-monitor", 25522)?;
     let incarnation = NodeIncarnation::generate();
-    let protocol = Arc::new(FixtureProtocol::build()?);
     let service = LatticeService::builder(node_config(
         cluster.clone(),
         "chaos-monitor",
         address,
         incarnation,
     ))?
-    .register_protocol(protocol)?
+    .use_protocol::<FixtureProtocol>()?
     .build()?;
     service.start().await?;
     service
@@ -939,18 +936,18 @@ fn entity_service(
     );
     context.insert_extension(ActivationDirectory::new(64)?)?;
     let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
-    let registry = Arc::new(ActorRegistry::new(
+    let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("DistributedEntityFixture"),
         ActorRegistryConfig {
             actor_ref: Some(ActorRefConfig {
                 cluster_id: cluster.clone(),
                 node_address: node.address.clone(),
                 node_incarnation: node.incarnation,
-                protocol_id: ProtocolId::new(PROTOCOL_ID)?,
             }),
             service: context.build(),
             ..ActorRegistryConfig::default()
         },
+        protocol.as_ref(),
     ));
     let mut builder = LatticeServiceBuilder::new(node_config(
         cluster.clone(),

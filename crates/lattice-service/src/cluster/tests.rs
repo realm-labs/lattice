@@ -402,17 +402,17 @@ async fn stale_generation_never_reaches_entity_loader() {
     }
     let protocol = Arc::new(EntityProtocol::build().unwrap());
     let binding = Arc::new(EntityProtocol::bind::<EntityActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new(
+    let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("Entity"),
         ActorRegistryConfig {
             actor_ref: Some(ActorRefConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: local_address.clone(),
                 node_incarnation: local_incarnation,
-                protocol_id: ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
             }),
             ..ActorRegistryConfig::default()
         },
+        binding.as_ref(),
     ));
     let loads = Arc::new(AtomicUsize::new(0));
     let mut router = ClusterLogicalRouter::new(
@@ -591,17 +591,17 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     let source_loads = Arc::new(AtomicUsize::new(0));
     let owner_loads = Arc::new(AtomicUsize::new(0));
     let registry = |address: NodeAddress, incarnation: NodeIncarnation| {
-        Arc::new(ActorRegistry::new(
+        Arc::new(ActorRegistry::new_bound(
             actor_kind!("RemoteEntity"),
             ActorRegistryConfig {
                 actor_ref: Some(ActorRefConfig {
                     cluster_id: cluster_id.clone(),
                     node_address: address,
                     node_incarnation: incarnation,
-                    protocol_id: ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
                 }),
                 ..ActorRegistryConfig::default()
             },
+            binding.as_ref(),
         ))
     };
     let source_messaging = Arc::new(OutboundMessaging::new(32).unwrap());

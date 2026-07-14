@@ -17,6 +17,7 @@ use tokio::sync::{Semaphore, watch};
 use crate::error::{ActorActivationError, ActorError};
 use crate::handle::ActorHandle;
 use crate::mailbox::MailboxConfig;
+use crate::protocol::{ActorProtocolBinding, Protocol};
 use crate::recipient::ActorSystem;
 use crate::runtime::{PassivationPolicy, ShardMigrationPolicy, spawn_actor_with_self_ref};
 use crate::traits::{Actor, ActorLifecycleState, PassivationReason, StopReason};
@@ -37,7 +38,6 @@ pub struct ActorRefConfig {
     pub cluster_id: ClusterId,
     pub node_address: NodeAddress,
     pub node_incarnation: NodeIncarnation,
-    pub protocol_id: ProtocolId,
 }
 
 impl Default for ActorRegistryConfig {
@@ -57,6 +57,7 @@ impl Default for ActorRegistryConfig {
 pub struct ActorRegistry<A: Actor> {
     kind: ActorKind,
     config: ActorRegistryConfig,
+    protocol_id: Option<ProtocolId>,
     entries: Arc<DashMap<ActorId, RegistryEntry<A>>>,
     actor_system: Arc<OnceLock<ActorSystem>>,
 }
@@ -97,9 +98,31 @@ where
 
 impl<A: Actor> ActorRegistry<A> {
     pub fn new(kind: ActorKind, config: ActorRegistryConfig) -> Self {
+        assert!(
+            config.actor_ref.is_none(),
+            "registries with exact ActorRefs must be constructed with ActorRegistry::new_bound"
+        );
         Self {
             kind,
             config,
+            protocol_id: None,
+            entries: Arc::new(DashMap::new()),
+            actor_system: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Constructs a registry whose exact activation references are bound to
+    /// the supplied server protocol. The reference protocol ID is derived from
+    /// the binding and cannot drift from the registered dispatcher.
+    pub fn new_bound<P: Protocol>(
+        kind: ActorKind,
+        config: ActorRegistryConfig,
+        protocol: &ActorProtocolBinding<A, P>,
+    ) -> Self {
+        Self {
+            kind,
+            config,
+            protocol_id: Some(protocol.protocol_id()),
             entries: Arc::new(DashMap::new()),
             actor_system: Arc::new(OnceLock::new()),
         }
@@ -112,6 +135,10 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub fn kind(&self) -> &ActorKind {
         &self.kind
+    }
+
+    pub fn protocol_id(&self) -> Option<ProtocolId> {
+        self.protocol_id
     }
 
     pub fn shard_migration_policy(&self) -> ShardMigrationPolicy {
@@ -150,7 +177,7 @@ impl<A: Actor> ActorRegistry<A> {
             config.cluster_id != *actor_ref.cluster_id()
                 || config.node_address != *actor_ref.node_address()
                 || config.node_incarnation != actor_ref.node_incarnation()
-                || config.protocol_id != actor_ref.protocol_id()
+                || self.protocol_id != Some(actor_ref.protocol_id())
         }) {
             return None;
         }
@@ -427,6 +454,7 @@ impl<A: Actor> ActorRegistry<A> {
 
     fn actor_ref_for(&self, actor_id: ActorId) -> Option<ActorRef> {
         let config = self.config.actor_ref.as_ref()?;
+        let protocol_id = self.protocol_id?;
         let path = ActorPath::user([
             "user".to_owned(),
             encode_segment(self.kind.as_str().as_bytes()),
@@ -439,7 +467,7 @@ impl<A: Actor> ActorRegistry<A> {
             config.node_incarnation,
             path,
             crate::runtime::next_activation_id(config.node_incarnation),
-            config.protocol_id,
+            protocol_id,
         )
         .ok()
     }

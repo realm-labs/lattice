@@ -138,6 +138,14 @@ impl LatticeServiceBuilder {
         registry: Arc<lattice_actor::registry::ActorRegistry<A>>,
         protocol: Arc<ActorProtocolBinding<A, P>>,
     ) -> Result<Self, ServiceError> {
+        if registry.protocol_id() != Some(protocol.protocol_id()) {
+            return Err(ServiceError::ProtocolRegistration(
+                lattice_actor::recipient::ProtocolRegistrationError::RegistryProtocolMismatch {
+                    registry_protocol_id: registry.protocol_id().map(|id| id.get()),
+                    binding_protocol_id: protocol.protocol_id().get(),
+                },
+            ));
+        }
         self.register_protocol_entry(protocol.protocol().clone())?;
         let actor_registry = registry.clone();
         self.actor_system_installers
@@ -162,6 +170,13 @@ impl LatticeServiceBuilder {
     ) -> Result<Self, ServiceError> {
         self.register_protocol_entry(protocol)?;
         Ok(self)
+    }
+
+    /// Builds and registers a protocol for outbound use without requiring the
+    /// caller to allocate or retain its runtime descriptor.
+    pub fn use_protocol<P: Protocol>(self) -> Result<Self, ServiceError> {
+        let protocol = Arc::new(P::build_protocol().map_err(ServiceError::ProtocolBuild)?);
+        self.register_protocol(protocol)
     }
 
     fn register_protocol_entry<P: Protocol>(

@@ -17,7 +17,7 @@ use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, Request, Responder, StopReason};
 use lattice_core::actor_kind;
-use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
+use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation};
 use lattice_core::id::ActorId;
 use lattice_discovery::provider::{
     ClusterDiscovery, DiscoveryError, DiscoveryOrigin, DiscoverySnapshot, DiscoverySource,
@@ -119,6 +119,19 @@ actor_protocol! {
     }
 }
 
+actor_protocol! {
+    OtherPingProtocol {
+        protocol_id: PROTOCOL_ID + 1;
+        name: "service-test/other-ping/v1";
+        ask 1 => Ping {
+            request_schema_version: 1,
+            response_schema_version: 1,
+            request_codec: PingCodec,
+            response_codec: PongCodec,
+        }
+    }
+}
+
 fn node_config(
     cluster_id: ClusterId,
     node_id: &str,
@@ -141,6 +154,34 @@ fn node_config(
         maximum_supervised_tasks: 32,
         shutdown_timeout: Duration::from_secs(2),
     }
+}
+
+#[test]
+fn actor_registration_rejects_a_registry_bound_to_another_protocol() {
+    let ping = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let other = OtherPingProtocol::bind::<PingActor>().unwrap();
+    let registry = Arc::new(ActorRegistry::new_bound(
+        actor_kind!("Ping"),
+        ActorRegistryConfig::default(),
+        &other,
+    ));
+    let config = node_config(
+        ClusterId::new("service-test").unwrap(),
+        "protocol-mismatch",
+        NodeAddress::new("127.0.0.1", 25250).unwrap(),
+        NodeIncarnation::new(1).unwrap(),
+    );
+
+    let result = LatticeService::builder(config)
+        .unwrap()
+        .register_actor(registry, ping);
+
+    assert!(matches!(
+        result,
+        Err(crate::error::ServiceError::ProtocolRegistration(
+            lattice_actor::recipient::ProtocolRegistrationError::RegistryProtocolMismatch { .. }
+        ))
+    ));
 }
 
 struct WatchDiscovery {
@@ -229,22 +270,21 @@ async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
     let server_address = NodeAddress::new("127.0.0.1", server_port).unwrap();
     let client_incarnation = NodeIncarnation::new(1).unwrap();
     let server_incarnation = NodeIncarnation::new(2).unwrap();
-    let protocol = Arc::new(PingProtocol::build().unwrap());
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
-    let registry = Arc::new(ActorRegistry::new(
+    let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("Ping"),
         ActorRegistryConfig {
             actor_ref: Some(ActorRefConfig {
                 cluster_id: cluster_id.clone(),
                 node_address: server_address.clone(),
                 node_incarnation: server_incarnation,
-                protocol_id: ProtocolId::new(PROTOCOL_ID).unwrap(),
             }),
             ..ActorRegistryConfig::default()
         },
+        binding.as_ref(),
     ));
     let handle = registry.start(ActorId::U64(1), PingActor).await.unwrap();
-    let target: ActorRef<PingProtocol> = handle.actor_ref().unwrap().try_typed().unwrap();
+    let target: ActorRef<PingProtocol> = handle.typed_actor_ref().unwrap().unwrap();
     let server = LatticeService::builder(node_config(
         cluster_id.clone(),
         "server",
@@ -263,7 +303,7 @@ async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
         client_incarnation,
     ))
     .unwrap()
-    .register_protocol(protocol)
+    .use_protocol::<PingProtocol>()
     .unwrap()
     .build()
     .unwrap();

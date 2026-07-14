@@ -130,6 +130,10 @@ type DecodeReplyFn = dyn Fn(&[u8]) -> Result<Box<dyn Any + Send>, DecodeError> +
 
 pub trait Protocol: ProtocolTag {
     const ID: u64;
+
+    fn build_protocol() -> Result<ActorProtocol<Self>, ProtocolBuildError>
+    where
+        Self: Sized;
 }
 
 pub trait SupportsTell<M: Message>: Protocol {}
@@ -686,6 +690,14 @@ macro_rules! actor_protocol {
 
         impl $crate::protocol::Protocol for $name {
             const ID: u64 = $protocol_id;
+
+            fn build_protocol() -> Result<
+                $crate::protocol::ActorProtocol<Self>,
+                $crate::protocol::ProtocolBuildError,
+            > {
+                let builder = $crate::protocol::ActorProtocol::<Self>::builder($protocol_name);
+                $crate::actor_protocol!(@apply_client builder; $($bindings)*).build()
+            }
         }
 
         impl $name {
@@ -693,8 +705,7 @@ macro_rules! actor_protocol {
                 $crate::protocol::ActorProtocol<Self>,
                 $crate::protocol::ProtocolBuildError,
             > {
-                let builder = $crate::protocol::ActorProtocol::<Self>::builder($protocol_name);
-                $crate::actor_protocol!(@apply_client builder; $($bindings)*).build()
+                <Self as $crate::protocol::Protocol>::build_protocol()
             }
 
             $visibility fn bind<A>() -> Result<
