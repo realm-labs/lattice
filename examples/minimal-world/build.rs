@@ -2,6 +2,15 @@
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let includes = vec!["proto".into(), lattice_codegen::proto_include()];
-    lattice_codegen::builder::configure().compile_messages(&["proto/world.proto"], &includes)?;
+    lattice_codegen::builder::configure()
+        .message_attribute(
+            ".world.EnterWorldRequest",
+            "#[derive(lattice_actor::Request)]",
+        )
+        .message_attribute(
+            ".world.EnterWorldRequest",
+            "#[request(response = EnterWorldReply)]",
+        )
+        .compile_messages(&["proto/world.proto"], &includes)?;
     Ok(())
 }

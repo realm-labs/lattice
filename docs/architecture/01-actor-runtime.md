@@ -286,12 +286,11 @@ impl Handler<WorldTick> for WorldActor {
 For asynchronous I/O, the responder launches bounded work and maps its output to a one-way continuation. The continuation is a later actor turn, so it can combine the query result with current actor state before replying:
 
 ```rust
+#[derive(lattice_actor::Message)]
 struct ProfileLoaded {
     result: Result<DbProfile, DbError>,
     reply_to: ReplyTo<GetPlayerViewResponse>,
 }
-
-impl Message for ProfileLoaded {}
 
 #[async_trait::async_trait]
 impl Responder<GetPlayerView> for WorldActor {

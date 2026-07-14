@@ -9,6 +9,7 @@ use crate::spec::ActorProtocolSpec;
 pub struct ActorProtocolCodegen {
     out_dir: Option<PathBuf>,
     protocols: Vec<ActorProtocolSpec>,
+    message_attributes: Vec<(String, String)>,
 }
 
 pub fn configure() -> ActorProtocolCodegen {
@@ -23,6 +24,20 @@ impl ActorProtocolCodegen {
 
     pub fn actor_protocol(mut self, protocol: ActorProtocolSpec) -> Self {
         self.protocols.push(protocol);
+        self
+    }
+
+    /// Adds an attribute to matching Protobuf message types.
+    ///
+    /// The path matching behavior is the same as
+    /// [`prost_build::Config::message_attribute`].
+    pub fn message_attribute(
+        mut self,
+        path: impl Into<String>,
+        attribute: impl Into<String>,
+    ) -> Self {
+        self.message_attributes
+            .push((path.into(), attribute.into()));
         self
     }
 
@@ -44,6 +59,9 @@ impl ActorProtocolCodegen {
             .map_err(|error| CodegenError::WriteGenerated(error.to_string()))?;
         let mut config = prost_build::Config::new();
         config.out_dir(&out_dir);
+        for (path, attribute) in &self.message_attributes {
+            config.message_attribute(path, attribute);
+        }
         config
             .compile_protos(proto_files, includes)
             .map_err(|error| CodegenError::ProtoCompile(error.to_string()))?;
@@ -88,5 +106,26 @@ mod tests {
         assert!(generated.contains("lattice_actor::actor_protocol!"));
         assert!(!generated.contains("tonic"));
         assert!(!generated.contains("DirectLink"));
+    }
+
+    #[test]
+    fn message_attributes_are_retained_for_prost_configuration() {
+        let codegen = configure()
+            .message_attribute(".game.LoginRequest", "#[derive(lattice_actor::Request)]")
+            .message_attribute(".game.LoginRequest", "#[request(response = LoginReply)]");
+
+        assert_eq!(
+            codegen.message_attributes,
+            vec![
+                (
+                    ".game.LoginRequest".to_owned(),
+                    "#[derive(lattice_actor::Request)]".to_owned(),
+                ),
+                (
+                    ".game.LoginRequest".to_owned(),
+                    "#[request(response = LoginReply)]".to_owned(),
+                ),
+            ]
+        );
     }
 }

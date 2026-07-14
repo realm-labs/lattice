@@ -8,9 +8,7 @@ use lattice_actor::error::{ActorCallError, ActorError, ActorStopError};
 use lattice_actor::registry::ActorRegistry;
 use lattice_actor::registry::ActorRegistryConfig;
 use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::{
-    Actor, ActorLifecycleState, PassivationReason, Request, Responder, StopReason,
-};
+use lattice_actor::traits::{Actor, ActorLifecycleState, PassivationReason, Responder, StopReason};
 use lattice_core::actor_kind;
 use lattice_core::id::ActorId;
 use tokio::sync::Semaphore;
@@ -37,11 +35,9 @@ impl Actor for PassivatingActor {
     }
 }
 
+#[derive(lattice_actor::Request)]
+#[request(response = ())]
 struct BeginPassivation;
-
-impl Request for BeginPassivation {
-    type Response = ();
-}
 
 #[async_trait]
 impl Responder<BeginPassivation> for PassivatingActor {
@@ -57,11 +53,9 @@ impl Responder<BeginPassivation> for PassivatingActor {
     }
 }
 
+#[derive(lattice_actor::Request)]
+#[request(response = ())]
 struct Ping;
-
-impl Request for Ping {
-    type Response = ();
-}
 
 #[async_trait]
 impl Responder<Ping> for PassivatingActor {

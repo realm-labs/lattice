@@ -10,7 +10,7 @@ use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions, PassivationPolicy, spawn_actor};
 use lattice_actor::traits::{
     Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
-    Message, PassivationReason, Request, Responder, StopReason,
+    PassivationReason, Responder, StopReason,
 };
 use lattice_actor::watch::{ActorTerminated, TerminatedReason};
 use lattice_core::service_context::ServiceContext;
@@ -237,10 +237,8 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
         type Error = ActorError;
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, lattice_actor::Message)]
     struct StopChild;
-
-    impl Message for StopChild {}
 
     struct ParentActor {
         child: Option<ActorHandle<ChildActor>>,
@@ -318,10 +316,8 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
         type Error = ActorError;
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, lattice_actor::Message)]
     struct StopChild;
-
-    impl Message for StopChild {}
 
     struct ParentActor {
         child: Option<ActorHandle<ChildActor>>,
@@ -386,19 +382,13 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
 
 #[tokio::test]
 async fn handler_error_returns_to_caller_and_actor_remains_running() {
-    #[derive(Debug)]
+    #[derive(Debug, lattice_actor::Request)]
+    #[request(response = String)]
     struct Ping(&'static str);
 
-    impl Request for Ping {
-        type Response = String;
-    }
-
-    #[derive(Debug)]
+    #[derive(Debug, lattice_actor::Request)]
+    #[request(response = ())]
     struct Fail;
-
-    impl Request for Fail {
-        type Response = ();
-    }
 
     struct TestActor;
 

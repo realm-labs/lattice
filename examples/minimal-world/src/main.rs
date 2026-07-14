@@ -12,7 +12,7 @@ use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::protocol::ProstCodec;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::{Actor, Request, Responder};
+use lattice_actor::traits::{Actor, Responder};
 use lattice_config::source::ConfigSource;
 use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation};
 use lattice_core::id::ActorId;
@@ -27,10 +27,6 @@ pub mod world {
 }
 
 use world::{EnterWorldReply, EnterWorldRequest};
-
-impl Request for EnterWorldRequest {
-    type Response = EnterWorldReply;
-}
 
 #[derive(Debug)]
 struct WorldActor {

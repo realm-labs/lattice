@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use lattice_actor::traits::Request;
 use lattice_core::actor_kind;
 use lattice_core::id::RouteKey;
 use prost::Message as ProstMessage;
@@ -8,7 +7,8 @@ use crate::binding::{GatewayRecipient, ProstClientMessageBinding};
 use crate::frame::{BinaryClientCodec, ClientCodec, ClientFrame};
 use crate::route::{GatewayRouteContext, MessageRouter, RouteDecision};
 
-#[derive(Clone, PartialEq, ProstMessage)]
+#[derive(Clone, PartialEq, ProstMessage, lattice_actor::Request)]
+#[request(response = Output)]
 struct Input {
     #[prost(uint64, tag = "1")]
     id: u64,
@@ -18,10 +18,6 @@ struct Input {
 struct Output {
     #[prost(uint64, tag = "1")]
     id: u64,
-}
-
-impl Request for Input {
-    type Response = Output;
 }
 
 #[derive(Clone)]

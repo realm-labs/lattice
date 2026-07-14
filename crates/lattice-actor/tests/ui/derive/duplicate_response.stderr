@@ -1,0 +1,5 @@
+error: duplicate `response` option
+ --> tests/ui/derive/duplicate_response.rs:2:27
+  |
+2 | #[request(response = u64, response = String)]
+  |                           ^^^^^^^^

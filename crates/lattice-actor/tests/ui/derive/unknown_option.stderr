@@ -1,0 +1,5 @@
+error: unsupported request option; expected `response`
+ --> tests/ui/derive/unknown_option.rs:2:11
+  |
+2 | #[request(reply = u64)]
+  |           ^^^^^

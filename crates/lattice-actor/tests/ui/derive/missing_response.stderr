@@ -1,0 +1,5 @@
+error: `Request` requires `#[request(response = Type)]`
+ --> tests/ui/derive/missing_response.rs:2:8
+  |
+2 | struct MissingResponse;
+  |        ^^^^^^^^^^^^^^^

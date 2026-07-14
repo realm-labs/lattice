@@ -15,7 +15,7 @@ use lattice_actor::protocol::EncodeError;
 use lattice_actor::protocol::WireCodec;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::{Actor, Request, Responder, StopReason};
+use lattice_actor::traits::{Actor, Responder, StopReason};
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation};
 use lattice_core::id::ActorId;
@@ -40,15 +40,12 @@ use crate::lifecycle::ServiceLifecycleState;
 
 const PROTOCOL_ID: u64 = 0x7465_7374_0000_0001;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, lattice_actor::Request)]
+#[request(response = Pong)]
 struct Ping(u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pong(u64);
-
-impl Request for Ping {
-    type Response = Pong;
-}
 
 #[derive(Clone, Copy)]
 struct PingCodec;

@@ -6,7 +6,7 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorError, ActorStopError};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
-use lattice_actor::traits::{Actor, Handler, Message, Request, Responder, StopReason};
+use lattice_actor::traits::{Actor, Handler, Responder, StopReason};
 use tokio::sync::{Mutex, Semaphore};
 
 struct WorldActor {
@@ -34,19 +34,14 @@ impl Actor for WorldActor {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, lattice_actor::Message)]
 struct WorldTick {
     delta_ms: u64,
 }
 
-impl Message for WorldTick {}
-
-#[derive(Debug)]
+#[derive(Debug, lattice_actor::Request)]
+#[request(response = u64)]
 struct InspectTicks;
-
-impl Request for InspectTicks {
-    type Response = u64;
-}
 
 #[async_trait]
 impl Handler<WorldTick> for WorldActor {

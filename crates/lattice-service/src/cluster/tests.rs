@@ -12,7 +12,7 @@ use lattice_actor::host::ProtocolHostRegistry;
 use lattice_actor::protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec};
 use lattice_actor::registry::{ActorCreateContext, ActorRefConfig, ActorRegistryConfig};
 use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::{Request, Responder};
+use lattice_actor::traits::Responder;
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{ClusterId, EntityId, NodeAddress, NodeIncarnation, ProtocolId};
 use lattice_placement::control::{
@@ -43,15 +43,12 @@ use crate::backend::ServiceInboundDispatch;
 
 const TEST_PROTOCOL_ID: u64 = 77;
 
-#[derive(Clone)]
+#[derive(Clone, lattice_actor::Request)]
+#[request(response = Value)]
 struct GetValue(u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Value(u64);
-
-impl Request for GetValue {
-    type Response = Value;
-}
 
 #[derive(Clone, Copy)]
 struct GetCodec;

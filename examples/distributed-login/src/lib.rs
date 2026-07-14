@@ -11,7 +11,7 @@ use lattice_actor::error::ActorError;
 use lattice_actor::protocol::ProstCodec;
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::{Actor, Request, Responder};
+use lattice_actor::traits::{Actor, Responder};
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation};
 use lattice_core::id::ActorId;
@@ -33,17 +33,6 @@ use game::{InitSessionReply, InitSessionRequest, LoginAcceptedReply, LoginReques
 
 pub const WORLD_PROTOCOL_ID: u64 = 0x6761_6d65_0000_0001;
 pub const PLAYER_PROTOCOL_ID: u64 = 0x6761_6d65_0000_0002;
-
-macro_rules! request_type {
-    ($message:ty, $reply:ty) => {
-        impl Request for $message {
-            type Response = $reply;
-        }
-    };
-}
-
-request_type!(LoginRequest, LoginAcceptedReply);
-request_type!(InitSessionRequest, InitSessionReply);
 
 #[derive(Debug)]
 pub struct WorldActor {

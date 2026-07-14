@@ -11,7 +11,7 @@ use lattice_actor::protocol::{
     ActorProtocolBinding, CodecDescriptor, DecodeError, EncodeError, Protocol, WireCodec,
 };
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
-use lattice_actor::traits::{Actor, Handler, Message, StopReason};
+use lattice_actor::traits::{Actor, Handler, StopReason};
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation};
 use lattice_core::id::ActorId;
@@ -26,18 +26,14 @@ const SOURCE_PROTOCOL_ID: u64 = 0x7265_665f_7372_6301;
 const SINK_PROTOCOL_ID: u64 = 0x7265_665f_736e_6b01;
 type SenderObserver = Arc<Mutex<Option<oneshot::Sender<Option<ActorRef>>>>>;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, lattice_actor::Message)]
 #[serde(bound = "")]
 struct SendTo {
     target: ActorRef<SinkProtocol>,
 }
 
-impl Message for SendTo {}
-
-#[derive(Debug)]
+#[derive(Debug, lattice_actor::Message)]
 struct Delivered;
-
-impl Message for Delivered {}
 
 #[derive(Clone, Copy)]
 struct SendToCodec;

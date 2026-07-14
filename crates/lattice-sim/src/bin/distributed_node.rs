@@ -19,7 +19,7 @@ use lattice_actor::protocol::WireCodec;
 use lattice_actor::registry::{ActorCreateContext, ActorLoader};
 use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::{Actor, Handler, Message, Request, Responder};
+use lattice_actor::traits::{Actor, Handler, Responder};
 use lattice_config::store::ConfigStore;
 use lattice_config_etcd::config::EtcdConfigStoreConfig;
 use lattice_config_etcd::store::EtcdConfigStore;
@@ -122,20 +122,15 @@ struct DiscoveryLifecycleArtifact {
     authoritative_up_members: Vec<(String, u128)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, lattice_actor::Request)]
+#[request(response = Pong)]
 struct Ping(u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pong(u64);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, lattice_actor::Message)]
 struct StopPing;
-
-impl Message for StopPing {}
-
-impl Request for Ping {
-    type Response = Pong;
-}
 
 #[derive(Clone, Copy)]
 struct PingCodec;

@@ -3,7 +3,7 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::handle::ActorHandle;
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
-use lattice_actor::traits::{Actor, Handler, Message};
+use lattice_actor::traits::{Actor, Handler};
 use lattice_core::actor_ref::{
     ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
 };
@@ -36,16 +36,16 @@ impl Actor for SourceActor {
     type Error = ActorError;
 }
 
+#[derive(lattice_actor::Message)]
 struct Start;
-impl Message for Start {}
 
+#[derive(lattice_actor::Message)]
 struct Relay {
     preserve_sender: bool,
 }
-impl Message for Relay {}
 
+#[derive(lattice_actor::Message)]
 struct Delivered;
-impl Message for Delivered {}
 
 #[async_trait]
 impl Handler<Start> for SourceActor {

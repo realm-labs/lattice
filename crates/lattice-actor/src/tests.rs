@@ -25,14 +25,11 @@ use lattice_core::instance::InstanceId;
 use lattice_core::service_context::ServiceContext;
 use lattice_core::{actor_kind, service_kind};
 
-#[derive(Debug)]
+#[derive(Debug, crate::Request)]
+#[request(response = String)]
 struct Ping(&'static str);
 
-impl Request for Ping {
-    type Response = String;
-}
-
-#[derive(Debug)]
+#[derive(Debug, crate::Message)]
 struct Record {
     value: &'static str,
     processed: Option<Arc<Semaphore>>,
@@ -54,56 +51,38 @@ impl Record {
     }
 }
 
-impl Message for Record {}
-
-#[derive(Debug)]
+#[derive(Debug, crate::Request)]
+#[request(response = &'static str)]
 struct StopAfterReply;
 
-impl Request for StopAfterReply {
-    type Response = &'static str;
-}
-
-#[derive(Debug)]
+#[derive(Debug, crate::Message)]
 struct Tick;
 
-impl Message for Tick {}
-
-#[derive(Debug)]
+#[derive(Debug, crate::Request)]
+#[request(response = &'static str)]
 struct DeferredReply {
     gate: Arc<Semaphore>,
     entered: Arc<Semaphore>,
 }
 
-impl Request for DeferredReply {
-    type Response = &'static str;
-}
-
+#[derive(crate::Message)]
 struct DeferredReady {
     reply_to: ReplyTo<&'static str>,
 }
 
-impl Message for DeferredReady {}
-
-#[derive(Debug)]
+#[derive(Debug, crate::Request)]
+#[request(response = InstanceId)]
 struct ReadContextInstance;
 
-impl Request for ReadContextInstance {
-    type Response = InstanceId;
-}
-
-#[derive(Debug)]
+#[derive(Debug, crate::Request)]
+#[request(response = InstanceId)]
 struct SpawnContextChild;
 
-impl Request for SpawnContextChild {
-    type Response = InstanceId;
-}
-
+#[derive(crate::Message)]
 struct ContextChildResolved {
     result: Result<InstanceId, ActorCallError>,
     reply_to: ReplyTo<InstanceId>,
 }
-
-impl Message for ContextChildResolved {}
 
 struct TestActor {
     events: Arc<Mutex<Vec<&'static str>>>,
@@ -111,10 +90,8 @@ struct TestActor {
     stopped: Option<Arc<Semaphore>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, crate::Message)]
 struct Fail;
-
-impl Message for Fail {}
 
 #[async_trait]
 impl Actor for TestActor {
@@ -335,17 +312,13 @@ impl Actor for BusinessErrorActor {
     }
 }
 
+#[derive(crate::Request)]
+#[request(response = ())]
 struct LoadBusinessState;
 
-impl Request for LoadBusinessState {
-    type Response = ();
-}
-
+#[derive(crate::Request)]
+#[request(response = &'static str)]
 struct RecoverBusinessState;
-
-impl Request for RecoverBusinessState {
-    type Response = &'static str;
-}
 
 fn load_business_state() -> Result<(), BusinessActorError> {
     Err(BusinessActorError::StoreUnavailable)

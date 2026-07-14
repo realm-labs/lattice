@@ -10,17 +10,14 @@ use lattice_actor::registry::{
     ActorCreateContext, ActorLoader, ActorRegistry, ActorRegistryConfig,
 };
 use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::{Actor, Request, Responder};
+use lattice_actor::traits::{Actor, Responder};
 use lattice_core::actor_kind;
 use lattice_core::id::ActorId;
 use tokio::sync::Semaphore;
 
-#[derive(Debug)]
+#[derive(Debug, lattice_actor::Request)]
+#[request(response = &'static str)]
 struct Ping;
-
-impl Request for Ping {
-    type Response = &'static str;
-}
 
 struct LazyActor;
 

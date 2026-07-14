@@ -8,7 +8,7 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorError, ActorTellError};
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::registry::{ActorRegistry, ActorRegistryConfig};
-use lattice_actor::traits::{Actor, Handler, Message, StopReason};
+use lattice_actor::traits::{Actor, Handler, StopReason};
 use lattice_core::actor_ref::{EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId};
 use lattice_core::{actor_kind, id::ActorId};
 use lattice_placement::allocation::AllocationRequest;
@@ -52,9 +52,8 @@ impl MatrixMeasurement {
 }
 
 struct BenchActor;
+#[derive(lattice_actor::Message)]
 struct BenchTell;
-
-impl Message for BenchTell {}
 
 #[async_trait]
 impl Actor for BenchActor {

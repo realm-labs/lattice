@@ -6,7 +6,7 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
-use lattice_actor::traits::{Actor, Handler, Message, Request, Responder};
+use lattice_actor::traits::{Actor, Handler, Responder};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchState {
@@ -29,13 +29,10 @@ impl Actor for MatchActor {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, lattice_actor::Request)]
+#[request(response = StartMatchReply)]
 struct StartMatch {
     operation_id: u64,
-}
-
-impl Request for StartMatch {
-    type Response = StartMatchReply;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,22 +41,15 @@ struct StartMatchReply {
     queued: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, lattice_actor::Message)]
 struct LoadingFinished;
 
-impl Message for LoadingFinished {}
-
-#[derive(Debug)]
+#[derive(Debug, lattice_actor::Message)]
 struct WorldTick;
 
-impl Message for WorldTick {}
-
-#[derive(Debug)]
+#[derive(Debug, lattice_actor::Request)]
+#[request(response = (MatchState, Vec<u64>))]
 struct InspectState;
-
-impl Request for InspectState {
-    type Response = (MatchState, Vec<u64>);
-}
 
 #[async_trait]
 impl Responder<StartMatch> for MatchActor {

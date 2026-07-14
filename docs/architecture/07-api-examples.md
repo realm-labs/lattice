@@ -15,22 +15,19 @@ pub struct PlayerActor {
 
 impl Actor for PlayerActor {}
 
+#[derive(lattice_actor::Message)]
 pub struct PositionUpdated {
     pub x: f32,
     pub y: f32,
 }
 
+#[derive(lattice_actor::Request)]
+#[request(response = PlayerProfile)]
 pub struct GetProfile;
 
 #[derive(Clone)]
 pub struct PlayerProfile {
     pub position: (f32, f32),
-}
-
-impl Message for PositionUpdated {}
-
-impl Request for GetProfile {
-    type Response = PlayerProfile;
 }
 
 #[async_trait::async_trait]
@@ -313,9 +310,9 @@ Association loss may first make a remote node suspect. Concrete termination is e
 ## 8. Ask Failure and Idempotency
 
 ```rust
-impl Request for ReserveItem {
-    type Response = Result<Reservation, ReserveItemError>;
-}
+#[derive(lattice_actor::Request)]
+#[request(response = Result<Reservation, ReserveItemError>)]
+struct ReserveItem;
 
 match inventory
     .ask(

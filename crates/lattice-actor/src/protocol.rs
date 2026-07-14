@@ -878,17 +878,12 @@ mod tests {
         type Error = ActorError;
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, crate::Message)]
     struct Tell(u64);
 
-    impl Message for Tell {}
-
-    #[derive(Clone)]
+    #[derive(Clone, crate::Request)]
+    #[request(response = u64)]
     struct Ask(u64);
-
-    impl Request for Ask {
-        type Response = u64;
-    }
 
     #[derive(Clone, Copy)]
     struct U64Codec;

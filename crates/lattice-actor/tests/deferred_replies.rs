@@ -8,7 +8,7 @@ use lattice_actor::error::{ActorCallError, ActorError};
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::spawn_actor;
-use lattice_actor::traits::{Actor, Handler, Message, Request, Responder, StopReason};
+use lattice_actor::traits::{Actor, Handler, Responder, StopReason};
 use tokio::sync::Semaphore;
 
 struct DeferredActor {
@@ -21,26 +21,22 @@ impl Actor for DeferredActor {
     type Error = ActorError;
 }
 
+#[derive(lattice_actor::Request)]
+#[request(response = u64)]
 struct Query {
     gate: Arc<Semaphore>,
     entered: Arc<Semaphore>,
     database_value: u64,
 }
 
-impl Request for Query {
-    type Response = u64;
-}
-
+#[derive(lattice_actor::Message)]
 struct QueryReady {
     database_value: u64,
     reply_to: ReplyTo<u64>,
 }
 
-impl Message for QueryReady {}
-
+#[derive(lattice_actor::Message)]
 struct SetValue(u64);
-
-impl Message for SetValue {}
 
 #[async_trait]
 impl Responder<Query> for DeferredActor {
@@ -95,13 +91,11 @@ impl Handler<SetValue> for DeferredActor {
     }
 }
 
+#[derive(lattice_actor::Request)]
+#[request(response = u64)]
 struct FailAfterPipe {
     gate: Arc<Semaphore>,
     entered: Arc<Semaphore>,
-}
-
-impl Request for FailAfterPipe {
-    type Response = u64;
 }
 
 #[async_trait]
@@ -131,17 +125,13 @@ impl Responder<FailAfterPipe> for DeferredActor {
     }
 }
 
+#[derive(lattice_actor::Request)]
+#[request(response = ())]
 struct ForgetReply;
 
-impl Request for ForgetReply {
-    type Response = ();
-}
-
+#[derive(lattice_actor::Request)]
+#[request(response = u64)]
 struct ReplyThenFail;
-
-impl Request for ReplyThenFail {
-    type Response = u64;
-}
 
 #[async_trait]
 impl Responder<ReplyThenFail> for DeferredActor {

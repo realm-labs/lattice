@@ -7,23 +7,18 @@ use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorExecutionPolicy, ActorScheduler, PassivationPolicy};
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
-use lattice_actor::traits::{Actor, Request, Responder};
+use lattice_actor::traits::{Actor, Responder};
 use lattice_core::id::ActorId;
 use lattice_core::service_context::ServiceContext;
 use tokio::sync::Mutex;
 
-#[derive(Debug)]
+#[derive(Debug, lattice_actor::Request)]
+#[request(response = String)]
 struct Ping(&'static str);
 
-impl Request for Ping {
-    type Response = String;
-}
-
+#[derive(lattice_actor::Request)]
+#[request(response = String)]
 struct CurrentThread;
-
-impl Request for CurrentThread {
-    type Response = String;
-}
 
 struct TestActor {
     events: Arc<Mutex<Vec<&'static str>>>,

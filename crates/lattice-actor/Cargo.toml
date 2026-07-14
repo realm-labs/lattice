@@ -12,6 +12,7 @@ bytes.workspace = true
 dashmap.workspace = true
 http.workspace = true
 lattice-core.workspace = true
+lattice-actor-macros.workspace = true
 lattice-remoting.workspace = true
 prost.workspace = true
 thiserror.workspace = true

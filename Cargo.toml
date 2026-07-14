@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lattice-actor",
+    "crates/lattice-actor-macros",
     "crates/lattice-config",
     "crates/lattice-config-etcd",
     "crates/lattice-core",
@@ -48,6 +49,7 @@ lattice-core = { path = "crates/lattice-core" }
 lattice-discovery = { path = "crates/lattice-discovery" }
 lattice-discovery-k8s = { path = "crates/lattice-discovery-k8s" }
 lattice-actor = { path = "crates/lattice-actor" }
+lattice-actor-macros = { path = "crates/lattice-actor-macros" }
 lattice-codegen = { path = "crates/lattice-codegen" }
 lattice-remoting = { path = "crates/lattice-remoting" }
 lattice-eventbus = { path = "crates/lattice-eventbus" }
@@ -60,10 +62,13 @@ lattice-sim = { path = "crates/lattice-sim" }
 opentelemetry = { version = "0.32.0", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["trace", "rt-tokio"] }
+proc-macro-crate = "3.5.0"
+proc-macro2 = "1.0.106"
 prost = "0.14.4"
 prost-build = "0.14.4"
 prost-reflect = "0.16.4"
 prost-types = "0.14.4"
+quote = "1.0.46"
 k8s-openapi = { version = "0.28.0", features = ["v1_35"] }
 kube = { version = "4.0.0", default-features = false, features = ["client", "runtime", "ring", "rustls-tls"] }
 rcgen = "0.14.8"
@@ -81,6 +86,7 @@ tracing = "0.1.44"
 tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json", "registry"] }
 trybuild = "1.0.116"
+syn = "2.0.118"
 uuid = { version = "1.18.1", features = ["v4"] }
 x509-parser = "0.18.1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }

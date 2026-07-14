@@ -216,9 +216,9 @@ The writer crossing from queued to a socket write is the uncertainty boundary. F
 Expected domain failures belong in the typed reply and use its registered reply codec:
 
 ```rust
-impl Request for ReserveItem {
-    type Response = Result<Reservation, ReserveItemError>;
-}
+#[derive(lattice_actor::Request)]
+#[request(response = Result<Reservation, ReserveItemError>)]
+struct ReserveItem;
 ```
 
 `ActorError`, panic, decode failure, stale activation, mailbox rejection, authorization failure, and deadline rejection are framework execution failures carried by a `Failure` frame with a stable `RemoteFailureCode`. Rust error type names, debug output, backtraces, and arbitrary strings are never wire contracts. Optional safe text/details are redacted and size-bounded. Tell-side Handler failures have no response and go to supervision, telemetry, and dead-letter/error inspection.

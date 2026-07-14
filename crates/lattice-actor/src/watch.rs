@@ -1,4 +1,4 @@
-use crate::traits::{Message, PassivationReason, StopReason};
+use crate::traits::{PassivationReason, StopReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WatchId(u64);
@@ -37,14 +37,12 @@ impl ActorIncarnation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, crate::Message)]
 pub struct ActorTerminated {
     pub target: LocalActorRef,
     pub incarnation: ActorIncarnation,
     pub reason: TerminatedReason,
 }
-
-impl Message for ActorTerminated {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminatedReason {
