@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::Instrument;
@@ -13,12 +13,12 @@ use lattice_core::service_context::ServiceContext;
 
 use crate::error::{ActorCallError, ActorError, ActorTellError, PipeToSelfError};
 use crate::handle::ActorHandle;
-use crate::protocol::SupportsTell;
-use crate::recipient::{ActorSystem, RecipientError};
+use crate::protocol::{SupportsAsk, SupportsTell};
+use crate::recipient::{ActorSystem, RecipientError, deadline_from_timeout};
 use crate::reply::{PendingReply, ReplyControl, ReplyTo};
 use crate::traits::{
     Actor, ChildActorKey, ChildActorOptions, ChildSupervision, Handler, Message, PassivationReason,
-    StopReason,
+    Request, StopReason,
 };
 use crate::watch::{ActorTerminated, WatchId};
 
@@ -36,6 +36,7 @@ pub struct ActorContext<A: Actor> {
     children: HashMap<ChildActorKey, Box<dyn ChildStop>>,
     next_watch_id: u64,
     sender: Option<ActorRef>,
+    current_deadline: Option<Instant>,
 }
 
 impl<A: Actor> fmt::Debug for ActorContext<A> {
@@ -60,6 +61,7 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
             .field("child_count", &self.children.len())
             .field("next_watch_id", &self.next_watch_id)
             .field("has_sender", &self.sender.is_some())
+            .field("current_deadline", &self.current_deadline)
             .finish()
     }
 }
@@ -86,6 +88,7 @@ impl<A: Actor> ActorContext<A> {
             children: HashMap::new(),
             next_watch_id: 0,
             sender: None,
+            current_deadline: None,
         }
     }
 
@@ -169,6 +172,29 @@ impl<A: Actor> ActorContext<A> {
             .await
     }
 
+    /// Sends a request using a relative timeout.
+    ///
+    /// While handling another request, the downstream ask cannot outlive the
+    /// current request's remaining deadline.
+    pub async fn ask<P, R>(
+        &mut self,
+        target: impl Into<RecipientRef<P>>,
+        request: R,
+        timeout: Duration,
+    ) -> Result<R::Response, RecipientError>
+    where
+        P: SupportsAsk<R>,
+        R: Request,
+    {
+        let requested_deadline = deadline_from_timeout(timeout)?;
+        let deadline = self
+            .current_deadline
+            .map_or(requested_deadline, |parent| parent.min(requested_deadline));
+        self.actor_system()?
+            .ask_until(target.into(), request, deadline)
+            .await
+    }
+
     /// Forwards to an exact or logical actor reference while preserving the
     /// current envelope sender.
     pub async fn forward<P, M>(
@@ -202,6 +228,10 @@ impl<A: Actor> ActorContext<A> {
 
     pub(crate) fn clear_sender(&mut self) {
         self.sender = None;
+    }
+
+    pub(crate) fn set_current_deadline(&mut self, deadline: Option<Instant>) {
+        self.current_deadline = deadline;
     }
 
     pub(crate) fn register_pending_reply<T>(&mut self, control: ReplyControl<T>) -> bool

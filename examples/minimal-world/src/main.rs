@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use lattice_actor::actor_protocol;
@@ -133,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 world_id: 1,
                 player_id: 1001,
             },
-            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
         )
         .await?;
     service.shutdown().await?;

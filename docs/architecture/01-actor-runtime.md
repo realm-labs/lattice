@@ -395,7 +395,11 @@ pub struct ActorHandle<A: Actor> {
 }
 
 impl<A: Actor> ActorHandle<A> {
-    pub async fn ask<R>(&self, request: R) -> Result<R::Response, ActorCallError>
+    pub async fn ask<R>(
+        &self,
+        request: R,
+        timeout: Duration,
+    ) -> Result<R::Response, ActorCallError>
     where
         A: Responder<R>,
         R: Request;
@@ -406,6 +410,18 @@ impl<A: Actor> ActorHandle<A> {
         M: Message;
 }
 ```
+
+Every ask has an explicit relative timeout. The runtime converts it to one monotonic deadline before mailbox admission; that deadline covers mailbox waiting, handler execution, and deferred reply delivery. A zero timeout returns `DeadlineExceeded`, and a duration that cannot be represented by `Instant` returns `InvalidTimeout`. There is no public unbounded or absolute-deadline ask API.
+
+Actor code can issue routed asks through `ActorContext`:
+
+```rust
+let reply = ctx
+    .ask(&entity_ref, request, Duration::from_secs(2))
+    .await?;
+```
+
+If the current message is itself an ask, `ActorContext` clamps the downstream deadline to the earlier of the parent deadline and the requested timeout. This prevents nested calls from extending the caller's original budget.
 
 `ActorHandle` must not cross remoting or EventBus boundaries. Cross-process messages carry `ActorRef`, `EntityRef`, or `SingletonRef`. A Gateway session is represented by an `ActorRef<GatewaySessionActor>`.
 

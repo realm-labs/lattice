@@ -388,6 +388,7 @@ fn completion_for_result<T>(result: &Result<T, ActorCallError>) -> RequestComple
 
 fn completion_for_error(error: &ActorCallError) -> RequestCompletion {
     match error {
+        ActorCallError::InvalidTimeout => RequestCompletion::InvalidTimeout,
         ActorCallError::MailboxFull => RequestCompletion::MailboxFull,
         ActorCallError::MailboxClosed => RequestCompletion::MailboxClosed,
         ActorCallError::ResponseDropped => RequestCompletion::ResponseDropped,

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
@@ -14,6 +15,8 @@ use lattice_actor::traits::{Actor, Responder};
 use lattice_core::actor_kind;
 use lattice_core::id::ActorId;
 use tokio::sync::Semaphore;
+
+const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, lattice_actor::Request)]
 #[request(response = &'static str)]
@@ -92,10 +95,10 @@ async fn concurrent_lazy_activation_starts_one_local_actor() {
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     release.add_permits(1);
     let first = tasks.pop().unwrap().await.unwrap().unwrap();
-    assert_eq!(first.ask(Ping).await.unwrap(), "pong");
+    assert_eq!(first.ask(Ping, ASK_TIMEOUT).await.unwrap(), "pong");
     for task in tasks {
         let handle = task.await.unwrap().unwrap();
-        assert_eq!(handle.ask(Ping).await.unwrap(), "pong");
+        assert_eq!(handle.ask(Ping, ASK_TIMEOUT).await.unwrap(), "pong");
     }
 
     assert_eq!(loads.load(Ordering::SeqCst), 1);
@@ -119,6 +122,6 @@ async fn loader_failure_is_explicit_and_allows_retry() {
         first,
         Err(ActorActivationError::ActivationFailed(_))
     ));
-    assert_eq!(second.ask(Ping).await.unwrap(), "pong");
+    assert_eq!(second.ask(Ping, ASK_TIMEOUT).await.unwrap(), "pong");
     assert_eq!(loads.load(Ordering::SeqCst), 2);
 }

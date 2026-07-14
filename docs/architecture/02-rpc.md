@@ -61,9 +61,12 @@ pub struct SingletonRef<A: Actor> {
 ```rust
 ctx.tell(&actor_ref, message).await?;
 ctx.forward(&entity_ref, message).await?;
+let reply = ctx.ask(&entity_ref, request, Duration::from_secs(2)).await?;
 
 service.tell(&actor_ref, message).await?;
-let reply = service.ask(&singleton_ref, request, deadline).await?;
+let reply = service
+    .ask(&singleton_ref, request, Duration::from_secs(2))
+    .await?;
 
 let actor_watch = service.watch(&actor_ref).await?;
 let entity_watch = service.watch_entity_current(&entity_ref).await?;
@@ -207,7 +210,7 @@ The reliable control envelope and framework control schemas belong to the remoti
 
 Timeout and disconnect can produce `UnknownResult`: the caller cannot know whether the destination handler ran. The framework does not automatically retry state-changing asks. Business protocols that require retry must carry their own idempotency key.
 
-The caller deadline is authoritative. Before local admission, Region buffering, and socket write, the sender rejects an expired ask and encodes only the remaining duration as `timeout_budget`; it never sends a wall-clock timestamp. The receiver derives a local monotonic deadline at receipt and checks it before decode/mailbox admission and again before starting the Handler. Handler execution is not forcibly cancelled after it starts, because cancellation cannot roll back business effects. A reply arriving after the caller removed its pending entry is discarded and counted.
+The caller supplies a relative timeout. The public API immediately derives one authoritative monotonic deadline and preserves it through local admission, Region buffering, retries, and remote hops. Before socket write, the sender encodes only the remaining duration as `timeout_budget`; it never sends a wall-clock timestamp. The receiver derives a local monotonic deadline at receipt and checks it before decode/mailbox admission and again before starting the Handler. Handler execution is not forcibly cancelled after it starts, because cancellation cannot roll back business effects. A reply arriving after the caller removed its pending entry is discarded and counted. Nested asks made through `ActorContext` cannot outlive the parent request deadline.
 
 The writer crossing from queued to a socket write is the uncertainty boundary. Failure before any frame bytes are committed is a known send failure; disconnect after writing begins yields `UnknownResult` unless a typed remote rejection/reply was received.
 

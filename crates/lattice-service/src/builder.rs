@@ -515,13 +515,13 @@ impl LatticeService {
         &self,
         target: impl Into<RecipientRef<P>>,
         request: R,
-        deadline: std::time::Instant,
+        timeout: std::time::Duration,
     ) -> Result<R::Response, RecipientError>
     where
         P: SupportsAsk<R>,
         R: Request,
     {
-        self.actor_system.ask(target, request, deadline).await
+        self.actor_system.ask(target, request, timeout).await
     }
 
     pub async fn watch<P: ProtocolTag>(

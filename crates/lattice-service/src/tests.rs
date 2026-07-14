@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -315,7 +315,7 @@ async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
         .await
         .unwrap();
     let reply = client
-        .ask(&target, Ping(41), Instant::now() + Duration::from_secs(1))
+        .ask(&target, Ping(41), Duration::from_secs(1))
         .await
         .unwrap();
     assert_eq!(reply, Pong(42));

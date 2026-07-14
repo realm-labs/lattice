@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use lattice_actor::actor_protocol;
@@ -175,7 +175,7 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn std::error::Error>
                 token: "demo-token".to_owned(),
                 gateway_session: None,
             },
-            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
         )
         .await?;
     service.shutdown().await?;

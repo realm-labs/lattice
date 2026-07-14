@@ -51,6 +51,7 @@ pub enum MailboxRejection {
 pub enum RequestCompletion {
     ReplyDelivered,
     RecoveredReplyDelivered,
+    InvalidTimeout,
     HandlerFailed,
     ResponseDropped,
     DeadlineExceeded,

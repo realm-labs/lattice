@@ -124,18 +124,6 @@ impl<R: Request> RequestEnvelope<R> {
     pub(crate) fn new(
         request: R,
         reply_tx: oneshot::Sender<Result<R::Response, ActorCallError>>,
-    ) -> Self {
-        Self {
-            request: Some(request),
-            reply_tx: Some(reply_tx),
-            enqueued_at: Instant::now(),
-            deadline: None,
-        }
-    }
-
-    pub(crate) fn with_deadline(
-        request: R,
-        reply_tx: oneshot::Sender<Result<R::Response, ActorCallError>>,
         deadline: Instant,
     ) -> Self {
         Self {
@@ -186,6 +174,7 @@ where
         metadata: &MessageMetadata,
     ) -> MessageOutcome {
         ctx.clear_sender();
+        ctx.set_current_deadline(None);
         if let Some(sender) = self.sender {
             ctx.set_sender(sender);
         }
@@ -200,6 +189,7 @@ where
         };
         actor.after_message(ctx, metadata, outcome);
         ctx.clear_sender();
+        ctx.set_current_deadline(None);
         outcome
     }
 }
@@ -227,6 +217,7 @@ where
         metadata: &MessageMetadata,
     ) -> MessageOutcome {
         ctx.clear_sender();
+        ctx.set_current_deadline(metadata.deadline());
         let request = self
             .request
             .as_ref()
@@ -248,6 +239,7 @@ where
             observation.complete(RequestCompletion::DeadlineExceeded);
             let outcome = MessageOutcome::Rejected(MessageRejection::DeadlineExceeded);
             actor.after_message(ctx, metadata, outcome);
+            ctx.set_current_deadline(None);
             return outcome;
         }
         let reply_tx = self
@@ -259,6 +251,7 @@ where
             control.cancel(ActorCallError::MailboxFull);
             let outcome = MessageOutcome::Rejected(MessageRejection::DeferredReplyCapacityExceeded);
             actor.after_message(ctx, metadata, outcome);
+            ctx.set_current_deadline(None);
             return outcome;
         }
 
@@ -300,6 +293,7 @@ where
             }
         };
         actor.after_message(ctx, metadata, outcome);
+        ctx.set_current_deadline(None);
         outcome
     }
 }

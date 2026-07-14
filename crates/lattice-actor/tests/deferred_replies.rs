@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
@@ -10,6 +10,8 @@ use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::spawn_actor;
 use lattice_actor::traits::{Actor, Handler, Responder, StopReason};
 use tokio::sync::Semaphore;
+
+const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct DeferredActor {
     value: u64,
@@ -189,7 +191,7 @@ async fn continuation_combines_async_result_with_current_actor_state() {
         let handle = handle.clone();
         let gate = gate.clone();
         let entered = entered.clone();
-        async move { handle.ask(query(gate, entered, 10)).await }
+        async move { handle.ask(query(gate, entered, 10), ASK_TIMEOUT).await }
     });
 
     entered.acquire().await.unwrap().forget();
@@ -213,16 +215,15 @@ async fn deferred_capacity_rejects_saturation_and_is_reused_after_completion() {
         let handle = handle.clone();
         let gate = first_gate.clone();
         let entered = first_entered.clone();
-        async move { handle.ask(query(gate, entered, 1)).await }
+        async move { handle.ask(query(gate, entered, 1), ASK_TIMEOUT).await }
     });
     first_entered.acquire().await.unwrap().forget();
 
     let rejected = handle
-        .ask(query(
-            Arc::new(Semaphore::new(0)),
-            Arc::new(Semaphore::new(0)),
-            2,
-        ))
+        .ask(
+            query(Arc::new(Semaphore::new(0)), Arc::new(Semaphore::new(0)), 2),
+            ASK_TIMEOUT,
+        )
         .await;
     assert!(matches!(rejected, Err(ActorCallError::MailboxFull)));
 
@@ -230,11 +231,10 @@ async fn deferred_capacity_rejects_saturation_and_is_reused_after_completion() {
     assert_eq!(first.await.unwrap().unwrap(), 2);
 
     let next = handle
-        .ask(query(
-            Arc::new(Semaphore::new(1)),
-            Arc::new(Semaphore::new(0)),
-            3,
-        ))
+        .ask(
+            query(Arc::new(Semaphore::new(1)), Arc::new(Semaphore::new(0)), 3),
+            ASK_TIMEOUT,
+        )
         .await
         .unwrap();
     assert_eq!(next, 4);
@@ -249,10 +249,13 @@ async fn responder_error_invalidates_a_reply_token_moved_to_background_work() {
     let entered = Arc::new(Semaphore::new(0));
 
     let result = handle
-        .ask(FailAfterPipe {
-            gate: gate.clone(),
-            entered: entered.clone(),
-        })
+        .ask(
+            FailAfterPipe {
+                gate: gate.clone(),
+                entered: entered.clone(),
+            },
+            ASK_TIMEOUT,
+        )
         .await;
     assert!(matches!(result, Err(ActorCallError::Handler(_))));
 
@@ -262,21 +265,42 @@ async fn responder_error_invalidates_a_reply_token_moved_to_background_work() {
 }
 
 #[tokio::test]
-async fn deadline_cancels_deferred_work_without_posting_a_continuation() {
+async fn timeout_cancels_deferred_work_without_posting_a_continuation() {
     let continuations = Arc::new(AtomicUsize::new(0));
     let handle = actor(continuations.clone(), MailboxConfig::default());
     let gate = Arc::new(Semaphore::new(0));
     let entered = Arc::new(Semaphore::new(0));
-    let deadline = Instant::now() + Duration::from_millis(30);
-
     let result = handle
-        .ask_before(query(gate.clone(), entered.clone(), 10), deadline)
+        .ask(
+            query(gate.clone(), entered.clone(), 10),
+            Duration::from_millis(30),
+        )
         .await;
     assert!(matches!(result, Err(ActorCallError::DeadlineExceeded)));
 
     gate.add_permits(1);
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(continuations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn zero_timeout_expires_without_enqueuing_the_request() {
+    let handle = actor(Arc::new(AtomicUsize::new(0)), MailboxConfig::default());
+
+    assert!(matches!(
+        handle.ask(ForgetReply, Duration::ZERO).await,
+        Err(ActorCallError::DeadlineExceeded)
+    ));
+}
+
+#[tokio::test]
+async fn unrepresentable_timeout_is_rejected_without_panicking() {
+    let handle = actor(Arc::new(AtomicUsize::new(0)), MailboxConfig::default());
+
+    assert!(matches!(
+        handle.ask(ForgetReply, Duration::MAX).await,
+        Err(ActorCallError::InvalidTimeout)
+    ));
 }
 
 #[tokio::test]
@@ -289,7 +313,7 @@ async fn stopping_actor_fails_an_active_deferred_request() {
         let handle = handle.clone();
         let gate = gate.clone();
         let entered = entered.clone();
-        async move { handle.ask(query(gate, entered, 10)).await }
+        async move { handle.ask(query(gate, entered, 10), ASK_TIMEOUT).await }
     });
 
     entered.acquire().await.unwrap().forget();
@@ -308,7 +332,7 @@ async fn dropping_reply_token_completes_request_explicitly() {
     let handle = actor(Arc::new(AtomicUsize::new(0)), MailboxConfig::default());
 
     assert!(matches!(
-        handle.ask(ForgetReply).await,
+        handle.ask(ForgetReply, ASK_TIMEOUT).await,
         Err(ActorCallError::ResponseDropped)
     ));
 }
@@ -317,7 +341,7 @@ async fn dropping_reply_token_completes_request_explicitly() {
 async fn responder_failure_wins_over_a_reply_sent_before_returning() {
     let handle = actor(Arc::new(AtomicUsize::new(0)), MailboxConfig::default());
 
-    let result = handle.ask(ReplyThenFail).await;
+    let result = handle.ask(ReplyThenFail, ASK_TIMEOUT).await;
     let Err(ActorCallError::Handler(error)) = result else {
         panic!("expected handler failure, got {result:?}");
     };

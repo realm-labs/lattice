@@ -698,7 +698,7 @@ async fn client(
     }
     connected??;
     let reply = service
-        .ask(&target, Ping(41), Instant::now() + Duration::from_secs(10))
+        .ask(&target, Ping(41), Duration::from_secs(10))
         .await;
     if expect_failure {
         service.shutdown().await?;
@@ -715,7 +715,7 @@ async fn client(
     let child_encoded = std::fs::read(reference.with_file_name("child-ref.json"))?;
     let child: ActorRef<FixtureProtocol> = serde_json::from_slice(&child_encoded)?;
     if service
-        .ask(&child, Ping(99), Instant::now() + Duration::from_secs(10))
+        .ask(&child, Ping(99), Duration::from_secs(10))
         .await?
         != Pong(100)
     {
@@ -766,7 +766,7 @@ async fn monitor(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     if service
-        .ask(&target, Ping(1), Instant::now() + Duration::from_secs(5))
+        .ask(&target, Ping(1), Duration::from_secs(5))
         .await?
         != Pong(2)
     {
@@ -796,11 +796,7 @@ async fn monitor(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         let result = service
-            .ask(
-                &target,
-                Ping(applied),
-                Instant::now() + Duration::from_secs(3),
-            )
+            .ask(&target, Ping(applied), Duration::from_secs(3))
             .await;
         write_atomic(
             PathBuf::from(format!("/artifacts/monitor-result-{applied}.json")),
@@ -901,11 +897,7 @@ async fn gateway(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     service.connect_peer(owner_identity).await?;
     let entity_type = fixture.reference.entity_type().as_str().to_owned();
     let reply = service
-        .ask(
-            &fixture.reference,
-            Ping(41),
-            Instant::now() + Duration::from_secs(10),
-        )
+        .ask(&fixture.reference, Ping(41), Duration::from_secs(10))
         .await?;
     if reply != Pong(42) {
         return Err("unexpected gateway EntityRef reply".into());

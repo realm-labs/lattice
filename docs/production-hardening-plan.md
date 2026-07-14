@@ -245,7 +245,7 @@ system refs may still serialize through the trusted internal protocol.
 
 ```rust
 recipient.tell(message).await
-recipient.ask(message, deadline).await
+recipient.ask(message, timeout).await
 ctx.watch(&actor_ref).await
 ctx.watch_current(&entity_ref).await
 ctx.watch_current(&singleton_ref).await

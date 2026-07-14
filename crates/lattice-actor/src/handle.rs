@@ -2,7 +2,7 @@ use std::any::type_name;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use lattice_core::actor_ref::{ActorRef, ProtocolTag, ReferenceError};
 use tokio::sync::{
@@ -102,15 +102,25 @@ impl<A: Actor> ActorHandle<A> {
         *self.lifecycle_tx.borrow()
     }
 
-    pub async fn ask<R>(&self, request: R) -> Result<R::Response, ActorCallError>
+    /// Sends a request and waits up to `timeout` for the complete response.
+    ///
+    /// The timeout covers mailbox admission and waiting, handler execution,
+    /// and deferred reply delivery.
+    pub async fn ask<R>(&self, request: R, timeout: Duration) -> Result<R::Response, ActorCallError>
     where
         A: Responder<R>,
         R: Request,
     {
-        self.ask_on_lane(request, MailboxLane::Normal).await
+        if timeout.is_zero() {
+            return Err(ActorCallError::DeadlineExceeded);
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(ActorCallError::InvalidTimeout)?;
+        self.ask_until(request, deadline).await
     }
 
-    pub async fn ask_before<R>(
+    pub(crate) async fn ask_until<R>(
         &self,
         request: R,
         deadline: Instant,
@@ -123,9 +133,8 @@ impl<A: Actor> ActorHandle<A> {
             return Err(ActorCallError::DeadlineExceeded);
         }
         let (reply_tx, reply_rx) = oneshot::channel();
-        let command = ActorCommand::Envelope(Box::new(RequestEnvelope::with_deadline(
-            request, reply_tx, deadline,
-        )));
+        let command =
+            ActorCommand::Envelope(Box::new(RequestEnvelope::new(request, reply_tx, deadline)));
         self.send_command(command, MailboxLane::Normal)?;
         match tokio::time::timeout_at(deadline.into(), reply_rx).await {
             Ok(result) => result.map_err(|_| ActorCallError::ResponseDropped)?,
@@ -133,7 +142,7 @@ impl<A: Actor> ActorHandle<A> {
         }
     }
 
-    pub(crate) async fn ask_before_owned<R>(
+    pub(crate) async fn ask_until_owned<R>(
         self,
         request: R,
         deadline: Instant,
@@ -146,9 +155,8 @@ impl<A: Actor> ActorHandle<A> {
             return Err(ActorCallError::DeadlineExceeded);
         }
         let (reply_tx, reply_rx) = oneshot::channel();
-        let command = ActorCommand::Envelope(Box::new(RequestEnvelope::with_deadline(
-            request, reply_tx, deadline,
-        )));
+        let command =
+            ActorCommand::Envelope(Box::new(RequestEnvelope::new(request, reply_tx, deadline)));
         self.send_command(command, MailboxLane::Normal)?;
         match tokio::time::timeout_at(deadline.into(), reply_rx).await {
             Ok(result) => result.map_err(|_| ActorCallError::ResponseDropped)?,
@@ -253,23 +261,6 @@ impl<A: Actor> ActorHandle<A> {
         self.try_tell_on_lane(msg, None, MailboxLane::System)
     }
 
-    async fn ask_on_lane<R>(
-        &self,
-        request: R,
-        lane: MailboxLane,
-    ) -> Result<R::Response, ActorCallError>
-    where
-        A: Responder<R>,
-        R: Request,
-    {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let command = ActorCommand::Envelope(Box::new(RequestEnvelope::new(request, reply_tx)));
-        self.send_command(command, lane)?;
-        reply_rx
-            .await
-            .map_err(|_| ActorCallError::ResponseDropped)?
-    }
-
     pub(crate) fn try_tell_from<M>(
         &self,
         msg: M,
@@ -368,6 +359,7 @@ impl<A: Actor> ActorHandle<A> {
 impl From<ActorCallError> for ActorTellError {
     fn from(value: ActorCallError) -> Self {
         match value {
+            ActorCallError::InvalidTimeout => Self::MailboxClosed,
             ActorCallError::MailboxFull => Self::MailboxFull,
             ActorCallError::MailboxClosed => Self::MailboxClosed,
             ActorCallError::ResponseDropped

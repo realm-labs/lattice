@@ -41,6 +41,8 @@ impl ActorStopError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ActorCallError {
+    #[error("actor ask timeout cannot be represented as a deadline")]
+    InvalidTimeout,
     #[error("actor mailbox is full")]
     MailboxFull,
     #[error("actor mailbox is closed")]

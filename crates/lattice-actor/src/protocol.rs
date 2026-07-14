@@ -547,7 +547,7 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
                     let message = codec.decode(&payload).map_err(DispatchError::Decode)?;
                     let deadline = deadline.ok_or(DispatchError::MissingDeadline)?;
                     let reply = handle
-                        .ask_before_owned(message, deadline)
+                        .ask_until_owned(message, deadline)
                         .await
                         .map_err(DispatchError::Actor)?;
                     let mut output = BytesMut::new();

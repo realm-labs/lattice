@@ -14,6 +14,8 @@ use lattice_core::id::ActorId;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
+const ASK_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct PassivatingActor {
     stop_entered: Arc<Semaphore>,
     release_stop: Arc<Semaphore>,
@@ -93,7 +95,7 @@ async fn request_arriving_while_actor_is_passivating_is_not_processed_by_old_inc
         .unwrap();
     let mut lifecycle = handle.subscribe_lifecycle();
 
-    handle.ask(BeginPassivation).await.unwrap();
+    handle.ask(BeginPassivation, ASK_TIMEOUT).await.unwrap();
     stop_entered.acquire().await.unwrap().forget();
     while *lifecycle.borrow() != ActorLifecycleState::Passivating {
         lifecycle.changed().await.unwrap();
@@ -101,7 +103,7 @@ async fn request_arriving_while_actor_is_passivating_is_not_processed_by_old_inc
 
     let mut blocked_call = tokio::spawn({
         let handle = handle.clone();
-        async move { handle.ask(Ping).await }
+        async move { handle.ask(Ping, ASK_TIMEOUT).await }
     });
     assert!(
         timeout(Duration::from_millis(10), &mut blocked_call)

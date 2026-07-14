@@ -16,6 +16,8 @@ use lattice_actor::watch::{ActorTerminated, TerminatedReason};
 use lattice_core::service_context::ServiceContext;
 use tokio::sync::{Mutex, Semaphore};
 
+const ASK_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[tokio::test]
 async fn local_actor_watch_sends_typed_termination_notification() {
     struct TargetActor;
@@ -424,8 +426,8 @@ async fn handler_error_returns_to_caller_and_actor_remains_running() {
 
     let handle = spawn_actor(TestActor, MailboxConfig::bounded(8));
 
-    let error = handle.ask(Fail).await;
-    let reply = handle.ask(Ping("after-error")).await.unwrap();
+    let error = handle.ask(Fail, ASK_TIMEOUT).await;
+    let reply = handle.ask(Ping("after-error"), ASK_TIMEOUT).await.unwrap();
 
     assert!(matches!(error, Err(ActorCallError::Handler(_))));
     assert_eq!(reply, "pong:after-error");

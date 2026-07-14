@@ -1,6 +1,6 @@
 use std::any::type_name;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
@@ -169,18 +169,24 @@ async fn actor_hooks_can_downcast_tell_and_request_payloads() {
 
     handle.tell(PayloadTell { value: 41 }).await.unwrap();
     let response = handle
-        .ask_before(
+        .ask(
             PayloadRequest {
                 value: "hello".to_owned(),
             },
-            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
         )
         .await
         .unwrap();
     assert_eq!(response, "reply:hello");
 
     handle.tell(FailingTell).await.unwrap();
-    assert_eq!(handle.ask(RecoveredRequest).await.unwrap(), "recovered");
+    assert_eq!(
+        handle
+            .ask(RecoveredRequest, Duration::from_secs(1))
+            .await
+            .unwrap(),
+        "recovered"
+    );
 
     let permits = tokio::time::timeout(Duration::from_secs(1), after_signal.acquire_many(4))
         .await
@@ -232,7 +238,7 @@ async fn actor_hooks_can_downcast_tell_and_request_payloads() {
                 kind: MessageKind::Request,
                 lane: MessageLane::Normal,
                 payload: "recovered-request".to_owned(),
-                has_deadline: false,
+                has_deadline: true,
             },
             HookEvent::After {
                 type_name: type_name::<RecoveredRequest>(),

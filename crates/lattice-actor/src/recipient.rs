@@ -2,7 +2,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -130,11 +130,27 @@ impl ActorSystem {
             .map_err(RecipientError::Tell)
     }
 
-    /// Sends a typed request from process code and waits until `deadline` for
-    /// its typed response.
+    /// Sends a typed request and waits up to `timeout` for its typed response.
+    ///
+    /// The timeout is converted to one absolute deadline before routing so
+    /// retries and remote hops share the same time budget.
     pub async fn ask<P, R>(
         &self,
         target: impl Into<RecipientRef<P>>,
+        request: R,
+        timeout: Duration,
+    ) -> Result<R::Response, RecipientError>
+    where
+        P: SupportsAsk<R>,
+        R: Request,
+    {
+        let deadline = deadline_from_timeout(timeout)?;
+        self.ask_until(target.into(), request, deadline).await
+    }
+
+    pub(crate) async fn ask_until<P, R>(
+        &self,
+        target: RecipientRef<P>,
         request: R,
         deadline: Instant,
     ) -> Result<R::Response, RecipientError>
@@ -145,7 +161,6 @@ impl ActorSystem {
         if Instant::now() >= deadline {
             return Err(RecipientError::Ask(AskError::DeadlineExceeded));
         }
-        let target = target.into();
         let protocol = self.protocol::<P>(target_protocol_id(&target))?;
         let (message_id, payload) = protocol
             .encode_request(DispatchMode::Ask, &request)
@@ -289,6 +304,8 @@ pub enum ProtocolRegistrationError {
 
 #[derive(Debug, Error)]
 pub enum RecipientError {
+    #[error("actor ask timeout cannot be represented as a deadline")]
+    InvalidTimeout,
     #[error("actor protocol {protocol_id} is not registered with this actor system")]
     ProtocolNotRegistered { protocol_id: u64 },
     #[error("actor protocol {protocol_id} is registered for a different protocol marker type")]
@@ -303,6 +320,15 @@ pub enum RecipientError {
     Ask(#[source] AskError),
     #[error("watch operation failed")]
     Watch(#[source] WatchError),
+}
+
+pub(crate) fn deadline_from_timeout(timeout: Duration) -> Result<Instant, RecipientError> {
+    if timeout.is_zero() {
+        return Err(RecipientError::Ask(AskError::DeadlineExceeded));
+    }
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or(RecipientError::InvalidTimeout)
 }
 
 impl From<RecipientError> for ActorError {

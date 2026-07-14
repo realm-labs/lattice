@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
@@ -11,6 +12,8 @@ use lattice_actor::traits::{Actor, Responder};
 use lattice_core::id::ActorId;
 use lattice_core::service_context::ServiceContext;
 use tokio::sync::Mutex;
+
+const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, lattice_actor::Request)]
 #[request(response = String)]
@@ -97,7 +100,7 @@ async fn dedicated_thread_pool_policy_runs_actor_with_same_mailbox_semantics() {
         .await
         .unwrap();
 
-    let reply = handle.ask(Ping("dedicated")).await.unwrap();
+    let reply = handle.ask(Ping("dedicated"), ASK_TIMEOUT).await.unwrap();
 
     assert_eq!(reply, "pong:dedicated");
     assert_eq!(*events.lock().await, vec!["dedicated"]);
@@ -124,7 +127,7 @@ async fn keyed_worker_pool_execution_policy_runs_actor_with_same_mailbox_semanti
         .await
         .unwrap();
 
-    let reply = handle.ask(Ping("shard-worker")).await.unwrap();
+    let reply = handle.ask(Ping("shard-worker"), ASK_TIMEOUT).await.unwrap();
 
     assert_eq!(reply, "pong:shard-worker");
     assert_eq!(*events.lock().await, vec!["shard-worker"]);
@@ -211,8 +214,8 @@ async fn dedicated_thread_pool_reuses_configured_worker_threads() {
         .unwrap();
 
     assert_eq!(
-        first.ask(CurrentThread).await.unwrap(),
-        second.ask(CurrentThread).await.unwrap()
+        first.ask(CurrentThread, ASK_TIMEOUT).await.unwrap(),
+        second.ask(CurrentThread, ASK_TIMEOUT).await.unwrap()
     );
 }
 
@@ -251,8 +254,8 @@ async fn dedicated_thread_pool_is_scoped_by_actor_type() {
         .unwrap();
 
     assert_ne!(
-        first.ask(CurrentThread).await.unwrap(),
-        second.ask(CurrentThread).await.unwrap()
+        first.ask(CurrentThread, ASK_TIMEOUT).await.unwrap(),
+        second.ask(CurrentThread, ASK_TIMEOUT).await.unwrap()
     );
 }
 
@@ -293,8 +296,8 @@ async fn keyed_worker_pool_uses_scheduler_key_for_worker_affinity() {
         .unwrap();
 
     assert_eq!(
-        first.ask(CurrentThread).await.unwrap(),
-        second.ask(CurrentThread).await.unwrap()
+        first.ask(CurrentThread, ASK_TIMEOUT).await.unwrap(),
+        second.ask(CurrentThread, ASK_TIMEOUT).await.unwrap()
     );
 }
 

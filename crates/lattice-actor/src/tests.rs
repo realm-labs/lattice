@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -24,6 +25,8 @@ use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
 use lattice_core::service_context::ServiceContext;
 use lattice_core::{actor_kind, service_kind};
+
+const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, crate::Request)]
 #[request(response = String)]
@@ -209,7 +212,7 @@ impl Responder<SpawnContextChild> for TestActor {
         )?;
         ctx.pipe_to_self(
             reply_to,
-            async move { handle.ask(ReadContextInstance).await },
+            async move { handle.ask(ReadContextInstance, ASK_TIMEOUT).await },
             |result, reply_to| ContextChildResolved { result, reply_to },
         )?;
         Ok(())
@@ -388,7 +391,10 @@ async fn actor_handler_can_use_business_error_with_question_mark() {
         MailboxConfig::default(),
     );
 
-    let error = handle.ask(LoadBusinessState).await.unwrap_err();
+    let error = handle
+        .ask(LoadBusinessState, ASK_TIMEOUT)
+        .await
+        .unwrap_err();
 
     match error {
         ActorCallError::Handler(error) => {
@@ -408,7 +414,7 @@ async fn actor_handler_error_hook_can_recover_response() {
         MailboxConfig::default(),
     );
 
-    let reply = handle.ask(RecoverBusinessState).await.unwrap();
+    let reply = handle.ask(RecoverBusinessState, ASK_TIMEOUT).await.unwrap();
 
     assert_eq!(reply, "fallback");
     assert_eq!(*observed_errors.lock().await, vec!["store_unavailable"]);
@@ -424,9 +430,9 @@ async fn actor_handle_ask_and_tell_deliver_typed_messages() {
     };
     let handle = spawn_actor(actor, MailboxConfig::bounded(8));
 
-    let reply = handle.ask(Ping("one")).await.unwrap();
+    let reply = handle.ask(Ping("one"), ASK_TIMEOUT).await.unwrap();
     handle.tell(Record::new("two")).await.unwrap();
-    let barrier = handle.ask(Ping("barrier")).await.unwrap();
+    let barrier = handle.ask(Ping("barrier"), ASK_TIMEOUT).await.unwrap();
 
     assert_eq!(reply, "pong:one");
     assert_eq!(barrier, "pong:barrier");
@@ -451,10 +457,13 @@ async fn deferred_reply_does_not_block_the_actor_mailbox() {
     let ask_handle = handle.clone();
     let ask = tokio::spawn(async move {
         ask_handle
-            .ask(DeferredReply {
-                gate: deferred_gate,
-                entered: deferred_entered,
-            })
+            .ask(
+                DeferredReply {
+                    gate: deferred_gate,
+                    entered: deferred_entered,
+                },
+                ASK_TIMEOUT,
+            )
             .await
     });
 
@@ -502,7 +511,7 @@ async fn actor_runtime_spawns_task_per_actor() {
         .spawn_actor(actor, ActorSpawnOptions::default())
         .await
         .unwrap();
-    let reply = handle.ask(Ping("runtime")).await.unwrap();
+    let reply = handle.ask(Ping("runtime"), ASK_TIMEOUT).await.unwrap();
 
     assert_eq!(reply, "pong:runtime");
     assert_eq!(*events.lock().await, vec!["runtime"]);
@@ -519,7 +528,7 @@ async fn standalone_actor_receives_empty_service_context() {
         MailboxConfig::default(),
     );
 
-    let instance = handle.ask(ReadContextInstance).await.unwrap();
+    let instance = handle.ask(ReadContextInstance, ASK_TIMEOUT).await.unwrap();
 
     assert_eq!(instance, InstanceId::new("local"));
 }
@@ -544,11 +553,11 @@ async fn actor_spawn_options_pass_service_context_to_handler_and_child() {
         .unwrap();
 
     assert_eq!(
-        handle.ask(ReadContextInstance).await.unwrap(),
+        handle.ask(ReadContextInstance, ASK_TIMEOUT).await.unwrap(),
         InstanceId::new("world-service")
     );
     assert_eq!(
-        handle.ask(SpawnContextChild).await.unwrap(),
+        handle.ask(SpawnContextChild, ASK_TIMEOUT).await.unwrap(),
         InstanceId::new("world-service")
     );
 }
@@ -645,7 +654,7 @@ async fn stop_uses_system_lane_and_closes_actor() {
     handle.stop(StopReason::Requested).await.unwrap();
     stopped.acquire().await.unwrap().forget();
 
-    let result = handle.ask(Ping("after-stop")).await;
+    let result = handle.ask(Ping("after-stop"), ASK_TIMEOUT).await;
     assert!(matches!(result, Err(ActorCallError::MailboxClosed)));
 }
 
@@ -744,7 +753,7 @@ async fn business_passivation_happens_after_handler_response() {
     };
     let handle = spawn_actor(actor, MailboxConfig::bounded(8));
 
-    let reply = handle.ask(StopAfterReply).await.unwrap();
+    let reply = handle.ask(StopAfterReply, ASK_TIMEOUT).await.unwrap();
     stopped.acquire().await.unwrap().forget();
     let after_stop = handle.tell(Record::new("after-stop")).await;
 

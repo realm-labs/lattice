@@ -8,6 +8,8 @@ use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
 use lattice_actor::traits::{Actor, Handler, Responder};
 
+const ASK_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchState {
     Loading,
@@ -147,7 +149,10 @@ async fn business_actor_models_state_machine_with_typed_messages_and_timer() {
         .await
         .unwrap();
 
-    let reply = handle.ask(StartMatch { operation_id: 7 }).await.unwrap();
+    let reply = handle
+        .ask(StartMatch { operation_id: 7 }, ASK_TIMEOUT)
+        .await
+        .unwrap();
     assert_eq!(
         reply,
         StartMatchReply {
@@ -156,13 +161,13 @@ async fn business_actor_models_state_machine_with_typed_messages_and_timer() {
         }
     );
     assert_eq!(
-        handle.ask(InspectState).await.unwrap(),
+        handle.ask(InspectState, ASK_TIMEOUT).await.unwrap(),
         (MatchState::Loading, vec![7])
     );
 
     let (state, pending) = tokio::time::timeout(Duration::from_millis(250), async {
         loop {
-            let snapshot = handle.ask(InspectState).await.unwrap();
+            let snapshot = handle.ask(InspectState, ASK_TIMEOUT).await.unwrap();
             if matches!(snapshot.0, MatchState::Running { tick } if tick >= 1) {
                 return snapshot;
             }

@@ -20,6 +20,8 @@ use lattice_actor::traits::{
 };
 use tokio::sync::Semaphore;
 
+const ASK_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, PartialEq, prost::Message, lattice_actor::Message)]
 struct WireTell {}
 
@@ -279,10 +281,13 @@ async fn runtime_observer_reports_deferred_completion_lifecycle_and_protocol_fai
     let ask_release = release.clone();
     let ask = tokio::spawn(async move {
         ask_handle
-            .ask(DeferredRequest {
-                entered: ask_entered,
-                release: ask_release,
-            })
+            .ask(
+                DeferredRequest {
+                    entered: ask_entered,
+                    release: ask_release,
+                },
+                ASK_TIMEOUT,
+            )
             .await
     });
     entered.acquire().await.unwrap().forget();
@@ -373,7 +378,7 @@ async fn runtime_observer_reports_mailbox_rejection() {
         Err(ActorTellError::MailboxFull)
     ));
     assert!(matches!(
-        handle.ask(QueuedRequest).await,
+        handle.ask(QueuedRequest, ASK_TIMEOUT).await,
         Err(ActorCallError::MailboxFull)
     ));
     wait_for_event(&events, &signal, |event| {
