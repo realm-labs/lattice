@@ -13,6 +13,7 @@ use lattice_core::service_context::ServiceContext;
 
 use crate::error::{ActorCallError, ActorError, ActorTellError, PipeToSelfError};
 use crate::handle::ActorHandle;
+use crate::protocol::SupportsTell;
 use crate::recipient::{ActorSystem, RecipientError};
 use crate::reply::{PendingReply, ReplyControl, ReplyTo};
 use crate::traits::{
@@ -23,7 +24,7 @@ use crate::watch::{ActorTerminated, WatchId};
 
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
-    self_ref: Option<ActorRef<A>>,
+    self_ref: Option<ActorRef>,
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
     lifecycle_request: Option<StopReason>,
@@ -34,7 +35,7 @@ pub struct ActorContext<A: Actor> {
     watches: HashMap<WatchId, JoinHandle<()>>,
     children: HashMap<ChildActorKey, Box<dyn ChildStop>>,
     next_watch_id: u64,
-    sender: Option<ActorRef<()>>,
+    sender: Option<ActorRef>,
 }
 
 impl<A: Actor> fmt::Debug for ActorContext<A> {
@@ -66,14 +67,14 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
 impl<A: Actor> ActorContext<A> {
     pub(crate) fn new(
         handle: ActorHandle<A>,
-        self_ref: Option<ActorRef<()>>,
+        self_ref: Option<ActorRef>,
         actor_system: Option<Arc<OnceLock<ActorSystem>>>,
         service: ServiceContext,
         deferred_capacity: usize,
     ) -> Self {
         Self {
             handle,
-            self_ref: self_ref.map(|actor_ref| actor_ref.cast()),
+            self_ref,
             actor_system,
             service,
             lifecycle_request: None,
@@ -93,7 +94,7 @@ impl<A: Actor> ActorContext<A> {
     /// Clone the reference before putting it in a message or retaining it. The
     /// reference remains bound to this activation and becomes stale after the
     /// actor stops or is replaced.
-    pub fn self_ref(&self) -> Option<&ActorRef<A>> {
+    pub fn self_ref(&self) -> Option<&ActorRef> {
         self.self_ref.as_ref()
     }
 
@@ -105,7 +106,7 @@ impl<A: Actor> ActorContext<A> {
         &self.service
     }
 
-    pub fn require_self_ref(&self) -> Result<&ActorRef<A>, ActorError> {
+    pub fn require_self_ref(&self) -> Result<&ActorRef, ActorError> {
         self.self_ref
             .as_ref()
             .ok_or_else(|| ActorError::new("actor self ref is not available"))
@@ -115,7 +116,7 @@ impl<A: Actor> ActorContext<A> {
     ///
     /// The value is message-scoped and read-only. Process-originated tells and
     /// asks have no actor sender; asks reply through their typed `ReplyTo`.
-    pub fn sender(&self) -> Option<&ActorRef<()>> {
+    pub fn sender(&self) -> Option<&ActorRef> {
         self.sender.as_ref()
     }
 
@@ -150,13 +151,13 @@ impl<A: Actor> ActorContext<A> {
     }
 
     /// Sends to an exact or logical actor reference with this actor as sender.
-    pub async fn tell<B, M>(
+    pub async fn tell<P, M>(
         &mut self,
-        target: impl Into<RecipientRef<B>>,
+        target: impl Into<RecipientRef<P>>,
         message: M,
     ) -> Result<(), RecipientError>
     where
-        B: Actor,
+        P: SupportsTell<M>,
         M: Message,
     {
         self.actor_system()?
@@ -170,13 +171,13 @@ impl<A: Actor> ActorContext<A> {
 
     /// Forwards to an exact or logical actor reference while preserving the
     /// current envelope sender.
-    pub async fn forward<B, M>(
+    pub async fn forward<P, M>(
         &mut self,
-        target: impl Into<RecipientRef<B>>,
+        target: impl Into<RecipientRef<P>>,
         message: M,
     ) -> Result<(), RecipientError>
     where
-        B: Actor,
+        P: SupportsTell<M>,
         M: Message,
     {
         self.actor_system()?
@@ -195,7 +196,7 @@ impl<A: Actor> ActorContext<A> {
             .ok_or(RecipientError::ActorSystemUnavailable)
     }
 
-    pub(crate) fn set_sender(&mut self, sender: ActorRef<()>) {
+    pub(crate) fn set_sender(&mut self, sender: ActorRef) {
         self.sender = Some(sender);
     }
 
@@ -409,7 +410,7 @@ impl<A: Actor> ActorContext<A> {
             child.key = key.as_str()
         );
         let _entered = span.enter();
-        let child_ref = self.child_actor_ref::<C>(&key, options.protocol_id)?;
+        let child_ref = self.child_actor_ref(&key, options.protocol_id)?;
         let handle = crate::runtime::spawn_actor_with_self_ref(
             actor,
             options.mailbox,
@@ -465,7 +466,7 @@ impl<A: Actor> ActorContext<A> {
             child.key = key.as_str()
         );
         let _entered = span.enter();
-        let child_ref = self.child_actor_ref::<C>(&key, options.protocol_id)?;
+        let child_ref = self.child_actor_ref(&key, options.protocol_id)?;
         let handle = crate::runtime::spawn_actor_with_self_ref(
             factory(),
             options.mailbox,
@@ -612,14 +613,11 @@ impl<A: Actor> ActorContext<A> {
         }
     }
 
-    fn child_actor_ref<C>(
+    fn child_actor_ref(
         &self,
         key: &ChildActorKey,
         protocol_id: Option<lattice_core::actor_ref::ProtocolId>,
-    ) -> Result<Option<ActorRef<C>>, ActorError>
-    where
-        C: Actor,
-    {
+    ) -> Result<Option<ActorRef>, ActorError> {
         let Some(protocol_id) = protocol_id else {
             return Ok(None);
         };
@@ -674,7 +672,7 @@ impl<C: Actor> ChildSlot<C> {
 struct ChildSlotStopper<C: Actor> {
     slot: Arc<ChildSlot<C>>,
     directory: Option<Arc<crate::directory::ActivationDirectory>>,
-    reference: Option<ActorRef<()>>,
+    reference: Option<ActorRef>,
 }
 
 impl<C: Actor> ChildStop for ChildSlotStopper<C> {

@@ -20,7 +20,7 @@ pub struct ActorHandle<A: Actor> {
     lifecycle_tx: watch::Sender<ActorLifecycleState>,
     normal_tx: mpsc::Sender<ActorCommand<A>>,
     system_tx: mpsc::Sender<ActorCommand<A>>,
-    actor_ref: Option<ActorRef<A>>,
+    actor_ref: Option<ActorRef>,
     _marker: PhantomData<fn() -> A>,
 }
 
@@ -42,7 +42,7 @@ impl<A: Actor> Clone for ActorHandle<A> {
             lifecycle_tx: self.lifecycle_tx.clone(),
             normal_tx: self.normal_tx.clone(),
             system_tx: self.system_tx.clone(),
-            actor_ref: self.actor_ref.as_ref().map(ActorRef::cast),
+            actor_ref: self.actor_ref.clone(),
             _marker: PhantomData,
         }
     }
@@ -55,7 +55,7 @@ impl<A: Actor> ActorHandle<A> {
         lifecycle_tx: watch::Sender<ActorLifecycleState>,
         normal_tx: mpsc::Sender<ActorCommand<A>>,
         system_tx: mpsc::Sender<ActorCommand<A>>,
-        actor_ref: Option<ActorRef<A>>,
+        actor_ref: Option<ActorRef>,
     ) -> Self {
         Self {
             local_ref,
@@ -72,7 +72,7 @@ impl<A: Actor> ActorHandle<A> {
         self.local_ref
     }
 
-    pub fn actor_ref(&self) -> Option<&ActorRef<A>> {
+    pub fn actor_ref(&self) -> Option<&ActorRef> {
         self.actor_ref.as_ref()
     }
 
@@ -232,7 +232,7 @@ impl<A: Actor> ActorHandle<A> {
     pub(crate) fn try_tell_from<M>(
         &self,
         msg: M,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
     ) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
@@ -244,7 +244,7 @@ impl<A: Actor> ActorHandle<A> {
     fn try_tell_on_lane<M>(
         &self,
         msg: M,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
         lane: MailboxLane,
     ) -> Result<(), ActorTellError>
     where

@@ -6,23 +6,27 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_ref::{ActorRef, EntityRef, ProtocolId, RecipientRef, SingletonRef};
+use lattice_core::actor_ref::{
+    ActorRef, EntityRef, ProtocolId, ProtocolTag, RecipientRef, SingletonRef,
+};
 use lattice_remoting::messaging::error::{AskError, TellError};
 use lattice_remoting::protocol::ProtocolFingerprint;
 use lattice_remoting::watch::{WatchError, WatchId};
 use thiserror::Error;
 
 use crate::error::ActorError;
-use crate::protocol::{ActorProtocol, DispatchError, DispatchMode};
-use crate::traits::{Actor, Message, Request};
+use crate::protocol::{
+    ActorProtocol, DispatchError, DispatchMode, Protocol, SupportsAsk, SupportsTell,
+};
+use crate::traits::{Message, Request};
 
 #[async_trait]
 #[doc(hidden)]
 pub trait RecipientBackend: Send + Sync + 'static {
     async fn tell(
         &self,
-        sender: Option<ActorRef<()>>,
-        target: RecipientRef<()>,
+        sender: Option<ActorRef>,
+        target: RecipientRef,
         protocol_fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -30,21 +34,18 @@ pub trait RecipientBackend: Send + Sync + 'static {
 
     async fn ask(
         &self,
-        target: RecipientRef<()>,
+        target: RecipientRef,
         protocol_fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, AskError>;
 
-    async fn watch_actor(&self, target: ActorRef<()>) -> Result<WatchId, WatchError>;
+    async fn watch_actor(&self, target: ActorRef) -> Result<WatchId, WatchError>;
 
-    async fn watch_entity_current(&self, target: EntityRef<()>) -> Result<WatchId, WatchError>;
+    async fn watch_entity_current(&self, target: EntityRef) -> Result<WatchId, WatchError>;
 
-    async fn watch_singleton_current(
-        &self,
-        target: SingletonRef<()>,
-    ) -> Result<WatchId, WatchError>;
+    async fn watch_singleton_current(&self, target: SingletonRef) -> Result<WatchId, WatchError>;
 
     async fn unwatch(&self, watch_id: WatchId) -> Result<(), WatchError>;
 }
@@ -91,29 +92,29 @@ impl ActorSystem {
 
     /// Sends a one-way message from process code. The receiver observes no
     /// actor sender.
-    pub async fn tell<A, M>(
+    pub async fn tell<P, M>(
         &self,
-        target: impl Into<RecipientRef<A>>,
+        target: impl Into<RecipientRef<P>>,
         message: M,
     ) -> Result<(), RecipientError>
     where
-        A: Actor,
+        P: SupportsTell<M>,
         M: Message,
     {
         self.tell_with_sender(target.into(), message, None).await
     }
 
-    pub(crate) async fn tell_with_sender<A, M>(
+    pub(crate) async fn tell_with_sender<P, M>(
         &self,
-        target: RecipientRef<A>,
+        target: RecipientRef<P>,
         message: M,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
     ) -> Result<(), RecipientError>
     where
-        A: Actor,
+        P: SupportsTell<M>,
         M: Message,
     {
-        let protocol = self.protocol::<A>(target_protocol_id(&target))?;
+        let protocol = self.protocol::<P>(target_protocol_id(&target))?;
         let (message_id, payload) = protocol
             .encode_request(DispatchMode::Tell, &message)
             .map_err(RecipientError::Dispatch)?;
@@ -131,21 +132,21 @@ impl ActorSystem {
 
     /// Sends a typed request from process code and waits until `deadline` for
     /// its typed response.
-    pub async fn ask<A, R>(
+    pub async fn ask<P, R>(
         &self,
-        target: impl Into<RecipientRef<A>>,
+        target: impl Into<RecipientRef<P>>,
         request: R,
         deadline: Instant,
     ) -> Result<R::Response, RecipientError>
     where
-        A: Actor,
+        P: SupportsAsk<R>,
         R: Request,
     {
         if Instant::now() >= deadline {
             return Err(RecipientError::Ask(AskError::DeadlineExceeded));
         }
         let target = target.into();
-        let protocol = self.protocol::<A>(target_protocol_id(&target))?;
+        let protocol = self.protocol::<P>(target_protocol_id(&target))?;
         let (message_id, payload) = protocol
             .encode_request(DispatchMode::Ask, &request)
             .map_err(RecipientError::Dispatch)?;
@@ -165,16 +166,19 @@ impl ActorSystem {
             .map_err(RecipientError::Dispatch)
     }
 
-    pub async fn watch<A>(&self, target: &ActorRef<A>) -> Result<WatchId, RecipientError> {
+    pub async fn watch<P: ProtocolTag>(
+        &self,
+        target: &ActorRef<P>,
+    ) -> Result<WatchId, RecipientError> {
         self.backend
             .watch_actor(target.erase())
             .await
             .map_err(RecipientError::Watch)
     }
 
-    pub async fn watch_entity_current<A>(
+    pub async fn watch_entity_current<P: ProtocolTag>(
         &self,
-        target: &EntityRef<A>,
+        target: &EntityRef<P>,
     ) -> Result<WatchId, RecipientError> {
         self.backend
             .watch_entity_current(target.erase())
@@ -182,9 +186,9 @@ impl ActorSystem {
             .map_err(RecipientError::Watch)
     }
 
-    pub async fn watch_singleton_current<A>(
+    pub async fn watch_singleton_current<P: ProtocolTag>(
         &self,
-        target: &SingletonRef<A>,
+        target: &SingletonRef<P>,
     ) -> Result<WatchId, RecipientError> {
         self.backend
             .watch_singleton_current(target.erase())
@@ -199,10 +203,10 @@ impl ActorSystem {
             .map_err(RecipientError::Watch)
     }
 
-    fn protocol<A: Actor>(
+    fn protocol<P: Protocol>(
         &self,
         protocol_id: ProtocolId,
-    ) -> Result<Arc<ActorProtocol<A>>, RecipientError> {
+    ) -> Result<Arc<ActorProtocol<P>>, RecipientError> {
         let registered = self.protocols.get(&protocol_id.get()).ok_or(
             RecipientError::ProtocolNotRegistered {
                 protocol_id: protocol_id.get(),
@@ -211,14 +215,14 @@ impl ActorSystem {
         registered
             .protocol
             .clone()
-            .downcast::<ActorProtocol<A>>()
+            .downcast::<ActorProtocol<P>>()
             .map_err(|_| RecipientError::ProtocolTypeMismatch {
                 protocol_id: protocol_id.get(),
             })
     }
 }
 
-fn target_protocol_id<A>(target: &RecipientRef<A>) -> ProtocolId {
+fn target_protocol_id<P: Protocol>(target: &RecipientRef<P>) -> ProtocolId {
     match target {
         RecipientRef::Actor(reference) => reference.protocol_id(),
         RecipientRef::Entity(reference) => reference.protocol_id(),
@@ -245,7 +249,7 @@ impl fmt::Debug for RegisteredActorProtocol {
 }
 
 impl RegisteredActorProtocol {
-    pub fn new<A: Actor>(protocol: Arc<ActorProtocol<A>>) -> Self {
+    pub fn new<P: Protocol>(protocol: Arc<ActorProtocol<P>>) -> Self {
         Self {
             protocol_id: protocol.protocol_id(),
             fingerprint: protocol.fingerprint(),
@@ -261,8 +265,8 @@ impl RegisteredActorProtocol {
         self.fingerprint
     }
 
-    pub fn is_for<A: Actor>(&self) -> bool {
-        self.protocol.is::<ActorProtocol<A>>()
+    pub fn is_for<P: Protocol>(&self) -> bool {
+        self.protocol.is::<ActorProtocol<P>>()
     }
 }
 
@@ -270,7 +274,7 @@ impl RegisteredActorProtocol {
 pub enum ProtocolRegistrationError {
     #[error("actor protocol {0:?} is already registered")]
     DuplicateProtocol(ProtocolId),
-    #[error("actor protocol {protocol_id} was registered for a different actor type")]
+    #[error("actor protocol {protocol_id} was registered for a different protocol marker type")]
     ProtocolTypeMismatch { protocol_id: u64 },
     #[error("actor registry is already attached to an actor system")]
     ActorSystemAlreadyInstalled,
@@ -280,7 +284,7 @@ pub enum ProtocolRegistrationError {
 pub enum RecipientError {
     #[error("actor protocol {protocol_id} is not registered with this actor system")]
     ProtocolNotRegistered { protocol_id: u64 },
-    #[error("actor protocol {protocol_id} is registered for a different actor type")]
+    #[error("actor protocol {protocol_id} is registered for a different protocol marker type")]
     ProtocolTypeMismatch { protocol_id: u64 },
     #[error("actor context has no actor system")]
     ActorSystemUnavailable,

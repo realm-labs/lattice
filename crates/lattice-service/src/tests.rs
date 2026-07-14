@@ -107,7 +107,7 @@ impl Responder<Ping> for PingActor {
 }
 
 actor_protocol! {
-    PingProtocol for PingActor {
+    PingProtocol {
         protocol_id: PROTOCOL_ID;
         name: "service-test/ping/v1";
         ask 1 => Ping {
@@ -230,6 +230,7 @@ async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
     let client_incarnation = NodeIncarnation::new(1).unwrap();
     let server_incarnation = NodeIncarnation::new(2).unwrap();
     let protocol = Arc::new(PingProtocol::build().unwrap());
+    let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
     let registry = Arc::new(ActorRegistry::new(
         actor_kind!("Ping"),
         ActorRegistryConfig {
@@ -243,7 +244,7 @@ async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
         },
     ));
     let handle = registry.start(ActorId::U64(1), PingActor).await.unwrap();
-    let target: ActorRef<PingActor> = handle.actor_ref().unwrap().cast();
+    let target: ActorRef<PingProtocol> = handle.actor_ref().unwrap().try_typed().unwrap();
     let server = LatticeService::builder(node_config(
         cluster_id.clone(),
         "server",
@@ -251,7 +252,7 @@ async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
         server_incarnation,
     ))
     .unwrap()
-    .register_actor(registry, protocol.clone())
+    .register_actor(registry, binding)
     .unwrap()
     .build()
     .unwrap();

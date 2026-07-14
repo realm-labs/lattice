@@ -6,7 +6,7 @@ use super::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SenderIdentity {
-    Actor(ActorRef<()>),
+    Actor(ActorRef),
     Process(u128),
 }
 
@@ -18,7 +18,7 @@ impl SenderIdentity {
         }
     }
 
-    pub(super) fn actor_ref(&self) -> Option<&ActorRef<()>> {
+    pub(super) fn actor_ref(&self) -> Option<&ActorRef> {
         match self {
             Self::Actor(reference) => Some(reference),
             Self::Process(_) => None,
@@ -26,7 +26,7 @@ impl SenderIdentity {
     }
 }
 
-impl<A> From<&ActorRef<A>> for SenderIdentity {
+impl<A: lattice_core::actor_ref::ProtocolTag> From<&ActorRef<A>> for SenderIdentity {
     fn from(value: &ActorRef<A>) -> Self {
         Self::Actor(value.erase())
     }
@@ -42,7 +42,7 @@ pub struct ExactActorTarget {
     pub protocol_id: ProtocolId,
 }
 
-impl<A> From<&ActorRef<A>> for ExactActorTarget {
+impl<A: lattice_core::actor_ref::ProtocolTag> From<&ActorRef<A>> for ExactActorTarget {
     fn from(value: &ActorRef<A>) -> Self {
         Self {
             cluster_id: value.cluster_id().clone(),
@@ -68,7 +68,9 @@ impl ExactActorTarget {
         .into_bytes()
     }
 
-    pub fn actor_ref<A>(&self) -> Result<ActorRef<A>, lattice_core::actor_ref::ReferenceError> {
+    pub fn actor_ref<A: lattice_core::actor_ref::ProtocolTag>(
+        &self,
+    ) -> Result<ActorRef<A>, lattice_core::actor_ref::ReferenceError> {
         ActorRef::new(
             self.cluster_id.clone(),
             self.node_address.clone(),
@@ -76,7 +78,8 @@ impl ExactActorTarget {
             self.actor_path.clone(),
             self.activation_id,
             self.protocol_id,
-        )
+        )?
+        .try_typed()
     }
 }
 
@@ -125,7 +128,7 @@ impl CorrelationId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundTell {
-    pub sender: Option<ActorRef<()>>,
+    pub sender: Option<ActorRef>,
     pub target: ExactActorTarget,
     pub message_id: u64,
     pub payload: Bytes,
@@ -142,7 +145,7 @@ pub struct InboundAsk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalEntityTarget {
-    pub reference: EntityRef<()>,
+    pub reference: EntityRef,
     pub owner_address: NodeAddress,
     pub owner_incarnation: NodeIncarnation,
     pub assignment_generation: u64,
@@ -150,7 +153,7 @@ pub struct LogicalEntityTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalSingletonTarget {
-    pub reference: SingletonRef<()>,
+    pub reference: SingletonRef,
     pub owner_address: NodeAddress,
     pub owner_incarnation: NodeIncarnation,
     pub assignment_generation: u64,
@@ -158,7 +161,7 @@ pub struct LogicalSingletonTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundEntityTell {
-    pub sender: Option<ActorRef<()>>,
+    pub sender: Option<ActorRef>,
     pub target: LogicalEntityTarget,
     pub message_id: u64,
     pub payload: Bytes,
@@ -175,7 +178,7 @@ pub struct InboundEntityAsk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundSingletonTell {
-    pub sender: Option<ActorRef<()>>,
+    pub sender: Option<ActorRef>,
     pub target: LogicalSingletonTarget,
     pub message_id: u64,
     pub payload: Bytes,

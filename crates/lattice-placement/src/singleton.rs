@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use lattice_core::actor_ref::{
-    ClusterId, ConfigFingerprint, ProtocolId, SingletonKind, SingletonRef,
+    ClusterId, ConfigFingerprint, ProtocolId, ProtocolTag, ReferenceError, SingletonKind,
+    SingletonRef,
 };
 use thiserror::Error;
 
@@ -101,13 +102,17 @@ impl SingletonProxy {
         })
     }
 
-    pub fn singleton_ref<A>(&self, cluster_id: ClusterId) -> SingletonRef<A> {
+    pub fn singleton_ref<P: ProtocolTag>(
+        &self,
+        cluster_id: ClusterId,
+    ) -> Result<SingletonRef<P>, ReferenceError> {
         SingletonRef::new(
             cluster_id,
             self.kind.clone(),
             self.protocol_id,
             self.fingerprint,
-        )
+        )?
+        .try_typed()
     }
 
     pub fn update_owner(&mut self, owner: Option<NodeKey>) -> Vec<SingletonBufferedMessage> {

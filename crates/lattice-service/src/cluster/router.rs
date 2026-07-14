@@ -1,11 +1,11 @@
 use super::entity::EntityRouteHost;
 use super::singleton::SingletonRouteHost;
 use super::{
-    Actor, ActorLoader, ActorProtocol, ActorRef, ActorRegistry, Arc, AskError, AssociationKey,
-    AssociationManager, BTreeMap, Bytes, ClusterLogicalRouter, ClusterRouterError,
+    Actor, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc, AskError,
+    AssociationKey, AssociationManager, BTreeMap, Bytes, ClusterLogicalRouter, ClusterRouterError,
     ConfigFingerprint, EntityConfig, EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID,
     LogicPlacementState, LogicalBufferConfig, LogicalEntityTarget, LogicalRouter,
-    LogicalSingletonTarget, Mutex, NodeKey, OutboundMessaging, PlacementSlotKey,
+    LogicalSingletonTarget, Mutex, NodeKey, OutboundMessaging, PlacementSlotKey, Protocol,
     ProtocolFingerprint, ProtocolId, RemoteMessageError, RouteBuffer, SingletonKind, SingletonRef,
     WatchError, async_trait,
 };
@@ -45,16 +45,17 @@ impl ClusterLogicalRouter {
         })
     }
 
-    pub fn register_entity<A, L>(
+    pub fn register_entity<A, L, P>(
         &mut self,
         config: EntityConfig,
         registry: Arc<ActorRegistry<A>>,
-        protocol: Arc<ActorProtocol<A>>,
+        protocol: Arc<ActorProtocolBinding<A, P>>,
         loader: L,
     ) -> Result<(), ClusterRouterError>
     where
         A: Actor,
         L: ActorLoader<A>,
+        P: Protocol,
     {
         if self.entities.len() + self.singletons.len() == self.maximum_registrations {
             return Err(ClusterRouterError::Capacity);
@@ -88,18 +89,19 @@ impl ClusterLogicalRouter {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn register_singleton<A, L>(
+    pub fn register_singleton<A, L, P>(
         &mut self,
         kind: SingletonKind,
         config_fingerprint: ConfigFingerprint,
         protocol_id: ProtocolId,
         registry: Arc<ActorRegistry<A>>,
-        protocol: Arc<ActorProtocol<A>>,
+        protocol: Arc<ActorProtocolBinding<A, P>>,
         loader: L,
     ) -> Result<(), ClusterRouterError>
     where
         A: Actor,
         L: ActorLoader<A>,
+        P: Protocol,
     {
         if self.entities.len() + self.singletons.len() == self.maximum_registrations {
             return Err(ClusterRouterError::Capacity);
@@ -138,8 +140,8 @@ impl ClusterLogicalRouter {
 impl LogicalRouter for ClusterLogicalRouter {
     async fn tell_entity(
         &self,
-        sender: Option<ActorRef<()>>,
-        target: EntityRef<()>,
+        sender: Option<ActorRef>,
+        target: EntityRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -153,7 +155,7 @@ impl LogicalRouter for ClusterLogicalRouter {
 
     async fn ask_entity(
         &self,
-        target: EntityRef<()>,
+        target: EntityRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -168,8 +170,8 @@ impl LogicalRouter for ClusterLogicalRouter {
 
     async fn tell_singleton(
         &self,
-        sender: Option<ActorRef<()>>,
-        target: SingletonRef<()>,
+        sender: Option<ActorRef>,
+        target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -183,7 +185,7 @@ impl LogicalRouter for ClusterLogicalRouter {
 
     async fn ask_singleton(
         &self,
-        target: SingletonRef<()>,
+        target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -198,8 +200,8 @@ impl LogicalRouter for ClusterLogicalRouter {
 
     async fn resolve_entity_current(
         &self,
-        target: EntityRef<()>,
-    ) -> Result<Option<ActorRef<()>>, WatchError> {
+        target: EntityRef,
+    ) -> Result<Option<ActorRef>, WatchError> {
         self.entities
             .get(target.entity_type())
             .ok_or(WatchError::NotActive)?
@@ -209,8 +211,8 @@ impl LogicalRouter for ClusterLogicalRouter {
 
     async fn resolve_singleton_current(
         &self,
-        target: SingletonRef<()>,
-    ) -> Result<Option<ActorRef<()>>, WatchError> {
+        target: SingletonRef,
+    ) -> Result<Option<ActorRef>, WatchError> {
         self.singletons
             .get(target.singleton_kind())
             .ok_or(WatchError::Unavailable)?
@@ -246,7 +248,7 @@ impl LogicalRouter for ClusterLogicalRouter {
 
     async fn receive_entity_tell(
         &self,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
         target: LogicalEntityTarget,
         message_id: u64,
         payload: Bytes,
@@ -279,7 +281,7 @@ impl LogicalRouter for ClusterLogicalRouter {
 
     async fn receive_singleton_tell(
         &self,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
         target: LogicalSingletonTarget,
         message_id: u64,
         payload: Bytes,

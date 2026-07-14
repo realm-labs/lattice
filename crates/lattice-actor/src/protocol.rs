@@ -7,13 +7,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
-use lattice_core::actor_ref::{ActorRef, ProtocolId};
+use lattice_core::actor_ref::{ActorRef, ProtocolId, ProtocolTag};
 use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
 use thiserror::Error;
 
 use crate::error::ActorCallError;
 use crate::handle::ActorHandle;
 use crate::traits::{Actor, Handler, Message, Request, Responder};
+
+#[doc(hidden)]
+pub use lattice_core::actor_ref::ProtocolTag as __ProtocolTag;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CodecDescriptor {
@@ -118,26 +121,32 @@ pub enum DispatchReply {
 
 type DispatchFuture =
     Pin<Box<dyn Future<Output = Result<DispatchReply, DispatchError>> + Send + 'static>>;
-type DispatchFn<A> = dyn Fn(ActorHandle<A>, Bytes, Option<Instant>, Option<ActorRef<()>>) -> DispatchFuture
+type DispatchFn<A> = dyn Fn(ActorHandle<A>, Bytes, Option<Instant>, Option<ActorRef>) -> DispatchFuture
     + Send
     + Sync
     + 'static;
 type EncodeRequestFn = dyn Fn(&dyn Any) -> Result<Bytes, EncodeError> + Send + Sync;
 type DecodeReplyFn = dyn Fn(&[u8]) -> Result<Box<dyn Any + Send>, DecodeError> + Send + Sync;
 
-struct Binding<A: Actor> {
+pub trait Protocol: ProtocolTag {
+    const ID: u64;
+}
+
+pub trait SupportsTell<M: Message>: Protocol {}
+
+pub trait SupportsAsk<R: Request>: Protocol {}
+
+struct ClientBinding {
     descriptor: MessageDescriptor,
-    dispatch: Arc<DispatchFn<A>>,
     request_type: TypeId,
     encode_request: Arc<EncodeRequestFn>,
     decode_reply: Option<Arc<DecodeReplyFn>>,
 }
 
-impl<A: Actor> Clone for Binding<A> {
+impl Clone for ClientBinding {
     fn clone(&self) -> Self {
         Self {
             descriptor: self.descriptor.clone(),
-            dispatch: self.dispatch.clone(),
             request_type: self.request_type,
             encode_request: self.encode_request.clone(),
             decode_reply: self.decode_reply.clone(),
@@ -156,21 +165,21 @@ struct MessageDescriptor {
     max_payload: usize,
 }
 
-pub struct ActorProtocol<A: Actor> {
+pub struct ActorProtocol<P: Protocol> {
     protocol_id: ProtocolId,
     name: String,
     fingerprint: ProtocolFingerprint,
-    bindings: BTreeMap<u64, Binding<A>>,
+    bindings: BTreeMap<u64, ClientBinding>,
+    protocol: PhantomData<fn() -> P>,
 }
 
-impl<A: Actor> ActorProtocol<A> {
-    pub fn builder(protocol_id: ProtocolId, name: impl Into<String>) -> ActorProtocolBuilder<A> {
+impl<P: Protocol> ActorProtocol<P> {
+    pub fn builder(name: impl Into<String>) -> ActorProtocolBuilder<P> {
         ActorProtocolBuilder {
-            protocol_id,
             name: name.into(),
             max_payload: 256 * 1024,
             bindings: Vec::new(),
-            actor: PhantomData,
+            protocol: PhantomData,
         }
     }
 
@@ -191,44 +200,6 @@ impl<A: Actor> ActorProtocol<A> {
             protocol_id: self.protocol_id,
             fingerprint: self.fingerprint,
         }
-    }
-
-    pub async fn dispatch(
-        &self,
-        handle: ActorHandle<A>,
-        message_id: u64,
-        mode: DispatchMode,
-        payload: Bytes,
-        deadline: Option<Instant>,
-    ) -> Result<DispatchReply, DispatchError> {
-        self.dispatch_with_sender(handle, message_id, mode, payload, deadline, None)
-            .await
-    }
-
-    #[doc(hidden)]
-    pub async fn dispatch_with_sender(
-        &self,
-        handle: ActorHandle<A>,
-        message_id: u64,
-        mode: DispatchMode,
-        payload: Bytes,
-        deadline: Option<Instant>,
-        sender: Option<ActorRef<()>>,
-    ) -> Result<DispatchReply, DispatchError> {
-        let binding = self
-            .bindings
-            .get(&message_id)
-            .ok_or(DispatchError::UnknownMessage(message_id))?;
-        if binding.descriptor.mode != mode {
-            return Err(DispatchError::ModeMismatch);
-        }
-        if payload.len() > binding.descriptor.max_payload {
-            return Err(DispatchError::PayloadTooLarge {
-                actual: payload.len(),
-                maximum: binding.descriptor.max_payload,
-            });
-        }
-        (binding.dispatch)(handle, payload, deadline, sender).await
     }
 
     pub fn encode_request<T: Send + 'static>(
@@ -275,15 +246,14 @@ impl<A: Actor> ActorProtocol<A> {
     }
 }
 
-pub struct ActorProtocolBuilder<A: Actor> {
-    protocol_id: ProtocolId,
+pub struct ActorProtocolBuilder<P: Protocol> {
     name: String,
     max_payload: usize,
-    bindings: Vec<Binding<A>>,
-    actor: PhantomData<fn() -> A>,
+    bindings: Vec<ClientBinding>,
+    protocol: PhantomData<fn() -> P>,
 }
 
-impl<A: Actor> ActorProtocolBuilder<A> {
+impl<P: Protocol> ActorProtocolBuilder<P> {
     pub fn max_payload(mut self, maximum: usize) -> Self {
         self.max_payload = maximum;
         self
@@ -291,12 +261,11 @@ impl<A: Actor> ActorProtocolBuilder<A> {
 
     pub fn tell<M, C>(mut self, message_id: u64, schema_version: u32, codec: C) -> Self
     where
-        A: Handler<M>,
         M: Message,
         C: WireCodec<M>,
     {
         let codec = Arc::new(codec);
-        self.bindings.push(Binding {
+        self.bindings.push(ClientBinding {
             descriptor: MessageDescriptor {
                 message_id,
                 mode: DispatchMode::Tell,
@@ -319,16 +288,6 @@ impl<A: Actor> ActorProtocolBuilder<A> {
                 })
             },
             decode_reply: None,
-            dispatch: Arc::new(move |handle, payload, _deadline, sender| {
-                let codec = codec.clone();
-                Box::pin(async move {
-                    let message = codec.decode(&payload).map_err(DispatchError::Decode)?;
-                    handle
-                        .try_tell_from(message, sender)
-                        .map_err(|_| DispatchError::MailboxRejected)?;
-                    Ok(DispatchReply::TellAccepted)
-                })
-            }),
         });
         self
     }
@@ -342,14 +301,13 @@ impl<A: Actor> ActorProtocolBuilder<A> {
         reply_codec: RC,
     ) -> Self
     where
-        A: Responder<Q>,
         Q: Request,
         C: WireCodec<Q>,
         RC: WireCodec<Q::Response>,
     {
         let codec = Arc::new(codec);
         let reply_codec = Arc::new(reply_codec);
-        self.bindings.push(Binding {
+        self.bindings.push(ClientBinding {
             descriptor: MessageDescriptor {
                 message_id,
                 mode: DispatchMode::Ask,
@@ -378,28 +336,11 @@ impl<A: Actor> ActorProtocolBuilder<A> {
                     Ok(Box::new(reply) as Box<dyn Any + Send>)
                 }))
             },
-            dispatch: Arc::new(move |handle, payload, deadline, _sender| {
-                let codec = codec.clone();
-                let reply_codec = reply_codec.clone();
-                Box::pin(async move {
-                    let message = codec.decode(&payload).map_err(DispatchError::Decode)?;
-                    let deadline = deadline.ok_or(DispatchError::MissingDeadline)?;
-                    let reply = handle
-                        .ask_before_owned(message, deadline)
-                        .await
-                        .map_err(DispatchError::Actor)?;
-                    let mut output = BytesMut::new();
-                    reply_codec
-                        .encode(&reply, &mut output)
-                        .map_err(DispatchError::Encode)?;
-                    Ok(DispatchReply::Ask(output.freeze()))
-                })
-            }),
         });
         self
     }
 
-    pub fn build(self) -> Result<ActorProtocol<A>, ProtocolBuildError> {
+    pub fn build(self) -> Result<ActorProtocol<P>, ProtocolBuildError> {
         if self.name.is_empty() || self.name.len() > 128 || self.name.chars().any(char::is_control)
         {
             return Err(ProtocolBuildError::InvalidName);
@@ -429,20 +370,204 @@ impl<A: Actor> ActorProtocolBuilder<A> {
         if bindings.is_empty() {
             return Err(ProtocolBuildError::Empty);
         }
-        let canonical = canonical_descriptor(self.protocol_id, &self.name, &bindings);
+        let protocol_id = protocol_id::<P>()?;
+        let canonical = canonical_descriptor(protocol_id, &self.name, &bindings);
         Ok(ActorProtocol {
-            protocol_id: self.protocol_id,
+            protocol_id,
             name: self.name,
             fingerprint: ProtocolFingerprint::digest(&canonical),
             bindings,
+            protocol: PhantomData,
         })
     }
 }
 
-fn canonical_descriptor<A: Actor>(
+pub struct ActorProtocolBinding<A: Actor, P: Protocol> {
+    protocol: Arc<ActorProtocol<P>>,
+    dispatch: BTreeMap<u64, Arc<DispatchFn<A>>>,
+}
+
+impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
+    pub fn builder(name: impl Into<String>) -> ActorProtocolBindingBuilder<A, P> {
+        ActorProtocolBindingBuilder {
+            client: ActorProtocol::<P>::builder(name),
+            dispatch: Vec::new(),
+            actor: PhantomData,
+        }
+    }
+
+    pub fn protocol(&self) -> &Arc<ActorProtocol<P>> {
+        &self.protocol
+    }
+
+    pub fn protocol_id(&self) -> ProtocolId {
+        self.protocol.protocol_id()
+    }
+
+    pub fn fingerprint(&self) -> ProtocolFingerprint {
+        self.protocol.fingerprint()
+    }
+
+    pub async fn dispatch(
+        &self,
+        handle: ActorHandle<A>,
+        message_id: u64,
+        mode: DispatchMode,
+        payload: Bytes,
+        deadline: Option<Instant>,
+    ) -> Result<DispatchReply, DispatchError> {
+        self.dispatch_with_sender(handle, message_id, mode, payload, deadline, None)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn dispatch_with_sender(
+        &self,
+        handle: ActorHandle<A>,
+        message_id: u64,
+        mode: DispatchMode,
+        payload: Bytes,
+        deadline: Option<Instant>,
+        sender: Option<ActorRef>,
+    ) -> Result<DispatchReply, DispatchError> {
+        let client = self
+            .protocol
+            .bindings
+            .get(&message_id)
+            .ok_or(DispatchError::UnknownMessage(message_id))?;
+        if client.descriptor.mode != mode {
+            return Err(DispatchError::ModeMismatch);
+        }
+        if payload.len() > client.descriptor.max_payload {
+            return Err(DispatchError::PayloadTooLarge {
+                actual: payload.len(),
+                maximum: client.descriptor.max_payload,
+            });
+        }
+        let dispatch = self
+            .dispatch
+            .get(&message_id)
+            .ok_or(DispatchError::UnknownMessage(message_id))?;
+        dispatch(handle, payload, deadline, sender).await
+    }
+}
+
+pub struct ActorProtocolBindingBuilder<A: Actor, P: Protocol> {
+    client: ActorProtocolBuilder<P>,
+    dispatch: Vec<(u64, Arc<DispatchFn<A>>)>,
+    actor: PhantomData<fn() -> A>,
+}
+
+impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
+    pub fn max_payload(mut self, maximum: usize) -> Self {
+        self.client = self.client.max_payload(maximum);
+        self
+    }
+
+    pub fn tell<M, C>(mut self, message_id: u64, schema_version: u32, codec: C) -> Self
+    where
+        A: Handler<M>,
+        M: Message,
+        C: WireCodec<M>,
+    {
+        let codec = Arc::new(codec);
+        self.client =
+            self.client
+                .tell::<M, _>(message_id, schema_version, SharedCodec(codec.clone()));
+        self.dispatch.push((
+            message_id,
+            Arc::new(move |handle, payload, _deadline, sender| {
+                let codec = codec.clone();
+                Box::pin(async move {
+                    let message = codec.decode(&payload).map_err(DispatchError::Decode)?;
+                    handle
+                        .try_tell_from(message, sender)
+                        .map_err(|_| DispatchError::MailboxRejected)?;
+                    Ok(DispatchReply::TellAccepted)
+                })
+            }),
+        ));
+        self
+    }
+
+    pub fn ask<Q, C, RC>(
+        mut self,
+        message_id: u64,
+        request_schema_version: u32,
+        response_schema_version: u32,
+        codec: C,
+        reply_codec: RC,
+    ) -> Self
+    where
+        A: Responder<Q>,
+        Q: Request,
+        C: WireCodec<Q>,
+        RC: WireCodec<Q::Response>,
+    {
+        let codec = Arc::new(codec);
+        let reply_codec = Arc::new(reply_codec);
+        self.client = self.client.ask::<Q, _, _>(
+            message_id,
+            request_schema_version,
+            response_schema_version,
+            SharedCodec(codec.clone()),
+            SharedCodec(reply_codec.clone()),
+        );
+        self.dispatch.push((
+            message_id,
+            Arc::new(move |handle, payload, deadline, _sender| {
+                let codec = codec.clone();
+                let reply_codec = reply_codec.clone();
+                Box::pin(async move {
+                    let message = codec.decode(&payload).map_err(DispatchError::Decode)?;
+                    let deadline = deadline.ok_or(DispatchError::MissingDeadline)?;
+                    let reply = handle
+                        .ask_before_owned(message, deadline)
+                        .await
+                        .map_err(DispatchError::Actor)?;
+                    let mut output = BytesMut::new();
+                    reply_codec
+                        .encode(&reply, &mut output)
+                        .map_err(DispatchError::Encode)?;
+                    Ok(DispatchReply::Ask(output.freeze()))
+                })
+            }),
+        ));
+        self
+    }
+
+    pub fn build(self) -> Result<ActorProtocolBinding<A, P>, ProtocolBuildError> {
+        let protocol = Arc::new(self.client.build()?);
+        let dispatch = self.dispatch.into_iter().collect();
+        Ok(ActorProtocolBinding { protocol, dispatch })
+    }
+}
+
+struct SharedCodec<C>(Arc<C>);
+
+impl<T, C: WireCodec<T>> WireCodec<T> for SharedCodec<C> {
+    const DESCRIPTOR: CodecDescriptor = C::DESCRIPTOR;
+
+    fn encode(&self, value: &T, output: &mut BytesMut) -> Result<(), EncodeError> {
+        self.0.encode(value, output)
+    }
+
+    fn decode(&self, input: &[u8]) -> Result<T, DecodeError> {
+        self.0.decode(input)
+    }
+}
+
+fn protocol_id<P: Protocol>() -> Result<ProtocolId, ProtocolBuildError> {
+    if P::PROTOCOL_ID != Some(P::ID) {
+        return Err(ProtocolBuildError::ProtocolTagMismatch);
+    }
+    __protocol_id(P::ID)
+}
+
+fn canonical_descriptor(
     protocol_id: ProtocolId,
     name: &str,
-    bindings: &BTreeMap<u64, Binding<A>>,
+    bindings: &BTreeMap<u64, ClientBinding>,
 ) -> Vec<u8> {
     let mut output = Vec::new();
     output.extend_from_slice(&protocol_id.get().to_be_bytes());
@@ -501,6 +626,8 @@ pub enum DispatchError {
 pub enum ProtocolBuildError {
     #[error("protocol ID zero is reserved")]
     ReservedProtocolId,
+    #[error("protocol marker ID does not match its reference tag ID")]
+    ProtocolTagMismatch,
     #[error("actor protocol name is empty, oversized, or contains control characters")]
     InvalidName,
     #[error("actor protocol payload limit must be nonzero")]
@@ -521,45 +648,121 @@ pub enum ProtocolBuildError {
 macro_rules! actor_protocol {
     (
         $(#[$meta:meta])*
-        $visibility:vis $name:ident for $actor:ty {
+        $visibility:vis $name:ident {
             protocol_id: $protocol_id:expr;
             name: $protocol_name:expr;
             $($bindings:tt)*
         }
     ) => {
-        $(#[$meta])*
+        $crate::actor_protocol!(@collect
+            [$(#[$meta])*]
+            [$visibility]
+            [$name]
+            [$protocol_id]
+            [$protocol_name]
+            [$($bindings)*]
+            []
+            [$($bindings)*]
+        );
+    };
+
+    (@collect
+        [$($meta:tt)*]
+        [$visibility:vis]
+        [$name:ident]
+        [$protocol_id:expr]
+        [$protocol_name:expr]
+        [$($bindings:tt)*]
+        [$($bounds:tt)*]
+        []
+    ) => {
+        $($meta)*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         $visibility struct $name;
+
+        impl $crate::protocol::__ProtocolTag for $name {
+            const PROTOCOL_ID: Option<u64> = Some($protocol_id);
+        }
+
+        impl $crate::protocol::Protocol for $name {
+            const ID: u64 = $protocol_id;
+        }
 
         impl $name {
             $visibility fn build() -> Result<
-                $crate::protocol::ActorProtocol<$actor>,
+                $crate::protocol::ActorProtocol<Self>,
                 $crate::protocol::ProtocolBuildError,
             > {
-                let builder = $crate::protocol::ActorProtocol::<$actor>::builder(
-                    $crate::protocol::__protocol_id($protocol_id)?,
+                let builder = $crate::protocol::ActorProtocol::<Self>::builder($protocol_name);
+                $crate::actor_protocol!(@apply_client builder; $($bindings)*).build()
+            }
+
+            $visibility fn bind<A>() -> Result<
+                $crate::protocol::ActorProtocolBinding<A, Self>,
+                $crate::protocol::ProtocolBuildError,
+            >
+            where
+                A: $crate::traits::Actor,
+                $($bounds)*
+            {
+                let builder = $crate::protocol::ActorProtocolBinding::<A, Self>::builder(
                     $protocol_name,
                 );
-                $crate::actor_protocol!(@apply builder; $($bindings)*).build()
+                $crate::actor_protocol!(@apply_server builder; $($bindings)*).build()
             }
         }
+
+        $crate::actor_protocol!(@support_impls $name; $($bindings)*);
     };
 
-    (@apply $builder:expr;) => { $builder };
+    (@collect
+        [$($meta:tt)*] [$visibility:vis] [$name:ident] [$protocol_id:expr] [$protocol_name:expr]
+        [$($bindings:tt)*] [$($bounds:tt)*]
+        [
+            tell $message_id:literal => $message:ty { $($config:tt)* }
+            $($remaining:tt)*
+        ]
+    ) => {
+        $crate::actor_protocol!(@collect
+            [$($meta)*] [$visibility] [$name] [$protocol_id] [$protocol_name]
+            [$($bindings)*]
+            [$($bounds)* A: $crate::traits::Handler<$message>,]
+            [$($remaining)*]
+        );
+    };
 
-    (@apply $builder:expr;
+    (@collect
+        [$($meta:tt)*] [$visibility:vis] [$name:ident] [$protocol_id:expr] [$protocol_name:expr]
+        [$($bindings:tt)*] [$($bounds:tt)*]
+        [
+            ask $message_id:literal => $message:ty { $($config:tt)* }
+            $($remaining:tt)*
+        ]
+    ) => {
+        $crate::actor_protocol!(@collect
+            [$($meta)*] [$visibility] [$name] [$protocol_id] [$protocol_name]
+            [$($bindings)*]
+            [$($bounds)* A: $crate::traits::Responder<$message>,]
+            [$($remaining)*]
+        );
+    };
+
+    (@apply_client $builder:expr;) => { $builder };
+
+    (@apply_client $builder:expr;
         tell $message_id:literal => $message:ty {
             schema_version: $schema_version:expr,
             codec: $codec:expr $(,)?
         }
         $($remaining:tt)*
     ) => {
-        $crate::actor_protocol!(@apply
+        $crate::actor_protocol!(@apply_client
             $builder.tell::<$message, _>($message_id, $schema_version, $codec);
             $($remaining)*
         )
     };
 
-    (@apply $builder:expr;
+    (@apply_client $builder:expr;
         ask $message_id:literal => $message:ty {
             request_schema_version: $request_schema_version:expr,
             response_schema_version: $response_schema_version:expr,
@@ -568,7 +771,7 @@ macro_rules! actor_protocol {
         }
         $($remaining:tt)*
     ) => {
-        $crate::actor_protocol!(@apply
+        $crate::actor_protocol!(@apply_client
             $builder.ask::<$message, _, _>(
                 $message_id,
                 $request_schema_version,
@@ -578,6 +781,60 @@ macro_rules! actor_protocol {
             );
             $($remaining)*
         )
+    };
+
+    (@apply_server $builder:expr;) => { $builder };
+
+    (@apply_server $builder:expr;
+        tell $message_id:literal => $message:ty {
+            schema_version: $schema_version:expr,
+            codec: $codec:expr $(,)?
+        }
+        $($remaining:tt)*
+    ) => {
+        $crate::actor_protocol!(@apply_server
+            $builder.tell::<$message, _>($message_id, $schema_version, $codec);
+            $($remaining)*
+        )
+    };
+
+    (@apply_server $builder:expr;
+        ask $message_id:literal => $message:ty {
+            request_schema_version: $request_schema_version:expr,
+            response_schema_version: $response_schema_version:expr,
+            request_codec: $request_codec:expr,
+            response_codec: $response_codec:expr $(,)?
+        }
+        $($remaining:tt)*
+    ) => {
+        $crate::actor_protocol!(@apply_server
+            $builder.ask::<$message, _, _>(
+                $message_id,
+                $request_schema_version,
+                $response_schema_version,
+                $request_codec,
+                $response_codec,
+            );
+            $($remaining)*
+        )
+    };
+
+    (@support_impls $protocol:ty;) => {};
+
+    (@support_impls $protocol:ty;
+        tell $message_id:literal => $message:ty { $($config:tt)* }
+        $($remaining:tt)*
+    ) => {
+        impl $crate::protocol::SupportsTell<$message> for $protocol {}
+        $crate::actor_protocol!(@support_impls $protocol; $($remaining)*);
+    };
+
+    (@support_impls $protocol:ty;
+        ask $message_id:literal => $message:ty { $($config:tt)* }
+        $($remaining:tt)*
+    ) => {
+        impl $crate::protocol::SupportsAsk<$message> for $protocol {}
+        $crate::actor_protocol!(@support_impls $protocol; $($remaining)*);
     };
 }
 
@@ -602,7 +859,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     struct TestActor {
-        observed_sender: Option<oneshot::Sender<Option<ActorRef<()>>>>,
+        observed_sender: Option<oneshot::Sender<Option<ActorRef>>>,
     }
 
     #[async_trait]
@@ -699,7 +956,7 @@ mod tests {
     }
 
     actor_protocol! {
-        TestProtocol for TestActor {
+        TestProtocol {
             protocol_id: 77;
             name: "test/v1";
             tell 1 => Tell {
@@ -718,17 +975,19 @@ mod tests {
     #[test]
     fn macro_and_builder_produce_the_same_fingerprint() {
         let generated = TestProtocol::build().unwrap();
-        let manual = ActorProtocol::<TestActor>::builder(ProtocolId::new(77).unwrap(), "test/v1")
+        let manual = ActorProtocol::<TestProtocol>::builder("test/v1")
             .tell::<Tell, _>(1, 1, U64Codec)
             .ask::<Ask, _, _>(2, 1, 1, U64Codec, U64Codec)
             .build()
             .unwrap();
         assert_eq!(generated.fingerprint(), manual.fingerprint());
+        let binding = TestProtocol::bind::<TestActor>().unwrap();
+        assert_eq!(generated.fingerprint(), binding.fingerprint());
     }
 
     #[test]
     fn duplicate_message_ids_fail_construction() {
-        let result = ActorProtocol::<TestActor>::builder(ProtocolId::new(77).unwrap(), "test/v1")
+        let result = ActorProtocol::<TestProtocol>::builder("test/v1")
             .tell::<Tell, _>(1, 1, U64Codec)
             .ask::<Ask, _, _>(1, 1, 1, U64Codec, U64Codec)
             .build();
@@ -741,7 +1000,7 @@ mod tests {
     #[test]
     fn request_and_response_schema_versions_change_the_fingerprint() {
         let build = |request_schema_version, response_schema_version| {
-            ActorProtocol::<TestActor>::builder(ProtocolId::new(77).unwrap(), "test/v1")
+            ActorProtocol::<TestProtocol>::builder("test/v1")
                 .ask::<Ask, _, _>(
                     1,
                     request_schema_version,
@@ -761,7 +1020,7 @@ mod tests {
 
     #[test]
     fn zero_schema_version_fails_construction() {
-        let result = ActorProtocol::<TestActor>::builder(ProtocolId::new(77).unwrap(), "test/v1")
+        let result = ActorProtocol::<TestProtocol>::builder("test/v1")
             .tell::<Tell, _>(1, 0, U64Codec)
             .build();
 
@@ -790,7 +1049,7 @@ mod tests {
             ProtocolId::new(77).unwrap(),
         )
         .unwrap();
-        let protocol = TestProtocol::build().unwrap();
+        let protocol = TestProtocol::bind::<TestActor>().unwrap();
 
         let result = protocol
             .dispatch_with_sender(

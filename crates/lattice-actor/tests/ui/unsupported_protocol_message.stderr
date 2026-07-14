@@ -1,0 +1,24 @@
+error[E0277]: the trait bound `ClientProtocol: SupportsTell<Unsupported>` is not satisfied
+  --> tests/ui/unsupported_protocol_message.rs:29:20
+   |
+29 |     require_tell::<ClientProtocol>();
+   |                    ^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `SupportsTell<Unsupported>` is not implemented for `ClientProtocol`
+      but trait `SupportsTell<Allowed>` is implemented for it
+  --> tests/ui/unsupported_protocol_message.rs:15:1
+   |
+15 | / actor_protocol! {
+16 | |     ClientProtocol {
+17 | |         protocol_id: 102;
+18 | |         name: "compile/unsupported/v1";
+...  |
+24 | | }
+   | |_^
+   = help: for that trait implementation, expected `Allowed`, found `Unsupported`
+note: required by a bound in `require_tell`
+  --> tests/ui/unsupported_protocol_message.rs:26:20
+   |
+26 | fn require_tell<P: SupportsTell<Unsupported>>() {}
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_tell`
+   = note: this error originates in the macro `$crate::actor_protocol` which comes from the expansion of the macro `actor_protocol` (in Nightly builds, run with -Z macro-backtrace for more info)

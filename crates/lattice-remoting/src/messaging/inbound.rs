@@ -12,7 +12,7 @@ use super::{
 pub trait InboundDispatch: Send + Sync + 'static {
     async fn tell(
         &self,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
@@ -28,7 +28,7 @@ pub trait InboundDispatch: Send + Sync + 'static {
 
     async fn tell_entity(
         &self,
-        _sender: Option<ActorRef<()>>,
+        _sender: Option<ActorRef>,
         _target: LogicalEntityTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -48,7 +48,7 @@ pub trait InboundDispatch: Send + Sync + 'static {
 
     async fn tell_singleton(
         &self,
-        _sender: Option<ActorRef<()>>,
+        _sender: Option<ActorRef>,
         _target: LogicalSingletonTarget,
         _message_id: u64,
         _payload: Bytes,

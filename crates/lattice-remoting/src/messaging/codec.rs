@@ -429,7 +429,7 @@ pub(super) fn target_from_wire(
 
 fn decode_sender(
     sender: Option<ExactActorTargetWire>,
-) -> Result<Option<ActorRef<()>>, RemoteMessageError> {
+) -> Result<Option<ActorRef>, RemoteMessageError> {
     sender
         .map(target_from_wire)
         .transpose()?
@@ -475,7 +475,8 @@ pub(super) fn entity_target_from_wire(
             EntityId::new(wire.entity_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
             ProtocolId::new(wire.protocol_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
             ConfigFingerprint::new(fingerprint),
-        ),
+        )
+        .map_err(|_| RemoteMessageError::InvalidPayload)?,
         owner_address: NodeAddress::new(wire.owner_host, owner_port)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
         owner_incarnation,
@@ -516,7 +517,8 @@ pub(super) fn singleton_target_from_wire(
                 .map_err(|_| RemoteMessageError::InvalidPayload)?,
             ProtocolId::new(wire.protocol_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
             ConfigFingerprint::new(fingerprint),
-        ),
+        )
+        .map_err(|_| RemoteMessageError::InvalidPayload)?,
         owner_address: NodeAddress::new(wire.owner_host, owner_port)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
         owner_incarnation,

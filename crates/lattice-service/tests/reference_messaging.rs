@@ -22,12 +22,12 @@ use tokio::sync::oneshot;
 
 const SOURCE_PROTOCOL_ID: u64 = 0x7265_665f_7372_6301;
 const SINK_PROTOCOL_ID: u64 = 0x7265_665f_736e_6b01;
-type SenderObserver = Arc<Mutex<Option<oneshot::Sender<Option<ActorRef<()>>>>>>;
+type SenderObserver = Arc<Mutex<Option<oneshot::Sender<Option<ActorRef>>>>>;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
 struct SendTo {
-    target: ActorRef<SinkActor>,
+    target: ActorRef<SinkProtocol>,
 }
 
 impl Message for SendTo {}
@@ -118,7 +118,7 @@ impl Handler<Delivered> for SinkActor {
 }
 
 actor_protocol! {
-    SourceProtocol for SourceActor {
+    SourceProtocol {
         protocol_id: SOURCE_PROTOCOL_ID;
         name: "reference/source/v1";
         tell 1 => SendTo {
@@ -129,7 +129,7 @@ actor_protocol! {
 }
 
 actor_protocol! {
-    SinkProtocol for SinkActor {
+    SinkProtocol {
         protocol_id: SINK_PROTOCOL_ID;
         name: "reference/sink/v1";
         tell 1 => Delivered {
@@ -165,8 +165,8 @@ async fn deserialized_actor_ref_sends_without_binding() {
     let cluster_id = ClusterId::new("reference-messaging").unwrap();
     let address = NodeAddress::new("127.0.0.1", 25261).unwrap();
     let incarnation = NodeIncarnation::new(1).unwrap();
-    let source_protocol = Arc::new(SourceProtocol::build().unwrap());
-    let sink_protocol = Arc::new(SinkProtocol::build().unwrap());
+    let source_protocol = Arc::new(SourceProtocol::bind::<SourceActor>().unwrap());
+    let sink_protocol = Arc::new(SinkProtocol::bind::<SinkActor>().unwrap());
     let source_registry = registry::<SourceActor>(
         actor_kind!("ReferenceSource"),
         SOURCE_PROTOCOL_ID,
@@ -195,9 +195,10 @@ async fn deserialized_actor_ref_sends_without_binding() {
         .start(ActorId::U64(1), SourceActor)
         .await
         .unwrap();
-    let sink_ref: ActorRef<SinkActor> = sink_handle.actor_ref().unwrap().cast();
-    let source_ref: ActorRef<SourceActor> = source_handle.actor_ref().unwrap().cast();
-    let decoded_sink: ActorRef<SinkActor> =
+    let sink_ref: ActorRef<SinkProtocol> = sink_handle.actor_ref().unwrap().try_typed().unwrap();
+    let source_ref: ActorRef<SourceProtocol> =
+        source_handle.actor_ref().unwrap().try_typed().unwrap();
+    let decoded_sink: ActorRef<SinkProtocol> =
         serde_json::from_slice(&serde_json::to_vec(&sink_ref).unwrap()).unwrap();
 
     let service = LatticeService::builder(NodeConfig {

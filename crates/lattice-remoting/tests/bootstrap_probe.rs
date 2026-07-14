@@ -33,7 +33,7 @@ struct RejectDispatch;
 impl InboundDispatch for RejectDispatch {
     async fn tell(
         &self,
-        _sender: Option<ActorRef<()>>,
+        _sender: Option<ActorRef>,
         _target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,

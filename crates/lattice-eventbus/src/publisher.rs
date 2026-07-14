@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lattice_actor::protocol::SupportsTell;
 use lattice_actor::recipient::ActorSystem;
-use lattice_actor::traits::{Actor, Message};
+use lattice_actor::traits::Message;
 use lattice_core::actor_ref::ActorRef;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
@@ -35,20 +36,20 @@ where
         Self { bus }
     }
 
-    pub async fn subscribe_recipient<A, M>(
+    pub async fn subscribe_recipient<P, M>(
         &self,
         subscription: EventSubscription,
         actor_system: ActorSystem,
-        recipient: ActorRef<A>,
+        recipient: ActorRef<P>,
     ) -> Result<EventSubscriptionHandle, EventBusError>
     where
-        A: Actor,
+        P: SupportsTell<M>,
         M: Message + ProstMessage + Default,
     {
         self.bus
             .subscribe(subscription, move |event: EventEnvelope| {
                 let actor_system = actor_system.clone();
-                let recipient: ActorRef<A> = recipient.cast();
+                let recipient = recipient.clone();
                 async move {
                     let message = M::decode(event.payload.as_slice()).map_err(|error| {
                         EventBusError::Decode {
@@ -65,22 +66,22 @@ where
             .await
     }
 
-    pub async fn subscribe_mapped<A, M, F>(
+    pub async fn subscribe_mapped<P, M, F>(
         &self,
         subscription: EventSubscription,
         actor_system: ActorSystem,
-        recipient: ActorRef<A>,
+        recipient: ActorRef<P>,
         map: F,
     ) -> Result<EventSubscriptionHandle, EventBusError>
     where
-        A: Actor,
+        P: SupportsTell<M>,
         M: Message,
         F: Fn(EventEnvelope) -> M + Send + Sync + 'static,
     {
         self.bus
             .subscribe(subscription, move |event: EventEnvelope| {
                 let actor_system = actor_system.clone();
-                let recipient: ActorRef<A> = recipient.cast();
+                let recipient = recipient.clone();
                 let message = map(event);
                 async move {
                     actor_system

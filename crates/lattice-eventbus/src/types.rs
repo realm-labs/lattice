@@ -39,7 +39,7 @@ pub struct EventEnvelope {
     pub event_type: String,
     pub source_service: ServiceKind,
     pub source_instance: InstanceId,
-    pub recipient: Option<RecipientRef<()>>,
+    pub recipient: Option<RecipientRef>,
     pub correlation_id: Option<String>,
     pub trace: TraceContext,
     pub occurred_unix_ms: u64,

@@ -1,10 +1,10 @@
 use super::{
-    Actor, ActorHandle, ActorId, ActorLoader, ActorProtocol, ActorRef, ActorRegistry, Arc,
+    Actor, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc,
     AskError, AssociationKey, AssociationManager, AssociationState, Bytes, DispatchMode,
     DispatchReply, EntityConfig, EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID,
     LogicPlacementState, LogicalEntityTarget, Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering,
-    OutboundMessaging, PlacementSlot, PlacementSlotKey, PlacementSlotState, ProtocolFingerprint,
-    RemoteMessageError, RouteBuffer, SenderIdentity, WatchError, async_trait,
+    OutboundMessaging, PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol,
+    ProtocolFingerprint, RemoteMessageError, RouteBuffer, SenderIdentity, WatchError, async_trait,
     decode_resolved_actor, drain_actor_ids, map_ask, map_dispatch, map_tell,
 };
 
@@ -12,15 +12,15 @@ use super::{
 pub(super) trait EntityRoute: Send + Sync {
     async fn tell(
         &self,
-        sender: Option<ActorRef<()>>,
-        target: EntityRef<()>,
+        sender: Option<ActorRef>,
+        target: EntityRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError>;
     async fn ask(
         &self,
-        target: EntityRef<()>,
+        target: EntityRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -28,7 +28,7 @@ pub(super) trait EntityRoute: Send + Sync {
     ) -> Result<Bytes, AskError>;
     async fn receive_tell(
         &self,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
         target: LogicalEntityTarget,
         message_id: u64,
         payload: Bytes,
@@ -40,10 +40,7 @@ pub(super) trait EntityRoute: Send + Sync {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError>;
-    async fn resolve_current(
-        &self,
-        target: EntityRef<()>,
-    ) -> Result<Option<ActorRef<()>>, WatchError>;
+    async fn resolve_current(&self, target: EntityRef) -> Result<Option<ActorRef>, WatchError>;
     async fn receive_resolve(
         &self,
         target: LogicalEntityTarget,
@@ -54,7 +51,7 @@ pub(super) trait EntityRoute: Send + Sync {
     ) -> Result<bool, RemoteMessageError>;
 }
 
-pub(super) struct EntityRouteHost<A: Actor, L: ActorLoader<A>> {
+pub(super) struct EntityRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
     pub(super) local_node: NodeKey,
     pub(super) state: Arc<Mutex<LogicPlacementState>>,
     pub(super) associations: Arc<AssociationManager>,
@@ -63,12 +60,12 @@ pub(super) struct EntityRouteHost<A: Actor, L: ActorLoader<A>> {
     pub(super) buffer: RouteBuffer,
     pub(super) config: EntityConfig,
     pub(super) registry: Arc<ActorRegistry<A>>,
-    pub(super) protocol: Arc<ActorProtocol<A>>,
+    pub(super) protocol: Arc<ActorProtocolBinding<A, P>>,
     pub(super) loader: L,
 }
 
-impl<A: Actor, L: ActorLoader<A>> EntityRouteHost<A, L> {
-    fn slot_key(&self, target: &EntityRef<()>) -> Result<PlacementSlotKey, RemoteMessageError> {
+impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
+    fn slot_key(&self, target: &EntityRef) -> Result<PlacementSlotKey, RemoteMessageError> {
         if target.protocol_id() != self.config.protocol_id
             || target.config_fingerprint() != self.config.fingerprint()
         {
@@ -82,7 +79,7 @@ impl<A: Actor, L: ActorLoader<A>> EntityRouteHost<A, L> {
 
     fn route_slot(
         &self,
-        target: &EntityRef<()>,
+        target: &EntityRef,
     ) -> Result<(PlacementSlotKey, PlacementSlot), RemoteMessageError> {
         let key = self.slot_key(target)?;
         let slot = self
@@ -97,7 +94,7 @@ impl<A: Actor, L: ActorLoader<A>> EntityRouteHost<A, L> {
 
     fn running_slot(
         &self,
-        target: &EntityRef<()>,
+        target: &EntityRef,
     ) -> Result<(PlacementSlotKey, PlacementSlot), RemoteMessageError> {
         let (key, slot) = self.route_slot(target)?;
         if slot.state != PlacementSlotState::Running || slot.owner.is_none() {
@@ -140,7 +137,7 @@ impl<A: Actor, L: ActorLoader<A>> EntityRouteHost<A, L> {
 
     async fn await_running_slot(
         &self,
-        target: &EntityRef<()>,
+        target: &EntityRef,
         payload_bytes: usize,
         requested_deadline: Option<Instant>,
     ) -> Result<(PlacementSlotKey, PlacementSlot), RemoteMessageError> {
@@ -218,15 +215,16 @@ impl<A: Actor, L: ActorLoader<A>> EntityRouteHost<A, L> {
 }
 
 #[async_trait]
-impl<A, L> EntityRoute for EntityRouteHost<A, L>
+impl<A, L, P> EntityRoute for EntityRouteHost<A, L, P>
 where
     A: Actor,
     L: ActorLoader<A>,
+    P: Protocol,
 {
     async fn tell(
         &self,
-        sender: Option<ActorRef<()>>,
-        target: EntityRef<()>,
+        sender: Option<ActorRef>,
+        target: EntityRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -279,7 +277,7 @@ where
 
     async fn ask(
         &self,
-        target: EntityRef<()>,
+        target: EntityRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -335,7 +333,7 @@ where
 
     async fn receive_tell(
         &self,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
         target: LogicalEntityTarget,
         message_id: u64,
         payload: Bytes,
@@ -393,10 +391,7 @@ where
         }
     }
 
-    async fn resolve_current(
-        &self,
-        target: EntityRef<()>,
-    ) -> Result<Option<ActorRef<()>>, WatchError> {
+    async fn resolve_current(&self, target: EntityRef) -> Result<Option<ActorRef>, WatchError> {
         let (key, slot) = self
             .route_slot(&target)
             .map_err(|_| WatchError::NotActive)?;

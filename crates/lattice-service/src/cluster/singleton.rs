@@ -1,9 +1,9 @@
 use super::{
-    Actor, ActorHandle, ActorId, ActorLoader, ActorProtocol, ActorRef, ActorRegistry, Arc,
+    Actor, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc,
     AskError, AssociationKey, AssociationManager, AssociationState, Bytes, ConfigFingerprint,
     DispatchMode, DispatchReply, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
     LogicalSingletonTarget, Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessaging,
-    PlacementSlot, PlacementSlotKey, PlacementSlotState, ProtocolFingerprint, ProtocolId,
+    PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol, ProtocolFingerprint, ProtocolId,
     RemoteMessageError, RouteBuffer, SenderIdentity, SingletonKind, SingletonRef, WatchError,
     async_trait, decode_resolved_actor, drain_actor_ids, map_ask, map_dispatch, map_tell,
 };
@@ -12,15 +12,15 @@ use super::{
 pub(super) trait SingletonRoute: Send + Sync {
     async fn tell(
         &self,
-        sender: Option<ActorRef<()>>,
-        target: SingletonRef<()>,
+        sender: Option<ActorRef>,
+        target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError>;
     async fn ask(
         &self,
-        target: SingletonRef<()>,
+        target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -28,7 +28,7 @@ pub(super) trait SingletonRoute: Send + Sync {
     ) -> Result<Bytes, AskError>;
     async fn receive_tell(
         &self,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
         target: LogicalSingletonTarget,
         message_id: u64,
         payload: Bytes,
@@ -40,10 +40,7 @@ pub(super) trait SingletonRoute: Send + Sync {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError>;
-    async fn resolve_current(
-        &self,
-        target: SingletonRef<()>,
-    ) -> Result<Option<ActorRef<()>>, WatchError>;
+    async fn resolve_current(&self, target: SingletonRef) -> Result<Option<ActorRef>, WatchError>;
     async fn receive_resolve(
         &self,
         target: LogicalSingletonTarget,
@@ -51,7 +48,7 @@ pub(super) trait SingletonRoute: Send + Sync {
     async fn drain(&self) -> Result<bool, RemoteMessageError>;
 }
 
-pub(super) struct SingletonRouteHost<A: Actor, L: ActorLoader<A>> {
+pub(super) struct SingletonRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
     pub(super) local_node: NodeKey,
     pub(super) state: Arc<Mutex<LogicPlacementState>>,
     pub(super) associations: Arc<AssociationManager>,
@@ -62,14 +59,14 @@ pub(super) struct SingletonRouteHost<A: Actor, L: ActorLoader<A>> {
     pub(super) config_fingerprint: ConfigFingerprint,
     pub(super) protocol_id: ProtocolId,
     pub(super) registry: Arc<ActorRegistry<A>>,
-    pub(super) protocol: Arc<ActorProtocol<A>>,
+    pub(super) protocol: Arc<ActorProtocolBinding<A, P>>,
     pub(super) loader: L,
 }
 
-impl<A: Actor, L: ActorLoader<A>> SingletonRouteHost<A, L> {
+impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
     fn slot(
         &self,
-        target: &SingletonRef<()>,
+        target: &SingletonRef,
     ) -> Result<lattice_placement::types::PlacementSlot, RemoteMessageError> {
         if target.protocol_id() != self.protocol_id
             || target.config_fingerprint() != self.config_fingerprint
@@ -84,7 +81,7 @@ impl<A: Actor, L: ActorLoader<A>> SingletonRouteHost<A, L> {
             .ok_or(RemoteMessageError::StaleAuthority)
     }
 
-    fn running_slot(&self, target: &SingletonRef<()>) -> Result<PlacementSlot, RemoteMessageError> {
+    fn running_slot(&self, target: &SingletonRef) -> Result<PlacementSlot, RemoteMessageError> {
         let slot = self.slot(target)?;
         if slot.state != PlacementSlotState::Running || slot.owner.is_none() {
             return Err(RemoteMessageError::ShardUnavailable);
@@ -118,7 +115,7 @@ impl<A: Actor, L: ActorLoader<A>> SingletonRouteHost<A, L> {
 
     async fn await_running_slot(
         &self,
-        target: &SingletonRef<()>,
+        target: &SingletonRef,
         payload_bytes: usize,
         requested_deadline: Option<Instant>,
     ) -> Result<PlacementSlot, RemoteMessageError> {
@@ -197,11 +194,11 @@ impl<A: Actor, L: ActorLoader<A>> SingletonRouteHost<A, L> {
 }
 
 #[async_trait]
-impl<A: Actor, L: ActorLoader<A>> SingletonRoute for SingletonRouteHost<A, L> {
+impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRouteHost<A, L, P> {
     async fn tell(
         &self,
-        sender: Option<ActorRef<()>>,
-        target: SingletonRef<()>,
+        sender: Option<ActorRef>,
+        target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -254,7 +251,7 @@ impl<A: Actor, L: ActorLoader<A>> SingletonRoute for SingletonRouteHost<A, L> {
 
     async fn ask(
         &self,
-        target: SingletonRef<()>,
+        target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -310,7 +307,7 @@ impl<A: Actor, L: ActorLoader<A>> SingletonRoute for SingletonRouteHost<A, L> {
 
     async fn receive_tell(
         &self,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
         target: LogicalSingletonTarget,
         message_id: u64,
         payload: Bytes,
@@ -368,10 +365,7 @@ impl<A: Actor, L: ActorLoader<A>> SingletonRoute for SingletonRouteHost<A, L> {
         }
     }
 
-    async fn resolve_current(
-        &self,
-        target: SingletonRef<()>,
-    ) -> Result<Option<ActorRef<()>>, WatchError> {
+    async fn resolve_current(&self, target: SingletonRef) -> Result<Option<ActorRef>, WatchError> {
         let key = PlacementSlotKey::Singleton(self.kind.clone());
         let slot = self.slot(&target).map_err(|_| WatchError::Unavailable)?;
         let owner = slot.owner.clone().ok_or(WatchError::Unavailable)?;

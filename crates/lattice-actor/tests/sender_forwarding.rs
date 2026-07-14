@@ -10,7 +10,7 @@ use lattice_core::actor_ref::{
 use tokio::sync::mpsc;
 
 struct TargetActor {
-    observed: mpsc::UnboundedSender<ActorRef<()>>,
+    observed: mpsc::UnboundedSender<ActorRef>,
 }
 
 struct ForwarderActor {
@@ -103,7 +103,7 @@ impl Handler<Delivered> for TargetActor {
     }
 }
 
-fn actor_ref<A>(name: &str, sequence: u64) -> ActorRef<A> {
+fn actor_ref(name: &str, sequence: u64) -> ActorRef {
     let incarnation = NodeIncarnation::new(7).unwrap();
     ActorRef::new(
         ClusterId::new("sender-forwarding").unwrap(),
@@ -130,24 +130,24 @@ async fn tell_uses_self_and_forward_preserves_the_original_sender() {
         .await
         .unwrap();
 
-    let forwarder_ref = actor_ref::<ForwarderActor>("forwarder", 2);
+    let forwarder_ref = actor_ref("forwarder", 2);
     let forwarder = runtime
         .spawn_actor(
             ForwarderActor { target },
             ActorSpawnOptions {
-                self_ref: Some(forwarder_ref.erase()),
+                self_ref: Some(forwarder_ref.clone()),
                 ..ActorSpawnOptions::default()
             },
         )
         .await
         .unwrap();
 
-    let source_ref = actor_ref::<SourceActor>("source", 3);
+    let source_ref = actor_ref("source", 3);
     let source = runtime
         .spawn_actor(
             SourceActor { forwarder },
             ActorSpawnOptions {
-                self_ref: Some(source_ref.erase()),
+                self_ref: Some(source_ref.clone()),
                 ..ActorSpawnOptions::default()
             },
         )

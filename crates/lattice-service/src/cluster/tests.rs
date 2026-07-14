@@ -112,7 +112,7 @@ impl Responder<GetValue> for EntityActor {
 }
 
 actor_protocol! {
-    EntityProtocol for EntityActor {
+    EntityProtocol {
         protocol_id: TEST_PROTOCOL_ID;
         name: "cluster-router-test/v1";
         ask 1 => GetValue {
@@ -401,6 +401,7 @@ async fn stale_generation_never_reaches_entity_loader() {
             .unwrap();
     }
     let protocol = Arc::new(EntityProtocol::build().unwrap());
+    let binding = Arc::new(EntityProtocol::bind::<EntityActor>().unwrap());
     let registry = Arc::new(ActorRegistry::new(
         actor_kind!("Entity"),
         ActorRegistryConfig {
@@ -428,11 +429,11 @@ async fn stale_generation_never_reaches_entity_loader() {
         .register_entity(
             entity_config.clone(),
             registry,
-            protocol.clone(),
+            binding,
             CountingLoader(loads.clone()),
         )
         .unwrap();
-    let reference = entity_config.entity_ref::<()>(cluster_id, entity_id);
+    let reference = entity_config.entity_ref(cluster_id, entity_id).unwrap();
     let (_, request) = protocol
         .encode_request(DispatchMode::Ask, &GetValue(2))
         .unwrap();
@@ -586,6 +587,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     )
     .await;
     let protocol = Arc::new(EntityProtocol::build().unwrap());
+    let binding = Arc::new(EntityProtocol::bind::<EntityActor>().unwrap());
     let source_loads = Arc::new(AtomicUsize::new(0));
     let owner_loads = Arc::new(AtomicUsize::new(0));
     let registry = |address: NodeAddress, incarnation: NodeIncarnation| {
@@ -620,7 +622,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         .register_entity(
             entity_config.clone(),
             source_registry.clone(),
-            protocol.clone(),
+            binding.clone(),
             CountingLoader(source_loads.clone()),
         )
         .unwrap();
@@ -630,7 +632,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
             singleton_fingerprint,
             ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
             source_registry,
-            protocol.clone(),
+            binding.clone(),
             CountingLoader(source_loads.clone()),
         )
         .unwrap();
@@ -648,7 +650,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         .register_entity(
             entity_config.clone(),
             owner_registry.clone(),
-            protocol.clone(),
+            binding.clone(),
             CountingLoader(owner_loads.clone()),
         )
         .unwrap();
@@ -658,7 +660,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
             singleton_fingerprint,
             ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
             owner_registry,
-            protocol.clone(),
+            binding,
             CountingLoader(owner_loads.clone()),
         )
         .unwrap();
@@ -722,7 +724,9 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     } else {
         owner_endpoint.connect_peer(source_identity).await.unwrap();
     }
-    let reference = entity_config.entity_ref::<()>(cluster_id.clone(), entity_id);
+    let reference = entity_config
+        .entity_ref(cluster_id.clone(), entity_id)
+        .unwrap();
     assert!(
         source_router
             .resolve_entity_current(reference.clone())
@@ -760,7 +764,8 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         singleton_kind,
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
         singleton_fingerprint,
-    );
+    )
+    .unwrap();
     assert!(
         source_router
             .resolve_singleton_current(singleton.clone())

@@ -322,7 +322,7 @@ fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
     }
 }
 
-fn actor_ref(node: &NodeKey) -> ActorRef<()> {
+fn actor_ref(node: &NodeKey) -> ActorRef {
     ActorRef::new(
         ClusterId::new("sim-cluster").unwrap(),
         node.address.clone(),

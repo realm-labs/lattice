@@ -47,7 +47,7 @@ fn active_association(
     association
 }
 
-fn target(protocol_id: ProtocolId) -> ActorRef<()> {
+fn target(protocol_id: ProtocolId) -> ActorRef {
     let node = NodeIncarnation::new(2).unwrap();
     ActorRef::new(
         ClusterId::new("test").unwrap(),
@@ -69,7 +69,7 @@ struct RecordingDispatch {
 impl InboundDispatch for RecordingDispatch {
     async fn tell(
         &self,
-        _sender: Option<ActorRef<()>>,
+        _sender: Option<ActorRef>,
         target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,
@@ -174,7 +174,7 @@ async fn outbound_tell_preserves_an_exact_actor_sender() {
     let mut receivers = association.take_receivers().unwrap();
     let messaging = OutboundMessaging::new(4).unwrap();
     let recipient = target(protocol_id);
-    let sender: ActorRef<()> = ActorRef::new(
+    let sender: ActorRef = ActorRef::new(
         ClusterId::new("test").unwrap(),
         NodeAddress::new("sender", 25521).unwrap(),
         NodeIncarnation::new(3).unwrap(),

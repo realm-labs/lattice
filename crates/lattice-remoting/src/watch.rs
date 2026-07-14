@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_ref::{ActorRef, EntityRef, NodeIncarnation, SingletonRef};
+use lattice_core::actor_ref::{ActorRef, EntityRef, NodeIncarnation, ProtocolTag, SingletonRef};
 use thiserror::Error;
 
 use crate::association::AssociationId;
@@ -159,7 +159,7 @@ impl WatchRegistry {
         })
     }
 
-    pub fn watch<A>(
+    pub fn watch<A: ProtocolTag>(
         &mut self,
         association_id: AssociationId,
         target: &ActorRef<A>,
@@ -361,12 +361,12 @@ impl WatchRegistry {
 
 #[async_trait]
 pub trait CurrentActivationResolver: Send + Sync {
-    async fn resolve_entity_current<A>(
+    async fn resolve_entity_current<A: ProtocolTag>(
         &self,
         reference: &EntityRef<A>,
     ) -> Result<Option<ActorRef<A>>, WatchError>;
 
-    async fn resolve_singleton_current<A>(
+    async fn resolve_singleton_current<A: ProtocolTag>(
         &self,
         reference: &SingletonRef<A>,
     ) -> Result<Option<ActorRef<A>>, WatchError>;
@@ -399,7 +399,7 @@ mod tests {
     use super::*;
     use lattice_core::actor_ref::{ActivationId, ActorPath, ClusterId, NodeAddress, ProtocolId};
 
-    fn actor(sequence: u64) -> ActorRef<()> {
+    fn actor(sequence: u64) -> ActorRef {
         let node = NodeIncarnation::new(2).unwrap();
         ActorRef::new(
             ClusterId::new("test").unwrap(),

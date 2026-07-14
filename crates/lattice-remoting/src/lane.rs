@@ -411,7 +411,7 @@ mod tests {
     impl InboundDispatch for EchoDispatch {
         async fn tell(
             &self,
-            _sender: Option<ActorRef<()>>,
+            _sender: Option<ActorRef>,
             _target: ExactActorTarget,
             _message_id: u64,
             _payload: Bytes,
@@ -554,7 +554,7 @@ mod tests {
                 .await
             })
         };
-        let target = ActorRef::<()>::new(
+        let target = ActorRef::new(
             ClusterId::new("lane-test").unwrap(),
             server_address,
             server_incarnation,

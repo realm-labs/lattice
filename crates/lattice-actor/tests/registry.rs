@@ -94,7 +94,7 @@ async fn remove_running_actor_allows_restart_with_same_id() {
 }
 
 struct SelfRefActor {
-    tx: Option<oneshot::Sender<ActorRef<SelfRefActor>>>,
+    tx: Option<oneshot::Sender<ActorRef>>,
 }
 
 #[async_trait]
@@ -102,7 +102,7 @@ impl Actor for SelfRefActor {
     type Error = ActorError;
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(ctx.require_self_ref()?.cast());
+            let _ = tx.send(ctx.require_self_ref()?.clone());
         }
         Ok(())
     }
@@ -140,7 +140,7 @@ async fn registry_injects_exact_actor_ref_into_context() {
     assert!(actor_ref.actor_path().to_string().starts_with("/user/"));
     assert!(registry.get_exact(&actor_ref).is_some());
 
-    let old = actor_ref.cast::<SelfRefActor>();
+    let old = actor_ref.clone();
     let actor_id = ActorId::Str("session-1".to_string());
     let first = registry.remove(&actor_id).await.unwrap();
     first

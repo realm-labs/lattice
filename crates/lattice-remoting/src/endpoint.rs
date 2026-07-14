@@ -873,7 +873,7 @@ mod tests {
     impl InboundDispatch for EchoDispatch {
         async fn tell(
             &self,
-            _sender: Option<ActorRef<()>>,
+            _sender: Option<ActorRef>,
             _target: ExactActorTarget,
             _message_id: u64,
             _payload: Bytes,
@@ -970,7 +970,7 @@ mod tests {
             association.state(),
             crate::association::AssociationState::Active
         );
-        let target = ActorRef::<()>::new(
+        let target = ActorRef::new(
             cluster_id,
             server_identity.address.clone(),
             server_identity.incarnation,

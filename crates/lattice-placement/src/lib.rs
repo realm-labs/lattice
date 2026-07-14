@@ -98,7 +98,9 @@ mod tests {
         .unwrap();
         let entity = EntityId::new(b"player-42".to_vec()).unwrap();
         assert_eq!(config.shard_for(&entity), ShardId::new(17));
-        let reference = config.entity_ref::<()>(ClusterId::new("test").unwrap(), entity);
+        let reference: lattice_core::actor_ref::EntityRef = config
+            .entity_ref(ClusterId::new("test").unwrap(), entity)
+            .unwrap();
         assert_eq!(reference.config_fingerprint(), config.fingerprint());
     }
 

@@ -10,7 +10,7 @@ use lattice_remoting::messaging::inbound::InboundDispatch;
 use lattice_remoting::messaging::target::ExactActorTarget;
 use thiserror::Error;
 
-use crate::protocol::{ActorProtocol, DispatchError, DispatchMode, DispatchReply};
+use crate::protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol};
 use crate::registry::ActorRegistry;
 use crate::traits::Actor;
 
@@ -25,7 +25,7 @@ trait ErasedActorHost: Send + Sync {
 
     async fn tell(
         &self,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
@@ -40,13 +40,13 @@ trait ErasedActorHost: Send + Sync {
     ) -> Result<Bytes, RemoteMessageError>;
 }
 
-pub struct ActorHost<A: Actor> {
+pub struct ActorHost<A: Actor, P: Protocol> {
     registry: Arc<ActorRegistry<A>>,
-    protocol: Arc<ActorProtocol<A>>,
+    protocol: Arc<ActorProtocolBinding<A, P>>,
 }
 
-impl<A: Actor> ActorHost<A> {
-    pub fn new(registry: Arc<ActorRegistry<A>>, protocol: Arc<ActorProtocol<A>>) -> Self {
+impl<A: Actor, P: Protocol> ActorHost<A, P> {
+    pub fn new(registry: Arc<ActorRegistry<A>>, protocol: Arc<ActorProtocolBinding<A, P>>) -> Self {
         Self { registry, protocol }
     }
 
@@ -54,7 +54,7 @@ impl<A: Actor> ActorHost<A> {
         &self,
         target: &ExactActorTarget,
     ) -> Result<crate::handle::ActorHandle<A>, RemoteMessageError> {
-        let reference = ActorRef::<A>::new(
+        let reference = ActorRef::new(
             target.cluster_id.clone(),
             target.node_address.clone(),
             target.node_incarnation,
@@ -70,7 +70,7 @@ impl<A: Actor> ActorHost<A> {
 }
 
 #[async_trait]
-impl<A: Actor> ErasedActorHost for ActorHost<A> {
+impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
     fn protocol_id(&self) -> ProtocolId {
         self.protocol.protocol_id()
     }
@@ -90,7 +90,7 @@ impl<A: Actor> ErasedActorHost for ActorHost<A> {
 
     async fn tell(
         &self,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,
@@ -165,7 +165,10 @@ impl ProtocolHostRegistry {
         })
     }
 
-    pub fn register<A: Actor>(&mut self, host: ActorHost<A>) -> Result<(), HostRegistryError> {
+    pub fn register<A: Actor, P: Protocol>(
+        &mut self,
+        host: ActorHost<A, P>,
+    ) -> Result<(), HostRegistryError> {
         if self.hosts.len() == self.maximum {
             return Err(HostRegistryError::Capacity);
         }
@@ -196,7 +199,7 @@ impl ProtocolHostRegistry {
 impl InboundDispatch for ProtocolHostRegistry {
     async fn tell(
         &self,
-        sender: Option<ActorRef<()>>,
+        sender: Option<ActorRef>,
         target: ExactActorTarget,
         message_id: u64,
         payload: Bytes,

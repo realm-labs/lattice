@@ -121,11 +121,11 @@ impl<R: Request> RequestEnvelope<R> {
 
 pub(crate) struct TellEnvelope<M: Message> {
     msg: M,
-    sender: Option<ActorRef<()>>,
+    sender: Option<ActorRef>,
 }
 
 impl<M: Message> TellEnvelope<M> {
-    pub(crate) fn new(msg: M, sender: Option<ActorRef<()>>) -> Self {
+    pub(crate) fn new(msg: M, sender: Option<ActorRef>) -> Self {
         Self { msg, sender }
     }
 }

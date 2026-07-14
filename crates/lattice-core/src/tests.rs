@@ -54,7 +54,7 @@ fn actor_key_converts_through_framework_ids() {
 fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
     let node = NodeIncarnation::new(7).unwrap();
     let protocol = ProtocolId::new(11).unwrap();
-    let actor = ActorRef::<()>::new(
+    let actor = ActorRef::new(
         ClusterId::new("test").unwrap(),
         NodeAddress::new("127.0.0.1", 19083).unwrap(),
         node,
@@ -63,13 +63,14 @@ fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
         protocol,
     )
     .unwrap();
-    let entity = EntityRef::<()>::new(
+    let entity = EntityRef::new(
         ClusterId::new("test").unwrap(),
         EntityType::new("world").unwrap(),
         EntityId::new(42_u64.to_be_bytes()).unwrap(),
         protocol,
         ConfigFingerprint::new([3; 32]),
-    );
+    )
+    .unwrap();
 
     assert_eq!(actor.node_incarnation(), node);
     assert_eq!(actor.actor_path().to_string(), "/user/session-1");

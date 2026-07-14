@@ -64,7 +64,7 @@ impl Responder<EnterWorldRequest> for WorldActor {
 }
 
 actor_protocol! {
-    pub WorldProtocol for WorldActor {
+    pub WorldProtocol {
         protocol_id: 0x776f_726c_6400_0001;
         name: "minimal-world/v1";
         ask 1 => EnterWorldRequest {
@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cluster_id = ClusterId::new("minimal-world")?;
     let address = NodeAddress::new("127.0.0.1", 25520)?;
     let incarnation = NodeIncarnation::generate();
-    let protocol = Arc::new(WorldProtocol::build()?);
+    let protocol = Arc::new(WorldProtocol::bind::<WorldActor>()?);
     let registry = Arc::new(ActorRegistry::new(
         actor_kind!("World"),
         ActorRegistryConfig {
@@ -113,10 +113,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-    let actor_ref: ActorRef<WorldActor> = handle
+    let actor_ref: ActorRef<WorldProtocol> = handle
         .actor_ref()
         .ok_or_else(|| std::io::Error::other("registry did not create an ActorRef"))?
-        .cast();
+        .try_typed()?;
     let service = LatticeService::builder(NodeConfig {
         cluster_id,
         node_id: "world-a".to_owned(),

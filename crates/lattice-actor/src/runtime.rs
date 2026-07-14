@@ -539,7 +539,7 @@ where
     let local_ref = LocalActorRef::new(NEXT_LOCAL_ACTOR_ID.fetch_add(1, Ordering::Relaxed));
     let (terminated_tx, _terminated_rx) = broadcast::channel(16);
     let (lifecycle_tx, _lifecycle_rx) = watch::channel(ActorLifecycleState::Empty);
-    let actor_ref = self_ref.as_ref().map(ActorRef::cast);
+    let actor_ref = self_ref.clone();
     let handle = ActorHandle::new(
         local_ref,
         terminated_tx,

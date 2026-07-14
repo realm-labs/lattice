@@ -109,7 +109,7 @@ impl Responder<InitSessionRequest> for PlayerActor {
 }
 
 actor_protocol! {
-    pub WorldProtocol for WorldActor {
+    pub WorldProtocol {
         protocol_id: WORLD_PROTOCOL_ID;
         name: "distributed-login/world/v1";
         ask 1 => LoginRequest {
@@ -122,7 +122,7 @@ actor_protocol! {
 }
 
 actor_protocol! {
-    pub PlayerProtocol for PlayerActor {
+    pub PlayerProtocol {
         protocol_id: PLAYER_PROTOCOL_ID;
         name: "distributed-login/player/v1";
         ask 1 => InitSessionRequest {
@@ -138,7 +138,7 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn std::error::Error>
     let cluster_id = ClusterId::new("distributed-login")?;
     let address = NodeAddress::new("127.0.0.1", 25530)?;
     let incarnation = NodeIncarnation::generate();
-    let protocol = Arc::new(WorldProtocol::build()?);
+    let protocol = Arc::new(WorldProtocol::bind::<WorldActor>()?);
     let registry = Arc::new(ActorRegistry::new(
         actor_kind!("World"),
         ActorRegistryConfig {
@@ -160,10 +160,10 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn std::error::Error>
             },
         )
         .await?;
-    let actor_ref: ActorRef<WorldActor> = handle
+    let actor_ref: ActorRef<WorldProtocol> = handle
         .actor_ref()
         .ok_or_else(|| std::io::Error::other("missing exact World ActorRef"))?
-        .cast();
+        .try_typed()?;
     let service = LatticeService::builder(NodeConfig {
         cluster_id,
         node_id: "world-a".to_owned(),

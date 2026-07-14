@@ -145,7 +145,7 @@ impl<A: Actor> ActorRegistry<A> {
         }
     }
 
-    pub fn get_exact(&self, actor_ref: &ActorRef<A>) -> Option<ActorHandle<A>> {
+    pub fn get_exact(&self, actor_ref: &ActorRef) -> Option<ActorHandle<A>> {
         if self.config.actor_ref.as_ref().is_none_or(|config| {
             config.cluster_id != *actor_ref.cluster_id()
                 || config.node_address != *actor_ref.node_address()
@@ -425,7 +425,7 @@ impl<A: Actor> ActorRegistry<A> {
         Ok(handle)
     }
 
-    fn actor_ref_for(&self, actor_id: ActorId) -> Option<ActorRef<A>> {
+    fn actor_ref_for(&self, actor_id: ActorId) -> Option<ActorRef> {
         let config = self.config.actor_ref.as_ref()?;
         let path = ActorPath::user([
             "user".to_owned(),

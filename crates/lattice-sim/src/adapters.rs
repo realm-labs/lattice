@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use lattice_core::actor_ref::{ActorRef, EntityId, NodeIncarnation};
+use lattice_core::actor_ref::{ActorRef, EntityId, NodeIncarnation, ProtocolTag};
 use lattice_placement::authority::AuthorityEffect;
 use lattice_placement::authority::AuthorityEvent;
 use lattice_placement::authority::PlacementAuthority;
@@ -235,7 +235,7 @@ impl WatchAdapter {
         Self { reducer }
     }
 
-    pub fn watch<A>(
+    pub fn watch<A: ProtocolTag>(
         &mut self,
         association: AssociationId,
         target: &ActorRef<A>,

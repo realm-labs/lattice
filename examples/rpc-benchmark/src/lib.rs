@@ -50,7 +50,7 @@ impl BenchmarkConfig {
 pub struct RemotingTopology {
     association: Arc<Association>,
     messaging: OutboundMessaging,
-    target: ActorRef<()>,
+    target: ActorRef,
     fingerprint: ProtocolFingerprint,
     drains: Vec<tokio::task::JoinHandle<()>>,
 }

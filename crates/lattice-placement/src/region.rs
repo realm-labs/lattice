@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use bytes::Bytes;
 use lattice_core::actor_ref::{
-    ConfigFingerprint, EntityId, EntityRef, EntityType, NodeIncarnation, ProtocolId,
+    ConfigFingerprint, EntityId, EntityRef, EntityType, NodeIncarnation, ProtocolId, ProtocolTag,
+    ReferenceError,
 };
 use thiserror::Error;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
@@ -95,18 +96,19 @@ impl EntityConfig {
         )
     }
 
-    pub fn entity_ref<A>(
+    pub fn entity_ref<P: ProtocolTag>(
         &self,
         cluster_id: lattice_core::actor_ref::ClusterId,
         entity_id: EntityId,
-    ) -> EntityRef<A> {
+    ) -> Result<EntityRef<P>, ReferenceError> {
         EntityRef::new(
             cluster_id,
             self.entity_type.clone(),
             entity_id,
             self.protocol_id,
             self.fingerprint,
-        )
+        )?
+        .try_typed()
     }
 }
 

@@ -72,7 +72,6 @@ mod tests {
         let spec = ActorProtocolSpec {
             visibility: "pub".to_owned(),
             registrar_name: "PlayerProtocol".to_owned(),
-            actor_type: "PlayerActor".to_owned(),
             protocol_id: 7,
             protocol_name: "player/v1".to_owned(),
             messages: vec![ProtocolMessageSpec {

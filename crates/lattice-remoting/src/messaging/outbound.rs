@@ -10,7 +10,7 @@ use super::target::{
 use super::{
     ActorRef, Arc, Association, AssociationId, AtomicU64, Bytes, CatalogueDecision, Duration,
     EntityRef, Frame, FrameKind, HashMap, Instant, Mutex, NodeAddress, NodeIncarnation, Ordering,
-    ProtocolFingerprint, ProtocolId, SingletonRef, oneshot,
+    ProtocolFingerprint, ProtocolId, ProtocolTag, SingletonRef, oneshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +52,7 @@ impl OutboundMessaging {
         })
     }
 
-    pub fn tell<A>(
+    pub fn tell<A: ProtocolTag>(
         &self,
         association: &Association,
         sender: &SenderIdentity,
@@ -85,7 +85,7 @@ impl OutboundMessaging {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn tell_entity<A>(
+    pub fn tell_entity<A: ProtocolTag>(
         &self,
         association: &Association,
         sender: &SenderIdentity,
@@ -128,7 +128,7 @@ impl OutboundMessaging {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn tell_singleton<A>(
+    pub fn tell_singleton<A: ProtocolTag>(
         &self,
         association: &Association,
         sender: &SenderIdentity,
@@ -171,7 +171,7 @@ impl OutboundMessaging {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn ask<A>(
+    pub async fn ask<A: ProtocolTag>(
         &self,
         association: &Association,
         sender: &SenderIdentity,
@@ -230,7 +230,7 @@ impl OutboundMessaging {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn ask_entity<A>(
+    pub async fn ask_entity<A: ProtocolTag>(
         &self,
         association: &Association,
         sender: &SenderIdentity,
@@ -273,7 +273,7 @@ impl OutboundMessaging {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn ask_singleton<A>(
+    pub async fn ask_singleton<A: ProtocolTag>(
         &self,
         association: &Association,
         sender: &SenderIdentity,

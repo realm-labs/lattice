@@ -213,7 +213,7 @@ struct EntityFixture {
     owner_node_id: String,
     owner_address: NodeAddress,
     owner_incarnation: String,
-    reference: EntityRef<PingActor>,
+    reference: EntityRef<FixtureProtocol>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -290,7 +290,7 @@ impl Handler<StopPing> for PingActor {
 }
 
 actor_protocol! {
-    FixtureProtocol for PingActor {
+    FixtureProtocol {
         protocol_id: PROTOCOL_ID;
         name: "distributed-fixture/ping/v1";
         ask 1 => Ping {
@@ -607,7 +607,7 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let cluster = ClusterId::new("docker-e2e")?;
     let address = NodeAddress::new("fixture-server", 25520)?;
     let incarnation = NodeIncarnation::generate();
-    let protocol = Arc::new(FixtureProtocol::build()?);
+    let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
     let mut service_context = ServiceContext::builder(
         ServiceKind::from_static("distributed-fixture"),
         InstanceId::new("distributed-fixture"),
@@ -635,7 +635,8 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .await?;
-    let target: ActorRef<PingActor> = handle.actor_ref().ok_or("missing actor ref")?.cast();
+    let target: ActorRef<FixtureProtocol> =
+        handle.actor_ref().ok_or("missing actor ref")?.try_typed()?;
     let service =
         LatticeService::builder(node_config(cluster, "fixture-server", address, incarnation))?
             .register_actor(registry, protocol)?
@@ -663,7 +664,7 @@ async fn client(
             Err(error) => return Err(Box::new(error)),
         }
     };
-    let target: ActorRef<PingActor> = serde_json::from_slice(&encoded)?;
+    let target: ActorRef<FixtureProtocol> = serde_json::from_slice(&encoded)?;
     let cluster = ClusterId::new("docker-e2e")?;
     let client_address = NodeAddress::new("aaa-client", 25521)?;
     let client_incarnation = NodeIncarnation::new(200)?;
@@ -708,7 +709,7 @@ async fn client(
         return Err("unexpected distributed reply".into());
     }
     let child_encoded = std::fs::read(reference.with_file_name("child-ref.json"))?;
-    let child: ActorRef<PingActor> = serde_json::from_slice(&child_encoded)?;
+    let child: ActorRef<FixtureProtocol> = serde_json::from_slice(&child_encoded)?;
     if service
         .ask(&child, Ping(99), Instant::now() + Duration::from_secs(10))
         .await?
@@ -739,7 +740,7 @@ async fn client(
 
 async fn monitor(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let encoded = wait_for_file(&reference).await?;
-    let target: ActorRef<PingActor> = serde_json::from_slice(&encoded)?;
+    let target: ActorRef<FixtureProtocol> = serde_json::from_slice(&encoded)?;
     let cluster = ClusterId::new("docker-e2e")?;
     let address = NodeAddress::new("aaa-monitor", 25522)?;
     let incarnation = NodeIncarnation::generate();
@@ -855,7 +856,7 @@ async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn std::error::Erro
             owner_node_id: owner.node_id,
             owner_address: owner.address,
             owner_incarnation: owner.incarnation.get().to_string(),
-            reference: entity_config.entity_ref(cluster, entity_id),
+            reference: entity_config.entity_ref(cluster, entity_id)?,
         })?,
     )?;
     tokio::signal::ctrl_c().await?;
@@ -937,7 +938,7 @@ fn entity_service(
         InstanceId::new(node.node_id.clone()),
     );
     context.insert_extension(ActivationDirectory::new(64)?)?;
-    let protocol = Arc::new(FixtureProtocol::build()?);
+    let protocol = Arc::new(FixtureProtocol::bind::<PingActor>()?);
     let registry = Arc::new(ActorRegistry::new(
         actor_kind!("DistributedEntityFixture"),
         ActorRegistryConfig {

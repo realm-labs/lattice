@@ -23,7 +23,6 @@ pub struct ProtocolMessageSpec {
 pub struct ActorProtocolSpec {
     pub visibility: String,
     pub registrar_name: String,
-    pub actor_type: String,
     pub protocol_id: u64,
     pub protocol_name: String,
     pub messages: Vec<ProtocolMessageSpec>,
@@ -33,7 +32,6 @@ impl ActorProtocolSpec {
     pub fn validate(&self) -> Result<(), CodegenError> {
         for (field, value) in [
             ("registrar_name", self.registrar_name.as_str()),
-            ("actor_type", self.actor_type.as_str()),
             ("protocol_name", self.protocol_name.as_str()),
         ] {
             if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {

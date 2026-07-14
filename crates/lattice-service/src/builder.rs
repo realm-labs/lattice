@@ -5,12 +5,14 @@ use std::sync::Arc;
 
 use lattice_actor::host::ActorHost;
 use lattice_actor::host::ProtocolHostRegistry;
-use lattice_actor::protocol::ActorProtocol;
+use lattice_actor::protocol::{
+    ActorProtocol, ActorProtocolBinding, Protocol, SupportsAsk, SupportsTell,
+};
 use lattice_actor::recipient::{
     ActorSystem, RecipientBackend, RecipientError, RegisteredActorProtocol,
 };
 use lattice_actor::traits::{Actor, Message, Request};
-use lattice_core::actor_ref::{ActorRef, EntityRef, RecipientRef, SingletonRef};
+use lattice_core::actor_ref::{ActorRef, EntityRef, ProtocolTag, RecipientRef, SingletonRef};
 use lattice_discovery::provider::ClusterDiscovery;
 use lattice_placement::authority::AuthorityEffect;
 use lattice_placement::control::{PlacementControlEvent, PlacementControlRouter};
@@ -131,12 +133,12 @@ impl LatticeServiceBuilder {
         self.messaging.clone()
     }
 
-    pub fn register_actor<A: Actor>(
+    pub fn register_actor<A: Actor, P: Protocol>(
         mut self,
         registry: Arc<lattice_actor::registry::ActorRegistry<A>>,
-        protocol: Arc<ActorProtocol<A>>,
+        protocol: Arc<ActorProtocolBinding<A, P>>,
     ) -> Result<Self, ServiceError> {
-        self.register_protocol_entry(protocol.clone())?;
+        self.register_protocol_entry(protocol.protocol().clone())?;
         let actor_registry = registry.clone();
         self.actor_system_installers
             .push(Box::new(move |actor_system| {
@@ -152,19 +154,19 @@ impl LatticeServiceBuilder {
         Ok(self)
     }
 
-    /// Registers a typed actor protocol for outbound use without hosting that
-    /// actor type in this process.
-    pub fn register_protocol<A: Actor>(
+    /// Registers a typed actor protocol for outbound use without hosting a
+    /// corresponding actor implementation in this process.
+    pub fn register_protocol<P: Protocol>(
         mut self,
-        protocol: Arc<ActorProtocol<A>>,
+        protocol: Arc<ActorProtocol<P>>,
     ) -> Result<Self, ServiceError> {
         self.register_protocol_entry(protocol)?;
         Ok(self)
     }
 
-    fn register_protocol_entry<A: Actor>(
+    fn register_protocol_entry<P: Protocol>(
         &mut self,
-        protocol: Arc<ActorProtocol<A>>,
+        protocol: Arc<ActorProtocol<P>>,
     ) -> Result<(), ServiceError> {
         let protocol_id = protocol.protocol_id().get();
         if self.actor_protocols.contains_key(&protocol_id) {
@@ -482,48 +484,48 @@ impl LatticeService {
         &self.actor_system
     }
 
-    pub async fn tell<A, M>(
+    pub async fn tell<P, M>(
         &self,
-        target: impl Into<RecipientRef<A>>,
+        target: impl Into<RecipientRef<P>>,
         message: M,
     ) -> Result<(), RecipientError>
     where
-        A: Actor,
+        P: SupportsTell<M>,
         M: Message,
     {
         self.actor_system.tell(target, message).await
     }
 
-    pub async fn ask<A, R>(
+    pub async fn ask<P, R>(
         &self,
-        target: impl Into<RecipientRef<A>>,
+        target: impl Into<RecipientRef<P>>,
         request: R,
         deadline: std::time::Instant,
     ) -> Result<R::Response, RecipientError>
     where
-        A: Actor,
+        P: SupportsAsk<R>,
         R: Request,
     {
         self.actor_system.ask(target, request, deadline).await
     }
 
-    pub async fn watch<A>(
+    pub async fn watch<P: ProtocolTag>(
         &self,
-        target: &ActorRef<A>,
+        target: &ActorRef<P>,
     ) -> Result<lattice_remoting::watch::WatchId, RecipientError> {
         self.actor_system.watch(target).await
     }
 
-    pub async fn watch_entity_current<A>(
+    pub async fn watch_entity_current<P: ProtocolTag>(
         &self,
-        target: &EntityRef<A>,
+        target: &EntityRef<P>,
     ) -> Result<lattice_remoting::watch::WatchId, RecipientError> {
         self.actor_system.watch_entity_current(target).await
     }
 
-    pub async fn watch_singleton_current<A>(
+    pub async fn watch_singleton_current<P: ProtocolTag>(
         &self,
-        target: &SingletonRef<A>,
+        target: &SingletonRef<P>,
     ) -> Result<lattice_remoting::watch::WatchId, RecipientError> {
         self.actor_system.watch_singleton_current(target).await
     }

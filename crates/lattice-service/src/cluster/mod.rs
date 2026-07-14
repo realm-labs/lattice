@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_actor::protocol::{ActorProtocol, DispatchError, DispatchMode, DispatchReply};
+use lattice_actor::protocol::{
+    ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol,
+};
 use lattice_actor::registry::{ActorLoader, ActorRegistry};
 use lattice_actor::traits::{Actor, ActorLifecycleState, PassivationReason, StopReason};
 use lattice_actor::{error::ActorCallError, handle::ActorHandle};
@@ -160,8 +162,8 @@ fn decode_resolved_actor(
     address: &lattice_core::actor_ref::NodeAddress,
     incarnation: lattice_core::actor_ref::NodeIncarnation,
     protocol_id: ProtocolId,
-) -> Result<ActorRef<()>, WatchError> {
-    let actor: ActorRef<()> =
+) -> Result<ActorRef, WatchError> {
+    let actor: ActorRef =
         serde_json::from_slice(payload).map_err(|_| WatchError::InvalidCommand)?;
     if actor.cluster_id() != cluster
         || actor.node_address() != address

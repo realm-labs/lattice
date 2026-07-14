@@ -1,14 +1,14 @@
 use std::any::Any;
 
 use dashmap::DashMap;
-use lattice_core::actor_ref::{ActorPath, ActorRef};
+use lattice_core::actor_ref::{ActorPath, ActorRef, ProtocolTag};
 use thiserror::Error;
 
 use crate::handle::ActorHandle;
 use crate::traits::{Actor, ActorLifecycleState};
 
 struct DirectoryEntry {
-    reference: ActorRef<()>,
+    reference: ActorRef,
     handle: Box<dyn Any + Send + Sync>,
 }
 
@@ -49,7 +49,10 @@ impl ActivationDirectory {
         Ok(())
     }
 
-    pub fn resolve<A: Actor>(&self, reference: &ActorRef<A>) -> Option<ActorHandle<A>> {
+    pub fn resolve<A: Actor, P: ProtocolTag>(
+        &self,
+        reference: &ActorRef<P>,
+    ) -> Option<ActorHandle<A>> {
         let entry = self.entries.get(reference.actor_path())?;
         if !entry.reference.same_activation(&reference.erase()) {
             return None;
@@ -64,7 +67,7 @@ impl ActivationDirectory {
         Some(handle.clone())
     }
 
-    pub fn remove(&self, reference: &ActorRef<()>) -> bool {
+    pub fn remove(&self, reference: &ActorRef) -> bool {
         self.entries
             .remove_if(reference.actor_path(), |_, entry| {
                 entry.reference.same_activation(reference)
