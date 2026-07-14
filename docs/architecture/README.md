@@ -8,6 +8,8 @@
 > Active cluster discovery and lifecycle plan: [../cluster-discovery-lifecycle-plan.md](../cluster-discovery-lifecycle-plan.md).
 > Discovery provider configuration and RBAC: [../cluster-discovery.md](../cluster-discovery.md).
 > Historical implementation record: [../implementation-plan.md](../implementation-plan.md).
+> Architecture and distributed-correctness review: [../architecture-review.md](../architecture-review.md).
+> Coordinator correctness hardening execution plan: [../coordinator-correctness-implementation-plan.md](../coordinator-correctness-implementation-plan.md).
 
 These documents describe the complete target model, not a disposable minimal v1. Implementation may land in dependency order, but target capabilities are simplified through shared internal mechanisms and narrow fault domains rather than omitted in ways that require later identity, wire, or ownership redesign.
 

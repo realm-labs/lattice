@@ -4,6 +4,8 @@
 > Decision: remove framework gRPC and reuse/refactor Direct Link transport internals as `lattice-remoting`
 > Model: ActorRef + EntityRef/ShardRegion + SingletonRef/SingletonProxy, inspired by Akka/Pekko
 > Coordination: etcd-backed Coordinator without Gossip
+> Open hardening findings (leader fencing, transactional placement commits, durable admin state, and storage bounds): [architecture-review.md](architecture-review.md)
+> Execution plan for those findings: [coordinator-correctness-implementation-plan.md](coordinator-correctness-implementation-plan.md)
 
 ---
 
