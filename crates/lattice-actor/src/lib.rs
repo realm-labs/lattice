@@ -10,6 +10,7 @@ pub mod error;
 pub mod handle;
 pub mod host;
 pub mod mailbox;
+pub mod observation;
 pub mod protocol;
 pub mod recipient;
 pub mod registry;

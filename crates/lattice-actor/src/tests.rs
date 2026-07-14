@@ -300,8 +300,12 @@ struct BusinessErrorActor {
 impl Actor for BusinessErrorActor {
     type Error = BusinessActorError;
 
-    async fn on_error<M>(&mut self, _ctx: &mut ActorContext<Self>, error: &BusinessActorError)
-    where
+    async fn on_error<M>(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _metadata: &crate::traits::MessageMetadata,
+        error: &BusinessActorError,
+    ) where
         M: Send + 'static,
     {
         let label = match error {

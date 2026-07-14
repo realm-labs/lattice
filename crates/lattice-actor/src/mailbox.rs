@@ -8,9 +8,11 @@ use tracing::{debug, warn};
 
 use crate::context::ActorContext;
 use crate::error::ActorCallError;
+use crate::observation::{RequestCompletion, RequestObservation};
 use crate::reply::ReplyTo;
 use crate::traits::{
-    Actor, Handler, Message, Request, Responder, ResponderErrorAction, StopReason,
+    Actor, Handler, Message, MessageKind, MessageLane, MessageMetadata, MessageOutcome,
+    MessageRejection, MessageView, Request, Responder, ResponderErrorAction, StopReason,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,21 +78,45 @@ impl MailboxLane {
     }
 }
 
+impl From<MailboxLane> for MessageLane {
+    fn from(value: MailboxLane) -> Self {
+        match value {
+            MailboxLane::Normal => Self::Normal,
+            MailboxLane::System => Self::System,
+        }
+    }
+}
+
 pub(crate) enum ActorCommand<A: Actor> {
     Envelope(Box<dyn ActorEnvelope<A>>),
     Stop(StopReason),
 }
 
+impl<A: Actor> ActorCommand<A> {
+    pub(crate) fn metadata(&self, lane: MailboxLane) -> Option<MessageMetadata> {
+        match self {
+            Self::Envelope(envelope) => Some(envelope.metadata(lane)),
+            Self::Stop(_) => None,
+        }
+    }
+}
+
 #[async_trait]
 pub(crate) trait ActorEnvelope<A: Actor>: Send {
-    fn message_type(&self) -> &'static str;
+    fn metadata(&self, lane: MailboxLane) -> MessageMetadata;
 
-    async fn handle(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>);
+    async fn handle(
+        self: Box<Self>,
+        actor: &mut A,
+        ctx: &mut ActorContext<A>,
+        metadata: &MessageMetadata,
+    ) -> MessageOutcome;
 }
 
 pub(crate) struct RequestEnvelope<R: Request> {
     request: Option<R>,
     reply_tx: Option<oneshot::Sender<Result<R::Response, ActorCallError>>>,
+    enqueued_at: Instant,
     deadline: Option<Instant>,
 }
 
@@ -102,6 +128,7 @@ impl<R: Request> RequestEnvelope<R> {
         Self {
             request: Some(request),
             reply_tx: Some(reply_tx),
+            enqueued_at: Instant::now(),
             deadline: None,
         }
     }
@@ -114,6 +141,7 @@ impl<R: Request> RequestEnvelope<R> {
         Self {
             request: Some(request),
             reply_tx: Some(reply_tx),
+            enqueued_at: Instant::now(),
             deadline: Some(deadline),
         }
     }
@@ -122,11 +150,16 @@ impl<R: Request> RequestEnvelope<R> {
 pub(crate) struct TellEnvelope<M: Message> {
     msg: M,
     sender: Option<ActorRef>,
+    enqueued_at: Instant,
 }
 
 impl<M: Message> TellEnvelope<M> {
     pub(crate) fn new(msg: M, sender: Option<ActorRef>) -> Self {
-        Self { msg, sender }
+        Self {
+            msg,
+            sender,
+            enqueued_at: Instant::now(),
+        }
     }
 }
 
@@ -136,20 +169,38 @@ where
     A: Handler<M>,
     M: Message,
 {
-    fn message_type(&self) -> &'static str {
-        type_name::<M>()
+    fn metadata(&self, lane: MailboxLane) -> MessageMetadata {
+        MessageMetadata::new(
+            type_name::<M>(),
+            MessageKind::Tell,
+            lane.into(),
+            self.enqueued_at,
+            None,
+        )
     }
 
-    async fn handle(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>) {
+    async fn handle(
+        self: Box<Self>,
+        actor: &mut A,
+        ctx: &mut ActorContext<A>,
+        metadata: &MessageMetadata,
+    ) -> MessageOutcome {
         ctx.clear_sender();
         if let Some(sender) = self.sender {
             ctx.set_sender(sender);
         }
-        if let Err(error) = actor.handle(ctx, self.msg).await {
-            warn!(message.type = type_name::<M>(), %error, "tell handler returned error");
-            actor.on_error::<M>(ctx, &error).await;
-        }
+        actor.before_message(ctx, MessageView::new(metadata, &self.msg));
+        let outcome = match actor.handle(ctx, self.msg).await {
+            Ok(()) => MessageOutcome::Handled,
+            Err(error) => {
+                warn!(message.type = type_name::<M>(), %error, "tell handler returned error");
+                actor.on_error::<M>(ctx, metadata, &error).await;
+                MessageOutcome::HandlerFailed
+            }
+        };
+        actor.after_message(ctx, metadata, outcome);
         ctx.clear_sender();
+        outcome
     }
 }
 
@@ -159,12 +210,34 @@ where
     A: Responder<R>,
     R: Request,
 {
-    fn message_type(&self) -> &'static str {
-        type_name::<R>()
+    fn metadata(&self, lane: MailboxLane) -> MessageMetadata {
+        MessageMetadata::new(
+            type_name::<R>(),
+            MessageKind::Request,
+            lane.into(),
+            self.enqueued_at,
+            self.deadline,
+        )
     }
 
-    async fn handle(mut self: Box<Self>, actor: &mut A, ctx: &mut ActorContext<A>) {
+    async fn handle(
+        mut self: Box<Self>,
+        actor: &mut A,
+        ctx: &mut ActorContext<A>,
+        metadata: &MessageMetadata,
+    ) -> MessageOutcome {
         ctx.clear_sender();
+        let request = self
+            .request
+            .as_ref()
+            .expect("request envelope message is present before dispatch");
+        actor.before_message(ctx, MessageView::new(metadata, request));
+        let handle = ctx.self_handle();
+        let observation = RequestObservation::new(
+            handle.observer().clone(),
+            handle.observation_metadata().clone(),
+            *metadata,
+        );
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -172,31 +245,39 @@ where
             if let Some(reply_tx) = self.reply_tx.take() {
                 let _ = reply_tx.send(Err(ActorCallError::DeadlineExceeded));
             }
-            return;
+            observation.complete(RequestCompletion::DeadlineExceeded);
+            let outcome = MessageOutcome::Rejected(MessageRejection::DeadlineExceeded);
+            actor.after_message(ctx, metadata, outcome);
+            return outcome;
         }
         let reply_tx = self
             .reply_tx
             .take()
             .expect("request envelope reply sender is present");
-        let (reply_to, control) = ReplyTo::new(reply_tx, self.deadline);
+        let (reply_to, control) = ReplyTo::new(reply_tx, self.deadline, observation);
         if !ctx.register_pending_reply(control.clone()) {
             control.cancel(ActorCallError::MailboxFull);
-            return;
+            let outcome = MessageOutcome::Rejected(MessageRejection::DeferredReplyCapacityExceeded);
+            actor.after_message(ctx, metadata, outcome);
+            return outcome;
         }
 
         let request = self
             .request
             .take()
             .expect("request envelope message is present");
-        match actor.respond(ctx, request, reply_to).await {
-            Ok(()) => control.handler_succeeded(),
+        let outcome = match actor.respond(ctx, request, reply_to).await {
+            Ok(()) => {
+                control.handler_succeeded();
+                MessageOutcome::Handled
+            }
             Err(error) => {
                 warn!(
                     message.type = type_name::<R>(),
                     %error,
                     "actor responder returned error"
                 );
-                actor.on_error::<R>(ctx, &error).await;
+                actor.on_error::<R>(ctx, metadata, &error).await;
                 match actor.respond_error(ctx, error).await {
                     ResponderErrorAction::Respond(response) => {
                         debug!(
@@ -204,6 +285,7 @@ where
                             "actor responder error recovered"
                         );
                         control.respond_after_error(response);
+                        MessageOutcome::HandlerErrorRecovered
                     }
                     ResponderErrorAction::Propagate(error) => {
                         warn!(
@@ -212,10 +294,13 @@ where
                             "actor responder error propagated"
                         );
                         control.handler_failed(error);
+                        MessageOutcome::HandlerFailed
                     }
                 }
             }
-        }
+        };
+        actor.after_message(ctx, metadata, outcome);
+        outcome
     }
 }
 

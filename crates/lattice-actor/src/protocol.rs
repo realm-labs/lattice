@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::error::ActorCallError;
 use crate::handle::ActorHandle;
+use crate::observation::ProtocolFailure;
 use crate::traits::{Actor, Handler, Message, Request, Responder};
 
 #[doc(hidden)]
@@ -434,25 +435,45 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
         deadline: Option<Instant>,
         sender: Option<ActorRef>,
     ) -> Result<DispatchReply, DispatchError> {
-        let client = self
-            .protocol
-            .bindings
-            .get(&message_id)
-            .ok_or(DispatchError::UnknownMessage(message_id))?;
-        if client.descriptor.mode != mode {
-            return Err(DispatchError::ModeMismatch);
+        let observer = handle.observer().clone();
+        let actor = handle.observation_metadata().clone();
+        let payload_size = payload.len();
+        let kind = match mode {
+            DispatchMode::Tell => crate::traits::MessageKind::Tell,
+            DispatchMode::Ask => crate::traits::MessageKind::Request,
+        };
+        let result = async {
+            let client = self
+                .protocol
+                .bindings
+                .get(&message_id)
+                .ok_or(DispatchError::UnknownMessage(message_id))?;
+            if client.descriptor.mode != mode {
+                return Err(DispatchError::ModeMismatch);
+            }
+            if payload.len() > client.descriptor.max_payload {
+                return Err(DispatchError::PayloadTooLarge {
+                    actual: payload.len(),
+                    maximum: client.descriptor.max_payload,
+                });
+            }
+            let dispatch = self
+                .dispatch
+                .get(&message_id)
+                .ok_or(DispatchError::UnknownMessage(message_id))?;
+            dispatch(handle, payload, deadline, sender).await
         }
-        if payload.len() > client.descriptor.max_payload {
-            return Err(DispatchError::PayloadTooLarge {
-                actual: payload.len(),
-                maximum: client.descriptor.max_payload,
-            });
+        .await;
+        if let Err(error) = &result {
+            observer.protocol_failed(
+                &actor,
+                message_id,
+                kind,
+                payload_size,
+                protocol_failure(error),
+            );
         }
-        let dispatch = self
-            .dispatch
-            .get(&message_id)
-            .ok_or(DispatchError::UnknownMessage(message_id))?;
-        dispatch(handle, payload, deadline, sender).await
+        result
     }
 }
 
@@ -624,6 +645,22 @@ pub enum DispatchError {
     Actor(#[source] ActorCallError),
     #[error("reply codec returned a different Rust type")]
     ReplyTypeMismatch,
+}
+
+fn protocol_failure(error: &DispatchError) -> ProtocolFailure {
+    match error {
+        DispatchError::UnregisteredType | DispatchError::UnknownMessage(_) => {
+            ProtocolFailure::UnknownMessage
+        }
+        DispatchError::ModeMismatch => ProtocolFailure::ModeMismatch,
+        DispatchError::PayloadTooLarge { .. } => ProtocolFailure::PayloadTooLarge,
+        DispatchError::Decode(_) => ProtocolFailure::DecodeFailed,
+        DispatchError::Encode(_) => ProtocolFailure::EncodeFailed,
+        DispatchError::MissingDeadline => ProtocolFailure::MissingDeadline,
+        DispatchError::MailboxRejected => ProtocolFailure::MailboxRejected,
+        DispatchError::Actor(_) => ProtocolFailure::ActorFailed,
+        DispatchError::ReplyTypeMismatch => ProtocolFailure::ReplyTypeMismatch,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

@@ -1,5 +1,7 @@
+use std::any::type_name;
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Instant;
 
 use lattice_core::actor_ref::{ActorRef, ProtocolTag, ReferenceError};
@@ -11,6 +13,7 @@ use tokio::sync::{
 
 use crate::error::{ActorCallError, ActorTellError};
 use crate::mailbox::{ActorCommand, MailboxLane, RequestEnvelope, TellEnvelope};
+use crate::observation::{ActorMetadata, ActorObserverHandle, MailboxRejection, RequestCompletion};
 use crate::traits::{Actor, ActorLifecycleState, Handler, Message, Request, Responder, StopReason};
 use crate::watch::{ActorTerminated, LocalActorRef};
 
@@ -20,7 +23,8 @@ pub struct ActorHandle<A: Actor> {
     lifecycle_tx: watch::Sender<ActorLifecycleState>,
     normal_tx: mpsc::Sender<ActorCommand<A>>,
     system_tx: mpsc::Sender<ActorCommand<A>>,
-    actor_ref: Option<ActorRef>,
+    metadata: Arc<ActorMetadata>,
+    observer: ActorObserverHandle,
     _marker: PhantomData<fn() -> A>,
 }
 
@@ -42,7 +46,8 @@ impl<A: Actor> Clone for ActorHandle<A> {
             lifecycle_tx: self.lifecycle_tx.clone(),
             normal_tx: self.normal_tx.clone(),
             system_tx: self.system_tx.clone(),
-            actor_ref: self.actor_ref.clone(),
+            metadata: self.metadata.clone(),
+            observer: self.observer.clone(),
             _marker: PhantomData,
         }
     }
@@ -56,6 +61,7 @@ impl<A: Actor> ActorHandle<A> {
         normal_tx: mpsc::Sender<ActorCommand<A>>,
         system_tx: mpsc::Sender<ActorCommand<A>>,
         actor_ref: Option<ActorRef>,
+        observer: ActorObserverHandle,
     ) -> Self {
         Self {
             local_ref,
@@ -63,7 +69,8 @@ impl<A: Actor> ActorHandle<A> {
             lifecycle_tx,
             normal_tx,
             system_tx,
-            actor_ref,
+            metadata: Arc::new(ActorMetadata::new(type_name::<A>(), local_ref, actor_ref)),
+            observer,
             _marker: PhantomData,
         }
     }
@@ -73,17 +80,22 @@ impl<A: Actor> ActorHandle<A> {
     }
 
     pub fn actor_ref(&self) -> Option<&ActorRef> {
-        self.actor_ref.as_ref()
+        self.metadata.actor_ref()
+    }
+
+    pub(crate) fn observer(&self) -> &ActorObserverHandle {
+        &self.observer
+    }
+
+    pub(crate) fn observation_metadata(&self) -> &ActorMetadata {
+        &self.metadata
     }
 
     /// Returns this activation's exact reference typed by a protocol marker.
     /// The embedded protocol ID is checked before the typed reference is
     /// returned.
     pub fn typed_actor_ref<P: ProtocolTag>(&self) -> Result<Option<ActorRef<P>>, ReferenceError> {
-        self.actor_ref
-            .as_ref()
-            .map(ActorRef::try_typed::<P>)
-            .transpose()
+        self.actor_ref().map(ActorRef::try_typed::<P>).transpose()
     }
 
     pub fn lifecycle_state(&self) -> ActorLifecycleState {
@@ -182,10 +194,29 @@ impl<A: Actor> ActorHandle<A> {
         M: Message,
     {
         let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg, None)));
-        self.normal_tx
-            .send(command)
-            .await
-            .map_err(|_| ActorTellError::MailboxClosed)
+        let metadata = command.metadata(MailboxLane::Normal);
+        match self.normal_tx.send(command).await {
+            Ok(()) => {
+                if let Some(metadata) = metadata {
+                    self.observer.message_enqueued(
+                        self.observation_metadata(),
+                        &metadata,
+                        self.normal_tx.max_capacity() - self.normal_tx.capacity(),
+                    );
+                }
+                Ok(())
+            }
+            Err(_) => {
+                if let Some(metadata) = metadata {
+                    self.observer.mailbox_rejected(
+                        self.observation_metadata(),
+                        &metadata,
+                        MailboxRejection::Closed,
+                    );
+                }
+                Err(ActorTellError::MailboxClosed)
+            }
+        }
     }
 
     pub(crate) fn subscribe_terminated(&self) -> broadcast::Receiver<ActorTerminated> {
@@ -280,15 +311,57 @@ impl<A: Actor> ActorHandle<A> {
         command: ActorCommand<A>,
         lane: MailboxLane,
     ) -> Result<(), ActorCallError> {
-        let result = match lane {
-            MailboxLane::Normal => self.normal_tx.try_send(command),
-            MailboxLane::System => self.system_tx.try_send(command),
+        let metadata = command.metadata(lane);
+        let sender = match lane {
+            MailboxLane::Normal => &self.normal_tx,
+            MailboxLane::System => &self.system_tx,
         };
-
-        result.map_err(|error| match error {
-            TrySendError::Full(_) => ActorCallError::MailboxFull,
-            TrySendError::Closed(_) => ActorCallError::MailboxClosed,
-        })
+        match sender.try_send(command) {
+            Ok(()) => {
+                if let Some(metadata) = metadata {
+                    self.observer.message_enqueued(
+                        self.observation_metadata(),
+                        &metadata,
+                        sender.max_capacity() - sender.capacity(),
+                    );
+                }
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => {
+                if let Some(metadata) = metadata {
+                    self.observer.mailbox_rejected(
+                        self.observation_metadata(),
+                        &metadata,
+                        MailboxRejection::Full,
+                    );
+                    if metadata.kind() == crate::traits::MessageKind::Request {
+                        self.observer.request_completed(
+                            self.observation_metadata(),
+                            &metadata,
+                            RequestCompletion::MailboxFull,
+                        );
+                    }
+                }
+                Err(ActorCallError::MailboxFull)
+            }
+            Err(TrySendError::Closed(_)) => {
+                if let Some(metadata) = metadata {
+                    self.observer.mailbox_rejected(
+                        self.observation_metadata(),
+                        &metadata,
+                        MailboxRejection::Closed,
+                    );
+                    if metadata.kind() == crate::traits::MessageKind::Request {
+                        self.observer.request_completed(
+                            self.observation_metadata(),
+                            &metadata,
+                            RequestCompletion::MailboxClosed,
+                        );
+                    }
+                }
+                Err(ActorCallError::MailboxClosed)
+            }
+        }
     }
 }
 

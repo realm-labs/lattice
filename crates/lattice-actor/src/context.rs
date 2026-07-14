@@ -418,6 +418,7 @@ impl<A: Actor> ActorContext<A> {
             child_ref.as_ref().map(ActorRef::erase),
             self.actor_system.clone(),
             self.service.clone(),
+            self.handle.observer().clone(),
         );
         let directory = self
             .service
@@ -474,6 +475,7 @@ impl<A: Actor> ActorContext<A> {
             child_ref.as_ref().map(ActorRef::erase),
             self.actor_system.clone(),
             self.service.clone(),
+            self.handle.observer().clone(),
         );
         let directory = self
             .service
@@ -585,6 +587,7 @@ impl<A: Actor> ActorContext<A> {
                 let service = self.service.clone();
                 let actor_system = self.actor_system.clone();
                 let child_ref = child.actor_ref().map(ActorRef::erase);
+                let observer = child.observer().clone();
                 self.spawn_scoped(async move {
                     loop {
                         if terminations.recv().await.is_err() {
@@ -597,6 +600,7 @@ impl<A: Actor> ActorContext<A> {
                             child_ref.as_ref().map(ActorRef::erase),
                             actor_system.clone(),
                             service.clone(),
+                            observer.clone(),
                         );
                         if let Some(directory) =
                             service.extension::<crate::directory::ActivationDirectory>()

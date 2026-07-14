@@ -17,6 +17,7 @@ use tokio::sync::{Semaphore, watch};
 use crate::error::{ActorActivationError, ActorError};
 use crate::handle::ActorHandle;
 use crate::mailbox::MailboxConfig;
+use crate::observation::ActorObserverHandle;
 use crate::protocol::{ActorProtocolBinding, Protocol};
 use crate::recipient::ActorSystem;
 use crate::runtime::{PassivationPolicy, ShardMigrationPolicy, spawn_actor_with_self_ref};
@@ -60,6 +61,7 @@ pub struct ActorRegistry<A: Actor> {
     protocol_id: Option<ProtocolId>,
     entries: Arc<DashMap<ActorId, RegistryEntry<A>>>,
     actor_system: Arc<OnceLock<ActorSystem>>,
+    observer: ActorObserverHandle,
 }
 
 impl<A: Actor> fmt::Debug for ActorRegistry<A> {
@@ -108,6 +110,7 @@ impl<A: Actor> ActorRegistry<A> {
             protocol_id: None,
             entries: Arc::new(DashMap::new()),
             actor_system: Arc::new(OnceLock::new()),
+            observer: ActorObserverHandle::default(),
         }
     }
 
@@ -125,7 +128,13 @@ impl<A: Actor> ActorRegistry<A> {
             protocol_id: Some(protocol.protocol_id()),
             entries: Arc::new(DashMap::new()),
             actor_system: Arc::new(OnceLock::new()),
+            observer: ActorObserverHandle::default(),
         }
+    }
+
+    pub fn with_observer(mut self, observer: ActorObserverHandle) -> Self {
+        self.observer = observer;
+        self
     }
 
     #[doc(hidden)]
@@ -439,6 +448,7 @@ impl<A: Actor> ActorRegistry<A> {
             self_ref,
             Some(self.actor_system.clone()),
             self.config.service.clone(),
+            self.observer.clone(),
         );
         if let Some(directory) = self
             .config

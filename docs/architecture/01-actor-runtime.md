@@ -105,6 +105,7 @@ pub enum ActorExecutionPolicy {
 #[derive(Debug, Clone)]
 pub struct ActorRuntimeConfig {
     pub default_execution: ActorExecutionPolicy,
+    pub observer: ActorObserverHandle,
 }
 
 pub struct ActorRuntime {
@@ -188,7 +189,29 @@ This keeps the first version simple while fixing the final scheduling boundary: 
 ```rust
 #[async_trait::async_trait]
 pub trait Actor: Sized + Send + 'static {
-    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn before_message(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _message: MessageView<'_>,
+    ) {}
+
+    fn after_message(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _metadata: &MessageMetadata,
+        _outcome: MessageOutcome,
+    ) {}
+
+    async fn on_error<M>(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _metadata: &MessageMetadata,
+        _error: &Self::Error,
+    ) where M: Send + 'static {}
+
+    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -234,6 +257,22 @@ where
 ```
 
 `Actor::stopping` is the final bounded save/cleanup hook; crash-safe business durability must not depend only on this hook. During a voluntary stop, failure enters `StopFailed`, keeps the activation registered, and blocks voluntary unload/claim release while the old claim remains valid. The runtime exposes the failure, retry state, deadline, and operator action instead of silently waiting forever. External shard/singleton claim loss is stronger: admission is fenced immediately and cleanup becomes best effort; `StopFailed` cannot extend distributed ownership or delay a replacement after the old claim is independently invalid.
+
+#### Message hooks and runtime observation
+
+`before_message` and `after_message` are synchronous actor-local hooks. `MessageView` provides immutable
+`Any`-based inspection through `is::<M>()` and `downcast_ref::<M>()`; it cannot consume, mutate,
+replace, or suppress typed dispatch. `MessageMetadata` reports the concrete Rust type, tell/request
+kind, mailbox lane, submission time, and optional deadline. `after_message` distinguishes successful,
+failed, recovered, and dequeued-but-rejected dispatch. Lifecycle commands such as stop remain on the
+lifecycle path rather than pretending to be business messages.
+
+Framework-wide telemetry uses one synchronous `ActorObserver`, configured through
+`ActorRuntimeConfig::observer` or `ActorRegistry::with_observer`. It observes accepted/rejected
+mailbox submissions, queue and processing time, lifecycle outcomes, protocol failures, and
+end-to-end request completion. Request completion is emitted once, including for deferred replies,
+caller drop, deadline, handler failure, and mailbox rejection. Observer callbacks must remain fast
+and must not use actor IDs, entity IDs, or payload values as unbounded metric labels.
 
 ### 7.4 Message Envelope Context
 

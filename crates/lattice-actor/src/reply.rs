@@ -5,6 +5,7 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 
 use crate::error::{ActorCallError, ActorError, ReplyError};
+use crate::observation::{RequestCompletion, RequestObservation};
 
 /// A single-use, typed capability for completing an actor request.
 ///
@@ -37,6 +38,7 @@ impl<T: Send + 'static> ReplyTo<T> {
     pub(crate) fn new(
         sender: oneshot::Sender<Result<T, ActorCallError>>,
         deadline: Option<Instant>,
+        observation: RequestObservation,
     ) -> (Self, ReplyControl<T>) {
         let slot = Arc::new(ReplySlot {
             state: Mutex::new(ReplyState {
@@ -46,6 +48,7 @@ impl<T: Send + 'static> ReplyTo<T> {
                 token: TokenState::Alive,
                 buffered: None,
             }),
+            observation,
         });
         (Self { slot: slot.clone() }, ReplyControl { slot })
     }
@@ -99,6 +102,10 @@ impl<T: Send + 'static> ReplyTo<T> {
                 state.buffered = None;
                 state.handler = HandlerState::Failed;
                 state.token = TokenState::Invalidated;
+                drop(state);
+                self.slot
+                    .observation
+                    .complete(RequestCompletion::CallerDropped);
                 return Err(ReplyError::ResponseDropped);
             }
             if state
@@ -125,16 +132,18 @@ impl<T: Send + 'static> ReplyTo<T> {
             }
         };
 
-        let deadline_exceeded = delivery
-            .as_ref()
-            .is_some_and(|(_, result)| matches!(result, Err(ActorCallError::DeadlineExceeded)));
         let Some((sender, result)) = delivery else {
             return Err(ReplyError::AlreadyCompleted);
         };
+        let completion = completion_for_result(&result);
         if sender.send(result).is_err() {
+            self.slot
+                .observation
+                .complete(RequestCompletion::CallerDropped);
             return Err(ReplyError::ResponseDropped);
         }
-        if deadline_exceeded {
+        self.slot.observation.complete(completion);
+        if completion == RequestCompletion::DeadlineExceeded {
             Err(ReplyError::DeadlineExceeded)
         } else {
             Ok(())
@@ -164,7 +173,15 @@ impl<T: Send + 'static> Drop for ReplyTo<T> {
             }
         };
         if let Some((sender, result)) = delivery {
-            let _ = sender.send(result);
+            if sender.send(result).is_err() {
+                self.slot
+                    .observation
+                    .complete(RequestCompletion::CallerDropped);
+            } else {
+                self.slot
+                    .observation
+                    .complete(RequestCompletion::ResponseDropped);
+            }
         }
     }
 }
@@ -206,7 +223,14 @@ impl<T: Send + 'static> ReplyControl<T> {
             }
         };
         if let Some((sender, result)) = delivery {
-            let _ = sender.send(result);
+            let completion = completion_for_result(&result);
+            if sender.send(result).is_err() {
+                self.slot
+                    .observation
+                    .complete(RequestCompletion::CallerDropped);
+            } else {
+                self.slot.observation.complete(completion);
+            }
         }
     }
 
@@ -229,11 +253,20 @@ impl<T: Send + 'static> ReplyControl<T> {
             state.sender.take().map(|sender| (sender, Ok(response)))
         };
         if let Some((sender, result)) = delivery {
-            let _ = sender.send(result);
+            if sender.send(result).is_err() {
+                self.slot
+                    .observation
+                    .complete(RequestCompletion::CallerDropped);
+            } else {
+                self.slot
+                    .observation
+                    .complete(RequestCompletion::RecoveredReplyDelivered);
+            }
         }
     }
 
     pub(crate) fn cancel(&self, error: ActorCallError) {
+        let completion = completion_for_error(&error);
         let delivery = {
             let mut state = self.lock();
             state.handler = HandlerState::Failed;
@@ -242,7 +275,13 @@ impl<T: Send + 'static> ReplyControl<T> {
             state.sender.take().map(|sender| (sender, Err(error)))
         };
         if let Some((sender, result)) = delivery {
-            let _ = sender.send(result);
+            if sender.send(result).is_err() {
+                self.slot
+                    .observation
+                    .complete(RequestCompletion::CallerDropped);
+            } else {
+                self.slot.observation.complete(completion);
+            }
         }
     }
 
@@ -265,6 +304,10 @@ impl<T: Send + 'static> ReplyControl<T> {
                 state.buffered = None;
                 state.handler = HandlerState::Failed;
                 state.token = TokenState::Invalidated;
+                drop(state);
+                self.slot
+                    .observation
+                    .complete(RequestCompletion::CallerDropped);
                 return true;
             }
             if state
@@ -284,6 +327,9 @@ impl<T: Send + 'static> ReplyControl<T> {
         };
         if let Some((sender, result)) = expiration {
             let _ = sender.send(result);
+            self.slot
+                .observation
+                .complete(RequestCompletion::DeadlineExceeded);
             true
         } else {
             false
@@ -307,6 +353,7 @@ impl<T: Send + 'static> PendingReply for ReplyControl<T> {
 
 struct ReplySlot<T: Send + 'static> {
     state: Mutex<ReplyState<T>>,
+    observation: RequestObservation,
 }
 
 struct ReplyState<T: Send + 'static> {
@@ -330,4 +377,21 @@ enum TokenState {
     Responded,
     Dropped,
     Invalidated,
+}
+
+fn completion_for_result<T>(result: &Result<T, ActorCallError>) -> RequestCompletion {
+    match result {
+        Ok(_) => RequestCompletion::ReplyDelivered,
+        Err(error) => completion_for_error(error),
+    }
+}
+
+fn completion_for_error(error: &ActorCallError) -> RequestCompletion {
+    match error {
+        ActorCallError::MailboxFull => RequestCompletion::MailboxFull,
+        ActorCallError::MailboxClosed => RequestCompletion::MailboxClosed,
+        ActorCallError::ResponseDropped => RequestCompletion::ResponseDropped,
+        ActorCallError::DeadlineExceeded => RequestCompletion::DeadlineExceeded,
+        ActorCallError::Handler(_) => RequestCompletion::HandlerFailed,
+    }
 }

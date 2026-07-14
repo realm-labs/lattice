@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::sync::{broadcast, oneshot, watch};
@@ -15,6 +15,7 @@ use crate::context::ActorContext;
 use crate::error::ActorSpawnError;
 use crate::handle::ActorHandle;
 use crate::mailbox::{ActorCommand, MailboxConfig, MailboxLane};
+use crate::observation::{ActorLifecycleEvent, ActorObserverHandle};
 use crate::recipient::ActorSystem;
 use crate::traits::{Actor, ActorLifecycleState, PassivationReason, StopReason};
 use crate::watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason};
@@ -43,12 +44,14 @@ pub enum ActorExecutionPolicy {
 #[derive(Debug, Clone)]
 pub struct ActorRuntimeConfig {
     pub default_execution: ActorExecutionPolicy,
+    pub observer: ActorObserverHandle,
 }
 
 impl Default for ActorRuntimeConfig {
     fn default() -> Self {
         Self {
             default_execution: ActorExecutionPolicy::TaskPerActor,
+            observer: ActorObserverHandle::default(),
         }
     }
 }
@@ -115,7 +118,8 @@ impl ActorRuntime {
         A: Actor,
     {
         let execution = options.execution.unwrap_or(self.config.default_execution);
-        self.scheduler.spawn(actor, options, execution)
+        self.scheduler
+            .spawn(actor, options, execution, self.config.observer.clone())
     }
 }
 
@@ -174,19 +178,22 @@ impl ActorScheduler {
         actor: A,
         options: ActorSpawnOptions,
         execution: ActorExecutionPolicy,
+        observer: ActorObserverHandle,
     ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor,
     {
         match execution {
-            ActorExecutionPolicy::TaskPerActor => Ok(spawn_task_per_actor(actor, options)),
+            ActorExecutionPolicy::TaskPerActor => {
+                Ok(spawn_task_per_actor(actor, options, observer))
+            }
             ActorExecutionPolicy::KeyedWorkerPool { worker_count } => {
                 if worker_count == 0 {
                     return Err(ActorSpawnError::InvalidExecutionPolicy {
                         reason: "KeyedWorkerPool worker_count must be greater than zero",
                     });
                 }
-                self.spawn_keyed_worker_pool_actor(actor, options, worker_count)
+                self.spawn_keyed_worker_pool_actor(actor, options, worker_count, observer)
             }
             ActorExecutionPolicy::DedicatedThreadPool { worker_count } => {
                 if worker_count == 0 {
@@ -194,7 +201,7 @@ impl ActorScheduler {
                         reason: "DedicatedThreadPool worker_count must be greater than zero",
                     });
                 }
-                self.spawn_dedicated_pool_actor(actor, options, worker_count)
+                self.spawn_dedicated_pool_actor(actor, options, worker_count, observer)
             }
         }
     }
@@ -204,6 +211,7 @@ impl ActorScheduler {
         actor: A,
         options: ActorSpawnOptions,
         worker_count: usize,
+        observer: ActorObserverHandle,
     ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor,
@@ -217,7 +225,7 @@ impl ActorScheduler {
             service,
             execution: _,
         } = options;
-        let parts = create_actor_parts(mailbox, self_ref, None, service);
+        let parts = create_actor_parts(mailbox, self_ref, None, service, observer);
         let scheduler_key =
             scheduler_key.unwrap_or_else(|| ActorId::U64(parts.handle.local_ref().id()));
         let worker_index = Self::keyed_worker_index(&scheduler_key, worker_count)?;
@@ -236,6 +244,7 @@ impl ActorScheduler {
         actor: A,
         options: ActorSpawnOptions,
         worker_count: usize,
+        observer: ActorObserverHandle,
     ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor,
@@ -252,7 +261,7 @@ impl ActorScheduler {
         } = options;
         Ok(spawn_actor_on_pool(
             actor,
-            create_actor_parts(mailbox, self_ref, None, service),
+            create_actor_parts(mailbox, self_ref, None, service, observer),
             passivation,
             &pool,
             worker_index,
@@ -491,15 +500,20 @@ pub(crate) fn spawn_actor_with_self_ref<A>(
     self_ref: Option<ActorRef>,
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
+    observer: ActorObserverHandle,
 ) -> ActorHandle<A>
 where
     A: Actor,
 {
-    let parts = create_actor_parts(mailbox, self_ref, actor_system, service);
+    let parts = create_actor_parts(mailbox, self_ref, actor_system, service, observer);
     spawn_actor_as_tokio_task(actor, parts, passivation, "task_per_actor")
 }
 
-fn spawn_task_per_actor<A>(actor: A, options: ActorSpawnOptions) -> ActorHandle<A>
+fn spawn_task_per_actor<A>(
+    actor: A,
+    options: ActorSpawnOptions,
+    observer: ActorObserverHandle,
+) -> ActorHandle<A>
 where
     A: Actor,
 {
@@ -511,7 +525,7 @@ where
         execution: _,
         scheduler_key: _,
     } = options;
-    let parts = create_actor_parts(mailbox, self_ref, None, service);
+    let parts = create_actor_parts(mailbox, self_ref, None, service, observer);
     spawn_actor_as_tokio_task(actor, parts, passivation, "task_per_actor")
 }
 
@@ -530,6 +544,7 @@ fn create_actor_parts<A>(
     self_ref: Option<ActorRef>,
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
+    observer: ActorObserverHandle,
 ) -> ActorRuntimeParts<A>
 where
     A: Actor,
@@ -547,6 +562,7 @@ where
         normal_tx,
         system_tx,
         actor_ref,
+        observer,
     );
 
     ActorRuntimeParts {
@@ -641,6 +657,10 @@ where
         actor.local_ref = local_ref
     );
     if let Err(error) = actor.started(&mut ctx).instrument(started_span).await {
+        handle.observer().lifecycle(
+            handle.observation_metadata(),
+            ActorLifecycleEvent::StartFailed,
+        );
         error!(
             actor.type = actor_type,
             actor.local_ref = local_ref,
@@ -667,6 +687,10 @@ where
                 "actor failed to stop after start failure"
             );
             handle.set_lifecycle_state(ActorLifecycleState::StopFailed);
+            handle.observer().lifecycle(
+                handle.observation_metadata(),
+                ActorLifecycleEvent::StopFailed(StopReason::StartFailed),
+            );
         } else {
             handle.set_lifecycle_state(ActorLifecycleState::Stopped);
         }
@@ -680,6 +704,9 @@ where
         return;
     }
     handle.set_lifecycle_state(ActorLifecycleState::Running);
+    handle
+        .observer()
+        .lifecycle(handle.observation_metadata(), ActorLifecycleEvent::Started);
     info!(
         actor.type = actor_type,
         actor.local_ref = local_ref,
@@ -693,6 +720,7 @@ where
             if handle_command(
                 command,
                 MailboxLane::System,
+                &handle,
                 &mut actor,
                 &mut ctx,
                 &mut stop_reason,
@@ -717,6 +745,7 @@ where
                         handle_command(
                             command,
                             MailboxLane::System,
+                            &handle,
                             &mut actor,
                             &mut ctx,
                             &mut stop_reason,
@@ -736,6 +765,7 @@ where
                         handle_command(
                             command,
                             MailboxLane::Normal,
+                            &handle,
                             &mut actor,
                             &mut ctx,
                             &mut stop_reason,
@@ -782,11 +812,19 @@ where
         ctx.cancel_all_tasks();
         ctx.stop_all_children(reason);
         handle.set_lifecycle_state(ActorLifecycleState::StopFailed);
+        handle.observer().lifecycle(
+            handle.observation_metadata(),
+            ActorLifecycleEvent::StopFailed(reason),
+        );
         return;
     }
     ctx.cancel_all_tasks();
     ctx.stop_all_children(reason);
     handle.set_lifecycle_state(ActorLifecycleState::Stopped);
+    handle.observer().lifecycle(
+        handle.observation_metadata(),
+        ActorLifecycleEvent::Stopped(reason),
+    );
     handle.publish_terminated(ActorTerminated {
         target: handle.local_ref(),
         incarnation: ActorIncarnation::new(handle.local_ref().id()),
@@ -803,6 +841,7 @@ where
 async fn handle_command<A>(
     command: ActorCommand<A>,
     lane: MailboxLane,
+    handle: &ActorHandle<A>,
     actor: &mut A,
     ctx: &mut ActorContext<A>,
     stop_reason: &mut Option<StopReason>,
@@ -813,25 +852,45 @@ where
 {
     match command {
         ActorCommand::Envelope(envelope) => {
-            let message_type = envelope.message_type();
+            let metadata = envelope.metadata(lane);
+            let started_at = Instant::now();
+            let actor_metadata = handle.observation_metadata();
+            handle.observer().message_started(
+                actor_metadata,
+                &metadata,
+                started_at.saturating_duration_since(metadata.enqueued_at()),
+            );
             let span = tracing::info_span!(
                 "actor.message",
                 otel.kind = "consumer",
                 actor.type = type_name::<A>(),
-                message.type = message_type,
+                message.type = metadata.type_name(),
+                message.kind = ?metadata.kind(),
                 mailbox.lane = lane.as_str()
             );
             debug!(
                 actor.type = type_name::<A>(),
-                message.type = message_type,
+                message.type = metadata.type_name(),
+                message.kind = ?metadata.kind(),
                 mailbox.lane = lane.as_str(),
                 "handling actor message"
             );
-            envelope.handle(actor, ctx).instrument(span).await;
+            let outcome = envelope
+                .handle(actor, ctx, &metadata)
+                .instrument(span)
+                .await;
+            handle.observer().message_finished(
+                actor_metadata,
+                &metadata,
+                outcome,
+                started_at.elapsed(),
+            );
             ctx.reap_runtime_work();
             debug!(
                 actor.type = type_name::<A>(),
-                message.type = message_type,
+                message.type = metadata.type_name(),
+                message.kind = ?metadata.kind(),
+                message.outcome = ?outcome,
                 mailbox.lane = lane.as_str(),
                 "actor message handled"
             );
