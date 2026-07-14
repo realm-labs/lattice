@@ -220,6 +220,11 @@ fn run_profile(
     };
     resource_samples.push(resource_sample(timer.elapsed()));
     let success = result.is_ok();
+    let replay_artifact = if matches!(profile, Profile::Soak) {
+        "soak-latest.json".to_owned()
+    } else {
+        format!("trace-{seed}.json")
+    };
     let manifest = Manifest {
         profile,
         seed,
@@ -239,8 +244,9 @@ fn run_profile(
         elapsed_millis: timer.elapsed().as_millis(),
         success,
         replay: format!(
-            "./scripts/test-docker.sh replay --artifact {}/trace-{seed}.json",
-            artifacts.display()
+            "./scripts/test-docker.sh replay --artifact {}/{}",
+            artifacts.display(),
+            replay_artifact
         ),
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         pinned_images: std::fs::read_to_string("tests/distributed/images.lock")

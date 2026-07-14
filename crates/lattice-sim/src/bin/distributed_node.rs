@@ -49,7 +49,9 @@ use lattice_placement::runtime::CoordinatorLeaderConfig;
 use lattice_placement::runtime::CoordinatorRuntimeError;
 use lattice_placement::session::LogicCoordinatorConfig;
 use lattice_placement::session::LogicCoordinatorSession;
+use lattice_placement::storage::CoordinatorStore;
 use lattice_placement::storage::InMemoryPlacementStore;
+use lattice_placement::storage::domain::DurableStorageLimits;
 use lattice_placement::storage::etcd::{EtcdPlacementConfig, EtcdPlacementStore};
 use lattice_placement::types::AssignmentGeneration;
 use lattice_placement::types::ClaimGrant;
@@ -60,6 +62,7 @@ use lattice_placement::types::PlacementSlot;
 use lattice_placement::types::PlacementSlotKey;
 use lattice_placement::types::PlacementSlotState;
 use lattice_placement::types::Revision;
+use lattice_placement::types::StateVersion;
 use lattice_remoting::association::AssociationKey;
 use lattice_remoting::association::AssociationManager;
 use lattice_remoting::association::LaneAttachment;
@@ -520,7 +523,15 @@ async fn coordinator(
         EtcdPlacementStore::connect(EtcdPlacementConfig {
             endpoints,
             cluster_prefix: format!("/lattice-ha/{run_id}"),
-            maximum_list_records: 256,
+            list_page_size: 64,
+            limits: DurableStorageLimits {
+                maximum_slots: 65_536,
+                maximum_plans: 4_096,
+                maximum_members: 1_024,
+                maximum_admin_operations: 4_096,
+                maximum_entity_configs: 1_024,
+                maximum_singleton_configs: 1_024,
+            },
             connect_options: None,
         })
         .await?,
@@ -828,8 +839,8 @@ async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn std::error::Erro
         "/artifacts/coordinator-placement-snapshot.json",
         serde_json::to_vec_pretty(&serde_json::json!({
             "redacted": true,
-            "term": slot.coordinator_term.get(),
-            "revision": slot.revision.get(),
+            "term": slot.version.term.get(),
+            "revision": slot.version.revision.get(),
             "slot": {
                 "entity_type": entity_config.entity_type.as_str(),
                 "shard_id": entity_config.shard_for(&entity_id).get(),
@@ -1043,7 +1054,7 @@ async fn install_fixture_snapshot(
         key: "shard/distributed-entity/fixture".to_owned(),
         value: serde_json::to_vec(slot)?.into(),
     };
-    let (begin, chunks, end) = build_snapshot(slot.revision, vec![record], &limits)?;
+    let (begin, chunks, end) = build_snapshot(slot.version, vec![record], &limits)?;
     let mut commands = vec![PlacementControlCommand::SnapshotBegin(begin)];
     commands.extend(
         chunks
@@ -1055,7 +1066,7 @@ async fn install_fixture_snapshot(
         commands.push(PlacementControlCommand::ClaimGranted(ClaimGrant {
             slot: slot.key.clone(),
             owner: slot.owner.clone().ok_or("fixture slot has no owner")?,
-            coordinator_term: slot.coordinator_term,
+            coordinator_term: slot.version.term,
             assignment_generation: slot.assignment_generation,
             grant_sequence: GrantSequence::new(1)?,
             ttl: Duration::from_secs(300),
@@ -1098,8 +1109,7 @@ fn fixture_entity_slot(
         owner: Some(owner),
         target: None,
         assignment_generation: AssignmentGeneration::new(1)?,
-        coordinator_term: CoordinatorTerm::new(1)?,
-        revision: Revision::new(1)?,
+        version: StateVersion::new(CoordinatorTerm::new(1)?, Revision::new(1)?),
         state: PlacementSlotState::Running,
         active_move: None,
         barrier_sessions: BTreeSet::new(),

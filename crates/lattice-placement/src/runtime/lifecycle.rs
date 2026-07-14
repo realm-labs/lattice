@@ -4,6 +4,7 @@ use super::{
     Instant, MoveProgress, PlacementControlCommand, PlacementControlEvent, PlacementSlotKey,
     PlacementSlotState, PlanStatus, RebalanceTrigger, mpsc, watch,
 };
+use crate::storage::domain::{DeletePlan, ReserveMove, UpdatePlan};
 
 impl<S: CoordinatorStore> CoordinatorLeader<S> {
     pub(super) async fn recover_persisted_plans(&mut self) -> Result<(), CoordinatorRuntimeError> {
@@ -55,39 +56,50 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                             plan_changed = true;
                             continue;
                         }
-                        let (barrier_revision, barrier_sessions) = if slot.state
+                        let (barrier_version, barrier_sessions) = if slot.state
                             == PlacementSlotState::Running
                             && slot.owner.as_ref() == Some(&movement.source)
                             && slot.assignment_generation == movement.expected_generation
                             && slot.active_move.is_none()
                         {
-                            let barrier_revision = self
-                                .revision
-                                .next()
-                                .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
+                            let expected_plan = plan.clone();
+                            let barrier_version = self.next_version()?;
                             let barrier_sessions = movement.barrier_sessions.clone();
                             if let Some(current) = plan
                                 .moves
                                 .iter_mut()
                                 .find(|current| current.shard_id == movement.shard_id)
                             {
-                                current.barrier_revision = Some(barrier_revision);
+                                current.barrier_version = Some(barrier_version);
                             }
-                            plan_changed = true;
-                            let expected = slot.revision;
+                            plan.record_revision = plan
+                                .record_revision
+                                .next()
+                                .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
+                            let expected_slot = slot.clone();
                             slot.target = Some(movement.target.clone());
                             slot.state = PlacementSlotState::BeginHandoff;
                             slot.active_move = Some(plan_id);
                             slot.barrier_sessions = barrier_sessions.clone();
-                            slot.coordinator_term = self.leader.term;
-                            slot.revision = barrier_revision;
-                            self.store
-                                .compare_and_put_slot(Some(expected), slot.clone())
+                            slot.version = barrier_version;
+                            let committed = self
+                                .store
+                                .reserve_move(
+                                    &self.leader_guard,
+                                    ReserveMove {
+                                        expected_plan,
+                                        plan,
+                                        expected_slot,
+                                        slot,
+                                    },
+                                )
                                 .await?;
-                            self.revision = barrier_revision;
-                            (barrier_revision, barrier_sessions)
+                            plan = committed.plan;
+                            slot = committed.slot;
+                            self.version = barrier_version;
+                            (barrier_version, barrier_sessions)
                         } else {
-                            (slot.revision, slot.barrier_sessions.clone())
+                            (slot.version, slot.barrier_sessions.clone())
                         };
                         let handoff = HandoffMachine::recover(
                             &slot,
@@ -95,7 +107,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                             movement.source,
                             movement.target,
                             movement.expected_generation,
-                            barrier_revision,
+                            barrier_version,
                             barrier_sessions,
                         )
                         .map_err(CoordinatorRuntimeError::Handoff)?;
@@ -105,13 +117,19 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 }
             }
             if plan_changed {
-                let expected = plan.revision;
-                plan.revision = plan
-                    .revision
+                let expected_plan = plan.clone();
+                plan.record_revision = plan
+                    .record_revision
                     .next()
                     .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
                 self.store
-                    .compare_and_put_plan(Some(expected), plan.clone(), plan.revision)
+                    .update_plan(
+                        &self.leader_guard,
+                        UpdatePlan {
+                            expected: expected_plan,
+                            plan: plan.clone(),
+                        },
+                    )
                     .await?;
                 self.plans.insert(plan_id, plan);
             }
@@ -156,7 +174,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 source,
                 target,
                 source_generation,
-                slot.revision,
+                slot.version,
                 slot.barrier_sessions.clone(),
             )
             .map_err(CoordinatorRuntimeError::Handoff)?;
@@ -209,14 +227,21 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                     PlanStatus::Completed | PlanStatus::Cancelled | PlanStatus::Failed
                 )
             })
-            .map(|plan| (plan.base_revision, plan.plan_id, plan.revision))
+            .map(|plan| (plan.base_version, plan.plan_id, plan.record_revision))
             .collect::<Vec<_>>();
         terminal.sort_unstable();
         let remove = terminal
             .len()
             .saturating_sub(self.config.maximum_completed_plan_history);
-        for (_, plan_id, revision) in terminal.into_iter().take(remove) {
-            self.store.delete_plan(plan_id, revision).await?;
+        for (_, plan_id, _) in terminal.into_iter().take(remove) {
+            let expected = self
+                .plans
+                .get(&plan_id)
+                .cloned()
+                .ok_or(CoordinatorRuntimeError::UnknownPlan)?;
+            self.store
+                .delete_plan(&self.leader_guard, DeletePlan { expected })
+                .await?;
             self.plans.remove(&plan_id);
         }
         Ok(())
@@ -232,6 +257,13 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         let mut rebalance = tokio::time::interval(self.config.rebalance_interval);
         rebalance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         rebalance.reset();
+        let reconciliation_millis =
+            u64::try_from(self.config.reconciliation_interval.as_millis()).unwrap_or(u64::MAX);
+        let jitter_bound = (reconciliation_millis / 4).max(1);
+        let jitter = std::time::Duration::from_millis(self.leader.term.get() % jitter_bound);
+        let mut reconciliation =
+            tokio::time::interval_at(Instant::now() + jitter, self.config.reconciliation_interval);
+        reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -240,6 +272,9 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                         self.store.revoke_lease(self.leader_lease_id).await?;
                         return Ok(());
                     }
+                }
+                _ = renewal.tick() => {
+                    self.renew().await?;
                 }
                 event = controls.recv() => {
                     let Some(event) = event else {
@@ -257,10 +292,10 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                     let Some(operation) = operation else {
                         return Err(CoordinatorRuntimeError::OperationClosed);
                     };
-                    self.handle_operation(operation).await;
+                    self.handle_operation(operation).await?;
                 }
-                _ = renewal.tick() => {
-                    self.renew().await?;
+                _ = reconciliation.tick() => {
+                    self.reconcile_bounded_pass().await?;
                 }
                 _ = rebalance.tick() => {
                     let entity_types = self.entity_configs.keys().cloned().collect::<Vec<_>>();

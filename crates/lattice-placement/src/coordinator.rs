@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::region::EntityConfig;
-use crate::types::{CoordinatorTerm, MonotonicTime, NodeKey, Revision, ShardId};
+use crate::types::{CoordinatorTerm, MonotonicTime, NodeKey, ShardId, StateVersion};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SingletonConfig {
@@ -21,6 +21,27 @@ pub struct LeaderRecord {
     pub node: NodeKey,
     pub protocol_generation: u64,
     pub term: CoordinatorTerm,
+}
+
+/// Exact lease-backed leadership identity required by every authoritative
+/// Coordinator storage commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderGuard {
+    record: LeaderRecord,
+}
+
+impl LeaderGuard {
+    pub fn new(record: LeaderRecord) -> Self {
+        Self { record }
+    }
+
+    pub fn record(&self) -> &LeaderRecord {
+        &self.record
+    }
+
+    pub fn term(&self) -> CoordinatorTerm {
+        self.record.term
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,7 +70,7 @@ pub struct MemberRecord {
     pub node: NodeKey,
     pub hello: NodeHello,
     pub status: MemberStatus,
-    pub revision: Revision,
+    pub version: StateVersion,
     pub lease_id: i64,
 }
 
@@ -82,7 +103,7 @@ pub enum MemberChange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberEvent {
-    pub revision: Revision,
+    pub version: StateVersion,
     pub change: MemberChange,
 }
 
@@ -206,7 +227,7 @@ pub struct SnapshotRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotBegin {
     pub snapshot_id: u128,
-    pub revision: Revision,
+    pub version: StateVersion,
     pub record_count: usize,
     pub total_bytes: usize,
     pub chunk_count: usize,
@@ -223,17 +244,17 @@ pub struct SnapshotChunk {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotEnd {
     pub snapshot_id: u128,
-    pub revision: Revision,
+    pub version: StateVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotInstall {
-    pub revision: Revision,
+    pub version: StateVersion,
     pub records: Vec<SnapshotRecord>,
 }
 
 pub fn build_snapshot(
-    revision: Revision,
+    version: StateVersion,
     mut records: Vec<SnapshotRecord>,
     limits: &SnapshotLimits,
 ) -> Result<(SnapshotBegin, Vec<SnapshotChunk>, SnapshotEnd), CoordinatorError> {
@@ -286,7 +307,7 @@ pub fn build_snapshot(
     }
     let begin = SnapshotBegin {
         snapshot_id,
-        revision,
+        version,
         record_count: chunks.iter().map(|chunk| chunk.records.len()).sum(),
         total_bytes,
         chunk_count: chunks.len(),
@@ -294,7 +315,7 @@ pub fn build_snapshot(
     };
     let end = SnapshotEnd {
         snapshot_id,
-        revision,
+        version,
     };
     Ok((begin, chunks, end))
 }
@@ -372,7 +393,7 @@ impl SnapshotStager {
     ) -> Result<SnapshotInstall, CoordinatorError> {
         if now >= self.deadline
             || end.snapshot_id != self.begin.snapshot_id
-            || end.revision != self.begin.revision
+            || end.version != self.begin.version
             || self.next_chunk != self.begin.chunk_count
             || self.records.len() != self.begin.record_count
             || self.bytes != self.begin.total_bytes
@@ -381,7 +402,7 @@ impl SnapshotStager {
             return Err(CoordinatorError::SnapshotIntegrity);
         }
         Ok(SnapshotInstall {
-            revision: self.begin.revision,
+            version: self.begin.version,
             records: self.records,
         })
     }
@@ -400,19 +421,27 @@ fn snapshot_digest(records: &[SnapshotRecord]) -> [u8; 32] {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordinatorDelta {
-    pub revision: Revision,
+    pub version: StateVersion,
     pub records: Vec<SnapshotRecord>,
 }
 
 #[derive(Debug, Default)]
 pub struct CoordinatorSession {
-    revision: Option<Revision>,
+    version: Option<StateVersion>,
     records: BTreeMap<String, Bytes>,
     ready: bool,
 }
 
 impl CoordinatorSession {
     pub fn install(&mut self, snapshot: SnapshotInstall) -> Result<(), CoordinatorError> {
+        if self.version.is_some_and(|current| {
+            snapshot.version.term < current.term
+                || (snapshot.version.term == current.term
+                    && snapshot.version.revision < current.revision)
+        }) {
+            self.ready = false;
+            return Err(CoordinatorError::StaleTerm);
+        }
         let mut records = BTreeMap::new();
         for record in snapshot.records {
             if records.insert(record.key, record.value).is_some() {
@@ -420,31 +449,43 @@ impl CoordinatorSession {
             }
         }
         self.records = records;
-        self.revision = Some(snapshot.revision);
+        self.version = Some(snapshot.version);
         self.ready = true;
         Ok(())
     }
 
     pub fn apply_delta(&mut self, delta: CoordinatorDelta) -> Result<(), CoordinatorError> {
-        let current = self.revision.ok_or(CoordinatorError::SnapshotRequired)?;
-        if delta.revision.get() != current.get().saturating_add(1) {
+        let current = self.version.ok_or(CoordinatorError::SnapshotRequired)?;
+        if !current.accepts_delta_after(delta.version) {
             self.ready = false;
-            return Err(CoordinatorError::RevisionGap);
+            return if delta.version.term > current.term {
+                Err(CoordinatorError::SnapshotRequired)
+            } else if delta.version.term < current.term {
+                Err(CoordinatorError::StaleTerm)
+            } else {
+                Err(CoordinatorError::RevisionGap)
+            };
         }
         let mut next = self.records.clone();
         for record in delta.records {
             next.insert(record.key, record.value);
         }
         self.records = next;
-        self.revision = Some(delta.revision);
+        self.version = Some(delta.version);
         Ok(())
     }
 
     pub fn apply_member_event(&mut self, event: MemberEvent) -> Result<(), CoordinatorError> {
-        let current = self.revision.ok_or(CoordinatorError::SnapshotRequired)?;
-        if event.revision.get() != current.get().saturating_add(1) {
+        let current = self.version.ok_or(CoordinatorError::SnapshotRequired)?;
+        if !current.accepts_delta_after(event.version) {
             self.ready = false;
-            return Err(CoordinatorError::RevisionGap);
+            return if event.version.term > current.term {
+                Err(CoordinatorError::SnapshotRequired)
+            } else if event.version.term < current.term {
+                Err(CoordinatorError::StaleTerm)
+            } else {
+                Err(CoordinatorError::RevisionGap)
+            };
         }
         match event.change {
             MemberChange::Upsert(member) => {
@@ -465,12 +506,12 @@ impl CoordinatorSession {
                 }
             }
         }
-        self.revision = Some(event.revision);
+        self.version = Some(event.version);
         Ok(())
     }
 
-    pub fn revision(&self) -> Option<Revision> {
-        self.revision
+    pub fn version(&self) -> Option<StateVersion> {
+        self.version
     }
 
     pub fn records(&self) -> impl ExactSizeIterator<Item = (&str, &Bytes)> {
@@ -614,8 +655,60 @@ pub enum CoordinatorError {
     SnapshotRequired,
     #[error("Coordinator revision gap requires resnapshot")]
     RevisionGap,
+    #[error("Coordinator state belongs to a stale term")]
+    StaleTerm,
     #[error("load report is invalid")]
     InvalidLoad,
     #[error("load report table reached its cardinality bound")]
     LoadCapacity,
+}
+
+#[cfg(test)]
+mod state_version_tests {
+    use super::*;
+    use crate::types::{CoordinatorTerm, Revision};
+
+    fn version(term: u64, revision: u64) -> StateVersion {
+        StateVersion::new(
+            CoordinatorTerm::new(term).unwrap(),
+            Revision::new(revision).unwrap(),
+        )
+    }
+
+    #[test]
+    fn higher_term_delta_requires_snapshot_and_lower_term_snapshot_is_stale() {
+        let mut session = CoordinatorSession::default();
+        session
+            .install(SnapshotInstall {
+                version: version(1, 7),
+                records: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            session
+                .apply_delta(CoordinatorDelta {
+                    version: version(2, 8),
+                    records: Vec::new(),
+                })
+                .unwrap_err(),
+            CoordinatorError::SnapshotRequired
+        );
+        assert!(!session.ready());
+        session
+            .install(SnapshotInstall {
+                version: version(2, 8),
+                records: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            session
+                .install(SnapshotInstall {
+                    version: version(1, 9),
+                    records: Vec::new(),
+                })
+                .unwrap_err(),
+            CoordinatorError::StaleTerm
+        );
+        assert!(!session.ready());
+    }
 }

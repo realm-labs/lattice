@@ -157,6 +157,7 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
         let entity_type = parse_entity_type(command.entity_type)?.ok_or(AdminApiError::Invalid)?;
         self.coordinator
             .evaluate_rebalance(
+                command.operation_id,
                 entity_type,
                 lattice_placement::allocation::RebalanceTrigger::Automatic,
             )
@@ -191,7 +192,11 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
             .ok_or(AdminApiError::Invalid)?;
         let shard_id = command.shard_id.ok_or(AdminApiError::Invalid)?;
         self.coordinator
-            .cancel_pending(plan_id, lattice_placement::types::ShardId::new(shard_id))
+            .cancel_pending(
+                command.operation_id,
+                plan_id,
+                lattice_placement::types::ShardId::new(shard_id),
+            )
             .await
             .map_err(map_coordinator_error)
     }

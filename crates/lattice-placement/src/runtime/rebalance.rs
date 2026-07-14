@@ -5,6 +5,10 @@ use super::{
     PlacementControlCommand, PlacementSlot, PlacementSlotKey, PlacementSlotState, PlanReason,
     SnapshotRecord,
 };
+use crate::storage::domain::{
+    ActivateAuthority, ClaimPredicate, CompleteMove, FenceAuthority, InstallAuthority, LeasedClaim,
+    ReserveMove, TransitionSlot,
+};
 
 impl<S: CoordinatorStore> CoordinatorLeader<S> {
     pub(super) async fn start_pending_moves(
@@ -97,12 +101,11 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .get_slot(&key)
             .await?
             .ok_or(CoordinatorRuntimeError::UnknownSlot)?;
+        let expected_slot = slot.clone();
+        let expected_plan = plan.clone();
         plan.begin_move(shard_id, slot.assignment_generation, slot.active_move)
             .map_err(CoordinatorRuntimeError::Plan)?;
-        let barrier_revision = self
-            .revision
-            .next()
-            .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
+        let barrier_version = self.next_version()?;
         let barrier_sessions: std::collections::BTreeSet<NodeIncarnation> = self
             .sessions
             .iter()
@@ -113,39 +116,43 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                     .then_some(*incarnation)
             })
             .collect();
-        plan.install_barrier(shard_id, barrier_revision, barrier_sessions.clone())
+        plan.install_barrier(shard_id, barrier_version, barrier_sessions.clone())
             .map_err(CoordinatorRuntimeError::Plan)?;
-        let expected_plan_revision = plan.revision;
-        plan.revision = plan
-            .revision
+        plan.record_revision = plan
+            .record_revision
             .next()
             .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
-        self.store
-            .compare_and_put_plan(Some(expected_plan_revision), plan.clone(), plan.revision)
-            .await?;
-        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::RebalanceAfterPlanPersist);
-        let expected_slot_revision = slot.revision;
         slot.target = Some(movement.target.clone());
         slot.state = PlacementSlotState::BeginHandoff;
         slot.active_move = Some(plan_id);
         slot.barrier_sessions = barrier_sessions.clone();
-        slot.coordinator_term = self.leader.term;
-        slot.revision = barrier_revision;
-        self.store
-            .compare_and_put_slot(Some(expected_slot_revision), slot.clone())
+        slot.version = barrier_version;
+        let committed = self
+            .store
+            .reserve_move(
+                &self.leader_guard,
+                ReserveMove {
+                    expected_plan,
+                    plan,
+                    expected_slot,
+                    slot,
+                },
+            )
             .await?;
+        let plan = committed.plan;
+        let slot = committed.slot;
         lattice_core::failpoint::hit(
             lattice_core::failpoint::Failpoint::RebalanceAfterReservationBeforeHandoff,
         );
         lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::HandoffAfterBeginPersist);
-        self.revision = barrier_revision;
+        self.version = barrier_version;
         let mut handoff = HandoffMachine::begin(
             key.clone(),
             plan_id,
             movement.source,
             movement.target,
             movement.expected_generation,
-            barrier_revision,
+            barrier_version,
             barrier_sessions,
         )
         .map_err(CoordinatorRuntimeError::Handoff)?;
@@ -186,7 +193,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 }
             };
             let delta = crate::coordinator::CoordinatorDelta {
-                revision: slot.revision,
+                version: slot.version,
                 records: include.then_some(record.clone()).into_iter().collect(),
             };
             let association = self
@@ -253,16 +260,21 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         {
             return Err(CoordinatorRuntimeError::StaleHandoff);
         }
-        let expected = slot.revision;
+        let expected_slot = slot.clone();
         slot.state = PlacementSlotState::Stopping;
-        slot.revision = self
-            .revision
-            .next()
-            .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
-        self.store
-            .compare_and_put_slot(Some(expected), slot.clone())
-            .await?;
-        self.revision = slot.revision;
+        slot.version = self.next_version()?;
+        let slot = self
+            .store
+            .transition_slot(
+                &self.leader_guard,
+                TransitionSlot {
+                    expected: expected_slot,
+                    slot,
+                },
+            )
+            .await?
+            .slot;
+        self.version = slot.version;
         self.publish_slot_delta(&slot).await?;
         if let Some(session) = self
             .sessions
@@ -278,7 +290,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 PlacementControlCommand::DrainSlot {
                     slot: key.clone(),
                     generation,
-                    revision: slot.revision,
+                    version: slot.version,
                 },
                 &self.config,
             )?;
@@ -314,16 +326,21 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         if slot.state != PlacementSlotState::Stopping {
             return Err(CoordinatorRuntimeError::StaleHandoff);
         }
-        let expected = slot.revision;
+        let expected_slot = slot.clone();
         slot.state = PlacementSlotState::StopFailed;
-        slot.revision = self
-            .revision
-            .next()
-            .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
-        self.store
-            .compare_and_put_slot(Some(expected), slot.clone())
-            .await?;
-        self.revision = slot.revision;
+        slot.version = self.next_version()?;
+        let slot = self
+            .store
+            .transition_slot(
+                &self.leader_guard,
+                TransitionSlot {
+                    expected: expected_slot,
+                    slot,
+                },
+            )
+            .await?
+            .slot;
+        self.version = slot.version;
         self.publish_slot_delta(&slot).await
     }
 
@@ -345,57 +362,59 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             lattice_core::failpoint::hit(
                 lattice_core::failpoint::Failpoint::HandoffAfterShardDrainedBeforeClaimRevoke,
             );
-            if let Some(old_claim) = self.store.get_claim(key).await? {
-                if old_claim.owner != handoff.source
-                    || old_claim.assignment_generation != handoff.source_generation
-                {
-                    return Err(CoordinatorRuntimeError::ClaimNotProven);
-                }
-                self.store.delete_claim(&old_claim).await?;
+            let old_claim = self.store.get_claim(key).await?;
+            if let Some(old_claim) = &old_claim
+                && (old_claim.grant.owner != handoff.source
+                    || old_claim.grant.assignment_generation != handoff.source_generation)
+            {
+                return Err(CoordinatorRuntimeError::ClaimNotProven);
             }
-            if let Some(claim) = self.claims.remove(key) {
-                let _ = self.store.revoke_lease(claim.lease_id).await;
+            if !matches!(
+                slot.state,
+                PlacementSlotState::Stopping | PlacementSlotState::StopFailed
+            ) || slot.active_move != Some(handoff.plan_id)
+            {
+                return Err(CoordinatorRuntimeError::StaleHandoff);
             }
-        }
-        if !matches!(
-            slot.state,
-            PlacementSlotState::Stopping
-                | PlacementSlotState::StopFailed
-                | PlacementSlotState::Fenced
-        ) || slot.active_move != Some(handoff.plan_id)
-        {
-            return Err(CoordinatorRuntimeError::StaleHandoff);
-        }
-        if slot.state != PlacementSlotState::Fenced {
-            let expected = slot.revision;
+            let expected_slot = slot.clone();
             slot.state = PlacementSlotState::Fenced;
-            slot.revision = self
-                .revision
-                .next()
-                .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
-            self.store
-                .compare_and_put_slot(Some(expected), slot.clone())
-                .await?;
-            self.revision = slot.revision;
+            slot.version = self.next_version()?;
+            slot = self
+                .store
+                .fence_authority(
+                    &self.leader_guard,
+                    FenceAuthority {
+                        expected_slot,
+                        expected_claim: old_claim
+                            .as_ref()
+                            .map(|claim| ClaimPredicate::Present(claim.grant.clone()))
+                            .unwrap_or(ClaimPredicate::Absent),
+                        slot,
+                    },
+                )
+                .await?
+                .slot;
+            lattice_core::failpoint::hit(
+                lattice_core::failpoint::Failpoint::FenceAuthorityAfterCommitBeforeEffect,
+            );
+            self.version = slot.version;
+            let old_lease = self.claims.remove(key).map(|claim| claim.lease_id);
             self.publish_slot_delta(&slot).await?;
+            if let Some(lease_id) = old_lease {
+                let _ = self.store.revoke_lease(lease_id).await;
+            }
         }
 
-        let expected = slot.revision;
+        if slot.state != PlacementSlotState::Fenced || slot.active_move != Some(handoff.plan_id) {
+            return Err(CoordinatorRuntimeError::StaleHandoff);
+        }
+        let lease_id = self.store.grant_lease(self.config.claim_ttl).await?;
+        let expected_slot = slot.clone();
         slot.owner = Some(handoff.target.clone());
         slot.target = None;
         slot.assignment_generation = handoff.target_generation;
         slot.state = PlacementSlotState::Allocating;
-        slot.coordinator_term = self.leader.term;
-        slot.revision = self
-            .revision
-            .next()
-            .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
-        self.store
-            .compare_and_put_slot(Some(expected), slot.clone())
-            .await?;
-        self.revision = slot.revision;
-        self.publish_slot_delta(&slot).await?;
-        let lease_id = self.store.grant_lease(self.config.claim_ttl).await?;
+        slot.version = self.next_version()?;
         let grant = ClaimGrant {
             slot: key.clone(),
             owner: handoff.target.clone(),
@@ -404,17 +423,56 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             grant_sequence: GrantSequence::new(1).expect("one is a valid grant sequence"),
             ttl: self.config.claim_ttl,
         };
-        self.store.put_claim(&grant, lease_id).await?;
+        let request = InstallAuthority {
+            expected_slot,
+            slot,
+            claim: LeasedClaim {
+                grant: grant.clone(),
+                lease_id,
+            },
+        };
+        let committed = match self
+            .store
+            .install_authority(&self.leader_guard, request)
+            .await
+        {
+            Ok(committed) => committed,
+            Err(crate::storage::StorageError::OutcomeUnknown) => {
+                self.reconciliation.focused = true;
+                match self.store.get_claim(key).await? {
+                    Some(claim) if claim.lease_id == lease_id && claim.grant == grant => {
+                        let slot = self
+                            .store
+                            .get_slot(key)
+                            .await?
+                            .ok_or(CoordinatorRuntimeError::UnknownSlot)?;
+                        crate::storage::domain::AuthorityCommit { slot, claim }
+                    }
+                    _ => {
+                        let _ = self.store.revoke_lease(lease_id).await;
+                        return Err(crate::storage::StorageError::OutcomeUnknown.into());
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = self.store.revoke_lease(lease_id).await;
+                return Err(error.into());
+            }
+        };
+        let slot = committed.slot;
+        let leased_claim = committed.claim;
+        self.version = slot.version;
         lattice_core::failpoint::hit(
             lattice_core::failpoint::Failpoint::HandoffAfterNewClaimBeforeGrantSend,
         );
         self.claims.insert(
             key.clone(),
             ClaimLease {
-                lease_id,
-                grant: grant.clone(),
+                lease_id: leased_claim.lease_id,
+                grant: leased_claim.grant.clone(),
             },
         );
+        self.publish_slot_delta(&slot).await?;
         let session = self
             .sessions
             .get(&handoff.target.incarnation)
@@ -426,7 +484,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
         send_control(
             &association,
-            PlacementControlCommand::ClaimGranted(grant),
+            PlacementControlCommand::ClaimGranted(leased_claim.grant),
             &self.config,
         )?;
         lattice_core::failpoint::hit(
@@ -469,40 +527,65 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         {
             return Err(CoordinatorRuntimeError::StaleHandoff);
         }
-        let expected = slot.revision;
+        let expected_slot = slot.clone();
         slot.state = PlacementSlotState::Running;
         slot.active_move = None;
         slot.barrier_sessions.clear();
-        slot.revision = self
-            .revision
-            .next()
-            .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
-        self.store
-            .compare_and_put_slot(Some(expected), slot.clone())
-            .await?;
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::HandoffAfterActivePersistBeforeDelta,
-        );
-        self.revision = slot.revision;
-        self.slot_assigned_at.insert(key.clone(), self.now());
-        self.handoffs.remove(key);
-        self.publish_slot_delta(&slot).await?;
-        if let PlacementSlotKey::Shard { shard_id, .. } = key {
+        slot.version = self.next_version()?;
+        let claim = self
+            .store
+            .get_claim(key)
+            .await?
+            .ok_or(CoordinatorRuntimeError::ClaimNotProven)?;
+        let (slot, completed_plan) = if let PlacementSlotKey::Shard { shard_id, .. } = key {
             let mut plan = self
                 .plans
                 .get(&handoff.plan_id)
                 .cloned()
                 .ok_or(CoordinatorRuntimeError::UnknownPlan)?;
-            let expected_plan_revision = plan.revision;
+            let expected_plan = plan.clone();
             plan.complete_move(*shard_id)
                 .map_err(CoordinatorRuntimeError::Plan)?;
-            plan.revision = plan
-                .revision
+            plan.record_revision = plan
+                .record_revision
                 .next()
                 .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
-            self.store
-                .compare_and_put_plan(Some(expected_plan_revision), plan.clone(), plan.revision)
+            let committed = self
+                .store
+                .complete_move(
+                    &self.leader_guard,
+                    CompleteMove {
+                        expected_slot,
+                        slot,
+                        expected_plan,
+                        plan,
+                        expected_claim: claim.grant,
+                    },
+                )
                 .await?;
+            (committed.slot, Some(committed.plan))
+        } else {
+            let committed = self
+                .store
+                .activate_authority(
+                    &self.leader_guard,
+                    ActivateAuthority {
+                        expected_slot,
+                        expected_claim: claim.grant,
+                        slot,
+                    },
+                )
+                .await?;
+            (committed.slot, None)
+        };
+        lattice_core::failpoint::hit(
+            lattice_core::failpoint::Failpoint::HandoffAfterActivePersistBeforeDelta,
+        );
+        self.version = slot.version;
+        self.slot_assigned_at.insert(key.clone(), self.now());
+        self.handoffs.remove(key);
+        self.publish_slot_delta(&slot).await?;
+        if let Some(plan) = completed_plan {
             self.plans.insert(plan.plan_id, plan);
             self.start_pending_moves(handoff.plan_id).await?;
             self.compact_plan_history().await?;

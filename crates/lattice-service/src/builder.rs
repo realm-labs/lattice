@@ -729,7 +729,7 @@ impl LatticeService {
                     let (slot, effect) = match effect {
                         LogicPlacementEffect::MemberEvent(event) => {
                             if let MemberEvent {
-                                revision,
+                                version,
                                 change: MemberChange::Removed { node, reason },
                             } = event.as_ref()
                             {
@@ -737,7 +737,8 @@ impl LatticeService {
                                     target: "lattice.cluster.members",
                                     node_id = %node.node_id,
                                     incarnation = node.incarnation.get(),
-                                    revision = revision.get(),
+                                    term = version.term.get(),
+                                    revision = version.revision.get(),
                                     ?reason,
                                     "authoritative member removed"
                                 );
@@ -746,7 +747,7 @@ impl LatticeService {
                                     .expect("watch registry poisoned")
                                     .node_down(node.incarnation);
                             } else if let MemberEvent {
-                                revision,
+                                version,
                                 change: MemberChange::Upsert(record),
                             } = event.as_ref()
                             {
@@ -754,7 +755,8 @@ impl LatticeService {
                                     target: "lattice.cluster.members",
                                     node_id = %record.node.node_id,
                                     incarnation = record.node.incarnation.get(),
-                                    revision = revision.get(),
+                                    term = version.term.get(),
+                                    revision = version.revision.get(),
                                     status = ?record.status,
                                     "authoritative member upserted"
                                 );
@@ -763,10 +765,10 @@ impl LatticeService {
                             continue;
                         }
                         LogicPlacementEffect::MemberSnapshot {
-                            revision,
+                            version,
                             members: snapshot,
                         } => {
-                            let _ = members.install_snapshot(revision, snapshot);
+                            let _ = members.install_snapshot(version, snapshot);
                             continue;
                         }
                         LogicPlacementEffect::DrainReady {

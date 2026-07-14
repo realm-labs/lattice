@@ -7,6 +7,15 @@ pub enum Failpoint {
     ControlAfterOutboxBeforeSocketWrite,
     ControlAfterRemoteApplyBeforeAck,
     CoordinatorAfterEtcdCommitBeforeDelta,
+    MemberBeforeGuardedCommit,
+    PlanBeforeGuardedCommit,
+    AuthorityBeforeGuardedCommit,
+    AdminBeforeGuardedCommit,
+    InitialAuthorityAfterCommitBeforeEffect,
+    FenceAuthorityAfterCommitBeforeEffect,
+    AdminAfterCommitBeforeResponse,
+    ReconciliationAfterCommitBeforeEffect,
+    MigrationAfterCommitBeforeProgress,
     SnapshotAfterStageBeforeInstall,
     RebalanceAfterPlanPersist,
     RebalanceAfterReservationBeforeHandoff,
@@ -23,11 +32,20 @@ pub enum Failpoint {
 }
 
 impl Failpoint {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 26] = [
         Self::AssociationAfterHandshakeBeforeCatalogue,
         Self::ControlAfterOutboxBeforeSocketWrite,
         Self::ControlAfterRemoteApplyBeforeAck,
         Self::CoordinatorAfterEtcdCommitBeforeDelta,
+        Self::MemberBeforeGuardedCommit,
+        Self::PlanBeforeGuardedCommit,
+        Self::AuthorityBeforeGuardedCommit,
+        Self::AdminBeforeGuardedCommit,
+        Self::InitialAuthorityAfterCommitBeforeEffect,
+        Self::FenceAuthorityAfterCommitBeforeEffect,
+        Self::AdminAfterCommitBeforeResponse,
+        Self::ReconciliationAfterCommitBeforeEffect,
+        Self::MigrationAfterCommitBeforeProgress,
         Self::SnapshotAfterStageBeforeInstall,
         Self::RebalanceAfterPlanPersist,
         Self::RebalanceAfterReservationBeforeHandoff,
@@ -53,6 +71,21 @@ impl Failpoint {
             Self::CoordinatorAfterEtcdCommitBeforeDelta => {
                 "coordinator_after_etcd_commit_before_delta"
             }
+            Self::MemberBeforeGuardedCommit => "member_before_guarded_commit",
+            Self::PlanBeforeGuardedCommit => "plan_before_guarded_commit",
+            Self::AuthorityBeforeGuardedCommit => "authority_before_guarded_commit",
+            Self::AdminBeforeGuardedCommit => "admin_before_guarded_commit",
+            Self::InitialAuthorityAfterCommitBeforeEffect => {
+                "initial_authority_after_commit_before_effect"
+            }
+            Self::FenceAuthorityAfterCommitBeforeEffect => {
+                "fence_authority_after_commit_before_effect"
+            }
+            Self::AdminAfterCommitBeforeResponse => "admin_after_commit_before_response",
+            Self::ReconciliationAfterCommitBeforeEffect => {
+                "reconciliation_after_commit_before_effect"
+            }
+            Self::MigrationAfterCommitBeforeProgress => "migration_after_commit_before_progress",
             Self::SnapshotAfterStageBeforeInstall => "snapshot_after_stage_before_install",
             Self::RebalanceAfterPlanPersist => "rebalance_after_plan_persist",
             Self::RebalanceAfterReservationBeforeHandoff => {

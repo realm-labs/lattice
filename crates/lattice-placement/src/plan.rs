@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::allocation::{ProposedMove, RebalanceProposal, RebalanceTrigger};
-use crate::types::{AssignmentGeneration, CoordinatorTerm, NodeKey, Revision, ShardId};
+use crate::types::{
+    AssignmentGeneration, CoordinatorTerm, NodeKey, PlanRevision, ShardId, StateVersion,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanStatus {
@@ -33,7 +35,7 @@ pub struct RebalanceMove {
     pub target: NodeKey,
     pub estimated_weight: u64,
     pub progress: MoveProgress,
-    pub barrier_revision: Option<Revision>,
+    pub barrier_version: Option<StateVersion>,
     pub barrier_sessions: BTreeSet<NodeIncarnation>,
 }
 
@@ -43,8 +45,8 @@ pub struct RebalancePlan {
     pub entity_type: EntityType,
     pub reason: PlanReason,
     pub coordinator_term: CoordinatorTerm,
-    pub base_revision: Revision,
-    pub revision: Revision,
+    pub base_version: StateVersion,
+    pub record_revision: PlanRevision,
     pub policy_id: String,
     pub policy_version: u32,
     pub status: PlanStatus,
@@ -92,8 +94,8 @@ impl RebalancePlan {
             entity_type,
             reason: PlanReason::from(&proposal.trigger),
             coordinator_term,
-            base_revision: proposal.base_revision,
-            revision: Revision::new(1).expect("one is a valid plan revision"),
+            base_version: proposal.base_version,
+            record_revision: PlanRevision::new(1).expect("one is a valid plan revision"),
             policy_id: proposal.policy_id.to_owned(),
             policy_version: proposal.policy_version,
             status: PlanStatus::Planned,
@@ -107,7 +109,7 @@ impl RebalancePlan {
                     target: movement.target,
                     estimated_weight: movement.estimated_weight,
                     progress: MoveProgress::Pending,
-                    barrier_revision: None,
+                    barrier_version: None,
                     barrier_sessions: BTreeSet::new(),
                 })
                 .collect(),
@@ -143,7 +145,7 @@ impl RebalancePlan {
     pub fn install_barrier(
         &mut self,
         shard_id: ShardId,
-        revision: Revision,
+        version: StateVersion,
         sessions: BTreeSet<NodeIncarnation>,
     ) -> Result<(), PlanError> {
         let movement = self
@@ -151,10 +153,10 @@ impl RebalancePlan {
             .iter_mut()
             .find(|movement| movement.shard_id == shard_id)
             .ok_or(PlanError::UnknownShard)?;
-        if movement.progress != MoveProgress::Handoff || movement.barrier_revision.is_some() {
+        if movement.progress != MoveProgress::Handoff || movement.barrier_version.is_some() {
             return Err(PlanError::IllegalProgress);
         }
-        movement.barrier_revision = Some(revision);
+        movement.barrier_version = Some(version);
         movement.barrier_sessions = sessions;
         Ok(())
     }

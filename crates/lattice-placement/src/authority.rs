@@ -94,7 +94,7 @@ impl PlacementAuthority {
                     current.key == slot.key
                         && current.owner == slot.owner
                         && current.assignment_generation == slot.assignment_generation
-                        && current.coordinator_term == slot.coordinator_term
+                        && current.version.term == slot.version.term
                 });
                 self.slot = Some(slot);
                 if !same_authority {
@@ -172,7 +172,7 @@ impl PlacementAuthority {
             || grant.owner != self.local_node
             || slot.owner.as_ref() != Some(&self.local_node)
             || grant.assignment_generation != slot.assignment_generation
-            || grant.coordinator_term != slot.coordinator_term
+            || grant.coordinator_term != slot.version.term
         {
             return Err(AuthorityError::StaleGrant);
         }

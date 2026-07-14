@@ -211,9 +211,9 @@ impl LogicJoinRuntime {
         handle: &LogicCoordinatorHandle,
     ) -> Result<(), ()> {
         match effect {
-            LogicPlacementEffect::MemberSnapshot { revision, members } => self
+            LogicPlacementEffect::MemberSnapshot { version, members } => self
                 .members
-                .install_snapshot(revision, members)
+                .install_snapshot(version, members)
                 .map_err(|_| ()),
             LogicPlacementEffect::MemberEvent(event) => {
                 if let MemberEvent {

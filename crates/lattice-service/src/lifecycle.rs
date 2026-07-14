@@ -71,13 +71,17 @@ impl ServiceLifecycle {
             (State::Joining, Event::SnapshotInstalled) => {
                 (State::Ready, &[Effect::OpenExternalAdmission])
             }
+            // A join has no external admission to close. Stay in Joining so a
+            // fresh snapshot, not a mere reconnect, remains the readiness gate.
+            (State::Joining, Event::CoordinatorLost | Event::Reconciled) => (State::Joining, &[]),
             (State::Ready, Event::CoordinatorLost) => {
                 (State::Degraded, &[Effect::CloseExternalAdmission])
             }
             (State::Degraded, Event::Reconciled) => {
                 (State::Ready, &[Effect::OpenExternalAdmission])
             }
-            (State::Ready | State::Degraded, Event::BeginDrain) => (
+            (State::Ready, Event::Reconciled) => (State::Ready, &[]),
+            (State::Joining | State::Ready | State::Degraded, Event::BeginDrain) => (
                 State::Draining,
                 &[Effect::CloseExternalAdmission, Effect::BeginPlacementDrain],
             ),
@@ -146,5 +150,32 @@ mod tests {
                 .is_err()
         );
         assert_eq!(lifecycle.state(), ServiceLifecycleState::Booting);
+    }
+
+    #[test]
+    fn coordinator_loss_during_join_still_requires_snapshot() {
+        let mut lifecycle = ServiceLifecycle::default();
+        lifecycle
+            .transition(ServiceLifecycleEvent::RemotingReady)
+            .unwrap();
+        assert!(
+            lifecycle
+                .transition(ServiceLifecycleEvent::CoordinatorLost)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            lifecycle
+                .transition(ServiceLifecycleEvent::Reconciled)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(lifecycle.state(), ServiceLifecycleState::Joining);
+        assert_eq!(
+            lifecycle
+                .transition(ServiceLifecycleEvent::SnapshotInstalled)
+                .unwrap(),
+            vec![ServiceLifecycleEffect::OpenExternalAdmission]
+        );
     }
 }

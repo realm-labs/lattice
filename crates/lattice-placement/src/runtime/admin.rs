@@ -1,37 +1,64 @@
 use super::membership::plan_priority;
 use super::{
-    AppliedAdminOperation, BTreeMap, CoordinatorInspection, CoordinatorLeader,
-    CoordinatorOperation, CoordinatorRuntimeError, CoordinatorStore, ForceRemoveRequest,
+    BTreeMap, CoordinatorInspection, CoordinatorLeader, CoordinatorOperation,
+    CoordinatorRuntimeError, CoordinatorStore, ForceRemoveRequest, Instant,
     ManualRelocationRequest, MoveProgress, NodeKey, PlacementSlotKey, PlacementSlotState,
     PlanReason, PlanStatus, RebalancePlan, RebalanceProposal, RebalanceTrigger,
 };
+use crate::storage::domain::{
+    AdminOperationRecord, AdminOperationResult, AdminOperationStatus, AutomaticBalanceSettings,
+    CommitAutomaticSettings, CompactAdminOperations, CreatePlan, CreatePlanWithOperation,
+    RecordAdminOperation, RemoveMemberWithOperation, UpdatePlan, UpdatePlanWithOperation,
+};
+
+struct PlanAdminContext {
+    operation_id: String,
+    fingerprint: String,
+    evaluation: bool,
+}
 
 impl<S: CoordinatorStore> CoordinatorLeader<S> {
-    pub(super) async fn handle_operation(&mut self, operation: CoordinatorOperation) {
-        match operation {
+    pub(super) async fn handle_operation(
+        &mut self,
+        operation: CoordinatorOperation,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let leadership_lost = match operation {
             CoordinatorOperation::SubmitRebalance {
                 proposal,
                 entity_type,
                 completion,
             } => {
                 let result = self.submit_rebalance(proposal, entity_type).await;
+                self.observe_operation_result("submit_rebalance", &result);
+                let lost = operation_lost_leadership(&result);
                 let _ = completion.send(result);
+                lost
             }
             CoordinatorOperation::CancelPending {
+                operation_id,
                 plan_id,
                 shard_id,
                 completion,
             } => {
-                let result = self.cancel_pending(plan_id, shard_id).await;
+                let result = self.cancel_pending(operation_id, plan_id, shard_id).await;
+                self.observe_operation_result("cancel_pending", &result);
+                let lost = operation_lost_leadership(&result);
                 let _ = completion.send(result);
+                lost
             }
             CoordinatorOperation::Evaluate {
+                operation_id,
                 entity_type,
                 trigger,
                 completion,
             } => {
-                let result = self.evaluate_rebalance(entity_type, trigger).await;
+                let result = self
+                    .evaluate_rebalance_operation(operation_id, entity_type, trigger)
+                    .await;
+                self.observe_operation_result("evaluate_rebalance", &result);
+                let lost = operation_lost_leadership(&result);
                 let _ = completion.send(result);
+                lost
             }
             CoordinatorOperation::SetAutomatic {
                 operation_id,
@@ -42,26 +69,71 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 let result = self
                     .set_automatic_paused(operation_id, entity_type, paused)
                     .await;
+                self.observe_operation_result("set_automatic", &result);
+                let lost = operation_lost_leadership(&result);
                 let _ = completion.send(result);
+                lost
             }
             CoordinatorOperation::ManualRelocate {
                 request,
                 completion,
             } => {
                 let result = self.manual_relocate(request).await;
+                self.observe_operation_result("manual_relocate", &result);
+                let lost = operation_lost_leadership(&result);
                 let _ = completion.send(result);
+                lost
             }
             CoordinatorOperation::ForceRemove {
                 request,
                 completion,
             } => {
                 let result = self.force_remove(request).await;
+                self.observe_operation_result("force_remove", &result);
+                let lost = operation_lost_leadership(&result);
                 let _ = completion.send(result);
+                lost
             }
             CoordinatorOperation::Inspect { completion } => {
                 let result = self.inspect().await;
+                let lost = operation_lost_leadership(&result);
                 let _ = completion.send(result);
+                lost
             }
+        };
+        if leadership_lost {
+            Err(crate::storage::StorageError::LeadershipLost.into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn observe_operation_result<T>(
+        &mut self,
+        family: &'static str,
+        result: &Result<T, CoordinatorRuntimeError>,
+    ) {
+        let Err(CoordinatorRuntimeError::Storage(error)) = result else {
+            return;
+        };
+        match error {
+            crate::storage::StorageError::LeadershipLost => {
+                self.leadership_loss_count = self.leadership_loss_count.saturating_add(1);
+                tracing::warn!(
+                    operation_family = family,
+                    "Coordinator leadership was fenced"
+                );
+            }
+            crate::storage::StorageError::CompareFailed => {
+                self.commit_conflict_count = self.commit_conflict_count.saturating_add(1);
+            }
+            crate::storage::StorageError::OutcomeUnknown => {
+                self.unknown_outcome_count = self.unknown_outcome_count.saturating_add(1);
+            }
+            crate::storage::StorageError::Capacity => {
+                self.capacity_rejection_count = self.capacity_rejection_count.saturating_add(1);
+            }
+            _ => {}
         }
     }
 
@@ -76,22 +148,59 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             entity_type.as_ref().map_or("*", |value| value.as_str()),
             paused
         );
-        if self
-            .prior_admin_operation(&operation_id, &fingerprint)?
-            .is_some()
-        {
-            return Ok(());
+        if let Some(result) = self.prior_admin_operation(&operation_id, &fingerprint)? {
+            return if result == AdminOperationResult::AutomaticBalanceUpdated {
+                Ok(())
+            } else {
+                Err(CoordinatorRuntimeError::IdempotencyConflict)
+            };
         }
+        self.reserve_admin_operation_capacity().await?;
+        let mut settings = self
+            .automatic_settings
+            .clone()
+            .unwrap_or(AutomaticBalanceSettings {
+                globally_paused: false,
+                paused_entity_types: Default::default(),
+                version: self.version,
+            });
         match entity_type {
             Some(entity_type) if paused => {
-                self.paused_entity_types.insert(entity_type);
+                settings.paused_entity_types.insert(entity_type);
             }
             Some(entity_type) => {
-                self.paused_entity_types.remove(&entity_type);
+                settings.paused_entity_types.remove(&entity_type);
             }
-            None => self.automatic_globally_paused = paused,
+            None => settings.globally_paused = paused,
         }
-        self.record_admin_operation(operation_id, fingerprint, None)
+        settings.version = self.version;
+        let operation = self.new_admin_operation(
+            operation_id,
+            fingerprint,
+            AdminOperationResult::AutomaticBalanceUpdated,
+            self.version,
+        )?;
+        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::AdminBeforeGuardedCommit);
+        let settings = self
+            .store
+            .commit_automatic_settings(
+                &self.leader_guard,
+                CommitAutomaticSettings {
+                    expected: self.automatic_settings.clone(),
+                    settings,
+                    operation: operation.clone(),
+                },
+            )
+            .await?;
+        lattice_core::failpoint::hit(
+            lattice_core::failpoint::Failpoint::AdminAfterCommitBeforeResponse,
+        );
+        self.automatic_globally_paused = settings.globally_paused;
+        self.paused_entity_types = settings.paused_entity_types.clone();
+        self.automatic_settings = Some(settings);
+        self.applied_admin_operations
+            .insert(operation.operation_id.clone(), operation);
+        self.compact_admin_operation_history().await
     }
 
     pub(super) async fn manual_relocate(
@@ -106,7 +215,17 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             request.target_node_id
         );
         if let Some(previous) = self.prior_admin_operation(&request.operation_id, &fingerprint)? {
-            return previous.ok_or(CoordinatorRuntimeError::InvalidAdminOperation);
+            return match previous {
+                AdminOperationResult::PlanCreated { plan_id } => Ok(plan_id),
+                _ => Err(CoordinatorRuntimeError::IdempotencyConflict),
+            };
+        }
+        let config = self
+            .entity_configs
+            .get(&request.entity_type)
+            .ok_or(CoordinatorRuntimeError::UnknownEntityConfig)?;
+        if request.shard_id.get() >= config.shard_count {
+            return Err(CoordinatorRuntimeError::ShardOutOfRange);
         }
         let key = PlacementSlotKey::Shard {
             entity_type: request.entity_type.clone(),
@@ -136,10 +255,6 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             })
             .map(|session| session.hello.node.clone())
             .ok_or(CoordinatorRuntimeError::IneligibleTarget)?;
-        let config = self
-            .entity_configs
-            .get(&request.entity_type)
-            .ok_or(CoordinatorRuntimeError::UnknownEntityConfig)?;
         let strategy = self
             .strategies
             .get(&(
@@ -150,7 +265,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         let proposal = RebalanceProposal {
             policy_id: strategy.policy_id(),
             policy_version: strategy.policy_version(),
-            base_revision: self.revision,
+            base_version: self.version,
             trigger: RebalanceTrigger::Manual {
                 source: Some(source.clone()),
                 target: Some(target.clone()),
@@ -165,9 +280,16 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 estimated_weight: 1,
             }],
         };
-        let plan_id = self.submit_rebalance(proposal, request.entity_type).await?;
-        self.record_admin_operation(request.operation_id, fingerprint, Some(plan_id))?;
-        Ok(plan_id)
+        self.submit_rebalance_inner(
+            proposal,
+            request.entity_type,
+            Some(PlanAdminContext {
+                operation_id: request.operation_id,
+                fingerprint,
+                evaluation: false,
+            }),
+        )
+        .await
     }
 
     pub(super) async fn force_remove(
@@ -179,14 +301,16 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             request.node_id,
             request.expected_incarnation.get()
         );
-        if self
-            .prior_admin_operation(&request.operation_id, &fingerprint)?
-            .is_some()
-        {
-            return Ok(());
-        }
-        if self.applied_admin_operations.len() == self.config.maximum_operations {
-            return Err(CoordinatorRuntimeError::OperationCapacity);
+        if let Some(previous) = self.prior_admin_operation(&request.operation_id, &fingerprint)? {
+            return match previous {
+                AdminOperationResult::MemberRemoved {
+                    ref node_id,
+                    incarnation,
+                } if node_id == &request.node_id && incarnation == request.expected_incarnation => {
+                    Ok(())
+                }
+                _ => Err(CoordinatorRuntimeError::IdempotencyConflict),
+            };
         }
         let member = self
             .store
@@ -196,22 +320,68 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         if member.node.incarnation != request.expected_incarnation {
             return Err(CoordinatorRuntimeError::StaleMember);
         }
-        self.remove_member(
+        self.reserve_admin_operation_capacity().await?;
+        let version = self.next_version()?;
+        let operation = self.new_admin_operation(
+            request.operation_id,
+            fingerprint,
+            AdminOperationResult::MemberRemoved {
+                node_id: request.node_id,
+                incarnation: request.expected_incarnation,
+            },
+            version,
+        )?;
+        self.store
+            .remove_member_with_operation(
+                &self.leader_guard,
+                RemoveMemberWithOperation {
+                    expected_member: member.clone(),
+                    operation: operation.clone(),
+                },
+            )
+            .await?;
+        self.applied_admin_operations
+            .insert(operation.operation_id.clone(), operation);
+        self.finish_member_removal(
             member,
             crate::coordinator::MemberRemovalReason::ForceRemoved,
+            version,
         )
         .await?;
-        self.record_admin_operation(request.operation_id, fingerprint, None)
+        self.compact_admin_operation_history().await
     }
 
     pub(super) async fn inspect(&self) -> Result<CoordinatorInspection, CoordinatorRuntimeError> {
+        let now = Instant::now();
         Ok(CoordinatorInspection {
-            term: self.leader.term,
-            revision: self.revision,
+            version: self.version,
             automatic_globally_paused: self.automatic_globally_paused,
             paused_entity_types: self.paused_entity_types.iter().cloned().collect(),
             slots: self.store.list_slots().await?,
             plans: self.store.list_plans().await?,
+            reconciliation_backlog: self.reconciliation.backlog,
+            reconciliation_oldest_pending_millis: self.reconciliation.oldest_pending.map(
+                |started| {
+                    u64::try_from(now.duration_since(started).as_millis()).unwrap_or(u64::MAX)
+                },
+            ),
+            reconciliation_last_success_age_millis: self.reconciliation.last_success.map(
+                |finished| {
+                    u64::try_from(now.duration_since(finished).as_millis()).unwrap_or(u64::MAX)
+                },
+            ),
+            quarantined_records: self
+                .reconciliation
+                .quarantined
+                .iter()
+                .map(|(key, reason)| (key.clone(), reason.clone()))
+                .collect(),
+            durable_limits: self.store.durable_limits(),
+            retained_admin_operations: self.applied_admin_operations.len(),
+            leadership_loss_count: self.leadership_loss_count,
+            commit_conflict_count: self.commit_conflict_count,
+            unknown_outcome_count: self.unknown_outcome_count,
+            capacity_rejection_count: self.capacity_rejection_count,
         })
     }
 
@@ -219,7 +389,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         &self,
         operation_id: &str,
         fingerprint: &str,
-    ) -> Result<Option<Option<u128>>, CoordinatorRuntimeError> {
+    ) -> Result<Option<AdminOperationResult>, CoordinatorRuntimeError> {
         if operation_id.is_empty() || operation_id.len() > 256 {
             return Err(CoordinatorRuntimeError::InvalidAdminOperation);
         }
@@ -227,7 +397,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .get(operation_id)
             .map(|previous| {
                 if previous.fingerprint == fingerprint {
-                    Ok(previous.plan_id)
+                    Ok(previous.result.clone())
                 } else {
                     Err(CoordinatorRuntimeError::IdempotencyConflict)
                 }
@@ -235,22 +405,98 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .transpose()
     }
 
-    pub(super) fn record_admin_operation(
-        &mut self,
+    fn new_admin_operation(
+        &self,
         operation_id: String,
         fingerprint: String,
-        plan_id: Option<u128>,
-    ) -> Result<(), CoordinatorRuntimeError> {
-        if self.applied_admin_operations.len() == self.config.maximum_operations {
+        result: AdminOperationResult,
+        version: crate::types::StateVersion,
+    ) -> Result<AdminOperationRecord, CoordinatorRuntimeError> {
+        if self.applied_admin_operations.len() >= self.config.maximum_admin_operation_records {
             return Err(CoordinatorRuntimeError::OperationCapacity);
         }
-        self.applied_admin_operations.insert(
+        let created_unix_millis = unix_millis()?;
+        let retention =
+            u64::try_from(self.config.admin_operation_retention.as_millis()).unwrap_or(u64::MAX);
+        Ok(AdminOperationRecord {
             operation_id,
-            AppliedAdminOperation {
-                fingerprint,
-                plan_id,
-            },
-        );
+            fingerprint,
+            status: AdminOperationStatus::Completed,
+            result,
+            version,
+            created_unix_millis,
+            expires_unix_millis: created_unix_millis.saturating_add(retention),
+        })
+    }
+
+    async fn persist_admin_operation(
+        &mut self,
+        operation: AdminOperationRecord,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let operation = self
+            .store
+            .record_admin_operation(
+                &self.leader_guard,
+                RecordAdminOperation {
+                    operation: operation.clone(),
+                },
+            )
+            .await?;
+        self.applied_admin_operations
+            .insert(operation.operation_id.clone(), operation);
+        self.compact_admin_operation_history().await
+    }
+
+    pub(super) async fn compact_admin_operation_history(
+        &mut self,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        self.compact_admin_operation_history_for(0).await
+    }
+
+    async fn reserve_admin_operation_capacity(&mut self) -> Result<(), CoordinatorRuntimeError> {
+        self.compact_admin_operation_history_for(1).await?;
+        if self.applied_admin_operations.len() >= self.config.maximum_admin_operation_records {
+            return Err(CoordinatorRuntimeError::OperationCapacity);
+        }
+        Ok(())
+    }
+
+    async fn compact_admin_operation_history_for(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let now = unix_millis()?;
+        let mut records = self
+            .applied_admin_operations
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| (record.created_unix_millis, record.operation_id.clone()));
+        let excess = records
+            .len()
+            .saturating_add(additional)
+            .saturating_sub(self.config.maximum_admin_operation_records);
+        let expected = records
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                (record.expires_unix_millis <= now || index < excess).then_some(record)
+            })
+            .collect::<Vec<_>>();
+        if expected.is_empty() {
+            return Ok(());
+        }
+        self.store
+            .compact_admin_operations(
+                &self.leader_guard,
+                CompactAdminOperations {
+                    expected: expected.clone(),
+                },
+            )
+            .await?;
+        for record in expected {
+            self.applied_admin_operations.remove(&record.operation_id);
+        }
         Ok(())
     }
 
@@ -299,12 +545,93 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         Ok(Some(plan_id))
     }
 
+    async fn evaluate_rebalance_operation(
+        &mut self,
+        operation_id: String,
+        entity_type: lattice_core::actor_ref::EntityType,
+        trigger: RebalanceTrigger,
+    ) -> Result<Option<u128>, CoordinatorRuntimeError> {
+        let fingerprint = format!("evaluate:{}:{trigger:?}", entity_type.as_str());
+        if let Some(previous) = self.prior_admin_operation(&operation_id, &fingerprint)? {
+            return match previous {
+                AdminOperationResult::EvaluationCompleted { plan_id } => Ok(plan_id),
+                _ => Err(CoordinatorRuntimeError::IdempotencyConflict),
+            };
+        }
+        if trigger == RebalanceTrigger::Automatic
+            && (self.automatic_globally_paused || self.paused_entity_types.contains(&entity_type))
+        {
+            return Err(CoordinatorRuntimeError::Allocation(
+                crate::allocation::AllocationError::AutomaticPaused,
+            ));
+        }
+        let config = self
+            .entity_configs
+            .get(&entity_type)
+            .cloned()
+            .ok_or(CoordinatorRuntimeError::UnknownEntityConfig)?;
+        let strategy = self
+            .strategies
+            .get(&(
+                config.allocation_policy_id.clone(),
+                config.allocation_policy_version,
+            ))
+            .cloned()
+            .ok_or(CoordinatorRuntimeError::UnknownStrategy)?;
+        let view = self.placement_view().await?;
+        let proposal = strategy
+            .rebalance(
+                &entity_type,
+                config.protocol_id,
+                trigger.clone(),
+                &view,
+                self.config.rebalance_limits,
+            )
+            .map_err(CoordinatorRuntimeError::Allocation)?;
+        if proposal.moves.is_empty() {
+            self.reserve_admin_operation_capacity().await?;
+            let operation = self.new_admin_operation(
+                operation_id,
+                fingerprint,
+                AdminOperationResult::EvaluationCompleted { plan_id: None },
+                self.version,
+            )?;
+            self.persist_admin_operation(operation).await?;
+            return Ok(None);
+        }
+        let plan_id = self
+            .submit_rebalance_inner(
+                proposal,
+                entity_type,
+                Some(PlanAdminContext {
+                    operation_id,
+                    fingerprint,
+                    evaluation: true,
+                }),
+            )
+            .await?;
+        if trigger == RebalanceTrigger::Automatic {
+            self.last_automatic_move_at = Some(view.now);
+        }
+        Ok(Some(plan_id))
+    }
+
     pub(super) async fn submit_rebalance(
         &mut self,
         proposal: RebalanceProposal,
         entity_type: lattice_core::actor_ref::EntityType,
     ) -> Result<u128, CoordinatorRuntimeError> {
-        if proposal.base_revision != self.revision
+        self.submit_rebalance_inner(proposal, entity_type, None)
+            .await
+    }
+
+    async fn submit_rebalance_inner(
+        &mut self,
+        proposal: RebalanceProposal,
+        entity_type: lattice_core::actor_ref::EntityType,
+        admin: Option<PlanAdminContext>,
+    ) -> Result<u128, CoordinatorRuntimeError> {
+        if proposal.base_version != self.version
             || proposal.moves.len() > self.config.rebalance_limits.moves_per_round
         {
             return Err(CoordinatorRuntimeError::StaleProposal);
@@ -325,15 +652,53 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         {
             return Err(CoordinatorRuntimeError::PlanConflict);
         }
+        if admin.is_some() {
+            self.reserve_admin_operation_capacity().await?;
+        }
         self.preempt_lower_priority(plan.reason.clone()).await?;
         self.revalidate_plan(&plan).await?;
-        self.store
-            .compare_and_put_plan(None, plan.clone(), plan.revision)
-            .await?;
-        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::RebalanceAfterPlanPersist);
         let plan_id = plan.plan_id;
+        let operation = admin
+            .map(|admin| {
+                let result = if admin.evaluation {
+                    AdminOperationResult::EvaluationCompleted {
+                        plan_id: Some(plan_id),
+                    }
+                } else {
+                    AdminOperationResult::PlanCreated { plan_id }
+                };
+                self.new_admin_operation(
+                    admin.operation_id,
+                    admin.fingerprint,
+                    result,
+                    self.version,
+                )
+            })
+            .transpose()?;
+        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::PlanBeforeGuardedCommit);
+        if let Some(operation) = operation.clone() {
+            self.store
+                .create_plan_with_operation(
+                    &self.leader_guard,
+                    CreatePlanWithOperation {
+                        plan: plan.clone(),
+                        operation: operation.clone(),
+                    },
+                )
+                .await?;
+            self.applied_admin_operations
+                .insert(operation.operation_id.clone(), operation);
+        } else {
+            self.store
+                .create_plan(&self.leader_guard, CreatePlan { plan: plan.clone() })
+                .await?;
+        }
+        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::RebalanceAfterPlanPersist);
         self.plans.insert(plan_id, plan);
         self.start_pending_moves(plan_id).await?;
+        if operation.is_some() {
+            self.compact_admin_operation_history().await?;
+        }
         Ok(plan_id)
     }
 
@@ -360,17 +725,23 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             if pending.is_empty() {
                 continue;
             }
-            let expected = plan.revision;
+            let expected_plan = plan.clone();
             for shard_id in pending {
                 plan.cancel_pending_move(shard_id)
                     .map_err(CoordinatorRuntimeError::Plan)?;
             }
-            plan.revision = plan
-                .revision
+            plan.record_revision = plan
+                .record_revision
                 .next()
                 .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
             self.store
-                .compare_and_put_plan(Some(expected), plan.clone(), plan.revision)
+                .update_plan(
+                    &self.leader_guard,
+                    UpdatePlan {
+                        expected: expected_plan,
+                        plan: plan.clone(),
+                    },
+                )
                 .await?;
             self.plans.insert(plan_id, plan);
         }
@@ -405,7 +776,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 .get_slot(&key)
                 .await?
                 .ok_or(CoordinatorRuntimeError::UnknownSlot)?;
-            if slot.revision > plan.base_revision
+            if slot.version > plan.base_version
                 || slot.owner.as_ref() != Some(&movement.source)
                 || slot.assignment_generation != movement.expected_generation
                 || slot.state != PlacementSlotState::Running
@@ -438,26 +809,68 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
 
     pub(super) async fn cancel_pending(
         &mut self,
+        operation_id: String,
         plan_id: u128,
         shard_id: crate::types::ShardId,
     ) -> Result<(), CoordinatorRuntimeError> {
+        let fingerprint = format!("cancel:{plan_id:032x}:{}", shard_id.get());
+        if let Some(previous) = self.prior_admin_operation(&operation_id, &fingerprint)? {
+            return if previous == (AdminOperationResult::PendingMoveCancelled { plan_id, shard_id })
+            {
+                Ok(())
+            } else {
+                Err(CoordinatorRuntimeError::IdempotencyConflict)
+            };
+        }
         let mut plan = self
             .plans
             .get(&plan_id)
             .cloned()
             .ok_or(CoordinatorRuntimeError::UnknownPlan)?;
-        let expected = plan.revision;
+        let expected_plan = plan.clone();
         plan.cancel_pending_move(shard_id)
             .map_err(CoordinatorRuntimeError::Plan)?;
-        plan.revision = plan
-            .revision
+        plan.record_revision = plan
+            .record_revision
             .next()
             .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
+        self.reserve_admin_operation_capacity().await?;
+        let operation = self.new_admin_operation(
+            operation_id,
+            fingerprint,
+            AdminOperationResult::PendingMoveCancelled { plan_id, shard_id },
+            self.version,
+        )?;
         self.store
-            .compare_and_put_plan(Some(expected), plan.clone(), plan.revision)
+            .update_plan_with_operation(
+                &self.leader_guard,
+                UpdatePlanWithOperation {
+                    expected_plan,
+                    plan: plan.clone(),
+                    operation: operation.clone(),
+                },
+            )
             .await?;
         self.plans.insert(plan_id, plan);
+        self.applied_admin_operations
+            .insert(operation.operation_id.clone(), operation);
         self.compact_plan_history().await?;
-        Ok(())
+        self.compact_admin_operation_history().await
     }
+}
+
+fn operation_lost_leadership<T>(result: &Result<T, CoordinatorRuntimeError>) -> bool {
+    matches!(
+        result,
+        Err(CoordinatorRuntimeError::Storage(
+            crate::storage::StorageError::LeadershipLost
+        ))
+    )
+}
+
+fn unix_millis() -> Result<u64, CoordinatorRuntimeError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .map_err(|_| CoordinatorRuntimeError::InvalidAdminOperation)
 }

@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use lattice_core::actor_ref::{EntityType, NodeIncarnation, ProtocolId};
 use thiserror::Error;
 
-use crate::types::{
-    AssignmentGeneration, CoordinatorTerm, MonotonicTime, NodeKey, Revision, ShardId,
-};
+use crate::types::{AssignmentGeneration, MonotonicTime, NodeKey, ShardId, StateVersion};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadSample {
@@ -47,8 +45,7 @@ impl PlacedShard {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementView {
-    pub coordinator_term: CoordinatorTerm,
-    pub revision: Revision,
+    pub version: StateVersion,
     pub now: MonotonicTime,
     pub reconciled: bool,
     pub degraded: bool,
@@ -142,7 +139,7 @@ pub struct ProposedMove {
 pub struct RebalanceProposal {
     pub policy_id: &'static str,
     pub policy_version: u32,
-    pub base_revision: Revision,
+    pub base_version: StateVersion,
     pub trigger: RebalanceTrigger,
     pub moves: Vec<ProposedMove>,
 }
@@ -322,7 +319,7 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
         Ok(RebalanceProposal {
             policy_id: self.policy_id(),
             policy_version: self.policy_version(),
-            base_revision: view.revision,
+            base_version: view.version,
             trigger,
             moves,
         })
@@ -557,8 +554,10 @@ mod tests {
             draining: false,
         };
         let view = PlacementView {
-            coordinator_term: CoordinatorTerm::new(1).unwrap(),
-            revision: Revision::new(1).unwrap(),
+            version: crate::types::StateVersion::new(
+                crate::types::CoordinatorTerm::new(1).unwrap(),
+                crate::types::Revision::new(1).unwrap(),
+            ),
             now: MonotonicTime::from_millis(100_000),
             reconciled: true,
             degraded: false,

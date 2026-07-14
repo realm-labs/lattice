@@ -46,8 +46,7 @@ mod tests {
             owner: Some(owner),
             target: None,
             assignment_generation: AssignmentGeneration::new(2).unwrap(),
-            coordinator_term: CoordinatorTerm::new(4).unwrap(),
-            revision: Revision::new(9).unwrap(),
+            version: StateVersion::new(CoordinatorTerm::new(4).unwrap(), Revision::new(9).unwrap()),
             state: PlacementSlotState::Running,
             active_move: None,
             barrier_sessions: Default::default(),
@@ -67,7 +66,7 @@ mod tests {
                 grant: ClaimGrant {
                     slot: slot.key.clone(),
                     owner: local,
-                    coordinator_term: slot.coordinator_term,
+                    coordinator_term: slot.version.term,
                     assignment_generation: slot.assignment_generation,
                     grant_sequence: GrantSequence::new(1).unwrap(),
                     ttl: Duration::from_secs(15),
@@ -127,8 +126,7 @@ mod tests {
             draining: false,
         };
         let view = PlacementView {
-            coordinator_term: CoordinatorTerm::new(1).unwrap(),
-            revision: Revision::new(1).unwrap(),
+            version: StateVersion::new(CoordinatorTerm::new(1).unwrap(), Revision::new(1).unwrap()),
             now: MonotonicTime::from_millis(100_000),
             reconciled: true,
             degraded: false,

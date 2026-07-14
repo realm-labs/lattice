@@ -5,12 +5,15 @@
 > Revalidation target: commit `78c197f`; the relevant placement and remoting behavior is unchanged
 > Scope: Coordinator leadership, placement persistence, handoff recovery, control delivery, bootstrap
 > identity, operational durability, and storage bounds
-> Verification: source audit of the cited paths; the original review's clean `cargo build --lib` result
-> was not rerun because this correction changes documentation only
+> Verification: source audit plus the native, real-etcd, deterministic simulation/model, Docker
+> quality/e2e/HA/chaos/k8s, 15-minute soak, and trace-replay gates recorded in the execution plan
 > Companion documents: [architecture index](architecture/README.md),
 > [production-hardening-plan.md](production-hardening-plan.md), and
 > [cluster-discovery-lifecycle-plan.md](cluster-discovery-lifecycle-plan.md)
 > Execution plan: [coordinator-correctness-implementation-plan.md](coordinator-correctness-implementation-plan.md)
+> Implementation status (2026-07-14): F1-F6 are implemented and accepted in the current worktree.
+> The detailed findings below remain the design/risk record for the pre-hard-switch baseline; exact
+> commands, run IDs, seeds, traces, and artifacts are tracked in the execution plan.
 
 ---
 
@@ -20,13 +23,13 @@ lattice has a strong distributed-systems foundation: exact-incarnation mTLS iden
 leadership and claims, revisioned snapshots, bounded reliable control delivery, explicit authority
 state machines, and shared production/simulation reducers.
 
-The principal correctness risk is narrower than the original review stated:
+The principal correctness risk in the reviewed baseline was narrower than the original review stated:
 
 > **Coordinator mutations are record-CAS protected, but they are not storage-fenced by the current
 > lease-backed leader record. Several placement transitions also span multiple records without an
 > atomic commit.**
 
-That produces two high-priority issues: a stale Coordinator can write after losing leadership, and
+That produced two high-priority issues: a stale Coordinator could write after losing leadership, and
 slot/claim recovery depends on later member activity in one authority-installation crash window.
 The remaining confirmed issues concern durable admin semantics and bounded etcd state.
 
@@ -40,12 +43,12 @@ The original review also reported three remoting defects that are not present:
 
 | ID | Finding | Severity | Disposition |
 |---|---|---:|---|
-| F1 | Placement writes do not prove that the writer still owns the leader lease | **High** | Confirmed |
-| F2 | Initial and replacement authority installation are not atomic slot-plus-claim commits | **High** | Confirmed |
-| F3 | Plan reservation/finalization and slot transitions are separate commits | **Medium** | Confirmed robustness gap |
-| F4 | Admin idempotency and automatic-balance pause state are volatile | **Medium** | Confirmed |
-| F5 | etcd creation paths do not enforce the configured key domain/cardinality | **Medium** | Confirmed |
-| F6 | Unknown persisted member sessions delay incarnation replacement until lease expiry | **Low** | Confirmed, safety-oriented tradeoff |
+| F1 | Placement writes did not prove that the writer still owned the leader lease | **High** | Implemented and accepted |
+| F2 | Initial and replacement authority installation were not atomic slot-plus-claim commits | **High** | Implemented and accepted |
+| F3 | Plan reservation/finalization and slot transitions were separate commits | **Medium** | Implemented and accepted |
+| F4 | Admin idempotency and automatic-balance pause state were volatile | **Medium** | Implemented and accepted |
+| F5 | etcd creation paths did not enforce the configured key domain/cardinality | **Medium** | Implemented and accepted |
+| F6 | Unknown persisted member sessions delayed incarnation replacement until lease expiry | **Low** | Implemented as observable safe waiting and accepted |
 
 Severity in this document measures impact under the documented fault model, not how difficult a fix
 is. “High” means a leadership or crash boundary can violate a required safety/liveness invariant;

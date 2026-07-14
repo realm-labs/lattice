@@ -68,7 +68,7 @@ pub enum LogicPlacementEffect {
     },
     MemberEvent(Box<MemberEvent>),
     MemberSnapshot {
-        revision: crate::types::Revision,
+        version: crate::types::StateVersion,
         members: Vec<MemberRecord>,
     },
     DrainReady {
@@ -497,7 +497,7 @@ impl LogicCoordinatorSession {
                         lattice_core::failpoint::hit(
                             lattice_core::failpoint::Failpoint::SnapshotAfterStageBeforeInstall,
                         );
-                        let revision = install.revision;
+                        let version = install.version;
                         let slots = decode_slots(&install.records)?;
                         let members = decode_members(&install.records)?;
                         self.install_snapshot_slots(slots)?;
@@ -508,10 +508,10 @@ impl LogicCoordinatorSession {
                             .install(install)
                             .map_err(LogicSessionError::Coordinator)?;
                         self.effects
-                            .try_send(LogicPlacementEffect::MemberSnapshot { revision, members })
+                            .try_send(LogicPlacementEffect::MemberSnapshot { version, members })
                             .map_err(|_| LogicSessionError::EffectBackpressure)?;
                         self.send(PlacementControlCommand::JoinReady {
-                            snapshot_revision: revision,
+                            snapshot_version: version,
                         })
                     }
                     PlacementControlCommand::StateDelta(delta) => self.apply_delta(delta),
@@ -556,11 +556,18 @@ impl LogicCoordinatorSession {
                     PlacementControlCommand::DrainSlot {
                         slot: key,
                         generation,
-                        ..
+                        version,
                     } => {
                         let effects = {
                             let mut state =
                                 self.state.lock().expect("logic placement state poisoned");
+                            if state
+                                .session
+                                .version()
+                                .is_none_or(|current| !current.satisfies(version))
+                            {
+                                return Err(LogicSessionError::StaleGeneration);
+                            }
                             let authority = state
                                 .authorities
                                 .get_mut(&key)
@@ -610,7 +617,7 @@ impl LogicCoordinatorSession {
                 .map_err(LogicSessionError::Coordinator)?;
         }
         self.install_slots(slots)?;
-        self.send(PlacementControlCommand::AppliedRevision(delta.revision))
+        self.send(PlacementControlCommand::AppliedRevision(delta.version))
     }
 
     fn apply_member_event(&self, event: MemberEvent) -> Result<(), LogicSessionError> {
@@ -635,7 +642,7 @@ impl LogicCoordinatorSession {
         let mut state = self.state.lock().expect("logic placement state poisoned");
         if member.status != MemberStatus::Up
             || member.node != state.local_node
-            || state.session.revision() != Some(member.revision)
+            || state.session.version() != Some(member.version)
         {
             return Err(LogicSessionError::StaleGeneration);
         }

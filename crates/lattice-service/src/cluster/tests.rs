@@ -28,6 +28,7 @@ use lattice_placement::types::CoordinatorTerm;
 use lattice_placement::types::GrantSequence;
 use lattice_placement::types::PlacementSlot;
 use lattice_placement::types::Revision;
+use lattice_placement::types::StateVersion;
 use lattice_remoting::association::AssociationKey;
 use lattice_remoting::association::LaneAttachment;
 use lattice_remoting::association::LaneKind;
@@ -208,7 +209,7 @@ async fn stage_logic_runtime(
     let state = logic.state();
     let (shutdown, shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(logic.run(controls, shutdown_rx));
-    let revision = slots.iter().map(|slot| slot.revision).max().unwrap();
+    let version = slots.iter().map(|slot| slot.version).max().unwrap();
     let records = slots
         .iter()
         .map(|slot| {
@@ -228,7 +229,7 @@ async fn stage_logic_runtime(
         })
         .collect();
     let limits = SnapshotLimits::default();
-    let (begin, chunks, end) = build_snapshot(revision, records, &limits).unwrap();
+    let (begin, chunks, end) = build_snapshot(version, records, &limits).unwrap();
     let mut commands = vec![PlacementControlCommand::SnapshotBegin(begin)];
     commands.extend(
         chunks
@@ -241,7 +242,7 @@ async fn stage_logic_runtime(
             commands.push(PlacementControlCommand::ClaimGranted(ClaimGrant {
                 slot: slot.key,
                 owner: hello.node.clone(),
-                coordinator_term: slot.coordinator_term,
+                coordinator_term: slot.version.term,
                 assignment_generation: slot.assignment_generation,
                 grant_sequence: GrantSequence::new(1).unwrap(),
                 ttl: Duration::from_secs(5),
@@ -354,15 +355,14 @@ async fn stale_generation_never_reaches_entity_loader() {
         owner: Some(local_node.clone()),
         target: None,
         assignment_generation: AssignmentGeneration::new(2).unwrap(),
-        coordinator_term: CoordinatorTerm::new(1).unwrap(),
-        revision: Revision::new(1).unwrap(),
+        version: StateVersion::new(CoordinatorTerm::new(1).unwrap(), Revision::new(1).unwrap()),
         state: PlacementSlotState::Running,
         active_move: None,
         barrier_sessions: Default::default(),
     };
     let limits = SnapshotLimits::default();
     let (begin, chunks, end) = build_snapshot(
-        Revision::new(1).unwrap(),
+        slot.version,
         vec![SnapshotRecord {
             key: "shard/entity/0".to_owned(),
             value: Bytes::from(serde_json::to_vec(&slot).unwrap()),
@@ -537,8 +537,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         owner: Some(owner_node.clone()),
         target: None,
         assignment_generation: AssignmentGeneration::new(7).unwrap(),
-        coordinator_term: CoordinatorTerm::new(3).unwrap(),
-        revision: Revision::new(9).unwrap(),
+        version: StateVersion::new(CoordinatorTerm::new(3).unwrap(), Revision::new(9).unwrap()),
         state: PlacementSlotState::Running,
         active_move: None,
         barrier_sessions: Default::default(),
@@ -551,8 +550,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         owner: Some(owner_node.clone()),
         target: None,
         assignment_generation: AssignmentGeneration::new(4).unwrap(),
-        coordinator_term: CoordinatorTerm::new(3).unwrap(),
-        revision: Revision::new(9).unwrap(),
+        version: StateVersion::new(CoordinatorTerm::new(3).unwrap(), Revision::new(9).unwrap()),
         state: PlacementSlotState::Running,
         active_move: None,
         barrier_sessions: Default::default(),

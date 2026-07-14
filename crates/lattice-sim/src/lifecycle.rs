@@ -4,7 +4,7 @@ use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
 use lattice_placement::coordinator::{
     MemberChange, MemberEvent, MemberRecord, MemberRemovalReason, MemberStatus, NodeHello,
 };
-use lattice_placement::types::{NodeKey, Revision};
+use lattice_placement::types::{CoordinatorTerm, NodeKey, Revision, StateVersion};
 use lattice_service::cluster::members::{MemberDirectory, MemberDirectoryError};
 use lattice_service::lifecycle::{
     ServiceLifecycle, ServiceLifecycleEffect, ServiceLifecycleError, ServiceLifecycleEvent,
@@ -189,8 +189,8 @@ impl LifecycleScenario {
                 }
                 ServiceLifecycleEffect::ReleaseRuntimeIdentity => {
                     self.state.admission_open = false;
-                    if let Some(revision) = self.members.snapshot().revision {
-                        self.members.install_snapshot(revision, Vec::new())?;
+                    if let Some(version) = self.members.snapshot().version {
+                        self.members.install_snapshot(version, Vec::new())?;
                     }
                 }
                 ServiceLifecycleEffect::BeginPlacementDrain => {}
@@ -255,21 +255,27 @@ fn member(node_id: &str, incarnation: u128, port: u16, revision: u64) -> MemberR
             singleton_configs: Vec::new(),
         },
         status: MemberStatus::Up,
-        revision: Revision::new(revision).unwrap(),
+        version: StateVersion::new(
+            CoordinatorTerm::new(1).unwrap(),
+            Revision::new(revision).unwrap(),
+        ),
         lease_id: i64::try_from(incarnation).unwrap(),
     }
 }
 
 fn upsert(record: MemberRecord) -> MemberEvent {
     MemberEvent {
-        revision: record.revision,
+        version: record.version,
         change: MemberChange::Upsert(Box::new(record)),
     }
 }
 
 fn removed(record: &MemberRecord, revision: u64) -> MemberEvent {
     MemberEvent {
-        revision: Revision::new(revision).unwrap(),
+        version: StateVersion::new(
+            CoordinatorTerm::new(1).unwrap(),
+            Revision::new(revision).unwrap(),
+        ),
         change: MemberChange::Removed {
             node: record.node.clone(),
             reason: MemberRemovalReason::FailureDetected,
@@ -325,7 +331,9 @@ mod tests {
         let scenario = run(20260713);
         assert_eq!(scenario.state.lifecycle, "Terminated");
         assert!(!scenario.state.admission_open);
-        assert_eq!(scenario.state.rejected_stale_events, 1);
+        // Strict StateVersion sequencing rejects every reordered gap, not
+        // only the formerly record-local stale revision.
+        assert_eq!(scenario.state.rejected_stale_events, 6);
     }
 
     #[test]

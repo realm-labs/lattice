@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -512,7 +513,8 @@ impl RemotingEndpoint {
                 }
                 completed = connections.join_next(), if !connections.is_empty() => {
                     if let Some(result) = completed {
-                        let _connection_result = result.map_err(EndpointError::Join)?;
+                        let connection_result = result.map_err(EndpointError::Join)?;
+                        observe_connection_result(&connection_result);
                     }
                 }
                 accepted = listener.accept() => {
@@ -528,7 +530,8 @@ impl RemotingEndpoint {
             }
         }
         while let Some(result) = connections.join_next().await {
-            let _connection_result = result.map_err(EndpointError::Join)?;
+            let connection_result = result.map_err(EndpointError::Join)?;
+            observe_connection_result(&connection_result);
         }
         Ok(())
     }
@@ -765,6 +768,21 @@ impl RemotingEndpoint {
         }
         tasks.push(tokio::spawn(future));
         Ok(())
+    }
+}
+
+fn observe_connection_result(result: &Result<(), EndpointError>) {
+    static FAILURES: AtomicU64 = AtomicU64::new(0);
+    let Err(error) = result else {
+        return;
+    };
+    let count = FAILURES.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if count == 1 || count.is_multiple_of(100) {
+        tracing::warn!(
+            connection_failure_count = count,
+            error = ?error,
+            "inbound remoting connection task failed (subsequent failures are aggregated)"
+        );
     }
 }
 

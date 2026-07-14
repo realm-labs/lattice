@@ -40,8 +40,36 @@ macro_rules! nonzero_counter {
 
 nonzero_counter!(CoordinatorTerm, "Coordinator term");
 nonzero_counter!(Revision, "Coordinator revision");
+nonzero_counter!(PlanRevision, "rebalance plan record revision");
 nonzero_counter!(AssignmentGeneration, "assignment generation");
 nonzero_counter!(GrantSequence, "grant sequence");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StateVersion {
+    pub term: CoordinatorTerm,
+    pub revision: Revision,
+}
+
+impl StateVersion {
+    pub const fn new(term: CoordinatorTerm, revision: Revision) -> Self {
+        Self { term, revision }
+    }
+
+    pub fn next_revision(self) -> Result<Self, PlacementTypeError> {
+        Ok(Self {
+            term: self.term,
+            revision: self.revision.next()?,
+        })
+    }
+
+    pub fn accepts_delta_after(self, next: Self) -> bool {
+        next.term == self.term && next.revision.get() == self.revision.get().saturating_add(1)
+    }
+
+    pub fn satisfies(self, barrier: Self) -> bool {
+        self.term == barrier.term && self.revision >= barrier.revision
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -122,8 +150,7 @@ pub struct PlacementSlot {
     pub owner: Option<NodeKey>,
     pub target: Option<NodeKey>,
     pub assignment_generation: AssignmentGeneration,
-    pub coordinator_term: CoordinatorTerm,
-    pub revision: Revision,
+    pub version: StateVersion,
     pub state: PlacementSlotState,
     pub active_move: Option<u128>,
     #[serde(default)]

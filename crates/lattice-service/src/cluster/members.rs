@@ -2,19 +2,19 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use lattice_placement::coordinator::{MemberChange, MemberEvent, MemberRecord};
-use lattice_placement::types::{NodeKey, Revision};
+use lattice_placement::types::{NodeKey, StateVersion};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberSnapshot {
-    pub revision: Option<Revision>,
+    pub version: Option<StateVersion>,
     pub members: Vec<MemberRecord>,
 }
 
 #[derive(Debug)]
 struct MemberDirectoryState {
-    revision: Option<Revision>,
+    version: Option<StateVersion>,
     members: BTreeMap<(String, lattice_core::actor_ref::NodeIncarnation), MemberRecord>,
 }
 
@@ -32,7 +32,7 @@ impl MemberDirectory {
         let (events, _) = broadcast::channel(event_capacity);
         Ok(Self {
             state: Mutex::new(MemberDirectoryState {
-                revision: None,
+                version: None,
                 members: BTreeMap::new(),
             }),
             events,
@@ -42,7 +42,7 @@ impl MemberDirectory {
     pub fn snapshot(&self) -> MemberSnapshot {
         let state = self.state.lock().expect("member directory poisoned");
         MemberSnapshot {
-            revision: state.revision,
+            version: state.version,
             members: state.members.values().cloned().collect(),
         }
     }
@@ -53,12 +53,12 @@ impl MemberDirectory {
 
     pub fn install_snapshot(
         &self,
-        revision: Revision,
+        version: StateVersion,
         records: Vec<MemberRecord>,
     ) -> Result<(), MemberDirectoryError> {
         let mut members = BTreeMap::new();
         for record in records {
-            if record.revision > revision || record.node != record.hello.node {
+            if record.version > version || record.node != record.hello.node {
                 return Err(MemberDirectoryError::InvalidRecord);
             }
             let key = member_key(&record.node);
@@ -67,25 +67,28 @@ impl MemberDirectory {
             }
         }
         let mut state = self.state.lock().expect("member directory poisoned");
-        if state.revision.is_some_and(|current| revision < current) {
+        if state
+            .version
+            .is_some_and(|current| version.term < current.term)
+        {
             return Err(MemberDirectoryError::StaleRevision);
         }
         state.members = members;
-        state.revision = Some(revision);
+        state.version = Some(version);
         Ok(())
     }
 
     pub fn apply(&self, event: MemberEvent) -> Result<(), MemberDirectoryError> {
         let mut state = self.state.lock().expect("member directory poisoned");
         if state
-            .revision
-            .is_some_and(|revision| event.revision <= revision)
+            .version
+            .is_none_or(|version| !version.accepts_delta_after(event.version))
         {
             return Err(MemberDirectoryError::StaleRevision);
         }
         match &event.change {
             MemberChange::Upsert(record) => {
-                if record.revision != event.revision || record.node != record.hello.node {
+                if record.version != event.version || record.node != record.hello.node {
                     return Err(MemberDirectoryError::InvalidRecord);
                 }
                 state
@@ -96,7 +99,7 @@ impl MemberDirectory {
                 state.members.remove(&member_key(node));
             }
         }
-        state.revision = Some(event.revision);
+        state.version = Some(event.version);
         drop(state);
         let _ = self.events.send(event);
         Ok(())
@@ -127,7 +130,7 @@ mod tests {
     use lattice_placement::coordinator::{
         MemberChange, MemberEvent, MemberRecord, MemberStatus, NodeHello,
     };
-    use lattice_placement::types::{NodeKey, Revision};
+    use lattice_placement::types::{CoordinatorTerm, NodeKey, Revision, StateVersion};
 
     use super::{MemberDirectory, MemberDirectoryError};
 
@@ -152,7 +155,10 @@ mod tests {
                 singleton_configs: Vec::new(),
             },
             status: MemberStatus::Up,
-            revision: Revision::new(revision).unwrap(),
+            version: StateVersion::new(
+                CoordinatorTerm::new(1).unwrap(),
+                Revision::new(revision).unwrap(),
+            ),
             lease_id: 1,
         }
     }
@@ -162,12 +168,12 @@ mod tests {
         let directory = MemberDirectory::new(4).unwrap();
         let first = member(1, 1);
         directory
-            .install_snapshot(Revision::new(1).unwrap(), vec![first.clone()])
+            .install_snapshot(first.version, vec![first.clone()])
             .unwrap();
         let replacement = member(2, 2);
         directory
             .apply(MemberEvent {
-                revision: Revision::new(2).unwrap(),
+                version: replacement.version,
                 change: MemberChange::Upsert(Box::new(replacement)),
             })
             .unwrap();
@@ -175,7 +181,10 @@ mod tests {
         assert_eq!(
             directory
                 .apply(MemberEvent {
-                    revision: Revision::new(2).unwrap(),
+                    version: StateVersion::new(
+                        CoordinatorTerm::new(1).unwrap(),
+                        Revision::new(2).unwrap(),
+                    ),
                     change: MemberChange::Removed {
                         node: first.node,
                         reason: lattice_placement::coordinator::MemberRemovalReason::ForceRemoved,

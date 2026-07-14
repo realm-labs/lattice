@@ -1,11 +1,12 @@
 use super::{
     Association, AssociationState, Bytes, ClaimGrant, ClaimLease, CoordinatorLeader,
-    CoordinatorLeaderConfig, CoordinatorRuntimeError, CoordinatorStore, GrantSequence,
-    HandoffEvent, HandoffPhase, Instant, MemberChange, MemberEvent, MemberRecord,
-    MemberRemovalReason, MemberSession, MemberStatus, NodeHello, NodeKey, PlacementControlCommand,
-    PlacementSlotKey, PlacementSlotState, PlanReason, RebalanceTrigger, SnapshotRecord,
-    build_snapshot, encode_control_command,
+    CoordinatorLeaderConfig, CoordinatorRuntimeError, CoordinatorStore, HandoffEvent, HandoffPhase,
+    Instant, MemberChange, MemberEvent, MemberRecord, MemberRemovalReason, MemberSession,
+    MemberStatus, NodeHello, NodeKey, PlacementControlCommand, PlacementSlotKey,
+    PlacementSlotState, PlanReason, RebalanceTrigger, SnapshotRecord, StateVersion, build_snapshot,
+    encode_control_command,
 };
+use crate::storage::domain::{CreateMember, LeasedClaim, RemoveMember, UpdateMember};
 
 impl<S: CoordinatorStore> CoordinatorLeader<S> {
     pub(super) async fn handle_control(
@@ -14,6 +15,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
     ) -> Result<(), CoordinatorRuntimeError> {
         match event {
             crate::control::PlacementControlEventKind::Reconcile { association, .. } => {
+                self.reconciliation.focused = true;
                 if let Some(session) = self.sessions.get(&association.remote_incarnation) {
                     self.send_snapshot(session.hello.clone(), association)
                         .await?;
@@ -42,20 +44,20 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                             self.store.keep_lease_alive(session.lease_id).await?;
                         }
                     }
-                    PlacementControlCommand::JoinReady { snapshot_revision } => {
-                        self.mark_member_up(remote, snapshot_revision, &inbound.association)
+                    PlacementControlCommand::JoinReady { snapshot_version } => {
+                        self.mark_member_up(remote, snapshot_version, &inbound.association)
                             .await?;
                     }
-                    PlacementControlCommand::AppliedRevision(revision) => {
+                    PlacementControlCommand::AppliedRevision(version) => {
                         let session = self
                             .sessions
                             .get_mut(&remote)
                             .ok_or(CoordinatorRuntimeError::UnknownSession)?;
                         if session
-                            .applied_revision
-                            .is_none_or(|current| revision > current)
+                            .applied_version
+                            .is_none_or(|current| version > current)
                         {
-                            session.applied_revision = Some(revision);
+                            session.applied_version = Some(version);
                         }
                         let barriers = self
                             .handoffs
@@ -63,7 +65,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                             .filter_map(|(key, handoff)| {
                                 (handoff.phase == HandoffPhase::Invalidating
                                     && handoff.required_sessions().contains(&remote)
-                                    && revision >= handoff.barrier_revision())
+                                    && version.satisfies(handoff.barrier_version()))
                                 .then_some(key.clone())
                             })
                             .collect::<Vec<_>>();
@@ -72,7 +74,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                                 key,
                                 HandoffEvent::AppliedRevision {
                                     session: remote,
-                                    revision,
+                                    version,
                                 },
                             )
                             .await?;
@@ -272,7 +274,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 return Err(CoordinatorRuntimeError::UnauthorizedCommand);
             }
             session.last_heartbeat = Instant::now();
-            session.snapshot_revision = Some(self.revision);
+            session.snapshot_version = Some(self.version);
             let status = session.record.status;
             let record = session.record.clone();
             self.send_snapshot(hello, association_key.clone()).await?;
@@ -290,6 +292,11 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             return Ok(());
         }
         for config in &hello.entity_configs {
+            if self.entity_configs.len() == self.config.maximum_entity_configs
+                && !self.entity_configs.contains_key(&config.entity_type)
+            {
+                return Err(CoordinatorRuntimeError::ConfigurationCapacity);
+            }
             if self
                 .entity_configs
                 .get(&config.entity_type)
@@ -307,6 +314,11 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 .insert(config.entity_type.clone(), config.clone());
         }
         for config in &hello.singleton_configs {
+            if self.singleton_configs.len() == self.config.maximum_singleton_configs
+                && !self.singleton_configs.contains_key(&config.kind)
+            {
+                return Err(CoordinatorRuntimeError::ConfigurationCapacity);
+            }
             if self
                 .singleton_configs
                 .get(&config.kind)
@@ -329,40 +341,90 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                         > self.config.member_heartbeat_timeout
                 });
             if !expired {
-                return Err(CoordinatorRuntimeError::StaleMember);
+                return Err(CoordinatorRuntimeError::IncarnationPending {
+                    predecessor: current.node.incarnation,
+                    remaining_ttl: self.store.lease_time_to_live(current.lease_id).await?,
+                });
             }
             self.remove_member(current.clone(), MemberRemovalReason::IncarnationReplaced)
                 .await?;
             existing = None;
         }
-        let (record, joined_at, created) = match existing {
-            Some(record)
+        let (record, joined_at, changed) = match existing {
+            Some(mut record)
                 if record.node.incarnation == hello.node.incarnation && record.hello == hello =>
             {
-                (record, self.now(), false)
+                let changed = record.version.term != self.leader.term;
+                if changed {
+                    let expected = record.clone();
+                    record.version = self.next_version()?;
+                    record = self
+                        .store
+                        .update_member(
+                            &self.leader_guard,
+                            UpdateMember {
+                                expected,
+                                member: record,
+                            },
+                        )
+                        .await?
+                        .member;
+                    self.version = record.version;
+                }
+                (record, self.now(), changed)
             }
             Some(_) => return Err(CoordinatorRuntimeError::StaleMember),
             None => {
                 let lease_id = self.store.grant_lease(self.config.member_lease_ttl).await?;
-                let revision = self.next_revision()?;
+                let version = self.next_version()?;
                 let record = MemberRecord {
                     node: hello.node.clone(),
                     hello: hello.clone(),
                     status: MemberStatus::Joining,
-                    revision,
+                    version,
                     lease_id,
                 };
-                if let Err(error) = self.store.create_member(&record).await {
-                    let _ = self.store.revoke_lease(lease_id).await;
-                    return Err(error.into());
-                }
-                self.revision = revision;
-                (record, self.now(), true)
+                lattice_core::failpoint::hit(
+                    lattice_core::failpoint::Failpoint::MemberBeforeGuardedCommit,
+                );
+                let committed = match self
+                    .store
+                    .create_member(
+                        &self.leader_guard,
+                        CreateMember {
+                            member: record.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(committed) => committed,
+                    Err(crate::storage::StorageError::OutcomeUnknown) => {
+                        self.reconciliation.focused = true;
+                        match self.store.get_member(&record.node.node_id).await? {
+                            Some(current) if current == record => {
+                                crate::storage::domain::MemberCommit {
+                                    revision: record.version.revision,
+                                    member: current,
+                                }
+                            }
+                            _ => {
+                                let _ = self.store.revoke_lease(lease_id).await;
+                                return Err(crate::storage::StorageError::OutcomeUnknown.into());
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = self.store.revoke_lease(lease_id).await;
+                        return Err(error.into());
+                    }
+                };
+                self.version = StateVersion::new(self.leader.term, committed.revision);
+                (committed.member, self.now(), true)
             }
         };
-        if created {
+        if changed {
             self.publish_member_event(MemberEvent {
-                revision: record.revision,
+                version: record.version,
                 change: MemberChange::Upsert(Box::new(record.clone())),
             })?;
         }
@@ -375,8 +437,8 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 lease_id: record.lease_id,
                 heartbeat_sequence: 0,
                 last_heartbeat: Instant::now(),
-                applied_revision: None,
-                snapshot_revision: Some(self.revision),
+                applied_version: None,
+                snapshot_version: Some(self.version),
                 draining: record.status == MemberStatus::Leaving,
                 drain_operation: None,
                 drain_ready: false,
@@ -402,9 +464,9 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         Ok(())
     }
 
-    pub(super) fn next_revision(&self) -> Result<crate::types::Revision, CoordinatorRuntimeError> {
-        self.revision
-            .next()
+    pub(super) fn next_version(&self) -> Result<StateVersion, CoordinatorRuntimeError> {
+        self.version
+            .next_revision()
             .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)
     }
 
@@ -428,22 +490,24 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         }
         let expected = session.record.clone();
         let association = session.association.clone();
-        let revision = self.next_revision()?;
+        let version = self.next_version()?;
         let mut member = expected.clone();
         member.hello = hello.clone();
-        member.revision = revision;
-        self.store
-            .compare_and_put_member(&expected, &member)
-            .await?;
+        member.version = version;
+        let member = self
+            .store
+            .update_member(&self.leader_guard, UpdateMember { expected, member })
+            .await?
+            .member;
         let session = self
             .sessions
             .get_mut(&incarnation)
             .ok_or(CoordinatorRuntimeError::UnknownSession)?;
         session.hello = hello;
         session.record = member.clone();
-        self.revision = revision;
+        self.version = version;
         self.publish_member_event(MemberEvent {
-            revision,
+            version,
             change: MemberChange::Upsert(Box::new(member)),
         })?;
         Ok(association)
@@ -452,7 +516,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
     pub(super) async fn mark_member_up(
         &mut self,
         incarnation: lattice_core::actor_ref::NodeIncarnation,
-        snapshot_revision: crate::types::Revision,
+        snapshot_version: StateVersion,
         association_key: &lattice_remoting::association::AssociationKey,
     ) -> Result<(), CoordinatorRuntimeError> {
         let session = self
@@ -460,7 +524,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .get(&incarnation)
             .ok_or(CoordinatorRuntimeError::UnknownSession)?;
         if &session.association != association_key
-            || session.snapshot_revision != Some(snapshot_revision)
+            || session.snapshot_version != Some(snapshot_version)
             || session.record.node.incarnation != incarnation
         {
             return Err(CoordinatorRuntimeError::StaleMember);
@@ -484,22 +548,24 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         }
         let expected = session.record.clone();
         let hello = session.hello.clone();
-        let revision = self.next_revision()?;
+        let version = self.next_version()?;
         let mut member = expected.clone();
         member.status = MemberStatus::Up;
-        member.revision = revision;
-        self.store
-            .compare_and_put_member(&expected, &member)
-            .await?;
+        member.version = version;
+        let member = self
+            .store
+            .update_member(&self.leader_guard, UpdateMember { expected, member })
+            .await?
+            .member;
         let session = self
             .sessions
             .get_mut(&incarnation)
             .ok_or(CoordinatorRuntimeError::UnknownSession)?;
         session.record = member.clone();
-        session.applied_revision = Some(revision);
-        self.revision = revision;
+        session.applied_version = Some(version);
+        self.version = version;
         self.publish_member_event(MemberEvent {
-            revision,
+            version,
             change: MemberChange::Upsert(Box::new(member.clone())),
         })?;
         let association = self
@@ -557,13 +623,15 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        let revision = self.next_revision()?;
+        let version = self.next_version()?;
         let mut member = expected.clone();
         member.status = MemberStatus::Leaving;
-        member.revision = revision;
-        self.store
-            .compare_and_put_member(&expected, &member)
-            .await?;
+        member.version = version;
+        let member = self
+            .store
+            .update_member(&self.leader_guard, UpdateMember { expected, member })
+            .await?
+            .member;
         let session = self
             .sessions
             .get_mut(&incarnation)
@@ -572,9 +640,9 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         session.draining = true;
         session.drain_operation = Some(operation_id);
         session.drain_ready = false;
-        self.revision = revision;
+        self.version = version;
         self.publish_member_event(MemberEvent {
-            revision,
+            version,
             change: MemberChange::Upsert(Box::new(member)),
         })?;
         for entity_type in entity_types {
@@ -678,15 +746,32 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         member: MemberRecord,
         reason: MemberRemovalReason,
     ) -> Result<(), CoordinatorRuntimeError> {
+        let committed = self
+            .store
+            .remove_member(
+                &self.leader_guard,
+                RemoveMember {
+                    expected: member.clone(),
+                },
+            )
+            .await?;
+        let version = StateVersion::new(self.leader.term, committed.revision);
+        self.finish_member_removal(member, reason, version).await
+    }
+
+    pub(super) async fn finish_member_removal(
+        &mut self,
+        member: MemberRecord,
+        reason: MemberRemovalReason,
+        version: StateVersion,
+    ) -> Result<(), CoordinatorRuntimeError> {
         let incarnation = member.node.incarnation;
         let node = member.node.clone();
-        let revision = self.next_revision()?;
-        self.store.compare_and_delete_member(&member).await?;
         self.store.revoke_lease(member.lease_id).await?;
         self.sessions.remove(&incarnation);
-        self.revision = revision;
+        self.version = version;
         self.publish_member_event(MemberEvent {
-            revision,
+            version,
             change: MemberChange::Removed {
                 node: node.clone(),
                 reason,
@@ -703,8 +788,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 ))
             })
             .collect::<Vec<_>>();
-        for (key, claim_lease, grant) in expired_claims {
-            self.store.delete_claim(&grant).await?;
+        for (key, claim_lease, _grant) in expired_claims {
             self.store.revoke_lease(claim_lease).await?;
             self.claims.remove(&key);
         }
@@ -825,7 +909,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                                 PlacementControlCommand::DrainSlot {
                                     slot: key,
                                     generation: handoff.source_generation,
-                                    revision: slot.revision,
+                                    version: slot.version,
                                 },
                                 &self.config,
                             )?;
@@ -880,7 +964,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             }
         }
         let (begin, chunks, end) =
-            build_snapshot(self.revision, records, &self.config.snapshot_limits)
+            build_snapshot(self.version, records, &self.config.snapshot_limits)
                 .map_err(CoordinatorRuntimeError::Coordinator)?;
         let association = self
             .associations
@@ -924,27 +1008,62 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             {
                 continue;
             }
-            let previous = self.store.get_claim(&slot.key).await?;
-            let sequence = previous
-                .as_ref()
-                .filter(|claim| claim.assignment_generation == slot.assignment_generation)
-                .map(|claim| claim.grant_sequence.next())
-                .transpose()
-                .map_err(|_| CoordinatorRuntimeError::ClaimSequence)?
-                .unwrap_or(GrantSequence::new(1).expect("one is a valid sequence"));
-            let grant = ClaimGrant {
-                slot: slot.key.clone(),
-                owner: hello.node.clone(),
-                coordinator_term: self.leader.term,
-                assignment_generation: slot.assignment_generation,
-                grant_sequence: sequence,
-                ttl: self.config.claim_ttl,
+            let Some(previous) = self.store.get_claim(&slot.key).await? else {
+                continue;
             };
-            let lease_id = match self.claims.get(&slot.key) {
-                Some(claim) => claim.lease_id,
-                None => self.store.grant_lease(self.config.claim_ttl).await?,
+            if previous.grant.owner != hello.node
+                || previous.grant.assignment_generation != slot.assignment_generation
+            {
+                return Err(CoordinatorRuntimeError::ClaimNotProven);
+            }
+            let committed = if previous.grant.coordinator_term == self.leader.term {
+                crate::storage::domain::AuthorityCommit {
+                    slot: slot.clone(),
+                    claim: previous,
+                }
+            } else {
+                let lease_id = self.store.grant_lease(self.config.claim_ttl).await?;
+                let mut adopted_slot = slot.clone();
+                adopted_slot.version = self.next_version()?;
+                let grant = ClaimGrant {
+                    slot: slot.key.clone(),
+                    owner: hello.node.clone(),
+                    coordinator_term: self.leader.term,
+                    assignment_generation: slot.assignment_generation,
+                    grant_sequence: previous
+                        .grant
+                        .grant_sequence
+                        .next()
+                        .map_err(|_| CoordinatorRuntimeError::ClaimSequence)?,
+                    ttl: self.config.claim_ttl,
+                };
+                let result = self
+                    .store
+                    .adopt_authority(
+                        &self.leader_guard,
+                        crate::storage::domain::AdoptAuthority {
+                            expected_slot: slot.clone(),
+                            expected_claim: previous.grant.clone(),
+                            slot: adopted_slot,
+                            claim: LeasedClaim { grant, lease_id },
+                        },
+                    )
+                    .await;
+                match result {
+                    Ok(committed) => {
+                        let _ = self.store.revoke_lease(previous.lease_id).await;
+                        self.version = committed.slot.version;
+                        self.publish_slot_delta(&committed.slot).await?;
+                        committed
+                    }
+                    Err(error) => {
+                        let _ = self.store.revoke_lease(lease_id).await;
+                        return Err(error.into());
+                    }
+                }
             };
-            self.store.put_claim(&grant, lease_id).await?;
+            let lease_id = committed.claim.lease_id;
+            let grant = committed.claim.grant;
             self.claims.insert(
                 slot.key.clone(),
                 ClaimLease {

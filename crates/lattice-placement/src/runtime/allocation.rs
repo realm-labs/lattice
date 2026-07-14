@@ -5,6 +5,7 @@ use super::{
     MoveProgress, NodeKey, PlacedShard, PlacementControlCommand, PlacementNode, PlacementSlot,
     PlacementSlotKey, PlacementSlotState, PlacementView, SingletonConfig,
 };
+use crate::storage::domain::{ActivateAuthority, AllocateInitial, LeasedClaim, ReserveHandoff};
 
 impl<S: CoordinatorStore> CoordinatorLeader<S> {
     pub(super) async fn ensure_shard_allocated(
@@ -12,6 +13,14 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         entity_type: lattice_core::actor_ref::EntityType,
         shard_id: crate::types::ShardId,
     ) -> Result<(), CoordinatorRuntimeError> {
+        let config = self
+            .entity_configs
+            .get(&entity_type)
+            .cloned()
+            .ok_or(CoordinatorRuntimeError::UnknownEntityConfig)?;
+        if shard_id.get() >= config.shard_count {
+            return Err(CoordinatorRuntimeError::ShardOutOfRange);
+        }
         let key = PlacementSlotKey::Shard {
             entity_type: entity_type.clone(),
             shard_id,
@@ -26,11 +35,6 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 Err(CoordinatorRuntimeError::StaleHandoff)
             };
         }
-        let config = self
-            .entity_configs
-            .get(&entity_type)
-            .cloned()
-            .ok_or(CoordinatorRuntimeError::UnknownEntityConfig)?;
         let strategy = self
             .strategies
             .get(&(
@@ -57,11 +61,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             target: None,
             assignment_generation: crate::types::AssignmentGeneration::new(1)
                 .expect("one is a valid assignment generation"),
-            coordinator_term: self.leader.term,
-            revision: self
-                .revision
-                .next()
-                .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?,
+            version: self.next_version()?,
             state: PlacementSlotState::Allocating,
             active_move: None,
             barrier_sessions: Default::default(),
@@ -97,11 +97,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             target: None,
             assignment_generation: crate::types::AssignmentGeneration::new(1)
                 .expect("one is a valid assignment generation"),
-            coordinator_term: self.leader.term,
-            revision: self
-                .revision
-                .next()
-                .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?,
+            version: self.next_version()?,
             state: PlacementSlotState::Allocating,
             active_move: None,
             barrier_sessions: Default::default(),
@@ -155,10 +151,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .ok_or(CoordinatorRuntimeError::UnknownSingletonConfig)?;
         let target = self.select_singleton_target(kind, &config, Some(&source))?;
         let plan_id = uuid::Uuid::new_v4().as_u128();
-        let barrier_revision = self
-            .revision
-            .next()
-            .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
+        let barrier_version = self.next_version()?;
         let barrier_sessions = self
             .sessions
             .iter()
@@ -168,24 +161,31 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 .then_some(*incarnation)
             })
             .collect::<std::collections::BTreeSet<_>>();
-        let expected = slot.revision;
+        let expected_slot = slot.clone();
         slot.target = Some(target.clone());
         slot.state = PlacementSlotState::BeginHandoff;
         slot.active_move = Some(plan_id);
         slot.barrier_sessions = barrier_sessions.clone();
-        slot.coordinator_term = self.leader.term;
-        slot.revision = barrier_revision;
-        self.store
-            .compare_and_put_slot(Some(expected), slot.clone())
+        slot.version = barrier_version;
+        let committed = self
+            .store
+            .reserve_handoff(
+                &self.leader_guard,
+                ReserveHandoff {
+                    expected_slot,
+                    slot,
+                },
+            )
             .await?;
-        self.revision = barrier_revision;
+        let slot = committed.slot;
+        self.version = slot.version;
         let mut handoff = HandoffMachine::begin(
             slot.key.clone(),
             plan_id,
             source,
             target,
             slot.assignment_generation,
-            barrier_revision,
+            barrier_version,
             barrier_sessions,
         )
         .map_err(CoordinatorRuntimeError::Handoff)?;
@@ -203,9 +203,6 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .owner
             .clone()
             .ok_or(CoordinatorRuntimeError::IneligibleTarget)?;
-        self.store.compare_and_put_slot(None, slot.clone()).await?;
-        self.revision = slot.revision;
-        self.publish_slot_delta(&slot).await?;
         let lease_id = self.store.grant_lease(self.config.claim_ttl).await?;
         let grant = ClaimGrant {
             slot: slot.key.clone(),
@@ -215,14 +212,58 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             grant_sequence: GrantSequence::new(1).expect("one is a valid grant sequence"),
             ttl: self.config.claim_ttl,
         };
-        self.store.put_claim(&grant, lease_id).await?;
+        let request = AllocateInitial {
+            slot,
+            claim: LeasedClaim {
+                grant: grant.clone(),
+                lease_id,
+            },
+        };
+        lattice_core::failpoint::hit(
+            lattice_core::failpoint::Failpoint::AuthorityBeforeGuardedCommit,
+        );
+        let committed = match self
+            .store
+            .allocate_initial(&self.leader_guard, request)
+            .await
+        {
+            Ok(committed) => committed,
+            Err(crate::storage::StorageError::OutcomeUnknown) => {
+                self.reconciliation.focused = true;
+                match self.store.get_claim(&grant.slot).await? {
+                    Some(claim) if claim.lease_id == lease_id && claim.grant == grant => {
+                        let slot = self
+                            .store
+                            .get_slot(&grant.slot)
+                            .await?
+                            .ok_or(CoordinatorRuntimeError::UnknownSlot)?;
+                        crate::storage::domain::AuthorityCommit { slot, claim }
+                    }
+                    _ => {
+                        let _ = self.store.revoke_lease(lease_id).await;
+                        return Err(crate::storage::StorageError::OutcomeUnknown.into());
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = self.store.revoke_lease(lease_id).await;
+                return Err(error.into());
+            }
+        };
+        let slot = committed.slot;
+        let leased_claim = committed.claim;
+        lattice_core::failpoint::hit(
+            lattice_core::failpoint::Failpoint::InitialAuthorityAfterCommitBeforeEffect,
+        );
+        self.version = slot.version;
         self.claims.insert(
             slot.key.clone(),
             ClaimLease {
-                lease_id,
-                grant: grant.clone(),
+                lease_id: leased_claim.lease_id,
+                grant: leased_claim.grant.clone(),
             },
         );
+        self.publish_slot_delta(&slot).await?;
         let session = self
             .sessions
             .get(&owner.incarnation)
@@ -234,7 +275,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
         send_control(
             &association,
-            PlacementControlCommand::ClaimGranted(grant),
+            PlacementControlCommand::ClaimGranted(leased_claim.grant),
             &self.config,
         )
     }
@@ -257,16 +298,27 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         {
             return Err(CoordinatorRuntimeError::StaleHandoff);
         }
-        let expected = slot.revision;
+        let expected_slot = slot.clone();
         slot.state = PlacementSlotState::Running;
-        slot.revision = self
-            .revision
-            .next()
-            .map_err(|_| CoordinatorRuntimeError::RevisionExhausted)?;
-        self.store
-            .compare_and_put_slot(Some(expected), slot.clone())
+        slot.version = self.next_version()?;
+        let claim = self
+            .store
+            .get_claim(key)
+            .await?
+            .ok_or(CoordinatorRuntimeError::ClaimNotProven)?;
+        let committed = self
+            .store
+            .activate_authority(
+                &self.leader_guard,
+                ActivateAuthority {
+                    expected_slot,
+                    expected_claim: claim.grant,
+                    slot,
+                },
+            )
             .await?;
-        self.revision = slot.revision;
+        let slot = committed.slot;
+        self.version = slot.version;
         self.slot_assigned_at.insert(key.clone(), self.now());
         self.publish_slot_delta(&slot).await
     }
@@ -364,11 +416,10 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             }
         }
         Ok(PlacementView {
-            coordinator_term: self.leader.term,
-            revision: self.revision,
+            version: self.version,
             now,
-            reconciled: true,
-            degraded: false,
+            reconciled: self.reconciliation.initial_complete,
+            degraded: !self.reconciliation.quarantined.is_empty(),
             nodes,
             shards,
             active_cluster_moves,

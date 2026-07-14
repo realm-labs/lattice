@@ -14,9 +14,9 @@ use crate::coordinator::{
     CoordinatorDelta, MemberEvent, MemberRecord, NodeHello, NodeLoadReport, ShardLoadReport,
     SnapshotBegin, SnapshotChunk, SnapshotEnd,
 };
-use crate::types::{AssignmentGeneration, ClaimGrant, Revision, ShardId};
+use crate::types::{AssignmentGeneration, ClaimGrant, ShardId, StateVersion};
 
-pub const PLACEMENT_CONTROL_GENERATION: u64 = 3;
+pub const PLACEMENT_CONTROL_GENERATION: u64 = 4;
 pub const DEFAULT_MAX_CONTROL_PAYLOAD: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,7 +27,7 @@ pub enum PlacementControlCommand {
         sequence: u64,
     },
     JoinReady {
-        snapshot_revision: Revision,
+        snapshot_version: StateVersion,
     },
     MemberUp(MemberRecord),
     MemberDelta(MemberEvent),
@@ -37,7 +37,7 @@ pub enum PlacementControlCommand {
     SnapshotChunk(SnapshotChunk),
     SnapshotEnd(SnapshotEnd),
     StateDelta(CoordinatorDelta),
-    AppliedRevision(Revision),
+    AppliedRevision(StateVersion),
     ClaimGranted(ClaimGrant),
     NodeLoad(NodeLoadReport),
     ShardLoad(ShardLoadReport),
@@ -53,7 +53,7 @@ pub enum PlacementControlCommand {
     DrainSlot {
         slot: crate::types::PlacementSlotKey,
         generation: AssignmentGeneration,
-        revision: Revision,
+        version: StateVersion,
     },
     SlotDrained {
         slot: crate::types::PlacementSlotKey,

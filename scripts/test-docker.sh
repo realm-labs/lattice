@@ -75,8 +75,8 @@ case "$profile" in
     service=runner-replay
     [ "${1:-}" = "--artifact" ] && [ -n "${2:-}" ] || { echo "replay requires --artifact <trace.json>" >&2; exit 2; }
     case "$2" in
-      "$artifacts"/*) LATTICE_REPLAY_ARTIFACT="/artifacts/${2#"$artifacts"/}" ;;
-      *) cp "$2" "$artifacts/replay.json"; LATTICE_REPLAY_ARTIFACT=/artifacts/replay.json ;;
+      "$artifacts"/*) LATTICE_REPLAY_ARTIFACT="../artifacts/${2#"$artifacts"/}" ;;
+      *) cp "$2" "$artifacts/replay.json"; LATTICE_REPLAY_ARTIFACT=../artifacts/replay.json ;;
     esac
     export LATTICE_REPLAY_ARTIFACT
     ;;

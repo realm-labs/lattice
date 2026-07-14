@@ -87,11 +87,19 @@ Inspection responses expose machine-readable lifecycle state, Coordinator term/r
 
 Rebalance operations include inspect/explain, pause/resume automatic planning, trigger an immediate evaluation, submit an idempotent manual relocation, and cancel only plan moves that have not entered handoff. The API exposes why a proposal was accepted/rejected and which eligibility, freshness, hysteresis, cooldown, or concurrency rule applied; it never allows an operator to bypass claim fencing.
 
-Operation IDs are stored with a bounded fingerprint. Repeating the same pause/resume or relocation
-returns the original result; reusing an ID for different arguments is an idempotency conflict.
+Operation IDs, status, typed result, `StateVersion`, and expiry metadata are stored durably with a
+bounded fingerprint. Pause settings and manual-plan/member/plan mutations are committed atomically
+with their operation result. Repeating any mutating operation during the configured count/age
+retention window returns the original typed result; reusing an ID for different arguments is an
+idempotency conflict. After compaction, clients must use a new operation ID.
 Manual relocation persists a normal generation-conditional plan and enters the same handoff path as
 automatic, drain, and recovery movement. Completed/cancelled/failed plan history is inspectable but
 bounded by the Coordinator retention policy.
+
+Inspection includes durable pause state, retained operation count, durable cardinality limits,
+current `StateVersion`, reconciliation backlog/quarantine, and aggregated leadership-loss,
+conflict, unknown-outcome, and capacity counts. Labels remain operation-family level and never carry
+record IDs.
 
 ## 6. Configuration Example
 

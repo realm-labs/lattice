@@ -33,6 +33,7 @@ use lattice_placement::types::PlacementSlotKey;
 use lattice_placement::types::PlacementSlotState;
 use lattice_placement::types::Revision;
 use lattice_placement::types::ShardId;
+use lattice_placement::types::StateVersion;
 use lattice_remoting::association::AssociationId;
 use lattice_remoting::control::CommandId;
 use lattice_remoting::control::ControlApply;
@@ -264,8 +265,7 @@ fn allocation_fixture(
             required_protocol: protocol,
         },
         PlacementView {
-            coordinator_term: CoordinatorTerm::new(1)?,
-            revision: Revision::new(1)?,
+            version: StateVersion::new(CoordinatorTerm::new(1)?, Revision::new(1)?),
             now: MonotonicTime::from_millis(100_000),
             reconciled: true,
             degraded: false,
@@ -307,7 +307,7 @@ fn reduce_handoff(
         source.clone(),
         target.clone(),
         generation,
-        Revision::new(1)?,
+        StateVersion::new(CoordinatorTerm::new(1)?, Revision::new(1)?),
         BTreeSet::new(),
     )?;
     machine.start();

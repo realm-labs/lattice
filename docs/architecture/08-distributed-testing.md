@@ -433,6 +433,9 @@ At minimum, real Docker scenarios cover:
 | DeathWatch | lost/replayed WatchAck/Terminated, reconnect, activation/path reuse, node-down confirmation |
 | Ask/tell | write-boundary UnknownResult, no automatic replay, stripe ordering, deadline at every admission point |
 | Resource/shutdown | queue/map limits, task panic, cancellation, repeated reconnect, bounded drain and zero orphan resources |
+| Coordinator transactions | exact live leader guard, atomic slot/claim and slot/plan, counter predicates, unknown-outcome reread |
+| Term stream/reconciliation | new-term snapshot gate, old-term ack rejection, bounded claim adoption/fencing and recovery liveness |
+| Storage migration | generation-3 dry-run/apply/interruption-resume, backup, lease lock, quarantine, counter verification |
 
 Assertions query structured admin/trace state. Tests must not parse human log text as the primary oracle or use `sleep` as proof that a state transition completed.
 
@@ -442,7 +445,7 @@ Assertions query structured admin/trace state. Tests must not parse human log te
 Pull request:
   Docker quality profile (fmt, clippy, workspace tests)
   reducer/unit/property tests
-  bounded small-state exploration
+  bounded small-state exploration of named Coordinator transactions, lease expiry, and migration resume
   fixed regression seeds
   Docker e2e smoke with real TCP and disposable etcd
 

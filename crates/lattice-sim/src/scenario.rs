@@ -9,10 +9,12 @@ use lattice_placement::handoff::HandoffEvent;
 use lattice_placement::handoff::HandoffMachine;
 use lattice_placement::handoff::HandoffPhase;
 use lattice_placement::types::AssignmentGeneration;
+use lattice_placement::types::CoordinatorTerm;
 use lattice_placement::types::NodeKey;
 use lattice_placement::types::PlacementSlotKey;
 use lattice_placement::types::Revision;
 use lattice_placement::types::ShardId;
+use lattice_placement::types::StateVersion;
 use lattice_remoting::association::AssociationId;
 use lattice_remoting::control::CommandId;
 use lattice_remoting::control::ControlApply;
@@ -90,7 +92,7 @@ impl Scenario {
             source.clone(),
             target.clone(),
             AssignmentGeneration::new(1).unwrap(),
-            Revision::new(2).unwrap(),
+            StateVersion::new(CoordinatorTerm::new(1).unwrap(), Revision::new(2).unwrap()),
             barrier,
         )
         .map_err(ScenarioError::Handoff)?;
@@ -188,7 +190,10 @@ impl Scenario {
                     .handoff
                     .transition(HandoffEvent::AppliedRevision {
                         session,
-                        revision: Revision::new(2).unwrap(),
+                        version: StateVersion::new(
+                            CoordinatorTerm::new(1).unwrap(),
+                            Revision::new(2).unwrap(),
+                        ),
                     })
                     .map_err(ScenarioError::Handoff)?;
                 self.apply_handoff_effects(effects)?;
@@ -413,72 +418,292 @@ mod tests {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-    struct TinyOwnership {
+    struct CoordinatorModel {
+        term: u8,
+        leader_live: bool,
+        phase: u8,
+        owner: u8,
         generation: u8,
-        owner: Option<u8>,
-        ready: bool,
+        claim: Option<(u8, u8, u8)>,
+        plan_active: bool,
+        recovery_debt: u8,
+        barrier_satisfied: bool,
+        ack_attempted: u8,
+        slots: u8,
+        paused: bool,
+        pause_steps: u8,
+        target_connected: bool,
+        stale_checked: bool,
+        conflict_checked: bool,
+        unknown_checked: bool,
+        last_commit_guard_valid: bool,
+        migration_phase: u8,
+        migration_cursor: u8,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-    enum TinyEvent {
+    enum ModelEvent {
+        Allocate,
+        Activate,
+        ReserveMove,
         Fence,
-        Claim,
-        Ready,
+        Install,
+        Complete,
+        ExpireClaim,
+        Reconcile,
+        LoseLeader,
+        CampaignSuccessor,
+        StaleLeaderWrite,
+        CompareConflict,
+        UnknownCommitResult,
+        Pause,
+        Resume,
+        DisconnectTarget,
+        AckOldTerm,
+        AckCurrentTerm,
+        StartMigration,
+        CommitMigrationPage,
+        InterruptMigration,
+        ResumeMigration,
     }
 
-    impl Explorable for TinyOwnership {
-        type Event = TinyEvent;
+    impl Explorable for CoordinatorModel {
+        type Event = ModelEvent;
         type Error = ();
 
         fn enabled(&self) -> Vec<Self::Event> {
-            if self.owner == Some(1) {
-                vec![TinyEvent::Fence]
-            } else if self.owner.is_none() {
-                vec![TinyEvent::Claim]
-            } else if !self.ready {
-                vec![TinyEvent::Ready]
+            let mut events = Vec::new();
+            if self.leader_live {
+                events.push(ModelEvent::LoseLeader);
+                if self.phase == 0 && self.slots < 2 {
+                    events.push(ModelEvent::Allocate);
+                    if !self.unknown_checked {
+                        events.push(ModelEvent::UnknownCommitResult);
+                    }
+                }
+                if self.phase == 1 && self.recovery_debt == 0 && !self.plan_active {
+                    events.push(ModelEvent::Activate);
+                }
+                if self.phase == 2 && self.recovery_debt == 0 && !self.plan_active {
+                    events.push(ModelEvent::ReserveMove);
+                }
+                if self.phase == 3 && self.plan_active {
+                    events.push(ModelEvent::Fence);
+                }
+                if self.phase == 4 && self.plan_active && self.target_connected {
+                    events.push(ModelEvent::Install);
+                }
+                if self.phase == 1 && self.plan_active && self.recovery_debt == 0 {
+                    events.push(ModelEvent::Complete);
+                }
+                if self.claim.is_some() && self.recovery_debt == 0 {
+                    events.push(ModelEvent::ExpireClaim);
+                }
+                if self.recovery_debt > 0 {
+                    events.push(ModelEvent::Reconcile);
+                }
+                if self.plan_active && self.ack_attempted == 0 {
+                    events.push(ModelEvent::AckOldTerm);
+                    events.push(ModelEvent::AckCurrentTerm);
+                }
+                if self.pause_steps == 0 {
+                    events.push(ModelEvent::Pause);
+                } else if self.pause_steps == 1 {
+                    events.push(ModelEvent::Resume);
+                }
+                if self.target_connected {
+                    events.push(ModelEvent::DisconnectTarget);
+                }
+                if !self.conflict_checked {
+                    events.push(ModelEvent::CompareConflict);
+                }
             } else {
-                Vec::new()
+                if self.term == 1 {
+                    events.push(ModelEvent::CampaignSuccessor);
+                }
+                if self.migration_phase == 0 {
+                    events.push(ModelEvent::StartMigration);
+                } else if self.migration_phase == 1 {
+                    events.push(ModelEvent::CommitMigrationPage);
+                    events.push(ModelEvent::InterruptMigration);
+                } else if self.migration_phase == 2 {
+                    events.push(ModelEvent::ResumeMigration);
+                }
             }
+            if self.term == 2 && !self.stale_checked {
+                events.push(ModelEvent::StaleLeaderWrite);
+            }
+            events
         }
 
         fn step(&self, event: &Self::Event) -> Result<Self, Self::Error> {
             let mut next = self.clone();
             match event {
-                TinyEvent::Fence if self.owner == Some(1) => next.owner = None,
-                TinyEvent::Claim if self.owner.is_none() => {
-                    next.owner = Some(2);
-                    next.generation = 2;
+                ModelEvent::Allocate if self.leader_live && self.phase == 0 => {
+                    next.phase = 1;
+                    next.owner = 1;
+                    next.generation = 1;
+                    next.claim = Some((1, 1, self.term));
+                    next.slots += 1;
+                    next.last_commit_guard_valid = true;
                 }
-                TinyEvent::Ready if self.owner == Some(2) => next.ready = true,
+                ModelEvent::Activate if self.leader_live && self.phase == 1 => {
+                    next.phase = 2;
+                    next.last_commit_guard_valid = true;
+                }
+                ModelEvent::ReserveMove if self.leader_live && self.phase == 2 => {
+                    next.phase = 3;
+                    next.plan_active = true;
+                    next.last_commit_guard_valid = true;
+                }
+                ModelEvent::Fence if self.leader_live && self.phase == 3 => {
+                    next.phase = 4;
+                    next.claim = None;
+                    next.last_commit_guard_valid = true;
+                }
+                ModelEvent::Install if self.leader_live && self.phase == 4 => {
+                    next.phase = 1;
+                    next.owner = 2;
+                    next.generation += 1;
+                    next.claim = Some((2, next.generation, self.term));
+                    next.last_commit_guard_valid = true;
+                }
+                ModelEvent::Complete if self.leader_live && self.phase == 1 => {
+                    next.phase = 2;
+                    next.plan_active = false;
+                    next.last_commit_guard_valid = true;
+                }
+                ModelEvent::ExpireClaim if self.claim.is_some() => {
+                    next.claim = None;
+                    next.recovery_debt = 2;
+                }
+                ModelEvent::Reconcile if self.recovery_debt > 1 => next.recovery_debt -= 1,
+                ModelEvent::Reconcile if self.recovery_debt == 1 => {
+                    next.recovery_debt = 0;
+                    next.phase = 4;
+                    next.plan_active = false;
+                    next.last_commit_guard_valid = true;
+                }
+                ModelEvent::LoseLeader if self.leader_live => next.leader_live = false,
+                ModelEvent::CampaignSuccessor if !self.leader_live && self.term == 1 => {
+                    next.term = 2;
+                    next.leader_live = true;
+                    if next.claim.is_some() {
+                        next.claim = Some((next.owner, next.generation, 2));
+                        next.last_commit_guard_valid = true;
+                    }
+                    next.barrier_satisfied = false;
+                    next.ack_attempted = 0;
+                }
+                ModelEvent::StaleLeaderWrite if self.term == 2 => next.stale_checked = true,
+                ModelEvent::CompareConflict if self.leader_live => next.conflict_checked = true,
+                ModelEvent::UnknownCommitResult if self.leader_live && self.phase == 0 => {
+                    next.phase = 1;
+                    next.owner = 1;
+                    next.generation = 1;
+                    next.claim = Some((1, 1, self.term));
+                    next.slots += 1;
+                    next.unknown_checked = true;
+                    next.last_commit_guard_valid = true;
+                }
+                ModelEvent::Pause if self.pause_steps == 0 => {
+                    next.paused = true;
+                    next.pause_steps = 1;
+                    next.last_commit_guard_valid = true;
+                }
+                ModelEvent::Resume if self.pause_steps == 1 => {
+                    next.paused = false;
+                    next.pause_steps = 2;
+                    next.last_commit_guard_valid = true;
+                }
+                ModelEvent::DisconnectTarget if self.target_connected => {
+                    next.target_connected = false;
+                }
+                ModelEvent::AckOldTerm if self.plan_active => next.ack_attempted = 1,
+                ModelEvent::AckCurrentTerm if self.plan_active => {
+                    next.ack_attempted = 2;
+                    next.barrier_satisfied = true;
+                }
+                ModelEvent::StartMigration if !self.leader_live && self.migration_phase == 0 => {
+                    next.migration_phase = 1;
+                }
+                ModelEvent::CommitMigrationPage if self.migration_phase == 1 => {
+                    next.migration_cursor += 1;
+                    next.migration_phase = 3;
+                }
+                ModelEvent::InterruptMigration if self.migration_phase == 1 => {
+                    next.migration_phase = 2;
+                }
+                ModelEvent::ResumeMigration if self.migration_phase == 2 => {
+                    next.migration_phase = 1;
+                }
                 _ => return Err(()),
             }
             Ok(next)
         }
 
         fn invariant(&self) -> Result<(), String> {
-            if self.ready && (self.owner != Some(2) || self.generation != 2) {
-                Err("ready owner lacks exact generation claim".to_owned())
-            } else {
-                Ok(())
+            if !self.last_commit_guard_valid {
+                return Err("a committed mutation lacked the exact live leader guard".to_owned());
             }
+            if matches!(self.phase, 1 | 2)
+                && self.recovery_debt == 0
+                && self.claim != Some((self.owner, self.generation, self.term))
+            {
+                return Err("active slot lacks its exact owner/generation/term claim".to_owned());
+            }
+            if (self.phase == 3 && !self.plan_active)
+                || (self.plan_active && !matches!(self.phase, 1 | 3 | 4))
+            {
+                return Err("slot active_move and plan movement disagree".to_owned());
+            }
+            if self.recovery_debt > 2 {
+                return Err("lease-expiry recovery exceeded its bounded obligation".to_owned());
+            }
+            if self.barrier_satisfied && self.ack_attempted != 2 {
+                return Err("an acknowledgement from another term satisfied the barrier".to_owned());
+            }
+            if self.slots > 2 {
+                return Err("durable slot cardinality exceeded its configured maximum".to_owned());
+            }
+            if self.migration_cursor > 1 || self.migration_phase > 3 {
+                return Err("migration cursor is not idempotently bounded".to_owned());
+            }
+            Ok(())
         }
     }
 
     #[test]
     fn bounded_state_explorer_checks_every_transition() {
         let report = StateExplorer {
-            maximum_states: 16,
-            maximum_depth: 8,
+            maximum_states: 20_000,
+            maximum_depth: 12,
         }
-        .explore(TinyOwnership {
-            generation: 1,
-            owner: Some(1),
-            ready: false,
+        .explore(CoordinatorModel {
+            term: 1,
+            leader_live: true,
+            phase: 0,
+            owner: 0,
+            generation: 0,
+            claim: None,
+            plan_active: false,
+            recovery_debt: 0,
+            barrier_satisfied: false,
+            ack_attempted: 0,
+            slots: 0,
+            paused: false,
+            pause_steps: 0,
+            target_connected: true,
+            stale_checked: false,
+            conflict_checked: false,
+            unknown_checked: false,
+            last_commit_guard_valid: true,
+            migration_phase: 0,
+            migration_cursor: 0,
         })
         .unwrap();
-        assert_eq!(report.visited_states, 4);
-        assert_eq!(report.maximum_depth_reached, 3);
+        assert!(report.visited_states > 1_000);
+        assert_eq!(report.maximum_depth_reached, 12);
     }
 
     #[test]

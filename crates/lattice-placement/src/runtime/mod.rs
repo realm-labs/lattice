@@ -20,16 +20,19 @@ use crate::control::{
     encode_control_command,
 };
 use crate::coordinator::{
-    LeaderRecord, LoadTable, MemberChange, MemberEvent, MemberRecord, MemberRemovalReason,
-    MemberStatus, NodeHello, SessionLimits, SingletonConfig, SnapshotLimits, SnapshotRecord,
-    build_snapshot,
+    LeaderGuard, LeaderRecord, LoadTable, MemberChange, MemberEvent, MemberRecord,
+    MemberRemovalReason, MemberStatus, NodeHello, SessionLimits, SingletonConfig, SnapshotLimits,
+    SnapshotRecord, build_snapshot,
 };
 use crate::handoff::{HandoffEffect, HandoffEvent, HandoffMachine, HandoffPhase};
 use crate::plan::{MoveProgress, PlanError, PlanReason, PlanStatus, RebalancePlan};
+use crate::storage::domain::{
+    AdminOperationRecord, AutomaticBalanceSettings, DurableStorageLimits,
+};
 use crate::storage::{CoordinatorStore, StorageError};
 use crate::types::{
     ClaimGrant, CoordinatorTerm, GrantSequence, NodeKey, PlacementSlot, PlacementSlotKey,
-    PlacementSlotState, Revision,
+    PlacementSlotState, StateVersion,
 };
 
 mod admin;
@@ -37,6 +40,7 @@ mod allocation;
 mod lifecycle;
 mod membership;
 mod rebalance;
+mod reconciliation;
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorLeaderConfig {
@@ -52,10 +56,18 @@ pub struct CoordinatorLeaderConfig {
     pub maximum_shard_loads: usize,
     pub maximum_control_payload: usize,
     pub maximum_operations: usize,
+    pub maximum_admin_operation_records: usize,
+    pub admin_operation_retention: Duration,
     pub maximum_plan_moves: usize,
     pub maximum_completed_plan_history: usize,
+    pub maximum_entity_configs: usize,
+    pub maximum_singleton_configs: usize,
     pub rebalance_limits: RebalanceLimits,
     pub rebalance_interval: Duration,
+    pub reconciliation_interval: Duration,
+    pub reconciliation_page_size: usize,
+    pub maximum_reconciliation_work_per_pass: usize,
+    pub maximum_quarantined_records: usize,
 }
 
 impl Default for CoordinatorLeaderConfig {
@@ -76,8 +88,12 @@ impl Default for CoordinatorLeaderConfig {
             maximum_shard_loads: 65_536,
             maximum_control_payload: DEFAULT_MAX_CONTROL_PAYLOAD,
             maximum_operations: 128,
+            maximum_admin_operation_records: 1024,
+            admin_operation_retention: Duration::from_secs(24 * 60 * 60),
             maximum_plan_moves: 64,
             maximum_completed_plan_history: 64,
+            maximum_entity_configs: 1024,
+            maximum_singleton_configs: 1024,
             rebalance_limits: RebalanceLimits {
                 moves_per_round: 16,
                 concurrent_cluster: 8,
@@ -86,6 +102,10 @@ impl Default for CoordinatorLeaderConfig {
                 concurrent_target: 1,
             },
             rebalance_interval: Duration::from_secs(30),
+            reconciliation_interval: Duration::from_secs(5),
+            reconciliation_page_size: 128,
+            maximum_reconciliation_work_per_pass: 256,
+            maximum_quarantined_records: 128,
         }
     }
 }
@@ -105,10 +125,18 @@ impl CoordinatorLeaderConfig {
             || self.maximum_shard_loads == 0
             || self.maximum_control_payload == 0
             || self.maximum_operations == 0
+            || self.maximum_admin_operation_records == 0
+            || self.admin_operation_retention.is_zero()
             || self.maximum_plan_moves == 0
             || self.maximum_completed_plan_history == 0
+            || self.maximum_entity_configs == 0
+            || self.maximum_singleton_configs == 0
             || self.rebalance_limits.validate().is_err()
             || self.rebalance_interval.is_zero()
+            || self.reconciliation_interval.is_zero()
+            || self.reconciliation_page_size == 0
+            || self.maximum_reconciliation_work_per_pass == 0
+            || self.maximum_quarantined_records == 0
         {
             return Err(CoordinatorRuntimeError::InvalidConfig);
         }
@@ -123,8 +151,8 @@ struct MemberSession {
     lease_id: i64,
     heartbeat_sequence: u64,
     last_heartbeat: Instant,
-    applied_revision: Option<Revision>,
-    snapshot_revision: Option<Revision>,
+    applied_version: Option<StateVersion>,
+    snapshot_version: Option<StateVersion>,
     draining: bool,
     drain_operation: Option<String>,
     drain_ready: bool,
@@ -154,17 +182,32 @@ pub struct ForceRemoveRequest {
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorInspection {
-    pub term: CoordinatorTerm,
-    pub revision: Revision,
+    pub version: StateVersion,
     pub automatic_globally_paused: bool,
     pub paused_entity_types: Vec<lattice_core::actor_ref::EntityType>,
     pub slots: Vec<PlacementSlot>,
     pub plans: Vec<RebalancePlan>,
+    pub reconciliation_backlog: usize,
+    pub reconciliation_oldest_pending_millis: Option<u64>,
+    pub reconciliation_last_success_age_millis: Option<u64>,
+    pub quarantined_records: Vec<(String, String)>,
+    pub durable_limits: DurableStorageLimits,
+    pub retained_admin_operations: usize,
+    pub leadership_loss_count: u64,
+    pub commit_conflict_count: u64,
+    pub unknown_outcome_count: u64,
+    pub capacity_rejection_count: u64,
 }
 
-struct AppliedAdminOperation {
-    fingerprint: String,
-    plan_id: Option<u128>,
+#[derive(Default)]
+struct ReconciliationState {
+    initial_complete: bool,
+    cursor: usize,
+    backlog: usize,
+    oldest_pending: Option<Instant>,
+    last_success: Option<Instant>,
+    quarantined: BTreeMap<String, String>,
+    focused: bool,
 }
 
 enum CoordinatorOperation {
@@ -174,11 +217,13 @@ enum CoordinatorOperation {
         completion: tokio::sync::oneshot::Sender<Result<u128, CoordinatorRuntimeError>>,
     },
     CancelPending {
+        operation_id: String,
         plan_id: u128,
         shard_id: crate::types::ShardId,
         completion: tokio::sync::oneshot::Sender<Result<(), CoordinatorRuntimeError>>,
     },
     Evaluate {
+        operation_id: String,
         entity_type: lattice_core::actor_ref::EntityType,
         trigger: RebalanceTrigger,
         completion: tokio::sync::oneshot::Sender<Result<Option<u128>, CoordinatorRuntimeError>>,
@@ -230,12 +275,14 @@ impl CoordinatorHandle {
 
     pub async fn cancel_pending(
         &self,
+        operation_id: String,
         plan_id: u128,
         shard_id: crate::types::ShardId,
     ) -> Result<(), CoordinatorRuntimeError> {
         let (completion, result) = tokio::sync::oneshot::channel();
         self.operations
             .send(CoordinatorOperation::CancelPending {
+                operation_id,
                 plan_id,
                 shard_id,
                 completion,
@@ -249,12 +296,14 @@ impl CoordinatorHandle {
 
     pub async fn evaluate_rebalance(
         &self,
+        operation_id: String,
         entity_type: lattice_core::actor_ref::EntityType,
         trigger: RebalanceTrigger,
     ) -> Result<Option<u128>, CoordinatorRuntimeError> {
         let (completion, result) = tokio::sync::oneshot::channel();
         self.operations
             .send(CoordinatorOperation::Evaluate {
+                operation_id,
                 entity_type,
                 trigger,
                 completion,
@@ -337,9 +386,10 @@ pub struct CoordinatorLeader<S: CoordinatorStore> {
     store: Arc<S>,
     associations: Arc<AssociationManager>,
     leader: LeaderRecord,
+    leader_guard: LeaderGuard,
     leader_lease_id: i64,
     config: CoordinatorLeaderConfig,
-    revision: Revision,
+    version: StateVersion,
     sessions: BTreeMap<NodeIncarnation, MemberSession>,
     claims: BTreeMap<PlacementSlotKey, ClaimLease>,
     loads: LoadTable,
@@ -364,7 +414,13 @@ pub struct CoordinatorLeader<S: CoordinatorStore> {
     >,
     automatic_globally_paused: bool,
     paused_entity_types: std::collections::BTreeSet<lattice_core::actor_ref::EntityType>,
-    applied_admin_operations: BTreeMap<String, AppliedAdminOperation>,
+    automatic_settings: Option<AutomaticBalanceSettings>,
+    applied_admin_operations: BTreeMap<String, AdminOperationRecord>,
+    reconciliation: ReconciliationState,
+    leadership_loss_count: u64,
+    commit_conflict_count: u64,
+    unknown_outcome_count: u64,
+    capacity_rejection_count: u64,
 }
 
 impl<S: CoordinatorStore> CoordinatorLeader<S> {
@@ -391,14 +447,9 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             let _ = store.revoke_lease(leader_lease_id).await;
             return Err(CoordinatorRuntimeError::NotLeader);
         }
+        let leader_guard = LeaderGuard::new(leader.clone());
         let slots = store.list_slots().await?;
-        let members = store.list_members().await?;
-        let revision = slots
-            .iter()
-            .map(|slot| slot.revision)
-            .chain(members.iter().map(|member| member.revision))
-            .max()
-            .unwrap_or(Revision::new(1).expect("one is a valid revision"));
+        let version = StateVersion::new(term, store.get_state_revision().await?);
         let loads = LoadTable::new(config.maximum_node_loads, config.maximum_shard_loads)
             .map_err(CoordinatorRuntimeError::Coordinator)?;
         let plans = store
@@ -407,6 +458,13 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .into_iter()
             .map(|plan| (plan.plan_id, plan))
             .collect();
+        let automatic_settings = store.get_automatic_settings().await?;
+        let applied_admin_operations = store
+            .list_admin_operations()
+            .await?
+            .into_iter()
+            .map(|operation| (operation.operation_id.clone(), operation))
+            .collect::<BTreeMap<_, _>>();
         let (operations, operation_receiver) = mpsc::channel(config.maximum_operations);
         let default_strategy: Arc<dyn ShardAllocationStrategy> =
             Arc::new(WeightedLeastLoad::default());
@@ -432,9 +490,10 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             store,
             associations,
             leader,
+            leader_guard,
             leader_lease_id,
             config,
-            revision,
+            version,
             sessions: BTreeMap::new(),
             claims: BTreeMap::new(),
             loads,
@@ -450,11 +509,24 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             last_automatic_move_at: None,
             node_load_received: BTreeMap::new(),
             shard_load_received: BTreeMap::new(),
-            automatic_globally_paused: false,
-            paused_entity_types: Default::default(),
-            applied_admin_operations: BTreeMap::new(),
+            automatic_globally_paused: automatic_settings
+                .as_ref()
+                .is_some_and(|settings| settings.globally_paused),
+            paused_entity_types: automatic_settings
+                .as_ref()
+                .map(|settings| settings.paused_entity_types.clone())
+                .unwrap_or_default(),
+            automatic_settings,
+            applied_admin_operations,
+            reconciliation: ReconciliationState::default(),
+            leadership_loss_count: 0,
+            commit_conflict_count: 0,
+            unknown_outcome_count: 0,
+            capacity_rejection_count: 0,
         };
+        leader.reconcile_initial_inventory().await?;
         leader.recover_persisted_plans().await?;
+        leader.compact_admin_operation_history().await?;
         Ok(leader)
     }
 
@@ -510,6 +582,11 @@ pub enum CoordinatorRuntimeError {
     UnknownSession,
     #[error("Coordinator member transition is stale or invalid")]
     StaleMember,
+    #[error("predecessor incarnation {predecessor:?} is still leased for {remaining_ttl:?}")]
+    IncarnationPending {
+        predecessor: NodeIncarnation,
+        remaining_ttl: Option<Duration>,
+    },
     #[error("Coordinator drain operation is not ready")]
     DrainNotReady,
     #[error("Coordinator association is unavailable")]
@@ -526,10 +603,14 @@ pub enum CoordinatorRuntimeError {
     IneligibleTarget,
     #[error("placement entity configuration is unknown")]
     UnknownEntityConfig,
+    #[error("shard ID is outside the configured entity key domain")]
+    ShardOutOfRange,
     #[error("placement singleton configuration is unknown")]
     UnknownSingletonConfig,
     #[error("placement configuration conflicts with an existing declaration")]
     ConfigurationConflict,
+    #[error("placement configuration cardinality limit reached")]
+    ConfigurationCapacity,
     #[error("allocation strategy is not registered")]
     UnknownStrategy,
     #[error("allocation strategy ID/version is already registered")]
@@ -556,5 +637,7 @@ pub enum CoordinatorRuntimeError {
     Association(#[from] lattice_remoting::association::AssociationError),
 }
 
+#[cfg(test)]
+mod reconciliation_tests;
 #[cfg(test)]
 mod tests;

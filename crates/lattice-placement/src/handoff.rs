@@ -4,7 +4,8 @@ use lattice_core::actor_ref::NodeIncarnation;
 use thiserror::Error;
 
 use crate::types::{
-    AssignmentGeneration, NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState, Revision,
+    AssignmentGeneration, NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState,
+    StateVersion,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +29,7 @@ pub enum HandoffEffect {
 pub enum HandoffEvent {
     AppliedRevision {
         session: NodeIncarnation,
-        revision: Revision,
+        version: StateVersion,
     },
     FenceSession(NodeIncarnation),
     SourceDrained {
@@ -62,12 +63,12 @@ pub struct HandoffMachine {
     pub source_generation: AssignmentGeneration,
     pub target_generation: AssignmentGeneration,
     pub phase: HandoffPhase,
-    barrier: RevisionBarrier,
+    barrier: VersionBarrier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RevisionBarrier {
-    revision: Revision,
+struct VersionBarrier {
+    version: StateVersion,
     required: BTreeSet<NodeIncarnation>,
     applied: BTreeSet<NodeIncarnation>,
 }
@@ -79,7 +80,7 @@ impl HandoffMachine {
         source: NodeKey,
         target: NodeKey,
         source_generation: AssignmentGeneration,
-        barrier_revision: Revision,
+        barrier_version: StateVersion,
         barrier_sessions: BTreeSet<NodeIncarnation>,
     ) -> Result<Self, HandoffError> {
         let target_generation = source_generation
@@ -93,8 +94,8 @@ impl HandoffMachine {
             source_generation,
             target_generation,
             phase: HandoffPhase::Invalidating,
-            barrier: RevisionBarrier {
-                revision: barrier_revision,
+            barrier: VersionBarrier {
+                version: barrier_version,
                 required: barrier_sessions,
                 applied: BTreeSet::new(),
             },
@@ -107,7 +108,7 @@ impl HandoffMachine {
         source: NodeKey,
         target: NodeKey,
         source_generation: AssignmentGeneration,
-        barrier_revision: Revision,
+        barrier_version: StateVersion,
         barrier_sessions: BTreeSet<NodeIncarnation>,
     ) -> Result<Self, HandoffError> {
         if slot.active_move != Some(plan_id) {
@@ -119,7 +120,7 @@ impl HandoffMachine {
             source,
             target.clone(),
             source_generation,
-            barrier_revision,
+            barrier_version,
             barrier_sessions,
         )?;
         machine.phase = match slot.state {
@@ -137,8 +138,8 @@ impl HandoffMachine {
         Ok(machine)
     }
 
-    pub fn barrier_revision(&self) -> Revision {
-        self.barrier.revision
+    pub fn barrier_version(&self) -> StateVersion {
+        self.barrier.version
     }
 
     pub fn required_sessions(&self) -> &BTreeSet<NodeIncarnation> {
@@ -157,10 +158,12 @@ impl HandoffMachine {
 
     pub fn transition(&mut self, event: HandoffEvent) -> Result<Vec<HandoffEffect>, HandoffError> {
         match event {
-            HandoffEvent::AppliedRevision { session, revision }
+            HandoffEvent::AppliedRevision { session, version }
                 if self.phase == HandoffPhase::Invalidating =>
             {
-                if revision < self.barrier.revision || !self.barrier.required.contains(&session) {
+                if !version.satisfies(self.barrier.version)
+                    || !self.barrier.required.contains(&session)
+                {
                     return Err(HandoffError::UnexpectedBarrierMember);
                 }
                 self.barrier.applied.insert(session);
@@ -255,15 +258,34 @@ mod tests {
             node("source", 1),
             node("target", 2),
             AssignmentGeneration::new(4).unwrap(),
-            Revision::new(8).unwrap(),
+            StateVersion::new(
+                crate::types::CoordinatorTerm::new(2).unwrap(),
+                crate::types::Revision::new(8).unwrap(),
+            ),
             [subscribed].into_iter().collect(),
         )
         .unwrap();
+        assert_eq!(
+            machine
+                .transition(HandoffEvent::AppliedRevision {
+                    session: subscribed,
+                    version: StateVersion::new(
+                        crate::types::CoordinatorTerm::new(1).unwrap(),
+                        crate::types::Revision::new(8).unwrap(),
+                    ),
+                })
+                .unwrap_err(),
+            HandoffError::UnexpectedBarrierMember
+        );
+        assert_eq!(machine.phase, HandoffPhase::Invalidating);
         assert!(
             machine
                 .transition(HandoffEvent::AppliedRevision {
                     session: NodeIncarnation::new(99).unwrap(),
-                    revision: Revision::new(8).unwrap(),
+                    version: StateVersion::new(
+                        crate::types::CoordinatorTerm::new(2).unwrap(),
+                        crate::types::Revision::new(8).unwrap(),
+                    ),
                 })
                 .is_err()
         );
@@ -271,7 +293,10 @@ mod tests {
             machine
                 .transition(HandoffEvent::AppliedRevision {
                     session: subscribed,
-                    revision: Revision::new(8).unwrap(),
+                    version: StateVersion::new(
+                        crate::types::CoordinatorTerm::new(2).unwrap(),
+                        crate::types::Revision::new(8).unwrap(),
+                    ),
                 })
                 .unwrap(),
             vec![HandoffEffect::DrainSource]

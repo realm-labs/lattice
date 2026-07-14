@@ -14,8 +14,14 @@ use lattice_remoting::messaging::target::ExactActorTarget;
 use crate::authority::AuthorityEffect;
 use crate::control::PlacementControlRouter;
 use crate::session::{LogicCoordinatorConfig, LogicCoordinatorSession};
+use crate::storage::domain::{
+    ActivateAuthority, AllocateInitial, CreatePlan, LeasedClaim, ReserveMove,
+};
 use crate::storage::{InMemoryPlacementStore, PlacementStore};
-use crate::types::{AssignmentGeneration, PlacementSlot, PlacementSlotState, ShardId};
+use crate::types::{
+    AssignmentGeneration, GrantSequence, PlacementSlot, PlacementSlotState, PlanRevision, Revision,
+    ShardId, StateVersion,
+};
 
 fn attach_test_session(
     associations: &AssociationManager,
@@ -68,9 +74,73 @@ async fn register_up(
     let incarnation = hello.node.incarnation;
     leader.register(hello, association.clone()).await.unwrap();
     leader
-        .mark_member_up(incarnation, leader.revision, &association)
+        .mark_member_up(incarnation, leader.version, &association)
         .await
         .unwrap();
+}
+
+async fn seed_running_slot(
+    leader: &mut CoordinatorLeader<InMemoryPlacementStore>,
+    mut slot: PlacementSlot,
+) {
+    let owner = slot.owner.clone().unwrap();
+    slot.version.term = leader.leader.term;
+    slot.state = PlacementSlotState::Allocating;
+    slot.active_move = None;
+    slot.target = None;
+    slot.version = leader.next_version().unwrap();
+    let lease_id = leader
+        .store
+        .grant_lease(leader.config.claim_ttl)
+        .await
+        .unwrap();
+    let grant = ClaimGrant {
+        slot: slot.key.clone(),
+        owner,
+        coordinator_term: leader.leader.term,
+        assignment_generation: slot.assignment_generation,
+        grant_sequence: GrantSequence::new(1).unwrap(),
+        ttl: leader.config.claim_ttl,
+    };
+    let committed = leader
+        .store
+        .allocate_initial(
+            &leader.leader_guard,
+            AllocateInitial {
+                slot,
+                claim: LeasedClaim {
+                    grant: grant.clone(),
+                    lease_id,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    leader.version = committed.slot.version;
+    leader.claims.insert(
+        committed.slot.key.clone(),
+        ClaimLease {
+            lease_id,
+            grant: grant.clone(),
+        },
+    );
+    let expected_slot = committed.slot;
+    let mut running = expected_slot.clone();
+    running.state = PlacementSlotState::Running;
+    running.version = leader.next_version().unwrap();
+    let committed = leader
+        .store
+        .activate_authority(
+            &leader.leader_guard,
+            ActivateAuthority {
+                expected_slot,
+                expected_claim: grant,
+                slot: running,
+            },
+        )
+        .await
+        .unwrap();
+    leader.version = committed.slot.version;
 }
 
 struct NoActors;
@@ -207,26 +277,8 @@ async fn real_control_session_installs_snapshot_and_matching_claim() {
         shard_id: ShardId::new(3),
     };
     let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
-    store
-        .compare_and_put_slot(
-            None,
-            PlacementSlot {
-                key: slot_key.clone(),
-                config_fingerprint: ConfigFingerprint::new([7; 32]),
-                owner: Some(logic_node.clone()),
-                target: None,
-                assignment_generation: AssignmentGeneration::new(1).unwrap(),
-                coordinator_term: CoordinatorTerm::new(1).unwrap(),
-                revision: Revision::new(1).unwrap(),
-                state: PlacementSlotState::Running,
-                active_move: None,
-                barrier_sessions: Default::default(),
-            },
-        )
-        .await
-        .unwrap();
-    let leader = CoordinatorLeader::elect(
-        store,
+    let mut leader = CoordinatorLeader::elect(
+        store.clone(),
         coordinator_associations,
         coordinator_node,
         CoordinatorTerm::new(1).unwrap(),
@@ -238,6 +290,21 @@ async fn real_control_session_installs_snapshot_and_matching_claim() {
     )
     .await
     .unwrap();
+    seed_running_slot(
+        &mut leader,
+        PlacementSlot {
+            key: slot_key.clone(),
+            config_fingerprint: ConfigFingerprint::new([7; 32]),
+            owner: Some(logic_node.clone()),
+            target: None,
+            assignment_generation: AssignmentGeneration::new(1).unwrap(),
+            version: StateVersion::new(CoordinatorTerm::new(1).unwrap(), Revision::new(1).unwrap()),
+            state: PlacementSlotState::Running,
+            active_move: None,
+            barrier_sessions: Default::default(),
+        },
+    )
+    .await;
     let hello = NodeHello {
         node: logic_node,
         roles: ["logic".to_owned()].into_iter().collect(),
@@ -331,24 +398,6 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
         shard_id: ShardId::new(1),
     };
     let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
-    store
-        .compare_and_put_slot(
-            None,
-            PlacementSlot {
-                key: slot_key.clone(),
-                config_fingerprint: ConfigFingerprint::new([9; 32]),
-                owner: Some(source.clone()),
-                target: None,
-                assignment_generation: AssignmentGeneration::new(1).unwrap(),
-                coordinator_term: CoordinatorTerm::new(1).unwrap(),
-                revision: Revision::new(1).unwrap(),
-                state: PlacementSlotState::Running,
-                active_move: None,
-                barrier_sessions: Default::default(),
-            },
-        )
-        .await
-        .unwrap();
     let mut leader = CoordinatorLeader::elect(
         store.clone(),
         associations,
@@ -359,6 +408,21 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
     )
     .await
     .unwrap();
+    seed_running_slot(
+        &mut leader,
+        PlacementSlot {
+            key: slot_key.clone(),
+            config_fingerprint: ConfigFingerprint::new([9; 32]),
+            owner: Some(source.clone()),
+            target: None,
+            assignment_generation: AssignmentGeneration::new(1).unwrap(),
+            version: StateVersion::new(CoordinatorTerm::new(1).unwrap(), Revision::new(1).unwrap()),
+            state: PlacementSlotState::Running,
+            active_move: None,
+            barrier_sessions: Default::default(),
+        },
+    )
+    .await;
     let protocol_id = lattice_core::actor_ref::ProtocolId::new(77).unwrap();
     let entity_config = crate::region::EntityConfig::new(
         entity_type.clone(),
@@ -403,18 +467,18 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
         leader
             .manual_relocate(ManualRelocationRequest {
                 target_node_id: source.node_id.clone(),
-                ..relocation
+                ..relocation.clone()
             })
             .await,
         Err(CoordinatorRuntimeError::IdempotencyConflict)
     ));
-    let barrier_revision = leader.handoffs[&slot_key].barrier_revision();
+    let barrier_version = leader.handoffs[&slot_key].barrier_version();
     leader
         .transition_handoff(
             slot_key.clone(),
             HandoffEvent::AppliedRevision {
                 session: source.incarnation,
-                revision: barrier_revision,
+                version: barrier_version,
             },
         )
         .await
@@ -424,7 +488,7 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
             slot_key.clone(),
             HandoffEvent::AppliedRevision {
                 session: target.incarnation,
-                revision: barrier_revision,
+                version: barrier_version,
             },
         )
         .await
@@ -447,7 +511,13 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
     assert_eq!(allocating.state, PlacementSlotState::Allocating);
     assert_eq!(allocating.owner.as_ref(), Some(&target));
     assert_eq!(
-        store.get_claim(&slot_key).await.unwrap().unwrap().owner,
+        store
+            .get_claim(&slot_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .grant
+            .owner,
         target
     );
     leader
@@ -465,6 +535,38 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
     assert!(active.active_move.is_none());
     let plan = store.get_plan(plan_id).await.unwrap().unwrap();
     assert_eq!(plan.status, PlanStatus::Completed);
+    store.revoke_lease(leader.leader_lease_id).await.unwrap();
+    let (successor_node, _) = node(&cluster_id, "successor", 26203, 203);
+    let mut successor = CoordinatorLeader::elect(
+        store,
+        Arc::new(
+            AssociationManager::new(
+                successor_node.address.clone(),
+                successor_node.incarnation,
+                RemotingConfig::default(),
+            )
+            .unwrap(),
+        ),
+        successor_node,
+        CoordinatorTerm::new(2).unwrap(),
+        2,
+        CoordinatorLeaderConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        successor.manual_relocate(relocation.clone()).await.unwrap(),
+        plan_id
+    );
+    assert!(matches!(
+        successor
+            .manual_relocate(ManualRelocationRequest {
+                target_node_id: "different-target".to_owned(),
+                ..relocation
+            })
+            .await,
+        Err(CoordinatorRuntimeError::IdempotencyConflict)
+    ));
 }
 
 #[tokio::test]
@@ -612,7 +714,7 @@ async fn admin_pause_is_idempotent_fingerprinted_and_inspectable() {
     );
     let store = Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
     let mut leader = CoordinatorLeader::elect(
-        store,
+        store.clone(),
         associations,
         coordinator,
         CoordinatorTerm::new(1).unwrap(),
@@ -637,20 +739,19 @@ async fn admin_pause_is_idempotent_fingerprinted_and_inspectable() {
         Err(CoordinatorRuntimeError::IdempotencyConflict)
     ));
     let inspection = leader.inspect().await.unwrap();
-    assert_eq!(inspection.term, CoordinatorTerm::new(1).unwrap());
+    assert_eq!(inspection.version.term, CoordinatorTerm::new(1).unwrap());
     assert_eq!(inspection.paused_entity_types, vec![entity_type]);
 
-    leader
-        .record_admin_operation("relocate-1".to_owned(), "move:a".to_owned(), Some(42))
-        .unwrap();
-    assert_eq!(
-        leader
-            .prior_admin_operation("relocate-1", "move:a")
-            .unwrap(),
-        Some(Some(42))
+    assert!(store.get_automatic_settings().await.unwrap().is_some());
+    assert!(
+        store
+            .get_admin_operation("pause-1")
+            .await
+            .unwrap()
+            .is_some()
     );
     assert!(matches!(
-        leader.prior_admin_operation("relocate-1", "move:b"),
+        leader.prior_admin_operation("pause-1", "move:b"),
         Err(CoordinatorRuntimeError::IdempotencyConflict)
     ));
 }
@@ -688,15 +789,18 @@ async fn terminal_plan_history_compacts_oldest_persisted_record() {
             entity_type: entity_type.clone(),
             reason: PlanReason::Manual,
             coordinator_term: CoordinatorTerm::new(1).unwrap(),
-            base_revision: Revision::new(id as u64).unwrap(),
-            revision: Revision::new(1).unwrap(),
+            base_version: StateVersion::new(
+                CoordinatorTerm::new(1).unwrap(),
+                Revision::new(id as u64).unwrap(),
+            ),
+            record_revision: PlanRevision::new(1).unwrap(),
             policy_id: "test".to_owned(),
             policy_version: 1,
             status: PlanStatus::Completed,
             moves: Vec::new(),
         };
         store
-            .compare_and_put_plan(None, plan.clone(), plan.revision)
+            .create_plan(&leader.leader_guard, CreatePlan { plan: plan.clone() })
             .await
             .unwrap();
         leader.plans.insert(id, plan);
@@ -709,7 +813,7 @@ async fn terminal_plan_history_compacts_oldest_persisted_record() {
 }
 
 #[tokio::test]
-async fn leader_recovery_resumes_handoff_and_cancels_stale_pending_move() {
+async fn leader_recovery_resumes_persisted_handoff() {
     use crate::allocation::{ProposedMove, RebalanceProposal, RebalanceTrigger};
 
     let cluster_id = ClusterId::new("recovery-test").unwrap();
@@ -721,7 +825,10 @@ async fn leader_recovery_resumes_handoff_and_cancels_stale_pending_move() {
     let proposal = |expected_generation| RebalanceProposal {
         policy_id: "test",
         policy_version: 1,
-        base_revision: Revision::new(1).unwrap(),
+        base_version: StateVersion::new(
+            CoordinatorTerm::new(1).unwrap(),
+            Revision::new(1).unwrap(),
+        ),
         trigger: RebalanceTrigger::Manual {
             source: Some(source.clone()),
             target: Some(target.clone()),
@@ -743,50 +850,15 @@ async fn leader_recovery_resumes_handoff_and_cancels_stale_pending_move() {
         4,
     )
     .unwrap();
+    let pending = started.clone();
     started
         .begin_move(shard_id, AssignmentGeneration::new(1).unwrap(), None)
         .unwrap();
-    started
-        .install_barrier(shard_id, Revision::new(2).unwrap(), Default::default())
-        .unwrap();
-    let stale = RebalancePlan::from_proposal(
-        proposal(AssignmentGeneration::new(9).unwrap()),
-        entity_type.clone(),
-        CoordinatorTerm::new(1).unwrap(),
-        4,
-    )
-    .unwrap();
     let slot_key = PlacementSlotKey::Shard {
         entity_type,
         shard_id,
     };
     let store = Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
-    store
-        .compare_and_put_slot(
-            None,
-            PlacementSlot {
-                key: slot_key.clone(),
-                config_fingerprint: ConfigFingerprint::new([7; 32]),
-                owner: Some(source),
-                target: Some(target),
-                assignment_generation: AssignmentGeneration::new(1).unwrap(),
-                coordinator_term: CoordinatorTerm::new(1).unwrap(),
-                revision: Revision::new(2).unwrap(),
-                state: PlacementSlotState::BeginHandoff,
-                active_move: Some(started.plan_id),
-                barrier_sessions: Default::default(),
-            },
-        )
-        .await
-        .unwrap();
-    store
-        .compare_and_put_plan(None, started.clone(), started.revision)
-        .await
-        .unwrap();
-    store
-        .compare_and_put_plan(None, stale.clone(), stale.revision)
-        .await
-        .unwrap();
     let associations = Arc::new(
         AssociationManager::new(
             coordinator.address.clone(),
@@ -795,7 +867,7 @@ async fn leader_recovery_resumes_handoff_and_cancels_stale_pending_move() {
         )
         .unwrap(),
     );
-    let leader = CoordinatorLeader::elect(
+    let mut leader = CoordinatorLeader::elect(
         store.clone(),
         associations,
         coordinator,
@@ -805,15 +877,61 @@ async fn leader_recovery_resumes_handoff_and_cancels_stale_pending_move() {
     )
     .await
     .unwrap();
+    seed_running_slot(
+        &mut leader,
+        PlacementSlot {
+            key: slot_key.clone(),
+            config_fingerprint: ConfigFingerprint::new([7; 32]),
+            owner: Some(source.clone()),
+            target: None,
+            assignment_generation: AssignmentGeneration::new(1).unwrap(),
+            version: StateVersion::new(CoordinatorTerm::new(1).unwrap(), Revision::new(1).unwrap()),
+            state: PlacementSlotState::Running,
+            active_move: None,
+            barrier_sessions: Default::default(),
+        },
+    )
+    .await;
+    store
+        .create_plan(
+            &leader.leader_guard,
+            CreatePlan {
+                plan: pending.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let barrier_version = leader.next_version().unwrap();
+    started
+        .install_barrier(shard_id, barrier_version, Default::default())
+        .unwrap();
+    started.record_revision = started.record_revision.next().unwrap();
+    let expected_slot = store.get_slot(&slot_key).await.unwrap().unwrap();
+    let mut handoff_slot = expected_slot.clone();
+    handoff_slot.target = Some(target);
+    handoff_slot.state = PlacementSlotState::BeginHandoff;
+    handoff_slot.active_move = Some(started.plan_id);
+    handoff_slot.version = barrier_version;
+    store
+        .reserve_move(
+            &leader.leader_guard,
+            ReserveMove {
+                expected_plan: pending,
+                plan: started.clone(),
+                expected_slot,
+                slot: handoff_slot,
+            },
+        )
+        .await
+        .unwrap();
+    leader.version = barrier_version;
+    leader.plans.insert(started.plan_id, started);
+    leader.recover_persisted_plans().await.unwrap();
     assert_eq!(
         store.get_slot(&slot_key).await.unwrap().unwrap().state,
         PlacementSlotState::Stopping
     );
     assert_eq!(leader.handoffs[&slot_key].phase, HandoffPhase::Draining);
-    assert_eq!(
-        store.get_plan(stale.plan_id).await.unwrap().unwrap().status,
-        PlanStatus::Cancelled
-    );
 }
 
 #[tokio::test]
@@ -914,7 +1032,7 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
             slot_key.clone(),
             HandoffEvent::AppliedRevision {
                 session: target.incarnation,
-                revision: persisted.revision,
+                version: persisted.version,
             },
         )
         .await
@@ -924,7 +1042,13 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
     assert_eq!(allocating.owner.as_ref(), Some(&target));
     assert_eq!(allocating.assignment_generation.get(), 2);
     assert_eq!(
-        store.get_claim(&slot_key).await.unwrap().unwrap().owner,
+        store
+            .get_claim(&slot_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .grant
+            .owner,
         target
     );
 
@@ -944,199 +1068,4 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
     assert!(active.barrier_sessions.is_empty());
 }
 
-#[tokio::test]
-async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
-    let cluster = ClusterId::new("member-lifecycle").unwrap();
-    let (coordinator, coordinator_identity) = node(&cluster, "coordinator", 30100, 100);
-    let (joining, _) = node(&cluster, "joining", 30101, 101);
-    let (forced, _) = node(&cluster, "forced", 30102, 102);
-    let (old_reused, _) = node(&cluster, "reused", 30103, 103);
-    let (new_reused, _) = node(&cluster, "reused", 30104, 104);
-    let config = RemotingConfig::default();
-    let associations = Arc::new(
-        AssociationManager::new(coordinator.address.clone(), coordinator.incarnation, config)
-            .unwrap(),
-    );
-    let joining_key = attach_test_session(
-        &associations,
-        &cluster,
-        coordinator_identity.incarnation,
-        &joining,
-        1000,
-    );
-    let forced_key = attach_test_session(
-        &associations,
-        &cluster,
-        coordinator_identity.incarnation,
-        &forced,
-        2000,
-    );
-    let old_reused_key = attach_test_session(
-        &associations,
-        &cluster,
-        coordinator_identity.incarnation,
-        &old_reused,
-        3000,
-    );
-    let new_reused_key = attach_test_session(
-        &associations,
-        &cluster,
-        coordinator_identity.incarnation,
-        &new_reused,
-        4000,
-    );
-    let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
-    let mut leader = CoordinatorLeader::elect(
-        store.clone(),
-        associations,
-        coordinator,
-        CoordinatorTerm::new(1).unwrap(),
-        3,
-        CoordinatorLeaderConfig::default(),
-    )
-    .await
-    .unwrap();
-
-    leader
-        .register(empty_hello(joining.clone()), joining_key.clone())
-        .await
-        .unwrap();
-    let joining_revision = leader.revision;
-    assert_eq!(
-        store.get_member("joining").await.unwrap().unwrap().status,
-        MemberStatus::Joining
-    );
-    assert!(matches!(
-        leader
-            .mark_member_up(
-                joining.incarnation,
-                joining_revision.next().unwrap(),
-                &joining_key,
-            )
-            .await,
-        Err(CoordinatorRuntimeError::StaleMember)
-    ));
-    leader
-        .mark_member_up(joining.incarnation, joining_revision, &joining_key)
-        .await
-        .unwrap();
-    let up = store.get_member("joining").await.unwrap().unwrap();
-    assert_eq!(up.status, MemberStatus::Up);
-    leader
-        .mark_member_up(joining.incarnation, joining_revision, &joining_key)
-        .await
-        .unwrap();
-
-    assert!(
-        leader
-            .begin_member_drain(
-                joining.incarnation,
-                "drain-1".to_string(),
-                NodeIncarnation::new(999).unwrap(),
-            )
-            .await
-            .is_err()
-    );
-    leader
-        .begin_member_drain(
-            joining.incarnation,
-            "drain-1".to_string(),
-            joining.incarnation,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        store.get_member("joining").await.unwrap().unwrap().status,
-        MemberStatus::Leaving
-    );
-    assert!(
-        leader
-            .complete_member_drain(joining.incarnation, "other", joining.incarnation)
-            .await
-            .is_err()
-    );
-    leader
-        .complete_member_drain(joining.incarnation, "drain-1", joining.incarnation)
-        .await
-        .unwrap();
-    assert!(store.get_member("joining").await.unwrap().is_none());
-
-    register_up(&mut leader, empty_hello(forced.clone()), forced_key).await;
-    let request = ForceRemoveRequest {
-        operation_id: "force-1".to_string(),
-        node_id: forced.node_id.clone(),
-        expected_incarnation: forced.incarnation,
-    };
-    assert!(
-        leader
-            .force_remove(ForceRemoveRequest {
-                expected_incarnation: NodeIncarnation::new(999).unwrap(),
-                ..request.clone()
-            })
-            .await
-            .is_err()
-    );
-    leader.force_remove(request.clone()).await.unwrap();
-    leader.force_remove(request).await.unwrap();
-    assert!(store.get_member("forced").await.unwrap().is_none());
-
-    register_up(&mut leader, empty_hello(old_reused.clone()), old_reused_key).await;
-    assert!(
-        leader
-            .register(empty_hello(new_reused.clone()), new_reused_key.clone())
-            .await
-            .is_err()
-    );
-    leader
-        .sessions
-        .get_mut(&old_reused.incarnation)
-        .unwrap()
-        .last_heartbeat = Instant::now() - Duration::from_secs(60);
-    leader
-        .register(empty_hello(new_reused.clone()), new_reused_key)
-        .await
-        .unwrap();
-    let current = store.get_member("reused").await.unwrap().unwrap();
-    assert_eq!(current.node, new_reused);
-    assert_eq!(current.status, MemberStatus::Joining);
-}
-
-#[tokio::test]
-async fn member_store_allows_one_incarnation_and_exact_record_cas_only() {
-    let store = InMemoryPlacementStore::new(8, 8).unwrap();
-    store.ensure_schema_generation().await.unwrap();
-    let first_lease = store.grant_lease(Duration::from_secs(5)).await.unwrap();
-    let second_lease = store.grant_lease(Duration::from_secs(5)).await.unwrap();
-    let cluster = ClusterId::new("member-store").unwrap();
-    let (first, _) = node(&cluster, "same-id", 30200, 1);
-    let (second, _) = node(&cluster, "same-id", 30201, 2);
-    let joining = MemberRecord {
-        node: first.clone(),
-        hello: empty_hello(first),
-        status: MemberStatus::Joining,
-        revision: Revision::new(1).unwrap(),
-        lease_id: first_lease,
-    };
-    let replacement = MemberRecord {
-        node: second.clone(),
-        hello: empty_hello(second),
-        status: MemberStatus::Joining,
-        revision: Revision::new(2).unwrap(),
-        lease_id: second_lease,
-    };
-    store.create_member(&joining).await.unwrap();
-    assert!(matches!(
-        store.create_member(&replacement).await,
-        Err(StorageError::IncarnationConflict)
-    ));
-    let mut up = joining.clone();
-    up.status = MemberStatus::Up;
-    up.revision = Revision::new(2).unwrap();
-    store.compare_and_put_member(&joining, &up).await.unwrap();
-    assert!(matches!(
-        store.compare_and_delete_member(&joining).await,
-        Err(StorageError::CompareFailed)
-    ));
-    store.compare_and_delete_member(&up).await.unwrap();
-    store.create_member(&replacement).await.unwrap();
-}
+mod lifecycle_tests;

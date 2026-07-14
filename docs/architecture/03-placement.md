@@ -53,22 +53,24 @@ The shared engine owns assignment persistence, term/generation validation, claim
 ## 3. Membership and Coordinator Leadership
 
 Nodes register through their remoting Coordinator session. `NodeHello` is a bounded session
-advertisement; persisted generation-3 membership is a `MemberRecord` containing the exact `NodeKey`,
-the validated hello, `Joining | Up | Leaving`, Coordinator revision and member lease ID. Removed is
+advertisement; persisted generation-4 membership is a `MemberRecord` containing the exact `NodeKey`,
+the validated hello, `Joining | Up | Leaving`, `StateVersion { term, revision }`, and member lease ID. Removed is
 an ordered event with the exact node incarnation and graceful, failure, force, or incarnation-replaced
 reason; it is not an active stored status. The Coordinator leader record is also lease-backed and
 fenced by an election term.
 
 Registration persists `Joining` and sends a full snapshot. The node replies with
-`JoinReady(snapshot_revision)` from the same Association. Only an exact revision match may CAS the
+`JoinReady(snapshot_version)` from the same Association. Only an exact term and revision match may CAS the
 record to `Up`; the resulting revisioned member delta and exact `MemberUp` acknowledgement open
 service admission. Replayed hello/join-ready commands from that session are idempotent. Allocation,
 handoff barriers, and singleton selection exclude every member not in `Up`.
 
 The full snapshot includes all active `MemberRecord` values. A logic session validates the complete
 digest, decodes members and placement slices, and emits one atomic member-snapshot effect before
-`JoinReady`. Service routing installs that replacement snapshot and then accepts only strictly
-increasing `MemberEvent` revisions; discovery candidates never enter this directory.
+`JoinReady`. Service routing installs that replacement snapshot and then accepts only contiguous
+`MemberEvent` deltas from the same term. A higher term requires a new snapshot, and lower-term
+snapshots, events, barriers, and acknowledgements are rejected; discovery candidates never enter
+this directory.
 
 Graceful drain CASes `Up -> Leaving`, moves placement through the normal persisted handoff path, and
 sends `DrainReady` only when no slot remains owned. `DrainComplete` deletes the exact record and
@@ -84,6 +86,20 @@ A new leader:
 4. reconciles observed claim holders before issuing new assignments;
 5. resumes required recovery/drain work, then allocation and automatic rebalancing only after reconciliation and fresh-input checks.
 
+Every authoritative mutation is a named domain transaction. Its storage predicate contains the
+exact serialized, lease-backed `LeaderRecord` and exact term, plus every record/counter comparison
+needed by the operation. Initial allocation and target installation put slot plus lease-attached
+claim atomically. Move reservation and completion update slot plus plan atomically. A false leader
+predicate is `LeadershipLost`, even when every record-local comparison still matches. Runtime
+effects, deltas, grants, and admin replies occur only after commit.
+
+Election begins with read-only bounded inventory. Reconciliation then adopts a matching older-term
+claim without changing owner or generation, fences active records whose claim is absent, and resumes
+persisted handoff phases. Periodic reconciliation uses bounded pages/work and exposes cursor backlog,
+oldest work, last success, and quarantine details. Claim lease expiry is an external fencing event:
+it may temporarily leave an active record claimless, but recovery must fence it and may reinstall
+only the same owner until previous authority invalidity is proven.
+
 Coordinator leadership does not by itself grant permission to serve a shard or singleton. The leader persists a generation claim in etcd and sends the selected owner a bounded `ClaimGranted` control message. The owner may serve only while the matching grant remains valid according to its local monotonic deadline. Runtime nodes do not acquire or renew claims by connecting to etcd directly. Claim authority remains per placement slot; transport may batch renewals for many slots owned by one node without weakening per-slot generation or expiry checks.
 
 ### 3.1 Revisioned State Snapshot
@@ -91,10 +107,10 @@ Coordinator leadership does not by itself grant permission to serve a shard or s
 The Coordinator session is node-level. `NodeHello` advertises the node incarnation, roles, capacity, hosted/proxied entity types, singleton eligibility/usage, and protocol catalogue. The snapshot contains cluster membership plus only the shard/singleton slices that the node is eligible to host or has subscribed to route. A node adding a Region or SingletonProxy subscription must install the corresponding snapshot slice before that component becomes Ready. The initial state may exceed the 256 KiB remoting frame, so it uses a bounded chunk protocol:
 
 ```text
-SnapshotBegin(snapshot_id, revision, chunk_count, total_bytes, blake3_digest)
+SnapshotBegin(snapshot_id, state_version, chunk_count, total_bytes, blake3_digest)
 SnapshotChunk(snapshot_id, index, bytes)  // at most 192 KiB payload
 SnapshotEnd(snapshot_id)
-AppliedRevision(revision)
+AppliedRevision(state_version)
 ```
 
 The receiver stages chunks outside the live routing table, rejects duplicate/out-of-range chunks, and enforces configured chunk count, total bytes, and assembly deadline. It atomically installs the snapshot only after every chunk and the BLAKE3 digest validate. A disconnect, timeout, digest mismatch, or revision gap discards staging and requests a fresh snapshot. Deltas received while staging are buffered only within a small bound or trigger resnapshot.
