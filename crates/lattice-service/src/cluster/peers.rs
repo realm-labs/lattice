@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use lattice_placement::coordinator::{MemberChange, MemberEvent, MemberRecord, MemberStatus};
+use lattice_placement::types::MembershipVersion;
 use lattice_placement::types::NodeKey;
-use lattice_placement::types::StateVersion;
 use lattice_remoting::association::{Association, AssociationManager, AssociationState};
 use lattice_remoting::endpoint::{EndpointError, RemotingEndpoint};
 use lattice_remoting::handshake::NodeIdentity;
@@ -61,7 +61,7 @@ impl PeerReconciler {
 
     pub async fn install_snapshot(
         &self,
-        version: StateVersion,
+        version: MembershipVersion,
         members: Vec<MemberRecord>,
     ) -> Result<(), PeerError> {
         self.members

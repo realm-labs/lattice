@@ -1,3 +1,5 @@
 [world]
-tick_ms = 5
 mailbox_capacity = 64
+placement_domain = "world"
+shard_count = 16
+capacity_units = 4

@@ -12,9 +12,11 @@ use lattice_actor::registry::{ActorLoader, ActorRegistry};
 use lattice_actor::traits::{Actor, ActorLifecycleState, PassivationReason, StopReason};
 use lattice_actor::{error::ActorCallError, handle::ActorHandle};
 use lattice_core::actor_ref::{
-    ActorRef, ConfigFingerprint, EntityRef, EntityType, ProtocolId, SingletonKind, SingletonRef,
+    ActorRef, ConfigFingerprint, EntityRef, EntityType, PlacementDomainId, ProtocolId,
+    SingletonKind, SingletonRef,
 };
 use lattice_core::id::ActorId;
+use lattice_placement::coordinator::SingletonConfig;
 use lattice_placement::region::EntityConfig;
 use lattice_placement::session::LogicPlacementState;
 use lattice_placement::types::NodeKey;
@@ -39,11 +41,13 @@ mod buffer;
 mod entity;
 pub mod join;
 pub mod members;
+pub(crate) mod membership_runtime;
 pub mod peers;
 mod proxy;
 mod router;
 pub(crate) mod runtime;
 mod singleton;
+mod singleton_proxy;
 
 use buffer::RouteBuffer;
 use entity::EntityRoute;
@@ -88,7 +92,7 @@ impl LogicalBufferConfig {
     }
 }
 
-pub struct ClusterLogicalRouter {
+pub struct DomainLogicalRouter {
     local_node: NodeKey,
     state: Arc<Mutex<LogicPlacementState>>,
     associations: Arc<AssociationManager>,
@@ -96,8 +100,8 @@ pub struct ClusterLogicalRouter {
     messaging: Arc<OutboundMessaging>,
     coordinator: AssociationKey,
     buffer_config: LogicalBufferConfig,
-    entities: BTreeMap<EntityType, Arc<dyn EntityRoute>>,
-    singletons: BTreeMap<SingletonKind, Arc<dyn SingletonRoute>>,
+    entities: BTreeMap<(PlacementDomainId, EntityType), Arc<dyn EntityRoute>>,
+    singletons: BTreeMap<(PlacementDomainId, SingletonKind), Arc<dyn SingletonRoute>>,
     maximum_registrations: usize,
 }
 
@@ -205,10 +209,16 @@ pub enum ClusterRouterError {
     Capacity,
     #[error("cluster logical router protocol does not match its config")]
     ProtocolMismatch,
-    #[error("entity type is already registered: {0:?}")]
-    DuplicateEntity(EntityType),
-    #[error("singleton kind is already registered: {0:?}")]
-    DuplicateSingleton(SingletonKind),
+    #[error("entity type {entity_type:?} is already registered in placement domain {domain}")]
+    DuplicateEntity {
+        domain: PlacementDomainId,
+        entity_type: EntityType,
+    },
+    #[error("singleton kind {kind:?} is already registered in placement domain {domain}")]
+    DuplicateSingleton {
+        domain: PlacementDomainId,
+        kind: SingletonKind,
+    },
 }
 
 #[cfg(test)]

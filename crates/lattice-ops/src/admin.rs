@@ -94,6 +94,7 @@ impl AdminAuth {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManualRelocation {
+    pub domain: String,
     pub operation_id: String,
     pub entity_type: String,
     pub shard_id: u32,
@@ -103,6 +104,7 @@ pub struct ManualRelocation {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlanCommand {
+    pub domain: String,
     pub operation_id: String,
     pub entity_type: Option<String>,
     pub plan_id: Option<String>,
@@ -134,6 +136,7 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
     async fn pause_automatic_rebalance(&self, command: PlanCommand) -> Result<(), AdminApiError> {
         self.coordinator
             .set_automatic_paused(
+                parse_domain(command.domain)?,
                 command.operation_id,
                 parse_entity_type(command.entity_type)?,
                 true,
@@ -145,6 +148,7 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
     async fn resume_automatic_rebalance(&self, command: PlanCommand) -> Result<(), AdminApiError> {
         self.coordinator
             .set_automatic_paused(
+                parse_domain(command.domain)?,
                 command.operation_id,
                 parse_entity_type(command.entity_type)?,
                 false,
@@ -157,6 +161,7 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
         let entity_type = parse_entity_type(command.entity_type)?.ok_or(AdminApiError::Invalid)?;
         self.coordinator
             .evaluate_rebalance(
+                parse_domain(command.domain)?,
                 command.operation_id,
                 entity_type,
                 lattice_placement::allocation::RebalanceTrigger::Automatic,
@@ -169,6 +174,7 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
     async fn relocate_shard(&self, command: ManualRelocation) -> Result<(), AdminApiError> {
         self.coordinator
             .relocate_shard(lattice_placement::runtime::ManualRelocationRequest {
+                domain: parse_domain(command.domain)?,
                 operation_id: command.operation_id,
                 entity_type: lattice_core::actor_ref::EntityType::new(command.entity_type)
                     .map_err(|_| AdminApiError::Invalid)?,
@@ -193,6 +199,7 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
         let shard_id = command.shard_id.ok_or(AdminApiError::Invalid)?;
         self.coordinator
             .cancel_pending(
+                parse_domain(command.domain)?,
                 command.operation_id,
                 plan_id,
                 lattice_placement::types::ShardId::new(shard_id),
@@ -200,6 +207,12 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
             .await
             .map_err(map_coordinator_error)
     }
+}
+
+fn parse_domain(
+    value: String,
+) -> Result<lattice_core::actor_ref::PlacementDomainId, AdminApiError> {
+    lattice_core::actor_ref::PlacementDomainId::new(value).map_err(|_| AdminApiError::Invalid)
 }
 
 fn parse_entity_type(

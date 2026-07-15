@@ -3,9 +3,10 @@ use super::{
     AskError, AssociationKey, AssociationManager, AssociationState, Bytes, ConfigFingerprint,
     DispatchMode, DispatchReply, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
     LogicalSingletonTarget, Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessaging,
-    PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol, ProtocolFingerprint, ProtocolId,
-    RemoteMessageError, RouteBuffer, SenderIdentity, SingletonKind, SingletonRef, WatchError,
-    async_trait, decode_resolved_actor, drain_actor_ids, map_ask, map_dispatch, map_tell,
+    PlacementDomainId, PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol,
+    ProtocolFingerprint, ProtocolId, RemoteMessageError, RouteBuffer, SenderIdentity,
+    SingletonKind, SingletonRef, WatchError, async_trait, decode_resolved_actor, drain_actor_ids,
+    map_ask, map_dispatch, map_tell,
 };
 
 #[async_trait]
@@ -55,6 +56,7 @@ pub(super) struct SingletonRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
     pub(super) messaging: Arc<OutboundMessaging>,
     pub(super) coordinator: AssociationKey,
     pub(super) buffer: RouteBuffer,
+    pub(super) domain: PlacementDomainId,
     pub(super) kind: SingletonKind,
     pub(super) config_fingerprint: ConfigFingerprint,
     pub(super) protocol_id: ProtocolId,
@@ -69,6 +71,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
         target: &SingletonRef,
     ) -> Result<lattice_placement::types::PlacementSlot, RemoteMessageError> {
         if target.protocol_id() != self.protocol_id
+            || target.domain() != &self.domain
             || target.config_fingerprint() != self.config_fingerprint
         {
             return Err(RemoteMessageError::ProtocolFingerprintMismatch);
@@ -76,7 +79,10 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
         self.state
             .lock()
             .expect("logic placement state poisoned")
-            .slot(&PlacementSlotKey::Singleton(self.kind.clone()))
+            .slot(&PlacementSlotKey::Singleton {
+                domain: self.domain.clone(),
+                kind: self.kind.clone(),
+            })
             .cloned()
             .ok_or(RemoteMessageError::StaleAuthority)
     }
@@ -100,8 +106,10 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
         let sequence = NEXT_LOGICAL_RESOLUTION.fetch_add(1, Ordering::Relaxed);
         let request_id = (self.local_node.incarnation.get() << 64) ^ u128::from(sequence);
         let payload = lattice_placement::control::encode_control_command(
+            &lattice_core::coordinator::CoordinatorScope::Placement(self.domain.clone()),
             &lattice_placement::control::PlacementControlCommand::ResolveSingleton {
                 request_id,
+                domain: self.domain.clone(),
                 kind: self.kind.clone(),
             },
             self.buffer.config.maximum_control_payload,
@@ -126,7 +134,10 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
             }
             Err(_) => {}
         }
-        let key = PlacementSlotKey::Singleton(self.kind.clone());
+        let key = PlacementSlotKey::Singleton {
+            domain: self.domain.clone(),
+            kind: self.kind.clone(),
+        };
         let (_admission, deadline, start_resolution) =
             self.buffer
                 .admit(key.clone(), payload_bytes, requested_deadline)?;
@@ -163,7 +174,10 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
         &self,
         target: &LogicalSingletonTarget,
     ) -> Result<PlacementSlotKey, RemoteMessageError> {
-        let key = PlacementSlotKey::Singleton(self.kind.clone());
+        let key = PlacementSlotKey::Singleton {
+            domain: self.domain.clone(),
+            kind: self.kind.clone(),
+        };
         let slot = self.slot(&target.reference)?;
         let state = self.state.lock().expect("logic placement state poisoned");
         if target.owner_address != self.local_node.address
@@ -366,7 +380,10 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
     }
 
     async fn resolve_current(&self, target: SingletonRef) -> Result<Option<ActorRef>, WatchError> {
-        let key = PlacementSlotKey::Singleton(self.kind.clone());
+        let key = PlacementSlotKey::Singleton {
+            domain: self.domain.clone(),
+            kind: self.kind.clone(),
+        };
         let slot = self.slot(&target).map_err(|_| WatchError::Unavailable)?;
         let owner = slot.owner.clone().ok_or(WatchError::Unavailable)?;
         if slot.state != PlacementSlotState::Running {

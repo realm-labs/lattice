@@ -67,11 +67,13 @@ pub(super) struct EntityRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
 impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
     fn slot_key(&self, target: &EntityRef) -> Result<PlacementSlotKey, RemoteMessageError> {
         if target.protocol_id() != self.config.protocol_id
+            || target.domain() != &self.config.domain
             || target.config_fingerprint() != self.config.fingerprint()
         {
             return Err(RemoteMessageError::ProtocolFingerprintMismatch);
         }
         Ok(PlacementSlotKey::Shard {
+            domain: self.config.domain.clone(),
             entity_type: self.config.entity_type.clone(),
             shard_id: self.config.shard_for(target.entity_id()),
         })
@@ -105,6 +107,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
 
     fn request_resolution(&self, key: &PlacementSlotKey) -> Result<(), RemoteMessageError> {
         let PlacementSlotKey::Shard {
+            domain,
             entity_type,
             shard_id,
         } = key
@@ -121,8 +124,10 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
         let sequence = NEXT_LOGICAL_RESOLUTION.fetch_add(1, Ordering::Relaxed);
         let request_id = (self.local_node.incarnation.get() << 64) ^ u128::from(sequence);
         let payload = lattice_placement::control::encode_control_command(
+            &lattice_core::coordinator::CoordinatorScope::Placement(domain.clone()),
             &lattice_placement::control::PlacementControlCommand::ResolveShard {
                 request_id,
+                domain: domain.clone(),
                 entity_type: entity_type.clone(),
                 shard_id: *shard_id,
             },

@@ -11,3 +11,9 @@ message EnterWorldReply {
   bool ok = 1;
   uint64 player_count = 2;
 }
+
+message GetClockRequest {}
+
+message GetClockReply {
+  uint64 tick = 1;
+}

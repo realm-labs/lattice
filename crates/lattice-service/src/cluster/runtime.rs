@@ -1,43 +1,52 @@
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lattice_placement::authority::AuthorityEffect;
 use lattice_placement::control::PlacementControlEvent;
-use lattice_placement::coordinator::{MemberChange, MemberEvent, NodeHello};
+use lattice_placement::coordinator::{MemberChange, MemberEvent, PlacementDomainHello};
 use lattice_placement::session::{
-    LogicCoordinatorConfig, LogicCoordinatorHandle, LogicCoordinatorSession, LogicPlacementEffect,
+    LogicCoordinatorConfig, LogicCoordinatorHandle, LogicPlacementEffect, PlacementDomainSession,
 };
 use lattice_remoting::association::AssociationManager;
 use lattice_remoting::messaging::outbound::OutboundMessaging;
 use lattice_remoting::watch::WatchRegistry;
 use tokio::sync::{mpsc, watch};
 
-use crate::backend::{LogicalRouter, SwitchableLogicalRouter};
+use crate::backend::{DomainRouterDirectory, LogicalRouter};
 use crate::builder::LogicalEntityInstaller;
-use crate::lifecycle::{ServiceLifecycle, ServiceLifecycleEvent, ServiceLifecycleState};
+use crate::lifecycle::{
+    NodeLifecycle, NodeLifecycleState, PlacementDomainState, ServiceHealthSnapshot,
+    ServiceLifecycleEvent,
+};
 
 use super::join::{BootstrapView, JoinController, JoinEvent};
 use super::peers::PeerReconciler;
-use super::{ClusterLogicalRouter, LogicalBufferConfig};
+use super::{DomainLogicalRouter, LogicalBufferConfig};
 
 pub(crate) struct LogicJoinRuntime {
     pub controller: Arc<JoinController>,
-    pub hello: NodeHello,
+    pub domain_hello: PlacementDomainHello,
     pub associations: Arc<AssociationManager>,
     pub controls: Option<mpsc::Receiver<PlacementControlEvent>>,
     pub config: LogicCoordinatorConfig,
     pub effect_capacity: usize,
-    pub router: Arc<SwitchableLogicalRouter>,
+    pub router: Arc<DomainRouterDirectory>,
     pub entity_installers: Vec<LogicalEntityInstaller>,
     pub messaging: Arc<OutboundMessaging>,
     pub buffer_config: LogicalBufferConfig,
     pub maximum_registrations: usize,
     pub peers: Arc<PeerReconciler>,
     pub watches: Arc<Mutex<WatchRegistry>>,
-    pub lifecycle: Arc<Mutex<ServiceLifecycle>>,
-    pub lifecycle_events: watch::Sender<ServiceLifecycleState>,
-    pub logic_handle: Arc<Mutex<Option<LogicCoordinatorHandle>>>,
-    pub drain_ready: watch::Sender<Option<String>>,
+    pub lifecycle: Arc<Mutex<NodeLifecycle>>,
+    pub lifecycle_events: watch::Sender<NodeLifecycleState>,
+    pub health: Arc<Mutex<ServiceHealthSnapshot>>,
+    pub health_events: watch::Sender<ServiceHealthSnapshot>,
+    pub logic_handles:
+        Arc<Mutex<BTreeMap<lattice_core::actor_ref::PlacementDomainId, LogicCoordinatorHandle>>>,
+    pub drain_ready: watch::Sender<BTreeMap<lattice_core::actor_ref::PlacementDomainId, String>>,
     pub bootstrap_view: Arc<BootstrapView>,
+    pub membership_ready: Arc<AtomicBool>,
 }
 
 impl LogicJoinRuntime {
@@ -56,13 +65,20 @@ impl LogicJoinRuntime {
                     leader,
                     association,
                 } => {
+                    if wait_for_membership(&self.membership_ready, &mut shutdown)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    self.set_domain_state(PlacementDomainState::Joining);
                     self.bootstrap_view.install(leader.clone());
                     let Some(receiver) = controls.take() else {
                         continue;
                     };
                     let key = association.key().clone();
-                    let Ok((session, effects)) = LogicCoordinatorSession::new(
-                        self.hello.clone(),
+                    let Ok((session, effects)) = PlacementDomainSession::new(
+                        self.domain_hello.clone(),
                         key,
                         self.associations.clone(),
                         self.config.clone(),
@@ -70,8 +86,8 @@ impl LogicJoinRuntime {
                     ) else {
                         break;
                     };
-                    let Ok(mut router) = ClusterLogicalRouter::new(
-                        self.hello.node.clone(),
+                    let Ok(mut router) = DomainLogicalRouter::new(
+                        self.domain_hello.node.clone(),
                         session.state(),
                         self.associations.clone(),
                         self.messaging.clone(),
@@ -85,24 +101,38 @@ impl LogicJoinRuntime {
                             &self.lifecycle_events,
                             ServiceLifecycleEvent::CoordinatorLost,
                         );
+                        self.set_domain_state(PlacementDomainState::Degraded);
                         break;
                     };
                     if self
                         .entity_installers
                         .iter()
-                        .any(|install| install(&mut router).is_err())
+                        .filter(|install| install.domain == self.domain_hello.domain)
+                        .any(|install| (install.install)(&mut router).is_err())
                     {
                         transition(
                             &self.lifecycle,
                             &self.lifecycle_events,
                             ServiceLifecycleEvent::CoordinatorLost,
                         );
+                        self.set_domain_state(PlacementDomainState::Degraded);
                         break;
                     }
-                    self.router.install(Arc::new(router));
+                    let domain = self.domain_hello.domain.clone();
+                    if self.router.install(&domain, Arc::new(router)).is_err() {
+                        transition(
+                            &self.lifecycle,
+                            &self.lifecycle_events,
+                            ServiceLifecycleEvent::CoordinatorLost,
+                        );
+                        self.set_domain_state(PlacementDomainState::Degraded);
+                        break;
+                    }
                     let handle = session.control_handle();
-                    *self.logic_handle.lock().expect("logic handle poisoned") =
-                        Some(handle.clone());
+                    self.logic_handles
+                        .lock()
+                        .expect("logic handles poisoned")
+                        .insert(self.domain_hello.domain.clone(), handle.clone());
                     controls = Some(
                         self.run_session(
                             leader,
@@ -115,11 +145,15 @@ impl LogicJoinRuntime {
                         )
                         .await,
                     );
-                    *self.logic_handle.lock().expect("logic handle poisoned") = None;
-                    self.router.clear();
+                    self.logic_handles
+                        .lock()
+                        .expect("logic handles poisoned")
+                        .remove(&self.domain_hello.domain);
+                    self.router.clear(&self.domain_hello.domain);
                 }
                 JoinEvent::CoordinatorLost { .. } => {
-                    self.router.clear();
+                    self.router.clear(&self.domain_hello.domain);
+                    self.set_domain_state(PlacementDomainState::Degraded);
                     transition(
                         &self.lifecycle,
                         &self.lifecycle_events,
@@ -127,12 +161,13 @@ impl LogicJoinRuntime {
                     );
                 }
                 JoinEvent::TerminalFailure(_) => {
+                    self.set_domain_state(PlacementDomainState::Terminated);
                     let event = if self
                         .lifecycle
                         .lock()
                         .expect("service lifecycle poisoned")
                         .state()
-                        == ServiceLifecycleState::Joining
+                        == NodeLifecycleState::JoiningMembership
                     {
                         ServiceLifecycleEvent::StartupFailed
                     } else {
@@ -151,7 +186,7 @@ impl LogicJoinRuntime {
     async fn run_session(
         &self,
         leader: lattice_remoting::bootstrap::BootstrapLeader,
-        session: LogicCoordinatorSession,
+        session: PlacementDomainSession,
         controls: mpsc::Receiver<PlacementControlEvent>,
         mut effects: mpsc::Receiver<LogicPlacementEffect>,
         handle: LogicCoordinatorHandle,
@@ -163,24 +198,30 @@ impl LogicJoinRuntime {
         let changed = handle.change_notifier();
         loop {
             if handle.ready() {
+                self.set_domain_state(PlacementDomainState::Ready);
                 let state = self
                     .lifecycle
                     .lock()
                     .expect("service lifecycle poisoned")
                     .state();
                 let event = match state {
-                    ServiceLifecycleState::Joining => {
+                    NodeLifecycleState::JoiningMembership
+                        if self.membership_ready.load(Ordering::Acquire)
+                            && self.all_domains_ready() =>
+                    {
                         Some(ServiceLifecycleEvent::SnapshotInstalled)
                     }
-                    ServiceLifecycleState::Degraded => Some(ServiceLifecycleEvent::Reconciled),
+                    NodeLifecycleState::Ready => None,
                     _ => None,
                 };
                 if let Some(event) = event {
                     transition(&self.lifecycle, &self.lifecycle_events, event);
+                    self.sync_node_health();
                 }
             }
             tokio::select! {
                 result = &mut task => {
+                    self.set_domain_state(PlacementDomainState::Degraded);
                     transition(
                         &self.lifecycle,
                         &self.lifecycle_events,
@@ -195,6 +236,7 @@ impl LogicJoinRuntime {
                         Some(JoinEvent::CoordinatorLost { leader: lost })
                             if lost.identity == leader.identity && lost.term == leader.term =>
                         {
+                            self.set_domain_state(PlacementDomainState::Degraded);
                             transition(
                                 &self.lifecycle,
                                 &self.lifecycle_events,
@@ -270,14 +312,16 @@ impl LogicJoinRuntime {
                 operation_id,
                 incarnation,
             } => {
-                if incarnation != self.hello.node.incarnation {
+                if incarnation != self.domain_hello.node.incarnation {
                     return Err(());
                 }
                 handle
                     .complete_member_drain(operation_id.clone())
                     .await
                     .map_err(|_| ())?;
-                self.drain_ready.send_replace(Some(operation_id));
+                let mut ready = self.drain_ready.borrow().clone();
+                ready.insert(self.domain_hello.domain.clone(), operation_id);
+                self.drain_ready.send_replace(ready);
                 Ok(())
             }
             LogicPlacementEffect::Authority { slot, effect } => match effect {
@@ -300,6 +344,34 @@ impl LogicJoinRuntime {
             },
         }
     }
+
+    fn set_domain_state(&self, state: PlacementDomainState) {
+        let mut health = self.health.lock().expect("service health poisoned");
+        health
+            .domains
+            .insert(self.domain_hello.domain.clone(), state);
+        self.health_events.send_replace(health.clone());
+    }
+
+    fn all_domains_ready(&self) -> bool {
+        self.health
+            .lock()
+            .expect("service health poisoned")
+            .domains
+            .values()
+            .all(|state| *state == PlacementDomainState::Ready)
+    }
+
+    fn sync_node_health(&self) {
+        let node = self
+            .lifecycle
+            .lock()
+            .expect("service lifecycle poisoned")
+            .state();
+        let mut health = self.health.lock().expect("service health poisoned");
+        health.node = node;
+        self.health_events.send_replace(health.clone());
+    }
 }
 
 async fn next_join_event(
@@ -315,8 +387,8 @@ async fn next_join_event(
 }
 
 fn transition(
-    lifecycle: &Arc<Mutex<ServiceLifecycle>>,
-    events: &watch::Sender<ServiceLifecycleState>,
+    lifecycle: &Arc<Mutex<NodeLifecycle>>,
+    events: &watch::Sender<NodeLifecycleState>,
     event: ServiceLifecycleEvent,
 ) {
     let mut lifecycle = lifecycle.lock().expect("service lifecycle poisoned");
@@ -328,4 +400,21 @@ fn transition(
 fn closed_controls() -> mpsc::Receiver<PlacementControlEvent> {
     let (_, receiver) = mpsc::channel(1);
     receiver
+}
+
+async fn wait_for_membership(
+    ready: &AtomicBool,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), ()> {
+    while !ready.load(Ordering::Acquire) {
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Err(());
+                }
+            }
+        }
+    }
+    Ok(())
 }

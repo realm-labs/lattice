@@ -46,6 +46,8 @@ pub enum ServiceError {
     CoordinatorUnavailable,
     #[error("node placement capacity must be nonzero")]
     InvalidCapacity,
+    #[error("discovery logic runtime requires exactly one explicit placement domain")]
+    InvalidPlacementDomains,
     #[error("graceful member leave exceeded its deadline")]
     LeaveTimeout,
 }

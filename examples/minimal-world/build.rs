@@ -11,6 +11,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".world.EnterWorldRequest",
             "#[request(response = EnterWorldReply)]",
         )
+        .message_attribute(
+            ".world.GetClockRequest",
+            "#[derive(lattice_actor::Request)]",
+        )
+        .message_attribute(
+            ".world.GetClockRequest",
+            "#[request(response = GetClockReply)]",
+        )
         .compile_messages(&["proto/world.proto"], &includes)?;
     Ok(())
 }

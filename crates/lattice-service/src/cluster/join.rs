@@ -1,9 +1,10 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use futures_util::{StreamExt, stream};
 use lattice_discovery::provider::{
-    ClusterDiscovery, DiscoveryOrigin, DiscoverySnapshot, DiscoveryTarget,
+    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryOrigin, DiscoveryTarget,
 };
 use lattice_remoting::association::{Association, AssociationManager, AssociationState};
 use lattice_remoting::bootstrap::{
@@ -30,7 +31,7 @@ pub enum JoinEvent {
 }
 
 pub struct JoinController {
-    discovery: Arc<dyn ClusterDiscovery>,
+    discovery: Arc<dyn CoordinatorDiscovery>,
     endpoint: Arc<RemotingEndpoint>,
     associations: Arc<AssociationManager>,
     config: ClusterJoinConfig,
@@ -38,7 +39,7 @@ pub struct JoinController {
 
 impl JoinController {
     pub fn new(
-        discovery: Arc<dyn ClusterDiscovery>,
+        discovery: Arc<dyn CoordinatorDiscovery>,
         endpoint: Arc<RemotingEndpoint>,
         associations: Arc<AssociationManager>,
         config: ClusterJoinConfig,
@@ -210,15 +211,17 @@ impl JoinController {
 
 async fn probe_snapshot(
     endpoint: &Arc<RemotingEndpoint>,
-    snapshot: DiscoverySnapshot,
+    snapshot: CoordinatorDirectorySnapshot,
     concurrency: usize,
 ) -> Result<BootstrapLeader, JoinError> {
     if snapshot.targets.is_empty() {
         return Err(JoinError::NoCandidates);
     }
+    let scope = snapshot.scope;
     let results = stream::iter(snapshot.targets.into_iter().map(|target| {
         let endpoint = endpoint.clone();
-        async move { endpoint.probe_candidate(probe_target(target)).await }
+        let scope = scope.clone();
+        async move { endpoint.probe_candidate(probe_target(scope, target)).await }
     }))
     .buffer_unordered(concurrency)
     .collect::<Vec<_>>()
@@ -247,7 +250,10 @@ async fn probe_snapshot(
     select_leader(leaders)
 }
 
-fn probe_target(target: DiscoveryTarget) -> BootstrapProbeTarget {
+fn probe_target(
+    scope: lattice_core::coordinator::CoordinatorScope,
+    target: DiscoveryTarget,
+) -> BootstrapProbeTarget {
     let tls_server_name = target.source.origins().find_map(|origin| match origin {
         DiscoveryOrigin::Dns { server_name, .. } => Some(server_name.clone()),
         DiscoveryOrigin::Static { .. }
@@ -255,6 +261,7 @@ fn probe_target(target: DiscoveryTarget) -> BootstrapProbeTarget {
         | DiscoveryOrigin::KubernetesEndpointSlice { .. } => None,
     });
     BootstrapProbeTarget {
+        scope,
         address: target.address,
         expected_node_id: target.expected_node_id,
         tls_server_name,
@@ -309,33 +316,50 @@ async fn establish_coordinator(
 #[derive(Debug)]
 pub struct BootstrapView {
     local: NodeIdentity,
-    leader: RwLock<Option<BootstrapLeader>>,
+    leaders: RwLock<BTreeMap<lattice_core::coordinator::CoordinatorScope, BootstrapLeader>>,
 }
 
 impl BootstrapView {
     pub fn new(local: NodeIdentity) -> Self {
         Self {
             local,
-            leader: RwLock::new(None),
+            leaders: RwLock::new(BTreeMap::new()),
         }
     }
 
     pub fn install(&self, leader: BootstrapLeader) {
-        *self.leader.write().expect("bootstrap leader view poisoned") = Some(leader);
+        self.leaders
+            .write()
+            .expect("bootstrap leader view poisoned")
+            .insert(leader.scope.clone(), leader);
     }
 
-    pub fn clear(&self) {
-        *self.leader.write().expect("bootstrap leader view poisoned") = None;
+    pub fn clear(&self, scope: &lattice_core::coordinator::CoordinatorScope) {
+        self.leaders
+            .write()
+            .expect("bootstrap leader view poisoned")
+            .remove(scope);
+    }
+
+    pub fn replace(&self, leaders: Vec<BootstrapLeader>) {
+        *self
+            .leaders
+            .write()
+            .expect("bootstrap leader view poisoned") = leaders
+            .into_iter()
+            .map(|leader| (leader.scope.clone(), leader))
+            .collect();
     }
 }
 
 impl BootstrapHandler for BootstrapView {
-    fn route(&self, _request: &BootstrapRequest) -> BootstrapRoute {
+    fn route(&self, request: &BootstrapRequest) -> BootstrapRoute {
         let Some(leader) = self
-            .leader
+            .leaders
             .read()
             .expect("bootstrap leader view poisoned")
-            .clone()
+            .get(&request.scope)
+            .cloned()
         else {
             return BootstrapRoute::RetryAfter {
                 delay: Duration::from_secs(1),
@@ -409,6 +433,7 @@ pub enum JoinError {
 #[cfg(test)]
 mod tests {
     use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
+    use lattice_core::coordinator::CoordinatorScope;
     use lattice_remoting::bootstrap::BootstrapLeader;
     use lattice_remoting::handshake::NodeIdentity;
 
@@ -416,6 +441,7 @@ mod tests {
 
     fn leader(node: &str, term: u64, generation: u64) -> BootstrapLeader {
         BootstrapLeader {
+            scope: CoordinatorScope::Membership,
             identity: NodeIdentity {
                 cluster_id: ClusterId::new("cluster").unwrap(),
                 node_id: node.to_string(),

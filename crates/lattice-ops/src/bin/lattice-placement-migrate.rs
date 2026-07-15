@@ -3,14 +3,16 @@ use std::path::PathBuf;
 
 use lattice_placement::storage::domain::DurableStorageLimits;
 use lattice_placement::storage::etcd::migration::{
-    CardinalityMode, MigrationConfig, MigrationMode, execute, execute_cardinality,
+    CardinalityMode, MigrationConfig, MigrationDomainMapping, MigrationMode, execute,
+    execute_cardinality,
 };
 
 const USAGE: &str = "usage: lattice-placement-migrate \
 <inspect|dry-run|apply|resume|inspect-counters|repair-counters> \
 --endpoints <url[,url]> --prefix <cluster-prefix> --page-size <n> \
 --max-slots <n> --max-plans <n> --max-members <n> --max-admin-operations <n> \
---max-entity-configs <n> --max-singleton-configs <n> [--backup <create-new-path>]";
+--max-entity-configs <n> --max-singleton-configs <n> \
+--mapping <domain-mapping.json> [--backup <create-new-path>]";
 
 #[derive(Clone, Copy)]
 enum Command {
@@ -52,6 +54,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .split(',')
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let mapping_path = PathBuf::from(required(&values, "--mapping")?);
+    let mapping: MigrationDomainMapping = serde_json::from_slice(&std::fs::read(&mapping_path)?)?;
     let config = MigrationConfig {
         endpoints,
         cluster_prefix: required(&values, "--prefix")?.to_owned(),
@@ -65,6 +69,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             maximum_singleton_configs: number(&values, "--max-singleton-configs")?,
         },
         backup_path: values.get("--backup").map(PathBuf::from),
+        mapping,
     };
     let known = [
         "--endpoints",
@@ -76,6 +81,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "--max-admin-operations",
         "--max-entity-configs",
         "--max-singleton-configs",
+        "--mapping",
         "--backup",
     ];
     if values.keys().any(|key| !known.contains(&key.as_str()))

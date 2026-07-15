@@ -9,7 +9,9 @@ use lattice_actor::error::{ActorError, ActorTellError};
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::registry::{ActorRegistry, ActorRegistryConfig};
 use lattice_actor::traits::{Actor, Handler, StopReason};
-use lattice_core::actor_ref::{EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId};
+use lattice_core::actor_ref::{
+    EntityId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
+};
 use lattice_core::{actor_kind, id::ActorId};
 use lattice_placement::allocation::AllocationRequest;
 use lattice_placement::allocation::PlacementView;
@@ -31,9 +33,9 @@ use lattice_placement::types::MonotonicTime;
 use lattice_placement::types::NodeKey;
 use lattice_placement::types::PlacementSlotKey;
 use lattice_placement::types::PlacementSlotState;
+use lattice_placement::types::PlacementVersion;
 use lattice_placement::types::Revision;
 use lattice_placement::types::ShardId;
-use lattice_placement::types::StateVersion;
 use lattice_remoting::association::AssociationId;
 use lattice_remoting::control::CommandId;
 use lattice_remoting::control::ControlApply;
@@ -111,6 +113,7 @@ pub fn placement_matrix(
     let entity_type = EntityType::new("benchmark-entity")?;
     let protocol = ProtocolId::new(0x6265_6e63_6800_0002)?;
     let config = EntityConfig::new(
+        placement_domain(),
         entity_type.clone(),
         protocol,
         1,
@@ -260,12 +263,18 @@ fn allocation_fixture(
     };
     Ok((
         AllocationRequest {
+            domain: placement_domain(),
             entity_type: entity_type.clone(),
             shard_id: ShardId::new(1),
             required_protocol: protocol,
         },
         PlacementView {
-            version: StateVersion::new(CoordinatorTerm::new(1)?, Revision::new(1)?),
+            domain: placement_domain(),
+            version: PlacementVersion::new(
+                placement_domain(),
+                CoordinatorTerm::new(1)?,
+                Revision::new(1)?,
+            ),
             now: MonotonicTime::from_millis(100_000),
             reconciled: true,
             degraded: false,
@@ -274,6 +283,7 @@ fn allocation_fixture(
                 placement_node(target, 0),
             ],
             shards: vec![PlacedShard {
+                domain: placement_domain(),
                 entity_type,
                 shard_id: ShardId::new(1),
                 owner: source,
@@ -300,6 +310,7 @@ fn reduce_handoff(
     let generation = AssignmentGeneration::new(1)?;
     let mut machine = HandoffMachine::begin(
         PlacementSlotKey::Shard {
+            domain: placement_domain(),
             entity_type: entity_type.clone(),
             shard_id: ShardId::new(1),
         },
@@ -307,7 +318,11 @@ fn reduce_handoff(
         source.clone(),
         target.clone(),
         generation,
-        StateVersion::new(CoordinatorTerm::new(1)?, Revision::new(1)?),
+        PlacementVersion::new(
+            placement_domain(),
+            CoordinatorTerm::new(1)?,
+            Revision::new(1)?,
+        ),
         BTreeSet::new(),
     )?;
     machine.start();
@@ -324,6 +339,10 @@ fn reduce_handoff(
         generation: generation.next()?,
     })?;
     Ok(())
+}
+
+fn placement_domain() -> PlacementDomainId {
+    PlacementDomainId::new("benchmark").expect("static placement domain is valid")
 }
 
 fn reduce_reconnect(command: u128) -> Result<(), Box<dyn std::error::Error>> {

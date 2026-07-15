@@ -2,19 +2,19 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use lattice_placement::coordinator::{MemberChange, MemberEvent, MemberRecord};
-use lattice_placement::types::{NodeKey, StateVersion};
+use lattice_placement::types::{MembershipVersion, NodeKey};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberSnapshot {
-    pub version: Option<StateVersion>,
+    pub version: Option<MembershipVersion>,
     pub members: Vec<MemberRecord>,
 }
 
 #[derive(Debug)]
 struct MemberDirectoryState {
-    version: Option<StateVersion>,
+    version: Option<MembershipVersion>,
     members: BTreeMap<(String, lattice_core::actor_ref::NodeIncarnation), MemberRecord>,
 }
 
@@ -53,7 +53,7 @@ impl MemberDirectory {
 
     pub fn install_snapshot(
         &self,
-        version: StateVersion,
+        version: MembershipVersion,
         records: Vec<MemberRecord>,
     ) -> Result<(), MemberDirectoryError> {
         let mut members = BTreeMap::new();
@@ -124,13 +124,13 @@ pub enum MemberDirectoryError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
     use lattice_placement::coordinator::{
-        MemberChange, MemberEvent, MemberRecord, MemberStatus, NodeHello,
+        MemberChange, MemberEvent, MemberHello, MemberRecord, MemberStatus,
     };
-    use lattice_placement::types::{CoordinatorTerm, NodeKey, Revision, StateVersion};
+    use lattice_placement::types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision};
 
     use super::{MemberDirectory, MemberDirectoryError};
 
@@ -142,20 +142,15 @@ mod tests {
         };
         MemberRecord {
             node: node.clone(),
-            hello: NodeHello {
+            hello: MemberHello {
                 node,
                 roles: BTreeSet::new(),
-                capacity_units: 1,
-                hosted_entity_types: BTreeSet::new(),
-                proxied_entity_types: BTreeSet::new(),
-                singleton_eligibility: BTreeSet::new(),
-                used_singletons: BTreeSet::new(),
+                failure_domains: BTreeMap::new(),
                 protocols: Vec::new(),
-                entity_configs: Vec::new(),
-                singleton_configs: Vec::new(),
+                remoting_capabilities: BTreeSet::new(),
             },
             status: MemberStatus::Up,
-            version: StateVersion::new(
+            version: MembershipVersion::new(
                 CoordinatorTerm::new(1).unwrap(),
                 Revision::new(revision).unwrap(),
             ),
@@ -181,7 +176,7 @@ mod tests {
         assert_eq!(
             directory
                 .apply(MemberEvent {
-                    version: StateVersion::new(
+                    version: MembershipVersion::new(
                         CoordinatorTerm::new(1).unwrap(),
                         Revision::new(2).unwrap(),
                     ),

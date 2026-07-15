@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -14,21 +14,27 @@ use lattice_actor::registry::{ActorCreateContext, ActorRefConfig, ActorRegistryC
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::Responder;
 use lattice_core::actor_kind;
-use lattice_core::actor_ref::{ClusterId, EntityId, NodeAddress, NodeIncarnation, ProtocolId};
+use lattice_core::actor_ref::{
+    ClusterId, EntityId, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
+};
+use lattice_core::coordinator::CoordinatorScope;
 use lattice_placement::control::{
     DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
     encode_control_command,
 };
-use lattice_placement::coordinator::{SnapshotLimits, SnapshotRecord, build_snapshot};
+use lattice_placement::coordinator::{
+    MemberHello, PlacementDomainHello, SingletonConfig, SnapshotLimits, SnapshotRecord,
+    SnapshotVersion, build_snapshot,
+};
 use lattice_placement::session::LogicCoordinatorConfig;
-use lattice_placement::session::LogicCoordinatorSession;
+use lattice_placement::session::PlacementDomainSession;
 use lattice_placement::types::AssignmentGeneration;
 use lattice_placement::types::ClaimGrant;
 use lattice_placement::types::CoordinatorTerm;
 use lattice_placement::types::GrantSequence;
 use lattice_placement::types::PlacementSlot;
+use lattice_placement::types::PlacementVersion;
 use lattice_placement::types::Revision;
-use lattice_placement::types::StateVersion;
 use lattice_remoting::association::AssociationKey;
 use lattice_remoting::association::LaneAttachment;
 use lattice_remoting::association::LaneKind;
@@ -43,6 +49,10 @@ use tokio::sync::watch;
 use crate::backend::ServiceInboundDispatch;
 
 const TEST_PROTOCOL_ID: u64 = 77;
+
+fn domain() -> PlacementDomainId {
+    PlacementDomainId::new("service-test").unwrap()
+}
 
 #[derive(Clone, lattice_actor::Request)]
 #[request(response = Value)]
@@ -177,8 +187,42 @@ async fn unused_address() -> NodeAddress {
     NodeAddress::new("127.0.0.1", port).unwrap()
 }
 
+struct TestHello {
+    member: MemberHello,
+    domain: PlacementDomainHello,
+}
+
+fn test_hello(
+    node: NodeKey,
+    hosted_entity_types: BTreeSet<lattice_core::actor_ref::EntityType>,
+    singleton_eligibility: BTreeSet<lattice_core::actor_ref::SingletonKind>,
+    used_singletons: BTreeSet<lattice_core::actor_ref::SingletonKind>,
+) -> TestHello {
+    TestHello {
+        member: MemberHello {
+            node: node.clone(),
+            roles: BTreeSet::new(),
+            failure_domains: BTreeMap::new(),
+            protocols: Vec::new(),
+            remoting_capabilities: BTreeSet::new(),
+        },
+        domain: PlacementDomainHello::new(
+            node,
+            domain(),
+            1,
+            hosted_entity_types,
+            BTreeSet::new(),
+            singleton_eligibility,
+            used_singletons,
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        ),
+    }
+}
+
 async fn stage_logic_runtime(
-    hello: lattice_placement::coordinator::NodeHello,
+    hello: TestHello,
     coordinator: AssociationKey,
     associations: Arc<AssociationManager>,
     slots: Vec<PlacementSlot>,
@@ -191,8 +235,8 @@ async fn stage_logic_runtime(
     let (control, controls) =
         PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
     let control = Arc::new(control);
-    let (logic, _effects) = LogicCoordinatorSession::new(
-        hello.clone(),
+    let (logic, _effects) = PlacementDomainSession::new(
+        hello.domain,
         coordinator.clone(),
         associations,
         LogicCoordinatorConfig::default(),
@@ -200,7 +244,7 @@ async fn stage_logic_runtime(
     )
     .unwrap();
     for slot in &slots {
-        if slot.owner.as_ref() == Some(&hello.node) {
+        if slot.owner.as_ref() == Some(&hello.member.node) {
             logic
                 .register_authority(slot.key.clone(), Duration::from_millis(10))
                 .unwrap();
@@ -209,17 +253,23 @@ async fn stage_logic_runtime(
     let state = logic.state();
     let (shutdown, shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(logic.run(controls, shutdown_rx));
-    let version = slots.iter().map(|slot| slot.version).max().unwrap();
+    let version = slots.iter().map(|slot| slot.version.clone()).max().unwrap();
     let records = slots
         .iter()
         .map(|slot| {
             let key = match &slot.key {
                 PlacementSlotKey::Shard {
+                    domain,
                     entity_type,
                     shard_id,
-                } => format!("shard/{}/{}", entity_type.as_str(), shard_id.get()),
-                PlacementSlotKey::Singleton(kind) => {
-                    format!("singleton/{}", kind.as_str())
+                } => format!(
+                    "domain/{}/shard/{}/{}",
+                    domain.as_str(),
+                    entity_type.as_str(),
+                    shard_id.get()
+                ),
+                PlacementSlotKey::Singleton { domain, kind } => {
+                    format!("domain/{}/singleton/{}", domain.as_str(), kind.as_str())
                 }
             };
             SnapshotRecord {
@@ -229,7 +279,8 @@ async fn stage_logic_runtime(
         })
         .collect();
     let limits = SnapshotLimits::default();
-    let (begin, chunks, end) = build_snapshot(version, records, &limits).unwrap();
+    let (begin, chunks, end) =
+        build_snapshot(SnapshotVersion::Placement(version), records, &limits).unwrap();
     let mut commands = vec![PlacementControlCommand::SnapshotBegin(begin)];
     commands.extend(
         chunks
@@ -238,10 +289,11 @@ async fn stage_logic_runtime(
     );
     commands.push(PlacementControlCommand::SnapshotEnd(end));
     for slot in slots {
-        if slot.owner.as_ref() == Some(&hello.node) {
+        if slot.owner.as_ref() == Some(&hello.member.node) {
             commands.push(PlacementControlCommand::ClaimGranted(ClaimGrant {
+                domain: slot.key.domain().clone(),
                 slot: slot.key,
-                owner: hello.node.clone(),
+                owner: hello.member.node.clone(),
                 coordinator_term: slot.version.term,
                 assignment_generation: slot.assignment_generation,
                 grant_sequence: GrantSequence::new(1).unwrap(),
@@ -254,7 +306,12 @@ async fn stage_logic_runtime(
             .apply(
                 coordinator.clone(),
                 CommandId::generate(),
-                encode_control_command(&command, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap(),
+                encode_control_command(
+                    &CoordinatorScope::Placement(domain()),
+                    &command,
+                    DEFAULT_MAX_CONTROL_PAYLOAD,
+                )
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -307,6 +364,7 @@ async fn stale_generation_never_reaches_entity_loader() {
             .unwrap();
     }
     let entity_config = EntityConfig::new(
+        domain(),
         EntityType::new("entity").unwrap(),
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
         16,
@@ -317,26 +375,21 @@ async fn stale_generation_never_reaches_entity_loader() {
     .unwrap();
     let entity_id = EntityId::new(b"player-42".to_vec()).unwrap();
     let slot_key = PlacementSlotKey::Shard {
+        domain: domain(),
         entity_type: entity_config.entity_type.clone(),
         shard_id: entity_config.shard_for(&entity_id),
     };
-    let hello = lattice_placement::coordinator::NodeHello {
-        node: local_node.clone(),
-        roles: BTreeSet::new(),
-        capacity_units: 1,
-        hosted_entity_types: [entity_config.entity_type.clone()].into_iter().collect(),
-        proxied_entity_types: BTreeSet::new(),
-        singleton_eligibility: BTreeSet::new(),
-        used_singletons: BTreeSet::new(),
-        protocols: Vec::new(),
-        entity_configs: Vec::new(),
-        singleton_configs: Vec::new(),
-    };
+    let hello = test_hello(
+        local_node.clone(),
+        [entity_config.entity_type.clone()].into_iter().collect(),
+        BTreeSet::new(),
+        BTreeSet::new(),
+    );
     let (control_router, controls) =
         PlacementControlRouter::bounded(32, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
     let control_router = Arc::new(control_router);
-    let (logic, _effects) = LogicCoordinatorSession::new(
-        hello,
+    let (logic, _effects) = PlacementDomainSession::new(
+        hello.domain,
         association_key.clone(),
         associations.clone(),
         LogicCoordinatorConfig::default(),
@@ -355,16 +408,25 @@ async fn stale_generation_never_reaches_entity_loader() {
         owner: Some(local_node.clone()),
         target: None,
         assignment_generation: AssignmentGeneration::new(2).unwrap(),
-        version: StateVersion::new(CoordinatorTerm::new(1).unwrap(), Revision::new(1).unwrap()),
+        version: PlacementVersion::new(
+            domain(),
+            CoordinatorTerm::new(1).unwrap(),
+            Revision::new(1).unwrap(),
+        ),
         state: PlacementSlotState::Running,
         active_move: None,
         barrier_sessions: Default::default(),
     };
     let limits = SnapshotLimits::default();
     let (begin, chunks, end) = build_snapshot(
-        slot.version,
+        SnapshotVersion::Placement(slot.version.clone()),
         vec![SnapshotRecord {
-            key: "shard/entity/0".to_owned(),
+            key: format!(
+                "domain/{}/shard/{}/{}",
+                domain().as_str(),
+                entity_config.entity_type.as_str(),
+                entity_config.shard_for(&entity_id).get()
+            ),
             value: Bytes::from(serde_json::to_vec(&slot).unwrap()),
         }],
         &limits,
@@ -379,6 +441,7 @@ async fn stale_generation_never_reaches_entity_loader() {
         .chain(std::iter::once(PlacementControlCommand::SnapshotEnd(end)))
         .chain(std::iter::once(PlacementControlCommand::ClaimGranted(
             ClaimGrant {
+                domain: domain(),
                 slot: slot_key.clone(),
                 owner: local_node.clone(),
                 coordinator_term: CoordinatorTerm::new(1).unwrap(),
@@ -392,7 +455,12 @@ async fn stale_generation_never_reaches_entity_loader() {
             .apply(
                 association_key.clone(),
                 CommandId::generate(),
-                encode_control_command(&command, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap(),
+                encode_control_command(
+                    &CoordinatorScope::Placement(domain()),
+                    &command,
+                    DEFAULT_MAX_CONTROL_PAYLOAD,
+                )
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -412,7 +480,7 @@ async fn stale_generation_never_reaches_entity_loader() {
         binding.as_ref(),
     ));
     let loads = Arc::new(AtomicUsize::new(0));
-    let mut router = ClusterLogicalRouter::new(
+    let mut router = DomainLogicalRouter::new(
         local_node.clone(),
         state,
         associations,
@@ -519,6 +587,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         coordinator_incarnation,
     );
     let entity_config = EntityConfig::new(
+        domain(),
         EntityType::new("remote-entity").unwrap(),
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
         16,
@@ -530,6 +599,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     let entity_id = EntityId::new(b"account-42".to_vec()).unwrap();
     let entity_slot = PlacementSlot {
         key: PlacementSlotKey::Shard {
+            domain: domain(),
             entity_type: entity_config.entity_type.clone(),
             shard_id: entity_config.shard_for(&entity_id),
         },
@@ -537,35 +607,47 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         owner: Some(owner_node.clone()),
         target: None,
         assignment_generation: AssignmentGeneration::new(7).unwrap(),
-        version: StateVersion::new(CoordinatorTerm::new(3).unwrap(), Revision::new(9).unwrap()),
+        version: PlacementVersion::new(
+            domain(),
+            CoordinatorTerm::new(3).unwrap(),
+            Revision::new(9).unwrap(),
+        ),
         state: PlacementSlotState::Running,
         active_move: None,
         barrier_sessions: Default::default(),
     };
     let singleton_kind = SingletonKind::new("remote-singleton").unwrap();
-    let singleton_fingerprint = ConfigFingerprint::new([5; 32]);
+    let singleton_config = SingletonConfig::new(
+        domain(),
+        singleton_kind.clone(),
+        ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
+    );
+    let singleton_fingerprint = singleton_config.fingerprint();
     let singleton_slot = PlacementSlot {
-        key: PlacementSlotKey::Singleton(singleton_kind.clone()),
+        key: PlacementSlotKey::Singleton {
+            domain: domain(),
+            kind: singleton_kind.clone(),
+        },
         config_fingerprint: singleton_fingerprint,
         owner: Some(owner_node.clone()),
         target: None,
         assignment_generation: AssignmentGeneration::new(4).unwrap(),
-        version: StateVersion::new(CoordinatorTerm::new(3).unwrap(), Revision::new(9).unwrap()),
+        version: PlacementVersion::new(
+            domain(),
+            CoordinatorTerm::new(3).unwrap(),
+            Revision::new(9).unwrap(),
+        ),
         state: PlacementSlotState::Running,
         active_move: None,
         barrier_sessions: Default::default(),
     };
-    let hello = |node: NodeKey| lattice_placement::coordinator::NodeHello {
-        node,
-        roles: BTreeSet::new(),
-        capacity_units: 1,
-        hosted_entity_types: [entity_config.entity_type.clone()].into_iter().collect(),
-        proxied_entity_types: BTreeSet::new(),
-        singleton_eligibility: [singleton_kind.clone()].into_iter().collect(),
-        used_singletons: [singleton_kind.clone()].into_iter().collect(),
-        protocols: Vec::new(),
-        entity_configs: Vec::new(),
-        singleton_configs: Vec::new(),
+    let hello = |node: NodeKey| {
+        test_hello(
+            node,
+            [entity_config.entity_type.clone()].into_iter().collect(),
+            [singleton_kind.clone()].into_iter().collect(),
+            [singleton_kind.clone()].into_iter().collect(),
+        )
     };
     let (source_state, source_control, source_shutdown, source_logic) = stage_logic_runtime(
         hello(source_node.clone()),
@@ -603,7 +685,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     let owner_messaging = Arc::new(OutboundMessaging::new(32).unwrap());
     let source_registry = registry(source_address.clone(), source_incarnation);
     let owner_registry = registry(owner_address.clone(), owner_incarnation);
-    let mut source_router = ClusterLogicalRouter::new(
+    let mut source_router = DomainLogicalRouter::new(
         source_node.clone(),
         source_state,
         source_associations.clone(),
@@ -623,15 +705,13 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         .unwrap();
     source_router
         .register_singleton(
-            singleton_kind.clone(),
-            singleton_fingerprint,
-            ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
+            singleton_config.clone(),
             source_registry,
             binding.clone(),
             CountingLoader(source_loads.clone()),
         )
         .unwrap();
-    let mut owner_router = ClusterLogicalRouter::new(
+    let mut owner_router = DomainLogicalRouter::new(
         owner_node.clone(),
         owner_state,
         owner_associations.clone(),
@@ -651,9 +731,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         .unwrap();
     owner_router
         .register_singleton(
-            singleton_kind.clone(),
-            singleton_fingerprint,
-            ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
+            singleton_config,
             owner_registry,
             binding,
             CountingLoader(owner_loads.clone()),
@@ -756,6 +834,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
     assert_eq!(current.node_incarnation(), owner_node.incarnation);
     let singleton = SingletonRef::new(
         cluster_id,
+        domain(),
         singleton_kind,
         ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
         singleton_fingerprint,

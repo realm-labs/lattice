@@ -1,66 +1,52 @@
-use super::entity::EntityRoute;
+use super::singleton::SingletonRoute;
 use super::{
-    ActorRef, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, EntityConfig,
-    EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalEntityTarget,
-    Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessaging, PlacementSlot,
-    PlacementSlotKey, PlacementSlotState, ProtocolFingerprint, RemoteMessageError, RouteBuffer,
-    SenderIdentity, WatchError, async_trait, decode_resolved_actor, map_tell,
+    ActorRef, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, Instant,
+    LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalSingletonTarget, Mutex,
+    NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessaging, PlacementSlot, PlacementSlotKey,
+    PlacementSlotState, ProtocolFingerprint, RemoteMessageError, RouteBuffer, SenderIdentity,
+    SingletonConfig, SingletonRef, WatchError, async_trait, decode_resolved_actor, map_tell,
 };
 
-pub(super) struct EntityProxyRoute {
-    pub(super) local_node: NodeKey,
-    pub(super) state: std::sync::Arc<Mutex<LogicPlacementState>>,
-    pub(super) associations: std::sync::Arc<AssociationManager>,
-    pub(super) peers: Option<std::sync::Arc<super::peers::PeerReconciler>>,
-    pub(super) messaging: std::sync::Arc<OutboundMessaging>,
-    pub(super) coordinator: AssociationKey,
-    pub(super) buffer: RouteBuffer,
-    pub(super) config: EntityConfig,
-    pub(super) fingerprint: ProtocolFingerprint,
+pub(super) struct SingletonProxyRoute {
+    pub local_node: NodeKey,
+    pub state: std::sync::Arc<Mutex<LogicPlacementState>>,
+    pub associations: std::sync::Arc<AssociationManager>,
+    pub peers: Option<std::sync::Arc<super::peers::PeerReconciler>>,
+    pub messaging: std::sync::Arc<OutboundMessaging>,
+    pub coordinator: AssociationKey,
+    pub buffer: RouteBuffer,
+    pub config: SingletonConfig,
+    pub fingerprint: ProtocolFingerprint,
 }
 
-impl EntityProxyRoute {
-    fn slot_key(&self, target: &EntityRef) -> Result<PlacementSlotKey, RemoteMessageError> {
+impl SingletonProxyRoute {
+    fn slot(&self, target: &SingletonRef) -> Result<PlacementSlot, RemoteMessageError> {
         if target.protocol_id() != self.config.protocol_id
             || target.domain() != &self.config.domain
             || target.config_fingerprint() != self.config.fingerprint()
         {
             return Err(RemoteMessageError::ProtocolFingerprintMismatch);
         }
-        Ok(PlacementSlotKey::Shard {
-            domain: self.config.domain.clone(),
-            entity_type: self.config.entity_type.clone(),
-            shard_id: self.config.shard_for(target.entity_id()),
-        })
-    }
-
-    fn running_slot(
-        &self,
-        target: &EntityRef,
-    ) -> Result<(PlacementSlotKey, PlacementSlot), RemoteMessageError> {
-        let key = self.slot_key(target)?;
-        let slot = self
-            .state
+        self.state
             .lock()
             .expect("logic placement state poisoned")
-            .slot(&key)
+            .slot(&PlacementSlotKey::Singleton {
+                domain: self.config.domain.clone(),
+                kind: self.config.kind.clone(),
+            })
             .cloned()
-            .ok_or(RemoteMessageError::StaleAuthority)?;
+            .ok_or(RemoteMessageError::StaleAuthority)
+    }
+
+    fn running_slot(&self, target: &SingletonRef) -> Result<PlacementSlot, RemoteMessageError> {
+        let slot = self.slot(target)?;
         if slot.state != PlacementSlotState::Running || slot.owner.is_none() {
             return Err(RemoteMessageError::ShardUnavailable);
         }
-        Ok((key, slot))
+        Ok(slot)
     }
 
-    fn request_resolution(&self, key: &PlacementSlotKey) -> Result<(), RemoteMessageError> {
-        let PlacementSlotKey::Shard {
-            domain,
-            entity_type,
-            shard_id,
-        } = key
-        else {
-            return Err(RemoteMessageError::InvalidPayload);
-        };
+    fn request_resolution(&self) -> Result<(), RemoteMessageError> {
         let association = self
             .associations
             .get(&self.coordinator)
@@ -71,12 +57,11 @@ impl EntityProxyRoute {
         let sequence = NEXT_LOGICAL_RESOLUTION.fetch_add(1, Ordering::Relaxed);
         let request_id = (self.local_node.incarnation.get() << 64) ^ u128::from(sequence);
         let payload = lattice_placement::control::encode_control_command(
-            &lattice_core::coordinator::CoordinatorScope::Placement(domain.clone()),
-            &lattice_placement::control::PlacementControlCommand::ResolveShard {
+            &lattice_core::coordinator::CoordinatorScope::Placement(self.config.domain.clone()),
+            &lattice_placement::control::PlacementControlCommand::ResolveSingleton {
                 request_id,
-                domain: domain.clone(),
-                entity_type: entity_type.clone(),
-                shard_id: *shard_id,
+                domain: self.config.domain.clone(),
+                kind: self.config.kind.clone(),
             },
             self.buffer.config.maximum_control_payload,
         )
@@ -89,19 +74,22 @@ impl EntityProxyRoute {
 
     async fn await_running_slot(
         &self,
-        target: &EntityRef,
+        target: &SingletonRef,
         payload_bytes: usize,
         requested_deadline: Option<Instant>,
-    ) -> Result<(PlacementSlotKey, PlacementSlot), RemoteMessageError> {
+    ) -> Result<PlacementSlot, RemoteMessageError> {
         if let Ok(slot) = self.running_slot(target) {
             return Ok(slot);
         }
-        let key = self.slot_key(target)?;
+        let key = PlacementSlotKey::Singleton {
+            domain: self.config.domain.clone(),
+            kind: self.config.kind.clone(),
+        };
         let (_admission, deadline, start_resolution) =
             self.buffer
                 .admit(key.clone(), payload_bytes, requested_deadline)?;
         if start_resolution {
-            self.request_resolution(&key)?;
+            self.request_resolution()?;
         }
         let changed = self
             .state
@@ -125,7 +113,7 @@ impl EntityProxyRoute {
 
     async fn remote_association(
         &self,
-        target: &EntityRef,
+        target: &SingletonRef,
         owner: &NodeKey,
     ) -> Result<std::sync::Arc<lattice_remoting::association::Association>, RemoteMessageError>
     {
@@ -139,27 +127,21 @@ impl EntityProxyRoute {
         {
             return Ok(association);
         }
-        let Some(peers) = &self.peers else {
-            return Err(RemoteMessageError::StaleAuthority);
-        };
-        peers.connect(owner).await.map_err(|error| {
-            tracing::warn!(
-                target: "lattice.cluster.logical",
-                %error,
-                owner = %owner.node_id,
-                "logical route could not establish the owner association"
-            );
-            RemoteMessageError::StaleAuthority
-        })
+        self.peers
+            .as_ref()
+            .ok_or(RemoteMessageError::StaleAuthority)?
+            .connect(owner)
+            .await
+            .map_err(|_| RemoteMessageError::StaleAuthority)
     }
 }
 
 #[async_trait]
-impl EntityRoute for EntityProxyRoute {
+impl SingletonRoute for SingletonProxyRoute {
     async fn tell(
         &self,
         sender: Option<ActorRef>,
-        target: EntityRef,
+        target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -167,7 +149,7 @@ impl EntityRoute for EntityProxyRoute {
         if fingerprint != self.fingerprint {
             return Err(RemoteMessageError::ProtocolFingerprintMismatch);
         }
-        let (_, slot) = self
+        let slot = self
             .await_running_slot(&target, payload.len(), None)
             .await?;
         let owner = slot.owner.ok_or(RemoteMessageError::StaleAuthority)?;
@@ -177,7 +159,7 @@ impl EntityRoute for EntityProxyRoute {
             .map(SenderIdentity::from)
             .unwrap_or_else(|| SenderIdentity::Process(self.local_node.incarnation.get()));
         self.messaging
-            .tell_entity(
+            .tell_singleton(
                 &association,
                 &sender,
                 &target,
@@ -194,7 +176,7 @@ impl EntityRoute for EntityProxyRoute {
 
     async fn ask(
         &self,
-        target: EntityRef,
+        target: SingletonRef,
         fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
@@ -205,7 +187,7 @@ impl EntityRoute for EntityProxyRoute {
                 RemoteMessageError::ProtocolFingerprintMismatch,
             ));
         }
-        let (_, slot) = self
+        let slot = self
             .await_running_slot(&target, payload.len(), Some(deadline))
             .await
             .map_err(AskError::Protocol)?;
@@ -217,7 +199,7 @@ impl EntityRoute for EntityProxyRoute {
             .await
             .map_err(AskError::Protocol)?;
         self.messaging
-            .ask_entity(
+            .ask_singleton(
                 &association,
                 &SenderIdentity::Process(self.local_node.incarnation.get()),
                 &target,
@@ -235,7 +217,7 @@ impl EntityRoute for EntityProxyRoute {
     async fn receive_tell(
         &self,
         _sender: Option<ActorRef>,
-        _target: LogicalEntityTarget,
+        _target: LogicalSingletonTarget,
         _message_id: u64,
         _payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
@@ -244,7 +226,7 @@ impl EntityRoute for EntityProxyRoute {
 
     async fn receive_ask(
         &self,
-        _target: LogicalEntityTarget,
+        _target: LogicalSingletonTarget,
         _message_id: u64,
         _payload: Bytes,
         _deadline: Instant,
@@ -252,24 +234,23 @@ impl EntityRoute for EntityProxyRoute {
         Err(RemoteMessageError::Unauthorized)
     }
 
-    async fn resolve_current(&self, target: EntityRef) -> Result<Option<ActorRef>, WatchError> {
-        let (_, slot) = self
-            .running_slot(&target)
-            .map_err(|_| WatchError::NotActive)?;
-        let owner = slot.owner.ok_or(WatchError::NotActive)?;
+    async fn resolve_current(&self, target: SingletonRef) -> Result<Option<ActorRef>, WatchError> {
+        let slot = self.slot(&target).map_err(|_| WatchError::Unavailable)?;
+        if slot.state != PlacementSlotState::Running {
+            return Ok(None);
+        }
+        let owner = slot.owner.ok_or(WatchError::Unavailable)?;
         let association = self
             .remote_association(&target, &owner)
             .await
-            .map_err(|_| WatchError::NotActive)?;
-        let expected_cluster = target.cluster_id().clone();
-        let expected_address = owner.address.clone();
+            .map_err(|_| WatchError::Unavailable)?;
         let result = self
             .messaging
-            .ask_entity(
+            .ask_singleton(
                 &association,
                 &SenderIdentity::Process(self.local_node.incarnation.get()),
                 &target,
-                owner.address,
+                owner.address.clone(),
                 owner.incarnation,
                 slot.assignment_generation.get(),
                 self.fingerprint,
@@ -277,29 +258,31 @@ impl EntityRoute for EntityProxyRoute {
                 Bytes::new(),
                 Instant::now() + self.buffer.config.maximum_residence,
             )
-            .await
-            .map_err(|_| WatchError::NotActive)?;
-        decode_resolved_actor(
-            &result,
-            &expected_cluster,
-            &expected_address,
-            owner.incarnation,
-            self.config.protocol_id,
-        )
-        .map(Some)
+            .await;
+        match result {
+            Ok(bytes) => decode_resolved_actor(
+                &bytes,
+                target.cluster_id(),
+                &owner.address,
+                owner.incarnation,
+                self.config.protocol_id,
+            )
+            .map(Some),
+            Err(AskError::Remote(
+                lattice_remoting::messaging::error::RemoteFailureCode::StaleActivation,
+            )) => Ok(None),
+            Err(_) => Err(WatchError::Unavailable),
+        }
     }
 
     async fn receive_resolve(
         &self,
-        _target: LogicalEntityTarget,
+        _target: LogicalSingletonTarget,
     ) -> Result<Bytes, RemoteMessageError> {
         Err(RemoteMessageError::Unauthorized)
     }
 
-    async fn drain(
-        &self,
-        _shard_id: lattice_placement::types::ShardId,
-    ) -> Result<bool, RemoteMessageError> {
+    async fn drain(&self) -> Result<bool, RemoteMessageError> {
         Ok(true)
     }
 }

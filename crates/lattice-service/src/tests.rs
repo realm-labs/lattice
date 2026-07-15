@@ -20,20 +20,23 @@ use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, Responder, StopReason};
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{
-    ActorRef, ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId,
+    ActorRef, ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
+    ProtocolId,
 };
+use lattice_core::coordinator::CoordinatorScope;
 use lattice_core::id::ActorId;
 use lattice_discovery::provider::{
-    ClusterDiscovery, DiscoveryError, DiscoveryOrigin, DiscoverySnapshot, DiscoverySource,
-    DiscoveryTarget,
+    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
+    DiscoverySource, DiscoveryTarget,
 };
 use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
 use lattice_placement::control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter};
 use lattice_placement::coordinator::MemberStatus;
 use lattice_placement::region::EntityConfig;
-use lattice_placement::runtime::{CoordinatorLeader, CoordinatorLeaderConfig};
-use lattice_placement::storage::{InMemoryPlacementStore, PlacementStore};
-use lattice_placement::types::{CoordinatorTerm, NodeKey};
+use lattice_placement::runtime::PlacementDomainLeaderConfig;
+use lattice_placement::runtime::host::{CoordinatorHost, CoordinatorHostConfig};
+use lattice_placement::storage::{InMemoryPlacementStore, MembershipStore};
+use lattice_placement::types::NodeKey;
 use lattice_remoting::config::RemotingConfig;
 use lattice_remoting::handshake::NodeIdentity;
 use lattice_remoting::watch::WatchStatus;
@@ -41,9 +44,43 @@ use lattice_remoting::watch::WatchStatus;
 use crate::builder::LatticeService;
 use crate::config::ClusterJoinConfig;
 use crate::config::NodeConfig;
-use crate::lifecycle::ServiceLifecycleState;
+use crate::lifecycle::{NodeLifecycleState, PlacementDomainState};
 
 const PROTOCOL_ID: u64 = 0x7465_7374_0000_0001;
+
+fn placement_domain() -> PlacementDomainId {
+    PlacementDomainId::new("service-test").unwrap()
+}
+
+fn secondary_domain() -> PlacementDomainId {
+    PlacementDomainId::new("service-secondary").unwrap()
+}
+
+fn proxy_config(domain: PlacementDomainId, name: &str) -> EntityConfig {
+    EntityConfig::new(
+        domain,
+        EntityType::new(name).unwrap(),
+        ProtocolId::new(PROTOCOL_ID).unwrap(),
+        1,
+        "weighted-least-load",
+        1,
+        Vec::new(),
+    )
+    .unwrap()
+}
+
+fn membership_probe_config() -> EntityConfig {
+    EntityConfig::new(
+        placement_domain(),
+        EntityType::new("membership-probe").unwrap(),
+        ProtocolId::new(PROTOCOL_ID).unwrap(),
+        1,
+        "weighted-least-load",
+        1,
+        Vec::new(),
+    )
+    .unwrap()
+}
 
 #[derive(Debug, Clone, lattice_actor::Request)]
 #[request(response = Pong)]
@@ -197,13 +234,19 @@ fn actor_registration_rejects_a_registry_bound_to_another_protocol() {
 }
 
 struct WatchDiscovery {
-    snapshots: tokio::sync::watch::Receiver<DiscoverySnapshot>,
+    scope: CoordinatorScope,
+    snapshots: tokio::sync::watch::Receiver<CoordinatorDirectorySnapshot>,
 }
 
-impl ClusterDiscovery for WatchDiscovery {
+impl CoordinatorDiscovery for WatchDiscovery {
+    fn scope(&self) -> &CoordinatorScope {
+        &self.scope
+    }
+
     fn snapshots(
         &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<DiscoverySnapshot, DiscoveryError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<CoordinatorDirectorySnapshot, DiscoveryError>> + Send + '_>>
+    {
         let receiver = self.snapshots.clone();
         Box::pin(futures_util::stream::unfold(
             (receiver, true),
@@ -218,8 +261,13 @@ impl ClusterDiscovery for WatchDiscovery {
     }
 }
 
-fn discovery_snapshot(generation: u64, node_id: &str, address: NodeAddress) -> DiscoverySnapshot {
-    DiscoverySnapshot {
+fn discovery_snapshot(
+    generation: u64,
+    node_id: &str,
+    address: NodeAddress,
+) -> CoordinatorDirectorySnapshot {
+    CoordinatorDirectorySnapshot {
+        scope: CoordinatorScope::Placement(placement_domain()),
         generation,
         targets: vec![DiscoveryTarget {
             address,
@@ -238,7 +286,26 @@ async fn coordinator_service(
     node_id: &str,
     address: NodeAddress,
     incarnation: NodeIncarnation,
-    term: u64,
+    _term: u64,
+) -> LatticeService {
+    coordinator_service_for_domains(
+        store,
+        cluster_id,
+        node_id,
+        address,
+        incarnation,
+        BTreeSet::from([placement_domain()]),
+    )
+    .await
+}
+
+async fn coordinator_service_for_domains(
+    store: Arc<InMemoryPlacementStore>,
+    cluster_id: ClusterId,
+    node_id: &str,
+    address: NodeAddress,
+    incarnation: NodeIncarnation,
+    domains: BTreeSet<PlacementDomainId>,
 ) -> LatticeService {
     let builder = LatticeService::builder(node_config(
         cluster_id,
@@ -247,7 +314,7 @@ async fn coordinator_service(
         incarnation,
     ))
     .unwrap();
-    let leader = CoordinatorLeader::elect(
+    let host = CoordinatorHost::elect(
         store,
         builder.association_manager(),
         NodeKey {
@@ -255,11 +322,13 @@ async fn coordinator_service(
             address,
             incarnation,
         },
-        CoordinatorTerm::new(term).unwrap(),
-        3,
-        CoordinatorLeaderConfig {
-            renewal_interval: Duration::from_millis(100),
-            ..CoordinatorLeaderConfig::default()
+        domains,
+        CoordinatorHostConfig {
+            placement: PlacementDomainLeaderConfig {
+                renewal_interval: Duration::from_millis(100),
+                ..PlacementDomainLeaderConfig::default()
+            },
+            ..CoordinatorHostConfig::default()
         },
     )
     .await
@@ -267,7 +336,7 @@ async fn coordinator_service(
     let (control, controls) =
         PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
     builder
-        .cluster_coordinator_runtime(Arc::new(control), leader, controls)
+        .coordinator_host(Arc::new(control), host, controls)
         .build()
         .unwrap()
 }
@@ -381,7 +450,7 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     .unwrap();
     let associations = coordinator_builder.association_manager();
     let store = Arc::new(InMemoryPlacementStore::new(32, 32).unwrap());
-    let leader = CoordinatorLeader::elect(
+    let host = CoordinatorHost::elect(
         store.clone(),
         associations,
         NodeKey {
@@ -389,11 +458,13 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
             address: coordinator_address.clone(),
             incarnation: coordinator_incarnation,
         },
-        CoordinatorTerm::new(1).unwrap(),
-        3,
-        CoordinatorLeaderConfig {
-            renewal_interval: Duration::from_millis(100),
-            ..CoordinatorLeaderConfig::default()
+        BTreeSet::from([placement_domain()]),
+        CoordinatorHostConfig {
+            placement: PlacementDomainLeaderConfig {
+                renewal_interval: Duration::from_millis(100),
+                ..PlacementDomainLeaderConfig::default()
+            },
+            ..CoordinatorHostConfig::default()
         },
     )
     .await
@@ -401,16 +472,17 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     let (coordinator_control, coordinator_controls) =
         PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
     let coordinator = coordinator_builder
-        .cluster_coordinator_runtime(Arc::new(coordinator_control), leader, coordinator_controls)
+        .coordinator_host(Arc::new(coordinator_control), host, coordinator_controls)
         .build()
         .unwrap();
     coordinator.start().await.unwrap();
 
     let discovery = Arc::new(
         StaticDiscovery::new(
+            CoordinatorScope::Placement(placement_domain()),
             "test",
             vec![StaticEndpoint {
-                address: coordinator_address,
+                address: coordinator_address.clone(),
                 expected_node_id: Some("coordinator".to_string()),
                 priority: 1,
             }],
@@ -432,21 +504,39 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
         NodeIncarnation::new(202).unwrap(),
     ))
     .unwrap()
-    .cluster_discovery(discovery)
+    .use_entity::<PingProtocol>(membership_probe_config())
+    .unwrap()
+    .domain_capacity(placement_domain(), 1)
+    .unwrap()
+    .coordinator_discovery(discovery)
+    .unwrap()
+    .coordinator_discovery(Arc::new(
+        StaticDiscovery::new(
+            CoordinatorScope::Membership,
+            "test-membership",
+            vec![StaticEndpoint {
+                address: coordinator_address,
+                expected_node_id: Some("coordinator".to_string()),
+                priority: 1,
+            }],
+        )
+        .unwrap(),
+    ))
+    .unwrap()
     .join_config(join_config)
     .member_event_capacity(64)
     .build()
     .unwrap();
     member.start().await.unwrap();
 
-    tokio::time::timeout(Duration::from_secs(15), async {
-        let mut lifecycle = member.subscribe_lifecycle();
-        while *lifecycle.borrow() != ServiceLifecycleState::Ready {
+    let ready = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut lifecycle = member.subscribe_node_lifecycle();
+        while *lifecycle.borrow() != NodeLifecycleState::Ready {
             lifecycle.changed().await.unwrap();
         }
     })
-    .await
-    .unwrap();
+    .await;
+    assert!(ready.is_ok(), "health: {:?}", member.health_snapshot());
     let snapshot = member.member_snapshot();
     assert!(snapshot.members.iter().any(|record| {
         record.node.node_id == "member"
@@ -458,7 +548,10 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
         .leave(tokio::time::Instant::now() + Duration::from_secs(2))
         .await
         .unwrap();
-    assert_eq!(member.lifecycle_state(), ServiceLifecycleState::Terminated);
+    assert_eq!(
+        member.node_lifecycle_state(),
+        NodeLifecycleState::Terminated
+    );
     assert!(store.get_member("member").await.unwrap().is_none());
     coordinator.shutdown().await.unwrap();
 }
@@ -487,9 +580,10 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
     )
     .await;
     coordinator.start().await.unwrap();
-    let discovery = || {
+    let discovery = |scope| {
         Arc::new(
             StaticDiscovery::new(
+                scope,
                 "multi-member",
                 vec![StaticEndpoint {
                     address: coordinator_address.clone(),
@@ -508,7 +602,14 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
             NodeIncarnation::new(incarnation).unwrap(),
         ))
         .unwrap()
-        .cluster_discovery(discovery())
+        .use_entity::<PingProtocol>(membership_probe_config())
+        .unwrap()
+        .domain_capacity(placement_domain(), 1)
+        .unwrap()
+        .coordinator_discovery(discovery(CoordinatorScope::Membership))
+        .unwrap()
+        .coordinator_discovery(discovery(CoordinatorScope::Placement(placement_domain())))
+        .unwrap()
         .join_config(ClusterJoinConfig {
             retry_initial: Duration::from_millis(10),
             retry_max: Duration::from_millis(100),
@@ -525,8 +626,8 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
     let second = member("second", second_address, 402);
     first.start().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        let mut lifecycle = first.subscribe_lifecycle();
-        while *lifecycle.borrow() != ServiceLifecycleState::Ready {
+        let mut lifecycle = first.subscribe_node_lifecycle();
+        while *lifecycle.borrow() != NodeLifecycleState::Ready {
             lifecycle.changed().await.unwrap();
         }
     })
@@ -534,8 +635,8 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
     .unwrap();
     second.start().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        let mut lifecycle = second.subscribe_lifecycle();
-        while *lifecycle.borrow() != ServiceLifecycleState::Ready {
+        let mut lifecycle = second.subscribe_node_lifecycle();
+        while *lifecycle.borrow() != NodeLifecycleState::Ready {
             lifecycle.changed().await.unwrap();
         }
     })
@@ -550,6 +651,144 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
         .await
         .unwrap();
     coordinator.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn one_domain_coordinator_loss_leaves_other_domain_ready() {
+    let membership_address = unused_address().await;
+    let coordinator_a_address = unused_address().await;
+    let coordinator_b_address = unused_address().await;
+    let member_address = unused_address().await;
+    let cluster_id = ClusterId::new("service-domain-isolation-test").unwrap();
+    let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
+    let domain_a = placement_domain();
+    let domain_b = secondary_domain();
+    let membership_coordinator = coordinator_service_for_domains(
+        store.clone(),
+        cluster_id.clone(),
+        "membership-coordinator",
+        membership_address.clone(),
+        NodeIncarnation::new(400).unwrap(),
+        BTreeSet::new(),
+    )
+    .await;
+    let coordinator_a = coordinator_service_for_domains(
+        store.clone(),
+        cluster_id.clone(),
+        "coordinator-a",
+        coordinator_a_address.clone(),
+        NodeIncarnation::new(401).unwrap(),
+        BTreeSet::from([domain_a.clone()]),
+    )
+    .await;
+    let coordinator_b = coordinator_service_for_domains(
+        store,
+        cluster_id.clone(),
+        "coordinator-b",
+        coordinator_b_address.clone(),
+        NodeIncarnation::new(402).unwrap(),
+        BTreeSet::from([domain_b.clone()]),
+    )
+    .await;
+    membership_coordinator.start().await.unwrap();
+    coordinator_a.start().await.unwrap();
+    coordinator_b.start().await.unwrap();
+
+    let discovery = |scope, name: &'static str, node_id: &'static str, address| {
+        Arc::new(
+            StaticDiscovery::new(
+                scope,
+                name,
+                vec![StaticEndpoint {
+                    address,
+                    expected_node_id: Some(node_id.to_string()),
+                    priority: 1,
+                }],
+            )
+            .unwrap(),
+        )
+    };
+    let member = LatticeService::builder(node_config(
+        cluster_id,
+        "multi-domain-member",
+        member_address,
+        NodeIncarnation::new(403).unwrap(),
+    ))
+    .unwrap()
+    .use_entity::<PingProtocol>(proxy_config(domain_a.clone(), "domain-a-proxy"))
+    .unwrap()
+    .use_entity::<PingProtocol>(proxy_config(domain_b.clone(), "domain-b-proxy"))
+    .unwrap()
+    .domain_capacity(domain_a.clone(), 1)
+    .unwrap()
+    .domain_capacity(domain_b.clone(), 1)
+    .unwrap()
+    .coordinator_discovery(discovery(
+        CoordinatorScope::Membership,
+        "membership",
+        "membership-coordinator",
+        membership_address,
+    ))
+    .unwrap()
+    .coordinator_discovery(discovery(
+        CoordinatorScope::Placement(domain_a.clone()),
+        "domain-a",
+        "coordinator-a",
+        coordinator_a_address,
+    ))
+    .unwrap()
+    .coordinator_discovery(discovery(
+        CoordinatorScope::Placement(domain_b.clone()),
+        "domain-b",
+        "coordinator-b",
+        coordinator_b_address,
+    ))
+    .unwrap()
+    .join_config(ClusterJoinConfig {
+        retry_initial: Duration::from_millis(10),
+        retry_max: Duration::from_millis(100),
+        join_timeout: Some(Duration::from_secs(5)),
+        ..ClusterJoinConfig::default()
+    })
+    .build()
+    .unwrap();
+    member.start().await.unwrap();
+    let mut health = member.subscribe_health();
+    let ready_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = health.borrow().clone();
+            if snapshot.node == NodeLifecycleState::Ready
+                && snapshot.domains.get(&domain_a) == Some(&PlacementDomainState::Ready)
+                && snapshot.domains.get(&domain_b) == Some(&PlacementDomainState::Ready)
+            {
+                break;
+            }
+            health.changed().await.unwrap();
+        }
+    })
+    .await;
+    assert!(ready_result.is_ok(), "health: {:?}", health.borrow());
+
+    coordinator_a.force_shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = health.borrow().clone();
+            if snapshot.node == NodeLifecycleState::Ready
+                && snapshot.domains.get(&domain_a) == Some(&PlacementDomainState::Degraded)
+                && snapshot.domains.get(&domain_b) == Some(&PlacementDomainState::Ready)
+            {
+                break;
+            }
+            health.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(member.node_lifecycle_state(), NodeLifecycleState::Ready);
+
+    member.force_shutdown().await.unwrap();
+    coordinator_b.force_shutdown().await.unwrap();
+    membership_coordinator.force_shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -597,6 +836,7 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
         binding.as_ref(),
     ));
     let entity_config = EntityConfig::new(
+        placement_domain(),
         EntityType::new("rollover-ping").unwrap(),
         ProtocolId::new(PROTOCOL_ID).unwrap(),
         8,
@@ -620,9 +860,18 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
     .unwrap()
     .register_entity(entity_config, registry, binding, PingLoader)
     .unwrap()
-    .cluster_discovery(Arc::new(WatchDiscovery {
+    .domain_capacity(placement_domain(), 1)
+    .unwrap()
+    .coordinator_discovery(Arc::new(WatchDiscovery {
+        scope: CoordinatorScope::Membership,
+        snapshots: discovery_rx.clone(),
+    }))
+    .unwrap()
+    .coordinator_discovery(Arc::new(WatchDiscovery {
+        scope: CoordinatorScope::Placement(placement_domain()),
         snapshots: discovery_rx,
     }))
+    .unwrap()
     .join_config(ClusterJoinConfig {
         retry_initial: Duration::from_millis(10),
         retry_max: Duration::from_millis(100),
@@ -634,9 +883,9 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
     .build()
     .unwrap();
     member.start().await.unwrap();
-    let mut lifecycle = member.subscribe_lifecycle();
+    let mut lifecycle = member.subscribe_node_lifecycle();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while *lifecycle.borrow() != ServiceLifecycleState::Ready {
+        while *lifecycle.borrow() != NodeLifecycleState::Ready {
             lifecycle.changed().await.unwrap();
         }
     })
@@ -645,9 +894,12 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
     assert_eq!(eventually_ping(&member, target.clone(), 1).await, Pong(2));
 
     coordinator_a.force_shutdown().await.unwrap();
+    let mut health = member.subscribe_health();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while *lifecycle.borrow() != ServiceLifecycleState::Degraded {
-            lifecycle.changed().await.unwrap();
+        while health.borrow().domains.get(&placement_domain())
+            != Some(&PlacementDomainState::Degraded)
+        {
+            health.changed().await.unwrap();
         }
     })
     .await
@@ -668,8 +920,9 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
         .send(discovery_snapshot(2, "coordinator-b", address_b))
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while *lifecycle.borrow() != ServiceLifecycleState::Ready {
-            lifecycle.changed().await.unwrap();
+        while health.borrow().domains.get(&placement_domain()) != Some(&PlacementDomainState::Ready)
+        {
+            health.changed().await.unwrap();
         }
     })
     .await

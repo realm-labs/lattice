@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -5,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_actor::host::ProtocolHostRegistry;
 use lattice_actor::recipient::RecipientBackend;
-use lattice_core::actor_ref::{ActorRef, EntityRef, RecipientRef, SingletonRef};
+use lattice_core::actor_ref::{ActorRef, EntityRef, PlacementDomainId, RecipientRef, SingletonRef};
 use lattice_placement::types::PlacementSlotKey;
 use lattice_remoting::association::AssociationId;
 use lattice_remoting::association::AssociationManager;
@@ -128,11 +129,11 @@ pub trait LogicalRouter: Send + Sync + 'static {
 /// Coordinator at runtime.  Recipient backends keep this facade for their
 /// whole lifetime while the active cluster router is replaced whenever the
 /// authoritative Coordinator changes.
-pub(crate) struct SwitchableLogicalRouter {
+pub(crate) struct SwitchableDomainRouter {
     current: RwLock<Option<Arc<dyn LogicalRouter>>>,
 }
 
-impl SwitchableLogicalRouter {
+impl SwitchableDomainRouter {
     pub(crate) fn new() -> Self {
         Self {
             current: RwLock::new(None),
@@ -157,7 +158,7 @@ impl SwitchableLogicalRouter {
 }
 
 #[async_trait]
-impl LogicalRouter for SwitchableLogicalRouter {
+impl LogicalRouter for SwitchableDomainRouter {
     async fn tell_entity(
         &self,
         sender: Option<ActorRef>,
@@ -284,6 +285,191 @@ impl LogicalRouter for SwitchableLogicalRouter {
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
         self.current()?
+            .receive_singleton_ask(target, message_id, payload, deadline)
+            .await
+    }
+}
+
+/// Bounded logical router directory with one independently switchable entry per domain.
+pub struct DomainRouterDirectory {
+    routers: BTreeMap<PlacementDomainId, Arc<SwitchableDomainRouter>>,
+}
+
+impl DomainRouterDirectory {
+    pub(crate) fn new(
+        domains: impl IntoIterator<Item = PlacementDomainId>,
+        maximum_domains: usize,
+    ) -> Result<Self, RemoteMessageError> {
+        if maximum_domains == 0 {
+            return Err(RemoteMessageError::Unauthorized);
+        }
+        let routers = domains
+            .into_iter()
+            .map(|domain| (domain, Arc::new(SwitchableDomainRouter::new())))
+            .collect::<BTreeMap<_, _>>();
+        if routers.is_empty() || routers.len() > maximum_domains {
+            return Err(RemoteMessageError::Unauthorized);
+        }
+        Ok(Self { routers })
+    }
+
+    pub(crate) fn install(
+        &self,
+        domain: &PlacementDomainId,
+        router: Arc<dyn LogicalRouter>,
+    ) -> Result<(), RemoteMessageError> {
+        self.routers
+            .get(domain)
+            .ok_or(RemoteMessageError::ShardUnavailable)?
+            .install(router);
+        Ok(())
+    }
+
+    pub(crate) fn clear(&self, domain: &PlacementDomainId) {
+        if let Some(router) = self.routers.get(domain) {
+            router.clear();
+        }
+    }
+
+    fn router(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Arc<SwitchableDomainRouter>, RemoteMessageError> {
+        self.routers
+            .get(domain)
+            .cloned()
+            .ok_or(RemoteMessageError::ShardUnavailable)
+    }
+}
+
+#[async_trait]
+impl LogicalRouter for DomainRouterDirectory {
+    async fn tell_entity(
+        &self,
+        sender: Option<ActorRef>,
+        target: EntityRef,
+        fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        self.router(target.domain())?
+            .tell_entity(sender, target, fingerprint, message_id, payload)
+            .await
+    }
+
+    async fn ask_entity(
+        &self,
+        target: EntityRef,
+        fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, AskError> {
+        self.router(target.domain())
+            .map_err(AskError::Protocol)?
+            .ask_entity(target, fingerprint, message_id, payload, deadline)
+            .await
+    }
+
+    async fn tell_singleton(
+        &self,
+        sender: Option<ActorRef>,
+        target: SingletonRef,
+        fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        self.router(target.domain())?
+            .tell_singleton(sender, target, fingerprint, message_id, payload)
+            .await
+    }
+
+    async fn ask_singleton(
+        &self,
+        target: SingletonRef,
+        fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, AskError> {
+        self.router(target.domain())
+            .map_err(AskError::Protocol)?
+            .ask_singleton(target, fingerprint, message_id, payload, deadline)
+            .await
+    }
+
+    async fn resolve_entity_current(
+        &self,
+        target: EntityRef,
+    ) -> Result<Option<ActorRef>, WatchError> {
+        self.router(target.domain())
+            .map_err(|_| WatchError::Unavailable)?
+            .resolve_entity_current(target)
+            .await
+    }
+
+    async fn resolve_singleton_current(
+        &self,
+        target: SingletonRef,
+    ) -> Result<Option<ActorRef>, WatchError> {
+        self.router(target.domain())
+            .map_err(|_| WatchError::Unavailable)?
+            .resolve_singleton_current(target)
+            .await
+    }
+
+    async fn drain_slot(&self, slot: PlacementSlotKey) -> Result<bool, RemoteMessageError> {
+        self.router(slot.domain())?.drain_slot(slot).await
+    }
+
+    async fn stop_fenced_slot(&self, slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
+        self.router(slot.domain())?.stop_fenced_slot(slot).await
+    }
+
+    async fn receive_entity_tell(
+        &self,
+        sender: Option<ActorRef>,
+        target: LogicalEntityTarget,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        self.router(target.reference.domain())?
+            .receive_entity_tell(sender, target, message_id, payload)
+            .await
+    }
+
+    async fn receive_entity_ask(
+        &self,
+        target: LogicalEntityTarget,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, RemoteMessageError> {
+        self.router(target.reference.domain())?
+            .receive_entity_ask(target, message_id, payload, deadline)
+            .await
+    }
+
+    async fn receive_singleton_tell(
+        &self,
+        sender: Option<ActorRef>,
+        target: LogicalSingletonTarget,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        self.router(target.reference.domain())?
+            .receive_singleton_tell(sender, target, message_id, payload)
+            .await
+    }
+
+    async fn receive_singleton_ask(
+        &self,
+        target: LogicalSingletonTarget,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, RemoteMessageError> {
+        self.router(target.reference.domain())?
             .receive_singleton_ask(target, message_id, payload, deadline)
             .await
     }

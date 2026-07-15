@@ -10,6 +10,7 @@ async-trait.workspace = true
 lattice-actor.workspace = true
 lattice-config.workspace = true
 lattice-core.workspace = true
+lattice-discovery.workspace = true
 lattice-eventbus.workspace = true
 lattice-gateway.workspace = true
 lattice-ops.workspace = true

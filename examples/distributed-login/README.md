@@ -11,6 +11,7 @@ Run the integration flow:
 cargo test -p distributed-login --test distributed_flow -- --nocapture
 ```
 
-The component-named binaries exercise the same API boundary. Real multi-process Coordinator,
-ShardRegion, Gateway, and failure scenarios live in the distributed acceptance harness rather than
-using private in-process placement stores that cannot represent a cluster.
+The component-named binaries exercise the same API boundary. Real multi-process membership and
+placement-domain leaders, `ShardRegion`, Gateway, and failure scenarios live in the distributed
+acceptance harness rather than using private in-process placement stores that cannot represent a
+cluster. Every actor registration in the example uses an explicit placement domain.

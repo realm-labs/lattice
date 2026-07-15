@@ -1,20 +1,37 @@
+use std::collections::BTreeMap;
+
+use lattice_core::actor_ref::PlacementDomainId;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServiceLifecycleState {
+pub enum NodeLifecycleState {
     Booting,
+    JoiningMembership,
+    Ready,
+    Draining,
+    Terminated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementDomainState {
     Joining,
     Ready,
     Degraded,
     Draining,
-    Stopping,
     Terminated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceHealthSnapshot {
+    pub node: NodeLifecycleState,
+    pub domains: BTreeMap<PlacementDomainId, PlacementDomainState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceLifecycleEvent {
     RemotingReady,
     SnapshotInstalled,
+    MembershipLost,
     CoordinatorLost,
     Reconciled,
     BeginDrain,
@@ -37,67 +54,78 @@ pub enum ServiceLifecycleEffect {
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[error("event {event:?} is invalid while service is {state:?}")]
 pub struct ServiceLifecycleError {
-    pub state: ServiceLifecycleState,
+    pub state: NodeLifecycleState,
     pub event: ServiceLifecycleEvent,
 }
 
 #[derive(Debug, Clone)]
-pub struct ServiceLifecycle {
-    state: ServiceLifecycleState,
+pub struct NodeLifecycle {
+    state: NodeLifecycleState,
+    recovering_membership: bool,
 }
 
-impl Default for ServiceLifecycle {
+impl Default for NodeLifecycle {
     fn default() -> Self {
         Self {
-            state: ServiceLifecycleState::Booting,
+            state: NodeLifecycleState::Booting,
+            recovering_membership: false,
         }
     }
 }
 
-impl ServiceLifecycle {
-    pub fn state(&self) -> ServiceLifecycleState {
+impl NodeLifecycle {
+    pub fn state(&self) -> NodeLifecycleState {
         self.state
+    }
+
+    pub fn recovering_membership(&self) -> bool {
+        self.recovering_membership
     }
 
     pub fn transition(
         &mut self,
         event: ServiceLifecycleEvent,
     ) -> Result<Vec<ServiceLifecycleEffect>, ServiceLifecycleError> {
+        use NodeLifecycleState as State;
         use ServiceLifecycleEffect as Effect;
         use ServiceLifecycleEvent as Event;
-        use ServiceLifecycleState as State;
 
         let (next, effects): (State, &[Effect]) = match (self.state, event) {
-            (State::Booting, Event::RemotingReady) => (State::Joining, &[]),
-            (State::Joining, Event::SnapshotInstalled) => {
+            (State::Booting, Event::RemotingReady) => (State::JoiningMembership, &[]),
+            (State::JoiningMembership, Event::SnapshotInstalled) => {
                 (State::Ready, &[Effect::OpenExternalAdmission])
             }
-            // A join has no external admission to close. Stay in Joining so a
-            // fresh snapshot, not a mere reconnect, remains the readiness gate.
-            (State::Joining, Event::CoordinatorLost | Event::Reconciled) => (State::Joining, &[]),
-            (State::Ready, Event::CoordinatorLost) => {
-                (State::Degraded, &[Effect::CloseExternalAdmission])
+            (State::Ready, Event::MembershipLost) => {
+                (State::JoiningMembership, &[Effect::CloseExternalAdmission])
             }
-            (State::Degraded, Event::Reconciled) => {
-                (State::Ready, &[Effect::OpenExternalAdmission])
-            }
-            (State::Ready, Event::Reconciled) => (State::Ready, &[]),
-            (State::Joining | State::Ready | State::Degraded, Event::BeginDrain) => (
+            (State::JoiningMembership, Event::MembershipLost) => (State::JoiningMembership, &[]),
+            (State::Draining, Event::MembershipLost) => (State::Draining, &[]),
+            (
+                State::JoiningMembership | State::Ready,
+                Event::CoordinatorLost | Event::Reconciled,
+            ) => (self.state, &[]),
+            (State::JoiningMembership | State::Ready, Event::BeginDrain) => (
                 State::Draining,
                 &[Effect::CloseExternalAdmission, Effect::BeginPlacementDrain],
             ),
             (State::Draining, Event::DrainComplete) => {
-                (State::Stopping, &[Effect::FenceClaimsAndStopRuntime])
+                (State::Draining, &[Effect::FenceClaimsAndStopRuntime])
             }
             (
-                State::Booting | State::Joining | State::Ready | State::Degraded | State::Draining,
+                State::Booting | State::JoiningMembership | State::Ready | State::Draining,
                 Event::ForceStop,
-            ) => (State::Stopping, &[Effect::FenceClaimsAndStopRuntime]),
-            (State::Booting | State::Joining, Event::StartupFailed) => {
+            ) => (
+                State::Terminated,
+                &[
+                    Effect::FenceClaimsAndStopRuntime,
+                    Effect::ReleaseRuntimeIdentity,
+                ],
+            ),
+            (State::Booting | State::JoiningMembership, Event::StartupFailed) => {
                 (State::Terminated, &[Effect::ReleaseRuntimeIdentity])
             }
             (
-                State::Joining | State::Ready | State::Degraded | State::Draining,
+                State::JoiningMembership | State::Ready | State::Draining,
                 Event::RuntimeTerminated,
             ) => (
                 State::Terminated,
@@ -106,7 +134,7 @@ impl ServiceLifecycle {
                     Effect::ReleaseRuntimeIdentity,
                 ],
             ),
-            (State::Stopping, Event::ShutdownComplete) => {
+            (State::Draining, Event::ShutdownComplete) => {
                 (State::Terminated, &[Effect::ReleaseRuntimeIdentity])
             }
             _ => {
@@ -116,6 +144,11 @@ impl ServiceLifecycle {
                 });
             }
         };
+        if event == Event::MembershipLost && self.state == State::Ready {
+            self.recovering_membership = true;
+        } else if event == Event::SnapshotInstalled || next == State::Terminated {
+            self.recovering_membership = false;
+        }
         self.state = next;
         Ok(effects.to_vec())
     }
@@ -127,7 +160,7 @@ mod tests {
 
     #[test]
     fn lifecycle_follows_ready_degraded_drain_and_shutdown() {
-        let mut lifecycle = ServiceLifecycle::default();
+        let mut lifecycle = NodeLifecycle::default();
         lifecycle
             .transition(ServiceLifecycleEvent::RemotingReady)
             .unwrap();
@@ -149,23 +182,23 @@ mod tests {
         lifecycle
             .transition(ServiceLifecycleEvent::ShutdownComplete)
             .unwrap();
-        assert_eq!(lifecycle.state(), ServiceLifecycleState::Terminated);
+        assert_eq!(lifecycle.state(), NodeLifecycleState::Terminated);
     }
 
     #[test]
     fn illegal_transition_has_no_state_change_or_effects() {
-        let mut lifecycle = ServiceLifecycle::default();
+        let mut lifecycle = NodeLifecycle::default();
         assert!(
             lifecycle
                 .transition(ServiceLifecycleEvent::DrainComplete)
                 .is_err()
         );
-        assert_eq!(lifecycle.state(), ServiceLifecycleState::Booting);
+        assert_eq!(lifecycle.state(), NodeLifecycleState::Booting);
     }
 
     #[test]
     fn coordinator_loss_during_join_still_requires_snapshot() {
-        let mut lifecycle = ServiceLifecycle::default();
+        let mut lifecycle = NodeLifecycle::default();
         lifecycle
             .transition(ServiceLifecycleEvent::RemotingReady)
             .unwrap();
@@ -181,12 +214,34 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(lifecycle.state(), ServiceLifecycleState::Joining);
+        assert_eq!(lifecycle.state(), NodeLifecycleState::JoiningMembership);
         assert_eq!(
             lifecycle
                 .transition(ServiceLifecycleEvent::SnapshotInstalled)
                 .unwrap(),
             vec![ServiceLifecycleEffect::OpenExternalAdmission]
         );
+    }
+
+    #[test]
+    fn membership_loss_revokes_node_readiness_until_a_new_snapshot() {
+        let mut lifecycle = NodeLifecycle::default();
+        lifecycle
+            .transition(ServiceLifecycleEvent::RemotingReady)
+            .unwrap();
+        lifecycle
+            .transition(ServiceLifecycleEvent::SnapshotInstalled)
+            .unwrap();
+        assert_eq!(
+            lifecycle
+                .transition(ServiceLifecycleEvent::MembershipLost)
+                .unwrap(),
+            vec![ServiceLifecycleEffect::CloseExternalAdmission]
+        );
+        assert_eq!(lifecycle.state(), NodeLifecycleState::JoiningMembership);
+        lifecycle
+            .transition(ServiceLifecycleEvent::SnapshotInstalled)
+            .unwrap();
+        assert_eq!(lifecycle.state(), NodeLifecycleState::Ready);
     }
 }
