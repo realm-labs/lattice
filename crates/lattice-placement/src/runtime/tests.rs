@@ -2,7 +2,13 @@ use super::*;
 use async_trait::async_trait;
 use lattice_core::actor_ref::{
     ActorRef, ClusterId, ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation,
+    PlacementDomainId,
 };
+use std::collections::BTreeSet;
+
+fn domain() -> PlacementDomainId {
+    PlacementDomainId::new("runtime-test").unwrap()
+}
 use lattice_remoting::config::RemotingConfig;
 use lattice_remoting::endpoint::RemotingEndpoint;
 use lattice_remoting::handshake::NodeIdentity;
@@ -13,14 +19,16 @@ use lattice_remoting::messaging::target::ExactActorTarget;
 
 use crate::authority::AuthorityEffect;
 use crate::control::PlacementControlRouter;
-use crate::session::{LogicCoordinatorConfig, LogicCoordinatorSession};
+use crate::coordinator::{MemberHello, MembershipLeaderGuard};
+use crate::session::{LogicCoordinatorConfig, PlacementDomainSession};
 use crate::storage::domain::{
-    ActivateAuthority, AllocateInitial, CreatePlan, LeasedClaim, ReserveMove,
+    ActivateAuthority, AllocateInitial, CreateDomainMember, CreateMember, CreatePlan, LeasedClaim,
+    ReserveMove,
 };
-use crate::storage::{InMemoryPlacementStore, PlacementStore};
+use crate::storage::{InMemoryPlacementStore, PlacementDomainStore};
 use crate::types::{
-    AssignmentGeneration, GrantSequence, PlacementSlot, PlacementSlotState, PlanRevision, Revision,
-    ShardId, StateVersion,
+    AssignmentGeneration, GrantSequence, PlacementSlot, PlacementSlotState, PlacementVersion,
+    PlanRevision, Revision, ShardId,
 };
 
 fn attach_test_session(
@@ -66,24 +74,153 @@ fn attach_test_session(
     key
 }
 
+async fn ensure_test_global_member(
+    leader: &mut PlacementDomainLeader<InMemoryPlacementStore>,
+    hello: &MemberHello,
+) -> MemberRecord {
+    if leader
+        .store
+        .get_member(&hello.node.node_id)
+        .await
+        .unwrap()
+        .is_none()
+    {
+        let membership_record = if let Some(record) = leader
+            .store
+            .get_leader(&CoordinatorScope::Membership)
+            .await
+            .unwrap()
+        {
+            record
+        } else {
+            let lease = leader
+                .store
+                .grant_lease(Duration::from_secs(30))
+                .await
+                .unwrap();
+            let record = LeaderRecord {
+                scope: CoordinatorScope::Membership,
+                node: leader.leader.node.clone(),
+                protocol_generation: COORDINATOR_PROTOCOL_GENERATION,
+                term: CoordinatorTerm::new(1).unwrap(),
+            };
+            assert!(leader.store.campaign_leader(&record, lease).await.unwrap());
+            record
+        };
+        let member_lease = leader
+            .store
+            .grant_lease(Duration::from_secs(30))
+            .await
+            .unwrap();
+        let member = MemberRecord {
+            node: hello.node.clone(),
+            hello: hello.clone(),
+            status: MemberStatus::Up,
+            version: MembershipVersion::new(
+                membership_record.term,
+                leader
+                    .store
+                    .get_membership_revision()
+                    .await
+                    .unwrap()
+                    .next()
+                    .unwrap(),
+            ),
+            lease_id: member_lease,
+        };
+        leader
+            .store
+            .create_member(
+                &MembershipLeaderGuard::new(membership_record).unwrap(),
+                CreateMember { member },
+            )
+            .await
+            .unwrap();
+    }
+    leader
+        .store
+        .get_member(&hello.node.node_id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
 async fn register_up(
-    leader: &mut CoordinatorLeader<InMemoryPlacementStore>,
-    hello: NodeHello,
+    leader: &mut PlacementDomainLeader<InMemoryPlacementStore>,
+    hello: TestHello,
     association: lattice_remoting::association::AssociationKey,
 ) {
-    let incarnation = hello.node.incarnation;
-    leader.register(hello, association.clone()).await.unwrap();
+    let incarnation = hello.member.node.incarnation;
+    ensure_test_global_member(leader, &hello.member).await;
     leader
-        .mark_member_up(incarnation, leader.version, &association)
+        .register(hello.domain, association.clone())
+        .await
+        .unwrap();
+    leader
+        .mark_member_up(incarnation, leader.membership_version, &association)
         .await
         .unwrap();
 }
 
 async fn seed_running_slot(
-    leader: &mut CoordinatorLeader<InMemoryPlacementStore>,
+    leader: &mut PlacementDomainLeader<InMemoryPlacementStore>,
     mut slot: PlacementSlot,
+    authority_hello: Option<&TestHello>,
 ) {
     let owner = slot.owner.clone().unwrap();
+    let member_hello = authority_hello
+        .map(|hello| hello.member.clone())
+        .unwrap_or_else(|| MemberHello {
+            node: owner.clone(),
+            roles: BTreeSet::new(),
+            failure_domains: BTreeMap::new(),
+            protocols: Vec::new(),
+            remoting_capabilities: BTreeSet::new(),
+        });
+    let expected_global_member = ensure_test_global_member(leader, &member_hello).await;
+    let expected_domain_member = if let Some(member) = leader
+        .store
+        .get_domain_member(&leader.version.domain, &owner.node_id)
+        .await
+        .unwrap()
+    {
+        member
+    } else {
+        let member = DomainMemberRecord {
+            node: owner.clone(),
+            hello: authority_hello
+                .map(|hello| hello.domain.clone())
+                .unwrap_or_else(|| {
+                    PlacementDomainHello::new(
+                        owner.clone(),
+                        leader.version.domain.clone(),
+                        1,
+                        BTreeSet::new(),
+                        BTreeSet::new(),
+                        BTreeSet::new(),
+                        BTreeSet::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        BTreeMap::new(),
+                    )
+                }),
+            status: DomainMemberStatus::Up,
+            version: leader.next_version().unwrap(),
+        };
+        let committed = leader
+            .store
+            .create_domain_member(
+                &leader.leader_guard,
+                CreateDomainMember {
+                    expected_global_member: expected_global_member.clone(),
+                    member,
+                },
+            )
+            .await
+            .unwrap();
+        leader.version = committed.member.version.clone();
+        committed.member
+    };
     slot.version.term = leader.leader.term;
     slot.state = PlacementSlotState::Allocating;
     slot.active_move = None;
@@ -95,6 +232,7 @@ async fn seed_running_slot(
         .await
         .unwrap();
     let grant = ClaimGrant {
+        domain: slot.key.domain().clone(),
         slot: slot.key.clone(),
         owner,
         coordinator_term: leader.leader.term,
@@ -107,6 +245,8 @@ async fn seed_running_slot(
         .allocate_initial(
             &leader.leader_guard,
             AllocateInitial {
+                expected_global_member,
+                expected_domain_member,
                 slot,
                 claim: LeasedClaim {
                     grant: grant.clone(),
@@ -116,7 +256,7 @@ async fn seed_running_slot(
         )
         .await
         .unwrap();
-    leader.version = committed.slot.version;
+    leader.version = committed.slot.version.clone();
     leader.claims.insert(
         committed.slot.key.clone(),
         ClaimLease {
@@ -191,19 +331,61 @@ fn node(
     )
 }
 
-fn empty_hello(node: NodeKey) -> NodeHello {
-    NodeHello {
-        node,
-        roles: Default::default(),
-        capacity_units: 1,
-        hosted_entity_types: Default::default(),
-        proxied_entity_types: Default::default(),
-        singleton_eligibility: Default::default(),
-        used_singletons: Default::default(),
-        protocols: Vec::new(),
-        entity_configs: Vec::new(),
-        singleton_configs: Vec::new(),
+#[derive(Clone)]
+struct TestHello {
+    member: MemberHello,
+    domain: PlacementDomainHello,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn test_hello(
+    node: NodeKey,
+    roles: BTreeSet<String>,
+    capacity_units: u64,
+    hosted_entity_types: BTreeSet<EntityType>,
+    proxied_entity_types: BTreeSet<EntityType>,
+    singleton_eligibility: BTreeSet<lattice_core::actor_ref::SingletonKind>,
+    used_singletons: BTreeSet<lattice_core::actor_ref::SingletonKind>,
+    protocols: Vec<lattice_remoting::protocol::ProtocolDescriptor>,
+    entity_configs: Vec<crate::region::EntityConfig>,
+    singleton_configs: Vec<SingletonConfig>,
+) -> TestHello {
+    TestHello {
+        member: MemberHello {
+            node: node.clone(),
+            roles,
+            failure_domains: Default::default(),
+            protocols,
+            remoting_capabilities: Default::default(),
+        },
+        domain: PlacementDomainHello::new(
+            node,
+            domain(),
+            capacity_units,
+            hosted_entity_types,
+            proxied_entity_types,
+            singleton_eligibility,
+            used_singletons,
+            entity_configs,
+            singleton_configs,
+            Default::default(),
+        ),
     }
+}
+
+fn empty_hello(node: NodeKey) -> TestHello {
+    test_hello(
+        node,
+        Default::default(),
+        1,
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 #[tokio::test]
@@ -270,26 +452,45 @@ async fn real_control_session_installs_snapshot_and_matching_claim() {
         .connect_peer(coordinator_identity)
         .await
         .unwrap();
+    let coordinator_to_logic = lattice_remoting::association::AssociationKey {
+        cluster_id: logic_to_coordinator.key().cluster_id.clone(),
+        local_incarnation: logic_to_coordinator.key().remote_incarnation,
+        remote_address: logic_node.address.clone(),
+        remote_incarnation: logic_to_coordinator.key().local_incarnation,
+    };
 
     let entity_type = EntityType::new("player").unwrap();
     let slot_key = PlacementSlotKey::Shard {
+        domain: domain(),
         entity_type: entity_type.clone(),
         shard_id: ShardId::new(3),
     };
     let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
-    let mut leader = CoordinatorLeader::elect(
+    let mut leader = PlacementDomainLeader::elect(
         store.clone(),
         coordinator_associations,
         coordinator_node,
+        CoordinatorScope::Placement(domain()),
         CoordinatorTerm::new(1).unwrap(),
-        2,
-        CoordinatorLeaderConfig {
+        PlacementDomainLeaderConfig {
             renewal_interval: Duration::from_secs(1),
-            ..CoordinatorLeaderConfig::default()
+            ..PlacementDomainLeaderConfig::default()
         },
     )
     .await
     .unwrap();
+    let hello = test_hello(
+        logic_node.clone(),
+        ["logic".to_owned()].into_iter().collect(),
+        1,
+        [entity_type.clone()].into_iter().collect(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
     seed_running_slot(
         &mut leader,
         PlacementSlot {
@@ -298,27 +499,24 @@ async fn real_control_session_installs_snapshot_and_matching_claim() {
             owner: Some(logic_node.clone()),
             target: None,
             assignment_generation: AssignmentGeneration::new(1).unwrap(),
-            version: StateVersion::new(CoordinatorTerm::new(1).unwrap(), Revision::new(1).unwrap()),
+            version: PlacementVersion::new(
+                domain(),
+                CoordinatorTerm::new(1).unwrap(),
+                Revision::new(1).unwrap(),
+            ),
             state: PlacementSlotState::Running,
             active_move: None,
             barrier_sessions: Default::default(),
         },
+        Some(&hello),
     )
     .await;
-    let hello = NodeHello {
-        node: logic_node,
-        roles: ["logic".to_owned()].into_iter().collect(),
-        capacity_units: 1,
-        hosted_entity_types: [entity_type].into_iter().collect(),
-        proxied_entity_types: Default::default(),
-        singleton_eligibility: Default::default(),
-        used_singletons: Default::default(),
-        protocols: Vec::new(),
-        entity_configs: Vec::new(),
-        singleton_configs: Vec::new(),
-    };
-    let (logic, mut effects) = LogicCoordinatorSession::new(
-        hello,
+    leader
+        .register(hello.domain.clone(), coordinator_to_logic)
+        .await
+        .unwrap();
+    let (logic, mut effects) = PlacementDomainSession::new(
+        hello.domain,
         logic_to_coordinator.key().clone(),
         logic_associations,
         LogicCoordinatorConfig::default(),
@@ -394,37 +592,24 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
     );
     let entity_type = EntityType::new("handoff-entity").unwrap();
     let slot_key = PlacementSlotKey::Shard {
+        domain: domain(),
         entity_type: entity_type.clone(),
         shard_id: ShardId::new(1),
     };
     let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
-    let mut leader = CoordinatorLeader::elect(
+    let mut leader = PlacementDomainLeader::elect(
         store.clone(),
         associations,
         coordinator_node,
+        CoordinatorScope::Placement(domain()),
         CoordinatorTerm::new(1).unwrap(),
-        2,
-        CoordinatorLeaderConfig::default(),
+        PlacementDomainLeaderConfig::default(),
     )
     .await
     .unwrap();
-    seed_running_slot(
-        &mut leader,
-        PlacementSlot {
-            key: slot_key.clone(),
-            config_fingerprint: ConfigFingerprint::new([9; 32]),
-            owner: Some(source.clone()),
-            target: None,
-            assignment_generation: AssignmentGeneration::new(1).unwrap(),
-            version: StateVersion::new(CoordinatorTerm::new(1).unwrap(), Revision::new(1).unwrap()),
-            state: PlacementSlotState::Running,
-            active_move: None,
-            barrier_sessions: Default::default(),
-        },
-    )
-    .await;
     let protocol_id = lattice_core::actor_ref::ProtocolId::new(77).unwrap();
     let entity_config = crate::region::EntityConfig::new(
+        domain(),
         entity_type.clone(),
         protocol_id,
         8,
@@ -437,21 +622,46 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
         protocol_id,
         fingerprint: lattice_remoting::protocol::ProtocolFingerprint::new([7; 32]),
     };
-    let hello = |node: NodeKey| NodeHello {
-        node,
-        roles: Default::default(),
-        capacity_units: 10,
-        hosted_entity_types: [entity_type.clone()].into_iter().collect(),
-        proxied_entity_types: Default::default(),
-        singleton_eligibility: Default::default(),
-        used_singletons: Default::default(),
-        protocols: vec![descriptor.clone()],
-        entity_configs: vec![entity_config.clone()],
-        singleton_configs: Vec::new(),
+    let hello = |node: NodeKey| {
+        test_hello(
+            node,
+            Default::default(),
+            10,
+            [entity_type.clone()].into_iter().collect(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            vec![descriptor.clone()],
+            vec![entity_config.clone()],
+            Vec::new(),
+        )
     };
-    register_up(&mut leader, hello(source.clone()), source_key).await;
-    register_up(&mut leader, hello(target.clone()), target_key).await;
+    let source_hello = hello(source.clone());
+    let target_hello = hello(target.clone());
+    seed_running_slot(
+        &mut leader,
+        PlacementSlot {
+            key: slot_key.clone(),
+            config_fingerprint: ConfigFingerprint::new([9; 32]),
+            owner: Some(source.clone()),
+            target: None,
+            assignment_generation: AssignmentGeneration::new(1).unwrap(),
+            version: PlacementVersion::new(
+                domain(),
+                CoordinatorTerm::new(1).unwrap(),
+                Revision::new(1).unwrap(),
+            ),
+            state: PlacementSlotState::Running,
+            active_move: None,
+            barrier_sessions: Default::default(),
+        },
+        Some(&source_hello),
+    )
+    .await;
+    register_up(&mut leader, source_hello, source_key).await;
+    register_up(&mut leader, target_hello, target_key).await;
     let relocation = ManualRelocationRequest {
+        domain: domain(),
         operation_id: "manual-1".to_owned(),
         entity_type: entity_type.clone(),
         shard_id: ShardId::new(1),
@@ -478,7 +688,7 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
             slot_key.clone(),
             HandoffEvent::AppliedRevision {
                 session: source.incarnation,
-                version: barrier_version,
+                version: barrier_version.clone(),
             },
         )
         .await
@@ -533,11 +743,11 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
     let active = store.get_slot(&slot_key).await.unwrap().unwrap();
     assert_eq!(active.state, PlacementSlotState::Running);
     assert!(active.active_move.is_none());
-    let plan = store.get_plan(plan_id).await.unwrap().unwrap();
+    let plan = store.get_plan(&domain(), plan_id).await.unwrap().unwrap();
     assert_eq!(plan.status, PlanStatus::Completed);
     store.revoke_lease(leader.leader_lease_id).await.unwrap();
     let (successor_node, _) = node(&cluster_id, "successor", 26203, 203);
-    let mut successor = CoordinatorLeader::elect(
+    let mut successor = PlacementDomainLeader::elect(
         store,
         Arc::new(
             AssociationManager::new(
@@ -548,9 +758,9 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
             .unwrap(),
         ),
         successor_node,
+        CoordinatorScope::Placement(domain()),
         CoordinatorTerm::new(2).unwrap(),
-        2,
-        CoordinatorLeaderConfig::default(),
+        PlacementDomainLeaderConfig::default(),
     )
     .await
     .unwrap();
@@ -598,19 +808,20 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
         40,
     );
     let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
-    let mut leader = CoordinatorLeader::elect(
+    let mut leader = PlacementDomainLeader::elect(
         store.clone(),
         associations,
         coordinator_node,
+        CoordinatorScope::Placement(domain()),
         CoordinatorTerm::new(1).unwrap(),
-        2,
-        CoordinatorLeaderConfig::default(),
+        PlacementDomainLeaderConfig::default(),
     )
     .await
     .unwrap();
     let entity_type = EntityType::new("allocated-entity").unwrap();
     let protocol_id = lattice_core::actor_ref::ProtocolId::new(55).unwrap();
     let entity_config = crate::region::EntityConfig::new(
+        domain(),
         entity_type.clone(),
         protocol_id,
         8,
@@ -621,46 +832,42 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
     .unwrap();
     let singleton_kind =
         lattice_core::actor_ref::SingletonKind::new("allocated-singleton").unwrap();
-    let singleton_config = SingletonConfig {
-        kind: singleton_kind.clone(),
-        protocol_id,
-        config_fingerprint: ConfigFingerprint::new([6; 32]),
-    };
+    let singleton_config = SingletonConfig::new(domain(), singleton_kind.clone(), protocol_id);
     let descriptor = lattice_remoting::protocol::ProtocolDescriptor {
         protocol_id,
         fingerprint: lattice_remoting::protocol::ProtocolFingerprint::new([8; 32]),
     };
     register_up(
         &mut leader,
-        NodeHello {
-            node: proxy,
-            roles: Default::default(),
-            capacity_units: 1,
-            hosted_entity_types: Default::default(),
-            proxied_entity_types: [entity_type.clone()].into_iter().collect(),
-            singleton_eligibility: Default::default(),
-            used_singletons: [singleton_kind.clone()].into_iter().collect(),
-            protocols: vec![descriptor.clone()],
-            entity_configs: Vec::new(),
-            singleton_configs: Vec::new(),
-        },
+        test_hello(
+            proxy,
+            Default::default(),
+            1,
+            Default::default(),
+            [entity_type.clone()].into_iter().collect(),
+            Default::default(),
+            [singleton_kind.clone()].into_iter().collect(),
+            vec![descriptor.clone()],
+            Vec::new(),
+            Vec::new(),
+        ),
         proxy_key,
     )
     .await;
     register_up(
         &mut leader,
-        NodeHello {
-            node: host.clone(),
-            roles: Default::default(),
-            capacity_units: 10,
-            hosted_entity_types: [entity_type.clone()].into_iter().collect(),
-            proxied_entity_types: Default::default(),
-            singleton_eligibility: [singleton_kind.clone()].into_iter().collect(),
-            used_singletons: Default::default(),
-            protocols: vec![descriptor],
-            entity_configs: vec![entity_config],
-            singleton_configs: vec![singleton_config],
-        },
+        test_hello(
+            host.clone(),
+            Default::default(),
+            10,
+            [entity_type.clone()].into_iter().collect(),
+            Default::default(),
+            [singleton_kind.clone()].into_iter().collect(),
+            Default::default(),
+            vec![descriptor],
+            vec![entity_config],
+            vec![singleton_config],
+        ),
         host_key,
     )
     .await;
@@ -669,6 +876,7 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
         .await
         .unwrap();
     let shard_key = PlacementSlotKey::Shard {
+        domain: domain(),
         entity_type,
         shard_id: ShardId::new(3),
     };
@@ -683,7 +891,10 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
         .ensure_singleton_allocated(singleton_kind.clone())
         .await
         .unwrap();
-    let singleton_key = PlacementSlotKey::Singleton(singleton_kind);
+    let singleton_key = PlacementSlotKey::Singleton {
+        domain: domain(),
+        kind: singleton_kind,
+    };
     let singleton = store.get_slot(&singleton_key).await.unwrap().unwrap();
     assert_eq!(singleton.owner.as_ref(), Some(&host));
     leader
@@ -713,13 +924,13 @@ async fn admin_pause_is_idempotent_fingerprinted_and_inspectable() {
         .unwrap(),
     );
     let store = Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
-    let mut leader = CoordinatorLeader::elect(
+    let mut leader = PlacementDomainLeader::elect(
         store.clone(),
         associations,
         coordinator,
+        CoordinatorScope::Placement(domain()),
         CoordinatorTerm::new(1).unwrap(),
-        2,
-        CoordinatorLeaderConfig::default(),
+        PlacementDomainLeaderConfig::default(),
     )
     .await
     .unwrap();
@@ -742,10 +953,16 @@ async fn admin_pause_is_idempotent_fingerprinted_and_inspectable() {
     assert_eq!(inspection.version.term, CoordinatorTerm::new(1).unwrap());
     assert_eq!(inspection.paused_entity_types, vec![entity_type]);
 
-    assert!(store.get_automatic_settings().await.unwrap().is_some());
     assert!(
         store
-            .get_admin_operation("pause-1")
+            .get_automatic_settings(&domain())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get_admin_operation(&domain(), "pause-1")
             .await
             .unwrap()
             .is_some()
@@ -769,15 +986,15 @@ async fn terminal_plan_history_compacts_oldest_persisted_record() {
         .unwrap(),
     );
     let store = Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
-    let mut leader = CoordinatorLeader::elect(
+    let mut leader = PlacementDomainLeader::elect(
         store.clone(),
         associations,
         coordinator,
+        CoordinatorScope::Placement(domain()),
         CoordinatorTerm::new(1).unwrap(),
-        2,
-        CoordinatorLeaderConfig {
+        PlacementDomainLeaderConfig {
             maximum_completed_plan_history: 2,
-            ..CoordinatorLeaderConfig::default()
+            ..PlacementDomainLeaderConfig::default()
         },
     )
     .await
@@ -785,11 +1002,13 @@ async fn terminal_plan_history_compacts_oldest_persisted_record() {
     let entity_type = EntityType::new("history-entity").unwrap();
     for id in 1..=3_u128 {
         let plan = RebalancePlan {
+            domain: domain(),
             plan_id: id,
             entity_type: entity_type.clone(),
             reason: PlanReason::Manual,
             coordinator_term: CoordinatorTerm::new(1).unwrap(),
-            base_version: StateVersion::new(
+            base_version: PlacementVersion::new(
+                domain(),
                 CoordinatorTerm::new(1).unwrap(),
                 Revision::new(id as u64).unwrap(),
             ),
@@ -806,266 +1025,11 @@ async fn terminal_plan_history_compacts_oldest_persisted_record() {
         leader.plans.insert(id, plan);
     }
     leader.compact_plan_history().await.unwrap();
-    assert!(store.get_plan(1).await.unwrap().is_none());
-    assert!(store.get_plan(2).await.unwrap().is_some());
-    assert!(store.get_plan(3).await.unwrap().is_some());
+    assert!(store.get_plan(&domain(), 1).await.unwrap().is_none());
+    assert!(store.get_plan(&domain(), 2).await.unwrap().is_some());
+    assert!(store.get_plan(&domain(), 3).await.unwrap().is_some());
     assert_eq!(leader.plans.len(), 2);
 }
 
-#[tokio::test]
-async fn leader_recovery_resumes_persisted_handoff() {
-    use crate::allocation::{ProposedMove, RebalanceProposal, RebalanceTrigger};
-
-    let cluster_id = ClusterId::new("recovery-test").unwrap();
-    let (coordinator, _) = node(&cluster_id, "coordinator", 26300, 300);
-    let (source, _) = node(&cluster_id, "source", 26301, 301);
-    let (target, _) = node(&cluster_id, "target", 26302, 302);
-    let entity_type = EntityType::new("recovery-entity").unwrap();
-    let shard_id = ShardId::new(4);
-    let proposal = |expected_generation| RebalanceProposal {
-        policy_id: "test",
-        policy_version: 1,
-        base_version: StateVersion::new(
-            CoordinatorTerm::new(1).unwrap(),
-            Revision::new(1).unwrap(),
-        ),
-        trigger: RebalanceTrigger::Manual {
-            source: Some(source.clone()),
-            target: Some(target.clone()),
-            bypass_improvement: true,
-        },
-        moves: vec![ProposedMove {
-            entity_type: entity_type.clone(),
-            shard_id,
-            expected_generation,
-            source: source.clone(),
-            target: target.clone(),
-            estimated_weight: 1,
-        }],
-    };
-    let mut started = RebalancePlan::from_proposal(
-        proposal(AssignmentGeneration::new(1).unwrap()),
-        entity_type.clone(),
-        CoordinatorTerm::new(1).unwrap(),
-        4,
-    )
-    .unwrap();
-    let pending = started.clone();
-    started
-        .begin_move(shard_id, AssignmentGeneration::new(1).unwrap(), None)
-        .unwrap();
-    let slot_key = PlacementSlotKey::Shard {
-        entity_type,
-        shard_id,
-    };
-    let store = Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
-    let associations = Arc::new(
-        AssociationManager::new(
-            coordinator.address.clone(),
-            coordinator.incarnation,
-            RemotingConfig::default(),
-        )
-        .unwrap(),
-    );
-    let mut leader = CoordinatorLeader::elect(
-        store.clone(),
-        associations,
-        coordinator,
-        CoordinatorTerm::new(1).unwrap(),
-        2,
-        CoordinatorLeaderConfig::default(),
-    )
-    .await
-    .unwrap();
-    seed_running_slot(
-        &mut leader,
-        PlacementSlot {
-            key: slot_key.clone(),
-            config_fingerprint: ConfigFingerprint::new([7; 32]),
-            owner: Some(source.clone()),
-            target: None,
-            assignment_generation: AssignmentGeneration::new(1).unwrap(),
-            version: StateVersion::new(CoordinatorTerm::new(1).unwrap(), Revision::new(1).unwrap()),
-            state: PlacementSlotState::Running,
-            active_move: None,
-            barrier_sessions: Default::default(),
-        },
-    )
-    .await;
-    store
-        .create_plan(
-            &leader.leader_guard,
-            CreatePlan {
-                plan: pending.clone(),
-            },
-        )
-        .await
-        .unwrap();
-    let barrier_version = leader.next_version().unwrap();
-    started
-        .install_barrier(shard_id, barrier_version, Default::default())
-        .unwrap();
-    started.record_revision = started.record_revision.next().unwrap();
-    let expected_slot = store.get_slot(&slot_key).await.unwrap().unwrap();
-    let mut handoff_slot = expected_slot.clone();
-    handoff_slot.target = Some(target);
-    handoff_slot.state = PlacementSlotState::BeginHandoff;
-    handoff_slot.active_move = Some(started.plan_id);
-    handoff_slot.version = barrier_version;
-    store
-        .reserve_move(
-            &leader.leader_guard,
-            ReserveMove {
-                expected_plan: pending,
-                plan: started.clone(),
-                expected_slot,
-                slot: handoff_slot,
-            },
-        )
-        .await
-        .unwrap();
-    leader.version = barrier_version;
-    leader.plans.insert(started.plan_id, started);
-    leader.recover_persisted_plans().await.unwrap();
-    assert_eq!(
-        store.get_slot(&slot_key).await.unwrap().unwrap().state,
-        PlacementSlotState::Stopping
-    );
-    assert_eq!(leader.handoffs[&slot_key].phase, HandoffPhase::Draining);
-}
-
-#[tokio::test]
-async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
-    let cluster_id = ClusterId::new("singleton-recovery-test").unwrap();
-    let (coordinator, _) = node(&cluster_id, "coordinator", 26400, 400);
-    let (source, _) = node(&cluster_id, "source", 26401, 401);
-    let (target, _) = node(&cluster_id, "target", 26402, 402);
-    let associations = Arc::new(
-        AssociationManager::new(
-            coordinator.address.clone(),
-            coordinator.incarnation,
-            RemotingConfig::default(),
-        )
-        .unwrap(),
-    );
-    let source_key = attach_test_session(
-        &associations,
-        &cluster_id,
-        coordinator.incarnation,
-        &source,
-        50,
-    );
-    let target_key = attach_test_session(
-        &associations,
-        &cluster_id,
-        coordinator.incarnation,
-        &target,
-        60,
-    );
-    let store = Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
-    let mut leader = CoordinatorLeader::elect(
-        store.clone(),
-        associations,
-        coordinator,
-        CoordinatorTerm::new(1).unwrap(),
-        2,
-        CoordinatorLeaderConfig {
-            member_heartbeat_timeout: Duration::from_millis(10),
-            ..CoordinatorLeaderConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let kind = lattice_core::actor_ref::SingletonKind::new("recovering-singleton").unwrap();
-    let protocol_id = lattice_core::actor_ref::ProtocolId::new(77).unwrap();
-    let singleton_config = SingletonConfig {
-        kind: kind.clone(),
-        protocol_id,
-        config_fingerprint: ConfigFingerprint::new([4; 32]),
-    };
-    let descriptor = lattice_remoting::protocol::ProtocolDescriptor {
-        protocol_id,
-        fingerprint: lattice_remoting::protocol::ProtocolFingerprint::new([5; 32]),
-    };
-    let hello = |node: NodeKey| NodeHello {
-        node,
-        roles: Default::default(),
-        capacity_units: 1,
-        hosted_entity_types: Default::default(),
-        proxied_entity_types: Default::default(),
-        singleton_eligibility: [kind.clone()].into_iter().collect(),
-        used_singletons: [kind.clone()].into_iter().collect(),
-        protocols: vec![descriptor.clone()],
-        entity_configs: Vec::new(),
-        singleton_configs: vec![singleton_config.clone()],
-    };
-    register_up(&mut leader, hello(source.clone()), source_key).await;
-    register_up(&mut leader, hello(target.clone()), target_key).await;
-    leader
-        .ensure_singleton_allocated(kind.clone())
-        .await
-        .unwrap();
-    let slot_key = PlacementSlotKey::Singleton(kind);
-    let initial = store.get_slot(&slot_key).await.unwrap().unwrap();
-    assert_eq!(initial.owner.as_ref(), Some(&source));
-    leader
-        .complete_initial_ready(&slot_key, &source, initial.assignment_generation)
-        .await
-        .unwrap();
-
-    leader
-        .sessions
-        .get_mut(&source.incarnation)
-        .unwrap()
-        .last_heartbeat = Instant::now() - Duration::from_secs(1);
-    leader.renew().await.unwrap();
-    let persisted = store.get_slot(&slot_key).await.unwrap().unwrap();
-    assert_eq!(persisted.state, PlacementSlotState::BeginHandoff);
-    assert_eq!(persisted.target.as_ref(), Some(&target));
-    assert!(store.get_claim(&slot_key).await.unwrap().is_none());
-
-    leader.handoffs.clear();
-    leader.recover_persisted_plans().await.unwrap();
-    assert_eq!(leader.handoffs[&slot_key].phase, HandoffPhase::Invalidating);
-    leader
-        .transition_handoff(
-            slot_key.clone(),
-            HandoffEvent::AppliedRevision {
-                session: target.incarnation,
-                version: persisted.version,
-            },
-        )
-        .await
-        .unwrap();
-    let allocating = store.get_slot(&slot_key).await.unwrap().unwrap();
-    assert_eq!(allocating.state, PlacementSlotState::Allocating);
-    assert_eq!(allocating.owner.as_ref(), Some(&target));
-    assert_eq!(allocating.assignment_generation.get(), 2);
-    assert_eq!(
-        store
-            .get_claim(&slot_key)
-            .await
-            .unwrap()
-            .unwrap()
-            .grant
-            .owner,
-        target
-    );
-
-    leader
-        .transition_handoff(
-            slot_key.clone(),
-            HandoffEvent::TargetReady {
-                target: allocating.owner.unwrap(),
-                generation: allocating.assignment_generation,
-            },
-        )
-        .await
-        .unwrap();
-    let active = store.get_slot(&slot_key).await.unwrap().unwrap();
-    assert_eq!(active.state, PlacementSlotState::Running);
-    assert!(active.active_move.is_none());
-    assert!(active.barrier_sessions.is_empty());
-}
-
 mod lifecycle_tests;
+mod recovery_tests;

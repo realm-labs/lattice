@@ -10,9 +10,10 @@ use kube::config::KubeConfigOptions;
 use kube::runtime::watcher;
 use kube::{Client, ResourceExt};
 use lattice_core::actor_ref::NodeAddress;
+use lattice_core::coordinator::CoordinatorScope;
 use lattice_discovery::provider::{
-    ClusterDiscovery, DiscoveryError, DiscoveryOrigin, DiscoverySnapshot, DiscoverySource,
-    DiscoveryTarget,
+    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
+    DiscoverySource, DiscoveryTarget,
 };
 
 const SERVICE_LABEL: &str = "kubernetes.io/service-name";
@@ -25,6 +26,7 @@ pub enum KubernetesCredentials {
 
 #[derive(Debug, Clone)]
 pub struct KubernetesEndpointSliceConfig {
+    pub scope: CoordinatorScope,
     pub namespace: String,
     pub service: String,
     pub label_selector: Option<String>,
@@ -114,10 +116,16 @@ impl KubernetesEndpointSliceDiscovery {
     }
 }
 
-impl ClusterDiscovery for KubernetesEndpointSliceDiscovery {
+impl CoordinatorDiscovery for KubernetesEndpointSliceDiscovery {
+    fn scope(&self) -> &CoordinatorScope {
+        &self.config.scope
+    }
+
     fn snapshots(
         &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<DiscoverySnapshot, DiscoveryError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<CoordinatorDirectorySnapshot, DiscoveryError>> + Send + '_>>
+    {
+        let scope = self.config.scope.clone();
         Box::pin(async_stream::stream! {
             let mut state = EndpointSliceState::default();
             let mut generation = 0_u64;
@@ -130,7 +138,7 @@ impl ClusterDiscovery for KubernetesEndpointSliceDiscovery {
                             if !emitted_initial {
                                 generation += 1;
                                 emitted_initial = true;
-                                yield Ok(DiscoverySnapshot { generation, targets: Vec::new() });
+                                yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets: Vec::new() });
                             }
                             yield Err(DiscoveryError::Provider {
                                 provider: "kubernetes_endpoint_slice",
@@ -144,7 +152,7 @@ impl ClusterDiscovery for KubernetesEndpointSliceDiscovery {
                                 Ok(targets) if !targets.is_empty() || !emitted_initial => {
                                     generation += 1;
                                     emitted_initial = true;
-                                    yield Ok(DiscoverySnapshot { generation, targets });
+                                    yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets });
                                 }
                                 Ok(_) => {
                                     yield Err(DiscoveryError::Provider {

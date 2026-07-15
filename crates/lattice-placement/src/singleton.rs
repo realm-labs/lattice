@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use lattice_core::actor_ref::{
-    ClusterId, ConfigFingerprint, ProtocolId, ProtocolTag, ReferenceError, SingletonKind,
-    SingletonRef,
+    ClusterId, ConfigFingerprint, PlacementDomainId, ProtocolId, ProtocolTag, ReferenceError,
+    SingletonKind, SingletonRef,
 };
 use thiserror::Error;
 
@@ -12,17 +12,20 @@ use crate::region::BufferedMessageMode;
 use crate::types::{MonotonicTime, NodeKey};
 
 pub struct SingletonManager {
+    pub domain: PlacementDomainId,
     pub kind: SingletonKind,
     authority: PlacementAuthority,
 }
 
 impl SingletonManager {
     pub fn new(
+        domain: PlacementDomainId,
         kind: SingletonKind,
         local_node: NodeKey,
         safety_margin: std::time::Duration,
     ) -> Result<Self, SingletonError> {
         Ok(Self {
+            domain,
             kind,
             authority: PlacementAuthority::new(local_node, safety_margin)
                 .map_err(SingletonError::Authority)?,
@@ -69,6 +72,7 @@ pub struct SingletonBufferedMessage {
 }
 
 pub struct SingletonProxy {
+    domain: PlacementDomainId,
     kind: SingletonKind,
     protocol_id: ProtocolId,
     fingerprint: ConfigFingerprint,
@@ -80,6 +84,7 @@ pub struct SingletonProxy {
 
 impl SingletonProxy {
     pub fn new(
+        domain: PlacementDomainId,
         kind: SingletonKind,
         protocol_id: ProtocolId,
         fingerprint: ConfigFingerprint,
@@ -92,6 +97,7 @@ impl SingletonProxy {
             return Err(SingletonError::ZeroLimit);
         }
         Ok(Self {
+            domain,
             kind,
             protocol_id,
             fingerprint,
@@ -108,6 +114,7 @@ impl SingletonProxy {
     ) -> Result<SingletonRef<P>, ReferenceError> {
         SingletonRef::new(
             cluster_id,
+            self.domain.clone(),
             self.kind.clone(),
             self.protocol_id,
             self.fingerprint,

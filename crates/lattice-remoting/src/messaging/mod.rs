@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_core::actor_ref::{
     ActivationId, ActorPath, ActorRef, ClusterId, ConfigFingerprint, EntityId, EntityRef,
-    EntityType, NodeAddress, NodeIncarnation, ProtocolId, ProtocolTag, SingletonKind, SingletonRef,
+    EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId, ProtocolTag,
+    SingletonKind, SingletonRef,
 };
 use prost::Message;
 use thiserror::Error;

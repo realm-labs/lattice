@@ -1,12 +1,16 @@
 use super::membership::{control_dispatch_error, send_control};
 use super::{
-    CoordinatorLeader, CoordinatorRuntimeError, CoordinatorStore, HandoffEvent, HandoffMachine,
-    Instant, MoveProgress, PlacementControlCommand, PlacementControlEvent, PlacementSlotKey,
-    PlacementSlotState, PlanStatus, RebalanceTrigger, mpsc, watch,
+    CoordinatorLeaseStore, CoordinatorRuntimeError, HandoffEvent, HandoffMachine, Instant,
+    MembershipStore, MoveProgress, PlacementControlCommand, PlacementControlEvent,
+    PlacementDomainLeader, PlacementDomainStore, PlacementSlotKey, PlacementSlotState, PlanStatus,
+    RebalanceTrigger, ScopedElectionStore, mpsc, watch,
 };
 use crate::storage::domain::{DeletePlan, ReserveMove, UpdatePlan};
 
-impl<S: CoordinatorStore> CoordinatorLeader<S> {
+impl<S> PlacementDomainLeader<S>
+where
+    S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
+{
     pub(super) async fn recover_persisted_plans(&mut self) -> Result<(), CoordinatorRuntimeError> {
         let plan_ids = self.plans.keys().copied().collect::<Vec<_>>();
         for plan_id in plan_ids {
@@ -18,6 +22,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             let mut plan_changed = false;
             for movement in plan.moves.clone() {
                 let key = PlacementSlotKey::Shard {
+                    domain: plan.domain.clone(),
                     entity_type: plan.entity_type.clone(),
                     shard_id: movement.shard_id,
                 };
@@ -70,7 +75,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                                 .iter_mut()
                                 .find(|current| current.shard_id == movement.shard_id)
                             {
-                                current.barrier_version = Some(barrier_version);
+                                current.barrier_version = Some(barrier_version.clone());
                             }
                             plan.record_revision = plan
                                 .record_revision
@@ -81,7 +86,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                             slot.state = PlacementSlotState::BeginHandoff;
                             slot.active_move = Some(plan_id);
                             slot.barrier_sessions = barrier_sessions.clone();
-                            slot.version = barrier_version;
+                            slot.version = barrier_version.clone();
                             let committed = self
                                 .store
                                 .reserve_move(
@@ -96,10 +101,10 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                                 .await?;
                             plan = committed.plan;
                             slot = committed.slot;
-                            self.version = barrier_version;
+                            self.version = barrier_version.clone();
                             (barrier_version, barrier_sessions)
                         } else {
-                            (slot.version, slot.barrier_sessions.clone())
+                            (slot.version.clone(), slot.barrier_sessions.clone())
                         };
                         let handoff = HandoffMachine::recover(
                             &slot,
@@ -134,8 +139,8 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 self.plans.insert(plan_id, plan);
             }
         }
-        for slot in self.store.list_slots().await? {
-            if !matches!(slot.key, PlacementSlotKey::Singleton(_))
+        for slot in self.store.list_slots(&self.version.domain).await? {
+            if !matches!(slot.key, PlacementSlotKey::Singleton { .. })
                 || slot.active_move.is_none()
                 || self.handoffs.contains_key(&slot.key)
             {
@@ -174,7 +179,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 source,
                 target,
                 source_generation,
-                slot.version,
+                slot.version.clone(),
                 slot.barrier_sessions.clone(),
             )
             .map_err(CoordinatorRuntimeError::Handoff)?;
@@ -227,7 +232,13 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                     PlanStatus::Completed | PlanStatus::Cancelled | PlanStatus::Failed
                 )
             })
-            .map(|plan| (plan.base_version, plan.plan_id, plan.record_revision))
+            .map(|plan| {
+                (
+                    plan.base_version.clone(),
+                    plan.plan_id,
+                    plan.record_revision,
+                )
+            })
             .collect::<Vec<_>>();
         terminal.sort_unstable();
         let remove = terminal
@@ -349,16 +360,10 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         let leaving = self
             .sessions
             .iter()
-            .filter_map(|(incarnation, session)| {
-                (session.record.status == crate::coordinator::MemberStatus::Leaving)
-                    .then_some(*incarnation)
-            })
+            .filter_map(|(incarnation, session)| session.draining.then_some(*incarnation))
             .collect::<Vec<_>>();
         for incarnation in leaving {
             self.maybe_send_drain_ready(incarnation).await?;
-        }
-        for session in self.sessions.values() {
-            self.store.keep_lease_alive(session.lease_id).await?;
         }
         for claim in self.claims.values() {
             self.store.keep_lease_alive(claim.lease_id).await?;
@@ -367,6 +372,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             {
                 send_control(
                     &association,
+                    &self.version.domain,
                     PlacementControlCommand::ClaimGranted(claim.grant.clone()),
                     &self.config,
                 )?;

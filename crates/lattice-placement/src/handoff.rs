@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::types::{
     AssignmentGeneration, NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState,
-    StateVersion,
+    PlacementVersion,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub enum HandoffEffect {
 pub enum HandoffEvent {
     AppliedRevision {
         session: NodeIncarnation,
-        version: StateVersion,
+        version: PlacementVersion,
     },
     FenceSession(NodeIncarnation),
     SourceDrained {
@@ -68,7 +68,7 @@ pub struct HandoffMachine {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VersionBarrier {
-    version: StateVersion,
+    version: PlacementVersion,
     required: BTreeSet<NodeIncarnation>,
     applied: BTreeSet<NodeIncarnation>,
 }
@@ -80,7 +80,7 @@ impl HandoffMachine {
         source: NodeKey,
         target: NodeKey,
         source_generation: AssignmentGeneration,
-        barrier_version: StateVersion,
+        barrier_version: PlacementVersion,
         barrier_sessions: BTreeSet<NodeIncarnation>,
     ) -> Result<Self, HandoffError> {
         let target_generation = source_generation
@@ -108,7 +108,7 @@ impl HandoffMachine {
         source: NodeKey,
         target: NodeKey,
         source_generation: AssignmentGeneration,
-        barrier_version: StateVersion,
+        barrier_version: PlacementVersion,
         barrier_sessions: BTreeSet<NodeIncarnation>,
     ) -> Result<Self, HandoffError> {
         if slot.active_move != Some(plan_id) {
@@ -138,8 +138,8 @@ impl HandoffMachine {
         Ok(machine)
     }
 
-    pub fn barrier_version(&self) -> StateVersion {
-        self.barrier.version
+    pub fn barrier_version(&self) -> PlacementVersion {
+        self.barrier.version.clone()
     }
 
     pub fn required_sessions(&self) -> &BTreeSet<NodeIncarnation> {
@@ -161,7 +161,7 @@ impl HandoffMachine {
             HandoffEvent::AppliedRevision { session, version }
                 if self.phase == HandoffPhase::Invalidating =>
             {
-                if !version.satisfies(self.barrier.version)
+                if !version.satisfies(&self.barrier.version)
                     || !self.barrier.required.contains(&session)
                 {
                     return Err(HandoffError::UnexpectedBarrierMember);
@@ -236,7 +236,7 @@ pub enum HandoffError {
 mod tests {
     use super::*;
     use crate::types::ShardId;
-    use lattice_core::actor_ref::{EntityType, NodeAddress, NodeIncarnation};
+    use lattice_core::actor_ref::{EntityType, NodeAddress, NodeIncarnation, PlacementDomainId};
 
     fn node(id: &str, incarnation: u128) -> NodeKey {
         NodeKey {
@@ -249,8 +249,10 @@ mod tests {
     #[test]
     fn barrier_excludes_unrelated_and_move_never_rolls_back() {
         let subscribed = NodeIncarnation::new(3).unwrap();
+        let domain = PlacementDomainId::new("test").unwrap();
         let mut machine = HandoffMachine::begin(
             PlacementSlotKey::Shard {
+                domain: domain.clone(),
                 entity_type: EntityType::new("entity").unwrap(),
                 shard_id: ShardId::new(1),
             },
@@ -258,7 +260,8 @@ mod tests {
             node("source", 1),
             node("target", 2),
             AssignmentGeneration::new(4).unwrap(),
-            StateVersion::new(
+            PlacementVersion::new(
+                domain.clone(),
                 crate::types::CoordinatorTerm::new(2).unwrap(),
                 crate::types::Revision::new(8).unwrap(),
             ),
@@ -269,7 +272,8 @@ mod tests {
             machine
                 .transition(HandoffEvent::AppliedRevision {
                     session: subscribed,
-                    version: StateVersion::new(
+                    version: PlacementVersion::new(
+                        domain.clone(),
                         crate::types::CoordinatorTerm::new(1).unwrap(),
                         crate::types::Revision::new(8).unwrap(),
                     ),
@@ -282,7 +286,8 @@ mod tests {
             machine
                 .transition(HandoffEvent::AppliedRevision {
                     session: NodeIncarnation::new(99).unwrap(),
-                    version: StateVersion::new(
+                    version: PlacementVersion::new(
+                        domain.clone(),
                         crate::types::CoordinatorTerm::new(2).unwrap(),
                         crate::types::Revision::new(8).unwrap(),
                     ),
@@ -293,7 +298,8 @@ mod tests {
             machine
                 .transition(HandoffEvent::AppliedRevision {
                     session: subscribed,
-                    version: StateVersion::new(
+                    version: PlacementVersion::new(
+                        domain,
                         crate::types::CoordinatorTerm::new(2).unwrap(),
                         crate::types::Revision::new(8).unwrap(),
                     ),

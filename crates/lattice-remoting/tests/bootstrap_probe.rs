@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
+use lattice_core::coordinator::CoordinatorScope;
 use lattice_remoting::association::{AssociationManager, AssociationState};
 use lattice_remoting::bootstrap::{
     BootstrapHandler, BootstrapLeader, BootstrapProbeTarget, BootstrapRejectionCode,
@@ -159,6 +160,7 @@ async fn ordinary_member_returns_authoritative_leader_redirect() {
     let cluster = ClusterId::new("redirect-test").unwrap();
     let server_identity = identity(cluster.clone(), "member", 2, server_port);
     let leader = BootstrapLeader {
+        scope: CoordinatorScope::Membership,
         identity: identity(cluster.clone(), "leader", 4, server_port + 10),
         term: 7,
         protocol_generation: 3,
@@ -292,7 +294,8 @@ async fn missing_required_bootstrap_feature_is_stably_rejected() {
     )
     .await
     .unwrap();
-    let mut request = BootstrapRequest::new(client_identity, cluster, None);
+    let mut request =
+        BootstrapRequest::new(CoordinatorScope::Membership, client_identity, cluster, None);
     request.features = FeatureBits::NONE;
 
     connection.write_frame(&request.to_frame()).await.unwrap();
@@ -395,6 +398,7 @@ async fn tls_probe_binds_returned_identity_to_certificate_incarnation() {
 
     let response = client
         .probe_candidate(BootstrapProbeTarget {
+            scope: CoordinatorScope::Membership,
             address: server_identity.address.clone(),
             expected_node_id: Some("server".to_string()),
             tls_server_name: Some("lattice.test".to_string()),
@@ -425,6 +429,7 @@ async fn tls_probe_rejects_certificate_for_different_incarnation() {
 
     let result = client
         .probe_candidate(BootstrapProbeTarget {
+            scope: CoordinatorScope::Membership,
             address: server_identity.address.clone(),
             expected_node_id: Some("server".to_string()),
             tls_server_name: Some("lattice.test".to_string()),
@@ -656,6 +661,7 @@ fn target(
     expected_node_id: Option<&str>,
 ) -> BootstrapProbeTarget {
     BootstrapProbeTarget {
+        scope: CoordinatorScope::Membership,
         address: identity.address.clone(),
         expected_node_id: expected_node_id.map(str::to_string),
         tls_server_name: None,

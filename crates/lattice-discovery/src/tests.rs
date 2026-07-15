@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use futures_util::{Stream, StreamExt};
 use lattice_config::store::{ConfigStore, ConfigStoreError, ConfigWatch, LocalConfigStore};
 use lattice_core::actor_ref::NodeAddress;
+use lattice_core::coordinator::CoordinatorScope;
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -16,21 +17,26 @@ use crate::aggregate::AggregateDiscovery;
 use crate::config_store::ConfigStoreDiscovery;
 use crate::dns::{DnsDiscovery, DnsDiscoveryConfig, DnsLookup, DnsMode, DnsResolver, SrvRecord};
 use crate::provider::{
-    ClusterDiscovery, DiscoveryError, DiscoveryOrigin, DiscoverySnapshot, DiscoverySource,
-    DiscoveryTarget,
+    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
+    DiscoverySource, DiscoveryTarget,
 };
 use crate::static_provider::{StaticDiscovery, StaticEndpoint};
 
 #[tokio::test]
 async fn static_discovery_emits_one_validated_snapshot() {
-    let discovery =
-        StaticDiscovery::new("test", vec![static_endpoint("a", 7447, Some("node-a"), 10)]).unwrap();
+    let discovery = StaticDiscovery::new(
+        scope(),
+        "test",
+        vec![static_endpoint("a", 7447, Some("node-a"), 10)],
+    )
+    .unwrap();
     let snapshots = discovery.snapshots().collect::<Vec<_>>().await;
 
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].as_ref().unwrap().generation, 1);
     assert!(
         StaticDiscovery::new(
+            scope(),
             "test",
             vec![
                 static_endpoint("a", 7447, None, 10),
@@ -47,6 +53,7 @@ async fn config_store_closes_get_watch_race_and_retains_last_valid_document() {
     let second = document(2, vec![("b", 7448, "node-b", 20)]);
     let store = RacingStore::new(first, second);
     let discovery = ConfigStoreDiscovery::with_reconnect_delay(
+        scope(),
         store.clone(),
         "/discovery",
         Duration::from_millis(1),
@@ -82,7 +89,7 @@ async fn config_store_closes_get_watch_race_and_retains_last_valid_document() {
 #[tokio::test]
 async fn config_store_absent_key_starts_empty_and_watch_populates() {
     let store = LocalConfigStore::default();
-    let discovery = ConfigStoreDiscovery::new(store.clone(), "/discovery").unwrap();
+    let discovery = ConfigStoreDiscovery::new(scope(), store.clone(), "/discovery").unwrap();
     let mut snapshots = discovery.snapshots();
 
     assert!(snapshots.next().await.unwrap().unwrap().targets.is_empty());
@@ -105,6 +112,7 @@ async fn config_store_absent_key_starts_empty_and_watch_populates() {
 async fn config_store_reconnects_after_closed_watch() {
     let store = ReconnectingStore::new(document(1, vec![("node-a", 7447, "node-a", 10)]));
     let discovery = ConfigStoreDiscovery::with_reconnect_delay(
+        scope(),
         store.clone(),
         "/discovery",
         Duration::from_millis(1),
@@ -210,16 +218,21 @@ async fn dns_srv_preserves_priority_weight_and_tls_server_name() {
 
 #[tokio::test]
 async fn aggregate_deduplicates_merges_sources_and_rotates_equal_priority() {
-    let first = Arc::new(SequenceDiscovery::new(vec![Ok(DiscoverySnapshot {
-        generation: 1,
-        targets: vec![target("a", 7447, None, 10), target("b", 7447, None, 10)],
-    })]));
+    let first = Arc::new(SequenceDiscovery::new(vec![Ok(
+        CoordinatorDirectorySnapshot {
+            scope: scope(),
+            generation: 1,
+            targets: vec![target("a", 7447, None, 10), target("b", 7447, None, 10)],
+        },
+    )]));
     let second = Arc::new(SequenceDiscovery::new(vec![
-        Ok(DiscoverySnapshot {
+        Ok(CoordinatorDirectorySnapshot {
+            scope: scope(),
             generation: 1,
             targets: vec![config_target("a", 7447, Some("node-a"), 5)],
         }),
-        Ok(DiscoverySnapshot {
+        Ok(CoordinatorDirectorySnapshot {
+            scope: scope(),
             generation: 2,
             targets: vec![
                 config_target("a", 7447, Some("node-a"), 5),
@@ -359,30 +372,44 @@ impl DnsResolver for FakeDnsResolver {
 
 #[derive(Clone)]
 struct SequenceDiscovery {
-    items: Vec<Result<DiscoverySnapshot, DiscoveryError>>,
+    scope: CoordinatorScope,
+    items: Vec<Result<CoordinatorDirectorySnapshot, DiscoveryError>>,
 }
 
 impl SequenceDiscovery {
-    fn new(items: Vec<Result<DiscoverySnapshot, DiscoveryError>>) -> Self {
-        Self { items }
+    fn new(items: Vec<Result<CoordinatorDirectorySnapshot, DiscoveryError>>) -> Self {
+        Self {
+            scope: scope(),
+            items,
+        }
     }
 }
 
-impl ClusterDiscovery for SequenceDiscovery {
+impl CoordinatorDiscovery for SequenceDiscovery {
+    fn scope(&self) -> &CoordinatorScope {
+        &self.scope
+    }
+
     fn snapshots(
         &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<DiscoverySnapshot, DiscoveryError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<CoordinatorDirectorySnapshot, DiscoveryError>> + Send + '_>>
+    {
         Box::pin(futures_util::stream::iter(self.items.clone()))
     }
 }
 
 fn dns_config(mode: DnsMode) -> DnsDiscoveryConfig {
     DnsDiscoveryConfig {
+        scope: scope(),
         mode,
         min_refresh: Duration::from_secs(5),
         max_refresh: Duration::from_secs(30),
         retry_delay: Duration::from_secs(3),
     }
+}
+
+fn scope() -> CoordinatorScope {
+    CoordinatorScope::Membership
 }
 
 fn document(generation: u64, endpoints: Vec<(&str, u16, &str, u16)>) -> serde_json::Value {

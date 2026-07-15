@@ -4,13 +4,21 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::coordinator::{LeaderGuard, LeaderRecord, MemberRecord};
+use lattice_core::actor_ref::PlacementDomainId;
+use lattice_core::coordinator::CoordinatorScope;
+
+use crate::coordinator::{
+    DomainMemberRecord, DomainMemberStatus, ExactLeaderGuard, LeaderRecord, MemberRecord,
+    MemberStatus, MembershipLeaderGuard, PlacementLeaderGuard, SessionLimits, SingletonConfig,
+};
 use crate::plan::{MoveProgress, RebalancePlan};
+use crate::region::EntityConfig;
 use crate::types::{PlacementSlot, PlacementSlotKey, PlacementSlotState, Revision};
 
 pub mod domain;
 pub mod etcd;
 mod memory_admin;
+mod memory_traits;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorePage<T> {
@@ -41,75 +49,16 @@ mod tests;
 use domain::{
     ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial, AuthorityCommit,
     AutomaticBalanceSettings, ClaimPredicate, CommitAutomaticSettings, CompactAdminOperations,
-    CompleteMove, CreateMember, CreatePlan, CreatePlanWithOperation, DeletePlan,
-    DurableStorageLimits, FenceAuthority, FenceMissingAuthority, InstallAuthority, LeasedClaim,
-    MemberCommit, MoveCommit, PlanCommit, RecordAdminOperation, RemoveMember,
-    RemoveMemberWithOperation, ReserveHandoff, ReserveMove, SlotCommit, TransitionSlot,
-    UpdateMember, UpdatePlan, UpdatePlanWithOperation,
+    CompleteMove, CreateDomainMember, CreateMember, CreatePlan, CreatePlanWithOperation,
+    DeletePlan, DomainMemberCommit, DurableStorageLimits, EntityConfigCommit, FenceAuthority,
+    FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit, MoveCommit, PlanCommit,
+    PutEntityConfig, PutSingletonConfig, RecordAdminOperation, RemoveDomainMember, RemoveMember,
+    ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit, TransitionSlot,
+    UpdateDomainMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
 };
 
-/// Read-only placement access. Authoritative writes are available only through
-/// the leader-guarded named commits on [`CoordinatorStore`].
 #[async_trait]
-pub trait PlacementStore: Send + Sync + 'static {
-    fn durable_limits(&self) -> DurableStorageLimits;
-    async fn get_state_revision(&self) -> Result<Revision, StorageError>;
-    async fn get_slot(&self, key: &PlacementSlotKey)
-    -> Result<Option<PlacementSlot>, StorageError>;
-    async fn get_plan(&self, plan_id: u128) -> Result<Option<RebalancePlan>, StorageError>;
-    async fn get_claim(&self, key: &PlacementSlotKey) -> Result<Option<LeasedClaim>, StorageError>;
-    async fn get_member(&self, node_id: &str) -> Result<Option<MemberRecord>, StorageError>;
-    async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError>;
-    async fn list_slots(&self) -> Result<Vec<PlacementSlot>, StorageError>;
-    async fn list_plans(&self) -> Result<Vec<RebalancePlan>, StorageError>;
-    async fn list_claims(&self) -> Result<Vec<LeasedClaim>, StorageError>;
-    async fn get_automatic_settings(
-        &self,
-    ) -> Result<Option<AutomaticBalanceSettings>, StorageError>;
-    async fn get_admin_operation(
-        &self,
-        operation_id: &str,
-    ) -> Result<Option<AdminOperationRecord>, StorageError>;
-    async fn list_admin_operations(&self) -> Result<Vec<AdminOperationRecord>, StorageError>;
-    async fn list_members_page(
-        &self,
-        offset: usize,
-        limit: usize,
-    ) -> Result<StorePage<MemberRecord>, StorageError> {
-        bounded_page(&self.list_members().await?, offset, limit)
-    }
-    async fn list_slots_page(
-        &self,
-        states: &[PlacementSlotState],
-        offset: usize,
-        limit: usize,
-    ) -> Result<StorePage<PlacementSlot>, StorageError> {
-        let records = self
-            .list_slots()
-            .await?
-            .into_iter()
-            .filter(|slot| states.is_empty() || states.contains(&slot.state))
-            .collect::<Vec<_>>();
-        bounded_page(&records, offset, limit)
-    }
-    async fn list_plans_page(
-        &self,
-        offset: usize,
-        limit: usize,
-    ) -> Result<StorePage<RebalancePlan>, StorageError> {
-        bounded_page(&self.list_plans().await?, offset, limit)
-    }
-    async fn list_claims_page(
-        &self,
-        offset: usize,
-        limit: usize,
-    ) -> Result<StorePage<LeasedClaim>, StorageError> {
-        bounded_page(&self.list_claims().await?, offset, limit)
-    }
-}
-
-#[async_trait]
-pub trait CoordinatorStore: PlacementStore {
+pub trait CoordinatorLeaseStore: Send + Sync + 'static {
     async fn ensure_schema_generation(&self) -> Result<(), StorageError>;
     async fn grant_lease(&self, ttl: std::time::Duration) -> Result<i64, StorageError>;
     async fn keep_lease_alive(&self, lease_id: i64) -> Result<(), StorageError>;
@@ -118,122 +67,263 @@ pub trait CoordinatorStore: PlacementStore {
         &self,
         lease_id: i64,
     ) -> Result<Option<std::time::Duration>, StorageError>;
+}
+
+#[async_trait]
+pub trait ScopedElectionStore: CoordinatorLeaseStore {
     async fn campaign_leader(
         &self,
         leader: &LeaderRecord,
         lease_id: i64,
     ) -> Result<bool, StorageError>;
-    async fn get_leader(&self) -> Result<Option<LeaderRecord>, StorageError>;
-    async fn get_leader_term(&self) -> Result<u64, StorageError>;
+    async fn get_leader(
+        &self,
+        scope: &CoordinatorScope,
+    ) -> Result<Option<LeaderRecord>, StorageError>;
+    async fn get_leader_term(&self, scope: &CoordinatorScope) -> Result<u64, StorageError>;
+}
 
+#[async_trait]
+pub trait MembershipStore: CoordinatorLeaseStore {
+    async fn get_membership_revision(&self) -> Result<Revision, StorageError>;
+    async fn get_member(&self, node_id: &str) -> Result<Option<MemberRecord>, StorageError>;
+    async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError>;
+    async fn list_members_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<StorePage<MemberRecord>, StorageError> {
+        bounded_page(&self.list_members().await?, offset, limit)
+    }
     async fn create_member(
         &self,
-        guard: &LeaderGuard,
+        guard: &MembershipLeaderGuard,
         request: CreateMember,
     ) -> Result<MemberCommit, StorageError>;
     async fn update_member(
         &self,
-        guard: &LeaderGuard,
+        guard: &MembershipLeaderGuard,
         request: UpdateMember,
     ) -> Result<MemberCommit, StorageError>;
     async fn remove_member(
         &self,
-        guard: &LeaderGuard,
+        guard: &MembershipLeaderGuard,
         request: RemoveMember,
     ) -> Result<MemberCommit, StorageError>;
+}
+
+#[async_trait]
+pub trait PlacementDomainStore: CoordinatorLeaseStore {
+    fn durable_limits(&self, domain: &PlacementDomainId) -> DurableStorageLimits;
+    async fn get_placement_revision(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Revision, StorageError>;
+    async fn get_domain_member(
+        &self,
+        domain: &PlacementDomainId,
+        node_id: &str,
+    ) -> Result<Option<DomainMemberRecord>, StorageError>;
+    async fn list_domain_members(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Vec<DomainMemberRecord>, StorageError>;
+    async fn create_domain_member(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: CreateDomainMember,
+    ) -> Result<DomainMemberCommit, StorageError>;
+    async fn update_domain_member(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: UpdateDomainMember,
+    ) -> Result<DomainMemberCommit, StorageError>;
+    async fn remove_domain_member(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: RemoveDomainMember,
+    ) -> Result<DomainMemberCommit, StorageError>;
+    async fn get_entity_config(
+        &self,
+        domain: &PlacementDomainId,
+        entity_type: &lattice_core::actor_ref::EntityType,
+    ) -> Result<Option<EntityConfig>, StorageError>;
+    async fn list_entity_configs(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Vec<EntityConfig>, StorageError>;
+    async fn put_entity_config(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: PutEntityConfig,
+    ) -> Result<EntityConfigCommit, StorageError>;
+    async fn get_singleton_config(
+        &self,
+        domain: &PlacementDomainId,
+        kind: &lattice_core::actor_ref::SingletonKind,
+    ) -> Result<Option<SingletonConfig>, StorageError>;
+    async fn list_singleton_configs(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Vec<SingletonConfig>, StorageError>;
+    async fn put_singleton_config(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: PutSingletonConfig,
+    ) -> Result<SingletonConfigCommit, StorageError>;
+    async fn get_slot(&self, key: &PlacementSlotKey)
+    -> Result<Option<PlacementSlot>, StorageError>;
+    async fn get_plan(
+        &self,
+        domain: &PlacementDomainId,
+        plan_id: u128,
+    ) -> Result<Option<RebalancePlan>, StorageError>;
+    async fn get_claim(&self, key: &PlacementSlotKey) -> Result<Option<LeasedClaim>, StorageError>;
+    async fn list_slots(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Vec<PlacementSlot>, StorageError>;
+    async fn list_plans(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Vec<RebalancePlan>, StorageError>;
+    async fn list_claims(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Vec<LeasedClaim>, StorageError>;
+    async fn get_automatic_settings(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Option<AutomaticBalanceSettings>, StorageError>;
+    async fn get_admin_operation(
+        &self,
+        domain: &PlacementDomainId,
+        operation_id: &str,
+    ) -> Result<Option<AdminOperationRecord>, StorageError>;
+    async fn list_admin_operations(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Vec<AdminOperationRecord>, StorageError>;
+    async fn list_slots_page(
+        &self,
+        domain: &PlacementDomainId,
+        states: &[PlacementSlotState],
+        offset: usize,
+        limit: usize,
+    ) -> Result<StorePage<PlacementSlot>, StorageError> {
+        let records = self
+            .list_slots(domain)
+            .await?
+            .into_iter()
+            .filter(|slot| states.is_empty() || states.contains(&slot.state))
+            .collect::<Vec<_>>();
+        bounded_page(&records, offset, limit)
+    }
+    async fn list_plans_page(
+        &self,
+        domain: &PlacementDomainId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<StorePage<RebalancePlan>, StorageError> {
+        bounded_page(&self.list_plans(domain).await?, offset, limit)
+    }
+    async fn list_claims_page(
+        &self,
+        domain: &PlacementDomainId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<StorePage<LeasedClaim>, StorageError> {
+        bounded_page(&self.list_claims(domain).await?, offset, limit)
+    }
+
     async fn create_plan(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CreatePlan,
     ) -> Result<PlanCommit, StorageError>;
     async fn update_plan(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: UpdatePlan,
     ) -> Result<PlanCommit, StorageError>;
     async fn delete_plan(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: DeletePlan,
     ) -> Result<PlanCommit, StorageError>;
     async fn transition_slot(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: TransitionSlot,
     ) -> Result<SlotCommit, StorageError>;
     async fn allocate_initial(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: AllocateInitial,
     ) -> Result<AuthorityCommit, StorageError>;
     async fn activate_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: ActivateAuthority,
     ) -> Result<SlotCommit, StorageError>;
     async fn reserve_move(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: ReserveMove,
     ) -> Result<MoveCommit, StorageError>;
     async fn reserve_handoff(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: ReserveHandoff,
     ) -> Result<SlotCommit, StorageError>;
     async fn fence_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: FenceAuthority,
     ) -> Result<SlotCommit, StorageError>;
     async fn fence_missing_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: FenceMissingAuthority,
     ) -> Result<SlotCommit, StorageError>;
     async fn install_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: InstallAuthority,
     ) -> Result<AuthorityCommit, StorageError>;
     async fn adopt_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: AdoptAuthority,
     ) -> Result<AuthorityCommit, StorageError>;
     async fn complete_move(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CompleteMove,
     ) -> Result<MoveCommit, StorageError>;
     async fn commit_automatic_settings(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CommitAutomaticSettings,
     ) -> Result<AutomaticBalanceSettings, StorageError>;
     async fn create_plan_with_operation(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CreatePlanWithOperation,
     ) -> Result<PlanCommit, StorageError>;
     async fn update_plan_with_operation(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: UpdatePlanWithOperation,
     ) -> Result<PlanCommit, StorageError>;
-    async fn remove_member_with_operation(
-        &self,
-        guard: &LeaderGuard,
-        request: RemoveMemberWithOperation,
-    ) -> Result<MemberCommit, StorageError>;
     async fn record_admin_operation(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: RecordAdminOperation,
     ) -> Result<AdminOperationRecord, StorageError>;
     async fn compact_admin_operations(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CompactAdminOperations,
     ) -> Result<(), StorageError>;
 }
@@ -250,17 +340,23 @@ pub struct InMemoryPlacementStore {
 #[derive(Debug, Default)]
 struct MemoryState {
     slots: BTreeMap<PlacementSlotKey, PlacementSlot>,
-    plans: BTreeMap<u128, RebalancePlan>,
+    plans: BTreeMap<(PlacementDomainId, u128), RebalancePlan>,
     schema_generation: Option<u64>,
-    state_revision: Option<Revision>,
+    membership_revision: Option<Revision>,
+    placement_revisions: BTreeMap<PlacementDomainId, Revision>,
     next_lease: i64,
     leases: BTreeMap<i64, LeaseState>,
-    leader: Option<(i64, LeaderRecord)>,
-    leader_term: u64,
+    leaders: BTreeMap<CoordinatorScope, (i64, LeaderRecord)>,
+    leader_terms: BTreeMap<CoordinatorScope, u64>,
     members: BTreeMap<String, MemberRecord>,
+    domain_members: BTreeMap<(PlacementDomainId, String), DomainMemberRecord>,
+    entity_configs:
+        BTreeMap<(PlacementDomainId, lattice_core::actor_ref::EntityType), EntityConfig>,
+    singleton_configs:
+        BTreeMap<(PlacementDomainId, lattice_core::actor_ref::SingletonKind), SingletonConfig>,
     claims: BTreeMap<PlacementSlotKey, LeasedClaim>,
-    automatic_settings: Option<AutomaticBalanceSettings>,
-    admin_operations: BTreeMap<String, AdminOperationRecord>,
+    automatic_settings: BTreeMap<PlacementDomainId, AutomaticBalanceSettings>,
+    admin_operations: BTreeMap<(PlacementDomainId, String), AdminOperationRecord>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -268,305 +364,9 @@ struct LeaseState {
     ttl: std::time::Duration,
 }
 
+include!("storage/memory_core.rs");
+
 impl InMemoryPlacementStore {
-    pub fn new(maximum_slots: usize, maximum_plans: usize) -> Result<Self, StorageError> {
-        if maximum_slots == 0 || maximum_plans == 0 {
-            return Err(StorageError::ZeroLimit);
-        }
-        Ok(Self {
-            inner: Arc::new(Mutex::new(MemoryState::default())),
-            maximum_slots,
-            maximum_plans,
-            maximum_members: maximum_slots,
-            maximum_admin_operations: maximum_plans,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn insert_generation_three_slot(&self, slot: PlacementSlot) {
-        let mut state = self.inner.lock().expect("placement memory store poisoned");
-        state.state_revision = Some(slot.version.revision);
-        state.slots.insert(slot.key.clone(), slot);
-    }
-
-    async fn fence_missing_authority(
-        &self,
-        guard: &LeaderGuard,
-        request: FenceMissingAuthority,
-    ) -> Result<SlotCommit, StorageError> {
-        let mut state = self.inner.lock().expect("placement memory store poisoned");
-        validate_guard(&state, guard)?;
-        validate_slot_common(guard, &state, Some(&request.expected_slot), &request.slot)?;
-        if state.claims.contains_key(&request.slot.key)
-            || !matches!(
-                request.expected_slot.state,
-                PlacementSlotState::Allocating | PlacementSlotState::Running
-            )
-            || request.slot.state != PlacementSlotState::Fenced
-            || request.expected_slot.owner != request.slot.owner
-            || request.expected_slot.assignment_generation != request.slot.assignment_generation
-            || request.expected_slot.active_move != request.slot.active_move
-        {
-            return Err(StorageError::InvalidTransition);
-        }
-        state.state_revision = Some(request.slot.version.revision);
-        state
-            .slots
-            .insert(request.slot.key.clone(), request.slot.clone());
-        Ok(SlotCommit { slot: request.slot })
-    }
-}
-
-fn initial_revision() -> Revision {
-    Revision::new(1).expect("one is a valid state revision")
-}
-
-fn validate_guard(state: &MemoryState, guard: &LeaderGuard) -> Result<(), StorageError> {
-    let Some((lease_id, leader)) = state.leader.as_ref() else {
-        return Err(StorageError::LeadershipLost);
-    };
-    if leader != guard.record()
-        || state.leader_term != guard.term().get()
-        || !state.leases.contains_key(lease_id)
-    {
-        return Err(StorageError::LeadershipLost);
-    }
-    Ok(())
-}
-
-fn validate_member_record(member: &MemberRecord) -> Result<(), StorageError> {
-    if member.node != member.hello.node || member.lease_id <= 0 || member.node.validate().is_err() {
-        return Err(StorageError::InvalidRecord);
-    }
-    Ok(())
-}
-
-fn validate_admin_operation(
-    guard: &LeaderGuard,
-    operation: &AdminOperationRecord,
-) -> Result<(), StorageError> {
-    if operation.operation_id.is_empty()
-        || operation.operation_id.len() > 256
-        || operation.fingerprint.is_empty()
-        || operation.fingerprint.len() > 1024
-        || operation.version.term != guard.term()
-        || operation.expires_unix_millis <= operation.created_unix_millis
-    {
-        return Err(StorageError::InvalidRecord);
-    }
-    Ok(())
-}
-
-fn validate_next_revision(state: &MemoryState, revision: Revision) -> Result<(), StorageError> {
-    let expected = state
-        .state_revision
-        .unwrap_or_else(initial_revision)
-        .next()
-        .map_err(|_| StorageError::CounterExhausted)?;
-    if revision != expected {
-        return Err(StorageError::CompareFailed);
-    }
-    Ok(())
-}
-
-fn validate_plan_update(
-    expected: &RebalancePlan,
-    plan: &RebalancePlan,
-) -> Result<(), StorageError> {
-    if expected.plan_id != plan.plan_id
-        || plan.record_revision
-            != expected
-                .record_revision
-                .next()
-                .map_err(|_| StorageError::CounterExhausted)?
-    {
-        return Err(StorageError::CompareFailed);
-    }
-    Ok(())
-}
-
-fn validate_claim_lease(state: &MemoryState, claim: &LeasedClaim) -> Result<(), StorageError> {
-    if claim.lease_id <= 0
-        || !state.leases.contains_key(&claim.lease_id)
-        || claim.grant.ttl.is_zero()
-    {
-        return Err(StorageError::InvalidRecord);
-    }
-    Ok(())
-}
-
-fn claim_matches(state: &MemoryState, expected: &crate::types::ClaimGrant) -> bool {
-    state
-        .claims
-        .get(&expected.slot)
-        .is_some_and(|current| current.grant == *expected)
-}
-
-fn validate_slot_common(
-    guard: &LeaderGuard,
-    state: &MemoryState,
-    expected: Option<&PlacementSlot>,
-    slot: &PlacementSlot,
-) -> Result<(), StorageError> {
-    slot.validate().map_err(|_| StorageError::InvalidRecord)?;
-    if slot.version.term != guard.term() {
-        return Err(StorageError::InvalidRecord);
-    }
-    if let Some(expected) = expected
-        && (expected.key != slot.key || state.slots.get(&slot.key) != Some(expected))
-    {
-        return Err(StorageError::CompareFailed);
-    }
-    validate_next_revision(state, slot.version.revision)
-}
-
-#[async_trait]
-impl PlacementStore for InMemoryPlacementStore {
-    fn durable_limits(&self) -> DurableStorageLimits {
-        DurableStorageLimits {
-            maximum_slots: self.maximum_slots,
-            maximum_plans: self.maximum_plans,
-            maximum_members: self.maximum_members,
-            maximum_admin_operations: self.maximum_admin_operations,
-            maximum_entity_configs: self.maximum_members,
-            maximum_singleton_configs: self.maximum_members,
-        }
-    }
-
-    async fn get_state_revision(&self) -> Result<Revision, StorageError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("placement memory store poisoned")
-            .state_revision
-            .unwrap_or_else(initial_revision))
-    }
-
-    async fn get_slot(
-        &self,
-        key: &PlacementSlotKey,
-    ) -> Result<Option<PlacementSlot>, StorageError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("placement memory store poisoned")
-            .slots
-            .get(key)
-            .cloned())
-    }
-
-    async fn get_plan(&self, plan_id: u128) -> Result<Option<RebalancePlan>, StorageError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("placement memory store poisoned")
-            .plans
-            .get(&plan_id)
-            .cloned())
-    }
-
-    async fn get_claim(&self, key: &PlacementSlotKey) -> Result<Option<LeasedClaim>, StorageError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("placement memory store poisoned")
-            .claims
-            .get(key)
-            .cloned())
-    }
-
-    async fn get_member(&self, node_id: &str) -> Result<Option<MemberRecord>, StorageError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("placement memory store poisoned")
-            .members
-            .get(node_id)
-            .cloned())
-    }
-
-    async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("placement memory store poisoned")
-            .members
-            .values()
-            .cloned()
-            .collect())
-    }
-
-    async fn list_slots(&self) -> Result<Vec<PlacementSlot>, StorageError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("placement memory store poisoned")
-            .slots
-            .values()
-            .cloned()
-            .collect())
-    }
-
-    async fn list_plans(&self) -> Result<Vec<RebalancePlan>, StorageError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("placement memory store poisoned")
-            .plans
-            .values()
-            .cloned()
-            .collect())
-    }
-
-    async fn list_claims(&self) -> Result<Vec<LeasedClaim>, StorageError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("placement memory store poisoned")
-            .claims
-            .values()
-            .cloned()
-            .collect())
-    }
-
-    async fn get_automatic_settings(
-        &self,
-    ) -> Result<Option<AutomaticBalanceSettings>, StorageError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("placement memory store poisoned")
-            .automatic_settings
-            .clone())
-    }
-
-    async fn get_admin_operation(
-        &self,
-        operation_id: &str,
-    ) -> Result<Option<AdminOperationRecord>, StorageError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("placement memory store poisoned")
-            .admin_operations
-            .get(operation_id)
-            .cloned())
-    }
-
-    async fn list_admin_operations(&self) -> Result<Vec<AdminOperationRecord>, StorageError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("placement memory store poisoned")
-            .admin_operations
-            .values()
-            .cloned()
-            .collect())
-    }
-}
-
-#[async_trait]
-impl CoordinatorStore for InMemoryPlacementStore {
     async fn ensure_schema_generation(&self) -> Result<(), StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         match state.schema_generation {
@@ -574,7 +374,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
             Some(_) => Err(StorageError::SchemaGenerationMismatch),
             None => {
                 state.schema_generation = Some(etcd::STORAGE_SCHEMA_GENERATION);
-                state.state_revision = Some(initial_revision());
+                state.membership_revision = Some(initial_revision());
                 Ok(())
             }
         }
@@ -606,13 +406,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
     async fn revoke_lease(&self, lease_id: i64) -> Result<(), StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         state.leases.remove(&lease_id);
-        if state
-            .leader
-            .as_ref()
-            .is_some_and(|(lease, _)| *lease == lease_id)
-        {
-            state.leader = None;
-        }
+        state.leaders.retain(|_, (lease, _)| *lease != lease_id);
         state
             .members
             .retain(|_, member| member.lease_id != lease_id);
@@ -638,49 +432,64 @@ impl CoordinatorStore for InMemoryPlacementStore {
         leader: &LeaderRecord,
         lease_id: i64,
     ) -> Result<bool, StorageError> {
+        leader.validate().map_err(|_| StorageError::InvalidRecord)?;
         let mut state = self.inner.lock().expect("placement memory store poisoned");
-        if !state.leases.contains_key(&lease_id) || state.leader.is_some() {
+        if !state.leases.contains_key(&lease_id) || state.leaders.contains_key(&leader.scope) {
             return Ok(false);
         }
         let expected = state
-            .leader_term
+            .leader_terms
+            .get(&leader.scope)
+            .copied()
+            .unwrap_or(0)
             .checked_add(1)
             .ok_or(StorageError::CounterExhausted)?;
         if leader.term.get() != expected {
             return Err(StorageError::CompareFailed);
         }
-        state.leader_term = expected;
-        state.leader = Some((lease_id, leader.clone()));
+        state.leader_terms.insert(leader.scope.clone(), expected);
+        state
+            .leaders
+            .insert(leader.scope.clone(), (lease_id, leader.clone()));
         Ok(true)
     }
 
-    async fn get_leader(&self) -> Result<Option<LeaderRecord>, StorageError> {
+    async fn get_leader_inner(
+        &self,
+        scope: &CoordinatorScope,
+    ) -> Result<Option<LeaderRecord>, StorageError> {
         Ok(self
             .inner
             .lock()
             .expect("placement memory store poisoned")
-            .leader
-            .as_ref()
+            .leaders
+            .get(scope)
             .map(|(_, leader)| leader.clone()))
     }
 
-    async fn get_leader_term(&self) -> Result<u64, StorageError> {
+    async fn get_leader_term_inner(&self, scope: &CoordinatorScope) -> Result<u64, StorageError> {
         Ok(self
             .inner
             .lock()
             .expect("placement memory store poisoned")
-            .leader_term)
+            .leader_terms
+            .get(scope)
+            .copied()
+            .unwrap_or(0))
     }
 
     async fn create_member(
         &self,
-        guard: &LeaderGuard,
+        guard: &MembershipLeaderGuard,
         request: CreateMember,
     ) -> Result<MemberCommit, StorageError> {
         validate_member_record(&request.member)?;
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         validate_guard(&state, guard)?;
-        validate_next_revision(&state, request.member.version.revision)?;
+        if guard.scope() != &CoordinatorScope::Membership {
+            return Err(StorageError::InvalidRecord);
+        }
+        validate_next_revision(&state, guard.scope(), request.member.version.revision)?;
         if !state.leases.contains_key(&request.member.lease_id) {
             return Err(StorageError::InvalidRecord);
         }
@@ -694,7 +503,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
         if state.members.len() == self.maximum_members {
             return Err(StorageError::Capacity);
         }
-        state.state_revision = Some(request.member.version.revision);
+        set_revision(&mut state, guard.scope(), request.member.version.revision);
         state
             .members
             .insert(request.member.node.node_id.clone(), request.member.clone());
@@ -706,13 +515,16 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn update_member(
         &self,
-        guard: &LeaderGuard,
+        guard: &MembershipLeaderGuard,
         request: UpdateMember,
     ) -> Result<MemberCommit, StorageError> {
         validate_member_record(&request.member)?;
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         validate_guard(&state, guard)?;
-        validate_next_revision(&state, request.member.version.revision)?;
+        if guard.scope() != &CoordinatorScope::Membership {
+            return Err(StorageError::InvalidRecord);
+        }
+        validate_next_revision(&state, guard.scope(), request.member.version.revision)?;
         if request.expected.node.node_id != request.member.node.node_id
             || request.expected.node.incarnation != request.member.node.incarnation
             || state.members.get(&request.expected.node.node_id) != Some(&request.expected)
@@ -720,7 +532,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
         {
             return Err(StorageError::CompareFailed);
         }
-        state.state_revision = Some(request.member.version.revision);
+        set_revision(&mut state, guard.scope(), request.member.version.revision);
         state
             .members
             .insert(request.member.node.node_id.clone(), request.member.clone());
@@ -732,7 +544,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn remove_member(
         &self,
-        guard: &LeaderGuard,
+        guard: &MembershipLeaderGuard,
         request: RemoveMember,
     ) -> Result<MemberCommit, StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
@@ -740,12 +552,13 @@ impl CoordinatorStore for InMemoryPlacementStore {
         if state.members.get(&request.expected.node.node_id) != Some(&request.expected) {
             return Err(StorageError::CompareFailed);
         }
-        let next = state
-            .state_revision
-            .unwrap_or_else(initial_revision)
+        if guard.scope() != &CoordinatorScope::Membership {
+            return Err(StorageError::InvalidRecord);
+        }
+        let next = current_revision(&state, guard.scope())
             .next()
             .map_err(|_| StorageError::CounterExhausted)?;
-        state.state_revision = Some(next);
+        set_revision(&mut state, guard.scope(), next);
         state.members.remove(&request.expected.node.node_id);
         Ok(MemberCommit {
             revision: next,
@@ -753,56 +566,193 @@ impl CoordinatorStore for InMemoryPlacementStore {
         })
     }
 
+    async fn create_domain_member(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: CreateDomainMember,
+    ) -> Result<DomainMemberCommit, StorageError> {
+        validate_domain_member_record(guard, &request.member)?;
+        if request.member.version.term != guard.term() {
+            return Err(StorageError::InvalidRecord);
+        }
+        let mut state = self.inner.lock().expect("placement memory store poisoned");
+        validate_guard(&state, guard)?;
+        if state
+            .members
+            .get(&request.expected_global_member.node.node_id)
+            != Some(&request.expected_global_member)
+            || request.expected_global_member.status != MemberStatus::Up
+            || request.expected_global_member.node != request.member.node
+            || state.domain_members.contains_key(&(
+                request.member.version.domain.clone(),
+                request.member.node.node_id.clone(),
+            ))
+        {
+            return Err(StorageError::CompareFailed);
+        }
+        validate_next_revision(&state, guard.scope(), request.member.version.revision)?;
+        if state
+            .domain_members
+            .keys()
+            .filter(|(domain, _)| domain == &request.member.version.domain)
+            .count()
+            == self.maximum_members
+        {
+            return Err(StorageError::Capacity);
+        }
+        set_revision(&mut state, guard.scope(), request.member.version.revision);
+        state.domain_members.insert(
+            (
+                request.member.version.domain.clone(),
+                request.member.node.node_id.clone(),
+            ),
+            request.member.clone(),
+        );
+        Ok(DomainMemberCommit {
+            member: request.member,
+        })
+    }
+
+    async fn update_domain_member(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: UpdateDomainMember,
+    ) -> Result<DomainMemberCommit, StorageError> {
+        validate_domain_member_record(guard, &request.expected)?;
+        validate_domain_member_record(guard, &request.member)?;
+        if request.member.version.term != guard.term() {
+            return Err(StorageError::InvalidRecord);
+        }
+        let mut state = self.inner.lock().expect("placement memory store poisoned");
+        validate_guard(&state, guard)?;
+        if state
+            .members
+            .get(&request.expected_global_member.node.node_id)
+            != Some(&request.expected_global_member)
+            || request.expected_global_member.status != MemberStatus::Up
+            || request.expected_global_member.node != request.member.node
+            || request.expected.node != request.member.node
+            || request.expected.version.domain != request.member.version.domain
+            || state.domain_members.get(&(
+                request.expected.version.domain.clone(),
+                request.expected.node.node_id.clone(),
+            )) != Some(&request.expected)
+        {
+            return Err(StorageError::CompareFailed);
+        }
+        validate_next_revision(&state, guard.scope(), request.member.version.revision)?;
+        set_revision(&mut state, guard.scope(), request.member.version.revision);
+        state.domain_members.insert(
+            (
+                request.member.version.domain.clone(),
+                request.member.node.node_id.clone(),
+            ),
+            request.member.clone(),
+        );
+        Ok(DomainMemberCommit {
+            member: request.member,
+        })
+    }
+
+    async fn remove_domain_member(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: RemoveDomainMember,
+    ) -> Result<DomainMemberCommit, StorageError> {
+        validate_domain_member_record(guard, &request.expected)?;
+        let mut state = self.inner.lock().expect("placement memory store poisoned");
+        validate_guard(&state, guard)?;
+        let key = (
+            request.expected.version.domain.clone(),
+            request.expected.node.node_id.clone(),
+        );
+        if state.domain_members.get(&key) != Some(&request.expected) {
+            return Err(StorageError::CompareFailed);
+        }
+        let next = current_revision(&state, guard.scope())
+            .next()
+            .map_err(|_| StorageError::CounterExhausted)?;
+        set_revision(&mut state, guard.scope(), next);
+        state.domain_members.remove(&key);
+        Ok(DomainMemberCommit {
+            member: request.expected,
+        })
+    }
+
     async fn create_plan(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CreatePlan,
     ) -> Result<PlanCommit, StorageError> {
+        validate_plan_domain(guard, &request.plan)?;
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         validate_guard(&state, guard)?;
         if request.plan.coordinator_term != guard.term()
             || request.plan.record_revision.get() != 1
-            || state.plans.contains_key(&request.plan.plan_id)
+            || state
+                .plans
+                .contains_key(&(request.plan.domain.clone(), request.plan.plan_id))
         {
             return Err(StorageError::CompareFailed);
         }
-        if state.plans.len() == self.maximum_plans {
+        if state
+            .plans
+            .keys()
+            .filter(|(domain, _)| domain == &request.plan.domain)
+            .count()
+            == self.maximum_plans
+        {
             return Err(StorageError::Capacity);
         }
-        state
-            .plans
-            .insert(request.plan.plan_id, request.plan.clone());
+        state.plans.insert(
+            (request.plan.domain.clone(), request.plan.plan_id),
+            request.plan.clone(),
+        );
         Ok(PlanCommit { plan: request.plan })
     }
 
     async fn update_plan(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: UpdatePlan,
     ) -> Result<PlanCommit, StorageError> {
+        validate_plan_domain(guard, &request.expected)?;
+        validate_plan_domain(guard, &request.plan)?;
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         validate_guard(&state, guard)?;
         validate_plan_update(&request.expected, &request.plan)?;
-        if state.plans.get(&request.expected.plan_id) != Some(&request.expected) {
+        if state
+            .plans
+            .get(&(request.expected.domain.clone(), request.expected.plan_id))
+            != Some(&request.expected)
+        {
             return Err(StorageError::CompareFailed);
         }
-        state
-            .plans
-            .insert(request.plan.plan_id, request.plan.clone());
+        state.plans.insert(
+            (request.plan.domain.clone(), request.plan.plan_id),
+            request.plan.clone(),
+        );
         Ok(PlanCommit { plan: request.plan })
     }
 
     async fn delete_plan(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: DeletePlan,
     ) -> Result<PlanCommit, StorageError> {
+        validate_plan_domain(guard, &request.expected)?;
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         validate_guard(&state, guard)?;
-        if state.plans.get(&request.expected.plan_id) != Some(&request.expected) {
+        if state
+            .plans
+            .get(&(request.expected.domain.clone(), request.expected.plan_id))
+            != Some(&request.expected)
+        {
             return Err(StorageError::CompareFailed);
         }
-        state.plans.remove(&request.expected.plan_id);
+        state
+            .plans
+            .remove(&(request.expected.domain.clone(), request.expected.plan_id));
         Ok(PlanCommit {
             plan: request.expected,
         })
@@ -810,7 +760,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn transition_slot(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: TransitionSlot,
     ) -> Result<SlotCommit, StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
@@ -834,7 +784,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
         {
             return Err(StorageError::InvalidTransition);
         }
-        state.state_revision = Some(request.slot.version.revision);
+        set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
             .insert(request.slot.key.clone(), request.slot.clone());
@@ -843,12 +793,22 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn allocate_initial(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: AllocateInitial,
     ) -> Result<AuthorityCommit, StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         validate_guard(&state, guard)?;
         validate_slot_common(guard, &state, None, &request.slot)?;
+        validate_assignment_members(
+            &state,
+            &request.expected_global_member,
+            &request.expected_domain_member,
+            request
+                .slot
+                .owner
+                .as_ref()
+                .ok_or(StorageError::InvalidRecord)?,
+        )?;
         validate_claim_lease(&state, &request.claim)?;
         if request.slot.state != PlacementSlotState::Allocating
             || request.slot.active_move.is_some()
@@ -861,7 +821,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
         if state.slots.len() == self.maximum_slots {
             return Err(StorageError::Capacity);
         }
-        state.state_revision = Some(request.slot.version.revision);
+        set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
             .insert(request.slot.key.clone(), request.slot.clone());
@@ -876,7 +836,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn activate_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: ActivateAuthority,
     ) -> Result<SlotCommit, StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
@@ -893,7 +853,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
         {
             return Err(StorageError::InvalidTransition);
         }
-        state.state_revision = Some(request.slot.version.revision);
+        set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
             .insert(request.slot.key.clone(), request.slot.clone());
@@ -902,14 +862,19 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn reserve_move(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: ReserveMove,
     ) -> Result<MoveCommit, StorageError> {
+        validate_plan_domain(guard, &request.expected_plan)?;
+        validate_plan_domain(guard, &request.plan)?;
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         validate_guard(&state, guard)?;
         validate_slot_common(guard, &state, Some(&request.expected_slot), &request.slot)?;
         validate_plan_update(&request.expected_plan, &request.plan)?;
-        if state.plans.get(&request.expected_plan.plan_id) != Some(&request.expected_plan)
+        if state.plans.get(&(
+            request.expected_plan.domain.clone(),
+            request.expected_plan.plan_id,
+        )) != Some(&request.expected_plan)
             || request.expected_slot.state != PlacementSlotState::Running
             || request.expected_slot.active_move.is_some()
             || request.slot.state != PlacementSlotState::BeginHandoff
@@ -923,13 +888,14 @@ impl CoordinatorStore for InMemoryPlacementStore {
         {
             return Err(StorageError::InvalidTransition);
         }
-        state.state_revision = Some(request.slot.version.revision);
+        set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
             .insert(request.slot.key.clone(), request.slot.clone());
-        state
-            .plans
-            .insert(request.plan.plan_id, request.plan.clone());
+        state.plans.insert(
+            (request.plan.domain.clone(), request.plan.plan_id),
+            request.plan.clone(),
+        );
         Ok(MoveCommit {
             slot: request.slot,
             plan: request.plan,
@@ -938,13 +904,13 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn reserve_handoff(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: ReserveHandoff,
     ) -> Result<SlotCommit, StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         validate_guard(&state, guard)?;
         validate_slot_common(guard, &state, Some(&request.expected_slot), &request.slot)?;
-        if !matches!(request.slot.key, PlacementSlotKey::Singleton(_))
+        if !matches!(request.slot.key, PlacementSlotKey::Singleton { .. })
             || request.expected_slot.state != PlacementSlotState::Running
             || request.expected_slot.active_move.is_some()
             || request.slot.state != PlacementSlotState::BeginHandoff
@@ -954,7 +920,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
         {
             return Err(StorageError::InvalidTransition);
         }
-        state.state_revision = Some(request.slot.version.revision);
+        set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
             .insert(request.slot.key.clone(), request.slot.clone());
@@ -963,7 +929,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn fence_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: FenceAuthority,
     ) -> Result<SlotCommit, StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
@@ -990,28 +956,30 @@ impl CoordinatorStore for InMemoryPlacementStore {
         if matches!(request.expected_claim, ClaimPredicate::Present(_)) {
             state.claims.remove(&request.slot.key);
         }
-        state.state_revision = Some(request.slot.version.revision);
+        set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
             .insert(request.slot.key.clone(), request.slot.clone());
         Ok(SlotCommit { slot: request.slot })
     }
 
-    async fn fence_missing_authority(
-        &self,
-        guard: &LeaderGuard,
-        request: FenceMissingAuthority,
-    ) -> Result<SlotCommit, StorageError> {
-        InMemoryPlacementStore::fence_missing_authority(self, guard, request).await
-    }
-
     async fn install_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: InstallAuthority,
     ) -> Result<AuthorityCommit, StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         validate_guard(&state, guard)?;
+        validate_assignment_members(
+            &state,
+            &request.expected_global_member,
+            &request.expected_domain_member,
+            request
+                .slot
+                .owner
+                .as_ref()
+                .ok_or(StorageError::InvalidRecord)?,
+        )?;
         validate_slot_common(guard, &state, Some(&request.expected_slot), &request.slot)?;
         validate_claim_lease(&state, &request.claim)?;
         if request.expected_slot.state != PlacementSlotState::Fenced
@@ -1028,7 +996,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
         {
             return Err(StorageError::InvalidTransition);
         }
-        state.state_revision = Some(request.slot.version.revision);
+        set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
             .insert(request.slot.key.clone(), request.slot.clone());
@@ -1043,11 +1011,21 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn adopt_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: AdoptAuthority,
     ) -> Result<AuthorityCommit, StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         validate_guard(&state, guard)?;
+        validate_assignment_members(
+            &state,
+            &request.expected_global_member,
+            &request.expected_domain_member,
+            request
+                .slot
+                .owner
+                .as_ref()
+                .ok_or(StorageError::InvalidRecord)?,
+        )?;
         validate_slot_common(guard, &state, Some(&request.expected_slot), &request.slot)?;
         validate_claim_lease(&state, &request.claim)?;
         if !claim_matches(&state, &request.expected_claim)
@@ -1062,7 +1040,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
         {
             return Err(StorageError::InvalidTransition);
         }
-        state.state_revision = Some(request.slot.version.revision);
+        set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
             .insert(request.slot.key.clone(), request.slot.clone());
@@ -1077,15 +1055,20 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn complete_move(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CompleteMove,
     ) -> Result<MoveCommit, StorageError> {
+        validate_plan_domain(guard, &request.expected_plan)?;
+        validate_plan_domain(guard, &request.plan)?;
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         validate_guard(&state, guard)?;
         validate_slot_common(guard, &state, Some(&request.expected_slot), &request.slot)?;
         validate_plan_update(&request.expected_plan, &request.plan)?;
         if !claim_matches(&state, &request.expected_claim)
-            || state.plans.get(&request.expected_plan.plan_id) != Some(&request.expected_plan)
+            || state.plans.get(&(
+                request.expected_plan.domain.clone(),
+                request.expected_plan.plan_id,
+            )) != Some(&request.expected_plan)
             || request.expected_slot.state != PlacementSlotState::Allocating
             || request.slot.state != PlacementSlotState::Running
             || request.expected_slot.active_move != Some(request.plan.plan_id)
@@ -1108,13 +1091,14 @@ impl CoordinatorStore for InMemoryPlacementStore {
         {
             return Err(StorageError::InvalidTransition);
         }
-        state.state_revision = Some(request.slot.version.revision);
+        set_revision(&mut state, guard.scope(), request.slot.version.revision);
         state
             .slots
             .insert(request.slot.key.clone(), request.slot.clone());
-        state
-            .plans
-            .insert(request.plan.plan_id, request.plan.clone());
+        state.plans.insert(
+            (request.plan.domain.clone(), request.plan.plan_id),
+            request.plan.clone(),
+        );
         Ok(MoveCommit {
             slot: request.slot,
             plan: request.plan,
@@ -1123,7 +1107,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn commit_automatic_settings(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CommitAutomaticSettings,
     ) -> Result<AutomaticBalanceSettings, StorageError> {
         memory_admin::commit_automatic_settings(self, guard, request)
@@ -1131,7 +1115,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn create_plan_with_operation(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CreatePlanWithOperation,
     ) -> Result<PlanCommit, StorageError> {
         memory_admin::create_plan_with_operation(self, guard, request)
@@ -1139,23 +1123,15 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn update_plan_with_operation(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: UpdatePlanWithOperation,
     ) -> Result<PlanCommit, StorageError> {
         memory_admin::update_plan_with_operation(self, guard, request)
     }
 
-    async fn remove_member_with_operation(
-        &self,
-        guard: &LeaderGuard,
-        request: RemoveMemberWithOperation,
-    ) -> Result<MemberCommit, StorageError> {
-        memory_admin::remove_member_with_operation(self, guard, request)
-    }
-
     async fn record_admin_operation(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: RecordAdminOperation,
     ) -> Result<AdminOperationRecord, StorageError> {
         memory_admin::record_admin_operation(self, guard, request)
@@ -1163,7 +1139,7 @@ impl CoordinatorStore for InMemoryPlacementStore {
 
     async fn compact_admin_operations(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CompactAdminOperations,
     ) -> Result<(), StorageError> {
         memory_admin::compact_admin_operations(self, guard, request)

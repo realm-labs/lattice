@@ -16,6 +16,7 @@ pub enum Failpoint {
     AdminAfterCommitBeforeResponse,
     ReconciliationAfterCommitBeforeEffect,
     MigrationAfterCommitBeforeProgress,
+    MigrationBeforeFinalize,
     SnapshotAfterStageBeforeInstall,
     RebalanceAfterPlanPersist,
     RebalanceAfterReservationBeforeHandoff,
@@ -32,7 +33,7 @@ pub enum Failpoint {
 }
 
 impl Failpoint {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::AssociationAfterHandshakeBeforeCatalogue,
         Self::ControlAfterOutboxBeforeSocketWrite,
         Self::ControlAfterRemoteApplyBeforeAck,
@@ -46,6 +47,7 @@ impl Failpoint {
         Self::AdminAfterCommitBeforeResponse,
         Self::ReconciliationAfterCommitBeforeEffect,
         Self::MigrationAfterCommitBeforeProgress,
+        Self::MigrationBeforeFinalize,
         Self::SnapshotAfterStageBeforeInstall,
         Self::RebalanceAfterPlanPersist,
         Self::RebalanceAfterReservationBeforeHandoff,
@@ -86,6 +88,7 @@ impl Failpoint {
                 "reconciliation_after_commit_before_effect"
             }
             Self::MigrationAfterCommitBeforeProgress => "migration_after_commit_before_progress",
+            Self::MigrationBeforeFinalize => "migration_before_finalize",
             Self::SnapshotAfterStageBeforeInstall => "snapshot_after_stage_before_install",
             Self::RebalanceAfterPlanPersist => "rebalance_after_plan_persist",
             Self::RebalanceAfterReservationBeforeHandoff => {

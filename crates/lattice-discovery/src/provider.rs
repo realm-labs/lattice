@@ -3,6 +3,7 @@ use std::pin::Pin;
 
 use futures_util::Stream;
 use lattice_core::actor_ref::NodeAddress;
+use lattice_core::coordinator::CoordinatorScope;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DiscoveryOrigin {
@@ -57,7 +58,8 @@ pub struct DiscoveryTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscoverySnapshot {
+pub struct CoordinatorDirectorySnapshot {
+    pub scope: CoordinatorScope,
     pub generation: u64,
     pub targets: Vec<DiscoveryTarget>,
 }
@@ -75,10 +77,12 @@ pub enum DiscoveryError {
     InvalidSnapshot { message: String },
 }
 
-pub trait ClusterDiscovery: Send + Sync {
+pub trait CoordinatorDiscovery: Send + Sync {
+    fn scope(&self) -> &CoordinatorScope;
+
     fn snapshots(
         &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<DiscoverySnapshot, DiscoveryError>> + Send + '_>>;
+    ) -> Pin<Box<dyn Stream<Item = Result<CoordinatorDirectorySnapshot, DiscoveryError>> + Send + '_>>;
 }
 
 pub(crate) fn validate_target(target: &DiscoveryTarget) -> Result<(), DiscoveryError> {
@@ -116,7 +120,9 @@ pub(crate) fn validate_target(target: &DiscoveryTarget) -> Result<(), DiscoveryE
     Ok(())
 }
 
-pub(crate) fn validate_snapshot(snapshot: &DiscoverySnapshot) -> Result<(), DiscoveryError> {
+pub(crate) fn validate_snapshot(
+    snapshot: &CoordinatorDirectorySnapshot,
+) -> Result<(), DiscoveryError> {
     if snapshot.generation == 0 {
         return Err(DiscoveryError::InvalidSnapshot {
             message: "generation zero is reserved".to_string(),

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use lattice_core::actor_ref::{
-    ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, SingletonKind,
+    ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, SingletonKind,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -45,12 +45,12 @@ nonzero_counter!(AssignmentGeneration, "assignment generation");
 nonzero_counter!(GrantSequence, "grant sequence");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct StateVersion {
+pub struct MembershipVersion {
     pub term: CoordinatorTerm,
     pub revision: Revision,
 }
 
-impl StateVersion {
+impl MembershipVersion {
     pub const fn new(term: CoordinatorTerm, revision: Revision) -> Self {
         Self { term, revision }
     }
@@ -68,6 +68,43 @@ impl StateVersion {
 
     pub fn satisfies(self, barrier: Self) -> bool {
         self.term == barrier.term && self.revision >= barrier.revision
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PlacementVersion {
+    pub domain: PlacementDomainId,
+    pub term: CoordinatorTerm,
+    pub revision: Revision,
+}
+
+impl PlacementVersion {
+    pub fn new(domain: PlacementDomainId, term: CoordinatorTerm, revision: Revision) -> Self {
+        Self {
+            domain,
+            term,
+            revision,
+        }
+    }
+
+    pub fn next_revision(&self) -> Result<Self, PlacementTypeError> {
+        Ok(Self {
+            domain: self.domain.clone(),
+            term: self.term,
+            revision: self.revision.next()?,
+        })
+    }
+
+    pub fn accepts_delta_after(&self, next: &Self) -> bool {
+        next.domain == self.domain
+            && next.term == self.term
+            && next.revision.get() == self.revision.get().saturating_add(1)
+    }
+
+    pub fn satisfies(&self, barrier: &Self) -> bool {
+        self.domain == barrier.domain
+            && self.term == barrier.term
+            && self.revision >= barrier.revision
     }
 }
 
@@ -126,10 +163,22 @@ impl NodeKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PlacementSlotKey {
     Shard {
+        domain: PlacementDomainId,
         entity_type: EntityType,
         shard_id: ShardId,
     },
-    Singleton(SingletonKind),
+    Singleton {
+        domain: PlacementDomainId,
+        kind: SingletonKind,
+    },
+}
+
+impl PlacementSlotKey {
+    pub fn domain(&self) -> &PlacementDomainId {
+        match self {
+            Self::Shard { domain, .. } | Self::Singleton { domain, .. } => domain,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,7 +199,7 @@ pub struct PlacementSlot {
     pub owner: Option<NodeKey>,
     pub target: Option<NodeKey>,
     pub assignment_generation: AssignmentGeneration,
-    pub version: StateVersion,
+    pub version: PlacementVersion,
     pub state: PlacementSlotState,
     pub active_move: Option<u128>,
     #[serde(default)]
@@ -200,6 +249,7 @@ impl PlacementSlot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimGrant {
+    pub domain: PlacementDomainId,
     pub slot: PlacementSlotKey,
     pub owner: NodeKey,
     pub coordinator_term: CoordinatorTerm,
@@ -211,6 +261,9 @@ pub struct ClaimGrant {
 impl ClaimGrant {
     pub fn validate(&self, safety_margin: Duration) -> Result<(), PlacementTypeError> {
         self.owner.validate()?;
+        if &self.domain != self.slot.domain() {
+            return Err(PlacementTypeError::ClaimDomainMismatch);
+        }
         if self.ttl.is_zero() || self.ttl <= safety_margin {
             return Err(PlacementTypeError::InvalidClaimTtl);
         }
@@ -230,4 +283,6 @@ pub enum PlacementTypeError {
     InvalidSlotState,
     #[error("claim TTL must exceed the nonzero safety margin")]
     InvalidClaimTtl,
+    #[error("claim domain does not match its placement slot domain")]
+    ClaimDomainMismatch,
 }

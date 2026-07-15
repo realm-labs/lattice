@@ -1,6 +1,6 @@
 use crate::actor_ref::{
     ActivationId, ActorPath, ActorRef, ClusterId, ConfigFingerprint, EntityId, EntityRef,
-    EntityType, NodeAddress, NodeIncarnation, ProtocolId,
+    EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
 };
 use crate::id::{ActorId, ActorKey, ActorKeyDecodeError, RouteKey};
 use crate::kind::{ActorKind, ServiceKind};
@@ -65,6 +65,7 @@ fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
     .unwrap();
     let entity = EntityRef::new(
         ClusterId::new("test").unwrap(),
+        PlacementDomainId::new("world").unwrap(),
         EntityType::new("world").unwrap(),
         EntityId::new(42_u64.to_be_bytes()).unwrap(),
         protocol,
@@ -75,6 +76,7 @@ fn actor_and_entity_refs_have_distinct_exact_and_logical_identity() {
     assert_eq!(actor.node_incarnation(), node);
     assert_eq!(actor.actor_path().to_string(), "/user/session-1");
     assert_eq!(entity.entity_id().as_bytes(), &42_u64.to_be_bytes());
+    assert_eq!(entity.domain().as_str(), "world");
 }
 
 #[test]

@@ -300,6 +300,7 @@ impl RemotingEndpoint {
             ),
         };
         let request = BootstrapRequest::new(
+            target.scope,
             self.local.clone(),
             self.local.cluster_id.clone(),
             target.expected_node_id,
@@ -469,7 +470,7 @@ impl RemotingEndpoint {
             lane,
             connection_nonce: nonce,
             maximum_frame_size: self.config.max_frame_size,
-            features: FeatureBits::REQUIRED_V1,
+            features: FeatureBits::REQUIRED_V2,
         };
         let peer_catalogue = negotiate_outbound(
             &mut connection,

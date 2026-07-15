@@ -538,6 +538,7 @@ fn rewrite_timeout_budget(frame: &mut Frame, timeout_nanos: u64) -> bool {
 
 fn entity_logical_bytes(target: &LogicalEntityTarget) -> Vec<u8> {
     let mut bytes = Vec::new();
+    bytes.extend_from_slice(target.reference.domain().as_str().as_bytes());
     bytes.extend_from_slice(target.reference.entity_type().as_str().as_bytes());
     bytes.extend_from_slice(target.reference.entity_id().as_bytes());
     bytes.extend_from_slice(&target.owner_incarnation.get().to_be_bytes());
@@ -547,6 +548,7 @@ fn entity_logical_bytes(target: &LogicalEntityTarget) -> Vec<u8> {
 
 fn singleton_logical_bytes(target: &LogicalSingletonTarget) -> Vec<u8> {
     let mut bytes = Vec::new();
+    bytes.extend_from_slice(target.reference.domain().as_str().as_bytes());
     bytes.extend_from_slice(target.reference.singleton_kind().as_str().as_bytes());
     bytes.extend_from_slice(&target.owner_incarnation.get().to_be_bytes());
     bytes.extend_from_slice(&target.assignment_generation.to_be_bytes());

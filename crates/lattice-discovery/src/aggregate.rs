@@ -4,13 +4,16 @@ use std::sync::Arc;
 
 use futures_util::Stream;
 use futures_util::StreamExt;
+use lattice_core::coordinator::CoordinatorScope;
 
 use crate::provider::{
-    ClusterDiscovery, DiscoveryError, DiscoverySnapshot, DiscoveryTarget, validate_snapshot,
+    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryTarget,
+    validate_snapshot,
 };
 
 pub struct AggregateDiscovery {
-    providers: Vec<Arc<dyn ClusterDiscovery>>,
+    scope: CoordinatorScope,
+    providers: Vec<Arc<dyn CoordinatorDiscovery>>,
 }
 
 impl std::fmt::Debug for AggregateDiscovery {
@@ -23,20 +26,32 @@ impl std::fmt::Debug for AggregateDiscovery {
 }
 
 impl AggregateDiscovery {
-    pub fn new(providers: Vec<Arc<dyn ClusterDiscovery>>) -> Result<Self, DiscoveryError> {
+    pub fn new(providers: Vec<Arc<dyn CoordinatorDiscovery>>) -> Result<Self, DiscoveryError> {
         if providers.is_empty() {
             return Err(DiscoveryError::InvalidConfiguration {
                 message: "aggregate discovery requires at least one provider".to_string(),
             });
         }
-        Ok(Self { providers })
+        let scope = providers[0].scope().clone();
+        if providers.iter().any(|provider| provider.scope() != &scope) {
+            return Err(DiscoveryError::InvalidConfiguration {
+                message: "aggregate discovery providers must have one Coordinator scope"
+                    .to_string(),
+            });
+        }
+        Ok(Self { scope, providers })
     }
 }
 
-impl ClusterDiscovery for AggregateDiscovery {
+impl CoordinatorDiscovery for AggregateDiscovery {
+    fn scope(&self) -> &CoordinatorScope {
+        &self.scope
+    }
+
     fn snapshots(
         &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<DiscoverySnapshot, DiscoveryError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<CoordinatorDirectorySnapshot, DiscoveryError>> + Send + '_>>
+    {
         let streams = self
             .providers
             .iter()
@@ -87,7 +102,7 @@ impl ClusterDiscovery for AggregateDiscovery {
                     Ok(targets) => {
                         output_generation += 1;
                         emitted = true;
-                        yield Ok(DiscoverySnapshot { generation: output_generation, targets });
+                        yield Ok(CoordinatorDirectorySnapshot { scope: self.scope.clone(), generation: output_generation, targets });
                     }
                     Err(error) => yield Err(error),
                 }
@@ -97,7 +112,7 @@ impl ClusterDiscovery for AggregateDiscovery {
 }
 
 fn merge_targets(
-    snapshots: &[Option<DiscoverySnapshot>],
+    snapshots: &[Option<CoordinatorDirectorySnapshot>],
     rotations: &mut BTreeMap<u16, usize>,
 ) -> Result<Vec<DiscoveryTarget>, DiscoveryError> {
     let mut merged = BTreeMap::new();

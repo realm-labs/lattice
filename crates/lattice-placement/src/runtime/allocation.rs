@@ -1,13 +1,17 @@
 use super::membership::send_control;
 use super::{
-    AllocationRequest, BTreeMap, ClaimGrant, ClaimLease, CoordinatorLeader,
-    CoordinatorRuntimeError, CoordinatorStore, GrantSequence, HandoffMachine, LoadSample,
-    MoveProgress, NodeKey, PlacedShard, PlacementControlCommand, PlacementNode, PlacementSlot,
-    PlacementSlotKey, PlacementSlotState, PlacementView, SingletonConfig,
+    AllocationRequest, BTreeMap, ClaimGrant, ClaimLease, CoordinatorLeaseStore,
+    CoordinatorRuntimeError, GrantSequence, HandoffMachine, LoadSample, MembershipStore,
+    MoveProgress, NodeKey, PlacedShard, PlacementControlCommand, PlacementDomainLeader,
+    PlacementDomainStore, PlacementNode, PlacementSlot, PlacementSlotKey, PlacementSlotState,
+    PlacementView, ScopedElectionStore, SingletonConfig,
 };
 use crate::storage::domain::{ActivateAuthority, AllocateInitial, LeasedClaim, ReserveHandoff};
 
-impl<S: CoordinatorStore> CoordinatorLeader<S> {
+impl<S> PlacementDomainLeader<S>
+where
+    S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
+{
     pub(super) async fn ensure_shard_allocated(
         &mut self,
         entity_type: lattice_core::actor_ref::EntityType,
@@ -22,6 +26,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             return Err(CoordinatorRuntimeError::ShardOutOfRange);
         }
         let key = PlacementSlotKey::Shard {
+            domain: config.domain.clone(),
             entity_type: entity_type.clone(),
             shard_id,
         };
@@ -43,10 +48,11 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             ))
             .cloned()
             .ok_or(CoordinatorRuntimeError::UnknownStrategy)?;
-        let view = self.placement_view().await?;
+        let view = self.placement_view(&config.domain).await?;
         let decision = strategy
             .allocate(
                 &AllocationRequest {
+                    domain: config.domain.clone(),
                     entity_type,
                     shard_id,
                     required_protocol: config.protocol_id,
@@ -73,7 +79,15 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         &mut self,
         kind: lattice_core::actor_ref::SingletonKind,
     ) -> Result<(), CoordinatorRuntimeError> {
-        let key = PlacementSlotKey::Singleton(kind.clone());
+        let config = self
+            .singleton_configs
+            .get(&kind)
+            .cloned()
+            .ok_or(CoordinatorRuntimeError::UnknownSingletonConfig)?;
+        let key = PlacementSlotKey::Singleton {
+            domain: config.domain.clone(),
+            kind: kind.clone(),
+        };
         if let Some(slot) = self.store.get_slot(&key).await? {
             return if matches!(
                 slot.state,
@@ -84,15 +98,10 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 Err(CoordinatorRuntimeError::StaleHandoff)
             };
         }
-        let config = self
-            .singleton_configs
-            .get(&kind)
-            .cloned()
-            .ok_or(CoordinatorRuntimeError::UnknownSingletonConfig)?;
         let target = self.select_singleton_target(&kind, &config, None)?;
         let slot = PlacementSlot {
             key,
-            config_fingerprint: config.config_fingerprint,
+            config_fingerprint: config.fingerprint(),
             owner: Some(target),
             target: None,
             assignment_generation: crate::types::AssignmentGeneration::new(1)
@@ -114,12 +123,13 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         self.sessions
             .values()
             .filter(|session| {
-                session.record.status == crate::coordinator::MemberStatus::Up
+                session.placement_up()
                     && !session.draining
                     && exclude != Some(&session.hello.node)
                     && session.hello.singleton_eligibility.contains(kind)
                     && session.hello.singleton_configs.contains(config)
                     && session
+                        .record
                         .hello
                         .protocols
                         .iter()
@@ -134,7 +144,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         &mut self,
         mut slot: PlacementSlot,
     ) -> Result<(), CoordinatorRuntimeError> {
-        let PlacementSlotKey::Singleton(kind) = &slot.key else {
+        let PlacementSlotKey::Singleton { kind, .. } = &slot.key else {
             return Err(CoordinatorRuntimeError::UnknownSlot);
         };
         if slot.state != PlacementSlotState::Running || slot.active_move.is_some() {
@@ -166,7 +176,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         slot.state = PlacementSlotState::BeginHandoff;
         slot.active_move = Some(plan_id);
         slot.barrier_sessions = barrier_sessions.clone();
-        slot.version = barrier_version;
+        slot.version = barrier_version.clone();
         let committed = self
             .store
             .reserve_handoff(
@@ -178,7 +188,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             )
             .await?;
         let slot = committed.slot;
-        self.version = slot.version;
+        self.version = slot.version.clone();
         let mut handoff = HandoffMachine::begin(
             slot.key.clone(),
             plan_id,
@@ -203,8 +213,11 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .owner
             .clone()
             .ok_or(CoordinatorRuntimeError::IneligibleTarget)?;
+        let (expected_global_member, expected_domain_member) =
+            self.assignment_members(&owner).await?;
         let lease_id = self.store.grant_lease(self.config.claim_ttl).await?;
         let grant = ClaimGrant {
+            domain: slot.key.domain().clone(),
             slot: slot.key.clone(),
             owner: owner.clone(),
             coordinator_term: self.leader.term,
@@ -213,6 +226,8 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             ttl: self.config.claim_ttl,
         };
         let request = AllocateInitial {
+            expected_global_member,
+            expected_domain_member,
             slot,
             claim: LeasedClaim {
                 grant: grant.clone(),
@@ -255,7 +270,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         lattice_core::failpoint::hit(
             lattice_core::failpoint::Failpoint::InitialAuthorityAfterCommitBeforeEffect,
         );
-        self.version = slot.version;
+        self.version = slot.version.clone();
         self.claims.insert(
             slot.key.clone(),
             ClaimLease {
@@ -275,6 +290,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
         send_control(
             &association,
+            &self.version.domain,
             PlacementControlCommand::ClaimGranted(leased_claim.grant),
             &self.config,
         )
@@ -318,15 +334,18 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             )
             .await?;
         let slot = committed.slot;
-        self.version = slot.version;
+        self.version = slot.version.clone();
         self.slot_assigned_at.insert(key.clone(), self.now());
         self.publish_slot_delta(&slot).await
     }
 
-    pub(super) async fn placement_view(&self) -> Result<PlacementView, CoordinatorRuntimeError> {
+    pub(super) async fn placement_view(
+        &self,
+        domain: &lattice_core::actor_ref::PlacementDomainId,
+    ) -> Result<PlacementView, CoordinatorRuntimeError> {
         let now = self.now();
         let mut reservations = BTreeMap::<NodeKey, u64>::new();
-        for plan in self.plans.values() {
+        for plan in self.plans.values().filter(|plan| &plan.domain == domain) {
             for (target, weight) in plan.target_reservations() {
                 *reservations.entry(target.clone()).or_default() += weight;
             }
@@ -334,12 +353,13 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         let nodes = self
             .sessions
             .values()
-            .filter(|session| session.record.status == crate::coordinator::MemberStatus::Up)
+            .filter(|session| session.placement_up())
             .map(|session| PlacementNode {
                 key: session.hello.node.clone(),
                 ready: true,
                 eligible_entity_types: session.hello.hosted_entity_types.clone(),
                 protocols: session
+                    .record
                     .hello
                     .protocols
                     .iter()
@@ -366,12 +386,16 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .collect();
         let shards = self
             .store
-            .list_slots()
+            .list_slots(&self.version.domain)
             .await?
             .into_iter()
             .filter_map(|slot| {
+                if slot.key.domain() != domain {
+                    return None;
+                }
                 let key = slot.key.clone();
                 let PlacementSlotKey::Shard {
+                    domain,
                     entity_type,
                     shard_id,
                 } = slot.key
@@ -384,6 +408,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                         .shard(owner.incarnation, &entity_type, shard_id)
                         .map(|report| report.weight);
                     PlacedShard {
+                        domain,
                         entity_type,
                         shard_id,
                         owner,
@@ -399,7 +424,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         let mut active_source_moves = BTreeMap::new();
         let mut active_target_moves = BTreeMap::new();
         let mut active_cluster_moves = 0;
-        for plan in self.plans.values() {
+        for plan in self.plans.values().filter(|plan| &plan.domain == domain) {
             for movement in &plan.moves {
                 if movement.progress == MoveProgress::Handoff {
                     active_cluster_moves += 1;
@@ -416,7 +441,8 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             }
         }
         Ok(PlacementView {
-            version: self.version,
+            domain: domain.clone(),
+            version: self.version.clone(),
             now,
             reconciled: self.reconciliation.initial_complete,
             degraded: !self.reconciliation.quarantined.is_empty(),

@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 
-use lattice_core::actor_ref::{EntityType, NodeIncarnation};
+use lattice_core::actor_ref::{EntityType, NodeIncarnation, PlacementDomainId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::allocation::{ProposedMove, RebalanceProposal, RebalanceTrigger};
 use crate::types::{
-    AssignmentGeneration, CoordinatorTerm, NodeKey, PlanRevision, ShardId, StateVersion,
+    AssignmentGeneration, CoordinatorTerm, NodeKey, PlacementVersion, PlanRevision, ShardId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,17 +35,18 @@ pub struct RebalanceMove {
     pub target: NodeKey,
     pub estimated_weight: u64,
     pub progress: MoveProgress,
-    pub barrier_version: Option<StateVersion>,
+    pub barrier_version: Option<PlacementVersion>,
     pub barrier_sessions: BTreeSet<NodeIncarnation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebalancePlan {
     pub plan_id: u128,
+    pub domain: PlacementDomainId,
     pub entity_type: EntityType,
     pub reason: PlanReason,
     pub coordinator_term: CoordinatorTerm,
-    pub base_version: StateVersion,
+    pub base_version: PlacementVersion,
     pub record_revision: PlanRevision,
     pub policy_id: String,
     pub policy_version: u32,
@@ -84,13 +85,14 @@ impl RebalancePlan {
         }
         let mut shards = BTreeSet::new();
         for movement in &proposal.moves {
-            validate_move(movement, &entity_type)?;
+            validate_move(movement, &proposal.domain, &entity_type)?;
             if !shards.insert(movement.shard_id) {
                 return Err(PlanError::DuplicateShard);
             }
         }
         Ok(Self {
             plan_id: uuid::Uuid::new_v4().as_u128(),
+            domain: proposal.domain,
             entity_type,
             reason: PlanReason::from(&proposal.trigger),
             coordinator_term,
@@ -145,7 +147,7 @@ impl RebalancePlan {
     pub fn install_barrier(
         &mut self,
         shard_id: ShardId,
-        version: StateVersion,
+        version: PlacementVersion,
         sessions: BTreeSet<NodeIncarnation>,
     ) -> Result<(), PlanError> {
         let movement = self
@@ -225,8 +227,13 @@ impl RebalancePlan {
     }
 }
 
-fn validate_move(movement: &ProposedMove, entity_type: &EntityType) -> Result<(), PlanError> {
-    if &movement.entity_type != entity_type
+fn validate_move(
+    movement: &ProposedMove,
+    domain: &PlacementDomainId,
+    entity_type: &EntityType,
+) -> Result<(), PlanError> {
+    if &movement.domain != domain
+        || &movement.entity_type != entity_type
         || movement.source == movement.target
         || movement.estimated_weight == 0
     {

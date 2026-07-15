@@ -1,6 +1,8 @@
 use std::time::Duration;
 
+use lattice_core::actor_ref::PlacementDomainId;
 use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
+use lattice_core::coordinator::CoordinatorScope;
 use prost::{Enumeration, Message};
 
 use crate::handshake::{FeatureBits, NodeIdentity};
@@ -11,6 +13,7 @@ pub const MAX_BOOTSTRAP_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapProbeTarget {
+    pub scope: CoordinatorScope,
     pub address: NodeAddress,
     pub expected_node_id: Option<String>,
     pub tls_server_name: Option<String>,
@@ -18,6 +21,7 @@ pub struct BootstrapProbeTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapRequest {
+    pub scope: CoordinatorScope,
     pub local: NodeIdentity,
     pub requested_cluster_id: ClusterId,
     pub expected_node_id: Option<String>,
@@ -29,18 +33,20 @@ pub struct BootstrapRequest {
 
 impl BootstrapRequest {
     pub fn new(
+        scope: CoordinatorScope,
         local: NodeIdentity,
         requested_cluster_id: ClusterId,
         expected_node_id: Option<String>,
     ) -> Self {
         let nonce = uuid::Uuid::new_v4().as_u128().max(1);
         Self {
+            scope,
             local,
             requested_cluster_id,
             expected_node_id,
             transport_major: TRANSPORT_MAJOR,
             transport_minor: TRANSPORT_MINOR,
-            features: FeatureBits::REQUIRED_V1,
+            features: FeatureBits::REQUIRED_V2,
             nonce,
         }
     }
@@ -69,7 +75,7 @@ impl BootstrapRequest {
         if self.transport_major != TRANSPORT_MAJOR || self.transport_minor > TRANSPORT_MINOR {
             return Some(BootstrapRejectionCode::IncompatibleTransport);
         }
-        if !self.features.contains(FeatureBits::REQUIRED_V1) {
+        if !self.features.contains(FeatureBits::REQUIRED_V2) {
             return Some(BootstrapRejectionCode::MissingRequiredFeature);
         }
         if self.requested_cluster_id != local.cluster_id
@@ -90,6 +96,7 @@ impl BootstrapRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapLeader {
+    pub scope: CoordinatorScope,
     pub identity: NodeIdentity,
     pub term: u64,
     pub protocol_generation: u64,
@@ -133,7 +140,7 @@ impl BootstrapResponse {
             nonce,
             transport_major: TRANSPORT_MAJOR,
             transport_minor: TRANSPORT_MINOR,
-            features: FeatureBits::REQUIRED_V1,
+            features: FeatureBits::REQUIRED_V2,
             result,
         }
     }
@@ -165,7 +172,7 @@ impl BootstrapResponse {
         }
         if self.transport_major != TRANSPORT_MAJOR
             || self.transport_minor > TRANSPORT_MINOR
-            || !self.features.contains(FeatureBits::REQUIRED_V1)
+            || !self.features.contains(FeatureBits::REQUIRED_V2)
         {
             return Err(BootstrapError::IncompatibleTransport);
         }
@@ -273,6 +280,10 @@ struct BootstrapRequestWire {
     expected_node_id: Option<String>,
     #[prost(bytes = "vec", tag = "7")]
     nonce: Vec<u8>,
+    #[prost(uint32, tag = "8")]
+    scope_kind: u32,
+    #[prost(string, tag = "9")]
+    placement_domain: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -321,6 +332,10 @@ struct BootstrapLeaderWire {
     term: u64,
     #[prost(uint64, tag = "3")]
     protocol_generation: u64,
+    #[prost(uint32, tag = "4")]
+    scope_kind: u32,
+    #[prost(string, tag = "5")]
+    placement_domain: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enumeration)]
@@ -343,6 +358,8 @@ impl From<&BootstrapRequest> for BootstrapRequestWire {
             local: Some(NodeIdentityWire::from(&value.local)),
             expected_node_id: value.expected_node_id.clone(),
             nonce: value.nonce.to_be_bytes().to_vec(),
+            scope_kind: scope_kind(&value.scope),
+            placement_domain: scope_domain(&value.scope),
         }
     }
 }
@@ -352,6 +369,7 @@ impl TryFrom<BootstrapRequestWire> for BootstrapRequest {
 
     fn try_from(value: BootstrapRequestWire) -> Result<Self, Self::Error> {
         Ok(Self {
+            scope: decode_scope(value.scope_kind, value.placement_domain)?,
             local: value
                 .local
                 .ok_or(BootstrapError::InvalidIdentity)?
@@ -512,6 +530,8 @@ impl From<&BootstrapLeader> for BootstrapLeaderWire {
             identity: Some(NodeIdentityWire::from(&value.identity)),
             term: value.term,
             protocol_generation: value.protocol_generation,
+            scope_kind: scope_kind(&value.scope),
+            placement_domain: scope_domain(&value.scope),
         }
     }
 }
@@ -521,6 +541,7 @@ impl TryFrom<BootstrapLeaderWire> for BootstrapLeader {
 
     fn try_from(value: BootstrapLeaderWire) -> Result<Self, Self::Error> {
         let leader = Self {
+            scope: decode_scope(value.scope_kind, value.placement_domain)?,
             identity: value
                 .identity
                 .ok_or(BootstrapError::InvalidIdentity)?
@@ -557,12 +578,37 @@ fn validate_leader(
 ) -> Result<(), BootstrapError> {
     validate_identity(&leader.identity)?;
     if leader.identity.cluster_id != request.requested_cluster_id
+        || leader.scope != request.scope
         || leader.term == 0
         || leader.protocol_generation == 0
     {
         return Err(BootstrapError::IdentityMismatch);
     }
     Ok(())
+}
+
+fn scope_kind(scope: &CoordinatorScope) -> u32 {
+    match scope {
+        CoordinatorScope::Membership => 1,
+        CoordinatorScope::Placement(_) => 2,
+    }
+}
+
+fn scope_domain(scope: &CoordinatorScope) -> String {
+    match scope {
+        CoordinatorScope::Membership => String::new(),
+        CoordinatorScope::Placement(domain) => domain.as_str().to_string(),
+    }
+}
+
+fn decode_scope(kind: u32, domain: String) -> Result<CoordinatorScope, BootstrapError> {
+    match (kind, domain.is_empty()) {
+        (1, true) => Ok(CoordinatorScope::Membership),
+        (2, false) => PlacementDomainId::new(domain)
+            .map(CoordinatorScope::Placement)
+            .map_err(|_| BootstrapError::InvalidIdentity),
+        _ => Err(BootstrapError::InvalidIdentity),
+    }
 }
 
 fn validate_identity(identity: &NodeIdentity) -> Result<(), BootstrapError> {
@@ -599,6 +645,7 @@ mod tests {
     #[test]
     fn request_and_response_round_trip_with_exact_identity() {
         let request = BootstrapRequest::new(
+            CoordinatorScope::Membership,
             identity("client", 1, 7447),
             ClusterId::new("test").unwrap(),
             Some("server".to_string()),
@@ -620,6 +667,7 @@ mod tests {
     #[test]
     fn nonce_expected_identity_and_required_feature_are_fenced() {
         let mut request = BootstrapRequest::new(
+            CoordinatorScope::Membership,
             identity("client", 1, 7447),
             ClusterId::new("test").unwrap(),
             Some("expected".to_string()),

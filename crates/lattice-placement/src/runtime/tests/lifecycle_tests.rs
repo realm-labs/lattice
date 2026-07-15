@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::membership_plane::{MembershipLeader, MembershipLeaderConfig};
 
 #[tokio::test]
 async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
@@ -42,25 +43,36 @@ async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
         4000,
     );
     let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
-    let mut leader = CoordinatorLeader::elect(
+    let mut membership = MembershipLeader::elect(
+        store.clone(),
+        coordinator.clone(),
+        CoordinatorTerm::new(1).unwrap(),
+        MembershipLeaderConfig::default(),
+    )
+    .await
+    .unwrap();
+    let mut leader = PlacementDomainLeader::elect(
         store.clone(),
         associations,
         coordinator,
+        CoordinatorScope::Placement(domain()),
         CoordinatorTerm::new(1).unwrap(),
-        3,
-        CoordinatorLeaderConfig::default(),
+        PlacementDomainLeaderConfig::default(),
     )
     .await
     .unwrap();
 
+    let joining_hello = empty_hello(joining.clone());
+    membership.join(joining_hello.member.clone()).await.unwrap();
+    membership.mark_up(&joining).await.unwrap();
     leader
-        .register(empty_hello(joining.clone()), joining_key.clone())
+        .register(joining_hello.domain, joining_key.clone())
         .await
         .unwrap();
-    let joining_version = leader.version;
+    let joining_version = leader.membership_version;
     assert_eq!(
         store.get_member("joining").await.unwrap().unwrap().status,
-        MemberStatus::Joining
+        MemberStatus::Up
     );
     assert!(matches!(
         leader
@@ -102,8 +114,13 @@ async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
         .await
         .unwrap();
     assert_eq!(
-        store.get_member("joining").await.unwrap().unwrap().status,
-        MemberStatus::Leaving
+        store
+            .get_domain_member(&domain(), "joining")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DomainMemberStatus::Leaving
     );
     assert!(
         leader
@@ -115,10 +132,29 @@ async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
         .complete_member_drain(joining.incarnation, "drain-1", joining.incarnation)
         .await
         .unwrap();
-    assert!(store.get_member("joining").await.unwrap().is_none());
+    assert!(
+        store
+            .get_domain_member(&domain(), "joining")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.get_member("joining").await.unwrap().unwrap().status,
+        MemberStatus::Up
+    );
+    membership.begin_leave(&joining).await.unwrap();
+    membership
+        .remove(&joining, MemberRemovalReason::GracefulLeave)
+        .await
+        .unwrap();
 
-    register_up(&mut leader, empty_hello(forced.clone()), forced_key).await;
+    let forced_hello = empty_hello(forced.clone());
+    membership.join(forced_hello.member.clone()).await.unwrap();
+    membership.mark_up(&forced).await.unwrap();
+    register_up(&mut leader, forced_hello, forced_key).await;
     let request = ForceRemoveRequest {
+        domain: domain(),
         operation_id: "force-1".to_string(),
         node_id: forced.node_id.clone(),
         expected_incarnation: forced.incarnation,
@@ -134,28 +170,44 @@ async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
     );
     leader.force_remove(request.clone()).await.unwrap();
     leader.force_remove(request).await.unwrap();
-    assert!(store.get_member("forced").await.unwrap().is_none());
+    assert!(
+        store
+            .get_domain_member(&domain(), "forced")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get_member("forced").await.unwrap().is_some());
 
-    register_up(&mut leader, empty_hello(old_reused.clone()), old_reused_key).await;
+    let old_reused_hello = empty_hello(old_reused.clone());
+    membership
+        .join(old_reused_hello.member.clone())
+        .await
+        .unwrap();
+    membership.mark_up(&old_reused).await.unwrap();
+    register_up(&mut leader, old_reused_hello, old_reused_key).await;
+    let reused_hello = empty_hello(new_reused.clone());
     assert!(matches!(
-        leader
-            .register(empty_hello(new_reused.clone()), new_reused_key.clone())
+            membership.join(reused_hello.member.clone())
             .await,
         Err(CoordinatorRuntimeError::IncarnationPending {
             predecessor,
             remaining_ttl: Some(_),
         }) if predecessor == old_reused.incarnation
     ));
+    membership.begin_leave(&old_reused).await.unwrap();
+    membership
+        .remove(&old_reused, MemberRemovalReason::IncarnationReplaced)
+        .await
+        .unwrap();
+    let reused_hello = empty_hello(new_reused.clone());
+    membership.join(reused_hello.member.clone()).await.unwrap();
+    membership.mark_up(&new_reused).await.unwrap();
     leader
-        .sessions
-        .get_mut(&old_reused.incarnation)
-        .unwrap()
-        .last_heartbeat = Instant::now() - Duration::from_secs(60);
-    leader
-        .register(empty_hello(new_reused.clone()), new_reused_key)
+        .register(reused_hello.domain, new_reused_key)
         .await
         .unwrap();
     let current = store.get_member("reused").await.unwrap().unwrap();
     assert_eq!(current.node, new_reused);
-    assert_eq!(current.status, MemberStatus::Joining);
+    assert_eq!(current.status, MemberStatus::Up);
 }

@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use lattice_core::actor_ref::{EntityType, NodeIncarnation, ProtocolId};
+use lattice_core::actor_ref::{EntityType, NodeIncarnation, PlacementDomainId, ProtocolId};
 use thiserror::Error;
 
-use crate::types::{AssignmentGeneration, MonotonicTime, NodeKey, ShardId, StateVersion};
+use crate::types::{AssignmentGeneration, MonotonicTime, NodeKey, PlacementVersion, ShardId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadSample {
@@ -28,6 +28,7 @@ pub struct PlacementNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacedShard {
+    pub domain: PlacementDomainId,
     pub entity_type: EntityType,
     pub shard_id: ShardId,
     pub owner: NodeKey,
@@ -45,7 +46,8 @@ impl PlacedShard {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementView {
-    pub version: StateVersion,
+    pub domain: PlacementDomainId,
+    pub version: PlacementVersion,
     pub now: MonotonicTime,
     pub reconciled: bool,
     pub degraded: bool,
@@ -60,6 +62,7 @@ pub struct PlacementView {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocationRequest {
+    pub domain: PlacementDomainId,
     pub entity_type: EntityType,
     pub shard_id: ShardId,
     pub required_protocol: ProtocolId,
@@ -127,6 +130,7 @@ impl RebalanceLimits {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposedMove {
+    pub domain: PlacementDomainId,
     pub entity_type: EntityType,
     pub shard_id: ShardId,
     pub expected_generation: AssignmentGeneration,
@@ -137,9 +141,10 @@ pub struct ProposedMove {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebalanceProposal {
+    pub domain: PlacementDomainId,
     pub policy_id: &'static str,
     pub policy_version: u32,
-    pub base_version: StateVersion,
+    pub base_version: PlacementVersion,
     pub trigger: RebalanceTrigger,
     pub moves: Vec<ProposedMove>,
 }
@@ -308,6 +313,7 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
             *source_counts.entry(shard.owner.clone()).or_default() += 1;
             *target_counts.entry(target.key.clone()).or_default() += 1;
             moves.push(ProposedMove {
+                domain: view.domain.clone(),
                 entity_type: entity_type.clone(),
                 shard_id: shard.shard_id,
                 expected_generation: shard.generation,
@@ -317,9 +323,10 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
             });
         }
         Ok(RebalanceProposal {
+            domain: view.domain.clone(),
             policy_id: self.policy_id(),
             policy_version: self.policy_version(),
-            base_version: view.version,
+            base_version: view.version.clone(),
             trigger,
             moves,
         })
@@ -522,7 +529,7 @@ pub enum AllocationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
+    use lattice_core::actor_ref::{NodeAddress, NodeIncarnation, PlacementDomainId};
 
     fn node(id: &str, incarnation: u128) -> NodeKey {
         NodeKey {
@@ -535,6 +542,7 @@ mod tests {
     fn automatic_view() -> (EntityType, ProtocolId, NodeKey, NodeKey, PlacementView) {
         let entity = EntityType::new("automatic-policy").unwrap();
         let protocol = ProtocolId::new(91).unwrap();
+        let domain = PlacementDomainId::new("automatic").unwrap();
         let source = node("source", 1);
         let target = node("target", 2);
         let placement_node = |key: NodeKey, weight| PlacementNode {
@@ -554,7 +562,9 @@ mod tests {
             draining: false,
         };
         let view = PlacementView {
-            version: crate::types::StateVersion::new(
+            domain: domain.clone(),
+            version: crate::types::PlacementVersion::new(
+                domain.clone(),
                 crate::types::CoordinatorTerm::new(1).unwrap(),
                 crate::types::Revision::new(1).unwrap(),
             ),
@@ -566,6 +576,7 @@ mod tests {
                 placement_node(target.clone(), 0),
             ],
             shards: vec![PlacedShard {
+                domain,
                 entity_type: entity.clone(),
                 shard_id: ShardId::new(1),
                 owner: source.clone(),

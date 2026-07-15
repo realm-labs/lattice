@@ -12,6 +12,7 @@ pub const MAX_ACTOR_PATH_BYTES: usize = 1024;
 pub const MAX_ACTOR_PATH_SEGMENT_BYTES: usize = 128;
 pub const MAX_ENTITY_ID_BYTES: usize = 256;
 pub const MAX_LOGICAL_KIND_BYTES: usize = 128;
+pub const MAX_PLACEMENT_DOMAIN_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ReferenceError {
@@ -365,6 +366,44 @@ macro_rules! bounded_kind {
 bounded_kind!(EntityType, "entity type");
 bounded_kind!(SingletonKind, "singleton kind");
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct PlacementDomainId(String);
+
+impl PlacementDomainId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ReferenceError> {
+        Ok(Self(validate_token(
+            value.into(),
+            "placement domain ID",
+            MAX_PLACEMENT_DOMAIN_ID_BYTES,
+        )?))
+    }
+
+    pub fn from_entity_type(entity_type: &EntityType) -> Self {
+        Self(entity_type.as_str().to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PlacementDomainId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PlacementDomainId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ConfigFingerprint([u8; 32]);
@@ -527,6 +566,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for ActorRef<P> {
 #[serde(bound = "")]
 pub struct EntityRef<P: ProtocolTag = ErasedProtocol> {
     cluster_id: ClusterId,
+    domain: PlacementDomainId,
     entity_type: EntityType,
     entity_id: EntityId,
     protocol_id: ProtocolId,
@@ -538,6 +578,7 @@ pub struct EntityRef<P: ProtocolTag = ErasedProtocol> {
 impl<P: ProtocolTag> EntityRef<P> {
     fn from_parts(
         cluster_id: ClusterId,
+        domain: PlacementDomainId,
         entity_type: EntityType,
         entity_id: EntityId,
         protocol_id: ProtocolId,
@@ -546,6 +587,7 @@ impl<P: ProtocolTag> EntityRef<P> {
         validate_protocol::<P>(protocol_id)?;
         Ok(Self {
             cluster_id,
+            domain,
             entity_type,
             entity_id,
             protocol_id,
@@ -556,6 +598,10 @@ impl<P: ProtocolTag> EntityRef<P> {
 
     pub fn cluster_id(&self) -> &ClusterId {
         &self.cluster_id
+    }
+
+    pub fn domain(&self) -> &PlacementDomainId {
+        &self.domain
     }
 
     pub fn entity_type(&self) -> &EntityType {
@@ -577,6 +623,7 @@ impl<P: ProtocolTag> EntityRef<P> {
     pub fn try_typed<Q: ProtocolTag>(&self) -> Result<EntityRef<Q>, ReferenceError> {
         EntityRef::from_parts(
             self.cluster_id.clone(),
+            self.domain.clone(),
             self.entity_type.clone(),
             self.entity_id.clone(),
             self.protocol_id,
@@ -587,6 +634,7 @@ impl<P: ProtocolTag> EntityRef<P> {
     pub fn erase(&self) -> EntityRef<ErasedProtocol> {
         EntityRef {
             cluster_id: self.cluster_id.clone(),
+            domain: self.domain.clone(),
             entity_type: self.entity_type.clone(),
             entity_id: self.entity_id.clone(),
             protocol_id: self.protocol_id,
@@ -599,6 +647,7 @@ impl<P: ProtocolTag> EntityRef<P> {
 impl EntityRef<ErasedProtocol> {
     pub fn new(
         cluster_id: ClusterId,
+        domain: PlacementDomainId,
         entity_type: EntityType,
         entity_id: EntityId,
         protocol_id: ProtocolId,
@@ -606,6 +655,7 @@ impl EntityRef<ErasedProtocol> {
     ) -> Result<Self, ReferenceError> {
         Self::from_parts(
             cluster_id,
+            domain,
             entity_type,
             entity_id,
             protocol_id,
@@ -617,6 +667,7 @@ impl EntityRef<ErasedProtocol> {
 #[derive(Deserialize)]
 struct EntityRefData {
     cluster_id: ClusterId,
+    domain: PlacementDomainId,
     entity_type: EntityType,
     entity_id: EntityId,
     protocol_id: ProtocolId,
@@ -631,6 +682,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for EntityRef<P> {
         let data = EntityRefData::deserialize(deserializer)?;
         Self::from_parts(
             data.cluster_id,
+            data.domain,
             data.entity_type,
             data.entity_id,
             data.protocol_id,
@@ -644,6 +696,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for EntityRef<P> {
 #[serde(bound = "")]
 pub struct SingletonRef<P: ProtocolTag = ErasedProtocol> {
     cluster_id: ClusterId,
+    domain: PlacementDomainId,
     singleton_kind: SingletonKind,
     protocol_id: ProtocolId,
     singleton_config_fingerprint: ConfigFingerprint,
@@ -654,6 +707,7 @@ pub struct SingletonRef<P: ProtocolTag = ErasedProtocol> {
 impl<P: ProtocolTag> SingletonRef<P> {
     fn from_parts(
         cluster_id: ClusterId,
+        domain: PlacementDomainId,
         singleton_kind: SingletonKind,
         protocol_id: ProtocolId,
         singleton_config_fingerprint: ConfigFingerprint,
@@ -661,6 +715,7 @@ impl<P: ProtocolTag> SingletonRef<P> {
         validate_protocol::<P>(protocol_id)?;
         Ok(Self {
             cluster_id,
+            domain,
             singleton_kind,
             protocol_id,
             singleton_config_fingerprint,
@@ -670,6 +725,10 @@ impl<P: ProtocolTag> SingletonRef<P> {
 
     pub fn cluster_id(&self) -> &ClusterId {
         &self.cluster_id
+    }
+
+    pub fn domain(&self) -> &PlacementDomainId {
+        &self.domain
     }
 
     pub fn singleton_kind(&self) -> &SingletonKind {
@@ -687,6 +746,7 @@ impl<P: ProtocolTag> SingletonRef<P> {
     pub fn try_typed<Q: ProtocolTag>(&self) -> Result<SingletonRef<Q>, ReferenceError> {
         SingletonRef::from_parts(
             self.cluster_id.clone(),
+            self.domain.clone(),
             self.singleton_kind.clone(),
             self.protocol_id,
             self.singleton_config_fingerprint,
@@ -696,6 +756,7 @@ impl<P: ProtocolTag> SingletonRef<P> {
     pub fn erase(&self) -> SingletonRef<ErasedProtocol> {
         SingletonRef {
             cluster_id: self.cluster_id.clone(),
+            domain: self.domain.clone(),
             singleton_kind: self.singleton_kind.clone(),
             protocol_id: self.protocol_id,
             singleton_config_fingerprint: self.singleton_config_fingerprint,
@@ -707,12 +768,14 @@ impl<P: ProtocolTag> SingletonRef<P> {
 impl SingletonRef<ErasedProtocol> {
     pub fn new(
         cluster_id: ClusterId,
+        domain: PlacementDomainId,
         singleton_kind: SingletonKind,
         protocol_id: ProtocolId,
         singleton_config_fingerprint: ConfigFingerprint,
     ) -> Result<Self, ReferenceError> {
         Self::from_parts(
             cluster_id,
+            domain,
             singleton_kind,
             protocol_id,
             singleton_config_fingerprint,
@@ -723,6 +786,7 @@ impl SingletonRef<ErasedProtocol> {
 #[derive(Deserialize)]
 struct SingletonRefData {
     cluster_id: ClusterId,
+    domain: PlacementDomainId,
     singleton_kind: SingletonKind,
     protocol_id: ProtocolId,
     singleton_config_fingerprint: ConfigFingerprint,
@@ -736,6 +800,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for SingletonRef<P> {
         let data = SingletonRefData::deserialize(deserializer)?;
         Self::from_parts(
             data.cluster_id,
+            data.domain,
             data.singleton_kind,
             data.protocol_id,
             data.singleton_config_fingerprint,
@@ -929,6 +994,7 @@ mod tests {
 
         let entity = EntityRef::new(
             ClusterId::new("test").unwrap(),
+            PlacementDomainId::new("world").unwrap(),
             EntityType::new("world").unwrap(),
             EntityId::new(b"entity-1".to_vec()).unwrap(),
             ProtocolId::new(7).unwrap(),
@@ -943,6 +1009,7 @@ mod tests {
 
         let singleton = SingletonRef::new(
             ClusterId::new("test").unwrap(),
+            PlacementDomainId::new("control").unwrap(),
             SingletonKind::new("leader").unwrap(),
             ProtocolId::new(7).unwrap(),
             ConfigFingerprint::new([2; 32]),
@@ -953,5 +1020,46 @@ mod tests {
         let encoded = serde_json::to_vec(&singleton).unwrap();
         assert!(serde_json::from_slice::<SingletonRef<TestProtocol>>(&encoded).is_ok());
         assert!(serde_json::from_slice::<SingletonRef<OtherProtocol>>(&encoded).is_err());
+    }
+
+    #[test]
+    fn placement_domain_id_is_bounded_canonical_and_serialized_explicitly() {
+        let domain = PlacementDomainId::new("player").unwrap();
+        assert_eq!(domain.as_str(), "player");
+        assert_eq!(serde_json::to_string(&domain).unwrap(), "\"player\"");
+        assert_eq!(
+            serde_json::from_str::<PlacementDomainId>("\"player\"").unwrap(),
+            domain
+        );
+        assert!(PlacementDomainId::new("").is_err());
+        assert!(PlacementDomainId::new("player/world").is_err());
+        assert!(PlacementDomainId::new("player\\world").is_err());
+        assert!(PlacementDomainId::new("player\nworld").is_err());
+        assert!(PlacementDomainId::new("x".repeat(MAX_PLACEMENT_DOMAIN_ID_BYTES + 1)).is_err());
+        for invalid in ["", ".", "..", "a/b", "a\\b", "a\0b", "a\nb"] {
+            let encoded = serde_json::to_string(invalid).unwrap();
+            assert!(serde_json::from_str::<PlacementDomainId>(&encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn placement_domain_id_round_trips_generated_canonical_tokens() {
+        let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut state = 0x9e37_79b9_u64;
+        for length in 1..=MAX_PLACEMENT_DOMAIN_ID_BYTES {
+            let mut value = String::with_capacity(length);
+            for _ in 0..length {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                value.push(alphabet[(state as usize) % alphabet.len()] as char);
+            }
+            let domain = PlacementDomainId::new(value).unwrap();
+            let encoded = serde_json::to_vec(&domain).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<PlacementDomainId>(&encoded).unwrap(),
+                domain
+            );
+        }
     }
 }

@@ -514,7 +514,7 @@ mod tests {
                 lane: LaneKind::Control,
                 connection_nonce: 10,
                 maximum_frame_size: 4096,
-                features: FeatureBits::REQUIRED_V1,
+                features: FeatureBits::REQUIRED_V2,
             },
             &[client_protocol],
             8,

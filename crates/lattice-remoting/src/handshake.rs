@@ -14,11 +14,13 @@ impl FeatureBits {
     pub const PROTOCOL_CATALOGUE: Self = Self(1 << 1);
     pub const MULTI_LANE: Self = Self(1 << 2);
     pub const BOOTSTRAP_PROBE: Self = Self(1 << 3);
-    pub const REQUIRED_V1: Self = Self(
+    pub const DOMAIN_SCOPED_LOGICAL_TARGETS: Self = Self(1 << 4);
+    pub const REQUIRED_V2: Self = Self(
         Self::RELIABLE_CONTROL.0
             | Self::PROTOCOL_CATALOGUE.0
             | Self::MULTI_LANE.0
-            | Self::BOOTSTRAP_PROBE.0,
+            | Self::BOOTSTRAP_PROBE.0
+            | Self::DOMAIN_SCOPED_LOGICAL_TARGETS.0,
     );
 
     pub const fn from_bits(bits: u64) -> Self {
@@ -149,7 +151,7 @@ impl HandshakeValidator {
         }
         Ok(Self {
             local,
-            required_features: FeatureBits::REQUIRED_V1,
+            required_features: FeatureBits::REQUIRED_V2,
             maximum_frame_size,
             bulk_stripes,
         })
@@ -395,7 +397,7 @@ mod tests {
             lane: LaneKind::Control,
             connection_nonce: 10,
             maximum_frame_size: 256 * 1024,
-            features: FeatureBits::REQUIRED_V1,
+            features: FeatureBits::REQUIRED_V2,
         };
         let decoded = Handshake::from_frame(&handshake.to_frame()).unwrap();
         HandshakeValidator::new(local.clone(), 256 * 1024, 1)

@@ -5,7 +5,8 @@ use std::sync::Arc;
 use futures_util::{Stream, StreamExt};
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort, EndpointSlice};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use lattice_discovery::provider::{ClusterDiscovery, DiscoveryError};
+use lattice_core::coordinator::CoordinatorScope;
+use lattice_discovery::provider::{CoordinatorDiscovery, DiscoveryError};
 
 use crate::endpoint_slice::{
     EndpointSliceSource, KubernetesCredentials, KubernetesEndpointSliceConfig,
@@ -103,6 +104,7 @@ impl EndpointSliceSource for FakeEndpointSliceSource {
 
 fn config() -> KubernetesEndpointSliceConfig {
     KubernetesEndpointSliceConfig {
+        scope: CoordinatorScope::Membership,
         namespace: "lattice".to_string(),
         service: "cluster".to_string(),
         label_selector: Some("app=lattice".to_string()),

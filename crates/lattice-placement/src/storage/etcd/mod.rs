@@ -1,28 +1,34 @@
 use std::time::Duration;
 
-use async_trait::async_trait;
 use etcd_client::{
     Client, Compare, CompareOp, ConnectOptions, GetOptions, SortOrder, SortTarget, Txn, TxnOp,
 };
+use lattice_core::actor_ref::PlacementDomainId;
+use lattice_core::coordinator::CoordinatorScope;
 use serde::{Serialize, de::DeserializeOwned};
 
+use super::StorageError;
 use super::domain::{
     ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial, AuthorityCommit,
     AutomaticBalanceSettings, CommitAutomaticSettings, CompactAdminOperations, CompleteMove,
-    CreateMember, CreatePlan, CreatePlanWithOperation, DeletePlan, DurableStorageLimits,
-    FenceAuthority, FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit, MoveCommit,
-    PlanCommit, RecordAdminOperation, RemoveMember, RemoveMemberWithOperation, ReserveHandoff,
-    ReserveMove, SlotCommit, TransitionSlot, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
+    CreateDomainMember, CreateMember, CreatePlan, CreatePlanWithOperation, DeletePlan,
+    DomainMemberCommit, DurableStorageLimits, EntityConfigCommit, FenceAuthority,
+    FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit, MoveCommit, PlanCommit,
+    PutEntityConfig, PutSingletonConfig, RecordAdminOperation, RemoveDomainMember, RemoveMember,
+    ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit, TransitionSlot,
+    UpdateDomainMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
 };
-use super::{CoordinatorStore, PlacementStore, StorageError};
-use crate::coordinator::{LeaderGuard, LeaderRecord, MemberRecord};
+use crate::coordinator::{
+    DomainMemberRecord, LeaderRecord, MemberRecord, MembershipLeaderGuard, PlacementLeaderGuard,
+};
 use crate::plan::RebalancePlan;
 use crate::types::{PlacementSlot, PlacementSlotKey, Revision};
 
 pub mod migration;
+mod traits;
 mod transactions;
 
-pub const STORAGE_SCHEMA_GENERATION: u64 = 4;
+pub const STORAGE_SCHEMA_GENERATION: u64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct EtcdPlacementConfig {
@@ -95,15 +101,10 @@ impl EtcdPlacementStore {
     async fn ensure_schema_generation_inner(&self) -> Result<(), StorageError> {
         let schema_key = self.key("schema_generation");
         let limits_key = self.key("schema/limits");
-        let revision_key = self.key("coordinator/state_revision");
+        let revision_key = self.key("membership/state_revision");
         let expected = STORAGE_SCHEMA_GENERATION.to_string().into_bytes();
         let expected_limits = encode(&self.limits)?;
-        let counter_keys = [
-            self.key("counters/slots"),
-            self.key("counters/plans"),
-            self.key("counters/members"),
-            self.key("counters/admin_operations"),
-        ];
+        let counter_keys = [self.key("membership/counters/members")];
         let schema = self.read_raw(&schema_key).await?;
         if let Some((bytes, _, _)) = &schema
             && bytes != &expected
@@ -177,7 +178,7 @@ impl EtcdPlacementStore {
             .as_ref()
             .is_some_and(|(bytes, _, _)| bytes == &expected)
             && self
-                .read_raw(&self.key("coordinator/state_revision"))
+                .read_raw(&self.key("membership/state_revision"))
                 .await?
                 .is_some()
             && self
@@ -238,15 +239,12 @@ impl EtcdPlacementStore {
         leader: &LeaderRecord,
         lease_id: i64,
     ) -> Result<bool, StorageError> {
-        leader
-            .node
-            .validate()
-            .map_err(|_| StorageError::InvalidRecord)?;
+        leader.validate().map_err(|_| StorageError::InvalidRecord)?;
         if lease_id <= 0 {
             return Err(StorageError::InvalidRecord);
         }
-        let leader_key = self.key("coordinator/leader");
-        let term_key = self.key("coordinator/term");
+        let leader_key = self.scope_key(&leader.scope, "leader");
+        let term_key = self.scope_key(&leader.scope, "term");
         let current_term = self.read_raw(&term_key).await?;
         let term = current_term
             .as_ref()
@@ -290,47 +288,97 @@ impl EtcdPlacementStore {
         format!("{}/{}", self.prefix, suffix)
     }
 
+    pub(super) fn scope_key(&self, scope: &CoordinatorScope, suffix: &str) -> String {
+        match scope {
+            CoordinatorScope::Membership => self.key(&format!("membership/{suffix}")),
+            CoordinatorScope::Placement(domain) => {
+                self.key(&format!("domains/{}/{suffix}", domain.as_str()))
+            }
+        }
+    }
+
     pub(super) fn slot_key(&self, key: &PlacementSlotKey) -> String {
         match key {
             PlacementSlotKey::Shard {
+                domain,
                 entity_type,
                 shard_id,
             } => self.key(&format!(
-                "shards/{}/{}",
+                "domains/{}/shards/{}/{}",
+                domain.as_str(),
                 entity_type.as_str(),
                 shard_id.get()
             )),
-            PlacementSlotKey::Singleton(kind) => self.key(&format!("singletons/{}", kind.as_str())),
+            PlacementSlotKey::Singleton { domain, kind } => self.key(&format!(
+                "domains/{}/singletons/{}",
+                domain.as_str(),
+                kind.as_str()
+            )),
         }
     }
 
     pub(super) fn claim_key(&self, key: &PlacementSlotKey) -> String {
         match key {
             PlacementSlotKey::Shard {
+                domain,
                 entity_type,
                 shard_id,
             } => self.key(&format!(
-                "shard_claims/{}/{}",
+                "domains/{}/shard_claims/{}/{}",
+                domain.as_str(),
                 entity_type.as_str(),
                 shard_id.get()
             )),
-            PlacementSlotKey::Singleton(kind) => {
-                self.key(&format!("singleton_claims/{}", kind.as_str()))
-            }
+            PlacementSlotKey::Singleton { domain, kind } => self.key(&format!(
+                "domains/{}/singleton_claims/{}",
+                domain.as_str(),
+                kind.as_str()
+            )),
         }
     }
 
-    pub(super) fn plan_key(&self, plan_id: u128) -> String {
-        self.key(&format!("rebalances/{plan_id:032x}"))
+    pub(super) fn plan_key(&self, domain: &PlacementDomainId, plan_id: u128) -> String {
+        self.key(&format!(
+            "domains/{}/rebalances/{plan_id:032x}",
+            domain.as_str()
+        ))
     }
 
-    pub(super) fn operation_key(&self, operation_id: &str) -> String {
+    pub(super) fn domain_member_key(&self, domain: &PlacementDomainId, node_id: &str) -> String {
+        self.key(&format!("domains/{}/members/{node_id}", domain.as_str()))
+    }
+
+    pub(super) fn entity_config_key(
+        &self,
+        domain: &PlacementDomainId,
+        entity_type: &lattice_core::actor_ref::EntityType,
+    ) -> String {
+        self.key(&format!(
+            "domains/{}/entity_types/{}",
+            domain.as_str(),
+            entity_type.as_str()
+        ))
+    }
+
+    pub(super) fn singleton_config_key(
+        &self,
+        domain: &PlacementDomainId,
+        kind: &lattice_core::actor_ref::SingletonKind,
+    ) -> String {
+        self.key(&format!(
+            "domains/{}/singleton_types/{}",
+            domain.as_str(),
+            kind.as_str()
+        ))
+    }
+
+    pub(super) fn operation_key(&self, domain: &PlacementDomainId, operation_id: &str) -> String {
         let encoded = operation_id
             .as_bytes()
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        self.key(&format!("operations/{encoded}"))
+        self.key(&format!("domains/{}/admin/{encoded}", domain.as_str()))
     }
 
     async fn get_json<T: DeserializeOwned>(&self, suffix: &str) -> Result<Option<T>, StorageError> {
@@ -433,15 +481,14 @@ impl EtcdPlacementStore {
     }
 }
 
-#[async_trait]
-impl PlacementStore for EtcdPlacementStore {
-    fn durable_limits(&self) -> DurableStorageLimits {
+impl EtcdPlacementStore {
+    fn durable_limits_inner(&self) -> DurableStorageLimits {
         self.limits
     }
 
-    async fn get_state_revision(&self) -> Result<Revision, StorageError> {
+    async fn get_membership_revision_inner(&self) -> Result<Revision, StorageError> {
         let Some((bytes, _, _)) = self
-            .read_raw(&self.key("coordinator/state_revision"))
+            .read_raw(&self.key("membership/state_revision"))
             .await?
         else {
             return Ok(Revision::new(1).expect("one is a valid state revision"));
@@ -456,8 +503,12 @@ impl PlacementStore for EtcdPlacementStore {
         self.get_json_key(&self.slot_key(key)).await
     }
 
-    async fn get_plan(&self, plan_id: u128) -> Result<Option<RebalancePlan>, StorageError> {
-        self.get_json_key(&self.plan_key(plan_id)).await
+    async fn get_plan(
+        &self,
+        domain: &PlacementDomainId,
+        plan_id: u128,
+    ) -> Result<Option<RebalancePlan>, StorageError> {
+        self.get_json_key(&self.plan_key(domain, plan_id)).await
     }
 
     async fn get_claim(&self, key: &PlacementSlotKey) -> Result<Option<LeasedClaim>, StorageError> {
@@ -473,19 +524,51 @@ impl PlacementStore for EtcdPlacementStore {
     }
 
     async fn get_member(&self, node_id: &str) -> Result<Option<MemberRecord>, StorageError> {
-        self.get_json(&format!("members/{node_id}")).await
-    }
-
-    async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError> {
-        self.list_json("members/", self.limits.maximum_members)
+        self.get_json(&format!("membership/members/{node_id}"))
             .await
     }
 
-    async fn list_slots(&self) -> Result<Vec<PlacementSlot>, StorageError> {
-        let mut slots = self.list_json("shards/", self.limits.maximum_slots).await?;
+    async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError> {
+        self.list_json("membership/members/", self.limits.maximum_members)
+            .await
+    }
+
+    async fn get_domain_member(
+        &self,
+        domain: &PlacementDomainId,
+        node_id: &str,
+    ) -> Result<Option<DomainMemberRecord>, StorageError> {
+        self.get_json_key(&self.domain_member_key(domain, node_id))
+            .await
+    }
+
+    async fn list_domain_members(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Vec<DomainMemberRecord>, StorageError> {
+        self.list_json(
+            &format!("domains/{}/members/", domain.as_str()),
+            self.limits.maximum_members,
+        )
+        .await
+    }
+
+    async fn list_slots(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Vec<PlacementSlot>, StorageError> {
+        let mut slots = self
+            .list_json(
+                &format!("domains/{}/shards/", domain.as_str()),
+                self.limits.maximum_slots,
+            )
+            .await?;
         slots.extend(
-            self.list_json("singletons/", self.limits.maximum_slots)
-                .await?,
+            self.list_json(
+                &format!("domains/{}/singletons/", domain.as_str()),
+                self.limits.maximum_slots,
+            )
+            .await?,
         );
         if slots.len() > self.limits.maximum_slots {
             return Err(StorageError::Capacity);
@@ -493,14 +576,28 @@ impl PlacementStore for EtcdPlacementStore {
         Ok(slots)
     }
 
-    async fn list_plans(&self) -> Result<Vec<RebalancePlan>, StorageError> {
-        self.list_json("rebalances/", self.limits.maximum_plans)
-            .await
+    async fn list_plans(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Vec<RebalancePlan>, StorageError> {
+        self.list_json(
+            &format!("domains/{}/rebalances/", domain.as_str()),
+            self.limits.maximum_plans,
+        )
+        .await
     }
 
-    async fn list_claims(&self) -> Result<Vec<LeasedClaim>, StorageError> {
-        let mut claims = self.list_claims_suffix("shard_claims/").await?;
-        claims.extend(self.list_claims_suffix("singleton_claims/").await?);
+    async fn list_claims(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Vec<LeasedClaim>, StorageError> {
+        let mut claims = self
+            .list_claims_suffix(&format!("domains/{}/shard_claims/", domain.as_str()))
+            .await?;
+        claims.extend(
+            self.list_claims_suffix(&format!("domains/{}/singleton_claims/", domain.as_str()))
+                .await?,
+        );
         if claims.len() > self.limits.maximum_slots {
             return Err(StorageError::Capacity);
         }
@@ -509,25 +606,37 @@ impl PlacementStore for EtcdPlacementStore {
 
     async fn get_automatic_settings(
         &self,
+        domain: &PlacementDomainId,
     ) -> Result<Option<AutomaticBalanceSettings>, StorageError> {
-        self.get_json("settings/automatic_balance").await
+        self.get_json(&format!(
+            "domains/{}/settings/automatic_balance",
+            domain.as_str()
+        ))
+        .await
     }
 
     async fn get_admin_operation(
         &self,
+        domain: &PlacementDomainId,
         operation_id: &str,
     ) -> Result<Option<AdminOperationRecord>, StorageError> {
-        self.get_json_key(&self.operation_key(operation_id)).await
+        self.get_json_key(&self.operation_key(domain, operation_id))
+            .await
     }
 
-    async fn list_admin_operations(&self) -> Result<Vec<AdminOperationRecord>, StorageError> {
-        self.list_json("operations/", self.limits.maximum_admin_operations)
-            .await
+    async fn list_admin_operations(
+        &self,
+        domain: &PlacementDomainId,
+    ) -> Result<Vec<AdminOperationRecord>, StorageError> {
+        self.list_json(
+            &format!("domains/{}/admin/", domain.as_str()),
+            self.limits.maximum_admin_operations,
+        )
+        .await
     }
 }
 
-#[async_trait]
-impl CoordinatorStore for EtcdPlacementStore {
+impl EtcdPlacementStore {
     async fn ensure_schema_generation(&self) -> Result<(), StorageError> {
         self.ensure_schema_generation_inner().await
     }
@@ -567,12 +676,15 @@ impl CoordinatorStore for EtcdPlacementStore {
         self.campaign_leader_inner(leader, lease_id).await
     }
 
-    async fn get_leader(&self) -> Result<Option<LeaderRecord>, StorageError> {
-        self.get_json("coordinator/leader").await
+    async fn get_leader_inner(
+        &self,
+        scope: &CoordinatorScope,
+    ) -> Result<Option<LeaderRecord>, StorageError> {
+        self.get_json_key(&self.scope_key(scope, "leader")).await
     }
 
-    async fn get_leader_term(&self) -> Result<u64, StorageError> {
-        self.read_raw(&self.key("coordinator/term"))
+    async fn get_leader_term_inner(&self, scope: &CoordinatorScope) -> Result<u64, StorageError> {
+        self.read_raw(&self.scope_key(scope, "term"))
             .await?
             .map(|(bytes, _, _)| parse_revision_value(&bytes).map(Revision::get))
             .transpose()
@@ -581,7 +693,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn create_member(
         &self,
-        guard: &LeaderGuard,
+        guard: &MembershipLeaderGuard,
         request: CreateMember,
     ) -> Result<MemberCommit, StorageError> {
         transactions::create_member(self, guard, request).await
@@ -589,7 +701,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn update_member(
         &self,
-        guard: &LeaderGuard,
+        guard: &MembershipLeaderGuard,
         request: UpdateMember,
     ) -> Result<MemberCommit, StorageError> {
         transactions::update_member(self, guard, request).await
@@ -597,15 +709,55 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn remove_member(
         &self,
-        guard: &LeaderGuard,
+        guard: &MembershipLeaderGuard,
         request: RemoveMember,
     ) -> Result<MemberCommit, StorageError> {
         transactions::remove_member(self, guard, request).await
     }
 
+    async fn create_domain_member(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: CreateDomainMember,
+    ) -> Result<DomainMemberCommit, StorageError> {
+        transactions::create_domain_member(self, guard, request).await
+    }
+
+    async fn update_domain_member(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: UpdateDomainMember,
+    ) -> Result<DomainMemberCommit, StorageError> {
+        transactions::update_domain_member(self, guard, request).await
+    }
+
+    async fn remove_domain_member(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: RemoveDomainMember,
+    ) -> Result<DomainMemberCommit, StorageError> {
+        transactions::remove_domain_member(self, guard, request).await
+    }
+
+    async fn put_entity_config(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: PutEntityConfig,
+    ) -> Result<EntityConfigCommit, StorageError> {
+        transactions::put_entity_config(self, guard, request).await
+    }
+
+    async fn put_singleton_config(
+        &self,
+        guard: &PlacementLeaderGuard,
+        request: PutSingletonConfig,
+    ) -> Result<SingletonConfigCommit, StorageError> {
+        transactions::put_singleton_config(self, guard, request).await
+    }
+
     async fn create_plan(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CreatePlan,
     ) -> Result<PlanCommit, StorageError> {
         transactions::create_plan(self, guard, request).await
@@ -613,7 +765,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn update_plan(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: UpdatePlan,
     ) -> Result<PlanCommit, StorageError> {
         transactions::update_plan(self, guard, request).await
@@ -621,7 +773,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn delete_plan(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: DeletePlan,
     ) -> Result<PlanCommit, StorageError> {
         transactions::delete_plan(self, guard, request).await
@@ -629,7 +781,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn transition_slot(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: TransitionSlot,
     ) -> Result<SlotCommit, StorageError> {
         transactions::transition_slot(self, guard, request).await
@@ -637,7 +789,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn allocate_initial(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: AllocateInitial,
     ) -> Result<AuthorityCommit, StorageError> {
         transactions::allocate_initial(self, guard, request).await
@@ -645,7 +797,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn activate_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: ActivateAuthority,
     ) -> Result<SlotCommit, StorageError> {
         transactions::activate_authority(self, guard, request).await
@@ -653,7 +805,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn reserve_move(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: ReserveMove,
     ) -> Result<MoveCommit, StorageError> {
         transactions::reserve_move(self, guard, request).await
@@ -661,7 +813,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn reserve_handoff(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: ReserveHandoff,
     ) -> Result<SlotCommit, StorageError> {
         transactions::reserve_handoff(self, guard, request).await
@@ -669,7 +821,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn fence_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: FenceAuthority,
     ) -> Result<SlotCommit, StorageError> {
         transactions::fence_authority(self, guard, request).await
@@ -677,7 +829,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn fence_missing_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: FenceMissingAuthority,
     ) -> Result<SlotCommit, StorageError> {
         transactions::fence_missing_authority(self, guard, request).await
@@ -685,7 +837,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn install_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: InstallAuthority,
     ) -> Result<AuthorityCommit, StorageError> {
         transactions::install_authority(self, guard, request).await
@@ -693,7 +845,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn adopt_authority(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: AdoptAuthority,
     ) -> Result<AuthorityCommit, StorageError> {
         transactions::adopt_authority(self, guard, request).await
@@ -701,7 +853,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn complete_move(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CompleteMove,
     ) -> Result<MoveCommit, StorageError> {
         transactions::complete_move(self, guard, request).await
@@ -709,7 +861,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn commit_automatic_settings(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CommitAutomaticSettings,
     ) -> Result<AutomaticBalanceSettings, StorageError> {
         transactions::commit_automatic_settings(self, guard, request).await
@@ -717,7 +869,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn create_plan_with_operation(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CreatePlanWithOperation,
     ) -> Result<PlanCommit, StorageError> {
         transactions::create_plan_with_operation(self, guard, request).await
@@ -725,23 +877,15 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn update_plan_with_operation(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: UpdatePlanWithOperation,
     ) -> Result<PlanCommit, StorageError> {
         transactions::update_plan_with_operation(self, guard, request).await
     }
 
-    async fn remove_member_with_operation(
-        &self,
-        guard: &LeaderGuard,
-        request: RemoveMemberWithOperation,
-    ) -> Result<MemberCommit, StorageError> {
-        transactions::remove_member_with_operation(self, guard, request).await
-    }
-
     async fn record_admin_operation(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: RecordAdminOperation,
     ) -> Result<AdminOperationRecord, StorageError> {
         transactions::record_admin_operation(self, guard, request).await
@@ -749,7 +893,7 @@ impl CoordinatorStore for EtcdPlacementStore {
 
     async fn compact_admin_operations(
         &self,
-        guard: &LeaderGuard,
+        guard: &PlacementLeaderGuard,
         request: CompactAdminOperations,
     ) -> Result<(), StorageError> {
         transactions::compact_admin_operations(self, guard, request).await

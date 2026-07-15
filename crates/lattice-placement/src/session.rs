@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use lattice_core::coordinator::CoordinatorScope;
 use lattice_remoting::association::AssociationManager;
 use lattice_remoting::association::AssociationState;
 use lattice_remoting::control::ControlDispatchError;
@@ -15,8 +16,8 @@ use crate::control::{
     PlacementControlEventKind, encode_control_command,
 };
 use crate::coordinator::{
-    CoordinatorDelta, CoordinatorSession, MemberEvent, MemberRecord, MemberStatus, NodeHello,
-    SnapshotLimits, SnapshotStager,
+    CoordinatorDelta, MemberEvent, MemberRecord, MemberStatus, PlacementDomainHello,
+    PlacementDomainState, SnapshotLimits, SnapshotStager, SnapshotVersion,
 };
 use crate::types::{MonotonicTime, NodeKey, PlacementSlot, PlacementSlotKey};
 
@@ -68,7 +69,7 @@ pub enum LogicPlacementEffect {
     },
     MemberEvent(Box<MemberEvent>),
     MemberSnapshot {
-        version: crate::types::StateVersion,
+        version: crate::types::MembershipVersion,
         members: Vec<MemberRecord>,
     },
     DrainReady {
@@ -79,10 +80,10 @@ pub enum LogicPlacementEffect {
 
 pub struct LogicPlacementState {
     local_node: NodeKey,
-    session: CoordinatorSession,
+    session: PlacementDomainState,
     slots: BTreeMap<PlacementSlotKey, PlacementSlot>,
     authorities: BTreeMap<PlacementSlotKey, PlacementAuthority>,
-    member_up: bool,
+    domain_up: bool,
     changed: Arc<Notify>,
 }
 
@@ -98,7 +99,7 @@ impl LogicPlacementState {
     }
 
     pub fn ready(&self) -> bool {
-        self.session.ready() && self.member_up
+        self.session.ready() && self.domain_up
     }
 
     pub fn change_notifier(&self) -> Arc<Notify> {
@@ -106,8 +107,8 @@ impl LogicPlacementState {
     }
 }
 
-pub struct LogicCoordinatorSession {
-    hello: NodeHello,
+pub struct PlacementDomainSession {
+    domain_hello: PlacementDomainHello,
     coordinator: lattice_remoting::association::AssociationKey,
     associations: Arc<AssociationManager>,
     config: LogicCoordinatorConfig,
@@ -127,6 +128,7 @@ struct LocalAuthorityEvent {
 
 #[derive(Clone)]
 pub struct LogicCoordinatorHandle {
+    domain: lattice_core::actor_ref::PlacementDomainId,
     coordinator: lattice_remoting::association::AssociationKey,
     associations: Arc<AssociationManager>,
     maximum_control_payload: usize,
@@ -135,6 +137,10 @@ pub struct LogicCoordinatorHandle {
 }
 
 impl LogicCoordinatorHandle {
+    pub fn domain(&self) -> &lattice_core::actor_ref::PlacementDomainId {
+        &self.domain
+    }
+
     pub fn ready(&self) -> bool {
         self.state
             .lock()
@@ -215,6 +221,7 @@ impl LogicCoordinatorHandle {
             .ok_or(LogicSessionError::AssociationUnavailable)?;
         let command_id = association.admit_control_command(
             encode_control_command(
+                &CoordinatorScope::Placement(self.domain.clone()),
                 &PlacementControlCommand::DrainComplete {
                     operation_id,
                     expected_incarnation: incarnation,
@@ -235,8 +242,12 @@ impl LogicCoordinatorHandle {
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
         association.admit_ephemeral_control(
-            encode_control_command(&command, self.maximum_control_payload)
-                .map_err(LogicSessionError::Control)?,
+            encode_control_command(
+                &CoordinatorScope::Placement(self.domain.clone()),
+                &command,
+                self.maximum_control_payload,
+            )
+            .map_err(LogicSessionError::Control)?,
         )?;
         Ok(())
     }
@@ -247,8 +258,12 @@ impl LogicCoordinatorHandle {
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
         association.admit_control_command(
-            encode_control_command(&command, self.maximum_control_payload)
-                .map_err(LogicSessionError::Control)?,
+            encode_control_command(
+                &CoordinatorScope::Placement(self.domain.clone()),
+                &command,
+                self.maximum_control_payload,
+            )
+            .map_err(LogicSessionError::Control)?,
         )?;
         Ok(())
     }
@@ -287,16 +302,20 @@ impl LogicCoordinatorHandle {
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
         association.admit_control_command(
-            encode_control_command(&command, self.maximum_control_payload)
-                .map_err(LogicSessionError::Control)?,
+            encode_control_command(
+                &CoordinatorScope::Placement(self.domain.clone()),
+                &command,
+                self.maximum_control_payload,
+            )
+            .map_err(LogicSessionError::Control)?,
         )?;
         Ok(())
     }
 }
 
-impl LogicCoordinatorSession {
+impl PlacementDomainSession {
     pub fn new(
-        hello: NodeHello,
+        domain_hello: PlacementDomainHello,
         coordinator: lattice_remoting::association::AssociationKey,
         associations: Arc<AssociationManager>,
         config: LogicCoordinatorConfig,
@@ -304,26 +323,27 @@ impl LogicCoordinatorSession {
     ) -> Result<(Self, mpsc::Receiver<LogicPlacementEffect>), LogicSessionError> {
         config.validate()?;
         if effect_capacity == 0
-            || hello.node.incarnation != coordinator.local_incarnation
-            || hello.node.address == coordinator.remote_address
+            || domain_hello.node.incarnation != coordinator.local_incarnation
+            || domain_hello.node.address == coordinator.remote_address
         {
             return Err(LogicSessionError::InvalidConfig);
         }
         let (effects, receiver) = mpsc::channel(effect_capacity);
         let (local_event_sender, local_events) = mpsc::channel(effect_capacity);
-        let local_node = hello.node.clone();
+        let local_node = domain_hello.node.clone();
+        let domain = domain_hello.domain.clone();
         Ok((
             Self {
-                hello,
+                domain_hello,
                 coordinator,
                 associations,
                 config,
                 state: Arc::new(Mutex::new(LogicPlacementState {
                     local_node,
-                    session: CoordinatorSession::default(),
+                    session: PlacementDomainState::new(domain),
                     slots: BTreeMap::new(),
                     authorities: BTreeMap::new(),
-                    member_up: false,
+                    domain_up: false,
                     changed: Arc::new(Notify::new()),
                 })),
                 stager: None,
@@ -343,6 +363,7 @@ impl LogicCoordinatorSession {
 
     pub fn control_handle(&self) -> LogicCoordinatorHandle {
         LogicCoordinatorHandle {
+            domain: self.domain_hello.domain.clone(),
             coordinator: self.coordinator.clone(),
             associations: self.associations.clone(),
             maximum_control_payload: self.config.maximum_control_payload,
@@ -378,7 +399,9 @@ impl LogicCoordinatorSession {
     }
 
     pub fn send_hello(&self) -> Result<(), LogicSessionError> {
-        self.send(PlacementControlCommand::NodeHello(self.hello.clone()))
+        self.send(PlacementControlCommand::PlacementDomainHello(
+            self.domain_hello.clone(),
+        ))
     }
 
     pub async fn run(
@@ -454,7 +477,7 @@ impl LogicCoordinatorSession {
                         .checked_add(1)
                         .ok_or(LogicSessionError::HeartbeatSequenceExhausted)?;
                     self.send(PlacementControlCommand::NodeHeartbeat {
-                        incarnation: self.hello.node.incarnation,
+                        incarnation: self.domain_hello.node.incarnation,
                         sequence: self.heartbeat_sequence,
                     })?;
                 }
@@ -481,12 +504,15 @@ impl LogicCoordinatorSession {
 
     async fn handle(&mut self, event: PlacementControlEventKind) -> Result<(), LogicSessionError> {
         match event {
+            PlacementControlEventKind::GlobalMemberRemoved { .. } => {
+                Err(LogicSessionError::UnauthorizedCommand)
+            }
             PlacementControlEventKind::Reconcile { association, .. } => {
                 self.require_coordinator(&association)?;
                 self.state
                     .lock()
                     .expect("logic placement state poisoned")
-                    .member_up = false;
+                    .domain_up = false;
                 self.send_hello()
             }
             PlacementControlEventKind::Command(inbound) => {
@@ -521,25 +547,29 @@ impl LogicCoordinatorSession {
                         lattice_core::failpoint::hit(
                             lattice_core::failpoint::Failpoint::SnapshotAfterStageBeforeInstall,
                         );
-                        let version = install.version;
-                        let slots = decode_slots(&install.records)?;
-                        let members = decode_members(&install.records)?;
-                        self.install_snapshot_slots(slots)?;
-                        self.state
-                            .lock()
-                            .expect("logic placement state poisoned")
-                            .session
-                            .install(install)
-                            .map_err(LogicSessionError::Coordinator)?;
-                        self.effects
-                            .try_send(LogicPlacementEffect::MemberSnapshot { version, members })
-                            .map_err(|_| LogicSessionError::EffectBackpressure)?;
-                        self.send(PlacementControlCommand::JoinReady {
-                            snapshot_version: version,
-                        })
+                        let version = install.version.clone();
+                        match version {
+                            SnapshotVersion::Membership(version) => {
+                                let _ = version;
+                                Err(LogicSessionError::UnauthorizedCommand)
+                            }
+                            SnapshotVersion::Placement(version) => {
+                                let slots = decode_slots(&install.records)?;
+                                self.install_snapshot_slots(slots)?;
+                                self.state
+                                    .lock()
+                                    .expect("logic placement state poisoned")
+                                    .session
+                                    .install(install)
+                                    .map_err(LogicSessionError::PlacementState)?;
+                                self.send(PlacementControlCommand::AppliedRevision(version))
+                            }
+                        }
                     }
                     PlacementControlCommand::StateDelta(delta) => self.apply_delta(delta),
-                    PlacementControlCommand::MemberDelta(event) => self.apply_member_event(event),
+                    PlacementControlCommand::MemberDelta(_) => {
+                        Err(LogicSessionError::UnauthorizedCommand)
+                    }
                     PlacementControlCommand::MemberUp(member) => self.apply_member_up(member),
                     PlacementControlCommand::ClaimGranted(grant) => {
                         let effects = {
@@ -588,7 +618,7 @@ impl LogicCoordinatorSession {
                             if state
                                 .session
                                 .version()
-                                .is_none_or(|current| !current.satisfies(version))
+                                .is_none_or(|current| !current.satisfies(&version))
                             {
                                 return Err(LogicSessionError::StaleGeneration);
                             }
@@ -608,7 +638,8 @@ impl LogicCoordinatorSession {
                         };
                         self.publish_effects(key, effects)
                     }
-                    PlacementControlCommand::NodeHello(_)
+                    PlacementControlCommand::MemberHello(_)
+                    | PlacementControlCommand::PlacementDomainHello(_)
                     | PlacementControlCommand::JoinReady { .. }
                     | PlacementControlCommand::NodeHeartbeat { .. }
                     | PlacementControlCommand::SubscribeEntity(_)
@@ -623,6 +654,7 @@ impl LogicCoordinatorSession {
                     | PlacementControlCommand::SlotReady { .. }
                     | PlacementControlCommand::BeginDrain { .. }
                     | PlacementControlCommand::DrainComplete { .. }
+                    | PlacementControlCommand::MembershipDrainComplete { .. }
                     | PlacementControlCommand::ForceRemove { .. } => {
                         Err(LogicSessionError::UnauthorizedCommand)
                     }
@@ -637,43 +669,19 @@ impl LogicCoordinatorSession {
             let mut state = self.state.lock().expect("logic placement state poisoned");
             state
                 .session
-                .apply_delta(delta.clone())
-                .map_err(LogicSessionError::Coordinator)?;
+                .apply(delta.clone())
+                .map_err(LogicSessionError::PlacementState)?;
         }
         self.install_slots(slots)?;
         self.send(PlacementControlCommand::AppliedRevision(delta.version))
     }
 
-    fn apply_member_event(&self, event: MemberEvent) -> Result<(), LogicSessionError> {
-        self.state
-            .lock()
-            .expect("logic placement state poisoned")
-            .session
-            .apply_member_event(event.clone())
-            .map_err(LogicSessionError::Coordinator)?;
-        self.effects
-            .try_send(LogicPlacementEffect::MemberEvent(Box::new(event)))
-            .map_err(|_| LogicSessionError::EffectBackpressure)?;
-        self.state
-            .lock()
-            .expect("logic placement state poisoned")
-            .changed
-            .notify_waiters();
-        Ok(())
-    }
-
     fn apply_member_up(&self, member: MemberRecord) -> Result<(), LogicSessionError> {
         let mut state = self.state.lock().expect("logic placement state poisoned");
-        if member.status != MemberStatus::Up
-            || member.node != state.local_node
-            || state
-                .session
-                .version()
-                .is_none_or(|current| !current.satisfies(member.version))
-        {
+        if member.status != MemberStatus::Up || member.node != state.local_node {
             return Err(LogicSessionError::StaleGeneration);
         }
-        state.member_up = true;
+        state.domain_up = true;
         state.changed.notify_waiters();
         Ok(())
     }
@@ -790,8 +798,9 @@ impl LogicCoordinatorSession {
         if association.state() == AssociationState::Closed {
             return Err(LogicSessionError::AssociationUnavailable);
         }
+        let scope = CoordinatorScope::Placement(self.domain_hello.domain.clone());
         association.admit_control_command(
-            encode_control_command(&command, self.config.maximum_control_payload)
+            encode_control_command(&scope, &command, self.config.maximum_control_payload)
                 .map_err(LogicSessionError::Control)?,
         )?;
         Ok(())
@@ -819,12 +828,30 @@ fn decode_slots(
 ) -> Result<BTreeMap<PlacementSlotKey, PlacementSlot>, LogicSessionError> {
     let mut slots = BTreeMap::new();
     for record in records {
-        if !(record.key.starts_with("shard/") || record.key.starts_with("singleton/")) {
+        if !record.key.starts_with("domain/") || record.key.contains("/member/") {
             continue;
         }
         let slot: PlacementSlot =
             serde_json::from_slice(&record.value).map_err(|_| LogicSessionError::Codec)?;
         slot.validate().map_err(|_| LogicSessionError::Codec)?;
+        let expected_key = match &slot.key {
+            PlacementSlotKey::Shard {
+                domain,
+                entity_type,
+                shard_id,
+            } => format!(
+                "domain/{}/shard/{}/{}",
+                domain.as_str(),
+                entity_type.as_str(),
+                shard_id.get()
+            ),
+            PlacementSlotKey::Singleton { domain, kind } => {
+                format!("domain/{}/singleton/{}", domain.as_str(), kind.as_str())
+            }
+        };
+        if record.key != expected_key {
+            return Err(LogicSessionError::Codec);
+        }
         if slots.insert(slot.key.clone(), slot).is_some() {
             return Err(LogicSessionError::Codec);
         }
@@ -832,6 +859,7 @@ fn decode_slots(
     Ok(slots)
 }
 
+#[allow(dead_code)]
 fn decode_members(
     records: &[crate::coordinator::SnapshotRecord],
 ) -> Result<Vec<MemberRecord>, LogicSessionError> {
@@ -863,6 +891,8 @@ fn session_dispatch_error(error: &LogicSessionError) -> ControlDispatchError {
         | LogicSessionError::SnapshotRequired
         | LogicSessionError::StaleGeneration
         | LogicSessionError::Coordinator(_)
+        | LogicSessionError::MembershipState(_)
+        | LogicSessionError::PlacementState(_)
         | LogicSessionError::Authority(_)
         | LogicSessionError::UnknownAuthority => ControlDispatchError::InvalidCommand,
         _ => ControlDispatchError::Unavailable,
@@ -897,6 +927,10 @@ pub enum LogicSessionError {
     EffectBackpressure,
     #[error("logic Coordinator state reducer rejected input")]
     Coordinator(#[source] crate::coordinator::CoordinatorError),
+    #[error("membership state reducer rejected input")]
+    MembershipState(#[source] crate::coordinator::MembershipStateError),
+    #[error("placement-domain state reducer rejected input")]
+    PlacementState(#[source] crate::coordinator::PlacementDomainStateError),
     #[error("logic Coordinator placement authority rejected input")]
     Authority(#[source] crate::authority::AuthorityError),
     #[error("logic Coordinator control codec failed")]

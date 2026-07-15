@@ -9,10 +9,11 @@ use futures_util::Stream;
 use hickory_resolver::TokioResolver;
 use hickory_resolver::proto::rr::{RData, RecordType};
 use lattice_core::actor_ref::NodeAddress;
+use lattice_core::coordinator::CoordinatorScope;
 
 use crate::provider::{
-    ClusterDiscovery, DiscoveryError, DiscoveryOrigin, DiscoverySnapshot, DiscoverySource,
-    DiscoveryTarget,
+    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
+    DiscoverySource, DiscoveryTarget,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,7 @@ pub enum DnsMode {
 
 #[derive(Debug, Clone)]
 pub struct DnsDiscoveryConfig {
+    pub scope: CoordinatorScope,
     pub mode: DnsMode,
     pub min_refresh: Duration,
     pub max_refresh: Duration,
@@ -87,10 +89,16 @@ impl DnsDiscovery {
     }
 }
 
-impl ClusterDiscovery for DnsDiscovery {
+impl CoordinatorDiscovery for DnsDiscovery {
+    fn scope(&self) -> &CoordinatorScope {
+        &self.config.scope
+    }
+
     fn snapshots(
         &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<DiscoverySnapshot, DiscoveryError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<CoordinatorDirectorySnapshot, DiscoveryError>> + Send + '_>>
+    {
+        let scope = self.config.scope.clone();
         Box::pin(async_stream::stream! {
             let mut generation = 0_u64;
             let mut emitted_initial = false;
@@ -99,14 +107,14 @@ impl ClusterDiscovery for DnsDiscovery {
                     Ok((targets, ttl)) if !targets.is_empty() => {
                         generation += 1;
                         emitted_initial = true;
-                        yield Ok(DiscoverySnapshot { generation, targets });
+                        yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets });
                         tokio::time::sleep(ttl.clamp(self.config.min_refresh, self.config.max_refresh)).await;
                     }
                     Ok(_) => {
                         if !emitted_initial {
                             generation += 1;
                             emitted_initial = true;
-                            yield Ok(DiscoverySnapshot { generation, targets: Vec::new() });
+                            yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets: Vec::new() });
                         }
                         yield Err(provider_error("DNS lookup returned no reachable targets"));
                         tokio::time::sleep(self.config.retry_delay).await;
@@ -115,7 +123,7 @@ impl ClusterDiscovery for DnsDiscovery {
                         if !emitted_initial {
                             generation += 1;
                             emitted_initial = true;
-                            yield Ok(DiscoverySnapshot { generation, targets: Vec::new() });
+                            yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets: Vec::new() });
                         }
                         yield Err(error);
                         tokio::time::sleep(self.config.retry_delay).await;

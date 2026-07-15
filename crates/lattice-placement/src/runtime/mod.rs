@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use lattice_core::actor_ref::NodeIncarnation;
+use lattice_core::actor_ref::{NodeIncarnation, PlacementDomainId};
+use lattice_core::coordinator::CoordinatorScope;
 use lattice_remoting::association::Association;
 use lattice_remoting::association::AssociationManager;
 use lattice_remoting::association::AssociationState;
@@ -20,30 +21,35 @@ use crate::control::{
     encode_control_command,
 };
 use crate::coordinator::{
-    LeaderGuard, LeaderRecord, LoadTable, MemberChange, MemberEvent, MemberRecord,
-    MemberRemovalReason, MemberStatus, NodeHello, SessionLimits, SingletonConfig, SnapshotLimits,
-    SnapshotRecord, build_snapshot,
+    COORDINATOR_PROTOCOL_GENERATION, DomainMemberRecord, DomainMemberStatus, LeaderRecord,
+    LoadTable, MemberRecord, MemberRemovalReason, MemberStatus, PlacementDomainHello,
+    PlacementLeaderGuard, SessionLimits, SingletonConfig, SnapshotLimits, SnapshotRecord,
+    build_snapshot,
 };
 use crate::handoff::{HandoffEffect, HandoffEvent, HandoffMachine, HandoffPhase};
 use crate::plan::{MoveProgress, PlanError, PlanReason, PlanStatus, RebalancePlan};
 use crate::storage::domain::{
     AdminOperationRecord, AutomaticBalanceSettings, DurableStorageLimits,
 };
-use crate::storage::{CoordinatorStore, StorageError};
+use crate::storage::{
+    CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore, StorageError,
+};
 use crate::types::{
-    ClaimGrant, CoordinatorTerm, GrantSequence, NodeKey, PlacementSlot, PlacementSlotKey,
-    PlacementSlotState, StateVersion,
+    ClaimGrant, CoordinatorTerm, GrantSequence, MembershipVersion, NodeKey, PlacementSlot,
+    PlacementSlotKey, PlacementSlotState, PlacementVersion,
 };
 
 mod admin;
 mod allocation;
+pub mod host;
 mod lifecycle;
 mod membership;
+pub mod membership_plane;
 mod rebalance;
 mod reconciliation;
 
 #[derive(Debug, Clone)]
-pub struct CoordinatorLeaderConfig {
+pub struct PlacementDomainLeaderConfig {
     pub leader_lease_ttl: Duration,
     pub member_lease_ttl: Duration,
     pub claim_ttl: Duration,
@@ -70,7 +76,7 @@ pub struct CoordinatorLeaderConfig {
     pub maximum_quarantined_records: usize,
 }
 
-impl Default for CoordinatorLeaderConfig {
+impl Default for PlacementDomainLeaderConfig {
     fn default() -> Self {
         Self {
             leader_lease_ttl: Duration::from_secs(10),
@@ -110,7 +116,7 @@ impl Default for CoordinatorLeaderConfig {
     }
 }
 
-impl CoordinatorLeaderConfig {
+impl PlacementDomainLeaderConfig {
     fn validate(&self) -> Result<(), CoordinatorRuntimeError> {
         if self.leader_lease_ttl.is_zero()
             || self.member_lease_ttl.is_zero()
@@ -145,18 +151,29 @@ impl CoordinatorLeaderConfig {
 }
 
 struct MemberSession {
-    hello: NodeHello,
+    hello: PlacementDomainHello,
     record: MemberRecord,
+    domain_record: Option<DomainMemberRecord>,
     association: lattice_remoting::association::AssociationKey,
     lease_id: i64,
     heartbeat_sequence: u64,
     last_heartbeat: Instant,
-    applied_version: Option<StateVersion>,
-    snapshot_version: Option<StateVersion>,
+    applied_version: Option<PlacementVersion>,
+    snapshot_version: Option<MembershipVersion>,
     draining: bool,
     drain_operation: Option<String>,
     drain_ready: bool,
     joined_at: crate::types::MonotonicTime,
+}
+
+impl MemberSession {
+    fn placement_up(&self) -> bool {
+        self.record.status == MemberStatus::Up
+            && self
+                .domain_record
+                .as_ref()
+                .is_some_and(|member| member.status == DomainMemberStatus::Up)
+    }
 }
 
 struct ClaimLease {
@@ -166,6 +183,7 @@ struct ClaimLease {
 
 #[derive(Debug, Clone)]
 pub struct ManualRelocationRequest {
+    pub domain: PlacementDomainId,
     pub operation_id: String,
     pub entity_type: lattice_core::actor_ref::EntityType,
     pub shard_id: crate::types::ShardId,
@@ -175,6 +193,7 @@ pub struct ManualRelocationRequest {
 
 #[derive(Debug, Clone)]
 pub struct ForceRemoveRequest {
+    pub domain: PlacementDomainId,
     pub operation_id: String,
     pub node_id: String,
     pub expected_incarnation: NodeIncarnation,
@@ -182,7 +201,7 @@ pub struct ForceRemoveRequest {
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorInspection {
-    pub version: StateVersion,
+    pub version: PlacementVersion,
     pub automatic_globally_paused: bool,
     pub paused_entity_types: Vec<lattice_core::actor_ref::EntityType>,
     pub slots: Vec<PlacementSlot>,
@@ -250,6 +269,7 @@ enum CoordinatorOperation {
 
 #[derive(Clone)]
 pub struct CoordinatorHandle {
+    domain: PlacementDomainId,
     operations: mpsc::Sender<CoordinatorOperation>,
 }
 
@@ -259,6 +279,9 @@ impl CoordinatorHandle {
         proposal: RebalanceProposal,
         entity_type: lattice_core::actor_ref::EntityType,
     ) -> Result<u128, CoordinatorRuntimeError> {
+        if proposal.domain != self.domain {
+            return Err(CoordinatorRuntimeError::InvalidAdminOperation);
+        }
         let (completion, result) = tokio::sync::oneshot::channel();
         self.operations
             .send(CoordinatorOperation::SubmitRebalance {
@@ -275,10 +298,12 @@ impl CoordinatorHandle {
 
     pub async fn cancel_pending(
         &self,
+        domain: PlacementDomainId,
         operation_id: String,
         plan_id: u128,
         shard_id: crate::types::ShardId,
     ) -> Result<(), CoordinatorRuntimeError> {
+        self.require_domain(&domain)?;
         let (completion, result) = tokio::sync::oneshot::channel();
         self.operations
             .send(CoordinatorOperation::CancelPending {
@@ -296,10 +321,12 @@ impl CoordinatorHandle {
 
     pub async fn evaluate_rebalance(
         &self,
+        domain: PlacementDomainId,
         operation_id: String,
         entity_type: lattice_core::actor_ref::EntityType,
         trigger: RebalanceTrigger,
     ) -> Result<Option<u128>, CoordinatorRuntimeError> {
+        self.require_domain(&domain)?;
         let (completion, result) = tokio::sync::oneshot::channel();
         self.operations
             .send(CoordinatorOperation::Evaluate {
@@ -317,10 +344,12 @@ impl CoordinatorHandle {
 
     pub async fn set_automatic_paused(
         &self,
+        domain: PlacementDomainId,
         operation_id: String,
         entity_type: Option<lattice_core::actor_ref::EntityType>,
         paused: bool,
     ) -> Result<(), CoordinatorRuntimeError> {
+        self.require_domain(&domain)?;
         let (completion, result) = tokio::sync::oneshot::channel();
         self.operations
             .send(CoordinatorOperation::SetAutomatic {
@@ -340,6 +369,7 @@ impl CoordinatorHandle {
         &self,
         request: ManualRelocationRequest,
     ) -> Result<u128, CoordinatorRuntimeError> {
+        self.require_domain(&request.domain)?;
         let (completion, result) = tokio::sync::oneshot::channel();
         self.operations
             .send(CoordinatorOperation::ManualRelocate {
@@ -357,6 +387,7 @@ impl CoordinatorHandle {
         &self,
         request: ForceRemoveRequest,
     ) -> Result<(), CoordinatorRuntimeError> {
+        self.require_domain(&request.domain)?;
         let (completion, result) = tokio::sync::oneshot::channel();
         self.operations
             .send(CoordinatorOperation::ForceRemove {
@@ -370,7 +401,11 @@ impl CoordinatorHandle {
             .map_err(|_| CoordinatorRuntimeError::OperationClosed)?
     }
 
-    pub async fn inspect(&self) -> Result<CoordinatorInspection, CoordinatorRuntimeError> {
+    pub async fn inspect(
+        &self,
+        domain: PlacementDomainId,
+    ) -> Result<CoordinatorInspection, CoordinatorRuntimeError> {
+        self.require_domain(&domain)?;
         let (completion, result) = tokio::sync::oneshot::channel();
         self.operations
             .send(CoordinatorOperation::Inspect { completion })
@@ -380,16 +415,28 @@ impl CoordinatorHandle {
             .await
             .map_err(|_| CoordinatorRuntimeError::OperationClosed)?
     }
+
+    fn require_domain(&self, domain: &PlacementDomainId) -> Result<(), CoordinatorRuntimeError> {
+        if domain == &self.domain {
+            Ok(())
+        } else {
+            Err(CoordinatorRuntimeError::InvalidAdminOperation)
+        }
+    }
 }
 
-pub struct CoordinatorLeader<S: CoordinatorStore> {
+pub struct PlacementDomainLeader<S>
+where
+    S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
+{
     store: Arc<S>,
     associations: Arc<AssociationManager>,
     leader: LeaderRecord,
-    leader_guard: LeaderGuard,
+    leader_guard: PlacementLeaderGuard,
     leader_lease_id: i64,
-    config: CoordinatorLeaderConfig,
-    version: StateVersion,
+    config: PlacementDomainLeaderConfig,
+    membership_version: MembershipVersion,
+    version: PlacementVersion,
     sessions: BTreeMap<NodeIncarnation, MemberSession>,
     claims: BTreeMap<PlacementSlotKey, ClaimLease>,
     loads: LoadTable,
@@ -423,44 +470,74 @@ pub struct CoordinatorLeader<S: CoordinatorStore> {
     capacity_rejection_count: u64,
 }
 
-impl<S: CoordinatorStore> CoordinatorLeader<S> {
+impl<S> PlacementDomainLeader<S>
+where
+    S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
+{
     pub async fn elect(
         store: Arc<S>,
         associations: Arc<AssociationManager>,
         node: NodeKey,
+        scope: CoordinatorScope,
         term: CoordinatorTerm,
-        protocol_generation: u64,
-        config: CoordinatorLeaderConfig,
+        config: PlacementDomainLeaderConfig,
     ) -> Result<Self, CoordinatorRuntimeError> {
         config.validate()?;
-        if protocol_generation == 0 {
-            return Err(CoordinatorRuntimeError::InvalidConfig);
-        }
         store.ensure_schema_generation().await?;
         let leader_lease_id = store.grant_lease(config.leader_lease_ttl).await?;
+        let domain = match &scope {
+            CoordinatorScope::Placement(domain) => domain.clone(),
+            CoordinatorScope::Membership => return Err(CoordinatorRuntimeError::InvalidConfig),
+        };
         let leader = LeaderRecord {
-            node,
-            protocol_generation,
+            scope,
+            node: node.clone(),
+            protocol_generation: COORDINATOR_PROTOCOL_GENERATION,
             term,
         };
         if !store.campaign_leader(&leader, leader_lease_id).await? {
             let _ = store.revoke_lease(leader_lease_id).await;
             return Err(CoordinatorRuntimeError::NotLeader);
         }
-        let leader_guard = LeaderGuard::new(leader.clone());
-        let slots = store.list_slots().await?;
-        let version = StateVersion::new(term, store.get_state_revision().await?);
+        let leader_guard = PlacementLeaderGuard::new(leader.clone())
+            .map_err(CoordinatorRuntimeError::Coordinator)?;
+        let membership_scope = CoordinatorScope::Membership;
+        let active_membership_term = store
+            .get_leader(&membership_scope)
+            .await?
+            .map(|leader| leader.term);
+        let persisted_membership_term = store.get_leader_term(&membership_scope).await?;
+        let membership_term = active_membership_term
+            .or_else(|| CoordinatorTerm::new(persisted_membership_term).ok())
+            .unwrap_or(term);
+        let slots = store.list_slots(&domain).await?;
+        let entity_configs = store
+            .list_entity_configs(&domain)
+            .await?
+            .into_iter()
+            .map(|config| (config.entity_type.clone(), config))
+            .collect();
+        let singleton_configs = store
+            .list_singleton_configs(&domain)
+            .await?
+            .into_iter()
+            .map(|config| (config.kind.clone(), config))
+            .collect();
+        let membership_revision = store.get_membership_revision().await?;
+        let placement_revision = store.get_placement_revision(&domain).await?;
+        let membership_version = MembershipVersion::new(membership_term, membership_revision);
+        let version = PlacementVersion::new(domain.clone(), term, placement_revision);
         let loads = LoadTable::new(config.maximum_node_loads, config.maximum_shard_loads)
             .map_err(CoordinatorRuntimeError::Coordinator)?;
         let plans = store
-            .list_plans()
+            .list_plans(&domain)
             .await?
             .into_iter()
             .map(|plan| (plan.plan_id, plan))
             .collect();
-        let automatic_settings = store.get_automatic_settings().await?;
+        let automatic_settings = store.get_automatic_settings(&domain).await?;
         let applied_admin_operations = store
-            .list_admin_operations()
+            .list_admin_operations(&domain)
             .await?
             .into_iter()
             .map(|operation| (operation.operation_id.clone(), operation))
@@ -493,6 +570,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             leader_guard,
             leader_lease_id,
             config,
+            membership_version,
             version,
             sessions: BTreeMap::new(),
             claims: BTreeMap::new(),
@@ -501,8 +579,8 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             handoffs: BTreeMap::new(),
             operations,
             operation_receiver,
-            entity_configs: BTreeMap::new(),
-            singleton_configs: BTreeMap::new(),
+            entity_configs,
+            singleton_configs,
             strategies,
             origin: Instant::now(),
             slot_assigned_at,
@@ -530,12 +608,36 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         Ok(leader)
     }
 
+    async fn assignment_members(
+        &self,
+        owner: &NodeKey,
+    ) -> Result<(MemberRecord, DomainMemberRecord), CoordinatorRuntimeError> {
+        let global = self
+            .store
+            .get_member(&owner.node_id)
+            .await?
+            .filter(|member| member.node == *owner && member.status == MemberStatus::Up)
+            .ok_or(CoordinatorRuntimeError::IneligibleTarget)?;
+        let domain = self
+            .store
+            .get_domain_member(&self.version.domain, &owner.node_id)
+            .await?
+            .filter(|member| {
+                member.node == *owner
+                    && member.status == DomainMemberStatus::Up
+                    && member.version.domain == self.version.domain
+            })
+            .ok_or(CoordinatorRuntimeError::IneligibleTarget)?;
+        Ok((global, domain))
+    }
+
     pub fn leader(&self) -> &LeaderRecord {
         &self.leader
     }
 
     pub fn handle(&self) -> CoordinatorHandle {
         CoordinatorHandle {
+            domain: self.version.domain.clone(),
             operations: self.operations.clone(),
         }
     }

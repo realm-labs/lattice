@@ -4,17 +4,19 @@ use std::time::Duration;
 use futures_util::Stream;
 use lattice_config::store::ConfigStore;
 use lattice_core::actor_ref::NodeAddress;
+use lattice_core::coordinator::CoordinatorScope;
 use serde::Deserialize;
 
 use crate::provider::{
-    ClusterDiscovery, DiscoveryError, DiscoveryOrigin, DiscoverySnapshot, DiscoverySource,
-    DiscoveryTarget,
+    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
+    DiscoverySource, DiscoveryTarget,
 };
 
 const CONFIG_STORE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct ConfigStoreDiscovery<S> {
+    scope: CoordinatorScope,
     store: S,
     key: String,
     reconnect_delay: Duration,
@@ -24,11 +26,16 @@ impl<S> ConfigStoreDiscovery<S>
 where
     S: ConfigStore,
 {
-    pub fn new(store: S, key: impl Into<String>) -> Result<Self, DiscoveryError> {
-        Self::with_reconnect_delay(store, key, Duration::from_millis(250))
+    pub fn new(
+        scope: CoordinatorScope,
+        store: S,
+        key: impl Into<String>,
+    ) -> Result<Self, DiscoveryError> {
+        Self::with_reconnect_delay(scope, store, key, Duration::from_millis(250))
     }
 
     pub fn with_reconnect_delay(
+        scope: CoordinatorScope,
         store: S,
         key: impl Into<String>,
         reconnect_delay: Duration,
@@ -40,6 +47,7 @@ where
             });
         }
         Ok(Self {
+            scope,
             store,
             key,
             reconnect_delay,
@@ -47,13 +55,19 @@ where
     }
 }
 
-impl<S> ClusterDiscovery for ConfigStoreDiscovery<S>
+impl<S> CoordinatorDiscovery for ConfigStoreDiscovery<S>
 where
     S: ConfigStore,
 {
+    fn scope(&self) -> &CoordinatorScope {
+        &self.scope
+    }
+
     fn snapshots(
         &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<DiscoverySnapshot, DiscoveryError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<CoordinatorDirectorySnapshot, DiscoveryError>> + Send + '_>>
+    {
+        let scope = self.scope.clone();
         Box::pin(async_stream::stream! {
             let mut output_generation = 0_u64;
             let mut document_generation = 0_u64;
@@ -67,7 +81,7 @@ where
                         if !emitted_initial {
                             output_generation += 1;
                             emitted_initial = true;
-                            yield Ok(DiscoverySnapshot { generation: output_generation, targets: Vec::new() });
+                            yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation: output_generation, targets: Vec::new() });
                         }
                         yield Err(provider_error(error));
                         tokio::time::sleep(self.reconnect_delay).await;
@@ -82,19 +96,19 @@ where
                             output_generation += 1;
                             emitted_initial = true;
                             last_value = fetched.clone();
-                            yield Ok(DiscoverySnapshot { generation: output_generation, targets });
+                            yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation: output_generation, targets });
                         }
                         Ok(None) if !emitted_initial => {
                             output_generation += 1;
                             emitted_initial = true;
-                            yield Ok(DiscoverySnapshot { generation: output_generation, targets: Vec::new() });
+                            yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation: output_generation, targets: Vec::new() });
                         }
                         Ok(None) => {}
                         Err(error) => {
                             if !emitted_initial {
                                 output_generation += 1;
                                 emitted_initial = true;
-                                yield Ok(DiscoverySnapshot { generation: output_generation, targets: Vec::new() });
+                                yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation: output_generation, targets: Vec::new() });
                             }
                             yield Err(error);
                         }
@@ -117,7 +131,7 @@ where
                             document_generation = next_document_generation;
                             output_generation += 1;
                             last_value = current;
-                            yield Ok(DiscoverySnapshot { generation: output_generation, targets });
+                            yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation: output_generation, targets });
                         }
                         Ok(None) => {}
                         Err(error) => yield Err(error),
@@ -132,7 +146,7 @@ where
                                 document_generation = next_document_generation;
                                 output_generation += 1;
                                 last_value = value;
-                                yield Ok(DiscoverySnapshot { generation: output_generation, targets });
+                                yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation: output_generation, targets });
                             }
                             Ok(None) => {}
                             Err(error) => yield Err(error),

@@ -3,9 +3,10 @@ use std::collections::BTreeSet;
 use lattice_core::actor_ref::{EntityType, NodeIncarnation};
 use serde::{Deserialize, Serialize};
 
-use crate::coordinator::MemberRecord;
+use crate::coordinator::{DomainMemberRecord, MemberRecord, SingletonConfig};
 use crate::plan::RebalancePlan;
-use crate::types::{ClaimGrant, PlacementSlot, ShardId, StateVersion};
+use crate::region::EntityConfig;
+use crate::types::{ClaimGrant, PlacementSlot, PlacementVersion, ShardId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeasedClaim {
@@ -47,6 +48,53 @@ pub struct MemberCommit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateDomainMember {
+    pub expected_global_member: MemberRecord,
+    pub member: DomainMemberRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateDomainMember {
+    pub expected_global_member: MemberRecord,
+    pub expected: DomainMemberRecord,
+    pub member: DomainMemberRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveDomainMember {
+    pub expected: DomainMemberRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainMemberCommit {
+    pub member: DomainMemberRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutEntityConfig {
+    pub expected: Option<EntityConfig>,
+    pub config: EntityConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutSingletonConfig {
+    pub expected: Option<SingletonConfig>,
+    pub config: SingletonConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityConfigCommit {
+    pub config: EntityConfig,
+    pub version: PlacementVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingletonConfigCommit {
+    pub config: SingletonConfig,
+    pub version: PlacementVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePlan {
     pub plan: RebalancePlan,
 }
@@ -80,6 +128,8 @@ pub struct SlotCommit {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocateInitial {
+    pub expected_global_member: MemberRecord,
+    pub expected_domain_member: DomainMemberRecord,
     pub slot: PlacementSlot,
     pub claim: LeasedClaim,
 }
@@ -106,6 +156,9 @@ pub struct ReserveHandoff {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Keeping the exact claim inline avoids an allocation in every authoritative
+// compare-and-swap request; these requests are bounded and short-lived.
+#[allow(clippy::large_enum_variant)]
 pub enum ClaimPredicate {
     Present(ClaimGrant),
     Absent,
@@ -126,6 +179,8 @@ pub struct FenceMissingAuthority {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallAuthority {
+    pub expected_global_member: MemberRecord,
+    pub expected_domain_member: DomainMemberRecord,
     pub expected_slot: PlacementSlot,
     pub slot: PlacementSlot,
     pub claim: LeasedClaim,
@@ -133,6 +188,8 @@ pub struct InstallAuthority {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdoptAuthority {
+    pub expected_global_member: MemberRecord,
+    pub expected_domain_member: DomainMemberRecord,
     pub expected_slot: PlacementSlot,
     pub expected_claim: ClaimGrant,
     pub slot: PlacementSlot,
@@ -164,7 +221,7 @@ pub struct MoveCommit {
 pub struct AutomaticBalanceSettings {
     pub globally_paused: bool,
     pub paused_entity_types: BTreeSet<EntityType>,
-    pub version: StateVersion,
+    pub version: PlacementVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,7 +254,7 @@ pub struct AdminOperationRecord {
     pub fingerprint: String,
     pub status: AdminOperationStatus,
     pub result: AdminOperationResult,
-    pub version: StateVersion,
+    pub version: PlacementVersion,
     pub created_unix_millis: u64,
     pub expires_unix_millis: u64,
 }
@@ -219,12 +276,6 @@ pub struct CreatePlanWithOperation {
 pub struct UpdatePlanWithOperation {
     pub expected_plan: RebalancePlan,
     pub plan: RebalancePlan,
-    pub operation: AdminOperationRecord,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoveMemberWithOperation {
-    pub expected_member: MemberRecord,
     pub operation: AdminOperationRecord,
 }
 

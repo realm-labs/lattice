@@ -1,38 +1,78 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
-use lattice_core::actor_ref::{EntityType, NodeIncarnation, SingletonKind};
+use lattice_core::actor_ref::{
+    ConfigFingerprint, EntityType, NodeIncarnation, PlacementDomainId, ProtocolId, SingletonKind,
+};
 use lattice_remoting::protocol::ProtocolDescriptor;
 use serde::{Deserialize, Serialize};
+
+use lattice_core::coordinator::CoordinatorScope;
 use thiserror::Error;
 
 use crate::region::EntityConfig;
-use crate::types::{CoordinatorTerm, MonotonicTime, NodeKey, ShardId, StateVersion};
+use crate::types::{
+    CoordinatorTerm, MembershipVersion, MonotonicTime, NodeKey, PlacementVersion, ShardId,
+};
+
+pub const COORDINATOR_PROTOCOL_GENERATION: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SingletonConfig {
+    pub domain: PlacementDomainId,
     pub kind: SingletonKind,
-    pub protocol_id: lattice_core::actor_ref::ProtocolId,
-    pub config_fingerprint: lattice_core::actor_ref::ConfigFingerprint,
+    pub protocol_id: ProtocolId,
+    config_fingerprint: ConfigFingerprint,
+}
+
+impl SingletonConfig {
+    pub fn new(domain: PlacementDomainId, kind: SingletonKind, protocol_id: ProtocolId) -> Self {
+        let mut canonical = Vec::new();
+        canonical.extend_from_slice(&(domain.as_str().len() as u32).to_be_bytes());
+        canonical.extend_from_slice(domain.as_str().as_bytes());
+        canonical.extend_from_slice(&(kind.as_str().len() as u32).to_be_bytes());
+        canonical.extend_from_slice(kind.as_str().as_bytes());
+        canonical.extend_from_slice(&protocol_id.get().to_be_bytes());
+        let config_fingerprint = ConfigFingerprint::new(*blake3::hash(&canonical).as_bytes());
+        Self {
+            domain,
+            kind,
+            protocol_id,
+            config_fingerprint,
+        }
+    }
+
+    pub fn fingerprint(&self) -> ConfigFingerprint {
+        self.config_fingerprint
+    }
+
+    pub fn validate(&self) -> bool {
+        Self::new(self.domain.clone(), self.kind.clone(), self.protocol_id).config_fingerprint
+            == self.config_fingerprint
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaderRecord {
+    pub scope: CoordinatorScope,
     pub node: NodeKey,
     pub protocol_generation: u64,
     pub term: CoordinatorTerm,
 }
 
-/// Exact lease-backed leadership identity required by every authoritative
-/// Coordinator storage commit.
+/// Exact lease-backed membership leadership identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeaderGuard {
+pub struct MembershipLeaderGuard {
     record: LeaderRecord,
 }
 
-impl LeaderGuard {
-    pub fn new(record: LeaderRecord) -> Self {
-        Self { record }
+impl MembershipLeaderGuard {
+    pub fn new(record: LeaderRecord) -> Result<Self, CoordinatorError> {
+        if record.scope != CoordinatorScope::Membership {
+            return Err(CoordinatorError::InvalidLeader);
+        }
+        record.validate()?;
+        Ok(Self { record })
     }
 
     pub fn record(&self) -> &LeaderRecord {
@@ -44,18 +84,95 @@ impl LeaderGuard {
     }
 }
 
+/// Exact lease-backed placement-domain leadership identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementLeaderGuard {
+    record: LeaderRecord,
+}
+
+pub(crate) trait ExactLeaderGuard {
+    fn record(&self) -> &LeaderRecord;
+
+    fn term(&self) -> CoordinatorTerm {
+        self.record().term
+    }
+
+    fn scope(&self) -> &CoordinatorScope {
+        &self.record().scope
+    }
+}
+
+impl ExactLeaderGuard for MembershipLeaderGuard {
+    fn record(&self) -> &LeaderRecord {
+        &self.record
+    }
+}
+
+impl ExactLeaderGuard for PlacementLeaderGuard {
+    fn record(&self) -> &LeaderRecord {
+        &self.record
+    }
+}
+
+impl PlacementLeaderGuard {
+    pub fn new(record: LeaderRecord) -> Result<Self, CoordinatorError> {
+        if !matches!(record.scope, CoordinatorScope::Placement(_)) {
+            return Err(CoordinatorError::InvalidLeader);
+        }
+        record.validate()?;
+        Ok(Self { record })
+    }
+
+    pub fn record(&self) -> &LeaderRecord {
+        &self.record
+    }
+
+    pub fn term(&self) -> CoordinatorTerm {
+        self.record.term
+    }
+
+    pub fn domain(&self) -> &PlacementDomainId {
+        let CoordinatorScope::Placement(domain) = &self.record.scope else {
+            unreachable!("placement guard constructor validates its scope")
+        };
+        domain
+    }
+}
+
+impl LeaderRecord {
+    pub fn validate(&self) -> Result<(), CoordinatorError> {
+        self.node
+            .validate()
+            .map_err(|_| CoordinatorError::InvalidLeader)?;
+        if self.protocol_generation != COORDINATOR_PROTOCOL_GENERATION {
+            return Err(CoordinatorError::InvalidLeader);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeHello {
+pub struct MemberHello {
     pub node: NodeKey,
     pub roles: BTreeSet<String>,
+    pub failure_domains: BTreeMap<String, String>,
+    pub protocols: Vec<ProtocolDescriptor>,
+    pub remoting_capabilities: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementDomainHello {
+    pub node: NodeKey,
+    pub domain: PlacementDomainId,
+    pub domain_config_fingerprint: ConfigFingerprint,
     pub capacity_units: u64,
     pub hosted_entity_types: BTreeSet<EntityType>,
     pub proxied_entity_types: BTreeSet<EntityType>,
     pub singleton_eligibility: BTreeSet<SingletonKind>,
     pub used_singletons: BTreeSet<SingletonKind>,
-    pub protocols: Vec<ProtocolDescriptor>,
     pub entity_configs: Vec<EntityConfig>,
     pub singleton_configs: Vec<SingletonConfig>,
+    pub constraints: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,10 +185,35 @@ pub enum MemberStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberRecord {
     pub node: NodeKey,
-    pub hello: NodeHello,
+    pub hello: MemberHello,
     pub status: MemberStatus,
-    pub version: StateVersion,
+    pub version: MembershipVersion,
     pub lease_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DomainMemberStatus {
+    Joining,
+    Up,
+    Leaving,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainMemberRecord {
+    pub node: NodeKey,
+    pub hello: PlacementDomainHello,
+    pub status: DomainMemberStatus,
+    pub version: PlacementVersion,
+}
+
+impl DomainMemberRecord {
+    pub fn validate(&self, limits: &SessionLimits) -> Result<(), CoordinatorError> {
+        self.hello.validate(limits)?;
+        if self.node != self.hello.node || self.version.domain != self.hello.domain {
+            return Err(CoordinatorError::InvalidDomainMember);
+        }
+        Ok(())
+    }
 }
 
 impl MemberRecord {
@@ -103,28 +245,30 @@ pub enum MemberChange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberEvent {
-    pub version: StateVersion,
+    pub version: MembershipVersion,
     pub change: MemberChange,
 }
 
-impl NodeHello {
+impl MemberHello {
     pub fn validate(&self, limits: &SessionLimits) -> Result<(), CoordinatorError> {
         self.node
             .validate()
             .map_err(|_| CoordinatorError::InvalidHello)?;
-        if self.capacity_units == 0
-            || self.roles.len() > limits.maximum_roles
-            || self.hosted_entity_types.len() > limits.maximum_entity_types
-            || self.proxied_entity_types.len() > limits.maximum_entity_types
-            || self.singleton_eligibility.len() > limits.maximum_singletons
-            || self.used_singletons.len() > limits.maximum_singletons
+        if self.roles.len() > limits.maximum_roles
+            || self.failure_domains.len() > limits.maximum_attributes
             || self.protocols.len() > limits.maximum_protocols
-            || self.entity_configs.len() > limits.maximum_entity_types
-            || self.singleton_configs.len() > limits.maximum_singletons
+            || self.remoting_capabilities.len() > limits.maximum_capabilities
             || self
                 .roles
                 .iter()
                 .any(|role| role.is_empty() || role.len() > 128)
+            || self.failure_domains.iter().any(|(key, value)| {
+                key.is_empty() || key.len() > 128 || value.is_empty() || value.len() > 256
+            })
+            || self
+                .remoting_capabilities
+                .iter()
+                .any(|capability| capability.is_empty() || capability.len() > 128)
         {
             return Err(CoordinatorError::InvalidHello);
         }
@@ -136,9 +280,63 @@ impl NodeHello {
         {
             return Err(CoordinatorError::InvalidHello);
         }
+        Ok(())
+    }
+}
+
+impl PlacementDomainHello {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        node: NodeKey,
+        domain: PlacementDomainId,
+        capacity_units: u64,
+        hosted_entity_types: BTreeSet<EntityType>,
+        proxied_entity_types: BTreeSet<EntityType>,
+        singleton_eligibility: BTreeSet<SingletonKind>,
+        used_singletons: BTreeSet<SingletonKind>,
+        entity_configs: Vec<EntityConfig>,
+        singleton_configs: Vec<SingletonConfig>,
+        constraints: BTreeMap<String, String>,
+    ) -> Self {
+        let domain_config_fingerprint = placement_domain_fingerprint(&domain);
+        Self {
+            node,
+            domain,
+            domain_config_fingerprint,
+            capacity_units,
+            hosted_entity_types,
+            proxied_entity_types,
+            singleton_eligibility,
+            used_singletons,
+            entity_configs,
+            singleton_configs,
+            constraints,
+        }
+    }
+
+    pub fn validate(&self, limits: &SessionLimits) -> Result<(), CoordinatorError> {
+        self.node
+            .validate()
+            .map_err(|_| CoordinatorError::InvalidHello)?;
+        if self.capacity_units == 0
+            || self.domain_config_fingerprint != placement_domain_fingerprint(&self.domain)
+            || self.hosted_entity_types.len() > limits.maximum_entity_types
+            || self.proxied_entity_types.len() > limits.maximum_entity_types
+            || self.singleton_eligibility.len() > limits.maximum_singletons
+            || self.used_singletons.len() > limits.maximum_singletons
+            || self.entity_configs.len() > limits.maximum_entity_types
+            || self.singleton_configs.len() > limits.maximum_singletons
+            || self.constraints.len() > limits.maximum_attributes
+            || self.constraints.iter().any(|(key, value)| {
+                key.is_empty() || key.len() > 128 || value.is_empty() || value.len() > 256
+            })
+        {
+            return Err(CoordinatorError::InvalidHello);
+        }
         let mut entity_types = BTreeSet::new();
         if self.entity_configs.iter().any(|config| {
             config.validate().is_err()
+                || config.domain != self.domain
                 || !entity_types.insert(config.entity_type.clone())
                 || !self.hosted_entity_types.contains(&config.entity_type)
         }) {
@@ -146,7 +344,9 @@ impl NodeHello {
         }
         let mut singleton_kinds = BTreeSet::new();
         if self.singleton_configs.iter().any(|config| {
-            !singleton_kinds.insert(config.kind.clone())
+            !config.validate()
+                || config.domain != self.domain
+                || !singleton_kinds.insert((config.domain.clone(), config.kind.clone()))
                 || !self.singleton_eligibility.contains(&config.kind)
         }) {
             return Err(CoordinatorError::InvalidHello);
@@ -160,9 +360,18 @@ impl NodeHello {
     }
 }
 
+fn placement_domain_fingerprint(domain: &PlacementDomainId) -> ConfigFingerprint {
+    let mut canonical = b"lattice-placement-domain-v1".to_vec();
+    canonical.extend_from_slice(&(domain.as_str().len() as u32).to_be_bytes());
+    canonical.extend_from_slice(domain.as_str().as_bytes());
+    ConfigFingerprint::new(*blake3::hash(&canonical).as_bytes())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLimits {
     pub maximum_roles: usize,
+    pub maximum_attributes: usize,
+    pub maximum_capabilities: usize,
     pub maximum_entity_types: usize,
     pub maximum_singletons: usize,
     pub maximum_protocols: usize,
@@ -172,6 +381,8 @@ impl Default for SessionLimits {
     fn default() -> Self {
         Self {
             maximum_roles: 32,
+            maximum_attributes: 64,
+            maximum_capabilities: 64,
             maximum_entity_types: 256,
             maximum_singletons: 256,
             maximum_protocols: 1024,
@@ -225,9 +436,15 @@ pub struct SnapshotRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotVersion {
+    Membership(MembershipVersion),
+    Placement(PlacementVersion),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotBegin {
     pub snapshot_id: u128,
-    pub version: StateVersion,
+    pub version: SnapshotVersion,
     pub record_count: usize,
     pub total_bytes: usize,
     pub chunk_count: usize,
@@ -244,17 +461,17 @@ pub struct SnapshotChunk {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotEnd {
     pub snapshot_id: u128,
-    pub version: StateVersion,
+    pub version: SnapshotVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotInstall {
-    pub version: StateVersion,
+    pub version: SnapshotVersion,
     pub records: Vec<SnapshotRecord>,
 }
 
 pub fn build_snapshot(
-    version: StateVersion,
+    version: SnapshotVersion,
     mut records: Vec<SnapshotRecord>,
     limits: &SnapshotLimits,
 ) -> Result<(SnapshotBegin, Vec<SnapshotChunk>, SnapshotEnd), CoordinatorError> {
@@ -307,7 +524,7 @@ pub fn build_snapshot(
     }
     let begin = SnapshotBegin {
         snapshot_id,
-        version,
+        version: version.clone(),
         record_count: chunks.iter().map(|chunk| chunk.records.len()).sum(),
         total_bytes,
         chunk_count: chunks.len(),
@@ -421,77 +638,58 @@ fn snapshot_digest(records: &[SnapshotRecord]) -> [u8; 32] {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordinatorDelta {
-    pub version: StateVersion,
+    pub version: PlacementVersion,
     pub records: Vec<SnapshotRecord>,
 }
 
 #[derive(Debug, Default)]
-pub struct CoordinatorSession {
-    version: Option<StateVersion>,
+pub struct MembershipState {
+    version: Option<MembershipVersion>,
     records: BTreeMap<String, Bytes>,
     ready: bool,
 }
 
-impl CoordinatorSession {
-    pub fn install(&mut self, snapshot: SnapshotInstall) -> Result<(), CoordinatorError> {
+impl MembershipState {
+    pub fn install(&mut self, snapshot: SnapshotInstall) -> Result<(), MembershipStateError> {
+        let SnapshotVersion::Membership(version) = snapshot.version else {
+            return Err(MembershipStateError::UnexpectedSnapshot);
+        };
         if self.version.is_some_and(|current| {
-            snapshot.version.term < current.term
-                || (snapshot.version.term == current.term
-                    && snapshot.version.revision < current.revision)
+            version.term < current.term
+                || (version.term == current.term && version.revision < current.revision)
         }) {
             self.ready = false;
-            return Err(CoordinatorError::StaleTerm);
+            return Err(MembershipStateError::StaleTerm);
         }
         let mut records = BTreeMap::new();
         for record in snapshot.records {
             if records.insert(record.key, record.value).is_some() {
-                return Err(CoordinatorError::DuplicateRecord);
+                return Err(MembershipStateError::DuplicateRecord);
             }
         }
+        self.version = Some(version);
         self.records = records;
-        self.version = Some(snapshot.version);
         self.ready = true;
         Ok(())
     }
 
-    pub fn apply_delta(&mut self, delta: CoordinatorDelta) -> Result<(), CoordinatorError> {
-        let current = self.version.ok_or(CoordinatorError::SnapshotRequired)?;
-        if !current.accepts_delta_after(delta.version) {
-            self.ready = false;
-            return if delta.version.term > current.term {
-                Err(CoordinatorError::SnapshotRequired)
-            } else if delta.version.term < current.term {
-                Err(CoordinatorError::StaleTerm)
-            } else {
-                Err(CoordinatorError::RevisionGap)
-            };
-        }
-        let mut next = self.records.clone();
-        for record in delta.records {
-            next.insert(record.key, record.value);
-        }
-        self.records = next;
-        self.version = Some(delta.version);
-        Ok(())
-    }
-
-    pub fn apply_member_event(&mut self, event: MemberEvent) -> Result<(), CoordinatorError> {
-        let current = self.version.ok_or(CoordinatorError::SnapshotRequired)?;
+    pub fn apply(&mut self, event: MemberEvent) -> Result<(), MembershipStateError> {
+        let current = self.version.ok_or(MembershipStateError::SnapshotRequired)?;
         if !current.accepts_delta_after(event.version) {
             self.ready = false;
             return if event.version.term > current.term {
-                Err(CoordinatorError::SnapshotRequired)
+                Err(MembershipStateError::SnapshotRequired)
             } else if event.version.term < current.term {
-                Err(CoordinatorError::StaleTerm)
+                Err(MembershipStateError::StaleTerm)
             } else {
-                Err(CoordinatorError::RevisionGap)
+                Err(MembershipStateError::RevisionGap)
             };
         }
         match event.change {
             MemberChange::Upsert(member) => {
                 let key = format!("member/{}", member.node.node_id);
                 let value =
-                    serde_json::to_vec(&member).map_err(|_| CoordinatorError::MemberCodec)?;
+                    serde_json::to_vec(&member).map_err(|_| MembershipStateError::MemberCodec)?;
                 self.records.insert(key, Bytes::from(value));
             }
             MemberChange::Removed { node, .. } => {
@@ -510,7 +708,7 @@ impl CoordinatorSession {
         Ok(())
     }
 
-    pub fn version(&self) -> Option<StateVersion> {
+    pub fn version(&self) -> Option<MembershipVersion> {
         self.version
     }
 
@@ -523,6 +721,129 @@ impl CoordinatorSession {
     pub fn ready(&self) -> bool {
         self.ready
     }
+
+    pub fn member(&self, node: &NodeKey) -> Option<MemberRecord> {
+        self.records
+            .get(&format!("member/{}", node.node_id))
+            .and_then(|value| serde_json::from_slice(value).ok())
+            .filter(|member: &MemberRecord| member.node == *node)
+    }
+}
+
+#[derive(Debug)]
+pub struct PlacementDomainState {
+    domain: PlacementDomainId,
+    version: Option<PlacementVersion>,
+    records: BTreeMap<String, Bytes>,
+    ready: bool,
+}
+
+impl PlacementDomainState {
+    pub fn new(domain: PlacementDomainId) -> Self {
+        Self {
+            domain,
+            version: None,
+            records: BTreeMap::new(),
+            ready: false,
+        }
+    }
+
+    pub fn install(&mut self, snapshot: SnapshotInstall) -> Result<(), PlacementDomainStateError> {
+        let SnapshotVersion::Placement(version) = snapshot.version else {
+            return Err(PlacementDomainStateError::UnexpectedSnapshot);
+        };
+        if version.domain != self.domain {
+            return Err(PlacementDomainStateError::DomainMismatch);
+        }
+        if self.version.as_ref().is_some_and(|current| {
+            version.term < current.term
+                || (version.term == current.term && version.revision < current.revision)
+        }) {
+            self.ready = false;
+            return Err(PlacementDomainStateError::StaleTerm);
+        }
+        let mut records = BTreeMap::new();
+        for record in snapshot.records {
+            if records.insert(record.key, record.value).is_some() {
+                return Err(PlacementDomainStateError::DuplicateRecord);
+            }
+        }
+        self.version = Some(version);
+        self.records = records;
+        self.ready = true;
+        Ok(())
+    }
+
+    pub fn apply(&mut self, delta: CoordinatorDelta) -> Result<(), PlacementDomainStateError> {
+        if delta.version.domain != self.domain {
+            return Err(PlacementDomainStateError::DomainMismatch);
+        }
+        let current = self
+            .version
+            .as_ref()
+            .ok_or(PlacementDomainStateError::SnapshotRequired)?;
+        if !current.accepts_delta_after(&delta.version) {
+            self.ready = false;
+            return if delta.version.term > current.term {
+                Err(PlacementDomainStateError::SnapshotRequired)
+            } else if delta.version.term < current.term {
+                Err(PlacementDomainStateError::StaleTerm)
+            } else {
+                Err(PlacementDomainStateError::RevisionGap)
+            };
+        }
+        for record in delta.records {
+            self.records.insert(record.key, record.value);
+        }
+        self.version = Some(delta.version);
+        Ok(())
+    }
+
+    pub fn version(&self) -> Option<&PlacementVersion> {
+        self.version.as_ref()
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = (&str, &Bytes)> {
+        self.records
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+    }
+
+    pub fn ready(&self) -> bool {
+        self.ready
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum MembershipStateError {
+    #[error("membership snapshot is required")]
+    SnapshotRequired,
+    #[error("membership revision gap requires a snapshot")]
+    RevisionGap,
+    #[error("membership state belongs to a stale term")]
+    StaleTerm,
+    #[error("membership snapshot contains a duplicate key")]
+    DuplicateRecord,
+    #[error("membership record codec failed")]
+    MemberCodec,
+    #[error("placement snapshot cannot be installed in membership state")]
+    UnexpectedSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PlacementDomainStateError {
+    #[error("placement-domain snapshot is required")]
+    SnapshotRequired,
+    #[error("placement-domain revision gap requires a snapshot")]
+    RevisionGap,
+    #[error("placement-domain state belongs to a stale term")]
+    StaleTerm,
+    #[error("placement-domain snapshot contains a duplicate key")]
+    DuplicateRecord,
+    #[error("placement snapshot belongs to another domain")]
+    DomainMismatch,
+    #[error("membership snapshot cannot be installed in placement-domain state")]
+    UnexpectedSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -635,12 +956,16 @@ impl LoadTable {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CoordinatorError {
+    #[error("Coordinator leader record is invalid or uses an unsupported generation")]
+    InvalidLeader,
     #[error("Coordinator session limits are invalid")]
     InvalidLimits,
     #[error("node registration is invalid or over its bounds")]
     InvalidHello,
     #[error("member record is invalid")]
     InvalidMember,
+    #[error("placement-domain member record is invalid")]
+    InvalidDomainMember,
     #[error("member record codec failed")]
     MemberCodec,
     #[error("snapshot exceeds its configured bounds")]
@@ -668,46 +993,72 @@ mod state_version_tests {
     use super::*;
     use crate::types::{CoordinatorTerm, Revision};
 
-    fn version(term: u64, revision: u64) -> StateVersion {
-        StateVersion::new(
+    fn version(term: u64, revision: u64) -> PlacementVersion {
+        PlacementVersion::new(
+            PlacementDomainId::new("test").unwrap(),
             CoordinatorTerm::new(term).unwrap(),
             Revision::new(revision).unwrap(),
         )
     }
 
     #[test]
+    fn singleton_config_fingerprint_has_a_domain_scoped_golden_vector() {
+        let config = SingletonConfig::new(
+            PlacementDomainId::new("battle").unwrap(),
+            SingletonKind::new("scheduler").unwrap(),
+            ProtocolId::new(0x1112_1314_1516_1718).unwrap(),
+        );
+        assert_eq!(
+            *config.fingerprint().as_bytes(),
+            [
+                217, 135, 248, 93, 126, 177, 148, 200, 159, 106, 130, 175, 125, 104, 218, 226, 30,
+                96, 2, 62, 254, 44, 79, 26, 117, 71, 189, 8, 177, 11, 237, 216,
+            ]
+        );
+        assert_ne!(
+            config.fingerprint(),
+            SingletonConfig::new(
+                PlacementDomainId::new("world").unwrap(),
+                config.kind.clone(),
+                config.protocol_id,
+            )
+            .fingerprint()
+        );
+    }
+
+    #[test]
     fn higher_term_delta_requires_snapshot_and_lower_term_snapshot_is_stale() {
-        let mut session = CoordinatorSession::default();
+        let mut session = PlacementDomainState::new(PlacementDomainId::new("test").unwrap());
         session
             .install(SnapshotInstall {
-                version: version(1, 7),
+                version: SnapshotVersion::Placement(version(1, 7)),
                 records: Vec::new(),
             })
             .unwrap();
         assert_eq!(
             session
-                .apply_delta(CoordinatorDelta {
+                .apply(CoordinatorDelta {
                     version: version(2, 8),
                     records: Vec::new(),
                 })
                 .unwrap_err(),
-            CoordinatorError::SnapshotRequired
+            PlacementDomainStateError::SnapshotRequired
         );
         assert!(!session.ready());
         session
             .install(SnapshotInstall {
-                version: version(2, 8),
+                version: SnapshotVersion::Placement(version(2, 8)),
                 records: Vec::new(),
             })
             .unwrap();
         assert_eq!(
             session
                 .install(SnapshotInstall {
-                    version: version(1, 9),
+                    version: SnapshotVersion::Placement(version(1, 9)),
                     records: Vec::new(),
                 })
                 .unwrap_err(),
-            CoordinatorError::StaleTerm
+            PlacementDomainStateError::StaleTerm
         );
         assert!(!session.ready());
     }

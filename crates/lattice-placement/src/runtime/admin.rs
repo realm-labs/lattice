@@ -1,14 +1,15 @@
 use super::membership::plan_priority;
 use super::{
-    BTreeMap, CoordinatorInspection, CoordinatorLeader, CoordinatorOperation,
-    CoordinatorRuntimeError, CoordinatorStore, ForceRemoveRequest, Instant,
-    ManualRelocationRequest, MoveProgress, NodeKey, PlacementSlotKey, PlacementSlotState,
-    PlanReason, PlanStatus, RebalancePlan, RebalanceProposal, RebalanceTrigger,
+    BTreeMap, CoordinatorInspection, CoordinatorLeaseStore, CoordinatorOperation,
+    CoordinatorRuntimeError, ForceRemoveRequest, Instant, ManualRelocationRequest, MembershipStore,
+    MoveProgress, NodeKey, PlacementDomainLeader, PlacementDomainStore, PlacementSlotKey,
+    PlacementSlotState, PlanReason, PlanStatus, RebalancePlan, RebalanceProposal, RebalanceTrigger,
+    ScopedElectionStore,
 };
 use crate::storage::domain::{
     AdminOperationRecord, AdminOperationResult, AdminOperationStatus, AutomaticBalanceSettings,
     CommitAutomaticSettings, CompactAdminOperations, CreatePlan, CreatePlanWithOperation,
-    RecordAdminOperation, RemoveMemberWithOperation, UpdatePlan, UpdatePlanWithOperation,
+    RecordAdminOperation, UpdatePlan, UpdatePlanWithOperation,
 };
 
 struct PlanAdminContext {
@@ -17,7 +18,10 @@ struct PlanAdminContext {
     evaluation: bool,
 }
 
-impl<S: CoordinatorStore> CoordinatorLeader<S> {
+impl<S> PlacementDomainLeader<S>
+where
+    S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
+{
     pub(super) async fn handle_operation(
         &mut self,
         operation: CoordinatorOperation,
@@ -162,7 +166,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .unwrap_or(AutomaticBalanceSettings {
                 globally_paused: false,
                 paused_entity_types: Default::default(),
-                version: self.version,
+                version: self.version.clone(),
             });
         match entity_type {
             Some(entity_type) if paused => {
@@ -173,12 +177,12 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             }
             None => settings.globally_paused = paused,
         }
-        settings.version = self.version;
+        settings.version = self.version.clone();
         let operation = self.new_admin_operation(
             operation_id,
             fingerprint,
             AdminOperationResult::AutomaticBalanceUpdated,
-            self.version,
+            self.version.clone(),
         )?;
         lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::AdminBeforeGuardedCommit);
         let settings = self
@@ -228,6 +232,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             return Err(CoordinatorRuntimeError::ShardOutOfRange);
         }
         let key = PlacementSlotKey::Shard {
+            domain: config.domain.clone(),
             entity_type: request.entity_type.clone(),
             shard_id: request.shard_id,
         };
@@ -250,8 +255,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .sessions
             .values()
             .find(|session| {
-                session.record.status == crate::coordinator::MemberStatus::Up
-                    && session.hello.node.node_id == request.target_node_id
+                session.placement_up() && session.hello.node.node_id == request.target_node_id
             })
             .map(|session| session.hello.node.clone())
             .ok_or(CoordinatorRuntimeError::IneligibleTarget)?;
@@ -263,15 +267,17 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             ))
             .ok_or(CoordinatorRuntimeError::UnknownStrategy)?;
         let proposal = RebalanceProposal {
+            domain: config.domain.clone(),
             policy_id: strategy.policy_id(),
             policy_version: strategy.policy_version(),
-            base_version: self.version,
+            base_version: self.version.clone(),
             trigger: RebalanceTrigger::Manual {
                 source: Some(source.clone()),
                 target: Some(target.clone()),
                 bypass_improvement: true,
             },
             moves: vec![crate::allocation::ProposedMove {
+                domain: config.domain.clone(),
                 entity_type: request.entity_type.clone(),
                 shard_id: request.shard_id,
                 expected_generation: request.expected_generation,
@@ -321,6 +327,11 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             return Err(CoordinatorRuntimeError::StaleMember);
         }
         self.reserve_admin_operation_capacity().await?;
+        self.remove_member(
+            member,
+            crate::coordinator::MemberRemovalReason::ForceRemoved,
+        )
+        .await?;
         let version = self.next_version()?;
         let operation = self.new_admin_operation(
             request.operation_id,
@@ -329,36 +340,30 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 node_id: request.node_id,
                 incarnation: request.expected_incarnation,
             },
-            version,
+            version.clone(),
         )?;
         self.store
-            .remove_member_with_operation(
+            .record_admin_operation(
                 &self.leader_guard,
-                RemoveMemberWithOperation {
-                    expected_member: member.clone(),
+                RecordAdminOperation {
                     operation: operation.clone(),
                 },
             )
             .await?;
+        self.version = version;
         self.applied_admin_operations
             .insert(operation.operation_id.clone(), operation);
-        self.finish_member_removal(
-            member,
-            crate::coordinator::MemberRemovalReason::ForceRemoved,
-            version,
-        )
-        .await?;
         self.compact_admin_operation_history().await
     }
 
     pub(super) async fn inspect(&self) -> Result<CoordinatorInspection, CoordinatorRuntimeError> {
         let now = Instant::now();
         Ok(CoordinatorInspection {
-            version: self.version,
+            version: self.version.clone(),
             automatic_globally_paused: self.automatic_globally_paused,
             paused_entity_types: self.paused_entity_types.iter().cloned().collect(),
-            slots: self.store.list_slots().await?,
-            plans: self.store.list_plans().await?,
+            slots: self.store.list_slots(&self.version.domain).await?,
+            plans: self.store.list_plans(&self.version.domain).await?,
             reconciliation_backlog: self.reconciliation.backlog,
             reconciliation_oldest_pending_millis: self.reconciliation.oldest_pending.map(
                 |started| {
@@ -376,7 +381,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 .iter()
                 .map(|(key, reason)| (key.clone(), reason.clone()))
                 .collect(),
-            durable_limits: self.store.durable_limits(),
+            durable_limits: self.store.durable_limits(&self.version.domain),
             retained_admin_operations: self.applied_admin_operations.len(),
             leadership_loss_count: self.leadership_loss_count,
             commit_conflict_count: self.commit_conflict_count,
@@ -410,7 +415,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         operation_id: String,
         fingerprint: String,
         result: AdminOperationResult,
-        version: crate::types::StateVersion,
+        version: crate::types::PlacementVersion,
     ) -> Result<AdminOperationRecord, CoordinatorRuntimeError> {
         if self.applied_admin_operations.len() >= self.config.maximum_admin_operation_records {
             return Err(CoordinatorRuntimeError::OperationCapacity);
@@ -525,7 +530,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             ))
             .cloned()
             .ok_or(CoordinatorRuntimeError::UnknownStrategy)?;
-        let view = self.placement_view().await?;
+        let view = self.placement_view(&config.domain).await?;
         let proposal = strategy
             .rebalance(
                 &entity_type,
@@ -578,7 +583,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             ))
             .cloned()
             .ok_or(CoordinatorRuntimeError::UnknownStrategy)?;
-        let view = self.placement_view().await?;
+        let view = self.placement_view(&config.domain).await?;
         let proposal = strategy
             .rebalance(
                 &entity_type,
@@ -594,7 +599,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 operation_id,
                 fingerprint,
                 AdminOperationResult::EvaluationCompleted { plan_id: None },
-                self.version,
+                self.version.clone(),
             )?;
             self.persist_admin_operation(operation).await?;
             return Ok(None);
@@ -671,7 +676,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                     admin.operation_id,
                     admin.fingerprint,
                     result,
-                    self.version,
+                    self.version.clone(),
                 )
             })
             .transpose()?;
@@ -768,6 +773,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         }
         for movement in &plan.moves {
             let key = PlacementSlotKey::Shard {
+                domain: plan.domain.clone(),
                 entity_type: plan.entity_type.clone(),
                 shard_id: movement.shard_id,
             };
@@ -788,7 +794,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 .sessions
                 .get(&movement.target.incarnation)
                 .filter(|session| {
-                    session.record.status == crate::coordinator::MemberStatus::Up
+                    session.placement_up()
                         && session.hello.node == movement.target
                         && session
                             .hello
@@ -839,7 +845,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             operation_id,
             fingerprint,
             AdminOperationResult::PendingMoveCancelled { plan_id, shard_id },
-            self.version,
+            self.version.clone(),
         )?;
         self.store
             .update_plan_with_operation(

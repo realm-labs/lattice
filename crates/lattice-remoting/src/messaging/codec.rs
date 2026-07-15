@@ -6,8 +6,8 @@ use super::target::{
 };
 use super::{
     ActivationId, ActorPath, ActorRef, Bytes, ClusterId, ConfigFingerprint, Duration, EntityId,
-    EntityRef, EntityType, Frame, FrameKind, Message, NodeAddress, NodeIncarnation, ProtocolId,
-    SingletonKind, SingletonRef,
+    EntityRef, EntityType, Frame, FrameKind, Message, NodeAddress, NodeIncarnation,
+    PlacementDomainId, ProtocolId, SingletonKind, SingletonRef,
 };
 
 pub fn ask_correlation(frame: &Frame) -> Option<CorrelationId> {
@@ -289,6 +289,8 @@ pub(super) struct EntityTargetWire {
     pub(super) config_fingerprint: Vec<u8>,
     #[prost(uint64, tag = "9")]
     pub(super) assignment_generation: u64,
+    #[prost(string, tag = "10")]
+    pub(super) domain: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -339,6 +341,8 @@ pub(super) struct SingletonTargetWire {
     pub(super) config_fingerprint: Vec<u8>,
     #[prost(uint64, tag = "8")]
     pub(super) assignment_generation: u64,
+    #[prost(string, tag = "9")]
+    pub(super) domain: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -447,6 +451,7 @@ pub(super) fn entity_target_to_wire(target: &LogicalEntityTarget) -> EntityTarge
         owner_host: target.owner_address.host().to_owned(),
         owner_port: u32::from(target.owner_address.port()),
         owner_incarnation: target.owner_incarnation.get().to_be_bytes().to_vec(),
+        domain: target.reference.domain().as_str().to_owned(),
         entity_type: target.reference.entity_type().as_str().to_owned(),
         entity_id: target.reference.entity_id().as_bytes().to_vec(),
         protocol_id: target.reference.protocol_id().get(),
@@ -471,6 +476,7 @@ pub(super) fn entity_target_from_wire(
     Ok(LogicalEntityTarget {
         reference: EntityRef::new(
             ClusterId::new(wire.cluster_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
+            PlacementDomainId::new(wire.domain).map_err(|_| RemoteMessageError::InvalidPayload)?,
             EntityType::new(wire.entity_type).map_err(|_| RemoteMessageError::InvalidPayload)?,
             EntityId::new(wire.entity_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
             ProtocolId::new(wire.protocol_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
@@ -490,6 +496,7 @@ pub(super) fn singleton_target_to_wire(target: &LogicalSingletonTarget) -> Singl
         owner_host: target.owner_address.host().to_owned(),
         owner_port: u32::from(target.owner_address.port()),
         owner_incarnation: target.owner_incarnation.get().to_be_bytes().to_vec(),
+        domain: target.reference.domain().as_str().to_owned(),
         singleton_kind: target.reference.singleton_kind().as_str().to_owned(),
         protocol_id: target.reference.protocol_id().get(),
         config_fingerprint: target.reference.config_fingerprint().as_bytes().to_vec(),
@@ -513,6 +520,7 @@ pub(super) fn singleton_target_from_wire(
     Ok(LogicalSingletonTarget {
         reference: SingletonRef::new(
             ClusterId::new(wire.cluster_id).map_err(|_| RemoteMessageError::InvalidPayload)?,
+            PlacementDomainId::new(wire.domain).map_err(|_| RemoteMessageError::InvalidPayload)?,
             SingletonKind::new(wire.singleton_kind)
                 .map_err(|_| RemoteMessageError::InvalidPayload)?,
             ProtocolId::new(wire.protocol_id).map_err(|_| RemoteMessageError::InvalidPayload)?,

@@ -3,10 +3,11 @@ use std::pin::Pin;
 use futures_util::Stream;
 use futures_util::stream;
 use lattice_core::actor_ref::NodeAddress;
+use lattice_core::coordinator::CoordinatorScope;
 
 use crate::provider::{
-    ClusterDiscovery, DiscoveryError, DiscoveryOrigin, DiscoverySnapshot, DiscoverySource,
-    DiscoveryTarget, validate_snapshot,
+    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
+    DiscoverySource, DiscoveryTarget, validate_snapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,11 +19,12 @@ pub struct StaticEndpoint {
 
 #[derive(Debug, Clone)]
 pub struct StaticDiscovery {
-    snapshot: DiscoverySnapshot,
+    snapshot: CoordinatorDirectorySnapshot,
 }
 
 impl StaticDiscovery {
     pub fn new(
+        scope: CoordinatorScope,
         name: impl Into<String>,
         endpoints: Vec<StaticEndpoint>,
     ) -> Result<Self, DiscoveryError> {
@@ -41,7 +43,8 @@ impl StaticDiscovery {
                 priority: endpoint.priority,
             })
             .collect();
-        let snapshot = DiscoverySnapshot {
+        let snapshot = CoordinatorDirectorySnapshot {
+            scope,
             generation: 1,
             targets,
         };
@@ -50,10 +53,15 @@ impl StaticDiscovery {
     }
 }
 
-impl ClusterDiscovery for StaticDiscovery {
+impl CoordinatorDiscovery for StaticDiscovery {
+    fn scope(&self) -> &CoordinatorScope {
+        &self.snapshot.scope
+    }
+
     fn snapshots(
         &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<DiscoverySnapshot, DiscoveryError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Stream<Item = Result<CoordinatorDirectorySnapshot, DiscoveryError>> + Send + '_>>
+    {
         Box::pin(stream::once(async { Ok(self.snapshot.clone()) }))
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -8,12 +9,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::STORAGE_SCHEMA_GENERATION;
+use crate::coordinator::SingletonConfig;
 use crate::plan::{MoveProgress, PlanStatus, RebalancePlan};
+use crate::region::EntityConfig;
 use crate::storage::domain::DurableStorageLimits;
-use crate::types::{ClaimGrant, PlacementSlot, PlacementSlotKey, PlacementSlotState, ShardId};
+use crate::types::{CoordinatorTerm, PlacementSlot, PlacementSlotState, PlacementVersion};
+use lattice_core::actor_ref::PlacementDomainId;
 
-const MIGRATING_SCHEMA: &str = "migrating-to-4";
+const MIGRATING_SCHEMA: &str = "migrating-to-5";
 const MIGRATION_LOCK_TTL_SECONDS: i64 = 300;
+// etcd defaults to 128 operations per transaction. Each target contributes
+// one compare and one put in addition to the common fencing comparisons.
+const MIGRATION_TXN_TARGET_BATCH: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationMode {
@@ -37,6 +44,13 @@ pub struct MigrationConfig {
     pub limits: DurableStorageLimits,
     /// Required for apply. Resume uses the backup recorded by apply.
     pub backup_path: Option<PathBuf>,
+    pub mapping: MigrationDomainMapping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationDomainMapping {
+    pub entity_types: BTreeMap<String, PlacementDomainId>,
+    pub singleton_kinds: BTreeMap<String, PlacementDomainId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -75,26 +89,39 @@ struct MigrationMarker {
     limits: DurableStorageLimits,
     completed: bool,
     backup_path: String,
+    mapping: MigrationDomainMapping,
 }
 
 #[derive(Debug, Error)]
 pub enum MigrationError {
     #[error("migration configuration is invalid")]
     InvalidConfig,
-    #[error("generation-3 storage is required")]
+    #[error("generation-4 storage is required")]
     WrongGeneration,
     #[error("migration must run while no Coordinator leader exists")]
     LeaderPresent,
+    #[error("migration requires all member and claim leases to be absent")]
+    LiveLeasePresent,
+    #[error("migration requires every handoff to be completed or cancelled")]
+    ActiveHandoff,
+    #[error("a generation-5 destination key already contains a different record")]
+    Collision,
     #[error("migration marker does not match the requested limits or term")]
     MarkerMismatch,
     #[error("another migration holds the lease-backed migration lock")]
     Locked,
-    #[error("a record cannot be converted to generation 4")]
+    #[error("a record cannot be converted to generation 5")]
     InvalidRecord,
+    #[error("every entity type and singleton kind requires an explicit placement-domain mapping")]
+    UnmappedType,
     #[error("configured durable cardinality is too small for existing records")]
     Capacity,
     #[error("migration compare failed; rerun with resume after inspecting storage")]
     CompareFailed,
+    #[error("migration record/progress compare failed; rerun with resume after inspecting storage")]
+    ProgressCompareFailed,
+    #[error("migration finalization compare failed; storage remains resumable")]
+    FinalizeCompareFailed,
     #[error("etcd migration request failed")]
     Etcd(#[from] etcd_client::Error),
     #[error("migration backup/export failed")]
@@ -122,10 +149,10 @@ pub async fn execute(
         .map(|record| record.value.as_slice())
         .ok_or(MigrationError::WrongGeneration)?;
     let schema_allowed = match mode {
-        MigrationMode::Apply => schema_value == b"3",
+        MigrationMode::Apply => schema_value == b"4",
         MigrationMode::Resume => schema_value == MIGRATING_SCHEMA.as_bytes(),
         MigrationMode::Inspect | MigrationMode::DryRun => {
-            schema_value == b"3" || schema_value == MIGRATING_SCHEMA.as_bytes()
+            schema_value == b"4" || schema_value == MIGRATING_SCHEMA.as_bytes()
         }
     };
     if !schema_allowed {
@@ -152,6 +179,7 @@ pub async fn execute(
         None,
     )
     .await?;
+    validate_full_stop(&config.cluster_prefix, &records)?;
     let has_state_records = records.iter().any(|record| {
         record_suffix(&config.cluster_prefix, &record.key).is_ok_and(|suffix| {
             suffix.starts_with("members/")
@@ -169,17 +197,18 @@ pub async fn execute(
     if has_state_records && term_record.is_none() {
         return Err(MigrationError::InvalidRecord);
     }
-    let marker_key = key(&config.cluster_prefix, "migration/generation-3-to-4");
-    let lock_key = key(&config.cluster_prefix, "migration/generation-3-to-4-lock");
+    let marker_key = key(&config.cluster_prefix, "migration/generation-4-to-5");
+    let lock_key = key(&config.cluster_prefix, "migration/generation-4-to-5-lock");
     let existing_marker = read_one(&mut client, &marker_key).await?;
     let mut marker = existing_marker
         .as_ref()
         .map(|record| serde_json::from_slice::<MigrationMarker>(&record.value))
         .transpose()?;
-    if marker
-        .as_ref()
-        .is_some_and(|marker| marker.coordinator_term != term || marker.limits != config.limits)
-    {
+    if marker.as_ref().is_some_and(|marker| {
+        marker.coordinator_term != term
+            || marker.limits != config.limits
+            || marker.mapping != config.mapping
+    }) {
         return Err(MigrationError::MarkerMismatch);
     }
     match mode {
@@ -222,6 +251,7 @@ pub async fn execute(
             limits: config.limits,
             completed: false,
             backup_path,
+            mapping: config.mapping.clone(),
         };
         let current_marker = if matches!(mode, MigrationMode::Apply) {
             initial.clone()
@@ -240,7 +270,7 @@ pub async fn execute(
         compares.push(term_compare(&term_key, term_record.as_ref(), term));
         let mut puts = Vec::new();
         if matches!(mode, MigrationMode::Apply) {
-            compares.push(Compare::value(schema_key.clone(), CompareOp::Equal, "3"));
+            compares.push(Compare::value(schema_key.clone(), CompareOp::Equal, "4"));
             compares.push(Compare::version(marker_key.clone(), CompareOp::Equal, 0));
             puts.push(TxnOp::put(schema_key.clone(), MIGRATING_SCHEMA, None));
             puts.push(TxnOp::put(
@@ -254,10 +284,18 @@ pub async fn execute(
                 CompareOp::Equal,
                 MIGRATING_SCHEMA,
             ));
-            compares.push(Compare::value(
+            compares.push(Compare::mod_revision(
                 marker_key.clone(),
                 CompareOp::Equal,
+                existing_marker
+                    .as_ref()
+                    .ok_or(MigrationError::MarkerMismatch)?
+                    .mod_revision,
+            ));
+            puts.push(TxnOp::put(
+                marker_key.clone(),
                 serde_json::to_vec(&current_marker)?,
+                None,
             ));
         }
         puts.push(TxnOp::put(
@@ -299,7 +337,6 @@ pub async fn execute(
     };
     let mut entity_configs = std::collections::BTreeMap::new();
     let mut singleton_configs = std::collections::BTreeMap::new();
-    let mut prepared = std::collections::BTreeMap::new();
     for record in &records {
         let suffix = record_suffix(&config.cluster_prefix, &record.key)?;
         update_counts(
@@ -309,25 +346,103 @@ pub async fn execute(
             &mut entity_configs,
             &mut singleton_configs,
         )?;
-        if skip_key(suffix) {
-            continue;
-        }
-        report.scanned_records = report.scanned_records.saturating_add(1);
-        let transformed = transform_record(suffix, &record.value, term)?;
-        if transformed.is_some()
-            || suffix.starts_with("members/")
-            || suffix.starts_with("shards/")
-            || suffix.starts_with("singletons/")
-            || suffix.starts_with("rebalances/")
+        collect_legacy_config_record(
+            suffix,
+            &record.value,
+            &mut entity_configs,
+            &mut singleton_configs,
+        )?;
+    }
+    validate_mapping(&entity_configs, &singleton_configs, &config.mapping)?;
+    let (config_targets, entity_fingerprints) = build_config_targets(
+        &config.cluster_prefix,
+        &entity_configs,
+        &singleton_configs,
+        &config.mapping,
+    )?;
+    let config_writer = records.iter().find(|record| {
+        record_suffix(&config.cluster_prefix, &record.key).is_ok_and(|suffix| {
+            suffix.starts_with("members/")
+                || suffix.starts_with("entity_types/")
+                || suffix.starts_with("singleton_types/")
+        })
+    });
+    let existing = records
+        .iter()
+        .map(|record| (record.key.as_str(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut prepared = BTreeMap::new();
+    for (target, value) in &config_targets {
+        if let Some(current) = existing.get(target.as_str())
+            && (schema_value == b"4" || current.value != *value)
         {
-            prepared.insert(
-                record.key.clone(),
-                transformed.unwrap_or_else(|| record.value.clone()),
-            );
+            return Err(MigrationError::Collision);
         }
     }
-    quarantine_transitional_records(&config.cluster_prefix, &records, &mut prepared, &mut report)?;
+    for record in &records {
+        let suffix = record_suffix(&config.cluster_prefix, &record.key)?;
+        if let Some(operation) = prepare_record(
+            &config.cluster_prefix,
+            suffix,
+            &record.value,
+            &config.mapping,
+            &entity_fingerprints,
+            BTreeMap::new(),
+            term,
+        )? {
+            for (target, value) in &operation.targets {
+                if let Some(current) = existing.get(target.as_str())
+                    && (schema_value == b"4" || current.value != *value)
+                {
+                    return Err(MigrationError::Collision);
+                }
+            }
+            report.scanned_records = report.scanned_records.saturating_add(1);
+            report.quarantined_records = report
+                .quarantined_records
+                .saturating_add(usize::from(operation.fenced));
+            prepared.insert(record.key.clone(), operation);
+        }
+    }
+    let inventory = build_target_inventory(
+        &config.cluster_prefix,
+        &config.mapping,
+        &records,
+        &prepared,
+        &config_targets,
+    )?;
     validate_counts(&report, config.limits)?;
+    if matches!(mode, MigrationMode::Apply | MigrationMode::Resume) {
+        let missing_config_targets = config_targets
+            .iter()
+            .filter(|(target, _)| !existing.contains_key(target.as_str()))
+            .map(|(target, value)| (target.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if !missing_config_targets.is_empty() {
+            let writer = config_writer.ok_or(MigrationError::InvalidRecord)?;
+            let write_result = write_bounded_targets(
+                &mut client,
+                &schema_key,
+                &leader_key,
+                &term_key,
+                term_record.as_ref(),
+                term,
+                &lock_key,
+                lock.as_ref().ok_or(MigrationError::Locked)?,
+                &marker_key,
+                marker.as_ref().ok_or(MigrationError::MarkerMismatch)?,
+                Some(writer),
+                &missing_config_targets,
+            )
+            .await;
+            if let Err(error) = write_result {
+                let _ = client
+                    .lease_revoke(lock.as_ref().ok_or(MigrationError::Locked)?.0)
+                    .await;
+                return Err(error);
+            }
+        }
+    }
     for (index, record) in records.iter().enumerate() {
         if resume_after
             .as_ref()
@@ -335,12 +450,9 @@ pub async fn execute(
         {
             continue;
         }
-        let Some(transformed) = prepared.get(&record.key) else {
+        let Some(operation) = prepared.get(&record.key) else {
             continue;
         };
-        if transformed == &record.value {
-            continue;
-        }
         report.transformed_records = report.transformed_records.saturating_add(1);
         if matches!(mode, MigrationMode::Apply | MigrationMode::Resume) {
             if index % config.page_size == 0 {
@@ -354,37 +466,46 @@ pub async fn execute(
                 last_key: Some(record.key.clone()),
                 ..current_marker.clone()
             };
+            let mut compares = vec![
+                Compare::mod_revision(record.key.clone(), CompareOp::Equal, record.mod_revision),
+                Compare::value(
+                    marker_key.clone(),
+                    CompareOp::Equal,
+                    serde_json::to_vec(&current_marker)?,
+                ),
+                Compare::version(leader_key.clone(), CompareOp::Equal, 0),
+                Compare::value(schema_key.clone(), CompareOp::Equal, MIGRATING_SCHEMA),
+                term_compare(&term_key, term_record.as_ref(), term),
+                Compare::value(
+                    lock_key.clone(),
+                    CompareOp::Equal,
+                    lock.as_ref().ok_or(MigrationError::Locked)?.1.clone(),
+                ),
+            ];
+            let mut operations = Vec::new();
+            for (target, value) in &operation.targets {
+                if let Some(current) = existing.get(target.as_str()) {
+                    compares.push(Compare::value(
+                        target.clone(),
+                        CompareOp::Equal,
+                        current.value.clone(),
+                    ));
+                } else {
+                    compares.push(Compare::version(target.clone(), CompareOp::Equal, 0));
+                    operations.push(TxnOp::put(target.clone(), value.clone(), None));
+                }
+            }
+            operations.push(TxnOp::delete(record.key.clone(), None));
+            operations.push(TxnOp::put(
+                marker_key.clone(),
+                serde_json::to_vec(&next_marker)?,
+                None,
+            ));
             let response = client
-                .txn(
-                    Txn::new()
-                        .when([
-                            Compare::mod_revision(
-                                record.key.clone(),
-                                CompareOp::Equal,
-                                record.mod_revision,
-                            ),
-                            Compare::value(
-                                marker_key.clone(),
-                                CompareOp::Equal,
-                                serde_json::to_vec(&current_marker)?,
-                            ),
-                            Compare::version(leader_key.clone(), CompareOp::Equal, 0),
-                            Compare::value(schema_key.clone(), CompareOp::Equal, MIGRATING_SCHEMA),
-                            term_compare(&term_key, term_record.as_ref(), term),
-                            Compare::value(
-                                lock_key.clone(),
-                                CompareOp::Equal,
-                                lock.as_ref().ok_or(MigrationError::Locked)?.1.clone(),
-                            ),
-                        ])
-                        .and_then([
-                            TxnOp::put(record.key.clone(), transformed.clone(), None),
-                            TxnOp::put(marker_key.clone(), serde_json::to_vec(&next_marker)?, None),
-                        ]),
-                )
+                .txn(Txn::new().when(compares).and_then(operations))
                 .await?;
             if !response.succeeded() {
-                return Err(MigrationError::CompareFailed);
+                return Err(MigrationError::ProgressCompareFailed);
             }
             lattice_core::failpoint::hit(
                 lattice_core::failpoint::Failpoint::MigrationAfterCommitBeforeProgress,
@@ -393,6 +514,7 @@ pub async fn execute(
         }
     }
     if matches!(mode, MigrationMode::Apply | MigrationMode::Resume) {
+        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::MigrationBeforeFinalize);
         let finalize_context = FinalizeContext {
             schema_key: &schema_key,
             marker_key: &marker_key,
@@ -402,17 +524,19 @@ pub async fn execute(
             term_record: term_record.as_ref(),
             lock: lock.as_ref().ok_or(MigrationError::Locked)?,
         };
-        finalize(
+        let finalize_result = finalize(
             &mut client,
             &config,
             finalize_context,
             marker.ok_or(MigrationError::MarkerMismatch)?,
             &report,
+            &inventory,
         )
-        .await?;
+        .await;
         client
             .lease_revoke(lock.ok_or(MigrationError::Locked)?.0)
             .await?;
+        finalize_result?;
         report.completed = true;
     }
     Ok(report)
@@ -467,6 +591,7 @@ pub async fn execute_cardinality(
         None,
     )
     .await?;
+    validate_full_stop(&config.cluster_prefix, &records)?;
     let mut inventory = MigrationReport {
         mode: "cardinality".to_owned(),
         scanned_records: 0,
@@ -493,27 +618,28 @@ pub async fn execute_cardinality(
         )?;
     }
     validate_counts(&inventory, config.limits)?;
-    let counter_names = ["slots", "plans", "members", "admin_operations"];
-    let mut counters = Vec::new();
-    for name in counter_names {
-        let counter = read_one(
-            &mut client,
-            &key(&config.cluster_prefix, &format!("counters/{name}")),
-        )
-        .await?
-        .ok_or(MigrationError::InvalidRecord)?;
-        let value = parse_usize(&counter.value)?;
-        counters.push((name, counter, value));
-    }
+    let actual_counters = generation_five_counters(&config.cluster_prefix, &records)?;
+    let stored_counters = records
+        .iter()
+        .filter(|record| actual_counters.contains_key(&record.key))
+        .map(|record| parse_usize(&record.value).map(|value| (record.key.clone(), value)))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let stored_total = |name: &str| {
+        stored_counters
+            .iter()
+            .filter(|(counter, _)| counter.ends_with(&format!("/counters/{name}")))
+            .map(|(_, value)| *value)
+            .sum()
+    };
     let mut report = CardinalityReport {
         slots: inventory.slots,
         plans: inventory.plans,
         members: inventory.members,
         admin_operations: inventory.admin_operations,
-        stored_slots: counters[0].2,
-        stored_plans: counters[1].2,
-        stored_members: counters[2].2,
-        stored_admin_operations: counters[3].2,
+        stored_slots: stored_total("slots"),
+        stored_plans: stored_total("plans"),
+        stored_members: stored_total("members"),
+        stored_admin_operations: stored_total("admin_operations"),
         repaired: false,
     };
     if mode == CardinalityMode::Repair {
@@ -526,41 +652,69 @@ pub async fn execute_cardinality(
             .await?
             .id();
         let lock_value = uuid::Uuid::new_v4().to_string();
-        let actual = [
-            inventory.slots,
-            inventory.plans,
-            inventory.members,
-            inventory.admin_operations,
-        ];
-        let mut compares = vec![
+        let compares = vec![
             Compare::value(
-                schema_key,
+                schema_key.clone(),
                 CompareOp::Equal,
                 STORAGE_SCHEMA_GENERATION.to_string(),
             ),
-            Compare::version(leader_key, CompareOp::Equal, 0),
-            Compare::mod_revision(limits_key, CompareOp::Equal, limits.mod_revision),
+            Compare::version(leader_key.clone(), CompareOp::Equal, 0),
+            Compare::mod_revision(limits_key.clone(), CompareOp::Equal, limits.mod_revision),
             Compare::version(lock_key.clone(), CompareOp::Equal, 0),
         ];
-        let mut puts = vec![TxnOp::put(
-            lock_key,
-            lock_value,
+        let puts = vec![TxnOp::put(
+            lock_key.clone(),
+            lock_value.clone(),
             Some(PutOptions::new().with_lease(lease_id)),
         )];
-        for (index, (name, counter, _)) in counters.iter().enumerate() {
-            let key = key(&config.cluster_prefix, &format!("counters/{name}"));
-            compares.push(Compare::mod_revision(
-                key.clone(),
-                CompareOp::Equal,
-                counter.mod_revision,
-            ));
-            puts.push(TxnOp::put(key, actual[index].to_string(), None));
-        }
         let response = client.txn(Txn::new().when(compares).and_then(puts)).await?;
-        let _ = client.lease_revoke(lease_id).await;
         if !response.succeeded() {
+            let _ = client.lease_revoke(lease_id).await;
             return Err(MigrationError::CompareFailed);
         }
+        let records_by_key = records
+            .iter()
+            .map(|record| (record.key.as_str(), record))
+            .collect::<BTreeMap<_, _>>();
+        for chunk in actual_counters
+            .iter()
+            .collect::<Vec<_>>()
+            .chunks(MIGRATION_TXN_TARGET_BATCH)
+        {
+            let mut compares = vec![
+                Compare::value(
+                    schema_key.clone(),
+                    CompareOp::Equal,
+                    STORAGE_SCHEMA_GENERATION.to_string(),
+                ),
+                Compare::version(leader_key.clone(), CompareOp::Equal, 0),
+                Compare::mod_revision(limits_key.clone(), CompareOp::Equal, limits.mod_revision),
+                Compare::value(lock_key.clone(), CompareOp::Equal, lock_value.clone()),
+            ];
+            let mut puts = Vec::with_capacity(chunk.len());
+            for (counter_key, actual) in chunk {
+                if let Some(counter) = records_by_key.get(counter_key.as_str()) {
+                    compares.push(Compare::mod_revision(
+                        (*counter_key).clone(),
+                        CompareOp::Equal,
+                        counter.mod_revision,
+                    ));
+                } else {
+                    compares.push(Compare::version(
+                        (*counter_key).clone(),
+                        CompareOp::Equal,
+                        0,
+                    ));
+                }
+                puts.push(TxnOp::put((*counter_key).clone(), actual.to_string(), None));
+            }
+            let response = client.txn(Txn::new().when(compares).and_then(puts)).await?;
+            if !response.succeeded() {
+                let _ = client.lease_revoke(lease_id).await;
+                return Err(MigrationError::CompareFailed);
+            }
+        }
+        let _ = client.lease_revoke(lease_id).await;
         report.stored_slots = report.slots;
         report.stored_plans = report.plans;
         report.stored_members = report.members;
@@ -570,420 +724,49 @@ pub async fn execute_cardinality(
     Ok(report)
 }
 
-#[derive(Debug, Serialize)]
-struct RawRecord {
-    key: String,
-    value: Vec<u8>,
-    mod_revision: i64,
-}
-
-fn record_suffix<'a>(prefix: &str, record_key: &'a str) -> Result<&'a str, MigrationError> {
-    record_key
-        .strip_prefix(&format!("{}/", prefix.trim_end_matches('/')))
-        .ok_or(MigrationError::InvalidRecord)
-}
-
-fn write_backup(path: &PathBuf, records: &[RawRecord]) -> Result<(), MigrationError> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    serde_json::to_writer_pretty(&mut file, records)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn term_compare(key: &str, record: Option<&RawRecord>, term: u64) -> Compare {
-    if record.is_some() {
-        Compare::value(key, CompareOp::Equal, term.to_string())
-    } else {
-        Compare::version(key, CompareOp::Equal, 0)
-    }
-}
-
-async fn read_one(client: &mut Client, key: &str) -> Result<Option<RawRecord>, etcd_client::Error> {
-    let response = client.get(key, None).await?;
-    Ok(response.kvs().first().map(|record| RawRecord {
-        key: String::from_utf8_lossy(record.key()).into_owned(),
-        value: record.value().to_vec(),
-        mod_revision: record.mod_revision(),
-    }))
-}
-
-async fn scan_prefix(
-    client: &mut Client,
-    prefix: &str,
-    page_size: usize,
-    maximum_records: usize,
-    start_after: Option<&str>,
-) -> Result<Vec<RawRecord>, MigrationError> {
-    let prefix = format!("{}/", prefix.trim_end_matches('/')).into_bytes();
-    let mut end = prefix.clone();
-    *end.last_mut().ok_or(MigrationError::InvalidConfig)? = b'0';
-    let mut start = start_after
-        .map(|value| {
-            let mut bytes = value.as_bytes().to_vec();
-            bytes.push(0);
-            bytes
-        })
-        .unwrap_or(prefix);
-    let limit = i64::try_from(page_size).map_err(|_| MigrationError::InvalidConfig)?;
-    let mut records = Vec::new();
-    loop {
-        let response = client
-            .get(
-                start.clone(),
-                Some(
-                    GetOptions::new()
-                        .with_range(end.clone())
-                        .with_limit(limit)
-                        .with_sort(SortTarget::Key, SortOrder::Ascend),
-                ),
-            )
-            .await?;
-        records.extend(response.kvs().iter().map(|record| RawRecord {
-            key: String::from_utf8_lossy(record.key()).into_owned(),
-            value: record.value().to_vec(),
-            mod_revision: record.mod_revision(),
-        }));
-        if records.len() > maximum_records {
-            return Err(MigrationError::Capacity);
-        }
-        if !response.more() {
-            break;
-        }
-        let last = response.kvs().last().ok_or(MigrationError::InvalidRecord)?;
-        start = last.key().to_vec();
-        start.push(0);
-    }
-    Ok(records)
-}
-
-fn transform_record(
-    suffix: &str,
-    value: &[u8],
-    current_term: u64,
-) -> Result<Option<Vec<u8>>, MigrationError> {
-    if suffix.starts_with("members/") {
-        let mut record: serde_json::Value = serde_json::from_slice(value)?;
-        if record.get("version").is_some() {
-            return Ok(None);
-        }
-        let revision = record
-            .as_object_mut()
-            .and_then(|object| object.remove("revision"))
-            .ok_or(MigrationError::InvalidRecord)?;
-        record["version"] = serde_json::json!({"term": current_term, "revision": revision});
-        return Ok(Some(serde_json::to_vec(&record)?));
-    }
-    if suffix.starts_with("shards/") || suffix.starts_with("singletons/") {
-        let mut record: serde_json::Value = serde_json::from_slice(value)?;
-        let object = record
-            .as_object_mut()
-            .ok_or(MigrationError::InvalidRecord)?;
-        if object.contains_key("version") {
-            return Ok(None);
-        }
-        object
-            .remove("coordinator_term")
-            .ok_or(MigrationError::InvalidRecord)?;
-        let revision = object
-            .remove("revision")
-            .ok_or(MigrationError::InvalidRecord)?;
-        object.insert(
-            "version".to_owned(),
-            serde_json::json!({"term": current_term, "revision": revision}),
-        );
-        return Ok(Some(serde_json::to_vec(&record)?));
-    }
-    if suffix.starts_with("rebalances/") {
-        let mut record: serde_json::Value = serde_json::from_slice(value)?;
-        let object = record
-            .as_object_mut()
-            .ok_or(MigrationError::InvalidRecord)?;
-        if object.contains_key("base_version") {
-            return Ok(None);
-        }
-        object
-            .get("coordinator_term")
-            .ok_or(MigrationError::InvalidRecord)?;
-        let base = object
-            .remove("base_revision")
-            .ok_or(MigrationError::InvalidRecord)?;
-        object.insert(
-            "base_version".to_owned(),
-            serde_json::json!({"term": current_term, "revision": base}),
-        );
-        if let Some(revision) = object.remove("revision") {
-            object.insert("record_revision".to_owned(), revision);
-        } else if !object.contains_key("record_revision") {
-            return Err(MigrationError::InvalidRecord);
-        }
-        let moves = object
-            .get_mut("moves")
-            .and_then(serde_json::Value::as_array_mut)
-            .ok_or(MigrationError::InvalidRecord)?;
-        for movement in moves {
-            let movement = movement
-                .as_object_mut()
-                .ok_or(MigrationError::InvalidRecord)?;
-            if let Some(barrier) = movement.remove("barrier_revision") {
-                movement.insert(
-                    "barrier_version".to_owned(),
-                    if barrier.is_null() {
-                        barrier
-                    } else {
-                        serde_json::json!({"term": current_term, "revision": barrier})
-                    },
-                );
-            }
-        }
-        return Ok(Some(serde_json::to_vec(&record)?));
-    }
-    Ok(None)
-}
-
-fn quarantine_transitional_records(
+fn generation_five_counters(
     prefix: &str,
     records: &[RawRecord],
-    prepared: &mut std::collections::BTreeMap<String, Vec<u8>>,
-    report: &mut MigrationReport,
-) -> Result<(), MigrationError> {
-    let mut slots = std::collections::BTreeMap::<PlacementSlotKey, (String, PlacementSlot)>::new();
-    let mut plans = std::collections::BTreeMap::<u128, (String, RebalancePlan)>::new();
-    let mut claims = std::collections::BTreeMap::<PlacementSlotKey, ClaimGrant>::new();
+) -> Result<BTreeMap<String, usize>, MigrationError> {
+    let membership_members = key(prefix, "membership/counters/members");
+    let mut counters = BTreeMap::from([(membership_members.clone(), 0usize)]);
     for record in records {
         let suffix = record_suffix(prefix, &record.key)?;
-        if suffix.starts_with("shard_claims/") || suffix.starts_with("singleton_claims/") {
-            let claim: ClaimGrant = serde_json::from_slice(&record.value)?;
-            claims.insert(claim.slot.clone(), claim);
-        }
-    }
-    for (record_key, value) in prepared.iter() {
-        let suffix = record_suffix(prefix, record_key)?;
-        if suffix.starts_with("shards/") || suffix.starts_with("singletons/") {
-            let slot: PlacementSlot = serde_json::from_slice(value)?;
-            slot.validate().map_err(|_| MigrationError::InvalidRecord)?;
-            slots.insert(slot.key.clone(), (record_key.clone(), slot));
-        } else if suffix.starts_with("rebalances/") {
-            let plan: RebalancePlan = serde_json::from_slice(value)?;
-            plans.insert(plan.plan_id, (record_key.clone(), plan));
-        }
-    }
-
-    let mut bad_slots = std::collections::BTreeSet::new();
-    let mut bad_moves = std::collections::BTreeSet::<(u128, ShardId)>::new();
-    for (slot_key, (_, slot)) in &slots {
-        if matches!(
-            slot.state,
-            PlacementSlotState::Allocating | PlacementSlotState::Running
-        ) && !claims
-            .get(slot_key)
-            .is_some_and(|claim| claim_matches_slot(claim, slot))
-        {
-            bad_slots.insert(slot_key.clone());
-        }
-        if let Some(plan_id) = slot.active_move {
-            let related = plans.get(&plan_id).is_some_and(|(_, plan)| {
-                plan_movement(plan, slot_key)
-                    .is_some_and(|movement| movement.progress == MoveProgress::Handoff)
-            });
-            if !related {
-                bad_slots.insert(slot_key.clone());
-            }
-        }
-    }
-    for (plan_id, (_, plan)) in &plans {
-        for movement in &plan.moves {
-            if movement.progress != MoveProgress::Handoff {
-                continue;
-            }
-            let slot_key = PlacementSlotKey::Shard {
-                entity_type: plan.entity_type.clone(),
-                shard_id: movement.shard_id,
-            };
-            if slots
-                .get(&slot_key)
-                .is_none_or(|(_, slot)| slot.active_move != Some(*plan_id))
-            {
-                bad_moves.insert((*plan_id, movement.shard_id));
-            }
-        }
-    }
-    for slot_key in &bad_slots {
-        let (record_key, mut slot) = slots
-            .get(slot_key)
-            .cloned()
-            .ok_or(MigrationError::InvalidRecord)?;
-        if let Some(plan_id) = slot.active_move
-            && let PlacementSlotKey::Shard { shard_id, .. } = &slot.key
-        {
-            bad_moves.insert((plan_id, *shard_id));
-        }
-        slot.state = PlacementSlotState::Fenced;
-        slot.target = None;
-        slot.active_move = None;
-        slot.barrier_sessions.clear();
-        prepared.insert(record_key, serde_json::to_vec(&slot)?);
-    }
-    let mut bad_plan_records = std::collections::BTreeSet::new();
-    for (plan_id, (record_key, original)) in &plans {
-        if !bad_moves
-            .iter()
-            .any(|(bad_plan_id, _)| bad_plan_id == plan_id)
-        {
+        if suffix.starts_with("membership/members/") {
+            *counters.entry(membership_members.clone()).or_default() += 1;
             continue;
         }
-        let mut plan = original.clone();
-        for movement in &mut plan.moves {
-            if bad_moves.contains(&(*plan_id, movement.shard_id)) {
-                movement.progress = MoveProgress::Failed;
-                movement.barrier_version = None;
-                movement.barrier_sessions.clear();
-            }
+        let Some(rest) = suffix.strip_prefix("domains/") else {
+            continue;
+        };
+        let (domain, scoped) = rest.split_once('/').ok_or(MigrationError::InvalidRecord)?;
+        PlacementDomainId::new(domain).map_err(|_| MigrationError::InvalidRecord)?;
+        for name in ["slots", "plans", "members", "admin_operations"] {
+            counters
+                .entry(key(prefix, &format!("domains/{domain}/counters/{name}")))
+                .or_default();
         }
-        plan.status = PlanStatus::Failed;
-        plan.record_revision = plan
-            .record_revision
-            .next()
-            .map_err(|_| MigrationError::InvalidRecord)?;
-        prepared.insert(record_key.clone(), serde_json::to_vec(&plan)?);
-        bad_plan_records.insert(*plan_id);
-    }
-    report.quarantined_records = bad_slots.len().saturating_add(bad_plan_records.len());
-    Ok(())
-}
-
-fn claim_matches_slot(claim: &ClaimGrant, slot: &PlacementSlot) -> bool {
-    claim.slot == slot.key
-        && slot.owner.as_ref() == Some(&claim.owner)
-        && claim.assignment_generation == slot.assignment_generation
-        && claim.coordinator_term == slot.version.term
-        && !claim.ttl.is_zero()
-}
-
-fn plan_movement<'a>(
-    plan: &'a RebalancePlan,
-    slot: &PlacementSlotKey,
-) -> Option<&'a crate::plan::RebalanceMove> {
-    let PlacementSlotKey::Shard {
-        entity_type,
-        shard_id,
-    } = slot
-    else {
-        return None;
-    };
-    (plan.entity_type == *entity_type)
-        .then(|| {
-            plan.moves
-                .iter()
-                .find(|movement| movement.shard_id == *shard_id)
-        })
-        .flatten()
-}
-
-fn skip_key(suffix: &str) -> bool {
-    suffix == "schema_generation"
-        || suffix.starts_with("schema/")
-        || suffix.starts_with("coordinator/")
-        || suffix.starts_with("counters/")
-        || suffix.starts_with("migration/")
-        || suffix.starts_with("shard_claims/")
-        || suffix.starts_with("singleton_claims/")
-}
-
-fn update_counts(
-    report: &mut MigrationReport,
-    suffix: &str,
-    value: &[u8],
-    entity_configs: &mut std::collections::BTreeMap<String, String>,
-    singleton_configs: &mut std::collections::BTreeMap<String, String>,
-) -> Result<(), MigrationError> {
-    if suffix.starts_with("shards/") || suffix.starts_with("singletons/") {
-        report.slots = report.slots.saturating_add(1);
-        report.state_revision = report.state_revision.max(record_revision(value)?);
-    } else if suffix.starts_with("rebalances/") {
-        report.plans = report.plans.saturating_add(1);
-    } else if suffix.starts_with("members/") {
-        report.members = report.members.saturating_add(1);
-        report.state_revision = report.state_revision.max(record_revision(value)?);
-        collect_member_configs(value, entity_configs, singleton_configs)?;
-        report.entity_configs = entity_configs.len();
-        report.singleton_configs = singleton_configs.len();
-    } else if suffix.starts_with("operations/") {
-        report.admin_operations = report.admin_operations.saturating_add(1);
-    }
-    Ok(())
-}
-
-fn record_revision(value: &[u8]) -> Result<u64, MigrationError> {
-    let value: serde_json::Value = serde_json::from_slice(value)?;
-    value
-        .get("revision")
-        .or_else(|| {
-            value
-                .get("version")
-                .and_then(|version| version.get("revision"))
-        })
-        .and_then(serde_json::Value::as_u64)
-        .ok_or(MigrationError::InvalidRecord)
-}
-
-fn collect_member_configs(
-    value: &[u8],
-    entity_configs: &mut std::collections::BTreeMap<String, String>,
-    singleton_configs: &mut std::collections::BTreeMap<String, String>,
-) -> Result<(), MigrationError> {
-    let value: serde_json::Value = serde_json::from_slice(value)?;
-    let hello = value.get("hello").ok_or(MigrationError::InvalidRecord)?;
-    collect_configs(hello, "entity_configs", "entity_type", entity_configs)?;
-    collect_configs(hello, "singleton_configs", "kind", singleton_configs)
-}
-
-fn collect_configs(
-    hello: &serde_json::Value,
-    collection: &str,
-    key_name: &str,
-    configs: &mut std::collections::BTreeMap<String, String>,
-) -> Result<(), MigrationError> {
-    let values = hello
-        .get(collection)
-        .and_then(serde_json::Value::as_array)
-        .ok_or(MigrationError::InvalidRecord)?;
-    for value in values {
-        let key = serde_json::to_string(value.get(key_name).ok_or(MigrationError::InvalidRecord)?)?;
-        let canonical = serde_json::to_string(value)?;
-        if configs
-            .get(&key)
-            .is_some_and(|existing| existing != &canonical)
-        {
-            return Err(MigrationError::InvalidRecord);
+        let counter = if scoped.starts_with("shards/") || scoped.starts_with("singletons/") {
+            Some("slots")
+        } else if scoped.starts_with("rebalances/") {
+            Some("plans")
+        } else if scoped.starts_with("members/") {
+            Some("members")
+        } else if scoped.starts_with("admin/") {
+            Some("admin_operations")
+        } else {
+            None
+        };
+        if let Some(counter) = counter {
+            *counters
+                .entry(key(prefix, &format!("domains/{domain}/counters/{counter}")))
+                .or_default() += 1;
         }
-        configs.insert(key, canonical);
     }
-    Ok(())
+    Ok(counters)
 }
 
-fn validate_counts(
-    report: &MigrationReport,
-    limits: DurableStorageLimits,
-) -> Result<(), MigrationError> {
-    if report.slots > limits.maximum_slots
-        || report.plans > limits.maximum_plans
-        || report.members > limits.maximum_members
-        || report.admin_operations > limits.maximum_admin_operations
-        || report.entity_configs > limits.maximum_entity_configs
-        || report.singleton_configs > limits.maximum_singleton_configs
-    {
-        return Err(MigrationError::Capacity);
-    }
-    Ok(())
-}
+include!("migration_helpers.rs");
 
 struct FinalizeContext<'a> {
     schema_key: &'a str,
@@ -1001,11 +784,28 @@ async fn finalize(
     context: FinalizeContext<'_>,
     marker: MigrationMarker,
     report: &MigrationReport,
+    inventory: &TargetInventory,
 ) -> Result<(), MigrationError> {
     let complete = MigrationMarker {
         completed: true,
         ..marker.clone()
     };
+    let metadata = finalization_targets(config, &marker, report, inventory)?;
+    write_bounded_targets(
+        client,
+        context.schema_key,
+        context.leader_key,
+        context.term_key,
+        context.term_record,
+        marker.coordinator_term,
+        context.lock_key,
+        context.lock,
+        context.marker_key,
+        &marker,
+        None,
+        &metadata,
+    )
+    .await?;
     let limits = serde_json::to_vec(&config.limits)?;
     let mut operations = vec![
         TxnOp::put(
@@ -1015,43 +815,37 @@ async fn finalize(
         ),
         TxnOp::put(key(&config.cluster_prefix, "schema/limits"), limits, None),
         TxnOp::put(
-            key(&config.cluster_prefix, "counters/slots"),
-            report.slots.to_string(),
-            None,
-        ),
-        TxnOp::put(
-            key(&config.cluster_prefix, "counters/plans"),
-            report.plans.to_string(),
-            None,
-        ),
-        TxnOp::put(
-            key(&config.cluster_prefix, "counters/members"),
-            report.members.to_string(),
-            None,
-        ),
-        TxnOp::put(
-            key(&config.cluster_prefix, "counters/admin_operations"),
-            report.admin_operations.to_string(),
-            None,
-        ),
-        TxnOp::put(
-            key(&config.cluster_prefix, "coordinator/state_revision"),
+            key(&config.cluster_prefix, "membership/state_revision"),
             report.state_revision.to_string(),
             None,
         ),
+        TxnOp::put(
+            key(&config.cluster_prefix, "membership/counters/members"),
+            inventory.membership_members.to_string(),
+            None,
+        ),
         TxnOp::put(context.marker_key, serde_json::to_vec(&complete)?, None),
+        TxnOp::delete(context.term_key, None),
+        TxnOp::delete(
+            key(&config.cluster_prefix, "coordinator/state_revision"),
+            None,
+        ),
+        TxnOp::delete(key(&config.cluster_prefix, "counters/slots"), None),
+        TxnOp::delete(key(&config.cluster_prefix, "counters/plans"), None),
+        TxnOp::delete(key(&config.cluster_prefix, "counters/members"), None),
+        TxnOp::delete(
+            key(&config.cluster_prefix, "counters/admin_operations"),
+            None,
+        ),
+        TxnOp::delete(
+            key(&config.cluster_prefix, "settings/automatic_balance"),
+            None,
+        ),
     ];
     if marker.coordinator_term > 0 {
         operations.push(TxnOp::put(
-            key(&config.cluster_prefix, "settings/automatic_balance"),
-            serde_json::to_vec(&serde_json::json!({
-                "globally_paused": false,
-                "paused_entity_types": [],
-                "version": {
-                    "term": marker.coordinator_term,
-                    "revision": report.state_revision,
-                }
-            }))?,
+            key(&config.cluster_prefix, "membership/term"),
+            marker.coordinator_term.to_string(),
             None,
         ));
     }
@@ -1079,8 +873,116 @@ async fn finalize(
     if response.succeeded() {
         Ok(())
     } else {
-        Err(MigrationError::CompareFailed)
+        Err(MigrationError::FinalizeCompareFailed)
     }
+}
+
+fn finalization_targets(
+    config: &MigrationConfig,
+    marker: &MigrationMarker,
+    report: &MigrationReport,
+    inventory: &TargetInventory,
+) -> Result<BTreeMap<String, Vec<u8>>, MigrationError> {
+    let mut targets = BTreeMap::new();
+    for (domain, counts) in &inventory.domains {
+        let scope = format!("domains/{}", domain.as_str());
+        for (suffix, value) in [
+            ("state_revision", report.state_revision),
+            ("counters/slots", counts.slots as u64),
+            ("counters/plans", counts.plans as u64),
+            ("counters/members", counts.members as u64),
+            ("counters/admin_operations", counts.admin_operations as u64),
+            ("counters/entity_configs", counts.entity_configs as u64),
+            (
+                "counters/singleton_configs",
+                counts.singleton_configs as u64,
+            ),
+        ] {
+            targets.insert(
+                key(&config.cluster_prefix, &format!("{scope}/{suffix}")),
+                value.to_string().into_bytes(),
+            );
+        }
+        if marker.coordinator_term > 0 {
+            targets.insert(
+                key(&config.cluster_prefix, &format!("{scope}/term")),
+                marker.coordinator_term.to_string().into_bytes(),
+            );
+            targets.insert(
+                key(
+                    &config.cluster_prefix,
+                    &format!("{scope}/settings/automatic_balance"),
+                ),
+                serde_json::to_vec(&serde_json::json!({
+                    "globally_paused": false,
+                    "paused_entity_types": [],
+                    "version": {
+                        "domain": domain,
+                        "term": marker.coordinator_term,
+                        "revision": report.state_revision,
+                    }
+                }))?,
+            );
+        }
+    }
+    Ok(targets)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_bounded_targets(
+    client: &mut Client,
+    schema_key: &str,
+    leader_key: &str,
+    term_key: &str,
+    term_record: Option<&RawRecord>,
+    term: u64,
+    lock_key: &str,
+    lock: &(i64, String),
+    marker_key: &str,
+    marker: &MigrationMarker,
+    source: Option<&RawRecord>,
+    targets: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), MigrationError> {
+    for chunk in targets
+        .iter()
+        .collect::<Vec<_>>()
+        .chunks(MIGRATION_TXN_TARGET_BATCH)
+    {
+        let mut compares = vec![
+            Compare::value(schema_key, CompareOp::Equal, MIGRATING_SCHEMA),
+            Compare::version(leader_key, CompareOp::Equal, 0),
+            term_compare(term_key, term_record, term),
+            Compare::value(lock_key, CompareOp::Equal, lock.1.clone()),
+            Compare::value(marker_key, CompareOp::Equal, serde_json::to_vec(marker)?),
+        ];
+        if let Some(source) = source {
+            compares.push(Compare::mod_revision(
+                source.key.clone(),
+                CompareOp::Equal,
+                source.mod_revision,
+            ));
+        }
+        let mut puts = Vec::with_capacity(chunk.len());
+        for (target, value) in chunk {
+            let current = read_one(client, target).await?;
+            if let Some(current) = current {
+                if current.value != **value {
+                    return Err(MigrationError::Collision);
+                }
+                continue;
+            }
+            compares.push(Compare::version((*target).clone(), CompareOp::Equal, 0));
+            puts.push(TxnOp::put((*target).clone(), (*value).clone(), None));
+        }
+        if puts.is_empty() {
+            continue;
+        }
+        let response = client.txn(Txn::new().when(compares).and_then(puts)).await?;
+        if !response.succeeded() {
+            return Err(MigrationError::FinalizeCompareFailed);
+        }
+    }
+    Ok(())
 }
 
 fn key(prefix: &str, suffix: &str) -> String {
@@ -1103,22 +1005,124 @@ fn parse_usize(value: &[u8]) -> Result<usize, MigrationError> {
 
 #[cfg(test)]
 mod tests {
-    use super::transform_record;
+    use super::{
+        MigrationDomainMapping, MigrationError, RawRecord, prepare_record, validate_full_stop,
+        validate_mapping,
+    };
+    use crate::types::{
+        AssignmentGeneration, CoordinatorTerm, NodeKey, PlacementSlot, PlacementSlotKey,
+        PlacementSlotState, PlacementVersion, Revision, ShardId,
+    };
+    use lattice_core::actor_ref::{
+        ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
+    };
 
     #[test]
-    fn generation_three_json_is_term_qualified_without_touching_claims() {
-        let slot = br#"{"coordinator_term":2,"revision":7,"state":"Running"}"#;
-        let transformed = transform_record("shards/entity/1", slot, 9)
-            .unwrap()
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
-        assert_eq!(value["version"]["term"], 9);
-        assert_eq!(value["version"]["revision"], 7);
-        assert!(value.get("coordinator_term").is_none());
-        assert!(
-            transform_record("shard_claims/entity/1", b"{}", 9)
-                .unwrap()
-                .is_none()
-        );
+    fn generation_four_slot_moves_to_its_mapped_domain_and_restarts_fenced() {
+        let domain = PlacementDomainId::new("payments").unwrap();
+        let entity = EntityType::new("invoice").unwrap();
+        let slot = PlacementSlot {
+            key: PlacementSlotKey::Shard {
+                domain: domain.clone(),
+                entity_type: entity.clone(),
+                shard_id: ShardId::new(7),
+            },
+            config_fingerprint: ConfigFingerprint::new([4; 32]),
+            owner: Some(NodeKey {
+                node_id: "old-owner".to_owned(),
+                address: NodeAddress::new("127.0.0.1", 29001).unwrap(),
+                incarnation: NodeIncarnation::new(1).unwrap(),
+            }),
+            target: None,
+            assignment_generation: AssignmentGeneration::new(9).unwrap(),
+            version: PlacementVersion::new(
+                domain.clone(),
+                CoordinatorTerm::new(3).unwrap(),
+                Revision::new(11).unwrap(),
+            ),
+            state: PlacementSlotState::Running,
+            active_move: None,
+            barrier_sessions: Default::default(),
+        };
+        let mut legacy = serde_json::to_value(slot).unwrap();
+        legacy["version"].as_object_mut().unwrap().remove("domain");
+        let mapping = MigrationDomainMapping {
+            entity_types: [(entity.as_str().to_owned(), domain.clone())]
+                .into_iter()
+                .collect(),
+            singleton_kinds: Default::default(),
+        };
+        let prepared = prepare_record(
+            "/cluster",
+            "shards/invoice/7",
+            &serde_json::to_vec(&legacy).unwrap(),
+            &mapping,
+            &Default::default(),
+            Default::default(),
+            3,
+        )
+        .unwrap()
+        .unwrap();
+        let migrated: PlacementSlot = serde_json::from_slice(
+            prepared
+                .targets
+                .get("/cluster/domains/payments/shards/invoice/7")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(prepared.fenced);
+        assert_eq!(migrated.state, PlacementSlotState::Fenced);
+        assert_eq!(migrated.assignment_generation.get(), 9);
+        assert_eq!(migrated.version.domain, domain);
+    }
+
+    #[test]
+    fn live_generation_four_member_lease_blocks_offline_migration() {
+        let records = [RawRecord {
+            key: "/cluster/members/node-a".to_owned(),
+            value: b"{}".to_vec(),
+            mod_revision: 1,
+            lease_id: 42,
+        }];
+        assert!(matches!(
+            validate_full_stop("/cluster", &records),
+            Err(MigrationError::LiveLeasePresent)
+        ));
+    }
+
+    #[test]
+    fn active_generation_four_handoff_blocks_offline_migration() {
+        let records = [RawRecord {
+            key: "/cluster/shards/invoice/7".to_owned(),
+            value: serde_json::to_vec(&serde_json::json!({
+                "state": "Running",
+                "active_move": { "operation_id": "move-1" }
+            }))
+            .unwrap(),
+            mod_revision: 1,
+            lease_id: 0,
+        }];
+        assert!(matches!(
+            validate_full_stop("/cluster", &records),
+            Err(MigrationError::ActiveHandoff)
+        ));
+    }
+
+    #[test]
+    fn every_discovered_type_requires_an_explicit_mapping() {
+        let entity_configs = [(serde_json::to_string("invoice").unwrap(), "{}".to_owned())]
+            .into_iter()
+            .collect();
+        assert!(matches!(
+            validate_mapping(
+                &entity_configs,
+                &Default::default(),
+                &MigrationDomainMapping {
+                    entity_types: Default::default(),
+                    singleton_kinds: Default::default(),
+                },
+            ),
+            Err(MigrationError::UnmappedType)
+        ));
     }
 }

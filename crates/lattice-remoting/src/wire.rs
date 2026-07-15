@@ -3,7 +3,7 @@ use prost::Message;
 use thiserror::Error;
 
 pub const TRANSPORT_MAJOR: u16 = 1;
-pub const TRANSPORT_MINOR: u16 = 1;
+pub const TRANSPORT_MINOR: u16 = 2;
 const HEADER_LEN: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+test-failpoints = ["lattice-core/test-failpoints"]
+
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true

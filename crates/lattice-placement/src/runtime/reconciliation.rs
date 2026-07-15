@@ -1,14 +1,17 @@
 use super::membership::send_control;
 use super::{
-    ClaimGrant, ClaimLease, CoordinatorLeader, CoordinatorRuntimeError, CoordinatorStore,
-    GrantSequence, HandoffEvent, Instant, PlacementControlCommand, PlacementSlot, PlacementSlotKey,
-    PlacementSlotState,
+    ClaimGrant, ClaimLease, CoordinatorLeaseStore, CoordinatorRuntimeError, GrantSequence,
+    HandoffEvent, Instant, MembershipStore, PlacementControlCommand, PlacementDomainLeader,
+    PlacementDomainStore, PlacementSlot, PlacementSlotKey, PlacementSlotState, ScopedElectionStore,
 };
 use crate::storage::domain::{
     AdoptAuthority, FenceMissingAuthority, InstallAuthority, LeasedClaim,
 };
 
-impl<S: CoordinatorStore> CoordinatorLeader<S> {
+impl<S> PlacementDomainLeader<S>
+where
+    S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
+{
     pub(super) async fn reconcile_initial_inventory(
         &mut self,
     ) -> Result<(), CoordinatorRuntimeError> {
@@ -16,7 +19,12 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         loop {
             let page = self
                 .store
-                .list_slots_page(&[], offset, self.config.reconciliation_page_size)
+                .list_slots_page(
+                    &self.version.domain,
+                    &[],
+                    offset,
+                    self.config.reconciliation_page_size,
+                )
                 .await?;
             for slot in page.records {
                 self.validate_slot_move_relationship(&slot);
@@ -47,7 +55,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .min(self.config.maximum_reconciliation_work_per_pass);
         let page = self
             .store
-            .list_slots_page(&[], self.reconciliation.cursor, limit)
+            .list_slots_page(&self.version.domain, &[], self.reconciliation.cursor, limit)
             .await?;
         let total = page.total;
         for slot in page.records {
@@ -102,6 +110,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                         .iter()
                         .filter(|movement| movement.progress == crate::plan::MoveProgress::Handoff)
                         .map(|movement| PlacementSlotKey::Shard {
+                            domain: plan.domain.clone(),
                             entity_type: plan.entity_type.clone(),
                             shard_id: movement.shard_id,
                         })
@@ -195,6 +204,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         let mut adopted = slot.clone();
         adopted.version = self.next_version()?;
         let grant = ClaimGrant {
+            domain: slot.key.domain().clone(),
             slot: slot.key.clone(),
             owner: previous.grant.owner.clone(),
             coordinator_term: self.leader.term,
@@ -206,11 +216,15 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 .map_err(|_| CoordinatorRuntimeError::ClaimSequence)?,
             ttl: self.config.claim_ttl,
         };
+        let (expected_global_member, expected_domain_member) =
+            self.assignment_members(&previous.grant.owner).await?;
         let result = self
             .store
             .adopt_authority(
                 &self.leader_guard,
                 AdoptAuthority {
+                    expected_global_member,
+                    expected_domain_member,
                     expected_slot: slot,
                     expected_claim: previous.grant.clone(),
                     slot: adopted,
@@ -227,7 +241,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                     lattice_core::failpoint::Failpoint::ReconciliationAfterCommitBeforeEffect,
                 );
                 let _ = self.store.revoke_lease(previous.lease_id).await;
-                self.version = committed.slot.version;
+                self.version = committed.slot.version.clone();
                 self.claims.insert(
                     committed.slot.key.clone(),
                     ClaimLease {
@@ -263,7 +277,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 },
             )
             .await?;
-        self.version = committed.slot.version;
+        self.version = committed.slot.version.clone();
         self.claims.remove(&committed.slot.key);
         self.publish_slot_delta(&committed.slot).await
     }
@@ -292,18 +306,23 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         allocating.state = PlacementSlotState::Allocating;
         allocating.version = self.next_version()?;
         let grant = ClaimGrant {
+            domain: allocating.key.domain().clone(),
             slot: allocating.key.clone(),
-            owner,
+            owner: owner.clone(),
             coordinator_term: self.leader.term,
             assignment_generation: allocating.assignment_generation,
             grant_sequence: GrantSequence::new(1).expect("one is a valid grant sequence"),
             ttl: self.config.claim_ttl,
         };
+        let (expected_global_member, expected_domain_member) =
+            self.assignment_members(&owner).await?;
         let result = self
             .store
             .install_authority(
                 &self.leader_guard,
                 InstallAuthority {
+                    expected_global_member,
+                    expected_domain_member,
                     expected_slot: slot,
                     slot: allocating,
                     claim: LeasedClaim {
@@ -315,7 +334,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .await;
         match result {
             Ok(committed) => {
-                self.version = committed.slot.version;
+                self.version = committed.slot.version.clone();
                 self.claims.insert(
                     committed.slot.key.clone(),
                     ClaimLease {
@@ -357,6 +376,7 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         };
         send_control(
             &association,
+            &self.version.domain,
             PlacementControlCommand::ClaimGranted(grant.clone()),
             &self.config,
         )

@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use bytes::Bytes;
 use lattice_core::actor_ref::{
-    ConfigFingerprint, EntityId, EntityRef, EntityType, NodeIncarnation, ProtocolId, ProtocolTag,
-    ReferenceError,
+    ConfigFingerprint, EntityId, EntityRef, EntityType, NodeIncarnation, PlacementDomainId,
+    ProtocolId, ProtocolTag, ReferenceError,
 };
 use thiserror::Error;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
@@ -13,12 +13,15 @@ use crate::types::{
 };
 
 pub const XXH3_V1_SEED: u64 = 0x4c41_5454_4943_4531;
+pub const XXH3_V1_HASH_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityConfig {
+    pub domain: PlacementDomainId,
     pub entity_type: EntityType,
     pub protocol_id: ProtocolId,
     pub shard_count: u32,
+    pub shard_hash_version: u32,
     pub allocation_policy_id: String,
     pub allocation_policy_version: u32,
     pub hard_constraints: Vec<String>,
@@ -27,6 +30,7 @@ pub struct EntityConfig {
 
 impl EntityConfig {
     pub fn new(
+        domain: PlacementDomainId,
         entity_type: EntityType,
         protocol_id: ProtocolId,
         shard_count: u32,
@@ -49,20 +53,29 @@ impl EntityConfig {
         hard_constraints.sort();
         hard_constraints.dedup();
         let mut canonical = Vec::new();
+        canonical.extend_from_slice(&(domain.as_str().len() as u32).to_be_bytes());
+        canonical.extend_from_slice(domain.as_str().as_bytes());
+        canonical.extend_from_slice(&(entity_type.as_str().len() as u32).to_be_bytes());
         canonical.extend_from_slice(entity_type.as_str().as_bytes());
         canonical.extend_from_slice(&protocol_id.get().to_be_bytes());
         canonical.extend_from_slice(&shard_count.to_be_bytes());
+        canonical.extend_from_slice(&XXH3_V1_HASH_VERSION.to_be_bytes());
+        canonical.extend_from_slice(&XXH3_V1_SEED.to_be_bytes());
+        canonical.extend_from_slice(&(allocation_policy_id.len() as u32).to_be_bytes());
         canonical.extend_from_slice(allocation_policy_id.as_bytes());
         canonical.extend_from_slice(&allocation_policy_version.to_be_bytes());
+        canonical.extend_from_slice(&(hard_constraints.len() as u32).to_be_bytes());
         for constraint in &hard_constraints {
             canonical.extend_from_slice(&(constraint.len() as u32).to_be_bytes());
             canonical.extend_from_slice(constraint.as_bytes());
         }
         let fingerprint = ConfigFingerprint::new(*blake3::hash(&canonical).as_bytes());
         Ok(Self {
+            domain,
             entity_type,
             protocol_id,
             shard_count,
+            shard_hash_version: XXH3_V1_HASH_VERSION,
             allocation_policy_id,
             allocation_policy_version,
             hard_constraints,
@@ -76,6 +89,7 @@ impl EntityConfig {
 
     pub fn validate(&self) -> Result<(), RegionError> {
         let rebuilt = Self::new(
+            self.domain.clone(),
             self.entity_type.clone(),
             self.protocol_id,
             self.shard_count,
@@ -83,7 +97,9 @@ impl EntityConfig {
             self.allocation_policy_version,
             self.hard_constraints.clone(),
         )?;
-        if rebuilt.fingerprint != self.fingerprint {
+        if self.shard_hash_version != XXH3_V1_HASH_VERSION
+            || rebuilt.fingerprint != self.fingerprint
+        {
             return Err(RegionError::InvalidConfig);
         }
         Ok(())
@@ -103,6 +119,7 @@ impl EntityConfig {
     ) -> Result<EntityRef<P>, ReferenceError> {
         EntityRef::new(
             cluster_id,
+            self.domain.clone(),
             self.entity_type.clone(),
             entity_id,
             self.protocol_id,
@@ -440,6 +457,7 @@ mod tests {
 
     fn entity() -> EntityConfig {
         EntityConfig::new(
+            PlacementDomainId::new("buffer-test").unwrap(),
             EntityType::new("buffer-test").unwrap(),
             ProtocolId::new(7).unwrap(),
             1,
@@ -448,6 +466,39 @@ mod tests {
             Vec::new(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn entity_config_fingerprint_has_a_domain_scoped_golden_vector() {
+        let config = EntityConfig::new(
+            PlacementDomainId::new("player").unwrap(),
+            EntityType::new("account").unwrap(),
+            ProtocolId::new(0x0102_0304_0506_0708).unwrap(),
+            128,
+            "weighted-least-load",
+            3,
+            vec!["region=ap-east".to_owned(), "tier=premium".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(
+            *config.fingerprint().as_bytes(),
+            [
+                23, 114, 47, 89, 240, 189, 169, 100, 98, 193, 20, 241, 131, 150, 55, 150, 122, 170,
+                148, 77, 168, 48, 140, 17, 155, 110, 142, 6, 249, 118, 222, 155,
+            ]
+        );
+
+        let another_domain = EntityConfig::new(
+            PlacementDomainId::new("world").unwrap(),
+            config.entity_type.clone(),
+            config.protocol_id,
+            config.shard_count,
+            config.allocation_policy_id.clone(),
+            config.allocation_policy_version,
+            config.hard_constraints.clone(),
+        )
+        .unwrap();
+        assert_ne!(config.fingerprint(), another_domain.fingerprint());
     }
 
     #[test]

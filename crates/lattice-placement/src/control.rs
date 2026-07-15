@@ -1,5 +1,6 @@
 use bytes::Bytes;
-use lattice_core::actor_ref::{EntityType, NodeIncarnation, SingletonKind};
+use lattice_core::actor_ref::{EntityType, NodeIncarnation, PlacementDomainId, SingletonKind};
+use lattice_core::coordinator::CoordinatorScope;
 use lattice_remoting::association::AssociationKey;
 use lattice_remoting::control::CommandId;
 use lattice_remoting::control::ControlDispatch;
@@ -7,27 +8,33 @@ use lattice_remoting::control::ControlDispatchError;
 use lattice_remoting::control::ControlGap;
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::RwLock;
 use thiserror::Error;
+
 use tokio::sync::{mpsc, oneshot};
 
 use crate::coordinator::{
-    CoordinatorDelta, MemberEvent, MemberRecord, NodeHello, NodeLoadReport, ShardLoadReport,
-    SnapshotBegin, SnapshotChunk, SnapshotEnd,
+    CoordinatorDelta, MemberEvent, MemberHello, MemberRecord, NodeLoadReport, PlacementDomainHello,
+    ShardLoadReport, SnapshotBegin, SnapshotChunk, SnapshotEnd,
 };
-use crate::types::{AssignmentGeneration, ClaimGrant, ShardId, StateVersion};
+use crate::types::{
+    AssignmentGeneration, ClaimGrant, MembershipVersion, PlacementVersion, ShardId,
+};
 
-pub const PLACEMENT_CONTROL_GENERATION: u64 = 4;
+pub const PLACEMENT_CONTROL_GENERATION: u64 = 5;
 pub const DEFAULT_MAX_CONTROL_PAYLOAD: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlacementControlCommand {
-    NodeHello(NodeHello),
+    MemberHello(MemberHello),
+    PlacementDomainHello(PlacementDomainHello),
     NodeHeartbeat {
         incarnation: NodeIncarnation,
         sequence: u64,
     },
     JoinReady {
-        snapshot_version: StateVersion,
+        snapshot_version: MembershipVersion,
     },
     MemberUp(MemberRecord),
     MemberDelta(MemberEvent),
@@ -37,23 +44,25 @@ pub enum PlacementControlCommand {
     SnapshotChunk(SnapshotChunk),
     SnapshotEnd(SnapshotEnd),
     StateDelta(CoordinatorDelta),
-    AppliedRevision(StateVersion),
+    AppliedRevision(PlacementVersion),
     ClaimGranted(ClaimGrant),
     NodeLoad(NodeLoadReport),
     ShardLoad(ShardLoadReport),
     ResolveShard {
         request_id: u128,
+        domain: PlacementDomainId,
         entity_type: EntityType,
         shard_id: ShardId,
     },
     ResolveSingleton {
         request_id: u128,
+        domain: PlacementDomainId,
         kind: SingletonKind,
     },
     DrainSlot {
         slot: crate::types::PlacementSlotKey,
         generation: AssignmentGeneration,
-        version: StateVersion,
+        version: PlacementVersion,
     },
     SlotDrained {
         slot: crate::types::PlacementSlotKey,
@@ -79,6 +88,10 @@ pub enum PlacementControlCommand {
         operation_id: String,
         expected_incarnation: NodeIncarnation,
     },
+    MembershipDrainComplete {
+        operation_id: String,
+        expected_incarnation: NodeIncarnation,
+    },
     ForceRemove {
         operation_id: String,
         node_id: String,
@@ -86,14 +99,25 @@ pub enum PlacementControlCommand {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedPlacementControlCommand {
+    pub scope: CoordinatorScope,
+    pub command: PlacementControlCommand,
+}
+
 pub fn encode_control_command(
+    scope: &CoordinatorScope,
     command: &PlacementControlCommand,
     maximum_payload: usize,
 ) -> Result<Bytes, PlacementControlError> {
     if maximum_payload == 0 {
         return Err(PlacementControlError::InvalidLimit);
     }
-    let payload = serde_json::to_vec(command).map_err(|_| PlacementControlError::Codec)?;
+    let payload = serde_json::to_vec(&ScopedPlacementControlCommand {
+        scope: scope.clone(),
+        command: command.clone(),
+    })
+    .map_err(|_| PlacementControlError::Codec)?;
     let wire = PlacementControlWire {
         generation: PLACEMENT_CONTROL_GENERATION,
         payload,
@@ -108,7 +132,7 @@ pub fn encode_control_command(
 pub fn decode_control_command(
     payload: &[u8],
     maximum_payload: usize,
-) -> Result<PlacementControlCommand, PlacementControlError> {
+) -> Result<ScopedPlacementControlCommand, PlacementControlError> {
     if maximum_payload == 0 {
         return Err(PlacementControlError::InvalidLimit);
     }
@@ -134,6 +158,7 @@ struct PlacementControlWire {
 pub struct InboundPlacementControl {
     pub association: AssociationKey,
     pub command_id: CommandId,
+    pub scope: CoordinatorScope,
     pub command: PlacementControlCommand,
 }
 
@@ -143,6 +168,10 @@ pub enum PlacementControlEventKind {
     Reconcile {
         association: AssociationKey,
         gap: Option<ControlGap>,
+    },
+    GlobalMemberRemoved {
+        node: crate::types::NodeKey,
+        reason: crate::coordinator::MemberRemovalReason,
     },
 }
 
@@ -199,7 +228,7 @@ impl ControlDispatch for PlacementControlRouter {
         command_id: CommandId,
         payload: Bytes,
     ) -> Result<(), ControlDispatchError> {
-        let command = decode_control_command(&payload, self.maximum_payload)
+        let scoped = decode_control_command(&payload, self.maximum_payload)
             .map_err(|_| ControlDispatchError::InvalidCommand)?;
         let (completion, applied) = oneshot::channel();
         self.sender
@@ -207,7 +236,8 @@ impl ControlDispatch for PlacementControlRouter {
                 kind: PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
                     association,
                     command_id,
-                    command,
+                    scope: scoped.scope,
+                    command: scoped.command,
                 })),
                 completion,
             })
@@ -237,6 +267,121 @@ impl ControlDispatch for PlacementControlRouter {
     }
 }
 
+/// Bounded receiver directory used by logic nodes with independent domain sessions.
+pub struct PlacementControlDirectory {
+    senders: RwLock<BTreeMap<CoordinatorScope, mpsc::Sender<PlacementControlEvent>>>,
+    capacity_per_scope: usize,
+    maximum_scopes: usize,
+    maximum_payload: usize,
+    application_timeout: std::time::Duration,
+}
+
+impl PlacementControlDirectory {
+    pub fn new(
+        capacity_per_scope: usize,
+        maximum_scopes: usize,
+        maximum_payload: usize,
+    ) -> Result<Self, PlacementControlError> {
+        if capacity_per_scope == 0 || maximum_scopes == 0 || maximum_payload == 0 {
+            return Err(PlacementControlError::InvalidLimit);
+        }
+        Ok(Self {
+            senders: RwLock::new(BTreeMap::new()),
+            capacity_per_scope,
+            maximum_scopes,
+            maximum_payload,
+            application_timeout: std::time::Duration::from_secs(5),
+        })
+    }
+
+    pub fn register(
+        &self,
+        scope: CoordinatorScope,
+    ) -> Result<mpsc::Receiver<PlacementControlEvent>, PlacementControlError> {
+        let mut senders = self.senders.write().expect("control directory poisoned");
+        if senders.contains_key(&scope) || senders.len() == self.maximum_scopes {
+            return Err(PlacementControlError::InvalidLimit);
+        }
+        let (sender, receiver) = mpsc::channel(self.capacity_per_scope);
+        senders.insert(scope, sender);
+        Ok(receiver)
+    }
+}
+
+#[async_trait::async_trait]
+impl ControlDispatch for PlacementControlDirectory {
+    async fn apply(
+        &self,
+        association: AssociationKey,
+        command_id: CommandId,
+        payload: Bytes,
+    ) -> Result<(), ControlDispatchError> {
+        let scoped = decode_control_command(&payload, self.maximum_payload)
+            .map_err(|_| ControlDispatchError::InvalidCommand)?;
+        let sender = self
+            .senders
+            .read()
+            .expect("control directory poisoned")
+            .get(&scoped.scope)
+            .cloned()
+            .ok_or(ControlDispatchError::Unavailable)?;
+        let (completion, applied) = oneshot::channel();
+        sender
+            .try_send(PlacementControlEvent {
+                kind: PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
+                    association,
+                    command_id,
+                    scope: scoped.scope,
+                    command: scoped.command,
+                })),
+                completion,
+            })
+            .map_err(|_| ControlDispatchError::Unavailable)?;
+        tokio::time::timeout(self.application_timeout, applied)
+            .await
+            .map_err(|_| ControlDispatchError::Unavailable)?
+            .map_err(|_| ControlDispatchError::Unavailable)?
+    }
+
+    async fn reconcile(
+        &self,
+        association: AssociationKey,
+        gap: Option<ControlGap>,
+    ) -> Result<(), ControlDispatchError> {
+        let senders = self
+            .senders
+            .read()
+            .expect("control directory poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if senders.is_empty() {
+            return Err(ControlDispatchError::Unavailable);
+        }
+        let mut completions = Vec::with_capacity(senders.len());
+        for sender in senders {
+            let (completion, reconciled) = oneshot::channel();
+            sender
+                .try_send(PlacementControlEvent {
+                    kind: PlacementControlEventKind::Reconcile {
+                        association: association.clone(),
+                        gap,
+                    },
+                    completion,
+                })
+                .map_err(|_| ControlDispatchError::Unavailable)?;
+            completions.push(reconciled);
+        }
+        for completion in completions {
+            tokio::time::timeout(self.application_timeout, completion)
+                .await
+                .map_err(|_| ControlDispatchError::Unavailable)?
+                .map_err(|_| ControlDispatchError::Unavailable)??;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PlacementControlError {
     #[error("placement control limits must be nonzero")]
@@ -259,8 +404,12 @@ mod tests {
             operation_id: "drain-1".to_string(),
             expected_incarnation: NodeIncarnation::new(1).unwrap(),
         };
-        let payload = encode_control_command(&command, 1024).unwrap();
-        assert_eq!(decode_control_command(&payload, 1024).unwrap(), command);
+        let scope = CoordinatorScope::Placement(PlacementDomainId::new("control-test").unwrap());
+        let payload = encode_control_command(&scope, &command, 1024).unwrap();
+        assert_eq!(
+            decode_control_command(&payload, 1024).unwrap(),
+            ScopedPlacementControlCommand { scope, command }
+        );
         assert_eq!(
             decode_control_command(&payload, 1).unwrap_err(),
             PlacementControlError::PayloadTooLarge

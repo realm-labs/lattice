@@ -5,6 +5,7 @@ pub mod authority;
 pub mod control;
 pub mod coordinator;
 pub mod handoff;
+pub mod membership_session;
 pub mod plan;
 pub mod region;
 pub mod runtime;
@@ -20,7 +21,7 @@ mod tests {
 
     use lattice_core::actor_ref::{
         ClusterId, ConfigFingerprint, EntityId, EntityType, NodeAddress, NodeIncarnation,
-        ProtocolId,
+        PlacementDomainId, ProtocolId,
     };
 
     use crate::allocation::*;
@@ -37,8 +38,10 @@ mod tests {
     }
 
     fn running_slot(owner: NodeKey) -> PlacementSlot {
+        let domain = PlacementDomainId::new("world").unwrap();
         PlacementSlot {
             key: PlacementSlotKey::Shard {
+                domain: domain.clone(),
                 entity_type: EntityType::new("world").unwrap(),
                 shard_id: ShardId::new(3),
             },
@@ -46,7 +49,11 @@ mod tests {
             owner: Some(owner),
             target: None,
             assignment_generation: AssignmentGeneration::new(2).unwrap(),
-            version: StateVersion::new(CoordinatorTerm::new(4).unwrap(), Revision::new(9).unwrap()),
+            version: PlacementVersion::new(
+                domain,
+                CoordinatorTerm::new(4).unwrap(),
+                Revision::new(9).unwrap(),
+            ),
             state: PlacementSlotState::Running,
             active_move: None,
             barrier_sessions: Default::default(),
@@ -64,6 +71,7 @@ mod tests {
         authority
             .transition(AuthorityEvent::InstallGrant {
                 grant: ClaimGrant {
+                    domain: slot.key.domain().clone(),
                     slot: slot.key.clone(),
                     owner: local,
                     coordinator_term: slot.version.term,
@@ -87,6 +95,7 @@ mod tests {
     #[test]
     fn xxh3_v1_entity_mapping_has_a_fixed_golden_vector() {
         let config = EntityConfig::new(
+            PlacementDomainId::new("world").unwrap(),
             EntityType::new("world").unwrap(),
             ProtocolId::new(7).unwrap(),
             128,
@@ -126,7 +135,12 @@ mod tests {
             draining: false,
         };
         let view = PlacementView {
-            version: StateVersion::new(CoordinatorTerm::new(1).unwrap(), Revision::new(1).unwrap()),
+            domain: PlacementDomainId::new("world").unwrap(),
+            version: PlacementVersion::new(
+                PlacementDomainId::new("world").unwrap(),
+                CoordinatorTerm::new(1).unwrap(),
+                Revision::new(1).unwrap(),
+            ),
             now: MonotonicTime::from_millis(100_000),
             reconciled: true,
             degraded: false,
@@ -139,6 +153,7 @@ mod tests {
             last_automatic_move_at: None,
         };
         let request = AllocationRequest {
+            domain: PlacementDomainId::new("world").unwrap(),
             entity_type,
             shard_id: ShardId::new(1),
             required_protocol: protocol,
