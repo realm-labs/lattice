@@ -1,13 +1,16 @@
 # Codex Goal Prompt
 
 ```text
-Your goal is to fully implement the lattice framework.
+Your goal is to execute the placement-domain Coordinator hard switch completely.
 
 Primary execution plan:
-- docs/production-hardening-plan.md
+- docs/placement-domain-coordinator-goal.md
 
-Historical reference only (do not execute its old tracker):
+Completed historical references (do not execute their old trackers):
+- docs/production-hardening-plan.md
 - docs/implementation-plan.md
+- docs/coordinator-correctness-implementation-plan.md
+- docs/cluster-discovery-lifecycle-plan.md
 
 Architecture acceptance sources:
 - docs/architecture/README.md
@@ -21,26 +24,26 @@ Architecture acceptance sources:
 - docs/architecture/07-api-examples.md
 - docs/architecture/08-distributed-testing.md
 
-First, read docs/production-hardening-plan.md completely, including its execution protocol.
-Then execute the Current Execution Pointer and its hard-switch macro batch through the tracker.
+First, read docs/placement-domain-coordinator-goal.md completely, including its execution protocol.
+Then execute its Current Execution Pointer and hard-switch macro batches through the tracker.
 
 This is a hard switch, not an incremental compatibility migration. Do not stop at documentation or API sketches.
-Implement the complete architecture described by docs/architecture rather than substituting a minimal v1 that requires a later structural rewrite. Multi-lane Associations, bounded protocol catalogues, revisioned snapshots, per-slot claims, subscribed-Region handoff barriers, pluggable allocation/capacity-aware persisted rebalancing, simulation-first deterministic correctness/executable invariants, Docker-based multi-process/chaos acceptance, EntityRef/SingletonRef watch_current, and the full Singleton model are required. Manage complexity through shared reliable control delivery, a shared PlacementSlot authority engine, generation-conditional RebalancePlans, shared production/simulation reducers, and narrow fault domains; do not delete or indefinitely defer these capabilities.
+Implement the complete placement-domain architecture rather than substituting a cluster-wide default domain that requires a later structural rewrite. Preserve multi-lane Associations, bounded protocol catalogues, revisioned snapshots, per-slot claims, subscribed-Region handoff barriers, pluggable allocation/capacity-aware persisted rebalancing, simulation-first deterministic correctness/executable invariants, Docker-based multi-process/chaos acceptance, EntityRef/SingletonRef watch_current, and the full Singleton model. Scope membership, leadership, storage, routing, capacity, lifecycle, administration and acceptance exactly as required by the active Goal.
 The implementation must use the Cargo workspace crate split defined in docs/architecture/00-overview.md and docs/production-hardening-plan.md. Do not implement lattice as one root crate with many internal modules.
-Phases are dependency/checklist groupings and may overlap inside one macro batch; they are not commit or green-build boundaries.
-When resuming from an existing implementation, do not trust tracker checkmarks as proof of completion. Audit checked items in the current phase and earlier dependency phases against the codebase before continuing. A checked item is valid only if it has concrete framework implementation plus executable test or runnable example coverage, or an explicit documented rationale for why no code is required. If a checked item is not backed by implementation/coverage, change it back to `[ ]` or add a precise missing-work subitem, then work on the earliest missing item.
+Batches are dependency/checklist groupings and may overlap inside one macro commit; they are not green-build boundaries by themselves.
+When resuming from an existing implementation, do not trust tracker checkmarks as proof of completion. Audit checked items in the current batch and earlier dependency batches against the codebase before continuing. A checked item is valid only if it has concrete framework implementation plus executable test or runnable example coverage, or an explicit documented rationale for why no code is required. If a checked item is not backed by implementation/coverage, change it back to `[ ]` or add a precise missing-work subitem, then work on the earliest missing item.
 Follow the macro-batch grouping in the plan. Prefer a large cross-crate replacement over compatibility adapters, temporary fallback routing, dual writes, or small commits created only to keep the workspace green.
 Intermediate worktrees and commits may intentionally fail to compile, test, or run while removed APIs and crates are being replaced. Record the known broken frontier and continue; do not restore obsolete APIs merely to regain compilation.
-After each completed macro batch, update docs/production-hardening-plan.md:
+After each completed macro batch, update docs/placement-domain-coordinator-goal.md:
 - mark completed tracker items with `[x]`;
 - add newly discovered missing work as `[ ]` items;
-- mark a phase status `[x]` only after every required checklist/evidence item in that phase is complete.
-Aim for the three large English conventional commits named in the hard-switch plan; use a fourth only for a genuinely independent migration or generated-code boundary. Do not create per-phase or per-checklist commits.
+- mark a batch status `[x]` only after every required checklist/evidence item in that batch is complete.
+Aim for the three large English conventional commits named in the active Goal after its documentation baseline. Do not create per-checklist commits.
 
 Final exit criteria:
-- Every phase status in the Current Progress Tracker is `[x]`.
-- Every deliverable, acceptance item, and suggested test in docs/production-hardening-plan.md is complete or covered by an explicit equivalent test.
-- Every item in the global completion criteria in docs/production-hardening-plan.md is satisfied.
+- Every batch status in the active Goal is `[x]`.
+- Every deliverable, invariant, migration item and acceptance test in the active Goal is complete.
+- Storage/control generation 5 is the only runtime model and the generation-4 placement topology is structurally absent.
 - Every architecture design under docs/architecture/ has a corresponding code implementation, example API, or executable test coverage.
 - examples/minimal-world runs and covers service bootstrap, actor registration, remoting, sharding, singleton, EventBus, scheduler, Gateway, ops, and telemetry.
 - The pinned Docker `quality`, `sim`, `model`, `e2e`, `e2e-ha-etcd`, `chaos`, and `k8s` profiles pass; required soak/replay evidence is retained. These profiles run fmt, clippy, tests, real TCP/TLS/etcd, fault scenarios and deployment-lifecycle checks without requiring a host Rust/Kubernetes test toolchain.
