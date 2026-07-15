@@ -11,12 +11,14 @@ use lattice_actor::protocol::{
 use lattice_actor::recipient::{
     ActorSystem, RecipientBackend, RecipientError, RegisteredActorProtocol,
 };
+use lattice_actor::registry::{ActorLoader, ActorRegistry};
 use lattice_actor::traits::{Actor, Message, Request};
 use lattice_core::actor_ref::{ActorRef, EntityRef, ProtocolTag, RecipientRef, SingletonRef};
 use lattice_discovery::provider::ClusterDiscovery;
 use lattice_placement::authority::AuthorityEffect;
 use lattice_placement::control::{PlacementControlEvent, PlacementControlRouter};
 use lattice_placement::coordinator::{MemberChange, MemberEvent, NodeHello};
+use lattice_placement::region::EntityConfig;
 use lattice_placement::runtime::CoordinatorHandle;
 use lattice_placement::runtime::CoordinatorLeader;
 use lattice_placement::session::LogicCoordinatorConfig;
@@ -38,11 +40,14 @@ use lattice_remoting::protocol::ProtocolDescriptor;
 use lattice_remoting::watch::WatchRegistry;
 use tokio::sync::{mpsc, watch};
 
-use crate::backend::{LogicalRouter, ServiceInboundDispatch, ServiceRecipientBackend};
+use crate::backend::{
+    LogicalRouter, ServiceInboundDispatch, ServiceRecipientBackend, SwitchableLogicalRouter,
+};
 use crate::cluster::join::{BootstrapView, JoinController};
 use crate::cluster::members::{MemberDirectory, MemberSnapshot};
 use crate::cluster::peers::PeerReconciler;
 use crate::cluster::runtime::LogicJoinRuntime;
+use crate::cluster::{ClusterLogicalRouter, ClusterRouterError, LogicalBufferConfig};
 use crate::config::{ClusterJoinConfig, NodeConfig};
 use crate::control::ServiceControlDispatch;
 use crate::error::ServiceError;
@@ -55,6 +60,9 @@ type ActorSystemInstaller = Box<
         + Sync,
 >;
 
+pub(crate) type LogicalEntityInstaller =
+    Arc<dyn Fn(&mut ClusterLogicalRouter) -> Result<(), ClusterRouterError> + Send + Sync>;
+
 pub struct LatticeServiceBuilder {
     config: NodeConfig,
     associations: Arc<AssociationManager>,
@@ -63,6 +71,9 @@ pub struct LatticeServiceBuilder {
     protocols: BTreeMap<u64, lattice_remoting::protocol::ProtocolFingerprint>,
     actor_protocols: BTreeMap<u64, RegisteredActorProtocol>,
     actor_system_installers: Vec<ActorSystemInstaller>,
+    entity_configs: Vec<EntityConfig>,
+    proxied_entity_configs: Vec<EntityConfig>,
+    entity_installers: Vec<LogicalEntityInstaller>,
     logical: Option<Arc<dyn LogicalRouter>>,
     control_dispatch: Arc<dyn ControlDispatch>,
     logic_runtime: Option<LogicRuntimeAssembly>,
@@ -72,6 +83,7 @@ pub struct LatticeServiceBuilder {
     discovery: Option<Arc<dyn ClusterDiscovery>>,
     join_config: ClusterJoinConfig,
     member_event_capacity: usize,
+    capacity_units: u64,
 }
 
 struct LogicRuntimeAssembly {
@@ -111,6 +123,9 @@ impl LatticeServiceBuilder {
             protocols: BTreeMap::new(),
             actor_protocols: BTreeMap::new(),
             actor_system_installers: Vec::new(),
+            entity_configs: Vec::new(),
+            proxied_entity_configs: Vec::new(),
+            entity_installers: Vec::new(),
             logical: None,
             control_dispatch: Arc::new(RejectControlDispatch),
             logic_runtime: None,
@@ -120,6 +135,7 @@ impl LatticeServiceBuilder {
             discovery: None,
             join_config: ClusterJoinConfig::default(),
             member_event_capacity: 256,
+            capacity_units: 1,
             associations,
             messaging,
         })
@@ -135,7 +151,7 @@ impl LatticeServiceBuilder {
 
     pub fn register_actor<A: Actor, P: Protocol>(
         mut self,
-        registry: Arc<lattice_actor::registry::ActorRegistry<A>>,
+        registry: Arc<ActorRegistry<A>>,
         protocol: Arc<ActorProtocolBinding<A, P>>,
     ) -> Result<Self, ServiceError> {
         if registry.protocol_id() != Some(protocol.protocol_id()) {
@@ -159,6 +175,81 @@ impl LatticeServiceBuilder {
         self.hosts
             .register(ActorHost::new(registry, protocol))
             .map_err(ServiceError::Host)?;
+        Ok(self)
+    }
+
+    /// Registers an actor as a placement-managed logical entity.
+    ///
+    /// The entity declaration is advertised in `NodeHello`, its protocol is
+    /// installed in the service catalogue, and the loader is re-registered
+    /// automatically whenever discovery selects a new Coordinator.
+    pub fn register_entity<A, L, P>(
+        mut self,
+        config: EntityConfig,
+        registry: Arc<ActorRegistry<A>>,
+        protocol: Arc<ActorProtocolBinding<A, P>>,
+        loader: L,
+    ) -> Result<Self, ServiceError>
+    where
+        A: Actor,
+        L: ActorLoader<A>,
+        P: Protocol,
+    {
+        config.validate().map_err(ServiceError::EntityConfig)?;
+        if config.protocol_id != protocol.protocol_id() {
+            return Err(ServiceError::LogicalRouter(
+                ClusterRouterError::ProtocolMismatch,
+            ));
+        }
+        if self
+            .entity_configs
+            .iter()
+            .chain(self.proxied_entity_configs.iter())
+            .any(|registered| registered.entity_type == config.entity_type)
+        {
+            return Err(ServiceError::LogicalRouter(
+                ClusterRouterError::DuplicateEntity(config.entity_type),
+            ));
+        }
+        self = self.register_actor(registry.clone(), protocol.clone())?;
+        self.entity_configs.push(config.clone());
+        self.entity_installers.push(Arc::new(move |router| {
+            router.register_entity(
+                config.clone(),
+                registry.clone(),
+                protocol.clone(),
+                loader.clone(),
+            )
+        }));
+        Ok(self)
+    }
+
+    /// Registers a logical entity protocol for outbound routing without
+    /// making this node eligible to own its shards.
+    pub fn use_entity<P: Protocol>(mut self, config: EntityConfig) -> Result<Self, ServiceError> {
+        config.validate().map_err(ServiceError::EntityConfig)?;
+        let protocol = Arc::new(P::build_protocol().map_err(ServiceError::ProtocolBuild)?);
+        if config.protocol_id != protocol.protocol_id() {
+            return Err(ServiceError::LogicalRouter(
+                ClusterRouterError::ProtocolMismatch,
+            ));
+        }
+        if self
+            .entity_configs
+            .iter()
+            .chain(self.proxied_entity_configs.iter())
+            .any(|registered| registered.entity_type == config.entity_type)
+        {
+            return Err(ServiceError::LogicalRouter(
+                ClusterRouterError::DuplicateEntity(config.entity_type),
+            ));
+        }
+        let fingerprint = protocol.fingerprint();
+        self = self.register_protocol(protocol)?;
+        self.proxied_entity_configs.push(config.clone());
+        self.entity_installers.push(Arc::new(move |router| {
+            router.register_entity_proxy(config.clone(), fingerprint)
+        }));
         Ok(self)
     }
 
@@ -227,6 +318,14 @@ impl LatticeServiceBuilder {
         self
     }
 
+    pub fn capacity_units(mut self, capacity_units: u64) -> Result<Self, ServiceError> {
+        if capacity_units == 0 {
+            return Err(ServiceError::InvalidCapacity);
+        }
+        self.capacity_units = capacity_units;
+        Ok(self)
+    }
+
     pub fn cluster_logic_runtime(
         mut self,
         router: Arc<dyn LogicalRouter>,
@@ -261,7 +360,13 @@ impl LatticeServiceBuilder {
         self.control_dispatch = dispatch;
         self.coordinator_runtime = Some(CoordinatorRuntimeAssembly {
             future: Box::pin(async move {
-                let _ = leader.run(controls, shutdown_rx).await;
+                if let Err(error) = leader.run(controls, shutdown_rx).await {
+                    tracing::error!(
+                        target: "lattice.cluster.coordinator",
+                        %error,
+                        "Coordinator leader runtime terminated"
+                    );
+                }
             }),
             shutdown,
             handle,
@@ -287,6 +392,7 @@ impl LatticeServiceBuilder {
             MemberDirectory::new(self.member_event_capacity)
                 .map_err(ServiceError::MemberDirectory)?,
         );
+        let mut discovered_router = None;
         let auto_join = if let Some(discovery) = self.discovery.take() {
             if self.logic_runtime.is_some() {
                 return Err(ServiceError::ConflictingClusterRuntime);
@@ -297,6 +403,9 @@ impl LatticeServiceBuilder {
             )
             .map_err(ServiceError::PlacementControl)?;
             self.control_dispatch = Arc::new(dispatch);
+            let switchable = Arc::new(SwitchableLogicalRouter::new());
+            self.logical = Some(switchable.clone());
+            discovered_router = Some(switchable);
             let protocols = self
                 .protocols
                 .iter()
@@ -316,13 +425,21 @@ impl LatticeServiceBuilder {
                         incarnation: self.config.incarnation,
                     },
                     roles: self.config.roles.clone(),
-                    capacity_units: 1,
-                    hosted_entity_types: Default::default(),
-                    proxied_entity_types: Default::default(),
+                    capacity_units: self.capacity_units,
+                    hosted_entity_types: self
+                        .entity_configs
+                        .iter()
+                        .map(|config| config.entity_type.clone())
+                        .collect(),
+                    proxied_entity_types: self
+                        .proxied_entity_configs
+                        .iter()
+                        .map(|config| config.entity_type.clone())
+                        .collect(),
                     singleton_eligibility: Default::default(),
                     used_singletons: Default::default(),
                     protocols,
-                    entity_configs: Vec::new(),
+                    entity_configs: self.entity_configs.clone(),
                     singleton_configs: Vec::new(),
                 },
             ))
@@ -428,8 +545,13 @@ impl LatticeServiceBuilder {
                     controls: Some(controls),
                     config: LogicCoordinatorConfig::default(),
                     effect_capacity: self.member_event_capacity,
-                    router: None,
-                    members: members.clone(),
+                    router: discovered_router
+                        .clone()
+                        .expect("discovery always installs a logical router"),
+                    entity_installers: self.entity_installers.clone(),
+                    messaging: messaging.clone(),
+                    buffer_config: LogicalBufferConfig::default(),
+                    maximum_registrations: self.config.maximum_actor_protocols,
                     peers: peers.clone(),
                     watches: watches.clone(),
                     lifecycle: lifecycle.clone(),
@@ -657,7 +779,20 @@ impl LatticeService {
                 .coordinator_handle
                 .lock()
                 .expect("service Coordinator handle poisoned") = Some(runtime.handle);
-            self.supervisor.spawn(runtime.future)?;
+            let lifecycle = self.lifecycle.clone();
+            let lifecycle_events = self.lifecycle_events.clone();
+            let endpoint = self.endpoint.clone();
+            self.supervisor.spawn(async move {
+                runtime.future.await;
+                let _ = endpoint.shutdown().await;
+                let mut lifecycle = lifecycle.lock().expect("service lifecycle poisoned");
+                if lifecycle
+                    .transition(ServiceLifecycleEvent::RuntimeTerminated)
+                    .is_ok()
+                {
+                    lifecycle_events.send_replace(lifecycle.state());
+                }
+            })?;
         }
         let join_runtime = self
             .join_runtime
@@ -721,7 +856,6 @@ impl LatticeService {
                 let _ = session.run(controls, shutdown_rx).await;
             })?;
             let watches = self.watches.clone();
-            let members = self.members.clone();
             let peers = self.peers.clone();
             let drain_ready = self.drain_ready.clone();
             self.supervisor.spawn(async move {
@@ -761,21 +895,25 @@ impl LatticeService {
                                     "authoritative member upserted"
                                 );
                             }
-                            let _ = peers.apply(*event);
+                            let _ = peers.apply(*event).await;
                             continue;
                         }
                         LogicPlacementEffect::MemberSnapshot {
                             version,
                             members: snapshot,
                         } => {
-                            let _ = members.install_snapshot(version, snapshot);
+                            let _ = peers.install_snapshot(version, snapshot).await;
                             continue;
                         }
                         LogicPlacementEffect::DrainReady {
                             operation_id,
                             incarnation: _,
                         } => {
-                            if handle.complete_member_drain(operation_id.clone()).is_ok() {
+                            if handle
+                                .complete_member_drain(operation_id.clone())
+                                .await
+                                .is_ok()
+                            {
                                 drain_ready.send_replace(Some(operation_id));
                             }
                             continue;

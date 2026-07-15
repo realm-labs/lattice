@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -121,6 +121,171 @@ pub trait LogicalRouter: Send + Sync + 'static {
         _deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
         Err(RemoteMessageError::Unauthorized)
+    }
+}
+
+/// Stable logical routing facade used by services that discover their
+/// Coordinator at runtime.  Recipient backends keep this facade for their
+/// whole lifetime while the active cluster router is replaced whenever the
+/// authoritative Coordinator changes.
+pub(crate) struct SwitchableLogicalRouter {
+    current: RwLock<Option<Arc<dyn LogicalRouter>>>,
+}
+
+impl SwitchableLogicalRouter {
+    pub(crate) fn new() -> Self {
+        Self {
+            current: RwLock::new(None),
+        }
+    }
+
+    pub(crate) fn install(&self, router: Arc<dyn LogicalRouter>) {
+        *self.current.write().expect("logical router poisoned") = Some(router);
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.current.write().expect("logical router poisoned") = None;
+    }
+
+    fn current(&self) -> Result<Arc<dyn LogicalRouter>, RemoteMessageError> {
+        self.current
+            .read()
+            .expect("logical router poisoned")
+            .clone()
+            .ok_or(RemoteMessageError::ShardUnavailable)
+    }
+}
+
+#[async_trait]
+impl LogicalRouter for SwitchableLogicalRouter {
+    async fn tell_entity(
+        &self,
+        sender: Option<ActorRef>,
+        target: EntityRef,
+        fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        self.current()?
+            .tell_entity(sender, target, fingerprint, message_id, payload)
+            .await
+    }
+
+    async fn ask_entity(
+        &self,
+        target: EntityRef,
+        fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, AskError> {
+        self.current()
+            .map_err(AskError::Protocol)?
+            .ask_entity(target, fingerprint, message_id, payload, deadline)
+            .await
+    }
+
+    async fn tell_singleton(
+        &self,
+        sender: Option<ActorRef>,
+        target: SingletonRef,
+        fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        self.current()?
+            .tell_singleton(sender, target, fingerprint, message_id, payload)
+            .await
+    }
+
+    async fn ask_singleton(
+        &self,
+        target: SingletonRef,
+        fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, AskError> {
+        self.current()
+            .map_err(AskError::Protocol)?
+            .ask_singleton(target, fingerprint, message_id, payload, deadline)
+            .await
+    }
+
+    async fn resolve_entity_current(
+        &self,
+        target: EntityRef,
+    ) -> Result<Option<ActorRef>, WatchError> {
+        self.current()
+            .map_err(|_| WatchError::Unavailable)?
+            .resolve_entity_current(target)
+            .await
+    }
+
+    async fn resolve_singleton_current(
+        &self,
+        target: SingletonRef,
+    ) -> Result<Option<ActorRef>, WatchError> {
+        self.current()
+            .map_err(|_| WatchError::Unavailable)?
+            .resolve_singleton_current(target)
+            .await
+    }
+
+    async fn drain_slot(&self, slot: PlacementSlotKey) -> Result<bool, RemoteMessageError> {
+        self.current()?.drain_slot(slot).await
+    }
+
+    async fn stop_fenced_slot(&self, slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
+        self.current()?.stop_fenced_slot(slot).await
+    }
+
+    async fn receive_entity_tell(
+        &self,
+        sender: Option<ActorRef>,
+        target: LogicalEntityTarget,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        self.current()?
+            .receive_entity_tell(sender, target, message_id, payload)
+            .await
+    }
+
+    async fn receive_entity_ask(
+        &self,
+        target: LogicalEntityTarget,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, RemoteMessageError> {
+        self.current()?
+            .receive_entity_ask(target, message_id, payload, deadline)
+            .await
+    }
+
+    async fn receive_singleton_tell(
+        &self,
+        sender: Option<ActorRef>,
+        target: LogicalSingletonTarget,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        self.current()?
+            .receive_singleton_tell(sender, target, message_id, payload)
+            .await
+    }
+
+    async fn receive_singleton_ask(
+        &self,
+        target: LogicalSingletonTarget,
+        message_id: u64,
+        payload: Bytes,
+        deadline: Instant,
+    ) -> Result<Bytes, RemoteMessageError> {
+        self.current()?
+            .receive_singleton_ask(target, message_id, payload, deadline)
+            .await
     }
 }
 

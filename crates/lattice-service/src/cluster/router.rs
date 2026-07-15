@@ -1,4 +1,5 @@
 use super::entity::EntityRouteHost;
+use super::proxy::EntityProxyRoute;
 use super::singleton::SingletonRouteHost;
 use super::{
     Actor, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc, AskError,
@@ -36,6 +37,7 @@ impl ClusterLogicalRouter {
             local_node,
             state,
             associations,
+            peers: None,
             messaging,
             coordinator,
             buffer_config,
@@ -43,6 +45,11 @@ impl ClusterLogicalRouter {
             singletons: BTreeMap::new(),
             maximum_registrations,
         })
+    }
+
+    pub(crate) fn with_peer_reconciler(mut self, peers: Arc<super::peers::PeerReconciler>) -> Self {
+        self.peers = Some(peers);
+        self
     }
 
     pub fn register_entity<A, L, P>(
@@ -79,6 +86,38 @@ impl ClusterLogicalRouter {
                     registry,
                     protocol,
                     loader,
+                }),
+            )
+            .is_some()
+        {
+            return Err(ClusterRouterError::DuplicateEntity(entity_type));
+        }
+        Ok(())
+    }
+
+    pub fn register_entity_proxy(
+        &mut self,
+        config: EntityConfig,
+        fingerprint: ProtocolFingerprint,
+    ) -> Result<(), ClusterRouterError> {
+        if self.entities.len() + self.singletons.len() == self.maximum_registrations {
+            return Err(ClusterRouterError::Capacity);
+        }
+        let entity_type = config.entity_type.clone();
+        if self
+            .entities
+            .insert(
+                entity_type.clone(),
+                Arc::new(EntityProxyRoute {
+                    local_node: self.local_node.clone(),
+                    state: self.state.clone(),
+                    associations: self.associations.clone(),
+                    peers: self.peers.clone(),
+                    messaging: self.messaging.clone(),
+                    coordinator: self.coordinator.clone(),
+                    buffer: RouteBuffer::new(self.buffer_config.clone()),
+                    config,
+                    fingerprint,
                 }),
             )
             .is_some()

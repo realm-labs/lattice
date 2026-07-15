@@ -249,6 +249,20 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
 
     pub async fn run(
         mut self,
+        controls: mpsc::Receiver<PlacementControlEvent>,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let result = self.run_loop(controls, shutdown).await;
+        let revoke = self.store.revoke_lease(self.leader_lease_id).await;
+        match (result, revoke) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(error)) => Err(error.into()),
+        }
+    }
+
+    async fn run_loop(
+        &mut self,
         mut controls: mpsc::Receiver<PlacementControlEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), CoordinatorRuntimeError> {
@@ -269,7 +283,6 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                 biased;
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        self.store.revoke_lease(self.leader_lease_id).await?;
                         return Ok(());
                     }
                 }
@@ -286,7 +299,13 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
                         .map(|_| ())
                         .map_err(control_dispatch_error);
                     let _ = event.completion.send(acknowledgement);
-                    result?;
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            target: "lattice.cluster.coordinator",
+                            %error,
+                            "Coordinator rejected a member control command"
+                        );
+                    }
                 }
                 operation = self.operation_receiver.recv() => {
                     let Some(operation) = operation else {

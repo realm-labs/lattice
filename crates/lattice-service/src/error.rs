@@ -20,6 +20,10 @@ pub enum ServiceError {
     ProtocolRegistration(#[source] lattice_actor::recipient::ProtocolRegistrationError),
     #[error("actor protocol construction failed")]
     ProtocolBuild(#[source] lattice_actor::protocol::ProtocolBuildError),
+    #[error("logical entity configuration is invalid")]
+    EntityConfig(#[source] lattice_placement::region::RegionError),
+    #[error("logical entity router construction failed")]
+    LogicalRouter(#[source] crate::cluster::ClusterRouterError),
     #[error("association manager construction failed")]
     Association(#[source] lattice_remoting::association::AssociationError),
     #[error("remote messaging construction failed")]
@@ -40,6 +44,8 @@ pub enum ServiceError {
     TaskFailed,
     #[error("service has no active Coordinator session")]
     CoordinatorUnavailable,
+    #[error("node placement capacity must be nonzero")]
+    InvalidCapacity,
     #[error("graceful member leave exceeded its deadline")]
     LeaveTimeout,
 }

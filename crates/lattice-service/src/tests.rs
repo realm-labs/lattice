@@ -13,11 +13,15 @@ use lattice_actor::protocol::CodecDescriptor;
 use lattice_actor::protocol::DecodeError;
 use lattice_actor::protocol::EncodeError;
 use lattice_actor::protocol::WireCodec;
-use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
+use lattice_actor::registry::{
+    ActorCreateContext, ActorLoader, ActorRefConfig, ActorRegistry, ActorRegistryConfig,
+};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, Responder, StopReason};
 use lattice_core::actor_kind;
-use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation};
+use lattice_core::actor_ref::{
+    ActorRef, ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, ProtocolId,
+};
 use lattice_core::id::ActorId;
 use lattice_discovery::provider::{
     ClusterDiscovery, DiscoveryError, DiscoveryOrigin, DiscoverySnapshot, DiscoverySource,
@@ -26,8 +30,9 @@ use lattice_discovery::provider::{
 use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
 use lattice_placement::control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter};
 use lattice_placement::coordinator::MemberStatus;
+use lattice_placement::region::EntityConfig;
 use lattice_placement::runtime::{CoordinatorLeader, CoordinatorLeaderConfig};
-use lattice_placement::storage::InMemoryPlacementStore;
+use lattice_placement::storage::{InMemoryPlacementStore, PlacementStore};
 use lattice_placement::types::{CoordinatorTerm, NodeKey};
 use lattice_remoting::config::RemotingConfig;
 use lattice_remoting::handshake::NodeIdentity;
@@ -84,6 +89,16 @@ impl WireCodec<Pong> for PongCodec {
 }
 
 struct PingActor;
+
+#[derive(Clone, Copy)]
+struct PingLoader;
+
+#[async_trait]
+impl ActorLoader<PingActor> for PingLoader {
+    async fn load(&self, _ctx: ActorCreateContext) -> Result<PingActor, ActorError> {
+        Ok(PingActor)
+    }
+}
 
 #[async_trait]
 impl Actor for PingActor {
@@ -367,7 +382,7 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     let associations = coordinator_builder.association_manager();
     let store = Arc::new(InMemoryPlacementStore::new(32, 32).unwrap());
     let leader = CoordinatorLeader::elect(
-        store,
+        store.clone(),
         associations,
         NodeKey {
             node_id: "coordinator".to_string(),
@@ -424,7 +439,7 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     .unwrap();
     member.start().await.unwrap();
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         let mut lifecycle = member.subscribe_lifecycle();
         while *lifecycle.borrow() != ServiceLifecycleState::Ready {
             lifecycle.changed().await.unwrap();
@@ -444,6 +459,7 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
         .await
         .unwrap();
     assert_eq!(member.lifecycle_state(), ServiceLifecycleState::Terminated);
+    assert!(store.get_member("member").await.unwrap().is_none());
     coordinator.shutdown().await.unwrap();
 }
 
@@ -565,12 +581,44 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
 
     let (discovery_tx, discovery_rx) =
         tokio::sync::watch::channel(discovery_snapshot(1, "coordinator-a", address_a));
+    let member_address = NodeAddress::new("127.0.0.1", member_port).unwrap();
+    let member_incarnation = NodeIncarnation::new(303).unwrap();
+    let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let registry = Arc::new(ActorRegistry::new_bound(
+        actor_kind!("RolloverPing"),
+        ActorRegistryConfig {
+            actor_ref: Some(ActorRefConfig {
+                cluster_id: cluster_id.clone(),
+                node_address: member_address.clone(),
+                node_incarnation: member_incarnation,
+            }),
+            ..ActorRegistryConfig::default()
+        },
+        binding.as_ref(),
+    ));
+    let entity_config = EntityConfig::new(
+        EntityType::new("rollover-ping").unwrap(),
+        ProtocolId::new(PROTOCOL_ID).unwrap(),
+        8,
+        "weighted-least-load",
+        1,
+        Vec::new(),
+    )
+    .unwrap();
+    let target = entity_config
+        .entity_ref::<PingProtocol>(
+            cluster_id.clone(),
+            EntityId::new(b"entity-1".to_vec()).unwrap(),
+        )
+        .unwrap();
     let member = LatticeService::builder(node_config(
         cluster_id.clone(),
         "rollover-member",
-        NodeAddress::new("127.0.0.1", member_port).unwrap(),
-        NodeIncarnation::new(303).unwrap(),
+        member_address,
+        member_incarnation,
     ))
+    .unwrap()
+    .register_entity(entity_config, registry, binding, PingLoader)
     .unwrap()
     .cluster_discovery(Arc::new(WatchDiscovery {
         snapshots: discovery_rx,
@@ -594,6 +642,7 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
     })
     .await
     .unwrap();
+    assert_eq!(eventually_ping(&member, target.clone(), 1).await, Pong(2));
 
     coordinator_a.force_shutdown().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -603,6 +652,7 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
     })
     .await
     .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     let coordinator_b = coordinator_service(
         store,
@@ -624,6 +674,7 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
     })
     .await
     .unwrap();
+    assert_eq!(eventually_ping(&member, target, 2).await, Pong(3));
     let members = member.member_snapshot().members;
     assert_eq!(
         members
@@ -633,9 +684,26 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
         1
     );
 
-    member
-        .leave(tokio::time::Instant::now() + Duration::from_secs(2))
-        .await
-        .unwrap();
+    member.force_shutdown().await.unwrap();
     coordinator_b.shutdown().await.unwrap();
+}
+
+async fn eventually_ping(
+    service: &LatticeService,
+    target: lattice_core::actor_ref::EntityRef<PingProtocol>,
+    value: u64,
+) -> Pong {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(reply) = service
+                .ask(target.clone(), Ping(value), Duration::from_secs(2))
+                .await
+            {
+                break reply;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap()
 }

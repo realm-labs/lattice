@@ -21,6 +21,7 @@ pub enum ServiceLifecycleEvent {
     DrainComplete,
     ForceStop,
     StartupFailed,
+    RuntimeTerminated,
     ShutdownComplete,
 }
 
@@ -95,6 +96,16 @@ impl ServiceLifecycle {
             (State::Booting | State::Joining, Event::StartupFailed) => {
                 (State::Terminated, &[Effect::ReleaseRuntimeIdentity])
             }
+            (
+                State::Joining | State::Ready | State::Degraded | State::Draining,
+                Event::RuntimeTerminated,
+            ) => (
+                State::Terminated,
+                &[
+                    Effect::CloseExternalAdmission,
+                    Effect::ReleaseRuntimeIdentity,
+                ],
+            ),
             (State::Stopping, Event::ShutdownComplete) => {
                 (State::Terminated, &[Effect::ReleaseRuntimeIdentity])
             }

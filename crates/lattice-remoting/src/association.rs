@@ -332,6 +332,13 @@ impl Association {
             .len()
     }
 
+    pub fn control_command_pending(&self, command_id: CommandId) -> bool {
+        self.reliable_control
+            .lock()
+            .expect("reliable control state poisoned")
+            .contains_outbound(command_id)
+    }
+
     pub fn preview_control(&self, envelope: &ControlEnvelope) -> ControlApply {
         self.reliable_control
             .lock()

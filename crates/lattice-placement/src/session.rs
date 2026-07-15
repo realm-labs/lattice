@@ -199,17 +199,34 @@ impl LogicCoordinatorHandle {
         })
     }
 
-    pub fn complete_member_drain(&self, operation_id: String) -> Result<(), LogicSessionError> {
+    pub async fn complete_member_drain(
+        &self,
+        operation_id: String,
+    ) -> Result<(), LogicSessionError> {
         let incarnation = self
             .state
             .lock()
             .expect("logic placement state poisoned")
             .local_node
             .incarnation;
-        self.send_reliable(PlacementControlCommand::DrainComplete {
-            operation_id,
-            expected_incarnation: incarnation,
-        })
+        let association = self
+            .associations
+            .get(&self.coordinator)
+            .ok_or(LogicSessionError::AssociationUnavailable)?;
+        let command_id = association.admit_control_command(
+            encode_control_command(
+                &PlacementControlCommand::DrainComplete {
+                    operation_id,
+                    expected_incarnation: incarnation,
+                },
+                self.maximum_control_payload,
+            )
+            .map_err(LogicSessionError::Control)?,
+        )?;
+        while association.control_command_pending(command_id) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
     }
 
     fn send_ephemeral(&self, command: PlacementControlCommand) -> Result<(), LogicSessionError> {
@@ -381,6 +398,13 @@ impl LogicCoordinatorSession {
         mpsc::Receiver<PlacementControlEvent>,
     ) {
         let result = self.run_loop(&mut controls, &mut shutdown).await;
+        if let Err(error) = &result {
+            tracing::warn!(
+                target: "lattice.cluster.logic",
+                %error,
+                "logic Coordinator session terminated"
+            );
+        }
         (result, controls)
     }
 
@@ -642,7 +666,10 @@ impl LogicCoordinatorSession {
         let mut state = self.state.lock().expect("logic placement state poisoned");
         if member.status != MemberStatus::Up
             || member.node != state.local_node
-            || state.session.version() != Some(member.version)
+            || state
+                .session
+                .version()
+                .is_none_or(|current| !current.satisfies(member.version))
         {
             return Err(LogicSessionError::StaleGeneration);
         }

@@ -340,6 +340,12 @@ impl ReliableControl {
         self.outbox.iter()
     }
 
+    pub fn contains_outbound(&self, command_id: CommandId) -> bool {
+        self.outbox
+            .iter()
+            .any(|envelope| envelope.command_id == command_id)
+    }
+
     pub fn reset_epoch(&mut self, epoch: AssociationId) {
         self.epoch = epoch;
         self.next_outbound_sequence = 1;

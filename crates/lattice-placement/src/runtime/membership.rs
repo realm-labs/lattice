@@ -16,9 +16,12 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
         match event {
             crate::control::PlacementControlEventKind::Reconcile { association, .. } => {
                 self.reconciliation.focused = true;
-                if let Some(session) = self.sessions.get(&association.remote_incarnation) {
-                    self.send_snapshot(session.hello.clone(), association)
-                        .await?;
+                if let Some(hello) = self
+                    .sessions
+                    .get(&association.remote_incarnation)
+                    .map(|session| session.hello.clone())
+                {
+                    self.send_snapshot(hello, association).await?;
                 }
             }
             crate::control::PlacementControlEventKind::Command(inbound) => {
@@ -523,10 +526,17 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
             .sessions
             .get(&incarnation)
             .ok_or(CoordinatorRuntimeError::UnknownSession)?;
-        if &session.association != association_key
-            || session.snapshot_version != Some(snapshot_version)
-            || session.record.node.incarnation != incarnation
+        if &session.association != association_key || session.record.node.incarnation != incarnation
         {
+            return Err(CoordinatorRuntimeError::StaleMember);
+        }
+        if session.snapshot_version != Some(snapshot_version) {
+            if session
+                .snapshot_version
+                .is_some_and(|current| snapshot_version < current)
+            {
+                return Ok(());
+            }
             return Err(CoordinatorRuntimeError::StaleMember);
         }
         if session.record.status == MemberStatus::Up {
@@ -933,10 +943,15 @@ impl<S: CoordinatorStore> CoordinatorLeader<S> {
     }
 
     pub(super) async fn send_snapshot(
-        &self,
+        &mut self,
         hello: NodeHello,
         association_key: lattice_remoting::association::AssociationKey,
     ) -> Result<(), CoordinatorRuntimeError> {
+        if let Some(session) = self.sessions.get_mut(&association_key.remote_incarnation)
+            && session.association == association_key
+        {
+            session.snapshot_version = Some(self.version);
+        }
         let mut records = Vec::new();
         for member in self.store.list_members().await? {
             records.push(SnapshotRecord {

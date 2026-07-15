@@ -7,15 +7,17 @@ use lattice_placement::session::{
     LogicCoordinatorConfig, LogicCoordinatorHandle, LogicCoordinatorSession, LogicPlacementEffect,
 };
 use lattice_remoting::association::AssociationManager;
+use lattice_remoting::messaging::outbound::OutboundMessaging;
 use lattice_remoting::watch::WatchRegistry;
 use tokio::sync::{mpsc, watch};
 
-use crate::backend::LogicalRouter;
+use crate::backend::{LogicalRouter, SwitchableLogicalRouter};
+use crate::builder::LogicalEntityInstaller;
 use crate::lifecycle::{ServiceLifecycle, ServiceLifecycleEvent, ServiceLifecycleState};
 
 use super::join::{BootstrapView, JoinController, JoinEvent};
-use super::members::MemberDirectory;
 use super::peers::PeerReconciler;
+use super::{ClusterLogicalRouter, LogicalBufferConfig};
 
 pub(crate) struct LogicJoinRuntime {
     pub controller: Arc<JoinController>,
@@ -24,8 +26,11 @@ pub(crate) struct LogicJoinRuntime {
     pub controls: Option<mpsc::Receiver<PlacementControlEvent>>,
     pub config: LogicCoordinatorConfig,
     pub effect_capacity: usize,
-    pub router: Option<Arc<dyn LogicalRouter>>,
-    pub members: Arc<MemberDirectory>,
+    pub router: Arc<SwitchableLogicalRouter>,
+    pub entity_installers: Vec<LogicalEntityInstaller>,
+    pub messaging: Arc<OutboundMessaging>,
+    pub buffer_config: LogicalBufferConfig,
+    pub maximum_registrations: usize,
     pub peers: Arc<PeerReconciler>,
     pub watches: Arc<Mutex<WatchRegistry>>,
     pub lifecycle: Arc<Mutex<ServiceLifecycle>>,
@@ -65,6 +70,36 @@ impl LogicJoinRuntime {
                     ) else {
                         break;
                     };
+                    let Ok(mut router) = ClusterLogicalRouter::new(
+                        self.hello.node.clone(),
+                        session.state(),
+                        self.associations.clone(),
+                        self.messaging.clone(),
+                        association.key().clone(),
+                        self.buffer_config.clone(),
+                        self.maximum_registrations,
+                    )
+                    .map(|router| router.with_peer_reconciler(self.peers.clone())) else {
+                        transition(
+                            &self.lifecycle,
+                            &self.lifecycle_events,
+                            ServiceLifecycleEvent::CoordinatorLost,
+                        );
+                        break;
+                    };
+                    if self
+                        .entity_installers
+                        .iter()
+                        .any(|install| install(&mut router).is_err())
+                    {
+                        transition(
+                            &self.lifecycle,
+                            &self.lifecycle_events,
+                            ServiceLifecycleEvent::CoordinatorLost,
+                        );
+                        break;
+                    }
+                    self.router.install(Arc::new(router));
                     let handle = session.control_handle();
                     *self.logic_handle.lock().expect("logic handle poisoned") =
                         Some(handle.clone());
@@ -81,8 +116,10 @@ impl LogicJoinRuntime {
                         .await,
                     );
                     *self.logic_handle.lock().expect("logic handle poisoned") = None;
+                    self.router.clear();
                 }
                 JoinEvent::CoordinatorLost { .. } => {
+                    self.router.clear();
                     transition(
                         &self.lifecycle,
                         &self.lifecycle_events,
@@ -212,8 +249,9 @@ impl LogicJoinRuntime {
     ) -> Result<(), ()> {
         match effect {
             LogicPlacementEffect::MemberSnapshot { version, members } => self
-                .members
+                .peers
                 .install_snapshot(version, members)
+                .await
                 .map_err(|_| ()),
             LogicPlacementEffect::MemberEvent(event) => {
                 if let MemberEvent {
@@ -226,7 +264,7 @@ impl LogicJoinRuntime {
                         .expect("watch registry poisoned")
                         .node_down(node.incarnation);
                 }
-                self.peers.apply(*event).map_err(|_| ())
+                self.peers.apply(*event).await.map_err(|_| ())
             }
             LogicPlacementEffect::DrainReady {
                 operation_id,
@@ -237,33 +275,29 @@ impl LogicJoinRuntime {
                 }
                 handle
                     .complete_member_drain(operation_id.clone())
+                    .await
                     .map_err(|_| ())?;
                 self.drain_ready.send_replace(Some(operation_id));
                 Ok(())
             }
-            LogicPlacementEffect::Authority { slot, effect } => {
-                let router = self.router.as_ref().ok_or(())?;
-                match effect {
-                    AuthorityEffect::DrainSlot => {
-                        let succeeded = router.drain_slot(slot.clone()).await.unwrap_or(false);
-                        handle.complete_drain(slot, succeeded).await.map_err(|_| ())
-                    }
-                    AuthorityEffect::PublishReady => handle.publish_ready(&slot).map_err(|_| ()),
-                    AuthorityEffect::PublishDrained => {
-                        handle.publish_drained(&slot).map_err(|_| ())
-                    }
-                    AuthorityEffect::PublishStopFailed => {
-                        handle.publish_stop_failed(&slot).map_err(|_| ())
-                    }
-                    AuthorityEffect::StopSlot => {
-                        router.stop_fenced_slot(slot).await.map_err(|_| ())
-                    }
-                    AuthorityEffect::FenceAdmission
-                    | AuthorityEffect::OpenAdmission
-                    | AuthorityEffect::StartSlot
-                    | AuthorityEffect::StateLossPossible => Ok(()),
+            LogicPlacementEffect::Authority { slot, effect } => match effect {
+                AuthorityEffect::DrainSlot => {
+                    let succeeded = self.router.drain_slot(slot.clone()).await.unwrap_or(false);
+                    handle.complete_drain(slot, succeeded).await.map_err(|_| ())
                 }
-            }
+                AuthorityEffect::PublishReady => handle.publish_ready(&slot).map_err(|_| ()),
+                AuthorityEffect::PublishDrained => handle.publish_drained(&slot).map_err(|_| ()),
+                AuthorityEffect::PublishStopFailed => {
+                    handle.publish_stop_failed(&slot).map_err(|_| ())
+                }
+                AuthorityEffect::StopSlot => {
+                    self.router.stop_fenced_slot(slot).await.map_err(|_| ())
+                }
+                AuthorityEffect::FenceAdmission
+                | AuthorityEffect::OpenAdmission
+                | AuthorityEffect::StartSlot
+                | AuthorityEffect::StateLossPossible => Ok(()),
+            },
         }
     }
 }

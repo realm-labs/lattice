@@ -571,6 +571,14 @@ impl CoordinatorStore for EtcdPlacementStore {
         self.get_json("coordinator/leader").await
     }
 
+    async fn get_leader_term(&self) -> Result<u64, StorageError> {
+        self.read_raw(&self.key("coordinator/term"))
+            .await?
+            .map(|(bytes, _, _)| parse_revision_value(&bytes).map(Revision::get))
+            .transpose()
+            .map(|term| term.unwrap_or(0))
+    }
+
     async fn create_member(
         &self,
         guard: &LeaderGuard,

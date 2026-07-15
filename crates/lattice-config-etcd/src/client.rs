@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use etcd_client::{Client, EventType};
+use etcd_client::{Client, ConnectOptions, EventType};
 use lattice_config::store::ConfigStoreError;
 use tokio::sync::watch;
 
@@ -18,8 +18,13 @@ pub(crate) struct RealEtcdConfigClient {
 }
 
 impl RealEtcdConfigClient {
-    pub(crate) async fn connect(endpoints: Vec<String>) -> Result<Self, ConfigStoreError> {
-        let client = Client::connect(endpoints, None).await.map_err(etcd_error)?;
+    pub(crate) async fn connect(
+        endpoints: Vec<String>,
+        options: Option<ConnectOptions>,
+    ) -> Result<Self, ConfigStoreError> {
+        let client = Client::connect(endpoints, options)
+            .await
+            .map_err(etcd_error)?;
         Ok(Self { client })
     }
 }

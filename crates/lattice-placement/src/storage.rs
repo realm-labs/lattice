@@ -124,6 +124,7 @@ pub trait CoordinatorStore: PlacementStore {
         lease_id: i64,
     ) -> Result<bool, StorageError>;
     async fn get_leader(&self) -> Result<Option<LeaderRecord>, StorageError>;
+    async fn get_leader_term(&self) -> Result<u64, StorageError>;
 
     async fn create_member(
         &self,
@@ -661,6 +662,14 @@ impl CoordinatorStore for InMemoryPlacementStore {
             .leader
             .as_ref()
             .map(|(_, leader)| leader.clone()))
+    }
+
+    async fn get_leader_term(&self) -> Result<u64, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("placement memory store poisoned")
+            .leader_term)
     }
 
     async fn create_member(

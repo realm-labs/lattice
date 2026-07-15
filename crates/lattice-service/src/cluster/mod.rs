@@ -40,6 +40,7 @@ mod entity;
 pub mod join;
 pub mod members;
 pub mod peers;
+mod proxy;
 mod router;
 pub(crate) mod runtime;
 mod singleton;
@@ -91,6 +92,7 @@ pub struct ClusterLogicalRouter {
     local_node: NodeKey,
     state: Arc<Mutex<LogicPlacementState>>,
     associations: Arc<AssociationManager>,
+    peers: Option<Arc<peers::PeerReconciler>>,
     messaging: Arc<OutboundMessaging>,
     coordinator: AssociationKey,
     buffer_config: LogicalBufferConfig,

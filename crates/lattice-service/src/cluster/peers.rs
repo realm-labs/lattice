@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use lattice_placement::coordinator::{MemberChange, MemberEvent, MemberStatus};
+use lattice_placement::coordinator::{MemberChange, MemberEvent, MemberRecord, MemberStatus};
 use lattice_placement::types::NodeKey;
+use lattice_placement::types::StateVersion;
 use lattice_remoting::association::{Association, AssociationManager, AssociationState};
 use lattice_remoting::endpoint::{EndpointError, RemotingEndpoint};
 use lattice_remoting::handshake::NodeIdentity;
@@ -58,7 +59,19 @@ impl PeerReconciler {
             .map_err(PeerError::Endpoint)
     }
 
-    pub fn apply(&self, event: MemberEvent) -> Result<(), PeerError> {
+    pub async fn install_snapshot(
+        &self,
+        version: StateVersion,
+        members: Vec<MemberRecord>,
+    ) -> Result<(), PeerError> {
+        self.members
+            .install_snapshot(version, members.clone())
+            .map_err(PeerError::Directory)?;
+        self.connect_authoritative_members(&members).await;
+        Ok(())
+    }
+
+    pub async fn apply(&self, event: MemberEvent) -> Result<(), PeerError> {
         if let MemberChange::Removed { node, .. } = &event.change
             && let Some(association) =
                 self.associations
@@ -70,7 +83,37 @@ impl PeerReconciler {
             self.associations
                 .remove(association.key(), association.id());
         }
-        self.members.apply(event).map_err(PeerError::Directory)
+        let connect = match &event.change {
+            MemberChange::Upsert(record) if record.status == MemberStatus::Up => {
+                Some(record.as_ref().clone())
+            }
+            _ => None,
+        };
+        self.members.apply(event).map_err(PeerError::Directory)?;
+        if let Some(member) = connect {
+            self.connect_authoritative_members(&[member]).await;
+        }
+        Ok(())
+    }
+
+    async fn connect_authoritative_members(&self, members: &[MemberRecord]) {
+        for member in members {
+            if member.status != MemberStatus::Up
+                || !self
+                    .associations
+                    .should_dial(&member.node.address, member.node.incarnation)
+            {
+                continue;
+            }
+            if let Err(error) = self.connect(&member.node).await {
+                tracing::warn!(
+                    target: "lattice.cluster.peers",
+                    %error,
+                    node_id = %member.node.node_id,
+                    "failed to reconcile an authoritative peer association"
+                );
+            }
+        }
     }
 }
 
@@ -80,6 +123,6 @@ pub enum PeerError {
     NotAuthoritativeUp,
     #[error("authoritative member directory rejected an event")]
     Directory(#[source] super::members::MemberDirectoryError),
-    #[error("peer endpoint failed")]
+    #[error("peer endpoint failed: {0}")]
     Endpoint(#[source] EndpointError),
 }
