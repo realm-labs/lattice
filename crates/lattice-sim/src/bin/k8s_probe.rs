@@ -4,7 +4,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use lattice_discovery::provider::ClusterDiscovery;
+use lattice_core::coordinator::CoordinatorScope;
+use lattice_discovery::provider::CoordinatorDiscovery;
 use lattice_discovery_k8s::endpoint_slice::{
     KubernetesCredentials, KubernetesEndpointSliceConfig, KubernetesEndpointSliceDiscovery,
 };
@@ -49,6 +50,7 @@ async fn spawn_endpoint_slice_watch(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| "default".to_owned());
     let discovery = KubernetesEndpointSliceDiscovery::connect(KubernetesEndpointSliceConfig {
+        scope: CoordinatorScope::Membership,
         namespace,
         service: "lattice-probe".to_owned(),
         label_selector: None,

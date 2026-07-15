@@ -81,23 +81,26 @@ Trace context propagates through Gateway bindings, actor envelopes, remoting fra
 
 `lattice-ops` exposes Rust inspector/command traits. An authenticated HTTP adapter may provide health, readiness, metrics, cluster summary, members, associations, shards, singletons, mailboxes, watches, allocation/rebalance plans, drain, and handoff commands.
 
-Mutating cluster operations are sent to the Coordinator actor through remoting. The HTTP adapter must not mutate etcd directly. Operations are authorized, audited, bounded by deadlines, and safe to retry only when their command protocol declares idempotency.
+Membership mutations go to the membership scope. Every placement inspect/explain/pause/rebalance/
+relocate/history mutation requires a `PlacementDomainId` and is sent to that domain's control
+handle. The HTTP adapter never mutates etcd directly.
 
-Inspection responses expose machine-readable lifecycle state, Coordinator term/revision, node incarnation, assignment generation, active plan/move IDs and partial/stale markers. The Docker distributed-test harness waits on these bounded predicates; fixed sleeps and human-log matching are not correctness oracles.
+Inspection responses expose node lifecycle, per-domain lifecycle, membership/domain terms and
+revisions, incarnation, assignment generation, plan/move IDs, and partial/stale markers.
 
 Rebalance operations include inspect/explain, pause/resume automatic planning, trigger an immediate evaluation, submit an idempotent manual relocation, and cancel only plan moves that have not entered handoff. The API exposes why a proposal was accepted/rejected and which eligibility, freshness, hysteresis, cooldown, or concurrency rule applied; it never allows an operator to bypass claim fencing.
 
-Operation IDs, status, typed result, `StateVersion`, and expiry metadata are stored durably with a
+Operation IDs, status, typed result, domain-qualified `PlacementVersion`, and expiry metadata are stored durably with a
 bounded fingerprint. Pause settings and manual-plan/member/plan mutations are committed atomically
 with their operation result. Repeating any mutating operation during the configured count/age
 retention window returns the original typed result; reusing an ID for different arguments is an
 idempotency conflict. After compaction, clients must use a new operation ID.
 Manual relocation persists a normal generation-conditional plan and enters the same handoff path as
 automatic, drain, and recovery movement. Completed/cancelled/failed plan history is inspectable but
-bounded by the Coordinator retention policy.
+bounded by the domain retention policy.
 
 Inspection includes durable pause state, retained operation count, durable cardinality limits,
-current `StateVersion`, reconciliation backlog/quarantine, and aggregated leadership-loss,
+current `PlacementVersion`, reconciliation backlog/quarantine, and aggregated leadership-loss,
 conflict, unknown-outcome, and capacity counts. Labels remain operation-family level and never carry
 record IDs.
 
@@ -109,8 +112,12 @@ cluster_id = "prod-game"
 node_id = "world-0"
 roles = ["logic", "world"]
 
-[node.placement]
+[node.placement_domains.world]
 capacity_units = 100
+zone = "cn-east-1a"
+
+[node.placement_domains.battle]
+capacity_units = 40
 zone = "cn-east-1a"
 
 [remoting]
@@ -174,15 +181,16 @@ url = "nats://nats:4222"
 bind = "0.0.0.0:19090"
 ```
 
-Only the Coordinator consumes general placement-store configuration. Other nodes use bootstrap access solely to locate and authenticate the Coordinator leader.
+Only CoordinatorHost processes consume generation-5 control-store configuration. Other nodes use
+scoped discovery to locate/authenticate membership and each required placement-domain leader.
 
 Cluster nodes configure candidate providers through `cluster_discovery` and a bounded
 `ClusterJoinConfig`. Static, ConfigStore, DNS and Kubernetes EndpointSlice records are reachability
-hints only. The authenticated Coordinator snapshot and revisioned member deltas populate the local
+hints only. The authenticated membership snapshot and revisioned member deltas populate the local
 member directory; discovery and direct store reads are never used for business routing.
 
 `LatticeService` exposes lifecycle and member snapshots plus bounded watches. `leave(deadline)`
-closes admission, coordinates placement drain, completes exact-incarnation membership removal and
+closes admission, drains all joined domains, completes exact-incarnation membership removal and
 then stops remoting. `shutdown()` spends the configured leave budget and force-stops on expiry;
 `force_shutdown()` immediately fences local work. The low-level `connect_peer(NodeIdentity)` API is
 diagnostic transport access and cannot admit a member or make a service Ready.
@@ -205,7 +213,7 @@ stale node or activation -> StaleActivation/Terminated; never reroute by path
 ```text
 EntityRef<PlayerActor>.ask(GetProfile)
   -> local Player ShardRegion computes shard
-  -> known owner or Coordinator assignment
+  -> known owner or placement-domain assignment
   -> owning region activates PlayerActor if absent
   -> mailbox handles GetProfile and replies
 ```
@@ -213,7 +221,7 @@ EntityRef<PlayerActor>.ask(GetProfile)
 ### Shard handoff
 
 ```text
-Coordinator starts handoff
+placement-domain leader starts handoff
   -> regions buffer within limits
   -> old owner drains and releases claim
   -> new owner acquires next generation
@@ -224,9 +232,9 @@ Coordinator starts handoff
 
 ```text
 eligible hosts report bounded latest-value load summaries
-  -> Coordinator builds immutable PlacementView
+  -> domain leader builds immutable PlacementView
   -> entity allocation strategy proposes generation-conditional moves
-  -> Coordinator validates freshness, eligibility, improvement and limits
+  -> domain leader validates freshness, eligibility, improvement and limits
   -> persists RebalancePlan
   -> each admitted move executes the normal shard handoff
   -> plan progress remains inspectable and recoverable after leader failover
@@ -239,13 +247,14 @@ SingletonRef<Matchmaker>.tell(command)
   -> local proxy
   -> current claim holder
   -> on failure proxy buffers within limits
-  -> Coordinator publishes next generation after old claim expires
+  -> singleton's domain leader publishes next generation after old claim expires
   -> proxy flushes
 ```
 
-### Coordinator temporarily unavailable
+### One placement domain temporarily unavailable
 
-Known routes and valid claim holders continue. New placement, failover, and unknown routes wait within bounded buffers, then fail explicitly. No runtime node manufactures an owner.
+Known routes in that domain continue while exact claims remain valid. New placement and unknown
+routes fail explicitly for that domain. Other domain routers and exact references remain available.
 
 ## 8. Forbidden Patterns
 
@@ -254,9 +263,9 @@ Do not expose remoting frames as a business API.
 Do not create a second gRPC path for internal actor commands.
 Do not address a replacement actor through a stale concrete ActorRef.
 Do not query or mutate etcd for every message.
-Do not let a load report or allocation strategy grant authority or bypass Coordinator validation.
-Do not start automatic rebalance while the Coordinator is degraded, unreconciled, or using stale required load inputs.
-Do not route normal data traffic through the Coordinator.
+Do not let a load report or allocation strategy grant authority or bypass domain-leader validation.
+Do not start automatic rebalance while that domain is degraded, unreconciled, or using stale inputs.
+Do not route normal data traffic through a membership or placement leader.
 Do not use EventBus for single-owner commands or immediate replies.
 Do not use unbounded association, proxy, shard, or mailbox buffers.
 Do not automatically retry state-changing asks after UnknownResult.

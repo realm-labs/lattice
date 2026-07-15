@@ -1,20 +1,22 @@
 # Cluster discovery and member lifecycle runbook
 
 Discovery records are reachability hints only. Never repair membership by editing DNS,
-EndpointSlices, or the ConfigStore discovery document. The Coordinator member revision, exact node
-incarnation, lease, and placement claims are authoritative.
+EndpointSlices, or the ConfigStore discovery document. The membership leader owns the exact member
+revision and incarnation. Each placement-domain leader independently owns that domain's members,
+configuration, slots, claims, plans, and revision.
 
 ## Signals and first checks
 
-The dashboard at `docs/operations/dashboards/cluster-lifecycle.json` groups the operational signals
-for discovery health, bootstrap attempts, join duration, lifecycle state, Coordinator reconciliation,
-drain, removal reasons, and stale-incarnation rejection. All queries use bounded labels such as
-cluster, provider, lifecycle state, and rejection/removal reason. Node IDs, addresses, operation IDs,
-and certificate identities belong in traces and bounded inspection output, not metric labels.
+The dashboard at `docs/operations/dashboards/cluster-lifecycle.json` groups discovery, bootstrap,
+node lifecycle, domain leader/session, route availability, capacity/load, authority inventory,
+reconciliation, cross-domain drain, removal, and stale-incarnation signals. Queries use bounded
+labels such as cluster, placement domain, provider, lifecycle state, and reason. Node IDs,
+addresses, operation IDs, and certificate identities belong in traces and bounded inspection
+output, not metric labels. Leader concentration is aggregated without a host label.
 
-For every incident, capture the exact cluster ID, node ID and incarnation, Coordinator term and
-revision, discovery provider generations, selected bootstrap endpoint, and the current member
-snapshot before taking a mutating action.
+For every incident, capture the exact cluster ID, node ID/incarnation, membership term/revision,
+affected placement domain and its term/revision, discovery generations, selected bootstrap
+endpoints, and current membership/domain snapshots before taking a mutating action.
 
 ## Stuck Joining
 
@@ -23,36 +25,51 @@ snapshot before taking a mutating action.
    candidate set explains reachability only; it does not imply missing membership.
 3. Probe a candidate with the configured TLS hostname. Check cluster mismatch, expected-node
    mismatch, feature/version rejection, certificate URI identity, redirect loops, and RetryAfter.
-4. Inspect the Coordinator for a `Joining` record with the node's exact incarnation and snapshot
+4. Inspect the membership leader for a `Joining` record with the node's exact incarnation and snapshot
    revision. A different live incarnation under the same node ID must be drained or force-removed;
    never rewrite discovery to make the new process inherit it.
 5. If the join is retryable, repair discovery/network/TLS and let the supervised backoff continue.
    Protocol/catalogue rejection is terminal and requires a compatible full-stop deployment.
 
-## Prolonged Degraded
+## Membership loss
 
-1. Verify admission closed when the Coordinator session was lost.
-2. Compare the node's last term/revision with the current leader. Same-term conflicting leaders are
-   a safety incident; stop new changes and preserve artifacts.
-3. Restore candidate reachability or the authenticated redirect path. Do not use discovery records
-   as a member directory and do not extend placement claims from discovery.
-4. Require a fresh atomic snapshot after a revision gap or leader rollover. Ready may reopen only
-   after exact `MemberUp` acknowledgement for the installed revision.
-5. Check claim deadlines. Expired shard/singleton claims stay fenced even if the data connection is
-   healthy.
+1. Verify new cluster/domain admission closed. Do not clear still-valid domain routes or claims.
+2. Compare the last membership term/revision with the membership leader. Same-term conflicting
+   leaders are a safety incident; stop changes and preserve artifacts.
+3. Restore membership-scope discovery or its authenticated redirect path. Discovery is never a
+   member directory and cannot extend placement claims.
+4. Require a fresh atomic membership snapshot after a gap or rollover. Admission may reopen only
+   after the exact local `Up` record is installed; a `Joining` snapshot is insufficient.
+5. Check required domains separately. Membership recovery can restore node readiness while one
+   domain remains visibly `Degraded`.
+
+## Partial placement-domain degradation
+
+1. Select the exact domain and confirm unrelated domains retain leader term, session readiness,
+   route availability, and claim counts.
+2. Compare the failed domain's last placement term/revision with its current leader. A higher-term
+   delta cannot reopen it; a complete same-term domain snapshot is required first.
+3. Restore only that domain's scoped discovery/control path. Do not restart membership or clear
+   another entry in the domain router directory.
+4. Known routes remain usable only while exact owner generation and local claim deadline remain
+   valid. Unknown homes, new allocations, and expired authority fail as domain unavailable.
+5. If leadership is concentrated, plan capacity from the aggregate concentration panel; do not
+   force leadership movement during an active safety incident.
 
 ## Drain timeout
 
-1. Inspect the drain operation ID, exact incarnation, remaining shard/singleton owners, handoff
-   barriers, and actor stop failures.
-2. Confirm the member is `Leaving` and new external/activation admission is closed.
-3. Resume persisted handoffs after leader failover; do not bypass the old-claim invalidation proof.
-4. If the shutdown deadline expires, use local force shutdown. Record that the Coordinator will
-   remove the exact incarnation after lease expiry and that recovery remains fenced until then.
+1. Inspect the aggregate drain operation, exact incarnation, and each joined domain's remaining
+   authorities, handoff barriers, and actor stop failures.
+2. Confirm domain/external admission is closed. Global membership remains `Up` until every required
+   domain completion is acknowledged; only then may it pass through `Leaving` to removal.
+3. Resume each domain's persisted handoffs independently after leader failover. A completed domain
+   stays complete when another domain times out.
+4. At deadline, force/fence every unfinished domain independently. Record unfinished domains and
+   verify membership removal happens only after their authorities are resolved or fenced.
 
 ## Force removal
 
-Use the authenticated Coordinator command with a unique operation ID, node ID, and the observed
+Use the authenticated membership command with a unique operation ID, node ID, and the observed
 expected incarnation. Repeat the same operation ID only with identical arguments. An incarnation
 mismatch is protective: refresh the member snapshot and never force-remove a newer replacement.
 After success, verify the revisioned `Removed(ForceRemoved)` event, revoked member lease, fenced

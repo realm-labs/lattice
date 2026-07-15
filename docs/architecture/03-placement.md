@@ -1,4 +1,4 @@
-# 03. Coordinator, Sharding, and Singleton Placement
+# 03. Membership, Placement Domains, Sharding, and Singletons
 
 > Control-plane state and data-plane behavior for logical actor references.
 > Back to: [architecture index](README.md)
@@ -7,9 +7,14 @@
 
 ## 1. Control-Plane Boundary
 
-The elected Coordinator is the sole writer of membership decisions, shard assignments, handoff state, and singleton assignments. Runtime nodes learn decisions through Coordinator messages and watch streams; they do not perform arbitrary etcd placement reads or writes.
+The membership leader is the sole writer of global exact-node lifecycle. Each `PlacementDomainId`
+has one independent lease-backed placement leader that is the sole writer of that domain's
+participants, configuration, shard/singleton assignments, claims, handoffs, plans, and admin
+operations. A supervised `CoordinatorHost` may campaign for several scopes; losing one scope does
+not stop another.
 
-A node may read the minimal Coordinator bootstrap record needed to find the current leader. After association, all control traffic uses actor remoting.
+A node discovers one membership scope and one placement scope for every domain it hosts or proxies.
+After authenticated association, all control traffic uses actor remoting.
 
 Normal `ActorRef`, `EntityRef`, and `SingletonRef` messages never go through etcd.
 
@@ -19,24 +24,29 @@ Recommended logical keys:
 
 ```text
 /lattice/<cluster>/schema_generation
-/lattice/<cluster>/coordinator/leader
-/lattice/<cluster>/members/<node_id>
-/lattice/<cluster>/entity_types/<entity_type>
-/lattice/<cluster>/shards/<entity_type>/<shard_id>
-/lattice/<cluster>/shard_claims/<entity_type>/<shard_id>
-/lattice/<cluster>/singletons/<singleton_kind>
-/lattice/<cluster>/singleton_claims/<singleton_kind>
-/lattice/<cluster>/rebalances/<plan_id>
+/lattice/<cluster>/membership/{leader,term,state_revision}
+/lattice/<cluster>/membership/members/<node_id>
+/lattice/<cluster>/domains/<domain>/{leader,term,state_revision}
+/lattice/<cluster>/domains/<domain>/members/<node_id>
+/lattice/<cluster>/domains/<domain>/entity_types/<entity_type>
+/lattice/<cluster>/domains/<domain>/shards/<entity_type>/<shard_id>
+/lattice/<cluster>/domains/<domain>/shard_claims/<entity_type>/<shard_id>
+/lattice/<cluster>/domains/<domain>/singletons/<singleton_kind>
+/lattice/<cluster>/domains/<domain>/singleton_claims/<singleton_kind>
+/lattice/<cluster>/domains/<domain>/rebalances/<plan_id>
+/lattice/<cluster>/domains/<domain>/admin/<operation_id>
 ```
 
 There are no per-entity placement keys and no concrete actor-path keys. Concrete `ActorRef` identity lives in remoting/runtime state; logical entity activation is local to its shard owner.
 
-All records carry schema generation and revision information. An incompatible schema generation prevents startup rather than guessing compatibility.
+Generation 5 is the only runtime schema. `MembershipVersion` orders membership; domain-qualified
+`PlacementVersion` orders each placement stream. Generation 4, `migrating-to-5`, or a different
+durable-limit record prevents startup rather than guessing compatibility.
 
 Shard and Singleton remain different public/runtime concepts, but their distributed authority is implemented by one internal placement-slot engine:
 
 ```text
-PlacementSlotKey = Shard(entity_type, shard_id) | Singleton(singleton_kind)
+PlacementSlotKey = Shard(domain, entity_type, shard_id) | Singleton(domain, singleton_kind)
 
 PlacementSlot {
   owner_node_incarnation,
@@ -50,48 +60,39 @@ PlacementSlot {
 
 The shared engine owns assignment persistence, term/generation validation, claim grant/renew/loss, local deadline fencing, drain, and replacement eligibility. `ShardRegion/Shard` and `SingletonProxy/SingletonManager` retain their distinct routing, activation, passivation, and public-reference semantics; they do not implement a second ownership algorithm.
 
-## 3. Membership and Coordinator Leadership
+## 3. Membership and Placement-Domain Leadership
 
-Nodes register through their remoting Coordinator session. `NodeHello` is a bounded session
-advertisement; persisted generation-4 membership is a `MemberRecord` containing the exact `NodeKey`,
-the validated hello, `Joining | Up | Leaving`, `StateVersion { term, revision }`, and member lease ID. Removed is
-an ordered event with the exact node incarnation and graceful, failure, force, or incarnation-replaced
-reason; it is not an active stored status. The Coordinator leader record is also lease-backed and
-fenced by an election term.
+Nodes first register through a membership session with bounded `MemberHello` (exact `NodeKey`, roles,
+failure-domain attributes, protocol catalogue, and remoting capabilities). Persisted `MemberRecord`
+contains that hello, `Joining | Up | Leaving`, `MembershipVersion`, and lease ID. Removed is an
+ordered exact-incarnation event, not a stored status.
 
-Registration persists `Joining` and sends a full snapshot. The node replies with
-`JoinReady(snapshot_version)` from the same Association. Only an exact term and revision match may CAS the
-record to `Up`; the resulting revisioned member delta and exact `MemberUp` acknowledgement open
-service admission. Replayed hello/join-ready commands from that session are idempotent. Allocation,
-handoff barriers, and singleton selection exclude every member not in `Up`.
+Registration persists `Joining` and sends a membership snapshot. `JoinReady(snapshot_version)` from
+the same Association performs the only `Joining -> Up` transition. A Joining snapshot never opens
+readiness; the local reducer must install its exact `Up` delta. Replayed hello/join-ready commands
+are idempotent.
 
-The full snapshot includes all active `MemberRecord` values. A logic session validates the complete
-digest, decodes members and placement slices, and emits one atomic member-snapshot effect before
-`JoinReady`. Service routing installs that replacement snapshot and then accepts only contiguous
-`MemberEvent` deltas from the same term. A higher term requires a new snapshot, and lower-term
-snapshots, events, barriers, and acknowledgements are rejected; discovery candidates never enter
-this directory.
+After global `Up`, each explicit domain session sends bounded `PlacementDomainHello`: domain/config
+fingerprint, positive quota, hosted configurations, proxy subscriptions, and constraints. The
+domain leader persists `DomainMemberRecord` and allocates only when both exact global and domain
+records are `Up`. A mismatch rejects only that domain.
 
-Graceful drain CASes `Up -> Leaving`, moves placement through the normal persisted handoff path, and
-sends `DrainReady` only when no slot remains owned. `DrainComplete` deletes the exact record and
-revokes its lease. Heartbeat expiry and administrative force removal use the same exact-record CAS
-removal path; force removal includes an operation ID and expected incarnation so it cannot remove a
-replacement process.
+Membership and placement snapshots/deltas use distinct reducers and error families. Scope/domain
+mismatch is rejected before mutation. A higher term requires a full snapshot for only that scope;
+lower-term snapshots, events, barriers, and acknowledgements are rejected.
 
-A new leader:
+A new placement-domain leader:
 
 1. obtains a higher election term;
-2. reconstructs members, assignments, claims, active RebalancePlans, and in-progress handoffs from etcd;
-3. establishes remoting associations to live members;
-4. reconciles observed claim holders before issuing new assignments;
+2. reconstructs only its domain members/configuration/assignments/claims/plans/handoffs;
+3. verifies exact authoritative global `Up` records;
+4. reconciles claim holders before issuing mutations;
 5. resumes required recovery/drain work, then allocation and automatic rebalancing only after reconciliation and fresh-input checks.
 
-Every authoritative mutation is a named domain transaction. Its storage predicate contains the
-exact serialized, lease-backed `LeaderRecord` and exact term, plus every record/counter comparison
-needed by the operation. Initial allocation and target installation put slot plus lease-attached
-claim atomically. Move reservation and completion update slot plus plan atomically. A false leader
-predicate is `LeadershipLost`, even when every record-local comparison still matches. Runtime
-effects, deltas, grants, and admin replies occur only after commit.
+Every authoritative mutation is a named domain transaction comparing an exact
+`PlacementLeaderGuard`, domain revision, global member, domain member/config, and operation-specific
+slot/claim/plan predicates. Typed guards make cross-plane use unrepresentable; scoped keys and
+contract tests reject cross-domain mutation. Runtime effects occur only after commit.
 
 Election begins with read-only bounded inventory. Reconciliation then adopts a matching older-term
 claim without changing owner or generation, fences active records whose claim is absent, and resumes
@@ -100,22 +101,27 @@ oldest work, last success, and quarantine details. Claim lease expiry is an exte
 it may temporarily leave an active record claimless, but recovery must fence it and may reinstall
 only the same owner until previous authority invalidity is proven.
 
-Coordinator leadership does not by itself grant permission to serve a shard or singleton. The leader persists a generation claim in etcd and sends the selected owner a bounded `ClaimGranted` control message. The owner may serve only while the matching grant remains valid according to its local monotonic deadline. Runtime nodes do not acquire or renew claims by connecting to etcd directly. Claim authority remains per placement slot; transport may batch renewals for many slots owned by one node without weakening per-slot generation or expiry checks.
+Placement leadership does not itself grant serving authority. The domain leader persists a claim and
+sends bounded `ClaimGranted`; owners validate domain, slot, generation, sequence, and monotonic TTL.
+Runtime nodes never acquire claims directly from etcd.
 
 ### 3.1 Revisioned State Snapshot
 
-The Coordinator session is node-level. `NodeHello` advertises the node incarnation, roles, capacity, hosted/proxied entity types, singleton eligibility/usage, and protocol catalogue. The snapshot contains cluster membership plus only the shard/singleton slices that the node is eligible to host or has subscribed to route. A node adding a Region or SingletonProxy subscription must install the corresponding snapshot slice before that component becomes Ready. The initial state may exceed the 256 KiB remoting frame, so it uses a bounded chunk protocol:
+Membership and every placement domain have separate bounded snapshot streams. A domain snapshot
+contains only that domain's configurations, participants, slots, claims, and plans. Adding a Region
+or SingletonProxy installs its domain slice before Ready. Large snapshots use:
 
 ```text
-SnapshotBegin(snapshot_id, state_version, chunk_count, total_bytes, blake3_digest)
+SnapshotBegin(snapshot_id, MembershipVersion|PlacementVersion, chunk_count, total_bytes, blake3_digest)
 SnapshotChunk(snapshot_id, index, bytes)  // at most 192 KiB payload
 SnapshotEnd(snapshot_id)
-AppliedRevision(state_version)
+AppliedRevision(PlacementVersion)
 ```
 
 The receiver stages chunks outside the live routing table, rejects duplicate/out-of-range chunks, and enforces configured chunk count, total bytes, and assembly deadline. It atomically installs the snapshot only after every chunk and the BLAKE3 digest validate. A disconnect, timeout, digest mismatch, or revision gap discards staging and requests a fresh snapshot. Deltas received while staging are buffered only within a small bound or trigger resnapshot.
 
-Snapshot pages, deltas, and acknowledgements use the Association reliable control stream. Coordinator revision provides state ordering and gap detection; Association control sequence provides bounded retransmission across a connection loss. Applying either a replayed control envelope or a replayed state revision is idempotent.
+Snapshot pages, deltas, and acknowledgements use reliable Association control. Scope version provides
+ordering/gap detection; Association sequence provides bounded retransmission. Replay is idempotent.
 
 ## 4. Sharded Entities
 
@@ -224,13 +230,18 @@ RebalanceProposal {
 }
 ```
 
-For the same `PlacementView`, policy version, trigger, and limits, a strategy must return the same ordered proposal. The Coordinator revalidates that every source/generation still matches, every target is Ready and eligible, no shard is already moving, projected target capacity including pending reservations is available, limits remain available, and the proposal was calculated from an acceptable revision. A strategy failure or invalid proposal skips the round and emits telemetry; it never partially mutates placement.
+For the same domain `PlacementView`, policy version, trigger, and limits, a strategy must return the same ordered proposal. The placement-domain leader revalidates sources, generations, eligible targets, pending domain capacity, concurrency limits, and base revision. A failure skips the round and never partially mutates placement.
 
 ### 6.2 Load and Capacity Model
 
-`NodeHello` supplies relatively stable hard inputs: roles, zone/failure-domain attributes, supported protocols/entity types, and positive capacity units. Ready nodes periodically send bounded latest-value `NodeLoadReport` control messages containing a boot-scoped sample sequence, active shard/entity counts, mailbox pressure, and processing/CPU load summaries. Shards may additionally report a bounded EWMA weight; absent shard measurements use weight `1`. Load reports are ephemeral and are not replayed by reliable control delivery; reconnect or leader change requires a fresh higher-sequence sample.
+`MemberHello` supplies global roles, failure-domain attributes, protocols, and remoting capabilities.
+Each `PlacementDomainHello` supplies that domain's hosted/proxied types, constraints, and explicit
+positive capacity units. Ready domain participants send bounded latest-value load reports. Two
+domains never consume one unspecified global capacity pool.
 
-Load reports are advisory, not authority. They are kept in Coordinator memory, bounded by live nodes/shards, and are not written to etcd on every sample. A new leader waits for fresh samples before automatic optimization. Stale/missing load excludes a node as an automatic rebalance target unless the strategy explicitly falls back to configured capacity for necessary allocation/recovery. Reports cannot override role, protocol, drain, claim, or health eligibility.
+Load reports are advisory, not authority. They are bounded in domain-leader memory and are not
+persisted on every sample. They cannot override global/domain membership, protocol, drain, claim,
+or health eligibility.
 
 The built-in `WeightedLeastLoad` strategy minimizes normalized load:
 
@@ -251,18 +262,20 @@ Placement work has explicit reasons and priority:
 4. Automatic: periodic tick, stable node join, or material capacity/load change.
 ```
 
-Recovery and drain bypass balance improvement and shard-residence thresholds but still obey fencing and bounded concurrency. Manual moves bypass improvement only when the command explicitly requests it. Automatic rebalancing requires a healthy reconciled Coordinator, fresh enough inputs, minimum shard residence, node-join stability delay, cluster cooldown, and improvement hysteresis. Coordinator degradation, leadership reconciliation, incompatible schema/protocols, or an active entity-type barrier pauses new automatic plans.
+Recovery and drain bypass balance improvement and residence thresholds but still obey fencing and
+bounded concurrency. Automatic rebalancing requires a healthy reconciled domain leader and fresh
+inputs. Failure or reconciliation in another domain does not pause this domain.
 
 ### 6.4 Persisted Plan and Limits
 
-The Coordinator converts an accepted proposal into a persisted, term/revision-fenced plan before starting a move:
+The placement-domain leader converts an accepted proposal into a persisted, domain/term/revision-fenced plan before starting a move:
 
 ```text
 RebalancePlan {
   plan_id
   entity_type
   reason
-  coordinator_term
+  domain and coordinator_term
   base_revision
   policy_id and policy_version
   status: Planned | Running | Completed | Cancelled | Failed
@@ -276,11 +289,16 @@ RebalancePlan {
 }
 ```
 
-Only one move may be active for a shard, and at most one automatic plan may be active per entity type. Pending moves reserve their estimated weight against target capacity so concurrent plans cannot overcommit a node. Limits apply independently to proposals and execution: maximum moves per round, and maximum concurrent moves per cluster, entity type, source node, and target node. The current leader measures cooldown and minimum residence with local monotonic timers derived from reconciled transition state, never from caller clocks. After leader failover, any interval whose elapsed duration cannot be proven is conservatively restarted from reconciliation time. Active plan count and retained completed-plan history are bounded by `maximum_completed_plan_history`. Recovery and each terminal transition compact only Completed/Cancelled/Failed records, ordered by authoritative base revision and plan ID. Deletion is revision-conditional in memory and etcd; active or handoff-linked plans are never retention candidates.
+Only one move may be active for a shard, and at most one automatic plan may be active per entity
+type. Pending moves reserve domain capacity. Limits apply per domain/entity/source/target plus an
+optional CoordinatorHost-wide cap; revisions and write sets are never shared across domains.
+Cooldown, history, and deletion remain bounded and revision-conditional.
 
 Higher-priority recovery/drain work may cancel or preempt lower-priority moves only while they remain `Pending`; their reservations are then released idempotently. A move that has entered `Handoff` owns the slot's `active_move` marker and must complete or recover forward before another plan may target that shard.
 
-A new Coordinator leader reconstructs plans and slot handoffs from etcd after claim reconciliation. It cancels stale `Pending` moves whose base assumptions no longer hold and idempotently resumes already persisted handoffs from their authoritative slot state. Cancellation stops only moves that have not crossed into handoff; once source invalidation/drain begins, the move is completed or recovered forward rather than rolled back to an ambiguous owner.
+A new domain leader reconstructs only its plans and handoffs after claim reconciliation. It cancels
+stale `Pending` moves and resumes persisted handoffs forward; another domain's state is neither read
+nor changed.
 
 ### 6.5 Singleton Boundary
 
@@ -288,21 +306,23 @@ Singletons reuse the shared placement move, drain, claim, and fencing machinery 
 
 ## 7. Handoff
 
-A controlled shard handoff uses the same node-level revision stream as normal assignment updates. Its barrier is complete for the affected entity type, not cluster-global: it contains the live node sessions whose `NodeHello` subscription says they host or proxy that entity type and therefore may cache its shard home. Nodes unrelated to the entity type cannot block the handoff.
+A controlled shard handoff uses its domain's revision stream. Its barrier contains only live sessions
+whose `PlacementDomainHello` subscribes to the affected entity type. Unrelated domains and types
+cannot block it.
 
 ```text
-Coordinator transactionally links optional plan/move ID and persists BeginHandoff(next generation, target)
-  -> publishes StateDelta(handoff revision)
+Domain leader transactionally links optional plan/move ID and persists BeginHandoff(next generation, target)
+  -> publishes domain delta(handoff revision)
   -> every subscribed Region in the frozen barrier set invalidates home, buffers, and AppliedRevision(revision)
   -> a node joining later receives the Handoff state in its snapshot before becoming Ready
   -> a node adding the entity-type subscription during handoff installs that snapshot slice before routing
   -> a failed barrier member leaves only through membership/lease fencing, not by handoff timeout alone
-  -> Coordinator sends DrainShard to source
+  -> domain leader sends DrainShard to source
   -> source stops admission, drains handlers, and stops entities
-  -> source sends ShardDrained; Coordinator revokes or independently proves expiry of old claim
-  -> Coordinator persists next-generation claim and sends ClaimGranted to target
+  -> source sends ShardDrained; domain leader revokes or proves expiry of old claim
+  -> domain leader persists next-generation claim and sends ClaimGranted to target
   -> target installs the grant, starts Shard, and sends ShardReady
-  -> Coordinator persists Active and publishes the next StateDelta
+  -> domain leader persists Active and publishes the next domain delta
   -> Regions apply the revision and flush unexpired bounded buffers
 ```
 
@@ -334,7 +354,10 @@ During temporary Coordinator unavailability:
 - unknown shards and exhausted buffers fail with `CoordinatorUnavailable` or `ShardUnavailable`;
 - recovery reconciles claims before buffered traffic resumes.
 
-This keeps a short control-plane outage from stopping healthy known data paths without permitting split ownership. It is deliberately bounded: a known route stops when its local grant deadline expires even if the data connection is healthy. Production configuration must therefore satisfy `Coordinator leader recovery objective < claim TTL - safety margin`; increasing the TTL extends outage tolerance but also increases the worst-case crash-failover delay.
+This keeps a short control-plane outage from stopping healthy known data paths without permitting
+split ownership. It is deliberately bounded: a known route stops at its local grant deadline.
+Production configuration must satisfy `placement-domain leader recovery objective < claim TTL -
+safety margin`; increasing TTL extends outage tolerance and worst-case crash-failover delay.
 
 ## 9. Passivation
 
@@ -344,23 +367,29 @@ Passivation does not write etcd or increment shard generation. `EntityRef` remai
 
 ## 10. Cluster Singletons
 
-Singleton kinds are declared at service startup. A SingletonProxy tracks the Coordinator assignment and forwards through remoting. Singleton routing and lifecycle remain separate from sharding, while ownership delegates to the shared placement-slot engine and uses the same term/generation/sequence/TTL grant and local monotonic fencing rules as shard ownership.
+Singleton kinds require an explicit domain. A SingletonProxy tracks that domain's assignment and
+forwards through remoting. Ownership uses the shared domain placement-slot engine while public
+singleton semantics remain distinct from sharding.
 
-On failure, the Coordinator waits until the old claim is invalid, selects a compatible node, publishes the next generation, and activates the new singleton. The first version supports fixed singleton kinds only; it does not retain the old Explicit Placement model.
+On failure, the domain leader waits until the old claim is invalid, selects a compatible domain
+member, publishes the next generation, and activates the new singleton.
 
 ## 11. Drain and Shutdown
 
-Graceful drain proceeds in this order:
+Graceful drain aggregates all joined domains:
 
-1. mark node draining, stop external admission, and reject new placements;
-2. hand off owned shards;
-3. relocate singleton ownership;
-4. drain actor mailboxes and pending asks within a deadline;
-5. terminate concrete actors and notify watchers;
-6. close remoting associations and revoke membership lease.
+1. stop new admission and begin every domain drain concurrently within bounds;
+2. independently hand off/fence shards and singletons in each domain;
+3. acknowledge each domain completion without undoing completed domains;
+4. stop activations and finish bounded work;
+5. remove global membership only after every required domain completion;
+6. at deadline, fence unfinished domains independently and terminate.
 
 Forced shutdown relies on lease expiry and claim fencing. Operators must be able to observe which shards or singletons still block a drain.
 
 ## 12. Migration Constraint
 
-The old generated gRPC, Explicit Placement, and Direct Link protocols are not wire-compatible with this design. Cutover is full-stop: stop old nodes, migrate/clear incompatible framework metadata under an explicit schema-generation procedure, then start only new-protocol nodes. Mixed clusters are unsupported.
+Generation 4 is not wire/storage compatible with generation 5. Cutover is full-stop: stop old
+processes, require a complete explicit type-to-domain mapping, run the resumable offline migration,
+verify fenced ownership/scoped counters, then start only generation-5 processes. Mixed clusters and
+automatic startup migration are unsupported.

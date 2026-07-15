@@ -1,21 +1,27 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
+#[path = "testctl/chaos.rs"]
+mod testctl_chaos;
 #[path = "testctl/discovery.rs"]
 mod testctl_discovery;
+#[path = "testctl/resources.rs"]
+mod testctl_resources;
+#[path = "testctl/scenarios.rs"]
+mod testctl_scenarios;
 
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode};
+use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use lattice_sim::domains::{MultiDomainScenario, MultiDomainScenarioConfig};
 use lattice_sim::lifecycle::{LifecycleScenario, LifecycleScenarioConfig};
 use lattice_sim::scenario::Scenario;
 use lattice_sim::scenario::ScenarioConfig;
 use lattice_sim::trace::TraceJournal;
 use serde::{Deserialize, Serialize};
+
+use testctl_scenarios::{wait_for_host_scope, wait_for_scope_across_hosts};
 
 #[derive(Parser)]
 #[command(name = "testctl")]
@@ -93,10 +99,24 @@ struct MonitorResult {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct CoordinatorLeadershipArtifact {
+struct ScopedLeadershipArtifact {
     node_id: String,
     term: u64,
     incarnation: u128,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MultiDomainHostArtifact {
+    node_id: String,
+    incarnation: u128,
+    scopes: std::collections::BTreeMap<String, ScopedLeadershipArtifact>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MultiDomainLogicArtifact {
+    node_id: String,
+    lifecycle: String,
+    domains: std::collections::BTreeMap<String, String>,
 }
 
 fn main() -> ExitCode {
@@ -133,7 +153,7 @@ fn run_profile(
         .map_err(|error| error.to_string())?
         .as_millis();
     let timer = Instant::now();
-    let mut resource_samples = vec![resource_sample(timer.elapsed())];
+    let mut resource_samples = vec![testctl_resources::sample(timer.elapsed())];
     let result = match profile {
         Profile::Quality => (|| {
             command("scripts/check-structure.sh", &[])?;
@@ -160,6 +180,7 @@ fn run_profile(
         ]),
         Profile::E2e => (|| {
             testctl_discovery::verify(artifacts)?;
+            multi_domain_real(artifacts)?;
             commands(&[
                 &[
                     "test",
@@ -192,7 +213,44 @@ fn run_profile(
         })(),
         Profile::E2eHaEtcd => ha_etcd_real(artifacts),
         Profile::Chaos => (|| {
-            chaos_real(artifacts)?;
+            multi_domain_real(artifacts)?;
+            testctl_chaos::verify(artifacts)?;
+            commands(&[
+                &[
+                    "test",
+                    "-p",
+                    "lattice-service",
+                    "one_domain_coordinator_loss_leaves_other_domain_ready",
+                ],
+                &[
+                    "test",
+                    "-p",
+                    "lattice-service",
+                    "membership_loss_revokes_node_readiness_until_a_new_snapshot",
+                ],
+                &[
+                    "test",
+                    "-p",
+                    "lattice-placement",
+                    "join_drain_and_force_remove_are_revisioned_idempotent_and_fenced",
+                ],
+                &[
+                    "test",
+                    "-p",
+                    "lattice-placement",
+                    "--test",
+                    "etcd_acceptance",
+                    "real_etcd_guarded_domain_commits_and_lease_expiry",
+                    "--",
+                    "--nocapture",
+                ],
+                &[
+                    "test",
+                    "-p",
+                    "lattice-sim",
+                    "multi_domain_trace_replays_independent_elections_and_handoffs",
+                ],
+            ])?;
             for current in seed..seed.saturating_add(32) {
                 simulate(current, artifacts)?;
             }
@@ -218,7 +276,7 @@ fn run_profile(
         (Err(error), _) => Err(error),
         (Ok(()), cleanup) => cleanup,
     };
-    resource_samples.push(resource_sample(timer.elapsed()));
+    resource_samples.push(testctl_resources::sample(timer.elapsed()));
     let success = result.is_ok();
     let replay_artifact = if matches!(profile, Profile::Soak) {
         "soak-latest.json".to_owned()
@@ -251,7 +309,7 @@ fn run_profile(
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         pinned_images: std::fs::read_to_string("tests/distributed/images.lock")
             .unwrap_or_else(|_| "unavailable".to_owned()),
-        scenarios: profile_scenarios(profile),
+        scenarios: testctl_scenarios::for_profile(profile),
         configuration: serde_json::json!({
             "duration_seconds": duration_seconds,
             "artifact_directory": artifacts,
@@ -263,35 +321,282 @@ fn run_profile(
     result
 }
 
-fn profile_scenarios(profile: Profile) -> Vec<&'static str> {
-    match profile {
-        Profile::Quality => vec!["fmt", "clippy", "workspace-tests"],
-        Profile::Sim => vec!["seeded-production-reducers"],
-        Profile::Model => vec!["bounded-state-explorer"],
-        Profile::E2e => vec![
-            "exact-actor-ref-child-watch",
-            "gateway-entity-ref-remote-shard",
-            "single-member-etcd",
-            "tcp",
-            "mutual-tls",
-            "claimed-entity-ref",
-            "static-discovery-cluster-join",
-            "config-store-discovery-cluster-join",
-            "graceful-member-leave",
+fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
+    let run_id = std::env::var("LATTICE_RUN_ID")
+        .map_err(|_| "multi-domain e2e requires LATTICE_RUN_ID".to_owned())?;
+    let containers = labeled_containers(&run_id)?;
+    let container = |needle: &str| {
+        containers
+            .lines()
+            .find(|name| name.contains(needle) && !name.contains("runner"))
+            .ok_or_else(|| format!("missing labeled {needle} container"))
+    };
+    let membership_container = container("domain-membership")?;
+    let alpha_container = container("domain-alpha")?;
+    let beta_container = container("domain-beta")?;
+    let gamma_container = container("domain-gamma")?;
+    let standby_container = container("domain-standby")?;
+    for name in [
+        membership_container,
+        alpha_container,
+        beta_container,
+        gamma_container,
+        standby_container,
+    ] {
+        require_label("container", name, &run_id)?;
+    }
+
+    let membership = wait_for_host_scope(
+        &artifacts.join("domain-membership.json"),
+        "membership",
+        0,
+        Duration::from_secs(120),
+    )?;
+    if membership.node_id != "domain-membership" {
+        return Err("dedicated membership host did not retain membership leadership".to_owned());
+    }
+    let alpha = wait_for_host_scope(
+        &artifacts.join("domain-alpha.json"),
+        "placement:domain-alpha",
+        0,
+        Duration::from_secs(120),
+    )?;
+    let beta = wait_for_host_scope(
+        &artifacts.join("domain-beta.json"),
+        "placement:domain-beta",
+        0,
+        Duration::from_secs(120),
+    )?;
+    let gamma = wait_for_host_scope(
+        &artifacts.join("domain-gamma.json"),
+        "placement:domain-gamma",
+        0,
+        Duration::from_secs(120),
+    )?;
+    let delta = wait_for_host_scope(
+        &artifacts.join("domain-alpha.json"),
+        "placement:domain-delta",
+        0,
+        Duration::from_secs(120),
+    )?;
+    if delta.node_id != alpha.node_id {
+        return Err("domain alpha host did not initially lead both alpha and delta".to_owned());
+    }
+    let leaders = [
+        alpha.node_id.as_str(),
+        beta.node_id.as_str(),
+        gamma.node_id.as_str(),
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+    if leaders.len() != 3 {
+        return Err(format!(
+            "expected three independently distributed domain leaders, found {leaders:?}"
+        ));
+    }
+    for name in ["domain-logic-a.json", "domain-logic-b.json"] {
+        wait_for_logic_ready(&artifacts.join(name), Duration::from_secs(30))?;
+    }
+
+    command("docker", &["stop", "--time", "1", alpha_container])?;
+    let replacement = wait_for_host_scope_while_checking_logic(
+        artifacts,
+        "placement:domain-alpha",
+        alpha.term,
+        Duration::from_secs(30),
+    );
+    let restart_result = (|| {
+        command("docker", &["start", alpha_container])?;
+        wait_for_running_container(alpha_container, Duration::from_secs(30))
+    })();
+    let replacement = replacement?;
+    restart_result?;
+    if replacement.node_id != "domain-standby" {
+        return Err(format!(
+            "domain alpha failed over to {}, expected domain-standby",
+            replacement.node_id
+        ));
+    }
+    let delta_replacement = wait_for_host_scope(
+        &artifacts.join("domain-standby.json"),
+        "placement:domain-delta",
+        delta.term,
+        Duration::from_secs(30),
+    )?;
+    if delta_replacement.node_id != "domain-standby" {
+        return Err(format!(
+            "domain delta failed over to {}, expected domain-standby",
+            delta_replacement.node_id
+        ));
+    }
+    let beta_after = wait_for_host_scope(
+        &artifacts.join("domain-beta.json"),
+        "placement:domain-beta",
+        0,
+        Duration::from_secs(2),
+    )?;
+    let gamma_after = wait_for_host_scope(
+        &artifacts.join("domain-gamma.json"),
+        "placement:domain-gamma",
+        0,
+        Duration::from_secs(2),
+    )?;
+    if beta_after.node_id != beta.node_id
+        || beta_after.term != beta.term
+        || gamma_after.node_id != gamma.node_id
+        || gamma_after.term != gamma.term
+    {
+        return Err("domain alpha failure changed beta or gamma leadership".to_owned());
+    }
+    for name in ["domain-logic-a.json", "domain-logic-b.json"] {
+        wait_for_logic_ready(&artifacts.join(name), Duration::from_secs(30))?;
+    }
+    command("docker", &["stop", "--time", "1", membership_container])?;
+    let membership_replacement = wait_for_scope_across_hosts(
+        artifacts,
+        &[
+            "domain-alpha.json",
+            "domain-beta.json",
+            "domain-gamma.json",
+            "domain-standby.json",
         ],
-        Profile::E2eHaEtcd => vec!["etcd-leader-failover", "coordinator-plan-recovery"],
-        Profile::Chaos => vec![
-            "pause-resume",
-            "netem-delay-loss",
-            "same-incarnation-reconnect",
-            "network-partition-heal",
-            "kill-start",
-            "same-address-restart",
-            "stale-reference-rejection",
-            "seed-corpus",
-        ],
-        Profile::K8s => vec!["probes", "dns", "rollout", "pdb-eviction"],
-        Profile::Soak => vec!["bounded-seeded-soak"],
+        "membership",
+        membership.term,
+        Duration::from_secs(30),
+    );
+    let membership_restart = (|| {
+        command("docker", &["start", membership_container])?;
+        wait_for_running_container(membership_container, Duration::from_secs(30))
+    })();
+    let membership_replacement = membership_replacement?;
+    membership_restart?;
+    if membership_replacement.node_id == membership.node_id {
+        return Err(format!(
+            "membership did not fail away from the stopped host: {}",
+            membership_replacement.node_id
+        ));
+    }
+    for name in ["domain-logic-a.json", "domain-logic-b.json"] {
+        wait_for_logic_ready(&artifacts.join(name), Duration::from_secs(30))?;
+    }
+    write_json(
+        &artifacts.join("multi-domain-failover.json"),
+        &serde_json::json!({
+            "membership": {
+                "node_id": membership.node_id,
+                "term": membership.term,
+                "incarnation": membership.incarnation.to_string(),
+            },
+            "initial": {
+                "alpha": {
+                    "node_id": alpha.node_id,
+                    "term": alpha.term,
+                    "incarnation": alpha.incarnation.to_string(),
+                },
+                "beta": {
+                    "node_id": beta.node_id,
+                    "term": beta.term,
+                    "incarnation": beta.incarnation.to_string(),
+                },
+                "gamma": {
+                    "node_id": gamma.node_id,
+                    "term": gamma.term,
+                    "incarnation": gamma.incarnation.to_string(),
+                },
+                "delta": {
+                    "node_id": delta.node_id,
+                    "term": delta.term,
+                    "incarnation": delta.incarnation.to_string(),
+                },
+            },
+            "replacement": {
+                "node_id": replacement.node_id,
+                "term": replacement.term,
+                "incarnation": replacement.incarnation.to_string(),
+            },
+            "delta_replacement": {
+                "node_id": delta_replacement.node_id,
+                "term": delta_replacement.term,
+                "incarnation": delta_replacement.incarnation.to_string(),
+            },
+            "membership_replacement": {
+                "node_id": membership_replacement.node_id,
+                "term": membership_replacement.term,
+                "incarnation": membership_replacement.incarnation.to_string(),
+            },
+            "unrelated_terms_unchanged": true,
+            "logic_nodes": ["domain-logic-a", "domain-logic-b"],
+        }),
+    )
+}
+
+fn wait_for_host_scope_while_checking_logic(
+    artifacts: &Path,
+    scope: &str,
+    minimum_term: u64,
+    timeout: Duration,
+) -> Result<ScopedLeadershipArtifact, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        for name in ["domain-logic-a.json", "domain-logic-b.json"] {
+            let logic = read_logic(&artifacts.join(name))?;
+            if logic.lifecycle != "Ready"
+                || logic.domains.get("domain-beta").map(String::as_str) != Some("Ready")
+                || logic.domains.get("domain-gamma").map(String::as_str) != Some("Ready")
+            {
+                return Err(format!(
+                    "unrelated domain degraded during alpha failover: {logic:?}"
+                ));
+            }
+        }
+        if let Ok(leader) = wait_for_host_scope(
+            &artifacts.join("domain-standby.json"),
+            scope,
+            minimum_term,
+            Duration::from_millis(10),
+        ) {
+            return Ok(leader);
+        }
+        if Instant::now() >= deadline {
+            return Err("standby did not acquire failed placement domain".to_owned());
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn read_logic(path: &Path) -> Result<MultiDomainLogicArtifact, String> {
+    serde_json::from_slice(&std::fs::read(path).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())
+}
+
+fn require_logic_ready(path: &Path) -> Result<(), String> {
+    let logic = read_logic(path)?;
+    if logic.lifecycle == "Ready"
+        && [
+            "domain-alpha",
+            "domain-beta",
+            "domain-gamma",
+            "domain-delta",
+        ]
+        .into_iter()
+        .all(|domain| logic.domains.get(domain).map(String::as_str) == Some("Ready"))
+    {
+        Ok(())
+    } else {
+        Err(format!("multi-domain logic node is not ready: {logic:?}"))
+    }
+}
+
+fn wait_for_logic_ready(path: &Path, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if require_logic_ready(path).is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return require_logic_ready(path);
+        }
+        std::thread::yield_now();
     }
 }
 
@@ -435,7 +740,7 @@ fn wait_for_coordinator_leadership(
     excluded_node: Option<&str>,
     minimum_term: u64,
     timeout: Duration,
-) -> Result<CoordinatorLeadershipArtifact, String> {
+) -> Result<ScopedLeadershipArtifact, String> {
     let deadline = Instant::now() + timeout;
     loop {
         for name in ["coordinator-a.json", "coordinator-b.json"] {
@@ -443,7 +748,7 @@ fn wait_for_coordinator_leadership(
             let Ok(bytes) = std::fs::read(path) else {
                 continue;
             };
-            let Ok(state) = serde_json::from_slice::<CoordinatorLeadershipArtifact>(&bytes) else {
+            let Ok(state) = serde_json::from_slice::<ScopedLeadershipArtifact>(&bytes) else {
                 continue;
             };
             if state.term > minimum_term
@@ -462,12 +767,17 @@ fn wait_for_coordinator_leadership(
 fn assert_coordinator_not_displaced(
     etcd_member: &str,
     run_id: &str,
-    expected: &CoordinatorLeadershipArtifact,
+    expected: &ScopedLeadershipArtifact,
     stable_period: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + stable_period;
+    let mut observed = false;
     while Instant::now() < deadline {
-        let (node_id, term) = coordinator_leader_from_etcd(etcd_member, run_id)?;
+        let Ok((node_id, term)) = coordinator_leader_from_etcd(etcd_member, run_id) else {
+            std::thread::yield_now();
+            continue;
+        };
+        observed = true;
         if node_id != expected.node_id || term < expected.term {
             return Err(format!(
                 "Coordinator leader changed from {} term {} to {node_id} term {term}",
@@ -476,11 +786,15 @@ fn assert_coordinator_not_displaced(
         }
         std::thread::yield_now();
     }
-    Ok(())
+    if observed {
+        Ok(())
+    } else {
+        Err("Coordinator leader was not observable during the stability window".to_owned())
+    }
 }
 
 fn coordinator_leader_from_etcd(etcd_member: &str, run_id: &str) -> Result<(String, u64), String> {
-    let key = format!("/lattice-ha/{run_id}/coordinator/leader");
+    let key = format!("/lattice-ha/{run_id}/domains/distributed-simulation/leader");
     let encoded = output(
         "docker",
         &[
@@ -660,279 +974,6 @@ fn wait_for_running_container(container: &str, timeout: Duration) -> Result<(), 
     }
 }
 
-fn chaos_real(artifacts: &Path) -> Result<(), String> {
-    let run_id =
-        std::env::var("LATTICE_RUN_ID").map_err(|_| "chaos requires LATTICE_RUN_ID".to_owned())?;
-    let network = std::env::var("LATTICE_DOCKER_NETWORK")
-        .map_err(|_| "chaos requires LATTICE_DOCKER_NETWORK".to_owned())?;
-    let containers = labeled_containers(&run_id)?;
-    let server = containers
-        .lines()
-        .find(|name| name.contains("fixture-server"))
-        .ok_or_else(|| "labeled fixture server is absent".to_owned())?;
-    require_label("container", server, &run_id)?;
-    require_label("network", &network, &run_id)?;
-    write_json(
-        &artifacts.join("fault-schedule.json"),
-        &serde_json::json!({
-            "run_id": run_id,
-            "operations": [
-                "pause-server",
-                "resume-server",
-                "netem-delay-150ms",
-                "netem-loss-100-percent",
-                "disconnect-network",
-                "assert-partition-failure",
-                "reconnect-same-address",
-                "kill-server",
-                "start-server-new-incarnation",
-                "assert-killed-reference-stale",
-                "restart-new-incarnation",
-                "assert-stale-reference-failure",
-                "assert-new-reference-recovery"
-            ]
-        }),
-    )?;
-
-    let mut monitor = ChaosMonitor::start()?;
-    command("docker", &["pause", server])?;
-    command("docker", &["unpause", server])?;
-    monitor.probe(Some(true))?;
-
-    require_label("container", server, &run_id)?;
-    command(
-        "docker",
-        &[
-            "exec", server, "tc", "qdisc", "add", "dev", "eth0", "root", "netem", "delay", "150ms",
-        ],
-    )?;
-    monitor.probe(None)?;
-    require_label("container", server, &run_id)?;
-    command(
-        "docker",
-        &["exec", server, "tc", "qdisc", "del", "dev", "eth0", "root"],
-    )?;
-    monitor.recover(Duration::from_secs(30))?;
-
-    require_label("container", server, &run_id)?;
-    command(
-        "docker",
-        &[
-            "exec", server, "tc", "qdisc", "add", "dev", "eth0", "root", "netem", "loss", "100%",
-        ],
-    )?;
-    monitor.probe(Some(false))?;
-    require_label("container", server, &run_id)?;
-    command(
-        "docker",
-        &["exec", server, "tc", "qdisc", "del", "dev", "eth0", "root"],
-    )?;
-    monitor.recover(Duration::from_secs(30))?;
-
-    let server_address = pin_container_host(server, "fixture-server", &run_id)?.to_string();
-    command("docker", &["network", "disconnect", &network, server])?;
-    monitor.probe(Some(false))?;
-    command(
-        "docker",
-        &[
-            "network",
-            "connect",
-            "--ip",
-            &server_address,
-            "--alias",
-            "fixture-server",
-            &network,
-            server,
-        ],
-    )?;
-    monitor.recover(Duration::from_secs(30))?;
-    monitor.stop()?;
-
-    let killed = artifacts.join("killed-server-ref.json");
-    std::fs::copy("/artifacts/server-ref.json", &killed).map_err(|error| error.to_string())?;
-    let old = std::fs::read(&killed).map_err(|error| error.to_string())?;
-    require_label("container", server, &run_id)?;
-    command("docker", &["kill", server])?;
-    require_label("container", server, &run_id)?;
-    command("docker", &["start", server])?;
-    wait_for_new_incarnation(&old)?;
-    distributed_client(&killed, true)?;
-    distributed_client(Path::new("/artifacts/server-ref.json"), false)?;
-
-    let stale = artifacts.join("stale-server-ref.json");
-    std::fs::copy("/artifacts/server-ref.json", &stale).map_err(|error| error.to_string())?;
-    let old = std::fs::read(&stale).map_err(|error| error.to_string())?;
-    require_label("container", server, &run_id)?;
-    command("docker", &["restart", server])?;
-    wait_for_new_incarnation(&old)?;
-    distributed_client(&stale, true)?;
-    distributed_client(Path::new("/artifacts/server-ref.json"), false)
-}
-
-fn wait_for_new_incarnation(old: &[u8]) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        if std::fs::read("/artifacts/server-ref.json").is_ok_and(|current| current != old) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("server restart did not publish a new incarnation".to_owned());
-        }
-        std::thread::yield_now();
-    }
-}
-
-fn pin_container_host(container: &str, host: &str, run_id: &str) -> Result<IpAddr, String> {
-    let address = output(
-        "docker",
-        &[
-            "container",
-            "inspect",
-            "--format",
-            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-            container,
-        ],
-    )?;
-    let address = address
-        .parse::<IpAddr>()
-        .map_err(|error| format!("invalid fixture address {address}: {error}"))?;
-    let mut hosts = OpenOptions::new()
-        .append(true)
-        .open("/etc/hosts")
-        .map_err(|error| format!("failed to pin fixture host: {error}"))?;
-    writeln!(hosts, "{address} {host} # lattice test run {run_id}")
-        .map_err(|error| format!("failed to pin fixture host: {error}"))?;
-    Ok(address)
-}
-
-fn distributed_client(reference: &Path, expect_failure: bool) -> Result<(), String> {
-    let mut arguments = vec![
-        "run",
-        "-p",
-        "lattice-sim",
-        "--bin",
-        "distributed-node",
-        "--",
-        "client",
-        "--reference",
-        reference
-            .to_str()
-            .ok_or_else(|| "reference path is not UTF-8".to_owned())?,
-    ];
-    if expect_failure {
-        arguments.push("--expect-failure");
-    }
-    cargo(&arguments)
-}
-
-struct ChaosMonitor {
-    child: Option<Child>,
-    next_sequence: u64,
-}
-
-impl ChaosMonitor {
-    fn start() -> Result<Self, String> {
-        for path in [
-            "/artifacts/monitor-ready.json",
-            "/artifacts/monitor-command.json",
-        ] {
-            let _ = std::fs::remove_file(path);
-        }
-        for sequence in 1..=16 {
-            let _ = std::fs::remove_file(format!("/artifacts/monitor-result-{sequence}.json"));
-        }
-        let child = Command::new("cargo")
-            .args([
-                "run",
-                "-p",
-                "lattice-sim",
-                "--bin",
-                "distributed-node",
-                "--",
-                "monitor",
-                "--reference",
-                "/artifacts/server-ref.json",
-            ])
-            .spawn()
-            .map_err(|error| format!("failed to start chaos monitor: {error}"))?;
-        wait_for_file(
-            Path::new("/artifacts/monitor-ready.json"),
-            Duration::from_secs(60),
-        )?;
-        Ok(Self {
-            child: Some(child),
-            next_sequence: 1,
-        })
-    }
-
-    fn probe(&mut self, expected: Option<bool>) -> Result<bool, String> {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        write_json_atomic(
-            Path::new("/artifacts/monitor-command.json"),
-            &MonitorCommand {
-                sequence,
-                stop: false,
-            },
-        )?;
-        let path = PathBuf::from(format!("/artifacts/monitor-result-{sequence}.json"));
-        wait_for_file(&path, Duration::from_secs(15))?;
-        let result: MonitorResult =
-            serde_json::from_slice(&std::fs::read(&path).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string())?;
-        if expected.is_some_and(|expected| expected != result.success) {
-            return Err(format!(
-                "chaos monitor probe {sequence} success={} did not match expected={expected:?}",
-                result.success
-            ));
-        }
-        Ok(result.success)
-    }
-
-    fn recover(&mut self, timeout: Duration) -> Result<(), String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if self.probe(None)? {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!("chaos monitor did not recover within {timeout:?}"));
-            }
-            std::thread::yield_now();
-        }
-    }
-
-    fn stop(&mut self) -> Result<(), String> {
-        write_json_atomic(
-            Path::new("/artifacts/monitor-command.json"),
-            &MonitorCommand {
-                sequence: u64::MAX,
-                stop: true,
-            },
-        )?;
-        let status = self
-            .child
-            .take()
-            .ok_or_else(|| "chaos monitor already stopped".to_owned())?
-            .wait()
-            .map_err(|error| error.to_string())?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("chaos monitor exited with {status}"))
-        }
-    }
-}
-
-impl Drop for ChaosMonitor {
-    fn drop(&mut self) {
-        if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
 fn wait_for_file(path: &Path, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -964,10 +1005,10 @@ fn require_label(kind: &str, name: &str, run_id: &str) -> Result<(), String> {
 }
 
 fn simulate(seed: u64, artifacts: &Path) -> Result<(), String> {
-    simulate_to(seed, &artifacts.join(format!("trace-{seed}.json")))
+    simulate_to(seed, &artifacts.join(format!("trace-{seed}.json")), true)
 }
 
-fn simulate_to(seed: u64, trace_path: &Path) -> Result<(), String> {
+fn simulate_to(seed: u64, trace_path: &Path, retain_companion_traces: bool) -> Result<(), String> {
     let mut scenario = Scenario::standard(ScenarioConfig {
         seed,
         maximum_events: 256,
@@ -991,10 +1032,25 @@ fn simulate_to(seed: u64, trace_path: &Path) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     lifecycle.schedule_acceptance();
     lifecycle.run().map_err(|error| error.to_string())?;
-    lifecycle
-        .trace
-        .write_json(&trace_path.with_file_name(format!("lifecycle-trace-{seed}.json")))
-        .map_err(|error| error.to_string())?;
+    if retain_companion_traces {
+        lifecycle
+            .trace
+            .write_json(&trace_path.with_file_name(format!("lifecycle-trace-{seed}.json")))
+            .map_err(|error| error.to_string())?;
+    }
+    let mut domains = MultiDomainScenario::standard(MultiDomainScenarioConfig {
+        seed,
+        maximum_events: 64,
+    })
+    .map_err(|error| error.to_string())?;
+    domains.schedule_acceptance();
+    domains.run().map_err(|error| error.to_string())?;
+    if retain_companion_traces {
+        domains
+            .trace
+            .write_json(&trace_path.with_file_name(format!("domain-trace-{seed}.json")))
+            .map_err(|error| error.to_string())?;
+    }
     result
 }
 
@@ -1010,78 +1066,55 @@ fn soak(
     let rolling_trace = artifacts.join("soak-latest.json");
     let mut next_sample = Instant::now() + Duration::from_secs(1);
     while Instant::now() < deadline {
-        simulate_to(current, &rolling_trace)?;
+        simulate_to(current, &rolling_trace, false)?;
         current = current.saturating_add(1);
         if Instant::now() >= next_sample {
-            samples.push(resource_sample(timer.elapsed()));
+            samples.push(testctl_resources::sample(timer.elapsed()));
             next_sample = Instant::now() + Duration::from_secs(1);
         }
     }
     let final_trace = artifacts.join(format!("trace-{}.json", current.saturating_sub(1)));
     std::fs::copy(&rolling_trace, final_trace).map_err(|error| error.to_string())?;
-    assert_resource_growth(samples, &resource_sample(timer.elapsed()))
-}
-
-fn resource_sample(elapsed: Duration) -> ResourceSample {
-    let process_status = std::fs::read_to_string("/proc/self/status").ok();
-    ResourceSample {
-        elapsed_millis: elapsed.as_millis(),
-        open_file_descriptors: std::fs::read_dir("/proc/self/fd")
-            .ok()
-            .map(|entries| entries.count()),
-        resident_memory_kib: status_value(&process_status, "VmRSS:"),
-        threads: status_value(&process_status, "Threads:"),
-        process_status,
-    }
-}
-
-fn status_value(status: &Option<String>, key: &str) -> Option<u64> {
-    status.as_deref()?.lines().find_map(|line| {
-        line.strip_prefix(key)?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()
-    })
-}
-
-fn assert_resource_growth(
-    samples: &[ResourceSample],
-    final_sample: &ResourceSample,
-) -> Result<(), String> {
-    let initial = samples
-        .first()
-        .ok_or_else(|| "soak has no initial resource sample".to_owned())?;
-    if let (Some(before), Some(after)) = (
-        initial.open_file_descriptors,
-        final_sample.open_file_descriptors,
-    ) && after > before.saturating_add(32)
-    {
-        return Err(format!(
-            "soak file descriptors grew from {before} to {after}"
-        ));
-    }
-    if let (Some(before), Some(after)) = (
-        initial.resident_memory_kib,
-        final_sample.resident_memory_kib,
-    ) && after > before.saturating_add(128 * 1024)
-    {
-        return Err(format!("soak RSS grew from {before} KiB to {after} KiB"));
-    }
-    if let (Some(before), Some(after)) = (initial.threads, final_sample.threads)
-        && after > before.saturating_add(16)
-    {
-        return Err(format!("soak threads grew from {before} to {after}"));
-    }
-    Ok(())
+    testctl_resources::assert_growth(samples, &testctl_resources::sample(timer.elapsed()))
 }
 
 fn replay(path: &Path) -> Result<(), String> {
     let expected = TraceJournal::read_json(path).map_err(|error| error.to_string())?;
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    simulate(expected.seed, directory)?;
-    let actual = TraceJournal::read_json(&directory.join(format!("trace-{}.json", expected.seed)))
-        .map_err(|error| error.to_string())?;
+    let actual = match expected.scenario.as_str() {
+        "standard-handoff" => {
+            let mut scenario = Scenario::standard(ScenarioConfig {
+                seed: expected.seed,
+                maximum_events: 256,
+            })
+            .map_err(|error| error.to_string())?;
+            scenario
+                .schedule_standard_workload()
+                .map_err(|error| error.to_string())?;
+            scenario.run().map_err(|error| error.to_string())?;
+            scenario.trace
+        }
+        "cluster-member-lifecycle" => {
+            let mut scenario = LifecycleScenario::standard(LifecycleScenarioConfig {
+                seed: expected.seed,
+                maximum_events: 64,
+            })
+            .map_err(|error| error.to_string())?;
+            scenario.schedule_acceptance();
+            scenario.run().map_err(|error| error.to_string())?;
+            scenario.trace
+        }
+        "multi-domain-isolation" => {
+            let mut scenario = MultiDomainScenario::standard(MultiDomainScenarioConfig {
+                seed: expected.seed,
+                maximum_events: 64,
+            })
+            .map_err(|error| error.to_string())?;
+            scenario.schedule_acceptance();
+            scenario.run().map_err(|error| error.to_string())?;
+            scenario.trace
+        }
+        scenario => return Err(format!("unsupported replay scenario {scenario}")),
+    };
     if actual == expected {
         Ok(())
     } else {

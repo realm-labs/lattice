@@ -46,7 +46,7 @@ This shape applies to at least:
 
 ```text
 Association and reliable control delivery
-Coordinator session and revisioned snapshot installation
+membership plus per-domain sessions and independently revisioned snapshot installation
 PlacementSlot claim/assignment lifecycle
 ShardRegion route/buffer state
 Handoff barrier and Shard lifecycle
@@ -61,7 +61,7 @@ Production executors interpret effects through real TCP, etcd, clocks, task supe
 External effects carry stable operation IDs and the domain fencing fields needed for replay-safe application:
 
 ```text
-Coordinator term and state revision
+membership term/revision or domain-qualified placement term/revision
 NodeIncarnation and Association epoch
 Control sequence and command ID
 Placement assignment generation and grant sequence
@@ -129,7 +129,7 @@ event_index and causal_parent_ids
 virtual/monotonic time
 node ID and NodeIncarnation
 AssociationId/epoch, lane and control sequence
-Coordinator term and state revision
+scope plus membership term/revision or domain-qualified placement term/revision
 PlacementSlot, assignment generation and grant sequence
 Rebalance plan/move ID and move status
 actor path and ActivationId
@@ -141,7 +141,7 @@ Ordering assertions use causal/domain sequence fields rather than log timestamps
 
 - tell order for one sender/recipient/stable bulk stripe/Association epoch;
 - reliable control sequence and cumulative acknowledgement order;
-- atomic Coordinator revision installation and gap rejection;
+- atomic scope-qualified revision installation and gap rejection;
 - handoff order from invalidation barrier through old-authority invalidation to new Active;
 - generation-conditional RebalanceMove progress;
 - at-most-one completion of one ask correlation or WatchId.
@@ -368,7 +368,7 @@ manifest.json
 scenario/seed/configuration
 structured trace and minimized replay trace
 container stdout/stderr
-Coordinator/placement/admin snapshots
+membership/domain/admin snapshots
 etcd revision/key dump with secrets redacted
 resource time series
 network/fault schedule
@@ -382,10 +382,23 @@ resources every second with explicit growth ceilings.
 
 Artifacts are copied to the host-mounted run directory before teardown. Secrets, business payloads, private keys and bearer tokens are redacted. Cleanup is idempotent and removes containers, networks, disposable volumes and project-local runner/probe images for the run even after timeout or interruption; failed cleanup is itself a test failure.
 
-The HA profile runs two independent production `CoordinatorLeader` processes against the
-three-member etcd cluster. Its structured oracle stops the elected Coordinator, requires a peer to
-publish a higher leadership term with its exact boot incarnation, restarts the old process, and
-checks that the restarted candidate cannot displace the current leader.
+The HA profile runs independent production CoordinatorHost candidates against three-member etcd.
+Its structured oracle stops an elected scope leader, requires a candidate to publish a higher term
+with its exact boot incarnation, restarts the old host, and checks that it cannot displace the
+current leader.
+
+The e2e profile runs a dedicated membership host, four placement domains, three initially distinct
+placement leaders, a host leading both alpha and delta, a standby campaigning for all scopes, and
+two logic nodes subscribed to all domains. Killing the alpha host must fail over both alpha and
+delta at independent higher terms while beta/gamma leadership and readiness stay unchanged. It then
+kills the membership host, requires an independent higher-term membership takeover, and waits for
+both logic nodes to reinstall exact local-`Up` membership snapshots. The `sim` profile retains a
+replayable two-domain trace; the `model` profile explores independent elections, membership loss,
+snapshot gates, progress, and handoffs under bounded interleavings.
+
+The chaos profile reuses that topology and adds `tc netem` delay/loss, network detach/reattach,
+process pause/kill/restart, real etcd lease expiry, cross-domain drain, and simultaneous independent
+handoff replay.
 
 ### 7.7 Kubernetes Boundary
 
@@ -424,18 +437,18 @@ At minimum, real Docker scenarios cover:
 
 | Area | Required scenarios |
 |---|---|
-| Node lifecycle | boot, incompatible join, Ready, Coordinator loss/restore, drain, forced kill, same-address new incarnation |
+| Node lifecycle | boot, incompatible join, exact local Up, membership loss/restore, aggregate domain drain, forced kill, same-address new incarnation |
 | Association | simultaneous dial, lane failure, control reconnect/replay, TLS identity failure, malformed/oversized frame |
-| Coordinator | leader crash before/after etcd commit, stale leader command, revision gap/resnapshot, lease expiry |
+| Membership/domains | independent leader crash, stale scoped command, revision gap/resnapshot, lease expiry, cross-domain rejection |
 | Shard | first allocation, lazy activation, passivation, buffer overflow, owner crash, claim expiry |
 | Handoff | join/leave during barrier, source crash at each boundary, target crash before/after grant/ready |
 | Rebalancing | deterministic plan, stale load, hysteresis/cooldown, capacity reservation, preemption, leader recovery |
 | DeathWatch | lost/replayed WatchAck/Terminated, reconnect, activation/path reuse, node-down confirmation |
 | Ask/tell | write-boundary UnknownResult, no automatic replay, stripe ordering, deadline at every admission point |
 | Resource/shutdown | queue/map limits, task panic, cancellation, repeated reconnect, bounded drain and zero orphan resources |
-| Coordinator transactions | exact live leader guard, atomic slot/claim and slot/plan, counter predicates, unknown-outcome reread |
+| Domain transactions | exact typed leader guard, atomic slot/claim and slot/plan, scoped counters, cross-domain impossibility, unknown-outcome reread |
 | Term stream/reconciliation | new-term snapshot gate, old-term ack rejection, bounded claim adoption/fencing and recovery liveness |
-| Storage migration | generation-3 dry-run/apply/interruption-resume, backup, lease lock, quarantine, counter verification |
+| Storage migration | generation-4-to-5 dry-run/apply/interruption-resume, explicit mapping, collision/unmapped rejection, atomic finalization failure, backup, lock, fenced ownership, counters |
 
 Assertions query structured admin/trace state. Tests must not parse human log text as the primary oracle or use `sleep` as proof that a state transition completed.
 

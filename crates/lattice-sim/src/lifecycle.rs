@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
 use lattice_placement::coordinator::{
-    MemberChange, MemberEvent, MemberRecord, MemberRemovalReason, MemberStatus, NodeHello,
+    MemberChange, MemberEvent, MemberHello, MemberRecord, MemberRemovalReason, MemberStatus,
 };
-use lattice_placement::types::{CoordinatorTerm, NodeKey, Revision, StateVersion};
+use lattice_placement::types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision};
 use lattice_service::cluster::members::{MemberDirectory, MemberDirectoryError};
 use lattice_service::lifecycle::{
-    ServiceLifecycle, ServiceLifecycleEffect, ServiceLifecycleError, ServiceLifecycleEvent,
-    ServiceLifecycleState,
+    NodeLifecycle, NodeLifecycleState, ServiceLifecycleEffect, ServiceLifecycleError,
+    ServiceLifecycleEvent,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -49,7 +49,7 @@ pub struct LifecycleScenario {
     pub state: LifecycleScenarioState,
     clock: SimClock,
     scheduler: SimScheduler<LifecycleEvent>,
-    lifecycle: ServiceLifecycle,
+    lifecycle: NodeLifecycle,
     members: MemberDirectory,
 }
 
@@ -76,7 +76,7 @@ impl LifecycleScenario {
             },
             clock: SimClock::new(),
             scheduler: SimScheduler::new(config.seed),
-            lifecycle: ServiceLifecycle::default(),
+            lifecycle: NodeLifecycle::default(),
             members: MemberDirectory::new(32)?,
         })
     }
@@ -127,7 +127,7 @@ impl LifecycleScenario {
             LifecycleEvent::Member(event) => match self.members.apply(event) {
                 Ok(()) => {
                     self.state.accepted_member_events += 1;
-                    if self.lifecycle.state() == ServiceLifecycleState::Joining {
+                    if self.lifecycle.state() == NodeLifecycleState::JoiningMembership {
                         self.apply_lifecycle(ServiceLifecycleEvent::SnapshotInstalled)?;
                     }
                 }
@@ -214,7 +214,7 @@ impl LifecycleScenario {
         if self.state.admission_open
             && !matches!(
                 self.lifecycle.state(),
-                ServiceLifecycleState::Ready | ServiceLifecycleState::Draining
+                NodeLifecycleState::Ready | NodeLifecycleState::Draining
             )
         {
             return Err(LifecycleInvariantViolation::AdmissionWithoutReady);
@@ -225,7 +225,7 @@ impl LifecycleScenario {
         {
             return Err(LifecycleInvariantViolation::DiscoveryMutatedMembership);
         }
-        if self.lifecycle.state() == ServiceLifecycleState::Terminated
+        if self.lifecycle.state() == NodeLifecycleState::Terminated
             && (!snapshot.members.is_empty() || self.state.admission_open)
         {
             return Err(LifecycleInvariantViolation::TerminatedRetainedAuthority);
@@ -242,20 +242,15 @@ fn member(node_id: &str, incarnation: u128, port: u16, revision: u64) -> MemberR
     };
     MemberRecord {
         node: node.clone(),
-        hello: NodeHello {
+        hello: MemberHello {
             node,
             roles: BTreeSet::new(),
-            capacity_units: 1,
-            hosted_entity_types: BTreeSet::new(),
-            proxied_entity_types: BTreeSet::new(),
-            singleton_eligibility: BTreeSet::new(),
-            used_singletons: BTreeSet::new(),
+            failure_domains: BTreeMap::new(),
             protocols: Vec::new(),
-            entity_configs: Vec::new(),
-            singleton_configs: Vec::new(),
+            remoting_capabilities: BTreeSet::new(),
         },
         status: MemberStatus::Up,
-        version: StateVersion::new(
+        version: MembershipVersion::new(
             CoordinatorTerm::new(1).unwrap(),
             Revision::new(revision).unwrap(),
         ),
@@ -272,7 +267,7 @@ fn upsert(record: MemberRecord) -> MemberEvent {
 
 fn removed(record: &MemberRecord, revision: u64) -> MemberEvent {
     MemberEvent {
-        version: StateVersion::new(
+        version: MembershipVersion::new(
             CoordinatorTerm::new(1).unwrap(),
             Revision::new(revision).unwrap(),
         ),
@@ -331,7 +326,7 @@ mod tests {
         let scenario = run(20260713);
         assert_eq!(scenario.state.lifecycle, "Terminated");
         assert!(!scenario.state.admission_open);
-        // Strict StateVersion sequencing rejects every reordered gap, not
+        // Strict MembershipVersion sequencing rejects every reordered gap, not
         // only the formerly record-local stale revision.
         assert_eq!(scenario.state.rejected_stale_events, 6);
     }

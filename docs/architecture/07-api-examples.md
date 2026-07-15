@@ -144,11 +144,14 @@ async fn main() -> anyhow::Result<()> {
                 .security(RemotingSecurity::from_config()?)
                 .build()?,
         )
-        .coordinator(CoordinatorBootstrap::from_config()?)
+        .coordinator_discovery(membership_discovery()?)
+        .coordinator_discovery(placement_discovery("player")?)
+        .coordinator_discovery(placement_discovery("matchmaking")?)
         .event_bus(NatsEventBus::from_config()?)
         .register_actor_protocol(player_protocol.clone())
         .register_sharded_entity(
             EntityType::builder::<PlayerActor>("player")
+                .domain(PlacementDomainId::new("player")?)
                 .shards(256)
                 .hash_version(ShardHashVersion::Xxh3V1)
                 .protocol(player_protocol)
@@ -169,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .register_singleton(
             SingletonType::builder::<MatchmakerActor>("matchmaker")
+                .domain(PlacementDomainId::new("matchmaking")?)
                 .protocol(matchmaker_protocol())
                 .factory(MatchmakerFactory::new(app))
                 .required_role("matchmaker")
@@ -181,7 +185,10 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-The Coordinator may run in dedicated processes or as an eligible role in the same service binary. Business nodes do not receive a general-purpose placement-store handle.
+`MemberHello` joins the membership scope; the two explicit configurations create independent
+`PlacementDomainHello` sessions with separate capacity, snapshots, terms, routing, and failure
+state. CoordinatorHost may run in dedicated or co-located processes. Business nodes never receive a
+general-purpose placement-store handle.
 
 ## 4. Concrete `ActorRef`: Any Live Actor Path
 
@@ -269,7 +276,7 @@ The caller never chooses an owner node. The local ShardRegion routes, activates,
 
 `watch_current` does not activate an inactive entity: it returns `WatchError::NotActive`. When it succeeds, it watches the current exact activation. Passivation or handoff emits `Terminated`; observing a later activation requires another `watch_current` call.
 
-## 6. `SingletonRef`: Fixed Cluster Singleton
+## 6. `SingletonRef`: Fixed Placement-Domain Singleton
 
 ```rust
 let matchmaker: SingletonRef<MatchmakerActor> =
@@ -282,7 +289,9 @@ let ticket = matchmaker
 let matchmaker_watch = ctx.watch_current(matchmaker.clone()).await?;
 ```
 
-The local proxy follows Coordinator assignments. `watch_current` returns `WatchError::Unavailable` when no singleton activation exists. Failover terminates the old activation watch; the logical reference remains usable and the replacement must be watched explicitly.
+The serialized `SingletonRef` includes its explicit placement domain. The local proxy follows only
+that domain's assignments. `watch_current` returns `WatchError::Unavailable` when no activation
+exists; failover terminates the old activation watch and the replacement must be watched explicitly.
 
 ## 7. DeathWatch
 
@@ -353,7 +362,9 @@ let routes = GatewayRoutes::builder()
 
 LatticeGateway::builder(NodeConfig::from_env()?)
     .remoting(RemotingConfig::from_config()?)
-    .coordinator(CoordinatorBootstrap::from_config()?)
+    .coordinator_discovery(membership_discovery()?)
+    .coordinator_discovery(placement_discovery("player")?)
+    .coordinator_discovery(placement_discovery("matchmaking")?)
     .client_codec(GameClientCodec::new())
     .routes(routes)
     .build()
@@ -394,6 +405,6 @@ Message codecs are format-neutral and fingerprints include codec/schema versions
 Local and remote tells use `Handler<M>`; local and remote asks use `Responder<R>`.
 Tell is at-most-once; ask has deadline/UnknownResult semantics.
 All DeathWatch registrations are activation-scoped; EntityRef/SingletonRef use watch_current without activating a target.
-Reliable control delivery is Association-scoped and shared by DeathWatch, Coordinator, Shard, and Singleton protocols; it never replays uncertain business messages.
+Reliable control delivery is Association-scoped and shared by DeathWatch, membership, placement-domain, Shard, and Singleton protocols; it never replays uncertain business messages.
 Business code never manually opens or owns node transport links.
 ```

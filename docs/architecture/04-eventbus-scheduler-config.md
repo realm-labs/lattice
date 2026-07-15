@@ -128,7 +128,7 @@ Bootstrap configuration constructs immutable or restart-bound runtime components
 ```text
 node identity and roles
 remoting endpoint, protocol limits, TLS, and authorization
-Coordinator bootstrap discovery
+membership and per-placement-domain bootstrap discovery
 entity types, shard counts, buffer limits, and passivation
 singleton definitions
 EventBus, ConfigStore, telemetry, admin HTTP, Gateway, and rate limits
@@ -150,20 +150,25 @@ Composite sources merge in order; later values override earlier values. Final co
 
 Bootstrap candidates come from the static, ConfigStore, DNS, and Kubernetes EndpointSlice providers
 defined in [Cluster Discovery Providers](../cluster-discovery.md). These providers expose addresses
-only. The authenticated bootstrap probe and Coordinator admission establish exact identity and
-membership; provider data is never a routing or placement authority.
+only. The authenticated bootstrap probe and `MembershipLeader` admission establish exact identity
+and membership; a separate scoped probe establishes each configured placement-domain session.
+Provider data is never a routing or placement authority.
 
-Coordinator-eligible processes receive authenticated etcd configuration and the authority to participate in leader election. Ordinary runtime and Gateway nodes receive only a narrow bootstrap client that can locate the leader and establish an authorized remoting association.
+CoordinatorHost processes receive authenticated etcd configuration and the authority to campaign
+for explicitly configured scopes. Ordinary runtime and Gateway nodes receive only narrow bootstrap
+clients that locate the membership leader and required placement-domain leaders.
 
 ```rust
-let service = LatticeService::builder(NodeConfig::from_env()?)
-    .config(ConfigSource::file("config/player-service.toml"))
-    .remoting(RemotingConfig::from_config()?)
-    .coordinator(CoordinatorBootstrap::from_config()?)
-    .event_bus(NatsEventBus::from_config()?)
-    .config_store(EtcdConfigStore::from_config()?)
-    .build()
-    .await?;
+let bootstrap = ConfigSource::file("config/player-service.toml").load()?;
+let player_domain = PlacementDomainId::new("player")?;
+let service = LatticeService::builder(bootstrap.section::<NodeConfig>("node")?)
+    .coordinator_discovery(membership_discovery()?)?
+    .coordinator_discovery(placement_discovery(player_domain.clone())?)?
+    .domain_capacity(player_domain, 8)?
+    .build()?;
+
+let event_bus = NatsEventBus::connect(bootstrap.section("event_bus")?).await?;
+let config_store = EtcdConfigStore::connect(bootstrap.section("config_store")?).await?;
 ```
 
 `ConfigStore` credentials are independent from Coordinator placement credentials. Sharing an etcd cluster does not imply sharing identities or write permissions.

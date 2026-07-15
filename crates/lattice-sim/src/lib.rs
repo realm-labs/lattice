@@ -2,6 +2,7 @@
 
 pub mod adapters;
 pub mod clock;
+pub mod domains;
 pub mod explorer;
 pub mod fault;
 pub mod lifecycle;

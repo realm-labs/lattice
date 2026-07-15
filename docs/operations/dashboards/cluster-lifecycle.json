@@ -60,6 +60,55 @@
         {"refId": "C", "expr": "sum(rate(lattice_stale_incarnation_rejections_total{cluster=~\"$cluster\"}[5m]))"},
         {"refId": "D", "expr": "sum(rate(lattice_forced_shutdowns_total{cluster=~\"$cluster\"}[5m]))"}
       ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Placement-domain leaders and sessions",
+      "targets": [
+        {"refId": "A", "expr": "max by (domain, state) (lattice_domain_leader_term{cluster=~\"$cluster\",domain=~\"$domain\"})"},
+        {"refId": "B", "expr": "min by (domain) (lattice_domain_session_ready{cluster=~\"$cluster\",domain=~\"$domain\"})"},
+        {"refId": "C", "expr": "lattice_domain_leader_concentration_max{cluster=~\"$cluster\"}"}
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Domain route availability and unresolved requests",
+      "targets": [
+        {"refId": "A", "expr": "min by (domain) (lattice_domain_route_available{cluster=~\"$cluster\",domain=~\"$domain\"})"},
+        {"refId": "B", "expr": "sum by (domain) (lattice_domain_unresolved_requests{cluster=~\"$cluster\",domain=~\"$domain\"})"}
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Domain membership, capacity, and load",
+      "targets": [
+        {"refId": "A", "expr": "sum by (domain) (lattice_domain_members{cluster=~\"$cluster\",domain=~\"$domain\"})"},
+        {"refId": "B", "expr": "sum by (domain) (lattice_domain_capacity_units{cluster=~\"$cluster\",domain=~\"$domain\"})"},
+        {"refId": "C", "expr": "sum by (domain) (lattice_domain_load_units{cluster=~\"$cluster\",domain=~\"$domain\"})"}
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Domain authority and reconciliation",
+      "targets": [
+        {"refId": "A", "expr": "sum by (domain) (lattice_domain_slots{cluster=~\"$cluster\",domain=~\"$domain\"})"},
+        {"refId": "B", "expr": "sum by (domain) (lattice_domain_claims{cluster=~\"$cluster\",domain=~\"$domain\"})"},
+        {"refId": "C", "expr": "sum by (domain) (lattice_domain_plans{cluster=~\"$cluster\",domain=~\"$domain\"})"},
+        {"refId": "D", "expr": "max by (domain) (lattice_domain_reconciliation_backlog{cluster=~\"$cluster\",domain=~\"$domain\"})"},
+        {"refId": "E", "expr": "max by (domain) (lattice_domain_reconciliation_oldest_millis{cluster=~\"$cluster\",domain=~\"$domain\"})"}
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Cross-domain drain progress",
+      "targets": [
+        {"refId": "A", "expr": "max by (domain, state) (lattice_domain_drain_remaining_authorities{cluster=~\"$cluster\",domain=~\"$domain\"})"}
+      ]
     }
   ],
   "templating": {
@@ -68,6 +117,13 @@
         "name": "cluster",
         "type": "query",
         "query": "label_values(lattice_member_lifecycle_state, cluster)",
+        "includeAll": true,
+        "allValue": ".*"
+      },
+      {
+        "name": "domain",
+        "type": "query",
+        "query": "label_values(lattice_domain_leader_term{cluster=~\"$cluster\"}, domain)",
         "includeAll": true,
         "allValue": ".*"
       }

@@ -19,13 +19,15 @@ All cross-node messages
   -> framed TCP, optionally TLS
 
 Control plane
-  -> Coordinator leader
+  -> membership leader plus independent placement-domain leaders
   -> independent etcd
 ```
 
 The framework has one internal transport model. It does not expose gRPC or Direct Link as parallel business APIs. Business code exchanges typed messages through actor references; remoting serializes those messages and manages node associations internally.
 
-Unlike Akka/Pekko Cluster, lattice does not use Gossip. Coordinator leadership, membership, shard ownership, claims, and singleton ownership are stored in independent etcd. Normal actor messages never pass through etcd or the Coordinator.
+Unlike Akka/Pekko Cluster, lattice does not use Gossip. Membership leadership and each
+placement-domain leadership, shard ownership, claim, and singleton record are stored in etcd under
+their exact scope. Normal actor messages never pass through etcd or a control-plane leader.
 
 ### 0.1 Why Direct Link Disappears
 
@@ -104,10 +106,12 @@ flowchart LR
     Broker["Event broker / NATS"]
     Etcd[("independent etcd")]
 
-    subgraph CoordNode["Coordinator-eligible node"]
+    subgraph CoordNode["CoordinatorHost node"]
         CoordRuntime["Actor runtime + remoting"]
-        Coordinator["Coordinator leader"]
-        CoordRuntime --- Coordinator
+        Membership["Membership candidate/leader"]
+        Domains["Independent placement-domain candidates/leaders"]
+        CoordRuntime --- Membership
+        CoordRuntime --- Domains
     end
 
     subgraph NodeA["Logic Service node A"]
@@ -115,7 +119,7 @@ flowchart LR
         GatewayA["Gateway adapter<br/>optional"]
         RuntimeA["Service + actor runtime"]
         RemotingA["Remoting endpoint"]
-        SessionA["Coordinator session"]
+        SessionA["Membership + domain sessions"]
         ActorsA["User and child actors"]
         RegionsA["ShardRegions<br/>Shards + entities"]
         SingletonsA["SingletonProxies<br/>Managers + activations"]
@@ -134,7 +138,7 @@ flowchart LR
         direction TB
         RuntimeB["Service + actor runtime"]
         RemotingB["Remoting endpoint"]
-        SessionB["Coordinator session"]
+        SessionB["Membership + domain sessions"]
         ActorsB["Actors / entities / singletons"]
 
         SessionB --> RuntimeB
@@ -170,9 +174,12 @@ Association(local NodeIncarnation, remote NodeIncarnation)
 
 All connections share Association identity, protocol negotiation, authorization, lifecycle, metrics, and closing. They use separate bounded queues and socket-owner tasks so bulk writes cannot head-of-line block heartbeat, DeathWatch, Coordinator control, asks, or replies. The group is created lazily per communicating node pair and is not a business-visible connection pool.
 
-The control connection carries one Association-scoped reliable control stream. Commands that must survive reconnect use sequence numbers, cumulative acknowledgements, a bounded replay outbox, and idempotent application. DeathWatch, Coordinator state, claims, handoff, drain, and Singleton control reuse this mechanism; tell/ask business frames do not.
+The control connection carries one Association-scoped reliable control stream. Commands that must survive reconnect use sequence numbers, cumulative acknowledgements, a bounded replay outbox, and idempotent application. DeathWatch, membership/domain state, claims, handoff, drain, and Singleton control reuse this mechanism; tell/ask business frames do not.
 
-Only Coordinator-eligible nodes receive general placement etcd credentials and watches. Ordinary nodes may read the minimal leader bootstrap record, then all control traffic moves to remoting. etcd is not connected to actor mailboxes, ShardRegion hot paths, Gateway forwarding, or EventBus delivery.
+Only CoordinatorHost processes receive generation-5 membership/domain write credentials. Ordinary
+nodes discover one membership scope plus every placement domain they host or proxy; after bootstrap,
+control moves to remoting. etcd is not connected to actor mailboxes, ShardRegion hot paths, Gateway
+forwarding, or EventBus delivery.
 
 ### 3.2 Roles a Logic Service May Carry
 
@@ -180,22 +187,22 @@ Roles are capabilities, not mutually exclusive process types. One `LatticeServic
 
 | Role | Responsibility | Required state/access |
 |---|---|---|
-| Base runtime | Actor system, protocol registry, mailboxes, supervision, remoting, Coordinator session | Required on every lattice node |
+| Base runtime | Actor system, protocol registry, mailboxes, supervision, remoting, membership session | Required on every lattice node |
 | Gateway | External connections, authentication, decode/encode, rate limits, recipient selection | Optional; no placement write access |
 | Concrete actor host | User guardian and arbitrary user/child actor paths | Local registry only |
 | Shard proxy | Creates `EntityRef`, hashes entity IDs, caches homes, forwards and buffers | Automatically present for each used entity type |
 | Shard host | Owns Shard tasks and activates entities for eligible entity types | Role/capacity eligibility plus valid shard claims |
 | Singleton proxy | Resolves `SingletonRef` and buffers briefly during failover | Present where a singleton is called |
 | Singleton host | Runs SingletonManager and singleton activation | Role eligibility plus valid singleton claim |
-| Coordinator eligible | Participates in leader election and may become Coordinator leader | The only role with placement etcd credentials |
+| CoordinatorHost | Independently campaigns for membership and explicitly configured placement domains | The only role with generation-5 control-store credentials |
 | Event subscriber | Converts typed broker events into service work or actor messages | Optional broker connection |
 | Ops endpoint | Health, readiness, metrics, inspection, drain/admin adapter | Optional external HTTP adapter |
 
 Recommended deployment shapes:
 
 ```text
-dedicated Coordinator nodes:
-  base runtime + Coordinator eligible + ops
+dedicated control-plane nodes:
+  base runtime + CoordinatorHost (membership and/or selected domains) + ops
 
 normal logic nodes:
   base runtime + concrete actor host + selected shard/singleton host roles + optional EventBus
@@ -213,7 +220,7 @@ flowchart TB
     Builder["LatticeServiceBuilder<br/>config + registrations"]
     Service["Service supervisor"]
     Remoting["Association manager<br/>listeners + lanes"]
-    CoordSession["Coordinator session<br/>revisioned state"]
+    CoordSession["Membership session + domain session directory<br/>independently revisioned state"]
     Protocols["ActorProtocol registry<br/>codecs + dispatch"]
     Registry["Local actor registry<br/>path + ActivationId"]
     UserGuardian["User guardian"]
@@ -313,7 +320,7 @@ Routing rules:
 2. `EntityRef` always enters the caller's local ShardRegion. The Region derives `shard_id` from the `entity_id`; it never extracts routing identity from the business payload.
 3. `SingletonRef` always enters the caller's local SingletonProxy.
 4. Local and remote delivery converge on the same bounded mailbox and typed `Handler<M>`.
-5. Known entity/singleton homes use only cached Coordinator state and direct remoting; they do not query etcd or hop through Coordinator.
+5. Known entity/singleton homes use only cached state from their exact placement domain and direct remoting; they do not query etcd or hop through a leader.
 
 ### 4.2 Tell, Ask, Watch, and Event Delivery
 
@@ -322,44 +329,55 @@ Routing rules:
 | Tell | recipient router → optional remoting → mailbox | Caller completes after bounded local admission; no Handler result returns |
 | Ask | Tell path plus correlation/deadline → Reply or Failure frame | Caller receives typed reply, typed failure, timeout, or `UnknownResult` |
 | Watch | exact ActorRef via registry/control lane; EntityRef/SingletonRef first resolve current activation without creating it | Produces `Terminated` for that activation; replacement requires a new watch |
-| Coordinator control | Coordinator session over the reliable remoting control stream | Revisioned snapshot/delta/ack, allocation, handoff, claim, drain; reconnect replays or reconciles bounded state |
+| Membership/domain control | Scoped sessions over reliable remoting control | Independent snapshot/delta/ack, allocation, handoff, claim, drain; reconnect reconciles only the affected scope |
 | EventBus event | broker subscription → typed adapter → optional recipient send | Broker guarantee plus business idempotency; never an implicit ask |
 | Scheduler message | managed timer → recipient send | Uses the recipient semantics at trigger time |
 
 Tell and ask are protocol modes registered by `ActorProtocol` and distinct typed business interactions. A tell uses `Message` plus `Handler<M>` and has no response capability. Actor-originated tells carry an optional exact sender reference: `tell` uses the current actor, while `forward` preserves the incoming sender. An ask uses `Request` plus `Responder<R>`, registers the codec for `R::Response`, and receives a single-use `ReplyTo<R::Response>`; it does not use the envelope sender as a reply channel. Asynchronous work returns through a bounded `ActorContext::pipe_to_self` continuation so the final response can safely read current actor state.
 
-### 4.3 Coordinator State Distribution
+### 4.3 Membership and Placement-Domain State Distribution
 
 ```mermaid
 sequenceDiagram
     participant N as Logic node
     participant D as Candidate discovery
-    participant C as Coordinator leader
+    participant M as Membership leader
+    participant C as Placement-domain leader
     participant E as independent etcd
     participant R as Local Regions and Proxies
 
     N->>D: consume replacement endpoint snapshot
-    N->>C: authenticated bootstrap probe + leader validation
-    N->>C: exact-incarnation Association + NodeHello
-    C->>E: create/renew member record and lease
-    C-->>N: sequenced SnapshotBegin + bounded SnapshotChunks + SnapshotEnd
-    N->>N: validate count, bytes, digest and revision
-    N->>R: atomically install members, shards, singletons and claim TTLs
+    N->>M: membership bootstrap + MemberHello
+    M->>E: persist Joining member and lease
+    M-->>N: bounded membership snapshot
+    N-->>M: JoinReady(snapshot version)
+    M->>E: exact Joining to Up transaction
+    M-->>N: MemberDelta(Up)
+    N->>C: domain bootstrap + PlacementDomainHello
+    C-->>N: bounded snapshot for exactly one domain
+    N->>N: validate scope, count, bytes, digest and PlacementVersion
+    N->>R: atomically install this domain's configs, slots, claims and plans
     N-->>C: AppliedRevision(revision)
 
     loop ordered control-plane changes
         C->>E: transactionally persist assignment/claim state
-        C-->>N: sequenced CoordinatorStateDelta(next revision)
-        N->>R: apply delta atomically
+        C-->>N: sequenced domain delta(next revision)
+        N->>R: apply only to matching domain router
         N-->>C: AppliedRevision(next revision)
     end
 
     Note over N,C: revision gap or reconnect requires a new bounded snapshot
 ```
 
-The session is node-level, not one registration loop per ShardRegion. One `NodeHello` advertises roles, capacity, hosted/proxied entity types, singleton eligibility/usage, node incarnation, and protocol fingerprints. Snapshot and delta content is filtered to the placement slices the node may host or has subscribed to route. A newly added Region/Proxy subscription installs its slice before becoming Ready.
+Every node has one membership session carrying bounded `MemberHello`. It also has one
+`PlacementDomainSession` per explicitly hosted/proxied domain carrying `PlacementDomainHello`,
+positive domain capacity, configurations, constraints, and subscriptions. There is no implicit
+default domain. Each snapshot/delta stream contains exactly one scope; a new Region/Proxy is Ready
+only after its domain snapshot is installed.
 
-Coordinator revision orders authoritative placement state; Association control sequence provides bounded retransmission across reconnect. Replaying either layer is idempotent. An unrecoverable control gap requests a fresh bounded snapshot rather than allowing partial routing state to become live.
+`MembershipVersion` and domain-qualified `PlacementVersion` independently order their streams;
+Association control sequence provides bounded retransmission. A gap or higher term requires a fresh
+snapshot only for that scope.
 
 ### 4.4 First Message to an Unassigned Shard
 
@@ -447,18 +465,14 @@ Automatic balancing runs only while the Coordinator is leader, Ready, claim-reco
 ```mermaid
 stateDiagram-v2
     [*] --> Booting
-    Booting --> Joining: config valid, protocols built, remoting listening
-    Joining --> Ready: NodeHello accepted and initial snapshot applied
-    Ready --> Degraded: Coordinator session unavailable
-    Degraded --> Ready: reconnect, reconcile, apply fresh snapshot
-    Ready --> Draining: operator or orchestrator drain
-    Degraded --> Draining: shutdown requested
-    Draining --> Stopping: shards handed off, singletons moved, admission closed
-    Stopping --> Terminated: actors stopped, watches notified, associations closed
+    Booting --> JoiningMembership: remoting listening
+    JoiningMembership --> Ready: exact local Up plus required domain snapshots
+    Ready --> JoiningMembership: membership lost; new admission closed
+    Ready --> Draining: aggregate drain requested
+    Draining --> Terminated: every domain resolved, membership removed, tasks stopped
     Booting --> Terminated: startup failure
-    Joining --> Terminated: join rejected or incompatible protocol
-    Ready --> Stopping: forced shutdown
-    Degraded --> Stopping: forced shutdown
+    JoiningMembership --> Terminated: terminal incompatibility
+    Ready --> Terminated: forced shutdown fences unfinished domains
     Terminated --> [*]
 ```
 
@@ -467,14 +481,15 @@ Lifecycle responsibilities:
 | State | Allowed behavior |
 |---|---|
 | Booting | Load/validate configuration, identity, roles, protocols, codecs, TLS and resource limits |
-| Joining | Accept only internal bootstrap/control traffic; establish Coordinator session and install snapshot |
+| JoiningMembership | Accept internal bootstrap/control traffic; install exact local `Up` membership and required domain snapshots |
 | Ready | Admit configured external traffic and normal actor messages |
-| Degraded | Continue known routes while local claim deadlines remain valid; stop new allocation/handoff/failover |
-| Draining | Reject new external admission and placements; hand off shards/singletons; finish bounded work |
-| Stopping | Fence claims, stop actors/children, complete pending asks, notify watches, cancel supervised tasks |
+| Draining | Reject new admission; drain domains concurrently; remove global membership only after all domain completions |
 | Terminated | No actor path, node incarnation, association, claim, or background task remains live |
 
-Claim expiry in `Degraded` fences only the affected Shard or SingletonManager. Concrete user actors may remain alive until service shutdown, but external readiness must reflect whether the node can still fulfill its declared roles.
+Each configured domain separately reports `Joining | Ready | Degraded | Draining | Terminated`.
+Domain A degradation changes only A's router/session; B and exact `ActorRef` traffic remain usable.
+Known routes survive only to their local claim deadline. Applications gate endpoints on the exact
+domains they require rather than one scalar process-degraded state.
 
 ### 5.2 Concrete User and Child Actor Lifecycle
 
@@ -544,12 +559,13 @@ stateDiagram-v2
 | Handler error | Actor runtime/supervisor | Complete ask with failure or record tell failure; apply supervision policy |
 | Mailbox or outbound queue full | Sender-side runtime | Reject admission explicitly; never grow an unbounded queue |
 | Association control loss | Association supervisor | Stop all new data admission, fail queued unwritten work, reconnect with incarnation checks; do not immediately declare actor death |
-| Coordinator session loss | Service supervisor | Enter Degraded; preserve known routes only until claim deadlines |
+| Membership session loss | Service supervisor | Close new admission; retain independently valid domain routes and recover from a membership snapshot |
+| Placement-domain session loss | Domain lifecycle/router | Degrade only that domain; preserve its known routes only until claim deadlines |
 | Shard/singleton claim loss | Local Shard or SingletonManager | Fence admission before best-effort stop; stopping failure cannot preserve authority |
-| Node incarnation declared dead | Coordinator and DeathWatch | Invalidate routes/claims and terminate watches bound to that incarnation |
-| etcd unavailable | Coordinator | Stop new decisions; preserve no authority beyond existing bounded leases/terms |
-| Allocation strategy/load input failure | Coordinator rebalancer | Reject the proposal or skip the round; never partially mutate placement |
-| Rebalance move failure | Coordinator and PlacementSlot authority | Persist progress, preserve fencing, then complete/recover forward or fail visibly; never roll back to ambiguous dual ownership |
+| Node incarnation declared dead | Membership leader, affected domain leaders, and DeathWatch | Fan out only to joined domains; terminate exact-incarnation watches |
+| etcd unavailable | CoordinatorHost scope tasks | Stop new scoped decisions; preserve no authority beyond existing bounded leases/terms |
+| Allocation strategy/load input failure | Placement-domain rebalancer | Reject the proposal or skip the round; never partially mutate placement |
+| Rebalance move failure | Placement-domain leader and PlacementSlot authority | Persist progress, preserve fencing, then complete/recover forward or fail visibly; never roll back to ambiguous dual ownership |
 
 ## 6. Core Invariants
 
@@ -565,12 +581,13 @@ Transport and business-protocol compatibility are separate: one mismatched Proto
 Every queue and temporary buffer is bounded.
 Only a valid claim holder may serve a shard or singleton generation.
 Shard and Singleton use one placement-slot authority engine for generation, claim, drain, and fencing while retaining distinct routing and lifecycle semantics.
-Allocation/rebalance strategies return proposals only; the Coordinator revalidates and persists every move before the existing handoff/claim state machine changes authority.
-Automatic rebalance is bounded by freshness, hysteresis, cooldown, minimum residence and concurrency limits, and stops while Coordinator state is degraded or unreconciled.
+Allocation/rebalance strategies return proposals only; the placement-domain leader revalidates and persists every move before the existing handoff/claim state machine changes authority.
+Automatic rebalance is bounded per domain by freshness, hysteresis, cooldown, minimum residence and concurrency limits, and stops while that domain is degraded or unreconciled.
 Control commands use bounded sequenced delivery plus idempotent reconciliation; business tell/ask frames are never replayed by that mechanism.
 Control-connection loss stops new Association data admission in v1.
-Known shard routes continue during temporary Coordinator loss while their claims remain valid.
-Unknown placement cannot be invented during Coordinator loss.
+Known routes continue during temporary loss of their domain leader while claims remain valid.
+Unknown placement cannot be invented during placement-domain leader loss.
+No membership or placement transaction can read or mutate another scope/domain.
 etcd is control-plane storage, never a per-message routing database.
 ```
 
@@ -587,7 +604,7 @@ lattice-remoting
   codec registry, wire frames, TCP/TLS associations, tell/ask/watch transport
 
 lattice-placement
-  Coordinator protocol, etcd metadata, membership, shards, claims, singletons
+  membership/domain protocols, CoordinatorHost, generation-5 etcd metadata, shards, claims, singletons
 
 lattice-service
   process assembly, ShardRegions, SingletonProxies, drain and shutdown
@@ -608,7 +625,11 @@ lattice exposes no framework gRPC service or business transport through it.
 
 ## 8. Verification Architecture
 
-Distributed correctness is tested at four layers: pure state-machine reducers, deterministic seeded cluster simulation, real Docker multi-process/TCP/TLS/etcd scenarios, and chaos/soak runs. Authoritative control components expose explicit state/event/effect transitions so production executors and the simulator share one transition algorithm.
+Distributed correctness is tested at four layers: pure state-machine reducers, deterministic seeded
+multi-domain simulation/model exploration and trace replay, real Docker multi-process/TCP/TLS/etcd
+scenarios, and chaos/soak runs. The e2e topology includes a dedicated membership host, three domain
+leaders, a multi-domain standby, and two logic nodes; one-domain loss must not change unrelated
+terms or readiness.
 
 The Logic service lifecycle is one of those production reducers. Service start/shutdown executes its
 `Booting -> Joining -> Ready/Degraded -> Draining/Stopping -> Terminated` transitions, and

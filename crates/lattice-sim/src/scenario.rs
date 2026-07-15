@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use lattice_core::actor_ref::{
-    ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+    ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, PlacementDomainId,
+    ProtocolId,
 };
 use lattice_core::failpoint::Failpoint;
 use lattice_placement::handoff::HandoffEffect;
@@ -12,9 +13,9 @@ use lattice_placement::types::AssignmentGeneration;
 use lattice_placement::types::CoordinatorTerm;
 use lattice_placement::types::NodeKey;
 use lattice_placement::types::PlacementSlotKey;
+use lattice_placement::types::PlacementVersion;
 use lattice_placement::types::Revision;
 use lattice_placement::types::ShardId;
-use lattice_placement::types::StateVersion;
 use lattice_remoting::association::AssociationId;
 use lattice_remoting::control::CommandId;
 use lattice_remoting::control::ControlApply;
@@ -85,6 +86,7 @@ impl Scenario {
             .collect::<BTreeSet<_>>();
         let handoff = HandoffMachine::begin(
             PlacementSlotKey::Shard {
+                domain: placement_domain(),
                 entity_type: lattice_core::actor_ref::EntityType::new("sim-entity").unwrap(),
                 shard_id: ShardId::new(1),
             },
@@ -92,7 +94,11 @@ impl Scenario {
             source.clone(),
             target.clone(),
             AssignmentGeneration::new(1).unwrap(),
-            StateVersion::new(CoordinatorTerm::new(1).unwrap(), Revision::new(2).unwrap()),
+            PlacementVersion::new(
+                placement_domain(),
+                CoordinatorTerm::new(1).unwrap(),
+                Revision::new(2).unwrap(),
+            ),
             barrier,
         )
         .map_err(ScenarioError::Handoff)?;
@@ -190,7 +196,8 @@ impl Scenario {
                     .handoff
                     .transition(HandoffEvent::AppliedRevision {
                         session,
-                        version: StateVersion::new(
+                        version: PlacementVersion::new(
+                            placement_domain(),
                             CoordinatorTerm::new(1).unwrap(),
                             Revision::new(2).unwrap(),
                         ),
@@ -307,6 +314,10 @@ impl Scenario {
         }
         Ok(())
     }
+}
+
+fn placement_domain() -> PlacementDomainId {
+    PlacementDomainId::new("simulation").unwrap()
 }
 
 fn phase_name(phase: HandoffPhase) -> &'static str {

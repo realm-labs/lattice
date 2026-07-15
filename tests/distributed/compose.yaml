@@ -69,6 +69,8 @@ services:
       etcd-single: {condition: service_healthy}
       discovery-static-member: {condition: service_healthy}
       discovery-config-member: {condition: service_healthy}
+      domain-logic-a: {condition: service_healthy}
+      domain-logic-b: {condition: service_healthy}
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
@@ -76,6 +78,12 @@ services:
     networks:
       testnet:
         aliases: [aaa-client, aaa-monitor]
+    volumes:
+      - ../..:/workspace:ro
+      - ../../target/test-artifacts/${LATTICE_RUN_ID:-local}:/artifacts
+      - cargo-home:/cargo-home
+      - cargo-target:/cargo-target
+      - /var/run/docker.sock:/var/run/docker.sock
     command:
       - sh
       - -c
@@ -107,7 +115,7 @@ services:
 
   etcd-single:
     <<: *etcd
-    profiles: [e2e]
+    profiles: [e2e, chaos]
     command:
       - /usr/local/bin/etcd
       - --name=etcd-single
@@ -157,6 +165,107 @@ services:
     command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "config-member", "--node-id", "config-member", "--port", "29202", "--reference", "/artifacts/discovery-config.json"]
     healthcheck:
       test: ["CMD-SHELL", "grep -q '\"lifecycle\": \"Ready\"' /artifacts/discovery-config.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
+
+  domain-membership:
+    <<: *runner
+    profiles: [e2e, chaos]
+    depends_on:
+      etcd-single: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "domain-host", "--node-id", "domain-membership", "--port", "29300", "--reference", "/artifacts/domain-membership.json"]
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q '\"membership\"' /artifacts/domain-membership.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
+
+  domain-alpha:
+    <<: *runner
+    profiles: [e2e, chaos]
+    depends_on:
+      domain-membership: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "domain-host", "--node-id", "domain-alpha", "--port", "29301", "--domains", "alpha,delta", "--reference", "/artifacts/domain-alpha.json"]
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q 'placement:domain-alpha' /artifacts/domain-alpha.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
+
+  domain-beta:
+    <<: *runner
+    profiles: [e2e, chaos]
+    depends_on:
+      domain-membership: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "domain-host", "--node-id", "domain-beta", "--port", "29302", "--domains", "beta", "--reference", "/artifacts/domain-beta.json"]
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q 'placement:domain-beta' /artifacts/domain-beta.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
+
+  domain-gamma:
+    <<: *runner
+    profiles: [e2e, chaos]
+    depends_on:
+      domain-membership: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "domain-host", "--node-id", "domain-gamma", "--port", "29303", "--domains", "gamma", "--reference", "/artifacts/domain-gamma.json"]
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q 'placement:domain-gamma' /artifacts/domain-gamma.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
+
+  domain-standby:
+    <<: *runner
+    profiles: [e2e, chaos]
+    depends_on:
+      domain-alpha: {condition: service_healthy}
+      domain-beta: {condition: service_healthy}
+      domain-gamma: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "domain-host", "--node-id", "domain-standby", "--port", "29304", "--domains", "alpha,beta,gamma,delta", "--reference", "/artifacts/domain-standby.json"]
+    healthcheck:
+      test: ["CMD", "test", "-s", "/artifacts/domain-standby.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
+
+  domain-logic-a:
+    <<: *runner
+    profiles: [e2e, chaos]
+    depends_on:
+      domain-standby: {condition: service_healthy}
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "domain-logic", "--node-id", "domain-logic-a", "--port", "29310", "--reference", "/artifacts/domain-logic-a.json"]
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q '\"lifecycle\": \"Ready\"' /artifacts/domain-logic-a.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
+
+  domain-logic-b:
+    <<: *runner
+    profiles: [e2e, chaos]
+    depends_on:
+      domain-standby: {condition: service_healthy}
+    command: ["cargo", "run", "-p", "lattice-sim", "--bin", "distributed-node", "--", "domain-logic", "--node-id", "domain-logic-b", "--port", "29311", "--reference", "/artifacts/domain-logic-b.json"]
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q '\"lifecycle\": \"Ready\"' /artifacts/domain-logic-b.json"]
       interval: 1s
       timeout: 1s
       retries: 600
@@ -262,6 +371,9 @@ services:
     profiles: [chaos]
     depends_on:
       fixture-server: {condition: service_healthy}
+      etcd-single: {condition: service_healthy}
+      domain-logic-a: {condition: service_healthy}
+      domain-logic-b: {condition: service_healthy}
     volumes:
       - ../..:/workspace:ro
       - ../../target/test-artifacts/${LATTICE_RUN_ID:-local}:/artifacts
@@ -272,6 +384,7 @@ services:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
       LATTICE_DOCKER_NETWORK: ${LATTICE_DOCKER_NETWORK:-bridge}
+      LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
     networks:
       testnet:
         aliases: [aaa-client, aaa-monitor]

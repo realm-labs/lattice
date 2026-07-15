@@ -1,92 +1,123 @@
-# Placement storage generation 3 to 4
+# Placement storage generation 4 to 5
 
-This is an offline, full-stop migration. Generation 3 and generation 4 services cannot share a
-placement prefix, and service startup never runs this migration automatically.
+This is an offline, full-stop hard switch from the unscoped generation-4 topology to membership plus
+explicit placement domains in generation 5. Generation 4 and 5 processes, references, control
+frames, and storage cannot share a live cluster. Service startup never runs this migration.
 
-## Preconditions and decision points
+## Preconditions
 
-1. Stop every lattice process using the target cluster prefix. Confirm the Coordinator leader key
-   is absent and allow member/claim leases to expire. If the leader key is present, stop: the tool
-   refuses to inspect or modify the prefix.
-2. Preserve the existing etcd backup required by the platform's disaster-recovery procedure. Pick a
-   second, local export path for the migration command. `apply` creates this file exclusively and
-   refuses to overwrite it; on Unix it is created with mode `0600`.
-3. Choose the permanent generation-4 cardinality limits. Every future Coordinator using this prefix
-   must use exactly the same limits. A mismatch rejects startup instead of changing capacity.
-4. Run `inspect`, then `dry-run`. Stop and investigate any malformed, conflicting-configuration, or
-   over-capacity result. Dry-run performs the complete conversion and transitional-state validation
-   in memory but writes no etcd key and no export.
+1. Stop every Lattice process using the prefix. Revoke old credentials and wait for the unscoped
+   leader, member, and claim leases to disappear. The tool rejects a live leader, any leased member
+   or claim, and every active handoff.
+2. Take the platform's complete etcd disaster-recovery backup. Also choose a protected JSON export
+   path for `apply`; it is created exclusively and never overwritten.
+3. Inventory every generation-4 `EntityType` and `SingletonKind`. Create an explicit mapping for all
+   of them. There is no implicit or default domain:
 
-The examples below abbreviate the required limit flags as `$LIMITS`. The full set is:
+   ```json
+   {
+     "entity_types": {
+       "player": "player",
+       "account-login": "player",
+       "world": "world"
+     },
+     "singleton_kinds": {
+       "battle-scheduler": "battle"
+     }
+   }
+   ```
+
+4. Choose permanent generation-5 cardinality limits. A later CoordinatorHost configured with
+   different limits rejects the prefix.
+5. Run `inspect`, then `dry-run`. Both execute full decoding, mapping, collision, full-stop, capacity,
+   and target-inventory validation without changing etcd.
+
+The examples abbreviate the required limits as `$LIMITS`:
 
 ```text
 --page-size N --max-slots N --max-plans N --max-members N \
 --max-admin-operations N --max-entity-configs N --max-singleton-configs N
 ```
 
-Do not put endpoint credentials on a shared command line or in a ticket. Prefer endpoints whose TLS
-credentials are supplied by the process environment or protected configuration.
-
 ```sh
-lattice-placement-migrate inspect --endpoints "$ENDPOINTS" --prefix "$PREFIX" $LIMITS
-lattice-placement-migrate dry-run --endpoints "$ENDPOINTS" --prefix "$PREFIX" $LIMITS
+lattice-placement-migrate inspect --endpoints "$ENDPOINTS" --prefix "$PREFIX" \
+  --mapping /protected/domain-mapping.json $LIMITS
+lattice-placement-migrate dry-run --endpoints "$ENDPOINTS" --prefix "$PREFIX" \
+  --mapping /protected/domain-mapping.json $LIMITS
 ```
+
+An unmapped type, malformed record, generation-5 destination collision, live lease, active handoff,
+or insufficient bound is a hard error. Fix the stopped-cluster input; never add a fallback mapping.
 
 ## Apply and resume
 
-`apply` writes the user-selected export before its first durable-key change. It then atomically
-changes `schema_generation=3` to `migrating-to-4`, writes a durable cursor, and acquires a
-lease-backed migration lock. Old and new services both reject the intermediate schema.
+`apply` writes the export before its first key change. It atomically changes
+`schema_generation=4` to `migrating-to-5`, writes a durable marker containing the exact mapping,
+term, limits, backup path, and cursor, then acquires a five-minute lease-backed lock.
 
 ```sh
 lattice-placement-migrate apply --endpoints "$ENDPOINTS" --prefix "$PREFIX" \
-  --backup /protected/path/placement-generation-3.json $LIMITS
+  --mapping /protected/domain-mapping.json \
+  --backup /protected/placement-generation-4.json $LIMITS
 ```
 
-If the process is interrupted, do not restart lattice. Retain the export and wait for the migration
-lock's five-minute lease to expire. Inspect the prefix and continue with the same limits:
+Each record transaction compares its source revision, destination absence/value, marker, schema,
+unchanged coordinator term, absent leader, and exact migration lock. Converted entity/singleton
+configuration is persisted under its mapped domain. Members move to the membership scope. Slots,
+plans, and admin history move only to their mapped domain.
+
+Configuration targets, per-domain finalization metadata, and cardinality repairs are written in
+bounded batches below etcd's transaction-operation ceiling. A crash between batches leaves the
+schema at `migrating-to-5`; `resume` verifies already-written values and continues idempotently. The
+final schema flip itself remains one compare-guarded transaction.
+
+Old ownership is never revived. Migrated running/allocating authority is written `Fenced`, targets
+and active barriers are cleared, and active plans/moves become failed. Assignment generations and
+state revisions remain monotonic; the generation-5 leader must establish fresh claims and install a
+fresh same-term snapshot before serving.
+
+After interruption, keep the cluster stopped. Wait for or revoke the old migration lock, inspect the
+prefix, then resume with the exact same mapping and limits:
 
 ```sh
-lattice-placement-migrate inspect --endpoints "$ENDPOINTS" --prefix "$PREFIX" $LIMITS
-lattice-placement-migrate resume --endpoints "$ENDPOINTS" --prefix "$PREFIX" $LIMITS
+lattice-placement-migrate inspect --endpoints "$ENDPOINTS" --prefix "$PREFIX" \
+  --mapping /protected/domain-mapping.json $LIMITS
+lattice-placement-migrate resume --endpoints "$ENDPOINTS" --prefix "$PREFIX" \
+  --mapping /protected/domain-mapping.json $LIMITS
 ```
 
-Resume compares the durable cursor, exact record revisions, the unchanged Coordinator term, the
-absent leader key, and its current migration lock on every write. Converted pages are not rewritten.
-Impossible transitional relationships are made visibly terminal: affected slots become `Fenced`
-and affected plan movements become `Failed`. Running or Allocating records without their exact
-owner/generation/term claim are fenced.
+Resume compares the marker revision and canonical marker value. Already committed records are not
+rewritten. A record/progress compare failure leaves the cursor unchanged. A finalization compare
+failure leaves `migrating-to-5`, releases the lock, and is resumable after the conflicting stopped
+state is investigated.
 
-## Verify and counter repair
+## Verify
 
-Successful apply/resume atomically installs schema generation 4, the selected limit metadata,
-slot/plan/member/admin counters, the maximum member/slot state revision, and default automatic
-balance settings. Verify the report, then inspect counters while the cluster remains stopped:
+Successful finalization atomically installs schema generation 5, scoped membership/domain terms and
+revisions, durable limits, per-scope counters, entity/singleton configurations, and per-domain
+automatic-balance settings. It deletes generation-4 coordinator/counter/settings keys.
 
 ```sh
-lattice-placement-migrate inspect-counters --endpoints "$ENDPOINTS" --prefix "$PREFIX" $LIMITS
+lattice-placement-migrate inspect-counters --endpoints "$ENDPOINTS" --prefix "$PREFIX" \
+  --mapping /protected/domain-mapping.json $LIMITS
 ```
 
-If actual bounded inventory and stored counters differ, investigate the cause first. The explicit
-repair command requires no leader, compares the schema, limit metadata, and exact counter revisions,
-then repairs all counters atomically. Normal service startup never performs this repair.
+If inventory and stored counters differ, investigate first. Counter repair requires the stopped
+generation-5 prefix and performs exact compare-and-swap updates; startup never repairs silently.
 
 ```sh
-lattice-placement-migrate repair-counters --endpoints "$ENDPOINTS" --prefix "$PREFIX" $LIMITS
+lattice-placement-migrate repair-counters --endpoints "$ENDPOINTS" --prefix "$PREFIX" \
+  --mapping /protected/domain-mapping.json $LIMITS
 ```
 
-Start generation-4 Coordinators only after verification. The first leader performs structural
-reconciliation before accepting mutation traffic, and every node must install a fresh generation-4
-snapshot for that leader's term.
+Verify that every expected domain has configuration/counters, every migrated authority is fenced,
+the report's inventory matches etcd, and no unscoped generation-4 placement key remains. Then start
+generation-5 membership/CoordinatorHost processes, wait for required domain health to become Ready,
+start logic nodes, and reopen admission.
 
-## Rollback decision
+## Rollback boundary
 
-Before `apply`, rollback means restoring the platform etcd backup or continuing to run generation 3.
-After the schema becomes `migrating-to-4`, do not edit records or set the schema back by hand. Either
-resume to generation 4, or stop all access and restore the complete pre-migration etcd backup. The
-JSON export is audit and record-recovery evidence; it does not recreate lease state and is not a
-substitute for the platform backup.
-
-Admin-operation idempotency is guaranteed only while its durable terminal record is retained. The
-retention window is the shorter of the configured age and count bounds; clients must use a new
-operation ID after that window.
+Before `apply`, rollback is the platform backup or continued generation-4 operation. Once the schema
+is `migrating-to-5`, never edit keys or set the schema back manually. Either resume to generation 5,
+or stop all access and restore the complete pre-migration etcd backup. The JSON export is audit and
+record-recovery evidence; it cannot recreate lease state and is not a platform backup.

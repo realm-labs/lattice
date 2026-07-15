@@ -1,8 +1,13 @@
 # Cluster Discovery Providers
 
-Cluster discovery publishes bootstrap candidates only. A discovered address is not a member, is not
-eligible for business routing, and does not become authoritative until the Coordinator admits the
-exact probed `NodeIncarnation`. Provider updates never add or remove members.
+Discovery publishes bootstrap candidates only. A discovered address is not a member, is not
+eligible for business routing, and does not become authoritative until the `MembershipLeader`
+admits the exact probed `NodeIncarnation`. Provider updates never add or remove members.
+
+Membership discovery and placement-domain discovery are separate inputs. Every node configures
+membership discovery. A node that hosts actors additionally configures one candidate discovery
+stream for every explicit `PlacementDomainId` it joins. Reusing the same provider implementation
+is allowed, but collapsing those streams into one unscoped candidate set is not.
 
 Applications construct providers through their defining module paths and may combine them with
 `lattice_discovery::aggregate::AggregateDiscovery`. Aggregation deduplicates by canonical
@@ -111,15 +116,21 @@ roleRef:
 ```
 
 The workload sets `serviceAccountName: lattice-node`. It does not receive permission to write
-EndpointSlices or read Coordinator membership and placement keys.
+EndpointSlices or read membership and placement-domain control keys.
 
 ## Deployment and hard-switch upgrade
 
-The bootstrap feature bit, Coordinator generation-3 member schema, and revisioned lifecycle control
-messages are one full-stop boundary. Drain and stop every old node, revoke old placement credentials,
-perform the documented schema-generation preflight/cleanup, and then start only the new release.
-Mixed handshake versions, dual member formats, fallback routing, and rolling old/new membership are
-unsupported.
+The generation-5 storage schema, membership handshake, and placement-domain handshake form one
+full-stop boundary. Drain and stop every generation-4 node, revoke old placement credentials, run
+the documented offline migration with an explicit type-to-domain mapping, and then start only the
+new release. Mixed handshake versions, dual record formats, fallback routing, and rolling
+generation-4/generation-5 membership are unsupported.
+
+Bootstrap is two-stage. A node first exchanges `MembershipHello` and becomes locally ready only
+after the admitted incarnation appears as `Up` in an installed membership snapshot. It then
+exchanges a scoped `PlacementHello` with each configured placement domain; actors in that domain
+remain unavailable until its own snapshot and route barriers are satisfied. Membership-only nodes
+stop after the first stage.
 
 Kubernetes workloads use a namespace-scoped ServiceAccount with only `list` and `watch` on
 `discovery.k8s.io/v1` EndpointSlices. Configure a named remoting Service port, a readiness probe that

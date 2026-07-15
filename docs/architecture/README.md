@@ -13,6 +13,9 @@
 
 These documents describe the complete target model, not a disposable minimal v1. Implementation may land in dependency order, but target capabilities are simplified through shared internal mechanisms and narrow fault domains rather than omitted in ways that require later identity, wire, or ownership redesign.
 
+Deployment and rollout: [placement-domain deployment](../operations/placement-domain-deployment.md)
+and [generation-4-to-5 migration](../operations/placement-generation-4-migration.md).
+
 ---
 
 ## Reading Order
@@ -22,7 +25,7 @@ These documents describe the complete target model, not a disposable minimal v1.
 | [00-overview.md](00-overview.md) | System topology, Logic Service roles, message routing, control flows, Actor/service lifecycles, invariants, and crate layout |
 | [01-actor-runtime.md](01-actor-runtime.md) | Rust core types, actor runtime, mailbox, ActorHandle, lifecycle |
 | [02-rpc.md](02-rpc.md) | Unified actor remoting, reference semantics, codecs, tell/ask, associations, and DeathWatch |
-| [03-placement.md](03-placement.md) | Coordinator, etcd metadata, ShardRegion, allocation/rebalancing, claims, handoff, singleton, drain, and outage behavior |
+| [03-placement.md](03-placement.md) | Membership, placement domains, CoordinatorHost, generation-5 etcd, routing, claims, handoff, singleton, drain, and isolation |
 | [04-eventbus-scheduler-config.md](04-eventbus-scheduler-config.md) | EventBus, actor scheduler, service scheduler, and configuration center |
 | [05-gateway-ops.md](05-gateway-ops.md) | Gateway routing, security, observability, config, common call flows, and forbidden patterns |
 | [06-appendix.md](06-appendix.md) | Recommended defaults, tradeoffs, framework/business boundary, summary |

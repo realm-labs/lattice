@@ -1,10 +1,11 @@
 use bytes::Bytes;
+use lattice_core::actor_ref::PlacementDomainId;
 use lattice_core::actor_ref::{ActorRef, EntityId, NodeIncarnation, ProtocolTag};
 use lattice_placement::authority::AuthorityEffect;
 use lattice_placement::authority::AuthorityEvent;
 use lattice_placement::authority::PlacementAuthority;
 use lattice_placement::coordinator::CoordinatorDelta;
-use lattice_placement::coordinator::CoordinatorSession;
+use lattice_placement::coordinator::PlacementDomainState;
 use lattice_placement::handoff::HandoffEffect;
 use lattice_placement::handoff::HandoffEvent;
 use lattice_placement::handoff::HandoffMachine;
@@ -26,11 +27,11 @@ use lattice_remoting::messaging::target::ExactActorTarget;
 use lattice_remoting::watch::WatchCommand;
 use lattice_remoting::watch::WatchId;
 use lattice_remoting::watch::WatchRegistry;
-use lattice_service::lifecycle::ServiceLifecycle;
+use lattice_service::lifecycle::NodeLifecycle;
+use lattice_service::lifecycle::NodeLifecycleState;
 use lattice_service::lifecycle::ServiceLifecycleEffect;
 use lattice_service::lifecycle::ServiceLifecycleError;
 use lattice_service::lifecycle::ServiceLifecycleEvent;
-use lattice_service::lifecycle::ServiceLifecycleState;
 
 pub struct ControlAdapter {
     reducer: ReliableControl,
@@ -60,24 +61,29 @@ impl ControlAdapter {
     }
 }
 
-#[derive(Default)]
 pub struct SessionAdapter {
-    reducer: CoordinatorSession,
+    reducer: PlacementDomainState,
 }
 
 impl SessionAdapter {
+    pub fn new(domain: PlacementDomainId) -> Self {
+        Self {
+            reducer: PlacementDomainState::new(domain),
+        }
+    }
+
     pub fn install(
         &mut self,
         snapshot: lattice_placement::coordinator::SnapshotInstall,
-    ) -> Result<(), lattice_placement::coordinator::CoordinatorError> {
+    ) -> Result<(), lattice_placement::coordinator::PlacementDomainStateError> {
         self.reducer.install(snapshot)
     }
 
     pub fn apply(
         &mut self,
         delta: CoordinatorDelta,
-    ) -> Result<(), lattice_placement::coordinator::CoordinatorError> {
-        self.reducer.apply_delta(delta)
+    ) -> Result<(), lattice_placement::coordinator::PlacementDomainStateError> {
+        self.reducer.apply(delta)
     }
 
     pub fn ready(&self) -> bool {
@@ -213,11 +219,11 @@ pub struct WatchAdapter {
 }
 
 #[derive(Default)]
-pub struct ServiceLifecycleAdapter {
-    reducer: ServiceLifecycle,
+pub struct NodeLifecycleAdapter {
+    reducer: NodeLifecycle,
 }
 
-impl ServiceLifecycleAdapter {
+impl NodeLifecycleAdapter {
     pub fn step(
         &mut self,
         event: ServiceLifecycleEvent,
@@ -225,7 +231,7 @@ impl ServiceLifecycleAdapter {
         self.reducer.transition(event)
     }
 
-    pub fn state(&self) -> ServiceLifecycleState {
+    pub fn state(&self) -> NodeLifecycleState {
         self.reducer.state()
     }
 }
@@ -254,12 +260,12 @@ mod service_lifecycle_tests {
 
     #[test]
     fn simulation_adapter_executes_production_service_reducer() {
-        let mut adapter = ServiceLifecycleAdapter::default();
+        let mut adapter = NodeLifecycleAdapter::default();
         adapter.step(ServiceLifecycleEvent::RemotingReady).unwrap();
         let effects = adapter
             .step(ServiceLifecycleEvent::SnapshotInstalled)
             .unwrap();
-        assert_eq!(adapter.state(), ServiceLifecycleState::Ready);
+        assert_eq!(adapter.state(), NodeLifecycleState::Ready);
         assert_eq!(effects, vec![ServiceLifecycleEffect::OpenExternalAdmission]);
     }
 }

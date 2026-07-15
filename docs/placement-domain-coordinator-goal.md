@@ -1,6 +1,6 @@
 # Placement-Domain Coordinator Hard-Switch Goal
 
-> Status: planned
+> Status: complete
 > Created: 2026-07-15
 > Implementation baseline: `6241fed20274801a555690c0d8a1d2459b6f7404`
 > Architecture baseline: [architecture/README.md](architecture/README.md)
@@ -69,24 +69,33 @@ gone.
 ### 0.2 Current Execution Pointer
 
 ```text
-Overall status: planned
-Current batch: Batch A — scoped identity, configuration and durable schema
-Completed batches: none
-Known broken frontier: none; implementation has not started
-Latest executable evidence: baseline 6241fed passed workspace format, check, clippy and tests before
-this goal was created
-Next implementation action: implement PlacementDomainId and remove unscoped placement identity
-Next coherent stopping point: Macro Batch 1 after Batches A and B compile and focused tests pass
-Final completion condition: every Batch A-E item and every acceptance criterion is checked
+Overall status: complete
+Current batch: none; Batches A-E are complete
+Completed batches: A, B, C, D and E
+Known broken frontier: none. Generation 5 is the only runtime storage and placement-control model;
+membership and placement-domain leadership, sessions, routing, lifecycle, operations, migration and
+distributed tests are explicitly scoped. The retained legacy key fixtures exist only as offline
+generation-4 migration inputs.
+Latest executable evidence (2026-07-15): exact-tree structure, format, workspace check, clippy and
+all-target/all-feature tests passed locally and in Linux quality run
+`20260715t-domain-quality-final3`. Retained Docker evidence passed for simulation
+`20260715t-domain-sim-final`, model exploration `20260715t-domain-model-final`, four-domain e2e and
+real etcd `20260715t-domain-e2e-final4`, three-member etcd HA
+`20260715t-domain-e2e-ha-final2`, domain-isolation chaos `20260715t-domain-chaos-final`, and kind
+`20260715t-domain-k8s-final`. Bounded resource soak `20260715t-domain-soak-final2` retained seven
+artifacts and its final rolling trace replayed exactly in `20260715t-domain-replay-final2`.
+Next implementation action: none for this goal
+Next coherent stopping point: goal complete
+Final completion condition: satisfied; every Batch A-E item and acceptance criterion is checked
 ```
 
 ### 0.3 Batch Tracker
 
-- [ ] Batch A — scoped identity, configuration and durable schema
-- [ ] Batch B — membership plane and multi-domain CoordinatorHost
-- [ ] Batch C — domain-scoped service routing and lifecycle
-- [ ] Batch D — domain-scoped placement operations and administration
-- [ ] Batch E — migration, simulation, distributed acceptance and documentation
+- [x] Batch A — scoped identity, configuration and durable schema
+- [x] Batch B — membership plane and multi-domain CoordinatorHost
+- [x] Batch C — domain-scoped service routing and lifecycle
+- [x] Batch D — domain-scoped placement operations and administration
+- [x] Batch E — migration, simulation, distributed acceptance and documentation
 
 ### 0.4 Commit Boundaries
 
@@ -436,80 +445,80 @@ Structure and compile-fail tests must prove these old APIs are absent.
 
 ### Batch A — Scoped identity, configuration and durable schema
 
-- [ ] Add and validate `PlacementDomainId` and Coordinator scope identity.
-- [ ] Require domain identity in entity, singleton, slot, claim, plan and logical-reference types.
-- [ ] Include domain identity in configuration fingerprints and golden vectors.
-- [ ] Split membership and domain placement versions, leader guards and errors.
-- [ ] Split memory and etcd store contracts and implement generation-5 scoped keys.
-- [ ] Scope named transactions, limits, pagination and reconciliation cursors by domain.
-- [ ] Bump storage/control/remoting generations and delete generation-4 decoders and constructors.
-- [ ] Add unit, property and real-etcd tests proving cross-domain mutation is impossible.
+- [x] Add and validate `PlacementDomainId` and Coordinator scope identity.
+- [x] Require domain identity in entity, singleton, slot, claim, plan and logical-reference types.
+- [x] Include domain identity in configuration fingerprints and golden vectors.
+- [x] Split membership and domain placement versions, leader guards and errors.
+- [x] Split memory and etcd store contracts and implement generation-5 scoped keys.
+- [x] Scope named transactions, limits, pagination and reconciliation cursors by domain.
+- [x] Bump storage/control/remoting generations and delete generation-4 decoders and constructors.
+- [x] Add unit, property and real-etcd tests proving cross-domain mutation is impossible.
 
 Exit condition: durable and wire identity cannot represent an unscoped placement operation, and
 memory/etcd backends pass the same scoped contract suite.
 
 ### Batch B — Membership plane and multi-domain CoordinatorHost
 
-- [ ] Separate global member lifecycle from domain participation and placement decisions.
-- [ ] Implement `MemberHello` and bounded `PlacementDomainHello` validation.
-- [ ] Implement a supervised CoordinatorHost with independent scope elections and leader tasks.
-- [ ] Allow one process to lead, stand by for and lose multiple domains independently.
-- [ ] Implement scoped discovery publication, candidate selection and leader rollover.
-- [ ] Make domain leaders consume authoritative global member events without becoming the global
+- [x] Separate global member lifecycle from domain participation and placement decisions.
+- [x] Implement `MemberHello` and bounded `PlacementDomainHello` validation.
+- [x] Implement a supervised CoordinatorHost with independent scope elections and leader tasks.
+- [x] Allow one process to lead, stand by for and lose multiple domains independently.
+- [x] Implement scoped discovery publication, candidate selection and leader rollover.
+- [x] Make domain leaders consume authoritative global member events without becoming the global
       member writer.
-- [ ] Persist and reconcile domain members, configuration and placement before accepting mutations.
-- [ ] Add election tests for simultaneous different-domain leaders and one-leader-per-domain safety.
+- [x] Persist and reconcile domain members, configuration and placement before accepting mutations.
+- [x] Add election tests for simultaneous different-domain leaders and one-leader-per-domain safety.
 
 Exit condition: at least two domains can elect different leaders on different hosts, and killing one
 leader leaves the other leader and membership plane operational.
 
 ### Batch C — Domain-scoped service routing and lifecycle
 
-- [ ] Replace the single logical router with a bounded domain router directory.
-- [ ] Build membership plus required-domain sessions automatically from registered configs.
-- [ ] Make `register_entity`, `use_entity`, singleton registration and proxy use domain-scoped refs.
-- [ ] Route local and remote tell/ask/watch with domain and assignment-generation validation.
-- [ ] Preserve bounded buffering and deadlines independently per domain and globally.
-- [ ] Implement node lifecycle, domain lifecycle and scoped readiness/health subscriptions.
-- [ ] Retain safely fenced known routes during a domain outage; reject unknown or expired authority.
-- [ ] Remove global router clearing and all cluster-wide placement fallback paths.
+- [x] Replace the single logical router with a bounded domain router directory.
+- [x] Build membership plus required-domain sessions automatically from registered configs.
+- [x] Make `register_entity`, `use_entity`, singleton registration and proxy use domain-scoped refs.
+- [x] Route local and remote tell/ask/watch with domain and assignment-generation validation.
+- [x] Preserve bounded buffering and deadlines independently per domain and globally.
+- [x] Implement node lifecycle, domain lifecycle and scoped readiness/health subscriptions.
+- [x] Retain safely fenced known routes during a domain outage; reject unknown or expired authority.
+- [x] Remove global router clearing and all cluster-wide placement fallback paths.
 
 Exit condition: failing domain A makes only A references unavailable while domain B and exact
 `ActorRef` traffic continue under executable tests.
 
 ### Batch D — Domain-scoped operations, capacity and drain
 
-- [ ] Scope allocation strategies, load tables, claims, plans and handoff barriers by domain.
-- [ ] Replace global placement capacity with explicit domain quotas and enforce them in validation.
-- [ ] Enforce per-domain and host-wide movement/concurrency limits without cross-domain state writes.
-- [ ] Scope singleton placement and reuse the same domain authority engine.
-- [ ] Aggregate graceful drain across joined domains and global membership.
-- [ ] Make crash recovery and global member removal fan out safely to affected domains.
-- [ ] Require domain IDs in inspect, explain, pause, rebalance, relocate and operation history APIs.
-- [ ] Add metrics, dashboards and runbook steps for partial domain degradation and drain.
+- [x] Scope allocation strategies, load tables, claims, plans and handoff barriers by domain.
+- [x] Replace global placement capacity with explicit domain quotas and enforce them in validation.
+- [x] Enforce per-domain and host-wide movement/concurrency limits without cross-domain state writes.
+- [x] Scope singleton placement and reuse the same domain authority engine.
+- [x] Aggregate graceful drain across joined domains and global membership.
+- [x] Make crash recovery and global member removal fan out safely to affected domains.
+- [x] Require domain IDs in inspect, explain, pause, rebalance, relocate and operation history APIs.
+- [x] Add metrics, dashboards and runbook steps for partial domain degradation and drain.
 
 Exit condition: allocation, rebalance, handoff, singleton movement, administration and drain work
 independently across domains and preserve every generation-4 fencing invariant.
 
 ### Batch E — Migration, simulation, distributed acceptance and documentation
 
-- [ ] Add an offline, resumable generation-4-to-5 migration command requiring an explicit mapping
+- [x] Add an offline, resumable generation-4-to-5 migration command requiring an explicit mapping
       from every EntityType and SingletonKind to a PlacementDomain.
-- [ ] Require a stopped cluster, absent live leader/member/claim leases and no active handoff before
+- [x] Require a stopped cluster, absent live leader/member/claim leases and no active handoff before
       migration; never migrate automatically during startup.
-- [ ] Preserve configuration and monotonic generations, but restart old ownership as safely fenced
+- [x] Preserve configuration and monotonic generations, but restart old ownership as safely fenced
       or unallocated authority that must be re-established by generation 5.
-- [ ] Add dry-run, apply, interruption/resume, collision, unmapped-type and rollback-boundary tests.
-- [ ] Extend production/simulation reducers, invariant checking, state exploration and trace replay
+- [x] Add dry-run, apply, interruption/resume, collision, unmapped-type and rollback-boundary tests.
+- [x] Extend production/simulation reducers, invariant checking, state exploration and trace replay
       with multiple domains and independent elections.
-- [ ] Add real-etcd and Docker tests with multiple CoordinatorHosts, domains and logic nodes.
-- [ ] Add chaos cases for one-domain leader loss, membership loss, host loss, partition, lease expiry,
+- [x] Add real-etcd and Docker tests with multiple CoordinatorHosts, domains and logic nodes.
+- [x] Add chaos cases for one-domain leader loss, membership loss, host loss, partition, lease expiry,
       drain and simultaneous independent handoffs.
-- [ ] Update all architecture, API example, operations, migration and deployment documents.
-- [ ] Update `examples/minimal-world` to demonstrate explicit domains without application-specific
+- [x] Update all architecture, API example, operations, migration and deployment documents.
+- [x] Update `examples/minimal-world` to demonstrate explicit domains without application-specific
       shortcuts.
-- [ ] Prove generation-4 APIs, keys, control messages and implicit default routing are absent.
-- [ ] Run every final acceptance command and retain replayable evidence.
+- [x] Prove generation-4 APIs, keys, control messages and implicit default routing are absent.
+- [x] Run every final acceptance command and retain replayable evidence.
 
 Exit condition: the new model is the only model in code, docs, examples, storage and wire protocols;
 all repository and distributed acceptance gates pass.

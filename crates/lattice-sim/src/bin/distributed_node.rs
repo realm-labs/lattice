@@ -1,6 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,32 +25,35 @@ use lattice_config_etcd::config::EtcdConfigStoreConfig;
 use lattice_config_etcd::store::EtcdConfigStore;
 use lattice_core::actor_kind;
 use lattice_core::actor_ref::{
-    ActorRef, ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation, ProtocolId,
+    ActorRef, ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation,
+    PlacementDomainId, ProtocolId,
 };
+use lattice_core::coordinator::CoordinatorScope;
 use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_core::service_context::ServiceContext;
 use lattice_discovery::config_store::ConfigStoreDiscovery;
-use lattice_discovery::provider::ClusterDiscovery;
+use lattice_discovery::provider::CoordinatorDiscovery;
 use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
 use lattice_placement::control::{
     DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
     encode_control_command,
 };
 use lattice_placement::coordinator::MemberStatus;
-use lattice_placement::coordinator::NodeHello;
 use lattice_placement::coordinator::SnapshotLimits;
 use lattice_placement::coordinator::SnapshotRecord;
+use lattice_placement::coordinator::SnapshotVersion;
 use lattice_placement::coordinator::build_snapshot;
+use lattice_placement::coordinator::{MemberHello, PlacementDomainHello};
 use lattice_placement::region::EntityConfig;
-use lattice_placement::runtime::CoordinatorLeader;
-use lattice_placement::runtime::CoordinatorLeaderConfig;
 use lattice_placement::runtime::CoordinatorRuntimeError;
+use lattice_placement::runtime::host::{CoordinatorHost, CoordinatorHostConfig};
+use lattice_placement::runtime::{PlacementDomainLeader, PlacementDomainLeaderConfig};
 use lattice_placement::session::LogicCoordinatorConfig;
-use lattice_placement::session::LogicCoordinatorSession;
-use lattice_placement::storage::CoordinatorStore;
+use lattice_placement::session::PlacementDomainSession;
 use lattice_placement::storage::InMemoryPlacementStore;
+use lattice_placement::storage::ScopedElectionStore;
 use lattice_placement::storage::domain::DurableStorageLimits;
 use lattice_placement::storage::etcd::{EtcdPlacementConfig, EtcdPlacementStore};
 use lattice_placement::types::AssignmentGeneration;
@@ -61,8 +64,8 @@ use lattice_placement::types::NodeKey;
 use lattice_placement::types::PlacementSlot;
 use lattice_placement::types::PlacementSlotKey;
 use lattice_placement::types::PlacementSlotState;
+use lattice_placement::types::PlacementVersion;
 use lattice_placement::types::Revision;
-use lattice_placement::types::StateVersion;
 use lattice_remoting::association::AssociationKey;
 use lattice_remoting::association::AssociationManager;
 use lattice_remoting::association::LaneAttachment;
@@ -74,10 +77,10 @@ use lattice_remoting::handshake::NodeIdentity;
 use lattice_remoting::watch::WatchStatus;
 use lattice_service::builder::LatticeService;
 use lattice_service::builder::LatticeServiceBuilder;
-use lattice_service::cluster::{ClusterLogicalRouter, LogicalBufferConfig};
+use lattice_service::cluster::{DomainLogicalRouter, LogicalBufferConfig};
 use lattice_service::config::ClusterJoinConfig;
 use lattice_service::config::NodeConfig;
-use lattice_service::lifecycle::ServiceLifecycleState;
+use lattice_service::lifecycle::NodeLifecycleState;
 use serde::{Deserialize, Serialize};
 
 const PROTOCOL_ID: u64 = 0x7369_6d00_0000_0001;
@@ -94,6 +97,8 @@ struct Cli {
     node_id: String,
     #[arg(long, default_value_t = 29101)]
     port: u16,
+    #[arg(long, default_value = "")]
+    domains: String,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -107,10 +112,12 @@ enum Role {
     DiscoveryCoordinator,
     StaticMember,
     ConfigMember,
+    DomainHost,
+    DomainLogic,
 }
 
-#[derive(Debug, Serialize)]
-struct CoordinatorLeadershipArtifact {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScopedLeadershipArtifact {
     node_id: String,
     term: u64,
     incarnation: u128,
@@ -123,6 +130,20 @@ struct DiscoveryLifecycleArtifact {
     provider: String,
     lifecycle: String,
     authoritative_up_members: Vec<(String, u128)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MultiDomainHostArtifact {
+    node_id: String,
+    incarnation: u128,
+    scopes: BTreeMap<String, ScopedLeadershipArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MultiDomainLogicArtifact {
+    node_id: String,
+    lifecycle: String,
+    domains: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, lattice_actor::Request)]
@@ -319,6 +340,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Role::StaticMember => discovery_member(cli.reference, cli.node_id, cli.port, false).await,
         Role::ConfigMember => discovery_member(cli.reference, cli.node_id, cli.port, true).await,
+        Role::DomainHost => domain_host(cli.reference, cli.node_id, cli.port, cli.domains).await,
+        Role::DomainLogic => domain_logic(cli.reference, cli.node_id, cli.port).await,
     }
 }
 
@@ -333,7 +356,7 @@ async fn discovery_coordinator(
     let builder =
         LatticeService::builder(node_config(cluster, &node_id, address.clone(), incarnation))?;
     let store = Arc::new(InMemoryPlacementStore::new(64, 64)?);
-    let leader = CoordinatorLeader::elect(
+    let host = CoordinatorHost::elect(
         store,
         builder.association_manager(),
         NodeKey {
@@ -341,17 +364,19 @@ async fn discovery_coordinator(
             address,
             incarnation,
         },
-        CoordinatorTerm::new(1)?,
-        3,
-        CoordinatorLeaderConfig {
-            renewal_interval: Duration::from_millis(100),
-            ..CoordinatorLeaderConfig::default()
+        BTreeSet::from([placement_domain()]),
+        CoordinatorHostConfig {
+            placement: PlacementDomainLeaderConfig {
+                renewal_interval: Duration::from_millis(100),
+                ..PlacementDomainLeaderConfig::default()
+            },
+            ..CoordinatorHostConfig::default()
         },
     )
     .await?;
     let (control, controls) = PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD)?;
     let service = builder
-        .cluster_coordinator_runtime(Arc::new(control), leader, controls)
+        .coordinator_host(Arc::new(control), host, controls)
         .build()?;
     service.start().await?;
     write_atomic(
@@ -360,7 +385,7 @@ async fn discovery_coordinator(
             node_id,
             incarnation: incarnation.get(),
             provider: "coordinator".to_owned(),
-            lifecycle: format!("{:?}", service.lifecycle_state()),
+            lifecycle: format!("{:?}", service.node_lifecycle_state()),
             authoritative_up_members: Vec::new(),
         })?,
     )?;
@@ -376,7 +401,8 @@ async fn discovery_member(
     config_store: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let coordinator = NodeAddress::new("discovery-coordinator", 29200)?;
-    let discovery: Arc<dyn ClusterDiscovery> = if config_store {
+    let scope = CoordinatorScope::Membership;
+    let discovery: Arc<dyn CoordinatorDiscovery> = if config_store {
         let run_id = std::env::var("LATTICE_RUN_ID")?;
         let endpoints = std::env::var("LATTICE_ETCD_ENDPOINTS")?
             .split(',')
@@ -402,9 +428,14 @@ async fn discovery_member(
                 }),
             )
             .await?;
-        Arc::new(ConfigStoreDiscovery::new(store, "/discovery/endpoints")?)
+        Arc::new(ConfigStoreDiscovery::new(
+            scope.clone(),
+            store,
+            "/discovery/endpoints",
+        )?)
     } else {
         Arc::new(StaticDiscovery::new(
+            scope,
             "docker-static",
             vec![StaticEndpoint {
                 address: coordinator,
@@ -434,14 +465,14 @@ async fn discovery_member(
         address,
         incarnation,
     ))?
-    .cluster_discovery(discovery)
+    .coordinator_discovery(discovery)?
     .join_config(join_config)
     .member_event_capacity(64)
     .build()?;
     service.start().await?;
-    let mut lifecycle = service.subscribe_lifecycle();
+    let mut lifecycle = service.subscribe_node_lifecycle();
     tokio::time::timeout(Duration::from_secs(30), async {
-        while *lifecycle.borrow() != ServiceLifecycleState::Ready {
+        while *lifecycle.borrow() != NodeLifecycleState::Ready {
             lifecycle.changed().await.map_err(|_| "lifecycle closed")?;
         }
         Ok::<(), &'static str>(())
@@ -502,7 +533,7 @@ fn write_discovery_artifact(
             node_id: node_id.to_owned(),
             incarnation: incarnation.get(),
             provider: provider.to_owned(),
-            lifecycle: format!("{:?}", service.lifecycle_state()),
+            lifecycle: format!("{:?}", service.node_lifecycle_state()),
             authoritative_up_members: members,
         })?,
     )?;
@@ -548,25 +579,26 @@ async fn coordinator(
         address,
         incarnation,
     };
-    let config = CoordinatorLeaderConfig {
+    let config = PlacementDomainLeaderConfig {
         leader_lease_ttl: Duration::from_secs(3),
         renewal_interval: Duration::from_secs(1),
-        ..CoordinatorLeaderConfig::default()
+        ..PlacementDomainLeaderConfig::default()
     };
     let mut next_term = 1_u64;
+    let scope = CoordinatorScope::Placement(placement_domain());
     loop {
-        match store.get_leader().await {
+        match store.get_leader(&scope).await {
             Ok(Some(current)) => {
                 next_term = next_term.max(current.term.get().saturating_add(1));
             }
             Ok(None) => {
                 let term = CoordinatorTerm::new(next_term)?;
-                match CoordinatorLeader::elect(
+                match PlacementDomainLeader::elect(
                     store.clone(),
                     associations.clone(),
                     node.clone(),
+                    scope.clone(),
                     term,
-                    2,
                     config.clone(),
                 )
                 .await
@@ -574,7 +606,7 @@ async fn coordinator(
                     Ok(leader) => {
                         write_coordinator_artifact(
                             &artifact,
-                            &CoordinatorLeadershipArtifact {
+                            &ScopedLeadershipArtifact {
                                 node_id: node_id.clone(),
                                 term: leader.leader().term.get(),
                                 incarnation: incarnation.get(),
@@ -601,7 +633,7 @@ async fn coordinator(
 
 fn write_coordinator_artifact(
     path: &std::path::Path,
-    artifact: &CoordinatorLeadershipArtifact,
+    artifact: &ScopedLeadershipArtifact,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let temporary = path.with_extension("tmp");
     std::fs::write(&temporary, serde_json::to_vec_pretty(artifact)?)?;
@@ -906,7 +938,7 @@ async fn gateway(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         "/artifacts/admin-snapshot.json",
         serde_json::to_vec_pretty(&serde_json::json!({
             "partial": false,
-            "service_lifecycle": format!("{:?}", service.lifecycle_state()),
+            "node_lifecycle": format!("{:?}", service.node_lifecycle_state()),
             "associations": service.associations().len(),
             "entity_type": entity_type,
             "authorized_owner_incarnation": owner.incarnation.get().to_string(),
@@ -980,28 +1012,35 @@ fn entity_service(
             connection_nonce: nonce,
         })?;
     }
-    let hello = NodeHello {
+    let _member_hello = MemberHello {
         node: node.clone(),
         roles: BTreeSet::from([if owns_slot { "entity" } else { "gateway" }.to_owned()]),
-        capacity_units: 1,
-        hosted_entity_types: if owns_slot {
-            BTreeSet::from([entity_config.entity_type.clone()])
-        } else {
-            BTreeSet::new()
-        },
-        proxied_entity_types: if owns_slot {
-            BTreeSet::new()
-        } else {
-            BTreeSet::from([entity_config.entity_type.clone()])
-        },
-        singleton_eligibility: BTreeSet::new(),
-        used_singletons: BTreeSet::new(),
+        failure_domains: BTreeMap::new(),
         protocols: Vec::new(),
-        entity_configs: Vec::new(),
-        singleton_configs: Vec::new(),
+        remoting_capabilities: BTreeSet::new(),
     };
-    let (logic, effects) = LogicCoordinatorSession::new(
-        hello,
+    let domain_hello = PlacementDomainHello::new(
+        node.clone(),
+        placement_domain(),
+        1,
+        if owns_slot {
+            BTreeSet::from([entity_config.entity_type.clone()])
+        } else {
+            BTreeSet::new()
+        },
+        if owns_slot {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([entity_config.entity_type.clone()])
+        },
+        BTreeSet::new(),
+        BTreeSet::new(),
+        Vec::new(),
+        Vec::new(),
+        BTreeMap::new(),
+    );
+    let (logic, effects) = PlacementDomainSession::new(
+        domain_hello,
         coordinator.clone(),
         associations.clone(),
         LogicCoordinatorConfig::default(),
@@ -1013,7 +1052,7 @@ fn entity_service(
     let state = logic.state();
     let (control, controls) = PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD)?;
     let control = Arc::new(control);
-    let mut router = ClusterLogicalRouter::new(
+    let mut router = DomainLogicalRouter::new(
         node,
         state,
         associations,
@@ -1043,10 +1082,28 @@ async fn install_fixture_snapshot(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let limits = SnapshotLimits::default();
     let record = SnapshotRecord {
-        key: "shard/distributed-entity/fixture".to_owned(),
+        key: match &slot.key {
+            PlacementSlotKey::Shard {
+                domain,
+                entity_type,
+                shard_id,
+            } => format!(
+                "domain/{}/shard/{}/{}",
+                domain.as_str(),
+                entity_type.as_str(),
+                shard_id.get()
+            ),
+            PlacementSlotKey::Singleton { domain, kind } => {
+                format!("domain/{}/singleton/{}", domain.as_str(), kind.as_str())
+            }
+        },
         value: serde_json::to_vec(slot)?.into(),
     };
-    let (begin, chunks, end) = build_snapshot(slot.version, vec![record], &limits)?;
+    let (begin, chunks, end) = build_snapshot(
+        SnapshotVersion::Placement(slot.version.clone()),
+        vec![record],
+        &limits,
+    )?;
     let mut commands = vec![PlacementControlCommand::SnapshotBegin(begin)];
     commands.extend(
         chunks
@@ -1056,6 +1113,7 @@ async fn install_fixture_snapshot(
     commands.push(PlacementControlCommand::SnapshotEnd(end));
     if owns_slot {
         commands.push(PlacementControlCommand::ClaimGranted(ClaimGrant {
+            domain: slot.key.domain().clone(),
             slot: slot.key.clone(),
             owner: slot.owner.clone().ok_or("fixture slot has no owner")?,
             coordinator_term: slot.version.term,
@@ -1069,86 +1127,16 @@ async fn install_fixture_snapshot(
             .apply(
                 coordinator.clone(),
                 CommandId::generate(),
-                encode_control_command(&command, DEFAULT_MAX_CONTROL_PAYLOAD)?,
+                encode_control_command(
+                    &CoordinatorScope::Placement(slot.key.domain().clone()),
+                    &command,
+                    DEFAULT_MAX_CONTROL_PAYLOAD,
+                )?,
             )
             .await?;
     }
     Ok(())
 }
 
-fn fixture_entity_config() -> Result<EntityConfig, Box<dyn std::error::Error>> {
-    Ok(EntityConfig::new(
-        EntityType::new("distributed-entity")?,
-        ProtocolId::new(PROTOCOL_ID)?,
-        16,
-        "weighted-least-load",
-        1,
-        Vec::new(),
-    )?)
-}
-
-fn fixture_entity_slot(
-    config: &EntityConfig,
-    entity_id: &EntityId,
-    owner: NodeKey,
-) -> Result<PlacementSlot, Box<dyn std::error::Error>> {
-    Ok(PlacementSlot {
-        key: PlacementSlotKey::Shard {
-            entity_type: config.entity_type.clone(),
-            shard_id: config.shard_for(entity_id),
-        },
-        config_fingerprint: config.fingerprint(),
-        owner: Some(owner),
-        target: None,
-        assignment_generation: AssignmentGeneration::new(1)?,
-        version: StateVersion::new(CoordinatorTerm::new(1)?, Revision::new(1)?),
-        state: PlacementSlotState::Running,
-        active_move: None,
-        barrier_sessions: BTreeSet::new(),
-    })
-}
-
-async fn wait_for_file(path: &PathBuf) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        match std::fs::read(path) {
-            Ok(encoded) => return Ok(encoded),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline =>
-            {
-                tokio::task::yield_now().await;
-            }
-            Err(error) => return Err(Box::new(error)),
-        }
-    }
-}
-
-fn write_atomic(path: PathBuf, contents: &[u8]) -> Result<(), std::io::Error> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&temporary, contents)?;
-    std::fs::rename(temporary, path)
-}
-
-fn node_config(
-    cluster_id: ClusterId,
-    node_id: &str,
-    address: NodeAddress,
-    incarnation: NodeIncarnation,
-) -> NodeConfig {
-    NodeConfig {
-        cluster_id,
-        node_id: node_id.to_owned(),
-        address,
-        incarnation,
-        roles: BTreeSet::new(),
-        remoting: RemotingConfig {
-            heartbeat_interval: Duration::from_millis(100),
-            shutdown_timeout: Duration::from_secs(2),
-            ..RemotingConfig::default()
-        },
-        maximum_actor_protocols: 8,
-        maximum_watches: 32,
-        maximum_supervised_tasks: 32,
-        shutdown_timeout: Duration::from_secs(2),
-    }
-}
+include!("distributed_node/helpers.rs");
+include!("distributed_node/domain_cluster.rs");

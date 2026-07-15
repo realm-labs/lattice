@@ -20,15 +20,15 @@ idle data-connection timeout: 60 s when no asks, watches, routes, or pending sen
 heartbeat interval: 2 s
 suspect after: 3 missed heartbeats
 maximum ask deadline: 30 s
-Coordinator snapshot chunk: 192 KiB; maximum assembled snapshot: 64 MiB / 5 s
+membership/domain snapshot chunk: 192 KiB; maximum assembled snapshot: 64 MiB / 5 s per session
 claim grant: 15 s TTL, renew every 5 s, 2 s local safety margin
-Coordinator leader recovery objective: less than claim TTL minus safety margin
-placement capacity: positive configured units per eligible shard-host node; default 100
+placement-domain leader recovery objective: less than claim TTL minus safety margin
+placement capacity: explicit positive units per node and joined domain; no global default pool
 entity passivation: 10 min, configured per type
 ShardRegion buffer: 1024 messages per shard, 10000 messages / 64 MiB per region
 rebalance: 10 s evaluation, 5 s load report, 20 s load-sample max age, 10% minimum relative improvement
 rebalance stability: 2 min minimum shard residence, 30 s node-join stability, 30 s cooldown
-rebalance limits: 4 moves per round, 8 cluster-wide, 4 per entity type, 2 per source/target node
+rebalance limits: 4 moves per round/domain, 8 per domain, 4 per entity type, 2 per source/target, plus optional host-wide cap
 drain deadline: 30-120 s by service class
 admin inspect timeout: 1-3 s per node
 ```
@@ -75,7 +75,7 @@ Framework owns:
 actor runtime, mailboxes, supervision, lifecycle, DeathWatch
 reference identity and remoting associations
 tell/ask correlation, deadlines, bounded buffering, codecs
-Coordinator protocol, membership, shards, claims, singletons, drain
+membership/domain protocols, CoordinatorHost, shards, claims, singletons, aggregate drain
 shared placement-slot authority and reliable control delivery
 allocation strategies, bounded load view, persisted rebalance plans and move limits
 EventBus, scheduler, config, Gateway adapters, inspection and telemetry abstractions
@@ -96,4 +96,4 @@ The framework does not require a business database and does not persist actor st
 
 ## 7. Summary
 
-Use concrete `ActorRef` for one live activation, `EntityRef` for a movable/passivated sharded identity, and `SingletonRef` for a failover-capable singleton. All three use one actor messaging and remoting runtime. Shard and Singleton keep separate public semantics while sharing placement authority; state-bearing protocols share reliable control delivery without replaying business traffic. etcd and the Coordinator establish control-plane truth; they stay out of healthy known message paths.
+Use concrete `ActorRef` for one live activation, `EntityRef` for a movable/passivated sharded identity, and `SingletonRef` for a failover-capable singleton. Logical references include an explicit placement domain. Shard and Singleton keep separate public semantics while sharing domain authority; membership/domain protocols use reliable control without replaying business traffic. etcd and scoped leaders establish control-plane truth and stay out of healthy known message paths.
