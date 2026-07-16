@@ -478,6 +478,7 @@ impl LogicalRouter for DomainRouterDirectory {
 pub(crate) struct ServiceInboundDispatch {
     pub hosts: Arc<ProtocolHostRegistry>,
     pub logical: Option<Arc<dyn LogicalRouter>>,
+    pub admission: crate::lifecycle::NodeAdmissionGate,
 }
 
 #[async_trait]
@@ -489,6 +490,9 @@ impl InboundDispatch for ServiceInboundDispatch {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
+        if !self.admission.is_open() {
+            return Err(RemoteMessageError::Unauthorized);
+        }
         self.hosts.tell(sender, target, message_id, payload).await
     }
 
@@ -499,6 +503,9 @@ impl InboundDispatch for ServiceInboundDispatch {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
+        if !self.admission.is_open() {
+            return Err(RemoteMessageError::Unauthorized);
+        }
         self.hosts.ask(target, message_id, payload, deadline).await
     }
 
@@ -509,6 +516,9 @@ impl InboundDispatch for ServiceInboundDispatch {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
+        if !self.admission.is_open() {
+            return Err(RemoteMessageError::Unauthorized);
+        }
         self.logical
             .as_ref()
             .ok_or(RemoteMessageError::Unauthorized)?
@@ -523,6 +533,9 @@ impl InboundDispatch for ServiceInboundDispatch {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
+        if !self.admission.is_open() {
+            return Err(RemoteMessageError::Unauthorized);
+        }
         self.logical
             .as_ref()
             .ok_or(RemoteMessageError::Unauthorized)?
@@ -537,6 +550,9 @@ impl InboundDispatch for ServiceInboundDispatch {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
+        if !self.admission.is_open() {
+            return Err(RemoteMessageError::Unauthorized);
+        }
         self.logical
             .as_ref()
             .ok_or(RemoteMessageError::Unauthorized)?
@@ -551,6 +567,9 @@ impl InboundDispatch for ServiceInboundDispatch {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
+        if !self.admission.is_open() {
+            return Err(RemoteMessageError::Unauthorized);
+        }
         self.logical
             .as_ref()
             .ok_or(RemoteMessageError::Unauthorized)?
@@ -570,6 +589,7 @@ pub(crate) struct ServiceRecipientBackend {
     pub maximum_control_payload: usize,
     pub supervisor: Arc<crate::supervisor::TaskSupervisor>,
     pub logical: Option<Arc<dyn LogicalRouter>>,
+    pub admission: crate::lifecycle::NodeAdmissionGate,
 }
 
 impl ServiceRecipientBackend {
@@ -604,6 +624,9 @@ impl RecipientBackend for ServiceRecipientBackend {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), TellError> {
+        if !self.admission.is_open() {
+            return Err(TellError::Remote(RemoteMessageError::Unauthorized));
+        }
         match target {
             RecipientRef::Actor(reference) if self.is_local(&reference) => self
                 .hosts
@@ -654,6 +677,9 @@ impl RecipientBackend for ServiceRecipientBackend {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, AskError> {
+        if !self.admission.is_open() {
+            return Err(AskError::Protocol(RemoteMessageError::Unauthorized));
+        }
         match target {
             RecipientRef::Actor(reference) if self.is_local(&reference) => self
                 .hosts

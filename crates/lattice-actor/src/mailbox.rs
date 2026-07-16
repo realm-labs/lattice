@@ -7,7 +7,8 @@ use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::context::ActorContext;
-use crate::error::ActorCallError;
+use crate::error::{ActorAdminError, ActorCallError};
+use crate::handle::ForceStopAuthorization;
 use crate::observation::{RequestCompletion, RequestObservation};
 use crate::reply::ReplyTo;
 use crate::traits::{
@@ -90,13 +91,21 @@ impl From<MailboxLane> for MessageLane {
 pub(crate) enum ActorCommand<A: Actor> {
     Envelope(Box<dyn ActorEnvelope<A>>),
     Stop(StopReason),
+    RetryStop(oneshot::Sender<Result<(), ActorAdminError>>),
+    Quarantine(oneshot::Sender<Result<(), ActorAdminError>>),
+    ForceStop {
+        authorization: ForceStopAuthorization,
+        result: oneshot::Sender<Result<(), ActorAdminError>>,
+    },
 }
 
 impl<A: Actor> ActorCommand<A> {
     pub(crate) fn metadata(&self, lane: MailboxLane) -> Option<MessageMetadata> {
         match self {
             Self::Envelope(envelope) => Some(envelope.metadata(lane)),
-            Self::Stop(_) => None,
+            Self::Stop(_) | Self::RetryStop(_) | Self::Quarantine(_) | Self::ForceStop { .. } => {
+                None
+            }
         }
     }
 }

@@ -5,15 +5,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::mpsc;
 use tokio::sync::{broadcast, oneshot, watch};
 use tracing::{Instrument, debug, error, info};
 
 use crate::context::ActorContext;
-use crate::error::ActorSpawnError;
-use crate::handle::ActorHandle;
+use crate::error::{ActorAdminError, ActorSpawnError};
+use crate::handle::{ActorHandle, ForcedDataLossEvent, StopFailureRecord, TerminalHook};
 use crate::mailbox::{ActorCommand, MailboxConfig, MailboxLane};
 use crate::observation::{ActorLifecycleEvent, ActorObserverHandle};
 use crate::recipient::ActorSystem;
@@ -225,7 +225,7 @@ impl ActorScheduler {
             service,
             execution: _,
         } = options;
-        let parts = create_actor_parts(mailbox, self_ref, None, service, observer);
+        let parts = create_actor_parts(mailbox, self_ref, None, service, observer, None);
         let scheduler_key =
             scheduler_key.unwrap_or_else(|| ActorId::U64(parts.handle.local_ref().id()));
         let worker_index = Self::keyed_worker_index(&scheduler_key, worker_count)?;
@@ -261,7 +261,7 @@ impl ActorScheduler {
         } = options;
         Ok(spawn_actor_on_pool(
             actor,
-            create_actor_parts(mailbox, self_ref, None, service, observer),
+            create_actor_parts(mailbox, self_ref, None, service, observer, None),
             passivation,
             &pool,
             worker_index,
@@ -493,6 +493,7 @@ where
         .expect("TaskPerActor execution is supported")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_actor_with_self_ref<A>(
     actor: A,
     mailbox: MailboxConfig,
@@ -501,11 +502,19 @@ pub(crate) fn spawn_actor_with_self_ref<A>(
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
     observer: ActorObserverHandle,
+    terminal_hook: Option<TerminalHook>,
 ) -> ActorHandle<A>
 where
     A: Actor,
 {
-    let parts = create_actor_parts(mailbox, self_ref, actor_system, service, observer);
+    let parts = create_actor_parts(
+        mailbox,
+        self_ref,
+        actor_system,
+        service,
+        observer,
+        terminal_hook,
+    );
     spawn_actor_as_tokio_task(actor, parts, passivation, "task_per_actor")
 }
 
@@ -525,7 +534,7 @@ where
         execution: _,
         scheduler_key: _,
     } = options;
-    let parts = create_actor_parts(mailbox, self_ref, None, service, observer);
+    let parts = create_actor_parts(mailbox, self_ref, None, service, observer, None);
     spawn_actor_as_tokio_task(actor, parts, passivation, "task_per_actor")
 }
 
@@ -545,6 +554,7 @@ fn create_actor_parts<A>(
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
     observer: ActorObserverHandle,
+    terminal_hook: Option<TerminalHook>,
 ) -> ActorRuntimeParts<A>
 where
     A: Actor,
@@ -553,12 +563,18 @@ where
     let (system_tx, system_rx) = mpsc::channel(mailbox.system_capacity());
     let local_ref = LocalActorRef::new(NEXT_LOCAL_ACTOR_ID.fetch_add(1, Ordering::Relaxed));
     let (terminated_tx, _terminated_rx) = broadcast::channel(16);
-    let (lifecycle_tx, _lifecycle_rx) = watch::channel(ActorLifecycleState::Empty);
+    let (lifecycle_tx, _lifecycle_rx) = watch::channel(ActorLifecycleState::Starting);
+    let stop_failure = Arc::new(Mutex::new(None));
+    let (forced_data_loss_tx, _forced_data_loss_rx) = broadcast::channel(16);
+    let terminal_hook = Arc::new(Mutex::new(terminal_hook));
     let actor_ref = self_ref.clone();
     let handle = ActorHandle::new(
         local_ref,
         terminated_tx,
         lifecycle_tx,
+        stop_failure,
+        forced_data_loss_tx,
+        terminal_hook,
         normal_tx,
         system_tx,
         actor_ref,
@@ -656,7 +672,8 @@ where
         actor.type = actor_type,
         actor.local_ref = local_ref
     );
-    if let Err(error) = actor.started(&mut ctx).instrument(started_span).await {
+    let startup_failure = if let Err(error) = actor.started(&mut ctx).instrument(started_span).await
+    {
         handle.observer().lifecycle(
             handle.observation_metadata(),
             ActorLifecycleEvent::StartFailed,
@@ -667,53 +684,30 @@ where
             %error,
             "actor failed to start"
         );
-        handle.set_lifecycle_state(ActorLifecycleState::Stopping);
-        let stopping_span = tracing::info_span!(
-            "actor.stopping",
-            otel.kind = "internal",
+        true
+    } else {
+        if handle.lifecycle_state() != ActorLifecycleState::Quarantined {
+            handle.set_lifecycle_state(ActorLifecycleState::Running);
+        }
+        handle
+            .observer()
+            .lifecycle(handle.observation_metadata(), ActorLifecycleEvent::Started);
+        info!(
             actor.type = actor_type,
             actor.local_ref = local_ref,
-            stop.reason = ?StopReason::StartFailed
+            "actor started"
         );
-        if let Err(error) = actor
-            .stopping(&mut ctx, StopReason::StartFailed)
-            .instrument(stopping_span)
-            .await
-        {
-            error!(
-                actor.type = actor_type,
-                actor.local_ref = local_ref,
-                %error,
-                "actor failed to stop after start failure"
-            );
-            handle.set_lifecycle_state(ActorLifecycleState::StopFailed);
-            handle.observer().lifecycle(
-                handle.observation_metadata(),
-                ActorLifecycleEvent::StopFailed(StopReason::StartFailed),
-            );
-        } else {
-            handle.set_lifecycle_state(ActorLifecycleState::Stopped);
-        }
-        ctx.cancel_all_tasks();
-        ctx.stop_all_children(StopReason::StartFailed);
-        handle.publish_terminated(ActorTerminated {
-            target: handle.local_ref(),
-            incarnation: ActorIncarnation::new(handle.local_ref().id()),
-            reason: TerminatedReason::from(StopReason::StartFailed),
-        });
-        return;
-    }
-    handle.set_lifecycle_state(ActorLifecycleState::Running);
-    handle
-        .observer()
-        .lifecycle(handle.observation_metadata(), ActorLifecycleEvent::Started);
-    info!(
-        actor.type = actor_type,
-        actor.local_ref = local_ref,
-        "actor started"
-    );
+        false
+    };
 
-    let mut stop_reason = None;
+    let externally_fenced = handle.lifecycle_state() == ActorLifecycleState::Quarantined;
+    let mut stop_reason = if startup_failure {
+        Some(StopReason::StartFailed)
+    } else if externally_fenced {
+        Some(StopReason::AuthorityLost)
+    } else {
+        None
+    };
 
     while stop_reason.is_none() {
         while let Ok(command) = system_rx.try_recv() {
@@ -784,58 +778,209 @@ where
 
     let reason = stop_reason.unwrap_or(StopReason::Requested);
     ctx.cancel_deferred_replies(crate::error::ActorCallError::MailboxClosed);
-    handle.set_lifecycle_state(match reason {
-        StopReason::Passivated(_) => ActorLifecycleState::Passivating,
-        StopReason::Requested | StopReason::MailboxClosed | StopReason::StartFailed => {
-            ActorLifecycleState::Stopping
-        }
-    });
-    let stopping_span = tracing::info_span!(
-        "actor.stopping",
-        otel.kind = "internal",
-        actor.type = actor_type,
-        actor.local_ref = local_ref,
-        stop.reason = ?reason
-    );
-    if let Err(error) = actor
-        .stopping(&mut ctx, reason)
-        .instrument(stopping_span)
-        .await
-    {
-        error!(
-            actor.type = actor_type,
-            actor.local_ref = local_ref,
-            stop.reason = ?reason,
-            %error,
-            "actor failed to stop"
-        );
-        ctx.cancel_all_tasks();
-        ctx.stop_all_children(reason);
-        handle.set_lifecycle_state(ActorLifecycleState::StopFailed);
-        handle.observer().lifecycle(
-            handle.observation_metadata(),
-            ActorLifecycleEvent::StopFailed(reason),
-        );
-        return;
-    }
     ctx.cancel_all_tasks();
     ctx.stop_all_children(reason);
+    let previous_phase = match reason {
+        StopReason::Passivated(_) => ActorLifecycleState::Passivating,
+        StopReason::Requested
+        | StopReason::MailboxClosed
+        | StopReason::StartFailed
+        | StopReason::AuthorityLost => ActorLifecycleState::Stopping,
+    };
+
+    let (forced, terminal_completion) = run_stopping_phase(
+        &mut actor,
+        &mut ctx,
+        &handle,
+        &mut normal_rx,
+        &mut system_rx,
+        reason,
+        previous_phase,
+    )
+    .await;
+
+    drop(actor);
+    handle.run_terminal_hook();
+    handle.clear_stop_failure();
     handle.set_lifecycle_state(ActorLifecycleState::Stopped);
     handle.observer().lifecycle(
         handle.observation_metadata(),
-        ActorLifecycleEvent::Stopped(reason),
+        if forced {
+            ActorLifecycleEvent::ForcedDataLoss(reason)
+        } else {
+            ActorLifecycleEvent::Stopped(reason)
+        },
     );
     handle.publish_terminated(ActorTerminated {
         target: handle.local_ref(),
         incarnation: ActorIncarnation::new(handle.local_ref().id()),
         reason: TerminatedReason::from(reason),
     });
+    if let Some(completion) = terminal_completion {
+        let _ = completion.send(Ok(()));
+    }
     info!(
         actor.type = actor_type,
         actor.local_ref = local_ref,
         stop.reason = ?reason,
+        forced,
         "actor stopped"
     );
+}
+
+async fn run_stopping_phase<A>(
+    actor: &mut A,
+    ctx: &mut ActorContext<A>,
+    handle: &ActorHandle<A>,
+    normal_rx: &mut mpsc::Receiver<ActorCommand<A>>,
+    system_rx: &mut mpsc::Receiver<ActorCommand<A>>,
+    reason: StopReason,
+    previous_phase: ActorLifecycleState,
+) -> (bool, Option<oneshot::Sender<Result<(), ActorAdminError>>>)
+where
+    A: Actor,
+{
+    let actor_type = type_name::<A>();
+    let local_ref = handle.local_ref().id();
+    let mut failure: Option<StopFailureRecord> = None;
+    let mut retry_result: Option<oneshot::Sender<Result<(), ActorAdminError>>> = None;
+    let mut quarantined = handle.lifecycle_state() == ActorLifecycleState::Quarantined;
+
+    loop {
+        handle.set_lifecycle_state(if quarantined {
+            ActorLifecycleState::Quarantined
+        } else {
+            previous_phase
+        });
+        if failure.is_some() {
+            handle.observer().lifecycle(
+                handle.observation_metadata(),
+                ActorLifecycleEvent::StopRetried(reason),
+            );
+        }
+        let stopping_span = tracing::info_span!(
+            "actor.stopping",
+            otel.kind = "internal",
+            actor.type = actor_type,
+            actor.local_ref = local_ref,
+            stop.reason = ?reason
+        );
+        match actor.stopping(ctx, reason).instrument(stopping_span).await {
+            Ok(()) => {
+                if failure.is_some() {
+                    crate::observation::record_resolved_stop_failure(false);
+                }
+                return (false, retry_result.take());
+            }
+            Err(stop_error) => {
+                let now = SystemTime::now();
+                let record = match failure.take() {
+                    Some(mut record) => {
+                        record.error = stop_error.message().to_owned();
+                        record.latest_attempt_time = now;
+                        record.attempt_count = record.attempt_count.saturating_add(1);
+                        record
+                    }
+                    None => {
+                        crate::observation::record_new_stop_failure();
+                        StopFailureRecord {
+                            reason,
+                            previous_phase,
+                            error: stop_error.message().to_owned(),
+                            first_failure_time: now,
+                            latest_attempt_time: now,
+                            attempt_count: 1,
+                            authoritative: !quarantined,
+                        }
+                    }
+                };
+                error!(
+                    actor.type = actor_type,
+                    actor.local_ref = local_ref,
+                    stop.reason = ?reason,
+                    stop.attempt = record.attempt_count,
+                    error = %stop_error,
+                    "actor failed to persist while stopping; retaining actor instance"
+                );
+                handle.record_stop_failure(record.clone());
+                failure = Some(record);
+                handle.set_lifecycle_state(if quarantined {
+                    ActorLifecycleState::Quarantined
+                } else {
+                    ActorLifecycleState::StopFailed
+                });
+                handle.observer().lifecycle(
+                    handle.observation_metadata(),
+                    ActorLifecycleEvent::StopFailed(reason),
+                );
+                normal_rx.close();
+                while normal_rx.try_recv().is_ok() {}
+                if let Some(result) = retry_result.take() {
+                    let _ = result.send(Err(ActorAdminError::StopFailed(stop_error)));
+                }
+            }
+        }
+
+        loop {
+            match system_rx.recv().await {
+                Some(ActorCommand::RetryStop(result)) => {
+                    retry_result = Some(result);
+                    break;
+                }
+                Some(ActorCommand::Quarantine(result)) => {
+                    quarantined = true;
+                    handle.mark_stop_failure_quarantined();
+                    handle.set_lifecycle_state(ActorLifecycleState::Quarantined);
+                    let _ = result.send(Ok(()));
+                }
+                Some(ActorCommand::ForceStop {
+                    authorization,
+                    result,
+                }) => {
+                    let failed_attempts = failure.as_ref().map_or(0, |record| record.attempt_count);
+                    error!(
+                        actor.type = actor_type,
+                        actor.local_ref = local_ref,
+                        stop.reason = ?reason,
+                        force.reason = %authorization.reason,
+                        force.ticket = %authorization.ticket,
+                        failed_attempts,
+                        "operator-authorized force stop discards retained actor state"
+                    );
+                    handle.publish_forced_data_loss(ForcedDataLossEvent {
+                        target: handle.local_ref(),
+                        stop_reason: reason,
+                        reason: authorization.reason,
+                        ticket: authorization.ticket,
+                        failed_attempts,
+                    });
+                    crate::observation::record_resolved_stop_failure(true);
+                    return (true, Some(result));
+                }
+                Some(ActorCommand::Stop(requested_reason)) => {
+                    debug!(
+                        actor.type = actor_type,
+                        actor.local_ref = local_ref,
+                        original.reason = ?reason,
+                        requested.reason = ?requested_reason,
+                        "retained actor ignored duplicate stop request"
+                    );
+                }
+                Some(ActorCommand::Envelope(_)) => {
+                    error!(
+                        actor.type = actor_type,
+                        actor.local_ref = local_ref,
+                        "retained actor rejected a system-lane business envelope"
+                    );
+                }
+                None => {
+                    // ActorContext retains a self handle, so this is reachable only during runtime
+                    // teardown. Keep the actor alive until that teardown drops the task.
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
 }
 
 async fn handle_command<A>(
@@ -909,6 +1054,24 @@ where
             );
             *stop_reason = Some(reason);
             return true;
+        }
+        ActorCommand::RetryStop(result) => {
+            let _ = result.send(Err(ActorAdminError::InvalidState {
+                operation: "retry_stop",
+                state: handle.lifecycle_state(),
+            }));
+        }
+        ActorCommand::Quarantine(result) => {
+            let _ = result.send(Err(ActorAdminError::InvalidState {
+                operation: "quarantine_after_authority_loss",
+                state: handle.lifecycle_state(),
+            }));
+        }
+        ActorCommand::ForceStop { result, .. } => {
+            let _ = result.send(Err(ActorAdminError::InvalidState {
+                operation: "force_stop",
+                state: handle.lifecycle_state(),
+            }));
         }
     }
 

@@ -178,6 +178,16 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+`wait_ready()` opens business use only after the logic node is `Ready` and every domain required by
+that deployment is `Ready`. Embedded mode also requires every managed Coordinator scope to be
+`Active` or `Standby`; a `Failed` scope is never hidden behind node readiness. Dedicated candidates
+use the same per-scope rule, and `Ready + Standby` is a healthy candidate.
+
+`shutdown()` is graceful: it closes admission, drains every configured placement domain, and returns
+a structured intervention error if retained `StopFailed` Actors prevent durability. It never falls
+back to discarding state. An operator may invoke the explicitly destructive `force_shutdown()` only
+under the force-stop/data-loss procedure in the operations runbook.
+
 `MemberHello` joins the membership scope; the two explicit configurations create independent
 `PlacementDomainHello` sessions with separate capacity, snapshots, terms, routing, and failure
 state. CoordinatorHost may run in dedicated or co-located processes. Business nodes never receive a

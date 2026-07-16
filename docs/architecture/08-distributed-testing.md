@@ -182,6 +182,10 @@ Every queue, outbox, buffer, pending map, watch registry, plan set and history s
 Every long-lived task is supervised and joined/cancelled within shutdown policy.
 Draining stops external admission before migration and final mailbox shutdown.
 Terminated service state retains no live actor path, claim, association, lease or detached task.
+A failed Actor stopping durability hook retains the exact Actor instance, rejects business traffic,
+and emits no terminal watch event until successful retry or an explicitly authorized force stop.
+External authority loss fences and quarantines the old instance without delaying proven replacement.
+Quarantine exhaustion is bounded, explicit, and never silently drops retained state.
 ```
 
 ### 5.4 Conditional Liveness
@@ -193,6 +197,8 @@ A compatible joining node becomes Ready or returns an explicit terminal join fai
 An allocated shard becomes Active or explicitly Unavailable/Failed.
 A handoff/rebalance move reaches Completed/Cancelled/Failed with inspectable reason.
 A valid pending watch reaches WatchAck or Terminated.
+A voluntary retained StopFailed Actor reaches persisted termination after RetryStop or remains an
+explicit drain blocker until operator action.
 A Coordinator failover reconciles claims/plans before new automatic placement work.
 Bounded buffers drain or fail their entries; no request waits forever.
 ```

@@ -72,6 +72,8 @@ Operators need structured inspection for:
 - singleton assignments, claims, and proxy buffers;
 - pending asks, deadlines, `UnknownResult`, and remote failures;
 - remote watches, orphan cleanup, and termination delivery.
+- retained `StopFailed` count/age/attempts, blocked drains, quarantine capacity/usage, forced
+  data-loss events, lifecycle-effect failures, and termination latency;
 
 Metrics must use low-cardinality labels. Actor paths, entity IDs, correlation IDs, and session IDs belong in sampled/redacted traces or bounded inspection responses, not metric labels.
 
@@ -86,7 +88,9 @@ relocate/history mutation requires a `PlacementDomainId` and is sent to that dom
 handle. The HTTP adapter never mutates etcd directly.
 
 Inspection responses expose node lifecycle, per-domain lifecycle, membership/domain terms and
-revisions, incarnation, assignment generation, plan/move IDs, and partial/stale markers.
+revisions, incarnation, assignment generation, plan/move IDs, Coordinator scope
+`Active | Standby | Failed`, retained stop-failure records, quarantine authority status, and
+partial/stale markers.
 
 Rebalance operations include inspect/explain, pause/resume automatic planning, trigger an immediate evaluation, submit an idempotent manual relocation, and cancel only plan moves that have not entered handoff. The API exposes why a proposal was accepted/rejected and which eligibility, freshness, hysteresis, cooldown, or concurrency rule applied; it never allows an operator to bypass claim fencing.
 
@@ -189,11 +193,28 @@ Cluster nodes configure candidate providers through `cluster_discovery` and a bo
 hints only. The authenticated membership snapshot and revisioned member deltas populate the local
 member directory; discovery and direct store reads are never used for business routing.
 
-`LatticeService` exposes lifecycle and member snapshots plus bounded watches. `leave(deadline)`
-closes admission, drains all joined domains, completes exact-incarnation membership removal and
-then stops remoting. `shutdown()` spends the configured leave budget and force-stops on expiry;
-`force_shutdown()` immediately fences local work. The low-level `connect_peer(NodeIdentity)` API is
+`LatticeService` exposes lifecycle and member snapshots plus bounded watches. `leave(deadline)` and
+`shutdown()` close admission, visibly mark every domain Draining, drain all joined domains, complete
+exact-incarnation membership removal, and then stop remoting and supervised tasks. A retained
+failure returns `LifecycleInterventionReport`; it never silently escalates to destructive shutdown.
+`force_shutdown()` immediately fences local work and is explicitly destructive. The low-level `connect_peer(NodeIdentity)` API is
 diagnostic transport access and cannot admit a member or make a service Ready.
+
+### 6.1 StopFailed and Quarantine Runbook
+
+1. Inspect the failure record: exact activation, original stop reason and phase, error, first/latest
+   attempt time, attempt count, shard/singleton ownership, and authoritative/quarantined status.
+2. Repair the persistence dependency and run `RetryStop`. A voluntary retained activation keeps its
+   reservation; a quarantined activation remains non-authoritative. Success performs eager cleanup
+   and emits exactly one terminal notification.
+3. If persistence cannot be repaired, obtain explicit incident/change authorization. Run
+   `ForceStop(reason, ticket)` or quarantine force-discard. This emits a high-severity
+   forced-data-loss event before cleanup and termination.
+4. Never interpret `StopFailed` as death, activate a voluntary replacement, edit placement storage,
+   or allow a quarantined activation back into routing.
+
+Alert on old or growing retained failures, blocked drain duration, quarantine usage near capacity,
+any forced-data-loss event, lifecycle-effect failure, and termination latency beyond policy.
 
 ## 7. Common Call Flows
 

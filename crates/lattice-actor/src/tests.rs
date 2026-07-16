@@ -18,8 +18,8 @@ use crate::runtime::{
     spawn_actor,
 };
 use crate::traits::{
-    Actor, ChildActorKey, ChildActorOptions, Handler, Message, PassivationReason, Request,
-    Responder, ResponderErrorAction, StopReason,
+    Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, Handler, Message,
+    PassivationReason, Request, Responder, ResponderErrorAction, StopReason,
 };
 use lattice_core::id::ActorId;
 use lattice_core::instance::InstanceId;
@@ -655,7 +655,12 @@ async fn stop_uses_system_lane_and_closes_actor() {
     stopped.acquire().await.unwrap().forget();
 
     let result = handle.ask(Ping("after-stop"), ASK_TIMEOUT).await;
-    assert!(matches!(result, Err(ActorCallError::MailboxClosed)));
+    assert!(matches!(
+        result,
+        Err(ActorCallError::LifecycleUnavailable {
+            state: ActorLifecycleState::Stopped
+        })
+    ));
 }
 
 #[tokio::test]
@@ -759,7 +764,12 @@ async fn business_passivation_happens_after_handler_response() {
 
     assert_eq!(reply, "reply-before-stop");
     assert_eq!(*events.lock().await, vec!["handled"]);
-    assert!(matches!(after_stop, Err(ActorTellError::MailboxClosed)));
+    assert!(matches!(
+        after_stop,
+        Err(ActorTellError::LifecycleUnavailable {
+            state: ActorLifecycleState::Stopped
+        })
+    ));
 }
 
 #[tokio::test]
@@ -860,6 +870,7 @@ async fn actor_registry_bounds_and_times_out_activation_waiters() {
             shard_migration: Default::default(),
             waiter_capacity: 0,
             waiter_timeout: std::time::Duration::from_millis(20),
+            quarantine_capacity: 8,
             actor_ref: None,
             service: ServiceContext::empty(),
         },

@@ -217,6 +217,7 @@ async fn deserialized_actor_ref_sends_without_binding() {
     .unwrap()
     .build()
     .unwrap();
+    service.start().await.unwrap();
 
     service
         .tell(
@@ -233,4 +234,5 @@ async fn deserialized_actor_ref_sends_without_binding() {
 
     source_handle.stop(StopReason::Requested).await.unwrap();
     sink_handle.stop(StopReason::Requested).await.unwrap();
+    service.shutdown().await.unwrap();
 }

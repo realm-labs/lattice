@@ -8,6 +8,7 @@ pub mod fault;
 pub mod lifecycle;
 pub mod network;
 pub mod process;
+pub mod retained_stop;
 pub mod scenario;
 pub mod store;
 pub mod trace;

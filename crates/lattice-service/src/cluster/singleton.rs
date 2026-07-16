@@ -47,6 +47,9 @@ pub(super) trait SingletonRoute: Send + Sync {
         target: LogicalSingletonTarget,
     ) -> Result<Bytes, RemoteMessageError>;
     async fn drain(&self) -> Result<bool, RemoteMessageError>;
+    async fn fence(&self) -> Result<(), RemoteMessageError> {
+        Ok(())
+    }
 }
 
 pub(super) struct SingletonRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
@@ -464,11 +467,29 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
     }
 
     async fn drain(&self) -> Result<bool, RemoteMessageError> {
+        let actor_id = ActorId::Str(self.kind.as_str().to_owned());
         drain_actor_ids(
             &self.registry,
-            [ActorId::Str(self.kind.as_str().to_owned())],
+            [actor_id],
             self.buffer.config.maximum_residence,
         )
         .await
+    }
+
+    async fn fence(&self) -> Result<(), RemoteMessageError> {
+        let actor_id = ActorId::Str(self.kind.as_str().to_owned());
+        if self.registry.get_running(&actor_id).is_some()
+            || self
+                .registry
+                .retained_stop_failures()
+                .iter()
+                .any(|failure| failure.actor_id == actor_id)
+        {
+            self.registry
+                .fence_after_authority_loss(&actor_id)
+                .await
+                .map_err(|_| RemoteMessageError::HandlerFailed)?;
+        }
+        Ok(())
     }
 }

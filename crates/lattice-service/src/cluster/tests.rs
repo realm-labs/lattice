@@ -757,6 +757,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
                 Arc::new(ServiceInboundDispatch {
                     hosts: Arc::new(ProtocolHostRegistry::new(1).unwrap()),
                     logical: Some(logical),
+                    admission: crate::lifecycle::NodeAdmissionGate::opened(),
                 }),
                 control,
                 vec![descriptor.clone()],

@@ -49,6 +49,12 @@ pub(super) trait EntityRoute: Send + Sync {
         &self,
         shard_id: lattice_placement::types::ShardId,
     ) -> Result<bool, RemoteMessageError>;
+    async fn fence(
+        &self,
+        _shard_id: lattice_placement::types::ShardId,
+    ) -> Result<(), RemoteMessageError> {
+        Ok(())
+    }
 }
 
 pub(super) struct EntityRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
@@ -488,6 +494,12 @@ where
             .registry
             .running_actor_ids()
             .into_iter()
+            .chain(
+                self.registry
+                    .retained_stop_failures()
+                    .into_iter()
+                    .map(|failure| failure.actor_id),
+            )
             .filter(|actor_id| match actor_id {
                 ActorId::Bytes(bytes) => lattice_core::actor_ref::EntityId::new(bytes.clone())
                     .is_ok_and(|entity_id| self.config.shard_for(&entity_id) == shard_id),
@@ -500,5 +512,34 @@ where
             self.buffer.config.maximum_residence,
         )
         .await
+    }
+
+    async fn fence(
+        &self,
+        shard_id: lattice_placement::types::ShardId,
+    ) -> Result<(), RemoteMessageError> {
+        let actor_ids = self
+            .registry
+            .running_actor_ids()
+            .into_iter()
+            .chain(
+                self.registry
+                    .retained_stop_failures()
+                    .into_iter()
+                    .map(|failure| failure.actor_id),
+            )
+            .filter(|actor_id| match actor_id {
+                ActorId::Bytes(bytes) => lattice_core::actor_ref::EntityId::new(bytes.clone())
+                    .is_ok_and(|entity_id| self.config.shard_for(&entity_id) == shard_id),
+                ActorId::Str(_) | ActorId::U64(_) | ActorId::I64(_) => false,
+            })
+            .collect::<Vec<_>>();
+        for actor_id in actor_ids {
+            self.registry
+                .fence_after_authority_loss(&actor_id)
+                .await
+                .map_err(|_| RemoteMessageError::HandlerFailed)?;
+        }
+        Ok(())
     }
 }

@@ -222,18 +222,26 @@ pub enum StopReason {
     Passivated(PassivationReason),
     MailboxClosed,
     StartFailed,
+    AuthorityLost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorLifecycleState {
-    Empty,
-    Activating,
-    Loading,
+    Starting,
     Running,
     Passivating,
     Stopping,
     StopFailed,
+    Quarantined,
     Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityActivationState {
+    Absent,
+    Activating,
+    Loading,
+    Active,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

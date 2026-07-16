@@ -166,6 +166,7 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn std::error::Error>
     })?
     .register_actor(registry, protocol)?
     .build()?;
+    service.start().await?;
     let reply = service
         .ask(
             &actor_ref,

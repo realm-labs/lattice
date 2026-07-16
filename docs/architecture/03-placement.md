@@ -328,7 +328,13 @@ Domain leader transactionally links optional plan/move ID and persists BeginHand
 
 The first version does not transfer in-memory actor state. Reactivated entities load state through business hooks when applicable. Stateful migration therefore needs business-level save/load correctness.
 
-`Actor::stopping` failure blocks voluntary `ShardDrained` and therefore blocks graceful handoff while the old claim is valid. It is observable and follows a bounded retry/operator policy rather than becoming an invisible permanent state. It never overrides fencing: explicit claim loss or local grant expiry first stops all new mailbox admission, then performs best-effort shutdown and raises `StateLossPossible` if cleanup/save fails. After the old claim is independently invalid, single-owner safety permits a new owner even when the crashed/fenced actor could not save; business persistence must be crash-safe if that recovery is required.
+`Actor::stopping` failure blocks voluntary `ShardDrained` and therefore blocks graceful handoff while
+the old claim is valid. The same Actor instance and registry reservation remain retained for
+`RetryStop`. It never overrides fencing: explicit claim loss or local grant expiry first closes node,
+slot, exact-activation, and logical admission; removes the old activation from routing; and places it
+in bounded non-authoritative quarantine. The Coordinator may then install replacement authority
+using the unchanged term/generation/claim proof. Quarantine can only inspect, retry persistence,
+export diagnostics, or explicitly force-discard; it cannot regain authority implicitly.
 
 ## 8. Claims, Failure, and Coordinator Outage
 
@@ -383,9 +389,11 @@ Graceful drain aggregates all joined domains:
 3. acknowledge each domain completion without undoing completed domains;
 4. stop activations and finish bounded work;
 5. remove global membership only after every required domain completion;
-6. at deadline, fence unfinished domains independently and terminate.
+6. at deadline, return a structured intervention report for voluntary `StopFailed` blockers; an
+   operator must choose retry or an explicit destructive force action.
 
-Forced shutdown relies on lease expiry and claim fencing. Operators must be able to observe which shards or singletons still block a drain.
+Forced shutdown relies on lease expiry and claim fencing and is never a transparent fallback from
+graceful shutdown. Operators can observe every blocking activation and quarantined old instance.
 
 ## 12. Migration Constraint
 

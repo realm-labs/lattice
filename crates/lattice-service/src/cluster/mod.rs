@@ -9,7 +9,7 @@ use lattice_actor::protocol::{
     ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol,
 };
 use lattice_actor::registry::{ActorLoader, ActorRegistry};
-use lattice_actor::traits::{Actor, ActorLifecycleState, PassivationReason, StopReason};
+use lattice_actor::traits::Actor;
 use lattice_actor::{error::ActorCallError, handle::ActorHandle};
 use lattice_core::actor_ref::{
     ActorRef, ConfigFingerprint, EntityRef, EntityType, PlacementDomainId, ProtocolId,
@@ -114,34 +114,8 @@ where
     A: Actor,
     I: IntoIterator<Item = ActorId>,
 {
-    for actor_id in actor_ids {
-        let Some(handle) = registry.remove(&actor_id).await else {
-            continue;
-        };
-        let mut lifecycle = handle.subscribe_lifecycle();
-        handle
-            .stop(StopReason::Passivated(PassivationReason::Drain))
-            .await
-            .map_err(|_| RemoteMessageError::HandlerFailed)?;
-        let stopped = tokio::time::timeout(timeout, async {
-            loop {
-                match *lifecycle.borrow() {
-                    ActorLifecycleState::Stopped => return true,
-                    ActorLifecycleState::StopFailed => return false,
-                    _ => {}
-                }
-                if lifecycle.changed().await.is_err() {
-                    return false;
-                }
-            }
-        })
-        .await
-        .unwrap_or(false);
-        if !stopped {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    let _ = timeout;
+    Ok(registry.drain_actor_ids(actor_ids).await.completed())
 }
 
 fn map_dispatch(error: DispatchError) -> RemoteMessageError {

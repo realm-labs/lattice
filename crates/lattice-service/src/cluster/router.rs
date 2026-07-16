@@ -333,7 +333,26 @@ impl LogicalRouter for DomainLogicalRouter {
     }
 
     async fn stop_fenced_slot(&self, slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
-        self.drain_slot(slot).await.map(|_| ())
+        match slot {
+            PlacementSlotKey::Shard {
+                domain,
+                entity_type,
+                shard_id,
+            } => {
+                self.entities
+                    .get(&(domain, entity_type))
+                    .ok_or(RemoteMessageError::UnsupportedProtocol)?
+                    .fence(shard_id)
+                    .await
+            }
+            PlacementSlotKey::Singleton { domain, kind } => {
+                self.singletons
+                    .get(&(domain, kind))
+                    .ok_or(RemoteMessageError::UnsupportedProtocol)?
+                    .fence()
+                    .await
+            }
+        }
     }
 
     async fn receive_entity_tell(

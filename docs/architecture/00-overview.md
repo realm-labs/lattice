@@ -472,10 +472,11 @@ stateDiagram-v2
     JoiningMembership --> Ready: exact local Up plus required domain snapshots
     Ready --> JoiningMembership: membership lost; new admission closed
     Ready --> Draining: aggregate drain requested
-    Draining --> Terminated: every domain resolved, membership removed, tasks stopped
-    Booting --> Terminated: startup failure
-    JoiningMembership --> Terminated: terminal incompatibility
-    Ready --> Terminated: forced shutdown fences unfinished domains
+    Draining --> Stopping: every domain resolved and membership removed
+    Booting --> Stopping: startup failure
+    JoiningMembership --> Stopping: terminal incompatibility
+    Ready --> Stopping: forced shutdown fences unfinished domains
+    Stopping --> Terminated: endpoint, claims, actors, tasks, and identity are gone
     Terminated --> [*]
 ```
 
@@ -487,6 +488,7 @@ Lifecycle responsibilities:
 | JoiningMembership | Accept internal bootstrap/control traffic; install exact local `Up` membership and required domain snapshots |
 | Ready | Admit configured external traffic and normal actor messages |
 | Draining | Reject new admission; drain domains concurrently; remove global membership only after all domain completions |
+| Stopping | Admission and authority fenced; endpoint and every supervised runtime component are being joined/stopped |
 | Terminated | No actor path, node incarnation, association, claim, or background task remains live |
 
 Each configured domain separately reports `Joining | Ready | Degraded | Draining | Terminated`.
@@ -498,21 +500,28 @@ domains they require rather than one scalar process-degraded state.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Absent
-    Absent --> Starting: spawn at canonical ActorPath
+    [*] --> Starting
     Starting --> Running: mailbox registered with new ActivationId
-    Starting --> Terminated: startup failure
+    Starting --> Stopping: startup failure
     Running --> Stopping: explicit stop, parent stop, supervision, service drain
-    Running --> Restarting: restart policy
-    Restarting --> Running: actor instance replaced with same activation
-    Restarting --> Stopping: restart failed
+    Running --> Passivating: idle or business passivation
+    Passivating --> StopFailed: stopping hook failed
+    Passivating --> Stopped: persistence succeeds
     Stopping --> StopFailed: stopping hook failed
-    StopFailed --> Stopping: retry or operator action
-    Stopping --> Terminated: unregister mailbox and notify watchers
-    Terminated --> [*]
+    StopFailed --> Stopping: RetryStop on the same instance
+    StopFailed --> Passivating: RetryStop restores passivation phase
+    StopFailed --> Quarantined: external authority lost
+    StopFailed --> Stopped: explicit ForceStop with data-loss authorization
+    Quarantined --> Stopped: retry-persist succeeds or explicit force-discard
+    Stopping --> Stopped: persistence succeeds
+    Stopped --> [*]
 ```
 
-A supervision restart replaces the actor instance inside the same registered actor cell, preserving `ActorPath`, `ActivationId`, concrete `ActorRef`, mailbox, and watches. A full stop followed by a new spawn at the same path creates a new `ActivationId`; old references and watches never retarget. Stopping a parent recursively stops its children.
+Registry activation/loading is a separate `Absent -> Activating -> Loading -> Active` state machine.
+`StopFailed` and `Quarantined` reject business traffic but are not terminal actor-cell states. A
+voluntary failure retains the exact Actor object, state, activation reservation, and pending
+DeathWatch relationship. A full successful stop followed by a new spawn creates a new
+`ActivationId`; old references and watches never retarget.
 
 ### 5.3 Sharded Entity Lifecycle
 
@@ -526,11 +535,16 @@ stateDiagram-v2
     Passivating --> Inactive: stop succeeds
     Passivating --> StopFailed: stopping hook fails
     StopFailed --> Passivating: retry or operator action
+    StopFailed --> Quarantined: shard claim externally lost
     Running --> Draining: shard handoff, claim loss, or node drain
     Draining --> Inactive: finish bounded work and stop activation
 ```
 
 Passivation is local and does not modify shard placement or etcd. `EntityRef` remains valid while inactive and may activate a later instance; a concrete `ActorRef` to the old entity activation terminates.
+
+Voluntary `StopFailed` blocks replacement and shard drain. External claim loss is stronger: the old
+activation is immediately removed from exact/logical routing and retained in bounded local
+quarantine, while the normal claim/generation proof may install a replacement elsewhere.
 
 The owning Shard has its own lifecycle:
 
@@ -582,6 +596,8 @@ Tell is at-most-once; ask has a deadline and may end with UnknownResult.
 ProtocolId and message IDs are explicit; fingerprints cover codec/schema versions and are negotiated per Association.
 Transport and business-protocol compatibility are separate: one mismatched ProtocolId cannot close an otherwise compatible Association.
 Every queue and temporary buffer is bounded.
+A failed Actor stopping durability hook never drops the Actor instance or emits ActorTerminated.
+Force stop is an explicit, ticketed data-loss operation and is never a graceful-shutdown fallback.
 Only a valid claim holder may serve a shard or singleton generation.
 Shard and Singleton use one placement-slot authority engine for generation, claim, drain, and fencing while retaining distinct routing and lifecycle semantics.
 Allocation/rebalance strategies return proposals only; the placement-domain leader revalidates and persists every move before the existing handoff/claim state machine changes authority.

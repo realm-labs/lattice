@@ -256,7 +256,13 @@ where
 }
 ```
 
-`Actor::stopping` is the final bounded save/cleanup hook; crash-safe business durability must not depend only on this hook. During a voluntary stop, failure enters `StopFailed`, keeps the activation registered, and blocks voluntary unload/claim release while the old claim remains valid. The runtime exposes the failure, retry state, deadline, and operator action instead of silently waiting forever. External shard/singleton claim loss is stronger: admission is fenced immediately and cleanup becomes best effort; `StopFailed` cannot extend distributed ownership or delay a replacement after the old claim is independently invalid.
+`Actor::stopping` is the business durability hook for a graceful stop. If it fails, the runtime
+retains the exact Actor object and its in-memory state, quiesces scoped tasks and children, rejects
+business traffic, keeps the admin lane open, and does not emit `ActorTerminated`. Implementations
+must make persistence retry-safe with idempotency, operation IDs, or version/CAS semantics. This
+does not make process memory crash-safe. External shard/singleton claim loss is stronger: admission
+and routing are fenced immediately, and the retained object moves to non-authoritative quarantine
+without delaying replacement authority.
 
 #### Message hooks and runtime observation
 
@@ -539,16 +545,19 @@ let child = ctx
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorLifecycleState {
-    Empty,
-    Activating,
-    Loading,
+    Starting,
     Running,
     Passivating,
     Stopping,
     StopFailed,
+    Quarantined,
     Stopped,
 }
 ```
+
+Registry activation is separately observable as
+`EntityActivationState::{Absent, Activating, Loading, Active}`. Loading variants never appear in a
+live Actor cell.
 
 Entity activation is serialized per `(EntityType, EntityId)` at the owning shard. Concrete spawn is serialized by the parent/path registry. Concurrent activation waiters are bounded and deadline-controlled.
 
@@ -559,9 +568,11 @@ The local registry prevents duplicate local activation and maps actor references
 Every registry in one service shares a bounded `ActivationDirectory` through `ServiceContext`.
 Root and child spawns register the exact `(ActorPath, ActivationId, protocol)` and typed local handle;
 remote protocol dispatch resolves through this directory, so heterogeneous child actor types remain
-addressable without flattening child paths into root registry keys. Stop, passivation, parent
-termination, and supervision replacement remove or replace the exact entry. Capacity exhaustion
-rejects registration rather than creating an untracked remote activation.
+addressable without flattening child paths into root registry keys. Successful stop, passivation,
+startup failure, and explicit force stop run one eager exact terminal-cleanup callback before the
+single `ActorTerminated` event. `StopFailed` remains reserved but non-routable; quarantine is removed
+from current routing and held in a separately bounded recovery map. Capacity exhaustion rejects
+registration or quarantine rather than silently dropping retained state.
 
 ### 8.3 Lazy Activation
 
@@ -576,10 +587,11 @@ Rules:
 ```text
 Passivation is requested by policy, admin command, or business code.
 The current handler is allowed to finish before stop begins.
-New entity messages during passivation are serialized by the ShardRegion and may activate a replacement after the old activation has fully stopped.
+New entity messages during passivation are rejected until the old activation has fully stopped.
 Actor::stopping is called for business save/cleanup.
 If voluntary stopping fails, enter StopFailed and keep the activation registered until the configured retry/operator policy resolves it while the old claim remains valid.
-If an external claim is lost, fence admission immediately and surface StateLossPossible when best-effort stopping fails.
+If an external claim is lost, fence exact/logical admission immediately, quarantine the old object,
+and surface StateLossPossible when persistence still fails; replacement authority does not wait.
 Scoped tasks and child actors are cancelled or stopped.
 ```
 

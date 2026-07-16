@@ -449,6 +449,7 @@ impl<A: Actor> ActorContext<A> {
             self.actor_system.clone(),
             self.service.clone(),
             self.handle.observer().clone(),
+            None,
         );
         let directory = self
             .service
@@ -506,6 +507,7 @@ impl<A: Actor> ActorContext<A> {
             self.actor_system.clone(),
             self.service.clone(),
             self.handle.observer().clone(),
+            None,
         );
         let directory = self
             .service
@@ -631,6 +633,7 @@ impl<A: Actor> ActorContext<A> {
                             actor_system.clone(),
                             service.clone(),
                             observer.clone(),
+                            None,
                         );
                         if let Some(directory) =
                             service.extension::<crate::directory::ActivationDirectory>()

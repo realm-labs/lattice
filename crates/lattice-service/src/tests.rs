@@ -368,6 +368,7 @@ async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
     .build()
     .unwrap();
     server.start().await.unwrap();
+    client.start().await.unwrap();
     client
         .connect_peer(NodeIdentity {
             cluster_id,
@@ -530,6 +531,13 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     assert_eq!(
         member.node_lifecycle_state(),
         NodeLifecycleState::Terminated
+    );
+    assert!(
+        member
+            .health_snapshot()
+            .domains
+            .values()
+            .all(|state| *state == PlacementDomainState::Terminated)
     );
     assert!(store.get_member("member").await.unwrap().is_none());
     coordinator.shutdown().await.unwrap();

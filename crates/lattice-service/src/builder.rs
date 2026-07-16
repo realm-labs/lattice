@@ -60,8 +60,8 @@ use crate::config::{ClusterJoinConfig, NodeConfig};
 use crate::control::ServiceControlDispatch;
 use crate::error::ServiceError;
 use crate::lifecycle::{
-    NodeLifecycle, NodeLifecycleState, PlacementDomainState, ServiceHealthSnapshot,
-    ServiceLifecycleEvent,
+    NodeAdmissionGate, NodeLifecycle, NodeLifecycleState, PlacementDomainState,
+    ProductionLifecycleDriver, ServiceHealthSnapshot, ServiceLifecycleEvent,
 };
 use crate::registration::{EntityOptions, SingletonOptions};
 use crate::supervisor::TaskSupervisor;
@@ -124,6 +124,12 @@ struct CoordinatorRuntimeAssembly {
         BTreeMap<
             lattice_core::coordinator::CoordinatorScope,
             lattice_placement::coordinator::LeaderRecord,
+        >,
+    >,
+    scope_states: watch::Receiver<
+        BTreeMap<
+            lattice_core::coordinator::CoordinatorScope,
+            lattice_placement::runtime::host::CoordinatorHostScopeState,
         >,
     >,
 }
@@ -618,6 +624,7 @@ impl LatticeServiceBuilder {
         S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
     {
         let directory = host.subscribe_directory();
+        let scope_states = host.subscribe_scope_states();
         let mut scope_records = Vec::new();
         if let Some(lattice_placement::runtime::host::CoordinatorHostScopeState::Active(record)) =
             host.scope_state(&lattice_core::coordinator::CoordinatorScope::Membership)
@@ -665,6 +672,7 @@ impl LatticeServiceBuilder {
             handles,
             bootstrap_leaders,
             directory,
+            scope_states,
         });
         self
     }
@@ -830,6 +838,7 @@ impl LatticeServiceBuilder {
             WatchRegistry::new(self.config.maximum_watches, self.config.maximum_watches)
                 .map_err(ServiceError::Watch)?,
         ));
+        let admission = NodeAdmissionGate::closed();
         let backend: Arc<dyn RecipientBackend> = Arc::new(ServiceRecipientBackend {
             local_cluster: self.config.cluster_id.clone(),
             local_address: self.config.address.clone(),
@@ -841,6 +850,7 @@ impl LatticeServiceBuilder {
             maximum_control_payload: lattice_placement::control::DEFAULT_MAX_CONTROL_PAYLOAD,
             supervisor: supervisor.clone(),
             logical: logical.clone(),
+            admission: admission.clone(),
         });
         let actor_system = ActorSystem::new(backend, self.actor_protocols.into_values())
             .map_err(ServiceError::ProtocolRegistration)?;
@@ -850,6 +860,7 @@ impl LatticeServiceBuilder {
         let inbound = Arc::new(ServiceInboundDispatch {
             hosts: hosts.clone(),
             logical,
+            admission: admission.clone(),
         });
         let control_dispatch = Arc::new(
             ServiceControlDispatch::new(
@@ -910,6 +921,7 @@ impl LatticeServiceBuilder {
         }
         let logic_handles = Arc::new(std::sync::Mutex::new(initial_logic_handles));
         let (drain_ready, _) = watch::channel(BTreeMap::new());
+        let (drain_blockers, _) = watch::channel(BTreeMap::new());
         let mut configured_domains = auto_join
             .iter()
             .map(|(_, _, _, hello)| hello.domain.clone())
@@ -924,8 +936,16 @@ impl LatticeServiceBuilder {
                 .cloned()
                 .map(|domain| (domain, PlacementDomainState::Joining))
                 .collect(),
+            coordinator_scopes: BTreeMap::new(),
         }));
         let (health_events, _) = watch::channel(health.lock().expect("health poisoned").clone());
+        let lifecycle_driver = ProductionLifecycleDriver::new(
+            lifecycle.clone(),
+            lifecycle_events.clone(),
+            health.clone(),
+            health_events.clone(),
+            admission,
+        );
         let membership_ready = Arc::new(AtomicBool::new(false));
         let membership_handle = Arc::new(std::sync::Mutex::new(None));
         let join_runtimes = auto_join
@@ -955,11 +975,12 @@ impl LatticeServiceBuilder {
                     peers: peers.clone(),
                     watches: watches.clone(),
                     lifecycle: lifecycle.clone(),
-                    lifecycle_events: lifecycle_events.clone(),
+                    lifecycle_driver: lifecycle_driver.clone(),
                     health: health.clone(),
                     health_events: health_events.clone(),
                     logic_handles: logic_handles.clone(),
                     drain_ready: drain_ready.clone(),
+                    drain_blockers: drain_blockers.clone(),
                     bootstrap_view: bootstrap_view.clone(),
                     membership_ready: membership_ready.clone(),
                 })
@@ -984,7 +1005,7 @@ impl LatticeServiceBuilder {
                     peers: peers.clone(),
                     watches: watches.clone(),
                     lifecycle: lifecycle.clone(),
-                    lifecycle_events: lifecycle_events.clone(),
+                    lifecycle_driver: lifecycle_driver.clone(),
                     health: health.clone(),
                     health_events: health_events.clone(),
                     bootstrap_view: bootstrap_view.clone(),
@@ -1011,7 +1032,7 @@ impl LatticeServiceBuilder {
             coordinator_runtime: std::sync::Mutex::new(self.coordinator_runtime),
             coordinator_shutdown: std::sync::Mutex::new(None),
             coordinator_handles: std::sync::Mutex::new(BTreeMap::new()),
-            lifecycle,
+            lifecycle_driver,
             lifecycle_events,
             health,
             health_events,
@@ -1019,6 +1040,7 @@ impl LatticeServiceBuilder {
             peers,
             bootstrap_view,
             drain_ready,
+            drain_blockers,
             configured_domains,
             drain_operation: std::sync::Mutex::new(None),
             join_config: self.join_config,

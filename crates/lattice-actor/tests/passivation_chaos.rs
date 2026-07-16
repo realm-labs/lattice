@@ -12,7 +12,6 @@ use lattice_actor::traits::{Actor, ActorLifecycleState, PassivationReason, Respo
 use lattice_core::actor_kind;
 use lattice_core::id::ActorId;
 use tokio::sync::Semaphore;
-use tokio::time::timeout;
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -101,19 +100,17 @@ async fn request_arriving_while_actor_is_passivating_is_not_processed_by_old_inc
         lifecycle.changed().await.unwrap();
     }
 
-    let mut blocked_call = tokio::spawn({
-        let handle = handle.clone();
-        async move { handle.ask(Ping, ASK_TIMEOUT).await }
-    });
-    assert!(
-        timeout(Duration::from_millis(10), &mut blocked_call)
-            .await
-            .is_err()
-    );
+    let result = handle.ask(Ping, ASK_TIMEOUT).await;
+    assert!(matches!(
+        result,
+        Err(ActorCallError::LifecycleUnavailable {
+            state: ActorLifecycleState::Passivating
+        })
+    ));
 
     release_stop.add_permits(1);
-    let result = blocked_call.await.unwrap();
-
-    assert!(matches!(result, Err(ActorCallError::MailboxClosed)));
+    while *lifecycle.borrow() != ActorLifecycleState::Stopped {
+        lifecycle.changed().await.unwrap();
+    }
     assert_eq!(handled_pings.load(Ordering::SeqCst), 0);
 }

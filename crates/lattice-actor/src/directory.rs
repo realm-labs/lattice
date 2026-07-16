@@ -58,9 +58,9 @@ impl ActivationDirectory {
             return None;
         }
         let handle = entry.handle.downcast_ref::<ActorHandle<A>>()?;
-        if matches!(
+        if !matches!(
             handle.lifecycle_state(),
-            ActorLifecycleState::Stopped | ActorLifecycleState::StopFailed
+            ActorLifecycleState::Starting | ActorLifecycleState::Running
         ) {
             return None;
         }

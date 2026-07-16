@@ -10,7 +10,7 @@ use lattice_remoting::watch::WatchRegistry;
 use tokio::sync::{mpsc, watch};
 
 use crate::lifecycle::{
-    NodeLifecycle, NodeLifecycleState, PlacementDomainState, ServiceHealthSnapshot,
+    NodeLifecycle, PlacementDomainState, ProductionLifecycleDriver, ServiceHealthSnapshot,
     ServiceLifecycleEvent,
 };
 
@@ -27,7 +27,7 @@ pub(crate) struct MembershipJoinRuntime {
     pub peers: Arc<PeerReconciler>,
     pub watches: Arc<Mutex<WatchRegistry>>,
     pub lifecycle: Arc<Mutex<NodeLifecycle>>,
-    pub lifecycle_events: watch::Sender<NodeLifecycleState>,
+    pub lifecycle_driver: ProductionLifecycleDriver,
     pub health: Arc<Mutex<ServiceHealthSnapshot>>,
     pub health_events: watch::Sender<ServiceHealthSnapshot>,
     pub bootstrap_view: Arc<BootstrapView>,
@@ -86,11 +86,9 @@ impl MembershipJoinRuntime {
                 JoinEvent::TerminalFailure(_) => {
                     self.ready.store(false, Ordering::Release);
                     *self.handle.lock().expect("membership handle poisoned") = None;
-                    transition(
-                        &self.lifecycle,
-                        &self.lifecycle_events,
-                        ServiceLifecycleEvent::StartupFailed,
-                    );
+                    let _ = self
+                        .lifecycle_driver
+                        .transition(ServiceLifecycleEvent::StartupFailed);
                     break;
                 }
             }
@@ -130,11 +128,9 @@ impl MembershipJoinRuntime {
                     .expect("service lifecycle poisoned")
                     .recovering_membership();
                 if recovering || self.all_domains_ready() {
-                    transition(
-                        &self.lifecycle,
-                        &self.lifecycle_events,
-                        ServiceLifecycleEvent::SnapshotInstalled,
-                    );
+                    let _ = self
+                        .lifecycle_driver
+                        .transition(ServiceLifecycleEvent::SnapshotInstalled);
                     self.sync_node_health();
                 }
             }
@@ -244,11 +240,9 @@ impl MembershipJoinRuntime {
 
     fn mark_membership_lost(&self) {
         self.ready.store(false, Ordering::Release);
-        transition(
-            &self.lifecycle,
-            &self.lifecycle_events,
-            ServiceLifecycleEvent::MembershipLost,
-        );
+        let _ = self
+            .lifecycle_driver
+            .transition(ServiceLifecycleEvent::MembershipLost);
         self.sync_node_health();
     }
 }
@@ -262,17 +256,6 @@ async fn next_join_event(
         changed = shutdown.changed() => {
             if changed.is_err() || *shutdown.borrow() { None } else { events.recv().await }
         }
-    }
-}
-
-fn transition(
-    lifecycle: &Arc<Mutex<NodeLifecycle>>,
-    events: &watch::Sender<NodeLifecycleState>,
-    event: ServiceLifecycleEvent,
-) {
-    let mut lifecycle = lifecycle.lock().expect("service lifecycle poisoned");
-    if lifecycle.transition(event).is_ok() {
-        events.send_replace(lifecycle.state());
     }
 }
 

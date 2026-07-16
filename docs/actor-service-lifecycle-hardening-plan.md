@@ -1,6 +1,6 @@
 # Lattice Actor and Service Lifecycle Hardening Execution Plan
 
-> Status: planned; implementation has not started
+> Status: complete; all lifecycle batches and final acceptance gates passed
 > Review date: 2026-07-16
 > Primary scope: `lattice-actor`, `lattice-service`, lifecycle-facing parts of `lattice-placement`
 > Architecture baseline: [architecture/](architecture/)
@@ -48,13 +48,17 @@ workspace format/clippy/tests, and documentation agreement.
 ## 0.1 Current Execution Pointer
 
 ```text
-Overall status: planned
-Current batch: Batch A — Actor StopFailed contract and retained runtime cell
-Completed batches: none
-Known broken frontier: none; implementation has not started
-First implementation action: add failing characterization tests for StopFailed retention, DeathWatch,
-retry, force stop, passivation cleanup, and shard drain after idle passivation
-Final completion condition: every invariant and acceptance item in Sections 3 and 8 is executable
+Overall status: complete
+Current batch: none — final acceptance complete
+Completed batches: Batch A, Batch B, Batch C, Batch D, Batch E
+Known broken frontier: none within this plan
+Implemented design frontier: voluntary StopFailed retains the exact Actor instance and Registry
+reservation; terminal cleanup is eager and exactly scoped; external authority loss fences routing and
+moves the old instance into bounded non-authoritative quarantine without waiting for persistence;
+production node lifecycle effects execute through one driver before observable state commits; domain
+and Coordinator-scope health enforce their documented readiness and termination postconditions
+Final completion evidence: focused Actor/placement/service tests, deterministic retained-stop replay
+and failpoint suites, workspace format/clippy/all-features tests, and architecture agreement passed
 ```
 
 ## 0.2 Execution Policy
@@ -326,15 +330,15 @@ service requirements and the managed candidate runtime.
 
 ### Batch A — Retained Actor Cell and StopFailed Contract
 
-- [ ] Add characterization tests demonstrating the current drop-on-StopFailed defect.
-- [ ] Refactor the Actor runtime loop so stopping failure retains the Actor instance.
-- [ ] Add lifecycle-aware rejection of business messages while stopping or failed.
-- [ ] Preserve the previous stop phase and reason for retry.
-- [ ] Add structured `StopFailureRecord` inspection.
-- [ ] Add `RetryStop` system command and ActorHandle/admin entry point.
-- [ ] Add explicit force-stop command with reason, ticket, metrics, logs, and data-loss event.
-- [ ] Make `ActorTerminated` exactly-once and terminal-only.
-- [ ] Define task/child quiescence so no background activity mutates a retained failed Actor.
+- [x] Add characterization tests demonstrating the current drop-on-StopFailed defect.
+- [x] Refactor the Actor runtime loop so stopping failure retains the Actor instance.
+- [x] Add lifecycle-aware rejection of business messages while stopping or failed.
+- [x] Preserve the previous stop phase and reason for retry.
+- [x] Add structured `StopFailureRecord` inspection.
+- [x] Add `RetryStop` system command and ActorHandle/admin entry point.
+- [x] Add explicit force-stop command with reason, ticket, metrics, logs, and data-loss event.
+- [x] Make `ActorTerminated` exactly-once and terminal-only.
+- [x] Define task/child quiescence so no background activity mutates a retained failed Actor.
 
 Batch A acceptance:
 
@@ -345,15 +349,15 @@ Batch A acceptance:
 
 ### Batch B — Registry, Passivation, Drain, and Quarantine
 
-- [ ] Replace lazy terminal cleanup with one eager completion callback owned by Registry/cell runtime.
-- [ ] Clean exact ActivationDirectory entries on every terminal path.
-- [ ] Ensure `running_actor_ids()` excludes stopped, failed, and quarantined cells.
-- [ ] Report retained StopFailed actors separately as drain blockers.
-- [ ] Prevent replacement activation while a voluntary StopFailed cell is retained.
-- [ ] Add bounded quarantine for externally fenced failed Actors.
-- [ ] Remove quarantined activations from current exact/logical routing without dropping the instance.
-- [ ] Add inspect, retry-persist, diagnostics-export, and force-discard quarantine operations.
-- [ ] Make Registry drain return a structured result rather than only an actor count or boolean.
+- [x] Replace lazy terminal cleanup with one eager completion callback owned by Registry/cell runtime.
+- [x] Clean exact ActivationDirectory entries on every terminal path.
+- [x] Ensure `running_actor_ids()` excludes stopped, failed, and quarantined cells.
+- [x] Report retained StopFailed actors separately as drain blockers.
+- [x] Prevent replacement activation while a voluntary StopFailed cell is retained.
+- [x] Add bounded quarantine for externally fenced failed Actors.
+- [x] Remove quarantined activations from current exact/logical routing without dropping the instance.
+- [x] Add inspect, retry-persist, diagnostics-export, and force-discard quarantine operations.
+- [x] Make Registry drain return a structured result rather than only an actor count or boolean.
 
 Batch B acceptance:
 
@@ -365,15 +369,15 @@ Batch B acceptance:
 
 ### Batch C — Service Lifecycle Driver and Admission
 
-- [ ] Introduce one serialized production lifecycle driver.
-- [ ] Consume every `ServiceLifecycleEffect`; make ignored effects impossible or loudly diagnosed.
-- [ ] Install the shared node business-admission gate in inbound and local dispatch paths.
-- [ ] Remove duplicate hand-written effect orchestration from membership, leave, force-stop, and
+- [x] Introduce one serialized production lifecycle driver.
+- [x] Consume every `ServiceLifecycleEffect`; make ignored effects impossible or loudly diagnosed.
+- [x] Install the shared node business-admission gate in inbound and local dispatch paths.
+- [x] Remove duplicate hand-written effect orchestration from membership, leave, force-stop, and
   runtime-termination callers.
-- [ ] Define effect failure and cancellation behavior.
-- [ ] Add `Stopping` if required to avoid publishing `Terminated` before shutdown completion.
-- [ ] Make graceful shutdown return a structured intervention report for retained failures.
-- [ ] Keep force shutdown explicitly destructive and auditable.
+- [x] Define effect failure and cancellation behavior.
+- [x] Add `Stopping` if required to avoid publishing `Terminated` before shutdown completion.
+- [x] Make graceful shutdown return a structured intervention report for retained failures.
+- [x] Keep force shutdown explicitly destructive and auditable.
 
 Batch C acceptance:
 
@@ -384,12 +388,12 @@ Batch C acceptance:
 
 ### Batch D — Domain and Coordinator Health
 
-- [ ] Drive every configured placement domain through Joining/Ready/Degraded/Draining/Terminated.
-- [ ] Publish per-domain drain progress and retained-Actor blockers.
-- [ ] Preserve domain-local degradation without incorrectly disabling unrelated domains.
-- [ ] Expose Coordinator scope Active/Standby/Failed health.
-- [ ] Correct client-only, embedded-candidate, and dedicated-candidate `wait_ready()` semantics.
-- [ ] Ensure application shutdown reports which logic/domain/candidate component blocked completion.
+- [x] Drive every configured placement domain through Joining/Ready/Degraded/Draining/Terminated.
+- [x] Publish per-domain drain progress and retained-Actor blockers.
+- [x] Preserve domain-local degradation without incorrectly disabling unrelated domains.
+- [x] Expose Coordinator scope Active/Standby/Failed health.
+- [x] Correct client-only, embedded-candidate, and dedicated-candidate `wait_ready()` semantics.
+- [x] Ensure application shutdown reports which logic/domain/candidate component blocked completion.
 
 Batch D acceptance:
 
@@ -400,13 +404,13 @@ Batch D acceptance:
 
 ### Batch E — State Naming, Documentation, and Full Acceptance
 
-- [ ] Separate activation/loading state from live Actor-cell lifecycle state.
-- [ ] Remove or implement currently unreachable lifecycle variants.
-- [ ] Update architecture diagrams, API examples, operations guidance, and error semantics.
-- [ ] Add an operator runbook for RetryStop, quarantine recovery, and force-stop data loss.
-- [ ] Add metrics and alerts for StopFailed age/count, quarantine capacity, blocked drain, forced data
+- [x] Separate activation/loading state from live Actor-cell lifecycle state.
+- [x] Remove or implement currently unreachable lifecycle variants.
+- [x] Update architecture diagrams, API examples, operations guidance, and error semantics.
+- [x] Add an operator runbook for RetryStop, quarantine recovery, and force-stop data loss.
+- [x] Add metrics and alerts for StopFailed age/count, quarantine capacity, blocked drain, forced data
   loss, lifecycle-effect failure, and termination latency.
-- [ ] Complete all focused, simulation, integration, and workspace gates.
+- [x] Complete all focused, simulation, integration, and workspace gates.
 
 ---
 
@@ -458,19 +462,19 @@ Batch D acceptance:
 
 All of the following are mandatory before marking this plan complete:
 
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- [ ] `cargo test -p lattice-actor --all-targets`
-- [ ] `cargo test -p lattice-placement --all-targets`
-- [ ] `cargo test -p lattice-service --all-targets`
-- [ ] deterministic lifecycle/placement simulation and replay pass
-- [ ] `cargo test --workspace --all-targets --all-features`
-- [ ] architecture lifecycle diagrams agree with executable state machines
-- [ ] no ignored production `ServiceLifecycleEffect`
-- [ ] no path treats `StopFailed` as terminal without explicit force-stop authorization
-- [ ] no graceful path drops an Actor whose stopping persistence failed
-- [ ] node/domain/candidate health postconditions are asserted by integration tests
-- [ ] operator runbook demonstrates retry recovery and force-stop data-loss handling
+- [x] `cargo fmt --all -- --check`
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- [x] `cargo test -p lattice-actor --all-targets`
+- [x] `cargo test -p lattice-placement --all-targets`
+- [x] `cargo test -p lattice-service --all-targets`
+- [x] deterministic lifecycle/placement simulation and replay pass
+- [x] `cargo test --workspace --all-targets --all-features`
+- [x] architecture lifecycle diagrams agree with executable state machines
+- [x] no ignored production `ServiceLifecycleEffect`
+- [x] no path treats `StopFailed` as terminal without explicit force-stop authorization
+- [x] no graceful path drops an Actor whose stopping persistence failed
+- [x] node/domain/candidate health postconditions are asserted by integration tests
+- [x] operator runbook demonstrates retry recovery and force-stop data-loss handling
 
 ---
 
@@ -483,4 +487,3 @@ All of the following are mandatory before marking this plan complete:
 - Treating process memory as crash-safe storage; quarantine protects against an avoidable runtime drop,
   not machine or process loss.
 - Introducing compatibility aliases or dual old/new lifecycle modes.
-

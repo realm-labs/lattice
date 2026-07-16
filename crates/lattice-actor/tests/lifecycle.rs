@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -466,6 +467,199 @@ async fn stopping_failure_enters_stop_failed_state() {
     .unwrap();
 
     assert_eq!(handle.lifecycle_state(), ActorLifecycleState::StopFailed);
+}
+
+#[tokio::test]
+async fn stopping_failure_retains_actor_state_and_retry_terminates_once() {
+    struct RetainedActor {
+        state: usize,
+        persistence_available: Arc<AtomicBool>,
+        persisted_state: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for RetainedActor {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl Actor for RetainedActor {
+        type Error = ActorError;
+
+        async fn stopping(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _reason: StopReason,
+        ) -> Result<(), ActorStopError> {
+            self.state += 1;
+            if !self.persistence_available.load(Ordering::SeqCst) {
+                return Err(ActorStopError::new("persistence unavailable"));
+            }
+            self.persisted_state.store(self.state, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct RetainedWatcher {
+        target: ActorHandle<RetainedActor>,
+        ready: Arc<Semaphore>,
+        notifications: Arc<Mutex<Vec<TerminatedReason>>>,
+        notified: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl Actor for RetainedWatcher {
+        type Error = ActorError;
+
+        async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+            ctx.watch(&self.target)?;
+            self.ready.add_permits(1);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Handler<ActorTerminated> for RetainedWatcher {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            notification: ActorTerminated,
+        ) -> Result<(), ActorError> {
+            self.notifications.lock().await.push(notification.reason);
+            self.notified.add_permits(1);
+            Ok(())
+        }
+    }
+
+    let persistence_available = Arc::new(AtomicBool::new(false));
+    let persisted_state = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let handle = spawn_actor(
+        RetainedActor {
+            state: 40,
+            persistence_available: persistence_available.clone(),
+            persisted_state: persisted_state.clone(),
+            dropped: dropped.clone(),
+        },
+        MailboxConfig::bounded(8),
+    );
+    let mut lifecycle = handle.subscribe_lifecycle();
+    let mut terminated = handle.subscribe_terminated();
+    let watcher_ready = Arc::new(Semaphore::new(0));
+    let watcher_notifications = Arc::new(Mutex::new(Vec::new()));
+    let watcher_notified = Arc::new(Semaphore::new(0));
+    let _watcher = spawn_actor(
+        RetainedWatcher {
+            target: handle.clone(),
+            ready: watcher_ready.clone(),
+            notifications: watcher_notifications.clone(),
+            notified: watcher_notified.clone(),
+        },
+        MailboxConfig::bounded(8),
+    );
+    watcher_ready.acquire().await.unwrap().forget();
+
+    handle.stop(StopReason::Requested).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while *lifecycle.borrow() != ActorLifecycleState::StopFailed {
+            lifecycle.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert!(terminated.try_recv().is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), watcher_notified.acquire())
+            .await
+            .is_err(),
+        "DeathWatch must remain pending while the exact actor is retained"
+    );
+    let failure = handle.inspect_stop_failure().expect("failure record");
+    assert_eq!(failure.reason, StopReason::Requested);
+    assert_eq!(failure.attempt_count, 1);
+
+    persistence_available.store(true, Ordering::SeqCst);
+    handle.retry_stop().await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(1), terminated.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.reason, TerminatedReason::Stopped);
+    assert_eq!(persisted_state.load(Ordering::SeqCst), 42);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert!(terminated.try_recv().is_err());
+    watcher_notified.acquire().await.unwrap().forget();
+    assert_eq!(
+        *watcher_notifications.lock().await,
+        vec![TerminatedReason::Stopped]
+    );
+}
+
+#[tokio::test]
+async fn stop_failed_rejects_business_traffic_but_accepts_force_stop() {
+    #[derive(lattice_actor::Message)]
+    struct BusinessMessage;
+
+    struct RetainedActor;
+
+    #[async_trait]
+    impl Actor for RetainedActor {
+        type Error = ActorError;
+
+        async fn stopping(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _reason: StopReason,
+        ) -> Result<(), ActorStopError> {
+            Err(ActorStopError::new("save failed"))
+        }
+    }
+
+    #[async_trait]
+    impl Handler<BusinessMessage> for RetainedActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _msg: BusinessMessage,
+        ) -> Result<(), ActorError> {
+            panic!("business message must not reach a retained actor")
+        }
+    }
+
+    let handle = spawn_actor(RetainedActor, MailboxConfig::bounded(8));
+    let mut lifecycle = handle.subscribe_lifecycle();
+    let mut data_loss = handle.subscribe_forced_data_loss();
+    handle.stop(StopReason::Requested).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while *lifecycle.borrow() != ActorLifecycleState::StopFailed {
+            lifecycle.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        handle.tell(BusinessMessage).await,
+        Err(lattice_actor::error::ActorTellError::LifecycleUnavailable {
+            state: ActorLifecycleState::StopFailed
+        })
+    ));
+
+    handle
+        .force_stop("approved state discard", "INC-1234")
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(1), data_loss.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.reason, "approved state discard");
+    assert_eq!(event.ticket, "INC-1234");
+    assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopped);
 }
 
 #[tokio::test]

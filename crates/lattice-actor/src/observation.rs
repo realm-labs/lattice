@@ -1,12 +1,43 @@
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use lattice_core::actor_ref::ActorRef;
 
 use crate::traits::{MessageKind, MessageMetadata, MessageOutcome, StopReason};
 use crate::watch::LocalActorRef;
+
+static ACTIVE_STOP_FAILURES: AtomicU64 = AtomicU64::new(0);
+static STOP_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FORCED_DATA_LOSS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorLifecycleMetricsSnapshot {
+    pub active_stop_failures: u64,
+    pub stop_failures_total: u64,
+    pub forced_data_loss_total: u64,
+}
+
+pub fn actor_lifecycle_metrics() -> ActorLifecycleMetricsSnapshot {
+    ActorLifecycleMetricsSnapshot {
+        active_stop_failures: ACTIVE_STOP_FAILURES.load(Ordering::Relaxed),
+        stop_failures_total: STOP_FAILURES_TOTAL.load(Ordering::Relaxed),
+        forced_data_loss_total: FORCED_DATA_LOSS_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+pub(crate) fn record_new_stop_failure() {
+    ACTIVE_STOP_FAILURES.fetch_add(1, Ordering::Relaxed);
+    STOP_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_resolved_stop_failure(forced: bool) {
+    ACTIVE_STOP_FAILURES.fetch_sub(1, Ordering::Relaxed);
+    if forced {
+        FORCED_DATA_LOSS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorMetadata {
@@ -57,6 +88,7 @@ pub enum RequestCompletion {
     DeadlineExceeded,
     MailboxFull,
     MailboxClosed,
+    LifecycleUnavailable,
     CallerDropped,
 }
 
@@ -66,6 +98,8 @@ pub enum ActorLifecycleEvent {
     StartFailed,
     Stopped(StopReason),
     StopFailed(StopReason),
+    StopRetried(StopReason),
+    ForcedDataLoss(StopReason),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -25,7 +25,7 @@ pub struct LatticeService {
     coordinator_shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
     coordinator_handles:
         std::sync::Mutex<BTreeMap<lattice_core::actor_ref::PlacementDomainId, CoordinatorHandle>>,
-    lifecycle: Arc<std::sync::Mutex<NodeLifecycle>>,
+    lifecycle_driver: ProductionLifecycleDriver,
     lifecycle_events: watch::Sender<NodeLifecycleState>,
     health: Arc<std::sync::Mutex<ServiceHealthSnapshot>>,
     health_events: watch::Sender<ServiceHealthSnapshot>,
@@ -33,6 +33,9 @@ pub struct LatticeService {
     peers: Arc<PeerReconciler>,
     bootstrap_view: Arc<BootstrapView>,
     drain_ready: watch::Sender<BTreeMap<lattice_core::actor_ref::PlacementDomainId, String>>,
+    drain_blockers: watch::Sender<
+        BTreeMap<lattice_core::actor_ref::PlacementDomainId, BTreeSet<lattice_placement::types::PlacementSlotKey>>,
+    >,
     configured_domains: BTreeSet<lattice_core::actor_ref::PlacementDomainId>,
     drain_operation: std::sync::Mutex<Option<String>>,
     join_config: ClusterJoinConfig,
@@ -134,10 +137,7 @@ impl LatticeService {
     }
 
     pub fn node_lifecycle_state(&self) -> NodeLifecycleState {
-        self.lifecycle
-            .lock()
-            .expect("service lifecycle poisoned")
-            .state()
+        self.lifecycle_driver.state()
     }
 
     pub fn subscribe_node_lifecycle(&self) -> watch::Receiver<NodeLifecycleState> {
@@ -174,31 +174,16 @@ impl LatticeService {
     }
 
     fn transition(&self, event: ServiceLifecycleEvent) -> Result<(), ServiceError> {
-        let mut lifecycle = self.lifecycle.lock().expect("service lifecycle poisoned");
-        let previous = lifecycle.state();
-        lifecycle
+        self.lifecycle_driver
             .transition(event)
             .map_err(ServiceError::Lifecycle)?;
-        let next = lifecycle.state();
-        {
-            let mut health = self.health.lock().expect("service health poisoned");
-            health.node = next;
-            self.health_events.send_replace(health.clone());
-        }
-        tracing::info!(
-            target: "lattice.cluster.lifecycle",
-            ?event,
-            ?previous,
-            ?next,
-            "member lifecycle transition"
-        );
-        self.lifecycle_events.send_replace(next);
         Ok(())
     }
 
     pub async fn start(&self) -> Result<(), ServiceError> {
         if let Err(error) = self.endpoint.bind().await {
             let _ = self.transition(ServiceLifecycleEvent::StartupFailed);
+            let _ = self.stop_components().await;
             return Err(ServiceError::Endpoint(error));
         }
         self.transition(ServiceLifecycleEvent::RemotingReady)?;
@@ -209,6 +194,7 @@ impl LatticeService {
             .take()
         {
             let mut directory = runtime.directory;
+            let mut scope_states = runtime.scope_states;
             let bootstrap_view = self.bootstrap_view.clone();
             let cluster_id = self.cluster_id.clone();
             self.supervisor.spawn(async move {
@@ -235,6 +221,33 @@ impl LatticeService {
                     }
                 }
             })?;
+            let health = self.health.clone();
+            let health_events = self.health_events.clone();
+            self.supervisor.spawn(async move {
+                loop {
+                    let scopes = scope_states
+                        .borrow_and_update()
+                        .iter()
+                        .map(|(scope, state)| {
+                            let state = match state {
+                                lattice_placement::runtime::host::CoordinatorHostScopeState::Active(_) => crate::lifecycle::CoordinatorScopeState::Active,
+                                lattice_placement::runtime::host::CoordinatorHostScopeState::Standby => crate::lifecycle::CoordinatorScopeState::Standby,
+                                lattice_placement::runtime::host::CoordinatorHostScopeState::Failed => crate::lifecycle::CoordinatorScopeState::Failed,
+                            };
+                            (scope.clone(), state)
+                        })
+                        .collect();
+                    let snapshot = {
+                        let mut health = health.lock().expect("service health poisoned");
+                        health.coordinator_scopes = scopes;
+                        health.clone()
+                    };
+                    health_events.send_replace(snapshot);
+                    if scope_states.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })?;
             *self
                 .coordinator_shutdown
                 .lock()
@@ -243,19 +256,12 @@ impl LatticeService {
                 .coordinator_handles
                 .lock()
                 .expect("service Coordinator handles poisoned") = runtime.handles;
-            let lifecycle = self.lifecycle.clone();
-            let lifecycle_events = self.lifecycle_events.clone();
+            let lifecycle_driver = self.lifecycle_driver.clone();
             let endpoint = self.endpoint.clone();
             self.supervisor.spawn(async move {
                 runtime.future.await;
                 let _ = endpoint.shutdown().await;
-                let mut lifecycle = lifecycle.lock().expect("service lifecycle poisoned");
-                if lifecycle
-                    .transition(ServiceLifecycleEvent::RuntimeTerminated)
-                    .is_ok()
-                {
-                    lifecycle_events.send_replace(lifecycle.state());
-                }
+                let _ = lifecycle_driver.transition(ServiceLifecycleEvent::RuntimeTerminated);
             })?;
         }
         let join_runtimes = std::mem::take(
@@ -305,16 +311,14 @@ impl LatticeService {
                 router,
             } = runtime;
             let readiness_handle = handle.clone();
-            let lifecycle = self.lifecycle.clone();
-            let lifecycle_events = self.lifecycle_events.clone();
+            let lifecycle_driver = self.lifecycle_driver.clone();
             self.supervisor.spawn(async move {
                 let changed = readiness_handle.change_notifier();
                 loop {
                     if readiness_handle.ready() {
-                        let mut lifecycle = lifecycle.lock().expect("service lifecycle poisoned");
-                        if lifecycle.state() == NodeLifecycleState::JoiningMembership {
-                            let _ = lifecycle.transition(ServiceLifecycleEvent::SnapshotInstalled);
-                            lifecycle_events.send_replace(lifecycle.state());
+                        if lifecycle_driver.state() == NodeLifecycleState::JoiningMembership {
+                            let _ = lifecycle_driver
+                                .transition(ServiceLifecycleEvent::SnapshotInstalled);
                         }
                         break;
                     }
@@ -334,6 +338,7 @@ impl LatticeService {
             let watches = self.watches.clone();
             let peers = self.peers.clone();
             let drain_ready = self.drain_ready.clone();
+            let drain_blockers = self.drain_blockers.clone();
             self.supervisor.spawn(async move {
                 while let Some(effect) = effects.recv().await {
                     let (slot, effect) = match effect {
@@ -404,8 +409,22 @@ impl LatticeService {
                             handle.complete_drain(slot, succeeded).await
                         }
                         AuthorityEffect::PublishReady => handle.publish_ready(&slot),
-                        AuthorityEffect::PublishDrained => handle.publish_drained(&slot),
-                        AuthorityEffect::PublishStopFailed => handle.publish_stop_failed(&slot),
+                        AuthorityEffect::PublishDrained => {
+                            let result = handle.publish_drained(&slot);
+                            let mut blockers = drain_blockers.borrow().clone();
+                            if let Some(slots) = blockers.get_mut(&domain) {
+                                slots.remove(&slot);
+                            }
+                            drain_blockers.send_replace(blockers);
+                            result
+                        }
+                        AuthorityEffect::PublishStopFailed => {
+                            let result = handle.publish_stop_failed(&slot);
+                            let mut blockers = drain_blockers.borrow().clone();
+                            blockers.entry(domain.clone()).or_default().insert(slot);
+                            drain_blockers.send_replace(blockers);
+                            result
+                        }
                         AuthorityEffect::StopSlot => {
                             router.stop_fenced_slot(slot).await.map_err(|_| {
                                 lattice_placement::session::LogicSessionError::ControlClosed
@@ -438,13 +457,22 @@ impl LatticeService {
     pub async fn leave(&self, deadline: tokio::time::Instant) -> Result<(), ServiceError> {
         match self.node_lifecycle_state() {
             NodeLifecycleState::Terminated => return Ok(()),
-            NodeLifecycleState::Booting | NodeLifecycleState::JoiningMembership => {
-                return self.force_shutdown().await;
+            NodeLifecycleState::Booting => {
+                self.transition(ServiceLifecycleEvent::StartupFailed)?;
+                return self.stop_components().await;
+            }
+            NodeLifecycleState::JoiningMembership => {
+                self.transition(ServiceLifecycleEvent::BeginDrain)?;
+                self.drain_blockers.send_replace(BTreeMap::new());
+                crate::lifecycle::record_blocked_drain_slots(0);
             }
             NodeLifecycleState::Ready => {
                 self.transition(ServiceLifecycleEvent::BeginDrain)?;
+                self.drain_blockers.send_replace(BTreeMap::new());
+                crate::lifecycle::record_blocked_drain_slots(0);
             }
             NodeLifecycleState::Draining => {}
+            NodeLifecycleState::Stopping => return self.stop_components().await,
         }
         let operation_id = {
             let mut operation = self
@@ -476,6 +504,10 @@ impl LatticeService {
                     .get(domain)
                     .is_some_and(|completed| completed == &operation_id)
             }) {
+                if self.configured_domains.is_empty() {
+                    self.transition(ServiceLifecycleEvent::DrainComplete)?;
+                    return self.stop_components().await;
+                }
                 let membership = self
                     .membership_handle
                     .lock()
@@ -500,7 +532,7 @@ impl LatticeService {
                         Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                             return Err(ServiceError::CoordinatorUnavailable);
                         }
-                        Err(_) => return Err(ServiceError::LeaveTimeout),
+                        Err(_) => return Err(self.drain_timeout_error()),
                     }
                 }
                 self.transition(ServiceLifecycleEvent::DrainComplete)?;
@@ -508,29 +540,23 @@ impl LatticeService {
             }
             tokio::time::timeout_at(deadline, ready.changed())
                 .await
-                .map_err(|_| ServiceError::LeaveTimeout)?
+                .map_err(|_| self.drain_timeout_error())?
                 .map_err(|_| ServiceError::CoordinatorUnavailable)?;
         }
     }
 
     pub async fn shutdown(&self) -> Result<(), ServiceError> {
         let deadline = tokio::time::Instant::now() + self.join_config.leave_timeout;
-        if self
-            .join_shutdown
-            .lock()
-            .expect("service join shutdown poisoned")
-            .is_some()
-            && self.leave(deadline).await.is_ok()
-        {
-            return Ok(());
-        }
-        self.force_shutdown().await
+        self.leave(deadline).await
     }
 
     pub async fn force_shutdown(&self) -> Result<(), ServiceError> {
         let state = self.node_lifecycle_state();
         if state == NodeLifecycleState::Terminated {
             return Ok(());
+        }
+        if state == NodeLifecycleState::Stopping {
+            return self.stop_components().await;
         }
         tracing::warn!(
             target: "lattice.cluster.lifecycle",
@@ -573,9 +599,32 @@ impl LatticeService {
         self.supervisor
             .shutdown(self.join_config.shutdown_timeout)
             .await?;
-        if self.node_lifecycle_state() == NodeLifecycleState::Draining {
+        if self.node_lifecycle_state() == NodeLifecycleState::Stopping {
+            for domain in &self.configured_domains {
+                self.lifecycle_driver
+                    .set_domain_state(domain.clone(), PlacementDomainState::Terminated);
+            }
             self.transition(ServiceLifecycleEvent::ShutdownComplete)?;
         }
         Ok(())
+    }
+
+    fn drain_timeout_error(&self) -> ServiceError {
+        let blocked_slots = self
+            .drain_blockers
+            .borrow()
+            .iter()
+            .filter(|(_, slots)| !slots.is_empty())
+            .map(|(domain, slots)| (domain.clone(), slots.iter().cloned().collect()))
+            .collect();
+        let report = crate::lifecycle::LifecycleInterventionReport { blocked_slots };
+        if report.blocked_slots.is_empty() {
+            ServiceError::LeaveTimeout
+        } else {
+            crate::lifecycle::record_blocked_drain_slots(
+                report.blocked_slots.values().map(Vec::len).sum(),
+            );
+            ServiceError::InterventionRequired(report)
+        }
     }
 }

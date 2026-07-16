@@ -106,6 +106,7 @@ where
     membership_associations:
         BTreeMap<NodeIncarnation, lattice_remoting::association::AssociationKey>,
     directory_events: watch::Sender<BTreeMap<CoordinatorScope, LeaderRecord>>,
+    scope_events: watch::Sender<BTreeMap<CoordinatorScope, CoordinatorHostScopeState>>,
     config: CoordinatorHostConfig,
 }
 
@@ -195,6 +196,15 @@ where
             }
         }
         let (directory_events, _) = watch::channel(directory);
+        let mut scope_states = BTreeMap::new();
+        scope_states.insert(CoordinatorScope::Membership, membership_state.clone());
+        for (domain, hosted) in &hosted {
+            scope_states.insert(
+                CoordinatorScope::Placement(domain.clone()),
+                hosted.state.clone(),
+            );
+        }
+        let (scope_events, _) = watch::channel(scope_states);
         Ok(Self {
             store,
             associations,
@@ -206,6 +216,7 @@ where
             pending_member_hellos: BTreeMap::new(),
             membership_associations: BTreeMap::new(),
             directory_events,
+            scope_events,
             config,
         })
     }
@@ -231,6 +242,12 @@ where
 
     pub fn subscribe_directory(&self) -> watch::Receiver<BTreeMap<CoordinatorScope, LeaderRecord>> {
         self.directory_events.subscribe()
+    }
+
+    pub fn subscribe_scope_states(
+        &self,
+    ) -> watch::Receiver<BTreeMap<CoordinatorScope, CoordinatorHostScopeState>> {
+        self.scope_events.subscribe()
     }
 
     pub fn active_domain_leaders(
@@ -739,6 +756,15 @@ where
             }
         }
         self.directory_events.send_replace(directory);
+        let mut scopes = BTreeMap::new();
+        scopes.insert(CoordinatorScope::Membership, self.membership_state.clone());
+        for (domain, hosted) in &self.domains {
+            scopes.insert(
+                CoordinatorScope::Placement(domain.clone()),
+                hosted.state.clone(),
+            );
+        }
+        self.scope_events.send_replace(scopes);
     }
 
     async fn fanout_global_member_removals(&self) -> Result<(), CoordinatorRuntimeError> {

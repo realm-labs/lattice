@@ -37,6 +37,10 @@ impl ActorStopError {
             message: message.into(),
         }
     }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -47,6 +51,10 @@ pub enum ActorCallError {
     MailboxFull,
     #[error("actor mailbox is closed")]
     MailboxClosed,
+    #[error("actor does not admit business traffic while lifecycle state is {state:?}")]
+    LifecycleUnavailable {
+        state: crate::traits::ActorLifecycleState,
+    },
     #[error("actor dropped the response before replying")]
     ResponseDropped,
     #[error("actor ask deadline elapsed before a response completed")]
@@ -89,6 +97,27 @@ pub enum ActorTellError {
     MailboxFull,
     #[error("actor mailbox is closed")]
     MailboxClosed,
+    #[error("actor does not admit business traffic while lifecycle state is {state:?}")]
+    LifecycleUnavailable {
+        state: crate::traits::ActorLifecycleState,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ActorAdminError {
+    #[error("actor admin operation {operation} is invalid while lifecycle state is {state:?}")]
+    InvalidState {
+        operation: &'static str,
+        state: crate::traits::ActorLifecycleState,
+    },
+    #[error("actor system mailbox is full")]
+    MailboxFull,
+    #[error("actor system mailbox is closed")]
+    MailboxClosed,
+    #[error("actor stopping persistence failed: {0}")]
+    StopFailed(ActorStopError),
+    #[error("actor admin operation response was dropped")]
+    ResponseDropped,
 }
 
 impl From<ActorTellError> for ActorError {
@@ -107,6 +136,10 @@ pub enum ActorActivationError {
     WaiterTimeout { timeout: Duration },
     #[error("actor activation failed: {0}")]
     ActivationFailed(ActorError),
+    #[error("actor activation is retained after stopping persistence failed")]
+    RetainedStopFailure,
+    #[error("actor activation is quarantined after external authority loss")]
+    Quarantined,
 }
 
 #[derive(Debug, Clone, Error)]

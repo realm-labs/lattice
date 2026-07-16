@@ -111,18 +111,56 @@ impl LatticeApplication {
     }
 
     pub async fn wait_ready(&self, timeout: Duration) -> Result<(), ServiceError> {
-        let service = self
-            .logic
-            .as_ref()
-            .or(self.coordinator.as_ref())
-            .ok_or(ServiceError::InvalidDeployment)?;
-        let mut lifecycle = service.subscribe_node_lifecycle();
         tokio::time::timeout(timeout, async {
-            while *lifecycle.borrow() != NodeLifecycleState::Ready {
-                lifecycle
-                    .changed()
-                    .await
-                    .map_err(|_| ServiceError::TaskFailed)?;
+            if let Some(logic) = &self.logic {
+                let mut health = logic.subscribe_health();
+                loop {
+                    let ready =
+                        health.borrow().node == NodeLifecycleState::Ready
+                            && health.borrow().domains.values().all(|state| {
+                                *state == crate::lifecycle::PlacementDomainState::Ready
+                            });
+                    if ready {
+                        break;
+                    }
+                    if matches!(
+                        health.borrow().node,
+                        NodeLifecycleState::Stopping | NodeLifecycleState::Terminated
+                    ) {
+                        return Err(ServiceError::TaskFailed);
+                    }
+                    health
+                        .changed()
+                        .await
+                        .map_err(|_| ServiceError::TaskFailed)?;
+                }
+            }
+            if let Some(coordinator) = &self.coordinator {
+                let mut health = coordinator.subscribe_health();
+                loop {
+                    let ready = health.borrow().node == NodeLifecycleState::Ready
+                        && !health.borrow().coordinator_scopes.is_empty()
+                        && health.borrow().coordinator_scopes.values().all(|state| {
+                            matches!(
+                                state,
+                                crate::lifecycle::CoordinatorScopeState::Active
+                                    | crate::lifecycle::CoordinatorScopeState::Standby
+                            )
+                        });
+                    if ready {
+                        break;
+                    }
+                    if matches!(
+                        health.borrow().node,
+                        NodeLifecycleState::Stopping | NodeLifecycleState::Terminated
+                    ) {
+                        return Err(ServiceError::TaskFailed);
+                    }
+                    health
+                        .changed()
+                        .await
+                        .map_err(|_| ServiceError::TaskFailed)?;
+                }
             }
             Ok::<(), ServiceError>(())
         })
@@ -136,13 +174,19 @@ impl LatticeApplication {
         if let Some(logic) = &self.logic
             && let Err(error) = logic.shutdown().await
         {
-            first_error = Some(error);
+            first_error = Some(ServiceError::ApplicationShutdown {
+                component: "logic",
+                source: Box::new(error),
+            });
         }
         if let Some(coordinator) = &self.coordinator
-            && let Err(error) = coordinator.force_shutdown().await
+            && let Err(error) = coordinator.shutdown().await
             && first_error.is_none()
         {
-            first_error = Some(error);
+            first_error = Some(ServiceError::ApplicationShutdown {
+                component: "coordinator-candidate",
+                source: Box::new(error),
+            });
         }
         match first_error {
             Some(error) => Err(error),
@@ -263,6 +307,7 @@ mod tests {
     use super::{CoordinatorDeploymentMode, EmbeddedCoordinatorConfig, LatticeApplication};
     use crate::builder::LatticeService;
     use crate::config::NodeConfig;
+    use crate::lifecycle::NodeLifecycleState;
     use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
     use lattice_placement::runtime::host::CoordinatorHostConfig;
     use lattice_placement::storage::InMemoryPlacementStore;
@@ -310,6 +355,10 @@ mod tests {
             .await
             .unwrap();
         application.shutdown().await.unwrap();
+        assert_eq!(
+            application.logic().unwrap().node_lifecycle_state(),
+            NodeLifecycleState::Terminated
+        );
     }
 
     #[tokio::test]
@@ -335,7 +384,21 @@ mod tests {
             .wait_ready(Duration::from_secs(2))
             .await
             .unwrap();
+        let health = application.coordinator_service().unwrap().health_snapshot();
+        assert!(!health.coordinator_scopes.is_empty());
+        assert!(health.coordinator_scopes.values().all(|state| matches!(
+            state,
+            crate::lifecycle::CoordinatorScopeState::Active
+                | crate::lifecycle::CoordinatorScopeState::Standby
+        )));
         application.shutdown().await.unwrap();
+        assert_eq!(
+            application
+                .coordinator_service()
+                .unwrap()
+                .node_lifecycle_state(),
+            NodeLifecycleState::Terminated
+        );
     }
 
     #[tokio::test]

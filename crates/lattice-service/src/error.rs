@@ -54,8 +54,16 @@ pub enum ServiceError {
     InvalidPlacementDomains,
     #[error("graceful member leave exceeded its deadline")]
     LeaveTimeout,
+    #[error("graceful shutdown requires operator intervention: {0:?}")]
+    InterventionRequired(crate::lifecycle::LifecycleInterventionReport),
     #[error("Coordinator deployment configuration is invalid")]
     InvalidDeployment,
     #[error("service readiness wait exceeded its deadline")]
     ReadinessTimeout,
+    #[error("application component {component} blocked shutdown")]
+    ApplicationShutdown {
+        component: &'static str,
+        #[source]
+        source: Box<ServiceError>,
+    },
 }

@@ -1,5 +1,6 @@
 use std::fmt;
 use std::future::Future;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -12,16 +13,19 @@ use lattice_core::actor_ref::{
 use lattice_core::id::ActorId;
 use lattice_core::kind::ActorKind;
 use lattice_core::service_context::ServiceContext;
+use thiserror::Error;
 use tokio::sync::{Semaphore, watch};
 
 use crate::error::{ActorActivationError, ActorError};
-use crate::handle::ActorHandle;
+use crate::handle::{ActorHandle, StopFailureRecord};
 use crate::mailbox::MailboxConfig;
 use crate::observation::ActorObserverHandle;
 use crate::protocol::{ActorProtocolBinding, Protocol};
 use crate::recipient::ActorSystem;
 use crate::runtime::{PassivationPolicy, ShardMigrationPolicy, spawn_actor_with_self_ref};
-use crate::traits::{Actor, ActorLifecycleState, PassivationReason, StopReason};
+use crate::traits::{
+    Actor, ActorLifecycleState, EntityActivationState, PassivationReason, StopReason,
+};
 
 #[derive(Debug, Clone)]
 pub struct ActorRegistryConfig {
@@ -30,6 +34,7 @@ pub struct ActorRegistryConfig {
     pub shard_migration: ShardMigrationPolicy,
     pub waiter_capacity: usize,
     pub waiter_timeout: Duration,
+    pub quarantine_capacity: usize,
     pub actor_ref: Option<ActorRefConfig>,
     pub service: ServiceContext,
 }
@@ -49,6 +54,7 @@ impl Default for ActorRegistryConfig {
             shard_migration: ShardMigrationPolicy::BlockRunningActors,
             waiter_capacity: 1024,
             waiter_timeout: Duration::from_secs(5),
+            quarantine_capacity: 1024,
             actor_ref: None,
             service: ServiceContext::empty(),
         }
@@ -60,6 +66,7 @@ pub struct ActorRegistry<A: Actor> {
     config: ActorRegistryConfig,
     protocol_id: Option<ProtocolId>,
     entries: Arc<DashMap<ActorId, RegistryEntry<A>>>,
+    quarantined: Arc<DashMap<ActorId, ActorHandle<A>>>,
     actor_system: Arc<OnceLock<ActorSystem>>,
     observer: ActorObserverHandle,
 }
@@ -80,6 +87,52 @@ pub struct ActorCreateContext {
     pub actor_kind: ActorKind,
     pub actor_id: ActorId,
     pub service: ServiceContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedActorFailure {
+    pub actor_id: ActorId,
+    pub local_ref: crate::watch::LocalActorRef,
+    pub failure: StopFailureRecord,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistryDrainResult {
+    pub requested: usize,
+    pub stopped: usize,
+    pub retained_failures: Vec<RetainedActorFailure>,
+    pub request_failures: Vec<ActorId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineDiagnostics {
+    pub actor_id: ActorId,
+    pub local_ref: crate::watch::LocalActorRef,
+    pub actor_ref: Option<ActorRef>,
+    pub failure: StopFailureRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorRegistryMetricsSnapshot {
+    pub retained_stop_failures: usize,
+    pub quarantine_used: usize,
+    pub quarantine_capacity: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ActorQuarantineError {
+    #[error("actor is not retained in StopFailed")]
+    NotRetained,
+    #[error("actor quarantine capacity {capacity} is exhausted")]
+    Capacity { capacity: usize },
+    #[error(transparent)]
+    Admin(#[from] crate::error::ActorAdminError),
+}
+
+impl RegistryDrainResult {
+    pub fn completed(&self) -> bool {
+        self.retained_failures.is_empty() && self.request_failures.is_empty()
+    }
 }
 
 #[async_trait]
@@ -104,11 +157,16 @@ impl<A: Actor> ActorRegistry<A> {
             config.actor_ref.is_none(),
             "registries with exact ActorRefs must be constructed with ActorRegistry::new_bound"
         );
+        assert!(
+            config.quarantine_capacity > 0,
+            "quarantine capacity must be nonzero"
+        );
         Self {
             kind,
             config,
             protocol_id: None,
             entries: Arc::new(DashMap::new()),
+            quarantined: Arc::new(DashMap::new()),
             actor_system: Arc::new(OnceLock::new()),
             observer: ActorObserverHandle::default(),
         }
@@ -122,11 +180,16 @@ impl<A: Actor> ActorRegistry<A> {
         config: ActorRegistryConfig,
         protocol: &ActorProtocolBinding<A, P>,
     ) -> Self {
+        assert!(
+            config.quarantine_capacity > 0,
+            "quarantine capacity must be nonzero"
+        );
         Self {
             kind,
             config,
             protocol_id: Some(protocol.protocol_id()),
             entries: Arc::new(DashMap::new()),
+            quarantined: Arc::new(DashMap::new()),
             actor_system: Arc::new(OnceLock::new()),
             observer: ActorObserverHandle::default(),
         }
@@ -158,10 +221,159 @@ impl<A: Actor> ActorRegistry<A> {
         self.entries
             .iter()
             .filter_map(|entry| match entry.value() {
-                RegistryEntry::Running(_) => Some(entry.key().clone()),
+                RegistryEntry::Running(handle)
+                    if is_business_admitted(handle.lifecycle_state()) =>
+                {
+                    Some(entry.key().clone())
+                }
+                RegistryEntry::Running(_) => None,
                 RegistryEntry::Activating(_) => None,
             })
             .collect()
+    }
+
+    pub fn activation_state(&self, actor_id: &ActorId) -> EntityActivationState {
+        match self.entries.get(actor_id).as_deref() {
+            Some(RegistryEntry::Running(_)) => EntityActivationState::Active,
+            Some(RegistryEntry::Activating(activation)) => activation.state(),
+            None => EntityActivationState::Absent,
+        }
+    }
+
+    pub fn retained_stop_failures(&self) -> Vec<RetainedActorFailure> {
+        let mut failures = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                RegistryEntry::Running(handle)
+                    if handle.lifecycle_state() == ActorLifecycleState::StopFailed =>
+                {
+                    handle
+                        .inspect_stop_failure()
+                        .map(|failure| RetainedActorFailure {
+                            actor_id: entry.key().clone(),
+                            local_ref: handle.local_ref(),
+                            failure,
+                        })
+                }
+                RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
+            })
+            .collect::<Vec<_>>();
+        failures.sort_by(|left, right| left.actor_id.cmp(&right.actor_id));
+        failures
+    }
+
+    pub fn quarantine_len(&self) -> usize {
+        self.quarantined.len()
+    }
+
+    pub fn lifecycle_metrics(&self) -> ActorRegistryMetricsSnapshot {
+        ActorRegistryMetricsSnapshot {
+            retained_stop_failures: self.retained_stop_failures().len(),
+            quarantine_used: self.quarantined.len(),
+            quarantine_capacity: self.config.quarantine_capacity,
+        }
+    }
+
+    pub fn inspect_quarantined(&self, actor_id: &ActorId) -> Option<QuarantineDiagnostics> {
+        let handle = self.quarantined.get(actor_id)?;
+        Some(QuarantineDiagnostics {
+            actor_id: actor_id.clone(),
+            local_ref: handle.local_ref(),
+            actor_ref: handle.actor_ref().map(ActorRef::erase),
+            failure: handle.inspect_stop_failure()?,
+        })
+    }
+
+    pub fn export_quarantine_diagnostics(&self, actor_id: &ActorId) -> Option<String> {
+        self.inspect_quarantined(actor_id)
+            .map(|diagnostics| format!("{diagnostics:#?}"))
+    }
+
+    pub async fn quarantine_after_authority_loss(
+        &self,
+        actor_id: &ActorId,
+    ) -> Result<QuarantineDiagnostics, ActorQuarantineError> {
+        self.fence_after_authority_loss(actor_id).await?;
+        self.inspect_quarantined(actor_id)
+            .ok_or(ActorQuarantineError::NotRetained)
+    }
+
+    pub async fn fence_after_authority_loss(
+        &self,
+        actor_id: &ActorId,
+    ) -> Result<(), ActorQuarantineError> {
+        let handle = self
+            .entry_handle(actor_id)
+            .ok_or(ActorQuarantineError::NotRetained)?;
+        let was_retained = handle.mark_external_authority_lost();
+        if self.quarantined.len() >= self.config.quarantine_capacity
+            && !self.quarantined.contains_key(actor_id)
+        {
+            tracing::error!(
+                actor.id = ?actor_id,
+                quarantine.capacity = self.config.quarantine_capacity,
+                "external authority was fenced but quarantine capacity is exhausted; operator intervention is mandatory"
+            );
+            return Err(ActorQuarantineError::Capacity {
+                capacity: self.config.quarantine_capacity,
+            });
+        }
+        self.entries.remove_if(actor_id, |_, entry| {
+            matches!(entry, RegistryEntry::Running(current) if current.local_ref() == handle.local_ref())
+        });
+        if let Some(directory) = self
+            .config
+            .service
+            .extension::<crate::directory::ActivationDirectory>()
+            && let Some(reference) = handle.actor_ref()
+        {
+            directory.remove(&reference.erase());
+        }
+        self.quarantined.insert(actor_id.clone(), handle);
+        let handle = self
+            .quarantined
+            .get(actor_id)
+            .map(|entry| entry.clone())
+            .ok_or(ActorQuarantineError::NotRetained)?;
+        handle
+            .begin_fenced_stop(was_retained, StopReason::AuthorityLost)
+            .map_err(|error| match error {
+                crate::error::ActorTellError::MailboxFull => {
+                    crate::error::ActorAdminError::MailboxFull
+                }
+                crate::error::ActorTellError::MailboxClosed
+                | crate::error::ActorTellError::LifecycleUnavailable { .. } => {
+                    crate::error::ActorAdminError::MailboxClosed
+                }
+            })
+            .map_err(ActorQuarantineError::Admin)?;
+        Ok(())
+    }
+
+    pub async fn retry_quarantined(&self, actor_id: &ActorId) -> Result<(), ActorQuarantineError> {
+        let handle = self
+            .quarantined
+            .get(actor_id)
+            .map(|entry| entry.clone())
+            .ok_or(ActorQuarantineError::NotRetained)?;
+        handle.retry_stop().await?;
+        Ok(())
+    }
+
+    pub async fn force_discard_quarantined(
+        &self,
+        actor_id: &ActorId,
+        reason: impl Into<String>,
+        ticket: impl Into<String>,
+    ) -> Result<(), ActorQuarantineError> {
+        let handle = self
+            .quarantined
+            .get(actor_id)
+            .map(|entry| entry.clone())
+            .ok_or(ActorQuarantineError::NotRetained)?;
+        handle.force_stop(reason, ticket).await?;
+        Ok(())
     }
 
     pub async fn get(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
@@ -170,13 +382,12 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub fn get_running(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
         match self.entries.get(actor_id).as_deref() {
-            Some(RegistryEntry::Running(handle)) if !is_terminal(handle.lifecycle_state()) => {
+            Some(RegistryEntry::Running(handle))
+                if is_business_admitted(handle.lifecycle_state()) =>
+            {
                 Some(handle.clone())
             }
-            Some(RegistryEntry::Running(_)) => {
-                self.entries.remove(actor_id);
-                None
-            }
+            Some(RegistryEntry::Running(_)) => None,
             Some(RegistryEntry::Activating(_)) | None => None,
         }
     }
@@ -200,7 +411,7 @@ impl<A: Actor> ActorRegistry<A> {
         }
         self.entries.iter().find_map(|entry| match entry.value() {
             RegistryEntry::Running(handle)
-                if !is_terminal(handle.lifecycle_state())
+                if is_business_admitted(handle.lifecycle_state())
                     && handle
                         .actor_ref()
                         .is_some_and(|current| current.same_activation(actor_ref)) =>
@@ -212,44 +423,81 @@ impl<A: Actor> ActorRegistry<A> {
     }
 
     pub async fn remove(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
-        match self.entries.remove(actor_id).map(|(_, entry)| entry) {
-            Some(RegistryEntry::Running(handle)) => {
-                if let Some(directory) = self
-                    .config
-                    .service
-                    .extension::<crate::directory::ActivationDirectory>()
-                    && let Some(reference) = handle.actor_ref()
-                {
-                    directory.remove(&reference.erase());
-                }
-                Some(handle)
-            }
-            Some(RegistryEntry::Activating(activation)) => {
-                activation.publish(Err(ActorActivationError::ActivationFailed(
-                    ActorError::new("actor registry entry removed during activation"),
-                )));
-                None
-            }
-            None => None,
+        let handle = self.entry_handle(actor_id)?;
+        if is_business_admitted(handle.lifecycle_state()) {
+            let _ = handle.stop(StopReason::Requested).await;
         }
+        Some(handle)
     }
 
-    pub async fn drain(&self) -> usize {
+    pub async fn drain(&self) -> RegistryDrainResult {
         let actor_ids = self
             .entries
             .iter()
             .map(|entry| entry.key().clone())
             .collect::<Vec<_>>();
-        let mut drained = 0;
+        self.drain_actor_ids(actor_ids).await
+    }
+
+    pub async fn drain_actor_ids<I>(&self, actor_ids: I) -> RegistryDrainResult
+    where
+        I: IntoIterator<Item = ActorId>,
+    {
+        let mut result = RegistryDrainResult::default();
         for actor_id in actor_ids {
-            if let Some(handle) = self.remove(&actor_id).await {
-                let _ = handle
-                    .stop(StopReason::Passivated(PassivationReason::Drain))
-                    .await;
-                drained += 1;
+            let Some(handle) = self.entry_handle(&actor_id) else {
+                continue;
+            };
+            if handle.lifecycle_state() == ActorLifecycleState::StopFailed {
+                if let Some(failure) = handle.inspect_stop_failure() {
+                    result.retained_failures.push(RetainedActorFailure {
+                        actor_id,
+                        local_ref: handle.local_ref(),
+                        failure,
+                    });
+                }
+                continue;
+            }
+            if !is_business_admitted(handle.lifecycle_state()) {
+                continue;
+            }
+            result.requested += 1;
+            let mut lifecycle = handle.subscribe_lifecycle();
+            if handle
+                .stop(StopReason::Passivated(PassivationReason::Drain))
+                .await
+                .is_err()
+            {
+                result.request_failures.push(actor_id);
+                continue;
+            }
+            let terminal = tokio::time::timeout(self.config.waiter_timeout, async {
+                loop {
+                    match *lifecycle.borrow() {
+                        ActorLifecycleState::Stopped => return true,
+                        ActorLifecycleState::StopFailed => return false,
+                        _ => {}
+                    }
+                    if lifecycle.changed().await.is_err() {
+                        return false;
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false);
+            if terminal {
+                result.stopped += 1;
+            } else if let Some(failure) = handle.inspect_stop_failure() {
+                result.retained_failures.push(RetainedActorFailure {
+                    actor_id,
+                    local_ref: handle.local_ref(),
+                    failure,
+                });
+            } else {
+                result.request_failures.push(actor_id);
             }
         }
-        drained
+        result
     }
 
     pub async fn passivate_actor_ids<I>(&self, actor_ids: I, reason: PassivationReason) -> usize
@@ -258,9 +506,28 @@ impl<A: Actor> ActorRegistry<A> {
     {
         let mut passivated = 0;
         for actor_id in actor_ids {
-            if let Some(handle) = self.remove(&actor_id).await {
-                let _ = handle.stop(StopReason::Passivated(reason)).await;
-                passivated += 1;
+            if let Some(handle) = self.entry_handle(&actor_id)
+                && is_business_admitted(handle.lifecycle_state())
+            {
+                let mut lifecycle = handle.subscribe_lifecycle();
+                if handle.stop(StopReason::Passivated(reason)).await.is_err() {
+                    continue;
+                }
+                let stopped = tokio::time::timeout(self.config.waiter_timeout, async {
+                    while *lifecycle.borrow() != ActorLifecycleState::Stopped {
+                        if *lifecycle.borrow() == ActorLifecycleState::StopFailed
+                            || lifecycle.changed().await.is_err()
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .await
+                .unwrap_or(false);
+                if stopped {
+                    passivated += 1;
+                }
             }
         }
         passivated
@@ -276,9 +543,12 @@ impl<A: Actor> ActorRegistry<A> {
             Entry::Occupied(_) => Err(ActorActivationError::AlreadyExists),
             Entry::Vacant(entry) => {
                 let handle = self
-                    .spawn_actor(actor_id, actor)
+                    .spawn_actor(actor_id.clone(), actor)
                     .map_err(ActorActivationError::ActivationFailed)?;
                 entry.insert(RegistryEntry::Running(handle.clone()));
+                if is_terminal(handle.lifecycle_state()) {
+                    self.remove_stopped_running_entry(&actor_id);
+                }
                 Ok(handle)
             }
         }
@@ -296,6 +566,16 @@ impl<A: Actor> ActorRegistry<A> {
         self.remove_stopped_running_entry(&actor_id);
         let lookup = match self.entries.entry(actor_id.clone()) {
             Entry::Occupied(entry) => match entry.get() {
+                RegistryEntry::Running(handle)
+                    if handle.lifecycle_state() == ActorLifecycleState::StopFailed =>
+                {
+                    return Err(ActorActivationError::RetainedStopFailure);
+                }
+                RegistryEntry::Running(handle)
+                    if handle.lifecycle_state() == ActorLifecycleState::Quarantined =>
+                {
+                    return Err(ActorActivationError::Quarantined);
+                }
                 RegistryEntry::Running(handle) => return Ok(handle.clone()),
                 RegistryEntry::Activating(activation) => RegistryLookup::Wait(activation.clone()),
             },
@@ -313,6 +593,8 @@ impl<A: Actor> ActorRegistry<A> {
             RegistryLookup::Activate(activation) => activation,
         };
 
+        activation.set_loading();
+
         let result = match activate().await {
             Ok(actor) => {
                 let still_activating = self.entries.remove_if(&actor_id, |_, entry| {
@@ -326,7 +608,10 @@ impl<A: Actor> ActorRegistry<A> {
                 match self.spawn_actor(actor_id.clone(), actor) {
                     Ok(handle) => {
                         self.entries
-                            .insert(actor_id, RegistryEntry::Running(handle.clone()));
+                            .insert(actor_id.clone(), RegistryEntry::Running(handle.clone()));
+                        if is_terminal(handle.lifecycle_state()) {
+                            self.remove_stopped_running_entry(&actor_id);
+                        }
                         Ok(handle)
                     }
                     Err(error) => Err(ActorActivationError::ActivationFailed(error)),
@@ -437,10 +722,36 @@ impl<A: Actor> ActorRegistry<A> {
         }
     }
 
+    fn entry_handle(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
+        match self.entries.get(actor_id).as_deref() {
+            Some(RegistryEntry::Running(handle)) => Some(handle.clone()),
+            Some(RegistryEntry::Activating(_)) | None => None,
+        }
+    }
+
     fn spawn_actor(&self, actor_id: ActorId, actor: A) -> Result<ActorHandle<A>, ActorError> {
         let self_ref = self
             .actor_ref_for(actor_id.clone())
             .map(|actor_ref| actor_ref.erase());
+        let entries = self.entries.clone();
+        let quarantined = self.quarantined.clone();
+        let terminal_actor_id = actor_id.clone();
+        let directory = self
+            .config
+            .service
+            .extension::<crate::directory::ActivationDirectory>();
+        let terminal_reference = self_ref.clone();
+        let terminal_hook = Box::new(move |local_ref| {
+            entries.remove_if(&terminal_actor_id, |_, entry| {
+                matches!(entry, RegistryEntry::Running(handle) if handle.local_ref() == local_ref)
+            });
+            quarantined.remove_if(&terminal_actor_id, |_, handle| {
+                handle.local_ref() == local_ref
+            });
+            if let (Some(directory), Some(reference)) = (&directory, &terminal_reference) {
+                directory.remove(reference);
+            }
+        });
         let handle = spawn_actor_with_self_ref(
             actor,
             self.config.mailbox,
@@ -449,6 +760,7 @@ impl<A: Actor> ActorRegistry<A> {
             Some(self.actor_system.clone()),
             self.config.service.clone(),
             self.observer.clone(),
+            Some(terminal_hook),
         );
         if let Some(directory) = self
             .config
@@ -458,6 +770,15 @@ impl<A: Actor> ActorRegistry<A> {
         {
             let _ = handle.try_stop_internal(StopReason::StartFailed);
             return Err(ActorError::new(error.to_string()));
+        }
+        if is_terminal(handle.lifecycle_state())
+            && let Some(directory) = self
+                .config
+                .service
+                .extension::<crate::directory::ActivationDirectory>()
+            && let Some(reference) = handle.actor_ref()
+        {
+            directory.remove(&reference.erase());
         }
         Ok(handle)
     }
@@ -503,9 +824,13 @@ fn encode_segment(bytes: &[u8]) -> String {
 }
 
 fn is_terminal(state: ActorLifecycleState) -> bool {
+    state == ActorLifecycleState::Stopped
+}
+
+fn is_business_admitted(state: ActorLifecycleState) -> bool {
     matches!(
         state,
-        ActorLifecycleState::Stopped | ActorLifecycleState::StopFailed
+        ActorLifecycleState::Starting | ActorLifecycleState::Running
     )
 }
 
@@ -522,6 +847,7 @@ enum RegistryLookup<A: Actor> {
 struct ActivationState<A: Actor> {
     result_tx: watch::Sender<Option<Result<ActorHandle<A>, ActorActivationError>>>,
     waiter_slots: Arc<Semaphore>,
+    state: AtomicU8,
 }
 
 impl<A: Actor> ActivationState<A> {
@@ -530,10 +856,22 @@ impl<A: Actor> ActivationState<A> {
         Arc::new(Self {
             result_tx,
             waiter_slots: Arc::new(Semaphore::new(waiter_capacity)),
+            state: AtomicU8::new(0),
         })
     }
 
     fn publish(&self, result: Result<ActorHandle<A>, ActorActivationError>) {
         self.result_tx.send_replace(Some(result));
+    }
+
+    fn set_loading(&self) {
+        self.state.store(1, Ordering::Release);
+    }
+
+    fn state(&self) -> EntityActivationState {
+        match self.state.load(Ordering::Acquire) {
+            0 => EntityActivationState::Activating,
+            _ => EntityActivationState::Loading,
+        }
     }
 }
