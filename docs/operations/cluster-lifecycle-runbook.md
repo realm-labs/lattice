@@ -67,6 +67,21 @@ endpoints, and current membership/domain snapshots before taking a mutating acti
 4. At deadline, force/fence every unfinished domain independently. Record unfinished domains and
    verify membership removal happens only after their authorities are resolved or fenced.
 
+## Actor StopFailed and quarantine
+
+1. Inspect `LatticeService::retained_actor_cells()` and record the exact `LocalActorRef`, logical
+   Actor ID, lifecycle, persistence error, attempt count, and authoritative/quarantined status.
+   Never operate on a logical Actor ID alone when more than one fenced activation is retained.
+2. Repair the persistence dependency, then call `LatticeService::retry_actor_stop(local_ref)`.
+   Successful persistence terminates that exact activation and automatically resumes a blocked
+   placement handoff. Retry never restores authority to a quarantined activation.
+3. If persistence cannot be recovered and data loss is explicitly approved, call
+   `LatticeService::force_stop_actor(local_ref, reason, ticket)`. Use a unique incident/change
+   ticket and preserve the forced-data-loss event.
+4. Quarantine capacity exhaustion is a safety backpressure condition. The overflow activation is
+   fenced and retained as a non-routable Registry blocker; resolve it before expecting another
+   activation with the same logical ID on that process.
+
 ## Force removal
 
 Use the authenticated membership command with a unique operation ID, node ID, and the observed

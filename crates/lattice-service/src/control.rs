@@ -69,7 +69,7 @@ impl ServiceControlDispatch {
     fn supervise_termination(
         &self,
         target: lattice_remoting::messaging::target::ExactActorTarget,
-        mut terminated: tokio::sync::broadcast::Receiver<lattice_actor::watch::ActorTerminated>,
+        mut terminated: lattice_actor::handle::ActorTerminationSubscription,
     ) -> Result<(), ControlDispatchError> {
         let watches = self.watches.clone();
         let associations = self.associations.clone();

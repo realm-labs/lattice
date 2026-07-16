@@ -11,7 +11,7 @@ use lattice_remoting::messaging::target::ExactActorTarget;
 use thiserror::Error;
 
 use crate::protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol};
-use crate::registry::ActorRegistry;
+use crate::registry::{ActorCellDiagnostics, ActorRegistry};
 use crate::traits::Actor;
 
 #[async_trait]
@@ -21,7 +21,20 @@ trait ErasedActorHost: Send + Sync {
     fn subscribe_terminated(
         &self,
         target: &ExactActorTarget,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::watch::ActorTerminated>>;
+    ) -> Option<crate::handle::ActorTerminationSubscription>;
+    async fn drain_all(&self) -> Vec<ActorCellDiagnostics>;
+    async fn force_shutdown_all(&self, reason: &str, ticket: &str) -> Vec<ActorCellDiagnostics>;
+    fn live_cells(&self) -> Vec<ActorCellDiagnostics>;
+    async fn retry_stop(
+        &self,
+        local_ref: crate::watch::LocalActorRef,
+    ) -> Option<Result<(), crate::registry::ActorQuarantineError>>;
+    async fn force_stop(
+        &self,
+        local_ref: crate::watch::LocalActorRef,
+        reason: &str,
+        ticket: &str,
+    ) -> Option<Result<(), crate::registry::ActorQuarantineError>>;
 
     async fn tell(
         &self,
@@ -82,10 +95,54 @@ impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
     fn subscribe_terminated(
         &self,
         target: &ExactActorTarget,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::watch::ActorTerminated>> {
+    ) -> Option<crate::handle::ActorTerminationSubscription> {
         self.resolve(target)
             .ok()
             .map(|handle| handle.subscribe_terminated())
+    }
+
+    async fn drain_all(&self) -> Vec<ActorCellDiagnostics> {
+        let _ = self.registry.drain().await;
+        self.registry.live_cells()
+    }
+
+    async fn force_shutdown_all(&self, reason: &str, ticket: &str) -> Vec<ActorCellDiagnostics> {
+        self.registry.force_shutdown(reason, ticket).await
+    }
+
+    fn live_cells(&self) -> Vec<ActorCellDiagnostics> {
+        self.registry.live_cells()
+    }
+
+    async fn retry_stop(
+        &self,
+        local_ref: crate::watch::LocalActorRef,
+    ) -> Option<Result<(), crate::registry::ActorQuarantineError>> {
+        self.registry
+            .live_cells()
+            .iter()
+            .any(|cell| cell.local_ref == local_ref)
+            .then(|| self.registry.retry_stop_exact(local_ref))?
+            .await
+            .into()
+    }
+
+    async fn force_stop(
+        &self,
+        local_ref: crate::watch::LocalActorRef,
+        reason: &str,
+        ticket: &str,
+    ) -> Option<Result<(), crate::registry::ActorQuarantineError>> {
+        self.registry
+            .live_cells()
+            .iter()
+            .any(|cell| cell.local_ref == local_ref)
+            .then(|| {
+                self.registry
+                    .force_stop_exact(local_ref, reason.to_owned(), ticket.to_owned())
+            })?
+            .await
+            .into()
     }
 
     async fn tell(
@@ -188,10 +245,63 @@ impl ProtocolHostRegistry {
     pub fn subscribe_terminated(
         &self,
         target: &ExactActorTarget,
-    ) -> Option<tokio::sync::broadcast::Receiver<crate::watch::ActorTerminated>> {
+    ) -> Option<crate::handle::ActorTerminationSubscription> {
         self.hosts
             .get(&target.protocol_id.get())
             .and_then(|host| host.subscribe_terminated(target))
+    }
+
+    pub async fn drain_all(&self) -> Vec<ActorCellDiagnostics> {
+        let mut cells = Vec::new();
+        for host in self.hosts.values() {
+            cells.extend(host.drain_all().await);
+        }
+        cells
+    }
+
+    pub async fn force_shutdown_all(
+        &self,
+        reason: &str,
+        ticket: &str,
+    ) -> Vec<ActorCellDiagnostics> {
+        let mut cells = Vec::new();
+        for host in self.hosts.values() {
+            cells.extend(host.force_shutdown_all(reason, ticket).await);
+        }
+        cells
+    }
+
+    pub fn live_cells(&self) -> Vec<ActorCellDiagnostics> {
+        self.hosts
+            .values()
+            .flat_map(|host| host.live_cells())
+            .collect()
+    }
+
+    pub async fn retry_stop(
+        &self,
+        local_ref: crate::watch::LocalActorRef,
+    ) -> Result<(), HostAdminError> {
+        for host in self.hosts.values() {
+            if let Some(result) = host.retry_stop(local_ref).await {
+                return result.map_err(HostAdminError::Actor);
+            }
+        }
+        Err(HostAdminError::NotFound(local_ref.id()))
+    }
+
+    pub async fn force_stop(
+        &self,
+        local_ref: crate::watch::LocalActorRef,
+        reason: &str,
+        ticket: &str,
+    ) -> Result<(), HostAdminError> {
+        for host in self.hosts.values() {
+            if let Some(result) = host.force_stop(local_ref, reason, ticket).await {
+                return result.map_err(HostAdminError::Actor);
+            }
+        }
+        Err(HostAdminError::NotFound(local_ref.id()))
     }
 }
 
@@ -254,4 +364,12 @@ pub enum HostRegistryError {
     Capacity,
     #[error("actor host registry contains duplicate ProtocolId {0}")]
     DuplicateProtocol(u64),
+}
+
+#[derive(Debug, Error)]
+pub enum HostAdminError {
+    #[error("Actor cell {0} is not registered on this service")]
+    NotFound(u64),
+    #[error(transparent)]
+    Actor(#[from] crate::registry::ActorQuarantineError),
 }

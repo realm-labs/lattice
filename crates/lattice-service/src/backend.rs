@@ -84,6 +84,10 @@ pub trait LogicalRouter: Send + Sync + 'static {
         Err(RemoteMessageError::Unauthorized)
     }
 
+    async fn wait_slot_drained(&self, _slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
+        Err(RemoteMessageError::Unauthorized)
+    }
+
     async fn receive_entity_tell(
         &self,
         _sender: Option<ActorRef>,
@@ -239,6 +243,10 @@ impl LogicalRouter for SwitchableDomainRouter {
 
     async fn stop_fenced_slot(&self, slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
         self.current()?.stop_fenced_slot(slot).await
+    }
+
+    async fn wait_slot_drained(&self, slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
+        self.current()?.wait_slot_drained(slot).await
     }
 
     async fn receive_entity_tell(
@@ -424,6 +432,10 @@ impl LogicalRouter for DomainRouterDirectory {
 
     async fn stop_fenced_slot(&self, slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
         self.router(slot.domain())?.stop_fenced_slot(slot).await
+    }
+
+    async fn wait_slot_drained(&self, slot: PlacementSlotKey) -> Result<(), RemoteMessageError> {
+        self.router(slot.domain())?.wait_slot_drained(slot).await
     }
 
     async fn receive_entity_tell(

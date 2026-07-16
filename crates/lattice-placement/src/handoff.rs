@@ -309,4 +309,47 @@ mod tests {
         );
         assert_eq!(machine.phase, HandoffPhase::Draining);
     }
+
+    #[test]
+    fn successful_retry_can_resume_a_stop_failed_handoff() {
+        let domain = PlacementDomainId::new("test").unwrap();
+        let source = node("source", 1);
+        let generation = AssignmentGeneration::new(4).unwrap();
+        let mut machine = HandoffMachine::begin(
+            PlacementSlotKey::Shard {
+                domain: domain.clone(),
+                entity_type: EntityType::new("entity").unwrap(),
+                shard_id: ShardId::new(1),
+            },
+            10,
+            source.clone(),
+            node("target", 2),
+            generation,
+            PlacementVersion::new(
+                domain,
+                crate::types::CoordinatorTerm::new(2).unwrap(),
+                crate::types::Revision::new(8).unwrap(),
+            ),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(machine.start(), vec![HandoffEffect::DrainSource]);
+        assert_eq!(
+            machine
+                .transition(HandoffEvent::SourceStopFailed {
+                    source: source.clone(),
+                    generation,
+                })
+                .unwrap(),
+            vec![HandoffEffect::StopFailed]
+        );
+        assert_eq!(machine.phase, HandoffPhase::Draining);
+        assert_eq!(
+            machine
+                .transition(HandoffEvent::SourceDrained { source, generation })
+                .unwrap(),
+            vec![HandoffEffect::ReplaceAuthority]
+        );
+        assert_eq!(machine.phase, HandoffPhase::ReplacingAuthority);
+    }
 }

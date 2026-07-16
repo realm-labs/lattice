@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -8,7 +9,7 @@ use bytes::BytesMut;
 use futures_util::Stream;
 use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
-use lattice_actor::error::ActorError;
+use lattice_actor::error::{ActorError, ActorStopError};
 use lattice_actor::protocol::CodecDescriptor;
 use lattice_actor::protocol::DecodeError;
 use lattice_actor::protocol::EncodeError;
@@ -210,6 +211,186 @@ fn actor_registration_rejects_a_registry_bound_to_another_protocol() {
             lattice_actor::recipient::ProtocolRegistrationError::RegistryProtocolMismatch { .. }
         ))
     ));
+}
+
+#[tokio::test]
+async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
+    struct ForceShutdownActor {
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ForceShutdownActor {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl Actor for ForceShutdownActor {
+        type Error = ActorError;
+
+        async fn stopping(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _reason: StopReason,
+        ) -> Result<(), ActorStopError> {
+            Err(ActorStopError::new("store unavailable"))
+        }
+    }
+
+    #[async_trait]
+    impl Responder<Ping> for ForceShutdownActor {
+        async fn respond(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            request: Ping,
+            reply_to: ReplyTo<Pong>,
+        ) -> Result<(), ActorError> {
+            let _ = reply_to.send(Pong(request.0));
+            Ok(())
+        }
+    }
+
+    let binding = Arc::new(PingProtocol::bind::<ForceShutdownActor>().unwrap());
+    let registry = Arc::new(ActorRegistry::new_bound(
+        actor_kind!("ForceShutdownActor"),
+        ActorRegistryConfig::default(),
+        binding.as_ref(),
+    ));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let handle = registry
+        .start(
+            ActorId::U64(1),
+            ForceShutdownActor {
+                dropped: dropped.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut data_loss = handle.subscribe_forced_data_loss();
+    let config = node_config(
+        ClusterId::new("force-shutdown-test").unwrap(),
+        "force-shutdown",
+        NodeAddress::new("127.0.0.1", 25251).unwrap(),
+        NodeIncarnation::new(1).unwrap(),
+    );
+    let service = LatticeService::builder(config)
+        .unwrap()
+        .register_actor(registry.clone(), binding)
+        .unwrap()
+        .build()
+        .unwrap();
+    service.start().await.unwrap();
+
+    let mut lifecycle = handle.subscribe_lifecycle();
+    handle.stop(StopReason::Requested).await.unwrap();
+    while *lifecycle.borrow() != lattice_actor::traits::ActorLifecycleState::StopFailed {
+        lifecycle.changed().await.unwrap();
+    }
+    let retained = service.retained_actor_cells();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].local_ref, handle.local_ref());
+    assert!(retained[0].stop_failure.is_some());
+
+    service.force_shutdown().await.unwrap();
+
+    assert_eq!(
+        service.node_lifecycle_state(),
+        NodeLifecycleState::Terminated
+    );
+    assert_eq!(
+        handle.lifecycle_state(),
+        lattice_actor::traits::ActorLifecycleState::Stopped
+    );
+    assert!(registry.live_cells().is_empty());
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    let event = tokio::time::timeout(Duration::from_secs(1), data_loss.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.reason, "service force shutdown");
+    assert!(event.ticket.starts_with("force-shutdown-"));
+}
+
+#[tokio::test]
+async fn service_retry_api_resolves_retained_actor_cell() {
+    struct RetryShutdownActor {
+        persistence_available: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Actor for RetryShutdownActor {
+        type Error = ActorError;
+
+        async fn stopping(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _reason: StopReason,
+        ) -> Result<(), ActorStopError> {
+            self.persistence_available
+                .load(Ordering::SeqCst)
+                .then_some(())
+                .ok_or_else(|| ActorStopError::new("store unavailable"))
+        }
+    }
+
+    #[async_trait]
+    impl Responder<Ping> for RetryShutdownActor {
+        async fn respond(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            request: Ping,
+            reply_to: ReplyTo<Pong>,
+        ) -> Result<(), ActorError> {
+            let _ = reply_to.send(Pong(request.0));
+            Ok(())
+        }
+    }
+
+    let binding = Arc::new(PingProtocol::bind::<RetryShutdownActor>().unwrap());
+    let registry = Arc::new(ActorRegistry::new_bound(
+        actor_kind!("RetryShutdownActor"),
+        ActorRegistryConfig::default(),
+        binding.as_ref(),
+    ));
+    let persistence_available = Arc::new(AtomicBool::new(false));
+    let handle = registry
+        .start(
+            ActorId::U64(1),
+            RetryShutdownActor {
+                persistence_available: persistence_available.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let config = node_config(
+        ClusterId::new("retry-shutdown-test").unwrap(),
+        "retry-shutdown",
+        NodeAddress::new("127.0.0.1", 25252).unwrap(),
+        NodeIncarnation::new(1).unwrap(),
+    );
+    let service = LatticeService::builder(config)
+        .unwrap()
+        .register_actor(registry, binding)
+        .unwrap()
+        .build()
+        .unwrap();
+    service.start().await.unwrap();
+
+    let mut lifecycle = handle.subscribe_lifecycle();
+    handle.stop(StopReason::Requested).await.unwrap();
+    while *lifecycle.borrow() != lattice_actor::traits::ActorLifecycleState::StopFailed {
+        lifecycle.changed().await.unwrap();
+    }
+    persistence_available.store(true, Ordering::SeqCst);
+    service.retry_actor_stop(handle.local_ref()).await.unwrap();
+
+    assert_eq!(
+        handle.lifecycle_state(),
+        lattice_actor::traits::ActorLifecycleState::Stopped
+    );
+    assert!(service.retained_actor_cells().is_empty());
+    service.shutdown().await.unwrap();
 }
 
 struct WatchDiscovery {

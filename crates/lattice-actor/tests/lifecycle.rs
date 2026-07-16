@@ -597,6 +597,13 @@ async fn stopping_failure_retains_actor_state_and_retry_terminates_once() {
         *watcher_notifications.lock().await,
         vec![TerminatedReason::Stopped]
     );
+    let mut late_termination = handle.subscribe_terminated();
+    let late_event = tokio::time::timeout(Duration::from_secs(1), late_termination.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(late_event, event);
+    assert!(late_termination.try_recv().is_err());
 }
 
 #[tokio::test]

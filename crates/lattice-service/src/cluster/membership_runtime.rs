@@ -127,7 +127,10 @@ impl MembershipJoinRuntime {
                     .lock()
                     .expect("service lifecycle poisoned")
                     .recovering_membership();
-                if recovering || self.all_domains_ready() {
+                let node_state = self.lifecycle_driver.state();
+                if node_state == crate::lifecycle::NodeLifecycleState::JoiningMembership
+                    && (recovering || self.all_domains_ready())
+                {
                     let _ = self
                         .lifecycle_driver
                         .transition(ServiceLifecycleEvent::SnapshotInstalled);

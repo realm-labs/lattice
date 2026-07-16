@@ -396,8 +396,173 @@ async fn quarantine_capacity_exhaustion_is_explicit_and_never_drops_retained_sta
     assert_eq!(registry.quarantine_len(), 1);
     assert_eq!(second.lifecycle_state(), ActorLifecycleState::Quarantined);
     assert!(registry.get_running(&second_id).is_none());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if registry.inspect_quarantined(&second_id).is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    registry
+        .force_discard_quarantined_exact(
+            second.local_ref(),
+            "quarantine overflow cleanup",
+            "OPS-47",
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while second.lifecycle_state() != ActorLifecycleState::Stopped {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(registry.inspect_quarantined(&second_id).is_none());
     assert_eq!(first_dropped.load(Ordering::SeqCst), 0);
-    assert_eq!(second_dropped.load(Ordering::SeqCst), 0);
+    assert_eq!(second_dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn repeated_authority_loss_retains_every_exact_activation() {
+    let registry = ActorRegistry::new(
+        actor_kind!("RetainedRegistryActor"),
+        ActorRegistryConfig {
+            quarantine_capacity: 2,
+            ..ActorRegistryConfig::default()
+        },
+    );
+    let actor_id = ActorId::U64(48);
+    let persistence_available = Arc::new(AtomicBool::new(false));
+    let first = registry
+        .start(
+            actor_id.clone(),
+            RetainedRegistryActor {
+                persistence_available: persistence_available.clone(),
+                dropped: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .await
+        .unwrap();
+    registry
+        .fence_after_authority_loss(&actor_id)
+        .await
+        .unwrap();
+
+    let second = registry
+        .get_or_activate(actor_id.clone(), || async {
+            Ok(RetainedRegistryActor {
+                persistence_available: persistence_available.clone(),
+                dropped: Arc::new(AtomicUsize::new(0)),
+            })
+        })
+        .await
+        .unwrap();
+    registry
+        .fence_after_authority_loss(&actor_id)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if registry.quarantined_activations(&actor_id).len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let retained = registry.quarantined_activations(&actor_id);
+    assert_eq!(retained[0].local_ref, first.local_ref());
+    assert_eq!(retained[1].local_ref, second.local_ref());
+
+    persistence_available.store(true, Ordering::SeqCst);
+    registry
+        .retry_quarantined_exact(first.local_ref())
+        .await
+        .unwrap();
+    registry
+        .retry_quarantined_exact(second.local_ref())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while registry.quarantine_len() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn authority_loss_during_stopping_finishes_in_non_authoritative_quarantine() {
+    struct ConcurrentFenceActor {
+        stopping_entered: Arc<Semaphore>,
+        release_stopping: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl Actor for ConcurrentFenceActor {
+        type Error = ActorError;
+
+        async fn stopping(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _reason: StopReason,
+        ) -> Result<(), ActorStopError> {
+            self.stopping_entered.add_permits(1);
+            self.release_stopping.acquire().await.unwrap().forget();
+            Err(ActorStopError::new("store unavailable"))
+        }
+    }
+
+    let registry = ActorRegistry::new(
+        actor_kind!("ConcurrentFenceActor"),
+        ActorRegistryConfig::default(),
+    );
+    let actor_id = ActorId::U64(49);
+    let stopping_entered = Arc::new(Semaphore::new(0));
+    let release_stopping = Arc::new(Semaphore::new(0));
+    let handle = registry
+        .start(
+            actor_id.clone(),
+            ConcurrentFenceActor {
+                stopping_entered: stopping_entered.clone(),
+                release_stopping: release_stopping.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    handle.stop(StopReason::Requested).await.unwrap();
+    stopping_entered.acquire().await.unwrap().forget();
+    assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopping);
+    registry
+        .fence_after_authority_loss(&actor_id)
+        .await
+        .unwrap();
+    release_stopping.add_permits(1);
+
+    let diagnostics = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(diagnostics) = registry.inspect_quarantined(&actor_id)
+                && handle.lifecycle_state() == ActorLifecycleState::Quarantined
+                && !diagnostics.failure.authoritative
+            {
+                break diagnostics;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Quarantined);
+    assert!(!diagnostics.failure.authoritative);
+    assert!(registry.get_running(&actor_id).is_none());
 }
 
 #[tokio::test]

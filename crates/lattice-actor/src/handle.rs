@@ -1,6 +1,7 @@
 use std::any::type_name;
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,6 +23,8 @@ pub(crate) type TerminalHook = Box<dyn FnOnce(LocalActorRef) + Send + 'static>;
 pub struct ActorHandle<A: Actor> {
     local_ref: LocalActorRef,
     terminated_tx: broadcast::Sender<ActorTerminated>,
+    termination: Arc<Mutex<Option<ActorTerminated>>>,
+    terminal_cleanup_started: Arc<AtomicBool>,
     lifecycle_tx: watch::Sender<ActorLifecycleState>,
     stop_failure: Arc<Mutex<Option<StopFailureRecord>>>,
     forced_data_loss_tx: broadcast::Sender<ForcedDataLossEvent>,
@@ -59,6 +62,44 @@ pub struct ForcedDataLossEvent {
     pub failed_attempts: u32,
 }
 
+/// A retained, single-delivery subscription to an Actor activation's terminal event.
+///
+/// Unlike a bare broadcast receiver, subscriptions created after termination still
+/// observe the terminal event. Each subscription yields the event at most once.
+pub struct ActorTerminationSubscription {
+    retained: Option<ActorTerminated>,
+    receiver: broadcast::Receiver<ActorTerminated>,
+    delivered: bool,
+}
+
+impl ActorTerminationSubscription {
+    pub fn try_recv(&mut self) -> Result<ActorTerminated, broadcast::error::TryRecvError> {
+        if self.delivered {
+            return Err(broadcast::error::TryRecvError::Closed);
+        }
+        if let Some(termination) = self.retained.take() {
+            self.delivered = true;
+            return Ok(termination);
+        }
+        let termination = self.receiver.try_recv()?;
+        self.delivered = true;
+        Ok(termination)
+    }
+
+    pub async fn recv(&mut self) -> Result<ActorTerminated, broadcast::error::RecvError> {
+        if self.delivered {
+            return Err(broadcast::error::RecvError::Closed);
+        }
+        if let Some(termination) = self.retained.take() {
+            self.delivered = true;
+            return Ok(termination);
+        }
+        let termination = self.receiver.recv().await?;
+        self.delivered = true;
+        Ok(termination)
+    }
+}
+
 impl<A: Actor> fmt::Debug for ActorHandle<A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -74,6 +115,8 @@ impl<A: Actor> Clone for ActorHandle<A> {
         Self {
             local_ref: self.local_ref,
             terminated_tx: self.terminated_tx.clone(),
+            termination: self.termination.clone(),
+            terminal_cleanup_started: self.terminal_cleanup_started.clone(),
             lifecycle_tx: self.lifecycle_tx.clone(),
             stop_failure: self.stop_failure.clone(),
             forced_data_loss_tx: self.forced_data_loss_tx.clone(),
@@ -104,6 +147,8 @@ impl<A: Actor> ActorHandle<A> {
         Self {
             local_ref,
             terminated_tx,
+            termination: Arc::new(Mutex::new(None)),
+            terminal_cleanup_started: Arc::new(AtomicBool::new(false)),
             lifecycle_tx,
             stop_failure,
             forced_data_loss_tx,
@@ -297,19 +342,24 @@ impl<A: Actor> ActorHandle<A> {
         self.send_system_command(ActorCommand::Stop(reason))
     }
 
-    pub(crate) fn mark_external_authority_lost(&self) -> bool {
-        let was_retained = self.lifecycle_state() == ActorLifecycleState::StopFailed;
+    pub(crate) fn mark_external_authority_lost(&self) -> ActorLifecycleState {
+        let previous = self.lifecycle_state();
         self.mark_stop_failure_quarantined();
         self.set_lifecycle_state(ActorLifecycleState::Quarantined);
-        was_retained
+        previous
     }
 
     pub(crate) fn begin_fenced_stop(
         &self,
-        was_retained: bool,
+        previous: ActorLifecycleState,
         reason: StopReason,
     ) -> Result<(), ActorTellError> {
-        if was_retained {
+        if matches!(
+            previous,
+            ActorLifecycleState::Passivating
+                | ActorLifecycleState::Stopping
+                | ActorLifecycleState::StopFailed
+        ) {
             let (result, _response) = oneshot::channel();
             self.send_system_command(ActorCommand::Quarantine(result))
         } else {
@@ -356,8 +406,18 @@ impl<A: Actor> ActorHandle<A> {
         }
     }
 
-    pub fn subscribe_terminated(&self) -> broadcast::Receiver<ActorTerminated> {
-        self.terminated_tx.subscribe()
+    pub fn subscribe_terminated(&self) -> ActorTerminationSubscription {
+        let receiver = self.terminated_tx.subscribe();
+        let retained = self
+            .termination
+            .lock()
+            .expect("actor termination mutex poisoned")
+            .clone();
+        ActorTerminationSubscription {
+            retained,
+            receiver,
+            delivered: false,
+        }
     }
 
     pub fn subscribe_forced_data_loss(&self) -> broadcast::Receiver<ForcedDataLossEvent> {
@@ -372,8 +432,30 @@ impl<A: Actor> ActorHandle<A> {
         self.lifecycle_tx.send_replace(state);
     }
 
+    pub(crate) fn mark_terminal_cleanup_started(&self) {
+        self.terminal_cleanup_started.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn terminal_cleanup_started(&self) -> bool {
+        self.terminal_cleanup_started.load(Ordering::Acquire)
+    }
+
     pub(crate) fn publish_terminated(&self, notification: ActorTerminated) {
-        let _ = self.terminated_tx.send(notification);
+        let should_publish = {
+            let mut termination = self
+                .termination
+                .lock()
+                .expect("actor termination mutex poisoned");
+            if termination.is_some() {
+                false
+            } else {
+                *termination = Some(notification.clone());
+                true
+            }
+        };
+        if should_publish {
+            let _ = self.terminated_tx.send(notification);
+        }
     }
 
     pub(crate) fn publish_forced_data_loss(&self, event: ForcedDataLossEvent) {

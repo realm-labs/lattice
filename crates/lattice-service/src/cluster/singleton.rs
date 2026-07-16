@@ -47,6 +47,9 @@ pub(super) trait SingletonRoute: Send + Sync {
         target: LogicalSingletonTarget,
     ) -> Result<Bytes, RemoteMessageError>;
     async fn drain(&self) -> Result<bool, RemoteMessageError>;
+    async fn wait_drained(&self) -> Result<(), RemoteMessageError> {
+        Ok(())
+    }
     async fn fence(&self) -> Result<(), RemoteMessageError> {
         Ok(())
     }
@@ -476,19 +479,39 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
         .await
     }
 
+    async fn wait_drained(&self) -> Result<(), RemoteMessageError> {
+        let actor_id = ActorId::Str(self.kind.as_str().to_owned());
+        self.registry.wait_actor_ids_terminal([actor_id]).await;
+        let key = PlacementSlotKey::Singleton {
+            domain: self.domain.clone(),
+            kind: self.kind.clone(),
+        };
+        let still_owned = self
+            .state
+            .lock()
+            .expect("logic placement state poisoned")
+            .slot(&key)
+            .is_some_and(|slot| {
+                slot.owner.as_ref() == Some(&self.local_node)
+                    && matches!(
+                        slot.state,
+                        PlacementSlotState::Stopping | PlacementSlotState::StopFailed
+                    )
+            });
+        if still_owned {
+            Ok(())
+        } else {
+            Err(RemoteMessageError::StaleAuthority)
+        }
+    }
+
     async fn fence(&self) -> Result<(), RemoteMessageError> {
         let actor_id = ActorId::Str(self.kind.as_str().to_owned());
-        if self.registry.get_running(&actor_id).is_some()
-            || self
-                .registry
-                .retained_stop_failures()
-                .iter()
-                .any(|failure| failure.actor_id == actor_id)
-        {
-            self.registry
-                .fence_after_authority_loss(&actor_id)
-                .await
-                .map_err(|_| RemoteMessageError::HandlerFailed)?;
+        if self.registry.active_actor_ids().contains(&actor_id) {
+            match self.registry.fence_after_authority_loss(&actor_id).await {
+                Ok(()) | Err(lattice_actor::registry::ActorQuarantineError::NotRetained) => {}
+                Err(_) => return Err(RemoteMessageError::HandlerFailed),
+            }
         }
         Ok(())
     }

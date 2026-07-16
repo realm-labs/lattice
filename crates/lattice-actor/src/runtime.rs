@@ -800,6 +800,7 @@ where
     .await;
 
     drop(actor);
+    handle.mark_terminal_cleanup_started();
     handle.run_terminal_hook();
     handle.clear_stop_failure();
     handle.set_lifecycle_state(ActorLifecycleState::Stopped);

@@ -26,6 +26,7 @@ use crate::runtime::{PassivationPolicy, ShardMigrationPolicy, spawn_actor_with_s
 use crate::traits::{
     Actor, ActorLifecycleState, EntityActivationState, PassivationReason, StopReason,
 };
+use crate::watch::LocalActorRef;
 
 #[derive(Debug, Clone)]
 pub struct ActorRegistryConfig {
@@ -66,7 +67,7 @@ pub struct ActorRegistry<A: Actor> {
     config: ActorRegistryConfig,
     protocol_id: Option<ProtocolId>,
     entries: Arc<DashMap<ActorId, RegistryEntry<A>>>,
-    quarantined: Arc<DashMap<ActorId, ActorHandle<A>>>,
+    quarantined: Arc<DashMap<LocalActorRef, QuarantinedEntry<A>>>,
     actor_system: Arc<OnceLock<ActorSystem>>,
     observer: ActorObserverHandle,
 }
@@ -110,6 +111,20 @@ pub struct QuarantineDiagnostics {
     pub local_ref: crate::watch::LocalActorRef,
     pub actor_ref: Option<ActorRef>,
     pub failure: StopFailureRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorCellDiagnostics {
+    pub actor_id: ActorId,
+    pub local_ref: LocalActorRef,
+    pub lifecycle: ActorLifecycleState,
+    pub quarantined: bool,
+    pub stop_failure: Option<StopFailureRecord>,
+}
+
+struct QuarantinedEntry<A: Actor> {
+    actor_id: ActorId,
+    handle: ActorHandle<A>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +247,25 @@ impl<A: Actor> ActorRegistry<A> {
             .collect()
     }
 
+    /// Returns every nonterminal activation still owned by the active registry.
+    ///
+    /// This intentionally includes Starting, Passivating, Stopping, and StopFailed
+    /// cells so an external authority fence cannot miss an in-flight stop.
+    pub fn active_actor_ids(&self) -> Vec<ActorId> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                RegistryEntry::Running(handle)
+                    if !is_terminal(handle.lifecycle_state())
+                        && handle.lifecycle_state() != ActorLifecycleState::Quarantined =>
+                {
+                    Some(entry.key().clone())
+                }
+                RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
+            })
+            .collect()
+    }
+
     pub fn activation_state(&self, actor_id: &ActorId) -> EntityActivationState {
         match self.entries.get(actor_id).as_deref() {
             Some(RegistryEntry::Running(_)) => EntityActivationState::Active,
@@ -275,10 +309,101 @@ impl<A: Actor> ActorRegistry<A> {
         }
     }
 
+    pub fn live_cells(&self) -> Vec<ActorCellDiagnostics> {
+        let mut cells = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                RegistryEntry::Running(handle) if !is_terminal(handle.lifecycle_state()) => {
+                    Some(ActorCellDiagnostics {
+                        actor_id: entry.key().clone(),
+                        local_ref: handle.local_ref(),
+                        lifecycle: handle.lifecycle_state(),
+                        quarantined: handle.lifecycle_state() == ActorLifecycleState::Quarantined,
+                        stop_failure: handle.inspect_stop_failure(),
+                    })
+                }
+                RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
+            })
+            .chain(self.quarantined.iter().filter_map(|entry| {
+                let handle = &entry.value().handle;
+                (!is_terminal(handle.lifecycle_state())).then(|| ActorCellDiagnostics {
+                    actor_id: entry.value().actor_id.clone(),
+                    local_ref: handle.local_ref(),
+                    lifecycle: handle.lifecycle_state(),
+                    quarantined: true,
+                    stop_failure: handle.inspect_stop_failure(),
+                })
+            }))
+            .collect::<Vec<_>>();
+        cells.sort_by_key(|cell| cell.local_ref.id());
+        cells
+    }
+
     pub fn inspect_quarantined(&self, actor_id: &ActorId) -> Option<QuarantineDiagnostics> {
-        let handle = self.quarantined.get(actor_id)?;
+        if let Some(entry) = self
+            .quarantined
+            .iter()
+            .filter(|entry| &entry.value().actor_id == actor_id)
+            .max_by_key(|entry| entry.key().id())
+        {
+            return self.quarantine_diagnostics(entry.value());
+        }
+        let handle = self.entry_handle(actor_id)?;
+        (handle.lifecycle_state() == ActorLifecycleState::Quarantined)
+            .then(|| self.handle_quarantine_diagnostics(actor_id.clone(), &handle))
+            .flatten()
+    }
+
+    pub fn inspect_quarantined_exact(
+        &self,
+        local_ref: LocalActorRef,
+    ) -> Option<QuarantineDiagnostics> {
+        if let Some(entry) = self.quarantined.get(&local_ref) {
+            return self.quarantine_diagnostics(entry.value());
+        }
+        self.entries.iter().find_map(|entry| match entry.value() {
+            RegistryEntry::Running(handle)
+                if handle.local_ref() == local_ref
+                    && handle.lifecycle_state() == ActorLifecycleState::Quarantined =>
+            {
+                self.handle_quarantine_diagnostics(entry.key().clone(), handle)
+            }
+            RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
+        })
+    }
+
+    pub fn quarantined_activations(&self, actor_id: &ActorId) -> Vec<QuarantineDiagnostics> {
+        let mut diagnostics = self
+            .quarantined
+            .iter()
+            .filter(|entry| &entry.value().actor_id == actor_id)
+            .filter_map(|entry| self.quarantine_diagnostics(entry.value()))
+            .chain(self.entries.iter().filter_map(|entry| match entry.value() {
+                RegistryEntry::Running(handle)
+                    if entry.key() == actor_id
+                        && handle.lifecycle_state() == ActorLifecycleState::Quarantined =>
+                {
+                    self.handle_quarantine_diagnostics(entry.key().clone(), handle)
+                }
+                RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
+            }))
+            .collect::<Vec<_>>();
+        diagnostics.sort_by_key(|entry| entry.local_ref.id());
+        diagnostics
+    }
+
+    fn quarantine_diagnostics(&self, entry: &QuarantinedEntry<A>) -> Option<QuarantineDiagnostics> {
+        self.handle_quarantine_diagnostics(entry.actor_id.clone(), &entry.handle)
+    }
+
+    fn handle_quarantine_diagnostics(
+        &self,
+        actor_id: ActorId,
+        handle: &ActorHandle<A>,
+    ) -> Option<QuarantineDiagnostics> {
         Some(QuarantineDiagnostics {
-            actor_id: actor_id.clone(),
+            actor_id,
             local_ref: handle.local_ref(),
             actor_ref: handle.actor_ref().map(ActorRef::erase),
             failure: handle.inspect_stop_failure()?,
@@ -306,22 +431,13 @@ impl<A: Actor> ActorRegistry<A> {
         let handle = self
             .entry_handle(actor_id)
             .ok_or(ActorQuarantineError::NotRetained)?;
-        let was_retained = handle.mark_external_authority_lost();
-        if self.quarantined.len() >= self.config.quarantine_capacity
-            && !self.quarantined.contains_key(actor_id)
-        {
-            tracing::error!(
-                actor.id = ?actor_id,
-                quarantine.capacity = self.config.quarantine_capacity,
-                "external authority was fenced but quarantine capacity is exhausted; operator intervention is mandatory"
-            );
-            return Err(ActorQuarantineError::Capacity {
-                capacity: self.config.quarantine_capacity,
+        let capacity_exhausted = self.quarantined.len() >= self.config.quarantine_capacity;
+        let previous = handle.mark_external_authority_lost();
+        if !capacity_exhausted {
+            self.entries.remove_if(actor_id, |_, entry| {
+                matches!(entry, RegistryEntry::Running(current) if current.local_ref() == handle.local_ref())
             });
         }
-        self.entries.remove_if(actor_id, |_, entry| {
-            matches!(entry, RegistryEntry::Running(current) if current.local_ref() == handle.local_ref())
-        });
         if let Some(directory) = self
             .config
             .service
@@ -330,14 +446,18 @@ impl<A: Actor> ActorRegistry<A> {
         {
             directory.remove(&reference.erase());
         }
-        self.quarantined.insert(actor_id.clone(), handle);
-        let handle = self
-            .quarantined
-            .get(actor_id)
-            .map(|entry| entry.clone())
-            .ok_or(ActorQuarantineError::NotRetained)?;
+        let local_ref = handle.local_ref();
+        if !capacity_exhausted {
+            self.quarantined.insert(
+                local_ref,
+                QuarantinedEntry {
+                    actor_id: actor_id.clone(),
+                    handle: handle.clone(),
+                },
+            );
+        }
         handle
-            .begin_fenced_stop(was_retained, StopReason::AuthorityLost)
+            .begin_fenced_stop(previous, StopReason::AuthorityLost)
             .map_err(|error| match error {
                 crate::error::ActorTellError::MailboxFull => {
                     crate::error::ActorAdminError::MailboxFull
@@ -348,14 +468,55 @@ impl<A: Actor> ActorRegistry<A> {
                 }
             })
             .map_err(ActorQuarantineError::Admin)?;
+        if capacity_exhausted {
+            tracing::error!(
+                actor.id = ?actor_id,
+                actor.local_ref = local_ref.id(),
+                quarantine.capacity = self.config.quarantine_capacity,
+                quarantine.used = self.quarantined.len(),
+                "external authority was fully fenced but retained as a registry overflow blocker; operator intervention is mandatory"
+            );
+            return Err(ActorQuarantineError::Capacity {
+                capacity: self.config.quarantine_capacity,
+            });
+        }
         Ok(())
     }
 
     pub async fn retry_quarantined(&self, actor_id: &ActorId) -> Result<(), ActorQuarantineError> {
         let handle = self
             .quarantined
-            .get(actor_id)
-            .map(|entry| entry.clone())
+            .iter()
+            .filter(|entry| &entry.value().actor_id == actor_id)
+            .max_by_key(|entry| entry.key().id())
+            .map(|entry| entry.value().handle.clone())
+            .or_else(|| {
+                self.entry_handle(actor_id)
+                    .filter(|handle| handle.lifecycle_state() == ActorLifecycleState::Quarantined)
+            })
+            .ok_or(ActorQuarantineError::NotRetained)?;
+        handle.retry_stop().await?;
+        Ok(())
+    }
+
+    pub async fn retry_quarantined_exact(
+        &self,
+        local_ref: LocalActorRef,
+    ) -> Result<(), ActorQuarantineError> {
+        let handle = self
+            .local_handle(local_ref)
+            .filter(|handle| handle.lifecycle_state() == ActorLifecycleState::Quarantined)
+            .ok_or(ActorQuarantineError::NotRetained)?;
+        handle.retry_stop().await?;
+        Ok(())
+    }
+
+    pub async fn retry_stop_exact(
+        &self,
+        local_ref: LocalActorRef,
+    ) -> Result<(), ActorQuarantineError> {
+        let handle = self
+            .local_handle(local_ref)
             .ok_or(ActorQuarantineError::NotRetained)?;
         handle.retry_stop().await?;
         Ok(())
@@ -369,8 +530,41 @@ impl<A: Actor> ActorRegistry<A> {
     ) -> Result<(), ActorQuarantineError> {
         let handle = self
             .quarantined
-            .get(actor_id)
-            .map(|entry| entry.clone())
+            .iter()
+            .filter(|entry| &entry.value().actor_id == actor_id)
+            .max_by_key(|entry| entry.key().id())
+            .map(|entry| entry.value().handle.clone())
+            .or_else(|| {
+                self.entry_handle(actor_id)
+                    .filter(|handle| handle.lifecycle_state() == ActorLifecycleState::Quarantined)
+            })
+            .ok_or(ActorQuarantineError::NotRetained)?;
+        handle.force_stop(reason, ticket).await?;
+        Ok(())
+    }
+
+    pub async fn force_discard_quarantined_exact(
+        &self,
+        local_ref: LocalActorRef,
+        reason: impl Into<String>,
+        ticket: impl Into<String>,
+    ) -> Result<(), ActorQuarantineError> {
+        let handle = self
+            .local_handle(local_ref)
+            .filter(|handle| handle.lifecycle_state() == ActorLifecycleState::Quarantined)
+            .ok_or(ActorQuarantineError::NotRetained)?;
+        handle.force_stop(reason, ticket).await?;
+        Ok(())
+    }
+
+    pub async fn force_stop_exact(
+        &self,
+        local_ref: LocalActorRef,
+        reason: impl Into<String>,
+        ticket: impl Into<String>,
+    ) -> Result<(), ActorQuarantineError> {
+        let handle = self
+            .local_handle(local_ref)
             .ok_or(ActorQuarantineError::NotRetained)?;
         handle.force_stop(reason, ticket).await?;
         Ok(())
@@ -439,6 +633,45 @@ impl<A: Actor> ActorRegistry<A> {
         self.drain_actor_ids(actor_ids).await
     }
 
+    /// Performs a destructive process-shutdown cleanup after first giving every
+    /// active Actor its normal persistence opportunity.
+    pub async fn force_shutdown(&self, reason: &str, ticket: &str) -> Vec<ActorCellDiagnostics> {
+        let drained = self.drain().await;
+        for retained in drained.retained_failures {
+            if let Some(handle) = self.entry_handle(&retained.actor_id)
+                && handle.local_ref() == retained.local_ref
+            {
+                let _ = handle
+                    .force_stop(reason.to_owned(), ticket.to_owned())
+                    .await;
+            }
+        }
+        let quarantined = self
+            .quarantined
+            .iter()
+            .map(|entry| entry.value().handle.clone())
+            .chain(self.entries.iter().filter_map(|entry| match entry.value() {
+                RegistryEntry::Running(handle)
+                    if handle.lifecycle_state() == ActorLifecycleState::Quarantined =>
+                {
+                    Some(handle.clone())
+                }
+                RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
+            }))
+            .collect::<Vec<_>>();
+        for handle in quarantined {
+            if matches!(
+                handle.lifecycle_state(),
+                ActorLifecycleState::StopFailed | ActorLifecycleState::Quarantined
+            ) {
+                let _ = handle
+                    .force_stop(reason.to_owned(), ticket.to_owned())
+                    .await;
+            }
+        }
+        self.live_cells()
+    }
+
     pub async fn drain_actor_ids<I>(&self, actor_ids: I) -> RegistryDrainResult
     where
         I: IntoIterator<Item = ActorId>,
@@ -448,28 +681,31 @@ impl<A: Actor> ActorRegistry<A> {
             let Some(handle) = self.entry_handle(&actor_id) else {
                 continue;
             };
-            if handle.lifecycle_state() == ActorLifecycleState::StopFailed {
-                if let Some(failure) = handle.inspect_stop_failure() {
-                    result.retained_failures.push(RetainedActorFailure {
-                        actor_id,
-                        local_ref: handle.local_ref(),
-                        failure,
-                    });
-                }
-                continue;
-            }
-            if !is_business_admitted(handle.lifecycle_state()) {
-                continue;
-            }
-            result.requested += 1;
             let mut lifecycle = handle.subscribe_lifecycle();
-            if handle
-                .stop(StopReason::Passivated(PassivationReason::Drain))
-                .await
-                .is_err()
-            {
-                result.request_failures.push(actor_id);
-                continue;
+            match handle.lifecycle_state() {
+                ActorLifecycleState::StopFailed => {
+                    if let Some(failure) = handle.inspect_stop_failure() {
+                        result.retained_failures.push(RetainedActorFailure {
+                            actor_id,
+                            local_ref: handle.local_ref(),
+                            failure,
+                        });
+                    }
+                    continue;
+                }
+                ActorLifecycleState::Stopped | ActorLifecycleState::Quarantined => continue,
+                ActorLifecycleState::Starting | ActorLifecycleState::Running => {
+                    result.requested += 1;
+                    if handle
+                        .stop(StopReason::Passivated(PassivationReason::Drain))
+                        .await
+                        .is_err()
+                    {
+                        result.request_failures.push(actor_id);
+                        continue;
+                    }
+                }
+                ActorLifecycleState::Passivating | ActorLifecycleState::Stopping => {}
             }
             let terminal = tokio::time::timeout(self.config.waiter_timeout, async {
                 loop {
@@ -498,6 +734,26 @@ impl<A: Actor> ActorRegistry<A> {
             }
         }
         result
+    }
+
+    /// Waits until the selected active Actor cells are actually gone.
+    /// StopFailed and Quarantined are deliberately nonterminal and keep this future pending.
+    pub async fn wait_actor_ids_terminal<I>(&self, actor_ids: I)
+    where
+        I: IntoIterator<Item = ActorId>,
+    {
+        let mut lifecycles = actor_ids
+            .into_iter()
+            .filter_map(|actor_id| self.entry_handle(&actor_id))
+            .map(|handle| handle.subscribe_lifecycle())
+            .collect::<Vec<_>>();
+        for lifecycle in &mut lifecycles {
+            while *lifecycle.borrow() != ActorLifecycleState::Stopped {
+                if lifecycle.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
     }
 
     pub async fn passivate_actor_ids<I>(&self, actor_ids: I, reason: PassivationReason) -> usize
@@ -546,7 +802,7 @@ impl<A: Actor> ActorRegistry<A> {
                     .spawn_actor(actor_id.clone(), actor)
                     .map_err(ActorActivationError::ActivationFailed)?;
                 entry.insert(RegistryEntry::Running(handle.clone()));
-                if is_terminal(handle.lifecycle_state()) {
+                if handle.terminal_cleanup_started() || is_terminal(handle.lifecycle_state()) {
                     self.remove_stopped_running_entry(&actor_id);
                 }
                 Ok(handle)
@@ -609,7 +865,9 @@ impl<A: Actor> ActorRegistry<A> {
                     Ok(handle) => {
                         self.entries
                             .insert(actor_id.clone(), RegistryEntry::Running(handle.clone()));
-                        if is_terminal(handle.lifecycle_state()) {
+                        if handle.terminal_cleanup_started()
+                            || is_terminal(handle.lifecycle_state())
+                        {
                             self.remove_stopped_running_entry(&actor_id);
                         }
                         Ok(handle)
@@ -729,6 +987,22 @@ impl<A: Actor> ActorRegistry<A> {
         }
     }
 
+    fn local_handle(&self, local_ref: LocalActorRef) -> Option<ActorHandle<A>> {
+        self.entries
+            .iter()
+            .find_map(|entry| match entry.value() {
+                RegistryEntry::Running(handle) if handle.local_ref() == local_ref => {
+                    Some(handle.clone())
+                }
+                RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
+            })
+            .or_else(|| {
+                self.quarantined
+                    .get(&local_ref)
+                    .map(|entry| entry.handle.clone())
+            })
+    }
+
     fn spawn_actor(&self, actor_id: ActorId, actor: A) -> Result<ActorHandle<A>, ActorError> {
         let self_ref = self
             .actor_ref_for(actor_id.clone())
@@ -745,8 +1019,8 @@ impl<A: Actor> ActorRegistry<A> {
             entries.remove_if(&terminal_actor_id, |_, entry| {
                 matches!(entry, RegistryEntry::Running(handle) if handle.local_ref() == local_ref)
             });
-            quarantined.remove_if(&terminal_actor_id, |_, handle| {
-                handle.local_ref() == local_ref
+            quarantined.remove_if(&local_ref, |_, entry| {
+                entry.actor_id == terminal_actor_id && entry.handle.local_ref() == local_ref
             });
             if let (Some(directory), Some(reference)) = (&directory, &terminal_reference) {
                 directory.remove(reference);

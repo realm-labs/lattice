@@ -20,6 +20,8 @@ pub enum ServiceError {
     ConflictingClusterRuntime,
     #[error("actor host registration failed")]
     Host(#[source] lattice_actor::host::HostRegistryError),
+    #[error("actor lifecycle administration failed")]
+    ActorLifecycleAdmin(#[source] lattice_actor::host::HostAdminError),
     #[error("actor protocol registration failed")]
     ProtocolRegistration(#[source] lattice_actor::recipient::ProtocolRegistrationError),
     #[error("actor protocol construction failed")]

@@ -1,6 +1,7 @@
 pub struct LatticeService {
     cluster_id: lattice_core::actor_ref::ClusterId,
     actor_system: ActorSystem,
+    hosts: Arc<lattice_actor::host::ProtocolHostRegistry>,
     associations: Arc<AssociationManager>,
     messaging: Arc<OutboundMessaging>,
     endpoint: Arc<RemotingEndpoint>,
@@ -39,6 +40,7 @@ pub struct LatticeService {
     configured_domains: BTreeSet<lattice_core::actor_ref::PlacementDomainId>,
     drain_operation: std::sync::Mutex<Option<String>>,
     join_config: ClusterJoinConfig,
+    force_actor_shutdown: std::sync::atomic::AtomicBool,
 }
 
 impl LatticeService {
@@ -48,6 +50,42 @@ impl LatticeService {
 
     pub fn actor_system(&self) -> &ActorSystem {
         &self.actor_system
+    }
+
+    pub fn retained_actor_cells(&self) -> Vec<lattice_actor::registry::ActorCellDiagnostics> {
+        self.hosts
+            .live_cells()
+            .into_iter()
+            .filter(|cell| {
+                matches!(
+                    cell.lifecycle,
+                    lattice_actor::traits::ActorLifecycleState::StopFailed
+                        | lattice_actor::traits::ActorLifecycleState::Quarantined
+                )
+            })
+            .collect()
+    }
+
+    pub async fn retry_actor_stop(
+        &self,
+        local_ref: lattice_actor::watch::LocalActorRef,
+    ) -> Result<(), ServiceError> {
+        self.hosts
+            .retry_stop(local_ref)
+            .await
+            .map_err(ServiceError::ActorLifecycleAdmin)
+    }
+
+    pub async fn force_stop_actor(
+        &self,
+        local_ref: lattice_actor::watch::LocalActorRef,
+        reason: &str,
+        ticket: &str,
+    ) -> Result<(), ServiceError> {
+        self.hosts
+            .force_stop(local_ref, reason, ticket)
+            .await
+            .map_err(ServiceError::ActorLifecycleAdmin)
     }
 
     pub async fn tell<P, M>(
@@ -248,6 +286,8 @@ impl LatticeService {
                     }
                 }
             })?;
+            self.lifecycle_driver
+                .register_runtime_shutdown(runtime.shutdown.clone());
             *self
                 .coordinator_shutdown
                 .lock()
@@ -278,6 +318,8 @@ impl LatticeService {
         let has_join_runtime = !join_runtimes.is_empty() || membership_join_runtime.is_some();
         if has_join_runtime {
             let (shutdown, shutdown_rx) = watch::channel(false);
+            self.lifecycle_driver
+                .register_runtime_shutdown(shutdown.clone());
             *self
                 .join_shutdown
                 .lock()
@@ -297,6 +339,8 @@ impl LatticeService {
         let has_logic_runtime = runtime.is_some();
         if let Some(runtime) = runtime {
             let (shutdown, shutdown_rx) = watch::channel(false);
+            self.lifecycle_driver
+                .register_runtime_shutdown(shutdown.clone());
             let mut readiness_shutdown = shutdown_rx.clone();
             *self
                 .logic_shutdown
@@ -421,14 +465,32 @@ impl LatticeService {
                         AuthorityEffect::PublishStopFailed => {
                             let result = handle.publish_stop_failed(&slot);
                             let mut blockers = drain_blockers.borrow().clone();
-                            blockers.entry(domain.clone()).or_default().insert(slot);
+                            let inserted = blockers
+                                .entry(domain.clone())
+                                .or_default()
+                                .insert(slot.clone());
                             drain_blockers.send_replace(blockers);
+                            if result.is_ok() && inserted {
+                                let router = router.clone();
+                                let handle = handle.clone();
+                                tokio::spawn(async move {
+                                    if router.wait_slot_drained(slot.clone()).await.is_ok() {
+                                        let _ = handle.complete_drain(slot, true).await;
+                                    }
+                                });
+                            }
                             result
                         }
                         AuthorityEffect::StopSlot => {
-                            router.stop_fenced_slot(slot).await.map_err(|_| {
+                            let result = router.stop_fenced_slot(slot.clone()).await.map_err(|_| {
                                 lattice_placement::session::LogicSessionError::ControlClosed
-                            })
+                            });
+                            let mut blockers = drain_blockers.borrow().clone();
+                            if let Some(slots) = blockers.get_mut(&domain) {
+                                slots.remove(&slot);
+                            }
+                            drain_blockers.send_replace(blockers);
+                            result
                         }
                         AuthorityEffect::FenceAdmission
                         | AuthorityEffect::OpenAdmission
@@ -551,6 +613,8 @@ impl LatticeService {
     }
 
     pub async fn force_shutdown(&self) -> Result<(), ServiceError> {
+        self.force_actor_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
         let state = self.node_lifecycle_state();
         if state == NodeLifecycleState::Terminated {
             return Ok(());
@@ -568,6 +632,28 @@ impl LatticeService {
     }
 
     async fn stop_components(&self) -> Result<(), ServiceError> {
+        let force = self
+            .force_actor_shutdown
+            .load(std::sync::atomic::Ordering::Acquire);
+        let remaining_actor_cells = if force {
+            let ticket = format!("force-shutdown-{}", uuid::Uuid::new_v4());
+            self.hosts
+                .force_shutdown_all("service force shutdown", &ticket)
+                .await
+        } else {
+            self.hosts.drain_all().await
+        };
+        if !remaining_actor_cells.is_empty() {
+            return Err(ServiceError::InterventionRequired(
+                crate::lifecycle::LifecycleInterventionReport {
+                    blocked_slots: BTreeMap::new(),
+                    retained_actor_cells: remaining_actor_cells
+                        .into_iter()
+                        .map(|cell| format!("{cell:?}"))
+                        .collect(),
+                },
+            ));
+        }
         if let Some(shutdown) = self
             .join_shutdown
             .lock()
@@ -617,7 +703,10 @@ impl LatticeService {
             .filter(|(_, slots)| !slots.is_empty())
             .map(|(domain, slots)| (domain.clone(), slots.iter().cloned().collect()))
             .collect();
-        let report = crate::lifecycle::LifecycleInterventionReport { blocked_slots };
+        let report = crate::lifecycle::LifecycleInterventionReport {
+            blocked_slots,
+            retained_actor_cells: Vec::new(),
+        };
         if report.blocked_slots.is_empty() {
             ServiceError::LeaveTimeout
         } else {

@@ -79,6 +79,7 @@ pub enum CoordinatorScopeState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LifecycleInterventionReport {
     pub blocked_slots: BTreeMap<PlacementDomainId, Vec<PlacementSlotKey>>,
+    pub retained_actor_cells: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +160,7 @@ pub struct ProductionLifecycleDriver {
     admission: NodeAdmissionGate,
     runtime_stop_requested: Arc<AtomicBool>,
     identity_released: Arc<AtomicBool>,
+    runtime_shutdowns: Arc<Mutex<Vec<tokio::sync::watch::Sender<bool>>>>,
     termination_started_at: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -178,6 +180,7 @@ impl ProductionLifecycleDriver {
             admission,
             runtime_stop_requested: Arc::new(AtomicBool::new(false)),
             identity_released: Arc::new(AtomicBool::new(false)),
+            runtime_shutdowns: Arc::new(Mutex::new(Vec::new())),
             termination_started_at: Arc::new(Mutex::new(None)),
         }
     }
@@ -199,6 +202,17 @@ impl ProductionLifecycleDriver {
 
     pub fn identity_released(&self) -> bool {
         self.identity_released.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn register_runtime_shutdown(&self, shutdown: tokio::sync::watch::Sender<bool>) {
+        let mut shutdowns = self
+            .runtime_shutdowns
+            .lock()
+            .expect("service runtime shutdown registry poisoned");
+        if self.runtime_stop_requested() {
+            let _ = shutdown.send(true);
+        }
+        shutdowns.push(shutdown);
     }
 
     pub fn transition(
@@ -304,6 +318,11 @@ impl ProductionLifecycleDriver {
             ServiceLifecycleEffect::FenceClaimsAndStopRuntime => {
                 self.admission.close();
                 self.runtime_stop_requested.store(true, Ordering::Release);
+                let mut shutdowns = self
+                    .runtime_shutdowns
+                    .lock()
+                    .expect("service runtime shutdown registry poisoned");
+                shutdowns.retain(|shutdown| shutdown.send(true).is_ok());
             }
             ServiceLifecycleEffect::ReleaseRuntimeIdentity => {
                 self.identity_released.store(true, Ordering::Release);
@@ -520,6 +539,8 @@ mod tests {
     fn production_driver_consumes_admission_drain_and_identity_effects() {
         let domain = PlacementDomainId::new("driver-test").unwrap();
         let driver = production_driver([domain.clone()]);
+        let (runtime_shutdown, runtime_shutdown_rx) = tokio::sync::watch::channel(false);
+        driver.register_runtime_shutdown(runtime_shutdown);
         driver
             .transition(ServiceLifecycleEvent::RemotingReady)
             .unwrap();
@@ -545,6 +566,7 @@ mod tests {
             .unwrap();
         assert_eq!(driver.state(), NodeLifecycleState::Stopping);
         assert!(driver.runtime_stop_requested());
+        assert!(*runtime_shutdown_rx.borrow());
         assert!(!driver.identity_released());
         driver
             .transition(ServiceLifecycleEvent::ShutdownComplete)

@@ -336,15 +336,34 @@ impl LogicJoinRuntime {
                 AuthorityEffect::PublishStopFailed => {
                     let result = handle.publish_stop_failed(&slot).map_err(|_| ());
                     let mut blockers = self.drain_blockers.borrow().clone();
-                    blockers
+                    let inserted = blockers
                         .entry(self.domain_hello.domain.clone())
                         .or_default()
-                        .insert(slot);
+                        .insert(slot.clone());
                     self.drain_blockers.send_replace(blockers);
+                    if result.is_ok() && inserted {
+                        let router = self.router.clone();
+                        let handle = handle.clone();
+                        tokio::spawn(async move {
+                            if router.wait_slot_drained(slot.clone()).await.is_ok() {
+                                let _ = handle.complete_drain(slot, true).await;
+                            }
+                        });
+                    }
                     result
                 }
                 AuthorityEffect::StopSlot => {
-                    self.router.stop_fenced_slot(slot).await.map_err(|_| ())
+                    let result = self
+                        .router
+                        .stop_fenced_slot(slot.clone())
+                        .await
+                        .map_err(|_| ());
+                    let mut blockers = self.drain_blockers.borrow().clone();
+                    if let Some(slots) = blockers.get_mut(&self.domain_hello.domain) {
+                        slots.remove(&slot);
+                    }
+                    self.drain_blockers.send_replace(blockers);
+                    result
                 }
                 AuthorityEffect::FenceAdmission
                 | AuthorityEffect::OpenAdmission

@@ -1017,6 +1017,7 @@ impl LatticeServiceBuilder {
         Ok(LatticeService {
             cluster_id: self.config.cluster_id.clone(),
             actor_system,
+            hosts,
             associations,
             messaging,
             endpoint,
@@ -1044,6 +1045,7 @@ impl LatticeServiceBuilder {
             configured_domains,
             drain_operation: std::sync::Mutex::new(None),
             join_config: self.join_config,
+            force_actor_shutdown: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }

@@ -49,6 +49,12 @@ pub(super) trait EntityRoute: Send + Sync {
         &self,
         shard_id: lattice_placement::types::ShardId,
     ) -> Result<bool, RemoteMessageError>;
+    async fn wait_drained(
+        &self,
+        _shard_id: lattice_placement::types::ShardId,
+    ) -> Result<(), RemoteMessageError> {
+        Ok(())
+    }
     async fn fence(
         &self,
         _shard_id: lattice_placement::types::ShardId,
@@ -492,14 +498,8 @@ where
     ) -> Result<bool, RemoteMessageError> {
         let actor_ids = self
             .registry
-            .running_actor_ids()
+            .active_actor_ids()
             .into_iter()
-            .chain(
-                self.registry
-                    .retained_stop_failures()
-                    .into_iter()
-                    .map(|failure| failure.actor_id),
-            )
             .filter(|actor_id| match actor_id {
                 ActorId::Bytes(bytes) => lattice_core::actor_ref::EntityId::new(bytes.clone())
                     .is_ok_and(|entity_id| self.config.shard_for(&entity_id) == shard_id),
@@ -514,20 +514,53 @@ where
         .await
     }
 
+    async fn wait_drained(
+        &self,
+        shard_id: lattice_placement::types::ShardId,
+    ) -> Result<(), RemoteMessageError> {
+        let actor_ids = self
+            .registry
+            .active_actor_ids()
+            .into_iter()
+            .filter(|actor_id| match actor_id {
+                ActorId::Bytes(bytes) => lattice_core::actor_ref::EntityId::new(bytes.clone())
+                    .is_ok_and(|entity_id| self.config.shard_for(&entity_id) == shard_id),
+                ActorId::Str(_) | ActorId::U64(_) | ActorId::I64(_) => false,
+            })
+            .collect::<Vec<_>>();
+        self.registry.wait_actor_ids_terminal(actor_ids).await;
+        let key = PlacementSlotKey::Shard {
+            domain: self.config.domain.clone(),
+            entity_type: self.config.entity_type.clone(),
+            shard_id,
+        };
+        let still_owned = self
+            .state
+            .lock()
+            .expect("logic placement state poisoned")
+            .slot(&key)
+            .is_some_and(|slot| {
+                slot.owner.as_ref() == Some(&self.local_node)
+                    && matches!(
+                        slot.state,
+                        PlacementSlotState::Stopping | PlacementSlotState::StopFailed
+                    )
+            });
+        if still_owned {
+            Ok(())
+        } else {
+            Err(RemoteMessageError::StaleAuthority)
+        }
+    }
+
     async fn fence(
         &self,
         shard_id: lattice_placement::types::ShardId,
     ) -> Result<(), RemoteMessageError> {
         let actor_ids = self
             .registry
-            .running_actor_ids()
+            .active_actor_ids()
             .into_iter()
-            .chain(
-                self.registry
-                    .retained_stop_failures()
-                    .into_iter()
-                    .map(|failure| failure.actor_id),
-            )
             .filter(|actor_id| match actor_id {
                 ActorId::Bytes(bytes) => lattice_core::actor_ref::EntityId::new(bytes.clone())
                     .is_ok_and(|entity_id| self.config.shard_for(&entity_id) == shard_id),
@@ -535,10 +568,10 @@ where
             })
             .collect::<Vec<_>>();
         for actor_id in actor_ids {
-            self.registry
-                .fence_after_authority_loss(&actor_id)
-                .await
-                .map_err(|_| RemoteMessageError::HandlerFailed)?;
+            match self.registry.fence_after_authority_loss(&actor_id).await {
+                Ok(()) | Err(lattice_actor::registry::ActorQuarantineError::NotRetained) => {}
+                Err(_) => return Err(RemoteMessageError::HandlerFailed),
+            }
         }
         Ok(())
     }
