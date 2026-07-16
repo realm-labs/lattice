@@ -319,7 +319,7 @@ impl RemotingEndpoint {
     }
 
     pub async fn shutdown(&self) -> Result<(), EndpointError> {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.send_replace(true);
         lattice_core::failpoint::hit(
             lattice_core::failpoint::Failpoint::ShutdownAfterFenceBeforeTaskJoin,
         );
@@ -503,6 +503,9 @@ impl RemotingEndpoint {
         listener: tokio::net::TcpListener,
     ) -> Result<(), EndpointError> {
         let mut shutdown = self.shutdown_tx.subscribe();
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         let mut connections = JoinSet::new();
         loop {
             tokio::select! {

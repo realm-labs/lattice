@@ -183,7 +183,10 @@ forwarding, or EventBus delivery.
 
 ### 3.2 Roles a Logic Service May Carry
 
-Roles are capabilities, not mutually exclusive process types. One `LatticeService` process may carry several roles, although production deployments should keep credentials and failure domains narrow.
+Roles are capabilities, not mutually exclusive process types. One application process may carry
+several roles. Embedded deployment supervises separate Coordinator and Logic remoting identities in
+that process so Coordinator election never depends on placement; production deployments should
+still keep credentials and failure domains narrow.
 
 | Role | Responsibility | Required state/access |
 |---|---|---|

@@ -129,66 +129,67 @@ Protocol ID, message IDs, interaction modes, codec/schema versions, and the resu
 
 ## 3. Start a Logic Service
 
+Application bootstrap has three deployment modes:
+
+| Mode | Process contents | Typical use |
+|---|---|---|
+| `EmbeddedCandidate` | Logic service plus an internally managed Coordinator candidate identity | local development and compact clusters |
+| `ClientOnly` | Logic service only; discovers external Coordinator candidates | ordinary production logic and Gateway nodes |
+| `DedicatedCandidate` | Coordinator candidate only | isolated production control plane |
+
+The embedded form deliberately uses a second remoting identity inside the same process. Coordinator
+election therefore remains below placement and never depends on the candidate's own ShardRegion or
+SingletonManager.
+
 ```rust
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let app = AppDeps::from_env().await?;
 
-    let service = LatticeService::builder(NodeConfig::from_env()?)
-        .remoting(
-            RemotingConfig::builder()
-                .listen("0.0.0.0:25520".parse()?)
-                .advertise("player-0.player:25520".parse()?)
-                .bulk_stripes_per_association(1)
-                .max_active_associations(256)
-                .security(RemotingSecurity::from_config()?)
-                .build()?,
+    let application = LatticeService::builder(NodeConfig::from_env()?)
+        .host_entity::<PlayerActor, PlayerProtocol, _>(
+            EntityOptions::new(
+                PlacementDomainId::new("player")?,
+                EntityType::new("player")?,
+                256,
+            )
+            .mailbox(MailboxConfig::bounded(1_024)),
+            PlayerActorFactory::new(app.clone()),
+        )?
+        .host_singleton::<MatchmakerActor, MatchmakerProtocol, _>(
+            SingletonOptions::new(
+                PlacementDomainId::new("matchmaking")?,
+                SingletonKind::new("matchmaker")?,
+            ),
+            MatchmakerFactory::new(app),
+        )?
+        .domain_capacity(PlacementDomainId::new("player")?, 8)?
+        .domain_capacity(PlacementDomainId::new("matchmaking")?, 1)?
+        .build_embedded(
+            placement_store,
+            EmbeddedCoordinatorConfig::new(coordinator_node_config),
         )
-        .coordinator_discovery(membership_discovery()?)
-        .coordinator_discovery(placement_discovery("player")?)
-        .coordinator_discovery(placement_discovery("matchmaking")?)
-        .event_bus(NatsEventBus::from_config()?)
-        .register_actor_protocol(player_protocol.clone())
-        .register_sharded_entity(
-            EntityType::builder::<PlayerActor>("player")
-                .domain(PlacementDomainId::new("player")?)
-                .shards(256)
-                .hash_version(ShardHashVersion::Xxh3V1)
-                .protocol(player_protocol)
-                .factory(PlayerActorFactory::new(app.clone()))
-                .passivate_after(Duration::from_secs(600))
-                .rebalance(
-                    RebalancePolicy::weighted_least_load()
-                        .interval(Duration::from_secs(10))
-                        .load_sample_max_age(Duration::from_secs(20))
-                        .min_relative_improvement(0.10)
-                        .min_shard_residence(Duration::from_secs(120))
-                        .node_join_stability(Duration::from_secs(30))
-                        .cooldown(Duration::from_secs(30))
-                        .max_moves_per_round(4)
-                        .max_concurrent_moves(8),
-                )
-                .build()?,
-        )
-        .register_singleton(
-            SingletonType::builder::<MatchmakerActor>("matchmaker")
-                .domain(PlacementDomainId::new("matchmaking")?)
-                .protocol(matchmaker_protocol())
-                .factory(MatchmakerFactory::new(app))
-                .required_role("matchmaker")
-                .build()?,
-        )
-        .build()
         .await?;
 
-    service.run_until_shutdown().await
+    application.start().await?;
+    application.wait_ready(Duration::from_secs(30)).await?;
+    shutdown_signal().await;
+    application.shutdown().await
 }
 ```
 
 `MemberHello` joins the membership scope; the two explicit configurations create independent
 `PlacementDomainHello` sessions with separate capacity, snapshots, terms, routing, and failure
 state. CoordinatorHost may run in dedicated or co-located processes. Business nodes never receive a
-general-purpose placement-store handle.
+general-purpose placement-store handle in `ClientOnly` mode; embedded candidates intentionally carry
+Coordinator credentials and should be used only where that wider trust boundary is acceptable.
+
+For a production `ClientOnly` node, install scoped discovery on the builder and finish with
+`build_client()`. A proxy-only ShardRegion is declared with `proxy_entity::<P>(EntityOptions)`; it
+subscribes to routing state and may buffer/forward messages, but it has no registry or loader and is
+never eligible to own a shard. `proxy_singleton::<P>(SingletonOptions)` is the corresponding
+singleton operation. Dedicated control-plane processes use
+`LatticeApplication::dedicated_candidate(...)`.
 
 ## 4. Concrete `ActorRef`: Any Live Actor Path
 

@@ -45,6 +45,7 @@ use crate::builder::LatticeService;
 use crate::config::ClusterJoinConfig;
 use crate::config::NodeConfig;
 use crate::lifecycle::{NodeLifecycleState, PlacementDomainState};
+use crate::registration::EntityOptions;
 
 const PROTOCOL_ID: u64 = 0x7465_7374_0000_0001;
 
@@ -56,30 +57,8 @@ fn secondary_domain() -> PlacementDomainId {
     PlacementDomainId::new("service-secondary").unwrap()
 }
 
-fn proxy_config(domain: PlacementDomainId, name: &str) -> EntityConfig {
-    EntityConfig::new(
-        domain,
-        EntityType::new(name).unwrap(),
-        ProtocolId::new(PROTOCOL_ID).unwrap(),
-        1,
-        "weighted-least-load",
-        1,
-        Vec::new(),
-    )
-    .unwrap()
-}
-
-fn membership_probe_config() -> EntityConfig {
-    EntityConfig::new(
-        placement_domain(),
-        EntityType::new("membership-probe").unwrap(),
-        ProtocolId::new(PROTOCOL_ID).unwrap(),
-        1,
-        "weighted-least-load",
-        1,
-        Vec::new(),
-    )
-    .unwrap()
+fn proxy_options(domain: PlacementDomainId, name: &str) -> EntityOptions {
+    EntityOptions::new(domain, EntityType::new(name).unwrap(), 1)
 }
 
 #[derive(Debug, Clone, lattice_actor::Request)]
@@ -504,7 +483,7 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
         NodeIncarnation::new(202).unwrap(),
     ))
     .unwrap()
-    .use_entity::<PingProtocol>(membership_probe_config())
+    .proxy_entity::<PingProtocol>(proxy_options(placement_domain(), "membership-probe"))
     .unwrap()
     .domain_capacity(placement_domain(), 1)
     .unwrap()
@@ -602,7 +581,7 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
             NodeIncarnation::new(incarnation).unwrap(),
         ))
         .unwrap()
-        .use_entity::<PingProtocol>(membership_probe_config())
+        .proxy_entity::<PingProtocol>(proxy_options(placement_domain(), "membership-probe"))
         .unwrap()
         .domain_capacity(placement_domain(), 1)
         .unwrap()
@@ -715,9 +694,9 @@ async fn one_domain_coordinator_loss_leaves_other_domain_ready() {
         NodeIncarnation::new(403).unwrap(),
     ))
     .unwrap()
-    .use_entity::<PingProtocol>(proxy_config(domain_a.clone(), "domain-a-proxy"))
+    .proxy_entity::<PingProtocol>(proxy_options(domain_a.clone(), "domain-a-proxy"))
     .unwrap()
-    .use_entity::<PingProtocol>(proxy_config(domain_b.clone(), "domain-b-proxy"))
+    .proxy_entity::<PingProtocol>(proxy_options(domain_b.clone(), "domain-b-proxy"))
     .unwrap()
     .domain_capacity(domain_a.clone(), 1)
     .unwrap()
@@ -858,7 +837,7 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
         member_incarnation,
     ))
     .unwrap()
-    .register_entity(entity_config, registry, binding, PingLoader)
+    .host_entity_with_registry(entity_config, registry, binding, PingLoader)
     .unwrap()
     .domain_capacity(placement_domain(), 1)
     .unwrap()

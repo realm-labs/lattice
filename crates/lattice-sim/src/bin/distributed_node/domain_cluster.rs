@@ -171,7 +171,7 @@ async fn domain_logic(
     ] {
         let domain = distributed_domain(name)?;
         builder = builder
-            .use_entity::<FixtureProtocol>(EntityConfig::new(
+            .proxy_entity_config::<FixtureProtocol>(EntityConfig::new(
                 domain.clone(),
                 EntityType::new(entity)?,
                 ProtocolId::new(PROTOCOL_ID)?,

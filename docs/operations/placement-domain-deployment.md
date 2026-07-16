@@ -5,6 +5,15 @@ for the membership scope and for every placement domain required by an applicati
 CoordinatorHost process may campaign for several scopes; dedicated membership-only hosts are
 supported by configuring zero placement domains.
 
+Applications select one explicit assembly mode. `EmbeddedCandidate` supervises a Coordinator
+candidate and Logic Service in the same operating-system process while retaining separate remoting
+identities. `ClientOnly` contains no store credentials and discovers external candidates.
+`DedicatedCandidate` contains no Logic Service and is the preferred strict control-plane shape.
+Candidate failover still requires a shared durable store and at least two running candidates; the
+embedded mode removes application bootstrap plumbing, not the distributed election requirement.
+Every embedded instance must receive the same candidate endpoint set through
+`EmbeddedCoordinatorConfig::candidates(...)`; its own endpoint is added automatically.
+
 ## Process topology
 
 For three domains, a production starting shape is:

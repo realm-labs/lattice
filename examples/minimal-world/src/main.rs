@@ -10,9 +10,7 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::protocol::ProstCodec;
-use lattice_actor::registry::{
-    ActorCreateContext, ActorLoader, ActorRefConfig, ActorRegistry, ActorRegistryConfig,
-};
+use lattice_actor::registry::{ActorCreateContext, ActorLoader};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::traits::{Actor, Responder};
 use lattice_config::source::ConfigSource;
@@ -20,11 +18,9 @@ use lattice_core::actor_ref::{
     ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
     SingletonKind, SingletonRef,
 };
-use lattice_core::coordinator::CoordinatorScope;
 use lattice_core::instance::InstanceId;
 use lattice_core::trace::TraceContext;
 use lattice_core::{actor_kind, service_kind};
-use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
 use lattice_eventbus::local::{EventBus, LocalEventBus};
 use lattice_eventbus::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
 use lattice_gateway::error::GatewayError;
@@ -36,16 +32,12 @@ use lattice_ops::telemetry::{
     InMemoryTelemetryExporter, OpenTelemetryPipeline, PlacementDomainTelemetry, TelemetryRecorder,
     TelemetryResource,
 };
-use lattice_placement::control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter};
-use lattice_placement::coordinator::SingletonConfig;
-use lattice_placement::region::EntityConfig;
-use lattice_placement::runtime::host::{CoordinatorHost, CoordinatorHostConfig};
 use lattice_placement::storage::InMemoryPlacementStore;
-use lattice_placement::types::NodeKey;
 use lattice_remoting::config::RemotingConfig;
 use lattice_service::builder::LatticeService;
 use lattice_service::config::{ClusterJoinConfig, NodeConfig};
-use lattice_service::lifecycle::NodeLifecycleState;
+use lattice_service::deployment::EmbeddedCoordinatorConfig;
+use lattice_service::registration::{EntityOptions, SingletonOptions};
 use prost::Message;
 use serde::Deserialize;
 
@@ -201,21 +193,6 @@ fn node_config(
     }
 }
 
-fn discovery(
-    scope: CoordinatorScope,
-    coordinator: NodeAddress,
-) -> Result<Arc<StaticDiscovery>, Box<dyn std::error::Error>> {
-    Ok(Arc::new(StaticDiscovery::new(
-        scope,
-        "minimal-world-coordinator",
-        vec![StaticEndpoint {
-            address: coordinator,
-            expected_node_id: Some("coordinator".to_owned()),
-            priority: 1,
-        }],
-    )?))
-}
-
 async fn eventually_enter(
     service: &LatticeService,
     target: lattice_core::actor_ref::EntityRef<WorldProtocol>,
@@ -276,78 +253,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logic_address = reserve_address()?;
     let store = Arc::new(InMemoryPlacementStore::new(1024, 128)?);
 
-    let coordinator_incarnation = NodeIncarnation::generate();
-    let coordinator_builder = LatticeService::builder(node_config(
-        cluster_id.clone(),
-        "coordinator",
-        coordinator_address.clone(),
-        coordinator_incarnation,
-    ))?;
-    let coordinator_host = CoordinatorHost::elect(
-        store,
-        coordinator_builder.association_manager(),
-        NodeKey {
-            node_id: "coordinator".to_owned(),
-            address: coordinator_address.clone(),
-            incarnation: coordinator_incarnation,
-        },
-        BTreeSet::from([domain.clone()]),
-        CoordinatorHostConfig::default(),
-    )
-    .await?;
-    let (coordinator_control, coordinator_controls) =
-        PlacementControlRouter::bounded(128, DEFAULT_MAX_CONTROL_PAYLOAD)?;
-    let coordinator = Arc::new(
-        coordinator_builder
-            .coordinator_host(
-                Arc::new(coordinator_control),
-                coordinator_host,
-                coordinator_controls,
-            )
-            .build()?,
-    );
-    coordinator.start().await?;
-
     let logic_incarnation = NodeIncarnation::generate();
-    let actor_ref_config = ActorRefConfig {
-        cluster_id: cluster_id.clone(),
-        node_address: logic_address.clone(),
-        node_incarnation: logic_incarnation,
-    };
-    let world_binding = Arc::new(WorldProtocol::bind::<WorldActor>()?);
-    let world_registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("World"),
-        ActorRegistryConfig {
-            mailbox: MailboxConfig::bounded(config.mailbox_capacity),
-            actor_ref: Some(actor_ref_config.clone()),
-            ..ActorRegistryConfig::default()
-        },
-        world_binding.as_ref(),
-    ));
-    let clock_binding = Arc::new(ClockProtocol::bind::<ClockActor>()?);
-    let clock_registry = Arc::new(ActorRegistry::new_bound(
-        actor_kind!("WorldClock"),
-        ActorRegistryConfig {
-            mailbox: MailboxConfig::bounded(config.mailbox_capacity),
-            actor_ref: Some(actor_ref_config),
-            ..ActorRegistryConfig::default()
-        },
-        clock_binding.as_ref(),
-    ));
-    let entity_config = EntityConfig::new(
+    let entity_options = EntityOptions::new(
         domain.clone(),
         EntityType::new("world")?,
-        ProtocolId::new(WORLD_PROTOCOL_ID)?,
         config.shard_count,
-        "weighted-least-load",
-        1,
-        Vec::new(),
-    )?;
-    let singleton_config = SingletonConfig::new(
-        domain.clone(),
-        SingletonKind::new("world-clock")?,
-        ProtocolId::new(CLOCK_PROTOCOL_ID)?,
-    );
+    )
+    .actor_kind(actor_kind!("World"))
+    .mailbox(MailboxConfig::bounded(config.mailbox_capacity));
+    let singleton_options =
+        SingletonOptions::new(domain.clone(), SingletonKind::new("world-clock")?)
+            .actor_kind(actor_kind!("WorldClock"))
+            .mailbox(MailboxConfig::bounded(config.mailbox_capacity));
+    let entity_config = entity_options.build(ProtocolId::new(WORLD_PROTOCOL_ID)?)?;
+    let singleton_config = singleton_options.build(ProtocolId::new(CLOCK_PROTOCOL_ID)?);
     let world_ref = entity_config
         .entity_ref::<WorldProtocol>(cluster_id.clone(), EntityId::new(b"world-1".to_vec())?)?;
     let clock_ref: SingletonRef<ClockProtocol> = SingletonRef::new(
@@ -359,43 +278,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?
     .try_typed()?;
 
-    let logic = Arc::new(
-        LatticeService::builder(node_config(
-            cluster_id.clone(),
-            "world-a",
-            logic_address,
-            logic_incarnation,
-        ))?
-        .register_entity(entity_config, world_registry, world_binding, WorldLoader)?
-        .register_singleton(singleton_config, clock_registry, clock_binding, ClockLoader)?
-        .domain_capacity(domain.clone(), config.capacity_units)?
-        .coordinator_discovery(discovery(
-            CoordinatorScope::Membership,
-            coordinator_address.clone(),
-        )?)?
-        .coordinator_discovery(discovery(
-            CoordinatorScope::Placement(domain.clone()),
-            coordinator_address,
-        )?)?
-        .join_config(ClusterJoinConfig {
-            retry_initial: Duration::from_millis(10),
-            retry_max: Duration::from_millis(100),
-            join_timeout: Some(Duration::from_secs(10)),
-            leave_timeout: Duration::from_secs(5),
-            shutdown_timeout: Duration::from_secs(5),
-            ..ClusterJoinConfig::default()
-        })
-        .build()?,
-    );
-    logic.start().await?;
-    let mut lifecycle = logic.subscribe_node_lifecycle();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while *lifecycle.borrow() != NodeLifecycleState::Ready {
-            lifecycle.changed().await?;
-        }
-        Ok::<(), tokio::sync::watch::error::RecvError>(())
+    let application = LatticeService::builder(node_config(
+        cluster_id.clone(),
+        "world-a",
+        logic_address,
+        logic_incarnation,
+    ))?
+    .host_entity::<WorldActor, WorldProtocol, _>(entity_options, WorldLoader)?
+    .host_singleton::<ClockActor, ClockProtocol, _>(singleton_options, ClockLoader)?
+    .domain_capacity(domain.clone(), config.capacity_units)?
+    .join_config(ClusterJoinConfig {
+        retry_initial: Duration::from_millis(10),
+        retry_max: Duration::from_millis(100),
+        join_timeout: Some(Duration::from_secs(10)),
+        leave_timeout: Duration::from_secs(5),
+        shutdown_timeout: Duration::from_secs(5),
+        ..ClusterJoinConfig::default()
     })
-    .await??;
+    .build_embedded(
+        store,
+        EmbeddedCoordinatorConfig::new(node_config(
+            cluster_id.clone(),
+            "coordinator",
+            coordinator_address,
+            NodeIncarnation::generate(),
+        )),
+    )
+    .await?;
+    application.start().await?;
+    application.wait_ready(Duration::from_secs(10)).await?;
+    let logic = application
+        .logic()
+        .ok_or_else(|| std::io::Error::other("logic service is unavailable"))?
+        .clone();
 
     let direct_reply = eventually_enter(&logic, world_ref.clone(), 1001).await?;
     let clock_reply = eventually_tick(&logic, clock_ref).await?;
@@ -494,7 +409,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = gateway_stop_tx.send(());
     gateway_task.await??;
 
-    let coordinator_handle = coordinator
+    let coordinator_handle = application
+        .coordinator_service()
+        .ok_or_else(|| std::io::Error::other("Coordinator service is unavailable"))?
         .coordinator(&domain)
         .ok_or_else(|| std::io::Error::other("domain Coordinator handle is unavailable"))?;
     let _admin_router = AdminHttpAdapter::new(
@@ -542,8 +459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_or(0, |batch| batch.metrics.len());
 
     scheduler.shutdown().await;
-    logic.shutdown().await?;
-    coordinator.force_shutdown().await?;
+    application.shutdown().await?;
 
     println!(
         "domain={} direct_players={} gateway_players={} singleton_tick={} event={} task={} metrics={}",

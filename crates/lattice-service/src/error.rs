@@ -12,6 +12,10 @@ pub enum ServiceError {
     MemberDirectory(#[source] crate::cluster::members::MemberDirectoryError),
     #[error("placement control router construction failed")]
     PlacementControl(#[source] lattice_placement::control::PlacementControlError),
+    #[error("Coordinator runtime construction failed")]
+    CoordinatorRuntime(#[from] lattice_placement::runtime::CoordinatorRuntimeError),
+    #[error("Coordinator discovery construction failed")]
+    Discovery(#[from] lattice_discovery::provider::DiscoveryError),
     #[error("discovery joining and a preassembled logic runtime cannot both be configured")]
     ConflictingClusterRuntime,
     #[error("actor host registration failed")]
@@ -50,4 +54,8 @@ pub enum ServiceError {
     InvalidPlacementDomains,
     #[error("graceful member leave exceeded its deadline")]
     LeaveTimeout,
+    #[error("Coordinator deployment configuration is invalid")]
+    InvalidDeployment,
+    #[error("service readiness wait exceeded its deadline")]
+    ReadinessTimeout,
 }

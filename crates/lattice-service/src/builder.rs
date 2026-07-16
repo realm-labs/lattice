@@ -7,12 +7,12 @@ use std::sync::atomic::AtomicBool;
 use lattice_actor::host::ActorHost;
 use lattice_actor::host::ProtocolHostRegistry;
 use lattice_actor::protocol::{
-    ActorProtocol, ActorProtocolBinding, Protocol, SupportsAsk, SupportsTell,
+    ActorProtocol, ActorProtocolBinder, ActorProtocolBinding, Protocol, SupportsAsk, SupportsTell,
 };
 use lattice_actor::recipient::{
     ActorSystem, RecipientBackend, RecipientError, RegisteredActorProtocol,
 };
-use lattice_actor::registry::{ActorLoader, ActorRegistry};
+use lattice_actor::registry::{ActorLoader, ActorRefConfig, ActorRegistry, ActorRegistryConfig};
 use lattice_actor::traits::{Actor, Message, Request};
 use lattice_core::actor_ref::{ActorRef, EntityRef, ProtocolTag, RecipientRef, SingletonRef};
 use lattice_discovery::provider::CoordinatorDiscovery;
@@ -63,6 +63,7 @@ use crate::lifecycle::{
     NodeLifecycle, NodeLifecycleState, PlacementDomainState, ServiceHealthSnapshot,
     ServiceLifecycleEvent,
 };
+use crate::registration::{EntityOptions, SingletonOptions};
 use crate::supervisor::TaskSupervisor;
 
 type ActorSystemInstaller = Box<
@@ -177,6 +178,36 @@ impl LatticeServiceBuilder {
         self.messaging.clone()
     }
 
+    pub(crate) fn node_config(&self) -> &NodeConfig {
+        &self.config
+    }
+
+    pub(crate) fn hosted_domains(&self) -> BTreeSet<lattice_core::actor_ref::PlacementDomainId> {
+        self.entity_configs
+            .iter()
+            .map(|config| config.domain.clone())
+            .chain(
+                self.singleton_configs
+                    .iter()
+                    .map(|config| config.domain.clone()),
+            )
+            .collect()
+    }
+
+    pub(crate) fn placement_domains(&self) -> BTreeSet<lattice_core::actor_ref::PlacementDomainId> {
+        self.entity_configs
+            .iter()
+            .chain(self.proxied_entity_configs.iter())
+            .map(|config| config.domain.clone())
+            .chain(
+                self.singleton_configs
+                    .iter()
+                    .chain(self.proxied_singleton_configs.iter())
+                    .map(|config| config.domain.clone()),
+            )
+            .collect()
+    }
+
     pub fn register_actor<A: Actor, P: Protocol>(
         mut self,
         registry: Arc<ActorRegistry<A>>,
@@ -206,12 +237,42 @@ impl LatticeServiceBuilder {
         Ok(self)
     }
 
-    /// Registers an actor as a placement-managed logical entity.
+    /// Hosts a placement-managed entity and derives its protocol binding,
+    /// registry identity, and placement protocol ID from application types.
+    pub fn host_entity<A, P, L>(
+        self,
+        options: EntityOptions,
+        loader: L,
+    ) -> Result<Self, ServiceError>
+    where
+        A: Actor,
+        P: Protocol + ActorProtocolBinder<A>,
+        L: ActorLoader<A>,
+    {
+        let protocol = Arc::new(P::bind_actor().map_err(ServiceError::ProtocolBuild)?);
+        let config = options
+            .build(protocol.protocol_id())
+            .map_err(ServiceError::EntityConfig)?;
+        let mut registry_config: ActorRegistryConfig = options.registry;
+        registry_config.actor_ref = Some(ActorRefConfig {
+            cluster_id: self.config.cluster_id.clone(),
+            node_address: self.config.address.clone(),
+            node_incarnation: self.config.incarnation,
+        });
+        let registry = Arc::new(ActorRegistry::new_bound(
+            options.actor_kind,
+            registry_config,
+            protocol.as_ref(),
+        ));
+        self.host_entity_with_registry(config, registry, protocol, loader)
+    }
+
+    /// Advanced entity registration using a prebuilt registry and binding.
     ///
     /// The entity declaration is advertised in `PlacementDomainHello`, its protocol is
     /// installed in the service catalogue, and the loader is re-registered
     /// automatically whenever discovery selects a new Coordinator.
-    pub fn register_entity<A, L, P>(
+    pub fn host_entity_with_registry<A, L, P>(
         mut self,
         config: EntityConfig,
         registry: Arc<ActorRegistry<A>>,
@@ -260,9 +321,21 @@ impl LatticeServiceBuilder {
         Ok(self)
     }
 
-    /// Registers a logical entity protocol for outbound routing without
-    /// making this node eligible to own its shards.
-    pub fn use_entity<P: Protocol>(mut self, config: EntityConfig) -> Result<Self, ServiceError> {
+    /// Installs a proxy-only ShardRegion without making this node eligible to
+    /// own shards or activate entity actors.
+    pub fn proxy_entity<P: Protocol>(self, options: EntityOptions) -> Result<Self, ServiceError> {
+        let protocol = P::build_protocol().map_err(ServiceError::ProtocolBuild)?;
+        let config = options
+            .build(protocol.protocol_id())
+            .map_err(ServiceError::EntityConfig)?;
+        self.proxy_entity_config::<P>(config)
+    }
+
+    /// Advanced proxy registration using a prebuilt placement configuration.
+    pub fn proxy_entity_config<P: Protocol>(
+        mut self,
+        config: EntityConfig,
+    ) -> Result<Self, ServiceError> {
         config.validate().map_err(ServiceError::EntityConfig)?;
         let protocol = Arc::new(P::build_protocol().map_err(ServiceError::ProtocolBuild)?);
         if config.protocol_id != protocol.protocol_id() {
@@ -297,7 +370,35 @@ impl LatticeServiceBuilder {
         Ok(self)
     }
 
-    pub fn register_singleton<A, L, P>(
+    /// Hosts a placement-managed singleton and derives its runtime plumbing.
+    pub fn host_singleton<A, P, L>(
+        self,
+        options: SingletonOptions,
+        loader: L,
+    ) -> Result<Self, ServiceError>
+    where
+        A: Actor,
+        P: Protocol + ActorProtocolBinder<A>,
+        L: ActorLoader<A>,
+    {
+        let protocol = Arc::new(P::bind_actor().map_err(ServiceError::ProtocolBuild)?);
+        let config = options.build(protocol.protocol_id());
+        let mut registry_config = options.registry;
+        registry_config.actor_ref = Some(ActorRefConfig {
+            cluster_id: self.config.cluster_id.clone(),
+            node_address: self.config.address.clone(),
+            node_incarnation: self.config.incarnation,
+        });
+        let registry = Arc::new(ActorRegistry::new_bound(
+            options.actor_kind,
+            registry_config,
+            protocol.as_ref(),
+        ));
+        self.host_singleton_with_registry(config, registry, protocol, loader)
+    }
+
+    /// Advanced singleton registration using a prebuilt registry and binding.
+    pub fn host_singleton_with_registry<A, L, P>(
         mut self,
         config: SingletonConfig,
         registry: Arc<ActorRegistry<A>>,
@@ -343,7 +444,17 @@ impl LatticeServiceBuilder {
         Ok(self)
     }
 
-    pub fn use_singleton<P: Protocol>(
+    /// Installs a proxy-only SingletonRoute without hosting its activation.
+    pub fn proxy_singleton<P: Protocol>(
+        self,
+        options: SingletonOptions,
+    ) -> Result<Self, ServiceError> {
+        let protocol = P::build_protocol().map_err(ServiceError::ProtocolBuild)?;
+        self.proxy_singleton_config::<P>(options.build(protocol.protocol_id()))
+    }
+
+    /// Advanced singleton proxy registration using a prebuilt configuration.
+    pub fn proxy_singleton_config<P: Protocol>(
         mut self,
         config: SingletonConfig,
     ) -> Result<Self, ServiceError> {
@@ -863,7 +974,7 @@ impl LatticeServiceBuilder {
                     self.join_config.clone(),
                 )
                 .map_err(ServiceError::Join)?;
-                Ok(MembershipJoinRuntime {
+                Ok::<MembershipJoinRuntime, ServiceError>(MembershipJoinRuntime {
                     controller: Arc::new(controller),
                     hello,
                     associations: associations.clone(),
