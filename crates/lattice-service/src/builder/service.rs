@@ -629,12 +629,15 @@ impl LatticeService {
             self.transition(ServiceLifecycleEvent::BeginDrain)?;
             state = NodeLifecycleState::Draining;
         }
-        if state == NodeLifecycleState::Draining
-            && let Some(membership) = self
+        let membership = {
+            self
                 .membership_handle
                 .lock()
                 .expect("membership handle poisoned")
                 .clone()
+        };
+        if state == NodeLifecycleState::Draining
+            && let Some(membership) = membership
         {
             let operation_id = format!("terminal-leave-{}", uuid::Uuid::new_v4());
             match tokio::time::timeout(
