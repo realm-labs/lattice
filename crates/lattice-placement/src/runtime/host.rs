@@ -787,20 +787,50 @@ where
                 if globally_up {
                     continue;
                 }
-                let (completion, _) = oneshot::channel();
-                sender
-                    .send(PlacementControlEvent {
-                        kind: PlacementControlEventKind::GlobalMemberRemoved {
-                            node: participant.node,
-                            reason: MemberRemovalReason::FailureDetected,
-                        },
-                        completion,
-                    })
-                    .await
-                    .map_err(|_| CoordinatorRuntimeError::ControlClosed)?;
+                self.remove_global_member_from_domain(
+                    sender,
+                    participant.node,
+                    MemberRemovalReason::FailureDetected,
+                )
+                .await?;
             }
         }
         Ok(())
+    }
+
+    async fn fanout_global_member_removal(
+        &self,
+        node: NodeKey,
+        reason: MemberRemovalReason,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        for hosted in self.domains.values() {
+            let Some(sender) = &hosted.sender else {
+                continue;
+            };
+            self.remove_global_member_from_domain(sender, node.clone(), reason)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_global_member_from_domain(
+        &self,
+        sender: &mpsc::Sender<PlacementControlEvent>,
+        node: NodeKey,
+        reason: MemberRemovalReason,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let (completion, completed) = oneshot::channel();
+        sender
+            .send(PlacementControlEvent {
+                kind: PlacementControlEventKind::GlobalMemberRemoved { node, reason },
+                completion,
+            })
+            .await
+            .map_err(|_| CoordinatorRuntimeError::ControlClosed)?;
+        completed
+            .await
+            .map_err(|_| CoordinatorRuntimeError::ControlClosed)?
+            .map_err(|_| CoordinatorRuntimeError::ControlClosed)
     }
 
     async fn complete_membership_drain(
@@ -842,8 +872,10 @@ where
             }
             MemberStatus::Leaving => {}
         }
-        membership
+        let removed = membership
             .remove(&member.node, MemberRemovalReason::GracefulLeave)
+            .await?;
+        self.fanout_global_member_removal(removed.node, MemberRemovalReason::GracefulLeave)
             .await?;
         Ok(())
     }

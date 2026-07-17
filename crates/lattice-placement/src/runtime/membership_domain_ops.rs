@@ -271,6 +271,19 @@ where
                 }
             }
         }
+        let remaining_slots = self.store.list_slots(&self.version.domain).await?;
+        for slot in remaining_slots
+            .into_iter()
+            .filter(|slot| {
+                slot.owner.as_ref() == Some(&node)
+                    && slot.state == PlacementSlotState::Running
+                    && slot.active_move.is_none()
+            })
+        {
+            if self.store.get_claim(&slot.key).await?.is_none() {
+                self.fence_missing_claim(slot).await?;
+            }
+        }
         Ok(())
     }
 

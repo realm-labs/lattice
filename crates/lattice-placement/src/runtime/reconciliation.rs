@@ -261,7 +261,7 @@ where
         Ok(())
     }
 
-    async fn fence_missing_claim(
+    pub(super) async fn fence_missing_claim(
         &mut self,
         slot: PlacementSlot,
     ) -> Result<(), CoordinatorRuntimeError> {
