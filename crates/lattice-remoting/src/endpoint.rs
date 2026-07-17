@@ -229,9 +229,18 @@ impl RemotingEndpoint {
             return Ok(association);
         }
         for lane in self.lanes() {
-            self.connect_lane(association.clone(), peer.clone(), lane)
-                .await?;
+            if association.lane_receiver_available(lane) {
+                self.connect_lane(association.clone(), peer.clone(), lane)
+                    .await?;
+            }
         }
+        tokio::time::timeout(self.config.connect_timeout, async {
+            while association.state() != crate::association::AssociationState::Active {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| EndpointError::ConnectTimeout)?;
         Ok(association)
     }
 
@@ -482,19 +491,12 @@ impl RemotingEndpoint {
         if lane == LaneKind::Control {
             association.install_peer_catalogue(peer_catalogue)?;
         }
-        association.attach(LaneAttachment {
+        association.attach_and_replay(LaneAttachment {
             association_id: association.id(),
             key: association.key().clone(),
             lane,
             connection_nonce: nonce,
         })?;
-        if lane == LaneKind::Control
-            && association.state() == crate::association::AssociationState::Active
-        {
-            for frame in association.replay_control_frames() {
-                association.try_admit_control(frame)?;
-            }
-        }
         Ok((connection.into_inner(), nonce))
     }
 
@@ -600,19 +602,12 @@ impl RemotingEndpoint {
         if handshake.lane == LaneKind::Control {
             association.install_peer_catalogue(peer_catalogue)?;
         }
-        association.attach(LaneAttachment {
+        association.attach_and_replay(LaneAttachment {
             association_id: handshake.association_id,
             key: association.key().clone(),
             lane: handshake.lane,
             connection_nonce: handshake.connection_nonce,
         })?;
-        if handshake.lane == LaneKind::Control
-            && association.state() == crate::association::AssociationState::Active
-        {
-            for frame in association.replay_control_frames() {
-                association.try_admit_control(frame)?;
-            }
-        }
         let mut receiver = association
             .take_lane_receiver(handshake.lane)
             .ok_or(EndpointError::LaneAlreadyRunning(handshake.lane))?;
@@ -729,7 +724,7 @@ impl RemotingEndpoint {
     ) -> Result<LaneExit, crate::lane::LaneError> {
         let association_id = association.id();
         let mut disconnect = self.disconnect_tx.subscribe();
-        let result = tokio::select! {
+        tokio::select! {
             result = run_bidirectional_lane(
                 association.clone(),
                 lane,
@@ -743,12 +738,11 @@ impl RemotingEndpoint {
                 shutdown,
             ) => result,
             () = wait_for_disconnect(&mut disconnect, association_id) => {
+                association.detach(lane, nonce);
+                self.messaging.fail_association(association_id);
                 Ok(LaneExit::RemoteClose)
             }
-        };
-        association.detach(lane, nonce);
-        self.messaging.fail_association(association_id);
-        result
+        }
     }
 
     fn lane_config(&self) -> BidirectionalLaneConfig {

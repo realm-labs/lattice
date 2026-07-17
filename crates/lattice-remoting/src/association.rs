@@ -210,6 +210,21 @@ impl Association {
         }
     }
 
+    pub(crate) fn lane_receiver_available(&self, lane: LaneKind) -> bool {
+        let slots = self
+            .receivers
+            .lock()
+            .expect("association receivers poisoned");
+        match lane {
+            LaneKind::Control => slots.control.is_some(),
+            LaneKind::Interactive => slots.interactive.is_some(),
+            LaneKind::Bulk(index) => slots
+                .bulk
+                .get(usize::from(index))
+                .is_some_and(Option::is_some),
+        }
+    }
+
     pub fn return_lane_receiver(
         &self,
         lane: LaneKind,
@@ -238,6 +253,14 @@ impl Association {
         &self,
         attachment: LaneAttachment,
     ) -> Result<AttachmentDecision, AssociationError> {
+        self.attach_with_activation(attachment)
+            .map(|(decision, _)| decision)
+    }
+
+    pub(crate) fn attach_with_activation(
+        &self,
+        attachment: LaneAttachment,
+    ) -> Result<(AttachmentDecision, bool), AssociationError> {
         if attachment.association_id != self.id || attachment.key != self.key {
             return Err(AssociationError::IdentityMismatch);
         }
@@ -266,8 +289,27 @@ impl Association {
             }
             Some(_) => AttachmentDecision::RejectedDuplicate,
         };
-        if self.has_complete_lane_group(&inner.lanes) {
+        let activated =
+            inner.state != AssociationState::Active && self.has_complete_lane_group(&inner.lanes);
+        if activated {
             inner.state = AssociationState::Active;
+        }
+        Ok((decision, activated))
+    }
+
+    pub(crate) fn attach_and_replay(
+        &self,
+        attachment: LaneAttachment,
+    ) -> Result<AttachmentDecision, AssociationError> {
+        let reliable_control = self
+            .reliable_control
+            .lock()
+            .expect("reliable control state poisoned");
+        let (decision, activated) = self.attach_with_activation(attachment)?;
+        if activated {
+            for envelope in reliable_control.replay() {
+                self.try_admit_control(control_envelope_frame(envelope))?;
+            }
         }
         Ok(decision)
     }
@@ -278,7 +320,9 @@ impl Association {
             return;
         }
         inner.lanes.remove(&lane);
-        inner.state = AssociationState::Reconnecting;
+        if lane == LaneKind::Control || inner.state != AssociationState::Active {
+            inner.state = AssociationState::Reconnecting;
+        }
     }
 
     pub fn try_admit_control(&self, frame: Frame) -> Result<(), AssociationError> {
@@ -290,19 +334,17 @@ impl Association {
         payload: bytes::Bytes,
     ) -> Result<CommandId, AssociationError> {
         let command_id = CommandId::generate();
-        let envelope = self
+        let mut reliable_control = self
             .reliable_control
             .lock()
-            .expect("reliable control state poisoned")
+            .expect("reliable control state poisoned");
+        let envelope = reliable_control
             .enqueue(command_id, payload)
             .map_err(AssociationError::ReliableControl)?;
         if self.state() == AssociationState::Active
             && let Err(error) = self.try_admit_control(control_envelope_frame(&envelope))
         {
-            self.reliable_control
-                .lock()
-                .expect("reliable control state poisoned")
-                .rollback_last(command_id);
+            reliable_control.rollback_last(command_id);
             return Err(error);
         }
         Ok(command_id)
@@ -811,6 +853,159 @@ mod tests {
             }),
             Err(AssociationError::NotActive)
         ));
+    }
+
+    #[test]
+    fn active_association_tolerates_a_transient_data_lane_disconnect() {
+        let association = Association::new(key(), RemotingConfig::default()).unwrap();
+        for (lane, nonce) in [
+            (LaneKind::Control, 1),
+            (LaneKind::Interactive, 2),
+            (LaneKind::Bulk(0), 3),
+        ] {
+            association
+                .attach(LaneAttachment {
+                    association_id: association.id(),
+                    key: key(),
+                    lane,
+                    connection_nonce: nonce,
+                })
+                .unwrap();
+        }
+
+        association.detach(LaneKind::Interactive, 2);
+
+        assert_eq!(association.state(), AssociationState::Active);
+        association
+            .try_admit_interactive(Frame {
+                kind: crate::wire::FrameKind::Ask,
+                payload: bytes::Bytes::new(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn activation_is_reported_when_a_non_control_lane_completes_the_group() {
+        let association = Association::new(key(), RemotingConfig::default()).unwrap();
+        let (_, control_activated) = association
+            .attach_with_activation(LaneAttachment {
+                association_id: association.id(),
+                key: key(),
+                lane: LaneKind::Control,
+                connection_nonce: 1,
+            })
+            .unwrap();
+        let (_, interactive_activated) = association
+            .attach_with_activation(LaneAttachment {
+                association_id: association.id(),
+                key: key(),
+                lane: LaneKind::Interactive,
+                connection_nonce: 2,
+            })
+            .unwrap();
+        let (_, bulk_activated) = association
+            .attach_with_activation(LaneAttachment {
+                association_id: association.id(),
+                key: key(),
+                lane: LaneKind::Bulk(0),
+                connection_nonce: 3,
+            })
+            .unwrap();
+        let (_, duplicate_activated) = association
+            .attach_with_activation(LaneAttachment {
+                association_id: association.id(),
+                key: key(),
+                lane: LaneKind::Interactive,
+                connection_nonce: 4,
+            })
+            .unwrap();
+
+        assert!(!control_activated);
+        assert!(!interactive_activated);
+        assert!(bulk_activated);
+        assert!(!duplicate_activated);
+        assert_eq!(association.state(), AssociationState::Active);
+    }
+
+    #[test]
+    fn queued_reliable_control_replays_when_a_non_control_lane_activates() {
+        let association = Association::new(key(), RemotingConfig::default()).unwrap();
+        association
+            .admit_control_command(bytes::Bytes::from_static(b"queued"))
+            .unwrap();
+        for (lane, nonce) in [
+            (LaneKind::Control, 1),
+            (LaneKind::Interactive, 2),
+            (LaneKind::Bulk(0), 3),
+        ] {
+            association
+                .attach_and_replay(LaneAttachment {
+                    association_id: association.id(),
+                    key: key(),
+                    lane,
+                    connection_nonce: nonce,
+                })
+                .unwrap();
+        }
+
+        let mut control = association.take_lane_receiver(LaneKind::Control).unwrap();
+        let envelope =
+            crate::control::decode_control_envelope(&control.try_recv().unwrap()).unwrap();
+        assert_eq!(envelope.sequence, 1);
+        assert_eq!(envelope.payload, bytes::Bytes::from_static(b"queued"));
+    }
+
+    #[test]
+    fn concurrent_reliable_admission_preserves_control_sequence_order() {
+        let config = RemotingConfig {
+            control_queue_frames: 1024,
+            max_control_outbox_frames: 1024,
+            ..RemotingConfig::default()
+        };
+        let association = Arc::new(Association::new(key(), config).unwrap());
+        for (lane, nonce) in [
+            (LaneKind::Control, 1),
+            (LaneKind::Interactive, 2),
+            (LaneKind::Bulk(0), 3),
+        ] {
+            association
+                .attach(LaneAttachment {
+                    association_id: association.id(),
+                    key: key(),
+                    lane,
+                    connection_nonce: nonce,
+                })
+                .unwrap();
+        }
+        let mut control = association.take_lane_receiver(LaneKind::Control).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let association = association.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..64 {
+                        association
+                            .admit_control_command(bytes::Bytes::from_static(b"command"))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let sequences = (0..512)
+            .map(|_| {
+                let frame = control.try_recv().unwrap();
+                crate::control::decode_control_envelope(&frame)
+                    .unwrap()
+                    .sequence
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, (1..=512).collect::<Vec<_>>());
     }
 
     #[test]
