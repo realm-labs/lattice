@@ -381,7 +381,11 @@ where
         // applies its snapshot, leaving authority replay permanently gated on a
         // revision the member was never sent.
         self.ensure_domain_member_up(hello.node.incarnation).await?;
-        self.send_snapshot(hello.clone(), association_key).await?;
+        // Persisting the new domain member advances the shared placement
+        // revision. Existing sessions must observe that revision before any
+        // later slot delta, otherwise their strict reducer sees a gap and
+        // tears down the Coordinator association.
+        self.synchronize_sessions().await?;
         if record.status == MemberStatus::Up {
             let session = self
                 .sessions
@@ -397,6 +401,45 @@ where
                 PlacementControlCommand::MemberUp(record),
                 &self.config,
             )?;
+        }
+        Ok(())
+    }
+
+    async fn synchronize_sessions(&mut self) -> Result<(), CoordinatorRuntimeError> {
+        let version = self.version.clone();
+        let sessions = self
+            .sessions
+            .values()
+            .filter(|session| session.placement_up())
+            .map(|session| {
+                (
+                    session.hello.clone(),
+                    session.association.clone(),
+                    session
+                        .applied_version
+                        .as_ref()
+                        .is_some_and(|current| current.accepts_delta_after(&version)),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (hello, association_key, accepts_delta) in sessions {
+            if accepts_delta {
+                let association = self
+                    .associations
+                    .get(&association_key)
+                    .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
+                send_control(
+                    &association,
+                    &self.version.domain,
+                    PlacementControlCommand::StateDelta(crate::coordinator::CoordinatorDelta {
+                        version: version.clone(),
+                        records: Vec::new(),
+                    }),
+                    &self.config,
+                )?;
+            } else {
+                self.send_snapshot(hello, association_key).await?;
+            }
         }
         Ok(())
     }

@@ -389,6 +389,76 @@ fn empty_hello(node: NodeKey) -> TestHello {
 }
 
 #[tokio::test]
+async fn joining_domain_member_advances_existing_sessions_to_latest_revision() {
+    let cluster_id = ClusterId::new("domain-join-revision-test").unwrap();
+    let (coordinator, _) = node(&cluster_id, "coordinator", 26000, 10);
+    let (first, _) = node(&cluster_id, "first", 26001, 11);
+    let (second, _) = node(&cluster_id, "second", 26002, 12);
+    let associations = Arc::new(
+        AssociationManager::new(
+            coordinator.address.clone(),
+            coordinator.incarnation,
+            RemotingConfig::default(),
+        )
+        .unwrap(),
+    );
+    let first_key = attach_test_session(
+        &associations,
+        &cluster_id,
+        coordinator.incarnation,
+        &first,
+        100,
+    );
+    let second_key = attach_test_session(
+        &associations,
+        &cluster_id,
+        coordinator.incarnation,
+        &second,
+        200,
+    );
+    let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
+    let mut leader = PlacementDomainLeader::elect(
+        store,
+        associations.clone(),
+        coordinator,
+        CoordinatorScope::Placement(domain()),
+        CoordinatorTerm::new(1).unwrap(),
+        PlacementDomainLeaderConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    register_up(&mut leader, empty_hello(first.clone()), first_key.clone()).await;
+    let applied_version = leader.version.clone();
+    leader
+        .sessions
+        .get_mut(&first.incarnation)
+        .unwrap()
+        .applied_version = Some(applied_version);
+    let first_association = associations.get(&first_key).unwrap();
+    let mut first_control = first_association
+        .take_lane_receiver(lattice_remoting::association::LaneKind::Control)
+        .unwrap();
+    while first_control.try_recv().is_ok() {}
+
+    register_up(&mut leader, empty_hello(second), second_key).await;
+
+    let mut delta_versions = Vec::new();
+    while let Ok(frame) = first_control.try_recv() {
+        let envelope = lattice_remoting::control::decode_control_envelope(&frame).unwrap();
+        let scoped =
+            crate::control::decode_control_command(&envelope.payload, DEFAULT_MAX_CONTROL_PAYLOAD)
+                .unwrap();
+        if let PlacementControlCommand::StateDelta(delta) = scoped.command {
+            assert!(delta.records.is_empty());
+            delta_versions.push(delta.version);
+        }
+    }
+
+    assert_eq!(delta_versions, vec![leader.version.clone()]);
+}
+
+#[tokio::test]
 async fn real_control_session_installs_snapshot_and_matching_claim() {
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let coordinator_port = probe.local_addr().unwrap().port();
