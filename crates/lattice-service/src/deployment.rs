@@ -194,6 +194,35 @@ impl LatticeApplication {
         }
     }
 
+    /// Terminates every component without requiring placement migration to another deployment.
+    ///
+    /// This is intended for an intentional whole-deployment stop. Local actors still receive
+    /// their normal stop lifecycle; use the lower-level force APIs only for operator recovery.
+    pub async fn terminal_shutdown(&self) -> Result<(), ServiceError> {
+        let mut first_error = None;
+        if let Some(logic) = &self.logic
+            && let Err(error) = logic.terminal_shutdown().await
+        {
+            first_error = Some(ServiceError::ApplicationShutdown {
+                component: "logic",
+                source: Box::new(error),
+            });
+        }
+        if let Some(coordinator) = &self.coordinator
+            && let Err(error) = coordinator.terminal_shutdown().await
+            && first_error.is_none()
+        {
+            first_error = Some(ServiceError::ApplicationShutdown {
+                component: "coordinator-candidate",
+                source: Box::new(error),
+            });
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     pub async fn dedicated_candidate<S>(
         node: NodeConfig,
         store: Arc<S>,
@@ -355,6 +384,27 @@ mod tests {
             .await
             .unwrap();
         application.shutdown().await.unwrap();
+        assert_eq!(
+            application.logic().unwrap().node_lifecycle_state(),
+            NodeLifecycleState::Terminated
+        );
+    }
+
+    #[tokio::test]
+    async fn client_only_supports_terminal_shutdown() {
+        let cluster = ClusterId::new("client-terminal-test").unwrap();
+        let application = LatticeService::builder(node(&cluster, "client"))
+            .unwrap()
+            .build_client()
+            .unwrap();
+
+        application.start().await.unwrap();
+        application
+            .wait_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        application.terminal_shutdown().await.unwrap();
+
         assert_eq!(
             application.logic().unwrap().node_lifecycle_state(),
             NodeLifecycleState::Terminated

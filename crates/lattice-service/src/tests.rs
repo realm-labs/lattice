@@ -313,6 +313,42 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
 }
 
 #[tokio::test]
+async fn terminal_shutdown_drains_local_actors_without_a_migration_target() {
+    let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let registry = Arc::new(ActorRegistry::new_bound(
+        actor_kind!("TerminalShutdownActor"),
+        ActorRegistryConfig::default(),
+        binding.as_ref(),
+    ));
+    let handle = registry.start(ActorId::U64(1), PingActor).await.unwrap();
+    let config = node_config(
+        ClusterId::new("terminal-shutdown-test").unwrap(),
+        "terminal-shutdown",
+        NodeAddress::new("127.0.0.1", 25253).unwrap(),
+        NodeIncarnation::new(1).unwrap(),
+    );
+    let service = LatticeService::builder(config)
+        .unwrap()
+        .register_actor(registry.clone(), binding)
+        .unwrap()
+        .build()
+        .unwrap();
+    service.start().await.unwrap();
+
+    service.terminal_shutdown().await.unwrap();
+
+    assert_eq!(
+        service.node_lifecycle_state(),
+        NodeLifecycleState::Terminated
+    );
+    assert_eq!(
+        handle.lifecycle_state(),
+        lattice_actor::traits::ActorLifecycleState::Stopped
+    );
+    assert!(registry.live_cells().is_empty());
+}
+
+#[tokio::test]
 async fn service_retry_api_resolves_retained_actor_cell() {
     struct RetryShutdownActor {
         persistence_available: Arc<AtomicBool>,

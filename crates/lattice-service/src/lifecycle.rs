@@ -294,7 +294,7 @@ impl ProductionLifecycleDriver {
             | NodeLifecycleState::Ready => true,
         };
         if !valid {
-            tracing::error!(?node, ?state, %domain, "rejected domain health transition that violates node postconditions");
+            tracing::debug!(?node, ?state, %domain, "ignored late domain health transition during termination");
             return;
         }
         let mut health = self.health.lock().expect("service health poisoned");
@@ -366,7 +366,13 @@ impl NodeLifecycle {
                 (State::JoiningMembership, &[Effect::CloseExternalAdmission])
             }
             (State::JoiningMembership, Event::MembershipLost) => (State::JoiningMembership, &[]),
-            (State::Draining, Event::MembershipLost) => (State::Draining, &[]),
+            (
+                State::Draining,
+                Event::MembershipLost
+                | Event::CoordinatorLost
+                | Event::Reconciled
+                | Event::SnapshotInstalled,
+            ) => (State::Draining, &[]),
             (
                 State::JoiningMembership | State::Ready,
                 Event::CoordinatorLost | Event::Reconciled,
@@ -401,6 +407,14 @@ impl NodeLifecycle {
                     Effect::FenceClaimsAndStopRuntime,
                 ],
             ),
+            (
+                State::Stopping,
+                Event::MembershipLost
+                | Event::CoordinatorLost
+                | Event::Reconciled
+                | Event::SnapshotInstalled
+                | Event::RuntimeTerminated,
+            ) => (State::Stopping, &[]),
             (State::Stopping, Event::ShutdownComplete) => {
                 (State::Terminated, &[Effect::ReleaseRuntimeIdentity])
             }
@@ -592,5 +606,39 @@ mod tests {
             .transition(ServiceLifecycleEvent::ShutdownComplete)
             .unwrap();
         assert_eq!(driver.state(), NodeLifecycleState::Terminated);
+    }
+
+    #[test]
+    fn late_cluster_events_do_not_reopen_a_terminating_node() {
+        let mut lifecycle = NodeLifecycle::default();
+        lifecycle
+            .transition(ServiceLifecycleEvent::RemotingReady)
+            .unwrap();
+        lifecycle
+            .transition(ServiceLifecycleEvent::SnapshotInstalled)
+            .unwrap();
+        lifecycle
+            .transition(ServiceLifecycleEvent::BeginDrain)
+            .unwrap();
+
+        for event in [
+            ServiceLifecycleEvent::CoordinatorLost,
+            ServiceLifecycleEvent::SnapshotInstalled,
+            ServiceLifecycleEvent::MembershipLost,
+        ] {
+            assert!(lifecycle.transition(event).unwrap().is_empty());
+            assert_eq!(lifecycle.state(), NodeLifecycleState::Draining);
+        }
+
+        lifecycle
+            .transition(ServiceLifecycleEvent::DrainComplete)
+            .unwrap();
+        assert!(
+            lifecycle
+                .transition(ServiceLifecycleEvent::RuntimeTerminated)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(lifecycle.state(), NodeLifecycleState::Stopping);
     }
 }

@@ -612,6 +612,27 @@ impl LatticeService {
         self.leave(deadline).await
     }
 
+    /// Stops this service as part of an intentional whole-deployment termination.
+    ///
+    /// Unlike [`Self::shutdown`], terminal shutdown does not require hosted placement slots to
+    /// migrate to another member. It fences cluster authority first, then drains local actors and
+    /// stops the remaining runtimes. Actor stop failures are still reported and are never forced.
+    pub async fn terminal_shutdown(&self) -> Result<(), ServiceError> {
+        let state = self.node_lifecycle_state();
+        if state == NodeLifecycleState::Terminated {
+            return Ok(());
+        }
+        if state != NodeLifecycleState::Stopping {
+            tracing::info!(
+                target: "lattice.cluster.lifecycle",
+                ?state,
+                "terminal shutdown fences local cluster authority"
+            );
+            self.transition(ServiceLifecycleEvent::ForceStop)?;
+        }
+        self.stop_components().await
+    }
+
     pub async fn force_shutdown(&self) -> Result<(), ServiceError> {
         self.force_actor_shutdown
             .store(true, std::sync::atomic::Ordering::Release);
