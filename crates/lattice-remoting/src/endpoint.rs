@@ -774,6 +774,10 @@ fn observe_connection_result(result: &Result<(), EndpointError>) {
     let Err(error) = result else {
         return;
     };
+    if is_peer_disconnect(error) {
+        tracing::debug!(error = ?error, "inbound remoting peer disconnected");
+        return;
+    }
     let count = FAILURES.fetch_add(1, Ordering::Relaxed).saturating_add(1);
     if count == 1 || count.is_multiple_of(100) {
         tracing::warn!(
@@ -782,6 +786,21 @@ fn observe_connection_result(result: &Result<(), EndpointError>) {
             "inbound remoting connection task failed (subsequent failures are aggregated)"
         );
     }
+}
+
+fn is_peer_disconnect(error: &EndpointError) -> bool {
+    let io = match error {
+        EndpointError::Wire(WireError::Io(io))
+        | EndpointError::Lane(crate::lane::LaneError::Wire(WireError::Io(io))) => io,
+        _ => return false,
+    };
+    matches!(
+        io.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
 }
 
 use std::future::Future;
@@ -841,6 +860,15 @@ async fn wait_for_disconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_normal_peer_disconnects_without_hiding_protocol_failures() {
+        let disconnected = EndpointError::Lane(crate::lane::LaneError::Wire(WireError::Io(
+            std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+        )));
+        assert!(is_peer_disconnect(&disconnected));
+        assert!(!is_peer_disconnect(&EndpointError::WrongDialDirection));
+    }
     use async_trait::async_trait;
     use bytes::Bytes;
     use lattice_core::actor_ref::{

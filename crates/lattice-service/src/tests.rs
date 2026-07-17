@@ -539,12 +539,9 @@ async fn coordinator_service_for_domains(
 
 #[tokio::test]
 async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server_port = probe.local_addr().unwrap().port();
-    drop(probe);
     let cluster_id = ClusterId::new("service-test").unwrap();
-    let client_address = NodeAddress::new("127.0.0.1", server_port - 1).unwrap();
-    let server_address = NodeAddress::new("127.0.0.1", server_port).unwrap();
+    let client_address = unused_address().await;
+    let server_address = unused_address().await;
     let client_incarnation = NodeIncarnation::new(1).unwrap();
     let server_incarnation = NodeIncarnation::new(2).unwrap();
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
