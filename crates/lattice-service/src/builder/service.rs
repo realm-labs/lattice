@@ -618,9 +618,42 @@ impl LatticeService {
     /// migrate to another member. It fences cluster authority first, then drains local actors and
     /// stops the remaining runtimes. Actor stop failures are still reported and are never forced.
     pub async fn terminal_shutdown(&self) -> Result<(), ServiceError> {
-        let state = self.node_lifecycle_state();
+        let mut state = self.node_lifecycle_state();
         if state == NodeLifecycleState::Terminated {
             return Ok(());
+        }
+        if matches!(
+            state,
+            NodeLifecycleState::JoiningMembership | NodeLifecycleState::Ready
+        ) {
+            self.transition(ServiceLifecycleEvent::BeginDrain)?;
+            state = NodeLifecycleState::Draining;
+        }
+        if state == NodeLifecycleState::Draining
+            && let Some(membership) = self
+                .membership_handle
+                .lock()
+                .expect("membership handle poisoned")
+                .clone()
+        {
+            let operation_id = format!("terminal-leave-{}", uuid::Uuid::new_v4());
+            match tokio::time::timeout(
+                self.join_config.shutdown_timeout,
+                membership.complete_drain(operation_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    target: "lattice.cluster.lifecycle",
+                    %error,
+                    "terminal shutdown could not release membership immediately"
+                ),
+                Err(_) => tracing::warn!(
+                    target: "lattice.cluster.lifecycle",
+                    "terminal shutdown membership release exceeded its deadline"
+                ),
+            }
         }
         if state != NodeLifecycleState::Stopping {
             tracing::info!(

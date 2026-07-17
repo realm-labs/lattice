@@ -775,7 +775,7 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
     let cluster_id = ClusterId::new("service-multi-member-test").unwrap();
     let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
     let coordinator = coordinator_service(
-        store,
+        store.clone(),
         cluster_id.clone(),
         "coordinator",
         coordinator_address.clone(),
@@ -846,10 +846,8 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
     })
     .await
     .unwrap();
-    first
-        .leave(tokio::time::Instant::now() + Duration::from_secs(2))
-        .await
-        .unwrap();
+    first.terminal_shutdown().await.unwrap();
+    assert!(store.get_member("first").await.unwrap().is_none());
     second
         .leave(tokio::time::Instant::now() + Duration::from_secs(2))
         .await
