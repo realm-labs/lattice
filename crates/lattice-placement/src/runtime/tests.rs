@@ -982,6 +982,135 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
 }
 
 #[tokio::test]
+async fn resolution_reassigns_fenced_slots_after_owner_restart() {
+    let cluster_id = ClusterId::new("fenced-recovery-test").unwrap();
+    let (coordinator_node, _) = node(&cluster_id, "coordinator", 26210, 210);
+    let (old_host, _) = node(&cluster_id, "host", 26211, 211);
+    let (host, _) = node(&cluster_id, "host", 26212, 212);
+    let associations = Arc::new(
+        AssociationManager::new(
+            coordinator_node.address.clone(),
+            coordinator_node.incarnation,
+            RemotingConfig::default(),
+        )
+        .unwrap(),
+    );
+    let host_key = attach_test_session(
+        &associations,
+        &cluster_id,
+        coordinator_node.incarnation,
+        &host,
+        50,
+    );
+    let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
+    let entity_type = EntityType::new("recovered-entity").unwrap();
+    let protocol_id = lattice_core::actor_ref::ProtocolId::new(56).unwrap();
+    let entity_config = crate::region::EntityConfig::new(
+        domain(),
+        entity_type.clone(),
+        protocol_id,
+        8,
+        "weighted-least-load",
+        1,
+        Vec::new(),
+    )
+    .unwrap();
+    let singleton_kind =
+        lattice_core::actor_ref::SingletonKind::new("recovered-singleton").unwrap();
+    let singleton_config = SingletonConfig::new(domain(), singleton_kind.clone(), protocol_id);
+    let shard_key = PlacementSlotKey::Shard {
+        domain: domain(),
+        entity_type: entity_type.clone(),
+        shard_id: ShardId::new(3),
+    };
+    let singleton_key = PlacementSlotKey::Singleton {
+        domain: domain(),
+        kind: singleton_kind.clone(),
+    };
+    store.insert_generation_three_slot(PlacementSlot {
+        key: shard_key.clone(),
+        config_fingerprint: entity_config.fingerprint(),
+        owner: Some(old_host.clone()),
+        target: None,
+        assignment_generation: AssignmentGeneration::new(7).unwrap(),
+        version: PlacementVersion::new(
+            domain(),
+            CoordinatorTerm::new(1).unwrap(),
+            Revision::new(1).unwrap(),
+        ),
+        state: PlacementSlotState::Fenced,
+        active_move: None,
+        barrier_sessions: Default::default(),
+    });
+    store.insert_generation_three_slot(PlacementSlot {
+        key: singleton_key.clone(),
+        config_fingerprint: singleton_config.fingerprint(),
+        owner: Some(old_host),
+        target: None,
+        assignment_generation: AssignmentGeneration::new(9).unwrap(),
+        version: PlacementVersion::new(
+            domain(),
+            CoordinatorTerm::new(1).unwrap(),
+            Revision::new(2).unwrap(),
+        ),
+        state: PlacementSlotState::Fenced,
+        active_move: None,
+        barrier_sessions: Default::default(),
+    });
+    let mut leader = PlacementDomainLeader::elect(
+        store.clone(),
+        associations,
+        coordinator_node,
+        CoordinatorScope::Placement(domain()),
+        CoordinatorTerm::new(1).unwrap(),
+        PlacementDomainLeaderConfig::default(),
+    )
+    .await
+    .unwrap();
+    let descriptor = lattice_remoting::protocol::ProtocolDescriptor {
+        protocol_id,
+        fingerprint: lattice_remoting::protocol::ProtocolFingerprint::new([9; 32]),
+    };
+    register_up(
+        &mut leader,
+        test_hello(
+            host.clone(),
+            Default::default(),
+            10,
+            [entity_type.clone()].into_iter().collect(),
+            Default::default(),
+            [singleton_kind.clone()].into_iter().collect(),
+            Default::default(),
+            vec![descriptor],
+            vec![entity_config],
+            vec![singleton_config],
+        ),
+        host_key,
+    )
+    .await;
+
+    leader
+        .ensure_shard_allocated(entity_type, ShardId::new(3))
+        .await
+        .unwrap();
+    let shard = store.get_slot(&shard_key).await.unwrap().unwrap();
+    assert_eq!(shard.owner.as_ref(), Some(&host));
+    assert_eq!(shard.assignment_generation.get(), 8);
+    assert_eq!(shard.state, PlacementSlotState::Allocating);
+    assert!(store.get_claim(&shard_key).await.unwrap().is_some());
+
+    leader
+        .ensure_singleton_allocated(singleton_kind)
+        .await
+        .unwrap();
+    let singleton = store.get_slot(&singleton_key).await.unwrap().unwrap();
+    assert_eq!(singleton.owner.as_ref(), Some(&host));
+    assert_eq!(singleton.assignment_generation.get(), 10);
+    assert_eq!(singleton.state, PlacementSlotState::Allocating);
+    assert!(store.get_claim(&singleton_key).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn admin_pause_is_idempotent_fingerprinted_and_inspectable() {
     let cluster_id = ClusterId::new("admin-test").unwrap();
     let (coordinator, _) = node(&cluster_id, "coordinator", 26300, 300);

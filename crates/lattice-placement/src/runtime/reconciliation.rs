@@ -1,8 +1,9 @@
 use super::membership::send_control;
 use super::{
-    ClaimGrant, ClaimLease, CoordinatorLeaseStore, CoordinatorRuntimeError, GrantSequence,
-    HandoffEvent, Instant, MembershipStore, PlacementControlCommand, PlacementDomainLeader,
-    PlacementDomainStore, PlacementSlot, PlacementSlotKey, PlacementSlotState, ScopedElectionStore,
+    AllocationRequest, ClaimGrant, ClaimLease, CoordinatorLeaseStore, CoordinatorRuntimeError,
+    GrantSequence, HandoffEvent, Instant, MembershipStore, PlacementControlCommand,
+    PlacementDomainLeader, PlacementDomainStore, PlacementSlot, PlacementSlotKey,
+    PlacementSlotState, ScopedElectionStore,
 };
 use crate::storage::domain::{
     AdoptAuthority, FenceMissingAuthority, InstallAuthority, LeasedClaim,
@@ -181,7 +182,7 @@ where
             (false, None)
                 if slot.state == PlacementSlotState::Fenced && slot.active_move.is_none() =>
             {
-                self.reinstall_same_owner(slot).await?;
+                self.reinstall_fenced_authority(slot).await?;
             }
             _ => {}
         }
@@ -282,23 +283,66 @@ where
         self.publish_slot_delta(&committed.slot).await
     }
 
-    async fn reinstall_same_owner(
+    pub(super) async fn reinstall_fenced_authority(
         &mut self,
         slot: PlacementSlot,
-    ) -> Result<(), CoordinatorRuntimeError> {
-        let Some(owner) = slot.owner.clone() else {
-            self.quarantine(&slot.key, "Fenced slot has no prior owner");
-            return Ok(());
-        };
-        if self
-            .sessions
-            .get(&owner.incarnation)
-            .is_none_or(|session| session.hello.node != owner)
-        {
-            return Ok(());
+    ) -> Result<bool, CoordinatorRuntimeError> {
+        if slot.state != PlacementSlotState::Fenced || slot.active_move.is_some() {
+            return Err(CoordinatorRuntimeError::StaleHandoff);
         }
+        // Election reconciliation runs before a placement view is declared reconciled and before
+        // any member session is available. Keep the fenced record durable during that pass; a
+        // bounded pass or an explicit resolve will reinstall it once an eligible host has joined.
+        if !self.reconciliation.initial_complete {
+            return Ok(false);
+        }
+        let owner = match &slot.key {
+            PlacementSlotKey::Shard {
+                entity_type,
+                shard_id,
+                ..
+            } => {
+                let Some(config) = self.entity_configs.get(entity_type).cloned() else {
+                    return Ok(false);
+                };
+                let strategy = self
+                    .strategies
+                    .get(&(
+                        config.allocation_policy_id.clone(),
+                        config.allocation_policy_version,
+                    ))
+                    .cloned()
+                    .ok_or(CoordinatorRuntimeError::UnknownStrategy)?;
+                let view = self.placement_view(&config.domain).await?;
+                match strategy.allocate(
+                    &AllocationRequest {
+                        domain: config.domain,
+                        entity_type: entity_type.clone(),
+                        shard_id: *shard_id,
+                        required_protocol: config.protocol_id,
+                    },
+                    &view,
+                ) {
+                    Ok(decision) => decision.target,
+                    Err(crate::allocation::AllocationError::NoEligibleNode) => return Ok(false),
+                    Err(error) => return Err(CoordinatorRuntimeError::Allocation(error)),
+                }
+            }
+            PlacementSlotKey::Singleton { kind, .. } => {
+                let Some(config) = self.singleton_configs.get(kind).cloned() else {
+                    return Ok(false);
+                };
+                match self.select_singleton_target(kind, &config, None) {
+                    Ok(target) => target,
+                    Err(CoordinatorRuntimeError::IneligibleTarget) => return Ok(false),
+                    Err(error) => return Err(error),
+                }
+            }
+        };
         let lease_id = self.store.grant_lease(self.config.claim_ttl).await?;
         let mut allocating = slot.clone();
+        allocating.owner = Some(owner.clone());
+        allocating.target = None;
         allocating.assignment_generation = allocating
             .assignment_generation
             .next()
@@ -344,7 +388,7 @@ where
                 );
                 self.publish_slot_delta(&committed.slot).await?;
                 self.replay_claim_if_connected(&grant)?;
-                Ok(())
+                Ok(true)
             }
             Err(error) => {
                 let _ = self.store.revoke_lease(lease_id).await;

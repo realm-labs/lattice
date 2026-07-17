@@ -31,13 +31,16 @@ where
             shard_id,
         };
         if let Some(slot) = self.store.get_slot(&key).await? {
-            return if matches!(
-                slot.state,
-                PlacementSlotState::Allocating | PlacementSlotState::Running
-            ) {
-                Ok(())
-            } else {
-                Err(CoordinatorRuntimeError::StaleHandoff)
+            return match slot.state {
+                PlacementSlotState::Allocating | PlacementSlotState::Running => Ok(()),
+                PlacementSlotState::Fenced if slot.active_move.is_none() => {
+                    if self.reinstall_fenced_authority(slot).await? {
+                        Ok(())
+                    } else {
+                        Err(CoordinatorRuntimeError::IneligibleTarget)
+                    }
+                }
+                _ => Err(CoordinatorRuntimeError::StaleHandoff),
             };
         }
         let strategy = self
@@ -89,13 +92,16 @@ where
             kind: kind.clone(),
         };
         if let Some(slot) = self.store.get_slot(&key).await? {
-            return if matches!(
-                slot.state,
-                PlacementSlotState::Allocating | PlacementSlotState::Running
-            ) {
-                Ok(())
-            } else {
-                Err(CoordinatorRuntimeError::StaleHandoff)
+            return match slot.state {
+                PlacementSlotState::Allocating | PlacementSlotState::Running => Ok(()),
+                PlacementSlotState::Fenced if slot.active_move.is_none() => {
+                    if self.reinstall_fenced_authority(slot).await? {
+                        Ok(())
+                    } else {
+                        Err(CoordinatorRuntimeError::IneligibleTarget)
+                    }
+                }
+                _ => Err(CoordinatorRuntimeError::StaleHandoff),
             };
         }
         let target = self.select_singleton_target(&kind, &config, None)?;
