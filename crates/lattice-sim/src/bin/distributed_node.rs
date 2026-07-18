@@ -40,12 +40,12 @@ use lattice_placement::control::{
     DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
     encode_control_command,
 };
-use lattice_placement::coordinator::MemberStatus;
 use lattice_placement::coordinator::SnapshotLimits;
 use lattice_placement::coordinator::SnapshotRecord;
 use lattice_placement::coordinator::SnapshotVersion;
 use lattice_placement::coordinator::build_snapshot;
 use lattice_placement::coordinator::{MemberHello, PlacementDomainHello};
+use lattice_placement::coordinator::{MemberRecord, MemberStatus};
 use lattice_placement::region::EntityConfig;
 use lattice_placement::runtime::CoordinatorRuntimeError;
 use lattice_placement::runtime::host::{CoordinatorHost, CoordinatorHostConfig};
@@ -60,6 +60,7 @@ use lattice_placement::types::AssignmentGeneration;
 use lattice_placement::types::ClaimGrant;
 use lattice_placement::types::CoordinatorTerm;
 use lattice_placement::types::GrantSequence;
+use lattice_placement::types::MembershipVersion;
 use lattice_placement::types::NodeKey;
 use lattice_placement::types::PlacementSlot;
 use lattice_placement::types::PlacementSlotKey;
@@ -233,6 +234,13 @@ struct EntityFixture {
     owner_address: NodeAddress,
     owner_incarnation: String,
     reference: EntityRef<FixtureProtocol>,
+}
+
+struct EntityServiceFixture {
+    service: LatticeService,
+    control: Arc<PlacementControlRouter>,
+    coordinator: AssociationKey,
+    member: MemberRecord,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -854,7 +862,12 @@ async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn std::error::Erro
     let entity_config = fixture_entity_config()?;
     let entity_id = EntityId::new(b"gateway-account-42".to_vec())?;
     let slot = fixture_entity_slot(&entity_config, &entity_id, owner.clone())?;
-    let (service, control, coordinator) = entity_service(
+    let EntityServiceFixture {
+        service,
+        control,
+        coordinator,
+        member,
+    } = entity_service(
         cluster.clone(),
         owner.clone(),
         entity_config.clone(),
@@ -862,7 +875,8 @@ async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn std::error::Erro
         true,
     )?;
     service.start().await?;
-    install_fixture_snapshot(&control, &coordinator, &slot, true).await?;
+    install_fixture_snapshot(&control, &coordinator, &slot, member, true).await?;
+    wait_for_node_ready(&service).await?;
     std::fs::write(
         "/artifacts/coordinator-placement-snapshot.json",
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -891,7 +905,7 @@ async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn std::error::Erro
         })?,
     )?;
     tokio::signal::ctrl_c().await?;
-    service.shutdown().await?;
+    service.force_shutdown().await?;
     Ok(())
 }
 
@@ -910,10 +924,15 @@ async fn gateway(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         return Err("entity fixture configuration mismatch".into());
     }
     let slot = fixture_entity_slot(&entity_config, fixture.reference.entity_id(), owner.clone())?;
-    let (service, control, coordinator) =
-        entity_service(cluster.clone(), local, entity_config, &slot, false)?;
+    let EntityServiceFixture {
+        service,
+        control,
+        coordinator,
+        member,
+    } = entity_service(cluster.clone(), local, entity_config, &slot, false)?;
     service.start().await?;
-    install_fixture_snapshot(&control, &coordinator, &slot, false).await?;
+    install_fixture_snapshot(&control, &coordinator, &slot, member, false).await?;
+    wait_for_node_ready(&service).await?;
     let owner_identity = NodeIdentity {
         cluster_id: cluster,
         node_id: owner.node_id.clone(),
@@ -948,7 +967,7 @@ async fn gateway(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         "/artifacts/gateway-entity-multiprocess.json",
         b"{\"reply\":42,\"authorized_owner\":true}\n",
     )?;
-    service.shutdown().await?;
+    service.force_shutdown().await?;
     Ok(())
 }
 
@@ -958,8 +977,7 @@ fn entity_service(
     entity_config: EntityConfig,
     slot: &PlacementSlot,
     owns_slot: bool,
-) -> Result<(LatticeService, Arc<PlacementControlRouter>, AssociationKey), Box<dyn std::error::Error>>
-{
+) -> Result<EntityServiceFixture, Box<dyn std::error::Error>> {
     let mut context = ServiceContext::builder(
         ServiceKind::from_static("distributed-entity-fixture"),
         InstanceId::new(node.node_id.clone()),
@@ -1012,12 +1030,19 @@ fn entity_service(
             connection_nonce: nonce,
         })?;
     }
-    let _member_hello = MemberHello {
+    let member_hello = MemberHello {
         node: node.clone(),
         roles: BTreeSet::from([if owns_slot { "entity" } else { "gateway" }.to_owned()]),
         failure_domains: BTreeMap::new(),
         protocols: Vec::new(),
         remoting_capabilities: BTreeSet::new(),
+    };
+    let member = MemberRecord {
+        node: node.clone(),
+        hello: member_hello,
+        status: MemberStatus::Up,
+        version: MembershipVersion::new(slot.version.term, slot.version.revision),
+        lease_id: 1,
     };
     let domain_hello = PlacementDomainHello::new(
         node.clone(),
@@ -1071,13 +1096,19 @@ fn entity_service(
     builder = builder
         .register_actor(registry, protocol)?
         .cluster_logic_runtime(router, control.clone(), logic, controls, effects);
-    Ok((builder.build()?, control, coordinator))
+    Ok(EntityServiceFixture {
+        service: builder.build()?,
+        control,
+        coordinator,
+        member,
+    })
 }
 
 async fn install_fixture_snapshot(
     control: &PlacementControlRouter,
     coordinator: &AssociationKey,
     slot: &PlacementSlot,
+    member: MemberRecord,
     owns_slot: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let limits = SnapshotLimits::default();
@@ -1111,6 +1142,7 @@ async fn install_fixture_snapshot(
             .map(PlacementControlCommand::SnapshotChunk),
     );
     commands.push(PlacementControlCommand::SnapshotEnd(end));
+    commands.push(PlacementControlCommand::MemberUp(member));
     if owns_slot {
         commands.push(PlacementControlCommand::ClaimGranted(ClaimGrant {
             domain: slot.key.domain().clone(),
@@ -1135,6 +1167,18 @@ async fn install_fixture_snapshot(
             )
             .await?;
     }
+    Ok(())
+}
+
+async fn wait_for_node_ready(service: &LatticeService) -> Result<(), Box<dyn std::error::Error>> {
+    let mut lifecycle = service.subscribe_node_lifecycle();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while *lifecycle.borrow() != NodeLifecycleState::Ready {
+            lifecycle.changed().await.map_err(|_| "lifecycle closed")?;
+        }
+        Ok::<(), &'static str>(())
+    })
+    .await??;
     Ok(())
 }
 
