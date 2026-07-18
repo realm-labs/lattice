@@ -1,5 +1,5 @@
 use std::any::{Any, TypeId};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -155,19 +155,8 @@ pub trait SupportsAsk<R: Request>: Protocol {}
 struct ClientBinding {
     descriptor: MessageDescriptor,
     request_type: TypeId,
-    encode_request: Arc<EncodeRequestFn>,
-    decode_reply: Option<Arc<DecodeReplyFn>>,
-}
-
-impl Clone for ClientBinding {
-    fn clone(&self) -> Self {
-        Self {
-            descriptor: self.descriptor.clone(),
-            request_type: self.request_type,
-            encode_request: self.encode_request.clone(),
-            decode_reply: self.decode_reply.clone(),
-        }
-    }
+    encode_request: Box<EncodeRequestFn>,
+    decode_reply: Option<Box<DecodeReplyFn>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,7 +174,9 @@ pub struct ActorProtocol<P: Protocol> {
     protocol_id: ProtocolId,
     name: String,
     fingerprint: ProtocolFingerprint,
-    bindings: BTreeMap<u64, ClientBinding>,
+    bindings: Box<[ClientBinding]>,
+    bindings_by_id: HashMap<u64, usize>,
+    bindings_by_type: HashMap<TypeId, usize>,
     protocol: PhantomData<fn() -> P>,
 }
 
@@ -223,11 +214,11 @@ impl<P: Protocol> ActorProtocol<P> {
         mode: DispatchMode,
         message: &T,
     ) -> Result<(u64, Bytes), DispatchError> {
-        let binding = self
-            .bindings
-            .values()
-            .find(|binding| binding.request_type == TypeId::of::<T>())
+        let binding_index = self
+            .bindings_by_type
+            .get(&TypeId::of::<T>())
             .ok_or(DispatchError::UnregisteredType)?;
+        let binding = &self.bindings[*binding_index];
         if binding.descriptor.mode != mode {
             return Err(DispatchError::ModeMismatch);
         }
@@ -246,10 +237,11 @@ impl<P: Protocol> ActorProtocol<P> {
         message_id: u64,
         payload: &[u8],
     ) -> Result<R::Response, DispatchError> {
-        let binding = self
-            .bindings
+        let binding_index = self
+            .bindings_by_id
             .get(&message_id)
             .ok_or(DispatchError::UnknownMessage(message_id))?;
+        let binding = &self.bindings[*binding_index];
         let decode = binding
             .decode_reply
             .as_ref()
@@ -294,7 +286,7 @@ impl<P: Protocol> ActorProtocolBuilder<P> {
             request_type: TypeId::of::<M>(),
             encode_request: {
                 let codec = codec.clone();
-                Arc::new(move |message| {
+                Box::new(move |message| {
                     let message = message
                         .downcast_ref::<M>()
                         .ok_or_else(|| EncodeError::new("message type does not match binding"))?;
@@ -336,7 +328,7 @@ impl<P: Protocol> ActorProtocolBuilder<P> {
             request_type: TypeId::of::<Q>(),
             encode_request: {
                 let codec = codec.clone();
-                Arc::new(move |message| {
+                Box::new(move |message| {
                     let message = message
                         .downcast_ref::<Q>()
                         .ok_or_else(|| EncodeError::new("message type does not match binding"))?;
@@ -347,7 +339,7 @@ impl<P: Protocol> ActorProtocolBuilder<P> {
             },
             decode_reply: {
                 let reply_codec = reply_codec.clone();
-                Some(Arc::new(move |input: &[u8]| {
+                Some(Box::new(move |input: &[u8]| {
                     let reply = reply_codec.decode(input)?;
                     Ok(Box::new(reply) as Box<dyn Any + Send>)
                 }))
@@ -388,11 +380,25 @@ impl<P: Protocol> ActorProtocolBuilder<P> {
         }
         let protocol_id = protocol_id::<P>()?;
         let canonical = canonical_descriptor(protocol_id, &self.name, &bindings);
+        let mut bindings_by_id = HashMap::with_capacity(bindings.len());
+        let mut bindings_by_type = HashMap::with_capacity(bindings.len());
+        let bindings = bindings
+            .into_iter()
+            .enumerate()
+            .map(|(binding_index, (message_id, binding))| {
+                bindings_by_type.insert(binding.request_type, binding_index);
+                bindings_by_id.insert(message_id, binding_index);
+                binding
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Ok(ActorProtocol {
             protocol_id,
             name: self.name,
             fingerprint: ProtocolFingerprint::digest(&canonical),
             bindings,
+            bindings_by_id,
+            bindings_by_type,
             protocol: PhantomData,
         })
     }
@@ -454,11 +460,12 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
             DispatchMode::Ask => crate::traits::MessageKind::Request,
         };
         let result = async {
-            let client = self
+            let binding_index = self
                 .protocol
-                .bindings
+                .bindings_by_id
                 .get(&message_id)
                 .ok_or(DispatchError::UnknownMessage(message_id))?;
+            let client = &self.protocol.bindings[*binding_index];
             if client.descriptor.mode != mode {
                 return Err(DispatchError::ModeMismatch);
             }
