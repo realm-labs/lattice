@@ -22,6 +22,7 @@ use crate::mailbox::MailboxConfig;
 use crate::observation::ActorObserverHandle;
 use crate::protocol::{ActorProtocolBinding, Protocol};
 use crate::recipient::ActorSystem;
+use crate::runtime::spawner::ActorSpawner;
 use crate::runtime::{
     ActorSpawnContext, ActorSpawnOptions, PassivationPolicy, ShardMigrationPolicy,
     spawn_actor_with_self_ref,
@@ -73,6 +74,7 @@ pub struct ActorRegistry<A: Actor> {
     quarantined: Arc<DashMap<LocalActorRef, QuarantinedEntry<A>>>,
     actor_system: Arc<OnceLock<ActorSystem>>,
     observer: ActorObserverHandle,
+    spawner: ActorSpawner,
 }
 
 impl<A: Actor> fmt::Debug for ActorRegistry<A> {
@@ -187,6 +189,7 @@ impl<A: Actor> ActorRegistry<A> {
             quarantined: Arc::new(DashMap::new()),
             actor_system: Arc::new(OnceLock::new()),
             observer: ActorObserverHandle::default(),
+            spawner: ActorSpawner::task_per_actor(),
         }
     }
 
@@ -210,6 +213,7 @@ impl<A: Actor> ActorRegistry<A> {
             quarantined: Arc::new(DashMap::new()),
             actor_system: Arc::new(OnceLock::new()),
             observer: ActorObserverHandle::default(),
+            spawner: ActorSpawner::task_per_actor(),
         }
     }
 
@@ -1043,8 +1047,10 @@ impl<A: Actor> ActorRegistry<A> {
                 actor_system: Some(self.actor_system.clone()),
                 observer: self.observer.clone(),
                 terminal_hook: Some(terminal_hook),
+                spawner: self.spawner.clone(),
             },
-        );
+        )
+        .map_err(|error| ActorError::new(error.to_string()))?;
         if let Some(directory) = self
             .config
             .service

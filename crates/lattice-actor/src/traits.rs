@@ -8,6 +8,7 @@ use crate::error::ActorStopError;
 use crate::mailbox::MailboxConfig;
 use crate::reply::ReplyTo;
 use lattice_core::actor_ref::{EntityId, ProtocolId};
+use lattice_core::id::ActorId;
 use thiserror::Error;
 
 /// A one-way message handled without a reply channel.
@@ -266,11 +267,27 @@ impl ChildActorKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
 pub struct ChildActorOptions {
     pub mailbox: MailboxConfig,
     pub supervision: ChildSupervision,
     pub protocol_id: Option<ProtocolId>,
+    /// Execution policy used to run this child.
+    pub execution: crate::runtime::ActorExecutionPolicy,
+    /// Affinity key used only by [`crate::runtime::ActorExecutionPolicy::KeyedWorkerPool`].
+    pub scheduler_key: Option<ActorId>,
+}
+
+impl Default for ChildActorOptions {
+    fn default() -> Self {
+        Self {
+            mailbox: MailboxConfig::default(),
+            supervision: ChildSupervision::default(),
+            protocol_id: None,
+            execution: crate::runtime::ActorExecutionPolicy::TaskPerActor,
+            scheduler_key: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

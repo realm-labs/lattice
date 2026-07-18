@@ -259,6 +259,7 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
                     protocol_id: None,
                     mailbox: MailboxConfig::bounded(8),
                     supervision: ChildSupervision::StopParent,
+                    ..ChildActorOptions::default()
                 },
             )?);
             Ok(())
@@ -342,6 +343,7 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
                     protocol_id: None,
                     mailbox: MailboxConfig::bounded(8),
                     supervision: ChildSupervision::RestartChild,
+                    ..ChildActorOptions::default()
                 },
             )?);
             Ok(())

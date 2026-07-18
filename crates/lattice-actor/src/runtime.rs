@@ -25,6 +25,10 @@ use lattice_core::actor_ref::ActorRef;
 use lattice_core::id::ActorId;
 use lattice_core::service_context::ServiceContext;
 
+pub(crate) mod spawner;
+
+use spawner::ActorSpawner;
+
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_ACTIVATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -119,9 +123,17 @@ impl ActorRuntime {
     where
         A: Actor,
     {
-        let execution = options.execution.unwrap_or(self.config.default_execution);
-        self.scheduler
-            .spawn(actor, options, execution, self.config.observer.clone())
+        let spawner = ActorSpawner::new(self.scheduler.clone(), self.config.default_execution);
+        spawner.spawn(
+            actor,
+            ActorSpawnContext {
+                options,
+                actor_system: None,
+                observer: self.config.observer.clone(),
+                terminal_hook: None,
+                spawner: spawner.clone(),
+            },
+        )
     }
 }
 
@@ -178,24 +190,21 @@ impl ActorScheduler {
     fn spawn<A>(
         &self,
         actor: A,
-        options: ActorSpawnOptions,
+        context: ActorSpawnContext,
         execution: ActorExecutionPolicy,
-        observer: ActorObserverHandle,
     ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor,
     {
         match execution {
-            ActorExecutionPolicy::TaskPerActor => {
-                Ok(spawn_task_per_actor(actor, options, observer))
-            }
+            ActorExecutionPolicy::TaskPerActor => Ok(spawn_task_per_actor(actor, context)),
             ActorExecutionPolicy::KeyedWorkerPool { worker_count } => {
                 if worker_count == 0 {
                     return Err(ActorSpawnError::InvalidExecutionPolicy {
                         reason: "KeyedWorkerPool worker_count must be greater than zero",
                     });
                 }
-                self.spawn_keyed_worker_pool_actor(actor, options, worker_count, observer)
+                self.spawn_keyed_worker_pool_actor(actor, context, worker_count)
             }
             ActorExecutionPolicy::DedicatedThreadPool { worker_count } => {
                 if worker_count == 0 {
@@ -203,7 +212,7 @@ impl ActorScheduler {
                         reason: "DedicatedThreadPool worker_count must be greater than zero",
                     });
                 }
-                self.spawn_dedicated_pool_actor(actor, options, worker_count, observer)
+                self.spawn_dedicated_pool_actor(actor, context, worker_count)
             }
         }
     }
@@ -211,23 +220,14 @@ impl ActorScheduler {
     fn spawn_keyed_worker_pool_actor<A>(
         &self,
         actor: A,
-        options: ActorSpawnOptions,
+        context: ActorSpawnContext,
         worker_count: usize,
-        observer: ActorObserverHandle,
     ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor,
     {
         let pool = self.keyed_worker_pool(worker_count)?;
-        let ActorSpawnOptions {
-            mailbox,
-            scheduler_key,
-            passivation,
-            self_ref,
-            service,
-            execution: _,
-        } = options;
-        let parts = create_actor_parts(mailbox, self_ref, None, service, observer, None);
+        let (parts, passivation, scheduler_key) = context.into_parts();
         let scheduler_key =
             scheduler_key.unwrap_or_else(|| ActorId::U64(parts.handle.local_ref().id()));
         let worker_index = Self::keyed_worker_index(&scheduler_key, worker_count)?;
@@ -244,26 +244,18 @@ impl ActorScheduler {
     fn spawn_dedicated_pool_actor<A>(
         &self,
         actor: A,
-        options: ActorSpawnOptions,
+        context: ActorSpawnContext,
         worker_count: usize,
-        observer: ActorObserverHandle,
     ) -> Result<ActorHandle<A>, ActorSpawnError>
     where
         A: Actor,
     {
         let pool = self.dedicated_worker_pool::<A>(worker_count)?;
         let worker_index = pool.next_worker_index();
-        let ActorSpawnOptions {
-            mailbox,
-            passivation,
-            self_ref,
-            service,
-            execution: _,
-            scheduler_key: _,
-        } = options;
+        let (parts, passivation, _scheduler_key) = context.into_parts();
         Ok(spawn_actor_on_pool(
             actor,
-            create_actor_parts(mailbox, self_ref, None, service, observer, None),
+            parts,
             passivation,
             &pool,
             worker_index,
@@ -500,54 +492,61 @@ pub(crate) struct ActorSpawnContext {
     pub(crate) actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     pub(crate) observer: ActorObserverHandle,
     pub(crate) terminal_hook: Option<TerminalHook>,
+    pub(crate) spawner: ActorSpawner,
 }
 
-pub(crate) fn spawn_actor_with_self_ref<A>(actor: A, context: ActorSpawnContext) -> ActorHandle<A>
-where
-    A: Actor,
-{
-    let ActorSpawnContext {
-        options,
-        actor_system,
-        observer,
-        terminal_hook,
-    } = context;
-    let ActorSpawnOptions {
-        mailbox,
-        passivation,
-        self_ref,
-        service,
-        execution: _,
-        scheduler_key: _,
-    } = options;
-    let parts = create_actor_parts(
-        mailbox,
-        self_ref,
-        actor_system,
-        service,
-        observer,
-        terminal_hook,
-    );
-    spawn_actor_as_tokio_task(actor, parts, passivation, "task_per_actor")
+impl ActorSpawnContext {
+    fn into_parts<A>(self) -> (ActorRuntimeParts<A>, PassivationPolicy, Option<ActorId>)
+    where
+        A: Actor,
+    {
+        let ActorSpawnContext {
+            options,
+            actor_system,
+            observer,
+            terminal_hook,
+            spawner,
+        } = self;
+        let ActorSpawnOptions {
+            mailbox,
+            passivation,
+            self_ref,
+            service,
+            scheduler_key,
+            execution: _,
+        } = options;
+        (
+            create_actor_parts(
+                mailbox,
+                self_ref,
+                actor_system,
+                service,
+                observer,
+                terminal_hook,
+                spawner,
+            ),
+            passivation,
+            scheduler_key,
+        )
+    }
 }
 
-fn spawn_task_per_actor<A>(
+pub(crate) fn spawn_actor_with_self_ref<A>(
     actor: A,
-    options: ActorSpawnOptions,
-    observer: ActorObserverHandle,
-) -> ActorHandle<A>
+    context: ActorSpawnContext,
+) -> Result<ActorHandle<A>, ActorSpawnError>
 where
     A: Actor,
 {
-    let ActorSpawnOptions {
-        mailbox,
-        passivation,
-        self_ref,
-        service,
-        execution: _,
-        scheduler_key: _,
-    } = options;
-    let parts = create_actor_parts(mailbox, self_ref, None, service, observer, None);
+    let spawner = context.spawner.clone();
+    spawner.spawn(actor, context)
+}
+
+fn spawn_task_per_actor<A>(actor: A, context: ActorSpawnContext) -> ActorHandle<A>
+where
+    A: Actor,
+{
+    let (parts, passivation, _scheduler_key) = context.into_parts();
     spawn_actor_as_tokio_task(actor, parts, passivation, "task_per_actor")
 }
 
@@ -558,6 +557,7 @@ struct ActorRuntimeParts<A: Actor> {
     self_ref: Option<ActorRef>,
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
+    spawner: ActorSpawner,
     deferred_capacity: usize,
 }
 
@@ -568,6 +568,7 @@ fn create_actor_parts<A>(
     service: ServiceContext,
     observer: ActorObserverHandle,
     terminal_hook: Option<TerminalHook>,
+    spawner: ActorSpawner,
 ) -> ActorRuntimeParts<A>
 where
     A: Actor,
@@ -601,6 +602,7 @@ where
         self_ref,
         actor_system,
         service,
+        spawner,
         deferred_capacity: mailbox.deferred_capacity(),
     }
 }
@@ -666,6 +668,7 @@ where
         self_ref,
         actor_system,
         service,
+        spawner,
         deferred_capacity,
     } = parts;
     let mut ctx = ActorContext::new(
@@ -673,6 +676,7 @@ where
         self_ref,
         actor_system,
         service,
+        spawner,
         deferred_capacity,
     );
     let activity_tx = spawn_passivation_monitor(&handle, passivation);

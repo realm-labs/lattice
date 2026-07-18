@@ -27,6 +27,7 @@ pub struct ActorContext<A: Actor> {
     self_ref: Option<ActorRef>,
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
+    spawner: crate::runtime::spawner::ActorSpawner,
     lifecycle_request: Option<StopReason>,
     tasks: JoinSet<()>,
     pipe_tasks: JoinSet<()>,
@@ -72,6 +73,7 @@ impl<A: Actor> ActorContext<A> {
         self_ref: Option<ActorRef>,
         actor_system: Option<Arc<OnceLock<ActorSystem>>>,
         service: ServiceContext,
+        spawner: crate::runtime::spawner::ActorSpawner,
         deferred_capacity: usize,
     ) -> Self {
         Self {
@@ -79,6 +81,7 @@ impl<A: Actor> ActorContext<A> {
             self_ref,
             actor_system,
             service,
+            spawner,
             lifecycle_request: None,
             tasks: JoinSet::new(),
             pipe_tasks: JoinSet::new(),
@@ -496,8 +499,8 @@ impl<A: Actor> ActorContext<A> {
             crate::runtime::ActorSpawnContext {
                 options: crate::runtime::ActorSpawnOptions {
                     mailbox: options.mailbox,
-                    execution: Some(crate::runtime::ActorExecutionPolicy::TaskPerActor),
-                    scheduler_key: None,
+                    execution: Some(options.execution),
+                    scheduler_key: options.scheduler_key.clone(),
                     passivation: crate::runtime::PassivationPolicy::Disabled,
                     self_ref: child_ref.as_ref().map(ActorRef::erase),
                     service: self.service.clone(),
@@ -505,8 +508,10 @@ impl<A: Actor> ActorContext<A> {
                 actor_system: self.actor_system.clone(),
                 observer: self.handle.observer().clone(),
                 terminal_hook: None,
+                spawner: self.spawner.clone(),
             },
-        );
+        )
+        .map_err(|error| ActorError::new(error.to_string()))?;
         let directory = self
             .service
             .extension::<crate::directory::ActivationDirectory>();
@@ -560,8 +565,8 @@ impl<A: Actor> ActorContext<A> {
             crate::runtime::ActorSpawnContext {
                 options: crate::runtime::ActorSpawnOptions {
                     mailbox: options.mailbox,
-                    execution: Some(crate::runtime::ActorExecutionPolicy::TaskPerActor),
-                    scheduler_key: None,
+                    execution: Some(options.execution),
+                    scheduler_key: options.scheduler_key.clone(),
                     passivation: crate::runtime::PassivationPolicy::Disabled,
                     self_ref: child_ref.as_ref().map(ActorRef::erase),
                     service: self.service.clone(),
@@ -569,8 +574,10 @@ impl<A: Actor> ActorContext<A> {
                 actor_system: self.actor_system.clone(),
                 observer: self.handle.observer().clone(),
                 terminal_hook: None,
+                spawner: self.spawner.clone(),
             },
-        );
+        )
+        .map_err(|error| ActorError::new(error.to_string()))?;
         let directory = self
             .service
             .extension::<crate::directory::ActivationDirectory>();
@@ -681,20 +688,19 @@ impl<A: Actor> ActorContext<A> {
                 let actor_system = self.actor_system.clone();
                 let child_ref = child.actor_ref().map(ActorRef::erase);
                 let observer = child.observer().clone();
+                let spawner = self.spawner.clone();
                 self.spawn_scoped(async move {
                     loop {
                         if terminations.recv().await.is_err() {
                             break;
                         }
-                        let replacement = crate::runtime::spawn_actor_with_self_ref(
+                        let replacement = match crate::runtime::spawn_actor_with_self_ref(
                             factory(),
                             crate::runtime::ActorSpawnContext {
                                 options: crate::runtime::ActorSpawnOptions {
                                     mailbox: options.mailbox,
-                                    execution: Some(
-                                        crate::runtime::ActorExecutionPolicy::TaskPerActor,
-                                    ),
-                                    scheduler_key: None,
+                                    execution: Some(options.execution),
+                                    scheduler_key: options.scheduler_key.clone(),
                                     passivation: crate::runtime::PassivationPolicy::Disabled,
                                     self_ref: child_ref.as_ref().map(ActorRef::erase),
                                     service: service.clone(),
@@ -702,8 +708,18 @@ impl<A: Actor> ActorContext<A> {
                                 actor_system: actor_system.clone(),
                                 observer: observer.clone(),
                                 terminal_hook: None,
+                                spawner: spawner.clone(),
                             },
-                        );
+                        ) {
+                            Ok(replacement) => replacement,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "supervised child could not be restarted"
+                                );
+                                break;
+                            }
+                        };
                         if let Some(directory) =
                             service.extension::<crate::directory::ActivationDirectory>()
                             && directory.register(&replacement).is_err()

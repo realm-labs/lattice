@@ -4,14 +4,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorError, ActorSpawnError};
+use lattice_actor::handle::ActorHandle;
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorExecutionPolicy, ActorScheduler, PassivationPolicy};
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
-use lattice_actor::traits::{Actor, Responder};
+use lattice_actor::traits::{
+    Actor, ChildActorKey, ChildActorOptions, ChildSupervision, Handler, Responder, StopReason,
+};
 use lattice_core::id::ActorId;
 use lattice_core::service_context::ServiceContext;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -29,6 +32,26 @@ struct TestActor {
 
 struct OtherActor;
 
+#[derive(lattice_actor::Request)]
+#[request(response = Vec<String>)]
+struct ChildThreads;
+
+struct ParentActor {
+    children: Vec<ActorHandle<TestActor>>,
+}
+
+#[derive(Debug, lattice_actor::Message)]
+struct RestartChild;
+
+struct ReportingChild {
+    started: mpsc::UnboundedSender<String>,
+}
+
+struct RestartingParent {
+    child: Option<ActorHandle<ReportingChild>>,
+    started: mpsc::UnboundedSender<String>,
+}
+
 #[async_trait]
 impl Actor for TestActor {
     type Error = ActorError;
@@ -37,6 +60,122 @@ impl Actor for TestActor {
 #[async_trait]
 impl Actor for OtherActor {
     type Error = ActorError;
+}
+
+#[async_trait]
+impl Actor for ParentActor {
+    type Error = ActorError;
+
+    async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
+        for (key, execution, scheduler_key) in [
+            (
+                "keyed-a",
+                ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 },
+                Some(ActorId::Str("shared-child-key".to_owned())),
+            ),
+            (
+                "keyed-b",
+                ActorExecutionPolicy::KeyedWorkerPool { worker_count: 2 },
+                Some(ActorId::Str("shared-child-key".to_owned())),
+            ),
+            (
+                "dedicated-a",
+                ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 },
+                None,
+            ),
+            (
+                "dedicated-b",
+                ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 },
+                None,
+            ),
+        ] {
+            self.children.push(ctx.spawn_child(
+                ChildActorKey::new(key),
+                TestActor {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                },
+                ChildActorOptions {
+                    mailbox: MailboxConfig::bounded(8),
+                    execution,
+                    scheduler_key,
+                    ..ChildActorOptions::default()
+                },
+            )?);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Actor for ReportingChild {
+    type Error = ActorError;
+
+    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
+        let _ = self
+            .started
+            .send(format!("{:?}", std::thread::current().id()));
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Actor for RestartingParent {
+    type Error = ActorError;
+
+    async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
+        let started = self.started.clone();
+        self.child = Some(ctx.spawn_child_with_factory(
+            ChildActorKey::new("restarting-child"),
+            move || ReportingChild {
+                started: started.clone(),
+            },
+            ChildActorOptions {
+                mailbox: MailboxConfig::bounded(8),
+                supervision: ChildSupervision::RestartChild,
+                execution: ActorExecutionPolicy::DedicatedThreadPool { worker_count: 1 },
+                ..ChildActorOptions::default()
+            },
+        )?);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<RestartChild> for RestartingParent {
+    async fn handle(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _message: RestartChild,
+    ) -> Result<(), ActorError> {
+        self.child
+            .as_ref()
+            .expect("child should be running")
+            .stop(StopReason::Requested)
+            .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Responder<ChildThreads> for ParentActor {
+    async fn respond(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+        _request: ChildThreads,
+        reply_to: ReplyTo<Vec<String>>,
+    ) -> Result<(), ActorError> {
+        let mut threads = Vec::with_capacity(self.children.len());
+        for child in &self.children {
+            threads.push(
+                child
+                    .ask(CurrentThread, ASK_TIMEOUT)
+                    .await
+                    .map_err(|error| ActorError::new(error.to_string()))?,
+            );
+        }
+        let _ = reply_to.send(threads);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -131,6 +270,51 @@ async fn keyed_worker_pool_execution_policy_runs_actor_with_same_mailbox_semanti
 
     assert_eq!(reply, "pong:shard-worker");
     assert_eq!(*events.lock().await, vec!["shard-worker"]);
+}
+
+#[tokio::test]
+async fn child_actors_use_selected_execution_policies_and_scheduler_affinity() {
+    let parent = ActorRuntime::default()
+        .spawn_actor(
+            ParentActor {
+                children: Vec::new(),
+            },
+            ActorSpawnOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let threads = parent.ask(ChildThreads, ASK_TIMEOUT).await.unwrap();
+    assert_eq!(threads.len(), 4);
+    assert_eq!(threads[0], threads[1]);
+    assert_eq!(threads[2], threads[3]);
+    assert_ne!(threads[0], threads[2]);
+}
+
+#[tokio::test]
+async fn supervised_child_restart_preserves_the_selected_execution_policy() {
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let parent = ActorRuntime::default()
+        .spawn_actor(
+            RestartingParent {
+                child: None,
+                started: started_tx,
+            },
+            ActorSpawnOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let first = tokio::time::timeout(ASK_TIMEOUT, started_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    parent.tell(RestartChild).await.unwrap();
+    let restarted = tokio::time::timeout(ASK_TIMEOUT, started_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, restarted);
 }
 
 #[tokio::test]

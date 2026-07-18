@@ -722,6 +722,7 @@ impl Actor for SupervisingParent {
                 mailbox: MailboxConfig::bounded(8),
                 supervision: self.supervision,
                 protocol_id: None,
+                ..ChildActorOptions::default()
             },
         )?);
         Ok(())
