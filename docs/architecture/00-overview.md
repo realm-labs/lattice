@@ -463,7 +463,78 @@ Automatic balancing runs only while the Coordinator is leader, Ready, claim-reco
 
 ## 5. Lifecycles
 
-### 5.1 Logic Service Lifecycle
+### 5.1 Framework Lifecycle Atlas
+
+The atlas below connects the major lifecycle reducers across the framework. Solid arrows show the
+normal readiness, authority, activation, drain, and termination path. Dashed arrows show the main
+failure propagation paths; they do not imply that the participating reducers commit one atomic
+transition.
+
+```mermaid
+flowchart TB
+    subgraph Service["Service and domain"]
+        direction LR
+        Node["NodeLifecycleState<br/>Booting → JoiningMembership → Ready<br/>Draining → Stopping → Terminated"]
+        Domain["PlacementDomainState<br/>Joining ↔ Ready ↔ Degraded<br/>Draining → Terminated"]
+    end
+
+    subgraph Control["Connections and control plane"]
+        direction LR
+        Association["AssociationState<br/>Establishing → Active ↔ Reconnecting<br/>Closing → Closed"]
+        Membership["MemberStatus / DomainMemberStatus<br/>Joining → Up → Leaving"]
+        Coordinator["CoordinatorScopeState<br/>Standby ↔ Active<br/>Failed"]
+    end
+
+    subgraph Authority["Authority and migration"]
+        direction LR
+        Slot["PlacementSlotState<br/>Unallocated → Allocating → Running<br/>BeginHandoff → Stopping<br/>StopFailed / Fenced"]
+        Handoff["HandoffPhase<br/>Invalidating → Draining → ReplacingAuthority<br/>Starting → Completed"]
+        Plan["PlanStatus<br/>Planned → Running → Completed<br/>Cancelled / Failed<br/>MoveProgress<br/>Pending → Handoff → Completed<br/>Cancelled / Failed"]
+    end
+
+    subgraph Runtime["Local runtime"]
+        direction LR
+        Activation["EntityActivationState<br/>Absent → Activating → Loading → Active"]
+        Actor["ActorLifecycleState<br/>Starting → Running → Passivating / Stopping<br/>StopFailed / Quarantined → Stopped"]
+        Watch["WatchStatus<br/>Pending → Active → Terminated<br/>Unknown"]
+    end
+
+    Association -->|"authenticated control channel"| Membership
+    Membership -->|"exact local Up"| Node
+    Coordinator -->|"reconciled scope snapshot"| Domain
+    Domain -->|"all required domains Ready"| Node
+    Domain -->|"valid assignment and claim"| Slot
+    Plan -->|"validated move"| Handoff
+    Slot -->|"begin handoff"| Handoff
+    Handoff -->|"new generation becomes Running"| Slot
+    Slot -->|"Running authorizes local load"| Activation
+    Activation -->|"register mailbox"| Actor
+    Actor -->|"watch exact ActivationId"| Watch
+    Node -->|"begin drain"| Domain
+    Domain -->|"drain and fence owned slots"| Slot
+    Slot -->|"stop local activation"| Actor
+    Actor -->|"publish terminal event"| Watch
+
+    Association -.->|"control or membership loss:<br/>close admission and rejoin"| Node
+    Coordinator -.->|"scope loss: degrade only this domain"| Domain
+    Slot -.->|"claim loss: fence, then quarantine or stop;<br/>allow a new generation"| Actor
+    Actor -.->|"callback panic: terminate activation;<br/>asks fail ActorPanicked; publish Panicked"| Watch
+```
+
+Legend:
+
+- Node labels are Rust enum names and variants; no diagram-only state is introduced.
+- Solid arrows summarize normal cross-reducer gates and consequences. Dashed arrows summarize the
+  four principal failure paths.
+- `Panicked`, `ActorPanicked`, and member removal are termination results, request outcomes, or
+  events rather than persistent lifecycle states.
+- Each placement domain, Coordinator scope, and Association advances independently; the atlas is
+  not a global transaction.
+- The state machines below and [Actor Runtime](01-actor-runtime.md),
+  [Remoting and RPC](02-rpc.md), and [Placement](03-placement.md) remain authoritative for detailed
+  local event edges.
+
+### 5.2 Logic Service Lifecycle
 
 ```mermaid
 stateDiagram-v2
@@ -496,14 +567,14 @@ Domain A degradation changes only A's router/session; B and exact `ActorRef` tra
 Known routes survive only to their local claim deadline. Applications gate endpoints on the exact
 domains they require rather than one scalar process-degraded state.
 
-### 5.2 Concrete User and Child Actor Lifecycle
+### 5.3 Concrete User and Child Actor Lifecycle
 
 ```mermaid
 stateDiagram-v2
     [*] --> Starting
     Starting --> Running: mailbox registered with new ActivationId
     Starting --> Stopping: startup failure
-    Running --> Stopping: explicit stop, parent stop, supervision, service drain
+    Running --> Stopping: explicit stop, parent stop, supervision, service drain, or Actor callback panic
     Running --> Passivating: idle or business passivation
     Passivating --> StopFailed: stopping hook failed
     Passivating --> Stopped: persistence succeeds
@@ -513,7 +584,7 @@ stateDiagram-v2
     StopFailed --> Quarantined: external authority lost
     StopFailed --> Stopped: explicit ForceStop with data-loss authorization
     Quarantined --> Stopped: retry-persist succeeds or explicit force-discard
-    Stopping --> Stopped: persistence succeeds
+    Stopping --> Stopped: persistence succeeds or panic cleanup completes
     Stopped --> [*]
 ```
 
@@ -521,9 +592,11 @@ Registry activation/loading is a separate `Absent -> Activating -> Loading -> Ac
 `StopFailed` and `Quarantined` reject business traffic but are not terminal actor-cell states. A
 voluntary failure retains the exact Actor object, state, activation reservation, and pending
 DeathWatch relationship. A full successful stop followed by a new spawn creates a new
-`ActivationId`; old references and watches never retarget.
+`ActivationId`; old references and watches never retarget. `Panicked` is a terminal lifecycle event,
+not an `ActorLifecycleState`: it terminates the current instance, after which child supervision may
+create a replacement instance with a new activation identity.
 
-### 5.3 Sharded Entity Lifecycle
+### 5.4 Sharded Entity Lifecycle
 
 ```mermaid
 stateDiagram-v2
@@ -554,7 +627,7 @@ Unassigned -> Starting/claiming -> Active -> Handoff/draining -> Stopped
 
 Only an Active Shard with a valid generation claim may load or invoke its entities.
 
-### 5.4 Singleton Lifecycle
+### 5.5 Singleton Lifecycle
 
 ```mermaid
 stateDiagram-v2
@@ -569,7 +642,7 @@ stateDiagram-v2
 
 `SingletonRef` and its local proxy survive ordinary activation replacement. The old concrete singleton activation terminates before a new generation is published Active. Proxy buffering during the unavailable interval is bounded and respects ask deadlines.
 
-### 5.5 Failure Ownership
+### 5.6 Failure Ownership
 
 | Failure | Component that reacts first | Required outcome |
 |---|---|---|
@@ -651,8 +724,10 @@ leaders, a multi-domain standby, and two logic nodes; one-domain loss must not c
 terms or readiness.
 
 The Logic service lifecycle is one of those production reducers. Service start/shutdown executes its
-`Booting -> Joining -> Ready/Degraded -> Draining/Stopping -> Terminated` transitions, and
-`lattice-sim::ServiceLifecycleAdapter` invokes that same reducer rather than a test-only model.
+`Booting -> JoiningMembership -> Ready -> Draining/Stopping -> Terminated` transitions. Each
+placement domain independently executes `Joining -> Ready/Degraded -> Draining -> Terminated`;
+`Degraded` is not a node lifecycle state. `lattice-sim::ServiceLifecycleAdapter` invokes the same
+production reducer rather than a test-only model.
 
 The test oracle checks ownership, generation, lifecycle, ordering and resource invariants after every simulated transition. Real scenarios use structured readiness/admin/trace state rather than fixed sleeps or human log parsing. Every randomized failure records a replay seed and causal trace.
 

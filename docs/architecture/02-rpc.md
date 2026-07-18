@@ -315,11 +315,18 @@ Connections are not eagerly created as a cluster-wide full mesh. An idle bulk or
 
 ### 4.4 Lifecycle and Partial Failure
 
+The logical Association follows the Rust `AssociationState` reducer:
+
 ```text
-Disconnected -> Connecting -> Handshaking -> Ready
-Ready -> Degraded -> Reconnecting -> Ready
-Ready/Degraded -> Closing -> Closed
+Establishing -> Active -> Reconnecting -> Active
+Establishing/Active/Reconnecting -> Closing -> Closed
 ```
+
+Each physical TCP/TLS lane separately passes through connection and handshake phases such as
+`Disconnected -> Connecting -> Handshaking -> Ready` and may become degraded while it reconnects.
+Those lane phases describe socket health; `Ready` and `Degraded` are not `AssociationState`
+variants. The Association remains the logical peer/incarnation epoch and supervises all of its
+physical lanes.
 
 - Control connection failure immediately stops new interactive/bulk admission for the whole Association, fails queued-but-unwritten work, and starts bounded reconnect/failure-detection handling. Already running remote Handlers are unaffected; no data lane continues independently in v1.
 - Interactive failure completes affected pending asks according to dispatch knowledge, including `UnknownResult` where necessary.

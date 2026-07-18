@@ -623,9 +623,16 @@ Recommended first-version decisions:
 
 ```text
 Handler error: return error to caller; actor remains running unless policy says otherwise.
-Panic: stop or restart according to actor policy.
+Actor callback panic: terminate the current instance after framework cleanup; do not continue or retry that instance.
 Child failure: restart child, stop child, or stop parent.
 voluntary stopping failure: enter observable StopFailed and block voluntary release while authority remains valid.
 externally fenced stopping failure: never retain authority; raise StateLossPossible for recovery/ops.
 Repeated failures: surface through metrics/admin API and require operator action when configured.
 ```
+
+A panic from `started`, message dispatch and its hooks, `stopping`, or Actor destruction produces the
+terminal `Panicked` lifecycle result. Pending asks fail with `ActorPanicked`, DeathWatch observes the
+termination exactly once, and the current activation is never resumed. A parent using the
+`RestartChild` supervision directive may construct a replacement child, but that replacement has a
+new activation identity. Panics in independently spawned scoped or pipe tasks remain isolated from
+the Actor and are harvested by the runtime as task failures.
