@@ -586,7 +586,7 @@ fn wait_for_host_scope_while_checking_logic(
         if Instant::now() >= deadline {
             return Err("standby did not acquire failed placement domain".to_owned());
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -622,7 +622,7 @@ fn wait_for_logic_ready(path: &Path, timeout: Duration) -> Result<(), String> {
         if Instant::now() >= deadline {
             return require_logic_ready(path);
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -772,7 +772,7 @@ fn wait_for_coordinator_leadership(
         if Instant::now() >= deadline {
             return Err("Coordinator leadership did not reach the required term".to_owned());
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -786,7 +786,7 @@ fn assert_coordinator_not_displaced(
     let mut observed = false;
     while Instant::now() < deadline {
         let Ok((node_id, term)) = coordinator_leader_from_etcd(etcd_member, run_id) else {
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(50));
             continue;
         };
         observed = true;
@@ -796,7 +796,7 @@ fn assert_coordinator_not_displaced(
                 expected.node_id, expected.term
             ));
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(50));
     }
     if observed {
         Ok(())
@@ -853,7 +853,7 @@ fn wait_for_etcd_failover(
         if Instant::now() >= deadline {
             return Err("surviving etcd quorum did not elect a new leader".to_owned());
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -959,7 +959,7 @@ fn wait_for_healthy_container(container: &str, timeout: Duration) -> Result<(), 
         if Instant::now() >= deadline {
             return Err(format!("container {container} did not become healthy"));
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -982,7 +982,7 @@ fn wait_for_running_container(container: &str, timeout: Duration) -> Result<(), 
         if Instant::now() >= deadline {
             return Err(format!("container {container} did not enter running state"));
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -998,7 +998,7 @@ fn wait_for_file(path: &Path, timeout: Duration) -> Result<(), String> {
                 path.display()
             ));
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
