@@ -217,15 +217,16 @@ async fn domain_logic(
         .join_config(ClusterJoinConfig {
             retry_initial: Duration::from_millis(25),
             retry_max: Duration::from_millis(250),
-            join_timeout: Some(Duration::from_secs(90)),
+            join_timeout: Some(Duration::from_secs(240)),
             ..ClusterJoinConfig::default()
         });
     let service = builder.build()?;
     service.start().await?;
     let mut health = service.subscribe_health();
-    tokio::time::timeout(Duration::from_secs(120), async {
+    let ready = tokio::time::timeout(Duration::from_secs(300), async {
         loop {
             let snapshot = health.borrow().clone();
+            write_domain_logic_artifact(&artifact, &node_id, &snapshot)?;
             if snapshot.node == NodeLifecycleState::Ready
                 && ["alpha", "beta", "gamma", "delta"].into_iter().all(|name| {
                     snapshot.domains.get(
@@ -236,11 +237,22 @@ async fn domain_logic(
             {
                 break;
             }
-            health.changed().await.expect("health sender remains active");
+            health.changed().await?;
         }
+        Ok::<(), Box<dyn std::error::Error>>(())
     })
-    .await?;
-    write_domain_logic_artifact(&artifact, &node_id, &health.borrow().clone())?;
+    .await;
+    match ready {
+        Ok(result) => result?,
+        Err(_) => {
+            let snapshot = health.borrow().clone();
+            write_domain_logic_artifact(&artifact, &node_id, &snapshot)?;
+            return Err(std::io::Error::other(format!(
+                "domain logic {node_id} did not become Ready within 300s; last health snapshot: {snapshot:?}"
+            ))
+            .into());
+        }
+    }
     loop {
         tokio::select! {
             changed = health.changed() => {

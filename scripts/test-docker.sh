@@ -97,5 +97,22 @@ docker build \
   -t "$runner_image" \
   "$root"
 
+case "$profile" in
+  e2e|e2e-ha-etcd|chaos)
+    echo "Preparing shared lattice-sim binaries in the Docker Cargo cache"
+    docker run --rm \
+      --label "io.lattice.test-run=$run_id" \
+      --init \
+      --cpus 4 \
+      --memory 4g \
+      -v "$root:/workspace:ro" \
+      -v "$LATTICE_CARGO_HOME_VOLUME:/cargo-home" \
+      -v "$LATTICE_CARGO_TARGET_VOLUME:/cargo-target" \
+      -w /workspace \
+      "$runner_image" \
+      cargo build -p lattice-sim --bin distributed-node --bin testctl
+    ;;
+esac
+
 docker compose -f "$compose" -p "$project" --profile "$profile" up \
   --no-build --abort-on-container-exit --exit-code-from "$service" "$service"

@@ -540,8 +540,13 @@ async fn coordinator_service_for_domains(
 #[tokio::test]
 async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
     let cluster_id = ClusterId::new("service-test").unwrap();
-    let client_address = unused_address().await;
-    let server_address = unused_address().await;
+    let first_address = unused_address().await;
+    let second_address = unused_address().await;
+    let (client_address, server_address) = if first_address < second_address {
+        (first_address, second_address)
+    } else {
+        (second_address, first_address)
+    };
     let client_incarnation = NodeIncarnation::new(1).unwrap();
     let server_incarnation = NodeIncarnation::new(2).unwrap();
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
