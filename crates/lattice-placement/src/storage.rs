@@ -1,19 +1,25 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use lattice_core::{
+    actor_ref::{EntityType, PlacementDomainId, SingletonKind},
+    coordinator::CoordinatorScope,
+};
 use thiserror::Error;
 
-use lattice_core::actor_ref::PlacementDomainId;
-use lattice_core::coordinator::CoordinatorScope;
-
-use crate::coordinator::{
-    DomainMemberRecord, DomainMemberStatus, ExactLeaderGuard, LeaderRecord, MemberRecord,
-    MemberStatus, MembershipLeaderGuard, PlacementLeaderGuard, SessionLimits, SingletonConfig,
+use crate::{
+    coordinator::{
+        DomainMemberRecord, DomainMemberStatus, ExactLeaderGuard, LeaderRecord, MemberRecord,
+        MemberStatus, MembershipLeaderGuard, PlacementLeaderGuard, SessionLimits, SingletonConfig,
+    },
+    plan::{MoveProgress, RebalancePlan},
+    region::EntityConfig,
+    types::{PlacementSlot, PlacementSlotKey, PlacementSlotState, Revision},
 };
-use crate::plan::{MoveProgress, RebalancePlan};
-use crate::region::EntityConfig;
-use crate::types::{PlacementSlot, PlacementSlotKey, PlacementSlotState, Revision};
 
 pub mod domain;
 pub mod etcd;
@@ -60,13 +66,10 @@ use domain::{
 #[async_trait]
 pub trait CoordinatorLeaseStore: Send + Sync + 'static {
     async fn ensure_schema_generation(&self) -> Result<(), StorageError>;
-    async fn grant_lease(&self, ttl: std::time::Duration) -> Result<i64, StorageError>;
+    async fn grant_lease(&self, ttl: Duration) -> Result<i64, StorageError>;
     async fn keep_lease_alive(&self, lease_id: i64) -> Result<(), StorageError>;
     async fn revoke_lease(&self, lease_id: i64) -> Result<(), StorageError>;
-    async fn lease_time_to_live(
-        &self,
-        lease_id: i64,
-    ) -> Result<Option<std::time::Duration>, StorageError>;
+    async fn lease_time_to_live(&self, lease_id: i64) -> Result<Option<Duration>, StorageError>;
 }
 
 #[async_trait]
@@ -146,7 +149,7 @@ pub trait PlacementDomainStore: CoordinatorLeaseStore {
     async fn get_entity_config(
         &self,
         domain: &PlacementDomainId,
-        entity_type: &lattice_core::actor_ref::EntityType,
+        entity_type: &EntityType,
     ) -> Result<Option<EntityConfig>, StorageError>;
     async fn list_entity_configs(
         &self,
@@ -160,7 +163,7 @@ pub trait PlacementDomainStore: CoordinatorLeaseStore {
     async fn get_singleton_config(
         &self,
         domain: &PlacementDomainId,
-        kind: &lattice_core::actor_ref::SingletonKind,
+        kind: &SingletonKind,
     ) -> Result<Option<SingletonConfig>, StorageError>;
     async fn list_singleton_configs(
         &self,
@@ -350,10 +353,8 @@ struct MemoryState {
     leader_terms: BTreeMap<CoordinatorScope, u64>,
     members: BTreeMap<String, MemberRecord>,
     domain_members: BTreeMap<(PlacementDomainId, String), DomainMemberRecord>,
-    entity_configs:
-        BTreeMap<(PlacementDomainId, lattice_core::actor_ref::EntityType), EntityConfig>,
-    singleton_configs:
-        BTreeMap<(PlacementDomainId, lattice_core::actor_ref::SingletonKind), SingletonConfig>,
+    entity_configs: BTreeMap<(PlacementDomainId, EntityType), EntityConfig>,
+    singleton_configs: BTreeMap<(PlacementDomainId, SingletonKind), SingletonConfig>,
     claims: BTreeMap<PlacementSlotKey, LeasedClaim>,
     automatic_settings: BTreeMap<PlacementDomainId, AutomaticBalanceSettings>,
     admin_operations: BTreeMap<(PlacementDomainId, String), AdminOperationRecord>,
@@ -361,7 +362,7 @@ struct MemoryState {
 
 #[derive(Debug, Clone, Copy)]
 struct LeaseState {
-    ttl: std::time::Duration,
+    ttl: Duration,
 }
 
 include!("storage/memory_core.rs");
@@ -380,7 +381,7 @@ impl InMemoryPlacementStore {
         }
     }
 
-    async fn grant_lease(&self, ttl: std::time::Duration) -> Result<i64, StorageError> {
+    async fn grant_lease(&self, ttl: Duration) -> Result<i64, StorageError> {
         if ttl.is_zero() {
             return Err(StorageError::InvalidConfig);
         }
@@ -414,10 +415,7 @@ impl InMemoryPlacementStore {
         Ok(())
     }
 
-    async fn lease_time_to_live(
-        &self,
-        lease_id: i64,
-    ) -> Result<Option<std::time::Duration>, StorageError> {
+    async fn lease_time_to_live(&self, lease_id: i64) -> Result<Option<Duration>, StorageError> {
         Ok(self
             .inner
             .lock()

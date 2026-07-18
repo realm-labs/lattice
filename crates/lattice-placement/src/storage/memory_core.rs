@@ -1,3 +1,5 @@
+use crate::types::{ClaimGrant, NodeKey};
+
 impl InMemoryPlacementStore {
     pub fn new(maximum_slots: usize, maximum_plans: usize) -> Result<Self, StorageError> {
         if maximum_slots == 0 || maximum_plans == 0 {
@@ -53,10 +55,7 @@ fn initial_revision() -> Revision {
     Revision::new(1).expect("one is a valid state revision")
 }
 
-fn validate_guard(
-    state: &MemoryState,
-    guard: &impl ExactLeaderGuard,
-) -> Result<(), StorageError> {
+fn validate_guard(state: &MemoryState, guard: &impl ExactLeaderGuard) -> Result<(), StorageError> {
     let Some((lease_id, leader)) = state.leaders.get(guard.scope()) else {
         return Err(StorageError::LeadershipLost);
     };
@@ -96,7 +95,7 @@ fn validate_assignment_members(
     state: &MemoryState,
     global_member: &MemberRecord,
     domain_member: &DomainMemberRecord,
-    owner: &crate::types::NodeKey,
+    owner: &NodeKey,
 ) -> Result<(), StorageError> {
     if global_member.status != MemberStatus::Up
         || domain_member.status != DomainMemberStatus::Up
@@ -204,7 +203,7 @@ fn validate_claim_lease(state: &MemoryState, claim: &LeasedClaim) -> Result<(), 
     Ok(())
 }
 
-fn claim_matches(state: &MemoryState, expected: &crate::types::ClaimGrant) -> bool {
+fn claim_matches(state: &MemoryState, expected: &ClaimGrant) -> bool {
     state
         .claims
         .get(&expected.slot)

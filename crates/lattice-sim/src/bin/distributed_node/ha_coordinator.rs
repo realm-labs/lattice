@@ -1,8 +1,4 @@
-async fn coordinator(
-    artifact: PathBuf,
-    node_id: String,
-    port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn coordinator(artifact: PathBuf, node_id: String, port: u16) -> Result<(), Box<dyn Error>> {
     let endpoints = std::env::var("LATTICE_ETCD_ENDPOINTS")?
         .split(',')
         .map(str::to_owned)
@@ -95,9 +91,9 @@ async fn coordinator(
 }
 
 fn write_coordinator_artifact(
-    path: &std::path::Path,
+    path: &Path,
     artifact: &ScopedLeadershipArtifact,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let temporary = path.with_extension("tmp");
     std::fs::write(&temporary, serde_json::to_vec_pretty(artifact)?)?;
     std::fs::rename(temporary, path)?;

@@ -1,9 +1,13 @@
-use std::future::Future;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, task::AbortHandle};
 
 #[derive(Debug, Clone)]
 pub struct ServiceScheduler {
@@ -76,7 +80,7 @@ impl Default for ServiceScheduler {
 #[derive(Debug)]
 struct ServiceSchedulerInner {
     stopped: Arc<AtomicBool>,
-    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    tasks: Mutex<Vec<AbortHandle>>,
 }
 
 #[derive(Debug, Clone)]

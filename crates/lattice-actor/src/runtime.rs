@@ -1,29 +1,40 @@
-use std::any::{TypeId, type_name};
-use std::collections::HashMap;
-use std::future::Future;
-use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    any::{TypeId, type_name},
+    collections::HashMap,
+    fmt::{Debug, Formatter, Result as FmtResult},
+    future::Future,
+    panic::AssertUnwindSafe,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc as std_mpsc,
+    },
+    thread::{Builder as ThreadBuilder, JoinHandle},
+    time::{Duration, Instant, SystemTime},
+};
 
 use futures_util::FutureExt;
-use tokio::sync::mpsc;
-use tokio::sync::{broadcast, oneshot, watch};
+use lattice_core::{
+    actor_ref::{ActivationId, ActorRef, NodeIncarnation},
+    id::ActorId,
+    service_context::ServiceContext,
+};
+use tokio::{
+    runtime::{Builder as RuntimeBuilder, Handle},
+    sync::{broadcast, mpsc, oneshot, watch},
+};
 use tracing::{Instrument, debug, error, info};
 
-use crate::context::ActorContext;
-use crate::error::{ActorAdminError, ActorCallError, ActorSpawnError};
-use crate::handle::{ActorHandle, ForcedDataLossEvent, StopFailureRecord, TerminalHook};
-use crate::mailbox::{ActorCommand, MailboxConfig, MailboxLane};
-use crate::observation::{ActorLifecycleEvent, ActorObserverHandle};
-use crate::recipient::ActorSystem;
-use crate::traits::{Actor, ActorLifecycleState, MessageOutcome, PassivationReason, StopReason};
-use crate::watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason};
-use lattice_core::actor_ref::ActorRef;
-use lattice_core::id::ActorId;
-use lattice_core::service_context::ServiceContext;
+use crate::{
+    context::ActorContext,
+    error::{ActorAdminError, ActorCallError, ActorSpawnError},
+    handle::{ActorHandle, ActorHandleInit, ForcedDataLossEvent, StopFailureRecord, TerminalHook},
+    mailbox::{ActorCommand, MailboxConfig, MailboxLane},
+    observation::{ActorLifecycleEvent, ActorObserverHandle},
+    recipient::ActorSystem,
+    traits::{Actor, ActorLifecycleState, MessageOutcome, PassivationReason, StopReason},
+    watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason},
+};
 
 pub(crate) mod spawner;
 
@@ -32,12 +43,9 @@ use spawner::ActorSpawner;
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_ACTIVATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-pub(crate) fn next_activation_id(
-    node_incarnation: lattice_core::actor_ref::NodeIncarnation,
-) -> lattice_core::actor_ref::ActivationId {
+pub(crate) fn next_activation_id(node_incarnation: NodeIncarnation) -> ActivationId {
     let sequence = NEXT_ACTIVATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    lattice_core::actor_ref::ActivationId::new(node_incarnation, sequence)
-        .expect("process activation sequence is nonzero")
+    ActivationId::new(node_incarnation, sequence).expect("process activation sequence is nonzero")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,8 +156,8 @@ pub struct ActorScheduler {
     pools: Arc<SchedulerPools>,
 }
 
-impl std::fmt::Debug for ActorScheduler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for ActorScheduler {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("ActorScheduler").finish_non_exhaustive()
     }
 }
@@ -376,7 +384,7 @@ impl Drop for ActorWorkerPool {
 }
 
 struct ActorWorker {
-    handle: tokio::runtime::Handle,
+    handle: Handle,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
 }
@@ -385,10 +393,10 @@ impl ActorWorker {
     fn start(kind: WorkerPoolKind, worker_index: usize) -> Result<Self, ActorSpawnError> {
         let (handle_tx, handle_rx) = std_mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let join_handle = std::thread::Builder::new()
+        let join_handle = ThreadBuilder::new()
             .name(kind.thread_name(worker_index))
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                let runtime = RuntimeBuilder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("actor worker runtime should build");
@@ -582,7 +590,7 @@ where
     let (forced_data_loss_tx, _forced_data_loss_rx) = broadcast::channel(16);
     let terminal_hook = Arc::new(Mutex::new(terminal_hook));
     let actor_ref = self_ref.clone();
-    let handle = ActorHandle::new(crate::handle::ActorHandleInit {
+    let handle = ActorHandle::new(ActorHandleInit {
         local_ref,
         terminated_tx,
         lifecycle_tx,
@@ -834,7 +842,7 @@ where
     }
 
     let reason = stop_reason.unwrap_or(StopReason::Requested);
-    ctx.cancel_deferred_replies(crate::error::ActorCallError::MailboxClosed);
+    ctx.cancel_deferred_replies(ActorCallError::MailboxClosed);
     ctx.cancel_all_tasks();
     ctx.stop_all_children(reason);
     let previous_phase = match reason {

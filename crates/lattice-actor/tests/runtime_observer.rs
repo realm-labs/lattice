@@ -1,22 +1,24 @@
-use std::any::type_name;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    any::type_name,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_actor::actor_protocol;
-use lattice_actor::context::ActorContext;
-use lattice_actor::error::{ActorCallError, ActorError, ActorTellError};
-use lattice_actor::mailbox::MailboxConfig;
-use lattice_actor::observation::{
-    ActorLifecycleEvent, ActorMetadata, ActorObserver, ActorObserverHandle, MailboxRejection,
-    ProtocolFailure, RequestCompletion,
-};
-use lattice_actor::protocol::DispatchMode;
-use lattice_actor::reply::ReplyTo;
-use lattice_actor::runtime::{ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions};
-use lattice_actor::traits::{
-    Actor, Handler, MessageKind, MessageMetadata, MessageOutcome, Responder, StopReason,
+use lattice_actor::{
+    actor_protocol,
+    context::ActorContext,
+    error::{ActorCallError, ActorError, ActorTellError},
+    mailbox::MailboxConfig,
+    observation::{
+        ActorLifecycleEvent, ActorMetadata, ActorObserver, ActorObserverHandle, MailboxRejection,
+        ProtocolFailure, RequestCompletion,
+    },
+    protocol::{DispatchError, DispatchMode, ProstCodec},
+    reply::ReplyTo,
+    runtime::{ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions},
+    traits::{Actor, Handler, MessageKind, MessageMetadata, MessageOutcome, Responder, StopReason},
 };
 use tokio::sync::Semaphore;
 
@@ -127,7 +129,7 @@ actor_protocol! {
         name: "observer/v1";
         tell 1 => WireTell {
             schema_version: 1,
-            codec: lattice_actor::protocol::ProstCodec,
+            codec: ProstCodec,
         }
     }
 }
@@ -317,10 +319,7 @@ async fn runtime_observer_reports_deferred_completion_lifecycle_and_protocol_fai
         .dispatch(handle.clone(), 999, DispatchMode::Tell, Bytes::new(), None)
         .await
         .unwrap_err();
-    assert!(matches!(
-        error,
-        lattice_actor::protocol::DispatchError::UnknownMessage(999)
-    ));
+    assert!(matches!(error, DispatchError::UnknownMessage(999)));
     wait_for_event(&events, &signal, |event| {
         *event
             == ObserverEvent::ProtocolFailed(

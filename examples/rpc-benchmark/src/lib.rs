@@ -1,23 +1,31 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
+use std::{error::Error as StdError, io::Error as IoError};
+
+use lattice_remoting::{association::AssociationError, messaging::error::TellError};
+use tokio::task::JoinHandle;
+
 pub mod matrix;
 pub mod metrics;
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use lattice_core::actor_ref::{
     ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
 };
-use lattice_remoting::association::Association;
-use lattice_remoting::association::AssociationKey;
-use lattice_remoting::association::LaneAttachment;
-use lattice_remoting::association::LaneKind;
-use lattice_remoting::config::RemotingConfig;
-use lattice_remoting::messaging::outbound::{OutboundMessage, OutboundMessaging};
-use lattice_remoting::messaging::target::SenderIdentity;
-use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
+use lattice_remoting::{
+    association::{Association, AssociationKey, LaneAttachment, LaneKind},
+    config::RemotingConfig,
+    messaging::{
+        outbound::{OutboundMessage, OutboundMessaging},
+        target::SenderIdentity,
+    },
+    protocol::{ProtocolDescriptor, ProtocolFingerprint},
+};
 use metrics::WorkloadReport;
 
 pub const BENCH_PROTOCOL_ID: u64 = 0x6265_6e63_6800_0001;
@@ -52,11 +60,11 @@ pub struct RemotingTopology {
     messaging: OutboundMessaging,
     target: ActorRef,
     fingerprint: ProtocolFingerprint,
-    drains: Vec<tokio::task::JoinHandle<()>>,
+    drains: Vec<JoinHandle<()>>,
 }
 
 impl RemotingTopology {
-    pub fn start(config: &BenchmarkConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn start(config: &BenchmarkConfig) -> Result<Self, Box<dyn StdError>> {
         let cluster_id = ClusterId::new("remoting-benchmark")?;
         let local_incarnation = NodeIncarnation::generate();
         let remote_incarnation = NodeIncarnation::generate();
@@ -108,7 +116,7 @@ impl RemotingTopology {
         )?;
         let receivers = association
             .take_receivers()
-            .ok_or_else(|| std::io::Error::other("association receivers already taken"))?;
+            .ok_or_else(|| IoError::other("association receivers already taken"))?;
         let drains = receivers
             .bulk
             .into_iter()
@@ -134,7 +142,7 @@ impl RemotingTopology {
         &self,
         requests: usize,
         payload_bytes: usize,
-    ) -> Result<WorkloadReport, Box<dyn std::error::Error>> {
+    ) -> Result<WorkloadReport, Box<dyn StdError>> {
         let started = Instant::now();
         let payload = Bytes::from(vec![0_u8; payload_bytes]);
         let sender = SenderIdentity::Process(1);
@@ -151,9 +159,9 @@ impl RemotingTopology {
                         successes += 1;
                         break;
                     }
-                    Err(lattice_remoting::messaging::error::TellError::Association(
-                        lattice_remoting::association::AssociationError::QueueFull,
-                    )) => tokio::task::yield_now().await,
+                    Err(TellError::Association(AssociationError::QueueFull)) => {
+                        tokio::task::yield_now().await
+                    }
                     Err(error) => return Err(Box::new(error)),
                 }
             }

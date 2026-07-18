@@ -1,9 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::{Debug, Formatter, Result as FmtResult},
+    pin::Pin,
+    sync::Arc,
+};
 
-use futures_util::Stream;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use lattice_core::coordinator::CoordinatorScope;
 
 use crate::provider::{
@@ -16,8 +18,8 @@ pub struct AggregateDiscovery {
     providers: Vec<Arc<dyn CoordinatorDiscovery>>,
 }
 
-impl std::fmt::Debug for AggregateDiscovery {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for AggregateDiscovery {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter
             .debug_struct("AggregateDiscovery")
             .field("provider_count", &self.providers.len())

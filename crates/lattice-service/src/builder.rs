@@ -1,82 +1,91 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex, atomic::AtomicBool},
+};
 
-use lattice_actor::host::ActorHost;
-use lattice_actor::host::ProtocolHostRegistry;
-use lattice_actor::protocol::{
-    ActorProtocol, ActorProtocolBinder, ActorProtocolBinding, Protocol, SupportsAsk, SupportsTell,
+use lattice_actor::{
+    host::{ActorHost, ProtocolHostRegistry},
+    protocol::{
+        ActorProtocol, ActorProtocolBinder, ActorProtocolBinding, Protocol, SupportsAsk,
+        SupportsTell,
+    },
+    recipient::{
+        ActorSystem, ProtocolRegistrationError, RecipientBackend, RecipientError,
+        RegisteredActorProtocol,
+    },
+    registry::{ActorLoader, ActorRefConfig, ActorRegistry, ActorRegistryConfig},
+    traits::{Actor, Message, Request},
 };
-use lattice_actor::recipient::{
-    ActorSystem, RecipientBackend, RecipientError, RegisteredActorProtocol,
+use lattice_core::{
+    actor_ref::{
+        ActorRef, EntityRef, PlacementDomainId, ProtocolId, ProtocolTag, RecipientRef, SingletonRef,
+    },
+    coordinator::CoordinatorScope,
 };
-use lattice_actor::registry::{ActorLoader, ActorRefConfig, ActorRegistry, ActorRegistryConfig};
-use lattice_actor::traits::{Actor, Message, Request};
-use lattice_core::actor_ref::{ActorRef, EntityRef, ProtocolTag, RecipientRef, SingletonRef};
 use lattice_discovery::provider::CoordinatorDiscovery;
-use lattice_placement::authority::AuthorityEffect;
-use lattice_placement::control::{
-    PlacementControlDirectory, PlacementControlEvent, PlacementControlRouter,
+use lattice_placement::{
+    authority::AuthorityEffect,
+    control::{PlacementControlDirectory, PlacementControlEvent, PlacementControlRouter},
+    coordinator::{
+        LeaderRecord, MemberChange, MemberEvent, MemberHello, PlacementDomainHello, SingletonConfig,
+    },
+    region::EntityConfig,
+    runtime::{
+        CoordinatorHandle,
+        host::{CoordinatorHost, CoordinatorHostScopeState},
+    },
+    session::{
+        LogicCoordinatorConfig, LogicCoordinatorHandle, LogicPlacementEffect,
+        PlacementDomainSession,
+    },
+    storage::{CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore},
+    types::NodeKey,
 };
-use lattice_placement::coordinator::{
-    MemberChange, MemberEvent, MemberHello, PlacementDomainHello, SingletonConfig,
+use lattice_remoting::{
+    association::{Association, AssociationKey, AssociationManager},
+    bootstrap::BootstrapLeader,
+    control::{ControlDispatch, RejectControlDispatch},
+    endpoint::{EndpointSecurity, RemotingEndpoint},
+    handshake::NodeIdentity,
+    messaging::outbound::OutboundMessaging,
+    protocol::{ProtocolDescriptor, ProtocolFingerprint},
+    watch::WatchRegistry,
 };
-use lattice_placement::region::EntityConfig;
-use lattice_placement::runtime::CoordinatorHandle;
-use lattice_placement::runtime::host::CoordinatorHost;
-use lattice_placement::session::LogicCoordinatorConfig;
-use lattice_placement::session::LogicCoordinatorHandle;
-use lattice_placement::session::LogicPlacementEffect;
-use lattice_placement::session::PlacementDomainSession;
-use lattice_placement::storage::{
-    CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore,
-};
-use lattice_placement::types::NodeKey;
-use lattice_remoting::association::Association;
-use lattice_remoting::association::AssociationManager;
-use lattice_remoting::bootstrap::BootstrapLeader;
-use lattice_remoting::control::ControlDispatch;
-use lattice_remoting::control::RejectControlDispatch;
-use lattice_remoting::endpoint::EndpointSecurity;
-use lattice_remoting::endpoint::RemotingEndpoint;
-use lattice_remoting::handshake::NodeIdentity;
-use lattice_remoting::messaging::outbound::OutboundMessaging;
-use lattice_remoting::protocol::ProtocolDescriptor;
-use lattice_remoting::watch::WatchRegistry;
 use tokio::sync::{mpsc, watch};
 
-use crate::backend::{
-    DomainRouterDirectory, LogicalRouter, ServiceInboundDispatch, ServiceRecipientBackend,
+use crate::{
+    backend::{
+        DomainRouterDirectory, LogicalRouter, ServiceInboundDispatch, ServiceRecipientBackend,
+    },
+    cluster::{
+        ClusterRouterError, DomainLogicalRouter, LogicalBufferConfig,
+        join::{BootstrapView, JoinController},
+        members::{MemberDirectory, MemberSnapshot},
+        membership_runtime::MembershipJoinRuntime,
+        peers::PeerReconciler,
+        runtime::LogicJoinRuntime,
+    },
+    config::{ClusterJoinConfig, NodeConfig},
+    control::ServiceControlDispatch,
+    error::ServiceError,
+    lifecycle::{
+        NodeAdmissionGate, NodeLifecycle, NodeLifecycleState, PlacementDomainState,
+        ProductionLifecycleDriver, ServiceHealthSnapshot, ServiceLifecycleEvent,
+    },
+    registration::{EntityOptions, SingletonOptions},
+    supervisor::TaskSupervisor,
 };
-use crate::cluster::join::{BootstrapView, JoinController};
-use crate::cluster::members::{MemberDirectory, MemberSnapshot};
-use crate::cluster::membership_runtime::MembershipJoinRuntime;
-use crate::cluster::peers::PeerReconciler;
-use crate::cluster::runtime::LogicJoinRuntime;
-use crate::cluster::{ClusterRouterError, DomainLogicalRouter, LogicalBufferConfig};
-use crate::config::{ClusterJoinConfig, NodeConfig};
-use crate::control::ServiceControlDispatch;
-use crate::error::ServiceError;
-use crate::lifecycle::{
-    NodeAdmissionGate, NodeLifecycle, NodeLifecycleState, PlacementDomainState,
-    ProductionLifecycleDriver, ServiceHealthSnapshot, ServiceLifecycleEvent,
-};
-use crate::registration::{EntityOptions, SingletonOptions};
-use crate::supervisor::TaskSupervisor;
 
-type ActorSystemInstaller = Box<
-    dyn Fn(&ActorSystem) -> Result<(), lattice_actor::recipient::ProtocolRegistrationError>
-        + Send
-        + Sync,
->;
+type ActorSystemInstaller =
+    Box<dyn Fn(&ActorSystem) -> Result<(), ProtocolRegistrationError> + Send + Sync>;
 type DomainEntityInstaller =
     dyn Fn(&mut DomainLogicalRouter) -> Result<(), ClusterRouterError> + Send + Sync;
 
 #[derive(Clone)]
 pub(crate) struct LogicalEntityInstaller {
-    pub domain: lattice_core::actor_ref::PlacementDomainId,
+    pub domain: PlacementDomainId,
     pub install: Arc<DomainEntityInstaller>,
 }
 
@@ -85,7 +94,7 @@ pub struct LatticeServiceBuilder {
     associations: Arc<AssociationManager>,
     messaging: Arc<OutboundMessaging>,
     hosts: ProtocolHostRegistry,
-    protocols: BTreeMap<u64, lattice_remoting::protocol::ProtocolFingerprint>,
+    protocols: BTreeMap<u64, ProtocolFingerprint>,
     actor_protocols: BTreeMap<u64, RegisteredActorProtocol>,
     actor_system_installers: Vec<ActorSystemInstaller>,
     entity_configs: Vec<EntityConfig>,
@@ -96,18 +105,17 @@ pub struct LatticeServiceBuilder {
     logical: Option<Arc<dyn LogicalRouter>>,
     control_dispatch: Arc<dyn ControlDispatch>,
     logic_runtime: Option<LogicRuntimeAssembly>,
-    control_scope: Option<lattice_remoting::association::AssociationKey>,
+    control_scope: Option<AssociationKey>,
     coordinator_runtime: Option<CoordinatorRuntimeAssembly>,
     endpoint_security: Option<EndpointSecurity>,
-    discoveries:
-        BTreeMap<lattice_core::coordinator::CoordinatorScope, Arc<dyn CoordinatorDiscovery>>,
+    discoveries: BTreeMap<CoordinatorScope, Arc<dyn CoordinatorDiscovery>>,
     join_config: ClusterJoinConfig,
     member_event_capacity: usize,
-    domain_capacity: BTreeMap<lattice_core::actor_ref::PlacementDomainId, u64>,
+    domain_capacity: BTreeMap<PlacementDomainId, u64>,
 }
 
 struct LogicRuntimeAssembly {
-    domain: lattice_core::actor_ref::PlacementDomainId,
+    domain: PlacementDomainId,
     session: PlacementDomainSession,
     controls: mpsc::Receiver<PlacementControlEvent>,
     effects: mpsc::Receiver<LogicPlacementEffect>,
@@ -118,20 +126,10 @@ struct LogicRuntimeAssembly {
 struct CoordinatorRuntimeAssembly {
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
     shutdown: watch::Sender<bool>,
-    handles: BTreeMap<lattice_core::actor_ref::PlacementDomainId, CoordinatorHandle>,
+    handles: BTreeMap<PlacementDomainId, CoordinatorHandle>,
     bootstrap_leaders: Vec<BootstrapLeader>,
-    directory: watch::Receiver<
-        BTreeMap<
-            lattice_core::coordinator::CoordinatorScope,
-            lattice_placement::coordinator::LeaderRecord,
-        >,
-    >,
-    scope_states: watch::Receiver<
-        BTreeMap<
-            lattice_core::coordinator::CoordinatorScope,
-            lattice_placement::runtime::host::CoordinatorHostScopeState,
-        >,
-    >,
+    directory: watch::Receiver<BTreeMap<CoordinatorScope, LeaderRecord>>,
+    scope_states: watch::Receiver<BTreeMap<CoordinatorScope, CoordinatorHostScopeState>>,
 }
 
 impl LatticeServiceBuilder {
@@ -188,7 +186,7 @@ impl LatticeServiceBuilder {
         &self.config
     }
 
-    pub(crate) fn hosted_domains(&self) -> BTreeSet<lattice_core::actor_ref::PlacementDomainId> {
+    pub(crate) fn hosted_domains(&self) -> BTreeSet<PlacementDomainId> {
         self.entity_configs
             .iter()
             .map(|config| config.domain.clone())
@@ -200,7 +198,7 @@ impl LatticeServiceBuilder {
             .collect()
     }
 
-    pub(crate) fn placement_domains(&self) -> BTreeSet<lattice_core::actor_ref::PlacementDomainId> {
+    pub(crate) fn placement_domains(&self) -> BTreeSet<PlacementDomainId> {
         self.entity_configs
             .iter()
             .chain(self.proxied_entity_configs.iter())
@@ -221,7 +219,7 @@ impl LatticeServiceBuilder {
     ) -> Result<Self, ServiceError> {
         if registry.protocol_id() != Some(protocol.protocol_id()) {
             return Err(ServiceError::ProtocolRegistration(
-                lattice_actor::recipient::ProtocolRegistrationError::RegistryProtocolMismatch {
+                ProtocolRegistrationError::RegistryProtocolMismatch {
                     registry_protocol_id: registry.protocol_id().map(|id| id.get()),
                     binding_protocol_id: protocol.protocol_id().get(),
                 },
@@ -233,9 +231,7 @@ impl LatticeServiceBuilder {
             .push(Box::new(move |actor_system| {
                 actor_registry
                     .install_actor_system(actor_system.clone())
-                    .map_err(|_| {
-                        lattice_actor::recipient::ProtocolRegistrationError::ActorSystemAlreadyInstalled
-                    })
+                    .map_err(|_| ProtocolRegistrationError::ActorSystemAlreadyInstalled)
             }));
         self.hosts
             .register(ActorHost::new(registry, protocol))
@@ -527,9 +523,7 @@ impl LatticeServiceBuilder {
                 return Ok(());
             }
             return Err(ServiceError::ProtocolRegistration(
-                lattice_actor::recipient::ProtocolRegistrationError::DuplicateProtocol(
-                    protocol.protocol_id(),
-                ),
+                ProtocolRegistrationError::DuplicateProtocol(protocol.protocol_id()),
             ));
         }
         self.protocols.insert(protocol_id, protocol.fingerprint());
@@ -576,7 +570,7 @@ impl LatticeServiceBuilder {
 
     pub fn domain_capacity(
         mut self,
-        domain: lattice_core::actor_ref::PlacementDomainId,
+        domain: PlacementDomainId,
         capacity_units: u64,
     ) -> Result<Self, ServiceError> {
         if capacity_units == 0
@@ -626,8 +620,8 @@ impl LatticeServiceBuilder {
         let directory = host.subscribe_directory();
         let scope_states = host.subscribe_scope_states();
         let mut scope_records = Vec::new();
-        if let Some(lattice_placement::runtime::host::CoordinatorHostScopeState::Active(record)) =
-            host.scope_state(&lattice_core::coordinator::CoordinatorScope::Membership)
+        if let Some(CoordinatorHostScopeState::Active(record)) =
+            host.scope_state(&CoordinatorScope::Membership)
         {
             scope_records.push(record.clone());
         }
@@ -705,7 +699,7 @@ impl LatticeServiceBuilder {
                 .protocols
                 .iter()
                 .map(|(protocol_id, fingerprint)| ProtocolDescriptor {
-                    protocol_id: lattice_core::actor_ref::ProtocolId::new(*protocol_id)
+                    protocol_id: ProtocolId::new(*protocol_id)
                         .expect("registered actor protocols have nonzero IDs"),
                     fingerprint: *fingerprint,
                 })
@@ -745,7 +739,7 @@ impl LatticeServiceBuilder {
                 protocols,
                 remoting_capabilities: BTreeSet::new(),
             };
-            let membership_scope = lattice_core::coordinator::CoordinatorScope::Membership;
+            let membership_scope = CoordinatorScope::Membership;
             let membership_discovery = self
                 .discoveries
                 .remove(&membership_scope)
@@ -759,7 +753,7 @@ impl LatticeServiceBuilder {
                 member_hello.clone(),
             ));
             for domain in domains {
-                let scope = lattice_core::coordinator::CoordinatorScope::Placement(domain.clone());
+                let scope = CoordinatorScope::Placement(domain.clone());
                 let discovery = self
                     .discoveries
                     .remove(&scope)
@@ -838,7 +832,7 @@ impl LatticeServiceBuilder {
         let hosts = Arc::new(self.hosts);
         let logical = self.logical;
         let supervisor = Arc::new(TaskSupervisor::new(self.config.maximum_supervised_tasks)?);
-        let watches = Arc::new(std::sync::Mutex::new(
+        let watches = Arc::new(Mutex::new(
             WatchRegistry::new(self.config.maximum_watches, self.config.maximum_watches)
                 .map_err(ServiceError::Watch)?,
         ));
@@ -896,7 +890,7 @@ impl LatticeServiceBuilder {
             self.protocols
                 .into_iter()
                 .map(|(protocol_id, fingerprint)| ProtocolDescriptor {
-                    protocol_id: lattice_core::actor_ref::ProtocolId::new(protocol_id)
+                    protocol_id: ProtocolId::new(protocol_id)
                         .expect("registered actor protocols have nonzero IDs"),
                     fingerprint,
                 })
@@ -920,13 +914,13 @@ impl LatticeServiceBuilder {
             associations.clone(),
             members.clone(),
         ));
-        let lifecycle = Arc::new(std::sync::Mutex::new(NodeLifecycle::default()));
+        let lifecycle = Arc::new(Mutex::new(NodeLifecycle::default()));
         let (lifecycle_events, _) = watch::channel(NodeLifecycleState::Booting);
         let mut initial_logic_handles = BTreeMap::new();
         if let Some(runtime) = self.logic_runtime.as_ref() {
             initial_logic_handles.insert(runtime.domain.clone(), runtime.handle.clone());
         }
-        let logic_handles = Arc::new(std::sync::Mutex::new(initial_logic_handles));
+        let logic_handles = Arc::new(Mutex::new(initial_logic_handles));
         let (drain_ready, _) = watch::channel(BTreeMap::new());
         let (drain_blockers, _) = watch::channel(BTreeMap::new());
         let mut configured_domains = auto_join
@@ -936,7 +930,7 @@ impl LatticeServiceBuilder {
         if let Some(runtime) = self.logic_runtime.as_ref() {
             configured_domains.insert(runtime.domain.clone());
         }
-        let health = Arc::new(std::sync::Mutex::new(ServiceHealthSnapshot {
+        let health = Arc::new(Mutex::new(ServiceHealthSnapshot {
             node: NodeLifecycleState::Booting,
             domains: configured_domains
                 .iter()
@@ -954,7 +948,7 @@ impl LatticeServiceBuilder {
             admission,
         );
         let membership_ready = Arc::new(AtomicBool::new(false));
-        let membership_handle = Arc::new(std::sync::Mutex::new(None));
+        let membership_handle = Arc::new(Mutex::new(None));
         let join_runtimes = auto_join
             .into_iter()
             .map(|(discovery, controls, _member_hello, domain_hello)| {
@@ -1029,17 +1023,17 @@ impl LatticeServiceBuilder {
             messaging,
             endpoint,
             supervisor,
-            logic_runtime: std::sync::Mutex::new(self.logic_runtime),
-            join_runtimes: std::sync::Mutex::new(join_runtimes),
-            membership_join_runtime: std::sync::Mutex::new(membership_join_runtime),
+            logic_runtime: Mutex::new(self.logic_runtime),
+            join_runtimes: Mutex::new(join_runtimes),
+            membership_join_runtime: Mutex::new(membership_join_runtime),
             membership_handle,
-            logic_shutdown: std::sync::Mutex::new(None),
-            join_shutdown: std::sync::Mutex::new(None),
+            logic_shutdown: Mutex::new(None),
+            join_shutdown: Mutex::new(None),
             logic_handles,
             watches,
-            coordinator_runtime: std::sync::Mutex::new(self.coordinator_runtime),
-            coordinator_shutdown: std::sync::Mutex::new(None),
-            coordinator_handles: std::sync::Mutex::new(BTreeMap::new()),
+            coordinator_runtime: Mutex::new(self.coordinator_runtime),
+            coordinator_shutdown: Mutex::new(None),
+            coordinator_handles: Mutex::new(BTreeMap::new()),
             lifecycle_driver,
             lifecycle_events,
             health,
@@ -1050,9 +1044,9 @@ impl LatticeServiceBuilder {
             drain_ready,
             drain_blockers,
             configured_domains,
-            drain_operation: std::sync::Mutex::new(None),
+            drain_operation: Mutex::new(None),
             join_config: self.join_config,
-            force_actor_shutdown: std::sync::atomic::AtomicBool::new(false),
+            force_actor_shutdown: AtomicBool::new(false),
         })
     }
 }

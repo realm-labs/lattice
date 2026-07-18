@@ -1,16 +1,15 @@
-use super::codec::*;
-use super::error::*;
-use super::inbound::*;
-use super::outbound::*;
-use super::target::*;
-
-use super::*;
-use crate::association::{AssociationKey, AssociationState, LaneAttachment, LaneKind};
-use crate::config::RemotingConfig;
-use crate::protocol::ProtocolDescriptor;
-use crate::transport::FramedConnection;
-use crate::wire::FrameCodec;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+use tokio::net::{TcpListener, TcpStream};
+
+use super::{codec::*, error::*, inbound::*, outbound::*, target::*, *};
+use crate::{
+    association::{AssociationKey, AssociationState, LaneAttachment, LaneKind},
+    config::RemotingConfig,
+    protocol::ProtocolDescriptor,
+    transport::FramedConnection,
+    wire::FrameCodec,
+};
 
 #[test]
 fn actor_panicked_maps_to_the_dedicated_remote_failure_code() {
@@ -111,7 +110,7 @@ impl InboundDispatch for RecordingDispatch {
 
 #[tokio::test]
 async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let protocol_id = ProtocolId::new(7).unwrap();
     let actor_ref = target(protocol_id);
@@ -130,7 +129,7 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
         .await
         .unwrap();
     });
-    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let stream = TcpStream::connect(address).await.unwrap();
     let mut client = FramedConnection::new(stream, FrameCodec::new(4096).unwrap());
     let exact = ExactActorTarget::from(&actor_ref);
     client

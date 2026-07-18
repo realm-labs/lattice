@@ -1,3 +1,8 @@
+use lattice_actor::registry::ActorQuarantineError;
+use lattice_core::{actor_ref::EntityId, coordinator::CoordinatorScope};
+use lattice_placement::{control::PlacementControlCommand, types::ShardId};
+use lattice_remoting::messaging::error::RemoteFailureCode;
+
 use super::{
     Actor, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc,
     AskError, AssociationKey, AssociationManager, AssociationState, Bytes, DispatchMode,
@@ -45,20 +50,11 @@ pub(super) trait EntityRoute: Send + Sync {
         &self,
         target: LogicalEntityTarget,
     ) -> Result<Bytes, RemoteMessageError>;
-    async fn drain(
-        &self,
-        shard_id: lattice_placement::types::ShardId,
-    ) -> Result<bool, RemoteMessageError>;
-    async fn wait_drained(
-        &self,
-        _shard_id: lattice_placement::types::ShardId,
-    ) -> Result<(), RemoteMessageError> {
+    async fn drain(&self, shard_id: ShardId) -> Result<bool, RemoteMessageError>;
+    async fn wait_drained(&self, _shard_id: ShardId) -> Result<(), RemoteMessageError> {
         Ok(())
     }
-    async fn fence(
-        &self,
-        _shard_id: lattice_placement::types::ShardId,
-    ) -> Result<(), RemoteMessageError> {
+    async fn fence(&self, _shard_id: ShardId) -> Result<(), RemoteMessageError> {
         Ok(())
     }
 }
@@ -136,8 +132,8 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
         let sequence = NEXT_LOGICAL_RESOLUTION.fetch_add(1, Ordering::Relaxed);
         let request_id = (self.local_node.incarnation.get() << 64) ^ u128::from(sequence);
         let payload = lattice_placement::control::encode_control_command(
-            &lattice_core::coordinator::CoordinatorScope::Placement(domain.clone()),
-            &lattice_placement::control::PlacementControlCommand::ResolveShard {
+            &CoordinatorScope::Placement(domain.clone()),
+            &PlacementControlCommand::ResolveShard {
                 request_id,
                 domain: domain.clone(),
                 entity_type: entity_type.clone(),
@@ -443,9 +439,7 @@ where
                     self.config.protocol_id,
                 )
                 .map(Some),
-                Err(AskError::Remote(
-                    lattice_remoting::messaging::error::RemoteFailureCode::StaleActivation,
-                )) => Ok(None),
+                Err(AskError::Remote(RemoteFailureCode::StaleActivation)) => Ok(None),
                 Err(_) => Err(WatchError::NotActive),
             };
         }
@@ -481,16 +475,13 @@ where
             .map_err(|_| RemoteMessageError::HandlerFailed)
     }
 
-    async fn drain(
-        &self,
-        shard_id: lattice_placement::types::ShardId,
-    ) -> Result<bool, RemoteMessageError> {
+    async fn drain(&self, shard_id: ShardId) -> Result<bool, RemoteMessageError> {
         let actor_ids = self
             .registry
             .active_actor_ids()
             .into_iter()
             .filter(|actor_id| match actor_id {
-                ActorId::Bytes(bytes) => lattice_core::actor_ref::EntityId::new(bytes.clone())
+                ActorId::Bytes(bytes) => EntityId::new(bytes.clone())
                     .is_ok_and(|entity_id| self.config.shard_for(&entity_id) == shard_id),
                 ActorId::Str(_) | ActorId::U64(_) | ActorId::I64(_) => false,
             })
@@ -503,16 +494,13 @@ where
         .await
     }
 
-    async fn wait_drained(
-        &self,
-        shard_id: lattice_placement::types::ShardId,
-    ) -> Result<(), RemoteMessageError> {
+    async fn wait_drained(&self, shard_id: ShardId) -> Result<(), RemoteMessageError> {
         let actor_ids = self
             .registry
             .active_actor_ids()
             .into_iter()
             .filter(|actor_id| match actor_id {
-                ActorId::Bytes(bytes) => lattice_core::actor_ref::EntityId::new(bytes.clone())
+                ActorId::Bytes(bytes) => EntityId::new(bytes.clone())
                     .is_ok_and(|entity_id| self.config.shard_for(&entity_id) == shard_id),
                 ActorId::Str(_) | ActorId::U64(_) | ActorId::I64(_) => false,
             })
@@ -542,23 +530,20 @@ where
         }
     }
 
-    async fn fence(
-        &self,
-        shard_id: lattice_placement::types::ShardId,
-    ) -> Result<(), RemoteMessageError> {
+    async fn fence(&self, shard_id: ShardId) -> Result<(), RemoteMessageError> {
         let actor_ids = self
             .registry
             .active_actor_ids()
             .into_iter()
             .filter(|actor_id| match actor_id {
-                ActorId::Bytes(bytes) => lattice_core::actor_ref::EntityId::new(bytes.clone())
+                ActorId::Bytes(bytes) => EntityId::new(bytes.clone())
                     .is_ok_and(|entity_id| self.config.shard_for(&entity_id) == shard_id),
                 ActorId::Str(_) | ActorId::U64(_) | ActorId::I64(_) => false,
             })
             .collect::<Vec<_>>();
         for actor_id in actor_ids {
             match self.registry.fence_after_authority_loss(&actor_id).await {
-                Ok(()) | Err(lattice_actor::registry::ActorQuarantineError::NotRetained) => {}
+                Ok(()) | Err(ActorQuarantineError::NotRetained) => {}
                 Err(_) => return Err(RemoteMessageError::HandlerFailed),
             }
         }

@@ -51,14 +51,19 @@
 //! a request whose caller has disconnected. It is intentionally named as an
 //! operation rather than a query because it may perform a terminal transition.
 
-use std::fmt;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::{
+    error::Error,
+    fmt,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Instant,
+};
 
 use tokio::sync::oneshot;
 
-use crate::error::{ActorCallError, ActorError, ReplyError};
-use crate::observation::{RequestCompletion, RequestObservation};
+use crate::{
+    error::{ActorCallError, ActorError, ReplyError},
+    observation::{RequestCompletion, RequestObservation},
+};
 
 /// A single-use, typed capability for completing an actor request.
 ///
@@ -117,7 +122,7 @@ impl<T: Send + 'static> ReplyTo<T> {
     /// continuation message after an asynchronous operation fails.
     pub fn fail<E>(self, error: E) -> Result<(), ReplyError>
     where
-        E: std::error::Error + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
     {
         self.finish(Err(ActorCallError::Handler(ActorError::from_error(error))))
     }
@@ -209,7 +214,7 @@ impl<T: Send + 'static> ReplyControl<T> {
 
     pub(crate) fn handler_failed<E>(&self, error: E)
     where
-        E: std::error::Error + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
     {
         self.cancel(ActorCallError::Handler(ActorError::from_error(error)));
     }
@@ -337,7 +342,7 @@ enum ReapAction<T: Send + 'static> {
 }
 
 impl<T: Send + 'static> ReplySlot<T> {
-    fn lock(&self) -> std::sync::MutexGuard<'_, ReplyState<T>> {
+    fn lock(&self) -> MutexGuard<'_, ReplyState<T>> {
         self.state.lock().expect("reply slot poisoned")
     }
 

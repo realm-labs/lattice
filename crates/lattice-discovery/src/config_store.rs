@@ -1,10 +1,8 @@
-use std::pin::Pin;
-use std::time::Duration;
+use std::{fmt::Display, pin::Pin, time::Duration};
 
 use futures_util::Stream;
 use lattice_config::store::ConfigStore;
-use lattice_core::actor_ref::NodeAddress;
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_core::{actor_ref::NodeAddress, coordinator::CoordinatorScope};
 use serde::Deserialize;
 
 use crate::provider::{
@@ -254,7 +252,7 @@ fn parse_update(
     Ok(Some((document.generation, targets)))
 }
 
-fn provider_error(error: impl std::fmt::Display) -> DiscoveryError {
+fn provider_error(error: impl Display) -> DiscoveryError {
     DiscoveryError::Provider {
         provider: "config_store",
         message: error.to_string(),

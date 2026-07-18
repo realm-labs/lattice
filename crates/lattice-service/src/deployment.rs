@@ -1,21 +1,20 @@
-use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use lattice_core::actor_ref::PlacementDomainId;
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_core::{actor_ref::PlacementDomainId, coordinator::CoordinatorScope};
 use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
-use lattice_placement::control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter};
-use lattice_placement::runtime::host::{CoordinatorHost, CoordinatorHostConfig};
-use lattice_placement::storage::{
-    CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore,
+use lattice_placement::{
+    control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
+    runtime::host::{CoordinatorHost, CoordinatorHostConfig},
+    storage::{CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore},
+    types::NodeKey,
 };
-use lattice_placement::types::NodeKey;
 
-use crate::builder::{LatticeService, LatticeServiceBuilder};
-use crate::config::NodeConfig;
-use crate::error::ServiceError;
-use crate::lifecycle::NodeLifecycleState;
+use crate::{
+    builder::{LatticeService, LatticeServiceBuilder},
+    config::NodeConfig,
+    error::ServiceError,
+    lifecycle::{CoordinatorScopeState, NodeLifecycleState, PlacementDomainState},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoordinatorDeploymentMode {
@@ -115,11 +114,12 @@ impl LatticeApplication {
             if let Some(logic) = &self.logic {
                 let mut health = logic.subscribe_health();
                 loop {
-                    let ready =
-                        health.borrow().node == NodeLifecycleState::Ready
-                            && health.borrow().domains.values().all(|state| {
-                                *state == crate::lifecycle::PlacementDomainState::Ready
-                            });
+                    let ready = health.borrow().node == NodeLifecycleState::Ready
+                        && health
+                            .borrow()
+                            .domains
+                            .values()
+                            .all(|state| *state == PlacementDomainState::Ready);
                     if ready {
                         break;
                     }
@@ -143,8 +143,7 @@ impl LatticeApplication {
                         && health.borrow().coordinator_scopes.values().all(|state| {
                             matches!(
                                 state,
-                                crate::lifecycle::CoordinatorScopeState::Active
-                                    | crate::lifecycle::CoordinatorScopeState::Standby
+                                CoordinatorScopeState::Active | CoordinatorScopeState::Standby
                             )
                         });
                     if ready {
@@ -333,20 +332,23 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{CoordinatorDeploymentMode, EmbeddedCoordinatorConfig, LatticeApplication};
-    use crate::builder::LatticeService;
-    use crate::config::NodeConfig;
-    use crate::lifecycle::NodeLifecycleState;
+    use std::{collections::BTreeSet, net::TcpListener, sync::Arc, time::Duration};
+
     use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
-    use lattice_placement::runtime::host::CoordinatorHostConfig;
-    use lattice_placement::storage::InMemoryPlacementStore;
+    use lattice_placement::{
+        runtime::host::CoordinatorHostConfig, storage::InMemoryPlacementStore,
+    };
     use lattice_remoting::config::RemotingConfig;
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
-    use std::time::Duration;
+
+    use super::{CoordinatorDeploymentMode, EmbeddedCoordinatorConfig, LatticeApplication};
+    use crate::{
+        builder::LatticeService,
+        config::NodeConfig,
+        lifecycle::{CoordinatorScopeState, NodeLifecycleState},
+    };
 
     fn unused_address() -> NodeAddress {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         NodeAddress::new("127.0.0.1", port).unwrap()
@@ -438,8 +440,7 @@ mod tests {
         assert!(!health.coordinator_scopes.is_empty());
         assert!(health.coordinator_scopes.values().all(|state| matches!(
             state,
-            crate::lifecycle::CoordinatorScopeState::Active
-                | crate::lifecycle::CoordinatorScopeState::Standby
+            CoordinatorScopeState::Active | CoordinatorScopeState::Standby
         )));
         application.shutdown().await.unwrap();
         assert_eq!(

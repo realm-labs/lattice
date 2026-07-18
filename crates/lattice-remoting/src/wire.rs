@@ -1,3 +1,5 @@
+use std::io::Error as IoError;
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use prost::Message;
 use thiserror::Error;
@@ -188,7 +190,7 @@ pub enum WireError {
     #[error("protobuf payload decode failed")]
     Decode(#[source] prost::DecodeError),
     #[error("I/O failed")]
-    Io(#[from] std::io::Error),
+    Io(#[from] IoError),
     #[error("TLS transport validation failed: {0}")]
     Tls(&'static str),
 }

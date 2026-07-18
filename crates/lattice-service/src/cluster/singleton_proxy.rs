@@ -1,19 +1,24 @@
-use super::singleton::SingletonRoute;
+use std::sync::Arc;
+
+use lattice_core::coordinator::CoordinatorScope;
+use lattice_placement::control::PlacementControlCommand;
+use lattice_remoting::{association::Association, messaging::error::RemoteFailureCode};
+
 use super::{
     ActorRef, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, Instant,
     LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalSingletonTarget, Mutex,
     NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessage, OutboundMessaging, PlacementSlot,
     PlacementSlotKey, PlacementSlotState, ProtocolFingerprint, RemoteMessageError, RouteBuffer,
     SenderIdentity, SingletonConfig, SingletonRef, WatchError, async_trait, decode_resolved_actor,
-    map_tell,
+    map_tell, peers::PeerReconciler, singleton::SingletonRoute,
 };
 
 pub(super) struct SingletonProxyRoute {
     pub local_node: NodeKey,
-    pub state: std::sync::Arc<Mutex<LogicPlacementState>>,
-    pub associations: std::sync::Arc<AssociationManager>,
-    pub peers: Option<std::sync::Arc<super::peers::PeerReconciler>>,
-    pub messaging: std::sync::Arc<OutboundMessaging>,
+    pub state: Arc<Mutex<LogicPlacementState>>,
+    pub associations: Arc<AssociationManager>,
+    pub peers: Option<Arc<PeerReconciler>>,
+    pub messaging: Arc<OutboundMessaging>,
     pub coordinator: AssociationKey,
     pub buffer: RouteBuffer,
     pub config: SingletonConfig,
@@ -58,8 +63,8 @@ impl SingletonProxyRoute {
         let sequence = NEXT_LOGICAL_RESOLUTION.fetch_add(1, Ordering::Relaxed);
         let request_id = (self.local_node.incarnation.get() << 64) ^ u128::from(sequence);
         let payload = lattice_placement::control::encode_control_command(
-            &lattice_core::coordinator::CoordinatorScope::Placement(self.config.domain.clone()),
-            &lattice_placement::control::PlacementControlCommand::ResolveSingleton {
+            &CoordinatorScope::Placement(self.config.domain.clone()),
+            &PlacementControlCommand::ResolveSingleton {
                 request_id,
                 domain: self.config.domain.clone(),
                 kind: self.config.kind.clone(),
@@ -116,8 +121,7 @@ impl SingletonProxyRoute {
         &self,
         target: &SingletonRef,
         owner: &NodeKey,
-    ) -> Result<std::sync::Arc<lattice_remoting::association::Association>, RemoteMessageError>
-    {
+    ) -> Result<Arc<Association>, RemoteMessageError> {
         if owner == &self.local_node {
             return Err(RemoteMessageError::StaleAuthority);
         }
@@ -270,9 +274,7 @@ impl SingletonRoute for SingletonProxyRoute {
                 self.config.protocol_id,
             )
             .map(Some),
-            Err(AskError::Remote(
-                lattice_remoting::messaging::error::RemoteFailureCode::StaleActivation,
-            )) => Ok(None),
+            Err(AskError::Remote(RemoteFailureCode::StaleActivation)) => Ok(None),
             Err(_) => Err(WatchError::Unavailable),
         }
     }

@@ -1,31 +1,36 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use lattice_core::{
+    actor_kind, id::ActorId, instance::InstanceId, service_context::ServiceContext, service_kind,
+};
 use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore, oneshot};
 
-use crate::context::ActorContext;
-use crate::error::{
-    ActorActivationError, ActorCallError, ActorError, ActorStopError, ActorTellError,
-    PipeToSelfError,
+use crate::{
+    context::ActorContext,
+    error::{
+        ActorActivationError, ActorCallError, ActorError, ActorStopError, ActorTellError,
+        PipeToSelfError,
+    },
+    mailbox::MailboxConfig,
+    registry::{ActorRegistry, ActorRegistryConfig},
+    reply::ReplyTo,
+    runtime::{
+        ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions,
+        PassivationPolicy, spawn_actor,
+    },
+    traits::{
+        Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, Handler, Message,
+        MessageMetadata, PassivationReason, Request, Responder, ResponderErrorAction, StopReason,
+    },
 };
-use crate::mailbox::MailboxConfig;
-use crate::registry::{ActorRegistry, ActorRegistryConfig};
-use crate::reply::ReplyTo;
-use crate::runtime::{
-    ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions, PassivationPolicy,
-    spawn_actor,
-};
-use crate::traits::{
-    Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, Handler, Message,
-    PassivationReason, Request, Responder, ResponderErrorAction, StopReason,
-};
-use lattice_core::id::ActorId;
-use lattice_core::instance::InstanceId;
-use lattice_core::service_context::ServiceContext;
-use lattice_core::{actor_kind, service_kind};
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -369,7 +374,7 @@ impl Actor for BusinessErrorActor {
     async fn on_error<M>(
         &mut self,
         _ctx: &mut ActorContext<Self>,
-        _metadata: &crate::traits::MessageMetadata,
+        _metadata: &MessageMetadata,
         error: &BusinessActorError,
     ) where
         M: Send + 'static,
@@ -539,7 +544,7 @@ async fn deferred_reply_does_not_block_the_actor_mailbox() {
         ))
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(1), processed.acquire())
+    tokio::time::timeout(Duration::from_secs(1), processed.acquire())
         .await
         .expect("mailbox should accept the next message while the reply is pending")
         .unwrap()
@@ -809,7 +814,7 @@ async fn local_timer_delivers_message_to_actor() {
     impl Actor for TimerActor {
         type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
-            ctx.notify_after(std::time::Duration::from_millis(5), Tick);
+            ctx.notify_after(Duration::from_millis(5), Tick);
             Ok(())
         }
     }
@@ -834,7 +839,7 @@ async fn local_timer_delivers_message_to_actor() {
         MailboxConfig::bounded(8),
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(*events.lock().await, vec!["tick"]);
 }
 
@@ -877,7 +882,7 @@ async fn scoped_task_is_cancelled_when_actor_stops() {
 
     handle.stop(StopReason::Requested).await.unwrap();
 
-    tokio::time::timeout(std::time::Duration::from_millis(100), dropped_rx)
+    tokio::time::timeout(Duration::from_millis(100), dropped_rx)
         .await
         .unwrap()
         .unwrap();
@@ -1005,7 +1010,7 @@ async fn actor_registry_bounds_and_times_out_activation_waiters() {
             passivation: Default::default(),
             shard_migration: Default::default(),
             waiter_capacity: 0,
-            waiter_timeout: std::time::Duration::from_millis(20),
+            waiter_timeout: Duration::from_millis(20),
             quarantine_capacity: 8,
             actor_ref: None,
             service: ServiceContext::empty(),
@@ -1032,7 +1037,7 @@ async fn actor_registry_bounds_and_times_out_activation_waiters() {
                 .await
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let second = registry
         .get_or_activate(actor_id, || async {

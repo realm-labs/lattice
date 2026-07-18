@@ -1,12 +1,15 @@
-use super::membership::send_control;
+use lattice_core::failpoint::Failpoint;
+
 use super::{
     AllocationRequest, ClaimGrant, ClaimLease, CoordinatorLeaseStore, CoordinatorRuntimeError,
     GrantSequence, HandoffEvent, Instant, MembershipStore, PlacementControlCommand,
     PlacementDomainLeader, PlacementDomainStore, PlacementSlot, PlacementSlotKey,
-    PlacementSlotState, ScopedElectionStore,
+    PlacementSlotState, ScopedElectionStore, membership::send_control,
 };
-use crate::storage::domain::{
-    AdoptAuthority, FenceMissingAuthority, InstallAuthority, LeasedClaim,
+use crate::{
+    allocation::AllocationError,
+    plan::MoveProgress,
+    storage::domain::{AdoptAuthority, FenceMissingAuthority, InstallAuthority, LeasedClaim},
 };
 
 impl<S> PlacementDomainLeader<S>
@@ -89,8 +92,7 @@ where
         if let PlacementSlotKey::Shard { shard_id, .. } = &slot.key {
             let valid = self.plans.get(&plan_id).is_some_and(|plan| {
                 plan.moves.iter().any(|movement| {
-                    movement.shard_id == *shard_id
-                        && movement.progress == crate::plan::MoveProgress::Handoff
+                    movement.shard_id == *shard_id && movement.progress == MoveProgress::Handoff
                 })
             });
             if !valid {
@@ -109,7 +111,7 @@ where
                 .flat_map(|plan| {
                     plan.moves
                         .iter()
-                        .filter(|movement| movement.progress == crate::plan::MoveProgress::Handoff)
+                        .filter(|movement| movement.progress == MoveProgress::Handoff)
                         .map(|movement| PlacementSlotKey::Shard {
                             domain: plan.domain.clone(),
                             entity_type: plan.entity_type.clone(),
@@ -238,9 +240,7 @@ where
             .await;
         match result {
             Ok(committed) => {
-                lattice_core::failpoint::hit(
-                    lattice_core::failpoint::Failpoint::ReconciliationAfterCommitBeforeEffect,
-                );
+                lattice_core::failpoint::hit(Failpoint::ReconciliationAfterCommitBeforeEffect);
                 let _ = self.store.revoke_lease(previous.lease_id).await;
                 self.version = committed.slot.version.clone();
                 self.claims.insert(
@@ -324,7 +324,7 @@ where
                     &view,
                 ) {
                     Ok(decision) => decision.target,
-                    Err(crate::allocation::AllocationError::NoEligibleNode) => return Ok(false),
+                    Err(AllocationError::NoEligibleNode) => return Ok(false),
                     Err(error) => return Err(CoordinatorRuntimeError::Allocation(error)),
                 }
             }

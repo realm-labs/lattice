@@ -1,13 +1,17 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_ref::{ActorRef, EntityRef, NodeIncarnation, ProtocolTag, SingletonRef};
+use lattice_core::{
+    actor_ref::{ActorRef, EntityRef, NodeIncarnation, ProtocolTag, SingletonRef},
+    failpoint::Failpoint,
+};
 use thiserror::Error;
 
-use crate::association::AssociationId;
-use crate::messaging::target::ExactActorTarget;
+use crate::{association::AssociationId, messaging::target::ExactActorTarget};
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -210,9 +214,7 @@ impl WatchRegistry {
             },
             target.clone(),
         );
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::WatchAfterInstallBeforeAck,
-        );
+        lattice_core::failpoint::hit(Failpoint::WatchAfterInstallBeforeAck);
         Ok(WatchCommand::WatchAck { watch_id, target })
     }
 
@@ -254,9 +256,7 @@ impl WatchRegistry {
         let Some(watches) = self.target_watches.remove(&target.actor_path.to_string()) else {
             return Vec::new();
         };
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::WatchAfterTerminatedBeforeAck,
-        );
+        lattice_core::failpoint::hit(Failpoint::WatchAfterTerminatedBeforeAck);
         watches
             .into_iter()
             .filter(|(_, watched)| watched == target)
@@ -397,8 +397,9 @@ pub enum WatchError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use lattice_core::actor_ref::{ActivationId, ActorPath, ClusterId, NodeAddress, ProtocolId};
+
+    use super::*;
 
     fn actor(sequence: u64) -> ActorRef {
         let node = NodeIncarnation::new(2).unwrap();

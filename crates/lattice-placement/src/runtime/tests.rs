@@ -1,34 +1,48 @@
-use super::*;
+use std::{collections::BTreeSet, time::Instant as StdInstant};
+
 use async_trait::async_trait;
 use lattice_core::actor_ref::{
     ActorRef, ClusterId, ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation,
-    PlacementDomainId,
+    PlacementDomainId, ProtocolId, SingletonKind,
 };
-use std::collections::BTreeSet;
+use lattice_remoting::{
+    association::{AssociationKey, LaneAttachment, LaneKind},
+    protocol::{ProtocolDescriptor, ProtocolFingerprint},
+};
+use tokio::net::TcpListener;
+
+use super::*;
+use crate::{region::EntityConfig, session::LogicPlacementEffect};
 
 fn domain() -> PlacementDomainId {
     PlacementDomainId::new("runtime-test").unwrap()
 }
-use lattice_remoting::config::RemotingConfig;
-use lattice_remoting::endpoint::RemotingEndpoint;
-use lattice_remoting::handshake::NodeIdentity;
-use lattice_remoting::messaging::error::RemoteMessageError;
-use lattice_remoting::messaging::inbound::InboundDispatch;
-use lattice_remoting::messaging::outbound::OutboundMessaging;
-use lattice_remoting::messaging::target::ExactActorTarget;
-
-use crate::authority::AuthorityEffect;
-use crate::control::PlacementControlRouter;
-use crate::coordinator::{MemberHello, MembershipLeaderGuard};
-use crate::session::{LogicCoordinatorConfig, PlacementDomainSession};
-use crate::storage::domain::{
-    ActivateAuthority, AllocateInitial, CreateDomainMember, CreateMember, CreatePlan, LeasedClaim,
-    ReserveMove,
+use lattice_remoting::{
+    config::RemotingConfig,
+    endpoint::RemotingEndpoint,
+    handshake::NodeIdentity,
+    messaging::{
+        error::RemoteMessageError, inbound::InboundDispatch, outbound::OutboundMessaging,
+        target::ExactActorTarget,
+    },
 };
-use crate::storage::{InMemoryPlacementStore, PlacementDomainStore};
-use crate::types::{
-    AssignmentGeneration, GrantSequence, PlacementSlot, PlacementSlotState, PlacementVersion,
-    PlanRevision, Revision, ShardId,
+
+use crate::{
+    authority::AuthorityEffect,
+    control::PlacementControlRouter,
+    coordinator::{MemberHello, MembershipLeaderGuard},
+    session::{LogicCoordinatorConfig, PlacementDomainSession},
+    storage::{
+        InMemoryPlacementStore, PlacementDomainStore,
+        domain::{
+            ActivateAuthority, AllocateInitial, CreateDomainMember, CreateMember, CreatePlan,
+            LeasedClaim, ReserveMove,
+        },
+    },
+    types::{
+        AssignmentGeneration, GrantSequence, PlacementSlot, PlacementSlotState, PlacementVersion,
+        PlanRevision, Revision, ShardId,
+    },
 };
 
 fn attach_test_session(
@@ -37,7 +51,7 @@ fn attach_test_session(
     coordinator_incarnation: NodeIncarnation,
     remote: &NodeKey,
     nonce_base: u128,
-) -> lattice_remoting::association::AssociationKey {
+) -> AssociationKey {
     let association = associations
         .get_or_create(
             cluster_id.clone(),
@@ -45,25 +59,19 @@ fn attach_test_session(
             remote.incarnation,
         )
         .unwrap();
-    let key = lattice_remoting::association::AssociationKey {
+    let key = AssociationKey {
         cluster_id: cluster_id.clone(),
         local_incarnation: coordinator_incarnation,
         remote_address: remote.address.clone(),
         remote_incarnation: remote.incarnation,
     };
     for (lane, nonce) in [
-        (lattice_remoting::association::LaneKind::Control, nonce_base),
-        (
-            lattice_remoting::association::LaneKind::Interactive,
-            nonce_base + 1,
-        ),
-        (
-            lattice_remoting::association::LaneKind::Bulk(0),
-            nonce_base + 2,
-        ),
+        (LaneKind::Control, nonce_base),
+        (LaneKind::Interactive, nonce_base + 1),
+        (LaneKind::Bulk(0), nonce_base + 2),
     ] {
         association
-            .attach(lattice_remoting::association::LaneAttachment {
+            .attach(LaneAttachment {
                 association_id: association.id(),
                 key: key.clone(),
                 lane,
@@ -148,7 +156,7 @@ async fn ensure_test_global_member(
 async fn register_up(
     leader: &mut PlacementDomainLeader<InMemoryPlacementStore>,
     hello: TestHello,
-    association: lattice_remoting::association::AssociationKey,
+    association: AssociationKey,
 ) {
     let incarnation = hello.member.node.incarnation;
     ensure_test_global_member(leader, &hello.member).await;
@@ -292,7 +300,7 @@ impl InboundDispatch for NoActors {
         _target: ExactActorTarget,
         _message_id: u64,
         _payload: Bytes,
-        _deadline: std::time::Instant,
+        _deadline: StdInstant,
     ) -> Result<Bytes, RemoteMessageError> {
         Err(RemoteMessageError::UnsupportedProtocol)
     }
@@ -333,10 +341,10 @@ struct TestHelloSpec {
     capacity_units: u64,
     hosted_entity_types: BTreeSet<EntityType>,
     proxied_entity_types: BTreeSet<EntityType>,
-    singleton_eligibility: BTreeSet<lattice_core::actor_ref::SingletonKind>,
-    used_singletons: BTreeSet<lattice_core::actor_ref::SingletonKind>,
-    protocols: Vec<lattice_remoting::protocol::ProtocolDescriptor>,
-    entity_configs: Vec<crate::region::EntityConfig>,
+    singleton_eligibility: BTreeSet<SingletonKind>,
+    used_singletons: BTreeSet<SingletonKind>,
+    protocols: Vec<ProtocolDescriptor>,
+    entity_configs: Vec<EntityConfig>,
     singleton_configs: Vec<SingletonConfig>,
 }
 
@@ -419,7 +427,7 @@ async fn joining_domain_member_advances_existing_sessions_to_latest_revision() {
         .applied_version = Some(applied_version);
     let first_association = associations.get(&first_key).unwrap();
     let mut first_control = first_association
-        .take_lane_receiver(lattice_remoting::association::LaneKind::Control)
+        .take_lane_receiver(LaneKind::Control)
         .unwrap();
     while first_control.try_recv().is_ok() {}
 
@@ -442,7 +450,7 @@ async fn joining_domain_member_advances_existing_sessions_to_latest_revision() {
 
 #[tokio::test]
 async fn real_control_session_installs_snapshot_and_matching_claim() {
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let coordinator_port = probe.local_addr().unwrap().port();
     drop(probe);
     let logic_port = coordinator_port - 1;
@@ -504,7 +512,7 @@ async fn real_control_session_installs_snapshot_and_matching_claim() {
         .connect_peer(coordinator_identity)
         .await
         .unwrap();
-    let coordinator_to_logic = lattice_remoting::association::AssociationKey {
+    let coordinator_to_logic = AssociationKey {
         cluster_id: logic_to_coordinator.key().cluster_id.clone(),
         local_incarnation: logic_to_coordinator.key().remote_incarnation,
         remote_address: logic_node.address.clone(),
@@ -596,7 +604,7 @@ async fn real_control_session_installs_snapshot_and_matching_claim() {
     .unwrap();
     let mut observed = Vec::new();
     while let Ok(effect) = effects.try_recv() {
-        if let crate::session::LogicPlacementEffect::Authority { effect, .. } = effect {
+        if let LogicPlacementEffect::Authority { effect, .. } = effect {
             observed.push(effect);
         }
     }
@@ -656,8 +664,8 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
     )
     .await
     .unwrap();
-    let protocol_id = lattice_core::actor_ref::ProtocolId::new(77).unwrap();
-    let entity_config = crate::region::EntityConfig::new(
+    let protocol_id = ProtocolId::new(77).unwrap();
+    let entity_config = EntityConfig::new(
         domain(),
         entity_type.clone(),
         protocol_id,
@@ -667,9 +675,9 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
         Vec::new(),
     )
     .unwrap();
-    let descriptor = lattice_remoting::protocol::ProtocolDescriptor {
+    let descriptor = ProtocolDescriptor {
         protocol_id,
-        fingerprint: lattice_remoting::protocol::ProtocolFingerprint::new([7; 32]),
+        fingerprint: ProtocolFingerprint::new([7; 32]),
     };
     let hello = |node: NodeKey| {
         test_hello(
@@ -866,8 +874,8 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
     .await
     .unwrap();
     let entity_type = EntityType::new("allocated-entity").unwrap();
-    let protocol_id = lattice_core::actor_ref::ProtocolId::new(55).unwrap();
-    let entity_config = crate::region::EntityConfig::new(
+    let protocol_id = ProtocolId::new(55).unwrap();
+    let entity_config = EntityConfig::new(
         domain(),
         entity_type.clone(),
         protocol_id,
@@ -877,12 +885,11 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
         Vec::new(),
     )
     .unwrap();
-    let singleton_kind =
-        lattice_core::actor_ref::SingletonKind::new("allocated-singleton").unwrap();
+    let singleton_kind = SingletonKind::new("allocated-singleton").unwrap();
     let singleton_config = SingletonConfig::new(domain(), singleton_kind.clone(), protocol_id);
-    let descriptor = lattice_remoting::protocol::ProtocolDescriptor {
+    let descriptor = ProtocolDescriptor {
         protocol_id,
-        fingerprint: lattice_remoting::protocol::ProtocolFingerprint::new([8; 32]),
+        fingerprint: ProtocolFingerprint::new([8; 32]),
     };
     register_up(
         &mut leader,
@@ -979,8 +986,8 @@ async fn resolution_reassigns_fenced_slots_after_owner_restart() {
     );
     let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
     let entity_type = EntityType::new("recovered-entity").unwrap();
-    let protocol_id = lattice_core::actor_ref::ProtocolId::new(56).unwrap();
-    let entity_config = crate::region::EntityConfig::new(
+    let protocol_id = ProtocolId::new(56).unwrap();
+    let entity_config = EntityConfig::new(
         domain(),
         entity_type.clone(),
         protocol_id,
@@ -990,8 +997,7 @@ async fn resolution_reassigns_fenced_slots_after_owner_restart() {
         Vec::new(),
     )
     .unwrap();
-    let singleton_kind =
-        lattice_core::actor_ref::SingletonKind::new("recovered-singleton").unwrap();
+    let singleton_kind = SingletonKind::new("recovered-singleton").unwrap();
     let singleton_config = SingletonConfig::new(domain(), singleton_kind.clone(), protocol_id);
     let shard_key = PlacementSlotKey::Shard {
         domain: domain(),
@@ -1042,9 +1048,9 @@ async fn resolution_reassigns_fenced_slots_after_owner_restart() {
     )
     .await
     .unwrap();
-    let descriptor = lattice_remoting::protocol::ProtocolDescriptor {
+    let descriptor = ProtocolDescriptor {
         protocol_id,
-        fingerprint: lattice_remoting::protocol::ProtocolFingerprint::new([9; 32]),
+        fingerprint: ProtocolFingerprint::new([9; 32]),
     };
     register_up(
         &mut leader,

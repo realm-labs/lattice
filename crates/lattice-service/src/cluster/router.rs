@@ -1,7 +1,3 @@
-use super::entity::EntityRouteHost;
-use super::proxy::EntityProxyRoute;
-use super::singleton::SingletonRouteHost;
-use super::singleton_proxy::SingletonProxyRoute;
 use super::{
     Actor, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc, AskError,
     AssociationKey, AssociationManager, BTreeMap, Bytes, ClusterRouterError, DomainLogicalRouter,
@@ -9,6 +5,8 @@ use super::{
     LogicalBufferConfig, LogicalEntityTarget, LogicalRouter, LogicalSingletonTarget, Mutex,
     NodeKey, OutboundMessaging, PlacementSlotKey, Protocol, ProtocolFingerprint,
     RemoteMessageError, RouteBuffer, SingletonConfig, SingletonRef, WatchError, async_trait,
+    entity::EntityRouteHost, peers::PeerReconciler, proxy::EntityProxyRoute,
+    singleton::SingletonRouteHost, singleton_proxy::SingletonProxyRoute,
 };
 
 impl DomainLogicalRouter {
@@ -47,7 +45,7 @@ impl DomainLogicalRouter {
         })
     }
 
-    pub(crate) fn with_peer_reconciler(mut self, peers: Arc<super::peers::PeerReconciler>) -> Self {
+    pub(crate) fn with_peer_reconciler(mut self, peers: Arc<PeerReconciler>) -> Self {
         self.peers = Some(peers);
         self
     }

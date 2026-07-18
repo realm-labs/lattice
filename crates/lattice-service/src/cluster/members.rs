@@ -1,8 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
+};
 
-use lattice_placement::coordinator::{MemberChange, MemberEvent, MemberRecord};
-use lattice_placement::types::{MembershipVersion, NodeKey};
+use lattice_core::actor_ref::NodeIncarnation;
+use lattice_placement::{
+    coordinator::{MemberChange, MemberEvent, MemberRecord},
+    types::{MembershipVersion, NodeKey},
+};
 use thiserror::Error;
 use tokio::sync::broadcast;
 
@@ -15,8 +20,8 @@ pub struct MemberSnapshot {
 #[derive(Debug)]
 struct MemberDirectoryState {
     version: Option<MembershipVersion>,
-    members: BTreeMap<(String, lattice_core::actor_ref::NodeIncarnation), MemberRecord>,
-    fenced_incarnations: BTreeSet<lattice_core::actor_ref::NodeIncarnation>,
+    members: BTreeMap<(String, NodeIncarnation), MemberRecord>,
+    fenced_incarnations: BTreeSet<NodeIncarnation>,
 }
 
 #[derive(Debug)]
@@ -115,7 +120,7 @@ impl MemberDirectory {
     /// A graceful leave has already committed the authoritative removal before this is called.
     /// The local membership runtime can still have an older snapshot in flight, so the fence and
     /// removal must be atomic with respect to snapshot installation.
-    pub(crate) fn fence_incarnation(&self, incarnation: lattice_core::actor_ref::NodeIncarnation) {
+    pub(crate) fn fence_incarnation(&self, incarnation: NodeIncarnation) {
         let mut state = self.state.lock().expect("member directory poisoned");
         state.fenced_incarnations.insert(incarnation);
         state
@@ -124,7 +129,7 @@ impl MemberDirectory {
     }
 }
 
-fn member_key(node: &NodeKey) -> (String, lattice_core::actor_ref::NodeIncarnation) {
+fn member_key(node: &NodeKey) -> (String, NodeIncarnation) {
     (node.node_id.clone(), node.incarnation)
 }
 
@@ -145,10 +150,12 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
-    use lattice_placement::coordinator::{
-        MemberChange, MemberEvent, MemberHello, MemberRecord, MemberStatus,
+    use lattice_placement::{
+        coordinator::{
+            MemberChange, MemberEvent, MemberHello, MemberRecord, MemberRemovalReason, MemberStatus,
+        },
+        types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision},
     };
-    use lattice_placement::types::{CoordinatorTerm, MembershipVersion, NodeKey, Revision};
 
     use super::{MemberDirectory, MemberDirectoryError};
 
@@ -200,7 +207,7 @@ mod tests {
                     ),
                     change: MemberChange::Removed {
                         node: first.node,
-                        reason: lattice_placement::coordinator::MemberRemovalReason::ForceRemoved,
+                        reason: MemberRemovalReason::ForceRemoved,
                     },
                 })
                 .unwrap_err(),

@@ -1,52 +1,56 @@
-use super::*;
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
-use lattice_actor::actor_protocol;
-use lattice_actor::context::ActorContext;
-use lattice_actor::error::{ActorCallError, ActorError};
-use lattice_actor::host::ProtocolHostRegistry;
-use lattice_actor::protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec};
-use lattice_actor::registry::{ActorCreateContext, ActorRefConfig, ActorRegistryConfig};
-use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::Responder;
-use lattice_core::actor_kind;
-use lattice_core::actor_ref::{
-    ClusterId, EntityId, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
+use lattice_actor::{
+    actor_protocol,
+    context::ActorContext,
+    error::{ActorCallError, ActorError},
+    host::ProtocolHostRegistry,
+    protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec},
+    registry::{ActorCreateContext, ActorRefConfig, ActorRegistryConfig},
+    reply::ReplyTo,
+    traits::Responder,
 };
-use lattice_core::coordinator::CoordinatorScope;
-use lattice_placement::control::{
-    DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
-    encode_control_command,
+use lattice_core::{
+    actor_kind,
+    actor_ref::{
+        ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
+        ProtocolId, SingletonKind,
+    },
+    coordinator::CoordinatorScope,
 };
-use lattice_placement::coordinator::{
-    MemberHello, PlacementDomainHello, SingletonConfig, SnapshotLimits, SnapshotRecord,
-    SnapshotVersion, build_snapshot,
+use lattice_placement::{
+    control::{
+        DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
+        encode_control_command,
+    },
+    coordinator::{
+        MemberHello, PlacementDomainHello, SingletonConfig, SnapshotLimits, SnapshotRecord,
+        SnapshotVersion, build_snapshot,
+    },
+    session::{LogicCoordinatorConfig, LogicSessionError, PlacementDomainSession},
+    types::{
+        AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, PlacementSlot,
+        PlacementVersion, Revision,
+    },
 };
-use lattice_placement::session::LogicCoordinatorConfig;
-use lattice_placement::session::PlacementDomainSession;
-use lattice_placement::types::AssignmentGeneration;
-use lattice_placement::types::ClaimGrant;
-use lattice_placement::types::CoordinatorTerm;
-use lattice_placement::types::GrantSequence;
-use lattice_placement::types::PlacementSlot;
-use lattice_placement::types::PlacementVersion;
-use lattice_placement::types::Revision;
-use lattice_remoting::association::AssociationKey;
-use lattice_remoting::association::LaneAttachment;
-use lattice_remoting::association::LaneKind;
-use lattice_remoting::config::RemotingConfig;
-use lattice_remoting::control::CommandId;
-use lattice_remoting::control::ControlDispatch;
-use lattice_remoting::endpoint::RemotingEndpoint;
-use lattice_remoting::handshake::NodeIdentity;
-use lattice_remoting::protocol::ProtocolDescriptor;
-use tokio::sync::watch;
+use lattice_remoting::{
+    association::{AssociationKey, LaneAttachment, LaneKind},
+    config::RemotingConfig,
+    control::{CommandId, ControlDispatch},
+    endpoint::RemotingEndpoint,
+    handshake::NodeIdentity,
+    protocol::ProtocolDescriptor,
+};
+use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 
-use crate::backend::ServiceInboundDispatch;
+use super::*;
+use crate::{backend::ServiceInboundDispatch, lifecycle::NodeAdmissionGate};
 
 const TEST_PROTOCOL_ID: u64 = 77;
 
@@ -189,7 +193,7 @@ fn attach_coordinator(
 }
 
 async fn unused_address() -> NodeAddress {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     NodeAddress::new("127.0.0.1", port).unwrap()
@@ -202,9 +206,9 @@ struct TestHello {
 
 fn test_hello(
     node: NodeKey,
-    hosted_entity_types: BTreeSet<lattice_core::actor_ref::EntityType>,
-    singleton_eligibility: BTreeSet<lattice_core::actor_ref::SingletonKind>,
-    used_singletons: BTreeSet<lattice_core::actor_ref::SingletonKind>,
+    hosted_entity_types: BTreeSet<EntityType>,
+    singleton_eligibility: BTreeSet<SingletonKind>,
+    used_singletons: BTreeSet<SingletonKind>,
 ) -> TestHello {
     TestHello {
         member: MemberHello {
@@ -231,7 +235,7 @@ async fn stage_logic_runtime(
     Arc<Mutex<LogicPlacementState>>,
     Arc<PlacementControlRouter>,
     watch::Sender<bool>,
-    tokio::task::JoinHandle<Result<(), lattice_placement::session::LogicSessionError>>,
+    JoinHandle<Result<(), LogicSessionError>>,
 ) {
     let (control, controls) =
         PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
@@ -758,7 +762,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
                 Arc::new(ServiceInboundDispatch {
                     hosts: Arc::new(ProtocolHostRegistry::new(1).unwrap()),
                     logical: Some(logical),
-                    admission: crate::lifecycle::NodeAdmissionGate::opened(),
+                    admission: NodeAdmissionGate::opened(),
                 }),
             )
             .control_dispatch(control)

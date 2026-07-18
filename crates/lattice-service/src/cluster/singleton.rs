@@ -1,3 +1,10 @@
+use lattice_actor::registry::ActorQuarantineError;
+use lattice_core::coordinator::CoordinatorScope;
+use lattice_placement::{
+    control::PlacementControlCommand, types::PlacementSlot as PlacementSlotRecord,
+};
+use lattice_remoting::messaging::error::RemoteFailureCode;
+
 use super::{
     Actor, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc,
     AskError, AssociationKey, AssociationManager, AssociationState, Bytes, ConfigFingerprint,
@@ -72,10 +79,7 @@ pub(super) struct SingletonRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
 }
 
 impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
-    fn slot(
-        &self,
-        target: &SingletonRef,
-    ) -> Result<lattice_placement::types::PlacementSlot, RemoteMessageError> {
+    fn slot(&self, target: &SingletonRef) -> Result<PlacementSlotRecord, RemoteMessageError> {
         if target.protocol_id() != self.protocol_id
             || target.domain() != &self.domain
             || target.config_fingerprint() != self.config_fingerprint
@@ -112,8 +116,8 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
         let sequence = NEXT_LOGICAL_RESOLUTION.fetch_add(1, Ordering::Relaxed);
         let request_id = (self.local_node.incarnation.get() << 64) ^ u128::from(sequence);
         let payload = lattice_placement::control::encode_control_command(
-            &lattice_core::coordinator::CoordinatorScope::Placement(self.domain.clone()),
-            &lattice_placement::control::PlacementControlCommand::ResolveSingleton {
+            &CoordinatorScope::Placement(self.domain.clone()),
+            &PlacementControlCommand::ResolveSingleton {
                 request_id,
                 domain: self.domain.clone(),
                 kind: self.kind.clone(),
@@ -422,9 +426,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
                     self.protocol_id,
                 )
                 .map(Some),
-                Err(AskError::Remote(
-                    lattice_remoting::messaging::error::RemoteFailureCode::StaleActivation,
-                )) => Ok(None),
+                Err(AskError::Remote(RemoteFailureCode::StaleActivation)) => Ok(None),
                 Err(_) => Err(WatchError::Unavailable),
             };
         }
@@ -498,7 +500,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
         let actor_id = ActorId::Str(self.kind.as_str().to_owned());
         if self.registry.active_actor_ids().contains(&actor_id) {
             match self.registry.fence_after_authority_loss(&actor_id).await {
-                Ok(()) | Err(lattice_actor::registry::ActorQuarantineError::NotRetained) => {}
+                Ok(()) | Err(ActorQuarantineError::NotRetained) => {}
                 Err(_) => return Err(RemoteMessageError::HandlerFailed),
             }
         }

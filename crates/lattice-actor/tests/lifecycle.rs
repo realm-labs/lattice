@@ -1,19 +1,25 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use lattice_actor::context::ActorContext;
-use lattice_actor::error::{ActorCallError, ActorError, ActorStopError};
-use lattice_actor::handle::ActorHandle;
-use lattice_actor::mailbox::MailboxConfig;
-use lattice_actor::reply::ReplyTo;
-use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions, PassivationPolicy, spawn_actor};
-use lattice_actor::traits::{
-    Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
-    PassivationReason, Responder, StopReason,
+use lattice_actor::{
+    context::ActorContext,
+    error::{ActorCallError, ActorError, ActorStopError, ActorTellError},
+    handle::ActorHandle,
+    mailbox::MailboxConfig,
+    reply::ReplyTo,
+    runtime::{ActorRuntime, ActorSpawnOptions, PassivationPolicy, spawn_actor},
+    traits::{
+        Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
+        PassivationReason, Responder, StopReason,
+    },
+    watch::{ActorTerminated, TerminatedReason},
 };
-use lattice_actor::watch::{ActorTerminated, TerminatedReason};
 use lattice_core::service_context::ServiceContext;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -653,7 +659,7 @@ async fn stop_failed_rejects_business_traffic_but_accepts_force_stop() {
 
     assert!(matches!(
         handle.tell(BusinessMessage).await,
-        Err(lattice_actor::error::ActorTellError::LifecycleUnavailable {
+        Err(ActorTellError::LifecycleUnavailable {
             state: ActorLifecycleState::StopFailed
         })
     ));

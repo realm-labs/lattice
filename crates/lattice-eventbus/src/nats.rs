@@ -1,19 +1,29 @@
-use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
 
 use async_nats::jetstream;
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use jetstream::{
+    consumer::{AckPolicy, pull::Config as PullConfig},
+    stream::{Config as StreamConfig, Stream},
+};
 use lattice_core::service_context::ConfiguredComponent;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{Instrument, warn};
 
-use crate::error::EventBusError;
-use crate::local::{EventBus, EventHandler, EventSubscriptionHandle};
-use crate::types::{EventEnvelope, EventId, EventSubscription};
+use crate::{
+    error::EventBusError,
+    local::{EventBus, EventHandler, EventSubscriptionHandle},
+    types::{EventEnvelope, EventId, EventSubscription},
+};
 
 #[derive(Debug, Clone)]
 pub struct NatsEventBus {
@@ -95,10 +105,10 @@ impl EventBus for NatsEventBus {
             let consumer = stream
                 .get_or_create_consumer(
                     &consumer_name,
-                    jetstream::consumer::pull::Config {
+                    PullConfig {
                         durable_name: Some(consumer_name.clone()),
                         filter_subject: subscription.filter.as_str().to_string(),
-                        ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                        ack_policy: AckPolicy::Explicit,
                         ..Default::default()
                     },
                 )
@@ -208,9 +218,9 @@ impl EventBus for NatsEventBus {
 async fn ensure_stream(
     jetstream: &jetstream::Context,
     config: &NatsEventBusConfig,
-) -> Result<jetstream::stream::Stream, EventBusError> {
+) -> Result<Stream, EventBusError> {
     jetstream
-        .get_or_create_stream(jetstream::stream::Config {
+        .get_or_create_stream(StreamConfig {
             name: config.stream.clone(),
             subjects: vec![">".to_string()],
             ..Default::default()
@@ -411,9 +421,7 @@ async fn deliver_if_needed(
 mod tests {
     use std::sync::Arc;
 
-    use lattice_core::instance::InstanceId;
-    use lattice_core::service_kind;
-    use lattice_core::trace::TraceContext;
+    use lattice_core::{instance::InstanceId, service_kind, trace::TraceContext};
     use tokio::sync::Mutex;
 
     use super::*;

@@ -1,7 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
-use std::path::Path;
-use std::sync::Arc;
+use std::{error::Error as StdError, io::Error as IoError, path::Path, sync::Arc};
 
 use futures_util::StreamExt;
 use lattice_core::coordinator::CoordinatorScope;
@@ -10,9 +9,11 @@ use lattice_discovery_k8s::endpoint_slice::{
     KubernetesCredentials, KubernetesEndpointSliceConfig, KubernetesEndpointSliceDiscovery,
 };
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::RwLock,
+};
 
 const DRAINING: &str = "/tmp/lattice-draining";
 const DRAIN_ACK: &str = "/tmp/lattice-drain-ack";
@@ -25,7 +26,7 @@ struct DiscoveryView {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn StdError>> {
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
     let discovery = Arc::new(RwLock::new(DiscoveryView::default()));
     spawn_endpoint_slice_watch(discovery.clone()).await?;
@@ -47,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn spawn_endpoint_slice_watch(
     view: Arc<RwLock<DiscoveryView>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn StdError>> {
     let namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| "default".to_owned());
     let discovery = KubernetesEndpointSliceDiscovery::connect(KubernetesEndpointSliceConfig {
         scope: CoordinatorScope::Membership,
@@ -83,7 +84,7 @@ async fn spawn_endpoint_slice_watch(
 async fn respond(
     mut stream: TcpStream,
     discovery: Arc<RwLock<DiscoveryView>>,
-) -> Result<(), std::io::Error> {
+) -> Result<(), IoError> {
     let mut request = [0_u8; 1024];
     let read = stream.read(&mut request).await?;
     let path = std::str::from_utf8(&request[..read])

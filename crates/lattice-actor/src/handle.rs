@@ -1,10 +1,15 @@
-use std::any::type_name;
-use std::fmt;
-use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    any::type_name,
+    fmt,
+    marker::PhantomData,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
+};
 
+use broadcast::error::{RecvError, TryRecvError};
 use lattice_core::actor_ref::{ActorRef, ProtocolTag, ReferenceError};
 use tokio::sync::{
     broadcast,
@@ -12,11 +17,15 @@ use tokio::sync::{
     oneshot, watch,
 };
 
-use crate::error::{ActorAdminError, ActorCallError, ActorTellError};
-use crate::mailbox::{ActorCommand, MailboxLane, RequestEnvelope, TellEnvelope};
-use crate::observation::{ActorMetadata, ActorObserverHandle, MailboxRejection, RequestCompletion};
-use crate::traits::{Actor, ActorLifecycleState, Handler, Message, Request, Responder, StopReason};
-use crate::watch::{ActorTerminated, LocalActorRef};
+use crate::{
+    error::{ActorAdminError, ActorCallError, ActorTellError},
+    mailbox::{ActorCommand, MailboxLane, RequestEnvelope, TellEnvelope},
+    observation::{ActorMetadata, ActorObserverHandle, MailboxRejection, RequestCompletion},
+    traits::{
+        Actor, ActorLifecycleState, Handler, Message, MessageKind, Request, Responder, StopReason,
+    },
+    watch::{ActorTerminated, LocalActorRef},
+};
 
 pub(crate) type TerminalHook = Box<dyn FnOnce(LocalActorRef) + Send + 'static>;
 
@@ -86,9 +95,9 @@ pub struct ActorTerminationSubscription {
 }
 
 impl ActorTerminationSubscription {
-    pub fn try_recv(&mut self) -> Result<ActorTerminated, broadcast::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<ActorTerminated, TryRecvError> {
         if self.delivered {
-            return Err(broadcast::error::TryRecvError::Closed);
+            return Err(TryRecvError::Closed);
         }
         if let Some(termination) = self.retained.take() {
             self.delivered = true;
@@ -99,9 +108,9 @@ impl ActorTerminationSubscription {
         Ok(termination)
     }
 
-    pub async fn recv(&mut self) -> Result<ActorTerminated, broadcast::error::RecvError> {
+    pub async fn recv(&mut self) -> Result<ActorTerminated, RecvError> {
         if self.delivered {
-            return Err(broadcast::error::RecvError::Closed);
+            return Err(RecvError::Closed);
         }
         if let Some(termination) = self.retained.take() {
             self.delivered = true;
@@ -608,7 +617,7 @@ impl<A: Actor> ActorHandle<A> {
                         &metadata,
                         MailboxRejection::Full,
                     );
-                    if metadata.kind() == crate::traits::MessageKind::Request {
+                    if metadata.kind() == MessageKind::Request {
                         self.observer.request_completed(
                             self.observation_metadata(),
                             &metadata,
@@ -625,7 +634,7 @@ impl<A: Actor> ActorHandle<A> {
                         &metadata,
                         MailboxRejection::Closed,
                     );
-                    if metadata.kind() == crate::traits::MessageKind::Request {
+                    if metadata.kind() == MessageKind::Request {
                         self.observer.request_completed(
                             self.observation_metadata(),
                             &metadata,

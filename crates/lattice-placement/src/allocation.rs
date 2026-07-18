@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use lattice_core::actor_ref::{EntityType, NodeIncarnation, PlacementDomainId, ProtocolId};
 use thiserror::Error;
@@ -444,7 +447,7 @@ fn compare_normalized(
     left: &&PlacementNode,
     right: &&PlacementNode,
     totals: &BTreeMap<NodeKey, u64>,
-) -> std::cmp::Ordering {
+) -> Ordering {
     let left_load = totals
         .get(&left.key)
         .copied()
@@ -528,8 +531,10 @@ pub enum AllocationError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use lattice_core::actor_ref::{NodeAddress, NodeIncarnation, PlacementDomainId};
+
+    use super::*;
+    use crate::types::{CoordinatorTerm, PlacementVersion, Revision};
 
     fn node(id: &str, incarnation: u128) -> NodeKey {
         NodeKey {
@@ -563,10 +568,10 @@ mod tests {
         };
         let view = PlacementView {
             domain: domain.clone(),
-            version: crate::types::PlacementVersion::new(
+            version: PlacementVersion::new(
                 domain.clone(),
-                crate::types::CoordinatorTerm::new(1).unwrap(),
-                crate::types::Revision::new(1).unwrap(),
+                CoordinatorTerm::new(1).unwrap(),
+                Revision::new(1).unwrap(),
             ),
             now: MonotonicTime::from_millis(100_000),
             reconciled: true,

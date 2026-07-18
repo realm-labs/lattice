@@ -1,36 +1,39 @@
-use std::fmt;
-use std::future::Future;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::{
+    fmt,
+    future::Future,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU8, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
-use lattice_core::actor_ref::{
-    ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+use dashmap::{DashMap, mapref::entry::Entry};
+use lattice_core::{
+    actor_ref::{ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId},
+    id::ActorId,
+    kind::ActorKind,
+    service_context::ServiceContext,
 };
-use lattice_core::id::ActorId;
-use lattice_core::kind::ActorKind;
-use lattice_core::service_context::ServiceContext;
 use thiserror::Error;
 use tokio::sync::{Semaphore, watch};
 
-use crate::error::{ActorActivationError, ActorError};
-use crate::handle::{ActorHandle, StopFailureRecord};
-use crate::mailbox::MailboxConfig;
-use crate::observation::ActorObserverHandle;
-use crate::protocol::{ActorProtocolBinding, Protocol};
-use crate::recipient::ActorSystem;
-use crate::runtime::spawner::ActorSpawner;
-use crate::runtime::{
-    ActorSpawnContext, ActorSpawnOptions, PassivationPolicy, ShardMigrationPolicy,
-    spawn_actor_with_self_ref,
+use crate::{
+    directory::ActivationDirectory,
+    error::{ActorActivationError, ActorAdminError, ActorError, ActorTellError},
+    handle::{ActorHandle, StopFailureRecord},
+    mailbox::MailboxConfig,
+    observation::ActorObserverHandle,
+    protocol::{ActorProtocolBinding, Protocol},
+    recipient::ActorSystem,
+    runtime::{
+        ActorSpawnContext, ActorSpawnOptions, PassivationPolicy, ShardMigrationPolicy,
+        spawn_actor_with_self_ref, spawner::ActorSpawner,
+    },
+    traits::{Actor, ActorLifecycleState, EntityActivationState, PassivationReason, StopReason},
+    watch::LocalActorRef,
 };
-use crate::traits::{
-    Actor, ActorLifecycleState, EntityActivationState, PassivationReason, StopReason,
-};
-use crate::watch::LocalActorRef;
 
 #[derive(Debug, Clone)]
 pub struct ActorRegistryConfig {
@@ -98,7 +101,7 @@ pub struct ActorCreateContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedActorFailure {
     pub actor_id: ActorId,
-    pub local_ref: crate::watch::LocalActorRef,
+    pub local_ref: LocalActorRef,
     pub failure: StopFailureRecord,
 }
 
@@ -113,7 +116,7 @@ pub struct RegistryDrainResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantineDiagnostics {
     pub actor_id: ActorId,
-    pub local_ref: crate::watch::LocalActorRef,
+    pub local_ref: LocalActorRef,
     pub actor_ref: Option<ActorRef>,
     pub failure: StopFailureRecord,
 }
@@ -146,7 +149,7 @@ pub enum ActorQuarantineError {
     #[error("actor quarantine capacity {capacity} is exhausted")]
     Capacity { capacity: usize },
     #[error(transparent)]
-    Admin(#[from] crate::error::ActorAdminError),
+    Admin(#[from] ActorAdminError),
 }
 
 impl RegistryDrainResult {
@@ -445,10 +448,7 @@ impl<A: Actor> ActorRegistry<A> {
                 matches!(entry, RegistryEntry::Running(current) if current.local_ref() == handle.local_ref())
             });
         }
-        if let Some(directory) = self
-            .config
-            .service
-            .extension::<crate::directory::ActivationDirectory>()
+        if let Some(directory) = self.config.service.extension::<ActivationDirectory>()
             && let Some(reference) = handle.actor_ref()
         {
             directory.remove(&reference.erase());
@@ -466,12 +466,9 @@ impl<A: Actor> ActorRegistry<A> {
         handle
             .begin_fenced_stop(previous, StopReason::AuthorityLost)
             .map_err(|error| match error {
-                crate::error::ActorTellError::MailboxFull => {
-                    crate::error::ActorAdminError::MailboxFull
-                }
-                crate::error::ActorTellError::MailboxClosed
-                | crate::error::ActorTellError::LifecycleUnavailable { .. } => {
-                    crate::error::ActorAdminError::MailboxClosed
+                ActorTellError::MailboxFull => ActorAdminError::MailboxFull,
+                ActorTellError::MailboxClosed | ActorTellError::LifecycleUnavailable { .. } => {
+                    ActorAdminError::MailboxClosed
                 }
             })
             .map_err(ActorQuarantineError::Admin)?;
@@ -602,10 +599,7 @@ impl<A: Actor> ActorRegistry<A> {
         }) {
             return None;
         }
-        if let Some(directory) = self
-            .config
-            .service
-            .extension::<crate::directory::ActivationDirectory>()
+        if let Some(directory) = self.config.service.extension::<ActivationDirectory>()
             && let Some(handle) = directory.resolve(actor_ref)
         {
             return Some(handle);
@@ -977,10 +971,7 @@ impl<A: Actor> ActorRegistry<A> {
             )
         });
         if let Some((_, RegistryEntry::Running(handle))) = removed
-            && let Some(directory) = self
-                .config
-                .service
-                .extension::<crate::directory::ActivationDirectory>()
+            && let Some(directory) = self.config.service.extension::<ActivationDirectory>()
             && let Some(reference) = handle.actor_ref()
         {
             directory.remove(&reference.erase());
@@ -1017,10 +1008,7 @@ impl<A: Actor> ActorRegistry<A> {
         let entries = self.entries.clone();
         let quarantined = self.quarantined.clone();
         let terminal_actor_id = actor_id.clone();
-        let directory = self
-            .config
-            .service
-            .extension::<crate::directory::ActivationDirectory>();
+        let directory = self.config.service.extension::<ActivationDirectory>();
         let terminal_reference = self_ref.clone();
         let terminal_hook = Box::new(move |local_ref| {
             entries.remove_if(&terminal_actor_id, |_, entry| {
@@ -1051,20 +1039,14 @@ impl<A: Actor> ActorRegistry<A> {
             },
         )
         .map_err(|error| ActorError::new(error.to_string()))?;
-        if let Some(directory) = self
-            .config
-            .service
-            .extension::<crate::directory::ActivationDirectory>()
+        if let Some(directory) = self.config.service.extension::<ActivationDirectory>()
             && let Err(error) = directory.register(&handle)
         {
             let _ = handle.try_stop_internal(StopReason::StartFailed);
             return Err(ActorError::new(error.to_string()));
         }
         if is_terminal(handle.lifecycle_state())
-            && let Some(directory) = self
-                .config
-                .service
-                .extension::<crate::directory::ActivationDirectory>()
+            && let Some(directory) = self.config.service.extension::<ActivationDirectory>()
             && let Some(reference) = handle.actor_ref()
         {
             directory.remove(&reference.erase());

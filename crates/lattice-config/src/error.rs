@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::{io::Error as IoError, path::PathBuf};
 
 use thiserror::Error;
+use toml::de::Error as TomlError;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -10,10 +11,10 @@ pub enum ConfigError {
     ReadFile {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: IoError,
     },
     #[error("failed to parse TOML config: {source}")]
-    ParseToml { source: toml::de::Error },
+    ParseToml { source: TomlError },
     #[error("failed to parse YAML config: {source}")]
     ParseYaml { source: serde_yaml::Error },
     #[error("failed to parse JSON config: {source}")]

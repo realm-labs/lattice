@@ -1,14 +1,21 @@
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    fmt,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::error::EventBusError;
-use crate::types::{EventEnvelope, EventSubscription};
+use crate::{
+    error::EventBusError,
+    types::{EventEnvelope, EventSubscription},
+};
 
 #[async_trait]
 pub trait EventHandler: Send + Sync + 'static {
@@ -19,7 +26,7 @@ pub trait EventHandler: Send + Sync + 'static {
 impl<F, Fut> EventHandler for F
 where
     F: Fn(EventEnvelope) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<(), EventBusError>> + Send,
+    Fut: Future<Output = Result<(), EventBusError>> + Send,
 {
     async fn handle(&self, event: EventEnvelope) -> Result<(), EventBusError> {
         self(event).await

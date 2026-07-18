@@ -1,18 +1,23 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use lattice_core::coordinator::CoordinatorScope;
-use tokio::sync::{broadcast, watch};
-
-use crate::coordinator::{
-    COORDINATOR_PROTOCOL_GENERATION, LeaderRecord, MemberChange, MemberEvent, MemberHello,
-    MemberRecord, MemberRemovalReason, MemberStatus, MembershipLeaderGuard, SessionLimits,
+use lattice_core::{coordinator::CoordinatorScope, failpoint::Failpoint};
+use tokio::{
+    sync::{broadcast, watch},
+    time::MissedTickBehavior,
 };
-use crate::storage::domain::{CreateMember, RemoveMember, UpdateMember};
-use crate::storage::{CoordinatorLeaseStore, MembershipStore, ScopedElectionStore};
-use crate::types::{CoordinatorTerm, MembershipVersion, NodeKey};
 
 use super::CoordinatorRuntimeError;
+use crate::{
+    coordinator::{
+        COORDINATOR_PROTOCOL_GENERATION, LeaderRecord, MemberChange, MemberEvent, MemberHello,
+        MemberRecord, MemberRemovalReason, MemberStatus, MembershipLeaderGuard, SessionLimits,
+    },
+    storage::{
+        CoordinatorLeaseStore, MembershipStore, ScopedElectionStore,
+        domain::{CreateMember, RemoveMember, UpdateMember},
+    },
+    types::{CoordinatorTerm, MembershipVersion, NodeKey},
+};
 
 #[derive(Debug, Clone)]
 pub struct MembershipLeaderConfig {
@@ -141,9 +146,7 @@ where
                 }
                 let mut member = current.clone();
                 member.version = self.next_version()?;
-                lattice_core::failpoint::hit(
-                    lattice_core::failpoint::Failpoint::MemberBeforeGuardedCommit,
-                );
+                lattice_core::failpoint::hit(Failpoint::MemberBeforeGuardedCommit);
                 let committed = self
                     .store
                     .update_member(
@@ -172,7 +175,7 @@ where
             version: self.next_version()?,
             lease_id,
         };
-        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::MemberBeforeGuardedCommit);
+        lattice_core::failpoint::hit(Failpoint::MemberBeforeGuardedCommit);
         let committed = match self
             .store
             .create_member(
@@ -232,7 +235,7 @@ where
             .await?
             .filter(|member| &member.node == node)
             .ok_or(CoordinatorRuntimeError::StaleMember)?;
-        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::MemberBeforeGuardedCommit);
+        lattice_core::failpoint::hit(Failpoint::MemberBeforeGuardedCommit);
         let committed = self
             .store
             .remove_member(
@@ -256,7 +259,7 @@ where
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), CoordinatorRuntimeError> {
         let mut renewal = tokio::time::interval(self.config.renewal_interval);
-        renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -285,7 +288,7 @@ where
         let mut member = expected.clone();
         member.status = status;
         member.version = self.next_version()?;
-        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::MemberBeforeGuardedCommit);
+        lattice_core::failpoint::hit(Failpoint::MemberBeforeGuardedCommit);
         let committed = self
             .store
             .update_member(&self.guard, UpdateMember { expected, member })

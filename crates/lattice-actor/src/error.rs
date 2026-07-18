@@ -1,7 +1,8 @@
-use std::error::Error as StdError;
-use std::time::Duration;
+use std::{error::Error as StdError, time::Duration};
 
 use thiserror::Error;
+
+use crate::{runtime::ActorExecutionPolicy, traits::ActorLifecycleState};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{message}")]
@@ -54,9 +55,7 @@ pub enum ActorCallError {
     #[error("actor panicked while processing its execution callback")]
     ActorPanicked,
     #[error("actor does not admit business traffic while lifecycle state is {state:?}")]
-    LifecycleUnavailable {
-        state: crate::traits::ActorLifecycleState,
-    },
+    LifecycleUnavailable { state: ActorLifecycleState },
     #[error("actor dropped the response before replying")]
     ResponseDropped,
     #[error("actor ask deadline elapsed before a response completed")]
@@ -100,9 +99,7 @@ pub enum ActorTellError {
     #[error("actor mailbox is closed")]
     MailboxClosed,
     #[error("actor does not admit business traffic while lifecycle state is {state:?}")]
-    LifecycleUnavailable {
-        state: crate::traits::ActorLifecycleState,
-    },
+    LifecycleUnavailable { state: ActorLifecycleState },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -110,7 +107,7 @@ pub enum ActorAdminError {
     #[error("actor admin operation {operation} is invalid while lifecycle state is {state:?}")]
     InvalidState {
         operation: &'static str,
-        state: crate::traits::ActorLifecycleState,
+        state: ActorLifecycleState,
     },
     #[error("actor system mailbox is full")]
     MailboxFull,
@@ -147,9 +144,7 @@ pub enum ActorActivationError {
 #[derive(Debug, Clone, Error)]
 pub enum ActorSpawnError {
     #[error("unsupported actor execution policy: {policy:?}")]
-    UnsupportedExecutionPolicy {
-        policy: crate::runtime::ActorExecutionPolicy,
-    },
+    UnsupportedExecutionPolicy { policy: ActorExecutionPolicy },
     #[error("invalid actor execution policy: {reason}")]
     InvalidExecutionPolicy { reason: &'static str },
     #[error("actor executor failed to start: {reason}")]

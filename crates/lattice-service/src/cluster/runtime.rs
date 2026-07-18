@@ -1,28 +1,42 @@
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-
-use lattice_placement::authority::AuthorityEffect;
-use lattice_placement::control::PlacementControlEvent;
-use lattice_placement::coordinator::{MemberChange, MemberEvent, PlacementDomainHello};
-use lattice_placement::session::{
-    LogicCoordinatorConfig, LogicCoordinatorHandle, LogicPlacementEffect, PlacementDomainSession,
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
-use lattice_remoting::association::AssociationManager;
-use lattice_remoting::messaging::outbound::OutboundMessaging;
-use lattice_remoting::watch::WatchRegistry;
+
+use lattice_core::actor_ref::PlacementDomainId;
+use lattice_placement::{
+    authority::AuthorityEffect,
+    control::PlacementControlEvent,
+    coordinator::{MemberChange, MemberEvent, PlacementDomainHello},
+    session::{
+        LogicCoordinatorConfig, LogicCoordinatorHandle, LogicPlacementEffect,
+        PlacementDomainSession,
+    },
+    types::PlacementSlotKey,
+};
+use lattice_remoting::{
+    association::AssociationManager, bootstrap::BootstrapLeader,
+    messaging::outbound::OutboundMessaging, watch::WatchRegistry,
+};
 use tokio::sync::{mpsc, watch};
 
-use crate::backend::{DomainRouterDirectory, LogicalRouter};
-use crate::builder::LogicalEntityInstaller;
-use crate::lifecycle::{
-    NodeLifecycle, NodeLifecycleState, PlacementDomainState, ProductionLifecycleDriver,
-    ServiceHealthSnapshot, ServiceLifecycleEvent,
+use super::{
+    DomainLogicalRouter, LogicalBufferConfig,
+    join::{BootstrapView, JoinController, JoinEvent},
+    peers::PeerReconciler,
 };
-
-use super::join::{BootstrapView, JoinController, JoinEvent};
-use super::peers::PeerReconciler;
-use super::{DomainLogicalRouter, LogicalBufferConfig};
+use crate::{
+    backend::{DomainRouterDirectory, LogicalRouter},
+    builder::LogicalEntityInstaller,
+    lifecycle::{
+        NodeLifecycle, NodeLifecycleState, PlacementDomainState, ProductionLifecycleDriver,
+        ServiceHealthSnapshot, ServiceLifecycleEvent,
+    },
+};
 
 pub(crate) struct LogicJoinRuntime {
     pub controller: Arc<JoinController>,
@@ -42,21 +56,15 @@ pub(crate) struct LogicJoinRuntime {
     pub lifecycle_driver: ProductionLifecycleDriver,
     pub health: Arc<Mutex<ServiceHealthSnapshot>>,
     pub health_events: watch::Sender<ServiceHealthSnapshot>,
-    pub logic_handles:
-        Arc<Mutex<BTreeMap<lattice_core::actor_ref::PlacementDomainId, LogicCoordinatorHandle>>>,
-    pub drain_ready: watch::Sender<BTreeMap<lattice_core::actor_ref::PlacementDomainId, String>>,
-    pub drain_blockers: watch::Sender<
-        BTreeMap<
-            lattice_core::actor_ref::PlacementDomainId,
-            std::collections::BTreeSet<lattice_placement::types::PlacementSlotKey>,
-        >,
-    >,
+    pub logic_handles: Arc<Mutex<BTreeMap<PlacementDomainId, LogicCoordinatorHandle>>>,
+    pub drain_ready: watch::Sender<BTreeMap<PlacementDomainId, String>>,
+    pub drain_blockers: watch::Sender<BTreeMap<PlacementDomainId, BTreeSet<PlacementSlotKey>>>,
     pub bootstrap_view: Arc<BootstrapView>,
     pub membership_ready: Arc<AtomicBool>,
 }
 
 struct LogicSessionRun {
-    leader: lattice_remoting::bootstrap::BootstrapLeader,
+    leader: BootstrapLeader,
     session: PlacementDomainSession,
     controls: mpsc::Receiver<PlacementControlEvent>,
     effects: mpsc::Receiver<LogicPlacementEffect>,
@@ -434,7 +442,7 @@ async fn wait_for_membership(
 ) -> Result<(), ()> {
     while !ready.load(Ordering::Acquire) {
         tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Err(());

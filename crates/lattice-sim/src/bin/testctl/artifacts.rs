@@ -1,9 +1,11 @@
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use super::Profile;
-use super::testctl_outcomes::{ScenarioOutcome, ScenarioStatus};
+use super::{
+    Profile,
+    testctl_outcomes::{ScenarioOutcome, ScenarioStatus},
+};
 
 #[derive(Serialize)]
 pub(super) struct Manifest {
@@ -55,14 +57,14 @@ pub(super) struct ScopedLeadershipArtifact {
 pub(super) struct MultiDomainHostArtifact {
     pub node_id: String,
     pub incarnation: u128,
-    pub scopes: std::collections::BTreeMap<String, ScopedLeadershipArtifact>,
+    pub scopes: BTreeMap<String, ScopedLeadershipArtifact>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(super) struct MultiDomainLogicArtifact {
     pub node_id: String,
     pub lifecycle: String,
-    pub domains: std::collections::BTreeMap<String, String>,
+    pub domains: BTreeMap<String, String>,
 }
 
 pub(super) fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {

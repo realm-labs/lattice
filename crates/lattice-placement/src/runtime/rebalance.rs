@@ -1,13 +1,24 @@
-use super::membership::{send_control, slot_record_key};
+use std::collections::BTreeSet;
+
+use lattice_core::failpoint::Failpoint;
+
 use super::{
     Bytes, ClaimGrant, ClaimLease, CoordinatorLeaseStore, CoordinatorRuntimeError, GrantSequence,
     HandoffEffect, HandoffEvent, HandoffMachine, MembershipStore, MoveProgress, NodeIncarnation,
     PlacementControlCommand, PlacementDomainLeader, PlacementDomainStore, PlacementSlot,
     PlacementSlotKey, PlacementSlotState, PlanReason, ScopedElectionStore, SnapshotRecord,
+    membership::{send_control, slot_record_key},
 };
-use crate::storage::domain::{
-    ActivateAuthority, ClaimPredicate, CompleteMove, FenceAuthority, InstallAuthority, LeasedClaim,
-    ReserveMove, TransitionSlot,
+use crate::{
+    coordinator::CoordinatorDelta,
+    storage::{
+        StorageError,
+        domain::{
+            ActivateAuthority, AuthorityCommit, ClaimPredicate, CompleteMove, FenceAuthority,
+            InstallAuthority, LeasedClaim, ReserveMove, TransitionSlot,
+        },
+    },
+    types::ShardId,
 };
 
 impl<S> PlacementDomainLeader<S>
@@ -39,7 +50,7 @@ where
     pub(super) fn can_start_move(
         &self,
         plan_id: u128,
-        shard_id: crate::types::ShardId,
+        shard_id: ShardId,
     ) -> Result<bool, CoordinatorRuntimeError> {
         let plan = self
             .plans
@@ -82,7 +93,7 @@ where
     pub(super) async fn begin_move(
         &mut self,
         plan_id: u128,
-        shard_id: crate::types::ShardId,
+        shard_id: ShardId,
     ) -> Result<(), CoordinatorRuntimeError> {
         let mut plan = self
             .plans
@@ -110,7 +121,7 @@ where
         plan.begin_move(shard_id, slot.assignment_generation, slot.active_move)
             .map_err(CoordinatorRuntimeError::Plan)?;
         let barrier_version = self.next_version()?;
-        let barrier_sessions: std::collections::BTreeSet<NodeIncarnation> = self
+        let barrier_sessions: BTreeSet<NodeIncarnation> = self
             .sessions
             .iter()
             .filter_map(|(incarnation, session)| {
@@ -145,10 +156,8 @@ where
             .await?;
         let plan = committed.plan;
         let slot = committed.slot;
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::RebalanceAfterReservationBeforeHandoff,
-        );
-        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::HandoffAfterBeginPersist);
+        lattice_core::failpoint::hit(Failpoint::RebalanceAfterReservationBeforeHandoff);
+        lattice_core::failpoint::hit(Failpoint::HandoffAfterBeginPersist);
         self.version = barrier_version.clone();
         let mut handoff = HandoffMachine::begin(
             key.clone(),
@@ -164,9 +173,7 @@ where
         self.plans.insert(plan_id, plan);
         self.handoffs.insert(key.clone(), handoff);
         self.publish_slot_delta(&slot).await?;
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::HandoffAfterPartialBarrier,
-        );
+        lattice_core::failpoint::hit(Failpoint::HandoffAfterPartialBarrier);
         Box::pin(self.apply_handoff_effects(key, effects)).await
     }
 
@@ -174,9 +181,7 @@ where
         &self,
         slot: &PlacementSlot,
     ) -> Result<(), CoordinatorRuntimeError> {
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::CoordinatorAfterEtcdCommitBeforeDelta,
-        );
+        lattice_core::failpoint::hit(Failpoint::CoordinatorAfterEtcdCommitBeforeDelta);
         let record = SnapshotRecord {
             key: slot_record_key(&slot.key),
             value: Bytes::from(
@@ -196,7 +201,7 @@ where
                         || session.hello.used_singletons.contains(kind)
                 }
             };
-            let delta = crate::coordinator::CoordinatorDelta {
+            let delta = CoordinatorDelta {
                 version: slot.version.clone(),
                 records: include.then_some(record.clone()).into_iter().collect(),
             };
@@ -300,7 +305,7 @@ where
                 },
                 &self.config,
             )?;
-            lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::HandoffAfterDrainSend);
+            lattice_core::failpoint::hit(Failpoint::HandoffAfterDrainSend);
         }
         let recovery = self
             .plans
@@ -365,9 +370,7 @@ where
             .await?
             .ok_or(CoordinatorRuntimeError::UnknownSlot)?;
         if slot.state != PlacementSlotState::Fenced {
-            lattice_core::failpoint::hit(
-                lattice_core::failpoint::Failpoint::HandoffAfterShardDrainedBeforeClaimRevoke,
-            );
+            lattice_core::failpoint::hit(Failpoint::HandoffAfterShardDrainedBeforeClaimRevoke);
             let old_claim = self.store.get_claim(key).await?;
             if let Some(old_claim) = &old_claim
                 && (old_claim.grant.owner != handoff.source
@@ -400,9 +403,7 @@ where
                 )
                 .await?
                 .slot;
-            lattice_core::failpoint::hit(
-                lattice_core::failpoint::Failpoint::FenceAuthorityAfterCommitBeforeEffect,
-            );
+            lattice_core::failpoint::hit(Failpoint::FenceAuthorityAfterCommitBeforeEffect);
             self.version = slot.version.clone();
             let old_lease = self.claims.remove(key).map(|claim| claim.lease_id);
             self.publish_slot_delta(&slot).await?;
@@ -448,7 +449,7 @@ where
             .await
         {
             Ok(committed) => committed,
-            Err(crate::storage::StorageError::OutcomeUnknown) => {
+            Err(StorageError::OutcomeUnknown) => {
                 self.reconciliation.focused = true;
                 match self.store.get_claim(key).await? {
                     Some(claim) if claim.lease_id == lease_id && claim.grant == grant => {
@@ -457,11 +458,11 @@ where
                             .get_slot(key)
                             .await?
                             .ok_or(CoordinatorRuntimeError::UnknownSlot)?;
-                        crate::storage::domain::AuthorityCommit { slot, claim }
+                        AuthorityCommit { slot, claim }
                     }
                     _ => {
                         let _ = self.store.revoke_lease(lease_id).await;
-                        return Err(crate::storage::StorageError::OutcomeUnknown.into());
+                        return Err(StorageError::OutcomeUnknown.into());
                     }
                 }
             }
@@ -473,9 +474,7 @@ where
         let slot = committed.slot;
         let leased_claim = committed.claim;
         self.version = slot.version.clone();
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::HandoffAfterNewClaimBeforeGrantSend,
-        );
+        lattice_core::failpoint::hit(Failpoint::HandoffAfterNewClaimBeforeGrantSend);
         self.claims.insert(
             key.clone(),
             ClaimLease {
@@ -499,9 +498,7 @@ where
             PlacementControlCommand::ClaimGranted(leased_claim.grant),
             &self.config,
         )?;
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::HandoffAfterGrantBeforeShardReady,
-        );
+        lattice_core::failpoint::hit(Failpoint::HandoffAfterGrantBeforeShardReady);
         let effects = self
             .handoffs
             .get_mut(key)
@@ -590,9 +587,7 @@ where
                 .await?;
             (committed.slot, None)
         };
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::HandoffAfterActivePersistBeforeDelta,
-        );
+        lattice_core::failpoint::hit(Failpoint::HandoffAfterActivePersistBeforeDelta);
         self.version = slot.version.clone();
         self.slot_assigned_at.insert(key.clone(), self.now());
         self.handoffs.remove(key);

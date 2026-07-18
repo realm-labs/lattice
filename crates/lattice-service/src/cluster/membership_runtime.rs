@@ -1,21 +1,27 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-
-use lattice_placement::control::PlacementControlEvent;
-use lattice_placement::coordinator::{MemberChange, MemberEvent, MemberHello};
-use lattice_placement::membership_session::{MembershipCoordinatorHandle, MembershipSession};
-use lattice_placement::session::{LogicCoordinatorConfig, LogicPlacementEffect};
-use lattice_remoting::association::AssociationManager;
-use lattice_remoting::watch::WatchRegistry;
-use tokio::sync::{mpsc, watch};
-
-use crate::lifecycle::{
-    NodeLifecycle, PlacementDomainState, ProductionLifecycleDriver, ServiceHealthSnapshot,
-    ServiceLifecycleEvent,
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 
-use super::join::{BootstrapView, JoinController, JoinEvent};
-use super::peers::PeerReconciler;
+use lattice_placement::{
+    control::PlacementControlEvent,
+    coordinator::{MemberChange, MemberEvent, MemberHello},
+    membership_session::{MembershipCoordinatorHandle, MembershipSession, MembershipSessionState},
+    session::{LogicCoordinatorConfig, LogicPlacementEffect},
+};
+use lattice_remoting::{
+    association::AssociationManager, bootstrap::BootstrapLeader, watch::WatchRegistry,
+};
+use tokio::sync::{mpsc, watch};
+
+use super::{
+    join::{BootstrapView, JoinController, JoinEvent},
+    peers::PeerReconciler,
+};
+use crate::lifecycle::{
+    NodeLifecycle, NodeLifecycleState, PlacementDomainState, ProductionLifecycleDriver,
+    ServiceHealthSnapshot, ServiceLifecycleEvent,
+};
 
 pub(crate) struct MembershipJoinRuntime {
     pub controller: Arc<JoinController>,
@@ -36,9 +42,9 @@ pub(crate) struct MembershipJoinRuntime {
 }
 
 struct MembershipSessionRun {
-    leader: lattice_remoting::bootstrap::BootstrapLeader,
+    leader: BootstrapLeader,
     session: MembershipSession,
-    state: Arc<Mutex<lattice_placement::membership_session::MembershipSessionState>>,
+    state: Arc<Mutex<MembershipSessionState>>,
     controls: mpsc::Receiver<PlacementControlEvent>,
     effects: mpsc::Receiver<LogicPlacementEffect>,
 }
@@ -140,7 +146,7 @@ impl MembershipJoinRuntime {
                     .expect("service lifecycle poisoned")
                     .recovering_membership();
                 let node_state = self.lifecycle_driver.state();
-                if node_state == crate::lifecycle::NodeLifecycleState::JoiningMembership
+                if node_state == NodeLifecycleState::JoiningMembership
                     && (recovering || self.all_domains_ready())
                 {
                     let _ = self

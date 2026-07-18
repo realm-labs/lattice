@@ -2,20 +2,19 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_actor::host::ProtocolHostRegistry;
-use lattice_remoting::association::Association;
-use lattice_remoting::association::AssociationKey;
-use lattice_remoting::association::AssociationManager;
-use lattice_remoting::control::CommandId;
-use lattice_remoting::control::ControlDispatch;
-use lattice_remoting::control::ControlDispatchError;
-use lattice_remoting::control::ControlGap;
-use lattice_remoting::watch::TerminatedReason;
-use lattice_remoting::watch::WatchCommand;
-use lattice_remoting::watch::WatchRegistry;
-use lattice_remoting::watch::decode_watch_command;
-use lattice_remoting::watch::encode_watch_command;
-use lattice_remoting::watch::is_watch_control;
+use lattice_actor::{
+    handle::ActorTerminationSubscription, host::ProtocolHostRegistry,
+    watch::TerminatedReason as WatchTerminatedReason,
+};
+use lattice_remoting::{
+    association::{Association, AssociationKey, AssociationManager},
+    control::{CommandId, ControlDispatch, ControlDispatchError, ControlGap},
+    messaging::target::ExactActorTarget,
+    watch::{
+        TerminatedReason, WatchCommand, WatchRegistry, decode_watch_command, encode_watch_command,
+        is_watch_control,
+    },
+};
 
 use crate::supervisor::TaskSupervisor;
 
@@ -68,8 +67,8 @@ impl ServiceControlDispatch {
 
     fn supervise_termination(
         &self,
-        target: lattice_remoting::messaging::target::ExactActorTarget,
-        mut terminated: lattice_actor::handle::ActorTerminationSubscription,
+        target: ExactActorTarget,
+        mut terminated: ActorTerminationSubscription,
     ) -> Result<(), ControlDispatchError> {
         let watches = self.watches.clone();
         let associations = self.associations.clone();
@@ -80,14 +79,12 @@ impl ServiceControlDispatch {
                     return;
                 };
                 let reason = match terminated.reason {
-                    lattice_actor::watch::TerminatedReason::Stopped => TerminatedReason::Stopped,
-                    lattice_actor::watch::TerminatedReason::Panicked => TerminatedReason::Panicked,
-                    lattice_actor::watch::TerminatedReason::Passivated => {
-                        TerminatedReason::Passivated
-                    }
-                    lattice_actor::watch::TerminatedReason::Migrated => TerminatedReason::Handoff,
-                    lattice_actor::watch::TerminatedReason::Fenced => TerminatedReason::ClaimLost,
-                    lattice_actor::watch::TerminatedReason::NodeDown => TerminatedReason::NodeDown,
+                    WatchTerminatedReason::Stopped => TerminatedReason::Stopped,
+                    WatchTerminatedReason::Panicked => TerminatedReason::Panicked,
+                    WatchTerminatedReason::Passivated => TerminatedReason::Passivated,
+                    WatchTerminatedReason::Migrated => TerminatedReason::Handoff,
+                    WatchTerminatedReason::Fenced => TerminatedReason::ClaimLost,
+                    WatchTerminatedReason::NodeDown => TerminatedReason::NodeDown,
                 };
                 let commands = watches
                     .lock()

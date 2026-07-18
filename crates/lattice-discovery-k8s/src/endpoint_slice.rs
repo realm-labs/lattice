@@ -1,16 +1,15 @@
-use std::collections::BTreeMap;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    fmt::{Debug, Display, Formatter, Result as FmtResult},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
-use futures_util::Stream;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use kube::api::Api;
-use kube::config::KubeConfigOptions;
-use kube::runtime::watcher;
-use kube::{Client, ResourceExt};
-use lattice_core::actor_ref::NodeAddress;
-use lattice_core::coordinator::CoordinatorScope;
+use kube::{Client, ResourceExt, api::Api, config::KubeConfigOptions, runtime::watcher};
+use lattice_core::{actor_ref::NodeAddress, coordinator::CoordinatorScope};
 use lattice_discovery::provider::{
     CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
     DiscoverySource, DiscoveryTarget,
@@ -69,8 +68,8 @@ pub struct KubernetesEndpointSliceDiscovery {
     source: Arc<dyn EndpointSliceSource>,
 }
 
-impl std::fmt::Debug for KubernetesEndpointSliceDiscovery {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for KubernetesEndpointSliceDiscovery {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter
             .debug_struct("KubernetesEndpointSliceDiscovery")
             .field("config", &self.config)
@@ -169,7 +168,7 @@ impl CoordinatorDiscovery for KubernetesEndpointSliceDiscovery {
                     provider: "kubernetes_endpoint_slice",
                     message: "watch stream ended; reconnecting".to_string(),
                 });
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         })
     }
@@ -334,7 +333,7 @@ fn selected_port(slice: &EndpointSlice, port_name: &str) -> Option<u16> {
     })
 }
 
-fn kube_config_error(error: impl std::fmt::Display) -> DiscoveryError {
+fn kube_config_error(error: impl Display) -> DiscoveryError {
     DiscoveryError::InvalidConfiguration {
         message: format!("cannot initialize Kubernetes client: {error}"),
     }

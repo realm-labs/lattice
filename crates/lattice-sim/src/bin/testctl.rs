@@ -1,5 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
+use std::collections::BTreeSet;
+
 #[path = "testctl/artifacts.rs"]
 mod testctl_artifacts;
 #[path = "testctl/chaos.rs"]
@@ -15,18 +17,20 @@ mod testctl_resources;
 #[path = "testctl/scenarios.rs"]
 mod testctl_scenarios;
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    path::{Path, PathBuf},
+    process::{Command, ExitCode},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use lattice_sim::domains::{MultiDomainScenario, MultiDomainScenarioConfig};
-use lattice_sim::lifecycle::{LifecycleScenario, LifecycleScenarioConfig};
-use lattice_sim::scenario::Scenario;
-use lattice_sim::scenario::ScenarioConfig;
-use lattice_sim::trace::TraceJournal;
+use lattice_sim::{
+    domains::{MultiDomainScenario, MultiDomainScenarioConfig},
+    lifecycle::{LifecycleScenario, LifecycleScenarioConfig},
+    scenario::{Scenario, ScenarioConfig},
+    trace::TraceJournal,
+};
 use serde::Serialize;
-
 use testctl_artifacts::{
     Manifest, MonitorCommand, MonitorResult, MultiDomainHostArtifact, MultiDomainLogicArtifact,
     ResourceSample, ScopedLeadershipArtifact, write_json, write_json_atomic, write_junit,
@@ -414,7 +418,7 @@ fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
         gamma.node_id.as_str(),
     ]
     .into_iter()
-    .collect::<std::collections::BTreeSet<_>>();
+    .collect::<BTreeSet<_>>();
     if leaders.len() != 3 {
         return Err(format!(
             "expected three independently distributed domain leaders, found {leaders:?}"

@@ -1,39 +1,44 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_actor::protocol::{
-    ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol,
+use lattice_actor::{
+    error::ActorCallError,
+    handle::ActorHandle,
+    protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol},
+    registry::{ActorLoader, ActorRegistry},
+    traits::Actor,
 };
-use lattice_actor::registry::{ActorLoader, ActorRegistry};
-use lattice_actor::traits::Actor;
-use lattice_actor::{error::ActorCallError, handle::ActorHandle};
-use lattice_core::actor_ref::{
-    ActorRef, ConfigFingerprint, EntityRef, EntityType, PlacementDomainId, ProtocolId,
-    SingletonKind, SingletonRef,
+use lattice_core::{
+    actor_ref::{
+        ActorRef, ClusterId, ConfigFingerprint, EntityRef, EntityType, NodeAddress,
+        NodeIncarnation, PlacementDomainId, ProtocolId, SingletonKind, SingletonRef,
+    },
+    id::ActorId,
 };
-use lattice_core::id::ActorId;
-use lattice_placement::coordinator::SingletonConfig;
-use lattice_placement::region::EntityConfig;
-use lattice_placement::session::LogicPlacementState;
-use lattice_placement::types::NodeKey;
-use lattice_placement::types::PlacementSlot;
-use lattice_placement::types::PlacementSlotKey;
-use lattice_placement::types::PlacementSlotState;
-use lattice_remoting::association::AssociationKey;
-use lattice_remoting::association::AssociationManager;
-use lattice_remoting::association::AssociationState;
-use lattice_remoting::messaging::error::AskError;
-use lattice_remoting::messaging::error::RemoteMessageError;
-use lattice_remoting::messaging::outbound::{OutboundMessage, OutboundMessaging};
-use lattice_remoting::messaging::target::LogicalEntityTarget;
-use lattice_remoting::messaging::target::LogicalSingletonTarget;
-use lattice_remoting::messaging::target::SenderIdentity;
-use lattice_remoting::protocol::ProtocolFingerprint;
-use lattice_remoting::watch::WatchError;
+use lattice_placement::{
+    coordinator::SingletonConfig,
+    region::EntityConfig,
+    session::LogicPlacementState,
+    types::{NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState},
+};
+use lattice_remoting::{
+    association::{AssociationKey, AssociationManager, AssociationState},
+    messaging::{
+        error::{AskError, RemoteMessageError, TellError},
+        outbound::{OutboundMessage, OutboundMessaging},
+        target::{LogicalEntityTarget, LogicalSingletonTarget, SenderIdentity},
+    },
+    protocol::ProtocolFingerprint,
+    watch::WatchError,
+};
 
 use crate::backend::LogicalRouter;
 
@@ -139,9 +144,9 @@ fn map_dispatch(error: DispatchError) -> RemoteMessageError {
 
 fn decode_resolved_actor(
     payload: &[u8],
-    cluster: &lattice_core::actor_ref::ClusterId,
-    address: &lattice_core::actor_ref::NodeAddress,
-    incarnation: lattice_core::actor_ref::NodeIncarnation,
+    cluster: &ClusterId,
+    address: &NodeAddress,
+    incarnation: NodeIncarnation,
     protocol_id: ProtocolId,
 ) -> Result<ActorRef, WatchError> {
     let actor: ActorRef =
@@ -156,13 +161,10 @@ fn decode_resolved_actor(
     Ok(actor)
 }
 
-fn map_tell(error: lattice_remoting::messaging::error::TellError) -> RemoteMessageError {
+fn map_tell(error: TellError) -> RemoteMessageError {
     match error {
-        lattice_remoting::messaging::error::TellError::Protocol(error)
-        | lattice_remoting::messaging::error::TellError::Remote(error) => error,
-        lattice_remoting::messaging::error::TellError::Association(_) => {
-            RemoteMessageError::HandlerFailed
-        }
+        TellError::Protocol(error) | TellError::Remote(error) => error,
+        TellError::Association(_) => RemoteMessageError::HandlerFailed,
     }
 }
 

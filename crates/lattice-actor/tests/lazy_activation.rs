@@ -1,19 +1,21 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use lattice_actor::context::ActorContext;
-use lattice_actor::error::ActorActivationError;
-use lattice_actor::error::ActorError;
-use lattice_actor::mailbox::MailboxConfig;
-use lattice_actor::registry::{
-    ActorCreateContext, ActorLoader, ActorRegistry, ActorRegistryConfig,
+use lattice_actor::{
+    context::ActorContext,
+    error::{ActorActivationError, ActorError},
+    mailbox::MailboxConfig,
+    registry::{ActorCreateContext, ActorLoader, ActorRegistry, ActorRegistryConfig},
+    reply::ReplyTo,
+    traits::{Actor, Responder},
 };
-use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::{Actor, Responder};
-use lattice_core::actor_kind;
-use lattice_core::id::ActorId;
+use lattice_core::{actor_kind, id::ActorId};
 use tokio::sync::Semaphore;
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -92,7 +94,7 @@ async fn concurrent_lazy_activation_starts_one_local_actor() {
         }));
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
     release.add_permits(1);
     let first = tasks.pop().unwrap().await.unwrap().unwrap();
     assert_eq!(first.ask(Ping, ASK_TIMEOUT).await.unwrap(), "pong");

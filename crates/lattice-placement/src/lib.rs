@@ -16,18 +16,17 @@ pub mod types;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::time::Duration;
-
-    use lattice_core::actor_ref::{
-        ClusterId, ConfigFingerprint, EntityId, EntityType, NodeAddress, NodeIncarnation,
-        PlacementDomainId, ProtocolId,
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        time::Duration,
     };
 
-    use crate::allocation::*;
-    use crate::authority::*;
-    use crate::region::*;
-    use crate::types::*;
+    use lattice_core::actor_ref::{
+        ClusterId, ConfigFingerprint, EntityId, EntityRef, EntityType, NodeAddress,
+        NodeIncarnation, PlacementDomainId, ProtocolId,
+    };
+
+    use crate::{allocation::*, authority::*, region::*, types::*};
 
     fn node(name: &str, incarnation: u128, port: u16) -> NodeKey {
         NodeKey {
@@ -106,7 +105,7 @@ mod tests {
         .unwrap();
         let entity = EntityId::new(b"player-42".to_vec()).unwrap();
         assert_eq!(config.shard_for(&entity), ShardId::new(17));
-        let reference: lattice_core::actor_ref::EntityRef = config
+        let reference: EntityRef = config
             .entity_ref(ClusterId::new("test").unwrap(), entity)
             .unwrap();
         assert_eq!(reference.config_fingerprint(), config.fingerprint());

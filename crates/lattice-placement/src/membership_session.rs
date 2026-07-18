@@ -1,23 +1,35 @@
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use lattice_core::coordinator::CoordinatorScope;
-use lattice_remoting::association::{AssociationManager, AssociationState};
-use lattice_remoting::control::ControlDispatchError;
-use tokio::sync::{Notify, mpsc, watch};
-
-use crate::control::{
-    PlacementControlCommand, PlacementControlEvent, PlacementControlEventKind,
-    encode_control_command,
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
-use crate::coordinator::{
-    MemberEvent, MemberHello, MemberRecord, MembershipState, SnapshotStager, SnapshotVersion,
+
+use lattice_core::{actor_ref::NodeIncarnation, coordinator::CoordinatorScope};
+use lattice_remoting::{
+    association::{AssociationKey, AssociationManager, AssociationState},
+    control::ControlDispatchError,
 };
-use crate::session::{LogicCoordinatorConfig, LogicPlacementEffect, LogicSessionError};
+use tokio::{
+    sync::{Notify, mpsc, watch},
+    time::MissedTickBehavior,
+};
+
+use crate::{
+    control::{
+        PlacementControlCommand, PlacementControlEvent, PlacementControlEventKind,
+        encode_control_command,
+    },
+    coordinator::{
+        MemberEvent, MemberHello, MemberRecord, MemberStatus, MembershipState, SnapshotRecord,
+        SnapshotStager, SnapshotVersion,
+    },
+    session::{LogicCoordinatorConfig, LogicPlacementEffect, LogicSessionError},
+    types::{MonotonicTime, NodeKey},
+};
 
 pub struct MembershipSessionState {
     session: MembershipState,
-    local_node: crate::types::NodeKey,
+    local_node: NodeKey,
     changed: Arc<Notify>,
 }
 
@@ -27,7 +39,7 @@ impl MembershipSessionState {
             && self
                 .session
                 .member(&self.local_node)
-                .is_some_and(|member| member.status == crate::coordinator::MemberStatus::Up)
+                .is_some_and(|member| member.status == MemberStatus::Up)
     }
 
     pub fn change_notifier(&self) -> Arc<Notify> {
@@ -37,7 +49,7 @@ impl MembershipSessionState {
 
 pub struct MembershipSession {
     hello: MemberHello,
-    coordinator: lattice_remoting::association::AssociationKey,
+    coordinator: AssociationKey,
     associations: Arc<AssociationManager>,
     config: LogicCoordinatorConfig,
     state: Arc<Mutex<MembershipSessionState>>,
@@ -48,8 +60,8 @@ pub struct MembershipSession {
 
 #[derive(Clone)]
 pub struct MembershipCoordinatorHandle {
-    local_incarnation: lattice_core::actor_ref::NodeIncarnation,
-    coordinator: lattice_remoting::association::AssociationKey,
+    local_incarnation: NodeIncarnation,
+    coordinator: AssociationKey,
     associations: Arc<AssociationManager>,
     maximum_control_payload: usize,
 }
@@ -81,7 +93,7 @@ impl MembershipCoordinatorHandle {
 impl MembershipSession {
     pub fn new(
         hello: MemberHello,
-        coordinator: lattice_remoting::association::AssociationKey,
+        coordinator: AssociationKey,
         associations: Arc<AssociationManager>,
         config: LogicCoordinatorConfig,
         effect_capacity: usize,
@@ -150,7 +162,7 @@ impl MembershipSession {
     ) -> Result<(), LogicSessionError> {
         self.send(PlacementControlCommand::MemberHello(self.hello.clone()))?;
         let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         heartbeat.reset();
         loop {
             tokio::select! {
@@ -209,7 +221,7 @@ impl MembershipSession {
                             SnapshotStager::begin(
                                 begin,
                                 self.config.snapshot_limits.clone(),
-                                crate::types::MonotonicTime::from_millis(0),
+                                MonotonicTime::from_millis(0),
                             )
                             .map_err(LogicSessionError::Coordinator)?,
                         );
@@ -219,14 +231,14 @@ impl MembershipSession {
                         .stager
                         .as_mut()
                         .ok_or(LogicSessionError::SnapshotRequired)?
-                        .push(chunk, crate::types::MonotonicTime::from_millis(0))
+                        .push(chunk, MonotonicTime::from_millis(0))
                         .map_err(LogicSessionError::Coordinator),
                     PlacementControlCommand::SnapshotEnd(end) => {
                         let install = self
                             .stager
                             .take()
                             .ok_or(LogicSessionError::SnapshotRequired)?
-                            .finish(end, crate::types::MonotonicTime::from_millis(0))
+                            .finish(end, MonotonicTime::from_millis(0))
                             .map_err(LogicSessionError::Coordinator)?;
                         let SnapshotVersion::Membership(version) = install.version.clone() else {
                             return Err(LogicSessionError::UnauthorizedCommand);
@@ -303,10 +315,7 @@ impl MembershipSession {
         Ok(())
     }
 
-    fn require_coordinator(
-        &self,
-        association: &lattice_remoting::association::AssociationKey,
-    ) -> Result<(), LogicSessionError> {
+    fn require_coordinator(&self, association: &AssociationKey) -> Result<(), LogicSessionError> {
         if association == &self.coordinator {
             Ok(())
         } else {
@@ -315,10 +324,8 @@ impl MembershipSession {
     }
 }
 
-fn decode_members(
-    records: &[crate::coordinator::SnapshotRecord],
-) -> Result<Vec<MemberRecord>, LogicSessionError> {
-    let mut members = std::collections::BTreeMap::new();
+fn decode_members(records: &[SnapshotRecord]) -> Result<Vec<MemberRecord>, LogicSessionError> {
+    let mut members = BTreeMap::new();
     for record in records {
         if !record.key.starts_with("member/") {
             continue;

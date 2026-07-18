@@ -1,3 +1,9 @@
+use lattice_core::{
+    actor_ref::{NodeIncarnation, PlacementDomainId},
+    coordinator::CoordinatorScope,
+};
+use lattice_remoting::{association::AssociationKey, control::ControlDispatchError};
+
 use super::{
     Association, AssociationState, Bytes, ClaimGrant, ClaimLease, CoordinatorLeaseStore,
     CoordinatorRuntimeError, HandoffEvent, HandoffPhase, Instant, MemberRecord,
@@ -7,11 +13,14 @@ use super::{
     PlacementVersion, PlanReason, RebalanceTrigger, ScopedElectionStore, SnapshotRecord,
     build_snapshot, encode_control_command,
 };
-use crate::coordinator::SnapshotVersion;
-use crate::coordinator::{DomainMemberRecord, DomainMemberStatus};
-use crate::storage::domain::{
-    CreateDomainMember, LeasedClaim, PutEntityConfig, PutSingletonConfig, RemoveDomainMember,
-    UpdateDomainMember,
+use crate::{
+    control::PlacementControlEventKind,
+    coordinator::{CoordinatorDelta, DomainMemberRecord, DomainMemberStatus, SnapshotVersion},
+    storage::domain::{
+        CreateDomainMember, LeasedClaim, PutEntityConfig, PutSingletonConfig, RemoveDomainMember,
+        UpdateDomainMember,
+    },
+    types::MonotonicTime,
 };
 
 impl<S> PlacementDomainLeader<S>
@@ -20,14 +29,14 @@ where
 {
     pub(super) async fn handle_control(
         &mut self,
-        event: crate::control::PlacementControlEventKind,
+        event: PlacementControlEventKind,
     ) -> Result<(), CoordinatorRuntimeError> {
         match event {
-            crate::control::PlacementControlEventKind::GlobalMemberRemoved { node, reason } => {
+            PlacementControlEventKind::GlobalMemberRemoved { node, reason } => {
                 self.remove_global_member_participation(node, reason)
                     .await?;
             }
-            crate::control::PlacementControlEventKind::Reconcile { association, .. } => {
+            PlacementControlEventKind::Reconcile { association, .. } => {
                 self.reconciliation.focused = true;
                 if let Some(hello) = self
                     .sessions
@@ -37,11 +46,9 @@ where
                     self.send_snapshot(hello, association).await?;
                 }
             }
-            crate::control::PlacementControlEventKind::Command(inbound) => {
+            PlacementControlEventKind::Command(inbound) => {
                 let remote = inbound.association.remote_incarnation;
-                let expected_scope = lattice_core::coordinator::CoordinatorScope::Placement(
-                    self.version.domain.clone(),
-                );
+                let expected_scope = CoordinatorScope::Placement(self.version.domain.clone());
                 if inbound.scope != expected_scope {
                     return Err(CoordinatorRuntimeError::UnauthorizedCommand);
                 }
@@ -293,8 +300,8 @@ where
         Ok(())
     }
 
-    pub(super) fn now(&self) -> crate::types::MonotonicTime {
-        crate::types::MonotonicTime::from_millis(
+    pub(super) fn now(&self) -> MonotonicTime {
+        MonotonicTime::from_millis(
             u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX),
         )
     }
@@ -302,7 +309,7 @@ where
     pub(super) async fn register(
         &mut self,
         hello: PlacementDomainHello,
-        association_key: lattice_remoting::association::AssociationKey,
+        association_key: AssociationKey,
     ) -> Result<(), CoordinatorRuntimeError> {
         hello
             .validate(&self.config.session_limits)
@@ -431,7 +438,7 @@ where
                 send_control(
                     &association,
                     &self.version.domain,
-                    PlacementControlCommand::StateDelta(crate::coordinator::CoordinatorDelta {
+                    PlacementControlCommand::StateDelta(CoordinatorDelta {
                         version: version.clone(),
                         records: Vec::new(),
                     }),
@@ -523,9 +530,9 @@ where
 
     pub(super) async fn persist_domain_hello(
         &mut self,
-        incarnation: lattice_core::actor_ref::NodeIncarnation,
+        incarnation: NodeIncarnation,
         hello: PlacementDomainHello,
-    ) -> Result<lattice_remoting::association::AssociationKey, CoordinatorRuntimeError> {
+    ) -> Result<AssociationKey, CoordinatorRuntimeError> {
         hello
             .validate(&self.config.session_limits)
             .map_err(CoordinatorRuntimeError::Coordinator)?;
@@ -577,9 +584,9 @@ where
 
     pub(super) async fn mark_member_up(
         &mut self,
-        incarnation: lattice_core::actor_ref::NodeIncarnation,
+        incarnation: NodeIncarnation,
         snapshot_version: MembershipVersion,
-        association_key: &lattice_remoting::association::AssociationKey,
+        association_key: &AssociationKey,
     ) -> Result<(), CoordinatorRuntimeError> {
         let session = self
             .sessions
@@ -627,7 +634,7 @@ where
 
     async fn ensure_domain_member_up(
         &mut self,
-        incarnation: lattice_core::actor_ref::NodeIncarnation,
+        incarnation: NodeIncarnation,
     ) -> Result<(), CoordinatorRuntimeError> {
         let session = self
             .sessions
@@ -733,25 +740,21 @@ where
 
 include!("membership_domain_ops.rs");
 
-pub(super) fn control_dispatch_error(
-    error: &CoordinatorRuntimeError,
-) -> lattice_remoting::control::ControlDispatchError {
+pub(super) fn control_dispatch_error(error: &CoordinatorRuntimeError) -> ControlDispatchError {
     match error {
         CoordinatorRuntimeError::UnauthorizedCommand
         | CoordinatorRuntimeError::UnknownSession
         | CoordinatorRuntimeError::Codec
         | CoordinatorRuntimeError::Coordinator(_)
         | CoordinatorRuntimeError::Control(_)
-        | CoordinatorRuntimeError::ClaimSequence => {
-            lattice_remoting::control::ControlDispatchError::InvalidCommand
-        }
-        _ => lattice_remoting::control::ControlDispatchError::Unavailable,
+        | CoordinatorRuntimeError::ClaimSequence => ControlDispatchError::InvalidCommand,
+        _ => ControlDispatchError::Unavailable,
     }
 }
 
 pub(super) fn send_control(
     association: &Association,
-    domain: &lattice_core::actor_ref::PlacementDomainId,
+    domain: &PlacementDomainId,
     command: PlacementControlCommand,
     config: &PlacementDomainLeaderConfig,
 ) -> Result<(), CoordinatorRuntimeError> {
@@ -759,7 +762,7 @@ pub(super) fn send_control(
         return Err(CoordinatorRuntimeError::AssociationUnavailable);
     }
     let payload = encode_control_command(
-        &lattice_core::coordinator::CoordinatorScope::Placement(domain.clone()),
+        &CoordinatorScope::Placement(domain.clone()),
         &command,
         config.maximum_control_payload,
     )

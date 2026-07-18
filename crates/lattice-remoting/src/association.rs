@@ -1,19 +1,27 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
-use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
+use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::config::RemotingConfig;
-use crate::control::{
-    CommandId, ControlAck, ControlApply, ControlEnvelope, ReliableControl, control_envelope_frame,
+use crate::{
+    config::{RemotingConfig, RemotingConfigError},
+    control::{
+        CommandId, ControlAck, ControlApply, ControlEnvelope, ReliableControl,
+        ReliableControlError, control_envelope_frame,
+    },
+    protocol::{
+        CatalogueDecision, CatalogueError, ProtocolCatalogue, ProtocolDescriptor,
+        ProtocolFingerprint,
+    },
+    wire::{Frame, FrameKind},
 };
-use crate::protocol::{
-    CatalogueDecision, CatalogueError, ProtocolCatalogue, ProtocolDescriptor, ProtocolFingerprint,
-};
-use crate::wire::Frame;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AssociationId(u128);
@@ -352,7 +360,7 @@ impl Association {
 
     pub fn admit_ephemeral_control(&self, payload: bytes::Bytes) -> Result<(), AssociationError> {
         self.try_admit_control(Frame {
-            kind: crate::wire::FrameKind::CoordinatorEvent,
+            kind: FrameKind::CoordinatorEvent,
             payload,
         })
     }
@@ -423,7 +431,7 @@ impl Association {
 
     pub fn protocol_decision(
         &self,
-        protocol_id: lattice_core::actor_ref::ProtocolId,
+        protocol_id: ProtocolId,
         fingerprint: ProtocolFingerprint,
     ) -> CatalogueDecision {
         self.peer_catalogue
@@ -773,7 +781,7 @@ pub fn stable_stripe(sender: &[u8], recipient: &[u8], stripes: usize) -> usize {
 #[derive(Debug, Error)]
 pub enum AssociationError {
     #[error("invalid remoting configuration")]
-    InvalidConfig(#[source] crate::config::RemotingConfigError),
+    InvalidConfig(#[source] RemotingConfigError),
     #[error("association registry is full")]
     AssociationLimit,
     #[error("lane attachment does not match association identity")]
@@ -799,12 +807,15 @@ pub enum AssociationError {
     #[error("peer protocol catalogue is invalid")]
     Catalogue(#[source] CatalogueError),
     #[error("association reliable control rejected the command")]
-    ReliableControl(#[source] crate::control::ReliableControlError),
+    ReliableControl(#[source] ReliableControlError),
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
     use super::*;
+    use crate::wire::FrameKind;
 
     fn key() -> AssociationKey {
         AssociationKey {
@@ -848,7 +859,7 @@ mod tests {
         assert_eq!(association.state(), AssociationState::Reconnecting);
         assert!(matches!(
             association.try_admit_interactive(Frame {
-                kind: crate::wire::FrameKind::Ask,
+                kind: FrameKind::Ask,
                 payload: bytes::Bytes::new(),
             }),
             Err(AssociationError::NotActive)
@@ -878,7 +889,7 @@ mod tests {
         assert_eq!(association.state(), AssociationState::Active);
         association
             .try_admit_interactive(Frame {
-                kind: crate::wire::FrameKind::Ask,
+                kind: FrameKind::Ask,
                 payload: bytes::Bytes::new(),
             })
             .unwrap();
@@ -978,7 +989,7 @@ mod tests {
                 .unwrap();
         }
         let mut control = association.take_lane_receiver(LaneKind::Control).unwrap();
-        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let barrier = Arc::new(Barrier::new(8));
         let workers = (0..8)
             .map(|_| {
                 let association = association.clone();
@@ -1089,13 +1100,13 @@ mod tests {
         }
         first
             .try_admit_interactive(Frame {
-                kind: crate::wire::FrameKind::Backpressure,
+                kind: FrameKind::Backpressure,
                 payload: bytes::Bytes::from_static(b"12345678"),
             })
             .unwrap();
         assert!(matches!(
             second.try_admit_interactive(Frame {
-                kind: crate::wire::FrameKind::Backpressure,
+                kind: FrameKind::Backpressure,
                 payload: bytes::Bytes::from_static(b"12345678"),
             }),
             Err(AssociationError::NodeByteBudgetExceeded)
@@ -1103,7 +1114,7 @@ mod tests {
         first.release_queued_bytes(8);
         second
             .try_admit_interactive(Frame {
-                kind: crate::wire::FrameKind::Backpressure,
+                kind: FrameKind::Backpressure,
                 payload: bytes::Bytes::from_static(b"12345678"),
             })
             .unwrap();

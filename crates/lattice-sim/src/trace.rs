@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{
+    io::{Error, Result as IoResult},
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,14 +51,14 @@ impl TraceJournal {
         true
     }
 
-    pub fn write_json(&self, path: &Path) -> std::io::Result<()> {
-        let encoded = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+    pub fn write_json(&self, path: &Path) -> IoResult<()> {
+        let encoded = serde_json::to_vec_pretty(self).map_err(Error::other)?;
         std::fs::write(path, encoded)
     }
 
-    pub fn read_json(path: &Path) -> std::io::Result<Self> {
+    pub fn read_json(path: &Path) -> IoResult<Self> {
         let encoded = std::fs::read(path)?;
-        serde_json::from_slice(&encoded).map_err(std::io::Error::other)
+        serde_json::from_slice(&encoded).map_err(Error::other)
     }
 
     pub fn shrink<F>(&self, still_fails: F) -> Self

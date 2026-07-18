@@ -273,10 +273,8 @@ pub(super) async fn reserve_handoff(
 ) -> Result<SlotCommit, StorageError> {
     ensure_guard_live(store, guard).await?;
     validate_slot(guard, Some(&request.expected_slot), &request.slot)?;
-    if !matches!(
-        request.slot.key,
-        crate::types::PlacementSlotKey::Singleton { .. }
-    ) || request.expected_slot.state != PlacementSlotState::Running
+    if !matches!(request.slot.key, PlacementSlotKey::Singleton { .. })
+        || request.expected_slot.state != PlacementSlotState::Running
         || request.expected_slot.active_move.is_some()
         || request.slot.state != PlacementSlotState::BeginHandoff
         || request.slot.active_move.is_none()

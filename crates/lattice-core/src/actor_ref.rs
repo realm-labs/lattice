@@ -1,8 +1,11 @@
-use std::fmt;
-use std::marker::PhantomData;
-use std::net::IpAddr;
+use std::{
+    fmt,
+    hash::Hash,
+    marker::PhantomData,
+    net::{IpAddr, Ipv6Addr},
+};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as SerdeDeError};
 use thiserror::Error;
 
 pub const MAX_CLUSTER_ID_BYTES: usize = 128;
@@ -93,7 +96,7 @@ impl NodeAddress {
 
 impl fmt::Display for NodeAddress {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
+        if self.host.parse::<Ipv6Addr>().is_ok() {
             write!(formatter, "[{}]:{}", self.host, self.port)
         } else {
             write!(formatter, "{}:{}", self.host, self.port)
@@ -264,7 +267,7 @@ impl<'de> Deserialize<'de> for ActorPath {
     {
         String::deserialize(deserializer)?
             .try_into()
-            .map_err(serde::de::Error::custom)
+            .map_err(SerdeDeError::custom)
     }
 }
 
@@ -290,9 +293,7 @@ impl ProtocolId {
 /// Concrete protocol tags declare their stable wire protocol ID. The erased
 /// tag deliberately accepts every valid protocol ID so infrastructure can
 /// route and observe references without knowing their application protocol.
-pub trait ProtocolTag:
-    fmt::Debug + Clone + PartialEq + Eq + std::hash::Hash + Send + Sync + 'static
-{
+pub trait ProtocolTag: fmt::Debug + Clone + PartialEq + Eq + Hash + Send + Sync + 'static {
     const PROTOCOL_ID: Option<u64>;
 }
 
@@ -400,7 +401,7 @@ impl<'de> Deserialize<'de> for PlacementDomainId {
         D: serde::Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
+        Self::new(value).map_err(SerdeDeError::custom)
     }
 }
 
@@ -558,7 +559,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for ActorRef<P> {
             data.activation_id,
             data.protocol_id,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(SerdeDeError::custom)
     }
 }
 
@@ -688,7 +689,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for EntityRef<P> {
             data.protocol_id,
             data.entity_config_fingerprint,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(SerdeDeError::custom)
     }
 }
 
@@ -805,7 +806,7 @@ impl<'de, P: ProtocolTag> Deserialize<'de> for SingletonRef<P> {
             data.protocol_id,
             data.singleton_config_fingerprint,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(SerdeDeError::custom)
     }
 }
 

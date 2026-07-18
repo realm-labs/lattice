@@ -1,6 +1,8 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+use std::error::Error;
+
+fn main() -> Result<(), Box<dyn Error>> {
     let includes = vec!["proto".into(), lattice_codegen::proto_include()];
     lattice_codegen::builder::configure()
         .message_attribute(".game.LoginRequest", "#[derive(lattice_actor::Request)]")

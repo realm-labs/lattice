@@ -1,28 +1,31 @@
-use std::any::type_name;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    any::type_name,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use lattice_actor::context::ActorContext;
-use lattice_actor::error::{ActorCallError, ActorError, ActorStopError};
-use lattice_actor::handle::ActorHandle;
-use lattice_actor::mailbox::MailboxConfig;
-use lattice_actor::observation::{
-    ActorLifecycleEvent, ActorMetadata, ActorObserver, ActorObserverHandle, RequestCompletion,
+use lattice_actor::{
+    context::ActorContext,
+    error::{ActorCallError, ActorError, ActorStopError},
+    handle::ActorHandle,
+    mailbox::MailboxConfig,
+    observation::{
+        ActorLifecycleEvent, ActorMetadata, ActorObserver, ActorObserverHandle, RequestCompletion,
+    },
+    registry::{ActorRegistry, ActorRegistryConfig},
+    reply::ReplyTo,
+    runtime::{ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions},
+    traits::{
+        Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
+        MessageMetadata, MessageOutcome, MessageView, Responder, StopReason,
+    },
+    watch::TerminatedReason,
 };
-use lattice_actor::registry::{ActorRegistry, ActorRegistryConfig};
-use lattice_actor::reply::ReplyTo;
-use lattice_actor::runtime::{
-    ActorExecutionPolicy, ActorRuntime, ActorRuntimeConfig, ActorSpawnOptions,
-};
-use lattice_actor::traits::{
-    Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
-    MessageMetadata, MessageOutcome, Responder, StopReason,
-};
-use lattice_actor::watch::TerminatedReason;
-use lattice_core::actor_kind;
-use lattice_core::id::ActorId;
+use lattice_core::{actor_kind, id::ActorId};
 use tokio::sync::Semaphore;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -272,11 +275,7 @@ struct BeforeHookPanicActor;
 impl Actor for BeforeHookPanicActor {
     type Error = ActorError;
 
-    fn before_message(
-        &mut self,
-        _ctx: &mut ActorContext<Self>,
-        _message: lattice_actor::traits::MessageView<'_>,
-    ) {
+    fn before_message(&mut self, _ctx: &mut ActorContext<Self>, _message: MessageView<'_>) {
         panic!("before hook crashed")
     }
 }

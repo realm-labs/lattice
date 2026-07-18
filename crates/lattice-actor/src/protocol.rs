@@ -1,23 +1,26 @@
-use std::any::{Any, TypeId};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::future::Future;
-use std::marker::PhantomData;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{
+    any::{Any, TypeId},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    sync::Arc,
+    time::Instant,
+};
 
 use bytes::{Bytes, BytesMut};
+#[doc(hidden)]
+pub use lattice_core::actor_ref::ProtocolTag as __ProtocolTag;
 use lattice_core::actor_ref::{ActorRef, ProtocolId, ProtocolTag};
 use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
 use thiserror::Error;
 
-use crate::error::ActorCallError;
-use crate::handle::ActorHandle;
-use crate::observation::ProtocolFailure;
-use crate::traits::{Actor, Handler, Message, Request, Responder};
-
-#[doc(hidden)]
-pub use lattice_core::actor_ref::ProtocolTag as __ProtocolTag;
+use crate::{
+    error::ActorCallError,
+    handle::ActorHandle,
+    observation::ProtocolFailure,
+    traits::{Actor, Handler, Message, MessageKind, Request, Responder},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CodecDescriptor {
@@ -456,8 +459,8 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
         let actor = handle.observation_metadata().clone();
         let payload_size = payload.len();
         let kind = match mode {
-            DispatchMode::Tell => crate::traits::MessageKind::Tell,
-            DispatchMode::Ask => crate::traits::MessageKind::Request,
+            DispatchMode::Tell => MessageKind::Tell,
+            DispatchMode::Ask => MessageKind::Request,
         };
         let result = async {
             let binding_index = self
@@ -925,17 +928,16 @@ pub fn __protocol_id(value: u64) -> Result<ProtocolId, ProtocolBuildError> {
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
-
-    use super::*;
-    use crate::context::ActorContext;
-    use crate::error::ActorError;
-    use crate::mailbox::MailboxConfig;
-    use crate::reply::ReplyTo;
-    use crate::runtime::spawn_actor;
     use lattice_core::actor_ref::{
         ActivationId, ActorPath, ClusterId, NodeAddress, NodeIncarnation,
     };
     use tokio::sync::oneshot;
+
+    use super::*;
+    use crate::{
+        context::ActorContext, error::ActorError, mailbox::MailboxConfig, reply::ReplyTo,
+        runtime::spawn_actor,
+    };
 
     struct TestActor {
         observed_sender: Option<oneshot::Sender<Option<ActorRef>>>,

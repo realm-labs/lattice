@@ -1,45 +1,68 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
-use std::collections::{BTreeSet, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{BTreeSet, HashSet},
+    error::Error as StdError,
+    io::Error as IoError,
+    net::TcpListener as StdTcpListener,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use lattice_actor::actor_protocol;
-use lattice_actor::context::ActorContext;
-use lattice_actor::error::ActorError;
-use lattice_actor::mailbox::MailboxConfig;
-use lattice_actor::protocol::ProstCodec;
-use lattice_actor::registry::{ActorCreateContext, ActorLoader};
-use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::{Actor, Responder};
-use lattice_config::source::ConfigSource;
-use lattice_core::actor_ref::{
-    ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
-    SingletonKind, SingletonRef,
+use lattice_actor::{
+    actor_protocol,
+    context::ActorContext,
+    error::ActorError,
+    mailbox::MailboxConfig,
+    protocol::ProstCodec,
+    registry::{ActorCreateContext, ActorLoader},
+    reply::ReplyTo,
+    traits::{Actor, Responder},
 };
-use lattice_core::instance::InstanceId;
-use lattice_core::trace::TraceContext;
-use lattice_core::{actor_kind, service_kind};
-use lattice_eventbus::local::{EventBus, LocalEventBus};
-use lattice_eventbus::types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter};
-use lattice_gateway::error::GatewayError;
-use lattice_gateway::frame::ClientFrame;
-use lattice_gateway::server::{GatewayTcpServer, read_client_frame, write_client_frame};
-use lattice_ops::admin::{AdminAuth, AdminHttpAdapter, AdminSnapshot, CoordinatorAdminHandler};
-use lattice_ops::scheduler::ServiceScheduler;
-use lattice_ops::telemetry::{
-    InMemoryTelemetryExporter, OpenTelemetryPipeline, PlacementDomainTelemetry, TelemetryRecorder,
-    TelemetryResource,
+use lattice_config::source::ConfigSource;
+use lattice_core::{
+    actor_kind,
+    actor_ref::{
+        ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation,
+        PlacementDomainId, ProtocolId, RecipientRef, SingletonKind, SingletonRef,
+    },
+    instance::InstanceId,
+    service_kind,
+    trace::TraceContext,
+};
+use lattice_eventbus::{
+    local::{EventBus, LocalEventBus},
+    types::{EventEnvelope, EventId, EventSubscription, Subject, SubjectFilter},
+};
+use lattice_gateway::{
+    error::GatewayError,
+    frame::ClientFrame,
+    server::{GatewayTcpServer, read_client_frame, write_client_frame},
+};
+use lattice_ops::{
+    admin::{AdminAuth, AdminHttpAdapter, AdminSnapshot, CoordinatorAdminHandler},
+    scheduler::ServiceScheduler,
+    telemetry::{
+        InMemoryTelemetryExporter, OpenTelemetryPipeline, PlacementDomainTelemetry,
+        TelemetryRecorder, TelemetryResource,
+    },
 };
 use lattice_placement::storage::InMemoryPlacementStore;
 use lattice_remoting::config::RemotingConfig;
-use lattice_service::builder::LatticeService;
-use lattice_service::config::{ClusterJoinConfig, NodeConfig};
-use lattice_service::deployment::EmbeddedCoordinatorConfig;
-use lattice_service::registration::{EntityOptions, SingletonOptions};
+use lattice_service::{
+    builder::LatticeService,
+    config::{ClusterJoinConfig, NodeConfig},
+    deployment::EmbeddedCoordinatorConfig,
+    registration::{EntityOptions, SingletonOptions},
+};
 use prost::Message;
 use serde::Deserialize;
+use tokio::{
+    net::{TcpListener as TokioTcpListener, TcpStream},
+    sync::Mutex,
+    time::Instant,
+};
 
 pub mod world {
     include!(concat!(env!("OUT_DIR"), "/world.rs"));
@@ -162,8 +185,8 @@ struct WorldConfig {
     capacity_units: u64,
 }
 
-fn reserve_address() -> Result<NodeAddress, Box<dyn std::error::Error>> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+fn reserve_address() -> Result<NodeAddress, Box<dyn StdError>> {
+    let listener = StdTcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     drop(listener);
     Ok(NodeAddress::new("127.0.0.1", port)?)
@@ -195,10 +218,10 @@ fn node_config(
 
 async fn eventually_enter(
     service: &LatticeService,
-    target: lattice_core::actor_ref::EntityRef<WorldProtocol>,
+    target: EntityRef<WorldProtocol>,
     player_id: u64,
-) -> Result<EnterWorldReply, Box<dyn std::error::Error>> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+) -> Result<EnterWorldReply, Box<dyn StdError>> {
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match service
             .ask(
@@ -212,7 +235,7 @@ async fn eventually_enter(
             .await
         {
             Ok(reply) => return Ok(reply),
-            Err(error) if tokio::time::Instant::now() < deadline => {
+            Err(error) if Instant::now() < deadline => {
                 let _ = error;
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -224,15 +247,15 @@ async fn eventually_enter(
 async fn eventually_tick(
     service: &LatticeService,
     target: SingletonRef<ClockProtocol>,
-) -> Result<GetClockReply, Box<dyn std::error::Error>> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+) -> Result<GetClockReply, Box<dyn StdError>> {
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match service
             .ask(&target, GetClockRequest {}, Duration::from_secs(1))
             .await
         {
             Ok(reply) => return Ok(reply),
-            Err(error) if tokio::time::Instant::now() < deadline => {
+            Err(error) if Instant::now() < deadline => {
                 let _ = error;
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -242,7 +265,7 @@ async fn eventually_tick(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn StdError>> {
     let config: WorldConfig =
         ConfigSource::file("examples/minimal-world/config/world-service.toml")
             .load()?
@@ -309,7 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     application.wait_ready(Duration::from_secs(10)).await?;
     let logic = application
         .logic()
-        .ok_or_else(|| std::io::Error::other("logic service is unavailable"))?
+        .ok_or_else(|| IoError::other("logic service is unavailable"))?
         .clone();
 
     let direct_reply = eventually_enter(&logic, world_ref.clone(), 1001).await?;
@@ -317,7 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bus = LocalEventBus::new();
     let (event_tx, event_rx) = tokio::sync::oneshot::channel();
-    let event_tx = Arc::new(tokio::sync::Mutex::new(Some(event_tx)));
+    let event_tx = Arc::new(Mutex::new(Some(event_tx)));
     bus.subscribe(
         EventSubscription::local(SubjectFilter::new("world.*")),
         move |event: EventEnvelope| {
@@ -337,7 +360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_type: "player-entered".to_owned(),
         source_service: service_kind!("World"),
         source_instance: InstanceId::new("world-a"),
-        recipient: Some(lattice_core::actor_ref::RecipientRef::from(&world_ref).erase()),
+        recipient: Some(RecipientRef::from(&world_ref).erase()),
         correlation_id: Some("minimal-world-run".to_owned()),
         trace: TraceContext::default(),
         occurred_unix_ms: 1,
@@ -355,7 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     let scheduled = scheduled_rx.await?;
 
-    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let gateway_listener = TokioTcpListener::bind("127.0.0.1:0").await?;
     let gateway_address = gateway_listener.local_addr()?;
     let gateway_logic = logic.clone();
     let gateway_world = world_ref.clone();
@@ -390,7 +413,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await
     });
-    let mut gateway_client = tokio::net::TcpStream::connect(gateway_address).await?;
+    let mut gateway_client = TcpStream::connect(gateway_address).await?;
     write_client_frame(
         &mut gateway_client,
         ClientFrame {
@@ -411,9 +434,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let coordinator_handle = application
         .coordinator_service()
-        .ok_or_else(|| std::io::Error::other("Coordinator service is unavailable"))?
+        .ok_or_else(|| IoError::other("Coordinator service is unavailable"))?
         .coordinator(&domain)
-        .ok_or_else(|| std::io::Error::other("domain Coordinator handle is unavailable"))?;
+        .ok_or_else(|| IoError::other("domain Coordinator handle is unavailable"))?;
     let _admin_router = AdminHttpAdapter::new(
         AdminAuth::disabled(),
         AdminSnapshot::default,

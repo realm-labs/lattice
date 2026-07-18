@@ -1,7 +1,9 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
+use std::error::Error;
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let reply = distributed_login::run_demo().await?;
     println!("gateway actor ask accepted={}", reply.accepted);
     Ok(())

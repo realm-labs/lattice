@@ -1,10 +1,15 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    error::Error,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-use remoting_benchmark::matrix::{local_actor_admission, placement_matrix};
-use remoting_benchmark::{BenchmarkConfig, RemotingTopology};
+use remoting_benchmark::{
+    BenchmarkConfig, RemotingTopology,
+    matrix::{local_actor_admission, placement_matrix},
+};
 
 struct CountingAllocator;
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
@@ -26,7 +31,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let config = BenchmarkConfig::from_env();
     let local = local_actor_admission(config.requests).await?;
     let topology = RemotingTopology::start(&config)?;

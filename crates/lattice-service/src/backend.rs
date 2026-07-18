@@ -1,32 +1,35 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, RwLock},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_actor::host::ProtocolHostRegistry;
-use lattice_actor::recipient::RecipientBackend;
-use lattice_core::actor_ref::{ActorRef, EntityRef, PlacementDomainId, RecipientRef, SingletonRef};
+use lattice_actor::{
+    host::ProtocolHostRegistry, recipient::RecipientBackend,
+    watch::TerminatedReason as WatchTerminatedReason,
+};
+use lattice_core::actor_ref::{
+    ActorRef, ClusterId, EntityRef, NodeAddress, NodeIncarnation, PlacementDomainId, RecipientRef,
+    SingletonRef,
+};
 use lattice_placement::types::PlacementSlotKey;
-use lattice_remoting::association::AssociationId;
-use lattice_remoting::association::AssociationManager;
-use lattice_remoting::messaging::error::AskError;
-use lattice_remoting::messaging::error::RemoteFailureCode;
-use lattice_remoting::messaging::error::RemoteMessageError;
-use lattice_remoting::messaging::error::TellError;
-use lattice_remoting::messaging::inbound::InboundDispatch;
-use lattice_remoting::messaging::outbound::{OutboundMessage, OutboundMessaging};
-use lattice_remoting::messaging::target::ExactActorTarget;
-use lattice_remoting::messaging::target::LogicalEntityTarget;
-use lattice_remoting::messaging::target::LogicalSingletonTarget;
-use lattice_remoting::messaging::target::SenderIdentity;
-use lattice_remoting::protocol::ProtocolFingerprint;
-use lattice_remoting::watch::TerminatedReason;
-use lattice_remoting::watch::WatchCommand;
-use lattice_remoting::watch::WatchError;
-use lattice_remoting::watch::WatchId;
-use lattice_remoting::watch::WatchRegistry;
-use lattice_remoting::watch::encode_watch_command;
+use lattice_remoting::{
+    association::{Association, AssociationError, AssociationId, AssociationManager},
+    messaging::{
+        error::{AskError, RemoteFailureCode, RemoteMessageError, TellError},
+        inbound::InboundDispatch,
+        outbound::{OutboundMessage, OutboundMessaging},
+        target::{ExactActorTarget, LogicalEntityTarget, LogicalSingletonTarget, SenderIdentity},
+    },
+    protocol::ProtocolFingerprint,
+    watch::{
+        TerminatedReason, WatchCommand, WatchError, WatchId, WatchRegistry, encode_watch_command,
+    },
+};
+
+use crate::{lifecycle::NodeAdmissionGate, supervisor::TaskSupervisor};
 
 #[async_trait]
 pub trait LogicalRouter: Send + Sync + 'static {
@@ -490,7 +493,7 @@ impl LogicalRouter for DomainRouterDirectory {
 pub(crate) struct ServiceInboundDispatch {
     pub hosts: Arc<ProtocolHostRegistry>,
     pub logical: Option<Arc<dyn LogicalRouter>>,
-    pub admission: crate::lifecycle::NodeAdmissionGate,
+    pub admission: NodeAdmissionGate,
 }
 
 #[async_trait]
@@ -591,17 +594,17 @@ impl InboundDispatch for ServiceInboundDispatch {
 }
 
 pub(crate) struct ServiceRecipientBackend {
-    pub local_cluster: lattice_core::actor_ref::ClusterId,
-    pub local_address: lattice_core::actor_ref::NodeAddress,
-    pub local_incarnation: lattice_core::actor_ref::NodeIncarnation,
+    pub local_cluster: ClusterId,
+    pub local_address: NodeAddress,
+    pub local_incarnation: NodeIncarnation,
     pub hosts: Arc<ProtocolHostRegistry>,
     pub associations: Arc<AssociationManager>,
     pub messaging: Arc<OutboundMessaging>,
     pub watches: Arc<Mutex<WatchRegistry>>,
     pub maximum_control_payload: usize,
-    pub supervisor: Arc<crate::supervisor::TaskSupervisor>,
+    pub supervisor: Arc<TaskSupervisor>,
     pub logical: Option<Arc<dyn LogicalRouter>>,
-    pub admission: crate::lifecycle::NodeAdmissionGate,
+    pub admission: NodeAdmissionGate,
 }
 
 impl ServiceRecipientBackend {
@@ -611,13 +614,7 @@ impl ServiceRecipientBackend {
             && reference.node_incarnation() == self.local_incarnation
     }
 
-    fn association(
-        &self,
-        reference: &ActorRef,
-    ) -> Result<
-        Arc<lattice_remoting::association::Association>,
-        lattice_remoting::association::AssociationError,
-    > {
+    fn association(&self, reference: &ActorRef) -> Result<Arc<Association>, AssociationError> {
         self.associations.get_or_create(
             reference.cluster_id().clone(),
             reference.node_address().clone(),
@@ -771,24 +768,14 @@ impl RecipientBackend for ServiceRecipientBackend {
                                     return;
                                 };
                                 let reason = match event.reason {
-                                    lattice_actor::watch::TerminatedReason::Stopped => {
-                                        TerminatedReason::Stopped
-                                    }
-                                    lattice_actor::watch::TerminatedReason::Panicked => {
-                                        TerminatedReason::Panicked
-                                    }
-                                    lattice_actor::watch::TerminatedReason::Passivated => {
+                                    WatchTerminatedReason::Stopped => TerminatedReason::Stopped,
+                                    WatchTerminatedReason::Panicked => TerminatedReason::Panicked,
+                                    WatchTerminatedReason::Passivated => {
                                         TerminatedReason::Passivated
                                     }
-                                    lattice_actor::watch::TerminatedReason::Migrated => {
-                                        TerminatedReason::Handoff
-                                    }
-                                    lattice_actor::watch::TerminatedReason::Fenced => {
-                                        TerminatedReason::ClaimLost
-                                    }
-                                    lattice_actor::watch::TerminatedReason::NodeDown => {
-                                        TerminatedReason::NodeDown
-                                    }
+                                    WatchTerminatedReason::Migrated => TerminatedReason::Handoff,
+                                    WatchTerminatedReason::Fenced => TerminatedReason::ClaimLost,
+                                    WatchTerminatedReason::NodeDown => TerminatedReason::NodeDown,
                                 };
                                 let commands = watches
                                     .lock()

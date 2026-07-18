@@ -1,31 +1,40 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
+use broadcast::error::RecvError;
 use bytes::Bytes;
-use lattice_core::actor_ref::{NodeIncarnation, PlacementDomainId};
-use lattice_core::coordinator::CoordinatorScope;
-use lattice_remoting::association::AssociationManager;
-use lattice_remoting::control::ControlDispatchError;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tokio::task::JoinSet;
+use lattice_core::{
+    actor_ref::{NodeIncarnation, PlacementDomainId},
+    coordinator::CoordinatorScope,
+};
+use lattice_remoting::{
+    association::{AssociationKey, AssociationManager},
+    control::ControlDispatchError,
+};
+use tokio::{
+    sync::{broadcast, mpsc, oneshot, watch},
+    task::JoinSet,
+    time::MissedTickBehavior,
+};
 
-use crate::control::{
-    PlacementControlCommand, PlacementControlEvent, PlacementControlEventKind,
-    encode_control_command,
-};
-use crate::coordinator::{
-    LeaderRecord, MemberEvent, MemberHello, MemberRemovalReason, MemberStatus, SnapshotRecord,
-    SnapshotVersion, build_snapshot,
-};
-use crate::storage::{
-    CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore,
-};
-use crate::types::NodeKey;
-
-use super::membership_plane::{MembershipLeader, MembershipLeaderConfig};
 use super::{
     CoordinatorHandle, CoordinatorRuntimeError, PlacementDomainLeader, PlacementDomainLeaderConfig,
+    membership_plane::{MembershipLeader, MembershipLeaderConfig},
+};
+use crate::{
+    control::{
+        PlacementControlCommand, PlacementControlEvent, PlacementControlEventKind,
+        encode_control_command,
+    },
+    coordinator::{
+        LeaderRecord, MemberChange, MemberEvent, MemberHello, MemberRemovalReason, MemberStatus,
+        SnapshotRecord, SnapshotVersion, build_snapshot,
+    },
+    storage::{CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore},
+    types::{MembershipVersion, NodeKey},
 };
 
 mod election;
@@ -107,8 +116,7 @@ where
     membership_state: CoordinatorHostScopeState,
     domains: BTreeMap<PlacementDomainId, HostedDomain<S>>,
     pending_member_hellos: BTreeMap<NodeIncarnation, MemberHello>,
-    membership_associations:
-        BTreeMap<NodeIncarnation, lattice_remoting::association::AssociationKey>,
+    membership_associations: BTreeMap<NodeIncarnation, AssociationKey>,
     directory_events: watch::Sender<BTreeMap<CoordinatorScope, LeaderRecord>>,
     scope_events: watch::Sender<BTreeMap<CoordinatorScope, CoordinatorHostScopeState>>,
     config: CoordinatorHostConfig,
@@ -284,7 +292,7 @@ where
         }
 
         let mut renewal = tokio::time::interval(self.config.renewal_interval);
-        renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -363,7 +371,7 @@ where
                 event = next_membership_event(&mut self.membership_events), if self.membership_events.is_some() => {
                     match event {
                         Ok(event) => self.broadcast_membership_event(event)?,
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                        Err(RecvError::Lagged(_)) => {
                             let associations = self
                                 .membership_associations
                                 .values()
@@ -373,7 +381,7 @@ where
                                 self.send_membership_snapshot(&association).await?;
                             }
                         }
-                        Err(broadcast::error::RecvError::Closed) => {
+                        Err(RecvError::Closed) => {
                             self.membership_events = None;
                         }
                     }
@@ -588,8 +596,8 @@ where
     async fn complete_member_join(
         &mut self,
         incarnation: NodeIncarnation,
-        snapshot_version: crate::types::MembershipVersion,
-        association: &lattice_remoting::association::AssociationKey,
+        snapshot_version: MembershipVersion,
+        association: &AssociationKey,
     ) -> Result<(), CoordinatorRuntimeError> {
         if association.remote_incarnation != incarnation
             || self.membership_associations.get(&incarnation) != Some(association)
@@ -630,7 +638,7 @@ where
 
     async fn send_membership_snapshot(
         &self,
-        association_key: &lattice_remoting::association::AssociationKey,
+        association_key: &AssociationKey,
     ) -> Result<(), CoordinatorRuntimeError> {
         let membership = self
             .membership
@@ -684,8 +692,8 @@ where
         event: MemberEvent,
     ) -> Result<(), CoordinatorRuntimeError> {
         let removed = match &event.change {
-            crate::coordinator::MemberChange::Removed { node, .. } => Some(node.incarnation),
-            crate::coordinator::MemberChange::Upsert(_) => None,
+            MemberChange::Removed { node, .. } => Some(node.incarnation),
+            MemberChange::Upsert(_) => None,
         };
         let payload = encode_control_command(
             &CoordinatorScope::Membership,
@@ -841,7 +849,7 @@ where
         &mut self,
         operation_id: &str,
         expected_incarnation: NodeIncarnation,
-        association: &lattice_remoting::association::AssociationKey,
+        association: &AssociationKey,
     ) -> Result<(), CoordinatorRuntimeError> {
         if operation_id.is_empty()
             || operation_id.len() > 256
@@ -887,7 +895,7 @@ where
 
 async fn next_membership_event(
     events: &mut Option<broadcast::Receiver<MemberEvent>>,
-) -> Result<MemberEvent, broadcast::error::RecvError> {
+) -> Result<MemberEvent, RecvError> {
     events
         .as_mut()
         .expect("membership event branch requires a receiver")
@@ -908,12 +916,14 @@ fn dispatch_error(error: CoordinatorRuntimeError) -> ControlDispatchError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
     use lattice_remoting::config::RemotingConfig;
 
-    use crate::control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter};
-    use crate::storage::InMemoryPlacementStore;
+    use super::*;
+    use crate::{
+        control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
+        storage::InMemoryPlacementStore,
+    };
 
     fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
         NodeKey {

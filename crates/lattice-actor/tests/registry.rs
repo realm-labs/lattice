@@ -1,24 +1,31 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use lattice_actor::actor_protocol;
-use lattice_actor::context::ActorContext;
-use lattice_actor::directory::ActivationDirectory;
-use lattice_actor::error::ActorActivationError;
-use lattice_actor::error::{ActorError, ActorStopError};
-use lattice_actor::mailbox::MailboxConfig;
-use lattice_actor::protocol::ProstCodec;
-use lattice_actor::registry::ActorRegistry;
-use lattice_actor::registry::{ActorQuarantineError, ActorRefConfig, ActorRegistryConfig};
-use lattice_actor::traits::{Actor, ActorLifecycleState, Handler, Message, StopReason};
-use lattice_core::actor_kind;
-use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
-use lattice_core::id::ActorId;
-use lattice_core::instance::InstanceId;
-use lattice_core::kind::ServiceKind;
-use lattice_core::service_context::ServiceContext;
+use lattice_actor::{
+    actor_protocol,
+    context::ActorContext,
+    directory::ActivationDirectory,
+    error::{ActorActivationError, ActorError, ActorStopError},
+    mailbox::MailboxConfig,
+    protocol::ProstCodec,
+    registry::{ActorQuarantineError, ActorRefConfig, ActorRegistry, ActorRegistryConfig},
+    runtime::PassivationPolicy,
+    traits::{Actor, ActorLifecycleState, Handler, Message, StopReason},
+};
+use lattice_core::{
+    actor_kind,
+    actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId},
+    id::ActorId,
+    instance::InstanceId,
+    kind::ServiceKind,
+    service_context::ServiceContext,
+};
 use tokio::sync::{Semaphore, oneshot};
 
 struct SlowActor;
@@ -92,7 +99,7 @@ async fn remove_running_actor_allows_restart_with_same_id() {
     let first = registry.start(actor_id.clone(), SlowActor).await.unwrap();
     let removed = registry.remove(&actor_id).await.unwrap();
     let mut lifecycle = removed.subscribe_lifecycle();
-    while *lifecycle.borrow() != lattice_actor::traits::ActorLifecycleState::Stopped {
+    while *lifecycle.borrow() != ActorLifecycleState::Stopped {
         lifecycle.changed().await.unwrap();
     }
     let second = registry.start(actor_id, SlowActor).await.unwrap();
@@ -187,7 +194,7 @@ async fn registry_injects_exact_actor_ref_into_context() {
     let actor_id = ActorId::Str("session-1".to_string());
     let first = registry.remove(&actor_id).await.unwrap();
     let mut lifecycle = first.subscribe_lifecycle();
-    while *lifecycle.borrow() != lattice_actor::traits::ActorLifecycleState::Stopped {
+    while *lifecycle.borrow() != ActorLifecycleState::Stopped {
         lifecycle.changed().await.unwrap();
     }
     let replacement = registry
@@ -580,9 +587,7 @@ async fn idle_passivation_eagerly_releases_registry_and_directory_capacity() {
     let registry = ActorRegistry::<SelfRefActor>::new_bound(
         actor_kind!("GatewaySession"),
         ActorRegistryConfig {
-            passivation: lattice_actor::runtime::PassivationPolicy::IdleTimeout(
-                Duration::from_millis(10),
-            ),
+            passivation: PassivationPolicy::IdleTimeout(Duration::from_millis(10)),
             actor_ref: Some(ActorRefConfig {
                 cluster_id: ClusterId::new("test").unwrap(),
                 node_address: NodeAddress::new("127.0.0.1", 19091).unwrap(),

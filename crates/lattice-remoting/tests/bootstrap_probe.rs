@@ -1,30 +1,39 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
-use lattice_core::coordinator::CoordinatorScope;
-use lattice_remoting::association::{AssociationManager, AssociationState};
-use lattice_remoting::bootstrap::{
-    BootstrapHandler, BootstrapLeader, BootstrapProbeTarget, BootstrapRejectionCode,
-    BootstrapRequest, BootstrapResult, BootstrapRoute,
+use lattice_core::{
+    actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId},
+    coordinator::CoordinatorScope,
 };
-use lattice_remoting::config::RemotingConfig;
-use lattice_remoting::control::RejectControlDispatch;
-use lattice_remoting::endpoint::{EndpointSecurity, RemotingEndpoint};
-use lattice_remoting::handshake::FeatureBits;
-use lattice_remoting::messaging::error::RemoteMessageError;
-use lattice_remoting::messaging::inbound::InboundDispatch;
-use lattice_remoting::messaging::outbound::OutboundMessaging;
-use lattice_remoting::messaging::target::ExactActorTarget;
-use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
-use lattice_remoting::transport::connect_tcp;
-use lattice_remoting::wire::{Frame, FrameCodec, FrameKind};
+use lattice_remoting::{
+    association::{AssociationManager, AssociationState},
+    bootstrap::{
+        BootstrapHandler, BootstrapLeader, BootstrapProbeTarget, BootstrapRejectionCode,
+        BootstrapRequest, BootstrapResponse, BootstrapResult, BootstrapRoute,
+    },
+    config::RemotingConfig,
+    control::RejectControlDispatch,
+    endpoint::{EndpointSecurity, RemotingEndpoint},
+    handshake::{FeatureBits, NodeIdentity},
+    messaging::{
+        error::RemoteMessageError, inbound::InboundDispatch, outbound::OutboundMessaging,
+        target::ExactActorTarget,
+    },
+    protocol::{ProtocolDescriptor, ProtocolFingerprint},
+    transport::connect_tcp,
+    wire::{Frame, FrameCodec, FrameKind},
+};
 use rcgen::{CertificateParams, KeyPair, SanType};
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::net::TcpListener;
 use tokio_rustls::rustls::{
-    ClientConfig, RootCertStore, ServerConfig, client::WebPkiServerVerifier,
+    ClientConfig, RootCertStore, ServerConfig,
+    client::WebPkiServerVerifier,
+    crypto::CryptoProvider,
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     server::WebPkiClientVerifier,
 };
 
@@ -299,10 +308,7 @@ async fn missing_required_bootstrap_feature_is_stably_rejected() {
     request.features = FeatureBits::NONE;
 
     connection.write_frame(&request.to_frame()).await.unwrap();
-    let response = lattice_remoting::bootstrap::BootstrapResponse::from_frame(
-        &connection.read_frame().await.unwrap(),
-    )
-    .unwrap();
+    let response = BootstrapResponse::from_frame(&connection.read_frame().await.unwrap()).unwrap();
 
     assert!(matches!(
         response.result,
@@ -467,9 +473,7 @@ impl BootstrapHandler for RedirectHandler {
     }
 }
 
-fn endpoint(
-    identity: lattice_remoting::handshake::NodeIdentity,
-) -> (Arc<RemotingEndpoint>, Arc<AssociationManager>) {
+fn endpoint(identity: NodeIdentity) -> (Arc<RemotingEndpoint>, Arc<AssociationManager>) {
     let config = RemotingConfig {
         heartbeat_interval: Duration::from_millis(50),
         shutdown_timeout: Duration::from_secs(2),
@@ -503,7 +507,7 @@ fn endpoint(
 }
 
 fn endpoint_with_security(
-    identity: lattice_remoting::handshake::NodeIdentity,
+    identity: NodeIdentity,
     security: EndpointSecurity,
 ) -> (Arc<RemotingEndpoint>, Arc<AssociationManager>) {
     let config = RemotingConfig {
@@ -541,9 +545,9 @@ fn endpoint_with_security(
 }
 
 fn tls_security_pair(
-    client_identity: &lattice_remoting::handshake::NodeIdentity,
-    server_identity: &lattice_remoting::handshake::NodeIdentity,
-    server_certificate_identity: &lattice_remoting::handshake::NodeIdentity,
+    client_identity: &NodeIdentity,
+    server_identity: &NodeIdentity,
+    server_certificate_identity: &NodeIdentity,
 ) -> (EndpointSecurity, EndpointSecurity) {
     let (client_certificate, client_key) = test_certificate(client_identity);
     let (server_certificate, server_key) = test_certificate(server_certificate_identity);
@@ -584,7 +588,7 @@ fn tls_security_pair(
 }
 
 fn client_config(
-    provider: Arc<tokio_rustls::rustls::crypto::CryptoProvider>,
+    provider: Arc<CryptoProvider>,
     trusted: CertificateDer<'static>,
     identity: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
@@ -604,7 +608,7 @@ fn client_config(
 }
 
 fn server_config(
-    provider: Arc<tokio_rustls::rustls::crypto::CryptoProvider>,
+    provider: Arc<CryptoProvider>,
     trusted: CertificateDer<'static>,
     identity: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
@@ -622,9 +626,7 @@ fn server_config(
         .unwrap()
 }
 
-fn test_certificate(
-    identity: &lattice_remoting::handshake::NodeIdentity,
-) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+fn test_certificate(identity: &NodeIdentity) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let mut params = CertificateParams::new(vec!["lattice.test".to_string()]).unwrap();
     params.subject_alt_names.push(SanType::URI(
         format!(
@@ -644,13 +646,8 @@ fn test_certificate(
     )
 }
 
-fn identity(
-    cluster_id: ClusterId,
-    node_id: &str,
-    incarnation: u128,
-    port: u16,
-) -> lattice_remoting::handshake::NodeIdentity {
-    lattice_remoting::handshake::NodeIdentity {
+fn identity(cluster_id: ClusterId, node_id: &str, incarnation: u128, port: u16) -> NodeIdentity {
+    NodeIdentity {
         cluster_id,
         node_id: node_id.to_string(),
         address: NodeAddress::new("127.0.0.1", port).unwrap(),
@@ -658,10 +655,7 @@ fn identity(
     }
 }
 
-fn target(
-    identity: &lattice_remoting::handshake::NodeIdentity,
-    expected_node_id: Option<&str>,
-) -> BootstrapProbeTarget {
+fn target(identity: &NodeIdentity, expected_node_id: Option<&str>) -> BootstrapProbeTarget {
     BootstrapProbeTarget {
         scope: CoordinatorScope::Membership,
         address: identity.address.clone(),
@@ -671,7 +665,7 @@ fn target(
 }
 
 async fn free_port() -> u16 {
-    tokio::net::TcpListener::bind("127.0.0.1:0")
+    TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap()
         .local_addr()

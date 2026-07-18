@@ -1,12 +1,26 @@
-use super::membership::send_control;
+use std::collections::BTreeSet;
+
+use lattice_core::{
+    actor_ref::{EntityType, PlacementDomainId, SingletonKind},
+    failpoint::Failpoint,
+};
+
 use super::{
     AllocationRequest, BTreeMap, ClaimGrant, ClaimLease, CoordinatorLeaseStore,
     CoordinatorRuntimeError, GrantSequence, HandoffMachine, LoadSample, MembershipStore,
     MoveProgress, NodeKey, PlacedShard, PlacementControlCommand, PlacementDomainLeader,
     PlacementDomainStore, PlacementNode, PlacementSlot, PlacementSlotKey, PlacementSlotState,
-    PlacementView, ScopedElectionStore, SingletonConfig,
+    PlacementView, ScopedElectionStore, SingletonConfig, membership::send_control,
 };
-use crate::storage::domain::{ActivateAuthority, AllocateInitial, LeasedClaim, ReserveHandoff};
+use crate::{
+    storage::{
+        StorageError,
+        domain::{
+            ActivateAuthority, AllocateInitial, AuthorityCommit, LeasedClaim, ReserveHandoff,
+        },
+    },
+    types::{AssignmentGeneration, ShardId},
+};
 
 impl<S> PlacementDomainLeader<S>
 where
@@ -14,8 +28,8 @@ where
 {
     pub(super) async fn ensure_shard_allocated(
         &mut self,
-        entity_type: lattice_core::actor_ref::EntityType,
-        shard_id: crate::types::ShardId,
+        entity_type: EntityType,
+        shard_id: ShardId,
     ) -> Result<(), CoordinatorRuntimeError> {
         let config = self
             .entity_configs
@@ -68,7 +82,7 @@ where
             config_fingerprint: config.fingerprint(),
             owner: Some(decision.target),
             target: None,
-            assignment_generation: crate::types::AssignmentGeneration::new(1)
+            assignment_generation: AssignmentGeneration::new(1)
                 .expect("one is a valid assignment generation"),
             version: self.next_version()?,
             state: PlacementSlotState::Allocating,
@@ -80,7 +94,7 @@ where
 
     pub(super) async fn ensure_singleton_allocated(
         &mut self,
-        kind: lattice_core::actor_ref::SingletonKind,
+        kind: SingletonKind,
     ) -> Result<(), CoordinatorRuntimeError> {
         let config = self
             .singleton_configs
@@ -110,7 +124,7 @@ where
             config_fingerprint: config.fingerprint(),
             owner: Some(target),
             target: None,
-            assignment_generation: crate::types::AssignmentGeneration::new(1)
+            assignment_generation: AssignmentGeneration::new(1)
                 .expect("one is a valid assignment generation"),
             version: self.next_version()?,
             state: PlacementSlotState::Allocating,
@@ -122,7 +136,7 @@ where
 
     pub(super) fn select_singleton_target(
         &self,
-        kind: &lattice_core::actor_ref::SingletonKind,
+        kind: &SingletonKind,
         config: &SingletonConfig,
         exclude: Option<&NodeKey>,
     ) -> Result<NodeKey, CoordinatorRuntimeError> {
@@ -176,7 +190,7 @@ where
                     || session.hello.singleton_eligibility.contains(kind))
                 .then_some(*incarnation)
             })
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         let expected_slot = slot.clone();
         slot.target = Some(target.clone());
         slot.state = PlacementSlotState::BeginHandoff;
@@ -240,16 +254,14 @@ where
                 lease_id,
             },
         };
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::AuthorityBeforeGuardedCommit,
-        );
+        lattice_core::failpoint::hit(Failpoint::AuthorityBeforeGuardedCommit);
         let committed = match self
             .store
             .allocate_initial(&self.leader_guard, request)
             .await
         {
             Ok(committed) => committed,
-            Err(crate::storage::StorageError::OutcomeUnknown) => {
+            Err(StorageError::OutcomeUnknown) => {
                 self.reconciliation.focused = true;
                 match self.store.get_claim(&grant.slot).await? {
                     Some(claim) if claim.lease_id == lease_id && claim.grant == grant => {
@@ -258,11 +270,11 @@ where
                             .get_slot(&grant.slot)
                             .await?
                             .ok_or(CoordinatorRuntimeError::UnknownSlot)?;
-                        crate::storage::domain::AuthorityCommit { slot, claim }
+                        AuthorityCommit { slot, claim }
                     }
                     _ => {
                         let _ = self.store.revoke_lease(lease_id).await;
-                        return Err(crate::storage::StorageError::OutcomeUnknown.into());
+                        return Err(StorageError::OutcomeUnknown.into());
                     }
                 }
             }
@@ -273,9 +285,7 @@ where
         };
         let slot = committed.slot;
         let leased_claim = committed.claim;
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::InitialAuthorityAfterCommitBeforeEffect,
-        );
+        lattice_core::failpoint::hit(Failpoint::InitialAuthorityAfterCommitBeforeEffect);
         self.version = slot.version.clone();
         self.claims.insert(
             slot.key.clone(),
@@ -306,7 +316,7 @@ where
         &mut self,
         key: &PlacementSlotKey,
         owner: &NodeKey,
-        generation: crate::types::AssignmentGeneration,
+        generation: AssignmentGeneration,
     ) -> Result<(), CoordinatorRuntimeError> {
         let mut slot = self
             .store
@@ -347,7 +357,7 @@ where
 
     pub(super) async fn placement_view(
         &self,
-        domain: &lattice_core::actor_ref::PlacementDomainId,
+        domain: &PlacementDomainId,
     ) -> Result<PlacementView, CoordinatorRuntimeError> {
         let now = self.now();
         let mut reservations = BTreeMap::<NodeKey, u64>::new();

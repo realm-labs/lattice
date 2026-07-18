@@ -1,11 +1,13 @@
 use async_trait::async_trait;
-use lattice_core::actor_kind;
-use lattice_core::id::RouteKey;
+use lattice_core::{actor_kind, id::RouteKey};
 use prost::Message as ProstMessage;
 
-use crate::binding::{GatewayRecipient, ProstClientMessageBinding};
-use crate::frame::{BinaryClientCodec, ClientCodec, ClientFrame};
-use crate::route::{GatewayRouteContext, MessageRouter, RouteDecision};
+use crate::{
+    binding::{GatewayRecipient, ProstClientMessageBinding},
+    error::GatewayError,
+    frame::{BinaryClientCodec, ClientCodec, ClientFrame},
+    route::{GatewayRouteContext, GatewayRouteSpec, MessageRouter, RouteDecision},
+};
 
 #[derive(Clone, PartialEq, ProstMessage, lattice_actor::Request)]
 #[request(response = Output)]
@@ -25,11 +27,7 @@ struct FakeRecipient;
 
 #[async_trait]
 impl GatewayRecipient<Input> for FakeRecipient {
-    async fn ask(
-        &self,
-        _route: RouteDecision,
-        message: Input,
-    ) -> Result<Output, crate::error::GatewayError> {
+    async fn ask(&self, _route: RouteDecision, message: Input) -> Result<Output, GatewayError> {
         Ok(Output { id: message.id + 1 })
     }
 }
@@ -40,8 +38,8 @@ impl MessageRouter for Router {
     fn route(
         &mut self,
         context: &GatewayRouteContext,
-        route: &crate::route::GatewayRouteSpec,
-    ) -> Result<RouteDecision, crate::error::GatewayError> {
+        route: &GatewayRouteSpec,
+    ) -> Result<RouteDecision, GatewayError> {
         Ok(RouteDecision::new(
             route.actor_kind.clone(),
             context.require_route_key("id")?,

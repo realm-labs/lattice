@@ -1,11 +1,20 @@
-use super::membership::{control_dispatch_error, send_control};
+use std::{collections::BTreeSet, time::Duration};
+
+use tokio::time::MissedTickBehavior;
+
 use super::{
     CoordinatorLeaseStore, CoordinatorRuntimeError, HandoffEvent, HandoffMachine, Instant,
     MembershipStore, MoveProgress, PlacementControlCommand, PlacementControlEvent,
     PlacementDomainLeader, PlacementDomainStore, PlacementSlotKey, PlacementSlotState, PlanStatus,
-    RebalanceTrigger, ScopedElectionStore, mpsc, watch,
+    RebalanceTrigger, ScopedElectionStore,
+    membership::{control_dispatch_error, send_control},
+    mpsc, watch,
 };
-use crate::storage::domain::{DeletePlan, ReserveMove, UpdatePlan};
+use crate::{
+    coordinator::MemberRemovalReason,
+    storage::domain::{DeletePlan, ReserveMove, UpdatePlan},
+    types::AssignmentGeneration,
+};
 
 impl<S> PlacementDomainLeader<S>
 where
@@ -159,7 +168,7 @@ where
                         .assignment_generation
                         .get()
                         .checked_sub(1)
-                        .and_then(|value| crate::types::AssignmentGeneration::new(value).ok())
+                        .and_then(|value| AssignmentGeneration::new(value).ok())
                         .ok_or(CoordinatorRuntimeError::StaleHandoff)?;
                     (target.clone(), target, previous)
                 } else {
@@ -191,7 +200,7 @@ where
             .await?
             .into_iter()
             .map(|hello| hello.node.incarnation)
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         let keys = self.handoffs.keys().cloned().collect::<Vec<_>>();
         for key in keys {
             let effects = {
@@ -278,17 +287,17 @@ where
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), CoordinatorRuntimeError> {
         let mut renewal = tokio::time::interval(self.config.renewal_interval);
-        renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut rebalance = tokio::time::interval(self.config.rebalance_interval);
-        rebalance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        rebalance.set_missed_tick_behavior(MissedTickBehavior::Delay);
         rebalance.reset();
         let reconciliation_millis =
             u64::try_from(self.config.reconciliation_interval.as_millis()).unwrap_or(u64::MAX);
         let jitter_bound = (reconciliation_millis / 4).max(1);
-        let jitter = std::time::Duration::from_millis(self.leader.term.get() % jitter_bound);
+        let jitter = Duration::from_millis(self.leader.term.get() % jitter_bound);
         let mut reconciliation =
             tokio::time::interval_at(Instant::now() + jitter, self.config.reconciliation_interval);
-        reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        reconciliation.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
@@ -351,11 +360,8 @@ where
             })
             .collect::<Vec<_>>();
         for (_incarnation, member) in expired {
-            self.remove_member(
-                member,
-                crate::coordinator::MemberRemovalReason::FailureDetected,
-            )
-            .await?;
+            self.remove_member(member, MemberRemovalReason::FailureDetected)
+                .await?;
         }
         let leaving = self
             .sessions

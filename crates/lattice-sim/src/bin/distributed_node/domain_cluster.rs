@@ -1,10 +1,12 @@
-fn distributed_domain(name: &str) -> Result<PlacementDomainId, Box<dyn std::error::Error>> {
+use lattice_placement::{
+    coordinator::LeaderRecord, runtime::membership_plane::MembershipLeaderConfig,
+};
+use lattice_service::lifecycle::{PlacementDomainState, ServiceHealthSnapshot};
+fn distributed_domain(name: &str) -> Result<PlacementDomainId, Box<dyn Error>> {
     Ok(PlacementDomainId::new(format!("domain-{name}"))?)
 }
 
-fn parse_distributed_domains(
-    value: &str,
-) -> Result<BTreeSet<PlacementDomainId>, Box<dyn std::error::Error>> {
+fn parse_distributed_domains(value: &str) -> Result<BTreeSet<PlacementDomainId>, Box<dyn Error>> {
     value
         .split(',')
         .filter(|value| !value.is_empty())
@@ -17,7 +19,7 @@ async fn domain_host(
     node_id: String,
     port: u16,
     domains: String,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let endpoints = std::env::var("LATTICE_ETCD_ENDPOINTS")?
         .split(',')
         .map(str::to_owned)
@@ -43,12 +45,8 @@ async fn domain_host(
     let cluster = ClusterId::new("docker-domain-e2e")?;
     let incarnation = NodeIncarnation::generate();
     let address = NodeAddress::new(node_id.clone(), port)?;
-    let builder = LatticeService::builder(node_config(
-        cluster,
-        &node_id,
-        address.clone(),
-        incarnation,
-    ))?;
+    let builder =
+        LatticeService::builder(node_config(cluster, &node_id, address.clone(), incarnation))?;
     let host = CoordinatorHost::elect(
         store,
         builder.association_manager(),
@@ -59,10 +57,10 @@ async fn domain_host(
         },
         parse_distributed_domains(&domains)?,
         CoordinatorHostConfig {
-            membership: lattice_placement::runtime::membership_plane::MembershipLeaderConfig {
+            membership: MembershipLeaderConfig {
                 leader_lease_ttl: Duration::from_secs(10),
                 renewal_interval: Duration::from_secs(1),
-                ..lattice_placement::runtime::membership_plane::MembershipLeaderConfig::default()
+                ..MembershipLeaderConfig::default()
             },
             placement: PlacementDomainLeaderConfig {
                 leader_lease_ttl: Duration::from_secs(10),
@@ -76,8 +74,7 @@ async fn domain_host(
     )
     .await?;
     let mut directory = host.subscribe_directory();
-    let (control, controls) =
-        PlacementControlRouter::bounded(256, DEFAULT_MAX_CONTROL_PAYLOAD)?;
+    let (control, controls) = PlacementControlRouter::bounded(256, DEFAULT_MAX_CONTROL_PAYLOAD)?;
     let service = builder
         .coordinator_host(Arc::new(control), host, controls)
         .build()?;
@@ -96,13 +93,8 @@ async fn domain_host(
                 break;
             }
             let snapshot = directory.borrow().clone();
-            if write_domain_host_artifact(
-                &writer_artifact,
-                &writer_node,
-                incarnation,
-                &snapshot,
-            )
-            .is_err()
+            if write_domain_host_artifact(&writer_artifact, &writer_node, incarnation, &snapshot)
+                .is_err()
             {
                 break;
             }
@@ -115,11 +107,11 @@ async fn domain_host(
 }
 
 fn write_domain_host_artifact(
-    artifact: &std::path::Path,
+    artifact: &Path,
     node_id: &str,
     incarnation: NodeIncarnation,
-    directory: &BTreeMap<CoordinatorScope, lattice_placement::coordinator::LeaderRecord>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    directory: &BTreeMap<CoordinatorScope, LeaderRecord>,
+) -> Result<(), Box<dyn Error>> {
     let scopes = directory
         .iter()
         .map(|(scope, leader)| {
@@ -150,11 +142,7 @@ fn write_domain_host_artifact(
     Ok(())
 }
 
-async fn domain_logic(
-    artifact: PathBuf,
-    node_id: String,
-    port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn domain_logic(artifact: PathBuf, node_id: String, port: u16) -> Result<(), Box<dyn Error>> {
     let cluster = ClusterId::new("docker-domain-e2e")?;
     let incarnation = NodeIncarnation::generate();
     let mut builder = LatticeService::builder(node_config(
@@ -230,16 +218,15 @@ async fn domain_logic(
             if snapshot.node == NodeLifecycleState::Ready
                 && ["alpha", "beta", "gamma", "delta"].into_iter().all(|name| {
                     snapshot.domains.get(
-                        &distributed_domain(name)
-                            .expect("static distributed domain must be valid"),
-                    ) == Some(&lattice_service::lifecycle::PlacementDomainState::Ready)
+                        &distributed_domain(name).expect("static distributed domain must be valid"),
+                    ) == Some(&PlacementDomainState::Ready)
                 })
             {
                 break;
             }
             health.changed().await?;
         }
-        Ok::<(), Box<dyn std::error::Error>>(())
+        Ok::<(), Box<dyn Error>>(())
     })
     .await;
     match ready {
@@ -247,7 +234,7 @@ async fn domain_logic(
         Err(_) => {
             let snapshot = health.borrow().clone();
             write_domain_logic_artifact(&artifact, &node_id, &snapshot)?;
-            return Err(std::io::Error::other(format!(
+            return Err(IoError::other(format!(
                 "domain logic {node_id} did not become Ready within 300s; last health snapshot: {snapshot:?}"
             ))
             .into());
@@ -275,7 +262,7 @@ fn domain_static_discovery(
     scope: CoordinatorScope,
     name: &'static str,
     candidates: &[(&str, u16)],
-) -> Result<Arc<dyn CoordinatorDiscovery>, Box<dyn std::error::Error>> {
+) -> Result<Arc<dyn CoordinatorDiscovery>, Box<dyn Error>> {
     let endpoints = candidates
         .iter()
         .enumerate()
@@ -286,15 +273,15 @@ fn domain_static_discovery(
                 priority: u16::try_from(index + 1)?,
             })
         })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     Ok(Arc::new(StaticDiscovery::new(scope, name, endpoints)?))
 }
 
 fn write_domain_logic_artifact(
-    artifact: &std::path::Path,
+    artifact: &Path,
     node_id: &str,
-    health: &lattice_service::lifecycle::ServiceHealthSnapshot,
-) -> Result<(), Box<dyn std::error::Error>> {
+    health: &ServiceHealthSnapshot,
+) -> Result<(), Box<dyn Error>> {
     write_atomic(
         artifact.to_path_buf(),
         &serde_json::to_vec_pretty(&MultiDomainLogicArtifact {
@@ -303,9 +290,7 @@ fn write_domain_logic_artifact(
             domains: health
                 .domains
                 .iter()
-                .map(|(domain, state)| {
-                    (domain.as_str().to_owned(), format!("{state:?}"))
-                })
+                .map(|(domain, state)| (domain.as_str().to_owned(), format!("{state:?}")))
                 .collect(),
         })?,
     )?;

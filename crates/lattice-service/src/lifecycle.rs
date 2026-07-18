@@ -1,12 +1,16 @@
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
-use lattice_core::actor_ref::PlacementDomainId;
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_core::{actor_ref::PlacementDomainId, coordinator::CoordinatorScope};
 use lattice_placement::types::PlacementSlotKey;
 use thiserror::Error;
+use tokio::sync::watch::Sender;
 
 static LIFECYCLE_TRANSITION_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static TERMINATION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -154,22 +158,22 @@ impl NodeAdmissionGate {
 #[derive(Clone)]
 pub struct ProductionLifecycleDriver {
     lifecycle: Arc<Mutex<NodeLifecycle>>,
-    lifecycle_events: tokio::sync::watch::Sender<NodeLifecycleState>,
+    lifecycle_events: Sender<NodeLifecycleState>,
     health: Arc<Mutex<ServiceHealthSnapshot>>,
-    health_events: tokio::sync::watch::Sender<ServiceHealthSnapshot>,
+    health_events: Sender<ServiceHealthSnapshot>,
     admission: NodeAdmissionGate,
     runtime_stop_requested: Arc<AtomicBool>,
     identity_released: Arc<AtomicBool>,
-    runtime_shutdowns: Arc<Mutex<Vec<tokio::sync::watch::Sender<bool>>>>,
+    runtime_shutdowns: Arc<Mutex<Vec<Sender<bool>>>>,
     termination_started_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ProductionLifecycleDriver {
     pub fn new(
         lifecycle: Arc<Mutex<NodeLifecycle>>,
-        lifecycle_events: tokio::sync::watch::Sender<NodeLifecycleState>,
+        lifecycle_events: Sender<NodeLifecycleState>,
         health: Arc<Mutex<ServiceHealthSnapshot>>,
-        health_events: tokio::sync::watch::Sender<ServiceHealthSnapshot>,
+        health_events: Sender<ServiceHealthSnapshot>,
         admission: NodeAdmissionGate,
     ) -> Self {
         Self {
@@ -204,7 +208,7 @@ impl ProductionLifecycleDriver {
         self.identity_released.load(Ordering::Acquire)
     }
 
-    pub(crate) fn register_runtime_shutdown(&self, shutdown: tokio::sync::watch::Sender<bool>) {
+    pub(crate) fn register_runtime_shutdown(&self, shutdown: Sender<bool>) {
         let mut shutdowns = self
             .runtime_shutdowns
             .lock()

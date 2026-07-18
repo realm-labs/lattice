@@ -1,8 +1,7 @@
-use std::collections::BTreeSet;
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
-use lattice_remoting::config::RemotingConfig;
+use lattice_remoting::config::{RemotingConfig, RemotingConfigError};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,13 +126,14 @@ pub enum NodeConfigError {
     #[error("node limits and shutdown timeout must be nonzero")]
     ZeroLimit,
     #[error("remoting configuration is invalid")]
-    Remoting(#[source] lattice_remoting::config::RemotingConfigError),
+    Remoting(#[source] RemotingConfigError),
 }
 
 #[cfg(test)]
 mod join_tests {
-    use super::{ClusterJoinConfig, ClusterJoinConfigError};
     use std::time::Duration;
+
+    use super::{ClusterJoinConfig, ClusterJoinConfigError};
 
     #[test]
     fn cluster_join_defaults_are_valid() {

@@ -3,26 +3,32 @@ use std::time::Duration;
 use etcd_client::{
     Client, Compare, CompareOp, ConnectOptions, GetOptions, SortOrder, SortTarget, Txn, TxnOp,
 };
-use lattice_core::actor_ref::PlacementDomainId;
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_core::{
+    actor_ref::{EntityType, PlacementDomainId, SingletonKind},
+    coordinator::CoordinatorScope,
+};
 use serde::{Serialize, de::DeserializeOwned};
 
-use super::StorageError;
-use super::domain::{
-    ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial, AuthorityCommit,
-    AutomaticBalanceSettings, CommitAutomaticSettings, CompactAdminOperations, CompleteMove,
-    CreateDomainMember, CreateMember, CreatePlan, CreatePlanWithOperation, DeletePlan,
-    DomainMemberCommit, DurableStorageLimits, EntityConfigCommit, FenceAuthority,
-    FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit, MoveCommit, PlanCommit,
-    PutEntityConfig, PutSingletonConfig, RecordAdminOperation, RemoveDomainMember, RemoveMember,
-    ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit, TransitionSlot,
-    UpdateDomainMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
+use super::{
+    StorageError,
+    domain::{
+        ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial, AuthorityCommit,
+        AutomaticBalanceSettings, CommitAutomaticSettings, CompactAdminOperations, CompleteMove,
+        CreateDomainMember, CreateMember, CreatePlan, CreatePlanWithOperation, DeletePlan,
+        DomainMemberCommit, DurableStorageLimits, EntityConfigCommit, FenceAuthority,
+        FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit, MoveCommit, PlanCommit,
+        PutEntityConfig, PutSingletonConfig, RecordAdminOperation, RemoveDomainMember,
+        RemoveMember, ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit,
+        TransitionSlot, UpdateDomainMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
+    },
 };
-use crate::coordinator::{
-    DomainMemberRecord, LeaderRecord, MemberRecord, MembershipLeaderGuard, PlacementLeaderGuard,
+use crate::{
+    coordinator::{
+        DomainMemberRecord, LeaderRecord, MemberRecord, MembershipLeaderGuard, PlacementLeaderGuard,
+    },
+    plan::RebalancePlan,
+    types::{PlacementSlot, PlacementSlotKey, Revision},
 };
-use crate::plan::RebalancePlan;
-use crate::types::{PlacementSlot, PlacementSlotKey, Revision};
 
 pub mod migration;
 mod traits;
@@ -351,7 +357,7 @@ impl EtcdPlacementStore {
     pub(super) fn entity_config_key(
         &self,
         domain: &PlacementDomainId,
-        entity_type: &lattice_core::actor_ref::EntityType,
+        entity_type: &EntityType,
     ) -> String {
         self.key(&format!(
             "domains/{}/entity_types/{}",
@@ -363,7 +369,7 @@ impl EtcdPlacementStore {
     pub(super) fn singleton_config_key(
         &self,
         domain: &PlacementDomainId,
-        kind: &lattice_core::actor_ref::SingletonKind,
+        kind: &SingletonKind,
     ) -> String {
         self.key(&format!(
             "domains/{}/singleton_types/{}",

@@ -1,18 +1,24 @@
-use super::entity::EntityRoute;
+use std::sync::Arc;
+
+use lattice_core::coordinator::CoordinatorScope;
+use lattice_placement::{control::PlacementControlCommand, types::ShardId};
+use lattice_remoting::association::Association;
+
 use super::{
     ActorRef, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, EntityConfig,
     EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalEntityTarget,
     Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessage, OutboundMessaging,
     PlacementSlot, PlacementSlotKey, PlacementSlotState, ProtocolFingerprint, RemoteMessageError,
-    RouteBuffer, SenderIdentity, WatchError, async_trait, decode_resolved_actor, map_tell,
+    RouteBuffer, SenderIdentity, WatchError, async_trait, decode_resolved_actor,
+    entity::EntityRoute, map_tell, peers::PeerReconciler,
 };
 
 pub(super) struct EntityProxyRoute {
     pub(super) local_node: NodeKey,
-    pub(super) state: std::sync::Arc<Mutex<LogicPlacementState>>,
-    pub(super) associations: std::sync::Arc<AssociationManager>,
-    pub(super) peers: Option<std::sync::Arc<super::peers::PeerReconciler>>,
-    pub(super) messaging: std::sync::Arc<OutboundMessaging>,
+    pub(super) state: Arc<Mutex<LogicPlacementState>>,
+    pub(super) associations: Arc<AssociationManager>,
+    pub(super) peers: Option<Arc<PeerReconciler>>,
+    pub(super) messaging: Arc<OutboundMessaging>,
     pub(super) coordinator: AssociationKey,
     pub(super) buffer: RouteBuffer,
     pub(super) config: EntityConfig,
@@ -71,8 +77,8 @@ impl EntityProxyRoute {
         let sequence = NEXT_LOGICAL_RESOLUTION.fetch_add(1, Ordering::Relaxed);
         let request_id = (self.local_node.incarnation.get() << 64) ^ u128::from(sequence);
         let payload = lattice_placement::control::encode_control_command(
-            &lattice_core::coordinator::CoordinatorScope::Placement(domain.clone()),
-            &lattice_placement::control::PlacementControlCommand::ResolveShard {
+            &CoordinatorScope::Placement(domain.clone()),
+            &PlacementControlCommand::ResolveShard {
                 request_id,
                 domain: domain.clone(),
                 entity_type: entity_type.clone(),
@@ -127,8 +133,7 @@ impl EntityProxyRoute {
         &self,
         target: &EntityRef,
         owner: &NodeKey,
-    ) -> Result<std::sync::Arc<lattice_remoting::association::Association>, RemoteMessageError>
-    {
+    ) -> Result<Arc<Association>, RemoteMessageError> {
         if owner == &self.local_node {
             return Err(RemoteMessageError::StaleAuthority);
         }
@@ -297,10 +302,7 @@ impl EntityRoute for EntityProxyRoute {
         Err(RemoteMessageError::Unauthorized)
     }
 
-    async fn drain(
-        &self,
-        _shard_id: lattice_placement::types::ShardId,
-    ) -> Result<bool, RemoteMessageError> {
+    async fn drain(&self, _shard_id: ShardId) -> Result<bool, RemoteMessageError> {
         Ok(true)
     }
 }

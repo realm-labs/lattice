@@ -1,16 +1,20 @@
-use super::codec::{
-    AskWire, EntityAskWire, EntityTellWire, SingletonAskWire, SingletonTellWire, TellWire,
-    ask_correlation, entity_target_to_wire, set_logical_ask_correlation, singleton_target_to_wire,
-    target_to_wire,
-};
-use super::error::{AskError, RemoteMessageError, TellError};
-use super::target::{
-    CorrelationId, ExactActorTarget, LogicalEntityTarget, LogicalSingletonTarget, SenderIdentity,
-};
+use tokio::time::Instant as TokioInstant;
+
 use super::{
     ActorRef, Arc, Association, AssociationId, AtomicU64, Bytes, CatalogueDecision, Duration,
     Frame, FrameKind, HashMap, Instant, Mutex, Ordering, ProtocolFingerprint, ProtocolId,
-    ProtocolTag, oneshot,
+    ProtocolTag,
+    codec::{
+        AskWire, EntityAskWire, EntityTellWire, SingletonAskWire, SingletonTellWire, TellWire,
+        ask_correlation, entity_target_to_wire, set_logical_ask_correlation,
+        singleton_target_to_wire, target_to_wire,
+    },
+    error::{AskError, RemoteMessageError, TellError},
+    oneshot,
+    target::{
+        CorrelationId, ExactActorTarget, LogicalEntityTarget, LogicalSingletonTarget,
+        SenderIdentity,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +228,7 @@ impl OutboundMessaging {
         association
             .try_admit_interactive(Frame::encode_message(FrameKind::Ask, &wire))
             .map_err(AskError::from)?;
-        let timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        let timeout = tokio::time::sleep_until(TokioInstant::from_std(deadline));
         tokio::pin!(timeout);
         let result = tokio::select! {
             result = receiver => result.unwrap_or(Err(AskError::AssociationLostBeforeWrite)),
@@ -336,7 +340,7 @@ impl OutboundMessaging {
         association
             .try_admit_interactive(frame)
             .map_err(AskError::from)?;
-        let timeout = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        let timeout = tokio::time::sleep_until(TokioInstant::from_std(deadline));
         tokio::pin!(timeout);
         let result = tokio::select! {
             result = receiver => result.unwrap_or(Err(AskError::AssociationLostBeforeWrite)),

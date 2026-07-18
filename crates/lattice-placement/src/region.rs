@@ -1,9 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use lattice_core::actor_ref::{
-    ConfigFingerprint, EntityId, EntityRef, EntityType, NodeIncarnation, PlacementDomainId,
-    ProtocolId, ProtocolTag, ReferenceError,
+    ClusterId, ConfigFingerprint, EntityId, EntityRef, EntityType, NodeIncarnation,
+    PlacementDomainId, ProtocolId, ProtocolTag, ReferenceError,
 };
 use thiserror::Error;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
@@ -114,7 +117,7 @@ impl EntityConfig {
 
     pub fn entity_ref<P: ProtocolTag>(
         &self,
-        cluster_id: lattice_core::actor_ref::ClusterId,
+        cluster_id: ClusterId,
         entity_id: EntityId,
     ) -> Result<EntityRef<P>, ReferenceError> {
         EntityRef::new(
@@ -312,9 +315,7 @@ impl ShardRegion {
             return Err(RegionError::BufferFull);
         }
         let residence_deadline = now
-            .checked_add(std::time::Duration::from_millis(
-                self.config.maximum_buffer_age_millis,
-            ))
+            .checked_add(Duration::from_millis(self.config.maximum_buffer_age_millis))
             .ok_or(RegionError::InvalidTime)?;
         let expires_at = match mode {
             BufferedMessageMode::Tell => residence_deadline,
@@ -452,8 +453,9 @@ pub enum RegionError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use lattice_core::actor_ref::{NodeAddress, ProtocolId};
+
+    use super::*;
 
     fn entity() -> EntityConfig {
         EntityConfig::new(

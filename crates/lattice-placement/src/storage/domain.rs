@@ -3,10 +3,12 @@ use std::collections::BTreeSet;
 use lattice_core::actor_ref::{EntityType, NodeIncarnation};
 use serde::{Deserialize, Serialize};
 
-use crate::coordinator::{DomainMemberRecord, MemberRecord, SingletonConfig};
-use crate::plan::RebalancePlan;
-use crate::region::EntityConfig;
-use crate::types::{ClaimGrant, PlacementSlot, PlacementVersion, ShardId};
+use crate::{
+    coordinator::{DomainMemberRecord, MemberRecord, SingletonConfig},
+    plan::RebalancePlan,
+    region::EntityConfig,
+    types::{ClaimGrant, PlacementSlot, PlacementVersion, Revision, ShardId},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeasedClaim {
@@ -44,7 +46,7 @@ pub struct RemoveMember {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberCommit {
     pub member: MemberRecord,
-    pub revision: crate::types::Revision,
+    pub revision: Revision,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

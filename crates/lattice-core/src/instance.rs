@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use http::Uri;
+use lattice_config::{error::ConfigError, source::ConfigSource};
 use serde::{Deserialize, Serialize};
 
 use crate::uri_serde;
@@ -82,10 +82,8 @@ pub struct InstanceConfig {
 }
 
 impl InstanceConfig {
-    pub fn from_env() -> Result<Self, lattice_config::error::ConfigError> {
-        lattice_config::source::ConfigSource::env("LATTICE")
-            .load()?
-            .section("instance")
+    pub fn from_env() -> Result<Self, ConfigError> {
+        ConfigSource::env("LATTICE").load()?.section("instance")
     }
 }
 

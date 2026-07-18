@@ -1,12 +1,16 @@
+use std::collections::BTreeSet;
+
+use crate::storage::domain::{AdoptAuthority, AuthorityCommit};
+
 impl<S> PlacementDomainLeader<S>
 where
     S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
 {
     pub(super) async fn begin_member_drain(
         &mut self,
-        incarnation: lattice_core::actor_ref::NodeIncarnation,
+        incarnation: NodeIncarnation,
         operation_id: String,
-        expected_incarnation: lattice_core::actor_ref::NodeIncarnation,
+        expected_incarnation: NodeIncarnation,
     ) -> Result<(), CoordinatorRuntimeError> {
         if operation_id.is_empty()
             || operation_id.len() > 256
@@ -104,7 +108,7 @@ where
 
     pub(super) async fn maybe_send_drain_ready(
         &mut self,
-        incarnation: lattice_core::actor_ref::NodeIncarnation,
+        incarnation: NodeIncarnation,
     ) -> Result<(), CoordinatorRuntimeError> {
         let session = self
             .sessions
@@ -150,9 +154,9 @@ where
 
     pub(super) async fn complete_member_drain(
         &mut self,
-        incarnation: lattice_core::actor_ref::NodeIncarnation,
+        incarnation: NodeIncarnation,
         operation_id: &str,
-        expected_incarnation: lattice_core::actor_ref::NodeIncarnation,
+        expected_incarnation: NodeIncarnation,
     ) -> Result<(), CoordinatorRuntimeError> {
         let session = self
             .sessions
@@ -252,7 +256,7 @@ where
                 } => Some(entity_type.clone()),
                 PlacementSlotKey::Singleton { .. } => None,
             })
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         for entity_type in entity_types {
             let _ = self
                 .evaluate_rebalance(
@@ -272,14 +276,11 @@ where
             }
         }
         let remaining_slots = self.store.list_slots(&self.version.domain).await?;
-        for slot in remaining_slots
-            .into_iter()
-            .filter(|slot| {
-                slot.owner.as_ref() == Some(&node)
-                    && slot.state == PlacementSlotState::Running
-                    && slot.active_move.is_none()
-            })
-        {
+        for slot in remaining_slots.into_iter().filter(|slot| {
+            slot.owner.as_ref() == Some(&node)
+                && slot.state == PlacementSlotState::Running
+                && slot.active_move.is_none()
+        }) {
             if self.store.get_claim(&slot.key).await?.is_none() {
                 self.fence_missing_claim(slot).await?;
             }
@@ -391,7 +392,7 @@ where
     pub(super) async fn send_snapshot(
         &mut self,
         hello: PlacementDomainHello,
-        association_key: lattice_remoting::association::AssociationKey,
+        association_key: AssociationKey,
     ) -> Result<(), CoordinatorRuntimeError> {
         let mut placement_records = Vec::new();
         for member in self.store.list_domain_members(&self.version.domain).await? {
@@ -474,8 +475,7 @@ where
             if slot.owner.as_ref() != Some(&hello.node)
                 || !matches!(
                     slot.state,
-                    crate::types::PlacementSlotState::Allocating
-                        | crate::types::PlacementSlotState::Running
+                    PlacementSlotState::Allocating | PlacementSlotState::Running
                 )
             {
                 continue;
@@ -489,7 +489,7 @@ where
                 return Err(CoordinatorRuntimeError::ClaimNotProven);
             }
             let committed = if previous.grant.coordinator_term == self.leader.term {
-                crate::storage::domain::AuthorityCommit {
+                AuthorityCommit {
                     slot: slot.clone(),
                     claim: previous,
                 }
@@ -516,7 +516,7 @@ where
                     .store
                     .adopt_authority(
                         &self.leader_guard,
-                        crate::storage::domain::AdoptAuthority {
+                        AdoptAuthority {
                             expected_global_member,
                             expected_domain_member,
                             expected_slot: slot.clone(),

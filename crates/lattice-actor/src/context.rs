@@ -1,33 +1,40 @@
-use std::any::type_name;
-use std::collections::HashMap;
-use std::fmt;
-use std::future::Future;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::{
+    any::type_name,
+    collections::HashMap,
+    fmt,
+    future::Future,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
+use lattice_core::{
+    actor_ref::{ActorRef, ProtocolId, RecipientRef},
+    service_context::ServiceContext,
+};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::Instrument;
 
-use lattice_core::actor_ref::{ActorRef, RecipientRef};
-use lattice_core::service_context::ServiceContext;
-
-use crate::error::{ActorCallError, ActorError, ActorTellError, PipeToSelfError};
-use crate::handle::ActorHandle;
-use crate::protocol::{SupportsAsk, SupportsTell};
-use crate::recipient::{ActorSystem, RecipientError, deadline_from_timeout};
-use crate::reply::{PendingReply, ReplyControl, ReplyTo};
-use crate::traits::{
-    Actor, ChildActorKey, ChildActorOptions, ChildSupervision, Handler, Message, PassivationReason,
-    Request, StopReason,
+use crate::{
+    directory::ActivationDirectory,
+    error::{ActorCallError, ActorError, ActorTellError, PipeToSelfError},
+    handle::ActorHandle,
+    protocol::{SupportsAsk, SupportsTell},
+    recipient::{ActorSystem, RecipientError, deadline_from_timeout},
+    reply::{PendingReply, ReplyControl, ReplyTo},
+    runtime::{ActorSpawnContext, ActorSpawnOptions, PassivationPolicy, spawner::ActorSpawner},
+    traits::{
+        Actor, ChildActorKey, ChildActorOptions, ChildSupervision, Handler, Message,
+        PassivationReason, Request, StopReason,
+    },
+    watch::{ActorTerminated, WatchId},
 };
-use crate::watch::{ActorTerminated, WatchId};
 
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
     self_ref: Option<ActorRef>,
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
-    spawner: crate::runtime::spawner::ActorSpawner,
+    spawner: ActorSpawner,
     lifecycle_request: Option<StopReason>,
     tasks: JoinSet<()>,
     pipe_tasks: JoinSet<()>,
@@ -73,7 +80,7 @@ impl<A: Actor> ActorContext<A> {
         self_ref: Option<ActorRef>,
         actor_system: Option<Arc<OnceLock<ActorSystem>>>,
         service: ServiceContext,
-        spawner: crate::runtime::spawner::ActorSpawner,
+        spawner: ActorSpawner,
         deferred_capacity: usize,
     ) -> Self {
         Self {
@@ -496,12 +503,12 @@ impl<A: Actor> ActorContext<A> {
         let child_ref = self.child_actor_ref(&key, options.protocol_id)?;
         let handle = crate::runtime::spawn_actor_with_self_ref(
             actor,
-            crate::runtime::ActorSpawnContext {
-                options: crate::runtime::ActorSpawnOptions {
+            ActorSpawnContext {
+                options: ActorSpawnOptions {
                     mailbox: options.mailbox,
                     execution: Some(options.execution),
                     scheduler_key: options.scheduler_key.clone(),
-                    passivation: crate::runtime::PassivationPolicy::Disabled,
+                    passivation: PassivationPolicy::Disabled,
                     self_ref: child_ref.as_ref().map(ActorRef::erase),
                     service: self.service.clone(),
                 },
@@ -512,9 +519,7 @@ impl<A: Actor> ActorContext<A> {
             },
         )
         .map_err(|error| ActorError::new(error.to_string()))?;
-        let directory = self
-            .service
-            .extension::<crate::directory::ActivationDirectory>();
+        let directory = self.service.extension::<ActivationDirectory>();
         if let Some(directory) = &directory
             && let Err(error) = directory.register(&handle)
         {
@@ -562,12 +567,12 @@ impl<A: Actor> ActorContext<A> {
         let child_ref = self.child_actor_ref(&key, options.protocol_id)?;
         let handle = crate::runtime::spawn_actor_with_self_ref(
             factory(),
-            crate::runtime::ActorSpawnContext {
-                options: crate::runtime::ActorSpawnOptions {
+            ActorSpawnContext {
+                options: ActorSpawnOptions {
                     mailbox: options.mailbox,
                     execution: Some(options.execution),
                     scheduler_key: options.scheduler_key.clone(),
-                    passivation: crate::runtime::PassivationPolicy::Disabled,
+                    passivation: PassivationPolicy::Disabled,
                     self_ref: child_ref.as_ref().map(ActorRef::erase),
                     service: self.service.clone(),
                 },
@@ -578,9 +583,7 @@ impl<A: Actor> ActorContext<A> {
             },
         )
         .map_err(|error| ActorError::new(error.to_string()))?;
-        let directory = self
-            .service
-            .extension::<crate::directory::ActivationDirectory>();
+        let directory = self.service.extension::<ActivationDirectory>();
         if let Some(directory) = &directory
             && let Err(error) = directory.register(&handle)
         {
@@ -696,12 +699,12 @@ impl<A: Actor> ActorContext<A> {
                         }
                         let replacement = match crate::runtime::spawn_actor_with_self_ref(
                             factory(),
-                            crate::runtime::ActorSpawnContext {
-                                options: crate::runtime::ActorSpawnOptions {
+                            ActorSpawnContext {
+                                options: ActorSpawnOptions {
                                     mailbox: options.mailbox,
                                     execution: Some(options.execution),
                                     scheduler_key: options.scheduler_key.clone(),
-                                    passivation: crate::runtime::PassivationPolicy::Disabled,
+                                    passivation: PassivationPolicy::Disabled,
                                     self_ref: child_ref.as_ref().map(ActorRef::erase),
                                     service: service.clone(),
                                 },
@@ -720,8 +723,7 @@ impl<A: Actor> ActorContext<A> {
                                 break;
                             }
                         };
-                        if let Some(directory) =
-                            service.extension::<crate::directory::ActivationDirectory>()
+                        if let Some(directory) = service.extension::<ActivationDirectory>()
                             && directory.register(&replacement).is_err()
                         {
                             let _ = replacement.try_stop_internal(StopReason::StartFailed);
@@ -738,7 +740,7 @@ impl<A: Actor> ActorContext<A> {
     fn child_actor_ref(
         &self,
         key: &ChildActorKey,
-        protocol_id: Option<lattice_core::actor_ref::ProtocolId>,
+        protocol_id: Option<ProtocolId>,
     ) -> Result<Option<ActorRef>, ActorError> {
         let Some(protocol_id) = protocol_id else {
             return Ok(None);
@@ -793,7 +795,7 @@ impl<C: Actor> ChildSlot<C> {
 
 struct ChildSlotStopper<C: Actor> {
     slot: Arc<ChildSlot<C>>,
-    directory: Option<Arc<crate::directory::ActivationDirectory>>,
+    directory: Option<Arc<ActivationDirectory>>,
     reference: Option<ActorRef>,
 }
 

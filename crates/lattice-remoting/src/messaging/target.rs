@@ -1,7 +1,8 @@
-use super::error::RemoteFailureCode;
+use lattice_core::actor_ref::{ProtocolTag, ReferenceError};
+
 use super::{
     ActivationId, ActorPath, ActorRef, Bytes, ClusterId, Duration, EntityRef, NodeAddress,
-    NodeIncarnation, ProtocolId, SingletonRef,
+    NodeIncarnation, ProtocolId, SingletonRef, error::RemoteFailureCode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -26,7 +27,7 @@ impl SenderIdentity {
     }
 }
 
-impl<A: lattice_core::actor_ref::ProtocolTag> From<&ActorRef<A>> for SenderIdentity {
+impl<A: ProtocolTag> From<&ActorRef<A>> for SenderIdentity {
     fn from(value: &ActorRef<A>) -> Self {
         Self::Actor(value.erase())
     }
@@ -42,7 +43,7 @@ pub struct ExactActorTarget {
     pub protocol_id: ProtocolId,
 }
 
-impl<A: lattice_core::actor_ref::ProtocolTag> From<&ActorRef<A>> for ExactActorTarget {
+impl<A: ProtocolTag> From<&ActorRef<A>> for ExactActorTarget {
     fn from(value: &ActorRef<A>) -> Self {
         Self {
             cluster_id: value.cluster_id().clone(),
@@ -68,9 +69,7 @@ impl ExactActorTarget {
         .into_bytes()
     }
 
-    pub fn actor_ref<A: lattice_core::actor_ref::ProtocolTag>(
-        &self,
-    ) -> Result<ActorRef<A>, lattice_core::actor_ref::ReferenceError> {
+    pub fn actor_ref<A: ProtocolTag>(&self) -> Result<ActorRef<A>, ReferenceError> {
         ActorRef::new(
             self.cluster_id.clone(),
             self.node_address.clone(),

@@ -1,3 +1,6 @@
+use lattice_core::actor_ref::{ProtocolId, SingletonKind};
+use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
+
 use super::*;
 
 #[tokio::test]
@@ -173,12 +176,12 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
     )
     .await
     .unwrap();
-    let kind = lattice_core::actor_ref::SingletonKind::new("recovering-singleton").unwrap();
-    let protocol_id = lattice_core::actor_ref::ProtocolId::new(77).unwrap();
+    let kind = SingletonKind::new("recovering-singleton").unwrap();
+    let protocol_id = ProtocolId::new(77).unwrap();
     let singleton_config = SingletonConfig::new(domain(), kind.clone(), protocol_id);
-    let descriptor = lattice_remoting::protocol::ProtocolDescriptor {
+    let descriptor = ProtocolDescriptor {
         protocol_id,
-        fingerprint: lattice_remoting::protocol::ProtocolFingerprint::new([5; 32]),
+        fingerprint: ProtocolFingerprint::new([5; 32]),
     };
     let hello = |node: NodeKey| {
         test_hello(

@@ -1,15 +1,19 @@
-use std::collections::BTreeMap;
-use std::net::IpAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    fmt::{Debug, Display, Formatter, Result as FmtResult},
+    net::IpAddr,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use futures_util::Stream;
-use hickory_resolver::TokioResolver;
-use hickory_resolver::proto::rr::{RData, RecordType};
-use lattice_core::actor_ref::NodeAddress;
-use lattice_core::coordinator::CoordinatorScope;
+use hickory_resolver::{
+    TokioResolver,
+    proto::rr::{RData, RecordType},
+};
+use lattice_core::{actor_ref::NodeAddress, coordinator::CoordinatorScope};
 
 use crate::provider::{
     CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
@@ -57,8 +61,8 @@ pub struct DnsDiscovery {
     config: DnsDiscoveryConfig,
 }
 
-impl std::fmt::Debug for DnsDiscovery {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for DnsDiscovery {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter
             .debug_struct("DnsDiscovery")
             .field("config", &self.config)
@@ -280,13 +284,13 @@ fn remaining_ttl(valid_until: Instant) -> Duration {
     valid_until.saturating_duration_since(Instant::now())
 }
 
-fn dns_configuration_error(error: impl std::fmt::Display) -> DiscoveryError {
+fn dns_configuration_error(error: impl Display) -> DiscoveryError {
     DiscoveryError::InvalidConfiguration {
         message: format!("cannot initialize system DNS resolver: {error}"),
     }
 }
 
-fn provider_error(error: impl std::fmt::Display) -> DiscoveryError {
+fn provider_error(error: impl Display) -> DiscoveryError {
     DiscoveryError::Provider {
         provider: "dns",
         message: error.to_string(),

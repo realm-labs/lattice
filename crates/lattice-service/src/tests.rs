@@ -1,52 +1,65 @@
-use std::collections::BTreeSet;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+    collections::BTreeSet,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
 use futures_util::Stream;
-use lattice_actor::actor_protocol;
-use lattice_actor::context::ActorContext;
-use lattice_actor::error::{ActorError, ActorStopError};
-use lattice_actor::protocol::CodecDescriptor;
-use lattice_actor::protocol::DecodeError;
-use lattice_actor::protocol::EncodeError;
-use lattice_actor::protocol::WireCodec;
-use lattice_actor::registry::{
-    ActorCreateContext, ActorLoader, ActorRefConfig, ActorRegistry, ActorRegistryConfig,
+use lattice_actor::{
+    actor_protocol,
+    context::ActorContext,
+    error::{ActorError, ActorStopError},
+    protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec},
+    recipient::ProtocolRegistrationError,
+    registry::{
+        ActorCreateContext, ActorLoader, ActorRefConfig, ActorRegistry, ActorRegistryConfig,
+    },
+    reply::ReplyTo,
+    traits::{Actor, ActorLifecycleState, Responder, StopReason},
 };
-use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::{Actor, Responder, StopReason};
-use lattice_core::actor_kind;
-use lattice_core::actor_ref::{
-    ActorRef, ClusterId, EntityId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
-    ProtocolId,
+use lattice_core::{
+    actor_kind,
+    actor_ref::{
+        ActorRef, ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation,
+        PlacementDomainId, ProtocolId,
+    },
+    coordinator::CoordinatorScope,
+    id::ActorId,
 };
-use lattice_core::coordinator::CoordinatorScope;
-use lattice_core::id::ActorId;
-use lattice_discovery::provider::{
-    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
-    DiscoverySource, DiscoveryTarget,
+use lattice_discovery::{
+    provider::{
+        CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
+        DiscoverySource, DiscoveryTarget,
+    },
+    static_provider::{StaticDiscovery, StaticEndpoint},
 };
-use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
-use lattice_placement::control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter};
-use lattice_placement::coordinator::MemberStatus;
-use lattice_placement::region::EntityConfig;
-use lattice_placement::runtime::PlacementDomainLeaderConfig;
-use lattice_placement::runtime::host::{CoordinatorHost, CoordinatorHostConfig};
-use lattice_placement::storage::{InMemoryPlacementStore, MembershipStore};
-use lattice_placement::types::NodeKey;
-use lattice_remoting::config::RemotingConfig;
-use lattice_remoting::handshake::NodeIdentity;
-use lattice_remoting::watch::WatchStatus;
+use lattice_placement::{
+    control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
+    coordinator::MemberStatus,
+    region::EntityConfig,
+    runtime::{
+        PlacementDomainLeaderConfig,
+        host::{CoordinatorHost, CoordinatorHostConfig},
+    },
+    storage::{InMemoryPlacementStore, MembershipStore},
+    types::NodeKey,
+};
+use lattice_remoting::{config::RemotingConfig, handshake::NodeIdentity, watch::WatchStatus};
+use tokio::{net::TcpListener, sync::watch::Receiver, time::Instant};
 
-use crate::builder::LatticeService;
-use crate::config::ClusterJoinConfig;
-use crate::config::NodeConfig;
-use crate::lifecycle::{NodeLifecycleState, PlacementDomainState};
-use crate::registration::EntityOptions;
+use crate::{
+    builder::LatticeService,
+    config::{ClusterJoinConfig, NodeConfig},
+    error::ServiceError,
+    lifecycle::{NodeLifecycleState, PlacementDomainState},
+    registration::EntityOptions,
+};
 
 const PROTOCOL_ID: u64 = 0x7465_7374_0000_0001;
 
@@ -207,8 +220,8 @@ fn actor_registration_rejects_a_registry_bound_to_another_protocol() {
 
     assert!(matches!(
         result,
-        Err(crate::error::ServiceError::ProtocolRegistration(
-            lattice_actor::recipient::ProtocolRegistrationError::RegistryProtocolMismatch { .. }
+        Err(ServiceError::ProtocolRegistration(
+            ProtocolRegistrationError::RegistryProtocolMismatch { .. }
         ))
     ));
 }
@@ -284,7 +297,7 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
 
     let mut lifecycle = handle.subscribe_lifecycle();
     handle.stop(StopReason::Requested).await.unwrap();
-    while *lifecycle.borrow() != lattice_actor::traits::ActorLifecycleState::StopFailed {
+    while *lifecycle.borrow() != ActorLifecycleState::StopFailed {
         lifecycle.changed().await.unwrap();
     }
     let retained = service.retained_actor_cells();
@@ -298,10 +311,7 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
         service.node_lifecycle_state(),
         NodeLifecycleState::Terminated
     );
-    assert_eq!(
-        handle.lifecycle_state(),
-        lattice_actor::traits::ActorLifecycleState::Stopped
-    );
+    assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopped);
     assert!(registry.live_cells().is_empty());
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
     let event = tokio::time::timeout(Duration::from_secs(1), data_loss.recv())
@@ -341,10 +351,7 @@ async fn terminal_shutdown_drains_local_actors_without_a_migration_target() {
         service.node_lifecycle_state(),
         NodeLifecycleState::Terminated
     );
-    assert_eq!(
-        handle.lifecycle_state(),
-        lattice_actor::traits::ActorLifecycleState::Stopped
-    );
+    assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopped);
     assert!(registry.live_cells().is_empty());
 }
 
@@ -415,23 +422,20 @@ async fn service_retry_api_resolves_retained_actor_cell() {
 
     let mut lifecycle = handle.subscribe_lifecycle();
     handle.stop(StopReason::Requested).await.unwrap();
-    while *lifecycle.borrow() != lattice_actor::traits::ActorLifecycleState::StopFailed {
+    while *lifecycle.borrow() != ActorLifecycleState::StopFailed {
         lifecycle.changed().await.unwrap();
     }
     persistence_available.store(true, Ordering::SeqCst);
     service.retry_actor_stop(handle.local_ref()).await.unwrap();
 
-    assert_eq!(
-        handle.lifecycle_state(),
-        lattice_actor::traits::ActorLifecycleState::Stopped
-    );
+    assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopped);
     assert!(service.retained_actor_cells().is_empty());
     service.shutdown().await.unwrap();
 }
 
 struct WatchDiscovery {
     scope: CoordinatorScope,
-    snapshots: tokio::sync::watch::Receiver<CoordinatorDirectorySnapshot>,
+    snapshots: Receiver<CoordinatorDirectorySnapshot>,
 }
 
 impl CoordinatorDiscovery for WatchDiscovery {
@@ -630,10 +634,10 @@ async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
 
 #[tokio::test]
 async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
-    let coordinator_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let coordinator_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let coordinator_port = coordinator_listener.local_addr().unwrap().port();
     drop(coordinator_listener);
-    let member_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let member_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let member_port = member_listener.local_addr().unwrap().port();
     drop(member_listener);
 
@@ -726,7 +730,7 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     }));
 
     member
-        .leave(tokio::time::Instant::now() + Duration::from_secs(2))
+        .leave(Instant::now() + Duration::from_secs(2))
         .await
         .unwrap();
     assert_eq!(
@@ -752,7 +756,7 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
 }
 
 async fn unused_address() -> NodeAddress {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     NodeAddress::new("127.0.0.1", port).unwrap()
@@ -840,7 +844,7 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
     first.terminal_shutdown().await.unwrap();
     assert!(store.get_member("first").await.unwrap().is_none());
     second
-        .leave(tokio::time::Instant::now() + Duration::from_secs(2))
+        .leave(Instant::now() + Duration::from_secs(2))
         .await
         .unwrap();
     coordinator.shutdown().await.unwrap();
@@ -986,13 +990,13 @@ async fn one_domain_coordinator_loss_leaves_other_domain_ready() {
 
 #[tokio::test]
 async fn coordinator_rollover_requires_reconciliation_before_ready() {
-    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port_a = listener_a.local_addr().unwrap().port();
     drop(listener_a);
-    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port_b = listener_b.local_addr().unwrap().port();
     drop(listener_b);
-    let member_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let member_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let member_port = member_listener.local_addr().unwrap().port();
     drop(member_listener);
 
@@ -1136,7 +1140,7 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
 
 async fn eventually_ping(
     service: &LatticeService,
-    target: lattice_core::actor_ref::EntityRef<PingProtocol>,
+    target: EntityRef<PingProtocol>,
     value: u64,
 ) -> Pong {
     tokio::time::timeout(Duration::from_secs(5), async {

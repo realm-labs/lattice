@@ -1,36 +1,50 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use etcd_client::Client;
-use lattice_core::actor_ref::{
-    ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
-    SingletonKind,
+use lattice_core::{
+    actor_ref::{
+        ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
+        SingletonKind,
+    },
+    coordinator::CoordinatorScope,
+    failpoint::Failpoint,
 };
-use lattice_core::coordinator::CoordinatorScope;
-use lattice_placement::allocation::{ProposedMove, RebalanceProposal, RebalanceTrigger};
-use lattice_placement::coordinator::{
-    DomainMemberRecord, DomainMemberStatus, LeaderRecord, MemberHello, MemberRecord, MemberStatus,
-    MembershipLeaderGuard, PlacementDomainHello, PlacementLeaderGuard, SingletonConfig,
+use lattice_placement::{
+    allocation::{ProposedMove, RebalanceProposal, RebalanceTrigger},
+    coordinator::{
+        DomainMemberRecord, DomainMemberStatus, LeaderRecord, MemberHello, MemberRecord,
+        MemberStatus, MembershipLeaderGuard, PlacementDomainHello, PlacementLeaderGuard,
+        SingletonConfig,
+    },
+    plan::RebalancePlan,
+    region::EntityConfig,
+    storage::{
+        CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore,
+        StorageError,
+        domain::{
+            ActivateAuthority, AllocateInitial, CreateDomainMember, CreateMember, CreatePlan,
+            DeletePlan, DurableStorageLimits, LeasedClaim, PutEntityConfig, PutSingletonConfig,
+            RemoveMember, TransitionSlot, UpdateMember,
+        },
+        etcd::{
+            EtcdPlacementConfig, EtcdPlacementStore,
+            migration::{
+                CardinalityMode, MigrationConfig, MigrationDomainMapping, MigrationError,
+                MigrationMode, execute as migrate, execute_cardinality,
+            },
+        },
+    },
+    types::{
+        AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, MembershipVersion,
+        NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState, PlacementVersion, Revision,
+        ShardId,
+    },
 };
-use lattice_placement::plan::RebalancePlan;
-use lattice_placement::region::EntityConfig;
-use lattice_placement::storage::domain::{
-    ActivateAuthority, AllocateInitial, CreateDomainMember, CreateMember, CreatePlan, DeletePlan,
-    DurableStorageLimits, LeasedClaim, PutEntityConfig, PutSingletonConfig, RemoveMember,
-    TransitionSlot, UpdateMember,
-};
-use lattice_placement::storage::etcd::migration::{
-    CardinalityMode, MigrationConfig, MigrationDomainMapping, MigrationError, MigrationMode,
-    execute as migrate, execute_cardinality,
-};
-use lattice_placement::storage::etcd::{EtcdPlacementConfig, EtcdPlacementStore};
-use lattice_placement::storage::{
-    CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore, StorageError,
-};
-use lattice_placement::types::{
-    AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, MembershipVersion, NodeKey,
-    PlacementSlot, PlacementSlotKey, PlacementSlotState, PlacementVersion, Revision, ShardId,
-};
+use tokio::time::Instant;
 
 #[path = "etcd_acceptance/bounded_migration.rs"]
 mod bounded_migration;
@@ -242,7 +256,7 @@ async fn real_etcd_guarded_domain_commits_and_lease_expiry() {
                 expected_global_member: foreign_global_member,
                 expected_domain_member: foreign_domain_member,
                 slot: foreign_slot,
-                claim: lattice_placement::storage::domain::LeasedClaim {
+                claim: LeasedClaim {
                     grant: ClaimGrant {
                         domain: foreign_domain.clone(),
                         slot: foreign_key.clone(),
@@ -401,15 +415,12 @@ async fn real_etcd_guarded_domain_commits_and_lease_expiry() {
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         if store.get_claim(&key).await.unwrap().is_none() {
             break;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "leased claim did not expire"
-        );
+        assert!(Instant::now() < deadline, "leased claim did not expire");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -790,10 +801,10 @@ async fn real_etcd_migration_finalization_compare_failure_is_atomic_and_resumabl
     let backup_path = backup_dir.path().join("generation-4.json");
     let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
-    let resume_rx = std::sync::Arc::new(std::sync::Mutex::new(resume_rx));
-    let hook_resume = std::sync::Arc::clone(&resume_rx);
+    let resume_rx = Arc::new(Mutex::new(resume_rx));
+    let hook_resume = Arc::clone(&resume_rx);
     let guard = lattice_core::failpoint::install_hook(move |point| {
-        if point == lattice_core::failpoint::Failpoint::MigrationBeforeFinalize {
+        if point == Failpoint::MigrationBeforeFinalize {
             reached_tx.send(()).unwrap();
             hook_resume.lock().unwrap().recv().unwrap();
         }

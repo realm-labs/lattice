@@ -1,20 +1,24 @@
-use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::PathBuf;
+use std::{
+    collections::BTreeMap,
+    io::{Error as IoError, Write},
+    path::PathBuf,
+};
 
 use etcd_client::{
     Client, Compare, CompareOp, GetOptions, PutOptions, SortOrder, SortTarget, Txn, TxnOp,
 };
+use lattice_core::{actor_ref::PlacementDomainId, failpoint::Failpoint};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::STORAGE_SCHEMA_GENERATION;
-use crate::coordinator::SingletonConfig;
-use crate::plan::{MoveProgress, PlanStatus, RebalancePlan};
-use crate::region::EntityConfig;
-use crate::storage::domain::DurableStorageLimits;
-use crate::types::{CoordinatorTerm, PlacementSlot, PlacementSlotState, PlacementVersion};
-use lattice_core::actor_ref::PlacementDomainId;
+use crate::{
+    coordinator::SingletonConfig,
+    plan::{MoveProgress, PlanStatus, RebalancePlan},
+    region::EntityConfig,
+    storage::domain::DurableStorageLimits,
+    types::{CoordinatorTerm, PlacementSlot, PlacementSlotState, PlacementVersion},
+};
 
 const MIGRATING_SCHEMA: &str = "migrating-to-5";
 const MIGRATION_LOCK_TTL_SECONDS: i64 = 300;
@@ -125,7 +129,7 @@ pub enum MigrationError {
     #[error("etcd migration request failed")]
     Etcd(#[from] etcd_client::Error),
     #[error("migration backup/export failed")]
-    Io(#[from] std::io::Error),
+    Io(#[from] IoError),
     #[error("migration JSON codec failed")]
     Codec(#[from] serde_json::Error),
 }
@@ -335,8 +339,8 @@ pub async fn execute(
         quarantined_records: 0,
         completed: false,
     };
-    let mut entity_configs = std::collections::BTreeMap::new();
-    let mut singleton_configs = std::collections::BTreeMap::new();
+    let mut entity_configs = BTreeMap::new();
+    let mut singleton_configs = BTreeMap::new();
     for record in &records {
         let suffix = record_suffix(&config.cluster_prefix, &record.key)?;
         update_counts(
@@ -509,14 +513,12 @@ pub async fn execute(
             if !response.succeeded() {
                 return Err(MigrationError::ProgressCompareFailed);
             }
-            lattice_core::failpoint::hit(
-                lattice_core::failpoint::Failpoint::MigrationAfterCommitBeforeProgress,
-            );
+            lattice_core::failpoint::hit(Failpoint::MigrationAfterCommitBeforeProgress);
             marker = Some(next_marker);
         }
     }
     if matches!(mode, MigrationMode::Apply | MigrationMode::Resume) {
-        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::MigrationBeforeFinalize);
+        lattice_core::failpoint::hit(Failpoint::MigrationBeforeFinalize);
         let finalize_context = FinalizeContext {
             schema_key: &schema_key,
             marker_key: &marker_key,
@@ -608,8 +610,8 @@ pub async fn execute_cardinality(
         quarantined_records: 0,
         completed: false,
     };
-    let mut entity_configs = std::collections::BTreeMap::new();
-    let mut singleton_configs = std::collections::BTreeMap::new();
+    let mut entity_configs = BTreeMap::new();
+    let mut singleton_configs = BTreeMap::new();
     for record in &records {
         update_counts(
             &mut inventory,
@@ -1016,6 +1018,10 @@ fn parse_usize(value: &[u8]) -> Result<usize, MigrationError> {
 
 #[cfg(test)]
 mod tests {
+    use lattice_core::actor_ref::{
+        ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
+    };
+
     use super::{
         MigrationDomainMapping, MigrationError, RawRecord, prepare_record, validate_full_stop,
         validate_mapping,
@@ -1023,9 +1029,6 @@ mod tests {
     use crate::types::{
         AssignmentGeneration, CoordinatorTerm, NodeKey, PlacementSlot, PlacementSlotKey,
         PlacementSlotState, PlacementVersion, Revision, ShardId,
-    };
-    use lattice_core::actor_ref::{
-        ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
     };
 
     #[test]

@@ -1,30 +1,36 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lattice_core::actor_ref::PlacementDomainId;
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_core::{
+    actor_ref::{EntityType, PlacementDomainId, SingletonKind},
+    coordinator::CoordinatorScope,
+};
 
 use super::{EtcdPlacementStore, parse_revision_value};
-use crate::coordinator::{
-    DomainMemberRecord, LeaderRecord, MemberRecord, MembershipLeaderGuard, PlacementLeaderGuard,
-    SingletonConfig,
+use crate::{
+    coordinator::{
+        DomainMemberRecord, LeaderRecord, MemberRecord, MembershipLeaderGuard,
+        PlacementLeaderGuard, SingletonConfig,
+    },
+    plan::RebalancePlan,
+    region::EntityConfig,
+    storage::{
+        CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore,
+        StorageError,
+        domain::{
+            ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial,
+            AuthorityCommit, AutomaticBalanceSettings, CommitAutomaticSettings,
+            CompactAdminOperations, CompleteMove, CreateDomainMember, CreateMember, CreatePlan,
+            CreatePlanWithOperation, DeletePlan, DomainMemberCommit, DurableStorageLimits,
+            EntityConfigCommit, FenceAuthority, FenceMissingAuthority, InstallAuthority,
+            LeasedClaim, MemberCommit, MoveCommit, PlanCommit, PutEntityConfig, PutSingletonConfig,
+            RecordAdminOperation, RemoveDomainMember, RemoveMember, ReserveHandoff, ReserveMove,
+            SingletonConfigCommit, SlotCommit, TransitionSlot, UpdateDomainMember, UpdateMember,
+            UpdatePlan, UpdatePlanWithOperation,
+        },
+    },
+    types::{PlacementSlot, PlacementSlotKey, Revision},
 };
-use crate::plan::RebalancePlan;
-use crate::region::EntityConfig;
-use crate::storage::domain::{
-    ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial, AuthorityCommit,
-    AutomaticBalanceSettings, CommitAutomaticSettings, CompactAdminOperations, CompleteMove,
-    CreateDomainMember, CreateMember, CreatePlan, CreatePlanWithOperation, DeletePlan,
-    DomainMemberCommit, DurableStorageLimits, EntityConfigCommit, FenceAuthority,
-    FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit, MoveCommit, PlanCommit,
-    PutEntityConfig, PutSingletonConfig, RecordAdminOperation, RemoveDomainMember, RemoveMember,
-    ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit, TransitionSlot,
-    UpdateDomainMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
-};
-use crate::storage::{
-    CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore, StorageError,
-};
-use crate::types::{PlacementSlot, PlacementSlotKey, Revision};
 
 #[async_trait]
 impl CoordinatorLeaseStore for EtcdPlacementStore {
@@ -155,7 +161,7 @@ impl PlacementDomainStore for EtcdPlacementStore {
     async fn get_entity_config(
         &self,
         domain: &PlacementDomainId,
-        entity_type: &lattice_core::actor_ref::EntityType,
+        entity_type: &EntityType,
     ) -> Result<Option<EntityConfig>, StorageError> {
         self.get_json_key(&self.entity_config_key(domain, entity_type))
             .await
@@ -180,7 +186,7 @@ impl PlacementDomainStore for EtcdPlacementStore {
     async fn get_singleton_config(
         &self,
         domain: &PlacementDomainId,
-        kind: &lattice_core::actor_ref::SingletonKind,
+        kind: &SingletonKind,
     ) -> Result<Option<SingletonConfig>, StorageError> {
         self.get_json_key(&self.singleton_config_key(domain, kind))
             .await

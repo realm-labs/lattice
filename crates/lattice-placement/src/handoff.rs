@@ -234,9 +234,10 @@ pub enum HandoffError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::types::ShardId;
     use lattice_core::actor_ref::{EntityType, NodeAddress, NodeIncarnation, PlacementDomainId};
+
+    use super::*;
+    use crate::types::{CoordinatorTerm, Revision, ShardId};
 
     fn node(id: &str, incarnation: u128) -> NodeKey {
         NodeKey {
@@ -262,8 +263,8 @@ mod tests {
             AssignmentGeneration::new(4).unwrap(),
             PlacementVersion::new(
                 domain.clone(),
-                crate::types::CoordinatorTerm::new(2).unwrap(),
-                crate::types::Revision::new(8).unwrap(),
+                CoordinatorTerm::new(2).unwrap(),
+                Revision::new(8).unwrap(),
             ),
             [subscribed].into_iter().collect(),
         )
@@ -274,8 +275,8 @@ mod tests {
                     session: subscribed,
                     version: PlacementVersion::new(
                         domain.clone(),
-                        crate::types::CoordinatorTerm::new(1).unwrap(),
-                        crate::types::Revision::new(8).unwrap(),
+                        CoordinatorTerm::new(1).unwrap(),
+                        Revision::new(8).unwrap(),
                     ),
                 })
                 .unwrap_err(),
@@ -288,8 +289,8 @@ mod tests {
                     session: NodeIncarnation::new(99).unwrap(),
                     version: PlacementVersion::new(
                         domain.clone(),
-                        crate::types::CoordinatorTerm::new(2).unwrap(),
-                        crate::types::Revision::new(8).unwrap(),
+                        CoordinatorTerm::new(2).unwrap(),
+                        Revision::new(8).unwrap(),
                     ),
                 })
                 .is_err()
@@ -300,8 +301,8 @@ mod tests {
                     session: subscribed,
                     version: PlacementVersion::new(
                         domain,
-                        crate::types::CoordinatorTerm::new(2).unwrap(),
-                        crate::types::Revision::new(8).unwrap(),
+                        CoordinatorTerm::new(2).unwrap(),
+                        Revision::new(8).unwrap(),
                     ),
                 })
                 .unwrap(),
@@ -327,8 +328,8 @@ mod tests {
             generation,
             PlacementVersion::new(
                 domain,
-                crate::types::CoordinatorTerm::new(2).unwrap(),
-                crate::types::Revision::new(8).unwrap(),
+                CoordinatorTerm::new(2).unwrap(),
+                Revision::new(8).unwrap(),
             ),
             BTreeSet::new(),
         )

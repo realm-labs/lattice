@@ -1,12 +1,20 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post};
-use axum::{Json, Router};
-use lattice_placement::plan::RebalancePlan;
-use lattice_placement::types::PlacementSlot;
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use lattice_core::actor_ref::{EntityType, PlacementDomainId};
+use lattice_placement::{
+    allocation::RebalanceTrigger,
+    plan::RebalancePlan,
+    runtime::{CoordinatorHandle, CoordinatorRuntimeError, ManualRelocationRequest},
+    types::{AssignmentGeneration, PlacementSlot, ShardId},
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,11 +130,11 @@ pub trait AdminMutationHandler: Send + Sync + 'static {
 
 #[derive(Clone)]
 pub struct CoordinatorAdminHandler {
-    coordinator: lattice_placement::runtime::CoordinatorHandle,
+    coordinator: CoordinatorHandle,
 }
 
 impl CoordinatorAdminHandler {
-    pub fn new(coordinator: lattice_placement::runtime::CoordinatorHandle) -> Self {
+    pub fn new(coordinator: CoordinatorHandle) -> Self {
         Self { coordinator }
     }
 }
@@ -164,7 +172,7 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
                 parse_domain(command.domain)?,
                 command.operation_id,
                 entity_type,
-                lattice_placement::allocation::RebalanceTrigger::Automatic,
+                RebalanceTrigger::Automatic,
             )
             .await
             .map(|_| ())
@@ -173,16 +181,14 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
 
     async fn relocate_shard(&self, command: ManualRelocation) -> Result<(), AdminApiError> {
         self.coordinator
-            .relocate_shard(lattice_placement::runtime::ManualRelocationRequest {
+            .relocate_shard(ManualRelocationRequest {
                 domain: parse_domain(command.domain)?,
                 operation_id: command.operation_id,
-                entity_type: lattice_core::actor_ref::EntityType::new(command.entity_type)
+                entity_type: EntityType::new(command.entity_type)
                     .map_err(|_| AdminApiError::Invalid)?,
-                shard_id: lattice_placement::types::ShardId::new(command.shard_id),
-                expected_generation: lattice_placement::types::AssignmentGeneration::new(
-                    command.expected_generation,
-                )
-                .map_err(|_| AdminApiError::Invalid)?,
+                shard_id: ShardId::new(command.shard_id),
+                expected_generation: AssignmentGeneration::new(command.expected_generation)
+                    .map_err(|_| AdminApiError::Invalid)?,
                 target_node_id: command.target_node_id,
             })
             .await
@@ -202,45 +208,33 @@ impl AdminMutationHandler for CoordinatorAdminHandler {
                 parse_domain(command.domain)?,
                 command.operation_id,
                 plan_id,
-                lattice_placement::types::ShardId::new(shard_id),
+                ShardId::new(shard_id),
             )
             .await
             .map_err(map_coordinator_error)
     }
 }
 
-fn parse_domain(
-    value: String,
-) -> Result<lattice_core::actor_ref::PlacementDomainId, AdminApiError> {
-    lattice_core::actor_ref::PlacementDomainId::new(value).map_err(|_| AdminApiError::Invalid)
+fn parse_domain(value: String) -> Result<PlacementDomainId, AdminApiError> {
+    PlacementDomainId::new(value).map_err(|_| AdminApiError::Invalid)
 }
 
-fn parse_entity_type(
-    value: Option<String>,
-) -> Result<Option<lattice_core::actor_ref::EntityType>, AdminApiError> {
+fn parse_entity_type(value: Option<String>) -> Result<Option<EntityType>, AdminApiError> {
     value
-        .map(|value| {
-            lattice_core::actor_ref::EntityType::new(value).map_err(|_| AdminApiError::Invalid)
-        })
+        .map(|value| EntityType::new(value).map_err(|_| AdminApiError::Invalid))
         .transpose()
 }
 
-fn map_coordinator_error(
-    error: lattice_placement::runtime::CoordinatorRuntimeError,
-) -> AdminApiError {
+fn map_coordinator_error(error: CoordinatorRuntimeError) -> AdminApiError {
     match error {
-        lattice_placement::runtime::CoordinatorRuntimeError::InvalidAdminOperation
-        | lattice_placement::runtime::CoordinatorRuntimeError::UnknownEntityConfig
-        | lattice_placement::runtime::CoordinatorRuntimeError::UnknownPlan
-        | lattice_placement::runtime::CoordinatorRuntimeError::UnknownSlot => {
-            AdminApiError::Invalid
-        }
-        lattice_placement::runtime::CoordinatorRuntimeError::IdempotencyConflict
-        | lattice_placement::runtime::CoordinatorRuntimeError::StaleProposal
-        | lattice_placement::runtime::CoordinatorRuntimeError::PlanConflict
-        | lattice_placement::runtime::CoordinatorRuntimeError::IneligibleTarget => {
-            AdminApiError::Conflict
-        }
+        CoordinatorRuntimeError::InvalidAdminOperation
+        | CoordinatorRuntimeError::UnknownEntityConfig
+        | CoordinatorRuntimeError::UnknownPlan
+        | CoordinatorRuntimeError::UnknownSlot => AdminApiError::Invalid,
+        CoordinatorRuntimeError::IdempotencyConflict
+        | CoordinatorRuntimeError::StaleProposal
+        | CoordinatorRuntimeError::PlanConflict
+        | CoordinatorRuntimeError::IneligibleTarget => AdminApiError::Conflict,
         _ => AdminApiError::Unavailable,
     }
 }
@@ -336,8 +330,8 @@ pub enum AdminApiError {
     Unavailable,
 }
 
-impl axum::response::IntoResponse for AdminApiError {
-    fn into_response(self) -> axum::response::Response {
+impl IntoResponse for AdminApiError {
+    fn into_response(self) -> Response {
         let status = match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Invalid => StatusCode::BAD_REQUEST,

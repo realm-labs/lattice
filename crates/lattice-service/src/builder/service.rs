@@ -1,46 +1,56 @@
+use std::{sync::atomic::Ordering, time::Duration};
+
+use lattice_actor::{
+    registry::ActorCellDiagnostics, traits::ActorLifecycleState, watch::LocalActorRef,
+};
+use lattice_core::actor_ref::ClusterId;
+use lattice_placement::{
+    membership_session::MembershipCoordinatorHandle, session::LogicSessionError,
+    types::PlacementSlotKey,
+};
+use lattice_remoting::watch::{WatchId, WatchStatus};
+use tokio::{
+    sync::broadcast::{Receiver, error::RecvError},
+    time::Instant,
+};
+
+use crate::{
+    cluster::peers::PeerError,
+    lifecycle::{CoordinatorScopeState, LifecycleInterventionReport},
+};
+
 pub struct LatticeService {
-    cluster_id: lattice_core::actor_ref::ClusterId,
+    cluster_id: ClusterId,
     actor_system: ActorSystem,
-    hosts: Arc<lattice_actor::host::ProtocolHostRegistry>,
+    hosts: Arc<ProtocolHostRegistry>,
     associations: Arc<AssociationManager>,
     messaging: Arc<OutboundMessaging>,
     endpoint: Arc<RemotingEndpoint>,
     supervisor: Arc<TaskSupervisor>,
-    logic_runtime: std::sync::Mutex<Option<LogicRuntimeAssembly>>,
-    join_runtimes: std::sync::Mutex<Vec<LogicJoinRuntime>>,
-    membership_join_runtime: std::sync::Mutex<Option<MembershipJoinRuntime>>,
-    membership_handle: Arc<
-        std::sync::Mutex<
-            Option<lattice_placement::membership_session::MembershipCoordinatorHandle>,
-        >,
-    >,
-    logic_shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
-    join_shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
-    logic_handles: Arc<
-        std::sync::Mutex<
-            BTreeMap<lattice_core::actor_ref::PlacementDomainId, LogicCoordinatorHandle>,
-        >,
-    >,
-    watches: Arc<std::sync::Mutex<WatchRegistry>>,
-    coordinator_runtime: std::sync::Mutex<Option<CoordinatorRuntimeAssembly>>,
-    coordinator_shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
-    coordinator_handles:
-        std::sync::Mutex<BTreeMap<lattice_core::actor_ref::PlacementDomainId, CoordinatorHandle>>,
+    logic_runtime: Mutex<Option<LogicRuntimeAssembly>>,
+    join_runtimes: Mutex<Vec<LogicJoinRuntime>>,
+    membership_join_runtime: Mutex<Option<MembershipJoinRuntime>>,
+    membership_handle: Arc<Mutex<Option<MembershipCoordinatorHandle>>>,
+    logic_shutdown: Mutex<Option<watch::Sender<bool>>>,
+    join_shutdown: Mutex<Option<watch::Sender<bool>>>,
+    logic_handles: Arc<Mutex<BTreeMap<PlacementDomainId, LogicCoordinatorHandle>>>,
+    watches: Arc<Mutex<WatchRegistry>>,
+    coordinator_runtime: Mutex<Option<CoordinatorRuntimeAssembly>>,
+    coordinator_shutdown: Mutex<Option<watch::Sender<bool>>>,
+    coordinator_handles: Mutex<BTreeMap<PlacementDomainId, CoordinatorHandle>>,
     lifecycle_driver: ProductionLifecycleDriver,
     lifecycle_events: watch::Sender<NodeLifecycleState>,
-    health: Arc<std::sync::Mutex<ServiceHealthSnapshot>>,
+    health: Arc<Mutex<ServiceHealthSnapshot>>,
     health_events: watch::Sender<ServiceHealthSnapshot>,
     members: Arc<MemberDirectory>,
     peers: Arc<PeerReconciler>,
     bootstrap_view: Arc<BootstrapView>,
-    drain_ready: watch::Sender<BTreeMap<lattice_core::actor_ref::PlacementDomainId, String>>,
-    drain_blockers: watch::Sender<
-        BTreeMap<lattice_core::actor_ref::PlacementDomainId, BTreeSet<lattice_placement::types::PlacementSlotKey>>,
-    >,
-    configured_domains: BTreeSet<lattice_core::actor_ref::PlacementDomainId>,
-    drain_operation: std::sync::Mutex<Option<String>>,
+    drain_ready: watch::Sender<BTreeMap<PlacementDomainId, String>>,
+    drain_blockers: watch::Sender<BTreeMap<PlacementDomainId, BTreeSet<PlacementSlotKey>>>,
+    configured_domains: BTreeSet<PlacementDomainId>,
+    drain_operation: Mutex<Option<String>>,
     join_config: ClusterJoinConfig,
-    force_actor_shutdown: std::sync::atomic::AtomicBool,
+    force_actor_shutdown: AtomicBool,
 }
 
 impl LatticeService {
@@ -52,24 +62,20 @@ impl LatticeService {
         &self.actor_system
     }
 
-    pub fn retained_actor_cells(&self) -> Vec<lattice_actor::registry::ActorCellDiagnostics> {
+    pub fn retained_actor_cells(&self) -> Vec<ActorCellDiagnostics> {
         self.hosts
             .live_cells()
             .into_iter()
             .filter(|cell| {
                 matches!(
                     cell.lifecycle,
-                    lattice_actor::traits::ActorLifecycleState::StopFailed
-                        | lattice_actor::traits::ActorLifecycleState::Quarantined
+                    ActorLifecycleState::StopFailed | ActorLifecycleState::Quarantined
                 )
             })
             .collect()
     }
 
-    pub async fn retry_actor_stop(
-        &self,
-        local_ref: lattice_actor::watch::LocalActorRef,
-    ) -> Result<(), ServiceError> {
+    pub async fn retry_actor_stop(&self, local_ref: LocalActorRef) -> Result<(), ServiceError> {
         self.hosts
             .retry_stop(local_ref)
             .await
@@ -78,7 +84,7 @@ impl LatticeService {
 
     pub async fn force_stop_actor(
         &self,
-        local_ref: lattice_actor::watch::LocalActorRef,
+        local_ref: LocalActorRef,
         reason: &str,
         ticket: &str,
     ) -> Result<(), ServiceError> {
@@ -104,7 +110,7 @@ impl LatticeService {
         &self,
         target: impl Into<RecipientRef<P>>,
         request: R,
-        timeout: std::time::Duration,
+        timeout: Duration,
     ) -> Result<R::Response, RecipientError>
     where
         P: SupportsAsk<R>,
@@ -116,28 +122,25 @@ impl LatticeService {
     pub async fn watch<P: ProtocolTag>(
         &self,
         target: &ActorRef<P>,
-    ) -> Result<lattice_remoting::watch::WatchId, RecipientError> {
+    ) -> Result<WatchId, RecipientError> {
         self.actor_system.watch(target).await
     }
 
     pub async fn watch_entity_current<P: ProtocolTag>(
         &self,
         target: &EntityRef<P>,
-    ) -> Result<lattice_remoting::watch::WatchId, RecipientError> {
+    ) -> Result<WatchId, RecipientError> {
         self.actor_system.watch_entity_current(target).await
     }
 
     pub async fn watch_singleton_current<P: ProtocolTag>(
         &self,
         target: &SingletonRef<P>,
-    ) -> Result<lattice_remoting::watch::WatchId, RecipientError> {
+    ) -> Result<WatchId, RecipientError> {
         self.actor_system.watch_singleton_current(target).await
     }
 
-    pub async fn unwatch(
-        &self,
-        watch_id: lattice_remoting::watch::WatchId,
-    ) -> Result<(), RecipientError> {
+    pub async fn unwatch(&self, watch_id: WatchId) -> Result<(), RecipientError> {
         self.actor_system.unwatch(watch_id).await
     }
 
@@ -153,20 +156,14 @@ impl LatticeService {
         &self.supervisor
     }
 
-    pub fn watch_status(
-        &self,
-        watch_id: lattice_remoting::watch::WatchId,
-    ) -> lattice_remoting::watch::WatchStatus {
+    pub fn watch_status(&self, watch_id: WatchId) -> WatchStatus {
         self.watches
             .lock()
             .expect("watch registry poisoned")
             .status(watch_id)
     }
 
-    pub fn coordinator(
-        &self,
-        domain: &lattice_core::actor_ref::PlacementDomainId,
-    ) -> Option<CoordinatorHandle> {
+    pub fn coordinator(&self, domain: &PlacementDomainId) -> Option<CoordinatorHandle> {
         self.coordinator_handles
             .lock()
             .expect("service Coordinator handles poisoned")
@@ -194,18 +191,15 @@ impl LatticeService {
         self.members.snapshot()
     }
 
-    pub fn subscribe_members(&self) -> tokio::sync::broadcast::Receiver<MemberEvent> {
+    pub fn subscribe_members(&self) -> Receiver<MemberEvent> {
         self.members.subscribe()
     }
 
     pub async fn connect_member(&self, node: &NodeKey) -> Result<Arc<Association>, ServiceError> {
         match self.peers.connect(node).await {
             Ok(association) => Ok(association),
-            Err(crate::cluster::peers::PeerError::Endpoint(error)) => {
-                Err(ServiceError::Endpoint(error))
-            }
-            Err(crate::cluster::peers::PeerError::NotAuthoritativeUp)
-            | Err(crate::cluster::peers::PeerError::Directory(_)) => {
+            Err(PeerError::Endpoint(error)) => Err(ServiceError::Endpoint(error)),
+            Err(PeerError::NotAuthoritativeUp) | Err(PeerError::Directory(_)) => {
                 Err(ServiceError::CoordinatorUnavailable)
             }
         }
@@ -268,9 +262,13 @@ impl LatticeService {
                         .iter()
                         .map(|(scope, state)| {
                             let state = match state {
-                                lattice_placement::runtime::host::CoordinatorHostScopeState::Active(_) => crate::lifecycle::CoordinatorScopeState::Active,
-                                lattice_placement::runtime::host::CoordinatorHostScopeState::Standby => crate::lifecycle::CoordinatorScopeState::Standby,
-                                lattice_placement::runtime::host::CoordinatorHostScopeState::Failed => crate::lifecycle::CoordinatorScopeState::Failed,
+                                CoordinatorHostScopeState::Active(_) => {
+                                    CoordinatorScopeState::Active
+                                }
+                                CoordinatorHostScopeState::Standby => {
+                                    CoordinatorScopeState::Standby
+                                }
+                                CoordinatorHostScopeState::Failed => CoordinatorScopeState::Failed,
                             };
                             (scope.clone(), state)
                         })
@@ -482,9 +480,10 @@ impl LatticeService {
                             result
                         }
                         AuthorityEffect::StopSlot => {
-                            let result = router.stop_fenced_slot(slot.clone()).await.map_err(|_| {
-                                lattice_placement::session::LogicSessionError::ControlClosed
-                            });
+                            let result = router
+                                .stop_fenced_slot(slot.clone())
+                                .await
+                                .map_err(|_| LogicSessionError::ControlClosed);
                             let mut blockers = drain_blockers.borrow().clone();
                             if let Some(slots) = blockers.get_mut(&domain) {
                                 slots.remove(&slot);
@@ -516,7 +515,7 @@ impl LatticeService {
             .map_err(ServiceError::Endpoint)
     }
 
-    pub async fn leave(&self, deadline: tokio::time::Instant) -> Result<(), ServiceError> {
+    pub async fn leave(&self, deadline: Instant) -> Result<(), ServiceError> {
         match self.node_lifecycle_state() {
             NodeLifecycleState::Terminated => return Ok(()),
             NodeLifecycleState::Booting => {
@@ -587,9 +586,8 @@ impl LatticeService {
                         .any(|member| member.node.incarnation == local_incarnation)
                     {
                         match tokio::time::timeout_at(deadline, membership_events.recv()).await {
-                            Ok(Ok(_))
-                            | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-                            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                            Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => {}
+                            Ok(Err(RecvError::Closed)) => {
                                 return Err(ServiceError::CoordinatorUnavailable);
                             }
                             Err(_) => return Err(self.drain_timeout_error()),
@@ -609,7 +607,7 @@ impl LatticeService {
     }
 
     pub async fn shutdown(&self) -> Result<(), ServiceError> {
-        let deadline = tokio::time::Instant::now() + self.join_config.leave_timeout;
+        let deadline = Instant::now() + self.join_config.leave_timeout;
         self.leave(deadline).await
     }
 
@@ -631,8 +629,7 @@ impl LatticeService {
             state = NodeLifecycleState::Draining;
         }
         let membership = {
-            self
-                .membership_handle
+            self.membership_handle
                 .lock()
                 .expect("membership handle poisoned")
                 .clone()
@@ -671,8 +668,7 @@ impl LatticeService {
     }
 
     pub async fn force_shutdown(&self) -> Result<(), ServiceError> {
-        self.force_actor_shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.force_actor_shutdown.store(true, Ordering::Release);
         let state = self.node_lifecycle_state();
         if state == NodeLifecycleState::Terminated {
             return Ok(());
@@ -690,9 +686,7 @@ impl LatticeService {
     }
 
     async fn stop_components(&self) -> Result<(), ServiceError> {
-        let force = self
-            .force_actor_shutdown
-            .load(std::sync::atomic::Ordering::Acquire);
+        let force = self.force_actor_shutdown.load(Ordering::Acquire);
         let remaining_actor_cells = if force {
             let ticket = format!("force-shutdown-{}", uuid::Uuid::new_v4());
             self.hosts
@@ -703,7 +697,7 @@ impl LatticeService {
         };
         if !remaining_actor_cells.is_empty() {
             return Err(ServiceError::InterventionRequired(
-                crate::lifecycle::LifecycleInterventionReport {
+                LifecycleInterventionReport {
                     blocked_slots: BTreeMap::new(),
                     retained_actor_cells: remaining_actor_cells
                         .into_iter()
@@ -761,7 +755,7 @@ impl LatticeService {
             .filter(|(_, slots)| !slots.is_empty())
             .map(|(domain, slots)| (domain.clone(), slots.iter().cloned().collect()))
             .collect();
-        let report = crate::lifecycle::LifecycleInterventionReport {
+        let report = LifecycleInterventionReport {
             blocked_slots,
             retained_actor_cells: Vec::new(),
         };

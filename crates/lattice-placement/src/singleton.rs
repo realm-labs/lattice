@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::Duration};
 
 use bytes::Bytes;
 use lattice_core::actor_ref::{
@@ -7,9 +7,11 @@ use lattice_core::actor_ref::{
 };
 use thiserror::Error;
 
-use crate::authority::{AuthorityEffect, AuthorityError, AuthorityEvent, PlacementAuthority};
-use crate::region::BufferedMessageMode;
-use crate::types::{MonotonicTime, NodeKey};
+use crate::{
+    authority::{AuthorityEffect, AuthorityError, AuthorityEvent, PlacementAuthority},
+    region::BufferedMessageMode,
+    types::{MonotonicTime, NodeKey},
+};
 
 pub struct SingletonManager {
     pub domain: PlacementDomainId,
@@ -22,7 +24,7 @@ impl SingletonManager {
         domain: PlacementDomainId,
         kind: SingletonKind,
         local_node: NodeKey,
-        safety_margin: std::time::Duration,
+        safety_margin: Duration,
     ) -> Result<Self, SingletonError> {
         Ok(Self {
             domain,
@@ -161,9 +163,7 @@ impl SingletonProxy {
             return Err(SingletonError::Unavailable);
         }
         let residence_deadline = now
-            .checked_add(std::time::Duration::from_millis(
-                self.config.maximum_buffer_age_millis,
-            ))
+            .checked_add(Duration::from_millis(self.config.maximum_buffer_age_millis))
             .ok_or(SingletonError::InvalidTime)?;
         let expires_at = match mode {
             BufferedMessageMode::Tell => residence_deadline,

@@ -1,18 +1,21 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_core::actor_ref::{ActorRef, ProtocolId};
-use lattice_remoting::messaging::error::RemoteMessageError;
-use lattice_remoting::messaging::inbound::InboundDispatch;
-use lattice_remoting::messaging::target::ExactActorTarget;
+use lattice_remoting::messaging::{
+    error::RemoteMessageError, inbound::InboundDispatch, target::ExactActorTarget,
+};
 use thiserror::Error;
 
-use crate::protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol};
-use crate::registry::{ActorCellDiagnostics, ActorRegistry};
-use crate::traits::Actor;
+use crate::{
+    error::ActorCallError,
+    handle::{ActorHandle, ActorTerminationSubscription},
+    protocol::{ActorProtocolBinding, DispatchError, DispatchMode, DispatchReply, Protocol},
+    registry::{ActorCellDiagnostics, ActorQuarantineError, ActorRegistry},
+    traits::Actor,
+    watch::LocalActorRef,
+};
 
 #[async_trait]
 trait ErasedActorHost: Send + Sync {
@@ -21,20 +24,20 @@ trait ErasedActorHost: Send + Sync {
     fn subscribe_terminated(
         &self,
         target: &ExactActorTarget,
-    ) -> Option<crate::handle::ActorTerminationSubscription>;
+    ) -> Option<ActorTerminationSubscription>;
     async fn drain_all(&self) -> Vec<ActorCellDiagnostics>;
     async fn force_shutdown_all(&self, reason: &str, ticket: &str) -> Vec<ActorCellDiagnostics>;
     fn live_cells(&self) -> Vec<ActorCellDiagnostics>;
     async fn retry_stop(
         &self,
-        local_ref: crate::watch::LocalActorRef,
-    ) -> Option<Result<(), crate::registry::ActorQuarantineError>>;
+        local_ref: LocalActorRef,
+    ) -> Option<Result<(), ActorQuarantineError>>;
     async fn force_stop(
         &self,
-        local_ref: crate::watch::LocalActorRef,
+        local_ref: LocalActorRef,
         reason: &str,
         ticket: &str,
-    ) -> Option<Result<(), crate::registry::ActorQuarantineError>>;
+    ) -> Option<Result<(), ActorQuarantineError>>;
 
     async fn tell(
         &self,
@@ -63,10 +66,7 @@ impl<A: Actor, P: Protocol> ActorHost<A, P> {
         Self { registry, protocol }
     }
 
-    fn resolve(
-        &self,
-        target: &ExactActorTarget,
-    ) -> Result<crate::handle::ActorHandle<A>, RemoteMessageError> {
+    fn resolve(&self, target: &ExactActorTarget) -> Result<ActorHandle<A>, RemoteMessageError> {
         let reference = ActorRef::new(
             target.cluster_id.clone(),
             target.node_address.clone(),
@@ -95,7 +95,7 @@ impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
     fn subscribe_terminated(
         &self,
         target: &ExactActorTarget,
-    ) -> Option<crate::handle::ActorTerminationSubscription> {
+    ) -> Option<ActorTerminationSubscription> {
         self.resolve(target)
             .ok()
             .map(|handle| handle.subscribe_terminated())
@@ -116,8 +116,8 @@ impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
 
     async fn retry_stop(
         &self,
-        local_ref: crate::watch::LocalActorRef,
-    ) -> Option<Result<(), crate::registry::ActorQuarantineError>> {
+        local_ref: LocalActorRef,
+    ) -> Option<Result<(), ActorQuarantineError>> {
         self.registry
             .live_cells()
             .iter()
@@ -129,10 +129,10 @@ impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
 
     async fn force_stop(
         &self,
-        local_ref: crate::watch::LocalActorRef,
+        local_ref: LocalActorRef,
         reason: &str,
         ticket: &str,
-    ) -> Option<Result<(), crate::registry::ActorQuarantineError>> {
+    ) -> Option<Result<(), ActorQuarantineError>> {
         self.registry
             .live_cells()
             .iter()
@@ -245,7 +245,7 @@ impl ProtocolHostRegistry {
     pub fn subscribe_terminated(
         &self,
         target: &ExactActorTarget,
-    ) -> Option<crate::handle::ActorTerminationSubscription> {
+    ) -> Option<ActorTerminationSubscription> {
         self.hosts
             .get(&target.protocol_id.get())
             .and_then(|host| host.subscribe_terminated(target))
@@ -278,10 +278,7 @@ impl ProtocolHostRegistry {
             .collect()
     }
 
-    pub async fn retry_stop(
-        &self,
-        local_ref: crate::watch::LocalActorRef,
-    ) -> Result<(), HostAdminError> {
+    pub async fn retry_stop(&self, local_ref: LocalActorRef) -> Result<(), HostAdminError> {
         for host in self.hosts.values() {
             if let Some(result) = host.retry_stop(local_ref).await {
                 return result.map_err(HostAdminError::Actor);
@@ -292,7 +289,7 @@ impl ProtocolHostRegistry {
 
     pub async fn force_stop(
         &self,
-        local_ref: crate::watch::LocalActorRef,
+        local_ref: LocalActorRef,
         reason: &str,
         ticket: &str,
     ) -> Result<(), HostAdminError> {
@@ -349,12 +346,10 @@ fn map_dispatch(error: DispatchError) -> RemoteMessageError {
         }
         DispatchError::MissingDeadline => RemoteMessageError::DeadlineExceeded,
         DispatchError::MailboxRejected => RemoteMessageError::MailboxRejected,
-        DispatchError::Actor(crate::error::ActorCallError::DeadlineExceeded) => {
+        DispatchError::Actor(ActorCallError::DeadlineExceeded) => {
             RemoteMessageError::DeadlineExceeded
         }
-        DispatchError::Actor(crate::error::ActorCallError::ActorPanicked) => {
-            RemoteMessageError::ActorPanicked
-        }
+        DispatchError::Actor(ActorCallError::ActorPanicked) => RemoteMessageError::ActorPanicked,
         DispatchError::Actor(_) => RemoteMessageError::HandlerFailed,
     }
 }
@@ -374,5 +369,5 @@ pub enum HostAdminError {
     #[error("Actor cell {0} is not registered on this service")]
     NotFound(u64),
     #[error(transparent)]
-    Actor(#[from] crate::registry::ActorQuarantineError),
+    Actor(#[from] ActorQuarantineError),
 }

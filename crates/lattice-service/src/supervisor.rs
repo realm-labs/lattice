@@ -1,8 +1,6 @@
-use std::future::Future;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::{future::Future, sync::Mutex, time::Duration};
 
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time::Instant};
 
 use crate::error::ServiceError;
 
@@ -38,16 +36,16 @@ impl TaskSupervisor {
     pub async fn shutdown(&self, timeout: Duration) -> Result<(), ServiceError> {
         let tasks =
             std::mem::take(&mut *self.tasks.lock().expect("service task supervisor poisoned"));
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         for mut task in tasks {
-            let now = tokio::time::Instant::now();
+            let now = Instant::now();
             if now < deadline && tokio::time::timeout_at(deadline, &mut task).await.is_ok() {
                 continue;
             }
             task.abort();
             let _ = task.await;
         }
-        if tokio::time::Instant::now() > deadline {
+        if Instant::now() > deadline {
             Err(ServiceError::ShutdownTimeout)
         } else {
             Ok(())

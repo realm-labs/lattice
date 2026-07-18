@@ -1,13 +1,18 @@
-use std::marker::PhantomData;
+use std::{
+    fmt::{Debug, Formatter, Result as FmtResult},
+    marker::PhantomData,
+};
 
 use async_trait::async_trait;
 use lattice_actor::traits::Request;
 use lattice_core::kind::ActorKind;
 use prost::Message as ProstMessage;
 
-use crate::error::GatewayError;
-use crate::frame::ClientFrame;
-use crate::route::{GatewayRouteContext, GatewayRouteSpec, MessageRouter, RouteDecision};
+use crate::{
+    error::GatewayError,
+    frame::ClientFrame,
+    route::{GatewayRouteContext, GatewayRouteSpec, MessageRouter, RouteDecision},
+};
 
 #[async_trait]
 pub trait GatewayRecipient<M>: Clone + Send + Sync + 'static
@@ -25,8 +30,8 @@ pub struct ProstClientMessageBinding<M> {
     _marker: PhantomData<fn() -> M>,
 }
 
-impl<M> std::fmt::Debug for ProstClientMessageBinding<M> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<M> Debug for ProstClientMessageBinding<M> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         formatter
             .debug_struct("ProstClientMessageBinding")
             .field("msg_id", &self.msg_id)

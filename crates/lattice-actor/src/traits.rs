@@ -1,15 +1,16 @@
-use async_trait::async_trait;
-use std::any::Any;
-use std::error::Error as StdError;
-use std::time::Instant;
+use std::{any::Any, error::Error as StdError, time::Instant};
 
-use crate::context::ActorContext;
-use crate::error::ActorStopError;
-use crate::mailbox::MailboxConfig;
-use crate::reply::ReplyTo;
-use lattice_core::actor_ref::{EntityId, ProtocolId};
-use lattice_core::id::ActorId;
+use async_trait::async_trait;
+use lattice_core::{
+    actor_ref::{EntityId, ProtocolId},
+    id::ActorId,
+};
 use thiserror::Error;
+
+use crate::{
+    context::ActorContext, error::ActorStopError, mailbox::MailboxConfig, reply::ReplyTo,
+    runtime::ActorExecutionPolicy,
+};
 
 /// A one-way message handled without a reply channel.
 pub trait Message: Send + 'static {}
@@ -273,7 +274,7 @@ pub struct ChildActorOptions {
     pub supervision: ChildSupervision,
     pub protocol_id: Option<ProtocolId>,
     /// Execution policy used to run this child.
-    pub execution: crate::runtime::ActorExecutionPolicy,
+    pub execution: ActorExecutionPolicy,
     /// Affinity key used only by [`crate::runtime::ActorExecutionPolicy::KeyedWorkerPool`].
     pub scheduler_key: Option<ActorId>,
 }
@@ -284,7 +285,7 @@ impl Default for ChildActorOptions {
             mailbox: MailboxConfig::default(),
             supervision: ChildSupervision::default(),
             protocol_id: None,
-            execution: crate::runtime::ActorExecutionPolicy::TaskPerActor,
+            execution: ActorExecutionPolicy::TaskPerActor,
             scheduler_key: None,
         }
     }

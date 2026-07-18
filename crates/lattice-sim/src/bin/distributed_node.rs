@@ -1,89 +1,88 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    io::{Error as IoError, ErrorKind},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
 use clap::{Parser, ValueEnum};
-use lattice_actor::actor_protocol;
-use lattice_actor::context::ActorContext;
-use lattice_actor::directory::ActivationDirectory;
-use lattice_actor::error::ActorError;
-use lattice_actor::protocol::CodecDescriptor;
-use lattice_actor::protocol::DecodeError;
-use lattice_actor::protocol::EncodeError;
-use lattice_actor::protocol::WireCodec;
-use lattice_actor::registry::{ActorCreateContext, ActorLoader};
-use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
-use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::{Actor, Handler, Responder};
+use lattice_actor::{
+    actor_protocol,
+    context::ActorContext,
+    directory::ActivationDirectory,
+    error::ActorError,
+    protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec},
+    registry::{
+        ActorCreateContext, ActorLoader, ActorRefConfig, ActorRegistry, ActorRegistryConfig,
+    },
+    reply::ReplyTo,
+    traits::{Actor, ChildActorKey, ChildActorOptions, Handler, Responder},
+};
 use lattice_config::store::ConfigStore;
-use lattice_config_etcd::config::EtcdConfigStoreConfig;
-use lattice_config_etcd::store::EtcdConfigStore;
-use lattice_core::actor_kind;
-use lattice_core::actor_ref::{
-    ActorRef, ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation,
-    PlacementDomainId, ProtocolId,
+use lattice_config_etcd::{config::EtcdConfigStoreConfig, store::EtcdConfigStore};
+use lattice_core::{
+    actor_kind,
+    actor_ref::{
+        ActorRef, ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation,
+        PlacementDomainId, ProtocolId,
+    },
+    coordinator::CoordinatorScope,
+    id::ActorId,
+    instance::InstanceId,
+    kind::ServiceKind,
+    service_context::ServiceContext,
 };
-use lattice_core::coordinator::CoordinatorScope;
-use lattice_core::id::ActorId;
-use lattice_core::instance::InstanceId;
-use lattice_core::kind::ServiceKind;
-use lattice_core::service_context::ServiceContext;
-use lattice_discovery::config_store::ConfigStoreDiscovery;
-use lattice_discovery::provider::CoordinatorDiscovery;
-use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
-use lattice_placement::control::{
-    DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
-    encode_control_command,
+use lattice_discovery::{
+    config_store::ConfigStoreDiscovery,
+    provider::CoordinatorDiscovery,
+    static_provider::{StaticDiscovery, StaticEndpoint},
 };
-use lattice_placement::coordinator::SnapshotLimits;
-use lattice_placement::coordinator::SnapshotRecord;
-use lattice_placement::coordinator::SnapshotVersion;
-use lattice_placement::coordinator::build_snapshot;
-use lattice_placement::coordinator::{MemberHello, PlacementDomainHello};
-use lattice_placement::coordinator::{MemberRecord, MemberStatus};
-use lattice_placement::region::EntityConfig;
-use lattice_placement::runtime::CoordinatorRuntimeError;
-use lattice_placement::runtime::host::{CoordinatorHost, CoordinatorHostConfig};
-use lattice_placement::runtime::{PlacementDomainLeader, PlacementDomainLeaderConfig};
-use lattice_placement::session::LogicCoordinatorConfig;
-use lattice_placement::session::PlacementDomainSession;
-use lattice_placement::storage::InMemoryPlacementStore;
-use lattice_placement::storage::ScopedElectionStore;
-use lattice_placement::storage::StorageError;
-use lattice_placement::storage::domain::DurableStorageLimits;
-use lattice_placement::storage::etcd::{EtcdPlacementConfig, EtcdPlacementStore};
-use lattice_placement::types::AssignmentGeneration;
-use lattice_placement::types::ClaimGrant;
-use lattice_placement::types::CoordinatorTerm;
-use lattice_placement::types::GrantSequence;
-use lattice_placement::types::MembershipVersion;
-use lattice_placement::types::NodeKey;
-use lattice_placement::types::PlacementSlot;
-use lattice_placement::types::PlacementSlotKey;
-use lattice_placement::types::PlacementSlotState;
-use lattice_placement::types::PlacementVersion;
-use lattice_placement::types::Revision;
-use lattice_remoting::association::AssociationKey;
-use lattice_remoting::association::AssociationManager;
-use lattice_remoting::association::LaneAttachment;
-use lattice_remoting::association::LaneKind;
-use lattice_remoting::config::RemotingConfig;
-use lattice_remoting::control::CommandId;
-use lattice_remoting::control::ControlDispatch;
-use lattice_remoting::handshake::NodeIdentity;
-use lattice_remoting::watch::WatchStatus;
-use lattice_service::builder::LatticeService;
-use lattice_service::builder::LatticeServiceBuilder;
-use lattice_service::cluster::{DomainLogicalRouter, LogicalBufferConfig};
-use lattice_service::config::ClusterJoinConfig;
-use lattice_service::config::NodeConfig;
-use lattice_service::lifecycle::NodeLifecycleState;
+use lattice_placement::{
+    control::{
+        DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
+        encode_control_command,
+    },
+    coordinator::{
+        MemberHello, MemberRecord, MemberStatus, PlacementDomainHello, SnapshotLimits,
+        SnapshotRecord, SnapshotVersion, build_snapshot,
+    },
+    region::EntityConfig,
+    runtime::{
+        CoordinatorRuntimeError, PlacementDomainLeader, PlacementDomainLeaderConfig,
+        host::{CoordinatorHost, CoordinatorHostConfig},
+    },
+    session::{LogicCoordinatorConfig, PlacementDomainSession},
+    storage::{
+        InMemoryPlacementStore, ScopedElectionStore, StorageError,
+        domain::DurableStorageLimits,
+        etcd::{EtcdPlacementConfig, EtcdPlacementStore},
+    },
+    types::{
+        AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, MembershipVersion,
+        NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState, PlacementVersion, Revision,
+    },
+};
+use lattice_remoting::{
+    association::{AssociationKey, AssociationManager, LaneAttachment, LaneKind},
+    config::RemotingConfig,
+    control::{CommandId, ControlDispatch},
+    handshake::NodeIdentity,
+    watch::WatchStatus,
+};
+use lattice_service::{
+    builder::{LatticeService, LatticeServiceBuilder},
+    cluster::{DomainLogicalRouter, LogicalBufferConfig},
+    config::{ClusterJoinConfig, NodeConfig},
+    lifecycle::NodeLifecycleState,
+};
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant as TokioInstant;
 
 const PROTOCOL_ID: u64 = 0x7369_6d00_0000_0001;
 
@@ -251,7 +250,7 @@ struct MonitorCommand {
 }
 
 impl EntityFixture {
-    fn owner(&self) -> Result<NodeKey, Box<dyn std::error::Error>> {
+    fn owner(&self) -> Result<NodeKey, Box<dyn Error>> {
         Ok(NodeKey {
             node_id: self.owner_node_id.clone(),
             address: self.owner_address.clone(),
@@ -269,16 +268,16 @@ impl Actor for PingActor {
             return Ok(());
         };
         let child = context.spawn_child(
-            lattice_actor::traits::ChildActorKey::new("remote-child"),
+            ChildActorKey::new("remote-child"),
             PingActor {
                 child_reference: None,
             },
-            lattice_actor::traits::ChildActorOptions {
+            ChildActorOptions {
                 protocol_id: Some(
                     ProtocolId::new(PROTOCOL_ID)
                         .map_err(|error| ActorError::new(error.to_string()))?,
                 ),
-                ..lattice_actor::traits::ChildActorOptions::default()
+                ..ChildActorOptions::default()
             },
         )?;
         let child_ref = child
@@ -335,7 +334,7 @@ actor_protocol! {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     match cli.role {
         Role::Server => server(cli.reference).await,
@@ -358,7 +357,7 @@ async fn discovery_coordinator(
     artifact: PathBuf,
     node_id: String,
     port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let cluster = ClusterId::new("docker-discovery")?;
     let address = NodeAddress::new(node_id.clone(), port)?;
     let incarnation = NodeIncarnation::generate();
@@ -408,7 +407,7 @@ async fn discovery_member(
     node_id: String,
     port: u16,
     config_store: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let coordinator = NodeAddress::new("discovery-coordinator", 29200)?;
     let scope = CoordinatorScope::Membership;
     let discovery: Arc<dyn CoordinatorDiscovery> = if config_store {
@@ -519,7 +518,7 @@ async fn discovery_member(
     })
     .await?;
     service
-        .leave(tokio::time::Instant::now() + Duration::from_secs(5))
+        .leave(TokioInstant::now() + Duration::from_secs(5))
         .await?;
     write_discovery_artifact(
         &artifact,
@@ -536,12 +535,12 @@ async fn discovery_member(
 }
 
 fn write_discovery_artifact(
-    artifact: &std::path::Path,
+    artifact: &Path,
     service: &LatticeService,
     node_id: &str,
     incarnation: NodeIncarnation,
     provider: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let members = service
         .member_snapshot()
         .members
@@ -562,7 +561,7 @@ fn write_discovery_artifact(
     Ok(())
 }
 
-async fn server(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+async fn server(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let cluster = ClusterId::new("docker-e2e")?;
     let address = NodeAddress::new("fixture-server", 25520)?;
     let incarnation = NodeIncarnation::generate();
@@ -606,17 +605,12 @@ async fn server(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn client(
-    reference: PathBuf,
-    expect_failure: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn client(reference: PathBuf, expect_failure: bool) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let encoded = loop {
         match std::fs::read(&reference) {
             Ok(encoded) => break encoded,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline =>
-            {
+            Err(error) if error.kind() == ErrorKind::NotFound && Instant::now() < deadline => {
                 tokio::task::yield_now().await;
             }
             Err(error) => return Err(Box::new(error)),
@@ -695,7 +689,7 @@ async fn client(
     Ok(())
 }
 
-async fn monitor(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+async fn monitor(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let encoded = wait_for_file(&reference).await?;
     let target: ActorRef<FixtureProtocol> = serde_json::from_slice(&encoded)?;
     let cluster = ClusterId::new("docker-e2e")?;
@@ -734,7 +728,7 @@ async fn monitor(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let command = match std::fs::read(&command_path) {
             Ok(encoded) => serde_json::from_slice::<MonitorCommand>(&encoded)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -764,7 +758,7 @@ async fn monitor(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let cluster = ClusterId::new("docker-e2e")?;
     let incarnation = NodeIncarnation::generate();
     let owner = NodeKey {
@@ -822,7 +816,7 @@ async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-async fn gateway(reference: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+async fn gateway(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let encoded = wait_for_file(&reference).await?;
     let fixture: EntityFixture = serde_json::from_slice(&encoded)?;
     let owner = fixture.owner()?;
@@ -890,7 +884,7 @@ fn entity_service(
     entity_config: EntityConfig,
     slot: &PlacementSlot,
     owns_slot: bool,
-) -> Result<EntityServiceFixture, Box<dyn std::error::Error>> {
+) -> Result<EntityServiceFixture, Box<dyn Error>> {
     let mut context = ServiceContext::builder(
         ServiceKind::from_static("distributed-entity-fixture"),
         InstanceId::new(node.node_id.clone()),
@@ -1015,7 +1009,7 @@ async fn install_fixture_snapshot(
     slot: &PlacementSlot,
     member: MemberRecord,
     owns_slot: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let limits = SnapshotLimits::default();
     let record = SnapshotRecord {
         key: match &slot.key {
@@ -1075,7 +1069,7 @@ async fn install_fixture_snapshot(
     Ok(())
 }
 
-async fn wait_for_node_ready(service: &LatticeService) -> Result<(), Box<dyn std::error::Error>> {
+async fn wait_for_node_ready(service: &LatticeService) -> Result<(), Box<dyn Error>> {
     let mut lifecycle = service.subscribe_node_lifecycle();
     tokio::time::timeout(Duration::from_secs(10), async {
         while *lifecycle.borrow() != NodeLifecycleState::Ready {

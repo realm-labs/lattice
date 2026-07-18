@@ -1,15 +1,26 @@
-use super::membership::plan_priority;
+use std::time::SystemTime;
+
+use lattice_core::{actor_ref::EntityType, failpoint::Failpoint};
+
 use super::{
     BTreeMap, CoordinatorInspection, CoordinatorLeaseStore, CoordinatorOperation,
     CoordinatorRuntimeError, ForceRemoveRequest, Instant, ManualRelocationRequest, MembershipStore,
     MoveProgress, NodeKey, PlacementDomainLeader, PlacementDomainStore, PlacementSlotKey,
     PlacementSlotState, PlanReason, PlanStatus, RebalancePlan, RebalanceProposal, RebalanceTrigger,
-    ScopedElectionStore,
+    ScopedElectionStore, membership::plan_priority,
 };
-use crate::storage::domain::{
-    AdminOperationRecord, AdminOperationResult, AdminOperationStatus, AutomaticBalanceSettings,
-    CommitAutomaticSettings, CompactAdminOperations, CreatePlan, CreatePlanWithOperation,
-    RecordAdminOperation, UpdatePlan, UpdatePlanWithOperation,
+use crate::{
+    allocation::{AllocationError, ProposedMove},
+    coordinator::MemberRemovalReason,
+    storage::{
+        StorageError,
+        domain::{
+            AdminOperationRecord, AdminOperationResult, AdminOperationStatus,
+            AutomaticBalanceSettings, CommitAutomaticSettings, CompactAdminOperations, CreatePlan,
+            CreatePlanWithOperation, RecordAdminOperation, UpdatePlan, UpdatePlanWithOperation,
+        },
+    },
+    types::{PlacementVersion, ShardId},
 };
 
 struct PlanAdminContext {
@@ -106,7 +117,7 @@ where
             }
         };
         if leadership_lost {
-            Err(crate::storage::StorageError::LeadershipLost.into())
+            Err(StorageError::LeadershipLost.into())
         } else {
             Ok(())
         }
@@ -121,20 +132,20 @@ where
             return;
         };
         match error {
-            crate::storage::StorageError::LeadershipLost => {
+            StorageError::LeadershipLost => {
                 self.leadership_loss_count = self.leadership_loss_count.saturating_add(1);
                 tracing::warn!(
                     operation_family = family,
                     "Coordinator leadership was fenced"
                 );
             }
-            crate::storage::StorageError::CompareFailed => {
+            StorageError::CompareFailed => {
                 self.commit_conflict_count = self.commit_conflict_count.saturating_add(1);
             }
-            crate::storage::StorageError::OutcomeUnknown => {
+            StorageError::OutcomeUnknown => {
                 self.unknown_outcome_count = self.unknown_outcome_count.saturating_add(1);
             }
-            crate::storage::StorageError::Capacity => {
+            StorageError::Capacity => {
                 self.capacity_rejection_count = self.capacity_rejection_count.saturating_add(1);
             }
             _ => {}
@@ -144,7 +155,7 @@ where
     pub(super) async fn set_automatic_paused(
         &mut self,
         operation_id: String,
-        entity_type: Option<lattice_core::actor_ref::EntityType>,
+        entity_type: Option<EntityType>,
         paused: bool,
     ) -> Result<(), CoordinatorRuntimeError> {
         let fingerprint = format!(
@@ -184,7 +195,7 @@ where
             AdminOperationResult::AutomaticBalanceUpdated,
             self.version.clone(),
         )?;
-        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::AdminBeforeGuardedCommit);
+        lattice_core::failpoint::hit(Failpoint::AdminBeforeGuardedCommit);
         let settings = self
             .store
             .commit_automatic_settings(
@@ -196,9 +207,7 @@ where
                 },
             )
             .await?;
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::AdminAfterCommitBeforeResponse,
-        );
+        lattice_core::failpoint::hit(Failpoint::AdminAfterCommitBeforeResponse);
         self.automatic_globally_paused = settings.globally_paused;
         self.paused_entity_types = settings.paused_entity_types.clone();
         self.automatic_settings = Some(settings);
@@ -276,7 +285,7 @@ where
                 target: Some(target.clone()),
                 bypass_improvement: true,
             },
-            moves: vec![crate::allocation::ProposedMove {
+            moves: vec![ProposedMove {
                 domain: config.domain.clone(),
                 entity_type: request.entity_type.clone(),
                 shard_id: request.shard_id,
@@ -327,11 +336,8 @@ where
             return Err(CoordinatorRuntimeError::StaleMember);
         }
         self.reserve_admin_operation_capacity().await?;
-        self.remove_member(
-            member,
-            crate::coordinator::MemberRemovalReason::ForceRemoved,
-        )
-        .await?;
+        self.remove_member(member, MemberRemovalReason::ForceRemoved)
+            .await?;
         let version = self.next_version()?;
         let operation = self.new_admin_operation(
             request.operation_id,
@@ -415,7 +421,7 @@ where
         operation_id: String,
         fingerprint: String,
         result: AdminOperationResult,
-        version: crate::types::PlacementVersion,
+        version: PlacementVersion,
     ) -> Result<AdminOperationRecord, CoordinatorRuntimeError> {
         if self.applied_admin_operations.len() >= self.config.maximum_admin_operation_records {
             return Err(CoordinatorRuntimeError::OperationCapacity);
@@ -507,14 +513,14 @@ where
 
     pub(super) async fn evaluate_rebalance(
         &mut self,
-        entity_type: lattice_core::actor_ref::EntityType,
+        entity_type: EntityType,
         trigger: RebalanceTrigger,
     ) -> Result<Option<u128>, CoordinatorRuntimeError> {
         if trigger == RebalanceTrigger::Automatic
             && (self.automatic_globally_paused || self.paused_entity_types.contains(&entity_type))
         {
             return Err(CoordinatorRuntimeError::Allocation(
-                crate::allocation::AllocationError::AutomaticPaused,
+                AllocationError::AutomaticPaused,
             ));
         }
         let config = self
@@ -553,7 +559,7 @@ where
     async fn evaluate_rebalance_operation(
         &mut self,
         operation_id: String,
-        entity_type: lattice_core::actor_ref::EntityType,
+        entity_type: EntityType,
         trigger: RebalanceTrigger,
     ) -> Result<Option<u128>, CoordinatorRuntimeError> {
         let fingerprint = format!("evaluate:{}:{trigger:?}", entity_type.as_str());
@@ -567,7 +573,7 @@ where
             && (self.automatic_globally_paused || self.paused_entity_types.contains(&entity_type))
         {
             return Err(CoordinatorRuntimeError::Allocation(
-                crate::allocation::AllocationError::AutomaticPaused,
+                AllocationError::AutomaticPaused,
             ));
         }
         let config = self
@@ -624,7 +630,7 @@ where
     pub(super) async fn submit_rebalance(
         &mut self,
         proposal: RebalanceProposal,
-        entity_type: lattice_core::actor_ref::EntityType,
+        entity_type: EntityType,
     ) -> Result<u128, CoordinatorRuntimeError> {
         self.submit_rebalance_inner(proposal, entity_type, None)
             .await
@@ -633,7 +639,7 @@ where
     async fn submit_rebalance_inner(
         &mut self,
         proposal: RebalanceProposal,
-        entity_type: lattice_core::actor_ref::EntityType,
+        entity_type: EntityType,
         admin: Option<PlanAdminContext>,
     ) -> Result<u128, CoordinatorRuntimeError> {
         if proposal.base_version != self.version
@@ -680,7 +686,7 @@ where
                 )
             })
             .transpose()?;
-        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::PlanBeforeGuardedCommit);
+        lattice_core::failpoint::hit(Failpoint::PlanBeforeGuardedCommit);
         if let Some(operation) = operation.clone() {
             self.store
                 .create_plan_with_operation(
@@ -698,7 +704,7 @@ where
                 .create_plan(&self.leader_guard, CreatePlan { plan: plan.clone() })
                 .await?;
         }
-        lattice_core::failpoint::hit(lattice_core::failpoint::Failpoint::RebalanceAfterPlanPersist);
+        lattice_core::failpoint::hit(Failpoint::RebalanceAfterPlanPersist);
         self.plans.insert(plan_id, plan);
         self.start_pending_moves(plan_id).await?;
         if operation.is_some() {
@@ -817,7 +823,7 @@ where
         &mut self,
         operation_id: String,
         plan_id: u128,
-        shard_id: crate::types::ShardId,
+        shard_id: ShardId,
     ) -> Result<(), CoordinatorRuntimeError> {
         let fingerprint = format!("cancel:{plan_id:032x}:{}", shard_id.get());
         if let Some(previous) = self.prior_admin_operation(&operation_id, &fingerprint)? {
@@ -869,13 +875,13 @@ fn operation_lost_leadership<T>(result: &Result<T, CoordinatorRuntimeError>) -> 
     matches!(
         result,
         Err(CoordinatorRuntimeError::Storage(
-            crate::storage::StorageError::LeadershipLost
+            StorageError::LeadershipLost
         ))
     )
 }
 
 fn unix_millis() -> Result<u64, CoordinatorRuntimeError> {
-    std::time::SystemTime::now()
+    SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .map_err(|_| CoordinatorRuntimeError::InvalidAdminOperation)

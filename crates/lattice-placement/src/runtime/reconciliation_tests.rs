@@ -1,25 +1,31 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
-use lattice_core::actor_ref::{ConfigFingerprint, NodeAddress, NodeIncarnation, PlacementDomainId};
-use lattice_core::coordinator::CoordinatorScope;
-use lattice_remoting::association::AssociationManager;
-use lattice_remoting::config::RemotingConfig;
+use lattice_core::{
+    actor_ref::{ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId},
+    coordinator::CoordinatorScope,
+};
+use lattice_remoting::{association::AssociationManager, config::RemotingConfig};
 
 use super::{PlacementDomainLeader, PlacementDomainLeaderConfig};
-use crate::coordinator::{
-    DomainMemberRecord, DomainMemberStatus, LeaderRecord, MemberHello, MemberRecord, MemberStatus,
-    MembershipLeaderGuard, PlacementDomainHello, PlacementLeaderGuard,
-};
-use crate::storage::domain::{AllocateInitial, CreateDomainMember, CreateMember, LeasedClaim};
-use crate::storage::{
-    CoordinatorLeaseStore, InMemoryPlacementStore, MembershipStore, PlacementDomainStore,
-    ScopedElectionStore,
-};
-use crate::types::{
-    AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, MembershipVersion, NodeKey,
-    PlacementSlot, PlacementSlotKey, PlacementSlotState, PlacementVersion, Revision, ShardId,
+use crate::{
+    coordinator::{
+        DomainMemberRecord, DomainMemberStatus, LeaderRecord, MemberHello, MemberRecord,
+        MemberStatus, MembershipLeaderGuard, PlacementDomainHello, PlacementLeaderGuard,
+    },
+    storage::{
+        CoordinatorLeaseStore, InMemoryPlacementStore, MembershipStore, PlacementDomainStore,
+        ScopedElectionStore,
+        domain::{AllocateInitial, CreateDomainMember, CreateMember, LeasedClaim},
+    },
+    types::{
+        AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, MembershipVersion,
+        NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState, PlacementVersion, Revision,
+        ShardId,
+    },
 };
 
 fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
@@ -38,7 +44,7 @@ fn slot(owner: NodeKey, version: PlacementVersion) -> PlacementSlot {
     PlacementSlot {
         key: PlacementSlotKey::Shard {
             domain: version.domain.clone(),
-            entity_type: lattice_core::actor_ref::EntityType::new("reconcile").unwrap(),
+            entity_type: EntityType::new("reconcile").unwrap(),
             shard_id: ShardId::new(1),
         },
         config_fingerprint: ConfigFingerprint::new([3; 32]),
@@ -265,7 +271,7 @@ async fn automatic_pause_and_operation_result_survive_leader_failover() {
     )
     .await
     .unwrap();
-    let entity = lattice_core::actor_ref::EntityType::new("paused").unwrap();
+    let entity = EntityType::new("paused").unwrap();
     first
         .set_automatic_paused("pause-stable".to_owned(), Some(entity.clone()), true)
         .await

@@ -1,23 +1,27 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::BTreeSet, error::Error as StdError, io::Error as IoError, sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use lattice_actor::actor_protocol;
-use lattice_actor::context::ActorContext;
-use lattice_actor::error::ActorError;
-use lattice_actor::protocol::ProstCodec;
-use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig};
-use lattice_actor::reply::ReplyTo;
-use lattice_actor::traits::{Actor, Responder};
-use lattice_core::actor_kind;
-use lattice_core::actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation};
-use lattice_core::id::ActorId;
+use lattice_actor::{
+    actor_protocol,
+    context::ActorContext,
+    error::ActorError,
+    protocol::ProstCodec,
+    registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig},
+    reply::ReplyTo,
+    traits::{Actor, Responder},
+};
+use lattice_core::{
+    actor_kind,
+    actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation},
+    id::ActorId,
+};
 use lattice_remoting::config::RemotingConfig;
-use lattice_service::builder::LatticeService;
-use lattice_service::config::NodeConfig;
+use lattice_service::{builder::LatticeService, config::NodeConfig};
 
 pub mod lattice {
     pub mod actor {
@@ -123,7 +127,7 @@ actor_protocol! {
     }
 }
 
-pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn std::error::Error>> {
+pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
     let cluster_id = ClusterId::new("distributed-login")?;
     let address = NodeAddress::new("127.0.0.1", 25530)?;
     let incarnation = NodeIncarnation::generate();
@@ -151,7 +155,7 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn std::error::Error>
         .await?;
     let actor_ref: ActorRef<WorldProtocol> = handle
         .typed_actor_ref()?
-        .ok_or_else(|| std::io::Error::other("missing exact World ActorRef"))?;
+        .ok_or_else(|| IoError::other("missing exact World ActorRef"))?;
     let service = LatticeService::builder(NodeConfig {
         cluster_id,
         node_id: "world-a".to_owned(),

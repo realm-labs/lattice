@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::{collections::BTreeMap, error::Error, path::PathBuf};
 
-use lattice_placement::storage::domain::DurableStorageLimits;
-use lattice_placement::storage::etcd::migration::{
-    CardinalityMode, MigrationConfig, MigrationDomainMapping, MigrationMode, execute,
-    execute_cardinality,
+use lattice_placement::storage::{
+    domain::DurableStorageLimits,
+    etcd::migration::{
+        CardinalityMode, MigrationConfig, MigrationDomainMapping, MigrationMode, execute,
+        execute_cardinality,
+    },
 };
 
 const USAGE: &str = "usage: lattice-placement-migrate \
@@ -31,7 +32,7 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let command = match args.next().as_deref() {
         Some("inspect") => Command::Migration(MigrationMode::Inspect),
@@ -103,16 +104,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn required<'a>(
     values: &'a BTreeMap<String, String>,
     name: &str,
-) -> Result<&'a str, Box<dyn std::error::Error>> {
+) -> Result<&'a str, Box<dyn Error>> {
     values
         .get(name)
         .map(String::as_str)
         .ok_or_else(|| USAGE.into())
 }
 
-fn number(
-    values: &BTreeMap<String, String>,
-    name: &str,
-) -> Result<usize, Box<dyn std::error::Error>> {
+fn number(values: &BTreeMap<String, String>, name: &str) -> Result<usize, Box<dyn Error>> {
     Ok(required(values, name)?.parse()?)
 }

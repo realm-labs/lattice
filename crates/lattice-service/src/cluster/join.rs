@@ -1,22 +1,30 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use futures_util::{StreamExt, stream};
+use lattice_core::coordinator::CoordinatorScope;
 use lattice_discovery::provider::{
     CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryOrigin, DiscoveryTarget,
 };
-use lattice_remoting::association::{Association, AssociationManager, AssociationState};
-use lattice_remoting::bootstrap::{
-    BootstrapHandler, BootstrapLeader, BootstrapProbeTarget, BootstrapRequest, BootstrapResult,
-    BootstrapRoute,
+use lattice_remoting::{
+    association::{Association, AssociationManager, AssociationState},
+    bootstrap::{
+        BootstrapHandler, BootstrapLeader, BootstrapProbeTarget, BootstrapRequest, BootstrapResult,
+        BootstrapRoute,
+    },
+    endpoint::{EndpointError, RemotingEndpoint},
+    handshake::NodeIdentity,
 };
-use lattice_remoting::endpoint::{EndpointError, RemotingEndpoint};
-use lattice_remoting::handshake::NodeIdentity;
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    sync::{mpsc, watch},
+    time::Instant,
+};
 
-use crate::config::ClusterJoinConfig;
+use crate::config::{ClusterJoinConfig, ClusterJoinConfigError};
 
 #[derive(Debug)]
 pub enum JoinEvent {
@@ -58,7 +66,7 @@ impl JoinController {
         events: mpsc::Sender<JoinEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) {
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let mut snapshots = self.discovery.snapshots();
         let mut latest = None;
         let mut discovery_closed = false;
@@ -116,7 +124,7 @@ impl JoinController {
                 continue;
             };
             attempt = attempt.saturating_add(1);
-            let probe_started = tokio::time::Instant::now();
+            let probe_started = Instant::now();
             match probe_snapshot(&self.endpoint, snapshot, self.config.probe_concurrency).await {
                 Ok(leader) => {
                     tracing::info!(
@@ -250,10 +258,7 @@ async fn probe_snapshot(
     select_leader(leaders)
 }
 
-fn probe_target(
-    scope: lattice_core::coordinator::CoordinatorScope,
-    target: DiscoveryTarget,
-) -> BootstrapProbeTarget {
+fn probe_target(scope: CoordinatorScope, target: DiscoveryTarget) -> BootstrapProbeTarget {
     let tls_server_name = target.source.origins().find_map(|origin| match origin {
         DiscoveryOrigin::Dns { server_name, .. } => Some(server_name.clone()),
         DiscoveryOrigin::Static { .. }
@@ -293,7 +298,7 @@ async fn establish_coordinator(
     match endpoint.connect_peer(leader.identity.clone()).await {
         Ok(association) => Ok(association),
         Err(EndpointError::WrongDialDirection) => {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 if let Some(association) = associations.get_exact(
                     &leader.identity.cluster_id,
@@ -303,7 +308,7 @@ async fn establish_coordinator(
                 {
                     return Ok(association);
                 }
-                if tokio::time::Instant::now() >= deadline {
+                if Instant::now() >= deadline {
                     return Err(JoinError::AssociationTimeout);
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -316,7 +321,7 @@ async fn establish_coordinator(
 #[derive(Debug)]
 pub struct BootstrapView {
     local: NodeIdentity,
-    leaders: RwLock<BTreeMap<lattice_core::coordinator::CoordinatorScope, BootstrapLeader>>,
+    leaders: RwLock<BTreeMap<CoordinatorScope, BootstrapLeader>>,
 }
 
 impl BootstrapView {
@@ -334,7 +339,7 @@ impl BootstrapView {
             .insert(leader.scope.clone(), leader);
     }
 
-    pub fn clear(&self, scope: &lattice_core::coordinator::CoordinatorScope) {
+    pub fn clear(&self, scope: &CoordinatorScope) {
         self.leaders
             .write()
             .expect("bootstrap leader view poisoned")
@@ -413,7 +418,7 @@ impl RetryBackoff {
 #[derive(Debug, Error)]
 pub enum JoinError {
     #[error("cluster join configuration is invalid")]
-    Config(#[source] crate::config::ClusterJoinConfigError),
+    Config(#[source] ClusterJoinConfigError),
     #[error("cluster discovery stream ended")]
     DiscoveryClosed,
     #[error("cluster join timed out")]
@@ -432,10 +437,11 @@ pub enum JoinError {
 
 #[cfg(test)]
 mod tests {
-    use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
-    use lattice_core::coordinator::CoordinatorScope;
-    use lattice_remoting::bootstrap::BootstrapLeader;
-    use lattice_remoting::handshake::NodeIdentity;
+    use lattice_core::{
+        actor_ref::{ClusterId, NodeAddress, NodeIncarnation},
+        coordinator::CoordinatorScope,
+    };
+    use lattice_remoting::{bootstrap::BootstrapLeader, handshake::NodeIdentity};
 
     use super::{JoinError, select_leader};
 

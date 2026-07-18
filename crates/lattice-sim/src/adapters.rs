@@ -1,37 +1,30 @@
 use bytes::Bytes;
-use lattice_core::actor_ref::PlacementDomainId;
-use lattice_core::actor_ref::{ActorRef, EntityId, NodeIncarnation, ProtocolTag};
-use lattice_placement::authority::AuthorityEffect;
-use lattice_placement::authority::AuthorityEvent;
-use lattice_placement::authority::PlacementAuthority;
-use lattice_placement::coordinator::CoordinatorDelta;
-use lattice_placement::coordinator::PlacementDomainState;
-use lattice_placement::handoff::HandoffEffect;
-use lattice_placement::handoff::HandoffEvent;
-use lattice_placement::handoff::HandoffMachine;
-use lattice_placement::plan::RebalancePlan;
-use lattice_placement::region::BufferedMessage;
-use lattice_placement::region::BufferedMessageMode;
-use lattice_placement::region::RouteDecision;
-use lattice_placement::region::ShardHome;
-use lattice_placement::region::ShardRegion;
-use lattice_placement::singleton::SingletonManager;
-use lattice_placement::types::MonotonicTime;
-use lattice_placement::types::ShardId;
-use lattice_remoting::association::AssociationId;
-use lattice_remoting::control::CommandId;
-use lattice_remoting::control::ControlApply;
-use lattice_remoting::control::ControlEnvelope;
-use lattice_remoting::control::ReliableControl;
-use lattice_remoting::messaging::target::ExactActorTarget;
-use lattice_remoting::watch::WatchCommand;
-use lattice_remoting::watch::WatchId;
-use lattice_remoting::watch::WatchRegistry;
-use lattice_service::lifecycle::NodeLifecycle;
-use lattice_service::lifecycle::NodeLifecycleState;
-use lattice_service::lifecycle::ServiceLifecycleEffect;
-use lattice_service::lifecycle::ServiceLifecycleError;
-use lattice_service::lifecycle::ServiceLifecycleEvent;
+use lattice_core::actor_ref::{
+    ActorRef, EntityId, NodeIncarnation, PlacementDomainId, ProtocolTag,
+};
+use lattice_placement::{
+    authority::{AuthorityEffect, AuthorityError, AuthorityEvent, PlacementAuthority},
+    coordinator::{
+        CoordinatorDelta, PlacementDomainState, PlacementDomainStateError, SnapshotInstall,
+    },
+    handoff::{HandoffEffect, HandoffError, HandoffEvent, HandoffMachine},
+    plan::{PlanError, RebalancePlan},
+    region::{
+        BufferedMessage, BufferedMessageMode, RegionError, RouteDecision, ShardHome, ShardRegion,
+    },
+    singleton::{SingletonError, SingletonManager},
+    types::{AssignmentGeneration, MonotonicTime, ShardId},
+};
+use lattice_remoting::{
+    association::AssociationId,
+    control::{CommandId, ControlApply, ControlEnvelope, ReliableControl, ReliableControlError},
+    messaging::target::ExactActorTarget,
+    watch::{WatchCommand, WatchError, WatchId, WatchRegistry},
+};
+use lattice_service::lifecycle::{
+    NodeLifecycle, NodeLifecycleState, ServiceLifecycleEffect, ServiceLifecycleError,
+    ServiceLifecycleEvent,
+};
 
 pub struct ControlAdapter {
     reducer: ReliableControl,
@@ -42,7 +35,7 @@ impl ControlAdapter {
         epoch: AssociationId,
         maximum_frames: usize,
         maximum_bytes: usize,
-    ) -> Result<Self, lattice_remoting::control::ReliableControlError> {
+    ) -> Result<Self, ReliableControlError> {
         Ok(Self {
             reducer: ReliableControl::new(epoch, maximum_frames, maximum_bytes)?,
         })
@@ -52,7 +45,7 @@ impl ControlAdapter {
         &mut self,
         command_id: CommandId,
         payload: Bytes,
-    ) -> Result<ControlEnvelope, lattice_remoting::control::ReliableControlError> {
+    ) -> Result<ControlEnvelope, ReliableControlError> {
         self.reducer.enqueue(command_id, payload)
     }
 
@@ -72,17 +65,11 @@ impl SessionAdapter {
         }
     }
 
-    pub fn install(
-        &mut self,
-        snapshot: lattice_placement::coordinator::SnapshotInstall,
-    ) -> Result<(), lattice_placement::coordinator::PlacementDomainStateError> {
+    pub fn install(&mut self, snapshot: SnapshotInstall) -> Result<(), PlacementDomainStateError> {
         self.reducer.install(snapshot)
     }
 
-    pub fn apply(
-        &mut self,
-        delta: CoordinatorDelta,
-    ) -> Result<(), lattice_placement::coordinator::PlacementDomainStateError> {
+    pub fn apply(&mut self, delta: CoordinatorDelta) -> Result<(), PlacementDomainStateError> {
         self.reducer.apply(delta)
     }
 
@@ -100,10 +87,7 @@ impl AuthorityAdapter {
         Self { reducer }
     }
 
-    pub fn step(
-        &mut self,
-        event: AuthorityEvent,
-    ) -> Result<Vec<AuthorityEffect>, lattice_placement::authority::AuthorityError> {
+    pub fn step(&mut self, event: AuthorityEvent) -> Result<Vec<AuthorityEffect>, AuthorityError> {
         self.reducer.transition(event)
     }
 
@@ -128,7 +112,7 @@ impl RegionAdapter {
         mode: BufferedMessageMode,
         payload: Bytes,
         now: MonotonicTime,
-    ) -> Result<RouteDecision, lattice_placement::region::RegionError> {
+    ) -> Result<RouteDecision, RegionError> {
         self.reducer
             .route(entity_id, message_id, mode, payload, now)
     }
@@ -137,7 +121,7 @@ impl RegionAdapter {
         &mut self,
         shard_id: ShardId,
         home: ShardHome,
-    ) -> Result<Vec<BufferedMessage>, lattice_placement::region::RegionError> {
+    ) -> Result<Vec<BufferedMessage>, RegionError> {
         self.reducer.apply_home(shard_id, home)
     }
 }
@@ -151,10 +135,7 @@ impl HandoffAdapter {
         Self { reducer }
     }
 
-    pub fn step(
-        &mut self,
-        event: HandoffEvent,
-    ) -> Result<Vec<HandoffEffect>, lattice_placement::handoff::HandoffError> {
+    pub fn step(&mut self, event: HandoffEvent) -> Result<Vec<HandoffEffect>, HandoffError> {
         self.reducer.transition(event)
     }
 
@@ -175,16 +156,13 @@ impl PlanAdapter {
     pub fn begin(
         &mut self,
         shard_id: ShardId,
-        generation: lattice_placement::types::AssignmentGeneration,
+        generation: AssignmentGeneration,
         active_move: Option<u128>,
-    ) -> Result<(), lattice_placement::plan::PlanError> {
+    ) -> Result<(), PlanError> {
         self.reducer.begin_move(shard_id, generation, active_move)
     }
 
-    pub fn complete(
-        &mut self,
-        shard_id: ShardId,
-    ) -> Result<(), lattice_placement::plan::PlanError> {
+    pub fn complete(&mut self, shard_id: ShardId) -> Result<(), PlanError> {
         self.reducer.complete_move(shard_id)
     }
 
@@ -202,10 +180,7 @@ impl SingletonAdapter {
         Self { reducer }
     }
 
-    pub fn step(
-        &mut self,
-        event: AuthorityEvent,
-    ) -> Result<Vec<AuthorityEffect>, lattice_placement::singleton::SingletonError> {
+    pub fn step(&mut self, event: AuthorityEvent) -> Result<Vec<AuthorityEffect>, SingletonError> {
         self.reducer.transition(event)
     }
 
@@ -245,7 +220,7 @@ impl WatchAdapter {
         &mut self,
         association: AssociationId,
         target: &ActorRef<A>,
-    ) -> Result<(WatchId, WatchCommand), lattice_remoting::watch::WatchError> {
+    ) -> Result<(WatchId, WatchCommand), WatchError> {
         self.reducer.watch(association, target)
     }
 

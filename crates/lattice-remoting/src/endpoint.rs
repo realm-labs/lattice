@@ -1,31 +1,53 @@
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::{
+    io::{Error as IoError, ErrorKind, Result as IoResult},
+    pin::Pin,
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
 
+use broadcast::error::RecvError;
+use lattice_core::failpoint::Failpoint;
 use thiserror::Error;
-use tokio::sync::{Semaphore, broadcast, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+    sync::{Mutex as AsyncMutex, Semaphore, broadcast, mpsc::Receiver, watch},
+    task::{JoinError, JoinHandle, JoinSet},
+    time::Instant,
+};
+use tokio_rustls::{
+    client::TlsStream as ClientTlsStream,
+    rustls::{ClientConfig, ServerConfig},
+    server::TlsStream as ServerTlsStream,
+};
 
-use crate::association::{
-    Association, AssociationError, AssociationId, AssociationManager, LaneAttachment, LaneKind,
+use crate::{
+    association::{
+        Association, AssociationError, AssociationId, AssociationManager, AssociationState,
+        LaneAttachment, LaneKind,
+    },
+    bootstrap::{
+        AcceptBootstrap, BootstrapError, BootstrapHandler, BootstrapProbeTarget,
+        BootstrapRejectionCode, BootstrapRequest, BootstrapResponse, BootstrapResult,
+        BootstrapRoute,
+    },
+    config::RemotingConfig,
+    control::{ControlDispatch, RejectControlDispatch},
+    handshake::{FeatureBits, Handshake, HandshakeError, HandshakeValidator, NodeIdentity},
+    lane::{BidirectionalLane, BidirectionalLaneConfig, LaneError, LaneExit, LaneServices},
+    messaging::{inbound::InboundDispatch, outbound::OutboundMessaging},
+    protocol::ProtocolDescriptor,
+    transport::{
+        FramedConnection, NegotiationError, bind_tcp, connect_tcp, connect_tls,
+        connect_tls_candidate, negotiate_inbound_from_frame, negotiate_outbound,
+        verify_peer_certificate_identity,
+    },
+    wire::{Frame, FrameCodec, FrameKind, WireError},
 };
-use crate::bootstrap::{
-    AcceptBootstrap, BootstrapError, BootstrapHandler, BootstrapProbeTarget,
-    BootstrapRejectionCode, BootstrapRequest, BootstrapResponse, BootstrapResult, BootstrapRoute,
-};
-use crate::config::RemotingConfig;
-use crate::control::{ControlDispatch, RejectControlDispatch};
-use crate::handshake::{FeatureBits, Handshake, HandshakeValidator, NodeIdentity};
-use crate::lane::{BidirectionalLane, BidirectionalLaneConfig, LaneExit, LaneServices};
-use crate::messaging::inbound::InboundDispatch;
-use crate::messaging::outbound::OutboundMessaging;
-use crate::protocol::ProtocolDescriptor;
-use crate::transport::{
-    FramedConnection, NegotiationError, bind_tcp, connect_tcp, connect_tls, connect_tls_candidate,
-    negotiate_inbound_from_frame, negotiate_outbound, verify_peer_certificate_identity,
-};
-use crate::wire::{Frame, FrameCodec, WireError};
 
 pub struct RemotingEndpoint {
     local: NodeIdentity,
@@ -40,14 +62,14 @@ pub struct RemotingEndpoint {
     disconnect_tx: broadcast::Sender<AssociationId>,
     tasks: Mutex<Vec<JoinHandle<Result<(), EndpointError>>>>,
     security: Option<EndpointSecurity>,
-    connect_lock: tokio::sync::Mutex<()>,
-    bootstrap_handler: std::sync::RwLock<Arc<dyn BootstrapHandler>>,
+    connect_lock: AsyncMutex<()>,
+    bootstrap_handler: RwLock<Arc<dyn BootstrapHandler>>,
 }
 
 #[derive(Clone)]
 pub struct EndpointSecurity {
-    pub client: Arc<tokio_rustls::rustls::ClientConfig>,
-    pub server: Arc<tokio_rustls::rustls::ServerConfig>,
+    pub client: Arc<ClientConfig>,
+    pub server: Arc<ServerConfig>,
     pub server_name: String,
 }
 
@@ -108,24 +130,24 @@ impl RemotingEndpointBuilder {
             disconnect_tx,
             tasks: Mutex::new(Vec::new()),
             security: self.security,
-            connect_lock: tokio::sync::Mutex::new(()),
-            bootstrap_handler: std::sync::RwLock::new(Arc::new(AcceptBootstrap)),
+            connect_lock: AsyncMutex::new(()),
+            bootstrap_handler: RwLock::new(Arc::new(AcceptBootstrap)),
         })
     }
 }
 
 enum EndpointStream {
-    Plain(tokio::net::TcpStream),
-    TlsClient(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
-    TlsServer(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
+    Plain(TcpStream),
+    TlsClient(ClientTlsStream<TcpStream>),
+    TlsServer(ServerTlsStream<TcpStream>),
 }
 
-impl tokio::io::AsyncRead for EndpointStream {
+impl AsyncRead for EndpointStream {
     fn poll_read(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-        buffer: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<IoResult<()>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_read(context, buffer),
             Self::TlsClient(stream) => Pin::new(stream).poll_read(context, buffer),
@@ -134,12 +156,12 @@ impl tokio::io::AsyncRead for EndpointStream {
     }
 }
 
-impl tokio::io::AsyncWrite for EndpointStream {
+impl AsyncWrite for EndpointStream {
     fn poll_write(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
         buffer: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
+    ) -> Poll<Result<usize, IoError>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_write(context, buffer),
             Self::TlsClient(stream) => Pin::new(stream).poll_write(context, buffer),
@@ -147,10 +169,7 @@ impl tokio::io::AsyncWrite for EndpointStream {
         }
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Result<(), IoError>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_flush(context),
             Self::TlsClient(stream) => Pin::new(stream).poll_flush(context),
@@ -158,10 +177,7 @@ impl tokio::io::AsyncWrite for EndpointStream {
         }
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Result<(), IoError>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_shutdown(context),
             Self::TlsClient(stream) => Pin::new(stream).poll_shutdown(context),
@@ -224,7 +240,7 @@ impl RemotingEndpoint {
             peer.address.clone(),
             peer.incarnation,
         )?;
-        if association.state() == crate::association::AssociationState::Active {
+        if association.state() == AssociationState::Active {
             return Ok(association);
         }
         for lane in self.lanes() {
@@ -234,7 +250,7 @@ impl RemotingEndpoint {
             }
         }
         tokio::time::timeout(self.config.connect_timeout, async {
-            while association.state() != crate::association::AssociationState::Active {
+            while association.state() != AssociationState::Active {
                 tokio::task::yield_now().await;
             }
         })
@@ -328,14 +344,12 @@ impl RemotingEndpoint {
 
     pub async fn shutdown(&self) -> Result<(), EndpointError> {
         self.shutdown_tx.send_replace(true);
-        lattice_core::failpoint::hit(
-            lattice_core::failpoint::Failpoint::ShutdownAfterFenceBeforeTaskJoin,
-        );
+        lattice_core::failpoint::hit(Failpoint::ShutdownAfterFenceBeforeTaskJoin);
         let tasks = {
             let mut tasks = self.tasks.lock().expect("endpoint task list poisoned");
             std::mem::take(&mut *tasks)
         };
-        let deadline = tokio::time::Instant::now() + self.config.shutdown_timeout;
+        let deadline = Instant::now() + self.config.shutdown_timeout;
         let mut timed_out = false;
         for mut task in tasks {
             match tokio::time::timeout_at(deadline, &mut task).await {
@@ -402,7 +416,7 @@ impl RemotingEndpoint {
                 if *shutdown.borrow() {
                     return Ok(());
                 }
-                if matches!(result, Ok(crate::lane::LaneExit::QueueClosed)) {
+                if matches!(result, Ok(LaneExit::QueueClosed)) {
                     return Ok(());
                 }
                 loop {
@@ -499,10 +513,7 @@ impl RemotingEndpoint {
         Ok((connection.into_inner(), nonce))
     }
 
-    async fn accept_loop(
-        self: Arc<Self>,
-        listener: tokio::net::TcpListener,
-    ) -> Result<(), EndpointError> {
+    async fn accept_loop(self: Arc<Self>, listener: TcpListener) -> Result<(), EndpointError> {
         let mut shutdown = self.shutdown_tx.subscribe();
         if *shutdown.borrow() {
             return Ok(());
@@ -541,10 +552,7 @@ impl RemotingEndpoint {
         Ok(())
     }
 
-    async fn accept_connection(
-        self: Arc<Self>,
-        stream: tokio::net::TcpStream,
-    ) -> Result<(), EndpointError> {
+    async fn accept_connection(self: Arc<Self>, stream: TcpStream) -> Result<(), EndpointError> {
         let validator = HandshakeValidator::new(
             self.local.clone(),
             self.config.max_frame_size,
@@ -570,7 +578,7 @@ impl RemotingEndpoint {
         let mut connection =
             FramedConnection::new(stream, FrameCodec::new(self.config.max_frame_size)?);
         let first_frame = connection.read_frame().await?;
-        if first_frame.kind == crate::wire::FrameKind::BootstrapRequest {
+        if first_frame.kind == FrameKind::BootstrapRequest {
             return self
                 .accept_bootstrap(connection, peer_certificate.as_deref(), first_frame)
                 .await;
@@ -649,7 +657,7 @@ impl RemotingEndpoint {
             response = BootstrapResponse::new(
                 request.nonce,
                 BootstrapResult::RetryAfter {
-                    delay: std::time::Duration::from_secs(1),
+                    delay: Duration::from_secs(1),
                     reason: "bootstrap route is temporarily unavailable".to_string(),
                 },
             );
@@ -717,10 +725,10 @@ impl RemotingEndpoint {
         association: Arc<Association>,
         lane: LaneKind,
         nonce: u128,
-        receiver: &mut tokio::sync::mpsc::Receiver<Frame>,
+        receiver: &mut Receiver<Frame>,
         stream: EndpointStream,
         shutdown: &mut watch::Receiver<bool>,
-    ) -> Result<LaneExit, crate::lane::LaneError> {
+    ) -> Result<LaneExit, LaneError> {
         let association_id = association.id();
         let mut disconnect = self.disconnect_tx.subscribe();
         tokio::select! {
@@ -789,15 +797,15 @@ fn observe_connection_result(result: &Result<(), EndpointError>) {
 fn is_peer_disconnect(error: &EndpointError) -> bool {
     let io = match error {
         EndpointError::Wire(WireError::Io(io))
-        | EndpointError::Lane(crate::lane::LaneError::Wire(WireError::Io(io))) => io,
+        | EndpointError::Lane(LaneError::Wire(WireError::Io(io))) => io,
         _ => return false,
     };
     matches!(
         io.kind(),
-        std::io::ErrorKind::UnexpectedEof
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::BrokenPipe
+        ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
     )
 }
 
@@ -812,9 +820,9 @@ pub enum EndpointError {
     #[error("association endpoint negotiation failed")]
     Negotiation(#[from] NegotiationError),
     #[error("association endpoint handshake failed")]
-    Handshake(#[from] crate::handshake::HandshakeError),
+    Handshake(#[from] HandshakeError),
     #[error("association lane failed")]
-    Lane(#[from] crate::lane::LaneError),
+    Lane(#[from] LaneError),
     #[error("only the stable lower node identity may dial")]
     WrongDialDirection,
     #[error("association connection cap reached")]
@@ -830,7 +838,7 @@ pub enum EndpointError {
     #[error("association endpoint task cap reached")]
     TaskLimit,
     #[error("association endpoint task failed")]
-    Join(#[source] tokio::task::JoinError),
+    Join(#[source] JoinError),
     #[error("association endpoint shutdown timed out")]
     ShutdownTimeout,
     #[error("association endpoint has no active connections")]
@@ -849,36 +857,47 @@ async fn wait_for_disconnect(
         match receiver.recv().await {
             Ok(received) if received == association_id => return,
             Ok(_) => {}
-            Err(broadcast::error::RecvError::Lagged(_))
-            | Err(broadcast::error::RecvError::Closed) => return,
+            Err(RecvError::Lagged(_)) | Err(RecvError::Closed) => return,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Error, ErrorKind};
+
+    use tokio::net::TcpListener;
+
     use super::*;
+    use crate::{
+        association::AssociationState, lane::LaneError, messaging::outbound::OutboundMessage,
+    };
 
     #[test]
     fn classifies_normal_peer_disconnects_without_hiding_protocol_failures() {
-        let disconnected = EndpointError::Lane(crate::lane::LaneError::Wire(WireError::Io(
-            std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
-        )));
+        let disconnected = EndpointError::Lane(LaneError::Wire(WireError::Io(Error::from(
+            ErrorKind::UnexpectedEof,
+        ))));
         assert!(is_peer_disconnect(&disconnected));
         assert!(!is_peer_disconnect(&EndpointError::WrongDialDirection));
     }
+    use std::time::{Duration, Instant};
+
     use async_trait::async_trait;
     use bytes::Bytes;
     use lattice_core::actor_ref::{
         ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
     };
-    use std::time::{Duration, Instant};
 
-    use crate::association::AssociationKey;
-    use crate::control::{CommandId, ControlDispatchError, ControlGap};
-    use crate::messaging::error::RemoteMessageError;
-    use crate::messaging::target::{ExactActorTarget, SenderIdentity};
-    use crate::protocol::ProtocolFingerprint;
+    use crate::{
+        association::AssociationKey,
+        control::{CommandId, ControlDispatchError, ControlGap},
+        messaging::{
+            error::RemoteMessageError,
+            target::{ExactActorTarget, SenderIdentity},
+        },
+        protocol::ProtocolFingerprint,
+    };
 
     struct EchoDispatch;
 
@@ -976,7 +995,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_tcp_endpoint_establishes_all_lanes_and_delivers_ask() {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_port = probe.local_addr().unwrap().port();
         drop(probe);
         let client_port = server_port.saturating_sub(1).max(1024);
@@ -1009,10 +1028,7 @@ mod tests {
             endpoint_with_control(server_identity.clone(), descriptor.clone(), control.clone());
         server.bind().await.unwrap();
         let association = client.connect_peer(server_identity.clone()).await.unwrap();
-        assert_eq!(
-            association.state(),
-            crate::association::AssociationState::Active
-        );
+        assert_eq!(association.state(), AssociationState::Active);
         let target = ActorRef::new(
             cluster_id,
             server_identity.address.clone(),
@@ -1028,11 +1044,7 @@ mod tests {
                 &association,
                 &SenderIdentity::Process(9),
                 &target,
-                crate::messaging::outbound::OutboundMessage::new(
-                    fingerprint,
-                    1,
-                    Bytes::from_static(b"hello"),
-                ),
+                OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"hello")),
                 Instant::now() + Duration::from_secs(1),
             )
             .await
@@ -1057,14 +1069,14 @@ mod tests {
         .unwrap();
         server.disconnect_association(association.id()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while association.state() != crate::association::AssociationState::Reconnecting {
+            while association.state() != AssociationState::Reconnecting {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while association.state() != crate::association::AssociationState::Active {
+            while association.state() != AssociationState::Active {
                 tokio::task::yield_now().await;
             }
         })
@@ -1076,11 +1088,7 @@ mod tests {
                 &association,
                 &SenderIdentity::Process(9),
                 &target,
-                crate::messaging::outbound::OutboundMessage::new(
-                    fingerprint,
-                    1,
-                    Bytes::from_static(b"again"),
-                ),
+                OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"again")),
                 Instant::now() + Duration::from_secs(1),
             )
             .await

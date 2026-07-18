@@ -1,26 +1,37 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
+use lattice_core::failpoint::Failpoint;
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
-use tokio::task::JoinSet;
+use tokio::{
+    sync::{mpsc, watch},
+    task::{JoinError, JoinSet},
+    time::MissedTickBehavior,
+};
 
-use crate::association::{Association, LaneKind};
-use crate::control::{
-    ControlApply, ControlDispatch, control_ack_frame, decode_control_ack, decode_control_envelope,
+use crate::{
+    association::{Association, AssociationError, LaneKind},
+    control::{
+        CommandId, ControlApply, ControlDispatch, ControlDispatchError, ReliableControlError,
+        control_ack_frame, decode_control_ack, decode_control_envelope,
+    },
+    messaging::{
+        codec::{
+            ask_correlation, decode_ask, decode_entity_ask, decode_entity_tell, decode_failure,
+            decode_reply, decode_singleton_ask, decode_singleton_tell, decode_tell, failure_frame,
+            reply_frame,
+        },
+        error::{AskError, RemoteFailureCode, RemoteMessageError},
+        inbound::{InboundDispatch, failure_code},
+        outbound::OutboundMessaging,
+        target::RemoteFailure,
+    },
+    transport::{FramedReader, FramedWriter, RemotingIo},
+    wire::{Frame, FrameCodec, FrameKind, WireError},
 };
-use crate::messaging::codec::{
-    ask_correlation, decode_ask, decode_entity_ask, decode_entity_tell, decode_failure,
-    decode_reply, decode_singleton_ask, decode_singleton_tell, decode_tell, failure_frame,
-    reply_frame,
-};
-use crate::messaging::error::{AskError, RemoteFailureCode, RemoteMessageError};
-use crate::messaging::inbound::{InboundDispatch, failure_code};
-use crate::messaging::outbound::OutboundMessaging;
-use crate::messaging::target::RemoteFailure;
-use crate::transport::{FramedReader, FramedWriter, RemotingIo};
-use crate::wire::{Frame, FrameKind, WireError};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BidirectionalLaneConfig {
@@ -127,17 +138,17 @@ where
     let dispatch = runtime.services.dispatch.clone();
     let control_dispatch = runtime.services.control_dispatch.clone();
     let config = runtime.config.validate()?;
-    let codec = crate::wire::FrameCodec::new(config.maximum_frame_size)?;
+    let codec = FrameCodec::new(config.maximum_frame_size)?;
     let (read, write) = tokio::io::split(stream);
     let mut reader = FramedReader::new(read, codec.clone());
     let mut writer = FramedWriter::new(write, codec);
     let mut asks = JoinSet::new();
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_received = Instant::now();
     let mut last_activity = Instant::now();
     let mut idle = tokio::time::interval(config.idle_data_connection_timeout);
-    idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    idle.set_missed_tick_behavior(MissedTickBehavior::Delay);
     idle.reset();
 
     loop {
@@ -168,7 +179,7 @@ where
                 let correlation = ask_correlation(&frame);
                 if frame.kind == FrameKind::ControlEnvelope {
                     lattice_core::failpoint::hit(
-                        lattice_core::failpoint::Failpoint::ControlAfterOutboxBeforeSocketWrite,
+                        Failpoint::ControlAfterOutboxBeforeSocketWrite,
                     );
                 }
                 let result = writer.write_frame_with_commit(&frame, || {
@@ -317,7 +328,7 @@ where
                                     )
                                     .await?;
                                 lattice_core::failpoint::hit(
-                                    lattice_core::failpoint::Failpoint::ControlAfterRemoteApplyBeforeAck,
+                                    Failpoint::ControlAfterRemoteApplyBeforeAck,
                                 );
                                 let ack = association.commit_control(envelope);
                                 writer.write_frame(&control_ack_frame(ack)).await?;
@@ -351,7 +362,7 @@ where
                         control_dispatch
                             .apply(
                                 association.key().clone(),
-                                crate::control::CommandId::generate(),
+                                CommandId::generate(),
                                 frame.payload,
                             )
                             .await?;
@@ -403,15 +414,15 @@ pub enum LaneError {
     #[error("lane received frame kind {kind:?} on {lane:?}")]
     UnexpectedFrame { lane: LaneKind, kind: FrameKind },
     #[error("inbound ask task failed")]
-    Join(#[source] tokio::task::JoinError),
+    Join(#[source] JoinError),
     #[error("inbound actor dispatch failed")]
     Dispatch(#[from] RemoteMessageError),
     #[error("reliable control dispatch failed")]
-    ControlDispatch(#[from] crate::control::ControlDispatchError),
+    ControlDispatch(#[from] ControlDispatchError),
     #[error("reliable control state rejected a frame")]
-    ReliableControl(#[from] crate::control::ReliableControlError),
+    ReliableControl(#[from] ReliableControlError),
     #[error("association rejected a reliable control acknowledgement")]
-    Association(#[from] crate::association::AssociationError),
+    Association(#[from] AssociationError),
     #[error("lane socket failed")]
     Wire(#[source] WireError),
 }
@@ -424,15 +435,23 @@ impl From<WireError> for LaneError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::association::{AssociationKey, LaneAttachment};
-    use crate::config::RemotingConfig;
-    use crate::messaging::error::RemoteMessageError;
-    use crate::messaging::target::{ExactActorTarget, SenderIdentity};
-    use crate::protocol::{ProtocolDescriptor, ProtocolFingerprint};
     use async_trait::async_trait;
     use lattice_core::actor_ref::{
         ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+    };
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::*;
+    use crate::{
+        association::{AssociationKey, LaneAttachment},
+        config::RemotingConfig,
+        control::RejectControlDispatch,
+        messaging::{
+            error::RemoteMessageError,
+            outbound::OutboundMessage,
+            target::{ExactActorTarget, SenderIdentity},
+        },
+        protocol::{ProtocolDescriptor, ProtocolFingerprint},
     };
 
     struct EchoDispatch;
@@ -503,7 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_tcp_bidirectional_interactive_lane_completes_ask() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socket = listener.local_addr().unwrap();
         let client_incarnation = NodeIncarnation::new(1).unwrap();
         let server_incarnation = NodeIncarnation::new(2).unwrap();
@@ -543,7 +562,7 @@ mod tests {
                     LaneServices::new(
                         messaging,
                         Arc::new(EchoDispatch),
-                        Arc::new(crate::control::RejectControlDispatch),
+                        Arc::new(RejectControlDispatch),
                     ),
                     BidirectionalLaneConfig {
                         maximum_frame_size: 4096,
@@ -557,7 +576,7 @@ mod tests {
                 .await
             })
         };
-        let stream = tokio::net::TcpStream::connect(socket).await.unwrap();
+        let stream = TcpStream::connect(socket).await.unwrap();
         let mut client_shutdown = shutdown_rx;
         let client_lane = {
             let association = client_association.clone();
@@ -570,7 +589,7 @@ mod tests {
                     LaneServices::new(
                         messaging,
                         Arc::new(EchoDispatch),
-                        Arc::new(crate::control::RejectControlDispatch),
+                        Arc::new(RejectControlDispatch),
                     ),
                     BidirectionalLaneConfig {
                         maximum_frame_size: 4096,
@@ -598,11 +617,7 @@ mod tests {
                 &client_association,
                 &SenderIdentity::Process(9),
                 &target,
-                crate::messaging::outbound::OutboundMessage::new(
-                    fingerprint,
-                    1,
-                    Bytes::from_static(b"echo"),
-                ),
+                OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"echo")),
                 Instant::now() + Duration::from_secs(1),
             )
             .await

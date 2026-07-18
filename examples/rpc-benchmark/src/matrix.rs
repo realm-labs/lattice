@@ -1,45 +1,42 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_actor::context::ActorContext;
-use lattice_actor::error::{ActorError, ActorTellError};
-use lattice_actor::mailbox::MailboxConfig;
-use lattice_actor::registry::{ActorRegistry, ActorRegistryConfig};
-use lattice_actor::traits::{Actor, Handler, StopReason};
-use lattice_core::actor_ref::{
-    EntityId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
+use lattice_actor::{
+    context::ActorContext,
+    error::{ActorError, ActorTellError},
+    mailbox::MailboxConfig,
+    registry::{ActorRegistry, ActorRegistryConfig},
+    traits::{Actor, Handler, StopReason},
 };
-use lattice_core::{actor_kind, id::ActorId};
-use lattice_placement::allocation::AllocationRequest;
-use lattice_placement::allocation::PlacementView;
-use lattice_placement::allocation::RebalanceLimits;
-use lattice_placement::allocation::RebalanceTrigger;
-use lattice_placement::allocation::ShardAllocationStrategy;
-use lattice_placement::allocation::WeightedLeastLoad;
-use lattice_placement::allocation::{LoadSample, PlacedShard, PlacementNode};
-use lattice_placement::handoff::HandoffEvent;
-use lattice_placement::handoff::HandoffMachine;
-use lattice_placement::region::BufferedMessageMode;
-use lattice_placement::region::EntityConfig;
-use lattice_placement::region::RegionConfig;
-use lattice_placement::region::ShardHome;
-use lattice_placement::region::ShardRegion;
-use lattice_placement::types::AssignmentGeneration;
-use lattice_placement::types::CoordinatorTerm;
-use lattice_placement::types::MonotonicTime;
-use lattice_placement::types::NodeKey;
-use lattice_placement::types::PlacementSlotKey;
-use lattice_placement::types::PlacementSlotState;
-use lattice_placement::types::PlacementVersion;
-use lattice_placement::types::Revision;
-use lattice_placement::types::ShardId;
-use lattice_remoting::association::AssociationId;
-use lattice_remoting::control::CommandId;
-use lattice_remoting::control::ControlApply;
-use lattice_remoting::control::ReliableControl;
+use lattice_core::{
+    actor_kind,
+    actor_ref::{
+        EntityId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
+    },
+    id::ActorId,
+};
+use lattice_placement::{
+    allocation::{
+        AllocationRequest, LoadSample, PlacedShard, PlacementNode, PlacementView, RebalanceLimits,
+        RebalanceTrigger, ShardAllocationStrategy, WeightedLeastLoad,
+    },
+    handoff::{HandoffEvent, HandoffMachine},
+    region::{BufferedMessageMode, EntityConfig, RegionConfig, ShardHome, ShardRegion},
+    types::{
+        AssignmentGeneration, CoordinatorTerm, MonotonicTime, NodeKey, PlacementSlotKey,
+        PlacementSlotState, PlacementVersion, Revision, ShardId,
+    },
+};
+use lattice_remoting::{
+    association::AssociationId,
+    control::{CommandId, ControlApply, ReliableControl},
+};
 
 #[derive(Debug, Clone)]
 pub struct MatrixMeasurement {
@@ -74,9 +71,7 @@ impl Handler<BenchTell> for BenchActor {
     }
 }
 
-pub async fn local_actor_admission(
-    operations: usize,
-) -> Result<MatrixMeasurement, Box<dyn std::error::Error>> {
+pub async fn local_actor_admission(operations: usize) -> Result<MatrixMeasurement, Box<dyn Error>> {
     let registry = Arc::new(ActorRegistry::new(
         actor_kind!("BenchmarkLocal"),
         ActorRegistryConfig {
@@ -107,7 +102,7 @@ pub async fn local_actor_admission(
 pub fn placement_matrix(
     operations: usize,
     payload_bytes: usize,
-) -> Result<Vec<MatrixMeasurement>, Box<dyn std::error::Error>> {
+) -> Result<Vec<MatrixMeasurement>, Box<dyn Error>> {
     let operations = operations.max(1);
     let payload = Bytes::from(vec![0_u8; payload_bytes]);
     let entity_type = EntityType::new("benchmark-entity")?;
@@ -244,7 +239,7 @@ fn allocation_fixture(
     protocol: ProtocolId,
     source: NodeKey,
     target: NodeKey,
-) -> Result<(AllocationRequest, PlacementView), Box<dyn std::error::Error>> {
+) -> Result<(AllocationRequest, PlacementView), Box<dyn Error>> {
     let placement_node = |key: NodeKey, weight| PlacementNode {
         key: key.clone(),
         ready: true,
@@ -306,7 +301,7 @@ fn reduce_handoff(
     entity_type: &EntityType,
     source: &NodeKey,
     target: &NodeKey,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let generation = AssignmentGeneration::new(1)?;
     let mut machine = HandoffMachine::begin(
         PlacementSlotKey::Shard {
@@ -345,7 +340,7 @@ fn placement_domain() -> PlacementDomainId {
     PlacementDomainId::new("benchmark").expect("static placement domain is valid")
 }
 
-fn reduce_reconnect(command: u128) -> Result<(), Box<dyn std::error::Error>> {
+fn reduce_reconnect(command: u128) -> Result<(), Box<dyn Error>> {
     let epoch = AssociationId::new(1).ok_or("invalid benchmark association ID")?;
     let envelope = {
         let mut sender = ReliableControl::new(epoch, 4, 1024)?;
@@ -366,11 +361,7 @@ fn reduce_reconnect(command: u128) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn node(
-    node_id: &str,
-    incarnation: u128,
-    port: u16,
-) -> Result<NodeKey, Box<dyn std::error::Error>> {
+fn node(node_id: &str, incarnation: u128, port: u16) -> Result<NodeKey, Box<dyn Error>> {
     Ok(NodeKey {
         node_id: node_id.to_owned(),
         address: NodeAddress::new("127.0.0.1", port)?,

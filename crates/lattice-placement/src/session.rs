@@ -1,25 +1,38 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use lattice_core::coordinator::CoordinatorScope;
-use lattice_remoting::association::AssociationManager;
-use lattice_remoting::association::AssociationState;
-use lattice_remoting::control::ControlDispatchError;
+use lattice_core::{
+    actor_ref::{NodeIncarnation, PlacementDomainId},
+    coordinator::CoordinatorScope,
+    failpoint::Failpoint,
+};
+use lattice_remoting::{
+    association::{AssociationError, AssociationKey, AssociationManager, AssociationState},
+    control::ControlDispatchError,
+};
 use thiserror::Error;
-use tokio::sync::{Notify, mpsc, watch};
-use tokio::time::Instant;
+use tokio::{
+    sync::{Notify, mpsc, watch},
+    time::{Instant, MissedTickBehavior},
+};
 
-use crate::authority::{AuthorityEffect, AuthorityEvent, PlacementAuthority};
-use crate::control::{
-    DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlEvent,
-    PlacementControlEventKind, encode_control_command,
+use crate::{
+    authority::{AuthorityEffect, AuthorityError, AuthorityEvent, PlacementAuthority},
+    control::{
+        DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlError,
+        PlacementControlEvent, PlacementControlEventKind, encode_control_command,
+    },
+    coordinator::{
+        CoordinatorDelta, CoordinatorError, MemberEvent, MemberRecord, MemberStatus,
+        MembershipStateError, NodeLoadReport, PlacementDomainHello, PlacementDomainState,
+        PlacementDomainStateError, ShardLoadReport, SnapshotLimits, SnapshotRecord, SnapshotStager,
+        SnapshotVersion,
+    },
+    types::{MembershipVersion, MonotonicTime, NodeKey, PlacementSlot, PlacementSlotKey},
 };
-use crate::coordinator::{
-    CoordinatorDelta, MemberEvent, MemberRecord, MemberStatus, PlacementDomainHello,
-    PlacementDomainState, SnapshotLimits, SnapshotStager, SnapshotVersion,
-};
-use crate::types::{MonotonicTime, NodeKey, PlacementSlot, PlacementSlotKey};
 
 #[derive(Debug, Clone)]
 pub struct LogicCoordinatorConfig {
@@ -69,12 +82,12 @@ pub enum LogicPlacementEffect {
     },
     MemberEvent(Box<MemberEvent>),
     MemberSnapshot {
-        version: crate::types::MembershipVersion,
+        version: MembershipVersion,
         members: Vec<MemberRecord>,
     },
     DrainReady {
         operation_id: String,
-        incarnation: lattice_core::actor_ref::NodeIncarnation,
+        incarnation: NodeIncarnation,
     },
 }
 
@@ -109,7 +122,7 @@ impl LogicPlacementState {
 
 pub struct PlacementDomainSession {
     domain_hello: PlacementDomainHello,
-    coordinator: lattice_remoting::association::AssociationKey,
+    coordinator: AssociationKey,
     associations: Arc<AssociationManager>,
     config: LogicCoordinatorConfig,
     state: Arc<Mutex<LogicPlacementState>>,
@@ -128,8 +141,8 @@ struct LocalAuthorityEvent {
 
 #[derive(Clone)]
 pub struct LogicCoordinatorHandle {
-    domain: lattice_core::actor_ref::PlacementDomainId,
-    coordinator: lattice_remoting::association::AssociationKey,
+    domain: PlacementDomainId,
+    coordinator: AssociationKey,
     associations: Arc<AssociationManager>,
     maximum_control_payload: usize,
     state: Arc<Mutex<LogicPlacementState>>,
@@ -137,7 +150,7 @@ pub struct LogicCoordinatorHandle {
 }
 
 impl LogicCoordinatorHandle {
-    pub fn domain(&self) -> &lattice_core::actor_ref::PlacementDomainId {
+    pub fn domain(&self) -> &PlacementDomainId {
         &self.domain
     }
 
@@ -178,17 +191,11 @@ impl LogicCoordinatorHandle {
         self.send_slot_command(slot, false, true)
     }
 
-    pub fn report_node_load(
-        &self,
-        report: crate::coordinator::NodeLoadReport,
-    ) -> Result<(), LogicSessionError> {
+    pub fn report_node_load(&self, report: NodeLoadReport) -> Result<(), LogicSessionError> {
         self.send_ephemeral(PlacementControlCommand::NodeLoad(report))
     }
 
-    pub fn report_shard_load(
-        &self,
-        report: crate::coordinator::ShardLoadReport,
-    ) -> Result<(), LogicSessionError> {
+    pub fn report_shard_load(&self, report: ShardLoadReport) -> Result<(), LogicSessionError> {
         self.send_ephemeral(PlacementControlCommand::ShardLoad(report))
     }
 
@@ -316,7 +323,7 @@ impl LogicCoordinatorHandle {
 impl PlacementDomainSession {
     pub fn new(
         domain_hello: PlacementDomainHello,
-        coordinator: lattice_remoting::association::AssociationKey,
+        coordinator: AssociationKey,
         associations: Arc<AssociationManager>,
         config: LogicCoordinatorConfig,
         effect_capacity: usize,
@@ -372,7 +379,7 @@ impl PlacementDomainSession {
         }
     }
 
-    pub fn coordinator_key(&self) -> &lattice_remoting::association::AssociationKey {
+    pub fn coordinator_key(&self) -> &AssociationKey {
         &self.coordinator
     }
 
@@ -438,9 +445,9 @@ impl PlacementDomainSession {
     ) -> Result<(), LogicSessionError> {
         self.send_hello()?;
         let mut tick = tokio::time::interval(self.config.tick_interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         heartbeat.reset();
         loop {
             tokio::select! {
@@ -544,9 +551,7 @@ impl PlacementDomainSession {
                             .ok_or(LogicSessionError::SnapshotRequired)?
                             .finish(end, self.now())
                             .map_err(LogicSessionError::Coordinator)?;
-                        lattice_core::failpoint::hit(
-                            lattice_core::failpoint::Failpoint::SnapshotAfterStageBeforeInstall,
-                        );
+                        lattice_core::failpoint::hit(Failpoint::SnapshotAfterStageBeforeInstall);
                         let version = install.version.clone();
                         match version {
                             SnapshotVersion::Membership(version) => {
@@ -806,10 +811,7 @@ impl PlacementDomainSession {
         Ok(())
     }
 
-    fn require_coordinator(
-        &self,
-        association: &lattice_remoting::association::AssociationKey,
-    ) -> Result<(), LogicSessionError> {
+    fn require_coordinator(&self, association: &AssociationKey) -> Result<(), LogicSessionError> {
         if association != &self.coordinator {
             return Err(LogicSessionError::UnauthorizedCommand);
         }
@@ -824,7 +826,7 @@ impl PlacementDomainSession {
 }
 
 fn decode_slots(
-    records: &[crate::coordinator::SnapshotRecord],
+    records: &[SnapshotRecord],
 ) -> Result<BTreeMap<PlacementSlotKey, PlacementSlot>, LogicSessionError> {
     let mut slots = BTreeMap::new();
     for record in records {
@@ -860,9 +862,7 @@ fn decode_slots(
 }
 
 #[allow(dead_code)]
-fn decode_members(
-    records: &[crate::coordinator::SnapshotRecord],
-) -> Result<Vec<MemberRecord>, LogicSessionError> {
+fn decode_members(records: &[SnapshotRecord]) -> Result<Vec<MemberRecord>, LogicSessionError> {
     let mut members = BTreeMap::new();
     for record in records {
         if !record.key.starts_with("member/") {
@@ -926,15 +926,15 @@ pub enum LogicSessionError {
     #[error("logic Coordinator effect queue is full or closed")]
     EffectBackpressure,
     #[error("logic Coordinator state reducer rejected input")]
-    Coordinator(#[source] crate::coordinator::CoordinatorError),
+    Coordinator(#[source] CoordinatorError),
     #[error("membership state reducer rejected input")]
-    MembershipState(#[source] crate::coordinator::MembershipStateError),
+    MembershipState(#[source] MembershipStateError),
     #[error("placement-domain state reducer rejected input")]
-    PlacementState(#[source] crate::coordinator::PlacementDomainStateError),
+    PlacementState(#[source] PlacementDomainStateError),
     #[error("logic Coordinator placement authority rejected input")]
-    Authority(#[source] crate::authority::AuthorityError),
+    Authority(#[source] AuthorityError),
     #[error("logic Coordinator control codec failed")]
-    Control(#[source] crate::control::PlacementControlError),
+    Control(#[source] PlacementControlError),
     #[error("logic Coordinator Association rejected control admission")]
-    Association(#[from] lattice_remoting::association::AssociationError),
+    Association(#[from] AssociationError),
 }

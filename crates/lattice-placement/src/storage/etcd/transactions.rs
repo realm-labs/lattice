@@ -1,24 +1,33 @@
 use etcd_client::{Compare, CompareOp, PutOptions, Txn, TxnOp};
 use lattice_core::coordinator::CoordinatorScope;
+use serde::de::DeserializeOwned;
 
 use super::{EtcdPlacementStore, decode, encode, map_etcd_txn, parse_revision_value};
-use crate::coordinator::{
-    DomainMemberRecord, DomainMemberStatus, ExactLeaderGuard, MemberRecord, MemberStatus,
-    MembershipLeaderGuard, PlacementLeaderGuard, SessionLimits,
+use crate::{
+    coordinator::{
+        DomainMemberRecord, DomainMemberStatus, ExactLeaderGuard, MemberRecord, MemberStatus,
+        MembershipLeaderGuard, PlacementLeaderGuard, SessionLimits,
+    },
+    plan::{MoveProgress, RebalancePlan},
+    storage::{
+        PlacementDomainStore, StorageError,
+        domain::{
+            ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial,
+            AuthorityCommit, AutomaticBalanceSettings, ClaimPredicate, CommitAutomaticSettings,
+            CompactAdminOperations, CompleteMove, CreateDomainMember, CreateMember, CreatePlan,
+            CreatePlanWithOperation, DeletePlan, DomainMemberCommit, EntityConfigCommit,
+            FenceAuthority, FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit,
+            MoveCommit, PlanCommit, PutEntityConfig, PutSingletonConfig, RecordAdminOperation,
+            RemoveDomainMember, RemoveMember, ReserveHandoff, ReserveMove, SingletonConfigCommit,
+            SlotCommit, TransitionSlot, UpdateDomainMember, UpdateMember, UpdatePlan,
+            UpdatePlanWithOperation,
+        },
+    },
+    types::{
+        ClaimGrant, NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState, PlacementVersion,
+        Revision,
+    },
 };
-use crate::plan::{MoveProgress, RebalancePlan};
-use crate::storage::domain::{
-    ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial, AuthorityCommit,
-    AutomaticBalanceSettings, ClaimPredicate, CommitAutomaticSettings, CompactAdminOperations,
-    CompleteMove, CreateDomainMember, CreateMember, CreatePlan, CreatePlanWithOperation,
-    DeletePlan, DomainMemberCommit, EntityConfigCommit, FenceAuthority, FenceMissingAuthority,
-    InstallAuthority, LeasedClaim, MemberCommit, MoveCommit, PlanCommit, PutEntityConfig,
-    PutSingletonConfig, RecordAdminOperation, RemoveDomainMember, RemoveMember, ReserveHandoff,
-    ReserveMove, SingletonConfigCommit, SlotCommit, TransitionSlot, UpdateDomainMember,
-    UpdateMember, UpdatePlan, UpdatePlanWithOperation,
-};
-use crate::storage::{PlacementDomainStore, StorageError};
-use crate::types::{ClaimGrant, PlacementSlot, PlacementSlotState, PlacementVersion, Revision};
 
 struct StateCounter {
     compare: Compare,
@@ -272,7 +281,7 @@ async fn exact_record<T>(
     expected: &T,
 ) -> Result<i64, StorageError>
 where
-    T: serde::de::DeserializeOwned + PartialEq,
+    T: DeserializeOwned + PartialEq,
 {
     let Some((bytes, mod_revision, _)) = store.read_raw(key).await? else {
         return Err(StorageError::CompareFailed);
@@ -295,7 +304,7 @@ async fn assignment_compares(
     store: &EtcdPlacementStore,
     global_member: &MemberRecord,
     domain_member: &DomainMemberRecord,
-    owner: &crate::types::NodeKey,
+    owner: &NodeKey,
 ) -> Result<[Compare; 2], StorageError> {
     if global_member.status != MemberStatus::Up
         || domain_member.status != DomainMemberStatus::Up

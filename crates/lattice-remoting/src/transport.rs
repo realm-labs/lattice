@@ -1,17 +1,31 @@
-use bytes::{BufMut, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, ServerConfig};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
-use x509_parser::extensions::{GeneralName, ParsedExtension};
-use x509_parser::parse_x509_certificate;
-
-use crate::association::LaneKind;
-use crate::handshake::{Handshake, HandshakeAck, HandshakeError, HandshakeValidator, NodeIdentity};
-use crate::protocol::{
-    CatalogueError, ProtocolDescriptor, catalogue_frame, decode_catalogue_frame,
+use std::{
+    io::{Error, ErrorKind},
+    sync::Arc,
 };
-use crate::wire::{Frame, FrameCodec, WireError};
+
+use bytes::{BufMut, BytesMut};
+use lattice_core::{actor_ref::NodeAddress, failpoint::Failpoint};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
+use tokio_rustls::{
+    TlsAcceptor, TlsConnector,
+    client::TlsStream as ClientTlsStream,
+    rustls::{ClientConfig, ServerConfig, pki_types::ServerName},
+    server::TlsStream as ServerTlsStream,
+};
+use x509_parser::{
+    extensions::{GeneralName, ParsedExtension},
+    parse_x509_certificate,
+};
+
+use crate::{
+    association::LaneKind,
+    handshake::{Handshake, HandshakeAck, HandshakeError, HandshakeValidator, NodeIdentity},
+    protocol::{CatalogueError, ProtocolDescriptor, catalogue_frame, decode_catalogue_frame},
+    wire::{Frame, FrameCodec, WireError},
+};
 
 pub trait RemotingIo: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
@@ -83,8 +97,8 @@ where
         while written < encoded.len() {
             let count = self.writer.write(&encoded[written..]).await?;
             if count == 0 {
-                return Err(WireError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
+                return Err(WireError::Io(Error::new(
+                    ErrorKind::WriteZero,
                     "remoting socket wrote zero bytes",
                 )));
             }
@@ -150,8 +164,8 @@ where
         while written < encoded.len() {
             let count = self.stream.write(&encoded[written..]).await?;
             if count == 0 {
-                return Err(WireError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
+                return Err(WireError::Io(Error::new(
+                    ErrorKind::WriteZero,
                     "remoting socket wrote zero bytes",
                 )));
             }
@@ -192,9 +206,7 @@ where
     if handshake.lane != LaneKind::Control {
         return Ok(Vec::new());
     }
-    lattice_core::failpoint::hit(
-        lattice_core::failpoint::Failpoint::AssociationAfterHandshakeBeforeCatalogue,
-    );
+    lattice_core::failpoint::hit(Failpoint::AssociationAfterHandshakeBeforeCatalogue);
     connection
         .write_frame(&catalogue_frame(local_catalogue))
         .await?;
@@ -241,9 +253,7 @@ where
     if handshake.lane != LaneKind::Control {
         return Ok((handshake, Vec::new()));
     }
-    lattice_core::failpoint::hit(
-        lattice_core::failpoint::Failpoint::AssociationAfterHandshakeBeforeCatalogue,
-    );
+    lattice_core::failpoint::hit(Failpoint::AssociationAfterHandshakeBeforeCatalogue);
     let peer = decode_catalogue_frame(&connection.read_frame().await?, maximum_protocols)?;
     connection
         .write_frame(&catalogue_frame(local_catalogue))
@@ -262,30 +272,28 @@ pub enum NegotiationError {
 }
 
 pub async fn connect_tcp(
-    address: &lattice_core::actor_ref::NodeAddress,
+    address: &NodeAddress,
     codec: FrameCodec,
-) -> Result<FramedConnection<tokio::net::TcpStream>, WireError> {
-    let stream = tokio::net::TcpStream::connect((address.host(), address.port())).await?;
+) -> Result<FramedConnection<TcpStream>, WireError> {
+    let stream = TcpStream::connect((address.host(), address.port())).await?;
     stream.set_nodelay(true)?;
     Ok(FramedConnection::new(stream, codec))
 }
 
-pub async fn bind_tcp(
-    address: &lattice_core::actor_ref::NodeAddress,
-) -> Result<tokio::net::TcpListener, WireError> {
-    tokio::net::TcpListener::bind((address.host(), address.port()))
+pub async fn bind_tcp(address: &NodeAddress) -> Result<TcpListener, WireError> {
+    TcpListener::bind((address.host(), address.port()))
         .await
         .map_err(WireError::Io)
 }
 
 pub async fn connect_tls(
-    address: &lattice_core::actor_ref::NodeAddress,
+    address: &NodeAddress,
     server_name: String,
-    config: std::sync::Arc<ClientConfig>,
+    config: Arc<ClientConfig>,
     expected_peer: &NodeIdentity,
     codec: FrameCodec,
-) -> Result<FramedConnection<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, WireError> {
-    let tcp = tokio::net::TcpStream::connect((address.host(), address.port())).await?;
+) -> Result<FramedConnection<ClientTlsStream<TcpStream>>, WireError> {
+    let tcp = TcpStream::connect((address.host(), address.port())).await?;
     tcp.set_nodelay(true)?;
     let server_name =
         ServerName::try_from(server_name).map_err(|_| WireError::Tls("invalid server name"))?;
@@ -306,18 +314,12 @@ pub async fn connect_tls(
 }
 
 pub async fn connect_tls_candidate(
-    address: &lattice_core::actor_ref::NodeAddress,
+    address: &NodeAddress,
     server_name: String,
-    config: std::sync::Arc<ClientConfig>,
+    config: Arc<ClientConfig>,
     codec: FrameCodec,
-) -> Result<
-    (
-        FramedConnection<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
-        Vec<u8>,
-    ),
-    WireError,
-> {
-    let tcp = tokio::net::TcpStream::connect((address.host(), address.port())).await?;
+) -> Result<(FramedConnection<ClientTlsStream<TcpStream>>, Vec<u8>), WireError> {
+    let tcp = TcpStream::connect((address.host(), address.port())).await?;
     tcp.set_nodelay(true)?;
     let server_name =
         ServerName::try_from(server_name).map_err(|_| WireError::Tls("invalid server name"))?;
@@ -336,11 +338,11 @@ pub async fn connect_tls_candidate(
 }
 
 pub async fn accept_tls(
-    stream: tokio::net::TcpStream,
-    config: std::sync::Arc<ServerConfig>,
+    stream: TcpStream,
+    config: Arc<ServerConfig>,
     expected_peer: &NodeIdentity,
     codec: FrameCodec,
-) -> Result<FramedConnection<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>, WireError> {
+) -> Result<FramedConnection<ServerTlsStream<TcpStream>>, WireError> {
     stream.set_nodelay(true)?;
     let stream = TlsAcceptor::from(config)
         .accept(stream)
@@ -390,18 +392,25 @@ pub fn verify_peer_certificate_identity(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::association::{AssociationId, LaneKind};
-    use crate::handshake::{FeatureBits, Handshake};
-    use crate::protocol::{ProtocolDescriptor, ProtocolFingerprint};
-    use crate::wire::FrameKind;
+    use std::sync::Arc;
+
     use bytes::Bytes;
     use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
     use rcgen::{CertificateParams, KeyPair, SanType};
-    use std::sync::Arc;
-    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::rustls::{
-        RootCertStore, client::WebPkiServerVerifier, server::WebPkiClientVerifier,
+        RootCertStore,
+        client::WebPkiServerVerifier,
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+        server::WebPkiClientVerifier,
+    };
+
+    use super::*;
+    use crate::{
+        association::{AssociationId, LaneKind},
+        handshake::{FeatureBits, Handshake},
+        protocol::{ProtocolDescriptor, ProtocolFingerprint},
+        wire::FrameKind,
     };
 
     fn test_certificate(
@@ -428,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_tcp_rejects_oversized_length_before_allocation() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -441,21 +450,21 @@ mod tests {
                 })
             ));
         });
-        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
         client.write_u32(65).await.unwrap();
         server.await.unwrap();
     }
 
     #[tokio::test]
     async fn real_tcp_frame_round_trip() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut connection = FramedConnection::new(stream, FrameCodec::new(1024).unwrap());
             connection.read_frame().await.unwrap()
         });
-        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let stream = TcpStream::connect(address).await.unwrap();
         let mut client = FramedConnection::new(stream, FrameCodec::new(1024).unwrap());
         let expected = Frame {
             kind: FrameKind::Tell,
@@ -467,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_tcp_handshake_binds_lane_and_exchanges_bounded_catalogue() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socket = listener.local_addr().unwrap();
         let cluster_id = ClusterId::new("test").unwrap();
         let server_identity = NodeIdentity {
@@ -503,7 +512,7 @@ mod tests {
             assert_eq!(handshake.lane, LaneKind::Control);
             assert_eq!(peer, vec![server_expected]);
         });
-        let stream = tokio::net::TcpStream::connect(socket).await.unwrap();
+        let stream = TcpStream::connect(socket).await.unwrap();
         let mut connection = FramedConnection::new(stream, FrameCodec::new(8192).unwrap());
         let peer = negotiate_outbound(
             &mut connection,
@@ -556,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn real_mutual_tls_socket_verifies_both_node_identities() {
         let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socket = listener.local_addr().unwrap();
         let cluster_id = ClusterId::new("tls-test").unwrap();
         let client_identity = NodeIdentity {

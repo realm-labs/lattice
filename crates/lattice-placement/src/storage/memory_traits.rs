@@ -1,28 +1,35 @@
-use super::domain::{
-    ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial, AuthorityCommit,
-    AutomaticBalanceSettings, CommitAutomaticSettings, CompactAdminOperations, CompleteMove,
-    CreateDomainMember, CreateMember, CreatePlan, CreatePlanWithOperation, DeletePlan,
-    DomainMemberCommit, DurableStorageLimits, EntityConfigCommit, FenceAuthority,
-    FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit, MoveCommit, PlanCommit,
-    PutEntityConfig, PutSingletonConfig, RecordAdminOperation, RemoveDomainMember, RemoveMember,
-    ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit, TransitionSlot,
-    UpdateDomainMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
+use std::time::Duration;
+
+use async_trait::async_trait;
+use lattice_core::{
+    actor_ref::{EntityType, PlacementDomainId, SingletonKind},
+    coordinator::CoordinatorScope,
 };
+
 use super::{
     CoordinatorLeaseStore, InMemoryPlacementStore, MembershipStore, PlacementDomainStore,
-    ScopedElectionStore, StorageError, current_revision, initial_revision, set_revision,
-    validate_guard,
+    ScopedElectionStore, StorageError, current_revision,
+    domain::{
+        ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial, AuthorityCommit,
+        AutomaticBalanceSettings, CommitAutomaticSettings, CompactAdminOperations, CompleteMove,
+        CreateDomainMember, CreateMember, CreatePlan, CreatePlanWithOperation, DeletePlan,
+        DomainMemberCommit, DurableStorageLimits, EntityConfigCommit, FenceAuthority,
+        FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit, MoveCommit, PlanCommit,
+        PutEntityConfig, PutSingletonConfig, RecordAdminOperation, RemoveDomainMember,
+        RemoveMember, ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit,
+        TransitionSlot, UpdateDomainMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
+    },
+    initial_revision, set_revision, validate_guard,
 };
-use crate::coordinator::{
-    DomainMemberRecord, ExactLeaderGuard, LeaderRecord, MemberRecord, MembershipLeaderGuard,
-    PlacementLeaderGuard, SingletonConfig,
+use crate::{
+    coordinator::{
+        DomainMemberRecord, ExactLeaderGuard, LeaderRecord, MemberRecord, MembershipLeaderGuard,
+        PlacementLeaderGuard, SingletonConfig,
+    },
+    plan::RebalancePlan,
+    region::EntityConfig,
+    types::{PlacementSlot, PlacementSlotKey, PlacementVersion, Revision},
 };
-use crate::plan::RebalancePlan;
-use crate::region::EntityConfig;
-use crate::types::{PlacementSlot, PlacementSlotKey, PlacementVersion, Revision};
-use async_trait::async_trait;
-use lattice_core::actor_ref::PlacementDomainId;
-use lattice_core::coordinator::CoordinatorScope;
 
 #[async_trait]
 impl CoordinatorLeaseStore for InMemoryPlacementStore {
@@ -30,7 +37,7 @@ impl CoordinatorLeaseStore for InMemoryPlacementStore {
         InMemoryPlacementStore::ensure_schema_generation(self).await
     }
 
-    async fn grant_lease(&self, ttl: std::time::Duration) -> Result<i64, StorageError> {
+    async fn grant_lease(&self, ttl: Duration) -> Result<i64, StorageError> {
         InMemoryPlacementStore::grant_lease(self, ttl).await
     }
 
@@ -42,10 +49,7 @@ impl CoordinatorLeaseStore for InMemoryPlacementStore {
         InMemoryPlacementStore::revoke_lease(self, lease_id).await
     }
 
-    async fn lease_time_to_live(
-        &self,
-        lease_id: i64,
-    ) -> Result<Option<std::time::Duration>, StorageError> {
+    async fn lease_time_to_live(&self, lease_id: i64) -> Result<Option<Duration>, StorageError> {
         InMemoryPlacementStore::lease_time_to_live(self, lease_id).await
     }
 }
@@ -173,7 +177,7 @@ impl PlacementDomainStore for InMemoryPlacementStore {
     async fn get_entity_config(
         &self,
         domain: &PlacementDomainId,
-        entity_type: &lattice_core::actor_ref::EntityType,
+        entity_type: &EntityType,
     ) -> Result<Option<EntityConfig>, StorageError> {
         Ok(self
             .inner
@@ -241,7 +245,7 @@ impl PlacementDomainStore for InMemoryPlacementStore {
     async fn get_singleton_config(
         &self,
         domain: &PlacementDomainId,
-        kind: &lattice_core::actor_ref::SingletonKind,
+        kind: &SingletonKind,
     ) -> Result<Option<SingletonConfig>, StorageError> {
         Ok(self
             .inner

@@ -1,14 +1,21 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use lattice_actor::context::ActorContext;
-use lattice_actor::error::{ActorCallError, ActorError};
-use lattice_actor::mailbox::MailboxConfig;
-use lattice_actor::reply::ReplyTo;
-use lattice_actor::runtime::spawn_actor;
-use lattice_actor::traits::{Actor, Handler, Responder, StopReason};
+use lattice_actor::{
+    context::ActorContext,
+    error::{ActorCallError, ActorError},
+    handle::ActorHandle,
+    mailbox::MailboxConfig,
+    reply::ReplyTo,
+    runtime::spawn_actor,
+    traits::{Actor, Handler, Responder, StopReason},
+};
 use tokio::sync::Semaphore;
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -168,10 +175,7 @@ fn query(gate: Arc<Semaphore>, entered: Arc<Semaphore>, database_value: u64) -> 
     }
 }
 
-fn actor(
-    continuations: Arc<AtomicUsize>,
-    mailbox: MailboxConfig,
-) -> lattice_actor::handle::ActorHandle<DeferredActor> {
+fn actor(continuations: Arc<AtomicUsize>, mailbox: MailboxConfig) -> ActorHandle<DeferredActor> {
     spawn_actor(
         DeferredActor {
             value: 1,

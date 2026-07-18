@@ -1,25 +1,29 @@
+use std::{collections::BTreeMap, sync::RwLock, time::Duration};
+
 use bytes::Bytes;
-use lattice_core::actor_ref::{EntityType, NodeIncarnation, PlacementDomainId, SingletonKind};
-use lattice_core::coordinator::CoordinatorScope;
-use lattice_remoting::association::AssociationKey;
-use lattice_remoting::control::CommandId;
-use lattice_remoting::control::ControlDispatch;
-use lattice_remoting::control::ControlDispatchError;
-use lattice_remoting::control::ControlGap;
+use lattice_core::{
+    actor_ref::{EntityType, NodeIncarnation, PlacementDomainId, SingletonKind},
+    coordinator::CoordinatorScope,
+};
+use lattice_remoting::{
+    association::AssociationKey,
+    control::{CommandId, ControlDispatch, ControlDispatchError, ControlGap},
+};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::sync::RwLock;
 use thiserror::Error;
-
 use tokio::sync::{mpsc, oneshot};
 
-use crate::coordinator::{
-    CoordinatorDelta, MemberEvent, MemberHello, MemberRecord, NodeLoadReport, PlacementDomainHello,
-    ShardLoadReport, SnapshotBegin, SnapshotChunk, SnapshotEnd,
-};
-use crate::types::{
-    AssignmentGeneration, ClaimGrant, MembershipVersion, PlacementVersion, ShardId,
+use crate::{
+    coordinator::{
+        CoordinatorDelta, MemberEvent, MemberHello, MemberRecord, MemberRemovalReason,
+        NodeLoadReport, PlacementDomainHello, ShardLoadReport, SnapshotBegin, SnapshotChunk,
+        SnapshotEnd,
+    },
+    types::{
+        AssignmentGeneration, ClaimGrant, MembershipVersion, NodeKey, PlacementSlotKey,
+        PlacementVersion, ShardId,
+    },
 };
 
 pub const PLACEMENT_CONTROL_GENERATION: u64 = 5;
@@ -60,20 +64,20 @@ pub enum PlacementControlCommand {
         kind: SingletonKind,
     },
     DrainSlot {
-        slot: crate::types::PlacementSlotKey,
+        slot: PlacementSlotKey,
         generation: AssignmentGeneration,
         version: PlacementVersion,
     },
     SlotDrained {
-        slot: crate::types::PlacementSlotKey,
+        slot: PlacementSlotKey,
         generation: AssignmentGeneration,
     },
     SlotStopFailed {
-        slot: crate::types::PlacementSlotKey,
+        slot: PlacementSlotKey,
         generation: AssignmentGeneration,
     },
     SlotReady {
-        slot: crate::types::PlacementSlotKey,
+        slot: PlacementSlotKey,
         generation: AssignmentGeneration,
     },
     BeginDrain {
@@ -170,8 +174,8 @@ pub enum PlacementControlEventKind {
         gap: Option<ControlGap>,
     },
     GlobalMemberRemoved {
-        node: crate::types::NodeKey,
-        reason: crate::coordinator::MemberRemovalReason,
+        node: NodeKey,
+        reason: MemberRemovalReason,
     },
 }
 
@@ -189,7 +193,7 @@ impl PlacementControlEvent {
 pub struct PlacementControlRouter {
     sender: mpsc::Sender<PlacementControlEvent>,
     maximum_payload: usize,
-    application_timeout: std::time::Duration,
+    application_timeout: Duration,
 }
 
 impl PlacementControlRouter {
@@ -197,13 +201,13 @@ impl PlacementControlRouter {
         capacity: usize,
         maximum_payload: usize,
     ) -> Result<(Self, mpsc::Receiver<PlacementControlEvent>), PlacementControlError> {
-        Self::bounded_with_timeout(capacity, maximum_payload, std::time::Duration::from_secs(5))
+        Self::bounded_with_timeout(capacity, maximum_payload, Duration::from_secs(5))
     }
 
     pub fn bounded_with_timeout(
         capacity: usize,
         maximum_payload: usize,
-        application_timeout: std::time::Duration,
+        application_timeout: Duration,
     ) -> Result<(Self, mpsc::Receiver<PlacementControlEvent>), PlacementControlError> {
         if capacity == 0 || maximum_payload == 0 || application_timeout.is_zero() {
             return Err(PlacementControlError::InvalidLimit);
@@ -273,7 +277,7 @@ pub struct PlacementControlDirectory {
     capacity_per_scope: usize,
     maximum_scopes: usize,
     maximum_payload: usize,
-    application_timeout: std::time::Duration,
+    application_timeout: Duration,
 }
 
 impl PlacementControlDirectory {
@@ -290,7 +294,7 @@ impl PlacementControlDirectory {
             capacity_per_scope,
             maximum_scopes,
             maximum_payload,
-            application_timeout: std::time::Duration::from_secs(5),
+            application_timeout: Duration::from_secs(5),
         })
     }
 

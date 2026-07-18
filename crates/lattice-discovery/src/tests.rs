@@ -1,26 +1,31 @@
-use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::{
+    collections::VecDeque,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use futures_util::{Stream, StreamExt};
 use lattice_config::store::{ConfigStore, ConfigStoreError, ConfigWatch, LocalConfigStore};
-use lattice_core::actor_ref::NodeAddress;
-use lattice_core::coordinator::CoordinatorScope;
+use lattice_core::{actor_ref::NodeAddress, coordinator::CoordinatorScope};
 use serde_json::json;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch::Sender};
 
-use crate::aggregate::AggregateDiscovery;
-use crate::config_store::ConfigStoreDiscovery;
-use crate::dns::{DnsDiscovery, DnsDiscoveryConfig, DnsLookup, DnsMode, DnsResolver, SrvRecord};
-use crate::provider::{
-    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
-    DiscoverySource, DiscoveryTarget,
+use crate::{
+    aggregate::AggregateDiscovery,
+    config_store::ConfigStoreDiscovery,
+    dns::{DnsDiscovery, DnsDiscoveryConfig, DnsLookup, DnsMode, DnsResolver, SrvRecord},
+    provider::{
+        CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
+        DiscoverySource, DiscoveryTarget,
+    },
+    static_provider::{StaticDiscovery, StaticEndpoint},
 };
-use crate::static_provider::{StaticDiscovery, StaticEndpoint};
 
 #[tokio::test]
 async fn static_discovery_emits_one_validated_snapshot() {
@@ -274,7 +279,7 @@ async fn aggregate_deduplicates_merges_sources_and_rotates_equal_priority() {
 #[derive(Clone)]
 struct RacingStore {
     first: serde_json::Value,
-    tx: tokio::sync::watch::Sender<Option<serde_json::Value>>,
+    tx: Sender<Option<serde_json::Value>>,
 }
 
 impl RacingStore {
@@ -302,7 +307,7 @@ impl ConfigStore for RacingStore {
 
 #[derive(Clone)]
 struct ReconnectingStore {
-    tx: tokio::sync::watch::Sender<Option<serde_json::Value>>,
+    tx: Sender<Option<serde_json::Value>>,
     watch_calls: Arc<AtomicUsize>,
     get_calls: Arc<AtomicUsize>,
 }

@@ -1,3 +1,5 @@
+use std::io::Error;
+
 use lattice_actor::traits::{Message, Request};
 
 #[derive(lattice_actor::Message)]
@@ -38,5 +40,5 @@ fn main() {
     assert_message::<Event>();
     assert_message::<WireTell>();
     assert_request::<GenericAsk<String>, Option<String>>();
-    assert_request::<QualifiedAsk, Result<Vec<u8>, std::io::Error>>();
+    assert_request::<QualifiedAsk, Result<Vec<u8>, Error>>();
 }

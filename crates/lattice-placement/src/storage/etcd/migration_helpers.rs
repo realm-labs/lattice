@@ -1,3 +1,7 @@
+use std::fs::OpenOptions;
+
+use lattice_core::actor_ref::ConfigFingerprint;
+
 #[derive(Debug, Serialize)]
 struct RawRecord {
     key: String,
@@ -13,7 +17,7 @@ fn record_suffix<'a>(prefix: &str, record_key: &'a str) -> Result<&'a str, Migra
 }
 
 fn write_backup(path: &PathBuf, records: &[RawRecord]) -> Result<(), MigrationError> {
-    let mut options = std::fs::OpenOptions::new();
+    let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
     {
@@ -153,7 +157,7 @@ fn prepare_record(
     suffix: &str,
     value: &[u8],
     mapping: &MigrationDomainMapping,
-    entity_fingerprints: &BTreeMap<String, lattice_core::actor_ref::ConfigFingerprint>,
+    entity_fingerprints: &BTreeMap<String, ConfigFingerprint>,
     mut extra_targets: BTreeMap<String, Vec<u8>>,
     coordinator_term: u64,
 ) -> Result<Option<PreparedRecord>, MigrationError> {
@@ -268,7 +272,7 @@ fn prepare_record(
 fn qualify_slot(
     value: &[u8],
     domain: &PlacementDomainId,
-    fingerprint: Option<lattice_core::actor_ref::ConfigFingerprint>,
+    fingerprint: Option<ConfigFingerprint>,
 ) -> Result<PlacementSlot, MigrationError> {
     let mut value: serde_json::Value = serde_json::from_slice(value)?;
     let object = value.as_object_mut().ok_or(MigrationError::InvalidRecord)?;
@@ -362,8 +366,8 @@ fn update_counts(
     report: &mut MigrationReport,
     suffix: &str,
     value: &[u8],
-    entity_configs: &mut std::collections::BTreeMap<String, String>,
-    singleton_configs: &mut std::collections::BTreeMap<String, String>,
+    entity_configs: &mut BTreeMap<String, String>,
+    singleton_configs: &mut BTreeMap<String, String>,
 ) -> Result<(), MigrationError> {
     let scoped = if let Some(rest) = suffix.strip_prefix("domains/") {
         rest.split_once('/')
@@ -410,8 +414,8 @@ fn record_revision(value: &[u8]) -> Result<u64, MigrationError> {
 
 fn collect_member_configs(
     value: &[u8],
-    entity_configs: &mut std::collections::BTreeMap<String, String>,
-    singleton_configs: &mut std::collections::BTreeMap<String, String>,
+    entity_configs: &mut BTreeMap<String, String>,
+    singleton_configs: &mut BTreeMap<String, String>,
 ) -> Result<(), MigrationError> {
     let value: serde_json::Value = serde_json::from_slice(value)?;
     let hello = value.get("hello").ok_or(MigrationError::InvalidRecord)?;
@@ -455,7 +459,7 @@ fn collect_configs(
     hello: &serde_json::Value,
     collection: &str,
     key_name: &str,
-    configs: &mut std::collections::BTreeMap<String, String>,
+    configs: &mut BTreeMap<String, String>,
 ) -> Result<(), MigrationError> {
     let Some(values) = hello.get(collection).and_then(serde_json::Value::as_array) else {
         return Ok(());
@@ -476,7 +480,7 @@ fn collect_configs(
 
 type ConfigTargets = (
     BTreeMap<String, Vec<u8>>,
-    BTreeMap<String, lattice_core::actor_ref::ConfigFingerprint>,
+    BTreeMap<String, ConfigFingerprint>,
 );
 
 fn build_config_targets(

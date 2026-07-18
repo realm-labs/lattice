@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{collections::BTreeMap, net::Ipv4Addr, pin::Pin, sync::Arc};
 
 use futures_util::{Stream, StreamExt};
-use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort, EndpointSlice};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::{
+    api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort, EndpointSlice},
+    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+};
 use lattice_core::coordinator::CoordinatorScope;
 use lattice_discovery::provider::{CoordinatorDiscovery, DiscoveryError};
 
@@ -126,7 +126,7 @@ fn endpoint_slice(name: &str, service: &str, address: &str) -> EndpointSlice {
         },
         address_type: if address.contains(':') {
             "IPv6".to_string()
-        } else if address.parse::<std::net::Ipv4Addr>().is_ok() {
+        } else if address.parse::<Ipv4Addr>().is_ok() {
             "IPv4".to_string()
         } else {
             "FQDN".to_string()

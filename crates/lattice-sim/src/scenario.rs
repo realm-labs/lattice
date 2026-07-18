@@ -1,35 +1,33 @@
 use std::collections::BTreeSet;
 
-use lattice_core::actor_ref::{
-    ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, PlacementDomainId,
-    ProtocolId,
+use lattice_core::{
+    actor_ref::{
+        ActivationId, ActorPath, ActorRef, ClusterId, EntityType, NodeAddress, NodeIncarnation,
+        PlacementDomainId, ProtocolId,
+    },
+    failpoint::Failpoint,
 };
-use lattice_core::failpoint::Failpoint;
-use lattice_placement::handoff::HandoffEffect;
-use lattice_placement::handoff::HandoffEvent;
-use lattice_placement::handoff::HandoffMachine;
-use lattice_placement::handoff::HandoffPhase;
-use lattice_placement::types::AssignmentGeneration;
-use lattice_placement::types::CoordinatorTerm;
-use lattice_placement::types::NodeKey;
-use lattice_placement::types::PlacementSlotKey;
-use lattice_placement::types::PlacementVersion;
-use lattice_placement::types::Revision;
-use lattice_placement::types::ShardId;
-use lattice_remoting::association::AssociationId;
-use lattice_remoting::control::CommandId;
-use lattice_remoting::control::ControlApply;
-use lattice_remoting::control::ControlEnvelope;
-use lattice_remoting::control::ReliableControl;
-use lattice_remoting::messaging::target::ExactActorTarget;
-use lattice_remoting::watch::WatchRegistry;
-use lattice_remoting::watch::WatchStatus;
+use lattice_placement::{
+    handoff::{HandoffEffect, HandoffError, HandoffEvent, HandoffMachine, HandoffPhase},
+    types::{
+        AssignmentGeneration, CoordinatorTerm, NodeKey, PlacementSlotKey, PlacementVersion,
+        Revision, ShardId,
+    },
+};
+use lattice_remoting::{
+    association::AssociationId,
+    control::{CommandId, ControlApply, ControlEnvelope, ReliableControl, ReliableControlError},
+    messaging::target::ExactActorTarget,
+    watch::{WatchError, WatchId, WatchRegistry, WatchStatus},
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::clock::{SimClock, SimScheduler};
-use crate::fault::{FailAction, FaultInjector};
-use crate::trace::{TraceEvent, TraceJournal};
+use crate::{
+    clock::{SimClock, SimScheduler},
+    fault::{FailAction, FaultInjector},
+    trace::{TraceEvent, TraceJournal},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioConfig {
@@ -71,7 +69,7 @@ pub struct Scenario {
     handoff: HandoffMachine,
     control: ReliableControl,
     watches: WatchRegistry,
-    watch_id: lattice_remoting::watch::WatchId,
+    watch_id: WatchId,
 }
 
 impl Scenario {
@@ -87,7 +85,7 @@ impl Scenario {
         let handoff = HandoffMachine::begin(
             PlacementSlotKey::Shard {
                 domain: placement_domain(),
-                entity_type: lattice_core::actor_ref::EntityType::new("sim-entity").unwrap(),
+                entity_type: EntityType::new("sim-entity").unwrap(),
                 shard_id: ShardId::new(1),
             },
             1,
@@ -371,28 +369,27 @@ pub enum ScenarioError {
     #[error("scenario observed an unexpected voluntary stop failure")]
     UnexpectedStopFailure,
     #[error(transparent)]
-    Handoff(#[from] lattice_placement::handoff::HandoffError),
+    Handoff(#[from] HandoffError),
     #[error(transparent)]
-    Control(#[from] lattice_remoting::control::ReliableControlError),
+    Control(#[from] ReliableControlError),
     #[error(transparent)]
-    Watch(#[from] lattice_remoting::watch::WatchError),
+    Watch(#[from] WatchError),
     #[error(transparent)]
     Invariant(#[from] InvariantViolation),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::{Arc, Mutex};
 
-    use crate::explorer::Explorable;
-    use crate::explorer::StateExplorer;
-    use crate::fault::FaultMatrix;
-    use crate::fault::FaultTarget;
-    use crate::network::SimNetwork;
-    use crate::process::ProcessState;
-    use crate::process::SimProcess;
-    use crate::store::SimEtcd;
+    use super::*;
+    use crate::{
+        explorer::{Explorable, StateExplorer},
+        fault::{FaultMatrix, FaultTarget},
+        network::SimNetwork,
+        process::{ProcessState, SimProcess},
+        store::{SimEtcd, SimWatchEvent},
+    };
 
     fn run(seed: u64) -> Scenario {
         let mut scenario = Scenario::standard(ScenarioConfig {
@@ -738,7 +735,7 @@ mod tests {
         etcd.compact(2);
         assert!(matches!(
             etcd.watch_from(1).as_slice(),
-            [crate::store::SimWatchEvent::Compacted { compacted: 2, .. }]
+            [SimWatchEvent::Compacted { compacted: 2, .. }]
         ));
     }
 

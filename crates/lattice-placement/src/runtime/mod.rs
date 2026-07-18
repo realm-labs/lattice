@@ -1,42 +1,52 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
-use lattice_core::actor_ref::{NodeIncarnation, PlacementDomainId};
-use lattice_core::coordinator::CoordinatorScope;
-use lattice_remoting::association::Association;
-use lattice_remoting::association::AssociationManager;
-use lattice_remoting::association::AssociationState;
+use lattice_core::{
+    actor_ref::{EntityType, NodeIncarnation, PlacementDomainId, SingletonKind},
+    coordinator::CoordinatorScope,
+};
+use lattice_remoting::association::{
+    Association, AssociationError, AssociationKey, AssociationManager, AssociationState,
+};
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
-use tokio::time::Instant;
+use tokio::{
+    sync::{mpsc, oneshot::Sender, watch},
+    time::Instant,
+};
 
-use crate::allocation::{
-    AllocationRequest, LoadSample, PlacedShard, PlacementNode, PlacementView, RebalanceLimits,
-    RebalanceProposal, RebalanceTrigger, ShardAllocationStrategy, WeightedLeastLoad,
-};
-use crate::control::{
-    DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlEvent,
-    encode_control_command,
-};
-use crate::coordinator::{
-    COORDINATOR_PROTOCOL_GENERATION, DomainMemberRecord, DomainMemberStatus, LeaderRecord,
-    LoadTable, MemberRecord, MemberRemovalReason, MemberStatus, PlacementDomainHello,
-    PlacementLeaderGuard, SessionLimits, SingletonConfig, SnapshotLimits, SnapshotRecord,
-    build_snapshot,
-};
-use crate::handoff::{HandoffEffect, HandoffEvent, HandoffMachine, HandoffPhase};
-use crate::plan::{MoveProgress, PlanError, PlanReason, PlanStatus, RebalancePlan};
-use crate::storage::domain::{
-    AdminOperationRecord, AutomaticBalanceSettings, DurableStorageLimits,
-};
-use crate::storage::{
-    CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore, StorageError,
-};
-use crate::types::{
-    ClaimGrant, CoordinatorTerm, GrantSequence, MembershipVersion, NodeKey, PlacementSlot,
-    PlacementSlotKey, PlacementSlotState, PlacementVersion,
+use crate::{
+    allocation::{
+        AllocationError, AllocationRequest, LoadSample, PlacedShard, PlacementNode, PlacementView,
+        RebalanceLimits, RebalanceProposal, RebalanceTrigger, ShardAllocationStrategy,
+        WeightedLeastLoad,
+    },
+    control::{
+        DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlError,
+        PlacementControlEvent, encode_control_command,
+    },
+    coordinator::{
+        COORDINATOR_PROTOCOL_GENERATION, CoordinatorError, DomainMemberRecord, DomainMemberStatus,
+        LeaderRecord, LoadTable, MemberRecord, MemberRemovalReason, MemberStatus,
+        PlacementDomainHello, PlacementLeaderGuard, SessionLimits, SingletonConfig, SnapshotLimits,
+        SnapshotRecord, build_snapshot,
+    },
+    handoff::{HandoffEffect, HandoffError, HandoffEvent, HandoffMachine, HandoffPhase},
+    plan::{MoveProgress, PlanError, PlanReason, PlanStatus, RebalancePlan},
+    region::EntityConfig,
+    storage::{
+        CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore,
+        StorageError,
+        domain::{AdminOperationRecord, AutomaticBalanceSettings, DurableStorageLimits},
+    },
+    types::{
+        AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, MembershipVersion,
+        MonotonicTime, NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState,
+        PlacementVersion, ShardId,
+    },
 };
 
 mod admin;
@@ -154,7 +164,7 @@ struct MemberSession {
     hello: PlacementDomainHello,
     record: MemberRecord,
     domain_record: Option<DomainMemberRecord>,
-    association: lattice_remoting::association::AssociationKey,
+    association: AssociationKey,
     lease_id: i64,
     heartbeat_sequence: u64,
     last_heartbeat: Instant,
@@ -163,7 +173,7 @@ struct MemberSession {
     draining: bool,
     drain_operation: Option<String>,
     drain_ready: bool,
-    joined_at: crate::types::MonotonicTime,
+    joined_at: MonotonicTime,
 }
 
 impl MemberSession {
@@ -185,9 +195,9 @@ struct ClaimLease {
 pub struct ManualRelocationRequest {
     pub domain: PlacementDomainId,
     pub operation_id: String,
-    pub entity_type: lattice_core::actor_ref::EntityType,
-    pub shard_id: crate::types::ShardId,
-    pub expected_generation: crate::types::AssignmentGeneration,
+    pub entity_type: EntityType,
+    pub shard_id: ShardId,
+    pub expected_generation: AssignmentGeneration,
     pub target_node_id: String,
 }
 
@@ -203,7 +213,7 @@ pub struct ForceRemoveRequest {
 pub struct CoordinatorInspection {
     pub version: PlacementVersion,
     pub automatic_globally_paused: bool,
-    pub paused_entity_types: Vec<lattice_core::actor_ref::EntityType>,
+    pub paused_entity_types: Vec<EntityType>,
     pub slots: Vec<PlacementSlot>,
     pub plans: Vec<RebalancePlan>,
     pub reconciliation_backlog: usize,
@@ -232,38 +242,37 @@ struct ReconciliationState {
 enum CoordinatorOperation {
     SubmitRebalance {
         proposal: RebalanceProposal,
-        entity_type: lattice_core::actor_ref::EntityType,
-        completion: tokio::sync::oneshot::Sender<Result<u128, CoordinatorRuntimeError>>,
+        entity_type: EntityType,
+        completion: Sender<Result<u128, CoordinatorRuntimeError>>,
     },
     CancelPending {
         operation_id: String,
         plan_id: u128,
-        shard_id: crate::types::ShardId,
-        completion: tokio::sync::oneshot::Sender<Result<(), CoordinatorRuntimeError>>,
+        shard_id: ShardId,
+        completion: Sender<Result<(), CoordinatorRuntimeError>>,
     },
     Evaluate {
         operation_id: String,
-        entity_type: lattice_core::actor_ref::EntityType,
+        entity_type: EntityType,
         trigger: RebalanceTrigger,
-        completion: tokio::sync::oneshot::Sender<Result<Option<u128>, CoordinatorRuntimeError>>,
+        completion: Sender<Result<Option<u128>, CoordinatorRuntimeError>>,
     },
     SetAutomatic {
         operation_id: String,
-        entity_type: Option<lattice_core::actor_ref::EntityType>,
+        entity_type: Option<EntityType>,
         paused: bool,
-        completion: tokio::sync::oneshot::Sender<Result<(), CoordinatorRuntimeError>>,
+        completion: Sender<Result<(), CoordinatorRuntimeError>>,
     },
     ManualRelocate {
         request: ManualRelocationRequest,
-        completion: tokio::sync::oneshot::Sender<Result<u128, CoordinatorRuntimeError>>,
+        completion: Sender<Result<u128, CoordinatorRuntimeError>>,
     },
     ForceRemove {
         request: ForceRemoveRequest,
-        completion: tokio::sync::oneshot::Sender<Result<(), CoordinatorRuntimeError>>,
+        completion: Sender<Result<(), CoordinatorRuntimeError>>,
     },
     Inspect {
-        completion:
-            tokio::sync::oneshot::Sender<Result<CoordinatorInspection, CoordinatorRuntimeError>>,
+        completion: Sender<Result<CoordinatorInspection, CoordinatorRuntimeError>>,
     },
 }
 
@@ -277,7 +286,7 @@ impl CoordinatorHandle {
     pub async fn submit_rebalance(
         &self,
         proposal: RebalanceProposal,
-        entity_type: lattice_core::actor_ref::EntityType,
+        entity_type: EntityType,
     ) -> Result<u128, CoordinatorRuntimeError> {
         if proposal.domain != self.domain {
             return Err(CoordinatorRuntimeError::InvalidAdminOperation);
@@ -301,7 +310,7 @@ impl CoordinatorHandle {
         domain: PlacementDomainId,
         operation_id: String,
         plan_id: u128,
-        shard_id: crate::types::ShardId,
+        shard_id: ShardId,
     ) -> Result<(), CoordinatorRuntimeError> {
         self.require_domain(&domain)?;
         let (completion, result) = tokio::sync::oneshot::channel();
@@ -323,7 +332,7 @@ impl CoordinatorHandle {
         &self,
         domain: PlacementDomainId,
         operation_id: String,
-        entity_type: lattice_core::actor_ref::EntityType,
+        entity_type: EntityType,
         trigger: RebalanceTrigger,
     ) -> Result<Option<u128>, CoordinatorRuntimeError> {
         self.require_domain(&domain)?;
@@ -346,7 +355,7 @@ impl CoordinatorHandle {
         &self,
         domain: PlacementDomainId,
         operation_id: String,
-        entity_type: Option<lattice_core::actor_ref::EntityType>,
+        entity_type: Option<EntityType>,
         paused: bool,
     ) -> Result<(), CoordinatorRuntimeError> {
         self.require_domain(&domain)?;
@@ -444,23 +453,16 @@ where
     handoffs: BTreeMap<PlacementSlotKey, HandoffMachine>,
     operations: mpsc::Sender<CoordinatorOperation>,
     operation_receiver: mpsc::Receiver<CoordinatorOperation>,
-    entity_configs: BTreeMap<lattice_core::actor_ref::EntityType, crate::region::EntityConfig>,
-    singleton_configs: BTreeMap<lattice_core::actor_ref::SingletonKind, SingletonConfig>,
+    entity_configs: BTreeMap<EntityType, EntityConfig>,
+    singleton_configs: BTreeMap<SingletonKind, SingletonConfig>,
     strategies: BTreeMap<(String, u32), Arc<dyn ShardAllocationStrategy>>,
     origin: Instant,
-    slot_assigned_at: BTreeMap<PlacementSlotKey, crate::types::MonotonicTime>,
-    last_automatic_move_at: Option<crate::types::MonotonicTime>,
-    node_load_received: BTreeMap<NodeIncarnation, crate::types::MonotonicTime>,
-    shard_load_received: BTreeMap<
-        (
-            NodeIncarnation,
-            lattice_core::actor_ref::EntityType,
-            crate::types::ShardId,
-        ),
-        crate::types::MonotonicTime,
-    >,
+    slot_assigned_at: BTreeMap<PlacementSlotKey, MonotonicTime>,
+    last_automatic_move_at: Option<MonotonicTime>,
+    node_load_received: BTreeMap<NodeIncarnation, MonotonicTime>,
+    shard_load_received: BTreeMap<(NodeIncarnation, EntityType, ShardId), MonotonicTime>,
     automatic_globally_paused: bool,
-    paused_entity_types: std::collections::BTreeSet<lattice_core::actor_ref::EntityType>,
+    paused_entity_types: BTreeSet<EntityType>,
     automatic_settings: Option<AutomaticBalanceSettings>,
     applied_admin_operations: BTreeMap<String, AdminOperationRecord>,
     reconciliation: ReconciliationState,
@@ -556,12 +558,7 @@ where
         let slot_assigned_at = slots
             .iter()
             .filter(|slot| slot.state == PlacementSlotState::Running)
-            .map(|slot| {
-                (
-                    slot.key.clone(),
-                    crate::types::MonotonicTime::from_millis(0),
-                )
-            })
+            .map(|slot| (slot.key.clone(), MonotonicTime::from_millis(0)))
             .collect();
         let mut leader = Self {
             store,
@@ -663,9 +660,9 @@ pub enum CoordinatorRuntimeError {
     #[error("Coordinator durable store failed")]
     Storage(#[from] StorageError),
     #[error("Coordinator reducer rejected state")]
-    Coordinator(#[source] crate::coordinator::CoordinatorError),
+    Coordinator(#[source] CoordinatorError),
     #[error("Coordinator control codec failed")]
-    Control(#[source] crate::control::PlacementControlError),
+    Control(#[source] PlacementControlError),
     #[error("Coordinator snapshot record codec failed")]
     Codec,
     #[error("Coordinator control stream closed")]
@@ -718,7 +715,7 @@ pub enum CoordinatorRuntimeError {
     #[error("allocation strategy ID/version is already registered")]
     DuplicateStrategy,
     #[error("allocation strategy rejected the placement view")]
-    Allocation(#[source] crate::allocation::AllocationError),
+    Allocation(#[source] AllocationError),
     #[error("placement slot does not exist")]
     UnknownSlot,
     #[error("rebalance plan does not exist")]
@@ -734,9 +731,9 @@ pub enum CoordinatorRuntimeError {
     #[error("rebalance plan reducer rejected a transition")]
     Plan(#[source] PlanError),
     #[error("handoff reducer rejected a transition")]
-    Handoff(#[source] crate::handoff::HandoffError),
+    Handoff(#[source] HandoffError),
     #[error("Coordinator Association rejected reliable control admission")]
-    Association(#[from] lattice_remoting::association::AssociationError),
+    Association(#[from] AssociationError),
 }
 
 #[cfg(test)]

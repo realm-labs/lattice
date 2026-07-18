@@ -1,18 +1,25 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use bytes::Bytes;
-use lattice_core::actor_ref::{
-    ConfigFingerprint, EntityType, NodeIncarnation, PlacementDomainId, ProtocolId, SingletonKind,
+use lattice_core::{
+    actor_ref::{
+        ConfigFingerprint, EntityType, NodeIncarnation, PlacementDomainId, ProtocolId,
+        SingletonKind,
+    },
+    coordinator::CoordinatorScope,
 };
 use lattice_remoting::protocol::ProtocolDescriptor;
 use serde::{Deserialize, Serialize};
-
-use lattice_core::coordinator::CoordinatorScope;
 use thiserror::Error;
 
-use crate::region::EntityConfig;
-use crate::types::{
-    CoordinatorTerm, MembershipVersion, MonotonicTime, NodeKey, PlacementVersion, ShardId,
+use crate::{
+    region::EntityConfig,
+    types::{
+        CoordinatorTerm, MembershipVersion, MonotonicTime, NodeKey, PlacementVersion, ShardId,
+    },
 };
 
 pub const COORDINATOR_PROTOCOL_GENERATION: u64 = 5;
@@ -617,9 +624,7 @@ impl SnapshotStager {
             return Err(CoordinatorError::SnapshotLimit);
         }
         let deadline = now
-            .checked_add(std::time::Duration::from_millis(
-                limits.staging_timeout_millis,
-            ))
+            .checked_add(Duration::from_millis(limits.staging_timeout_millis))
             .ok_or(CoordinatorError::SnapshotLimit)?;
         Ok(Self {
             limits,
@@ -1047,6 +1052,8 @@ pub enum CoordinatorError {
 
 #[cfg(test)]
 mod state_version_tests {
+    use lattice_core::actor_ref::NodeAddress;
+
     use super::*;
     use crate::types::{CoordinatorTerm, Revision};
 
@@ -1088,7 +1095,7 @@ mod state_version_tests {
         let domain = PlacementDomainId::new("battle").unwrap();
         let node = NodeKey {
             node_id: "node-a".to_owned(),
-            address: lattice_core::actor_ref::NodeAddress::new("127.0.0.1", 25520).unwrap(),
+            address: NodeAddress::new("127.0.0.1", 25520).unwrap(),
             incarnation: NodeIncarnation::new(1).unwrap(),
         };
         let empty = PlacementDomainHello::builder(node.clone(), domain.clone(), 1).build();

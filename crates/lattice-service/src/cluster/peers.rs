@@ -1,17 +1,21 @@
 use std::sync::Arc;
 
-use lattice_placement::coordinator::{MemberChange, MemberEvent, MemberRecord, MemberStatus};
-use lattice_placement::types::MembershipVersion;
-use lattice_placement::types::NodeKey;
-use lattice_remoting::association::{Association, AssociationManager, AssociationState};
-use lattice_remoting::endpoint::{EndpointError, RemotingEndpoint};
-use lattice_remoting::handshake::NodeIdentity;
+use lattice_core::actor_ref::ClusterId;
+use lattice_placement::{
+    coordinator::{MemberChange, MemberEvent, MemberRecord, MemberStatus},
+    types::{MembershipVersion, NodeKey},
+};
+use lattice_remoting::{
+    association::{Association, AssociationManager, AssociationState},
+    endpoint::{EndpointError, RemotingEndpoint},
+    handshake::NodeIdentity,
+};
 use thiserror::Error;
 
-use super::members::MemberDirectory;
+use super::members::{MemberDirectory, MemberDirectoryError};
 
 pub struct PeerReconciler {
-    cluster_id: lattice_core::actor_ref::ClusterId,
+    cluster_id: ClusterId,
     endpoint: Arc<RemotingEndpoint>,
     associations: Arc<AssociationManager>,
     members: Arc<MemberDirectory>,
@@ -19,7 +23,7 @@ pub struct PeerReconciler {
 
 impl PeerReconciler {
     pub fn new(
-        cluster_id: lattice_core::actor_ref::ClusterId,
+        cluster_id: ClusterId,
         endpoint: Arc<RemotingEndpoint>,
         associations: Arc<AssociationManager>,
         members: Arc<MemberDirectory>,
@@ -122,7 +126,7 @@ pub enum PeerError {
     #[error("peer is not an exact authoritative Up member")]
     NotAuthoritativeUp,
     #[error("authoritative member directory rejected an event")]
-    Directory(#[source] super::members::MemberDirectoryError),
+    Directory(#[source] MemberDirectoryError),
     #[error("peer endpoint failed: {0}")]
     Endpoint(#[source] EndpointError),
 }

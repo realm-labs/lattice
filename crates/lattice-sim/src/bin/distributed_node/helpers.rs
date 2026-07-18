@@ -1,4 +1,4 @@
-fn fixture_entity_config() -> Result<EntityConfig, Box<dyn std::error::Error>> {
+fn fixture_entity_config() -> Result<EntityConfig, Box<dyn Error>> {
     Ok(EntityConfig::new(
         placement_domain(),
         EntityType::new("distributed-entity")?,
@@ -14,7 +14,7 @@ fn fixture_entity_slot(
     config: &EntityConfig,
     entity_id: &EntityId,
     owner: NodeKey,
-) -> Result<PlacementSlot, Box<dyn std::error::Error>> {
+) -> Result<PlacementSlot, Box<dyn Error>> {
     Ok(PlacementSlot {
         key: PlacementSlotKey::Shard {
             domain: config.domain.clone(),
@@ -40,14 +40,12 @@ fn placement_domain() -> PlacementDomainId {
     PlacementDomainId::new("distributed-simulation").expect("static placement domain is valid")
 }
 
-async fn wait_for_file(path: &PathBuf) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+async fn wait_for_file(path: &PathBuf) -> Result<Vec<u8>, Box<dyn Error>> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match std::fs::read(path) {
             Ok(encoded) => return Ok(encoded),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline =>
-            {
+            Err(error) if error.kind() == ErrorKind::NotFound && Instant::now() < deadline => {
                 tokio::task::yield_now().await;
             }
             Err(error) => return Err(Box::new(error)),
@@ -55,7 +53,7 @@ async fn wait_for_file(path: &PathBuf) -> Result<Vec<u8>, Box<dyn std::error::Er
     }
 }
 
-fn write_atomic(path: PathBuf, contents: &[u8]) -> Result<(), std::io::Error> {
+fn write_atomic(path: PathBuf, contents: &[u8]) -> Result<(), IoError> {
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::write(&temporary, contents)?;
     std::fs::rename(temporary, path)
