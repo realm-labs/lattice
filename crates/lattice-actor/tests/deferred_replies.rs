@@ -51,7 +51,7 @@ impl Responder<Query> for DeferredActor {
         request.entered.add_permits(1);
         let gate = request.gate;
         let database_value = request.database_value;
-        ctx.pipe_to_self(
+        ctx.defer_reply(
             reply_to,
             async move {
                 if let Ok(permit) = gate.acquire_owned().await {
@@ -110,7 +110,7 @@ impl Responder<FailAfterPipe> for DeferredActor {
     ) -> Result<(), ActorError> {
         request.entered.add_permits(1);
         let gate = request.gate;
-        ctx.pipe_to_self(
+        ctx.defer_reply(
             reply_to,
             async move {
                 if let Ok(permit) = gate.acquire_owned().await {

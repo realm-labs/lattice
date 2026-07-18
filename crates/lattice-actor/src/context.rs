@@ -313,10 +313,52 @@ impl<A: Actor> ActorContext<A> {
         self.tasks.spawn(future);
     }
 
-    /// Runs asynchronous work outside the actor turn, then posts its result
-    /// back as a one-way message. The continuation handles the message with
-    /// exclusive actor access and owns the original reply token.
-    pub fn pipe_to_self<T, Fut, Map, M>(
+    /// Runs asynchronous work outside the actor turn and posts its result back
+    /// as a one-way message.
+    ///
+    /// The mapping function runs in the scoped background task. The resulting
+    /// message is handled in a later actor turn, so other mailbox traffic may
+    /// be processed first. The work is bounded by the deferred-operation
+    /// capacity and is aborted when the actor stops.
+    ///
+    /// Use [`Self::defer_reply`] when the continuation owns an ask reply token
+    /// and must inherit that request's deadline and failure semantics.
+    pub fn pipe_to_self<Fut, Map, M>(
+        &mut self,
+        future: Fut,
+        map: Map,
+    ) -> Result<(), PipeToSelfError>
+    where
+        A: Handler<M>,
+        M: Message,
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+        Map: FnOnce(Fut::Output) -> M + Send + 'static,
+    {
+        self.reserve_pipe_task()?;
+        let handle = self.handle.clone();
+        self.pipe_tasks.spawn(async move {
+            let message = map(future.await);
+            if let Err(error) = handle.send_tell_internal(message).await {
+                tracing::debug!(
+                    actor.type = type_name::<A>(),
+                    %error,
+                    "actor pipe-to-self continuation was not delivered"
+                );
+            }
+        });
+        Ok(())
+    }
+
+    /// Defers an ask reply while asynchronous work runs outside the actor turn.
+    ///
+    /// Unlike [`Self::pipe_to_self`], this operation owns a [`ReplyTo`] and
+    /// therefore observes the ask deadline. Capacity exhaustion, deadline
+    /// expiry, and failure to post the continuation complete the request with
+    /// `MailboxFull`, `DeadlineExceeded`, or `MailboxClosed`, respectively.
+    /// The mapping function receives the reply token so the later actor turn
+    /// can finish the request using current actor state.
+    pub fn defer_reply<T, Fut, Map, M>(
         &mut self,
         reply_to: ReplyTo<T>,
         future: Fut,
@@ -330,13 +372,10 @@ impl<A: Actor> ActorContext<A> {
         Fut::Output: Send + 'static,
         Map: FnOnce(Fut::Output, ReplyTo<T>) -> M + Send + 'static,
     {
-        self.reap_runtime_work();
         let control = reply_to.control();
-        if self.pipe_tasks.len() >= self.deferred_capacity {
+        if let Err(error) = self.reserve_pipe_task() {
             control.cancel(ActorCallError::MailboxFull);
-            return Err(PipeToSelfError::Capacity {
-                capacity: self.deferred_capacity,
-            });
+            return Err(error);
         }
 
         let handle = self.handle.clone();
@@ -371,6 +410,17 @@ impl<A: Actor> ActorContext<A> {
             }
         });
         Ok(())
+    }
+
+    fn reserve_pipe_task(&mut self) -> Result<(), PipeToSelfError> {
+        self.reap_runtime_work();
+        if self.pipe_tasks.len() >= self.deferred_capacity {
+            Err(PipeToSelfError::Capacity {
+                capacity: self.deferred_capacity,
+            })
+        } else {
+            Ok(())
+        }
     }
 
     pub fn watch<B>(&mut self, target: &ActorHandle<B>) -> Result<WatchId, ActorError>

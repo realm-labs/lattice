@@ -336,7 +336,7 @@ Routing rules:
 | EventBus event | broker subscription → typed adapter → optional recipient send | Broker guarantee plus business idempotency; never an implicit ask |
 | Scheduler message | managed timer → recipient send | Uses the recipient semantics at trigger time |
 
-Tell and ask are protocol modes registered by `ActorProtocol` and distinct typed business interactions. A tell uses `Message` plus `Handler<M>` and has no response capability. Actor-originated tells carry an optional exact sender reference: `tell` uses the current actor, while `forward` preserves the incoming sender. An ask uses `Request` plus `Responder<R>`, registers the codec for `R::Response`, and receives a single-use `ReplyTo<R::Response>`; it does not use the envelope sender as a reply channel. Asynchronous work returns through a bounded `ActorContext::pipe_to_self` continuation so the final response can safely read current actor state.
+Tell and ask are protocol modes registered by `ActorProtocol` and distinct typed business interactions. A tell uses `Message` plus `Handler<M>` and has no response capability. Actor-originated tells carry an optional exact sender reference: `tell` uses the current actor, while `forward` preserves the incoming sender. An ask uses `Request` plus `Responder<R>`, registers the codec for `R::Response`, and receives a single-use `ReplyTo<R::Response>`; it does not use the envelope sender as a reply channel. General asynchronous work returns through a bounded `ActorContext::pipe_to_self` continuation. Request-aware work uses `ActorContext::defer_reply` so the continuation preserves the ask deadline and can safely reply using current actor state.
 
 ### 4.3 Membership and Placement-Domain State Distribution
 

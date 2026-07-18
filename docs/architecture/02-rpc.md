@@ -171,7 +171,7 @@ where
     A: Responder<R>;
 ```
 
-`ActorProtocol` explicitly declares the permitted interaction mode. A `tell` registration has no response codec and permits fire-and-forget delivery only. Tell envelopes may carry the sending actor's exact `ActorRef`; `tell` replaces it with the current actor and `forward` preserves it across local or remote routing. An `ask` registration includes the associated response codec and dispatches to `Responder<R>` with a typed `ReplyTo<R::Response>`. Ask replies never depend on the tell sender field. The responder may reply immediately or use bounded `pipe_to_self` work to post a continuation back to the actor before replying.
+`ActorProtocol` explicitly declares the permitted interaction mode. A `tell` registration has no response codec and permits fire-and-forget delivery only. Tell envelopes may carry the sending actor's exact `ActorRef`; `tell` replaces it with the current actor and `forward` preserves it across local or remote routing. An `ask` registration includes the associated response codec and dispatches to `Responder<R>` with a typed `ReplyTo<R::Response>`. Ask replies never depend on the tell sender field. The responder may reply immediately or use bounded `defer_reply` work to post a continuation back to the actor while preserving the ask deadline.
 
 ### 2.3 Registration Rules
 

@@ -328,7 +328,16 @@ impl Handler<WorldTick> for WorldActor {
 }
 ```
 
-For asynchronous I/O, the responder launches bounded work and maps its output to a one-way continuation. The continuation is a later actor turn, so it can combine the query result with current actor state before replying:
+For asynchronous I/O that is not tied to an ask, any handler can launch bounded work and map its output to a one-way continuation:
+
+```rust
+ctx.pipe_to_self(
+    async move { db.refresh_profile(player_id).await },
+    |result| ProfileRefreshed { result },
+)?;
+```
+
+When the work belongs to an ask, the responder uses `defer_reply` so the continuation inherits the request deadline and owns its reply capability. The continuation is a later actor turn, so it can combine the query result with current actor state before replying:
 
 ```rust
 #[derive(lattice_actor::Message)]
@@ -346,7 +355,7 @@ impl Responder<GetPlayerView> for WorldActor {
         reply_to: ReplyTo<GetPlayerViewResponse>,
     ) -> Result<(), ActorError> {
         let db = self.db.clone();
-        ctx.pipe_to_self(
+        ctx.defer_reply(
             reply_to,
             async move { db.load_profile(request.player_id).await },
             |result, reply_to| ProfileLoaded { result, reply_to },
@@ -371,7 +380,7 @@ impl Handler<ProfileLoaded> for WorldActor {
 }
 ```
 
-`pipe_to_self` is bounded by the mailbox's deferred capacity, observes the ask deadline, and is cancelled when the actor stops or passivates. Other messages may interleave before the continuation, which is precisely why it observes current rather than captured actor state.
+`defer_reply` is bounded by the mailbox's deferred capacity, observes the ask deadline, and is cancelled when the actor stops or passivates. Other messages may interleave before the continuation, which is precisely why it observes current rather than captured actor state. For asynchronous work that is not tied to an ask, `pipe_to_self(future, map)` posts the mapped result back as an ordinary one-way message without reply or deadline semantics.
 
 ### 7.6 Mailbox
 
@@ -443,7 +452,8 @@ Actor handlers should not block realtime actor execution with unbounded slow I/O
 
 ```text
 Small bounded I/O in handler when latency is acceptable.
-ActorContext `pipe_to_self` for bounded request work that must return to actor state.
+ActorContext `pipe_to_self` for bounded asynchronous work that must return to actor state.
+ActorContext `defer_reply` for request work that must preserve the ask deadline and reply capability.
 ActorContext scoped task for cancellable background work that has no caller reply.
 Dedicated service-level worker for heavy or shared I/O.
 Business pending state plus retry/compensation for cross-service workflows.
