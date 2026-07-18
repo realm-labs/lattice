@@ -121,6 +121,7 @@ pub enum MessageOutcome {
     Handled,
     HandlerFailed,
     HandlerErrorRecovered,
+    Panicked,
     Rejected(MessageRejection),
 }
 

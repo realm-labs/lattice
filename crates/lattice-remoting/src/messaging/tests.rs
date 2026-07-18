@@ -12,6 +12,14 @@ use crate::transport::FramedConnection;
 use crate::wire::FrameCodec;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+#[test]
+fn actor_panicked_maps_to_the_dedicated_remote_failure_code() {
+    assert_eq!(
+        failure_code(&RemoteMessageError::ActorPanicked),
+        RemoteFailureCode::ActorPanicked
+    );
+}
+
 fn active_association(
     protocol_id: ProtocolId,
     fingerprint: ProtocolFingerprint,
@@ -94,6 +102,9 @@ impl InboundDispatch for RecordingDispatch {
         if Instant::now() >= deadline {
             return Err(RemoteMessageError::DeadlineExceeded);
         }
+        if payload == Bytes::from_static(b"panic") {
+            return Err(RemoteMessageError::ActorPanicked);
+        }
         Ok(payload)
     }
 }
@@ -155,6 +166,24 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
         decode_reply(&reply).unwrap(),
         (correlation, Bytes::from_static(b"ask"))
     );
+    let panic_correlation = CorrelationId::new(9, 2).unwrap();
+    client
+        .write_frame(&Frame::encode_message(
+            FrameKind::Ask,
+            &AskWire {
+                sender: 9_u128.to_be_bytes().to_vec(),
+                target: Some(target_to_wire(&exact)),
+                correlation_id: panic_correlation.to_bytes().to_vec(),
+                timeout_nanos: Duration::from_secs(1).as_nanos() as u64,
+                message_id: 2,
+                payload: b"panic".to_vec(),
+            },
+        ))
+        .await
+        .unwrap();
+    let failure = decode_failure(&client.read_frame().await.unwrap()).unwrap();
+    assert_eq!(failure.correlation_id, panic_correlation);
+    assert_eq!(failure.code, RemoteFailureCode::ActorPanicked);
     client
         .write_frame(&Frame {
             kind: FrameKind::Close,

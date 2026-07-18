@@ -39,6 +39,10 @@ pub(crate) fn record_resolved_stop_failure(forced: bool) {
     }
 }
 
+pub(crate) fn record_abandoned_stop_failure() {
+    ACTIVE_STOP_FAILURES.fetch_sub(1, Ordering::Relaxed);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorMetadata {
     actor_type: &'static str,
@@ -88,6 +92,7 @@ pub enum RequestCompletion {
     DeadlineExceeded,
     MailboxFull,
     MailboxClosed,
+    ActorPanicked,
     LifecycleUnavailable,
     CallerDropped,
 }
@@ -96,6 +101,7 @@ pub enum RequestCompletion {
 pub enum ActorLifecycleEvent {
     Started,
     StartFailed,
+    Panicked,
     Stopped(StopReason),
     StopFailed(StopReason),
     StopRetried(StopReason),

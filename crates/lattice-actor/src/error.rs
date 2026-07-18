@@ -51,6 +51,8 @@ pub enum ActorCallError {
     MailboxFull,
     #[error("actor mailbox is closed")]
     MailboxClosed,
+    #[error("actor panicked while processing its execution callback")]
+    ActorPanicked,
     #[error("actor does not admit business traffic while lifecycle state is {state:?}")]
     LifecycleUnavailable {
         state: crate::traits::ActorLifecycleState,

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
-use lattice_actor::error::ActorError;
+use lattice_actor::error::{ActorCallError, ActorError};
 use lattice_actor::host::ProtocolHostRegistry;
 use lattice_actor::protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec};
 use lattice_actor::registry::{ActorCreateContext, ActorRefConfig, ActorRegistryConfig};
@@ -49,6 +49,14 @@ use tokio::sync::watch;
 use crate::backend::ServiceInboundDispatch;
 
 const TEST_PROTOCOL_ID: u64 = 77;
+
+#[test]
+fn actor_panic_dispatch_maps_to_remote_actor_panicked() {
+    assert_eq!(
+        map_dispatch(DispatchError::Actor(ActorCallError::ActorPanicked)),
+        RemoteMessageError::ActorPanicked
+    );
+}
 
 fn domain() -> PlacementDomainId {
     PlacementDomainId::new("service-test").unwrap()

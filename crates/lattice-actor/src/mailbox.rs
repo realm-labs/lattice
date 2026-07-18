@@ -114,8 +114,12 @@ impl<A: Actor> ActorCommand<A> {
 pub(crate) trait ActorEnvelope<A: Actor>: Send {
     fn metadata(&self, lane: MailboxLane) -> MessageMetadata;
 
+    fn reject_panicked(&mut self) -> Option<RequestCompletion> {
+        None
+    }
+
     async fn handle(
-        self: Box<Self>,
+        &mut self,
         actor: &mut A,
         ctx: &mut ActorContext<A>,
         metadata: &MessageMetadata,
@@ -145,7 +149,7 @@ impl<R: Request> RequestEnvelope<R> {
 }
 
 pub(crate) struct TellEnvelope<M: Message> {
-    msg: M,
+    msg: Option<M>,
     sender: Option<ActorRef>,
     enqueued_at: Instant,
 }
@@ -153,7 +157,7 @@ pub(crate) struct TellEnvelope<M: Message> {
 impl<M: Message> TellEnvelope<M> {
     pub(crate) fn new(msg: M, sender: Option<ActorRef>) -> Self {
         Self {
-            msg,
+            msg: Some(msg),
             sender,
             enqueued_at: Instant::now(),
         }
@@ -177,18 +181,26 @@ where
     }
 
     async fn handle(
-        self: Box<Self>,
+        &mut self,
         actor: &mut A,
         ctx: &mut ActorContext<A>,
         metadata: &MessageMetadata,
     ) -> MessageOutcome {
         ctx.clear_sender();
         ctx.set_current_deadline(None);
-        if let Some(sender) = self.sender {
+        if let Some(sender) = self.sender.take() {
             ctx.set_sender(sender);
         }
-        actor.before_message(ctx, MessageView::new(metadata, &self.msg));
-        let outcome = match actor.handle(ctx, self.msg).await {
+        let msg = self
+            .msg
+            .as_ref()
+            .expect("tell envelope message is present before dispatch");
+        actor.before_message(ctx, MessageView::new(metadata, msg));
+        let msg = self
+            .msg
+            .take()
+            .expect("tell envelope message is present before dispatch");
+        let outcome = match actor.handle(ctx, msg).await {
             Ok(()) => MessageOutcome::Handled,
             Err(error) => {
                 warn!(message.type = type_name::<M>(), %error, "tell handler returned error");
@@ -219,8 +231,19 @@ where
         )
     }
 
+    fn reject_panicked(&mut self) -> Option<RequestCompletion> {
+        let reply_tx = self.reply_tx.take()?;
+        Some(
+            if reply_tx.send(Err(ActorCallError::ActorPanicked)).is_ok() {
+                RequestCompletion::ActorPanicked
+            } else {
+                RequestCompletion::CallerDropped
+            },
+        )
+    }
+
     async fn handle(
-        mut self: Box<Self>,
+        &mut self,
         actor: &mut A,
         ctx: &mut ActorContext<A>,
         metadata: &MessageMetadata,

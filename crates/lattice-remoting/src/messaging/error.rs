@@ -23,6 +23,7 @@ pub enum RemoteFailureCode {
     HandlerFailed = 8,
     ProtocolMismatch = 9,
     Internal = 10,
+    ActorPanicked = 11,
 }
 
 impl TryFrom<u32> for RemoteFailureCode {
@@ -40,6 +41,7 @@ impl TryFrom<u32> for RemoteFailureCode {
             8 => Ok(Self::HandlerFailed),
             9 => Ok(Self::ProtocolMismatch),
             10 => Ok(Self::Internal),
+            11 => Ok(Self::ActorPanicked),
             _ => Err(()),
         }
     }
@@ -109,4 +111,20 @@ pub enum RemoteMessageError {
     Unauthorized,
     #[error("remote handler failed")]
     HandlerFailed,
+    #[error("remote actor panicked")]
+    ActorPanicked,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RemoteFailureCode;
+
+    #[test]
+    fn actor_panicked_failure_code_is_stable() {
+        assert_eq!(RemoteFailureCode::ActorPanicked as u16, 11);
+        assert_eq!(
+            RemoteFailureCode::try_from(11),
+            Ok(RemoteFailureCode::ActorPanicked)
+        );
+    }
 }

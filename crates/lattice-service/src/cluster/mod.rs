@@ -131,6 +131,7 @@ fn map_dispatch(error: DispatchError) -> RemoteMessageError {
         DispatchError::MissingDeadline | DispatchError::Actor(ActorCallError::DeadlineExceeded) => {
             RemoteMessageError::DeadlineExceeded
         }
+        DispatchError::Actor(ActorCallError::ActorPanicked) => RemoteMessageError::ActorPanicked,
         DispatchError::MailboxRejected => RemoteMessageError::MailboxRejected,
         DispatchError::Actor(_) => RemoteMessageError::HandlerFailed,
     }

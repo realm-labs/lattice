@@ -469,11 +469,12 @@ impl<A: Actor> ActorHandle<A> {
             .expect("actor stop failure mutex poisoned") = Some(record);
     }
 
-    pub(crate) fn clear_stop_failure(&self) {
+    pub(crate) fn clear_stop_failure(&self) -> bool {
         self.stop_failure
             .lock()
             .expect("actor stop failure mutex poisoned")
-            .take();
+            .take()
+            .is_some()
     }
 
     pub(crate) fn mark_stop_failure_quarantined(&self) {
@@ -639,6 +640,7 @@ impl From<ActorCallError> for ActorTellError {
             ActorCallError::InvalidTimeout => Self::MailboxClosed,
             ActorCallError::MailboxFull => Self::MailboxFull,
             ActorCallError::MailboxClosed => Self::MailboxClosed,
+            ActorCallError::ActorPanicked => Self::MailboxClosed,
             ActorCallError::LifecycleUnavailable { state } => Self::LifecycleUnavailable { state },
             ActorCallError::ResponseDropped
             | ActorCallError::DeadlineExceeded

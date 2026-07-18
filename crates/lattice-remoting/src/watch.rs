@@ -33,6 +33,7 @@ impl WatchId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TerminatedReason {
     Stopped,
+    Panicked,
     Passivated,
     Handoff,
     ClaimLost,
@@ -69,7 +70,7 @@ pub enum WatchStatus {
 }
 
 const WATCH_CONTROL_MAGIC: &[u8; 4] = b"LWCH";
-pub const WATCH_CONTROL_GENERATION: u32 = 1;
+pub const WATCH_CONTROL_GENERATION: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WatchControlEnvelope {
@@ -462,6 +463,32 @@ mod tests {
         assert_eq!(
             decode_watch_command(&encoded, 4).unwrap_err(),
             WatchError::PayloadTooLarge
+        );
+    }
+
+    #[test]
+    fn panicked_termination_requires_watch_generation_two() {
+        assert_eq!(WATCH_CONTROL_GENERATION, 2);
+        let target = actor(1);
+        let command = WatchCommand::Terminated {
+            watch_id: WatchId::new(7, 9).unwrap(),
+            target: ExactActorTarget::from(&target),
+            reason: TerminatedReason::Panicked,
+        };
+        let encoded = encode_watch_command(&command, 4096).unwrap();
+        assert_eq!(decode_watch_command(&encoded, 4096).unwrap(), command);
+
+        let mut legacy = WATCH_CONTROL_MAGIC.to_vec();
+        legacy.extend_from_slice(
+            &serde_json::to_vec(&WatchControlEnvelope {
+                generation: 1,
+                command,
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            decode_watch_command(&legacy, 4096).unwrap_err(),
+            WatchError::GenerationMismatch
         );
     }
 

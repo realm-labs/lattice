@@ -81,6 +81,7 @@ impl ServiceControlDispatch {
                 };
                 let reason = match terminated.reason {
                     lattice_actor::watch::TerminatedReason::Stopped => TerminatedReason::Stopped,
+                    lattice_actor::watch::TerminatedReason::Panicked => TerminatedReason::Panicked,
                     lattice_actor::watch::TerminatedReason::Passivated => {
                         TerminatedReason::Passivated
                     }

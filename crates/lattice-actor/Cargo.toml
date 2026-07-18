@@ -10,6 +10,7 @@ async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
+futures-util.workspace = true
 http.workspace = true
 lattice-core.workspace = true
 lattice-actor-macros.workspace = true

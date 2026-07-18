@@ -1,23 +1,25 @@
 use std::any::{TypeId, type_name};
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
+use futures_util::FutureExt;
 use tokio::sync::mpsc;
 use tokio::sync::{broadcast, oneshot, watch};
 use tracing::{Instrument, debug, error, info};
 
 use crate::context::ActorContext;
-use crate::error::{ActorAdminError, ActorSpawnError};
+use crate::error::{ActorAdminError, ActorCallError, ActorSpawnError};
 use crate::handle::{ActorHandle, ForcedDataLossEvent, StopFailureRecord, TerminalHook};
 use crate::mailbox::{ActorCommand, MailboxConfig, MailboxLane};
 use crate::observation::{ActorLifecycleEvent, ActorObserverHandle};
 use crate::recipient::ActorSystem;
-use crate::traits::{Actor, ActorLifecycleState, PassivationReason, StopReason};
+use crate::traits::{Actor, ActorLifecycleState, MessageOutcome, PassivationReason, StopReason};
 use crate::watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason};
 use lattice_core::actor_ref::ActorRef;
 use lattice_core::id::ActorId;
@@ -672,32 +674,48 @@ where
         actor.type = actor_type,
         actor.local_ref = local_ref
     );
-    let startup_failure = if let Err(error) = actor.started(&mut ctx).instrument(started_span).await
+    let startup_failure = match AssertUnwindSafe(actor.started(&mut ctx).instrument(started_span))
+        .catch_unwind()
+        .await
     {
-        handle.observer().lifecycle(
-            handle.observation_metadata(),
-            ActorLifecycleEvent::StartFailed,
-        );
-        error!(
-            actor.type = actor_type,
-            actor.local_ref = local_ref,
-            %error,
-            "actor failed to start"
-        );
-        true
-    } else {
-        if handle.lifecycle_state() != ActorLifecycleState::Quarantined {
-            handle.set_lifecycle_state(ActorLifecycleState::Running);
+        Ok(Err(error)) => {
+            handle.observer().lifecycle(
+                handle.observation_metadata(),
+                ActorLifecycleEvent::StartFailed,
+            );
+            error!(
+                actor.type = actor_type,
+                actor.local_ref = local_ref,
+                %error,
+                "actor failed to start"
+            );
+            true
         }
-        handle
-            .observer()
-            .lifecycle(handle.observation_metadata(), ActorLifecycleEvent::Started);
-        info!(
-            actor.type = actor_type,
-            actor.local_ref = local_ref,
-            "actor started"
-        );
-        false
+        Ok(Ok(())) => {
+            if handle.lifecycle_state() != ActorLifecycleState::Quarantined {
+                handle.set_lifecycle_state(ActorLifecycleState::Running);
+            }
+            handle
+                .observer()
+                .lifecycle(handle.observation_metadata(), ActorLifecycleEvent::Started);
+            info!(
+                actor.type = actor_type,
+                actor.local_ref = local_ref,
+                "actor started"
+            );
+            false
+        }
+        Err(payload) => {
+            terminate_panicked_actor(
+                actor,
+                &mut ctx,
+                &handle,
+                &mut normal_rx,
+                &mut system_rx,
+                ActorPanic::new("started", payload),
+            );
+            return;
+        }
     };
 
     let externally_fenced = handle.lifecycle_state() == ActorLifecycleState::Quarantined;
@@ -709,9 +727,10 @@ where
         None
     };
 
-    while stop_reason.is_none() {
+    let mut actor_panic = None;
+    while stop_reason.is_none() && actor_panic.is_none() {
         while let Ok(command) = system_rx.try_recv() {
-            if handle_command(
+            match handle_command(
                 command,
                 MailboxLane::System,
                 &handle,
@@ -722,11 +741,16 @@ where
             )
             .await
             {
-                break;
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(panic) => {
+                    actor_panic = Some(panic);
+                    break;
+                }
             }
         }
 
-        if stop_reason.is_some() {
+        if stop_reason.is_some() || actor_panic.is_some() {
             break;
         }
 
@@ -736,7 +760,7 @@ where
             command = system_rx.recv() => {
                 match command {
                     Some(command) => {
-                        handle_command(
+                        if let Err(panic) = handle_command(
                             command,
                             MailboxLane::System,
                             &handle,
@@ -745,7 +769,10 @@ where
                             &mut stop_reason,
                             activity_tx.as_ref(),
                         )
-                        .await;
+                        .await
+                        {
+                            actor_panic = Some(panic);
+                        }
                     }
                     None if normal_rx.is_closed() => {
                         stop_reason = Some(StopReason::MailboxClosed);
@@ -756,7 +783,7 @@ where
             command = normal_rx.recv() => {
                 match command {
                     Some(command) => {
-                        handle_command(
+                        if let Err(panic) = handle_command(
                             command,
                             MailboxLane::Normal,
                             &handle,
@@ -765,7 +792,10 @@ where
                             &mut stop_reason,
                             activity_tx.as_ref(),
                         )
-                        .await;
+                        .await
+                        {
+                            actor_panic = Some(panic);
+                        }
                     }
                     None if system_rx.is_closed() => {
                         stop_reason = Some(StopReason::MailboxClosed);
@@ -774,6 +804,18 @@ where
                 }
             }
         }
+    }
+
+    if let Some(panic) = actor_panic {
+        terminate_panicked_actor(
+            actor,
+            &mut ctx,
+            &handle,
+            &mut normal_rx,
+            &mut system_rx,
+            panic,
+        );
+        return;
     }
 
     let reason = stop_reason.unwrap_or(StopReason::Requested);
@@ -788,7 +830,7 @@ where
         | StopReason::AuthorityLost => ActorLifecycleState::Stopping,
     };
 
-    let (forced, terminal_completion) = run_stopping_phase(
+    let (forced, terminal_completion) = match run_stopping_phase(
         &mut actor,
         &mut ctx,
         &handle,
@@ -797,12 +839,33 @@ where
         reason,
         previous_phase,
     )
-    .await;
+    .await
+    {
+        Ok(completion) => completion,
+        Err(panic) => {
+            terminate_panicked_actor(
+                actor,
+                &mut ctx,
+                &handle,
+                &mut normal_rx,
+                &mut system_rx,
+                panic,
+            );
+            return;
+        }
+    };
 
-    drop(actor);
+    handle.clear_stop_failure();
+    if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(actor))) {
+        normal_rx.close();
+        system_rx.close();
+        reject_queued_commands(&mut normal_rx, MailboxLane::Normal, &handle);
+        reject_queued_commands(&mut system_rx, MailboxLane::System, &handle);
+        finalize_panicked_actor(&handle, ActorPanic::new("drop", payload));
+        return;
+    }
     handle.mark_terminal_cleanup_started();
     handle.run_terminal_hook();
-    handle.clear_stop_failure();
     handle.set_lifecycle_state(ActorLifecycleState::Stopped);
     handle.observer().lifecycle(
         handle.observation_metadata(),
@@ -837,7 +900,7 @@ async fn run_stopping_phase<A>(
     system_rx: &mut mpsc::Receiver<ActorCommand<A>>,
     reason: StopReason,
     previous_phase: ActorLifecycleState,
-) -> (bool, Option<oneshot::Sender<Result<(), ActorAdminError>>>)
+) -> Result<(bool, Option<oneshot::Sender<Result<(), ActorAdminError>>>), ActorPanic>
 where
     A: Actor,
 {
@@ -866,14 +929,18 @@ where
             actor.local_ref = local_ref,
             stop.reason = ?reason
         );
-        match actor.stopping(ctx, reason).instrument(stopping_span).await {
-            Ok(()) => {
+        match AssertUnwindSafe(actor.stopping(ctx, reason).instrument(stopping_span))
+            .catch_unwind()
+            .await
+        {
+            Err(payload) => return Err(ActorPanic::new("stopping", payload)),
+            Ok(Ok(())) => {
                 if failure.is_some() {
                     crate::observation::record_resolved_stop_failure(false);
                 }
-                return (false, retry_result.take());
+                return Ok((false, retry_result.take()));
             }
-            Err(stop_error) => {
+            Ok(Err(stop_error)) => {
                 let now = SystemTime::now();
                 let record = match failure.take() {
                     Some(mut record) => {
@@ -956,7 +1023,7 @@ where
                         failed_attempts,
                     });
                     crate::observation::record_resolved_stop_failure(true);
-                    return (true, Some(result));
+                    return Ok((true, Some(result)));
                 }
                 Some(ActorCommand::Stop(requested_reason)) => {
                     debug!(
@@ -992,12 +1059,12 @@ async fn handle_command<A>(
     ctx: &mut ActorContext<A>,
     stop_reason: &mut Option<StopReason>,
     activity_tx: Option<&watch::Sender<u64>>,
-) -> bool
+) -> Result<bool, ActorPanic>
 where
     A: Actor,
 {
     match command {
-        ActorCommand::Envelope(envelope) => {
+        ActorCommand::Envelope(mut envelope) => {
             let metadata = envelope.metadata(lane);
             let started_at = Instant::now();
             let actor_metadata = handle.observation_metadata();
@@ -1021,10 +1088,29 @@ where
                 mailbox.lane = lane.as_str(),
                 "handling actor message"
             );
-            let outcome = envelope
-                .handle(actor, ctx, &metadata)
-                .instrument(span)
-                .await;
+            let outcome =
+                match AssertUnwindSafe(envelope.handle(actor, ctx, &metadata).instrument(span))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(payload) => {
+                        if let Some(completion) = envelope.reject_panicked() {
+                            handle.observer().request_completed(
+                                actor_metadata,
+                                &metadata,
+                                completion,
+                            );
+                        }
+                        handle.observer().message_finished(
+                            actor_metadata,
+                            &metadata,
+                            MessageOutcome::Panicked,
+                            started_at.elapsed(),
+                        );
+                        return Err(ActorPanic::new("message", payload));
+                    }
+                };
             handle.observer().message_finished(
                 actor_metadata,
                 &metadata,
@@ -1043,7 +1129,7 @@ where
             record_activity(activity_tx);
             if let Some(requested_reason) = ctx.take_lifecycle_request() {
                 *stop_reason = Some(requested_reason);
-                return true;
+                return Ok(true);
             }
         }
         ActorCommand::Stop(reason) => {
@@ -1054,7 +1140,7 @@ where
                 "actor stop requested"
             );
             *stop_reason = Some(reason);
-            return true;
+            return Ok(true);
         }
         ActorCommand::RetryStop(result) => {
             let _ = result.send(Err(ActorAdminError::InvalidState {
@@ -1076,48 +1162,8 @@ where
         }
     }
 
-    false
+    Ok(false)
 }
 
-fn spawn_passivation_monitor<A>(
-    handle: &ActorHandle<A>,
-    passivation: PassivationPolicy,
-) -> Option<watch::Sender<u64>>
-where
-    A: Actor,
-{
-    let PassivationPolicy::IdleTimeout(timeout) = passivation else {
-        return None;
-    };
-
-    let (activity_tx, mut activity_rx) = watch::channel(0_u64);
-    let handle = handle.clone();
-    tokio::spawn(async move {
-        loop {
-            let observed = *activity_rx.borrow();
-            tokio::select! {
-                _ = tokio::time::sleep(timeout) => {
-                    if *activity_rx.borrow() == observed {
-                        let _ = handle.try_stop_internal(StopReason::Passivated(
-                            PassivationReason::IdleTimeout,
-                        ));
-                        break;
-                    }
-                }
-                changed = activity_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    Some(activity_tx)
-}
-
-fn record_activity(activity_tx: Option<&watch::Sender<u64>>) {
-    if let Some(activity_tx) = activity_tx {
-        let next = activity_tx.borrow().wrapping_add(1);
-        activity_tx.send_replace(next);
-    }
-}
+include!("runtime/panic.rs");
+include!("runtime/passivation.rs");

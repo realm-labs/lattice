@@ -47,6 +47,7 @@ pub struct ActorTerminated {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminatedReason {
     Stopped,
+    Panicked,
     Passivated,
     Migrated,
     Fenced,

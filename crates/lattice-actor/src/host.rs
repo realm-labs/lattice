@@ -352,6 +352,9 @@ fn map_dispatch(error: DispatchError) -> RemoteMessageError {
         DispatchError::Actor(crate::error::ActorCallError::DeadlineExceeded) => {
             RemoteMessageError::DeadlineExceeded
         }
+        DispatchError::Actor(crate::error::ActorCallError::ActorPanicked) => {
+            RemoteMessageError::ActorPanicked
+        }
         DispatchError::Actor(_) => RemoteMessageError::HandlerFailed,
     }
 }

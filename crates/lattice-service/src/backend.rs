@@ -778,6 +778,9 @@ impl RecipientBackend for ServiceRecipientBackend {
                                     lattice_actor::watch::TerminatedReason::Stopped => {
                                         TerminatedReason::Stopped
                                     }
+                                    lattice_actor::watch::TerminatedReason::Panicked => {
+                                        TerminatedReason::Panicked
+                                    }
                                     lattice_actor::watch::TerminatedReason::Passivated => {
                                         TerminatedReason::Passivated
                                     }
@@ -896,6 +899,7 @@ fn map_remote_ask(error: RemoteMessageError) -> AskError {
         RemoteMessageError::InvalidPayload => RemoteFailureCode::DecodeFailed,
         RemoteMessageError::DeadlineExceeded => RemoteFailureCode::DeadlineExceeded,
         RemoteMessageError::Unauthorized => RemoteFailureCode::Unauthorized,
+        RemoteMessageError::ActorPanicked => RemoteFailureCode::ActorPanicked,
         RemoteMessageError::ShardUnavailable
         | RemoteMessageError::HandlerFailed
         | RemoteMessageError::ZeroPendingLimit => RemoteFailureCode::HandlerFailed,

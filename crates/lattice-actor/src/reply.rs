@@ -391,6 +391,7 @@ fn completion_for_error(error: &ActorCallError) -> RequestCompletion {
         ActorCallError::InvalidTimeout => RequestCompletion::InvalidTimeout,
         ActorCallError::MailboxFull => RequestCompletion::MailboxFull,
         ActorCallError::MailboxClosed => RequestCompletion::MailboxClosed,
+        ActorCallError::ActorPanicked => RequestCompletion::ActorPanicked,
         ActorCallError::LifecycleUnavailable { .. } => RequestCompletion::LifecycleUnavailable,
         ActorCallError::ResponseDropped => RequestCompletion::ResponseDropped,
         ActorCallError::DeadlineExceeded => RequestCompletion::DeadlineExceeded,
