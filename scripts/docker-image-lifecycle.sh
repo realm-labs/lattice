@@ -17,15 +17,31 @@ case "$retention_hours" in
   ''|*[!0-9]*) echo "invalid lattice image retention hours: $retention_hours" >&2; exit 2 ;;
 esac
 case "$mode" in
-  preflight|cleanup) ;;
-  *) echo "usage: $0 <preflight|cleanup>" >&2; exit 2 ;;
+  preflight|cleanup|cleanup-current) ;;
+  *) echo "usage: $0 <preflight|cleanup|cleanup-current>" >&2; exit 2 ;;
 esac
 
+if [ "$mode" = cleanup-current ]; then
+  for tag in $current_tags; do
+    image_id=$(docker image ls -q "$tag" 2>/dev/null | head -n 1)
+    [ -n "$image_id" ] || continue
+    if docker ps -aq --filter "ancestor=$image_id" | grep -q .; then
+      echo "refusing to remove test image still used by a container: $tag" >&2
+      exit 1
+    fi
+    docker image rm "$tag" >/dev/null
+  done
+  exit 0
+fi
+
 docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
-disk_path=$docker_root
-[ -n "$disk_path" ] && [ -e "$disk_path" ] || disk_path=/
+disk_path=
+if [ -n "$docker_root" ] && [ -e "$docker_root" ]; then
+  disk_path=$docker_root
+fi
 
 disk_percent() {
+  [ -n "$disk_path" ] || return 0
   df -P "$disk_path" | awk 'NR == 2 { value = $(NF - 1); gsub(/%/, "", value); print value }'
 }
 
@@ -60,12 +76,13 @@ remove_candidate() {
 cleanup_expired() {
   now=$(date -u +%s)
   cutoff=$((now - retention_hours * 3600))
-  docker image ls --filter "label=$label" --format '{{.ID}} {{.Repository}}:{{.Tag}}' |
+  docker image ls -a --filter "label=$label" --format '{{.ID}} {{.Repository}}:{{.Tag}}' |
     sort -u | while read -r image_id tag; do
       [ -n "$image_id" ] || continue
       created=$(docker image inspect --format '{{.Created}}' "$image_id" 2>/dev/null || true)
       [ -n "$created" ] || continue
-      created_epoch=$(date -u -d "$created" +%s 2>/dev/null || echo "$now")
+      normalized=$(printf '%s\n' "$created" | sed 's/\.[0-9][0-9]*Z$/Z/')
+      created_epoch=$(date -u -d "$normalized" +%s 2>/dev/null || date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$normalized" +%s 2>/dev/null || echo "$now")
       [ "$created_epoch" -lt "$cutoff" ] || continue
       remove_candidate "$image_id" "$tag" || true
     done
@@ -77,7 +94,7 @@ cleanup_to_watermark() {
   [ "$usage" -ge 80 ] || return 0
   candidates=$(mktemp)
   trap 'rm -f "$candidates"' EXIT INT TERM
-  docker image ls --filter "label=$label" --format '{{.ID}} {{.Repository}}:{{.Tag}}' |
+  docker image ls -a --filter "label=$label" --format '{{.ID}} {{.Repository}}:{{.Tag}}' |
     sort -u | while read -r image_id tag; do
       created=$(docker image inspect --format '{{.Created}}' "$image_id" 2>/dev/null || true)
       [ -n "$created" ] && printf '%s\t%s\t%s\n' "$created" "$image_id" "$tag"

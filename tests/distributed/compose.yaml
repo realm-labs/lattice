@@ -2,11 +2,6 @@ name: lattice-distributed
 
 x-runner: &runner
   image: ${LATTICE_RUNNER_IMAGE:-lattice-test-runner:local}
-  build:
-    context: ../..
-    dockerfile: tests/distributed/Dockerfile.runner
-    labels:
-      org.realm-labs.lattice.test: "true"
   working_dir: /workspace
   volumes:
     - ../..:/workspace:ro

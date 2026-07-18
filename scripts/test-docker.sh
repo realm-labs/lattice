@@ -18,6 +18,7 @@ runner_image="lattice-test-runner:$run_id"
 probe_image="lattice-k8s-probe:$run_id"
 export LATTICE_RUNNER_IMAGE=$runner_image
 export LATTICE_CURRENT_IMAGE_TAGS="$runner_image $probe_image"
+export LATTICE_DOCKER_CACHE_HELPER_IMAGE=$runner_image
 
 cache_volumes=$("$root/scripts/docker-test-cache.sh" ensure)
 LATTICE_CARGO_HOME_VOLUME=${cache_volumes%%:*}
@@ -43,6 +44,8 @@ cleanup() {
     echo "Docker cleanup leaked labeled resources for project $project" >&2
     cleanup_failed=1
   fi
+  "$root/scripts/docker-test-cache.sh" maintain || cleanup_failed=1
+  "$root/scripts/docker-image-lifecycle.sh" cleanup-current || cleanup_failed=1
   "$root/scripts/docker-image-lifecycle.sh" cleanup || cleanup_failed=1
   if [ "${cleanup_failed:-0}" -ne 0 ]; then
     echo "Docker cleanup failed for project $project" >&2
@@ -88,5 +91,11 @@ case "$profile" in
   *) echo "unknown profile: $profile" >&2; exit 2 ;;
 esac
 
+docker build \
+  --label org.realm-labs.lattice.test=true \
+  -f "$root/tests/distributed/Dockerfile.runner" \
+  -t "$runner_image" \
+  "$root"
+
 docker compose -f "$compose" -p "$project" --profile "$profile" up \
-  --build --abort-on-container-exit --exit-code-from "$service" "$service"
+  --no-build --abort-on-container-exit --exit-code-from "$service" "$service"
