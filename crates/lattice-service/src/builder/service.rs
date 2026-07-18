@@ -566,36 +566,37 @@ impl LatticeService {
                     .get(domain)
                     .is_some_and(|completed| completed == &operation_id)
             }) {
-                if self.configured_domains.is_empty() {
-                    self.transition(ServiceLifecycleEvent::DrainComplete)?;
-                    return self.stop_components().await;
-                }
                 let membership = self
                     .membership_handle
                     .lock()
                     .expect("membership handle poisoned")
-                    .clone()
-                    .ok_or(ServiceError::CoordinatorUnavailable)?;
-                membership
-                    .complete_drain(operation_id.clone())
-                    .await
-                    .map_err(|_| ServiceError::CoordinatorUnavailable)?;
-                let local_incarnation = self.endpoint.local_identity().incarnation;
-                let mut membership_events = self.members.subscribe();
-                while self
-                    .members
-                    .snapshot()
-                    .members
-                    .iter()
-                    .any(|member| member.node.incarnation == local_incarnation)
-                {
-                    match tokio::time::timeout_at(deadline, membership_events.recv()).await {
-                        Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                            return Err(ServiceError::CoordinatorUnavailable);
+                    .clone();
+                if let Some(membership) = membership {
+                    membership
+                        .complete_drain(operation_id.clone())
+                        .await
+                        .map_err(|_| ServiceError::CoordinatorUnavailable)?;
+                    let local_incarnation = self.endpoint.local_identity().incarnation;
+                    self.members.fence_incarnation(local_incarnation);
+                    let mut membership_events = self.members.subscribe();
+                    while self
+                        .members
+                        .snapshot()
+                        .members
+                        .iter()
+                        .any(|member| member.node.incarnation == local_incarnation)
+                    {
+                        match tokio::time::timeout_at(deadline, membership_events.recv()).await {
+                            Ok(Ok(_))
+                            | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                                return Err(ServiceError::CoordinatorUnavailable);
+                            }
+                            Err(_) => return Err(self.drain_timeout_error()),
                         }
-                        Err(_) => return Err(self.drain_timeout_error()),
                     }
+                } else if !self.configured_domains.is_empty() {
+                    return Err(ServiceError::CoordinatorUnavailable);
                 }
                 self.transition(ServiceLifecycleEvent::DrainComplete)?;
                 return self.stop_components().await;

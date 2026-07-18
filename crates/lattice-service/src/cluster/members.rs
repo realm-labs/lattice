@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use lattice_placement::coordinator::{MemberChange, MemberEvent, MemberRecord};
@@ -16,6 +16,7 @@ pub struct MemberSnapshot {
 struct MemberDirectoryState {
     version: Option<MembershipVersion>,
     members: BTreeMap<(String, lattice_core::actor_ref::NodeIncarnation), MemberRecord>,
+    fenced_incarnations: BTreeSet<lattice_core::actor_ref::NodeIncarnation>,
 }
 
 #[derive(Debug)]
@@ -34,6 +35,7 @@ impl MemberDirectory {
             state: Mutex::new(MemberDirectoryState {
                 version: None,
                 members: BTreeMap::new(),
+                fenced_incarnations: BTreeSet::new(),
             }),
             events,
         })
@@ -73,6 +75,7 @@ impl MemberDirectory {
         {
             return Err(MemberDirectoryError::StaleRevision);
         }
+        members.retain(|(_, incarnation), _| !state.fenced_incarnations.contains(incarnation));
         state.members = members;
         state.version = Some(version);
         Ok(())
@@ -91,9 +94,11 @@ impl MemberDirectory {
                 if record.version != event.version || record.node != record.hello.node {
                     return Err(MemberDirectoryError::InvalidRecord);
                 }
-                state
-                    .members
-                    .insert(member_key(&record.node), *record.clone());
+                if !state.fenced_incarnations.contains(&record.node.incarnation) {
+                    state
+                        .members
+                        .insert(member_key(&record.node), *record.clone());
+                }
             }
             MemberChange::Removed { node, .. } => {
                 state.members.remove(&member_key(node));
@@ -103,6 +108,19 @@ impl MemberDirectory {
         drop(state);
         let _ = self.events.send(event);
         Ok(())
+    }
+
+    /// Permanently excludes an incarnation from this local directory.
+    ///
+    /// A graceful leave has already committed the authoritative removal before this is called.
+    /// The local membership runtime can still have an older snapshot in flight, so the fence and
+    /// removal must be atomic with respect to snapshot installation.
+    pub(crate) fn fence_incarnation(&self, incarnation: lattice_core::actor_ref::NodeIncarnation) {
+        let mut state = self.state.lock().expect("member directory poisoned");
+        state.fenced_incarnations.insert(incarnation);
+        state
+            .members
+            .retain(|(_, member_incarnation), _| *member_incarnation != incarnation);
     }
 }
 
@@ -188,5 +206,21 @@ mod tests {
                 .unwrap_err(),
             MemberDirectoryError::StaleRevision
         );
+    }
+
+    #[test]
+    fn fenced_incarnation_cannot_be_reintroduced_by_a_late_snapshot() {
+        let directory = MemberDirectory::new(4).unwrap();
+        let local = member(1, 1);
+        directory
+            .install_snapshot(local.version, vec![local.clone()])
+            .unwrap();
+
+        directory.fence_incarnation(local.node.incarnation);
+        directory
+            .install_snapshot(local.version, vec![local.clone()])
+            .unwrap();
+
+        assert!(directory.snapshot().members.is_empty());
     }
 }

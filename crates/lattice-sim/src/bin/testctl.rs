@@ -1,9 +1,13 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
+#[path = "testctl/artifacts.rs"]
+mod testctl_artifacts;
 #[path = "testctl/chaos.rs"]
 mod testctl_chaos;
 #[path = "testctl/discovery.rs"]
 mod testctl_discovery;
+#[path = "testctl/outcomes.rs"]
+mod testctl_outcomes;
 #[path = "testctl/resources.rs"]
 mod testctl_resources;
 #[path = "testctl/scenarios.rs"]
@@ -19,8 +23,13 @@ use lattice_sim::lifecycle::{LifecycleScenario, LifecycleScenarioConfig};
 use lattice_sim::scenario::Scenario;
 use lattice_sim::scenario::ScenarioConfig;
 use lattice_sim::trace::TraceJournal;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
+use testctl_artifacts::{
+    Manifest, MonitorCommand, MonitorResult, MultiDomainHostArtifact, MultiDomainLogicArtifact,
+    ResourceSample, ScopedLeadershipArtifact, write_json, write_json_atomic, write_junit,
+};
+use testctl_outcomes::ScenarioRunner;
 use testctl_scenarios::{wait_for_host_scope, wait_for_scope_across_hosts};
 
 #[derive(Parser)]
@@ -61,64 +70,6 @@ enum Profile {
     Soak,
 }
 
-#[derive(Serialize)]
-struct Manifest {
-    profile: Profile,
-    seed: u64,
-    source_commit: String,
-    source_status: String,
-    source_fingerprint: String,
-    started_unix_millis: u128,
-    elapsed_millis: u128,
-    success: bool,
-    replay: String,
-    platform: String,
-    pinned_images: String,
-    scenarios: Vec<&'static str>,
-    configuration: serde_json::Value,
-}
-
-#[derive(Serialize)]
-struct ResourceSample {
-    elapsed_millis: u128,
-    open_file_descriptors: Option<usize>,
-    resident_memory_kib: Option<u64>,
-    threads: Option<u64>,
-    process_status: Option<String>,
-}
-
-#[derive(Serialize)]
-struct MonitorCommand {
-    sequence: u64,
-    stop: bool,
-}
-
-#[derive(serde::Deserialize)]
-struct MonitorResult {
-    success: bool,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct ScopedLeadershipArtifact {
-    node_id: String,
-    term: u64,
-    incarnation: u128,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct MultiDomainHostArtifact {
-    node_id: String,
-    incarnation: u128,
-    scopes: std::collections::BTreeMap<String, ScopedLeadershipArtifact>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct MultiDomainLogicArtifact {
-    node_id: String,
-    lifecycle: String,
-    domains: std::collections::BTreeMap<String, String>,
-}
-
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -154,12 +105,14 @@ fn run_profile(
         .as_millis();
     let timer = Instant::now();
     let mut resource_samples = vec![testctl_resources::sample(timer.elapsed())];
-    let result = match profile {
-        Profile::Quality => (|| {
-            command("scripts/check-structure.sh", &[])?;
-            commands(&[
-                &["fmt", "--all", "--", "--check"],
-                &[
+    let scenario_names = testctl_scenarios::for_profile(profile);
+    let mut runner = ScenarioRunner::new(&scenario_names);
+    match profile {
+        Profile::Quality => {
+            runner.run("structure", || command("scripts/check-structure.sh", &[]));
+            runner.run("fmt", || cargo(&["fmt", "--all", "--", "--check"]));
+            runner.run("clippy", || {
+                cargo(&[
                     "clippy",
                     "--workspace",
                     "--all-targets",
@@ -167,22 +120,47 @@ fn run_profile(
                     "--",
                     "-D",
                     "warnings",
-                ],
-                &["test", "--workspace", "--all-features"],
-            ])
-        })(),
-        Profile::Sim => simulate(seed, artifacts),
-        Profile::Model => cargo(&[
-            "test",
-            "-p",
-            "lattice-sim",
-            "bounded_state_explorer_checks_every_transition",
-        ]),
-        Profile::E2e => (|| {
-            testctl_discovery::verify(artifacts)?;
-            multi_domain_real(artifacts)?;
-            commands(&[
-                &[
+                ])
+            });
+            runner.run("workspace-tests", || {
+                cargo(&["test", "--workspace", "--all-features"])
+            });
+        }
+        Profile::Sim => runner.run("seeded-simulation-suite", || simulate(seed, artifacts)),
+        Profile::Model => {
+            runner.run("bounded-state-explorer", || {
+                cargo(&[
+                    "test",
+                    "-p",
+                    "lattice-sim",
+                    "scenario::tests::bounded_state_explorer_checks_every_transition",
+                ])
+            });
+            runner.run("multi-domain-bounded-state-explorer", || {
+                cargo(&[
+                    "test",
+                    "-p",
+                    "lattice-sim",
+                    "domains::tests::multi_domain_bounded_state_explorer_checks_every_transition",
+                ])
+            });
+        }
+        Profile::E2e => {
+            runner.run("exact-actor-ref-child-watch", || {
+                distributed_node("client", &artifacts.join("server-ref.json"))
+            });
+            runner.run("gateway-entity-ref-remote-shard", || {
+                distributed_node("gateway", &artifacts.join("entity-ref.json"))
+            });
+            runner.run("static-discovery-lifecycle", || {
+                testctl_discovery::verify_case(artifacts, "discovery-static.json", "static")
+            });
+            runner.run("config-store-discovery-lifecycle", || {
+                testctl_discovery::verify_case(artifacts, "discovery-config.json", "config-store")
+            });
+            runner.run("multi-domain-failover", || multi_domain_real(artifacts));
+            runner.run("single-member-etcd", || {
+                cargo(&[
                     "test",
                     "-p",
                     "lattice-placement",
@@ -190,51 +168,81 @@ fn run_profile(
                     "etcd_acceptance",
                     "--",
                     "--nocapture",
-                ],
-                &[
+                ])
+            });
+            runner.run("tcp", || {
+                cargo(&[
                     "test",
                     "-p",
                     "lattice-remoting",
                     "real_tcp_endpoint_establishes_all_lanes_and_delivers_ask",
-                ],
-                &[
+                ])
+            });
+            runner.run("mutual-tls", || {
+                cargo(&[
                     "test",
                     "-p",
                     "lattice-remoting",
                     "real_mutual_tls_socket_verifies_both_node_identities",
-                ],
-                &[
+                ])
+            });
+            runner.run("claimed-entity-ref", || {
+                cargo(&[
                     "test",
                     "-p",
                     "lattice-service",
                     "remote_entity_ask_reaches_only_claimed_owner",
-                ],
-            ])
-        })(),
-        Profile::E2eHaEtcd => ha_etcd_real(artifacts),
-        Profile::Chaos => (|| {
-            multi_domain_real(artifacts)?;
-            testctl_chaos::verify(artifacts)?;
-            commands(&[
-                &[
+                ])
+            });
+        }
+        Profile::E2eHaEtcd => {
+            runner.run("etcd-coordinator-failover", || ha_etcd_real(artifacts));
+            runner.run("leader-recovery-resume", || {
+                cargo(&[
+                    "test",
+                    "-p",
+                    "lattice-placement",
+                    "leader_recovery_resumes_handoff_and_cancels_stale_pending_move",
+                ])
+            });
+            runner.run("singleton-forward-recovery", || {
+                cargo(&[
+                    "test",
+                    "-p",
+                    "lattice-placement",
+                    "singleton_owner_loss_recovers_forward_after_leader_restart",
+                ])
+            });
+        }
+        Profile::Chaos => {
+            runner.run("multi-domain-failover", || multi_domain_real(artifacts));
+            runner.run("docker-fault-sequence", || testctl_chaos::verify(artifacts));
+            runner.run("one-domain-coordinator-loss", || {
+                cargo(&[
                     "test",
                     "-p",
                     "lattice-service",
                     "one_domain_coordinator_loss_leaves_other_domain_ready",
-                ],
-                &[
+                ])
+            });
+            runner.run("membership-loss", || {
+                cargo(&[
                     "test",
                     "-p",
                     "lattice-service",
                     "membership_loss_revokes_node_readiness_until_a_new_snapshot",
-                ],
-                &[
+                ])
+            });
+            runner.run("drain-force-remove", || {
+                cargo(&[
                     "test",
                     "-p",
                     "lattice-placement",
                     "join_drain_and_force_remove_are_revisioned_idempotent_and_fenced",
-                ],
-                &[
+                ])
+            });
+            runner.run("etcd-lease-expiry", || {
+                cargo(&[
                     "test",
                     "-p",
                     "lattice-placement",
@@ -243,28 +251,37 @@ fn run_profile(
                     "real_etcd_guarded_domain_commits_and_lease_expiry",
                     "--",
                     "--nocapture",
-                ],
-                &[
+                ])
+            });
+            runner.run("multi-domain-trace-replay", || {
+                cargo(&[
                     "test",
                     "-p",
                     "lattice-sim",
                     "multi_domain_trace_replays_independent_elections_and_handoffs",
-                ],
-            ])?;
-            for current in seed..seed.saturating_add(32) {
-                simulate(current, artifacts)?;
-            }
-            Ok(())
-        })(),
-        Profile::K8s => command("sh", &["tests/distributed/k8s/verify.sh"]),
-        Profile::Soak => soak(
-            seed,
-            duration_seconds,
-            artifacts,
-            timer,
-            &mut resource_samples,
-        ),
-    };
+                ])
+            });
+            runner.run("seed-corpus", || {
+                for current in seed..seed.saturating_add(32) {
+                    simulate(current, artifacts)?;
+                }
+                Ok(())
+            });
+        }
+        Profile::K8s => runner.run("k8s-lifecycle", || {
+            command("sh", &["tests/distributed/k8s/verify.sh"])
+        }),
+        Profile::Soak => runner.run("bounded-seeded-soak", || {
+            soak(
+                seed,
+                duration_seconds,
+                artifacts,
+                timer,
+                &mut resource_samples,
+            )
+        }),
+    }
+    let scenario_result = runner.finish();
     let cleanup_result = if matches!(profile, Profile::E2eHaEtcd | Profile::Chaos | Profile::K8s)
         && Path::new("/var/run/docker.sock").exists()
     {
@@ -272,9 +289,13 @@ fn run_profile(
     } else {
         Ok(())
     };
-    let result = match (result, cleanup_result) {
-        (Err(error), _) => Err(error),
-        (Ok(()), cleanup) => cleanup,
+    let infrastructure_error = cleanup_result.as_ref().err().cloned();
+    let result = match (scenario_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(scenarios), Err(cleanup)) => {
+            Err(format!("{scenarios}; infrastructure cleanup: {cleanup}"))
+        }
     };
     resource_samples.push(testctl_resources::sample(timer.elapsed()));
     let success = result.is_ok();
@@ -309,14 +330,20 @@ fn run_profile(
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         pinned_images: std::fs::read_to_string("tests/distributed/images.lock")
             .unwrap_or_else(|_| "unavailable".to_owned()),
-        scenarios: testctl_scenarios::for_profile(profile),
+        scenarios: runner.outcomes().to_vec(),
+        infrastructure_error: infrastructure_error.clone(),
         configuration: serde_json::json!({
             "duration_seconds": duration_seconds,
             "artifact_directory": artifacts,
         }),
     };
     write_json(&artifacts.join("manifest.json"), &manifest)?;
-    write_junit(&artifacts.join("junit.xml"), profile, success)?;
+    write_junit(
+        &artifacts.join("junit.xml"),
+        profile,
+        runner.outcomes(),
+        infrastructure_error.as_deref(),
+    )?;
     write_json(&artifacts.join("resource-samples.json"), &resource_samples)?;
     result
 }
@@ -689,20 +716,6 @@ fn ha_etcd_real(artifacts: &Path) -> Result<(), String> {
         }),
     )?;
 
-    commands(&[
-        &[
-            "test",
-            "-p",
-            "lattice-placement",
-            "leader_recovery_resumes_handoff_and_cancels_stale_pending_move",
-        ],
-        &[
-            "test",
-            "-p",
-            "lattice-placement",
-            "singleton_owner_loss_recovers_forward_after_leader_restart",
-        ],
-    ])?;
     let status = output(
         "docker",
         &[
@@ -1122,15 +1135,25 @@ fn replay(path: &Path) -> Result<(), String> {
     }
 }
 
-fn commands(commands: &[&[&str]]) -> Result<(), String> {
-    for arguments in commands {
-        cargo(arguments)?;
-    }
-    Ok(())
-}
-
 fn cargo(arguments: &[&str]) -> Result<(), String> {
     command("cargo", arguments)
+}
+
+fn distributed_node(mode: &str, reference: &Path) -> Result<(), String> {
+    let reference = reference
+        .to_str()
+        .ok_or_else(|| "distributed fixture reference path is not UTF-8".to_owned())?;
+    cargo(&[
+        "run",
+        "-p",
+        "lattice-sim",
+        "--bin",
+        "distributed-node",
+        "--",
+        mode,
+        "--reference",
+        reference,
+    ])
 }
 
 fn command(program: &str, arguments: &[&str]) -> Result<(), String> {
@@ -1156,29 +1179,4 @@ fn output(program: &str, arguments: &[&str]) -> Result<String, String> {
     String::from_utf8(output.stdout)
         .map(|value| value.trim().to_owned())
         .map_err(|error| error.to_string())
-}
-
-fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
-    let encoded = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    std::fs::write(path, encoded).map_err(|error| error.to_string())
-}
-
-fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
-    let encoded = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&temporary, encoded).map_err(|error| error.to_string())?;
-    std::fs::rename(temporary, path).map_err(|error| error.to_string())
-}
-
-fn write_junit(path: &Path, profile: Profile, success: bool) -> Result<(), String> {
-    let failure = if success {
-        String::new()
-    } else {
-        "<failure message=\"profile failed\"/>".to_owned()
-    };
-    let xml = format!(
-        "<testsuite name=\"lattice-{profile:?}\" tests=\"1\" failures=\"{}\"><testcase name=\"{profile:?}\">{failure}</testcase></testsuite>\n",
-        usize::from(!success)
-    );
-    std::fs::write(path, xml).map_err(|error| error.to_string())
 }

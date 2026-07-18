@@ -671,18 +671,6 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
         .unwrap();
     coordinator.start().await.unwrap();
 
-    let discovery = Arc::new(
-        StaticDiscovery::new(
-            CoordinatorScope::Placement(placement_domain()),
-            "test",
-            vec![StaticEndpoint {
-                address: coordinator_address.clone(),
-                expected_node_id: Some("coordinator".to_string()),
-                priority: 1,
-            }],
-        )
-        .unwrap(),
-    );
     let join_config = ClusterJoinConfig {
         retry_initial: Duration::from_millis(10),
         retry_max: Duration::from_millis(100),
@@ -697,12 +685,6 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
         NodeAddress::new("127.0.0.1", member_port).unwrap(),
         NodeIncarnation::new(202).unwrap(),
     ))
-    .unwrap()
-    .proxy_entity::<PingProtocol>(proxy_options(placement_domain(), "membership-probe"))
-    .unwrap()
-    .domain_capacity(placement_domain(), 1)
-    .unwrap()
-    .coordinator_discovery(discovery)
     .unwrap()
     .coordinator_discovery(Arc::new(
         StaticDiscovery::new(
@@ -754,6 +736,13 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
             .all(|state| *state == PlacementDomainState::Terminated)
     );
     assert!(store.get_member("member").await.unwrap().is_none());
+    assert!(
+        member
+            .member_snapshot()
+            .members
+            .iter()
+            .all(|record| record.node.incarnation != NodeIncarnation::new(202).unwrap())
+    );
     coordinator.shutdown().await.unwrap();
 }
 

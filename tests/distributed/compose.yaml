@@ -83,8 +83,6 @@ services:
       - sh
       - -c
       - >-
-        cargo run -p lattice-sim --bin distributed-node -- client --reference /artifacts/server-ref.json &&
-        cargo run -p lattice-sim --bin distributed-node -- gateway --reference /artifacts/entity-ref.json &&
         cargo run -p lattice-sim --bin testctl -- run e2e --seed ${LATTICE_TEST_SEED:-1} --artifacts /artifacts
 
   fixture-server:

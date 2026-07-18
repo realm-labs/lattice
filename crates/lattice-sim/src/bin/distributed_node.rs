@@ -486,6 +486,19 @@ async fn discovery_member(
         Ok::<(), &'static str>(())
     })
     .await??;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if service.member_snapshot().members.iter().any(|record| {
+                record.node.node_id == node_id
+                    && record.node.incarnation == incarnation
+                    && record.status == MemberStatus::Up
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await?;
     write_discovery_artifact(
         &artifact,
         &service,
