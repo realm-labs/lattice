@@ -422,16 +422,18 @@ pub async fn execute(
             let writer = config_writer.ok_or(MigrationError::InvalidRecord)?;
             let write_result = write_bounded_targets(
                 &mut client,
-                &schema_key,
-                &leader_key,
-                &term_key,
-                term_record.as_ref(),
-                term,
-                &lock_key,
-                lock.as_ref().ok_or(MigrationError::Locked)?,
-                &marker_key,
-                marker.as_ref().ok_or(MigrationError::MarkerMismatch)?,
-                Some(writer),
+                BoundedWriteContext {
+                    schema_key: &schema_key,
+                    leader_key: &leader_key,
+                    term_key: &term_key,
+                    term_record: term_record.as_ref(),
+                    term,
+                    lock_key: &lock_key,
+                    lock: lock.as_ref().ok_or(MigrationError::Locked)?,
+                    marker_key: &marker_key,
+                    marker: marker.as_ref().ok_or(MigrationError::MarkerMismatch)?,
+                    source: Some(writer),
+                },
                 &missing_config_targets,
             )
             .await;
@@ -793,16 +795,18 @@ async fn finalize(
     let metadata = finalization_targets(config, &marker, report, inventory)?;
     write_bounded_targets(
         client,
-        context.schema_key,
-        context.leader_key,
-        context.term_key,
-        context.term_record,
-        marker.coordinator_term,
-        context.lock_key,
-        context.lock,
-        context.marker_key,
-        &marker,
-        None,
+        BoundedWriteContext {
+            schema_key: context.schema_key,
+            leader_key: context.leader_key,
+            term_key: context.term_key,
+            term_record: context.term_record,
+            term: marker.coordinator_term,
+            lock_key: context.lock_key,
+            lock: context.lock,
+            marker_key: context.marker_key,
+            marker: &marker,
+            source: None,
+        },
         &metadata,
     )
     .await?;
@@ -928,19 +932,22 @@ fn finalization_targets(
     Ok(targets)
 }
 
-#[allow(clippy::too_many_arguments)]
+struct BoundedWriteContext<'a> {
+    schema_key: &'a str,
+    leader_key: &'a str,
+    term_key: &'a str,
+    term_record: Option<&'a RawRecord>,
+    term: u64,
+    lock_key: &'a str,
+    lock: &'a (i64, String),
+    marker_key: &'a str,
+    marker: &'a MigrationMarker,
+    source: Option<&'a RawRecord>,
+}
+
 async fn write_bounded_targets(
     client: &mut Client,
-    schema_key: &str,
-    leader_key: &str,
-    term_key: &str,
-    term_record: Option<&RawRecord>,
-    term: u64,
-    lock_key: &str,
-    lock: &(i64, String),
-    marker_key: &str,
-    marker: &MigrationMarker,
-    source: Option<&RawRecord>,
+    context: BoundedWriteContext<'_>,
     targets: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), MigrationError> {
     for chunk in targets
@@ -949,13 +956,17 @@ async fn write_bounded_targets(
         .chunks(MIGRATION_TXN_TARGET_BATCH)
     {
         let mut compares = vec![
-            Compare::value(schema_key, CompareOp::Equal, MIGRATING_SCHEMA),
-            Compare::version(leader_key, CompareOp::Equal, 0),
-            term_compare(term_key, term_record, term),
-            Compare::value(lock_key, CompareOp::Equal, lock.1.clone()),
-            Compare::value(marker_key, CompareOp::Equal, serde_json::to_vec(marker)?),
+            Compare::value(context.schema_key, CompareOp::Equal, MIGRATING_SCHEMA),
+            Compare::version(context.leader_key, CompareOp::Equal, 0),
+            term_compare(context.term_key, context.term_record, context.term),
+            Compare::value(context.lock_key, CompareOp::Equal, context.lock.1.clone()),
+            Compare::value(
+                context.marker_key,
+                CompareOp::Equal,
+                serde_json::to_vec(context.marker)?,
+            ),
         ];
-        if let Some(source) = source {
+        if let Some(source) = context.source {
             compares.push(Compare::mod_revision(
                 source.key.clone(),
                 CompareOp::Equal,

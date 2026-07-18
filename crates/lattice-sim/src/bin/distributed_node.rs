@@ -957,26 +957,18 @@ fn entity_service(
         version: MembershipVersion::new(slot.version.term, slot.version.revision),
         lease_id: 1,
     };
-    let domain_hello = PlacementDomainHello::new(
-        node.clone(),
-        placement_domain(),
-        1,
-        if owns_slot {
+    let domain_hello = PlacementDomainHello::builder(node.clone(), placement_domain(), 1)
+        .hosted_entity_types(if owns_slot {
             BTreeSet::from([entity_config.entity_type.clone()])
         } else {
             BTreeSet::new()
-        },
-        if owns_slot {
+        })
+        .proxied_entity_types(if owns_slot {
             BTreeSet::new()
         } else {
             BTreeSet::from([entity_config.entity_type.clone()])
-        },
-        BTreeSet::new(),
-        BTreeSet::new(),
-        Vec::new(),
-        Vec::new(),
-        BTreeMap::new(),
-    );
+        })
+        .build();
     let (logic, effects) = PlacementDomainSession::new(
         domain_hello,
         coordinator.clone(),

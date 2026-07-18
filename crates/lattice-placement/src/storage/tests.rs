@@ -50,18 +50,7 @@ fn hello(node: NodeKey) -> MemberHello {
 }
 
 fn domain_hello(node: NodeKey, domain: PlacementDomainId) -> PlacementDomainHello {
-    PlacementDomainHello::new(
-        node,
-        domain,
-        1,
-        BTreeSet::new(),
-        BTreeSet::new(),
-        BTreeSet::new(),
-        BTreeSet::new(),
-        Vec::new(),
-        Vec::new(),
-        BTreeMap::new(),
-    )
+    PlacementDomainHello::builder(node, domain, 1).build()
 }
 
 fn authority_records(

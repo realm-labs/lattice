@@ -495,20 +495,31 @@ where
         .expect("TaskPerActor execution is supported")
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_actor_with_self_ref<A>(
-    actor: A,
-    mailbox: MailboxConfig,
-    passivation: PassivationPolicy,
-    self_ref: Option<ActorRef>,
-    actor_system: Option<Arc<OnceLock<ActorSystem>>>,
-    service: ServiceContext,
-    observer: ActorObserverHandle,
-    terminal_hook: Option<TerminalHook>,
-) -> ActorHandle<A>
+pub(crate) struct ActorSpawnContext {
+    pub(crate) options: ActorSpawnOptions,
+    pub(crate) actor_system: Option<Arc<OnceLock<ActorSystem>>>,
+    pub(crate) observer: ActorObserverHandle,
+    pub(crate) terminal_hook: Option<TerminalHook>,
+}
+
+pub(crate) fn spawn_actor_with_self_ref<A>(actor: A, context: ActorSpawnContext) -> ActorHandle<A>
 where
     A: Actor,
 {
+    let ActorSpawnContext {
+        options,
+        actor_system,
+        observer,
+        terminal_hook,
+    } = context;
+    let ActorSpawnOptions {
+        mailbox,
+        passivation,
+        self_ref,
+        service,
+        execution: _,
+        scheduler_key: _,
+    } = options;
     let parts = create_actor_parts(
         mailbox,
         self_ref,
@@ -570,7 +581,7 @@ where
     let (forced_data_loss_tx, _forced_data_loss_rx) = broadcast::channel(16);
     let terminal_hook = Arc::new(Mutex::new(terminal_hook));
     let actor_ref = self_ref.clone();
-    let handle = ActorHandle::new(
+    let handle = ActorHandle::new(crate::handle::ActorHandleInit {
         local_ref,
         terminated_tx,
         lifecycle_tx,
@@ -581,7 +592,7 @@ where
         system_tx,
         actor_ref,
         observer,
-    );
+    });
 
     ActorRuntimeParts {
         handle,

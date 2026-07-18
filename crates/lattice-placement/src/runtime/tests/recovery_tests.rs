@@ -183,15 +183,14 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
     let hello = |node: NodeKey| {
         test_hello(
             node,
-            Default::default(),
-            1,
-            Default::default(),
-            Default::default(),
-            [kind.clone()].into_iter().collect(),
-            [kind.clone()].into_iter().collect(),
-            vec![descriptor.clone()],
-            Vec::new(),
-            vec![singleton_config.clone()],
+            TestHelloSpec {
+                capacity_units: 1,
+                singleton_eligibility: [kind.clone()].into_iter().collect(),
+                used_singletons: [kind.clone()].into_iter().collect(),
+                protocols: vec![descriptor.clone()],
+                singleton_configs: vec![singleton_config.clone()],
+                ..TestHelloSpec::default()
+            },
         )
     };
     register_up(&mut leader, hello(source.clone()), source_key).await;

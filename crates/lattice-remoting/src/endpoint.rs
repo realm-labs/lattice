@@ -17,7 +17,7 @@ use crate::bootstrap::{
 use crate::config::RemotingConfig;
 use crate::control::{ControlDispatch, RejectControlDispatch};
 use crate::handshake::{FeatureBits, Handshake, HandshakeValidator, NodeIdentity};
-use crate::lane::{BidirectionalLaneConfig, LaneExit, run_bidirectional_lane};
+use crate::lane::{BidirectionalLane, BidirectionalLaneConfig, LaneExit, LaneServices};
 use crate::messaging::inbound::InboundDispatch;
 use crate::messaging::outbound::OutboundMessaging;
 use crate::protocol::ProtocolDescriptor;
@@ -49,6 +49,69 @@ pub struct EndpointSecurity {
     pub client: Arc<tokio_rustls::rustls::ClientConfig>,
     pub server: Arc<tokio_rustls::rustls::ServerConfig>,
     pub server_name: String,
+}
+
+pub struct RemotingEndpointBuilder {
+    local: NodeIdentity,
+    config: RemotingConfig,
+    associations: Arc<AssociationManager>,
+    messaging: Arc<OutboundMessaging>,
+    dispatch: Arc<dyn InboundDispatch>,
+    control_dispatch: Arc<dyn ControlDispatch>,
+    catalogue: Vec<ProtocolDescriptor>,
+    security: Option<EndpointSecurity>,
+}
+
+impl RemotingEndpointBuilder {
+    pub fn control_dispatch(mut self, control_dispatch: Arc<dyn ControlDispatch>) -> Self {
+        self.control_dispatch = control_dispatch;
+        self
+    }
+
+    pub fn catalogue(mut self, catalogue: Vec<ProtocolDescriptor>) -> Self {
+        self.catalogue = catalogue;
+        self
+    }
+
+    pub fn security(mut self, security: EndpointSecurity) -> Self {
+        self.security = Some(security);
+        self
+    }
+
+    pub fn build(self) -> Result<RemotingEndpoint, EndpointError> {
+        self.config
+            .validate()
+            .map_err(AssociationError::InvalidConfig)?;
+        if self
+            .security
+            .as_ref()
+            .is_some_and(|security| security.server_name.is_empty())
+        {
+            return Err(EndpointError::InvalidSecurity);
+        }
+        if self.catalogue.len() > self.config.max_protocols_per_peer {
+            return Err(EndpointError::ProtocolLimit);
+        }
+        let connection_limit = self.config.required_socket_budget().saturating_sub(1);
+        let (shutdown_tx, _) = watch::channel(false);
+        let (disconnect_tx, _) = broadcast::channel(self.config.max_associations);
+        Ok(RemotingEndpoint {
+            local: self.local,
+            config: self.config,
+            associations: self.associations,
+            messaging: self.messaging,
+            dispatch: self.dispatch,
+            control_dispatch: self.control_dispatch,
+            catalogue: self.catalogue,
+            connections: Arc::new(Semaphore::new(connection_limit)),
+            shutdown_tx,
+            disconnect_tx,
+            tasks: Mutex::new(Vec::new()),
+            security: self.security,
+            connect_lock: tokio::sync::Mutex::new(()),
+            bootstrap_handler: std::sync::RwLock::new(Arc::new(AcceptBootstrap)),
+        })
+    }
 }
 
 enum EndpointStream {
@@ -108,87 +171,23 @@ impl tokio::io::AsyncWrite for EndpointStream {
 }
 
 impl RemotingEndpoint {
-    pub fn new(
+    pub fn builder(
         local: NodeIdentity,
         config: RemotingConfig,
         associations: Arc<AssociationManager>,
         messaging: Arc<OutboundMessaging>,
         dispatch: Arc<dyn InboundDispatch>,
-        catalogue: Vec<ProtocolDescriptor>,
-    ) -> Result<Self, EndpointError> {
-        Self::new_with_control(
+    ) -> RemotingEndpointBuilder {
+        RemotingEndpointBuilder {
             local,
             config,
             associations,
             messaging,
             dispatch,
-            Arc::new(RejectControlDispatch),
-            catalogue,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_control(
-        local: NodeIdentity,
-        config: RemotingConfig,
-        associations: Arc<AssociationManager>,
-        messaging: Arc<OutboundMessaging>,
-        dispatch: Arc<dyn InboundDispatch>,
-        control_dispatch: Arc<dyn ControlDispatch>,
-        catalogue: Vec<ProtocolDescriptor>,
-    ) -> Result<Self, EndpointError> {
-        Self::new_with_control_and_security(
-            local,
-            config,
-            associations,
-            messaging,
-            dispatch,
-            control_dispatch,
-            catalogue,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_control_and_security(
-        local: NodeIdentity,
-        config: RemotingConfig,
-        associations: Arc<AssociationManager>,
-        messaging: Arc<OutboundMessaging>,
-        dispatch: Arc<dyn InboundDispatch>,
-        control_dispatch: Arc<dyn ControlDispatch>,
-        catalogue: Vec<ProtocolDescriptor>,
-        security: Option<EndpointSecurity>,
-    ) -> Result<Self, EndpointError> {
-        config.validate().map_err(AssociationError::InvalidConfig)?;
-        if security
-            .as_ref()
-            .is_some_and(|security| security.server_name.is_empty())
-        {
-            return Err(EndpointError::InvalidSecurity);
+            control_dispatch: Arc::new(RejectControlDispatch),
+            catalogue: Vec::new(),
+            security: None,
         }
-        if catalogue.len() > config.max_protocols_per_peer {
-            return Err(EndpointError::ProtocolLimit);
-        }
-        let connection_limit = config.required_socket_budget().saturating_sub(1);
-        let (shutdown_tx, _) = watch::channel(false);
-        let (disconnect_tx, _) = broadcast::channel(config.max_associations);
-        Ok(Self {
-            local,
-            config,
-            associations,
-            messaging,
-            dispatch,
-            control_dispatch,
-            catalogue,
-            connections: Arc::new(Semaphore::new(connection_limit)),
-            shutdown_tx,
-            disconnect_tx,
-            tasks: Mutex::new(Vec::new()),
-            security,
-            connect_lock: tokio::sync::Mutex::new(()),
-            bootstrap_handler: std::sync::RwLock::new(Arc::new(AcceptBootstrap)),
-        })
     }
 
     pub fn local_identity(&self) -> &NodeIdentity {
@@ -725,18 +724,17 @@ impl RemotingEndpoint {
         let association_id = association.id();
         let mut disconnect = self.disconnect_tx.subscribe();
         tokio::select! {
-            result = run_bidirectional_lane(
+            result = BidirectionalLane::new(
                 association.clone(),
                 lane,
                 nonce,
-                receiver,
-                stream,
-                self.messaging.clone(),
-                self.dispatch.clone(),
-                self.control_dispatch.clone(),
+                LaneServices::new(
+                    self.messaging.clone(),
+                    self.dispatch.clone(),
+                    self.control_dispatch.clone(),
+                ),
                 self.lane_config(),
-                shutdown,
-            ) => result,
+            ).run(receiver, stream, shutdown) => result,
             () = wait_for_disconnect(&mut disconnect, association_id) => {
                 association.detach(lane, nonce);
                 self.messaging.fail_association(association_id);
@@ -962,15 +960,16 @@ mod tests {
             .unwrap(),
         );
         Arc::new(
-            RemotingEndpoint::new_with_control(
+            RemotingEndpoint::builder(
                 identity,
                 config,
                 manager,
                 Arc::new(OutboundMessaging::new(32).unwrap()),
                 Arc::new(EchoDispatch),
-                control,
-                vec![protocol],
             )
+            .control_dispatch(control)
+            .catalogue(vec![protocol])
+            .build()
             .unwrap(),
         )
     }
@@ -1029,9 +1028,11 @@ mod tests {
                 &association,
                 &SenderIdentity::Process(9),
                 &target,
-                fingerprint,
-                1,
-                Bytes::from_static(b"hello"),
+                crate::messaging::outbound::OutboundMessage::new(
+                    fingerprint,
+                    1,
+                    Bytes::from_static(b"hello"),
+                ),
                 Instant::now() + Duration::from_secs(1),
             )
             .await
@@ -1075,9 +1076,11 @@ mod tests {
                 &association,
                 &SenderIdentity::Process(9),
                 &target,
-                fingerprint,
-                1,
-                Bytes::from_static(b"again"),
+                crate::messaging::outbound::OutboundMessage::new(
+                    fingerprint,
+                    1,
+                    Bytes::from_static(b"again"),
+                ),
                 Instant::now() + Duration::from_secs(1),
             )
             .await

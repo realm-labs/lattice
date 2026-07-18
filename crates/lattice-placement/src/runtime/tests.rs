@@ -191,18 +191,8 @@ async fn seed_running_slot(
             hello: authority_hello
                 .map(|hello| hello.domain.clone())
                 .unwrap_or_else(|| {
-                    PlacementDomainHello::new(
-                        owner.clone(),
-                        leader.version.domain.clone(),
-                        1,
-                        BTreeSet::new(),
-                        BTreeSet::new(),
-                        BTreeSet::new(),
-                        BTreeSet::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        BTreeMap::new(),
-                    )
+                    PlacementDomainHello::builder(owner.clone(), leader.version.domain.clone(), 1)
+                        .build()
                 }),
             status: DomainMemberStatus::Up,
             version: leader.next_version().unwrap(),
@@ -337,9 +327,8 @@ struct TestHello {
     domain: PlacementDomainHello,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn test_hello(
-    node: NodeKey,
+#[derive(Default)]
+struct TestHelloSpec {
     roles: BTreeSet<String>,
     capacity_units: u64,
     hosted_entity_types: BTreeSet<EntityType>,
@@ -349,42 +338,35 @@ fn test_hello(
     protocols: Vec<lattice_remoting::protocol::ProtocolDescriptor>,
     entity_configs: Vec<crate::region::EntityConfig>,
     singleton_configs: Vec<SingletonConfig>,
-) -> TestHello {
+}
+
+fn test_hello(node: NodeKey, spec: TestHelloSpec) -> TestHello {
     TestHello {
         member: MemberHello {
             node: node.clone(),
-            roles,
+            roles: spec.roles,
             failure_domains: Default::default(),
-            protocols,
+            protocols: spec.protocols,
             remoting_capabilities: Default::default(),
         },
-        domain: PlacementDomainHello::new(
-            node,
-            domain(),
-            capacity_units,
-            hosted_entity_types,
-            proxied_entity_types,
-            singleton_eligibility,
-            used_singletons,
-            entity_configs,
-            singleton_configs,
-            Default::default(),
-        ),
+        domain: PlacementDomainHello::builder(node, domain(), spec.capacity_units)
+            .hosted_entity_types(spec.hosted_entity_types)
+            .proxied_entity_types(spec.proxied_entity_types)
+            .singleton_eligibility(spec.singleton_eligibility)
+            .used_singletons(spec.used_singletons)
+            .entity_configs(spec.entity_configs)
+            .singleton_configs(spec.singleton_configs)
+            .build(),
     }
 }
 
 fn empty_hello(node: NodeKey) -> TestHello {
     test_hello(
         node,
-        Default::default(),
-        1,
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        TestHelloSpec {
+            capacity_units: 1,
+            ..TestHelloSpec::default()
+        },
     )
 }
 
@@ -494,27 +476,27 @@ async fn real_control_session_installs_snapshot_and_matching_claim() {
     let (coordinator_router, coordinator_controls) =
         PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
     let logic_endpoint = Arc::new(
-        RemotingEndpoint::new_with_control(
+        RemotingEndpoint::builder(
             logic_identity.clone(),
             remoting.clone(),
             logic_associations.clone(),
             Arc::new(OutboundMessaging::new(32).unwrap()),
             Arc::new(NoActors),
-            Arc::new(logic_router),
-            Vec::new(),
         )
+        .control_dispatch(Arc::new(logic_router))
+        .build()
         .unwrap(),
     );
     let coordinator_endpoint = Arc::new(
-        RemotingEndpoint::new_with_control(
+        RemotingEndpoint::builder(
             coordinator_identity.clone(),
             remoting,
             coordinator_associations.clone(),
             Arc::new(OutboundMessaging::new(32).unwrap()),
             Arc::new(NoActors),
-            Arc::new(coordinator_router),
-            Vec::new(),
         )
+        .control_dispatch(Arc::new(coordinator_router))
+        .build()
         .unwrap(),
     );
     coordinator_endpoint.bind().await.unwrap();
@@ -551,15 +533,12 @@ async fn real_control_session_installs_snapshot_and_matching_claim() {
     .unwrap();
     let hello = test_hello(
         logic_node.clone(),
-        ["logic".to_owned()].into_iter().collect(),
-        1,
-        [entity_type.clone()].into_iter().collect(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        TestHelloSpec {
+            roles: ["logic".to_owned()].into_iter().collect(),
+            capacity_units: 1,
+            hosted_entity_types: [entity_type.clone()].into_iter().collect(),
+            ..TestHelloSpec::default()
+        },
     );
     seed_running_slot(
         &mut leader,
@@ -695,15 +674,13 @@ async fn persisted_handoff_barrier_replaces_claim_forward() {
     let hello = |node: NodeKey| {
         test_hello(
             node,
-            Default::default(),
-            10,
-            [entity_type.clone()].into_iter().collect(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            vec![descriptor.clone()],
-            vec![entity_config.clone()],
-            Vec::new(),
+            TestHelloSpec {
+                capacity_units: 10,
+                hosted_entity_types: [entity_type.clone()].into_iter().collect(),
+                protocols: vec![descriptor.clone()],
+                entity_configs: vec![entity_config.clone()],
+                ..TestHelloSpec::default()
+            },
         )
     };
     let source_hello = hello(source.clone());
@@ -911,15 +888,13 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
         &mut leader,
         test_hello(
             proxy,
-            Default::default(),
-            1,
-            Default::default(),
-            [entity_type.clone()].into_iter().collect(),
-            Default::default(),
-            [singleton_kind.clone()].into_iter().collect(),
-            vec![descriptor.clone()],
-            Vec::new(),
-            Vec::new(),
+            TestHelloSpec {
+                capacity_units: 1,
+                proxied_entity_types: [entity_type.clone()].into_iter().collect(),
+                used_singletons: [singleton_kind.clone()].into_iter().collect(),
+                protocols: vec![descriptor.clone()],
+                ..TestHelloSpec::default()
+            },
         ),
         proxy_key,
     )
@@ -928,15 +903,15 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
         &mut leader,
         test_hello(
             host.clone(),
-            Default::default(),
-            10,
-            [entity_type.clone()].into_iter().collect(),
-            Default::default(),
-            [singleton_kind.clone()].into_iter().collect(),
-            Default::default(),
-            vec![descriptor],
-            vec![entity_config],
-            vec![singleton_config],
+            TestHelloSpec {
+                capacity_units: 10,
+                hosted_entity_types: [entity_type.clone()].into_iter().collect(),
+                singleton_eligibility: [singleton_kind.clone()].into_iter().collect(),
+                protocols: vec![descriptor],
+                entity_configs: vec![entity_config],
+                singleton_configs: vec![singleton_config],
+                ..TestHelloSpec::default()
+            },
         ),
         host_key,
     )
@@ -1075,15 +1050,15 @@ async fn resolution_reassigns_fenced_slots_after_owner_restart() {
         &mut leader,
         test_hello(
             host.clone(),
-            Default::default(),
-            10,
-            [entity_type.clone()].into_iter().collect(),
-            Default::default(),
-            [singleton_kind.clone()].into_iter().collect(),
-            Default::default(),
-            vec![descriptor],
-            vec![entity_config],
-            vec![singleton_config],
+            TestHelloSpec {
+                capacity_units: 10,
+                hosted_entity_types: [entity_type.clone()].into_iter().collect(),
+                singleton_eligibility: [singleton_kind.clone()].into_iter().collect(),
+                protocols: vec![descriptor],
+                entity_configs: vec![entity_config],
+                singleton_configs: vec![singleton_config],
+                ..TestHelloSpec::default()
+            },
         ),
         host_key,
     )

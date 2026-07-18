@@ -3,9 +3,9 @@ use super::{
     AskError, AssociationKey, AssociationManager, AssociationState, Bytes, DispatchMode,
     DispatchReply, EntityConfig, EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID,
     LogicPlacementState, LogicalEntityTarget, Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering,
-    OutboundMessaging, PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol,
-    ProtocolFingerprint, RemoteMessageError, RouteBuffer, SenderIdentity, WatchError, async_trait,
-    decode_resolved_actor, drain_actor_ids, map_ask, map_dispatch, map_tell,
+    OutboundMessage, OutboundMessaging, PlacementSlot, PlacementSlotKey, PlacementSlotState,
+    Protocol, ProtocolFingerprint, RemoteMessageError, RouteBuffer, SenderIdentity, WatchError,
+    async_trait, decode_resolved_actor, drain_actor_ids, map_ask, map_dispatch, map_tell,
 };
 
 #[async_trait]
@@ -280,13 +280,8 @@ where
             .tell_entity(
                 &association,
                 &sender,
-                &logical.reference,
-                owner.address,
-                owner.incarnation,
-                logical.assignment_generation,
-                fingerprint,
-                message_id,
-                payload,
+                logical,
+                OutboundMessage::new(fingerprint, message_id, payload),
             )
             .map(|_| ())
             .map_err(map_tell)
@@ -336,13 +331,8 @@ where
             .ask_entity(
                 &association,
                 &SenderIdentity::Process(self.local_node.incarnation.get()),
-                &logical.reference,
-                owner.address,
-                owner.incarnation,
-                logical.assignment_generation,
-                fingerprint,
-                message_id,
-                payload,
+                logical,
+                OutboundMessage::new(fingerprint, message_id, payload),
                 deadline,
             )
             .await
@@ -435,13 +425,12 @@ where
                 .ask_entity(
                     &association,
                     &SenderIdentity::Process(self.local_node.incarnation.get()),
-                    &logical.reference,
-                    logical.owner_address,
-                    logical.owner_incarnation,
-                    logical.assignment_generation,
-                    self.protocol.fingerprint(),
-                    LOGICAL_RESOLVE_MESSAGE_ID,
-                    Bytes::new(),
+                    logical,
+                    OutboundMessage::new(
+                        self.protocol.fingerprint(),
+                        LOGICAL_RESOLVE_MESSAGE_ID,
+                        Bytes::new(),
+                    ),
                     Instant::now() + self.buffer.config.maximum_residence,
                 )
                 .await;

@@ -137,7 +137,6 @@ impl DomainLogicalRouter {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn register_singleton<A, L, P>(
         &mut self,
         config: SingletonConfig,

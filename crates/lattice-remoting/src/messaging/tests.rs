@@ -224,9 +224,7 @@ async fn outbound_tell_preserves_an_exact_actor_sender() {
             &association,
             &sender_identity,
             &recipient,
-            fingerprint,
-            1,
-            Bytes::from_static(b"tell"),
+            OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"tell")),
         )
         .unwrap();
 
@@ -259,9 +257,7 @@ async fn disconnect_result_changes_only_at_socket_write_boundary() {
                     &task_association,
                     &SenderIdentity::Process(9),
                     &actor_ref,
-                    fingerprint,
-                    1,
-                    Bytes::new(),
+                    OutboundMessage::new(fingerprint, 1, Bytes::new()),
                     Instant::now() + Duration::from_secs(5),
                 )
                 .await
@@ -292,9 +288,7 @@ async fn expired_queued_ask_is_dropped_before_socket_write() {
                 &task_association,
                 &SenderIdentity::Process(9),
                 &actor_ref,
-                fingerprint,
-                1,
-                Bytes::new(),
+                OutboundMessage::new(fingerprint, 1, Bytes::new()),
                 Instant::now() + Duration::from_millis(10),
             )
             .await
@@ -316,9 +310,7 @@ fn one_protocol_mismatch_does_not_close_the_association() {
         &association,
         &SenderIdentity::Process(9),
         &actor_ref,
-        ProtocolFingerprint::digest(b"other"),
-        1,
-        Bytes::new(),
+        OutboundMessage::new(ProtocolFingerprint::digest(b"other"), 1, Bytes::new()),
     );
     assert!(matches!(
         mismatch,
@@ -333,9 +325,7 @@ fn one_protocol_mismatch_does_not_close_the_association() {
                 &association,
                 &SenderIdentity::Process(9),
                 &actor_ref,
-                fingerprint,
-                1,
-                Bytes::new(),
+                OutboundMessage::new(fingerprint, 1, Bytes::new()),
             )
             .is_ok()
     );

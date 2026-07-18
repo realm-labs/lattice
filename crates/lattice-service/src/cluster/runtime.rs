@@ -55,6 +55,14 @@ pub(crate) struct LogicJoinRuntime {
     pub membership_ready: Arc<AtomicBool>,
 }
 
+struct LogicSessionRun {
+    leader: lattice_remoting::bootstrap::BootstrapLeader,
+    session: PlacementDomainSession,
+    controls: mpsc::Receiver<PlacementControlEvent>,
+    effects: mpsc::Receiver<LogicPlacementEffect>,
+    handle: LogicCoordinatorHandle,
+}
+
 impl LogicJoinRuntime {
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         let (join_events_tx, mut join_events) = mpsc::channel(8);
@@ -135,11 +143,13 @@ impl LogicJoinRuntime {
                         .insert(self.domain_hello.domain.clone(), handle.clone());
                     controls = Some(
                         self.run_session(
-                            leader,
-                            session,
-                            receiver,
-                            effects,
-                            handle,
+                            LogicSessionRun {
+                                leader,
+                                session,
+                                controls: receiver,
+                                effects,
+                                handle,
+                            },
                             &mut join_events,
                             &mut shutdown,
                         )
@@ -180,17 +190,19 @@ impl LogicJoinRuntime {
         let _ = controller.await;
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn run_session(
         &self,
-        leader: lattice_remoting::bootstrap::BootstrapLeader,
-        session: PlacementDomainSession,
-        controls: mpsc::Receiver<PlacementControlEvent>,
-        mut effects: mpsc::Receiver<LogicPlacementEffect>,
-        handle: LogicCoordinatorHandle,
+        run: LogicSessionRun,
         join_events: &mut mpsc::Receiver<JoinEvent>,
         shutdown: &mut watch::Receiver<bool>,
     ) -> mpsc::Receiver<PlacementControlEvent> {
+        let LogicSessionRun {
+            leader,
+            session,
+            controls,
+            mut effects,
+            handle,
+        } = run;
         let (session_shutdown, session_shutdown_rx) = watch::channel(false);
         let mut task = tokio::spawn(session.run_recoverable(controls, session_shutdown_rx));
         let changed = handle.change_notifier();

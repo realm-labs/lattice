@@ -9,8 +9,8 @@ use super::target::{
 };
 use super::{
     ActorRef, Arc, Association, AssociationId, AtomicU64, Bytes, CatalogueDecision, Duration,
-    EntityRef, Frame, FrameKind, HashMap, Instant, Mutex, NodeAddress, NodeIncarnation, Ordering,
-    ProtocolFingerprint, ProtocolId, ProtocolTag, SingletonRef, oneshot,
+    Frame, FrameKind, HashMap, Instant, Mutex, Ordering, ProtocolFingerprint, ProtocolId,
+    ProtocolTag, oneshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,24 @@ pub struct OutboundMessaging {
     pending: Arc<PendingState>,
 }
 
+/// Encoded protocol message data shared by exact and logical outbound routes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundMessage {
+    expected_fingerprint: ProtocolFingerprint,
+    message_id: u64,
+    payload: Bytes,
+}
+
+impl OutboundMessage {
+    pub fn new(expected_fingerprint: ProtocolFingerprint, message_id: u64, payload: Bytes) -> Self {
+        Self {
+            expected_fingerprint,
+            message_id,
+            payload,
+        }
+    }
+}
+
 impl OutboundMessaging {
     pub fn new(maximum_pending_asks: usize) -> Result<Self, RemoteMessageError> {
         if maximum_pending_asks == 0 {
@@ -57,20 +75,22 @@ impl OutboundMessaging {
         association: &Association,
         sender: &SenderIdentity,
         target: &ActorRef<A>,
-        expected_fingerprint: ProtocolFingerprint,
-        message_id: u64,
-        payload: Bytes,
+        message: OutboundMessage,
     ) -> Result<usize, TellError> {
-        check_protocol(association, target.protocol_id(), expected_fingerprint)
-            .map_err(TellError::Protocol)?;
+        check_protocol(
+            association,
+            target.protocol_id(),
+            message.expected_fingerprint,
+        )
+        .map_err(TellError::Protocol)?;
         let target = ExactActorTarget::from(target);
         let sender_bytes = sender.stable_bytes();
         let target_bytes = target.stable_bytes();
         let wire = TellWire {
             sender: sender_bytes.clone(),
             target: Some(target_to_wire(&target)),
-            message_id,
-            payload: payload.to_vec(),
+            message_id: message.message_id,
+            payload: message.payload.to_vec(),
             sender_actor: sender
                 .actor_ref()
                 .map(|reference| target_to_wire(&ExactActorTarget::from(reference))),
@@ -84,27 +104,19 @@ impl OutboundMessaging {
             .map_err(TellError::Association)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn tell_entity<A: ProtocolTag>(
+    pub fn tell_entity(
         &self,
         association: &Association,
         sender: &SenderIdentity,
-        target: &EntityRef<A>,
-        owner_address: NodeAddress,
-        owner_incarnation: NodeIncarnation,
-        assignment_generation: u64,
-        expected_fingerprint: ProtocolFingerprint,
-        message_id: u64,
-        payload: Bytes,
+        target: LogicalEntityTarget,
+        message: OutboundMessage,
     ) -> Result<usize, TellError> {
-        check_protocol(association, target.protocol_id(), expected_fingerprint)
-            .map_err(TellError::Protocol)?;
-        let target = LogicalEntityTarget {
-            reference: target.erase(),
-            owner_address,
-            owner_incarnation,
-            assignment_generation,
-        };
+        check_protocol(
+            association,
+            target.reference.protocol_id(),
+            message.expected_fingerprint,
+        )
+        .map_err(TellError::Protocol)?;
         let sender_bytes = sender.stable_bytes();
         let recipient_bytes = entity_logical_bytes(&target);
         association
@@ -116,8 +128,8 @@ impl OutboundMessaging {
                     &EntityTellWire {
                         sender: sender_bytes.clone(),
                         target: Some(entity_target_to_wire(&target)),
-                        message_id,
-                        payload: payload.to_vec(),
+                        message_id: message.message_id,
+                        payload: message.payload.to_vec(),
                         sender_actor: sender
                             .actor_ref()
                             .map(|reference| target_to_wire(&ExactActorTarget::from(reference))),
@@ -127,27 +139,19 @@ impl OutboundMessaging {
             .map_err(TellError::Association)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn tell_singleton<A: ProtocolTag>(
+    pub fn tell_singleton(
         &self,
         association: &Association,
         sender: &SenderIdentity,
-        target: &SingletonRef<A>,
-        owner_address: NodeAddress,
-        owner_incarnation: NodeIncarnation,
-        assignment_generation: u64,
-        expected_fingerprint: ProtocolFingerprint,
-        message_id: u64,
-        payload: Bytes,
+        target: LogicalSingletonTarget,
+        message: OutboundMessage,
     ) -> Result<usize, TellError> {
-        check_protocol(association, target.protocol_id(), expected_fingerprint)
-            .map_err(TellError::Protocol)?;
-        let target = LogicalSingletonTarget {
-            reference: target.erase(),
-            owner_address,
-            owner_incarnation,
-            assignment_generation,
-        };
+        check_protocol(
+            association,
+            target.reference.protocol_id(),
+            message.expected_fingerprint,
+        )
+        .map_err(TellError::Protocol)?;
         let sender_bytes = sender.stable_bytes();
         let recipient_bytes = singleton_logical_bytes(&target);
         association
@@ -159,8 +163,8 @@ impl OutboundMessaging {
                     &SingletonTellWire {
                         sender: sender_bytes.clone(),
                         target: Some(singleton_target_to_wire(&target)),
-                        message_id,
-                        payload: payload.to_vec(),
+                        message_id: message.message_id,
+                        payload: message.payload.to_vec(),
                         sender_actor: sender
                             .actor_ref()
                             .map(|reference| target_to_wire(&ExactActorTarget::from(reference))),
@@ -170,22 +174,23 @@ impl OutboundMessaging {
             .map_err(TellError::Association)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn ask<A: ProtocolTag>(
         &self,
         association: &Association,
         sender: &SenderIdentity,
         target: &ActorRef<A>,
-        expected_fingerprint: ProtocolFingerprint,
-        message_id: u64,
-        payload: Bytes,
+        message: OutboundMessage,
         deadline: Instant,
     ) -> Result<Bytes, AskError> {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or(AskError::DeadlineExceeded)?;
-        check_protocol(association, target.protocol_id(), expected_fingerprint)
-            .map_err(AskError::Protocol)?;
+        check_protocol(
+            association,
+            target.protocol_id(),
+            message.expected_fingerprint,
+        )
+        .map_err(AskError::Protocol)?;
         let correlation = self.next_correlation()?;
         let (completion, receiver) = oneshot::channel();
         {
@@ -213,8 +218,8 @@ impl OutboundMessaging {
             target: Some(target_to_wire(&ExactActorTarget::from(target))),
             correlation_id: correlation.to_bytes().to_vec(),
             timeout_nanos: duration_nanos(remaining),
-            message_id,
-            payload: payload.to_vec(),
+            message_id: message.message_id,
+            payload: message.payload.to_vec(),
         };
         association
             .try_admit_interactive(Frame::encode_message(FrameKind::Ask, &wire))
@@ -229,31 +234,23 @@ impl OutboundMessaging {
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn ask_entity<A: ProtocolTag>(
+    pub async fn ask_entity(
         &self,
         association: &Association,
         sender: &SenderIdentity,
-        target: &EntityRef<A>,
-        owner_address: NodeAddress,
-        owner_incarnation: NodeIncarnation,
-        assignment_generation: u64,
-        expected_fingerprint: ProtocolFingerprint,
-        message_id: u64,
-        payload: Bytes,
+        target: LogicalEntityTarget,
+        message: OutboundMessage,
         deadline: Instant,
     ) -> Result<Bytes, AskError> {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or(AskError::DeadlineExceeded)?;
-        check_protocol(association, target.protocol_id(), expected_fingerprint)
-            .map_err(AskError::Protocol)?;
-        let logical = LogicalEntityTarget {
-            reference: target.erase(),
-            owner_address,
-            owner_incarnation,
-            assignment_generation,
-        };
+        check_protocol(
+            association,
+            target.reference.protocol_id(),
+            message.expected_fingerprint,
+        )
+        .map_err(AskError::Protocol)?;
         self.enqueue_logical_ask(
             association,
             deadline,
@@ -261,42 +258,34 @@ impl OutboundMessaging {
                 FrameKind::EntityAsk,
                 &EntityAskWire {
                     sender: sender.stable_bytes(),
-                    target: Some(entity_target_to_wire(&logical)),
+                    target: Some(entity_target_to_wire(&target)),
                     correlation_id: Vec::new(),
                     timeout_nanos: duration_nanos(remaining),
-                    message_id,
-                    payload: payload.to_vec(),
+                    message_id: message.message_id,
+                    payload: message.payload.to_vec(),
                 },
             ),
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn ask_singleton<A: ProtocolTag>(
+    pub async fn ask_singleton(
         &self,
         association: &Association,
         sender: &SenderIdentity,
-        target: &SingletonRef<A>,
-        owner_address: NodeAddress,
-        owner_incarnation: NodeIncarnation,
-        assignment_generation: u64,
-        expected_fingerprint: ProtocolFingerprint,
-        message_id: u64,
-        payload: Bytes,
+        target: LogicalSingletonTarget,
+        message: OutboundMessage,
         deadline: Instant,
     ) -> Result<Bytes, AskError> {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or(AskError::DeadlineExceeded)?;
-        check_protocol(association, target.protocol_id(), expected_fingerprint)
-            .map_err(AskError::Protocol)?;
-        let logical = LogicalSingletonTarget {
-            reference: target.erase(),
-            owner_address,
-            owner_incarnation,
-            assignment_generation,
-        };
+        check_protocol(
+            association,
+            target.reference.protocol_id(),
+            message.expected_fingerprint,
+        )
+        .map_err(AskError::Protocol)?;
         self.enqueue_logical_ask(
             association,
             deadline,
@@ -304,11 +293,11 @@ impl OutboundMessaging {
                 FrameKind::SingletonAsk,
                 &SingletonAskWire {
                     sender: sender.stable_bytes(),
-                    target: Some(singleton_target_to_wire(&logical)),
+                    target: Some(singleton_target_to_wire(&target)),
                     correlation_id: Vec::new(),
                     timeout_nanos: duration_nanos(remaining),
-                    message_id,
-                    payload: payload.to_vec(),
+                    message_id: message.message_id,
+                    payload: message.payload.to_vec(),
                 },
             ),
         )

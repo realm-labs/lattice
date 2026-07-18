@@ -46,57 +46,87 @@ impl BidirectionalLaneConfig {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run_bidirectional_lane<S>(
-    association: Arc<Association>,
-    lane: LaneKind,
-    connection_nonce: u128,
-    receiver: &mut mpsc::Receiver<Frame>,
-    stream: S,
+#[derive(Clone)]
+pub struct LaneServices {
     messaging: Arc<OutboundMessaging>,
     dispatch: Arc<dyn InboundDispatch>,
     control_dispatch: Arc<dyn ControlDispatch>,
-    config: BidirectionalLaneConfig,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<LaneExit, LaneError>
-where
-    S: RemotingIo,
-{
-    let config = config.validate()?;
-    let result = run_bidirectional_lane_inner(
-        &association,
-        lane,
-        receiver,
-        stream,
-        &messaging,
-        dispatch,
-        control_dispatch,
-        config,
-        shutdown,
-    )
-    .await;
-    association.detach(lane, connection_nonce);
-    if result.is_err() {
-        messaging.fail_association(association.id());
-    }
-    result
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_bidirectional_lane_inner<S>(
-    association: &Association,
+impl LaneServices {
+    pub fn new(
+        messaging: Arc<OutboundMessaging>,
+        dispatch: Arc<dyn InboundDispatch>,
+        control_dispatch: Arc<dyn ControlDispatch>,
+    ) -> Self {
+        Self {
+            messaging,
+            dispatch,
+            control_dispatch,
+        }
+    }
+}
+
+pub struct BidirectionalLane {
+    association: Arc<Association>,
     lane: LaneKind,
+    connection_nonce: u128,
+    services: LaneServices,
+    config: BidirectionalLaneConfig,
+}
+
+impl BidirectionalLane {
+    pub fn new(
+        association: Arc<Association>,
+        lane: LaneKind,
+        connection_nonce: u128,
+        services: LaneServices,
+        config: BidirectionalLaneConfig,
+    ) -> Self {
+        Self {
+            association,
+            lane,
+            connection_nonce,
+            services,
+            config,
+        }
+    }
+
+    pub async fn run<S>(
+        self,
+        receiver: &mut mpsc::Receiver<Frame>,
+        stream: S,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<LaneExit, LaneError>
+    where
+        S: RemotingIo,
+    {
+        let result = run_bidirectional_lane_inner(&self, receiver, stream, shutdown).await;
+        self.association.detach(self.lane, self.connection_nonce);
+        if result.is_err() {
+            self.services
+                .messaging
+                .fail_association(self.association.id());
+        }
+        result
+    }
+}
+
+async fn run_bidirectional_lane_inner<S>(
+    runtime: &BidirectionalLane,
     receiver: &mut mpsc::Receiver<Frame>,
     stream: S,
-    messaging: &OutboundMessaging,
-    dispatch: Arc<dyn InboundDispatch>,
-    control_dispatch: Arc<dyn ControlDispatch>,
-    config: BidirectionalLaneConfig,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<LaneExit, LaneError>
 where
     S: RemotingIo,
 {
+    let association = runtime.association.as_ref();
+    let lane = runtime.lane;
+    let messaging = runtime.services.messaging.as_ref();
+    let dispatch = runtime.services.dispatch.clone();
+    let control_dispatch = runtime.services.control_dispatch.clone();
+    let config = runtime.config.validate()?;
     let codec = crate::wire::FrameCodec::new(config.maximum_frame_size)?;
     let (read, write) = tokio::io::split(stream);
     let mut reader = FramedReader::new(read, codec.clone());
@@ -506,15 +536,15 @@ mod tests {
             let messaging = server_messaging.clone();
             tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
-                run_bidirectional_lane(
+                BidirectionalLane::new(
                     association,
                     LaneKind::Interactive,
                     2,
-                    &mut server_receiver,
-                    stream,
-                    messaging,
-                    Arc::new(EchoDispatch),
-                    Arc::new(crate::control::RejectControlDispatch),
+                    LaneServices::new(
+                        messaging,
+                        Arc::new(EchoDispatch),
+                        Arc::new(crate::control::RejectControlDispatch),
+                    ),
                     BidirectionalLaneConfig {
                         maximum_frame_size: 4096,
                         maximum_concurrent_inbound_asks: 8,
@@ -522,8 +552,8 @@ mod tests {
                         heartbeat_miss_limit: 10,
                         idle_data_connection_timeout: Duration::from_secs(60),
                     },
-                    &mut server_shutdown,
                 )
+                .run(&mut server_receiver, stream, &mut server_shutdown)
                 .await
             })
         };
@@ -533,15 +563,15 @@ mod tests {
             let association = client_association.clone();
             let messaging = client_messaging.clone();
             tokio::spawn(async move {
-                run_bidirectional_lane(
+                BidirectionalLane::new(
                     association,
                     LaneKind::Interactive,
                     2,
-                    &mut client_receiver,
-                    stream,
-                    messaging,
-                    Arc::new(EchoDispatch),
-                    Arc::new(crate::control::RejectControlDispatch),
+                    LaneServices::new(
+                        messaging,
+                        Arc::new(EchoDispatch),
+                        Arc::new(crate::control::RejectControlDispatch),
+                    ),
                     BidirectionalLaneConfig {
                         maximum_frame_size: 4096,
                         maximum_concurrent_inbound_asks: 8,
@@ -549,8 +579,8 @@ mod tests {
                         heartbeat_miss_limit: 10,
                         idle_data_connection_timeout: Duration::from_secs(60),
                     },
-                    &mut client_shutdown,
                 )
+                .run(&mut client_receiver, stream, &mut client_shutdown)
                 .await
             })
         };
@@ -568,9 +598,11 @@ mod tests {
                 &client_association,
                 &SenderIdentity::Process(9),
                 &target,
-                fingerprint,
-                1,
-                Bytes::from_static(b"echo"),
+                crate::messaging::outbound::OutboundMessage::new(
+                    fingerprint,
+                    1,
+                    Bytes::from_static(b"echo"),
+                ),
                 Instant::now() + Duration::from_secs(1),
             )
             .await

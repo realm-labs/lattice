@@ -35,6 +35,14 @@ pub(crate) struct MembershipJoinRuntime {
     pub handle: Arc<Mutex<Option<MembershipCoordinatorHandle>>>,
 }
 
+struct MembershipSessionRun {
+    leader: lattice_remoting::bootstrap::BootstrapLeader,
+    session: MembershipSession,
+    state: Arc<Mutex<lattice_placement::membership_session::MembershipSessionState>>,
+    controls: mpsc::Receiver<PlacementControlEvent>,
+    effects: mpsc::Receiver<LogicPlacementEffect>,
+}
+
 impl MembershipJoinRuntime {
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         let (join_events_tx, mut join_events) = mpsc::channel(8);
@@ -67,11 +75,13 @@ impl MembershipJoinRuntime {
                     let state = session.state();
                     let returned = self
                         .run_session(
-                            leader,
-                            session,
-                            state,
-                            receiver,
-                            effects,
+                            MembershipSessionRun {
+                                leader,
+                                session,
+                                state,
+                                controls: receiver,
+                                effects,
+                            },
                             &mut join_events,
                             &mut shutdown,
                         )
@@ -98,17 +108,19 @@ impl MembershipJoinRuntime {
         let _ = controller.await;
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn run_session(
         &self,
-        leader: lattice_remoting::bootstrap::BootstrapLeader,
-        session: MembershipSession,
-        state: Arc<Mutex<lattice_placement::membership_session::MembershipSessionState>>,
-        controls: mpsc::Receiver<PlacementControlEvent>,
-        mut effects: mpsc::Receiver<LogicPlacementEffect>,
+        run: MembershipSessionRun,
         join_events: &mut mpsc::Receiver<JoinEvent>,
         shutdown: &mut watch::Receiver<bool>,
     ) -> mpsc::Receiver<PlacementControlEvent> {
+        let MembershipSessionRun {
+            leader,
+            session,
+            state,
+            controls,
+            mut effects,
+        } = run;
         let (session_shutdown, session_shutdown_rx) = watch::channel(false);
         let mut task = tokio::spawn(session.run_recoverable(controls, session_shutdown_rx));
         let changed = state

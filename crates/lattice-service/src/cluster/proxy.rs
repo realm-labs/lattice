@@ -2,9 +2,9 @@ use super::entity::EntityRoute;
 use super::{
     ActorRef, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, EntityConfig,
     EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalEntityTarget,
-    Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessaging, PlacementSlot,
-    PlacementSlotKey, PlacementSlotState, ProtocolFingerprint, RemoteMessageError, RouteBuffer,
-    SenderIdentity, WatchError, async_trait, decode_resolved_actor, map_tell,
+    Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessage, OutboundMessaging,
+    PlacementSlot, PlacementSlotKey, PlacementSlotState, ProtocolFingerprint, RemoteMessageError,
+    RouteBuffer, SenderIdentity, WatchError, async_trait, decode_resolved_actor, map_tell,
 };
 
 pub(super) struct EntityProxyRoute {
@@ -180,13 +180,13 @@ impl EntityRoute for EntityProxyRoute {
             .tell_entity(
                 &association,
                 &sender,
-                &target,
-                owner.address,
-                owner.incarnation,
-                slot.assignment_generation.get(),
-                fingerprint,
-                message_id,
-                payload,
+                LogicalEntityTarget {
+                    reference: target,
+                    owner_address: owner.address,
+                    owner_incarnation: owner.incarnation,
+                    assignment_generation: slot.assignment_generation.get(),
+                },
+                OutboundMessage::new(fingerprint, message_id, payload),
             )
             .map(|_| ())
             .map_err(map_tell)
@@ -220,13 +220,13 @@ impl EntityRoute for EntityProxyRoute {
             .ask_entity(
                 &association,
                 &SenderIdentity::Process(self.local_node.incarnation.get()),
-                &target,
-                owner.address,
-                owner.incarnation,
-                slot.assignment_generation.get(),
-                fingerprint,
-                message_id,
-                payload,
+                LogicalEntityTarget {
+                    reference: target,
+                    owner_address: owner.address,
+                    owner_incarnation: owner.incarnation,
+                    assignment_generation: slot.assignment_generation.get(),
+                },
+                OutboundMessage::new(fingerprint, message_id, payload),
                 deadline,
             )
             .await
@@ -263,18 +263,19 @@ impl EntityRoute for EntityProxyRoute {
             .map_err(|_| WatchError::NotActive)?;
         let expected_cluster = target.cluster_id().clone();
         let expected_address = owner.address.clone();
+        let expected_incarnation = owner.incarnation;
         let result = self
             .messaging
             .ask_entity(
                 &association,
                 &SenderIdentity::Process(self.local_node.incarnation.get()),
-                &target,
-                owner.address,
-                owner.incarnation,
-                slot.assignment_generation.get(),
-                self.fingerprint,
-                LOGICAL_RESOLVE_MESSAGE_ID,
-                Bytes::new(),
+                LogicalEntityTarget {
+                    reference: target,
+                    owner_address: owner.address,
+                    owner_incarnation: owner.incarnation,
+                    assignment_generation: slot.assignment_generation.get(),
+                },
+                OutboundMessage::new(self.fingerprint, LOGICAL_RESOLVE_MESSAGE_ID, Bytes::new()),
                 Instant::now() + self.buffer.config.maximum_residence,
             )
             .await
@@ -283,7 +284,7 @@ impl EntityRoute for EntityProxyRoute {
             &result,
             &expected_cluster,
             &expected_address,
-            owner.incarnation,
+            expected_incarnation,
             self.config.protocol_id,
         )
         .map(Some)

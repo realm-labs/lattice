@@ -285,32 +285,22 @@ impl MemberHello {
 }
 
 impl PlacementDomainHello {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn builder(
         node: NodeKey,
         domain: PlacementDomainId,
         capacity_units: u64,
-        hosted_entity_types: BTreeSet<EntityType>,
-        proxied_entity_types: BTreeSet<EntityType>,
-        singleton_eligibility: BTreeSet<SingletonKind>,
-        used_singletons: BTreeSet<SingletonKind>,
-        entity_configs: Vec<EntityConfig>,
-        singleton_configs: Vec<SingletonConfig>,
-        constraints: BTreeMap<String, String>,
-    ) -> Self {
-        let domain_config_fingerprint = placement_domain_fingerprint(&domain);
-        Self {
+    ) -> PlacementDomainHelloBuilder {
+        PlacementDomainHelloBuilder {
             node,
             domain,
-            domain_config_fingerprint,
             capacity_units,
-            hosted_entity_types,
-            proxied_entity_types,
-            singleton_eligibility,
-            used_singletons,
-            entity_configs,
-            singleton_configs,
-            constraints,
+            hosted_entity_types: BTreeSet::new(),
+            proxied_entity_types: BTreeSet::new(),
+            singleton_eligibility: BTreeSet::new(),
+            used_singletons: BTreeSet::new(),
+            entity_configs: Vec::new(),
+            singleton_configs: Vec::new(),
+            constraints: BTreeMap::new(),
         }
     }
 
@@ -357,6 +347,73 @@ impl PlacementDomainHello {
     pub fn subscribes_to(&self, entity_type: &EntityType) -> bool {
         self.hosted_entity_types.contains(entity_type)
             || self.proxied_entity_types.contains(entity_type)
+    }
+}
+
+pub struct PlacementDomainHelloBuilder {
+    node: NodeKey,
+    domain: PlacementDomainId,
+    capacity_units: u64,
+    hosted_entity_types: BTreeSet<EntityType>,
+    proxied_entity_types: BTreeSet<EntityType>,
+    singleton_eligibility: BTreeSet<SingletonKind>,
+    used_singletons: BTreeSet<SingletonKind>,
+    entity_configs: Vec<EntityConfig>,
+    singleton_configs: Vec<SingletonConfig>,
+    constraints: BTreeMap<String, String>,
+}
+
+impl PlacementDomainHelloBuilder {
+    pub fn hosted_entity_types(mut self, value: BTreeSet<EntityType>) -> Self {
+        self.hosted_entity_types = value;
+        self
+    }
+
+    pub fn proxied_entity_types(mut self, value: BTreeSet<EntityType>) -> Self {
+        self.proxied_entity_types = value;
+        self
+    }
+
+    pub fn singleton_eligibility(mut self, value: BTreeSet<SingletonKind>) -> Self {
+        self.singleton_eligibility = value;
+        self
+    }
+
+    pub fn used_singletons(mut self, value: BTreeSet<SingletonKind>) -> Self {
+        self.used_singletons = value;
+        self
+    }
+
+    pub fn entity_configs(mut self, value: Vec<EntityConfig>) -> Self {
+        self.entity_configs = value;
+        self
+    }
+
+    pub fn singleton_configs(mut self, value: Vec<SingletonConfig>) -> Self {
+        self.singleton_configs = value;
+        self
+    }
+
+    pub fn constraints(mut self, value: BTreeMap<String, String>) -> Self {
+        self.constraints = value;
+        self
+    }
+
+    pub fn build(self) -> PlacementDomainHello {
+        let domain_config_fingerprint = placement_domain_fingerprint(&self.domain);
+        PlacementDomainHello {
+            node: self.node,
+            domain: self.domain,
+            domain_config_fingerprint,
+            capacity_units: self.capacity_units,
+            hosted_entity_types: self.hosted_entity_types,
+            proxied_entity_types: self.proxied_entity_types,
+            singleton_eligibility: self.singleton_eligibility,
+            used_singletons: self.used_singletons,
+            entity_configs: self.entity_configs,
+            singleton_configs: self.singleton_configs,
+            constraints: self.constraints,
+        }
     }
 }
 
@@ -1024,6 +1081,37 @@ mod state_version_tests {
             )
             .fingerprint()
         );
+    }
+
+    #[test]
+    fn placement_domain_hello_builder_preserves_defaults_and_configuration() {
+        let domain = PlacementDomainId::new("battle").unwrap();
+        let node = NodeKey {
+            node_id: "node-a".to_owned(),
+            address: lattice_core::actor_ref::NodeAddress::new("127.0.0.1", 25520).unwrap(),
+            incarnation: NodeIncarnation::new(1).unwrap(),
+        };
+        let empty = PlacementDomainHello::builder(node.clone(), domain.clone(), 1).build();
+        assert!(empty.hosted_entity_types.is_empty());
+        assert!(empty.constraints.is_empty());
+        assert_eq!(
+            empty.domain_config_fingerprint,
+            placement_domain_fingerprint(&domain)
+        );
+        empty.validate(&SessionLimits::default()).unwrap();
+
+        let entity_type = EntityType::new("player").unwrap();
+        let singleton_kind = SingletonKind::new("matchmaker").unwrap();
+        let configured = PlacementDomainHello::builder(node, domain, 8)
+            .hosted_entity_types(BTreeSet::from([entity_type.clone()]))
+            .proxied_entity_types(BTreeSet::from([EntityType::new("chat").unwrap()]))
+            .singleton_eligibility(BTreeSet::from([singleton_kind.clone()]))
+            .used_singletons(BTreeSet::from([singleton_kind]))
+            .constraints(BTreeMap::from([("zone".to_owned(), "east".to_owned())]))
+            .build();
+        assert_eq!(configured.capacity_units, 8);
+        assert!(configured.hosted_entity_types.contains(&entity_type));
+        configured.validate(&SessionLimits::default()).unwrap();
     }
 
     #[test]

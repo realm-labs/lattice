@@ -28,7 +28,7 @@ use lattice_remoting::association::AssociationManager;
 use lattice_remoting::association::AssociationState;
 use lattice_remoting::messaging::error::AskError;
 use lattice_remoting::messaging::error::RemoteMessageError;
-use lattice_remoting::messaging::outbound::OutboundMessaging;
+use lattice_remoting::messaging::outbound::{OutboundMessage, OutboundMessaging};
 use lattice_remoting::messaging::target::LogicalEntityTarget;
 use lattice_remoting::messaging::target::LogicalSingletonTarget;
 use lattice_remoting::messaging::target::SenderIdentity;

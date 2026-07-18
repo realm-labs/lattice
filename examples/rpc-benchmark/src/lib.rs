@@ -15,7 +15,7 @@ use lattice_remoting::association::AssociationKey;
 use lattice_remoting::association::LaneAttachment;
 use lattice_remoting::association::LaneKind;
 use lattice_remoting::config::RemotingConfig;
-use lattice_remoting::messaging::outbound::OutboundMessaging;
+use lattice_remoting::messaging::outbound::{OutboundMessage, OutboundMessaging};
 use lattice_remoting::messaging::target::SenderIdentity;
 use lattice_remoting::protocol::{ProtocolDescriptor, ProtocolFingerprint};
 use metrics::WorkloadReport;
@@ -145,9 +145,7 @@ impl RemotingTopology {
                     &self.association,
                     &sender,
                     &self.target,
-                    self.fingerprint,
-                    1,
-                    payload.clone(),
+                    OutboundMessage::new(self.fingerprint, 1, payload.clone()),
                 ) {
                     Ok(_) => {
                         successes += 1;

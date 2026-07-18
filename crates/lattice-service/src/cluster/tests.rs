@@ -214,18 +214,11 @@ fn test_hello(
             protocols: Vec::new(),
             remoting_capabilities: BTreeSet::new(),
         },
-        domain: PlacementDomainHello::new(
-            node,
-            domain(),
-            1,
-            hosted_entity_types,
-            BTreeSet::new(),
-            singleton_eligibility,
-            used_singletons,
-            Vec::new(),
-            Vec::new(),
-            BTreeMap::new(),
-        ),
+        domain: PlacementDomainHello::builder(node, domain(), 1)
+            .hosted_entity_types(hosted_entity_types)
+            .singleton_eligibility(singleton_eligibility)
+            .used_singletons(used_singletons)
+            .build(),
     }
 }
 
@@ -757,7 +750,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
                     logical: Arc<dyn LogicalRouter>,
                     control: Arc<PlacementControlRouter>| {
         Arc::new(
-            RemotingEndpoint::new_with_control(
+            RemotingEndpoint::builder(
                 identity,
                 remoting.clone(),
                 associations,
@@ -767,9 +760,10 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
                     logical: Some(logical),
                     admission: crate::lifecycle::NodeAdmissionGate::opened(),
                 }),
-                control,
-                vec![descriptor.clone()],
             )
+            .control_dispatch(control)
+            .catalogue(vec![descriptor.clone()])
+            .build()
             .unwrap(),
         )
     };

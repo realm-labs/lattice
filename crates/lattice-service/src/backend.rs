@@ -15,7 +15,7 @@ use lattice_remoting::messaging::error::RemoteFailureCode;
 use lattice_remoting::messaging::error::RemoteMessageError;
 use lattice_remoting::messaging::error::TellError;
 use lattice_remoting::messaging::inbound::InboundDispatch;
-use lattice_remoting::messaging::outbound::OutboundMessaging;
+use lattice_remoting::messaging::outbound::{OutboundMessage, OutboundMessaging};
 use lattice_remoting::messaging::target::ExactActorTarget;
 use lattice_remoting::messaging::target::LogicalEntityTarget;
 use lattice_remoting::messaging::target::LogicalSingletonTarget;
@@ -658,9 +658,7 @@ impl RecipientBackend for ServiceRecipientBackend {
                         &association,
                         &sender,
                         &reference,
-                        protocol_fingerprint,
-                        message_id,
-                        payload,
+                        OutboundMessage::new(protocol_fingerprint, message_id, payload),
                     )
                     .map(|_| ())
             }
@@ -705,9 +703,7 @@ impl RecipientBackend for ServiceRecipientBackend {
                         &association,
                         &SenderIdentity::Process(self.local_incarnation.get()),
                         &reference,
-                        protocol_fingerprint,
-                        message_id,
-                        payload,
+                        OutboundMessage::new(protocol_fingerprint, message_id, payload),
                         deadline,
                     )
                     .await

@@ -22,7 +22,10 @@ use crate::mailbox::MailboxConfig;
 use crate::observation::ActorObserverHandle;
 use crate::protocol::{ActorProtocolBinding, Protocol};
 use crate::recipient::ActorSystem;
-use crate::runtime::{PassivationPolicy, ShardMigrationPolicy, spawn_actor_with_self_ref};
+use crate::runtime::{
+    ActorSpawnContext, ActorSpawnOptions, PassivationPolicy, ShardMigrationPolicy,
+    spawn_actor_with_self_ref,
+};
 use crate::traits::{
     Actor, ActorLifecycleState, EntityActivationState, PassivationReason, StopReason,
 };
@@ -1028,13 +1031,19 @@ impl<A: Actor> ActorRegistry<A> {
         });
         let handle = spawn_actor_with_self_ref(
             actor,
-            self.config.mailbox,
-            self.config.passivation,
-            self_ref,
-            Some(self.actor_system.clone()),
-            self.config.service.clone(),
-            self.observer.clone(),
-            Some(terminal_hook),
+            ActorSpawnContext {
+                options: ActorSpawnOptions {
+                    mailbox: self.config.mailbox,
+                    execution: None,
+                    scheduler_key: None,
+                    passivation: self.config.passivation,
+                    self_ref,
+                    service: self.config.service.clone(),
+                },
+                actor_system: Some(self.actor_system.clone()),
+                observer: self.observer.clone(),
+                terminal_hook: Some(terminal_hook),
+            },
         );
         if let Some(directory) = self
             .config

@@ -20,6 +20,19 @@ use crate::watch::{ActorTerminated, LocalActorRef};
 
 pub(crate) type TerminalHook = Box<dyn FnOnce(LocalActorRef) + Send + 'static>;
 
+pub(crate) struct ActorHandleInit<A: Actor> {
+    pub(crate) local_ref: LocalActorRef,
+    pub(crate) terminated_tx: broadcast::Sender<ActorTerminated>,
+    pub(crate) lifecycle_tx: watch::Sender<ActorLifecycleState>,
+    pub(crate) stop_failure: Arc<Mutex<Option<StopFailureRecord>>>,
+    pub(crate) forced_data_loss_tx: broadcast::Sender<ForcedDataLossEvent>,
+    pub(crate) terminal_hook: Arc<Mutex<Option<TerminalHook>>>,
+    pub(crate) normal_tx: mpsc::Sender<ActorCommand<A>>,
+    pub(crate) system_tx: mpsc::Sender<ActorCommand<A>>,
+    pub(crate) actor_ref: Option<ActorRef>,
+    pub(crate) observer: ActorObserverHandle,
+}
+
 pub struct ActorHandle<A: Actor> {
     local_ref: LocalActorRef,
     terminated_tx: broadcast::Sender<ActorTerminated>,
@@ -131,32 +144,24 @@ impl<A: Actor> Clone for ActorHandle<A> {
 }
 
 impl<A: Actor> ActorHandle<A> {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        local_ref: LocalActorRef,
-        terminated_tx: broadcast::Sender<ActorTerminated>,
-        lifecycle_tx: watch::Sender<ActorLifecycleState>,
-        stop_failure: Arc<Mutex<Option<StopFailureRecord>>>,
-        forced_data_loss_tx: broadcast::Sender<ForcedDataLossEvent>,
-        terminal_hook: Arc<Mutex<Option<TerminalHook>>>,
-        normal_tx: mpsc::Sender<ActorCommand<A>>,
-        system_tx: mpsc::Sender<ActorCommand<A>>,
-        actor_ref: Option<ActorRef>,
-        observer: ActorObserverHandle,
-    ) -> Self {
+    pub(crate) fn new(init: ActorHandleInit<A>) -> Self {
         Self {
-            local_ref,
-            terminated_tx,
+            local_ref: init.local_ref,
+            terminated_tx: init.terminated_tx,
             termination: Arc::new(Mutex::new(None)),
             terminal_cleanup_started: Arc::new(AtomicBool::new(false)),
-            lifecycle_tx,
-            stop_failure,
-            forced_data_loss_tx,
-            terminal_hook,
-            normal_tx,
-            system_tx,
-            metadata: Arc::new(ActorMetadata::new(type_name::<A>(), local_ref, actor_ref)),
-            observer,
+            lifecycle_tx: init.lifecycle_tx,
+            stop_failure: init.stop_failure,
+            forced_data_loss_tx: init.forced_data_loss_tx,
+            terminal_hook: init.terminal_hook,
+            normal_tx: init.normal_tx,
+            system_tx: init.system_tx,
+            metadata: Arc::new(ActorMetadata::new(
+                type_name::<A>(),
+                init.local_ref,
+                init.actor_ref,
+            )),
+            observer: init.observer,
             _marker: PhantomData,
         }
     }

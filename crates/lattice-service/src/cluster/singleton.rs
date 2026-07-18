@@ -2,9 +2,9 @@ use super::{
     Actor, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc,
     AskError, AssociationKey, AssociationManager, AssociationState, Bytes, ConfigFingerprint,
     DispatchMode, DispatchReply, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
-    LogicalSingletonTarget, Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessaging,
-    PlacementDomainId, PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol,
-    ProtocolFingerprint, ProtocolId, RemoteMessageError, RouteBuffer, SenderIdentity,
+    LogicalSingletonTarget, Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessage,
+    OutboundMessaging, PlacementDomainId, PlacementSlot, PlacementSlotKey, PlacementSlotState,
+    Protocol, ProtocolFingerprint, ProtocolId, RemoteMessageError, RouteBuffer, SenderIdentity,
     SingletonKind, SingletonRef, WatchError, async_trait, decode_resolved_actor, drain_actor_ids,
     map_ask, map_dispatch, map_tell,
 };
@@ -257,13 +257,8 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
             .tell_singleton(
                 &association,
                 &sender,
-                &logical.reference,
-                owner.address,
-                owner.incarnation,
-                logical.assignment_generation,
-                fingerprint,
-                message_id,
-                payload,
+                logical,
+                OutboundMessage::new(fingerprint, message_id, payload),
             )
             .map(|_| ())
             .map_err(map_tell)
@@ -313,13 +308,8 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
             .ask_singleton(
                 &association,
                 &SenderIdentity::Process(self.local_node.incarnation.get()),
-                &logical.reference,
-                owner.address,
-                owner.incarnation,
-                logical.assignment_generation,
-                fingerprint,
-                message_id,
-                payload,
+                logical,
+                OutboundMessage::new(fingerprint, message_id, payload),
                 deadline,
             )
             .await
@@ -414,13 +404,12 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRoute for SingletonRoute
                 .ask_singleton(
                     &association,
                     &SenderIdentity::Process(self.local_node.incarnation.get()),
-                    &logical.reference,
-                    logical.owner_address,
-                    logical.owner_incarnation,
-                    logical.assignment_generation,
-                    self.protocol.fingerprint(),
-                    LOGICAL_RESOLVE_MESSAGE_ID,
-                    Bytes::new(),
+                    logical,
+                    OutboundMessage::new(
+                        self.protocol.fingerprint(),
+                        LOGICAL_RESOLVE_MESSAGE_ID,
+                        Bytes::new(),
+                    ),
                     Instant::now() + self.buffer.config.maximum_residence,
                 )
                 .await;

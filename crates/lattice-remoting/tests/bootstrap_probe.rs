@@ -488,14 +488,15 @@ fn endpoint(
         fingerprint: ProtocolFingerprint::digest(b"bootstrap-probe/v1"),
     };
     let endpoint = Arc::new(
-        RemotingEndpoint::new(
+        RemotingEndpoint::builder(
             identity,
             config,
             manager.clone(),
             Arc::new(OutboundMessaging::new(16).unwrap()),
             Arc::new(RejectDispatch),
-            vec![descriptor],
         )
+        .catalogue(vec![descriptor])
+        .build()
         .unwrap(),
     );
     (endpoint, manager)
@@ -523,16 +524,17 @@ fn endpoint_with_security(
         fingerprint: ProtocolFingerprint::digest(b"bootstrap-probe/v1"),
     };
     let endpoint = Arc::new(
-        RemotingEndpoint::new_with_control_and_security(
+        RemotingEndpoint::builder(
             identity,
             config,
             manager.clone(),
             Arc::new(OutboundMessaging::new(16).unwrap()),
             Arc::new(RejectDispatch),
-            Arc::new(RejectControlDispatch),
-            vec![descriptor],
-            Some(security),
         )
+        .control_dispatch(Arc::new(RejectControlDispatch))
+        .catalogue(vec![descriptor])
+        .security(security)
+        .build()
         .unwrap(),
     );
     (endpoint, manager)

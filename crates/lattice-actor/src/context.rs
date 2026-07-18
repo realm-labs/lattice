@@ -493,13 +493,19 @@ impl<A: Actor> ActorContext<A> {
         let child_ref = self.child_actor_ref(&key, options.protocol_id)?;
         let handle = crate::runtime::spawn_actor_with_self_ref(
             actor,
-            options.mailbox,
-            crate::runtime::PassivationPolicy::Disabled,
-            child_ref.as_ref().map(ActorRef::erase),
-            self.actor_system.clone(),
-            self.service.clone(),
-            self.handle.observer().clone(),
-            None,
+            crate::runtime::ActorSpawnContext {
+                options: crate::runtime::ActorSpawnOptions {
+                    mailbox: options.mailbox,
+                    execution: Some(crate::runtime::ActorExecutionPolicy::TaskPerActor),
+                    scheduler_key: None,
+                    passivation: crate::runtime::PassivationPolicy::Disabled,
+                    self_ref: child_ref.as_ref().map(ActorRef::erase),
+                    service: self.service.clone(),
+                },
+                actor_system: self.actor_system.clone(),
+                observer: self.handle.observer().clone(),
+                terminal_hook: None,
+            },
         );
         let directory = self
             .service
@@ -551,13 +557,19 @@ impl<A: Actor> ActorContext<A> {
         let child_ref = self.child_actor_ref(&key, options.protocol_id)?;
         let handle = crate::runtime::spawn_actor_with_self_ref(
             factory(),
-            options.mailbox,
-            crate::runtime::PassivationPolicy::Disabled,
-            child_ref.as_ref().map(ActorRef::erase),
-            self.actor_system.clone(),
-            self.service.clone(),
-            self.handle.observer().clone(),
-            None,
+            crate::runtime::ActorSpawnContext {
+                options: crate::runtime::ActorSpawnOptions {
+                    mailbox: options.mailbox,
+                    execution: Some(crate::runtime::ActorExecutionPolicy::TaskPerActor),
+                    scheduler_key: None,
+                    passivation: crate::runtime::PassivationPolicy::Disabled,
+                    self_ref: child_ref.as_ref().map(ActorRef::erase),
+                    service: self.service.clone(),
+                },
+                actor_system: self.actor_system.clone(),
+                observer: self.handle.observer().clone(),
+                terminal_hook: None,
+            },
         );
         let directory = self
             .service
@@ -676,13 +688,21 @@ impl<A: Actor> ActorContext<A> {
                         }
                         let replacement = crate::runtime::spawn_actor_with_self_ref(
                             factory(),
-                            options.mailbox,
-                            crate::runtime::PassivationPolicy::Disabled,
-                            child_ref.as_ref().map(ActorRef::erase),
-                            actor_system.clone(),
-                            service.clone(),
-                            observer.clone(),
-                            None,
+                            crate::runtime::ActorSpawnContext {
+                                options: crate::runtime::ActorSpawnOptions {
+                                    mailbox: options.mailbox,
+                                    execution: Some(
+                                        crate::runtime::ActorExecutionPolicy::TaskPerActor,
+                                    ),
+                                    scheduler_key: None,
+                                    passivation: crate::runtime::PassivationPolicy::Disabled,
+                                    self_ref: child_ref.as_ref().map(ActorRef::erase),
+                                    service: service.clone(),
+                                },
+                                actor_system: actor_system.clone(),
+                                observer: observer.clone(),
+                                terminal_hook: None,
+                            },
                         );
                         if let Some(directory) =
                             service.extension::<crate::directory::ActivationDirectory>()

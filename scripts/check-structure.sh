@@ -14,6 +14,21 @@ check_file() {
     status=1
   fi
 
+  if ! awk -v path="$relative" '
+    /allow[[:space:]]*\([^]]*clippy::too_many_arguments/ {
+      print path ":" NR ": bare allow for clippy::too_many_arguments is forbidden" > "/dev/stderr"
+      failed = 1
+    }
+    /expect[[:space:]]*\([^]]*clippy::too_many_arguments/ &&
+      $0 !~ /reason[[:space:]]*=[[:space:]]*"[^"]*[^"[:space:]][^"]*"/ {
+      print path ":" NR ": clippy::too_many_arguments expectation requires a non-empty same-line reason" > "/dev/stderr"
+      failed = 1
+    }
+    END { exit failed ? 1 : 0 }
+  ' "$file"; then
+    echo failed >"$failure_marker"
+  fi
+
   awk '/^[[:space:]]*pub(\([^)]*\))?[[:space:]]+use[[:space:]]/ {
       print NR "\t" $0
     }' "$file" |

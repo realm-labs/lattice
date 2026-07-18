@@ -799,30 +799,34 @@ impl LatticeServiceBuilder {
                     discovery,
                     controls,
                     member_hello.clone(),
-                    PlacementDomainHello::new(
-                        node.clone(),
-                        domain,
-                        capacity,
-                        hosted
-                            .iter()
-                            .map(|config| config.entity_type.clone())
-                            .collect(),
-                        proxied
-                            .iter()
-                            .map(|config| config.entity_type.clone())
-                            .collect(),
-                        hosted_singletons
-                            .iter()
-                            .map(|config| config.kind.clone())
-                            .collect(),
-                        proxied_singletons
-                            .iter()
-                            .map(|config| config.kind.clone())
-                            .collect(),
-                        hosted,
-                        hosted_singletons,
-                        BTreeMap::new(),
-                    ),
+                    PlacementDomainHello::builder(node.clone(), domain, capacity)
+                        .hosted_entity_types(
+                            hosted
+                                .iter()
+                                .map(|config| config.entity_type.clone())
+                                .collect(),
+                        )
+                        .proxied_entity_types(
+                            proxied
+                                .iter()
+                                .map(|config| config.entity_type.clone())
+                                .collect(),
+                        )
+                        .singleton_eligibility(
+                            hosted_singletons
+                                .iter()
+                                .map(|config| config.kind.clone())
+                                .collect(),
+                        )
+                        .used_singletons(
+                            proxied_singletons
+                                .iter()
+                                .map(|config| config.kind.clone())
+                                .collect(),
+                        )
+                        .entity_configs(hosted)
+                        .singleton_configs(hosted_singletons)
+                        .build(),
                 ));
             }
             if !self.discoveries.is_empty() || !self.domain_capacity.is_empty() {
@@ -880,26 +884,29 @@ impl LatticeServiceBuilder {
             address: self.config.address.clone(),
             incarnation: self.config.incarnation,
         };
-        let endpoint = Arc::new(
-            RemotingEndpoint::new_with_control_and_security(
-                local_identity.clone(),
-                self.config.remoting.clone(),
-                associations.clone(),
-                messaging.clone(),
-                inbound,
-                control_dispatch,
-                self.protocols
-                    .into_iter()
-                    .map(|(protocol_id, fingerprint)| ProtocolDescriptor {
-                        protocol_id: lattice_core::actor_ref::ProtocolId::new(protocol_id)
-                            .expect("registered actor protocols have nonzero IDs"),
-                        fingerprint,
-                    })
-                    .collect(),
-                self.endpoint_security,
-            )
-            .map_err(ServiceError::Endpoint)?,
+        let endpoint_builder = RemotingEndpoint::builder(
+            local_identity.clone(),
+            self.config.remoting.clone(),
+            associations.clone(),
+            messaging.clone(),
+            inbound,
+        )
+        .control_dispatch(control_dispatch)
+        .catalogue(
+            self.protocols
+                .into_iter()
+                .map(|(protocol_id, fingerprint)| ProtocolDescriptor {
+                    protocol_id: lattice_core::actor_ref::ProtocolId::new(protocol_id)
+                        .expect("registered actor protocols have nonzero IDs"),
+                    fingerprint,
+                })
+                .collect(),
         );
+        let endpoint_builder = match self.endpoint_security {
+            Some(security) => endpoint_builder.security(security),
+            None => endpoint_builder,
+        };
+        let endpoint = Arc::new(endpoint_builder.build().map_err(ServiceError::Endpoint)?);
         let bootstrap_view = Arc::new(BootstrapView::new(local_identity));
         if let Some(runtime) = self.coordinator_runtime.as_ref() {
             for leader in &runtime.bootstrap_leaders {

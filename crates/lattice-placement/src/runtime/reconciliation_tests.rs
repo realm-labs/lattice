@@ -116,18 +116,7 @@ async fn persist_authority_records(
     let placement_domain = domain();
     let domain_member = DomainMemberRecord {
         node: owner.clone(),
-        hello: PlacementDomainHello::new(
-            owner,
-            placement_domain.clone(),
-            1,
-            BTreeSet::new(),
-            BTreeSet::new(),
-            BTreeSet::new(),
-            BTreeSet::new(),
-            Vec::new(),
-            Vec::new(),
-            BTreeMap::new(),
-        ),
+        hello: PlacementDomainHello::builder(owner, placement_domain.clone(), 1).build(),
         status: DomainMemberStatus::Up,
         version: PlacementVersion::new(
             placement_domain.clone(),

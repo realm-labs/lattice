@@ -2,9 +2,10 @@ use super::singleton::SingletonRoute;
 use super::{
     ActorRef, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, Instant,
     LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalSingletonTarget, Mutex,
-    NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessaging, PlacementSlot, PlacementSlotKey,
-    PlacementSlotState, ProtocolFingerprint, RemoteMessageError, RouteBuffer, SenderIdentity,
-    SingletonConfig, SingletonRef, WatchError, async_trait, decode_resolved_actor, map_tell,
+    NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessage, OutboundMessaging, PlacementSlot,
+    PlacementSlotKey, PlacementSlotState, ProtocolFingerprint, RemoteMessageError, RouteBuffer,
+    SenderIdentity, SingletonConfig, SingletonRef, WatchError, async_trait, decode_resolved_actor,
+    map_tell,
 };
 
 pub(super) struct SingletonProxyRoute {
@@ -162,13 +163,13 @@ impl SingletonRoute for SingletonProxyRoute {
             .tell_singleton(
                 &association,
                 &sender,
-                &target,
-                owner.address,
-                owner.incarnation,
-                slot.assignment_generation.get(),
-                fingerprint,
-                message_id,
-                payload,
+                LogicalSingletonTarget {
+                    reference: target,
+                    owner_address: owner.address,
+                    owner_incarnation: owner.incarnation,
+                    assignment_generation: slot.assignment_generation.get(),
+                },
+                OutboundMessage::new(fingerprint, message_id, payload),
             )
             .map(|_| ())
             .map_err(map_tell)
@@ -202,13 +203,13 @@ impl SingletonRoute for SingletonProxyRoute {
             .ask_singleton(
                 &association,
                 &SenderIdentity::Process(self.local_node.incarnation.get()),
-                &target,
-                owner.address,
-                owner.incarnation,
-                slot.assignment_generation.get(),
-                fingerprint,
-                message_id,
-                payload,
+                LogicalSingletonTarget {
+                    reference: target,
+                    owner_address: owner.address,
+                    owner_incarnation: owner.incarnation,
+                    assignment_generation: slot.assignment_generation.get(),
+                },
+                OutboundMessage::new(fingerprint, message_id, payload),
                 deadline,
             )
             .await
@@ -244,25 +245,26 @@ impl SingletonRoute for SingletonProxyRoute {
             .remote_association(&target, &owner)
             .await
             .map_err(|_| WatchError::Unavailable)?;
+        let expected_cluster = target.cluster_id().clone();
         let result = self
             .messaging
             .ask_singleton(
                 &association,
                 &SenderIdentity::Process(self.local_node.incarnation.get()),
-                &target,
-                owner.address.clone(),
-                owner.incarnation,
-                slot.assignment_generation.get(),
-                self.fingerprint,
-                LOGICAL_RESOLVE_MESSAGE_ID,
-                Bytes::new(),
+                LogicalSingletonTarget {
+                    reference: target,
+                    owner_address: owner.address.clone(),
+                    owner_incarnation: owner.incarnation,
+                    assignment_generation: slot.assignment_generation.get(),
+                },
+                OutboundMessage::new(self.fingerprint, LOGICAL_RESOLVE_MESSAGE_ID, Bytes::new()),
                 Instant::now() + self.buffer.config.maximum_residence,
             )
             .await;
         match result {
             Ok(bytes) => decode_resolved_actor(
                 &bytes,
-                target.cluster_id(),
+                &expected_cluster,
                 &owner.address,
                 owner.incarnation,
                 self.config.protocol_id,
