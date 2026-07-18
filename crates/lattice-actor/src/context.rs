@@ -354,7 +354,7 @@ impl<A: Actor> ActorContext<A> {
                 future.await
             };
 
-            if control.is_complete() {
+            if control.reap() {
                 return;
             }
             let message = map(output, reply_to);
@@ -565,8 +565,7 @@ impl<A: Actor> ActorContext<A> {
     pub(crate) fn reap_runtime_work(&mut self) {
         Self::reap_tasks(&mut self.tasks, "scoped");
         Self::reap_tasks(&mut self.pipe_tasks, "pipe_to_self");
-        self.pending_replies
-            .retain(|pending| !pending.is_complete());
+        self.pending_replies.retain(|pending| !pending.reap());
     }
 
     pub(crate) fn stop_all_children(&mut self, reason: StopReason) {
