@@ -1,17 +1,21 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
+#[cfg(feature = "test-failpoints")]
+use std::sync::Mutex;
+
 use etcd_client::Client;
+#[cfg(feature = "test-failpoints")]
+use lattice_core::failpoint::Failpoint;
 use lattice_core::{
     actor_ref::{
         ConfigFingerprint, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId, ProtocolId,
         SingletonKind,
     },
     coordinator::CoordinatorScope,
-    failpoint::Failpoint,
 };
 use lattice_placement::{
     allocation::{ProposedMove, RebalanceProposal, RebalanceTrigger},
@@ -44,7 +48,7 @@ use lattice_placement::{
         ShardId,
     },
 };
-use tokio::time::Instant;
+use tokio::{sync::Barrier, task::JoinSet, time::Instant};
 
 #[path = "etcd_acceptance/bounded_migration.rs"]
 mod bounded_migration;
@@ -137,6 +141,66 @@ async fn seed_generation_four_slot(raw: &mut Client, prefix: &str) -> (String, V
         .await
         .unwrap();
     (slot_key, slot_bytes)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_schema_initialization_is_idempotent_and_rejects_legacy_data() {
+    let Some(endpoints) = endpoints() else {
+        eprintln!("LATTICE_ETCD_ENDPOINTS is absent; Docker acceptance owns this test");
+        return;
+    };
+    let prefix = format!(
+        "/lattice-schema-race-tests/{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let mut stores = Vec::new();
+    for _ in 0..16 {
+        stores.push(
+            EtcdPlacementStore::connect(EtcdPlacementConfig {
+                endpoints: endpoints.clone(),
+                cluster_prefix: prefix.clone(),
+                list_page_size: 16,
+                limits: limits(64),
+                connect_options: None,
+            })
+            .await
+            .unwrap(),
+        );
+    }
+    let barrier = Arc::new(Barrier::new(stores.len()));
+    let mut initializers = JoinSet::new();
+    for store in stores {
+        let barrier = barrier.clone();
+        initializers.spawn(async move {
+            barrier.wait().await;
+            store.ensure_schema_generation().await
+        });
+    }
+    while let Some(result) = initializers.join_next().await {
+        result.unwrap().unwrap();
+    }
+
+    let legacy_prefix = format!(
+        "/lattice-schema-legacy-tests/{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let mut raw = Client::connect(endpoints.clone(), None).await.unwrap();
+    raw.put(format!("{legacy_prefix}/legacy/member"), "present", None)
+        .await
+        .unwrap();
+    let legacy = EtcdPlacementStore::connect(EtcdPlacementConfig {
+        endpoints,
+        cluster_prefix: legacy_prefix,
+        list_page_size: 16,
+        limits: limits(64),
+        connect_options: None,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        legacy.ensure_schema_generation().await,
+        Err(StorageError::SchemaGenerationMismatch)
+    ));
 }
 
 #[tokio::test]

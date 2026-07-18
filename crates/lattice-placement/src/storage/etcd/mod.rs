@@ -112,61 +112,26 @@ impl EtcdPlacementStore {
         let expected_limits = encode(&self.limits)?;
         let counter_keys = [self.key("membership/counters/members")];
         let schema = self.read_raw(&schema_key).await?;
-        if let Some((bytes, _, _)) = &schema
-            && bytes != &expected
-        {
-            return Err(StorageError::SchemaGenerationMismatch);
-        }
-        if schema.is_none() {
-            let mut client = self.client.clone();
-            let response = client
-                .get(
-                    self.key(""),
-                    Some(GetOptions::new().with_prefix().with_limit(1)),
-                )
-                .await
-                .map_err(map_etcd_read)?;
-            if !response.kvs().is_empty() {
-                return Err(StorageError::SchemaGenerationMismatch);
-            }
-        } else {
-            if self
-                .read_raw(&limits_key)
+        if schema.is_some() {
+            return if self
+                .schema_metadata_matches(&expected, &expected_limits)
                 .await?
-                .is_none_or(|(value, _, _)| value != expected_limits)
             {
-                return Err(StorageError::SchemaGenerationMismatch);
-            }
-            for key in &counter_keys {
-                if self.read_raw(key).await?.is_none() {
-                    return Err(StorageError::SchemaGenerationMismatch);
-                }
-            }
-            if self.read_raw(&revision_key).await?.is_none() {
-                return Err(StorageError::SchemaGenerationMismatch);
-            }
+                Ok(())
+            } else {
+                Err(StorageError::SchemaGenerationMismatch)
+            };
         }
-        let mut compares = Vec::new();
-        let mut puts = Vec::new();
-        if schema.is_none() {
-            compares.push(Compare::version(schema_key.clone(), CompareOp::Equal, 0));
-            puts.push(TxnOp::put(schema_key.clone(), expected.clone(), None));
-            compares.push(Compare::version(limits_key.clone(), CompareOp::Equal, 0));
-            puts.push(TxnOp::put(
-                limits_key.clone(),
-                expected_limits.clone(),
-                None,
-            ));
-            for key in &counter_keys {
-                compares.push(Compare::version(key.clone(), CompareOp::Equal, 0));
-                puts.push(TxnOp::put(key.clone(), "0", None));
-            }
-            compares.push(Compare::version(revision_key.clone(), CompareOp::Equal, 0));
-            puts.push(TxnOp::put(revision_key, "1", None));
+
+        let compares = vec![Compare::version(self.key(""), CompareOp::Equal, 0).with_prefix()];
+        let mut puts = vec![
+            TxnOp::put(schema_key, expected.clone(), None),
+            TxnOp::put(limits_key.clone(), expected_limits.clone(), None),
+        ];
+        for key in &counter_keys {
+            puts.push(TxnOp::put(key.clone(), "0", None));
         }
-        if compares.is_empty() {
-            return Ok(());
-        }
+        puts.push(TxnOp::put(revision_key, "1", None));
         let mut client = self.client.clone();
         let response = client
             .txn(Txn::new().when(compares).and_then(puts))
@@ -175,28 +140,47 @@ impl EtcdPlacementStore {
         if response.succeeded() {
             return Ok(());
         }
-        let schema = self.read_raw(&schema_key).await?;
-        let mut counters_present = true;
-        for key in &counter_keys {
-            counters_present &= self.read_raw(key).await?.is_some();
-        }
-        if schema
-            .as_ref()
-            .is_some_and(|(bytes, _, _)| bytes == &expected)
-            && self
-                .read_raw(&self.key("membership/state_revision"))
-                .await?
-                .is_some()
-            && self
-                .read_raw(&limits_key)
-                .await?
-                .is_some_and(|(value, _, _)| value == expected_limits)
-            && counters_present
+
+        if self
+            .schema_metadata_matches(&expected, &expected_limits)
+            .await?
         {
             Ok(())
         } else {
             Err(StorageError::SchemaGenerationMismatch)
         }
+    }
+
+    async fn schema_metadata_matches(
+        &self,
+        expected: &[u8],
+        expected_limits: &[u8],
+    ) -> Result<bool, StorageError> {
+        let Some((schema, _, _)) = self.read_raw(&self.key("schema_generation")).await? else {
+            return Ok(false);
+        };
+        if schema != expected {
+            return Ok(false);
+        }
+        if self
+            .read_raw(&self.key("schema/limits"))
+            .await?
+            .is_none_or(|(value, _, _)| value != expected_limits)
+        {
+            return Ok(false);
+        }
+        if self
+            .read_raw(&self.key("membership/counters/members"))
+            .await?
+            .is_none()
+            || self
+                .read_raw(&self.key("membership/state_revision"))
+                .await?
+                .is_none()
+        {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     async fn grant_lease_inner(&self, ttl: Duration) -> Result<i64, StorageError> {
