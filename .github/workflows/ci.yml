@@ -90,6 +90,15 @@ jobs:
       - name: Run pinned profile
         run: ./scripts/test-docker.sh e2e
 
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-e2e-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Save Docker cargo cache
         if: success() && steps.docker-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
@@ -126,6 +135,15 @@ jobs:
 
       - name: Run pinned profile
         run: ./scripts/test-docker.sh e2e-ha-etcd
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-ha-etcd-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-artifacts
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Save Docker cargo cache
         if: success() && steps.docker-cache.outputs.cache-hit != 'true'
@@ -164,6 +182,15 @@ jobs:
       - name: Run kind profile
         run: ./scripts/test-docker.sh k8s
 
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kind-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Save Docker cargo cache
         if: success() && steps.docker-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
@@ -200,6 +227,15 @@ jobs:
 
       - name: Run pinned profile
         run: ./scripts/test-docker.sh chaos
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-chaos-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-artifacts
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Save Docker cargo cache
         if: success() && steps.docker-cache.outputs.cache-hit != 'true'

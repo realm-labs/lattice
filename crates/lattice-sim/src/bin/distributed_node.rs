@@ -601,7 +601,7 @@ async fn coordinator(
         incarnation,
     };
     let config = PlacementDomainLeaderConfig {
-        leader_lease_ttl: Duration::from_secs(3),
+        leader_lease_ttl: Duration::from_secs(10),
         renewal_interval: Duration::from_secs(1),
         ..PlacementDomainLeaderConfig::default()
     };

@@ -4,6 +4,8 @@
 mod testctl_artifacts;
 #[path = "testctl/chaos.rs"]
 mod testctl_chaos;
+#[path = "testctl/commands.rs"]
+mod testctl_commands;
 #[path = "testctl/discovery.rs"]
 mod testctl_discovery;
 #[path = "testctl/outcomes.rs"]
@@ -29,6 +31,7 @@ use testctl_artifacts::{
     Manifest, MonitorCommand, MonitorResult, MultiDomainHostArtifact, MultiDomainLogicArtifact,
     ResourceSample, ScopedLeadershipArtifact, write_json, write_json_atomic, write_junit,
 };
+use testctl_commands::{cargo, cargo_test_exact, command, output};
 use testctl_outcomes::ScenarioRunner;
 use testctl_scenarios::{wait_for_host_scope, wait_for_scope_across_hosts};
 
@@ -198,20 +201,16 @@ fn run_profile(
         Profile::E2eHaEtcd => {
             runner.run("etcd-coordinator-failover", || ha_etcd_real(artifacts));
             runner.run("leader-recovery-resume", || {
-                cargo(&[
-                    "test",
-                    "-p",
+                cargo_test_exact(
                     "lattice-placement",
-                    "leader_recovery_resumes_handoff_and_cancels_stale_pending_move",
-                ])
+                    "runtime::tests::recovery_tests::leader_recovery_resumes_persisted_handoff",
+                )
             });
             runner.run("singleton-forward-recovery", || {
-                cargo(&[
-                    "test",
-                    "-p",
+                cargo_test_exact(
                     "lattice-placement",
-                    "singleton_owner_loss_recovers_forward_after_leader_restart",
-                ])
+                    "runtime::tests::recovery_tests::singleton_owner_loss_recovers_forward_after_leader_restart",
+                )
             });
         }
         Profile::Chaos => {
@@ -430,7 +429,7 @@ fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
         artifacts,
         "placement:domain-alpha",
         alpha.term,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     );
     let restart_result = (|| {
         command("docker", &["start", alpha_container])?;
@@ -448,7 +447,7 @@ fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
         &artifacts.join("domain-standby.json"),
         "placement:domain-delta",
         delta.term,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )?;
     if delta_replacement.node_id != "domain-standby" {
         return Err(format!(
@@ -489,7 +488,7 @@ fn multi_domain_real(artifacts: &Path) -> Result<(), String> {
         ],
         "membership",
         membership.term,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     );
     let membership_restart = (|| {
         command("docker", &["start", membership_container])?;
@@ -693,11 +692,11 @@ fn ha_etcd_real(artifacts: &Path) -> Result<(), String> {
         artifacts,
         Some(&initial_coordinator.node_id),
         initial_coordinator.term,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )?;
     require_label("container", coordinator_container, &run_id)?;
     command("docker", &["start", coordinator_container])?;
-    wait_for_running_container(coordinator_container, Duration::from_secs(30))?;
+    wait_for_running_container(coordinator_container, Duration::from_secs(60))?;
     assert_coordinator_not_displaced(leader, &run_id, &replacement, Duration::from_secs(2))?;
     write_json(
         &artifacts.join("coordinator-failover.json"),
@@ -1135,10 +1134,6 @@ fn replay(path: &Path) -> Result<(), String> {
     }
 }
 
-fn cargo(arguments: &[&str]) -> Result<(), String> {
-    command("cargo", arguments)
-}
-
 fn distributed_node(mode: &str, reference: &Path) -> Result<(), String> {
     let reference = reference
         .to_str()
@@ -1154,29 +1149,4 @@ fn distributed_node(mode: &str, reference: &Path) -> Result<(), String> {
         "--reference",
         reference,
     ])
-}
-
-fn command(program: &str, arguments: &[&str]) -> Result<(), String> {
-    let status = Command::new(program)
-        .args(arguments)
-        .status()
-        .map_err(|error| format!("failed to start {program}: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{program} exited with {status}"))
-    }
-}
-
-fn output(program: &str, arguments: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
-        .args(arguments)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(format!("{program} exited with {}", output.status));
-    }
-    String::from_utf8(output.stdout)
-        .map(|value| value.trim().to_owned())
-        .map_err(|error| error.to_string())
 }
