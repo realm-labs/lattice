@@ -7,16 +7,20 @@ on:
   pull_request:
     branches:
       - main
+  schedule:
+    - cron: "0 18 * * *"
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  LATTICE_DOCKER_CACHE_ABI: runner-v1-rust-1.97.0-bookworm
 
 jobs:
   rust:
     name: Rust
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -29,7 +33,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
 
       - name: Cache cargo
         uses: actions/cache@v6
@@ -38,35 +42,98 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-rust-1.97.0-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-rust-1.97.0-
 
       - name: Structure
         run: scripts/check-structure.sh
 
       - name: Format
-        run: cargo fmt --all -- --check
+        run: cargo +1.97.0 fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo +1.97.0 clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --all-features
+        run: cargo +1.97.0 test --workspace --all-features
 
-  docker-acceptance:
-    name: Docker ${{ matrix.profile }}
+      - name: Deterministic simulation
+        run: cargo +1.97.0 run -p lattice-sim --bin testctl -- run sim --seed 1 --artifacts target/test-artifacts/native-sim
+
+      - name: Bounded model exploration
+        run: cargo +1.97.0 run -p lattice-sim --bin testctl -- run model --seed 1 --artifacts target/test-artifacts/native-model
+
+  docker-e2e:
+    name: Docker e2e
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        profile: [quality, sim, model, e2e]
+    env:
+      LATTICE_DOCKER_CACHE_ROOT: target/docker-cache/current
+      LATTICE_DOCKER_CACHE_PROFILE: e2e
+
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Restore Docker cargo cache
+        id: docker-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: target/docker-cache/current
+          key: ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-${{ hashFiles('Cargo.lock') }}-
+            ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-
+
       - name: Run pinned profile
-        run: ./scripts/test-docker.sh ${{ matrix.profile }}
+        run: ./scripts/test-docker.sh e2e
+
+      - name: Save Docker cargo cache
+        if: success() && steps.docker-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target/docker-cache/current
+          key: ${{ steps.docker-cache.outputs.cache-primary-key }}
+
+      - name: Enforce scoped image retention
+        if: always()
+        run: ./scripts/docker-image-lifecycle.sh cleanup
+
+  docker-ha-etcd:
+    name: Docker HA etcd
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      LATTICE_DOCKER_CACHE_ROOT: target/docker-cache/current
+      LATTICE_DOCKER_CACHE_PROFILE: e2e-ha-etcd
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Restore Docker cargo cache
+        id: docker-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: target/docker-cache/current
+          key: ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-${{ hashFiles('Cargo.lock') }}-
+            ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-
+
+      - name: Run pinned profile
+        run: ./scripts/test-docker.sh e2e-ha-etcd
+
+      - name: Save Docker cargo cache
+        if: success() && steps.docker-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target/docker-cache/current
+          key: ${{ steps.docker-cache.outputs.cache-primary-key }}
+
       - name: Enforce scoped image retention
         if: always()
         run: ./scripts/docker-image-lifecycle.sh cleanup
@@ -76,11 +143,71 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      LATTICE_DOCKER_CACHE_ROOT: target/docker-cache/current
+      LATTICE_DOCKER_CACHE_PROFILE: k8s
+
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Restore Docker cargo cache
+        id: docker-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: target/docker-cache/current
+          key: ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-${{ hashFiles('Cargo.lock') }}-
+            ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-
+
       - name: Run kind profile
         run: ./scripts/test-docker.sh k8s
+
+      - name: Save Docker cargo cache
+        if: success() && steps.docker-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target/docker-cache/current
+          key: ${{ steps.docker-cache.outputs.cache-primary-key }}
+
+      - name: Enforce scoped image retention
+        if: always()
+        run: ./scripts/docker-image-lifecycle.sh cleanup
+
+  docker-chaos:
+    name: Nightly Docker chaos
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      LATTICE_DOCKER_CACHE_ROOT: target/docker-cache/current
+      LATTICE_DOCKER_CACHE_PROFILE: chaos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Restore Docker cargo cache
+        id: docker-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: target/docker-cache/current
+          key: ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-${{ hashFiles('Cargo.lock') }}-
+            ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-
+
+      - name: Run pinned profile
+        run: ./scripts/test-docker.sh chaos
+
+      - name: Save Docker cargo cache
+        if: success() && steps.docker-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target/docker-cache/current
+          key: ${{ steps.docker-cache.outputs.cache-primary-key }}
+
       - name: Enforce scoped image retention
         if: always()
         run: ./scripts/docker-image-lifecycle.sh cleanup

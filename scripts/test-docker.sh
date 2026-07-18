@@ -19,6 +19,11 @@ probe_image="lattice-k8s-probe:$run_id"
 export LATTICE_RUNNER_IMAGE=$runner_image
 export LATTICE_CURRENT_IMAGE_TAGS="$runner_image $probe_image"
 
+cache_volumes=$("$root/scripts/docker-test-cache.sh" ensure)
+LATTICE_CARGO_HOME_VOLUME=${cache_volumes%%:*}
+LATTICE_CARGO_TARGET_VOLUME=${cache_volumes#*:}
+export LATTICE_CARGO_HOME_VOLUME LATTICE_CARGO_TARGET_VOLUME
+
 "$root/scripts/docker-image-lifecycle.sh" preflight
 
 cleanup() {

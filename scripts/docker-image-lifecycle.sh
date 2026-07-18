@@ -96,6 +96,7 @@ cleanup_to_watermark
 
 usage=$(disk_percent)
 if [ -n "$usage" ] && [ "$usage" -ge 90 ]; then
-  echo "Docker storage is ${usage}% full after scoped lattice test-image cleanup; free space or move Docker's data root before retrying" >&2
+  echo "Docker storage is ${usage}% full after scoped lattice test-image cleanup" >&2
+  echo "inspect lattice build caches with scripts/docker-test-cache.sh status and, if needed, remove them with scripts/docker-test-cache.sh clean; otherwise free space or move Docker's data root before retrying" >&2
   exit 1
 fi

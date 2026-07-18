@@ -422,11 +422,11 @@ networks:
 
 volumes:
   cargo-home:
-    labels:
-      io.lattice.test-run: ${LATTICE_RUN_ID:-local}
+    name: ${LATTICE_CARGO_HOME_VOLUME:?run tests through scripts/test-docker.sh}
+    external: true
   cargo-target:
-    labels:
-      io.lattice.test-run: ${LATTICE_RUN_ID:-local}
+    name: ${LATTICE_CARGO_TARGET_VOLUME:?run tests through scripts/test-docker.sh}
+    external: true
   etcd-single-data:
     labels:
       io.lattice.test-run: ${LATTICE_RUN_ID:-local}

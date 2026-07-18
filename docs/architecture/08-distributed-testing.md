@@ -287,13 +287,14 @@ tests/distributed/
   images.lock
   k8s/
 scripts/
+  docker-test-cache.sh
   test-docker.sh
 target/test-artifacts/<run-id>/
 ```
 
 `Dockerfile.runner` pins the Rust toolchain and installs all test-only utilities. External images such as etcd and network-fault helpers are pinned by immutable digest in `images.lock`; `latest` tags are forbidden for acceptance evidence. TLS certificates are generated inside the isolated test environment or loaded from non-secret test fixtures, never by host tooling.
 
-The thin host entrypoint checks Docker/Compose availability, assigns a unique Compose project/run ID, invokes the requested profile, collects the exit code, and always runs `down --volumes --remove-orphans --rmi local`. It must not require host cargo, rustc, etcdctl, openssl, curl, Python packages, or a pre-existing lattice binary.
+The thin host entrypoint checks Docker/Compose availability, prepares the versioned Cargo cache volumes, assigns a unique Compose project/run ID, invokes the requested profile, collects the exit code, and always runs `down --volumes --remove-orphans`. It must not require host cargo, rustc, etcdctl, openssl, curl, Python packages, or a pre-existing lattice binary.
 
 ### 7.3 Compose Profiles
 
@@ -328,7 +329,7 @@ An additional HA-etcd profile runs a disposable three-member etcd cluster for le
 leader, waits for a different surviving leader, reruns schema/lease/slot/claim acceptance on the
 quorum, restores health, and exercises persisted Coordinator handoff and Singleton forward recovery.
 
-Containers share only an isolated per-run network and named test volumes. Fixed host ports are unnecessary by default. Services use health/readiness protocols, not fixed sleeps. Every container has CPU/memory/file-descriptor limits representative enough to expose unbounded growth, while performance benchmarks use a separate documented profile without chaos throttling.
+Containers share only an isolated per-run network and named test-data volumes. Runner containers also share external `CARGO_HOME` and target-cache volumes whose names include the runner cache ABI and Docker architecture. Those build-only caches contain no test state and survive run teardown; Cargo remains responsible for fingerprinting source, features, and lockfile changes. Fixed host ports are unnecessary by default. Services use health/readiness protocols, not fixed sleeps. Every container has CPU/memory/file-descriptor limits representative enough to expose unbounded growth, while performance benchmarks use a separate documented profile without chaos throttling.
 
 ### 7.4 Topology and Scenario Orchestration
 
@@ -361,9 +362,11 @@ The repository supplies one stable wrapper whose implementation uses Docker Comp
 ./scripts/test-docker.sh k8s
 ./scripts/test-docker.sh soak --duration 4h --seed <seed>
 ./scripts/test-docker.sh replay --artifact <trace.json>
+./scripts/docker-test-cache.sh status
+./scripts/docker-test-cache.sh clean
 ```
 
-Direct `cargo test` remains a useful developer fast path for reducers/simulation, but it is not a substitute for final adapter/integration Docker evidence. The wrapper records image digests, source commit, platform, configuration, seed, scenario list, start/end time and exit status.
+Direct `cargo test` remains a useful developer fast path for reducers/simulation, but it is not a substitute for final adapter/integration Docker evidence. The wrapper records image digests, source commit, platform, configuration, seed, scenario list, start/end time and exit status. Local runs use Docker-managed Cargo cache volumes. CI sets `LATTICE_DOCKER_CACHE_ROOT` to expose the same logical volumes through a repository-ignored bind directory that the CI cache service can restore and save. Cache cleanup is always explicit and refuses to remove a volume attached to any container.
 
 ### 7.6 Artifacts and Cleanup
 
@@ -435,7 +438,9 @@ used by the host wrapper, CI, testctl-controlled Docker/kind profiles, and kind 
 running and current-run images, removes only unused labeled images older than 72 hours in CI or seven
 days for developers, starts oldest-first labeled cleanup at 80 percent disk use, and fails with an
 actionable diagnostic if usage remains at or above 90 percent. Unscoped Docker prune commands remain
-forbidden.
+forbidden. Cargo caches carry `org.realm-labs.lattice.test-cache=true`, never a per-run resource
+label, and are managed only through `scripts/docker-test-cache.sh`. A runner toolchain, base-system,
+or build-ABI change must bump the cache ABI before the new runner is used.
 
 ## 8. Real Multi-Process Scenario Matrix
 
@@ -462,25 +467,19 @@ Assertions query structured admin/trace state. Tests must not parse human log te
 
 ```text
 Pull request:
-  Docker quality profile (fmt, clippy, workspace tests)
-  reducer/unit/property tests
-  bounded small-state exploration of named Coordinator transactions, lease expiry, and migration resume
-  fixed regression seeds
+  native pinned-toolchain fmt, clippy, workspace tests, simulation and bounded model exploration
   Docker e2e smoke with real TCP and disposable etcd
 
 Main branch:
-  broader seed corpus
-  TLS and HA-etcd profiles
-  Coordinator/handoff/rebalance failpoint matrix
-  multi-process lifecycle and shutdown tests
+  pull-request gates
+  Docker HA-etcd failover and disposable Kubernetes lifecycle profiles
 
-Nightly:
-  thousands of generated schedules
+Nightly (18:00 UTC):
   chaos profile with partitions/pause/kill/store faults
-  1–4 hour soak and resource-growth checks
 
 Release:
   full required fault matrix
+  1–4 hour soak and resource-growth checks
   reproducible Docker image digest manifest
   migration/full-stop cutover scenario
   disposable Kubernetes deployment-lifecycle profile
