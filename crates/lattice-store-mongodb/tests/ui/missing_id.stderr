@@ -1,0 +1,8 @@
+error: MongoDocument requires exactly one field annotated with #[mongo(id)]
+ --> tests/ui/missing_id.rs:5:1
+  |
+5 | / #[mongo(collection = "missing_id")]
+6 | | struct MissingId {
+7 | |     value: i32,
+8 | | }
+  | |_^

@@ -1,0 +1,6 @@
+error: MongoDocument requires exactly one #[mongo(id)] field
+  --> tests/ui/duplicate_document_ids.rs:9:5
+   |
+ 9 | /     #[mongo(id)]
+10 | |     second: u64,
+   | |_______________^

@@ -1,0 +1,24 @@
+[package]
+name = "lattice-store-mongodb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MongoDB document persistence, incremental scanning, and actor coordination for Lattice"
+readme = "README.md"
+keywords = ["mongodb", "actor", "persistence", "document"]
+categories = ["database"]
+
+[dependencies]
+async-trait.workspace = true
+lattice-actor.workspace = true
+lattice-store-mongodb-macros.workspace = true
+mongodb.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+trybuild.workspace = true
+

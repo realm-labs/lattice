@@ -1,0 +1,6 @@
+error: Mongo persistence derives require named fields
+ --> tests/ui/tuple_scan.rs:5:1
+  |
+5 | / #[mongo(collection = "tuple")]
+6 | | struct Tuple(#[mongo(id)] u64, i32);
+  | |____________________________________^

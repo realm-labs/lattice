@@ -1,0 +1,5 @@
+error: MongoDocumentSet fields must have type Tracked<T> or use #[mongo(skip)]
+ --> tests/ui/document_set_untracked.rs:6:12
+  |
+6 |     value: String,
+  |            ^^^^^^
