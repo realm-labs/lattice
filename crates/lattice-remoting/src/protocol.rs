@@ -185,6 +185,8 @@ pub enum CatalogueError {
     WrongFrameKind,
     #[error("protocol catalogue frame is invalid")]
     InvalidWire,
+    #[error("protocol catalogue changed after association negotiation")]
+    ChangedAfterInstall,
 }
 
 #[cfg(test)]

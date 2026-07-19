@@ -1,6 +1,7 @@
 use bytes::Bytes;
+use std::sync::atomic::Ordering;
 
-use super::{Association, AssociationError, AssociationManager, AssociationState, LaneKind};
+use super::{Association, AssociationError, AssociationManager, LaneKind, lane_mask};
 use crate::wire::{Frame, FrameKind};
 
 impl Association {
@@ -30,22 +31,24 @@ impl Association {
     }
 
     pub fn attached_lane_count(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("association state poisoned")
-            .lanes
-            .len()
+        self.attached_lanes.load(Ordering::Acquire).count_ones() as usize
     }
 
     pub(super) fn prepare_data_lane(&self, lane: LaneKind) -> Result<(), AssociationError> {
-        let needs_wake = {
-            let mut inner = self.inner.lock().expect("association state poisoned");
-            if inner.state != AssociationState::Active {
-                return Err(AssociationError::NotActive);
-            }
-            !inner.lanes.contains_key(&lane) && inner.wake_pending.insert(lane)
-        };
-        if !needs_wake {
+        self.ensure_active()?;
+        let mask = lane_mask(lane);
+        if self.attached_lanes.load(Ordering::Acquire) & mask != 0 {
+            return Ok(());
+        }
+        if self.wake_pending_lanes.fetch_or(mask, Ordering::AcqRel) & mask != 0 {
+            return Ok(());
+        }
+        if let Err(error) = self.ensure_active() {
+            self.wake_pending_lanes.fetch_and(!mask, Ordering::AcqRel);
+            return Err(error);
+        }
+        if self.attached_lanes.load(Ordering::Acquire) & mask != 0 {
+            self.wake_pending_lanes.fetch_and(!mask, Ordering::AcqRel);
             return Ok(());
         }
         self.notify_lane_wake(lane)?;
@@ -54,11 +57,7 @@ impl Association {
             payload: Bytes::copy_from_slice(&[encode_lane_wake(lane)?]),
         };
         if let Err(error) = self.try_admit_control(frame) {
-            self.inner
-                .lock()
-                .expect("association state poisoned")
-                .wake_pending
-                .remove(&lane);
+            self.wake_pending_lanes.fetch_and(!mask, Ordering::AcqRel);
             return Err(error);
         }
         Ok(())

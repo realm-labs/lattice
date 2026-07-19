@@ -4,6 +4,29 @@ use lattice_core::actor_ref::{ActorPath, ActorRef, ProtocolTag};
 use super::target::{CorrelationId, LogicalEntityTarget, LogicalSingletonTarget};
 use super::{Frame, FrameKind};
 
+#[derive(Debug, Clone)]
+pub(super) struct PreparedExactTarget {
+    encoded: Bytes,
+}
+
+impl PreparedExactTarget {
+    pub(super) fn new<A: ProtocolTag>(target: &ActorRef<A>) -> Self {
+        let mut encoded = BytesMut::with_capacity(exact_target_len(target));
+        encode_exact_target(target, &mut encoded);
+        Self {
+            encoded: encoded.freeze(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.encoded.len()
+    }
+
+    fn encode(&self, output: &mut impl BufMut) {
+        output.put_slice(&self.encoded);
+    }
+}
+
 pub(super) fn tell_frame<A: ProtocolTag>(
     target: &ActorRef<A>,
     sender_actor: Option<&ActorRef>,
@@ -24,6 +47,30 @@ pub(super) fn tell_frame<A: ProtocolTag>(
         if let Some(sender) = sender_actor {
             encode_nested_prefix(5, sender_len.expect("sender length must exist"), output);
             encode_exact_target(sender, output);
+        }
+    })
+}
+
+pub(super) fn prepared_tell_frame(
+    target: &PreparedExactTarget,
+    sender_actor: Option<&PreparedExactTarget>,
+    message_id: u64,
+    payload: Bytes,
+) -> Frame {
+    let target_len = target.len();
+    let sender_len = sender_actor.map(PreparedExactTarget::len);
+    let encoded_len = nested_len(2, target_len)
+        + varint_field_len(3, message_id)
+        + bytes_field_len(4, &payload)
+        + sender_len.map_or(0, |len| nested_len(5, len));
+    encode_frame(FrameKind::Tell, encoded_len, |output| {
+        encode_nested_prefix(2, target_len, output);
+        target.encode(output);
+        encode_varint_field(3, message_id, output);
+        encode_bytes_field(4, &payload, output);
+        if let Some(sender) = sender_actor {
+            encode_nested_prefix(5, sender_len.expect("sender length must exist"), output);
+            sender.encode(output);
         }
     })
 }
@@ -434,6 +481,15 @@ mod tests {
                     sender_actor: Some(target_to_wire(&sender)),
                 },
             )
+        );
+        assert_eq!(
+            prepared_tell_frame(
+                &PreparedExactTarget::new(&target),
+                Some(&PreparedExactTarget::new(&sender)),
+                31,
+                payload.clone(),
+            ),
+            tell_frame(&target, Some(&sender), 31, payload.clone())
         );
         assert_eq!(
             ask_frame(&target, correlation, 41, 31, payload.clone()),

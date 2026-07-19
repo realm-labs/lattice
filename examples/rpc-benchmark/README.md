@@ -6,6 +6,11 @@ and reliable-control reconnect replay. The remoting topology attaches control, i
 configurable bulk lanes, installs a bounded protocol catalogue, uses stable sender/target striping,
 and continuously drains admitted frames while maintaining the Association byte budget.
 
+Criterion records both paths: `prepared_bulk_tell_admission` binds the stable Association, exact
+target, sender, protocol decision, and bulk stripe once before the timed loop;
+`unprepared_bulk_tell_admission` exercises the one-shot convenience API. The allocator-instrumented
+`measure` binary uses the prepared route and excludes route construction from its measurement window.
+
 Run:
 
 ```bash

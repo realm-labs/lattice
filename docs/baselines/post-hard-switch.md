@@ -62,6 +62,38 @@ elapsed time by 61.4%, increases admission throughput by 2.59x, and reduces allo
 message by 94.7%. The remaining approximately one allocation per message is the final contiguous
 protobuf frame buffer. Both captures measure bounded queue admission, not socket-delivery latency.
 
+### Atomic Association Fast Path
+
+A follow-up capture on 2026-07-19 moved active Association state, attached-lane state, and lane-wake
+coordination to atomic state while making the negotiated peer protocol catalogue immutable and
+lock-free to read. The same Criterion workload measured `4.2733-4.4234 ms`, with a `4.3383 ms`
+point estimate, or approximately 2,305,050 admissions/s. Criterion reported a 12.6% improvement over
+the direct-encoding baseline above.
+
+The corresponding allocator-instrumented run retained the single-allocation shape at 10,021
+allocations (`1.002/message`) with FDs stable at `10 / 10`. Its single-run timing was 5.973 ms, or
+1,674,294 admissions/s; as above, Criterion is the timing baseline and the counting-allocator binary
+is used for allocation and FD evidence.
+
+### Prepared Exact-Actor Route
+
+The optimized API can bind a stable exact ActorRef and Association before a hot send loop. Route
+preparation performs protocol validation, exact-target and optional sender encoding, and bulk-stripe
+selection once. Preparation is intentionally outside the timed and allocation-instrumented window;
+the one-shot convenience path remains a separate Criterion case.
+
+On the same 2026-07-19 host, Criterion measured:
+
+| Path | 10,000-message batch | Admissions/s |
+|---|---:|---:|
+| Prepared exact route | 2.4596-2.5402 ms (2.5042 ms point estimate) | ~3,993,291 |
+| One-shot convenience API | 4.2961-4.3964 ms (4.3452 ms point estimate) | ~2,301,390 |
+
+The prepared path reduces elapsed admission time by 42.4% relative to the one-shot path in the same
+run. The allocator-instrumented prepared run recorded 10,039 allocations (`1.004/message`), stable
+FDs at `10 / 10`, and 4,766,728 admissions/s in its single timing sample. The allocation remains the
+final contiguous protobuf frame; cached route construction adds no per-message allocation.
+
 The legacy benchmark did not record allocation or observed-FD numbers, so this document does not
 invent a before/after percentage for those dimensions. The same release run records the complete
 runtime/reducer comparison matrix:

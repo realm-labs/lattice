@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -73,19 +73,31 @@ pub enum AttachmentDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum AssociationState {
-    Establishing,
-    Active,
-    Reconnecting,
-    Closing,
-    Closed,
+    Establishing = 0,
+    Active = 1,
+    Reconnecting = 2,
+    Closing = 3,
+    Closed = 4,
+}
+
+impl AssociationState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Establishing,
+            1 => Self::Active,
+            2 => Self::Reconnecting,
+            3 => Self::Closing,
+            4 => Self::Closed,
+            _ => unreachable!("association state is only written from AssociationState"),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct AssociationInner {
-    state: AssociationState,
     lanes: HashMap<LaneKind, u128>,
-    wake_pending: HashSet<LaneKind>,
 }
 
 #[derive(Debug)]
@@ -100,6 +112,9 @@ pub struct Association {
     id: AssociationId,
     key: AssociationKey,
     config: RemotingConfig,
+    state: AtomicU8,
+    attached_lanes: AtomicU64,
+    wake_pending_lanes: AtomicU64,
     inner: Mutex<AssociationInner>,
     control: mpsc::Sender<Frame>,
     interactive: mpsc::Sender<Frame>,
@@ -107,7 +122,7 @@ pub struct Association {
     receivers: Mutex<AssociationReceiverSlots>,
     queued_bytes: AtomicUsize,
     node_queued_bytes: Arc<AtomicUsize>,
-    peer_catalogue: Mutex<ProtocolCatalogue>,
+    peer_catalogue: OnceLock<ProtocolCatalogue>,
     reliable_control: Mutex<ReliableControl>,
     interactive_wake: Notify,
     bulk_wakes: Vec<Notify>,
@@ -133,7 +148,6 @@ impl Association {
         node_queued_bytes: Arc<AtomicUsize>,
     ) -> Result<Self, AssociationError> {
         config.validate().map_err(AssociationError::InvalidConfig)?;
-        let max_protocols_per_peer = config.max_protocols_per_peer;
         let max_control_outbox_frames = config.max_control_outbox_frames;
         let max_control_outbox_bytes = config.max_control_outbox_bytes;
         let bulk_stripes = config.bulk_stripes;
@@ -150,10 +164,11 @@ impl Association {
             id,
             key,
             config,
+            state: AtomicU8::new(AssociationState::Establishing as u8),
+            attached_lanes: AtomicU64::new(0),
+            wake_pending_lanes: AtomicU64::new(0),
             inner: Mutex::new(AssociationInner {
-                state: AssociationState::Establishing,
                 lanes: HashMap::new(),
-                wake_pending: HashSet::new(),
             }),
             control,
             interactive,
@@ -165,10 +180,7 @@ impl Association {
             }),
             queued_bytes: AtomicUsize::new(0),
             node_queued_bytes,
-            peer_catalogue: Mutex::new(
-                ProtocolCatalogue::new(max_protocols_per_peer)
-                    .expect("validated protocol catalogue limit"),
-            ),
+            peer_catalogue: OnceLock::new(),
             reliable_control: Mutex::new(
                 ReliableControl::new(id, max_control_outbox_frames, max_control_outbox_bytes)
                     .expect("validated reliable control limits"),
@@ -187,7 +199,7 @@ impl Association {
     }
 
     pub fn state(&self) -> AssociationState {
-        self.inner.lock().expect("association state poisoned").state
+        AssociationState::from_u8(self.state.load(Ordering::Acquire))
     }
 
     pub fn take_receivers(&self) -> Option<AssociationReceivers> {
@@ -288,7 +300,7 @@ impl Association {
         }
         let mut inner = self.inner.lock().expect("association state poisoned");
         if matches!(
-            inner.state,
+            self.state(),
             AssociationState::Closing | AssociationState::Closed
         ) {
             return Err(AssociationError::Closed);
@@ -306,11 +318,15 @@ impl Association {
             }
             Some(_) => AttachmentDecision::RejectedDuplicate,
         };
-        inner.wake_pending.remove(&attachment.lane);
+        let lane_mask = lane_mask(attachment.lane);
+        self.attached_lanes.fetch_or(lane_mask, Ordering::Release);
+        self.wake_pending_lanes
+            .fetch_and(!lane_mask, Ordering::AcqRel);
         let activated =
-            inner.state != AssociationState::Active && self.has_complete_lane_group(&inner.lanes);
+            self.state() != AssociationState::Active && self.has_complete_lane_group(&inner.lanes);
         if activated {
-            inner.state = AssociationState::Active;
+            self.state
+                .store(AssociationState::Active as u8, Ordering::Release);
         }
         Ok((decision, activated))
     }
@@ -338,11 +354,14 @@ impl Association {
             return;
         }
         inner.lanes.remove(&lane);
-        if lane == LaneKind::Control || inner.state != AssociationState::Active {
-            inner.state = AssociationState::Reconnecting;
+        self.attached_lanes
+            .fetch_and(!lane_mask(lane), Ordering::AcqRel);
+        if lane == LaneKind::Control || self.state() != AssociationState::Active {
+            self.state
+                .store(AssociationState::Reconnecting as u8, Ordering::Release);
         }
         if lane == LaneKind::Control {
-            inner.wake_pending.clear();
+            self.wake_pending_lanes.store(0, Ordering::Release);
             drop(inner);
             self.interactive_wake.notify_one();
             for wake in &self.bulk_wakes {
@@ -440,11 +459,27 @@ impl Association {
     where
         I: IntoIterator<Item = ProtocolDescriptor>,
     {
-        self.peer_catalogue
-            .lock()
-            .expect("peer protocol catalogue poisoned")
+        let mut catalogue = ProtocolCatalogue::new(self.config.max_protocols_per_peer)
+            .expect("validated protocol catalogue limit");
+        catalogue
             .install(descriptors)
-            .map_err(AssociationError::Catalogue)
+            .map_err(AssociationError::Catalogue)?;
+        if let Some(installed) = self.peer_catalogue.get() {
+            return if installed == &catalogue {
+                Ok(())
+            } else {
+                Err(AssociationError::Catalogue(
+                    CatalogueError::ChangedAfterInstall,
+                ))
+            };
+        }
+        match self.peer_catalogue.set(catalogue) {
+            Ok(()) => Ok(()),
+            Err(catalogue) if self.peer_catalogue.get() == Some(&catalogue) => Ok(()),
+            Err(_) => Err(AssociationError::Catalogue(
+                CatalogueError::ChangedAfterInstall,
+            )),
+        }
     }
 
     pub fn protocol_decision(
@@ -453,9 +488,10 @@ impl Association {
         fingerprint: ProtocolFingerprint,
     ) -> CatalogueDecision {
         self.peer_catalogue
-            .lock()
-            .expect("peer protocol catalogue poisoned")
-            .compare(protocol_id, fingerprint)
+            .get()
+            .map_or(CatalogueDecision::Unsupported, |catalogue| {
+                catalogue.compare(protocol_id, fingerprint)
+            })
     }
 
     pub fn try_admit_interactive(&self, frame: Frame) -> Result<(), AssociationError> {
@@ -471,17 +507,37 @@ impl Association {
     where
         F: FnOnce(&mut blake3::Hasher),
     {
+        let stripe = self.bulk_stripe(update_route_hash)?;
+        self.try_admit_prepared_bulk(stripe, frame)?;
+        Ok(stripe)
+    }
+
+    pub(crate) fn bulk_stripe<F>(&self, update_route_hash: F) -> Result<usize, AssociationError>
+    where
+        F: FnOnce(&mut blake3::Hasher),
+    {
         self.ensure_active()?;
-        let stripe = if self.bulk.len() == 1 {
+        Ok(if self.bulk.len() == 1 {
             0
         } else {
             let mut hasher = blake3::Hasher::new();
             update_route_hash(&mut hasher);
             stripe_from_hash(&hasher.finalize(), self.bulk.len())
-        };
+        })
+    }
+
+    pub(crate) fn try_admit_prepared_bulk(
+        &self,
+        stripe: usize,
+        frame: Frame,
+    ) -> Result<(), AssociationError> {
+        if stripe >= self.bulk.len() {
+            return Err(AssociationError::InvalidBulkStripe(
+                u8::try_from(stripe).unwrap_or(u8::MAX),
+            ));
+        }
         self.prepare_data_lane(LaneKind::Bulk(stripe as u8))?;
-        self.try_admit(&self.bulk[stripe], frame)?;
-        Ok(stripe)
+        self.try_admit(&self.bulk[stripe], frame)
     }
 
     pub fn release_queued_bytes(&self, bytes: usize) {
@@ -499,16 +555,22 @@ impl Association {
 
     pub fn begin_close(&self) {
         let mut inner = self.inner.lock().expect("association state poisoned");
-        if inner.state != AssociationState::Closed {
-            inner.state = AssociationState::Closing;
+        if self.state() != AssociationState::Closed {
+            self.state
+                .store(AssociationState::Closing as u8, Ordering::Release);
             inner.lanes.clear();
+            self.attached_lanes.store(0, Ordering::Release);
+            self.wake_pending_lanes.store(0, Ordering::Release);
         }
     }
 
     pub fn finish_close(&self) {
         let mut inner = self.inner.lock().expect("association state poisoned");
-        inner.state = AssociationState::Closed;
+        self.state
+            .store(AssociationState::Closed as u8, Ordering::Release);
         inner.lanes.clear();
+        self.attached_lanes.store(0, Ordering::Release);
+        self.wake_pending_lanes.store(0, Ordering::Release);
     }
 
     fn try_admit(
@@ -564,6 +626,15 @@ impl Association {
             && (0..self.config.bulk_stripes)
                 .all(|index| lanes.contains_key(&LaneKind::Bulk(index as u8)))
     }
+}
+
+fn lane_mask(lane: LaneKind) -> u64 {
+    let bit = match lane {
+        LaneKind::Control => 0,
+        LaneKind::Interactive => 1,
+        LaneKind::Bulk(index) => u32::from(index) + 2,
+    };
+    1_u64 << bit
 }
 
 #[derive(Debug)]
@@ -840,6 +911,7 @@ mod tests {
     use std::sync::Barrier;
 
     use super::*;
+    use crate::protocol::ProtocolFingerprint;
     use crate::wire::FrameKind;
 
     fn key() -> AssociationKey {
@@ -949,6 +1021,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(stripe, 0);
+    }
+
+    #[test]
+    fn peer_catalogue_allows_idempotent_reinstall_but_rejects_changes() {
+        let association = Association::new(key(), RemotingConfig::default()).unwrap();
+        let protocol_id = ProtocolId::new(7).unwrap();
+        let original = ProtocolFingerprint::digest(b"original");
+        let changed = ProtocolFingerprint::digest(b"changed");
+        let descriptor = |fingerprint| ProtocolDescriptor {
+            protocol_id,
+            fingerprint,
+        };
+
+        association
+            .install_peer_catalogue([descriptor(original)])
+            .unwrap();
+        association
+            .install_peer_catalogue([descriptor(original)])
+            .unwrap();
+        assert!(matches!(
+            association.install_peer_catalogue([descriptor(changed)]),
+            Err(AssociationError::Catalogue(
+                CatalogueError::ChangedAfterInstall
+            ))
+        ));
+        assert_eq!(
+            association.protocol_decision(protocol_id, original),
+            CatalogueDecision::Enabled
+        );
+        assert!(matches!(
+            association.protocol_decision(protocol_id, changed),
+            CatalogueDecision::FingerprintMismatch { actual } if actual == original
+        ));
     }
 
     #[test]

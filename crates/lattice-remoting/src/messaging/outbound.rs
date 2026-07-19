@@ -6,8 +6,8 @@ use super::{
     ProtocolTag,
     codec::{AskWire, EntityAskWire, SingletonAskWire, ask_correlation},
     encode::{
-        ask_frame, entity_ask_frame, entity_tell_frame, singleton_ask_frame, singleton_tell_frame,
-        tell_frame,
+        PreparedExactTarget, ask_frame, entity_ask_frame, entity_tell_frame, prepared_tell_frame,
+        singleton_ask_frame, singleton_tell_frame, tell_frame,
     },
     error::{AskError, RemoteMessageError, TellError},
     oneshot,
@@ -39,6 +39,44 @@ pub struct OutboundMessaging {
     boot_id: u128,
     next_correlation: AtomicU64,
     pending: Arc<PendingState>,
+}
+
+/// A stable exact-actor bulk-tell route bound to one Association generation.
+///
+/// Protocol compatibility, target encoding, sender encoding, and bulk stripe
+/// selection are completed during preparation. If the bound Association is
+/// replaced or closes, admission fails and callers must prepare a new route.
+#[derive(Debug, Clone)]
+pub struct PreparedExactTellRoute {
+    association: Arc<Association>,
+    stripe: usize,
+    target: PreparedExactTarget,
+    sender_actor: Option<PreparedExactTarget>,
+}
+
+impl PreparedExactTellRoute {
+    pub fn association_id(&self) -> AssociationId {
+        self.association.id()
+    }
+
+    pub fn stripe(&self) -> usize {
+        self.stripe
+    }
+
+    pub fn tell(&self, message_id: u64, payload: Bytes) -> Result<usize, TellError> {
+        self.association
+            .try_admit_prepared_bulk(
+                self.stripe,
+                prepared_tell_frame(
+                    &self.target,
+                    self.sender_actor.as_ref(),
+                    message_id,
+                    payload,
+                ),
+            )
+            .map_err(TellError::Association)?;
+        Ok(self.stripe)
+    }
 }
 
 /// Encoded protocol message data shared by exact and logical outbound routes.
@@ -102,6 +140,35 @@ impl OutboundMessaging {
                 frame,
             )
             .map_err(TellError::Association)
+    }
+
+    /// Prepares a stable exact-actor tell route for a hot send loop.
+    ///
+    /// Preparation validates the immutable peer protocol catalogue and caches
+    /// the encoded target, optional actor sender, and selected bulk stripe.
+    /// The returned route is bound to `association`; callers prepare another
+    /// route after that Association closes or is replaced.
+    pub fn prepare_exact_tell_route<A: ProtocolTag>(
+        &self,
+        association: Arc<Association>,
+        sender: &SenderIdentity,
+        target: &ActorRef<A>,
+        expected_fingerprint: ProtocolFingerprint,
+    ) -> Result<PreparedExactTellRoute, TellError> {
+        check_protocol(&association, target.protocol_id(), expected_fingerprint)
+            .map_err(TellError::Protocol)?;
+        let stripe = association
+            .bulk_stripe(|hasher| {
+                sender.update_route_hash(hasher);
+                update_actor_route_hash(hasher, target);
+            })
+            .map_err(TellError::Association)?;
+        Ok(PreparedExactTellRoute {
+            association,
+            stripe,
+            target: PreparedExactTarget::new(target),
+            sender_actor: sender.actor_ref().map(PreparedExactTarget::new),
+        })
     }
 
     pub fn tell_entity(

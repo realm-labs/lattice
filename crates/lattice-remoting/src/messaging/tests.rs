@@ -228,6 +228,50 @@ async fn outbound_tell_preserves_an_exact_actor_sender() {
 }
 
 #[tokio::test]
+async fn prepared_exact_tell_preserves_sender_and_is_bound_to_association() {
+    let protocol_id = ProtocolId::new(7).unwrap();
+    let fingerprint = ProtocolFingerprint::digest(b"test/v1");
+    let association = active_association(protocol_id, fingerprint);
+    let mut receivers = association.take_receivers().unwrap();
+    let messaging = OutboundMessaging::new(4).unwrap();
+    let recipient = target(protocol_id);
+    let sender: ActorRef = ActorRef::new(
+        ClusterId::new("test").unwrap(),
+        NodeAddress::new("sender", 25521).unwrap(),
+        NodeIncarnation::new(3).unwrap(),
+        ActorPath::user(["user", "sender"]).unwrap(),
+        ActivationId::new(NodeIncarnation::new(3).unwrap(), 9).unwrap(),
+        protocol_id,
+    )
+    .unwrap();
+    let route = messaging
+        .prepare_exact_tell_route(
+            association.clone(),
+            &SenderIdentity::from(&sender),
+            &recipient,
+            fingerprint,
+        )
+        .unwrap();
+
+    let stripe = route.tell(1, Bytes::from_static(b"tell")).unwrap();
+    let decoded = decode_tell(&receivers.bulk[stripe].recv().await.unwrap()).unwrap();
+    let decoded_target: ActorRef = decoded.target.actor_ref().unwrap();
+    assert!(decoded_target.same_activation(&recipient));
+    assert!(
+        decoded
+            .sender
+            .as_ref()
+            .is_some_and(|actual| actual.same_activation(&sender))
+    );
+
+    association.begin_close();
+    assert!(matches!(
+        route.tell(2, Bytes::new()),
+        Err(TellError::Association(AssociationError::NotActive))
+    ));
+}
+
+#[tokio::test]
 async fn disconnect_result_changes_only_at_socket_write_boundary() {
     let protocol_id = ProtocolId::new(7).unwrap();
     let fingerprint = ProtocolFingerprint::digest(b"test/v1");

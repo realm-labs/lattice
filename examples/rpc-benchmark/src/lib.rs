@@ -21,7 +21,7 @@ use lattice_remoting::{
     association::{Association, AssociationKey, LaneAttachment, LaneKind},
     config::RemotingConfig,
     messaging::{
-        outbound::{OutboundMessage, OutboundMessaging},
+        outbound::{OutboundMessage, OutboundMessaging, PreparedExactTellRoute},
         target::SenderIdentity,
     },
     protocol::{ProtocolDescriptor, ProtocolFingerprint},
@@ -60,6 +60,8 @@ pub struct RemotingTopology {
     messaging: OutboundMessaging,
     target: ActorRef,
     fingerprint: ProtocolFingerprint,
+    sender: SenderIdentity,
+    prepared: PreparedExactTellRoute,
     drains: Vec<JoinHandle<()>>,
 }
 
@@ -129,11 +131,21 @@ impl RemotingTopology {
                 })
             })
             .collect();
+        let messaging = OutboundMessaging::new(1)?;
+        let sender = SenderIdentity::Process(1);
+        let prepared = messaging.prepare_exact_tell_route(
+            association.clone(),
+            &sender,
+            &target,
+            fingerprint,
+        )?;
         Ok(Self {
             association,
-            messaging: OutboundMessaging::new(1)?,
+            messaging,
             target,
             fingerprint,
+            sender,
+            prepared,
             drains,
         })
     }
@@ -145,13 +157,45 @@ impl RemotingTopology {
     ) -> Result<WorkloadReport, Box<dyn StdError>> {
         let started = Instant::now();
         let payload = Bytes::from(vec![0_u8; payload_bytes]);
-        let sender = SenderIdentity::Process(1);
+        let mut successes = 0;
+        for _ in 0..requests {
+            loop {
+                match self.prepared.tell(1, payload.clone()) {
+                    Ok(_) => {
+                        successes += 1;
+                        break;
+                    }
+                    Err(TellError::Association(AssociationError::QueueFull)) => {
+                        tokio::task::yield_now().await
+                    }
+                    Err(error) => return Err(Box::new(error)),
+                }
+            }
+        }
+        Ok(WorkloadReport {
+            name: "association_prepared_bulk_tell_admission",
+            requests,
+            successes,
+            errors: requests - successes,
+            elapsed: started.elapsed(),
+            latencies: vec![Duration::ZERO; successes],
+            observed_actor_ids: [1].into_iter().collect(),
+        })
+    }
+
+    pub async fn run_unprepared_bulk_tell(
+        &self,
+        requests: usize,
+        payload_bytes: usize,
+    ) -> Result<WorkloadReport, Box<dyn StdError>> {
+        let started = Instant::now();
+        let payload = Bytes::from(vec![0_u8; payload_bytes]);
         let mut successes = 0;
         for _ in 0..requests {
             loop {
                 match self.messaging.tell(
                     &self.association,
-                    &sender,
+                    &self.sender,
                     &self.target,
                     OutboundMessage::new(self.fingerprint, 1, payload.clone()),
                 ) {
@@ -167,7 +211,7 @@ impl RemotingTopology {
             }
         }
         Ok(WorkloadReport {
-            name: "association_bulk_tell_admission",
+            name: "association_unprepared_bulk_tell_admission",
             requests,
             successes,
             errors: requests - successes,
