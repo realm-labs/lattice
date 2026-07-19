@@ -29,6 +29,39 @@ is compared only to the legacy pooled-admission role. The initial accepted budge
   per Association in this in-memory topology;
 - no more than a 20% regression from this post-switch baseline without an explained benchmark update.
 
+## Optimized Outbound Encoding Baseline
+
+Captured on 2026-07-19 on the same Apple M1 Max host with Darwin 26.5.2 and `rustc 1.97.1`, after
+removing owned wire-target construction and encoding outbound messages directly into one exactly
+sized protobuf frame. The workload remains `10,000` messages, `128` payload bytes, and one bulk
+stripe.
+
+The allocator-instrumented release command above produced:
+
+| Measurement | Observed |
+|---|---:|
+| Bounded bulk-tell admissions | 1,713,857/s |
+| Elapsed | 5.835 ms |
+| Allocations | 10,027 (1.003/message) |
+| Deallocations | 10,020 |
+| Process FDs before/after | 10 / 10 |
+| Association physical lanes | 3 (control, interactive, one bulk) |
+
+The timing-only Criterion command was:
+
+```text
+cargo bench -p remoting-benchmark --bench remoting_benchmark
+```
+
+It measured `4.8673-5.0444 ms` per 10,000-message batch, with a `4.9227 ms` point estimate, or
+approximately 2,031,406 admissions/s. Criterion is the timing baseline; the `measure` binary remains
+the allocation and FD baseline because its counting allocator adds overhead.
+
+Against the original post-hard-switch `measure` capture, the like-for-like instrumented run reduces
+elapsed time by 61.4%, increases admission throughput by 2.59x, and reduces allocator calls per
+message by 94.7%. The remaining approximately one allocation per message is the final contiguous
+protobuf frame buffer. Both captures measure bounded queue admission, not socket-delivery latency.
+
 The legacy benchmark did not record allocation or observed-FD numbers, so this document does not
 invent a before/after percentage for those dimensions. The same release run records the complete
 runtime/reducer comparison matrix:

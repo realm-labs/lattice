@@ -20,6 +20,7 @@ use crate::transport::{FramedConnection, RemotingIo};
 use crate::wire::{Frame, FrameKind};
 
 pub mod codec;
+mod encode;
 pub mod error;
 pub mod inbound;
 pub mod outbound;

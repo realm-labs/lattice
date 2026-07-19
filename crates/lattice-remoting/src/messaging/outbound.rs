@@ -4,10 +4,10 @@ use super::{
     ActorRef, Arc, Association, AssociationId, AtomicU64, Bytes, CatalogueDecision, Duration,
     Frame, FrameKind, HashMap, Instant, Mutex, Ordering, ProtocolFingerprint, ProtocolId,
     ProtocolTag,
-    codec::{
-        AskWire, EntityAskWire, EntityTellWire, SingletonAskWire, SingletonTellWire, TellWire,
-        ask_correlation, entity_target_to_wire, set_logical_ask_correlation,
-        singleton_target_to_wire, target_to_wire,
+    codec::{AskWire, EntityAskWire, SingletonAskWire, ask_correlation},
+    encode::{
+        ask_frame, entity_ask_frame, entity_tell_frame, singleton_ask_frame, singleton_tell_frame,
+        tell_frame,
     },
     error::{AskError, RemoteMessageError, TellError},
     oneshot,
@@ -87,19 +87,19 @@ impl OutboundMessaging {
             message.expected_fingerprint,
         )
         .map_err(TellError::Protocol)?;
-        let wire = TellWire {
-            target: Some(target_to_wire(target)),
-            message_id: message.message_id,
-            payload: message.payload,
-            sender_actor: sender.actor_ref().map(target_to_wire),
-        };
+        let frame = tell_frame(
+            target,
+            sender.actor_ref(),
+            message.message_id,
+            message.payload,
+        );
         association
             .try_admit_bulk(
                 |hasher| {
                     sender.update_route_hash(hasher);
                     update_actor_route_hash(hasher, target);
                 },
-                Frame::encode_message(FrameKind::Tell, &wire),
+                frame,
             )
             .map_err(TellError::Association)
     }
@@ -123,14 +123,11 @@ impl OutboundMessaging {
                     sender.update_route_hash(hasher);
                     target.update_route_hash(hasher);
                 },
-                Frame::encode_message(
-                    FrameKind::EntityTell,
-                    &EntityTellWire {
-                        target: Some(entity_target_to_wire(&target)),
-                        message_id: message.message_id,
-                        payload: message.payload,
-                        sender_actor: sender.actor_ref().map(target_to_wire),
-                    },
+                entity_tell_frame(
+                    &target,
+                    sender.actor_ref(),
+                    message.message_id,
+                    message.payload,
                 ),
             )
             .map_err(TellError::Association)
@@ -155,14 +152,11 @@ impl OutboundMessaging {
                     sender.update_route_hash(hasher);
                     target.update_route_hash(hasher);
                 },
-                Frame::encode_message(
-                    FrameKind::SingletonTell,
-                    &SingletonTellWire {
-                        target: Some(singleton_target_to_wire(&target)),
-                        message_id: message.message_id,
-                        payload: message.payload,
-                        sender_actor: sender.actor_ref().map(target_to_wire),
-                    },
+                singleton_tell_frame(
+                    &target,
+                    sender.actor_ref(),
+                    message.message_id,
+                    message.payload,
                 ),
             )
             .map_err(TellError::Association)
@@ -207,15 +201,14 @@ impl OutboundMessaging {
             pending: self.pending.clone(),
             armed: true,
         };
-        let wire = AskWire {
-            target: Some(target_to_wire(target)),
-            correlation_id: Bytes::copy_from_slice(&correlation.to_bytes()),
-            timeout_nanos: duration_nanos(remaining),
-            message_id: message.message_id,
-            payload: message.payload,
-        };
         association
-            .try_admit_interactive(Frame::encode_message(FrameKind::Ask, &wire))
+            .try_admit_interactive(ask_frame(
+                target,
+                correlation,
+                duration_nanos(remaining),
+                message.message_id,
+                message.payload,
+            ))
             .map_err(AskError::from)?;
         let timeout = tokio::time::sleep_until(TokioInstant::from_std(deadline));
         tokio::pin!(timeout);
@@ -244,20 +237,15 @@ impl OutboundMessaging {
             message.expected_fingerprint,
         )
         .map_err(AskError::Protocol)?;
-        self.enqueue_logical_ask(
-            association,
-            deadline,
-            Frame::encode_message(
-                FrameKind::EntityAsk,
-                &EntityAskWire {
-                    target: Some(entity_target_to_wire(&target)),
-                    correlation_id: Bytes::new(),
-                    timeout_nanos: duration_nanos(remaining),
-                    message_id: message.message_id,
-                    payload: message.payload,
-                },
-            ),
-        )
+        self.enqueue_logical_ask(association, deadline, |correlation| {
+            entity_ask_frame(
+                &target,
+                correlation,
+                duration_nanos(remaining),
+                message.message_id,
+                message.payload,
+            )
+        })
         .await
     }
 
@@ -278,31 +266,28 @@ impl OutboundMessaging {
             message.expected_fingerprint,
         )
         .map_err(AskError::Protocol)?;
-        self.enqueue_logical_ask(
-            association,
-            deadline,
-            Frame::encode_message(
-                FrameKind::SingletonAsk,
-                &SingletonAskWire {
-                    target: Some(singleton_target_to_wire(&target)),
-                    correlation_id: Bytes::new(),
-                    timeout_nanos: duration_nanos(remaining),
-                    message_id: message.message_id,
-                    payload: message.payload,
-                },
-            ),
-        )
+        self.enqueue_logical_ask(association, deadline, |correlation| {
+            singleton_ask_frame(
+                &target,
+                correlation,
+                duration_nanos(remaining),
+                message.message_id,
+                message.payload,
+            )
+        })
         .await
     }
 
-    async fn enqueue_logical_ask(
+    async fn enqueue_logical_ask<F>(
         &self,
         association: &Association,
         deadline: Instant,
-        mut frame: Frame,
-    ) -> Result<Bytes, AskError> {
+        encode_frame: F,
+    ) -> Result<Bytes, AskError>
+    where
+        F: FnOnce(CorrelationId) -> Frame,
+    {
         let correlation = self.next_correlation()?;
-        set_logical_ask_correlation(&mut frame, correlation)?;
         let (completion, receiver) = oneshot::channel();
         {
             let mut entries = self.pending.entries.lock().expect("pending asks poisoned");
@@ -324,6 +309,7 @@ impl OutboundMessaging {
             pending: self.pending.clone(),
             armed: true,
         };
+        let frame = encode_frame(correlation);
         association
             .try_admit_interactive(frame)
             .map_err(AskError::from)?;

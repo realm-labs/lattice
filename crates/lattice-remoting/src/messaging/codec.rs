@@ -1,4 +1,4 @@
-use super::error::{AskError, RemoteFailureCode, RemoteMessageError};
+use super::error::{RemoteFailureCode, RemoteMessageError};
 use super::target::{
     CorrelationId, ExactActorTarget, InboundAsk, InboundEntityAsk, InboundEntityTell,
     InboundSingletonAsk, InboundSingletonTell, InboundTell, LogicalEntityTarget,
@@ -23,31 +23,6 @@ pub fn ask_correlation(frame: &Frame) -> Option<CorrelationId> {
         _ => return None,
     };
     CorrelationId::from_bytes(&bytes)
-}
-
-pub(super) fn set_logical_ask_correlation(
-    frame: &mut Frame,
-    correlation: CorrelationId,
-) -> Result<(), AskError> {
-    match frame.kind {
-        FrameKind::EntityAsk => {
-            let mut wire = frame
-                .decode_message::<EntityAskWire>()
-                .map_err(|_| AskError::Protocol(RemoteMessageError::InvalidPayload))?;
-            wire.correlation_id = Bytes::copy_from_slice(&correlation.to_bytes());
-            *frame = Frame::encode_message(FrameKind::EntityAsk, &wire);
-            Ok(())
-        }
-        FrameKind::SingletonAsk => {
-            let mut wire = frame
-                .decode_message::<SingletonAskWire>()
-                .map_err(|_| AskError::Protocol(RemoteMessageError::InvalidPayload))?;
-            wire.correlation_id = Bytes::copy_from_slice(&correlation.to_bytes());
-            *frame = Frame::encode_message(FrameKind::SingletonAsk, &wire);
-            Ok(())
-        }
-        _ => Err(AskError::Protocol(RemoteMessageError::InvalidPayload)),
-    }
 }
 
 pub fn decode_tell(frame: &Frame) -> Result<InboundTell, RemoteMessageError> {
@@ -166,13 +141,7 @@ pub fn decode_singleton_ask(frame: &Frame) -> Result<InboundSingletonAsk, Remote
 }
 
 pub fn reply_frame(correlation_id: CorrelationId, payload: Bytes) -> Frame {
-    Frame::encode_message(
-        FrameKind::Reply,
-        &ReplyWire {
-            correlation_id: Bytes::copy_from_slice(&correlation_id.to_bytes()),
-            payload,
-        },
-    )
+    super::encode::reply_frame(correlation_id, payload)
 }
 
 pub fn decode_reply(frame: &Frame) -> Result<(CorrelationId, Bytes), RemoteMessageError> {
@@ -191,14 +160,11 @@ pub fn decode_reply(frame: &Frame) -> Result<(CorrelationId, Bytes), RemoteMessa
 
 pub fn failure_frame(failure: &RemoteFailure) -> Frame {
     let detail = failure.safe_detail.as_deref().unwrap_or("");
-    Frame::encode_message(
-        FrameKind::Failure,
-        &FailureWire {
-            correlation_id: Bytes::copy_from_slice(&failure.correlation_id.to_bytes()),
-            code: failure.code as u32,
-            safe_detail: detail.chars().take(256).collect(),
-        },
-    )
+    let detail = detail
+        .char_indices()
+        .nth(256)
+        .map_or(detail, |(end, _)| &detail[..end]);
+    super::encode::failure_frame(failure.correlation_id, failure.code as u32, detail)
 }
 
 pub fn decode_failure(frame: &Frame) -> Result<RemoteFailure, RemoteMessageError> {
@@ -381,6 +347,7 @@ pub(super) struct FailureWire {
     pub(super) safe_detail: String,
 }
 
+#[cfg(test)]
 pub(super) fn target_to_wire<A: lattice_core::actor_ref::ProtocolTag>(
     target: &ActorRef<A>,
 ) -> ExactActorTargetWire {
@@ -435,6 +402,7 @@ fn decode_sender(
         .transpose()
 }
 
+#[cfg(test)]
 pub(super) fn entity_target_to_wire(target: &LogicalEntityTarget) -> EntityTargetWire {
     EntityTargetWire {
         cluster_id: target.reference.cluster_id().as_str().to_owned(),
@@ -484,6 +452,7 @@ pub(super) fn entity_target_from_wire(
     })
 }
 
+#[cfg(test)]
 pub(super) fn singleton_target_to_wire(target: &LogicalSingletonTarget) -> SingletonTargetWire {
     SingletonTargetWire {
         cluster_id: target.reference.cluster_id().as_str().to_owned(),
