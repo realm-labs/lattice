@@ -17,7 +17,7 @@ use lattice_remoting::{
     },
     config::RemotingConfig,
     control::RejectControlDispatch,
-    endpoint::{EndpointSecurity, RemotingEndpoint},
+    endpoint::{EndpointError, EndpointSecurity, RemotingEndpoint},
     handshake::{FeatureBits, NodeIdentity},
     messaging::{
         error::RemoteMessageError, inbound::InboundDispatch, outbound::OutboundMessaging,
@@ -28,7 +28,7 @@ use lattice_remoting::{
     wire::{Frame, FrameCodec, FrameKind},
 };
 use rcgen::{CertificateParams, KeyPair, SanType};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     client::WebPkiServerVerifier,
@@ -105,6 +105,89 @@ async fn higher_identity_can_request_an_on_demand_reverse_connection() {
     assert_eq!(higher_manager.len(), 1);
     higher.shutdown().await.unwrap();
     lower.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_cancels_an_inbound_connection_stalled_before_handshake() {
+    let port = free_port().await;
+    let cluster = ClusterId::new("stalled-inbound-shutdown").unwrap();
+    let config = RemotingConfig {
+        connect_timeout: Duration::from_secs(5),
+        shutdown_timeout: Duration::from_millis(200),
+        ..test_config()
+    };
+    let (endpoint, _) = endpoint_with_config(identity(cluster, "server", 1, port), config);
+    endpoint.bind().await.unwrap();
+    let _stalled = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while endpoint.open_connection_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    endpoint.shutdown().await.unwrap();
+    assert!(matches!(
+        endpoint.bind().await,
+        Err(EndpointError::ShuttingDown)
+    ));
+}
+
+#[tokio::test]
+async fn shutdown_cancels_a_reconnect_stalled_during_negotiation() {
+    let (lower_port, higher_port) = ordered_free_ports().await;
+    let cluster = ClusterId::new("stalled-reconnect-shutdown").unwrap();
+    let lower_identity = identity(cluster.clone(), "lower", 1, lower_port);
+    let higher_identity = identity(cluster, "higher", 2, higher_port);
+    let config = RemotingConfig {
+        connect_timeout: Duration::from_secs(5),
+        reconnect_backoff_min: Duration::from_millis(10),
+        reconnect_backoff_max: Duration::from_millis(10),
+        shutdown_timeout: Duration::from_millis(200),
+        ..test_config()
+    };
+    let (lower, _) = endpoint_with_config(lower_identity.clone(), config.clone());
+    let (higher, _) = endpoint_with_config(higher_identity, config);
+    lower.bind().await.unwrap();
+    higher.bind().await.unwrap();
+    higher.connect_peer(lower_identity).await.unwrap();
+
+    higher.shutdown().await.unwrap();
+    let blackhole = TcpListener::bind(("127.0.0.1", higher_port)).await.unwrap();
+    let (_stalled, _) = tokio::time::timeout(Duration::from_secs(1), blackhole.accept())
+        .await
+        .unwrap()
+        .unwrap();
+
+    lower.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn connect_timeout_bounds_the_complete_outbound_negotiation() {
+    let (local_port, peer_port) = ordered_free_ports().await;
+    let cluster = ClusterId::new("bounded-outbound-negotiation").unwrap();
+    let local_identity = identity(cluster.clone(), "local", 1, local_port);
+    let peer_identity = identity(cluster, "peer", 2, peer_port);
+    let config = RemotingConfig {
+        connect_timeout: Duration::from_millis(100),
+        shutdown_timeout: Duration::from_millis(200),
+        ..test_config()
+    };
+    let (endpoint, _) = endpoint_with_config(local_identity, config);
+    let blackhole = TcpListener::bind(("127.0.0.1", peer_port)).await.unwrap();
+    let accept = tokio::spawn(async move {
+        let (_stalled, _) = blackhole.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+
+    assert!(matches!(
+        endpoint.connect_peer(peer_identity).await,
+        Err(EndpointError::ConnectTimeout)
+    ));
+    endpoint.shutdown().await.unwrap();
+    accept.abort();
+    let _ = accept.await;
 }
 
 #[tokio::test]
@@ -494,11 +577,21 @@ impl BootstrapHandler for RedirectHandler {
 }
 
 fn endpoint(identity: NodeIdentity) -> (Arc<RemotingEndpoint>, Arc<AssociationManager>) {
-    let config = RemotingConfig {
+    endpoint_with_config(identity, test_config())
+}
+
+fn test_config() -> RemotingConfig {
+    RemotingConfig {
         heartbeat_interval: Duration::from_millis(50),
         shutdown_timeout: Duration::from_secs(2),
         ..RemotingConfig::default()
-    };
+    }
+}
+
+fn endpoint_with_config(
+    identity: NodeIdentity,
+    config: RemotingConfig,
+) -> (Arc<RemotingEndpoint>, Arc<AssociationManager>) {
     let manager = Arc::new(
         AssociationManager::new(
             identity.address.clone(),

@@ -8,13 +8,11 @@ use std::{
 };
 
 use broadcast::error::RecvError;
-use lattice_core::failpoint::Failpoint;
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Mutex as AsyncMutex, Semaphore, broadcast, mpsc::Receiver, watch},
     task::{JoinError, JoinHandle, JoinSet},
-    time::Instant,
 };
 use tokio_rustls::rustls::{ClientConfig, ServerConfig};
 
@@ -42,9 +40,11 @@ use crate::{
     wire::{Frame, FrameCodec, FrameKind, WireError},
 };
 
+mod lifecycle;
 mod reverse_dial;
 mod stream;
 
+use lifecycle::wait_for_shutdown;
 use stream::EndpointStream;
 
 pub struct RemotingEndpoint {
@@ -173,6 +173,7 @@ impl RemotingEndpoint {
     }
 
     pub async fn bind(self: &Arc<Self>) -> Result<(), EndpointError> {
+        self.ensure_running()?;
         let listener = bind_tcp(&self.local.address).await?;
         let endpoint = self.clone();
         self.spawn(async move { endpoint.accept_loop(listener).await })?;
@@ -183,7 +184,16 @@ impl RemotingEndpoint {
         self: &Arc<Self>,
         peer: NodeIdentity,
     ) -> Result<Arc<Association>, EndpointError> {
-        let _connection_guard = self.connect_lock.lock().await;
+        let mut shutdown = self.shutdown_tx.subscribe();
+        self.ensure_running()?;
+        let _connection_guard = tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown) => {
+                return Err(EndpointError::ShuttingDown);
+            }
+            guard = self.connect_lock.lock() => guard,
+        };
+        self.ensure_running()?;
         if let Some(association) =
             self.associations
                 .get_exact(&peer.cluster_id, &peer.address, peer.incarnation)
@@ -195,7 +205,11 @@ impl RemotingEndpoint {
             .associations
             .should_dial(&peer.address, peer.incarnation)
         {
-            return self.request_reverse_peer(peer).await;
+            return tokio::select! {
+                biased;
+                () = wait_for_shutdown(&mut shutdown) => Err(EndpointError::ShuttingDown),
+                result = self.request_reverse_peer(peer) => result,
+            };
         }
         let association = self.associations.get_or_create(
             peer.cluster_id.clone(),
@@ -208,13 +222,19 @@ impl RemotingEndpoint {
                     .await?;
             }
         }
-        tokio::time::timeout(self.config.connect_timeout, async {
-            while association.state() != AssociationState::Active {
-                tokio::task::yield_now().await;
+        tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown) => {
+                return Err(EndpointError::ShuttingDown);
             }
-        })
-        .await
-        .map_err(|_| EndpointError::ConnectTimeout)?;
+            result = tokio::time::timeout(self.config.connect_timeout, async {
+                while association.state() != AssociationState::Active {
+                    tokio::task::yield_now().await;
+                }
+            }) => {
+                result.map_err(|_| EndpointError::ConnectTimeout)?;
+            }
+        }
         Ok(association)
     }
 
@@ -222,6 +242,8 @@ impl RemotingEndpoint {
         self: &Arc<Self>,
         target: BootstrapProbeTarget,
     ) -> Result<BootstrapResponse, EndpointError> {
+        let mut shutdown = self.shutdown_tx.subscribe();
+        self.ensure_running()?;
         if target
             .expected_node_id
             .as_ref()
@@ -238,12 +260,14 @@ impl RemotingEndpoint {
             .clone()
             .try_acquire_owned()
             .map_err(|_| EndpointError::ConnectionLimit)?;
-        let result = tokio::time::timeout(
-            self.config.connect_timeout,
-            self.probe_candidate_inner(target),
-        )
-        .await
-        .map_err(|_| EndpointError::ConnectTimeout)?;
+        let result = tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown) => Err(EndpointError::ShuttingDown),
+            result = tokio::time::timeout(
+                self.config.connect_timeout,
+                self.probe_candidate_inner(target),
+            ) => result.map_err(|_| EndpointError::ConnectTimeout)?,
+        };
         drop(permit);
         result
     }
@@ -304,34 +328,6 @@ impl RemotingEndpoint {
         Ok(response)
     }
 
-    pub async fn shutdown(&self) -> Result<(), EndpointError> {
-        self.shutdown_tx.send_replace(true);
-        lattice_core::failpoint::hit(Failpoint::ShutdownAfterFenceBeforeTaskJoin);
-        let tasks = {
-            let mut tasks = self.tasks.lock().expect("endpoint task list poisoned");
-            std::mem::take(&mut *tasks)
-        };
-        let deadline = Instant::now() + self.config.shutdown_timeout;
-        let mut timed_out = false;
-        for mut task in tasks {
-            match tokio::time::timeout_at(deadline, &mut task).await {
-                Ok(Ok(result)) => result?,
-                Ok(Err(error)) if error.is_cancelled() => {}
-                Ok(Err(error)) => return Err(EndpointError::Join(error)),
-                Err(_) => {
-                    timed_out = true;
-                    task.abort();
-                    let _ = task.await;
-                }
-            }
-        }
-        if timed_out {
-            Err(EndpointError::ShutdownTimeout)
-        } else {
-            Ok(())
-        }
-    }
-
     pub fn disconnect_association(
         &self,
         association_id: AssociationId,
@@ -348,17 +344,24 @@ impl RemotingEndpoint {
         peer: NodeIdentity,
         lane: LaneKind,
     ) -> Result<(), EndpointError> {
+        let mut shutdown = self.shutdown_tx.subscribe();
+        self.ensure_running()?;
         let permit = self
             .connections
             .clone()
             .try_acquire_owned()
             .map_err(|_| EndpointError::ConnectionLimit)?;
-        let (stream, nonce) = self.open_outbound_lane(&association, &peer, lane).await?;
+        let (stream, nonce) = tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown) => {
+                return Err(EndpointError::ShuttingDown);
+            }
+            result = self.open_outbound_lane(&association, &peer, lane) => result?,
+        };
         let mut receiver = association
             .take_lane_receiver(lane)
             .ok_or(EndpointError::LaneAlreadyRunning(lane))?;
         let endpoint = self.clone();
-        let mut shutdown = self.shutdown_tx.subscribe();
         let mut disconnect = self.disconnect_tx.subscribe();
         self.spawn(async move {
             let mut connection_permit = Some(permit);
@@ -418,7 +421,12 @@ impl RemotingEndpoint {
                         };
                         connection_permit = Some(permit);
                     }
-                    match endpoint.open_outbound_lane(&association, &peer, lane).await {
+                    let connection = tokio::select! {
+                        biased;
+                        () = wait_for_shutdown(&mut shutdown) => return Ok(()),
+                        result = endpoint.open_outbound_lane(&association, &peer, lane) => result,
+                    };
+                    match connection {
                         Ok(connection) => {
                             current = Some(connection);
                             backoff = endpoint.config.reconnect_backoff_min;
@@ -445,38 +453,48 @@ impl RemotingEndpoint {
         peer: &NodeIdentity,
         lane: LaneKind,
     ) -> Result<(EndpointStream, u128), EndpointError> {
+        tokio::time::timeout(
+            self.config.connect_timeout,
+            self.open_outbound_lane_inner(association, peer, lane),
+        )
+        .await
+        .map_err(|_| EndpointError::ConnectTimeout)?
+    }
+
+    async fn open_outbound_lane_inner(
+        &self,
+        association: &Association,
+        peer: &NodeIdentity,
+        lane: LaneKind,
+    ) -> Result<(EndpointStream, u128), EndpointError> {
         let codec = FrameCodec::new(self.config.max_frame_size)?;
         let security = self.security.clone();
         let address = peer.address.clone();
         let expected_peer = peer.clone();
-        let mut connection = tokio::time::timeout(self.config.connect_timeout, async move {
-            match security {
-                Some(security) => connect_tls(
-                    &address,
-                    security.server_name,
-                    security.client,
-                    &expected_peer,
-                    codec,
+        let mut connection = match security {
+            Some(security) => connect_tls(
+                &address,
+                security.server_name,
+                security.client,
+                &expected_peer,
+                codec,
+            )
+            .await
+            .map(|connection| {
+                FramedConnection::new(
+                    EndpointStream::TlsClient(connection.into_inner()),
+                    FrameCodec::new(self.config.max_frame_size)
+                        .expect("validated endpoint frame size"),
                 )
-                .await
-                .map(|connection| {
-                    FramedConnection::new(
-                        EndpointStream::TlsClient(connection.into_inner()),
-                        FrameCodec::new(self.config.max_frame_size)
-                            .expect("validated endpoint frame size"),
-                    )
-                }),
-                None => connect_tcp(&address, codec).await.map(|connection| {
-                    FramedConnection::new(
-                        EndpointStream::Plain(connection.into_inner()),
-                        FrameCodec::new(self.config.max_frame_size)
-                            .expect("validated endpoint frame size"),
-                    )
-                }),
-            }
-        })
-        .await
-        .map_err(|_| EndpointError::ConnectTimeout)??;
+            }),
+            None => connect_tcp(&address, codec).await.map(|connection| {
+                FramedConnection::new(
+                    EndpointStream::Plain(connection.into_inner()),
+                    FrameCodec::new(self.config.max_frame_size)
+                        .expect("validated endpoint frame size"),
+                )
+            }),
+        }?;
         let nonce = uuid::Uuid::new_v4().as_u128();
         let handshake = Handshake {
             source: self.local.clone(),
@@ -538,10 +556,7 @@ impl RemotingEndpoint {
                 }
             }
         }
-        while let Some(result) = connections.join_next().await {
-            let connection_result = result.map_err(EndpointError::Join)?;
-            observe_connection_result(&connection_result);
-        }
+        connections.shutdown().await;
         Ok(())
     }
 
@@ -776,6 +791,7 @@ impl RemotingEndpoint {
         F: Future<Output = Result<(), EndpointError>> + Send + 'static,
     {
         let mut tasks = self.tasks.lock().expect("endpoint task list poisoned");
+        self.ensure_running()?;
         tasks.retain(|task| !task.is_finished());
         if tasks.len() >= self.config.required_socket_budget() {
             return Err(EndpointError::TaskLimit);
@@ -849,6 +865,8 @@ pub enum EndpointError {
     InvalidSecurity,
     #[error("association endpoint task cap reached")]
     TaskLimit,
+    #[error("association endpoint is shutting down")]
+    ShuttingDown,
     #[error("association endpoint task failed")]
     Join(#[source] JoinError),
     #[error("association endpoint shutdown timed out")]
