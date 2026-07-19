@@ -1,5 +1,5 @@
 use std::{
-    io::{Error, ErrorKind},
+    io::{Error, ErrorKind, IoSlice},
     sync::Arc,
 };
 
@@ -57,11 +57,10 @@ where
                 maximum: self.codec.max_frame_size(),
             });
         }
-        let mut body = vec![0_u8; declared];
-        self.reader.read_exact(&mut body).await?;
-        let mut frame = BytesMut::with_capacity(4 + body.len());
+        let mut frame = BytesMut::with_capacity(4 + declared);
         frame.put_u32(declared as u32);
-        frame.extend_from_slice(&body);
+        frame.resize(4 + declared, 0);
+        self.reader.read_exact(&mut frame[4..]).await?;
         self.codec.decode(frame.freeze())
     }
 }
@@ -91,23 +90,7 @@ where
     where
         F: FnOnce(),
     {
-        let encoded = self.codec.encode(frame)?;
-        let mut written = 0;
-        let mut on_first_socket_write = Some(on_first_socket_write);
-        while written < encoded.len() {
-            let count = self.writer.write(&encoded[written..]).await?;
-            if count == 0 {
-                return Err(WireError::Io(Error::new(
-                    ErrorKind::WriteZero,
-                    "remoting socket wrote zero bytes",
-                )));
-            }
-            if let Some(callback) = on_first_socket_write.take() {
-                callback();
-            }
-            written += count;
-        }
-        Ok(written)
+        write_vectored_frame(&mut self.writer, &self.codec, frame, on_first_socket_write).await
     }
 
     pub async fn flush(&mut self) -> Result<(), WireError> {
@@ -136,18 +119,15 @@ where
                 maximum: self.codec.max_frame_size(),
             });
         }
-        let mut body = vec![0_u8; declared];
-        self.stream.read_exact(&mut body).await?;
-        let mut frame = BytesMut::with_capacity(4 + body.len());
+        let mut frame = BytesMut::with_capacity(4 + declared);
         frame.put_u32(declared as u32);
-        frame.extend_from_slice(&body);
+        frame.resize(4 + declared, 0);
+        self.stream.read_exact(&mut frame[4..]).await?;
         self.codec.decode(frame.freeze())
     }
 
     pub async fn write_frame(&mut self, frame: &Frame) -> Result<usize, WireError> {
-        let encoded = self.codec.encode(frame)?;
-        self.stream.write_all(&encoded).await?;
-        Ok(encoded.len())
+        write_vectored_frame(&mut self.stream, &self.codec, frame, || {}).await
     }
 
     pub async fn write_frame_with_commit<F>(
@@ -158,23 +138,7 @@ where
     where
         F: FnOnce(),
     {
-        let encoded = self.codec.encode(frame)?;
-        let mut written = 0;
-        let mut on_first_socket_write = Some(on_first_socket_write);
-        while written < encoded.len() {
-            let count = self.stream.write(&encoded[written..]).await?;
-            if count == 0 {
-                return Err(WireError::Io(Error::new(
-                    ErrorKind::WriteZero,
-                    "remoting socket wrote zero bytes",
-                )));
-            }
-            if let Some(callback) = on_first_socket_write.take() {
-                callback();
-            }
-            written += count;
-        }
-        Ok(written)
+        write_vectored_frame(&mut self.stream, &self.codec, frame, on_first_socket_write).await
     }
 
     pub async fn flush(&mut self) -> Result<(), WireError> {
@@ -188,6 +152,49 @@ where
     pub fn into_inner(self) -> S {
         self.stream
     }
+}
+
+async fn write_vectored_frame<W, F>(
+    writer: &mut W,
+    codec: &FrameCodec,
+    frame: &Frame,
+    on_first_socket_write: F,
+) -> Result<usize, WireError>
+where
+    W: AsyncWrite + Unpin,
+    F: FnOnce(),
+{
+    let header = codec.header(frame)?;
+    let payload = frame.payload();
+    let total = header.len() + payload.len();
+    let mut header_written = 0;
+    let mut payload_written = 0;
+    let mut on_first_socket_write = Some(on_first_socket_write);
+    while header_written + payload_written < total {
+        let count = if header_written < header.len() {
+            let buffers = [
+                IoSlice::new(&header[header_written..]),
+                IoSlice::new(&payload[payload_written..]),
+            ];
+            writer.write_vectored(&buffers).await?
+        } else {
+            writer.write(&payload[payload_written..]).await?
+        };
+        if count == 0 {
+            return Err(WireError::Io(Error::new(
+                ErrorKind::WriteZero,
+                "remoting socket wrote zero bytes",
+            )));
+        }
+        if let Some(callback) = on_first_socket_write.take() {
+            callback();
+        }
+        let remaining_header = header.len() - header_written;
+        let header_count = count.min(remaining_header);
+        header_written += header_count;
+        payload_written += count - header_count;
+    }
+    Ok(total)
 }
 
 pub async fn negotiate_outbound<S>(
@@ -392,12 +399,22 @@ pub fn verify_peer_certificate_identity(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
 
     use bytes::Bytes;
     use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
     use rcgen::{CertificateParams, KeyPair, SanType};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::{
+        io::AsyncWrite,
+        net::{TcpListener, TcpStream},
+    };
     use tokio_rustls::rustls::{
         RootCertStore,
         client::WebPkiServerVerifier,
@@ -412,6 +429,60 @@ mod tests {
         protocol::{ProtocolDescriptor, ProtocolFingerprint},
         wire::FrameKind,
     };
+
+    struct PartialVectoredWriter {
+        bytes: Vec<u8>,
+        maximum_write: usize,
+    }
+
+    impl AsyncWrite for PartialVectoredWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let count = buffer.len().min(self.maximum_write);
+            self.bytes.extend_from_slice(&buffer[..count]);
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffers: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut remaining = self.maximum_write;
+            let mut count = 0;
+            for buffer in buffers {
+                let written = buffer.len().min(remaining);
+                self.bytes.extend_from_slice(&buffer[..written]);
+                count += written;
+                remaining -= written;
+                if remaining == 0 {
+                    break;
+                }
+            }
+            Poll::Ready(Ok(count))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn test_certificate(
         identity: &NodeIdentity,
@@ -466,12 +537,31 @@ mod tests {
         });
         let stream = TcpStream::connect(address).await.unwrap();
         let mut client = FramedConnection::new(stream, FrameCodec::new(1024).unwrap());
-        let expected = Frame {
-            kind: FrameKind::Tell,
-            payload: Bytes::from_static(b"opaque"),
-        };
+        let expected = Frame::new(FrameKind::Tell, Bytes::from_static(b"opaque"));
         client.write_frame(&expected).await.unwrap();
         assert_eq!(server.await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn vectored_frame_write_handles_partial_header_and_payload_writes() {
+        let codec = FrameCodec::new(1024).unwrap();
+        let frame = Frame::new(FrameKind::Tell, Bytes::from_static(b"opaque-payload"));
+        let expected = codec.encode(&frame).unwrap();
+        let mut writer = PartialVectoredWriter {
+            bytes: Vec::new(),
+            maximum_write: 3,
+        };
+        let commits = AtomicUsize::new(0);
+
+        let written = write_vectored_frame(&mut writer, &codec, &frame, || {
+            commits.fetch_add(1, Ordering::Relaxed);
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(written, expected.len());
+        assert_eq!(writer.bytes, expected);
+        assert_eq!(commits.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -633,10 +723,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let expected = Frame {
-            kind: FrameKind::Heartbeat,
-            payload: Bytes::from_static(b"tls"),
-        };
+        let expected = Frame::new(FrameKind::Heartbeat, Bytes::from_static(b"tls"));
         client.write_frame(&expected).await.unwrap();
         assert_eq!(client.read_frame().await.unwrap(), expected);
         server.await.unwrap();

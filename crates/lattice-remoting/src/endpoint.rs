@@ -1,11 +1,9 @@
 use std::{
-    io::{Error as IoError, ErrorKind, Result as IoResult},
-    pin::Pin,
+    io::ErrorKind,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    task::{Context, Poll},
     time::Duration,
 };
 
@@ -13,17 +11,12 @@ use broadcast::error::RecvError;
 use lattice_core::failpoint::Failpoint;
 use thiserror::Error;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{Mutex as AsyncMutex, Semaphore, broadcast, mpsc::Receiver, watch},
     task::{JoinError, JoinHandle, JoinSet},
     time::Instant,
 };
-use tokio_rustls::{
-    client::TlsStream as ClientTlsStream,
-    rustls::{ClientConfig, ServerConfig},
-    server::TlsStream as ServerTlsStream,
-};
+use tokio_rustls::rustls::{ClientConfig, ServerConfig};
 
 use crate::{
     association::{
@@ -50,6 +43,9 @@ use crate::{
 };
 
 mod reverse_dial;
+mod stream;
+
+use stream::EndpointStream;
 
 pub struct RemotingEndpoint {
     local: NodeIdentity,
@@ -135,56 +131,6 @@ impl RemotingEndpointBuilder {
             connect_lock: AsyncMutex::new(()),
             bootstrap_handler: RwLock::new(Arc::new(AcceptBootstrap)),
         })
-    }
-}
-
-enum EndpointStream {
-    Plain(TcpStream),
-    TlsClient(ClientTlsStream<TcpStream>),
-    TlsServer(ServerTlsStream<TcpStream>),
-}
-
-impl AsyncRead for EndpointStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<IoResult<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_read(context, buffer),
-            Self::TlsClient(stream) => Pin::new(stream).poll_read(context, buffer),
-            Self::TlsServer(stream) => Pin::new(stream).poll_read(context, buffer),
-        }
-    }
-}
-
-impl AsyncWrite for EndpointStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<Result<usize, IoError>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_write(context, buffer),
-            Self::TlsClient(stream) => Pin::new(stream).poll_write(context, buffer),
-            Self::TlsServer(stream) => Pin::new(stream).poll_write(context, buffer),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Result<(), IoError>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_flush(context),
-            Self::TlsClient(stream) => Pin::new(stream).poll_flush(context),
-            Self::TlsServer(stream) => Pin::new(stream).poll_flush(context),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Result<(), IoError>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_shutdown(context),
-            Self::TlsClient(stream) => Pin::new(stream).poll_shutdown(context),
-            Self::TlsServer(stream) => Pin::new(stream).poll_shutdown(context),
-        }
     }
 }
 

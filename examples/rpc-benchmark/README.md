@@ -10,6 +10,9 @@ Criterion records both paths: `prepared_bulk_tell_admission` binds the stable As
 target, sender, protocol decision, and bulk stripe once before the timed loop;
 `unprepared_bulk_tell_admission` exercises the one-shot convenience API. The allocator-instrumented
 `measure` binary uses the prepared route and excludes route construction from its measurement window.
+`remoting_frame_write` compares the production stack-header/vectored-write path with the contiguous
+coalescing codec fallback. Its sink target isolates framing overhead; it is not a network-latency
+benchmark. The `measure` output also records allocator calls for both write paths.
 
 Run:
 

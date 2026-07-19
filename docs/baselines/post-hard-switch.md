@@ -94,6 +94,36 @@ run. The allocator-instrumented prepared run recorded 10,039 allocations (`1.004
 FDs at `10 / 10`, and 4,766,728 admissions/s in its single timing sample. The allocation remains the
 final contiguous protobuf frame; cached route construction adds no per-message allocation.
 
+### Vectored Transport Frame Write
+
+A further 2026-07-19 capture kept the protobuf payload as the one owned allocation, constructed the
+12-byte transport header on the Writer stack, and wrote header plus payload with vectored I/O. This
+avoids allocating and copying a second contiguous transport frame. The reader now also allocates its
+bounded frame buffer once instead of reading through an intermediate `Vec` and copying it.
+
+The allocator-instrumented release run measured 10,020 allocations (`1.002/message`) for 10,000
+prepared admissions, stable FDs at `10 / 10`, and 4,511,955 admissions/s in its single timing sample.
+The framing-specific counters were:
+
+| Write path | Allocations for 10,000 frames | Deallocations |
+|---|---:|---:|
+| Stack header + vectored Writer | 0 | 0 |
+| Contiguous coalescing codec | 10,000 | 10,000 |
+
+Criterion measured the complete admission paths and the isolated framing work as follows:
+
+| Path | Time |
+|---|---:|
+| Prepared exact route, 10,000 admissions | 2.0632-2.1514 ms (2.1094 ms point estimate) |
+| One-shot convenience API, 10,000 admissions | 3.1028-3.1134 ms (3.1088 ms point estimate) |
+| Vectored Writer into a sink | 10.204-10.240 ns (10.219 ns point estimate) |
+| Contiguous coalescing codec | 34.929-35.037 ns (34.981 ns point estimate) |
+
+The sink comparison isolates header construction, Writer dispatch, allocation, and copying; it does
+not include a socket syscall, TLS record construction, scheduling, or delivery latency. TCP and TLS
+round-trip tests remain the transport-correctness evidence; a deterministic bounded writer test
+covers partial vectored writes across the header/payload boundary.
+
 The legacy benchmark did not record allocation or observed-FD numbers, so this document does not
 invent a before/after percentage for those dimensions. The same release run records the complete
 runtime/reducer comparison matrix:

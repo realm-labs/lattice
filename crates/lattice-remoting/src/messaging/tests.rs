@@ -180,10 +180,7 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
     assert_eq!(failure.correlation_id, panic_correlation);
     assert_eq!(failure.code, RemoteFailureCode::ActorPanicked);
     client
-        .write_frame(&Frame {
-            kind: FrameKind::Close,
-            payload: Bytes::new(),
-        })
+        .write_frame(&Frame::new(FrameKind::Close, Bytes::new()))
         .await
         .unwrap();
     server.await.unwrap();

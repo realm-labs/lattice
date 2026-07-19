@@ -52,10 +52,10 @@ impl Association {
             return Ok(());
         }
         self.notify_lane_wake(lane)?;
-        let frame = Frame {
-            kind: FrameKind::LaneWake,
-            payload: Bytes::copy_from_slice(&[encode_lane_wake(lane)?]),
-        };
+        let frame = Frame::new(
+            FrameKind::LaneWake,
+            Bytes::copy_from_slice(&[encode_lane_wake(lane)?]),
+        );
         if let Err(error) = self.try_admit_control(frame) {
             self.wake_pending_lanes.fetch_and(!mask, Ordering::AcqRel);
             return Err(error);

@@ -175,7 +175,7 @@ where
                 let Some(mut frame) = outbound else {
                     return Ok(LaneExit::QueueClosed);
                 };
-                let reserved_bytes = frame.payload.len();
+                let reserved_bytes = frame.payload_len();
                 if !messaging.prepare_ask_for_socket_write(&mut frame) {
                     association.release_queued_bytes(reserved_bytes);
                     continue;
@@ -318,10 +318,9 @@ where
                         );
                     }
                     FrameKind::Heartbeat if lane == LaneKind::Control => {
-                        writer.write_frame(&Frame {
-                            kind: FrameKind::HeartbeatAck,
-                            payload: Bytes::new(),
-                        }).await?;
+                        writer
+                            .write_frame(&Frame::new(FrameKind::HeartbeatAck, Bytes::new()))
+                            .await?;
                     }
                     FrameKind::HeartbeatAck if lane == LaneKind::Control => {}
                     FrameKind::ControlEnvelope if lane == LaneKind::Control => {
@@ -371,7 +370,7 @@ where
                             .apply(
                                 association.key().clone(),
                                 CommandId::generate(),
-                                frame.payload,
+                                frame.into_payload(),
                             )
                             .await?;
                     }
@@ -392,10 +391,9 @@ where
                 {
                     return Err(LaneError::HeartbeatTimeout);
                 }
-                writer.write_frame(&Frame {
-                    kind: FrameKind::Heartbeat,
-                    payload: Bytes::new(),
-                }).await?;
+                writer
+                    .write_frame(&Frame::new(FrameKind::Heartbeat, Bytes::new()))
+                    .await?;
             }
             () = &mut idle, if lane != LaneKind::Control => {
                 if lane == LaneKind::Interactive
@@ -415,7 +413,7 @@ where
 }
 
 fn decode_lane_wake(frame: &Frame) -> Result<LaneKind, LaneError> {
-    let [encoded] = frame.payload.as_ref() else {
+    let [encoded] = frame.payload() else {
         return Err(LaneError::InvalidLaneWake);
     };
     if *encoded == 0 {

@@ -7,6 +7,7 @@ use thiserror::Error;
 pub const TRANSPORT_MAJOR: u16 = 1;
 pub const TRANSPORT_MINOR: u16 = 3;
 const HEADER_LEN: usize = 8;
+pub(crate) const WIRE_HEADER_LEN: usize = 4 + HEADER_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
@@ -82,19 +83,51 @@ impl TryFrom<u16> for FrameKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub kind: FrameKind,
-    pub payload: Bytes,
+    payload: Bytes,
 }
 
 impl Frame {
+    pub fn new(kind: FrameKind, payload: Bytes) -> Self {
+        Self { kind, payload }
+    }
+
     pub fn encode_message<M: Message>(kind: FrameKind, message: &M) -> Self {
-        Self {
-            kind,
-            payload: Bytes::from(message.encode_to_vec()),
-        }
+        Self::encode_payload(kind, message.encoded_len(), |output| {
+            message
+                .encode(output)
+                .expect("BytesMut provides capacity for the encoded message");
+        })
     }
 
     pub fn decode_message<M: Message + Default>(&self) -> Result<M, WireError> {
-        M::decode(self.payload.clone()).map_err(WireError::Decode)
+        M::decode(self.payload_bytes()).map_err(WireError::Decode)
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
+    pub fn payload_bytes(&self) -> Bytes {
+        self.payload.clone()
+    }
+
+    pub fn into_payload(self) -> Bytes {
+        self.payload
+    }
+
+    pub(crate) fn encode_payload(
+        kind: FrameKind,
+        payload_len: usize,
+        encode: impl FnOnce(&mut BytesMut),
+    ) -> Self {
+        let mut payload = BytesMut::with_capacity(payload_len);
+        encode(&mut payload);
+        debug_assert_eq!(payload.len(), payload_len);
+        Self::new(kind, payload.freeze())
     }
 }
 
@@ -116,9 +149,29 @@ impl FrameCodec {
     }
 
     pub fn encode(&self, frame: &Frame) -> Result<Bytes, WireError> {
+        let frame_len = self.validate(frame)?;
+        let mut output = BytesMut::with_capacity(4 + frame_len);
+        output.extend_from_slice(&self.header(frame)?);
+        output.extend_from_slice(frame.payload());
+        Ok(output.freeze())
+    }
+
+    pub(crate) fn header(&self, frame: &Frame) -> Result<[u8; WIRE_HEADER_LEN], WireError> {
+        let frame_len = self.validate(frame)?;
+        let mut header = [0_u8; WIRE_HEADER_LEN];
+        let mut output = header.as_mut_slice();
+        output.put_u32(frame_len as u32);
+        output.put_u16(TRANSPORT_MAJOR);
+        output.put_u16(TRANSPORT_MINOR);
+        output.put_u16(frame.kind as u16);
+        output.put_u16(0);
+        Ok(header)
+    }
+
+    fn validate(&self, frame: &Frame) -> Result<usize, WireError> {
         let frame_len =
             HEADER_LEN
-                .checked_add(frame.payload.len())
+                .checked_add(frame.payload_len())
                 .ok_or(WireError::FrameTooLarge {
                     actual: usize::MAX,
                     maximum: self.max_frame_size,
@@ -129,14 +182,7 @@ impl FrameCodec {
                 maximum: self.max_frame_size,
             });
         }
-        let mut output = BytesMut::with_capacity(4 + frame_len);
-        output.put_u32(frame_len as u32);
-        output.put_u16(TRANSPORT_MAJOR);
-        output.put_u16(TRANSPORT_MINOR);
-        output.put_u16(frame.kind as u16);
-        output.put_u16(0);
-        output.extend_from_slice(&frame.payload);
-        Ok(output.freeze())
+        Ok(frame_len)
     }
 
     pub fn decode(&self, mut input: Bytes) -> Result<Frame, WireError> {
@@ -166,10 +212,7 @@ impl FrameCodec {
         if reserved != 0 {
             return Err(WireError::ReservedBits(reserved));
         }
-        Ok(Frame {
-            kind,
-            payload: input,
-        })
+        Ok(Frame::new(kind, input))
     }
 }
 
@@ -215,10 +258,31 @@ mod tests {
     #[test]
     fn frame_round_trips_without_json() {
         let codec = FrameCodec::new(1024).unwrap();
-        let frame = Frame {
-            kind: FrameKind::Tell,
-            payload: Bytes::from_static(b"opaque"),
-        };
-        assert_eq!(codec.decode(codec.encode(&frame).unwrap()).unwrap(), frame);
+        let frame = Frame::new(FrameKind::Tell, Bytes::from_static(b"opaque"));
+        let encoded = codec.encode(&frame).unwrap();
+        let decoded = codec.decode(encoded).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn encoded_message_and_vectored_header_preserve_wire_semantics() {
+        #[derive(Clone, PartialEq, Message)]
+        struct TestMessage {
+            #[prost(bytes = "bytes", tag = "1")]
+            value: Bytes,
+        }
+
+        let codec = FrameCodec::new(1024).unwrap();
+        let frame = Frame::encode_message(
+            FrameKind::Tell,
+            &TestMessage {
+                value: Bytes::from_static(b"payload"),
+            },
+        );
+        let mut vectored = BytesMut::new();
+        vectored.extend_from_slice(&codec.header(&frame).unwrap());
+        vectored.extend_from_slice(frame.payload());
+        assert_eq!(codec.encode(&frame).unwrap(), vectored);
+        assert_eq!(codec.decode(vectored.freeze()).unwrap(), frame);
     }
 }

@@ -23,6 +23,7 @@ use crate::{
     wire::{Frame, FrameKind},
 };
 
+mod manager;
 mod wake;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -396,10 +397,7 @@ impl Association {
     }
 
     pub fn admit_ephemeral_control(&self, payload: bytes::Bytes) -> Result<(), AssociationError> {
-        self.try_admit_control(Frame {
-            kind: FrameKind::CoordinatorEvent,
-            payload,
-        })
+        self.try_admit_control(Frame::new(FrameKind::CoordinatorEvent, payload))
     }
 
     pub fn replay_control_frames(&self) -> Vec<Frame> {
@@ -579,7 +577,7 @@ impl Association {
         frame: Frame,
     ) -> Result<(), AssociationError> {
         self.ensure_active()?;
-        let bytes = frame.payload.len();
+        let bytes = frame.payload_len();
         self.reserve_bytes(bytes)?;
         if sender.try_send(frame).is_err() {
             self.release_queued_bytes(bytes);
@@ -652,217 +650,6 @@ pub struct AssociationManager {
     associations: Mutex<HashMap<AssociationKey, Arc<Association>>>,
     remote_incarnations: Mutex<HashMap<NodeAddress, NodeIncarnation>>,
     queued_bytes: Arc<AtomicUsize>,
-}
-
-impl AssociationManager {
-    pub fn new(
-        local_address: NodeAddress,
-        local_incarnation: NodeIncarnation,
-        config: RemotingConfig,
-    ) -> Result<Self, AssociationError> {
-        config.validate().map_err(AssociationError::InvalidConfig)?;
-        Ok(Self {
-            local_address,
-            local_incarnation,
-            config,
-            associations: Mutex::new(HashMap::new()),
-            remote_incarnations: Mutex::new(HashMap::new()),
-            queued_bytes: Arc::new(AtomicUsize::new(0)),
-        })
-    }
-
-    pub fn get_or_create(
-        &self,
-        cluster_id: ClusterId,
-        remote_address: NodeAddress,
-        remote_incarnation: NodeIncarnation,
-    ) -> Result<Arc<Association>, AssociationError> {
-        {
-            let mut incarnations = self
-                .remote_incarnations
-                .lock()
-                .expect("remote incarnation registry poisoned");
-            match incarnations.get(&remote_address) {
-                Some(current) if *current != remote_incarnation => {
-                    return Err(AssociationError::OldOrUnreconciledIncarnation);
-                }
-                Some(_) => {}
-                None => {
-                    incarnations.insert(remote_address.clone(), remote_incarnation);
-                }
-            }
-        }
-        let key = AssociationKey {
-            cluster_id,
-            local_incarnation: self.local_incarnation,
-            remote_address,
-            remote_incarnation,
-        };
-        let mut associations = self
-            .associations
-            .lock()
-            .expect("association registry poisoned");
-        if let Some(existing) = associations.get(&key) {
-            return Ok(existing.clone());
-        }
-        if associations.len() == self.config.max_associations {
-            return Err(AssociationError::AssociationLimit);
-        }
-        let association = Arc::new(Association::new_with_id_and_budget(
-            key.clone(),
-            AssociationId::generate(),
-            self.config.clone(),
-            self.queued_bytes.clone(),
-        )?);
-        associations.insert(key, association.clone());
-        Ok(association)
-    }
-
-    pub fn get_or_accept(
-        &self,
-        cluster_id: ClusterId,
-        remote_address: NodeAddress,
-        remote_incarnation: NodeIncarnation,
-        association_id: AssociationId,
-    ) -> Result<Arc<Association>, AssociationError> {
-        {
-            let mut incarnations = self
-                .remote_incarnations
-                .lock()
-                .expect("remote incarnation registry poisoned");
-            match incarnations.get(&remote_address) {
-                Some(current) if *current != remote_incarnation => {
-                    return Err(AssociationError::OldOrUnreconciledIncarnation);
-                }
-                Some(_) => {}
-                None => {
-                    incarnations.insert(remote_address.clone(), remote_incarnation);
-                }
-            }
-        }
-        let key = AssociationKey {
-            cluster_id,
-            local_incarnation: self.local_incarnation,
-            remote_address,
-            remote_incarnation,
-        };
-        let mut associations = self
-            .associations
-            .lock()
-            .expect("association registry poisoned");
-        if let Some(existing) = associations.get(&key) {
-            return if existing.id() == association_id {
-                Ok(existing.clone())
-            } else {
-                Err(AssociationError::IncomingAssociationConflict)
-            };
-        }
-        if associations.len() == self.config.max_associations {
-            return Err(AssociationError::AssociationLimit);
-        }
-        let association = Arc::new(Association::new_with_id_and_budget(
-            key.clone(),
-            association_id,
-            self.config.clone(),
-            self.queued_bytes.clone(),
-        )?);
-        associations.insert(key, association.clone());
-        Ok(association)
-    }
-
-    pub fn should_dial(
-        &self,
-        remote_address: &NodeAddress,
-        remote_incarnation: NodeIncarnation,
-    ) -> bool {
-        (&self.local_address, self.local_incarnation.get())
-            < (remote_address, remote_incarnation.get())
-    }
-
-    pub fn remove(&self, key: &AssociationKey, id: AssociationId) -> bool {
-        let mut associations = self
-            .associations
-            .lock()
-            .expect("association registry poisoned");
-        if associations
-            .get(key)
-            .is_some_and(|association| association.id() == id)
-        {
-            associations.remove(key);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn get(&self, key: &AssociationKey) -> Option<Arc<Association>> {
-        self.associations
-            .lock()
-            .expect("association registry poisoned")
-            .get(key)
-            .cloned()
-    }
-
-    pub fn get_exact(
-        &self,
-        cluster_id: &ClusterId,
-        remote_address: &NodeAddress,
-        remote_incarnation: NodeIncarnation,
-    ) -> Option<Arc<Association>> {
-        self.get(&AssociationKey {
-            cluster_id: cluster_id.clone(),
-            local_incarnation: self.local_incarnation,
-            remote_address: remote_address.clone(),
-            remote_incarnation,
-        })
-    }
-
-    pub fn get_by_id(&self, id: AssociationId) -> Option<Arc<Association>> {
-        self.associations
-            .lock()
-            .expect("association registry poisoned")
-            .values()
-            .find(|association| association.id() == id)
-            .cloned()
-    }
-
-    pub fn replace_remote_incarnation(
-        &self,
-        address: NodeAddress,
-        incarnation: NodeIncarnation,
-    ) -> usize {
-        self.remote_incarnations
-            .lock()
-            .expect("remote incarnation registry poisoned")
-            .insert(address.clone(), incarnation);
-        let mut associations = self
-            .associations
-            .lock()
-            .expect("association registry poisoned");
-        let old_keys = associations
-            .keys()
-            .filter(|key| key.remote_address == address && key.remote_incarnation != incarnation)
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in &old_keys {
-            if let Some(association) = associations.remove(key) {
-                association.begin_close();
-                association.finish_close();
-            }
-        }
-        old_keys.len()
-    }
-
-    pub fn len(&self) -> usize {
-        self.associations
-            .lock()
-            .expect("association registry poisoned")
-            .len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 fn stripe_from_hash(hash: &blake3::Hash, stripes: usize) -> usize {
@@ -955,10 +742,7 @@ mod tests {
         association.detach(LaneKind::Control, 10);
         assert_eq!(association.state(), AssociationState::Reconnecting);
         assert!(matches!(
-            association.try_admit_interactive(Frame {
-                kind: FrameKind::Ask,
-                payload: bytes::Bytes::new(),
-            }),
+            association.try_admit_interactive(Frame::new(FrameKind::Ask, bytes::Bytes::new())),
             Err(AssociationError::NotActive)
         ));
     }
@@ -985,10 +769,7 @@ mod tests {
 
         assert_eq!(association.state(), AssociationState::Active);
         association
-            .try_admit_interactive(Frame {
-                kind: FrameKind::Ask,
-                payload: bytes::Bytes::new(),
-            })
+            .try_admit_interactive(Frame::new(FrameKind::Ask, bytes::Bytes::new()))
             .unwrap();
     }
 
@@ -1013,10 +794,7 @@ mod tests {
         let stripe = association
             .try_admit_bulk(
                 |_| panic!("single-stripe admission must not hash the route"),
-                Frame {
-                    kind: FrameKind::Tell,
-                    payload: bytes::Bytes::from_static(b"message"),
-                },
+                Frame::new(FrameKind::Tell, bytes::Bytes::from_static(b"message")),
             )
             .unwrap();
 
@@ -1260,24 +1038,24 @@ mod tests {
             }
         }
         first
-            .try_admit_interactive(Frame {
-                kind: FrameKind::Backpressure,
-                payload: bytes::Bytes::from_static(b"12345678"),
-            })
+            .try_admit_interactive(Frame::new(
+                FrameKind::Backpressure,
+                bytes::Bytes::from_static(b"12345678"),
+            ))
             .unwrap();
         assert!(matches!(
-            second.try_admit_interactive(Frame {
-                kind: FrameKind::Backpressure,
-                payload: bytes::Bytes::from_static(b"12345678"),
-            }),
+            second.try_admit_interactive(Frame::new(
+                FrameKind::Backpressure,
+                bytes::Bytes::from_static(b"12345678"),
+            )),
             Err(AssociationError::NodeByteBudgetExceeded)
         ));
         first.release_queued_bytes(8);
         second
-            .try_admit_interactive(Frame {
-                kind: FrameKind::Backpressure,
-                payload: bytes::Bytes::from_static(b"12345678"),
-            })
+            .try_admit_interactive(Frame::new(
+                FrameKind::Backpressure,
+                bytes::Bytes::from_static(b"12345678"),
+            ))
             .unwrap();
     }
 }

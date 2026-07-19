@@ -118,10 +118,7 @@ where
             }
             FrameKind::Heartbeat => {
                 connection
-                    .write_frame(&Frame {
-                        kind: FrameKind::HeartbeatAck,
-                        payload: Bytes::new(),
-                    })
+                    .write_frame(&Frame::new(FrameKind::HeartbeatAck, Bytes::new()))
                     .await?;
             }
             FrameKind::HeartbeatAck | FrameKind::Backpressure => {}

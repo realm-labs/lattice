@@ -217,13 +217,7 @@ pub(super) fn failure_frame(correlation: CorrelationId, code: u32, safe_detail: 
 }
 
 fn encode_frame(kind: FrameKind, encoded_len: usize, encode: impl FnOnce(&mut BytesMut)) -> Frame {
-    let mut payload = BytesMut::with_capacity(encoded_len);
-    encode(&mut payload);
-    debug_assert_eq!(payload.len(), encoded_len);
-    Frame {
-        kind,
-        payload: payload.freeze(),
-    }
+    Frame::encode_payload(kind, encoded_len, encode)
 }
 
 fn exact_target_len<A: ProtocolTag>(target: &ActorRef<A>) -> usize {

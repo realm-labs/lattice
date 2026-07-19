@@ -3,9 +3,15 @@
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     error::Error,
+    hint::black_box,
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use bytes::Bytes;
+use lattice_remoting::{
+    transport::FramedWriter,
+    wire::{Frame, FrameCodec, FrameKind},
+};
 use remoting_benchmark::{
     BenchmarkConfig, RemotingTopology,
     matrix::{local_actor_admission, placement_matrix},
@@ -14,6 +20,12 @@ use remoting_benchmark::{
 struct CountingAllocator;
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static DEALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct WirePayload {
+    #[prost(bytes = "bytes", tag = "1")]
+    payload: Bytes,
+}
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -33,6 +45,8 @@ static GLOBAL: CountingAllocator = CountingAllocator;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = BenchmarkConfig::from_env();
+    let frame_write_allocations =
+        measure_frame_write(config.requests, config.payload_bytes).await?;
     let local = local_actor_admission(config.requests).await?;
     let topology = RemotingTopology::start(&config)?;
     let before_allocations = ALLOCATIONS.load(Ordering::Relaxed);
@@ -80,10 +94,60 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "open_fds_before": before_fds,
         "open_fds_after": after_remote_fds,
         "physical_connections": 2 + config.bulk_stripes,
+        "frame_write_allocations": frame_write_allocations,
         "matrix": matrix,
     });
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+async fn measure_frame_write(
+    requests: usize,
+    payload_bytes: usize,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let codec = FrameCodec::new(256 * 1024)?;
+    let frame = Frame::encode_message(
+        FrameKind::Tell,
+        &WirePayload {
+            payload: Bytes::from(vec![0_u8; payload_bytes]),
+        },
+    );
+    let (vectored_allocations, vectored_deallocations) =
+        measure_writer_allocations(codec.clone(), &frame, requests).await?;
+    let before_allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let before_deallocations = DEALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..requests {
+        black_box(codec.encode(black_box(&frame))?);
+    }
+    let coalescing_allocations = ALLOCATIONS.load(Ordering::Relaxed) - before_allocations;
+    let coalescing_deallocations = DEALLOCATIONS.load(Ordering::Relaxed) - before_deallocations;
+    Ok(serde_json::json!({
+        "vectored_writer": {
+            "allocations": vectored_allocations,
+            "deallocations": vectored_deallocations,
+        },
+        "coalescing_codec": {
+            "allocations": coalescing_allocations,
+            "deallocations": coalescing_deallocations,
+        },
+    }))
+}
+
+async fn measure_writer_allocations(
+    codec: FrameCodec,
+    frame: &Frame,
+    requests: usize,
+) -> Result<(u64, u64), Box<dyn Error>> {
+    let mut writer = FramedWriter::new(tokio::io::sink(), codec);
+    let before_allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let before_deallocations = DEALLOCATIONS.load(Ordering::Relaxed);
+    for _ in 0..requests {
+        black_box(writer.write_frame(black_box(frame)).await?);
+    }
+    Ok((
+        ALLOCATIONS.load(Ordering::Relaxed) - before_allocations,
+        DEALLOCATIONS.load(Ordering::Relaxed) - before_deallocations,
+    ))
 }
 
 fn open_file_descriptors() -> Option<usize> {

@@ -301,10 +301,7 @@ async fn business_frame_before_association_is_rejected_without_registry_entry() 
     .unwrap();
 
     connection
-        .write_frame(&Frame {
-            kind: FrameKind::Tell,
-            payload: Bytes::new(),
-        })
+        .write_frame(&Frame::new(FrameKind::Tell, Bytes::new()))
         .await
         .unwrap();
     assert!(connection.read_frame().await.is_err());
