@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -8,7 +8,7 @@ use std::{
 
 use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::{
     config::{RemotingConfig, RemotingConfigError},
@@ -22,6 +22,8 @@ use crate::{
     },
     wire::{Frame, FrameKind},
 };
+
+mod wake;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AssociationId(u128);
@@ -83,6 +85,7 @@ pub enum AssociationState {
 struct AssociationInner {
     state: AssociationState,
     lanes: HashMap<LaneKind, u128>,
+    wake_pending: HashSet<LaneKind>,
 }
 
 #[derive(Debug)]
@@ -106,6 +109,8 @@ pub struct Association {
     node_queued_bytes: Arc<AtomicUsize>,
     peer_catalogue: Mutex<ProtocolCatalogue>,
     reliable_control: Mutex<ReliableControl>,
+    interactive_wake: Notify,
+    bulk_wakes: Vec<Notify>,
 }
 
 impl Association {
@@ -131,6 +136,7 @@ impl Association {
         let max_protocols_per_peer = config.max_protocols_per_peer;
         let max_control_outbox_frames = config.max_control_outbox_frames;
         let max_control_outbox_bytes = config.max_control_outbox_bytes;
+        let bulk_stripes = config.bulk_stripes;
         let (control, control_rx) = mpsc::channel(config.control_queue_frames);
         let (interactive, interactive_rx) = mpsc::channel(config.interactive_queue_frames);
         let mut bulk = Vec::with_capacity(config.bulk_stripes);
@@ -147,6 +153,7 @@ impl Association {
             inner: Mutex::new(AssociationInner {
                 state: AssociationState::Establishing,
                 lanes: HashMap::new(),
+                wake_pending: HashSet::new(),
             }),
             control,
             interactive,
@@ -166,6 +173,8 @@ impl Association {
                 ReliableControl::new(id, max_control_outbox_frames, max_control_outbox_bytes)
                     .expect("validated reliable control limits"),
             ),
+            interactive_wake: Notify::new(),
+            bulk_wakes: (0..bulk_stripes).map(|_| Notify::new()).collect(),
         })
     }
 
@@ -297,6 +306,7 @@ impl Association {
             }
             Some(_) => AttachmentDecision::RejectedDuplicate,
         };
+        inner.wake_pending.remove(&attachment.lane);
         let activated =
             inner.state != AssociationState::Active && self.has_complete_lane_group(&inner.lanes);
         if activated {
@@ -330,6 +340,14 @@ impl Association {
         inner.lanes.remove(&lane);
         if lane == LaneKind::Control || inner.state != AssociationState::Active {
             inner.state = AssociationState::Reconnecting;
+        }
+        if lane == LaneKind::Control {
+            inner.wake_pending.clear();
+            drop(inner);
+            self.interactive_wake.notify_one();
+            for wake in &self.bulk_wakes {
+                wake.notify_one();
+            }
         }
     }
 
@@ -441,6 +459,7 @@ impl Association {
     }
 
     pub fn try_admit_interactive(&self, frame: Frame) -> Result<(), AssociationError> {
+        self.prepare_data_lane(LaneKind::Interactive)?;
         self.try_admit(&self.interactive, frame)
     }
 
@@ -452,6 +471,7 @@ impl Association {
     ) -> Result<usize, AssociationError> {
         self.ensure_active()?;
         let stripe = stable_stripe(sender_identity, recipient_identity, self.bulk.len());
+        self.prepare_data_lane(LaneKind::Bulk(stripe as u8))?;
         self.try_admit(&self.bulk[stripe], frame)?;
         Ok(stripe)
     }
@@ -804,6 +824,8 @@ pub enum AssociationError {
     IncomingAssociationConflict,
     #[error("association lane queue receiver is already owned")]
     LaneReceiverConflict,
+    #[error("lane wake requested an invalid data lane")]
+    InvalidLaneWake,
     #[error("peer protocol catalogue is invalid")]
     Catalogue(#[source] CatalogueError),
     #[error("association reliable control rejected the command")]

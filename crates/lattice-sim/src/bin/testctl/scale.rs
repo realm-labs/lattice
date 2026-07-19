@@ -9,6 +9,8 @@ use serde::Serialize;
 use super::testctl_artifacts::{
     MemberArtifact, MembershipVersionArtifact, ScaleNodeArtifact, write_json,
 };
+#[cfg(test)]
+use super::testctl_artifacts::{ProcessResourceArtifact, RingArtifact};
 
 #[derive(Serialize)]
 struct ConvergenceArtifact {
@@ -18,7 +20,23 @@ struct ConvergenceArtifact {
     membership_term: u64,
     membership_revision: u64,
     convergence_millis: u128,
+    startup_window_seconds: u64,
+    metrics: ScaleMetricsArtifact,
     members: Vec<MemberArtifact>,
+}
+
+#[derive(Serialize)]
+struct ScaleMetricsArtifact {
+    maximum_join_millis: u128,
+    maximum_ring_millis: u128,
+    total_resident_memory_kib: u64,
+    maximum_resident_memory_kib: u64,
+    maximum_threads: u64,
+    maximum_open_file_descriptors: usize,
+    total_associations: usize,
+    maximum_associations: usize,
+    total_attached_lanes: usize,
+    maximum_attached_lanes: usize,
 }
 
 pub(super) fn run(artifacts: &Path) -> Result<(), String> {
@@ -30,6 +48,10 @@ pub(super) fn run(artifacts: &Path) -> Result<(), String> {
         return Err("scale topology needs at least one member".to_owned());
     }
     let expected_logic = expected_members;
+    let startup_window_seconds = std::env::var("LATTICE_SCALE_STARTUP_WINDOW_SECONDS")
+        .unwrap_or_else(|_| "0".to_owned())
+        .parse::<u64>()
+        .map_err(|error| format!("invalid LATTICE_SCALE_STARTUP_WINDOW_SECONDS: {error}"))?;
     let directory = artifacts.join("scale");
     let started = Instant::now();
     let deadline = started + Duration::from_secs(600);
@@ -48,6 +70,8 @@ pub(super) fn run(artifacts: &Path) -> Result<(), String> {
                     membership_term: version.term,
                     membership_revision: version.revision,
                     convergence_millis: started.elapsed().as_millis(),
+                    startup_window_seconds,
+                    metrics: scale_metrics(&nodes),
                     members,
                 },
             )?;
@@ -58,7 +82,7 @@ pub(super) fn run(artifacts: &Path) -> Result<(), String> {
                 "{expected_members}-node cluster did not converge within 600s; {observation}"
             ));
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
@@ -105,10 +129,19 @@ fn evaluate_convergence(
     if identities.len() != expected_logic {
         return Err("scale logic artifacts contain duplicate node identities".to_owned());
     }
+    if nodes
+        .iter()
+        .map(|node| node.node_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        != expected_logic
+    {
+        return Err("scale logic artifacts contain duplicate node IDs".to_owned());
+    }
 
     let mut expected_version = None;
     let mut expected_directory = None;
-    for node in nodes {
+    for (index, node) in nodes.iter().enumerate() {
         if node.lifecycle != "Ready" || !node.domains.is_empty() {
             return Ok(None);
         }
@@ -122,6 +155,30 @@ fn evaluate_convergence(
             || !directory.iter().any(|member| {
                 member.node_id == node.node_id && member.incarnation == node.incarnation
             })
+        {
+            return Ok(None);
+        }
+        let Some(ring) = &node.ring else {
+            return Ok(None);
+        };
+        let expected_peer = &nodes[(index + 1) % nodes.len()].node_id;
+        if &ring.peer_node_id != expected_peer
+            || ring.request != index as u64
+            || ring.reply != ring.request + 1
+            || !ring.data_lanes_slept
+            || node.join_millis.is_none()
+            || node
+                .resources
+                .resident_memory_kib
+                .is_none_or(|value| value == 0)
+            || node.resources.threads.is_none_or(|value| value == 0)
+            || node
+                .resources
+                .open_file_descriptors
+                .is_none_or(|value| value == 0)
+            || node.associations == 0
+            || node.associations > 3
+            || node.attached_lanes != node.associations
         {
             return Ok(None);
         }
@@ -150,6 +207,52 @@ fn evaluate_convergence(
     Ok(Some((version, directory.into_iter().collect())))
 }
 
+fn scale_metrics(nodes: &[ScaleNodeArtifact]) -> ScaleMetricsArtifact {
+    ScaleMetricsArtifact {
+        maximum_join_millis: nodes
+            .iter()
+            .filter_map(|node| node.join_millis)
+            .max()
+            .unwrap_or_default(),
+        maximum_ring_millis: nodes
+            .iter()
+            .filter_map(|node| node.ring.as_ref().map(|ring| ring.elapsed_millis))
+            .max()
+            .unwrap_or_default(),
+        total_resident_memory_kib: nodes
+            .iter()
+            .filter_map(|node| node.resources.resident_memory_kib)
+            .sum(),
+        maximum_resident_memory_kib: nodes
+            .iter()
+            .filter_map(|node| node.resources.resident_memory_kib)
+            .max()
+            .unwrap_or_default(),
+        maximum_threads: nodes
+            .iter()
+            .filter_map(|node| node.resources.threads)
+            .max()
+            .unwrap_or_default(),
+        maximum_open_file_descriptors: nodes
+            .iter()
+            .filter_map(|node| node.resources.open_file_descriptors)
+            .max()
+            .unwrap_or_default(),
+        total_associations: nodes.iter().map(|node| node.associations).sum(),
+        maximum_associations: nodes
+            .iter()
+            .map(|node| node.associations)
+            .max()
+            .unwrap_or_default(),
+        total_attached_lanes: nodes.iter().map(|node| node.attached_lanes).sum(),
+        maximum_attached_lanes: nodes
+            .iter()
+            .map(|node| node.attached_lanes)
+            .max()
+            .unwrap_or_default(),
+    }
+}
+
 fn observation(
     nodes: &[ScaleNodeArtifact],
     expected_logic: usize,
@@ -163,8 +266,9 @@ fn observation(
         .iter()
         .filter(|node| node.members.len() == expected_members)
         .count();
+    let ring_complete = nodes.iter().filter(|node| node.ring.is_some()).count();
     format!(
-        "logic artifacts={}/{expected_logic}, ready={ready}/{expected_logic}, full membership={complete_membership}/{expected_logic}",
+        "logic artifacts={}/{expected_logic}, ready={ready}/{expected_logic}, full membership={complete_membership}/{expected_logic}, ring={ring_complete}/{expected_logic}",
         nodes.len()
     )
 }
@@ -194,6 +298,21 @@ mod tests {
                 domains: Default::default(),
                 membership_version: Some(version),
                 members: members.clone(),
+                join_millis: Some(100),
+                ring: Some(RingArtifact {
+                    peer_node_id: format!("logic-{:02}", (index + 1) % 64),
+                    request: index as u64,
+                    reply: index as u64 + 1,
+                    elapsed_millis: 10,
+                    data_lanes_slept: true,
+                }),
+                resources: ProcessResourceArtifact {
+                    resident_memory_kib: Some(1024),
+                    threads: Some(2),
+                    open_file_descriptors: Some(8),
+                },
+                associations: 3,
+                attached_lanes: 3,
             })
             .collect()
     }
@@ -241,6 +360,8 @@ mod tests {
             membership_term: 1,
             membership_revision: 2,
             convergence_millis: 3,
+            startup_window_seconds: 0,
+            metrics: scale_metrics(&converged_nodes()),
             members: vec![MemberArtifact {
                 node_id: "logic".to_owned(),
                 incarnation: u128::MAX,

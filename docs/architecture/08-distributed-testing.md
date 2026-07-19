@@ -315,6 +315,9 @@ e2e:
 scale:
   64 real member nodes plus a dedicated membership-coordinator process
   every member must become Ready and publish the same 64-member term/revision/directory
+  every member hosts a real actor and completes one ask in a 64-node ring
+  data lanes must return to their dormant state after the ring becomes idle
+  node-level RSS/thread/FD, association, lane and phase timing evidence is aggregated
   multi-domain placement and failover remain covered by the e2e profile
 
 chaos:
@@ -331,7 +334,9 @@ k8s:
 Installing membership does not eagerly create an all-to-all remoting mesh. The authoritative
 directory is retained locally, routing connects to an exact `Up` peer on demand, and removal closes
 an existing association if one was opened. This keeps idle-cluster connection count linear while
-preserving incarnation-fenced lazy routing.
+preserving incarnation-fenced lazy routing. If the requester is not the stable dial side, an exact
+identity-checked bootstrap request asks the peer to reverse-dial. Interactive and bulk lanes sleep
+after their idle timeout; queued work sends a wake over the persistent control lane.
 
 An additional HA-etcd profile runs a disposable three-member etcd cluster for lease/store failover scenarios. Ordinary PR tests may use one disposable etcd container; final storage/leadership evidence includes the HA profile.
 
@@ -369,6 +374,7 @@ The repository supplies one stable wrapper whose implementation uses Docker Comp
 ./scripts/test-docker.sh e2e
 ./scripts/test-docker.sh e2e-ha-etcd
 ./scripts/test-docker.sh scale
+./scripts/test-docker.sh scale --startup-window 90
 ./scripts/test-docker.sh chaos
 ./scripts/test-docker.sh k8s
 ./scripts/test-docker.sh soak --duration 4h --seed <seed>
@@ -376,6 +382,10 @@ The repository supplies one stable wrapper whose implementation uses Docker Comp
 ./scripts/docker-test-cache.sh status
 ./scripts/docker-test-cache.sh clean
 ```
+
+The default scale run is a 64-node join storm (`--startup-window 0`). A nonzero startup window
+deterministically spreads replicas across that many seconds and exercises gradual expansion using
+the same convergence and ring-traffic oracle.
 
 Direct `cargo test` remains a useful developer fast path for reducers/simulation, but it is not a substitute for final adapter/integration Docker evidence. The wrapper records image digests, source commit, platform, configuration, seed, scenario list, start/end time and exit status. Local runs use Docker-managed Cargo cache volumes. CI sets `LATTICE_DOCKER_CACHE_ROOT` to expose the same logical volumes through a repository-ignored bind directory that the CI cache service can restore and save. Destructive full-cache cleanup remains explicit; bounded periodic maintenance is automatic and refuses to touch a volume attached to any container.
 

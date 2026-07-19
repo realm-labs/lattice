@@ -345,6 +345,7 @@ fn run_profile(
             "duration_seconds": duration_seconds,
             "artifact_directory": artifacts,
             "scale_expected_members": std::env::var("LATTICE_SCALE_EXPECTED_MEMBERS").ok(),
+            "scale_startup_window_seconds": std::env::var("LATTICE_SCALE_STARTUP_WINDOW_SECONDS").ok(),
         }),
     };
     write_json(&artifacts.join("manifest.json"), &manifest)?;

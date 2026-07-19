@@ -5,7 +5,7 @@ use std::{
 
 use lattice_core::actor_ref::NodeIncarnation;
 use lattice_placement::{
-    coordinator::{MemberChange, MemberEvent, MemberRecord},
+    coordinator::{MemberChange, MemberEvent, MemberRecord, MemberStatus},
     types::{MembershipVersion, NodeKey},
 };
 use thiserror::Error;
@@ -56,6 +56,16 @@ impl MemberDirectory {
 
     pub fn subscribe(&self) -> broadcast::Receiver<MemberEvent> {
         self.events.subscribe()
+    }
+
+    pub(crate) fn lookup_up(&self, node: &NodeKey) -> Option<MemberRecord> {
+        self.state
+            .lock()
+            .expect("member directory poisoned")
+            .members
+            .get(&member_key(node))
+            .filter(|record| record.node == *node && record.status == MemberStatus::Up)
+            .cloned()
     }
 
     pub fn install_snapshot(

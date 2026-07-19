@@ -273,6 +273,7 @@ services:
       domain-membership: {condition: service_healthy}
     environment:
       LATTICE_SCALE_EXPECTED_MEMBERS: ${LATTICE_SCALE_EXPECTED_MEMBERS:-64}
+      LATTICE_SCALE_STARTUP_WINDOW_SECONDS: ${LATTICE_SCALE_STARTUP_WINDOW_SECONDS:-0}
     cpus: 0.25
     mem_limit: 512m
     ulimits:
@@ -283,7 +284,12 @@ services:
       - /bin/sh
       - -c
       - >-
-        delay="$$(printf '%s' "$${HOSTNAME}" | cksum | awk '{print $$1 % 90}')";
+        window="$${LATTICE_SCALE_STARTUP_WINDOW_SECONDS}";
+        if [ "$${window}" -eq 0 ]; then
+          delay=0;
+        else
+          delay="$$(printf '%s' "$${HOSTNAME}" | cksum | awk -v window="$${window}" '{print $$1 % (window + 1)}')";
+        fi;
         sleep "$${delay}";
         exec /cargo-target/debug/distributed-node domain-logic
         --node-id "$${HOSTNAME}"
@@ -427,6 +433,7 @@ services:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
       LATTICE_SCALE_EXPECTED_MEMBERS: ${LATTICE_SCALE_EXPECTED_MEMBERS:-64}
+      LATTICE_SCALE_STARTUP_WINDOW_SECONDS: ${LATTICE_SCALE_STARTUP_WINDOW_SECONDS:-0}
     command: ["/cargo-target/debug/testctl", "run", "scale", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
 
   runner-soak:

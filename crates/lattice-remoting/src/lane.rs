@@ -9,7 +9,7 @@ use thiserror::Error;
 use tokio::{
     sync::{mpsc, watch},
     task::{JoinError, JoinSet},
-    time::MissedTickBehavior,
+    time::{Instant as TokioInstant, MissedTickBehavior},
 };
 
 use crate::{
@@ -138,6 +138,9 @@ where
     let dispatch = runtime.services.dispatch.clone();
     let control_dispatch = runtime.services.control_dispatch.clone();
     let config = runtime.config.validate()?;
+    if *shutdown.borrow() {
+        return Ok(LaneExit::Shutdown);
+    }
     let codec = FrameCodec::new(config.maximum_frame_size)?;
     let (read, write) = tokio::io::split(stream);
     let mut reader = FramedReader::new(read, codec.clone());
@@ -146,10 +149,8 @@ where
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_received = Instant::now();
-    let mut last_activity = Instant::now();
-    let mut idle = tokio::time::interval(config.idle_data_connection_timeout);
-    idle.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    idle.reset();
+    let idle = tokio::time::sleep(config.idle_data_connection_timeout);
+    tokio::pin!(idle);
 
     loop {
         tokio::select! {
@@ -166,6 +167,9 @@ where
                 };
                 let frame = completed.map_err(LaneError::Join)??;
                 writer.write_frame(&frame).await?;
+                idle.as_mut().reset(
+                    TokioInstant::now() + config.idle_data_connection_timeout
+                );
             }
             outbound = receiver.recv() => {
                 let Some(mut frame) = outbound else {
@@ -189,12 +193,16 @@ where
                 }).await;
                 association.release_queued_bytes(reserved_bytes);
                 result?;
-                last_activity = Instant::now();
+                idle.as_mut().reset(
+                    TokioInstant::now() + config.idle_data_connection_timeout
+                );
             }
             inbound = reader.read_frame() => {
                 let frame = inbound?;
                 last_received = Instant::now();
-                last_activity = last_received;
+                idle.as_mut().reset(
+                    TokioInstant::now() + config.idle_data_connection_timeout
+                );
                 match frame.kind {
                     FrameKind::Tell if matches!(lane, LaneKind::Bulk(_)) => {
                         let tell = decode_tell(&frame)?;
@@ -368,6 +376,12 @@ where
                             .await?;
                     }
                     FrameKind::Backpressure => {}
+                    FrameKind::LaneWake if lane == LaneKind::Control => {
+                        let lane = decode_lane_wake(&frame)?;
+                        association
+                            .notify_lane_wake(lane)
+                            .map_err(LaneError::Association)?;
+                    }
                     FrameKind::Close => return Ok(LaneExit::RemoteClose),
                     kind => return Err(LaneError::UnexpectedFrame { lane, kind }),
                 }
@@ -383,16 +397,31 @@ where
                     payload: Bytes::new(),
                 }).await?;
             }
-            _ = idle.tick(), if lane != LaneKind::Control => {
-                if Instant::now().duration_since(last_activity)
-                    >= config.idle_data_connection_timeout
+            () = &mut idle, if lane != LaneKind::Control => {
+                if lane == LaneKind::Interactive
+                    && (!asks.is_empty()
+                        || messaging.has_pending_for_association(association.id()))
                 {
-                    writer.flush().await?;
-                    return Ok(LaneExit::Idle);
+                    idle.as_mut().reset(
+                        TokioInstant::now() + config.idle_data_connection_timeout
+                    );
+                    continue;
                 }
+                writer.flush().await?;
+                return Ok(LaneExit::Idle);
             }
         }
     }
+}
+
+fn decode_lane_wake(frame: &Frame) -> Result<LaneKind, LaneError> {
+    let [encoded] = frame.payload.as_ref() else {
+        return Err(LaneError::InvalidLaneWake);
+    };
+    if *encoded == 0 {
+        return Ok(LaneKind::Interactive);
+    }
+    Ok(LaneKind::Bulk(encoded.saturating_sub(1)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +442,8 @@ pub enum LaneError {
     HeartbeatTimeout,
     #[error("lane received frame kind {kind:?} on {lane:?}")]
     UnexpectedFrame { lane: LaneKind, kind: FrameKind },
+    #[error("lane wake frame has an invalid payload")]
+    InvalidLaneWake,
     #[error("inbound ask task failed")]
     Join(#[source] JoinError),
     #[error("inbound actor dispatch failed")]
@@ -454,7 +485,9 @@ mod tests {
         protocol::{ProtocolDescriptor, ProtocolFingerprint},
     };
 
-    struct EchoDispatch;
+    struct EchoDispatch {
+        delay: Duration,
+    }
 
     #[async_trait]
     impl InboundDispatch for EchoDispatch {
@@ -475,6 +508,7 @@ mod tests {
             payload: Bytes,
             deadline: Instant,
         ) -> Result<Bytes, RemoteMessageError> {
+            tokio::time::sleep(self.delay).await;
             if Instant::now() >= deadline {
                 return Err(RemoteMessageError::DeadlineExceeded);
             }
@@ -521,7 +555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_tcp_bidirectional_interactive_lane_completes_ask() {
+    async fn interactive_lane_stays_awake_while_ask_is_in_flight() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socket = listener.local_addr().unwrap();
         let client_incarnation = NodeIncarnation::new(1).unwrap();
@@ -561,7 +595,9 @@ mod tests {
                     2,
                     LaneServices::new(
                         messaging,
-                        Arc::new(EchoDispatch),
+                        Arc::new(EchoDispatch {
+                            delay: Duration::from_millis(125),
+                        }),
                         Arc::new(RejectControlDispatch),
                     ),
                     BidirectionalLaneConfig {
@@ -569,7 +605,7 @@ mod tests {
                         maximum_concurrent_inbound_asks: 8,
                         heartbeat_interval: Duration::from_millis(100),
                         heartbeat_miss_limit: 10,
-                        idle_data_connection_timeout: Duration::from_secs(60),
+                        idle_data_connection_timeout: Duration::from_millis(25),
                     },
                 )
                 .run(&mut server_receiver, stream, &mut server_shutdown)
@@ -588,7 +624,9 @@ mod tests {
                     2,
                     LaneServices::new(
                         messaging,
-                        Arc::new(EchoDispatch),
+                        Arc::new(EchoDispatch {
+                            delay: Duration::from_millis(125),
+                        }),
                         Arc::new(RejectControlDispatch),
                     ),
                     BidirectionalLaneConfig {
@@ -596,7 +634,7 @@ mod tests {
                         maximum_concurrent_inbound_asks: 8,
                         heartbeat_interval: Duration::from_millis(100),
                         heartbeat_miss_limit: 10,
-                        idle_data_connection_timeout: Duration::from_secs(60),
+                        idle_data_connection_timeout: Duration::from_millis(25),
                     },
                 )
                 .run(&mut client_receiver, stream, &mut client_shutdown)

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use lattice_core::actor_ref::ClusterId;
 use lattice_placement::{
-    coordinator::{MemberChange, MemberEvent, MemberRecord, MemberStatus},
+    coordinator::{MemberChange, MemberEvent, MemberRecord},
     types::{MembershipVersion, NodeKey},
 };
 use lattice_remoting::{
@@ -39,10 +39,7 @@ impl PeerReconciler {
     pub async fn connect(&self, node: &NodeKey) -> Result<Arc<Association>, PeerError> {
         let authoritative = self
             .members
-            .snapshot()
-            .members
-            .into_iter()
-            .find(|record| record.node == *node && record.status == MemberStatus::Up)
+            .lookup_up(node)
             .ok_or(PeerError::NotAuthoritativeUp)?;
         if let Some(association) = self.associations.get_exact(
             &self.cluster_id,

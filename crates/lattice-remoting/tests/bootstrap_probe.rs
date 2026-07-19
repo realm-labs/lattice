@@ -85,6 +85,29 @@ async fn tcp_probe_discovers_exact_identity_without_creating_association() {
 }
 
 #[tokio::test]
+async fn higher_identity_can_request_an_on_demand_reverse_connection() {
+    let (lower_port, higher_port) = ordered_free_ports().await;
+    let cluster = ClusterId::new("reverse-peer-test").unwrap();
+    let lower_identity = identity(cluster.clone(), "lower", 1, lower_port);
+    let higher_identity = identity(cluster, "higher", 2, higher_port);
+    let (lower, lower_manager) = endpoint(lower_identity.clone());
+    let (higher, higher_manager) = endpoint(higher_identity);
+    lower.bind().await.unwrap();
+    higher.bind().await.unwrap();
+
+    let association = higher.connect_peer(lower_identity.clone()).await.unwrap();
+    let repeated = higher.connect_peer(lower_identity.clone()).await.unwrap();
+
+    assert_eq!(association.key().remote_address, lower_identity.address);
+    assert_eq!(repeated.id(), association.id());
+    assert_eq!(association.state(), AssociationState::Active);
+    assert_eq!(lower_manager.len(), 1);
+    assert_eq!(higher_manager.len(), 1);
+    higher.shutdown().await.unwrap();
+    lower.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn simultaneous_probes_remain_probe_only() {
     let server_port = free_port().await;
     let cluster = ClusterId::new("simultaneous-probe").unwrap();
@@ -674,7 +697,10 @@ async fn free_port() -> u16 {
 }
 
 async fn ordered_free_ports() -> (u16, u16) {
-    let first = free_port().await;
-    let second = free_port().await;
+    let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first = first_listener.local_addr().unwrap().port();
+    let second = second_listener.local_addr().unwrap().port();
+    drop((first_listener, second_listener));
     (first.min(second), first.max(second))
 }

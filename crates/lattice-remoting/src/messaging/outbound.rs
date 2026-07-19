@@ -422,6 +422,15 @@ impl OutboundMessaging {
             .len()
     }
 
+    pub(crate) fn has_pending_for_association(&self, association_id: AssociationId) -> bool {
+        self.pending
+            .entries
+            .lock()
+            .expect("pending asks poisoned")
+            .values()
+            .any(|pending| pending.association_id == association_id)
+    }
+
     pub fn pending_correlations(&self) -> Vec<CorrelationId> {
         self.pending
             .entries

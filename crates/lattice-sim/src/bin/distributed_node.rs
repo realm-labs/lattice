@@ -154,6 +154,11 @@ struct MultiDomainLogicArtifact {
     domains: BTreeMap<String, String>,
     membership_version: Option<MembershipVersionArtifact>,
     members: Vec<MemberArtifact>,
+    join_millis: Option<u128>,
+    ring: Option<RingArtifact>,
+    resources: ProcessResourceArtifact,
+    associations: usize,
+    attached_lanes: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -167,6 +172,34 @@ struct MemberArtifact {
     node_id: String,
     incarnation: u128,
     status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RingArtifact {
+    peer_node_id: String,
+    request: u64,
+    reply: u64,
+    elapsed_millis: u128,
+    data_lanes_slept: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ProcessResourceArtifact {
+    resident_memory_kib: Option<u64>,
+    threads: Option<u64>,
+    open_file_descriptors: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LogicEvidence {
+    join_millis: Option<u128>,
+    ring: Option<RingArtifact>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ScaleActorArtifact {
+    node_id: String,
+    reference: ActorRef<FixtureProtocol>,
 }
 
 #[derive(Debug, Clone, lattice_actor::Request)]

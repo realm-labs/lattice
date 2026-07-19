@@ -31,7 +31,7 @@ use crate::{
         LaneAttachment, LaneKind,
     },
     bootstrap::{
-        AcceptBootstrap, BootstrapError, BootstrapHandler, BootstrapProbeTarget,
+        AcceptBootstrap, BootstrapError, BootstrapHandler, BootstrapProbeTarget, BootstrapPurpose,
         BootstrapRejectionCode, BootstrapRequest, BootstrapResponse, BootstrapResult,
         BootstrapRoute,
     },
@@ -48,6 +48,8 @@ use crate::{
     },
     wire::{Frame, FrameCodec, FrameKind, WireError},
 };
+
+mod reverse_dial;
 
 pub struct RemotingEndpoint {
     local: NodeIdentity,
@@ -210,6 +212,13 @@ impl RemotingEndpoint {
         &self.local
     }
 
+    pub fn open_connection_count(&self) -> usize {
+        self.config
+            .required_socket_budget()
+            .saturating_sub(1)
+            .saturating_sub(self.connections.available_permits())
+    }
+
     pub fn install_bootstrap_handler(&self, handler: Arc<dyn BootstrapHandler>) {
         *self
             .bootstrap_handler
@@ -229,20 +238,24 @@ impl RemotingEndpoint {
         peer: NodeIdentity,
     ) -> Result<Arc<Association>, EndpointError> {
         let _connection_guard = self.connect_lock.lock().await;
+        if let Some(association) =
+            self.associations
+                .get_exact(&peer.cluster_id, &peer.address, peer.incarnation)
+            && association.state() == AssociationState::Active
+        {
+            return Ok(association);
+        }
         if !self
             .associations
             .should_dial(&peer.address, peer.incarnation)
         {
-            return Err(EndpointError::WrongDialDirection);
+            return self.request_reverse_peer(peer).await;
         }
         let association = self.associations.get_or_create(
             peer.cluster_id.clone(),
             peer.address.clone(),
             peer.incarnation,
         )?;
-        if association.state() == AssociationState::Active {
-            return Ok(association);
-        }
         for lane in self.lanes() {
             if association.lane_receiver_available(lane) {
                 self.connect_lane(association.clone(), peer.clone(), lane)
@@ -293,20 +306,29 @@ impl RemotingEndpoint {
         &self,
         target: BootstrapProbeTarget,
     ) -> Result<BootstrapResponse, EndpointError> {
+        let request = BootstrapRequest::new(
+            target.scope,
+            self.local.clone(),
+            self.local.cluster_id.clone(),
+            target.expected_node_id,
+        );
+        self.probe_request_inner(target.address, target.tls_server_name, request)
+            .await
+    }
+
+    async fn probe_request_inner(
+        &self,
+        address: lattice_core::actor_ref::NodeAddress,
+        tls_server_name: Option<String>,
+        request: BootstrapRequest,
+    ) -> Result<BootstrapResponse, EndpointError> {
         let codec = FrameCodec::new(self.config.max_frame_size)?;
         let (mut connection, peer_certificate) = match &self.security {
             Some(security) => {
-                let server_name = target
-                    .tls_server_name
-                    .clone()
-                    .unwrap_or_else(|| security.server_name.clone());
-                let (connection, certificate) = connect_tls_candidate(
-                    &target.address,
-                    server_name,
-                    security.client.clone(),
-                    codec,
-                )
-                .await?;
+                let server_name = tls_server_name.unwrap_or_else(|| security.server_name.clone());
+                let (connection, certificate) =
+                    connect_tls_candidate(&address, server_name, security.client.clone(), codec)
+                        .await?;
                 (
                     FramedConnection::new(
                         EndpointStream::TlsClient(connection.into_inner()),
@@ -317,18 +339,12 @@ impl RemotingEndpoint {
             }
             None => (
                 FramedConnection::new(
-                    EndpointStream::Plain(connect_tcp(&target.address, codec).await?.into_inner()),
+                    EndpointStream::Plain(connect_tcp(&address, codec).await?.into_inner()),
                     FrameCodec::new(self.config.max_frame_size)?,
                 ),
                 None,
             ),
         };
-        let request = BootstrapRequest::new(
-            target.scope,
-            self.local.clone(),
-            self.local.cluster_id.clone(),
-            target.expected_node_id,
-        );
         connection.write_frame(&request.to_frame()).await?;
         connection.flush().await?;
         let response = BootstrapResponse::from_frame(&connection.read_frame().await?)?;
@@ -397,8 +413,9 @@ impl RemotingEndpoint {
             .ok_or(EndpointError::LaneAlreadyRunning(lane))?;
         let endpoint = self.clone();
         let mut shutdown = self.shutdown_tx.subscribe();
+        let mut disconnect = self.disconnect_tx.subscribe();
         self.spawn(async move {
-            let _permit = permit;
+            let mut connection_permit = Some(permit);
             let mut current = Some((stream, nonce));
             let mut backoff = endpoint.config.reconnect_backoff_min;
             loop {
@@ -419,6 +436,23 @@ impl RemotingEndpoint {
                 if matches!(result, Ok(LaneExit::QueueClosed)) {
                     return Ok(());
                 }
+                if matches!(result, Ok(LaneExit::Idle)) && lane != LaneKind::Control {
+                    connection_permit.take();
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return Ok(());
+                            }
+                        }
+                        () = wait_for_disconnect(&mut disconnect, association.id()) => {
+                            if matches!(association.state(), AssociationState::Closing | AssociationState::Closed) {
+                                return Ok(());
+                            }
+                        }
+                        () = association.wait_for_lane_wake(lane) => {}
+                    }
+                    backoff = endpoint.config.reconnect_backoff_min;
+                }
                 loop {
                     tokio::select! {
                         changed = shutdown.changed() => {
@@ -428,6 +462,16 @@ impl RemotingEndpoint {
                         }
                         () = tokio::time::sleep(backoff) => {}
                     }
+                    let acquired_for_attempt = connection_permit.is_none();
+                    if acquired_for_attempt {
+                        let Ok(permit) = endpoint.connections.clone().try_acquire_owned() else {
+                            backoff = backoff
+                                .saturating_mul(2)
+                                .min(endpoint.config.reconnect_backoff_max);
+                            continue;
+                        };
+                        connection_permit = Some(permit);
+                    }
                     match endpoint.open_outbound_lane(&association, &peer, lane).await {
                         Ok(connection) => {
                             current = Some(connection);
@@ -435,6 +479,9 @@ impl RemotingEndpoint {
                             break;
                         }
                         Err(_) => {
+                            if acquired_for_attempt {
+                                connection_permit.take();
+                            }
                             backoff = backoff
                                 .saturating_mul(2)
                                 .min(endpoint.config.reconnect_backoff_max);
@@ -680,6 +727,23 @@ impl RemotingEndpoint {
     }
 
     fn bootstrap_response(&self, request: &BootstrapRequest) -> BootstrapResponse {
+        if request.purpose == BootstrapPurpose::DirectPeer {
+            let result = if self
+                .associations
+                .should_dial(&request.local.address, request.local.incarnation)
+            {
+                BootstrapResult::ReverseDial {
+                    remote: self.local.clone(),
+                    leader: None,
+                }
+            } else {
+                BootstrapResult::Identity {
+                    remote: self.local.clone(),
+                    leader: None,
+                }
+            };
+            return BootstrapResponse::new(request.nonce, result);
+        }
         let route = self
             .bootstrap_handler
             .read()
@@ -825,6 +889,8 @@ pub enum EndpointError {
     Lane(#[from] LaneError),
     #[error("only the stable lower node identity may dial")]
     WrongDialDirection,
+    #[error("the authoritative peer rejected a reverse-dial request")]
+    ReverseDialRejected,
     #[error("association connection cap reached")]
     ConnectionLimit,
     #[error("association connection timed out")]
@@ -861,6 +927,10 @@ async fn wait_for_disconnect(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "endpoint/idle_tests.rs"]
+mod idle_tests;
 
 #[cfg(test)]
 mod tests {

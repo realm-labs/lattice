@@ -88,6 +88,27 @@ pub(super) struct ScaleNodeArtifact {
     pub domains: BTreeMap<String, String>,
     pub membership_version: Option<MembershipVersionArtifact>,
     pub members: Vec<MemberArtifact>,
+    pub join_millis: Option<u128>,
+    pub ring: Option<RingArtifact>,
+    pub resources: ProcessResourceArtifact,
+    pub associations: usize,
+    pub attached_lanes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct RingArtifact {
+    pub peer_node_id: String,
+    pub request: u64,
+    pub reply: u64,
+    pub elapsed_millis: u128,
+    pub data_lanes_slept: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct ProcessResourceArtifact {
+    pub resident_memory_kib: Option<u64>,
+    pub threads: Option<u64>,
+    pub open_file_descriptors: Option<usize>,
 }
 
 pub(super) fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {

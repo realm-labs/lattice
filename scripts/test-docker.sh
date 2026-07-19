@@ -62,12 +62,26 @@ case "$profile" in
   scale)
     service=runner-scale
     LATTICE_SCALE_EXPECTED_MEMBERS=${LATTICE_SCALE_EXPECTED_MEMBERS:-64}
+    LATTICE_SCALE_STARTUP_WINDOW_SECONDS=${LATTICE_SCALE_STARTUP_WINDOW_SECONDS:-0}
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --startup-window)
+          [ "$#" -ge 2 ] || { echo "missing value for --startup-window" >&2; exit 2; }
+          LATTICE_SCALE_STARTUP_WINDOW_SECONDS=$2
+          shift 2
+          ;;
+        *) echo "unknown scale option: $1" >&2; exit 2 ;;
+      esac
+    done
     case "$LATTICE_SCALE_EXPECTED_MEMBERS" in
       ''|*[!0-9]*) echo "invalid scale member count: $LATTICE_SCALE_EXPECTED_MEMBERS" >&2; exit 2 ;;
     esac
+    case "$LATTICE_SCALE_STARTUP_WINDOW_SECONDS" in
+      ''|*[!0-9]*) echo "invalid scale startup window: $LATTICE_SCALE_STARTUP_WINDOW_SECONDS" >&2; exit 2 ;;
+    esac
     [ "$LATTICE_SCALE_EXPECTED_MEMBERS" -gt 0 ] || { echo "scale needs at least one member" >&2; exit 2; }
     LATTICE_SCALE_LOGIC_NODES=$LATTICE_SCALE_EXPECTED_MEMBERS
-    export LATTICE_SCALE_EXPECTED_MEMBERS LATTICE_SCALE_LOGIC_NODES
+    export LATTICE_SCALE_EXPECTED_MEMBERS LATTICE_SCALE_LOGIC_NODES LATTICE_SCALE_STARTUP_WINDOW_SECONDS
     ;;
   soak)
     service=runner-soak

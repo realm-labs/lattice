@@ -21,6 +21,7 @@ pub struct BootstrapProbeTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapRequest {
+    pub purpose: BootstrapPurpose,
     pub scope: CoordinatorScope,
     pub local: NodeIdentity,
     pub requested_cluster_id: ClusterId,
@@ -40,6 +41,7 @@ impl BootstrapRequest {
     ) -> Self {
         let nonce = uuid::Uuid::new_v4().as_u128().max(1);
         Self {
+            purpose: BootstrapPurpose::CoordinatorDiscovery,
             scope,
             local,
             requested_cluster_id,
@@ -49,6 +51,18 @@ impl BootstrapRequest {
             features: FeatureBits::REQUIRED_V2,
             nonce,
         }
+    }
+
+    pub fn direct_peer(local: NodeIdentity, expected: &NodeIdentity) -> Self {
+        let requested_cluster_id = local.cluster_id.clone();
+        let mut request = Self::new(
+            CoordinatorScope::Membership,
+            local,
+            requested_cluster_id,
+            Some(expected.node_id.clone()),
+        );
+        request.purpose = BootstrapPurpose::DirectPeer;
+        request
     }
 
     pub fn to_frame(&self) -> Frame {
@@ -90,8 +104,18 @@ impl BootstrapRequest {
         {
             return Some(BootstrapRejectionCode::ExpectedNodeMismatch);
         }
+        if self.purpose == BootstrapPurpose::DirectPeer && self.expected_node_id.is_none() {
+            return Some(BootstrapRejectionCode::InvalidIdentity);
+        }
         None
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enumeration)]
+#[repr(i32)]
+pub enum BootstrapPurpose {
+    CoordinatorDiscovery = 0,
+    DirectPeer = 1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +308,8 @@ struct BootstrapRequestWire {
     scope_kind: u32,
     #[prost(string, tag = "9")]
     placement_domain: String,
+    #[prost(enumeration = "BootstrapPurpose", tag = "10")]
+    purpose: i32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -360,6 +386,7 @@ impl From<&BootstrapRequest> for BootstrapRequestWire {
             nonce: value.nonce.to_be_bytes().to_vec(),
             scope_kind: scope_kind(&value.scope),
             placement_domain: scope_domain(&value.scope),
+            purpose: value.purpose as i32,
         }
     }
 }
@@ -369,6 +396,8 @@ impl TryFrom<BootstrapRequestWire> for BootstrapRequest {
 
     fn try_from(value: BootstrapRequestWire) -> Result<Self, Self::Error> {
         Ok(Self {
+            purpose: BootstrapPurpose::try_from(value.purpose)
+                .map_err(|_| BootstrapError::InvalidIdentity)?,
             scope: decode_scope(value.scope_kind, value.placement_domain)?,
             local: value
                 .local
