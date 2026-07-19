@@ -12,10 +12,16 @@ pub enum SenderIdentity {
 }
 
 impl SenderIdentity {
-    pub(super) fn stable_bytes(&self) -> Vec<u8> {
+    pub(super) fn update_route_hash(&self, hasher: &mut blake3::Hasher) {
         match self {
-            Self::Actor(reference) => ExactActorTarget::from(reference).stable_bytes(),
-            Self::Process(value) => value.to_be_bytes().to_vec(),
+            Self::Actor(reference) => {
+                hasher.update(b"actor-sender");
+                update_actor_route_hash(hasher, reference);
+            }
+            Self::Process(value) => {
+                hasher.update(b"process-sender");
+                hasher.update(&value.to_be_bytes());
+            }
         }
     }
 
@@ -57,18 +63,6 @@ impl<A: ProtocolTag> From<&ActorRef<A>> for ExactActorTarget {
 }
 
 impl ExactActorTarget {
-    pub(super) fn stable_bytes(&self) -> Vec<u8> {
-        format!(
-            "{}:{}:{}:{}:{}",
-            self.node_address,
-            self.node_incarnation.get(),
-            self.actor_path,
-            self.activation_id.local_sequence(),
-            self.protocol_id.get()
-        )
-        .into_bytes()
-    }
-
     pub fn actor_ref<A: ProtocolTag>(&self) -> Result<ActorRef<A>, ReferenceError> {
         ActorRef::new(
             self.cluster_id.clone(),
@@ -125,6 +119,29 @@ impl CorrelationId {
     }
 }
 
+pub(super) fn update_actor_route_hash<A: ProtocolTag>(
+    hasher: &mut blake3::Hasher,
+    target: &ActorRef<A>,
+) {
+    hasher.update(b"exact-actor-target");
+    update_route_bytes(hasher, target.cluster_id().as_str().as_bytes());
+    update_route_bytes(hasher, target.node_address().host().as_bytes());
+    hasher.update(&target.node_address().port().to_be_bytes());
+    hasher.update(&target.node_incarnation().get().to_be_bytes());
+    let segments = target.actor_path().segments();
+    hasher.update(&(segments.len() as u64).to_be_bytes());
+    for segment in segments {
+        update_route_bytes(hasher, segment.as_bytes());
+    }
+    hasher.update(&target.activation_id().local_sequence().to_be_bytes());
+    hasher.update(&target.protocol_id().get().to_be_bytes());
+}
+
+fn update_route_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundTell {
     pub sender: Option<ActorRef>,
@@ -150,12 +167,39 @@ pub struct LogicalEntityTarget {
     pub assignment_generation: u64,
 }
 
+impl LogicalEntityTarget {
+    pub(super) fn update_route_hash(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(b"logical-entity-target");
+        update_route_bytes(hasher, self.reference.cluster_id().as_str().as_bytes());
+        update_route_bytes(hasher, self.reference.domain().as_str().as_bytes());
+        update_route_bytes(hasher, self.reference.entity_type().as_str().as_bytes());
+        update_route_bytes(hasher, self.reference.entity_id().as_bytes());
+        update_route_bytes(hasher, self.owner_address.host().as_bytes());
+        hasher.update(&self.owner_address.port().to_be_bytes());
+        hasher.update(&self.owner_incarnation.get().to_be_bytes());
+        hasher.update(&self.assignment_generation.to_be_bytes());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalSingletonTarget {
     pub reference: SingletonRef,
     pub owner_address: NodeAddress,
     pub owner_incarnation: NodeIncarnation,
     pub assignment_generation: u64,
+}
+
+impl LogicalSingletonTarget {
+    pub(super) fn update_route_hash(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(b"logical-singleton-target");
+        update_route_bytes(hasher, self.reference.cluster_id().as_str().as_bytes());
+        update_route_bytes(hasher, self.reference.domain().as_str().as_bytes());
+        update_route_bytes(hasher, self.reference.singleton_kind().as_str().as_bytes());
+        update_route_bytes(hasher, self.owner_address.host().as_bytes());
+        hasher.update(&self.owner_address.port().to_be_bytes());
+        hasher.update(&self.owner_incarnation.get().to_be_bytes());
+        hasher.update(&self.assignment_generation.to_be_bytes());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

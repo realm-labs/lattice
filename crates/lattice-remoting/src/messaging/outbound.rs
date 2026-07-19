@@ -12,8 +12,8 @@ use super::{
     error::{AskError, RemoteMessageError, TellError},
     oneshot,
     target::{
-        CorrelationId, ExactActorTarget, LogicalEntityTarget, LogicalSingletonTarget,
-        SenderIdentity,
+        CorrelationId, LogicalEntityTarget, LogicalSingletonTarget, SenderIdentity,
+        update_actor_route_hash,
     },
 };
 
@@ -87,22 +87,18 @@ impl OutboundMessaging {
             message.expected_fingerprint,
         )
         .map_err(TellError::Protocol)?;
-        let target = ExactActorTarget::from(target);
-        let sender_bytes = sender.stable_bytes();
-        let target_bytes = target.stable_bytes();
         let wire = TellWire {
-            sender: sender_bytes.clone(),
-            target: Some(target_to_wire(&target)),
+            target: Some(target_to_wire(target)),
             message_id: message.message_id,
-            payload: message.payload.to_vec(),
-            sender_actor: sender
-                .actor_ref()
-                .map(|reference| target_to_wire(&ExactActorTarget::from(reference))),
+            payload: message.payload,
+            sender_actor: sender.actor_ref().map(target_to_wire),
         };
         association
             .try_admit_bulk(
-                &sender_bytes,
-                &target_bytes,
+                |hasher| {
+                    sender.update_route_hash(hasher);
+                    update_actor_route_hash(hasher, target);
+                },
                 Frame::encode_message(FrameKind::Tell, &wire),
             )
             .map_err(TellError::Association)
@@ -121,22 +117,19 @@ impl OutboundMessaging {
             message.expected_fingerprint,
         )
         .map_err(TellError::Protocol)?;
-        let sender_bytes = sender.stable_bytes();
-        let recipient_bytes = entity_logical_bytes(&target);
         association
             .try_admit_bulk(
-                &sender_bytes,
-                &recipient_bytes,
+                |hasher| {
+                    sender.update_route_hash(hasher);
+                    target.update_route_hash(hasher);
+                },
                 Frame::encode_message(
                     FrameKind::EntityTell,
                     &EntityTellWire {
-                        sender: sender_bytes.clone(),
                         target: Some(entity_target_to_wire(&target)),
                         message_id: message.message_id,
-                        payload: message.payload.to_vec(),
-                        sender_actor: sender
-                            .actor_ref()
-                            .map(|reference| target_to_wire(&ExactActorTarget::from(reference))),
+                        payload: message.payload,
+                        sender_actor: sender.actor_ref().map(target_to_wire),
                     },
                 ),
             )
@@ -156,22 +149,19 @@ impl OutboundMessaging {
             message.expected_fingerprint,
         )
         .map_err(TellError::Protocol)?;
-        let sender_bytes = sender.stable_bytes();
-        let recipient_bytes = singleton_logical_bytes(&target);
         association
             .try_admit_bulk(
-                &sender_bytes,
-                &recipient_bytes,
+                |hasher| {
+                    sender.update_route_hash(hasher);
+                    target.update_route_hash(hasher);
+                },
                 Frame::encode_message(
                     FrameKind::SingletonTell,
                     &SingletonTellWire {
-                        sender: sender_bytes.clone(),
                         target: Some(singleton_target_to_wire(&target)),
                         message_id: message.message_id,
-                        payload: message.payload.to_vec(),
-                        sender_actor: sender
-                            .actor_ref()
-                            .map(|reference| target_to_wire(&ExactActorTarget::from(reference))),
+                        payload: message.payload,
+                        sender_actor: sender.actor_ref().map(target_to_wire),
                     },
                 ),
             )
@@ -181,7 +171,7 @@ impl OutboundMessaging {
     pub async fn ask<A: ProtocolTag>(
         &self,
         association: &Association,
-        sender: &SenderIdentity,
+        _sender: &SenderIdentity,
         target: &ActorRef<A>,
         message: OutboundMessage,
         deadline: Instant,
@@ -218,12 +208,11 @@ impl OutboundMessaging {
             armed: true,
         };
         let wire = AskWire {
-            sender: sender.stable_bytes(),
-            target: Some(target_to_wire(&ExactActorTarget::from(target))),
-            correlation_id: correlation.to_bytes().to_vec(),
+            target: Some(target_to_wire(target)),
+            correlation_id: Bytes::copy_from_slice(&correlation.to_bytes()),
             timeout_nanos: duration_nanos(remaining),
             message_id: message.message_id,
-            payload: message.payload.to_vec(),
+            payload: message.payload,
         };
         association
             .try_admit_interactive(Frame::encode_message(FrameKind::Ask, &wire))
@@ -241,7 +230,7 @@ impl OutboundMessaging {
     pub async fn ask_entity(
         &self,
         association: &Association,
-        sender: &SenderIdentity,
+        _sender: &SenderIdentity,
         target: LogicalEntityTarget,
         message: OutboundMessage,
         deadline: Instant,
@@ -261,12 +250,11 @@ impl OutboundMessaging {
             Frame::encode_message(
                 FrameKind::EntityAsk,
                 &EntityAskWire {
-                    sender: sender.stable_bytes(),
                     target: Some(entity_target_to_wire(&target)),
-                    correlation_id: Vec::new(),
+                    correlation_id: Bytes::new(),
                     timeout_nanos: duration_nanos(remaining),
                     message_id: message.message_id,
-                    payload: message.payload.to_vec(),
+                    payload: message.payload,
                 },
             ),
         )
@@ -276,7 +264,7 @@ impl OutboundMessaging {
     pub async fn ask_singleton(
         &self,
         association: &Association,
-        sender: &SenderIdentity,
+        _sender: &SenderIdentity,
         target: LogicalSingletonTarget,
         message: OutboundMessage,
         deadline: Instant,
@@ -296,12 +284,11 @@ impl OutboundMessaging {
             Frame::encode_message(
                 FrameKind::SingletonAsk,
                 &SingletonAskWire {
-                    sender: sender.stable_bytes(),
                     target: Some(singleton_target_to_wire(&target)),
-                    correlation_id: Vec::new(),
+                    correlation_id: Bytes::new(),
                     timeout_nanos: duration_nanos(remaining),
                     message_id: message.message_id,
-                    payload: message.payload.to_vec(),
+                    payload: message.payload,
                 },
             ),
         )
@@ -536,23 +523,4 @@ fn rewrite_timeout_budget(frame: &mut Frame, timeout_nanos: u64) -> bool {
         }
         _ => false,
     }
-}
-
-fn entity_logical_bytes(target: &LogicalEntityTarget) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(target.reference.domain().as_str().as_bytes());
-    bytes.extend_from_slice(target.reference.entity_type().as_str().as_bytes());
-    bytes.extend_from_slice(target.reference.entity_id().as_bytes());
-    bytes.extend_from_slice(&target.owner_incarnation.get().to_be_bytes());
-    bytes.extend_from_slice(&target.assignment_generation.to_be_bytes());
-    bytes
-}
-
-fn singleton_logical_bytes(target: &LogicalSingletonTarget) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(target.reference.domain().as_str().as_bytes());
-    bytes.extend_from_slice(target.reference.singleton_kind().as_str().as_bytes());
-    bytes.extend_from_slice(&target.owner_incarnation.get().to_be_bytes());
-    bytes.extend_from_slice(&target.assignment_generation.to_be_bytes());
-    bytes
 }

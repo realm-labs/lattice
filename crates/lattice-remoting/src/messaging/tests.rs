@@ -131,15 +131,13 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
     });
     let stream = TcpStream::connect(address).await.unwrap();
     let mut client = FramedConnection::new(stream, FrameCodec::new(4096).unwrap());
-    let exact = ExactActorTarget::from(&actor_ref);
     client
         .write_frame(&Frame::encode_message(
             FrameKind::Tell,
             &TellWire {
-                sender: 9_u128.to_be_bytes().to_vec(),
-                target: Some(target_to_wire(&exact)),
+                target: Some(target_to_wire(&actor_ref)),
                 message_id: 1,
-                payload: b"tell".to_vec(),
+                payload: Bytes::from_static(b"tell"),
                 sender_actor: None,
             },
         ))
@@ -150,12 +148,11 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
         .write_frame(&Frame::encode_message(
             FrameKind::Ask,
             &AskWire {
-                sender: 9_u128.to_be_bytes().to_vec(),
-                target: Some(target_to_wire(&exact)),
-                correlation_id: correlation.to_bytes().to_vec(),
+                target: Some(target_to_wire(&actor_ref)),
+                correlation_id: Bytes::copy_from_slice(&correlation.to_bytes()),
                 timeout_nanos: Duration::from_secs(1).as_nanos() as u64,
                 message_id: 2,
-                payload: b"ask".to_vec(),
+                payload: Bytes::from_static(b"ask"),
             },
         ))
         .await
@@ -170,12 +167,11 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
         .write_frame(&Frame::encode_message(
             FrameKind::Ask,
             &AskWire {
-                sender: 9_u128.to_be_bytes().to_vec(),
-                target: Some(target_to_wire(&exact)),
-                correlation_id: panic_correlation.to_bytes().to_vec(),
+                target: Some(target_to_wire(&actor_ref)),
+                correlation_id: Bytes::copy_from_slice(&panic_correlation.to_bytes()),
                 timeout_nanos: Duration::from_secs(1).as_nanos() as u64,
                 message_id: 2,
-                payload: b"panic".to_vec(),
+                payload: Bytes::from_static(b"panic"),
             },
         ))
         .await
@@ -212,13 +208,7 @@ async fn outbound_tell_preserves_an_exact_actor_sender() {
     )
     .unwrap();
     let sender_identity = SenderIdentity::from(&sender);
-    let stripe = crate::association::stable_stripe(
-        &sender_identity.stable_bytes(),
-        &ExactActorTarget::from(&recipient).stable_bytes(),
-        receivers.bulk.len(),
-    );
-
-    messaging
+    let stripe = messaging
         .tell(
             &association,
             &sender_identity,

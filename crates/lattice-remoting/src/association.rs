@@ -463,14 +463,22 @@ impl Association {
         self.try_admit(&self.interactive, frame)
     }
 
-    pub fn try_admit_bulk(
+    pub(crate) fn try_admit_bulk<F>(
         &self,
-        sender_identity: &[u8],
-        recipient_identity: &[u8],
+        update_route_hash: F,
         frame: Frame,
-    ) -> Result<usize, AssociationError> {
+    ) -> Result<usize, AssociationError>
+    where
+        F: FnOnce(&mut blake3::Hasher),
+    {
         self.ensure_active()?;
-        let stripe = stable_stripe(sender_identity, recipient_identity, self.bulk.len());
+        let stripe = if self.bulk.len() == 1 {
+            0
+        } else {
+            let mut hasher = blake3::Hasher::new();
+            update_route_hash(&mut hasher);
+            stripe_from_hash(&hasher.finalize(), self.bulk.len())
+        };
         self.prepare_data_lane(LaneKind::Bulk(stripe as u8))?;
         self.try_admit(&self.bulk[stripe], frame)?;
         Ok(stripe)
@@ -786,15 +794,10 @@ impl AssociationManager {
     }
 }
 
-pub fn stable_stripe(sender: &[u8], recipient: &[u8], stripes: usize) -> usize {
+fn stripe_from_hash(hash: &blake3::Hash, stripes: usize) -> usize {
     debug_assert!(stripes > 0);
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&(sender.len() as u64).to_be_bytes());
-    hasher.update(sender);
-    hasher.update(&(recipient.len() as u64).to_be_bytes());
-    hasher.update(recipient);
     let mut prefix = [0_u8; 8];
-    prefix.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    prefix.copy_from_slice(&hash.as_bytes()[..8]);
     (u64::from_be_bytes(prefix) as usize) % stripes
 }
 
@@ -915,6 +918,37 @@ mod tests {
                 payload: bytes::Bytes::new(),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn single_bulk_stripe_skips_route_hashing() {
+        let association = Association::new(key(), RemotingConfig::default()).unwrap();
+        for (lane, nonce) in [
+            (LaneKind::Control, 1),
+            (LaneKind::Interactive, 2),
+            (LaneKind::Bulk(0), 3),
+        ] {
+            association
+                .attach(LaneAttachment {
+                    association_id: association.id(),
+                    key: key(),
+                    lane,
+                    connection_nonce: nonce,
+                })
+                .unwrap();
+        }
+
+        let stripe = association
+            .try_admit_bulk(
+                |_| panic!("single-stripe admission must not hash the route"),
+                Frame {
+                    kind: FrameKind::Tell,
+                    payload: bytes::Bytes::from_static(b"message"),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(stripe, 0);
     }
 
     #[test]
