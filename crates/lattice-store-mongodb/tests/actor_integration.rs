@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
-use lattice_actor::error::ActorError;
+use lattice_actor::error::{ActorError, ActorStopError};
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::runtime::spawn_actor;
-use lattice_actor::traits::{Actor, Handler, StopReason};
+use lattice_actor::traits::{Actor, ActorLifecycleState, Handler, StopReason};
 use lattice_store_mongodb::document::LoadedDocument;
 use lattice_store_mongodb::document::tracked::Tracked;
 use lattice_store_mongodb::error::MongoStoreError;
@@ -15,6 +16,7 @@ use lattice_store_mongodb::persistence::actor::{
     CompletionStatus, MongoFlushCompleted, PersistenceStatus,
 };
 use lattice_store_mongodb::persistence::coordinator::MongoPersistenceCoordinator;
+use lattice_store_mongodb::persistence::coordinator::drain::{MongoDrainOptions, MongoDrainReport};
 use lattice_store_mongodb::persistence::request::{
     DocumentWriteOutcome, FlushGeneration, FlushOutcome, PreparedDocumentWrite, PreparedWriteStore,
 };
@@ -82,6 +84,43 @@ impl PreparedWriteStore for BlockingStore {
         let _drop_signal = DropSignal(self.dropped.clone());
         self.entered.add_permits(1);
         std::future::pending().await
+    }
+}
+
+#[derive(Clone)]
+struct BlockingThenAcknowledgingStore {
+    attempts: Arc<AtomicUsize>,
+    entered: Arc<Semaphore>,
+    dropped: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl PreparedWriteStore for BlockingThenAcknowledgingStore {
+    async fn flush(
+        &self,
+        writes: Vec<PreparedDocumentWrite>,
+    ) -> Result<FlushOutcome, MongoStoreError> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            let _drop_signal = DropSignal(self.dropped.clone());
+            self.entered.add_permits(1);
+            std::future::pending().await
+        } else {
+            Ok(FlushOutcome {
+                documents: writes
+                    .into_iter()
+                    .map(|write| {
+                        (
+                            write.token,
+                            DocumentWriteOutcome::Applied {
+                                previous_version: write.expected_version,
+                                new_version: write.expected_version + 1,
+                                updated_at_ms: 101,
+                            },
+                        )
+                    })
+                    .collect(),
+            })
+        }
     }
 }
 
@@ -214,6 +253,98 @@ fn actor(
         observed,
         signal,
         generation: None,
+    }
+}
+
+struct StoppingDrainActor {
+    coordinator: MongoPersistenceCoordinator,
+    document: Tracked<TestDocument>,
+    store: Arc<dyn PreparedWriteStore>,
+    report: Arc<Mutex<Option<MongoDrainReport>>>,
+    drained: Arc<Semaphore>,
+    drain_options: MongoDrainOptions,
+}
+
+#[async_trait]
+impl Actor for StoppingDrainActor {
+    type Error = ActorError;
+
+    async fn stopping(
+        &mut self,
+        _context: &mut ActorContext<Self>,
+        _reason: StopReason,
+    ) -> Result<(), ActorStopError> {
+        let report = self
+            .coordinator
+            .drain(self.store.as_ref(), self.drain_options, |preparation| {
+                preparation.scan_tracked(&self.document)
+            })
+            .await?;
+        *self.report.lock().expect("drain report mutex poisoned") = Some(report);
+        self.drained.add_permits(1);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<Persist> for StoppingDrainActor {
+    async fn handle(
+        &mut self,
+        context: &mut ActorContext<Self>,
+        _message: Persist,
+    ) -> Result<(), Self::Error> {
+        let prepared = self
+            .coordinator
+            .prepare(ScanBudget::generous(), |preparation| {
+                preparation.scan_tracked(&self.document)
+            })
+            .map_err(ActorError::from_error)?;
+        self.coordinator
+            .dispatch_prepared(context, self.store.clone(), prepared)
+            .map_err(ActorError::from_error)?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<MongoFlushCompleted> for StoppingDrainActor {
+    async fn handle(
+        &mut self,
+        _context: &mut ActorContext<Self>,
+        completion: MongoFlushCompleted,
+    ) -> Result<(), Self::Error> {
+        self.coordinator
+            .apply_completion(completion)
+            .map_err(ActorError::from_error)?;
+        Ok(())
+    }
+}
+
+fn stopping_drain_actor(
+    store: Arc<dyn PreparedWriteStore>,
+    report: Arc<Mutex<Option<MongoDrainReport>>>,
+    drained: Arc<Semaphore>,
+    drain_options: MongoDrainOptions,
+) -> StoppingDrainActor {
+    let mut coordinator = MongoPersistenceCoordinator::new(11);
+    let mut document = coordinator
+        .track_loaded(LoadedDocument {
+            version: 4,
+            updated_at_ms: 8,
+            value: TestDocument {
+                id: 42,
+                value: "old".to_owned(),
+            },
+        })
+        .expect("fixture document should attach");
+    document.write().value = "new".to_owned();
+    StoppingDrainActor {
+        coordinator,
+        document,
+        store,
+        report,
+        drained,
+        drain_options,
     }
 }
 
@@ -354,4 +485,126 @@ async fn aborting_in_flight_marks_unknown_and_cancels_pipe_task() {
         None,
         "aborting the pipe task must not synthesize a completion"
     );
+}
+
+#[tokio::test]
+async fn actor_stopping_replays_and_awaits_the_cancelled_in_flight_flush() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Semaphore::new(0));
+    let dropped = Arc::new(Semaphore::new(0));
+    let drained = Arc::new(Semaphore::new(0));
+    let report = Arc::new(Mutex::new(None));
+    let store = Arc::new(BlockingThenAcknowledgingStore {
+        attempts: attempts.clone(),
+        entered: entered.clone(),
+        dropped: dropped.clone(),
+    });
+    let handle = spawn_actor(
+        stopping_drain_actor(
+            store,
+            report.clone(),
+            drained.clone(),
+            MongoDrainOptions {
+                timeout: Duration::from_secs(2),
+                ..MongoDrainOptions::default()
+            },
+        ),
+        MailboxConfig::bounded(8),
+    );
+
+    handle.tell(Persist).await.expect("persist should enqueue");
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .expect("first flush should start")
+        .expect("entry signal should remain open")
+        .forget();
+    handle
+        .stop(StopReason::Requested)
+        .await
+        .expect("stop should enqueue");
+    tokio::time::timeout(Duration::from_secs(2), dropped.acquire())
+        .await
+        .expect("stopping should cancel the actor-dispatched flush")
+        .expect("drop signal should remain open")
+        .forget();
+    tokio::time::timeout(Duration::from_secs(2), drained.acquire())
+        .await
+        .expect("stopping should finish the direct drain")
+        .expect("drain signal should remain open")
+        .forget();
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let report = report
+        .lock()
+        .expect("drain report mutex poisoned")
+        .expect("drain report should be retained");
+    assert_eq!(report.recovered_in_flight, 1);
+    assert_eq!(report.flush_attempts, 1);
+    assert_eq!(report.persistence.applied, 1);
+}
+
+#[tokio::test]
+async fn retry_stop_resumes_a_timed_out_drain_without_losing_dirty_state() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Semaphore::new(0));
+    let dropped = Arc::new(Semaphore::new(0));
+    let drained = Arc::new(Semaphore::new(0));
+    let report = Arc::new(Mutex::new(None));
+    let store = Arc::new(BlockingThenAcknowledgingStore {
+        attempts: attempts.clone(),
+        entered: entered.clone(),
+        dropped: dropped.clone(),
+    });
+    let handle = spawn_actor(
+        stopping_drain_actor(
+            store,
+            report.clone(),
+            drained.clone(),
+            MongoDrainOptions {
+                timeout: Duration::from_millis(20),
+                ..MongoDrainOptions::default()
+            },
+        ),
+        MailboxConfig::bounded(8),
+    );
+    let mut lifecycle = handle.subscribe_lifecycle();
+
+    handle
+        .stop(StopReason::Requested)
+        .await
+        .expect("stop should enqueue");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while *lifecycle.borrow() != ActorLifecycleState::StopFailed {
+            lifecycle
+                .changed()
+                .await
+                .expect("actor should remain alive");
+        }
+    })
+    .await
+    .expect("timed out drain should enter StopFailed");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(
+        report
+            .lock()
+            .expect("drain report mutex poisoned")
+            .is_none()
+    );
+
+    handle
+        .retry_stop()
+        .await
+        .expect("retry_stop should replay retained work");
+    tokio::time::timeout(Duration::from_secs(2), drained.acquire())
+        .await
+        .expect("retry should finish the direct drain")
+        .expect("drain signal should remain open")
+        .forget();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let report = report
+        .lock()
+        .expect("drain report mutex poisoned")
+        .expect("successful retry should retain a report");
+    assert_eq!(report.recovered_in_flight, 1);
+    assert_eq!(report.persistence.applied, 1);
 }

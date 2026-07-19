@@ -15,6 +15,7 @@ impl<'a> MongoPreparation<'a> {
         documents: &'a BTreeMap<MongoDocumentKey, DocumentState>,
         generation: FlushGeneration,
         budget: ScanBudget,
+        continue_after_document_failures: bool,
     ) -> Self {
         Self {
             documents,
@@ -28,6 +29,7 @@ impl<'a> MongoPreparation<'a> {
             scans: 0,
             changed_paths: 0,
             scan_complete: true,
+            continue_after_document_failures,
         }
     }
 
@@ -69,7 +71,7 @@ impl<'a> MongoPreparation<'a> {
             .get(&key)
             .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
         if state.conflict.is_some() {
-            self.scan_complete = false;
+            self.scan_complete &= self.continue_after_document_failures;
             return Ok(());
         }
         if state
@@ -78,7 +80,7 @@ impl<'a> MongoPreparation<'a> {
             .or_else(|| self.rejections.get(&key))
             .is_some_and(|rejection| rejection.mutation_epoch == mutation_epoch)
         {
-            self.scan_complete = false;
+            self.scan_complete &= self.continue_after_document_failures;
             return Ok(());
         }
         let cursor = state.scan_cursor();
@@ -161,7 +163,7 @@ impl<'a> MongoPreparation<'a> {
     }
 
     fn reject(&mut self, key: MongoDocumentKey, mutation_epoch: Option<u64>, error: String) {
-        self.scan_complete = false;
+        self.scan_complete &= self.continue_after_document_failures;
         self.rejections.insert(
             key,
             DocumentRejection {

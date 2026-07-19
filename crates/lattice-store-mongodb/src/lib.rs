@@ -196,6 +196,39 @@
 //! [`persistence::actor::MongoFlushCompleted`] later calls `apply_completion`.
 //! The default retry policy starts at 50 ms, doubles, and caps at 2 seconds.
 //!
+//! Actor shutdown uses the mailbox-independent
+//! [`persistence::coordinator::MongoPersistenceCoordinator::drain_set`]
+//! instead. It directly awaits each store write and repeats bounded scan
+//! passes until every resident document is acknowledged:
+//!
+//! ```ignore
+//! async fn stopping(
+//!     &mut self,
+//!     _context: &mut ActorContext<Self>,
+//!     _reason: StopReason,
+//! ) -> Result<(), ActorStopError> {
+//!     self.persistence
+//!         .drain_set(
+//!             self.store.as_ref(),
+//!             &self.documents,
+//!             MongoDrainOptions::default(),
+//!         )
+//!         .await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! A drain takes over an actor-dispatched write that was cancelled as stopping
+//! began and replays its exact operation ID under a new generation. Timeout,
+//! conflict, or definitive rejection returns an error suitable for
+//! `ActorStopError`; Lattice then retains the actor in `StopFailed` so a later
+//! `retry_stop` can resume the same durable work. Already-unloaded clean lazy
+//! state is not loaded during shutdown. A conflict, encoding failure, or
+//! definitive rejection is isolated to its document during drain: all other
+//! resident documents continue through their remaining budgeted passes before
+//! one aggregated document-failure error is returned. That error retains the
+//! successful [`persistence::coordinator::drain::MongoDrainReport`].
+//!
 //! For data that does not need snapshot scanning, use
 //! [`persistence::direct::DirectDocumentStore`] for explicit whole-document
 //! insert, replace, and delete operations. Coordinated writes execute through

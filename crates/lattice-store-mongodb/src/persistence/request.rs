@@ -11,6 +11,13 @@ use super::types::{MongoDocumentKey, MongoFieldPath};
 
 #[async_trait::async_trait]
 pub trait PreparedWriteStore: Send + Sync + 'static {
+    /// Executes one prepared batch and returns exactly one outcome per token.
+    ///
+    /// The same logical write may be delivered more than once after an
+    /// ambiguous transport failure or an actor shutdown race. Implementations
+    /// must use `expected_version` and `operation_id` to reconcile exact
+    /// retries rather than apply the mutation twice. `MongoStore` implements
+    /// this contract using optimistic filters and `_lattice_write_id`.
     async fn flush(
         &self,
         writes: Vec<PreparedDocumentWrite>,
