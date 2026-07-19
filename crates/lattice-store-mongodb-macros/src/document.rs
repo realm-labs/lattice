@@ -115,6 +115,9 @@ fn is_document_id_field(field: &syn::Field) -> syn::Result<bool> {
                     let _ = meta.value()?.parse::<syn::Expr>()?;
                 }
                 Ok(())
+            } else if meta.path.is_ident("adapter") {
+                let _ = meta.value()?.parse::<syn::Path>()?;
+                Ok(())
             } else {
                 Err(meta.error("unsupported Mongo document field option"))
             }

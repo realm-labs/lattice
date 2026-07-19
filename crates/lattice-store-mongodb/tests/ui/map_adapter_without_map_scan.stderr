@@ -1,0 +1,5 @@
+error: #[mongo(adapter = ...)] requires #[mongo(scan = "map")]
+  --> tests/ui/map_adapter_without_map_scan.rs:12:5
+   |
+12 |     values: std::collections::BTreeMap<String, i32>,
+   |     ^^^^^^

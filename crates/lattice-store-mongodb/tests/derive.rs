@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use lattice_store_mongodb::document::set::{MongoDocumentCollection, MongoDocumentSet};
 use lattice_store_mongodb::document::tracked::Tracked;
@@ -12,11 +14,101 @@ use lattice_store_mongodb::loading::table::{MongoLazyTable, MongoTableSpec, Mong
 use lattice_store_mongodb::persistence::coordinator::{
     MongoPersistenceCoordinator, PersistenceError,
 };
-use lattice_store_mongodb::scan::{FieldChange, MongoScan as _, ScanBudget, ScanCursor};
+use lattice_store_mongodb::scan::{
+    FieldChange, MongoMapScanAdapter, MongoScan as _, ScanBudget, ScanCursor, ScanError,
+};
 use lattice_store_mongodb::store::MongoStore;
 use lattice_store_mongodb::{MongoDocument, MongoDocumentSet, MongoScan};
-use mongodb::bson::{doc, to_bson};
+use mongodb::bson::{Bson, doc, to_bson};
 use serde::{Deserialize, Serialize};
+
+static MAP_CONTAINER_SERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+static CUSTOM_MAP_SERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+static DEFERRED_VALUE_SERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct CountingMap(BTreeMap<String, i32>);
+
+impl Serialize for CountingMap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        MAP_CONTAINER_SERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'a> IntoIterator for &'a CountingMap {
+    type Item = (&'a String, &'a i32);
+    type IntoIter = std::collections::btree_map::Iter<'a, String, i32>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct DeferredValue(i32);
+
+impl Serialize for DeferredValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        DEFERRED_VALUE_SERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+        self.0.serialize(serializer)
+    }
+}
+
+mod prefixed_string_map {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::CUSTOM_MAP_SERIALIZATIONS;
+
+    pub fn serialize<S>(value: &BTreeMap<String, i32>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        CUSTOM_MAP_SERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+        value
+            .iter()
+            .map(|(key, value)| (format!("key_{key}"), value.to_string()))
+            .collect::<BTreeMap<_, _>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<String, i32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        BTreeMap::<String, String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(key, value)| {
+                let key = key.strip_prefix("key_").ok_or_else(|| {
+                    serde::de::Error::custom("custom map key is missing the key_ prefix")
+                })?;
+                let value = value.parse().map_err(serde::de::Error::custom)?;
+                Ok((key.to_owned(), value))
+            })
+            .collect()
+    }
+}
+
+struct PrefixedStringMapAdapter;
+
+impl MongoMapScanAdapter<String, i32> for PrefixedStringMapAdapter {
+    fn encode_key(key: &String) -> Result<String, ScanError> {
+        Ok(format!("key_{key}"))
+    }
+
+    fn encode_value(value: &i32) -> Result<Bson, ScanError> {
+        Ok(Bson::String(value.to_string()))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, MongoDocument, MongoScan)]
 #[mongo(collection = "macro_docs")]
@@ -106,6 +198,34 @@ struct UnsafePathKeyDoc {
     id: u64,
     #[mongo(scan = "map")]
     values: HashMap<String, i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, MongoDocument, MongoScan)]
+#[mongo(collection = "streaming_map_docs")]
+struct StreamingMapDoc {
+    #[mongo(id)]
+    id: u64,
+    #[mongo(scan = "map")]
+    values: CountingMap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, MongoDocument, MongoScan)]
+#[mongo(collection = "field_budget_docs")]
+struct FieldBudgetDoc {
+    #[mongo(id)]
+    id: u64,
+    first: i32,
+    deferred: DeferredValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, MongoDocument, MongoScan)]
+#[mongo(collection = "custom_map_adapter_docs")]
+struct CustomMapAdapterDoc {
+    #[mongo(id)]
+    id: u64,
+    #[serde(with = "prefixed_string_map")]
+    #[mongo(scan = "map", adapter = PrefixedStringMapAdapter)]
+    values: BTreeMap<String, i32>,
 }
 
 #[derive(Debug, MongoDocumentSet)]
@@ -435,6 +555,135 @@ fn explicit_map_scan_rejects_unencoded_mongodb_path_keys() {
         error,
         lattice_store_mongodb::scan::ScanError::InvalidMapKey(key) if key == "a.b"
     ));
+}
+
+#[test]
+fn map_scan_encodes_entries_without_serializing_the_map_container() {
+    MAP_CONTAINER_SERIALIZATIONS.store(0, Ordering::Relaxed);
+    let mut value = StreamingMapDoc {
+        id: 42,
+        values: CountingMap(BTreeMap::from([
+            ("one".to_owned(), 1),
+            ("two".to_owned(), 2),
+        ])),
+    };
+    let baseline = value.capture().expect("streaming map should capture");
+    assert_eq!(MAP_CONTAINER_SERIALIZATIONS.load(Ordering::Relaxed), 0);
+
+    value.values.0.insert("one".to_owned(), 10);
+    value.values.0.remove("two");
+    value.values.0.insert("three".to_owned(), 3);
+    let delta = value
+        .diff(
+            &baseline,
+            ScanCursor::default(),
+            &mut ScanBudget::generous(),
+        )
+        .expect("streaming map should diff");
+
+    assert_eq!(MAP_CONTAINER_SERIALIZATIONS.load(Ordering::Relaxed), 0);
+    let changes = delta
+        .changes
+        .into_iter()
+        .map(|change| match change {
+            FieldChange::Set { path, value } => (path.0, Some(value)),
+            FieldChange::Unset { path } => (path.0, None),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        changes,
+        [
+            ("values.one".to_owned(), Some(10_i32.into())),
+            ("values.three".to_owned(), Some(3_i32.into())),
+            ("values.two".to_owned(), None),
+        ]
+    );
+}
+
+#[test]
+fn custom_map_adapter_matches_custom_serde_without_serializing_the_container() {
+    CUSTOM_MAP_SERIALIZATIONS.store(0, Ordering::Relaxed);
+    let mut value = CustomMapAdapterDoc {
+        id: 42,
+        values: BTreeMap::from([("one".to_owned(), 1), ("two".to_owned(), 2)]),
+    };
+
+    let baseline = value.capture().expect("adapter baseline should capture");
+    assert_eq!(CUSTOM_MAP_SERIALIZATIONS.load(Ordering::Relaxed), 0);
+
+    let Bson::Document(encoded) = to_bson(&value).expect("full document should serialize") else {
+        panic!("custom Map document should encode as BSON");
+    };
+    assert_eq!(
+        encoded.get_document("values").expect("encoded Map"),
+        &doc! { "key_one": "1", "key_two": "2" }
+    );
+    assert_eq!(CUSTOM_MAP_SERIALIZATIONS.load(Ordering::Relaxed), 1);
+
+    let loaded_baseline = CustomMapAdapterDoc::capture_bson(&encoded)
+        .expect("serialized BSON should produce the same baseline shape");
+    value.values.insert("one".to_owned(), 10);
+    value.values.remove("two");
+
+    CUSTOM_MAP_SERIALIZATIONS.store(0, Ordering::Relaxed);
+    for baseline in [&baseline, &loaded_baseline] {
+        let delta = value
+            .diff(baseline, ScanCursor::default(), &mut ScanBudget::generous())
+            .expect("custom adapter should diff");
+        assert_eq!(
+            delta.changes,
+            [
+                FieldChange::Set {
+                    path: lattice_store_mongodb::persistence::types::MongoFieldPath::new(
+                        "values.key_one",
+                    ),
+                    value: Bson::String("10".to_owned()),
+                },
+                FieldChange::Unset {
+                    path: lattice_store_mongodb::persistence::types::MongoFieldPath::new(
+                        "values.key_two",
+                    ),
+                },
+            ]
+        );
+    }
+    assert_eq!(CUSTOM_MAP_SERIALIZATIONS.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn field_budget_does_not_serialize_deferred_fields() {
+    let mut value = FieldBudgetDoc {
+        id: 42,
+        first: 1,
+        deferred: DeferredValue(1),
+    };
+    let mut baseline = value
+        .capture()
+        .expect("field-budget document should capture");
+    value.first = 2;
+    value.deferred = DeferredValue(2);
+    DEFERRED_VALUE_SERIALIZATIONS.store(0, Ordering::Relaxed);
+
+    let mut first_budget = ScanBudget::new(1, 1, Duration::from_secs(1));
+    let first = value
+        .diff(&baseline, ScanCursor::default(), &mut first_budget)
+        .expect("first field batch should scan");
+    assert!(!first.complete);
+    assert_eq!(DEFERRED_VALUE_SERIALIZATIONS.load(Ordering::Relaxed), 0);
+    let cursor = baseline
+        .apply(first.commit)
+        .expect("first field baseline should advance");
+
+    let second = value
+        .diff(&baseline, cursor, &mut ScanBudget::generous())
+        .expect("deferred field batch should scan");
+    assert!(second.complete);
+    assert_eq!(DEFERRED_VALUE_SERIALIZATIONS.load(Ordering::Relaxed), 1);
+    assert!(
+        second.changes.iter().any(|change| {
+            matches!(change, FieldChange::Set { path, .. } if path.0 == "deferred")
+        })
+    );
 }
 
 fn loaded_documents(id: u64) -> LoadedMacroDocuments {

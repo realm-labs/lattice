@@ -98,6 +98,9 @@ pub(crate) struct SerdeFieldShape {
     pub(crate) serialized_name: String,
     pub(crate) skipped: bool,
     pub(crate) flattened: bool,
+    pub(crate) serialize_with: Option<syn::Path>,
+    pub(crate) serialize_with_module: Option<syn::Path>,
+    pub(crate) skip_serializing_if: Option<syn::Path>,
 }
 
 pub(crate) fn serde_field_shape(
@@ -110,6 +113,9 @@ pub(crate) fn serde_field_shape(
         .unwrap_or_else(|| ident.to_string());
     let mut skipped = false;
     let mut flattened = false;
+    let mut serialize_with = None;
+    let mut serialize_with_module = None;
+    let mut skip_serializing_if = None;
     for attribute in &field.attrs {
         if !attribute.path().is_ident("serde") {
             continue;
@@ -137,6 +143,35 @@ pub(crate) fn serde_field_shape(
                 flattened = true;
                 return Ok(());
             }
+            if meta.path.is_ident("with") {
+                let value = meta.value()?.parse::<LitStr>()?;
+                let module = syn::parse_str::<syn::Path>(&value.value())
+                    .map_err(|error| syn::Error::new(value.span(), error))?;
+                let mut function = module.clone();
+                function.segments.push(syn::PathSegment::from(Ident::new(
+                    "serialize",
+                    value.span(),
+                )));
+                serialize_with = Some(function);
+                serialize_with_module = Some(module);
+                return Ok(());
+            }
+            if meta.path.is_ident("serialize_with") {
+                let value = meta.value()?.parse::<LitStr>()?;
+                serialize_with = Some(
+                    syn::parse_str::<syn::Path>(&value.value())
+                        .map_err(|error| syn::Error::new(value.span(), error))?,
+                );
+                return Ok(());
+            }
+            if meta.path.is_ident("skip_serializing_if") {
+                let value = meta.value()?.parse::<LitStr>()?;
+                skip_serializing_if = Some(
+                    syn::parse_str::<syn::Path>(&value.value())
+                        .map_err(|error| syn::Error::new(value.span(), error))?,
+                );
+                return Ok(());
+            }
             consume_meta(meta)
         })?;
     }
@@ -144,6 +179,9 @@ pub(crate) fn serde_field_shape(
         serialized_name,
         skipped,
         flattened,
+        serialize_with,
+        serialize_with_module,
+        skip_serializing_if,
     })
 }
 
@@ -166,6 +204,20 @@ pub(crate) fn store_crate_path() -> syn::Result<proc_macro2::TokenStream> {
         Err(error) => Err(syn::Error::new(
             Span::call_site(),
             format!("could not resolve the `lattice-store-mongodb` crate: {error}"),
+        )),
+    }
+}
+
+pub(crate) fn serde_crate_path() -> syn::Result<proc_macro2::TokenStream> {
+    match crate_name("serde") {
+        Ok(FoundCrate::Itself) => Ok(quote!(::serde)),
+        Ok(FoundCrate::Name(name)) => {
+            let ident = Ident::new(&name, Span::call_site());
+            Ok(quote!(::#ident))
+        }
+        Err(error) => Err(syn::Error::new(
+            Span::call_site(),
+            format!("could not resolve the `serde` crate: {error}"),
         )),
     }
 }

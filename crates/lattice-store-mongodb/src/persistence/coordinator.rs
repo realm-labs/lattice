@@ -45,32 +45,27 @@ impl DocumentState {
             || self.create_mode.is_some()
     }
 
-    fn scan_cursor(&self, mutation_epoch: Option<u64>) -> ScanCursor {
-        if mutation_epoch.is_some()
-            && self
-                .scanning_mutation_epoch
-                .is_some_and(|scanning| Some(scanning) != mutation_epoch)
-        {
-            ScanCursor::default()
-        } else {
-            self.cursor.clone()
-        }
+    fn scan_cursor(&self) -> ScanCursor {
+        self.cursor.clone()
+    }
+
+    fn sweep_is_current(&self, mutation_epoch: Option<u64>) -> bool {
+        mutation_epoch.is_none()
+            || self.scanning_mutation_epoch.is_none()
+            || self.scanning_mutation_epoch == mutation_epoch
     }
 
     fn apply_commit_metadata(
         &mut self,
         mutation_epoch: Option<u64>,
         scan_complete: bool,
+        sweep_complete: bool,
         changed: bool,
     ) -> bool {
         let Some(mutation_epoch) = mutation_epoch else {
             return false;
         };
-        let changed = if self.scanning_mutation_epoch == Some(mutation_epoch) {
-            self.scanning_changed || changed
-        } else {
-            changed
-        };
+        let changed = self.scanning_changed || changed;
         if scan_complete {
             let false_positive =
                 self.acknowledged_mutation_epoch != Some(mutation_epoch) && !changed;
@@ -79,7 +74,9 @@ impl DocumentState {
             self.scanning_changed = false;
             false_positive
         } else {
-            self.scanning_mutation_epoch = Some(mutation_epoch);
+            if sweep_complete || self.scanning_mutation_epoch.is_none() {
+                self.scanning_mutation_epoch = Some(mutation_epoch);
+            }
             self.scanning_changed = changed;
             false
         }
@@ -131,14 +128,14 @@ pub struct PersistenceCounters {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PersistenceScanMetrics {
-    /// Number of business documents encoded for diff scans.
-    pub encoded_documents: u64,
-    /// Estimated BSON bytes produced by business-document encoding.
+    /// Number of individual business values encoded for diff scans.
+    pub encoded_values: u64,
+    /// Estimated BSON bytes produced while encoding individual business values.
     ///
-    /// This is calculated while walking the encoded document and deliberately
-    /// avoids a second BSON serialization solely for metrics.
+    /// This is calculated from the encoded BSON values and deliberately avoids
+    /// a second BSON serialization solely for metrics.
     pub estimated_encoded_bytes: u64,
-    /// Nanoseconds spent encoding Rust business documents into BSON.
+    /// Nanoseconds spent encoding Rust business values into BSON.
     pub encoding_nanos: u64,
     /// Number of map entries hashed while preparing field-level diffs.
     pub map_entries_hashed: u64,
@@ -149,9 +146,7 @@ pub struct PersistenceScanMetrics {
 
 impl PersistenceScanMetrics {
     fn record_work(&mut self, work: ScanWorkMetrics) {
-        self.encoded_documents = self
-            .encoded_documents
-            .saturating_add(work.encoded_documents);
+        self.encoded_values = self.encoded_values.saturating_add(work.encoded_values);
         self.estimated_encoded_bytes = self
             .estimated_encoded_bytes
             .saturating_add(work.estimated_encoded_bytes);
@@ -644,6 +639,7 @@ impl MongoPersistenceCoordinator {
                     let false_positive = state.apply_commit_metadata(
                         document_commit.mutation_epoch,
                         document_commit.scan_complete,
+                        document_commit.sweep_complete,
                         document_commit.changed,
                     );
                     if false_positive {
@@ -909,6 +905,7 @@ impl MongoPersistenceCoordinator {
             let false_positive = state.apply_commit_metadata(
                 commit.mutation_epoch,
                 commit.scan_complete,
+                commit.sweep_complete,
                 commit.changed,
             );
             if false_positive {
@@ -1003,9 +1000,10 @@ impl<'a> MongoPreparation<'a> {
             self.scan_complete = false;
             return Ok(());
         }
-        let cursor = state.scan_cursor(mutation_epoch);
+        let cursor = state.scan_cursor();
         let delta = value.diff(&state.baseline, cursor.clone(), &mut self.budget)?;
-        self.scan_complete &= delta.complete;
+        let scan_complete = delta.complete && state.sweep_is_current(mutation_epoch);
+        self.scan_complete &= scan_complete;
         self.scans = self.scans.saturating_add(1);
         self.changed_paths = self
             .changed_paths
@@ -1018,7 +1016,8 @@ impl<'a> MongoPreparation<'a> {
             key: key.clone(),
             scan: delta.commit,
             mutation_epoch,
-            scan_complete: delta.complete,
+            sweep_complete: delta.complete,
+            scan_complete,
             changed,
         };
         if delta.changes.is_empty() && state.create_mode.is_none() {
@@ -1293,7 +1292,7 @@ mod tests {
 
         assert!(prepared.request.is_none());
         assert_eq!(coordinator.counters().scans, 1);
-        assert_eq!(coordinator.scan_metrics().encoded_documents, 1);
+        assert_eq!(coordinator.scan_metrics().encoded_values, 2);
         assert!(coordinator.scan_metrics().estimated_encoded_bytes > 0);
         assert_eq!(coordinator.scan_metrics().map_entries_hashed, 1);
         coordinator
@@ -1559,7 +1558,7 @@ mod tests {
         let mut coordinator = loaded(&old, None);
         let partial = coordinator
             .prepare(
-                ScanBudget::new(1, 1, 8, Duration::from_secs(1)),
+                ScanBudget::new(1, 1, Duration::from_secs(1)),
                 |preparation| preparation.scan(&value),
             )
             .unwrap();
@@ -1568,8 +1567,8 @@ mod tests {
         let DocumentOperation::Update { sets, .. } = &request.writes[0].operation else {
             panic!("partial document should update");
         };
-        assert!(sets.keys().any(|path| path.0 == "items.two"));
-        assert!(!sets.keys().any(|path| path.0 == "name"));
+        assert!(sets.keys().any(|path| path.0 == "name"));
+        assert!(!sets.keys().any(|path| path.0 == "items.two"));
         let generation = request.generation;
         let token = request.writes[0].token;
         coordinator.begin_flush(partial.commit).unwrap();
@@ -1598,6 +1597,93 @@ mod tests {
         let DocumentOperation::Update { sets, .. } = &resumed.request.unwrap().writes[0].operation
         else {
             panic!("resumed document should update");
+        };
+        assert!(sets.keys().any(|path| path.0 == "items.two"));
+        assert!(!sets.keys().any(|path| path.0 == "name"));
+    }
+
+    #[test]
+    fn mutation_during_a_field_sweep_finishes_the_sweep_then_rescans_from_start() {
+        let old = document("old");
+        let mut value = crate::document::tracked::Tracked::clean(old.clone());
+        let mut coordinator = loaded(&old, Some(0));
+        value.write().name = "first".to_owned();
+
+        let first = coordinator
+            .prepare(
+                ScanBudget::new(1, 1, Duration::from_secs(1)),
+                |preparation| preparation.scan_tracked(&value),
+            )
+            .expect("first field should prepare");
+        assert!(!first.scan_complete);
+        let first_request = first.request.as_ref().expect("name should change");
+        let first_token = first_request.writes[0].token;
+        let first_generation = first_request.generation;
+        coordinator.begin_flush(first.commit).unwrap();
+        coordinator
+            .complete(
+                first_generation,
+                FlushOutcome {
+                    documents: BTreeMap::from([(
+                        first_token,
+                        DocumentWriteOutcome::Applied {
+                            previous_version: 3,
+                            new_version: 4,
+                            updated_at_ms: 20,
+                        },
+                    )]),
+                },
+            )
+            .unwrap();
+
+        {
+            let write = value.write();
+            write.name = "second".to_owned();
+            write.items.insert("two".to_owned(), 2);
+        }
+        let second = coordinator
+            .prepare(ScanBudget::generous(), |preparation| {
+                preparation.scan_tracked(&value)
+            })
+            .expect("remaining field should prepare");
+        assert!(!second.scan_complete);
+        let second_request = second.request.as_ref().expect("map should change");
+        let DocumentOperation::Update { sets, .. } = &second_request.writes[0].operation else {
+            panic!("map field should update");
+        };
+        assert!(sets.keys().any(|path| path.0 == "items.two"));
+        assert!(!sets.keys().any(|path| path.0 == "name"));
+        let second_token = second_request.writes[0].token;
+        let second_generation = second_request.generation;
+        coordinator.begin_flush(second.commit).unwrap();
+        coordinator
+            .complete(
+                second_generation,
+                FlushOutcome {
+                    documents: BTreeMap::from([(
+                        second_token,
+                        DocumentWriteOutcome::Applied {
+                            previous_version: 4,
+                            new_version: 5,
+                            updated_at_ms: 30,
+                        },
+                    )]),
+                },
+            )
+            .unwrap();
+
+        let third = coordinator
+            .prepare(ScanBudget::generous(), |preparation| {
+                preparation.scan_tracked(&value)
+            })
+            .expect("new epoch should receive a complete follow-up sweep");
+        assert!(third.scan_complete);
+        let third_request = third
+            .request
+            .as_ref()
+            .expect("earlier field should be rescanned");
+        let DocumentOperation::Update { sets, .. } = &third_request.writes[0].operation else {
+            panic!("name field should update");
         };
         assert!(sets.keys().any(|path| path.0 == "name"));
         assert!(!sets.keys().any(|path| path.0 == "items.two"));

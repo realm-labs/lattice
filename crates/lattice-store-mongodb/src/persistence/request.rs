@@ -77,6 +77,9 @@ pub struct DocumentCommit {
     /// Mutation epoch observed while preparing this document. Scan-only
     /// callers leave this unset.
     pub mutation_epoch: Option<u64>,
+    /// Whether this batch reached the end of the field sequence, even if an
+    /// epoch change requires another full sweep before the document is clean.
+    pub(crate) sweep_complete: bool,
     pub scan_complete: bool,
     pub(crate) changed: bool,
 }

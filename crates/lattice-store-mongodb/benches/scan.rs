@@ -25,7 +25,7 @@ struct MapDocument {
 }
 
 fn scan_budget() -> ScanBudget {
-    ScanBudget::new(usize::MAX, usize::MAX, usize::MAX, Duration::from_secs(60))
+    ScanBudget::new(usize::MAX, usize::MAX, Duration::from_secs(60))
 }
 
 fn whole_document_scans(criterion: &mut Criterion) {

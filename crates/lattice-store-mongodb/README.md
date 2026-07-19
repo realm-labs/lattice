@@ -138,9 +138,15 @@ baseline.
 
 Map entry scanning is explicit. An ordinary map is treated as one whole BSON
 field; opt in with `#[mongo(scan = "map")]` only when per-key `$set`/`$unset`
-updates are useful. Dynamic keys containing `.`, a leading `$`, NUL, or the
-empty string cannot be used directly as MongoDB update-path segments. Encode
-the stored BSON keys and update paths consistently with the Serde adapter:
+updates are useful. A Map scan consumes one field from `ScanBudget`, walks the
+Map once, and serializes each value independently. Unchanged values are dropped
+immediately; changed values are reused directly in `$set`, and missing keys
+produce `$unset`. The full Map is never materialized as BSON during a diff.
+There is deliberately no Map-entry cursor or separate Map-entry budget.
+
+Dynamic keys containing `.`, a leading `$`, NUL, or the empty string cannot be
+used directly as MongoDB update-path segments. Encode the stored BSON keys and
+update paths consistently with the Serde adapter:
 
 ```rust
 # use std::collections::HashMap;
@@ -163,10 +169,45 @@ decoded back into their logical Rust keys on load. Use
 `bson_serde::encode_path_key` when building a MongoDB query against one encoded
 map entry.
 
-`MongoPersistenceCoordinator::scan_metrics()` exposes cumulative encoding
-time, estimated encoded bytes, hashed map entries, and false-positive scans.
-The byte count is estimated during the existing BSON walk and does not trigger
-another serialization pass. To measure scan regressions locally, run
+Custom Map serializers must declare how one entry is encoded so the scan does
+not have to invoke the container serializer:
+
+```rust
+use lattice_store_mongodb::scan::{MongoMapScanAdapter, ScanError};
+use mongodb::bson::Bson;
+
+struct StringValueMapAdapter;
+
+impl MongoMapScanAdapter<String, i32> for StringValueMapAdapter {
+    fn encode_key(key: &String) -> Result<String, ScanError> {
+        Ok(format!("key_{key}"))
+    }
+
+    fn encode_value(value: &i32) -> Result<Bson, ScanError> {
+        Ok(Bson::String(value.to_string()))
+    }
+}
+
+#[serde(with = "custom_map_serde")]
+#[mongo(scan = "map", adapter = StringValueMapAdapter)]
+items: HashMap<String, i32>,
+```
+
+The adapter's key and value BSON must exactly match `custom_map_serde`'s stored
+representation. Invalid update-path keys and duplicate encoded keys are still
+rejected by the framework.
+
+`ScanBudget` limits documents and complete business fields. A field is the
+smallest scan unit: with a two-field budget, one preparation scans fields A and
+B and the next resumes at C. Large Map fields can therefore exceed the duration
+target for one field, but cannot repeatedly starve later fields. State that
+requires bounded entry-level loading should be modeled as a `MongoLazyTable`.
+
+`MongoPersistenceCoordinator::scan_metrics()` exposes cumulative encoded
+values, encoding time, estimated encoded bytes, hashed map entries, and
+false-positive scans. The byte count is estimated from BSON values already
+produced for comparison and does not trigger another serialization pass. To
+measure scan regressions locally, run
 `cargo bench -p lattice-store-mongodb --bench scan`; the benchmark covers
 1 KiB, 10 KiB, and 1 MiB documents plus 1,000- and 10,000-entry maps.
 

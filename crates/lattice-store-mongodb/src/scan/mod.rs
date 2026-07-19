@@ -12,11 +12,22 @@ use mongodb::bson::{Bson, Document};
 pub type BsonDocument = mongodb::bson::Document;
 use serde::Serialize;
 
-use crate::document::{MongoDocument, encode_business_document};
+use crate::document::{MongoDocument, bson_serde::encode_path_key};
 use crate::persistence::types::MongoFieldPath;
 
 pub trait MongoMapKey {
     fn mongo_map_key(&self) -> String;
+}
+
+/// Entry-level encoding used by an opt-in Map scan.
+///
+/// The adapter must produce the same BSON key and value representation as the
+/// field's Serde serializer. It is called one entry at a time, so a custom Map
+/// serializer does not need to materialize the complete Map during a diff.
+pub trait MongoMapScanAdapter<K: ?Sized, V: ?Sized> {
+    fn encode_key(key: &K) -> Result<String, ScanError>;
+
+    fn encode_value(value: &V) -> Result<Bson, ScanError>;
 }
 
 macro_rules! integer_map_keys {
@@ -47,7 +58,7 @@ pub trait MongoScan: MongoDocument {
     /// Captures a baseline from an already serialized business document. The
     /// derive overrides this to retain declared Map policies.
     fn capture_bson(document: &Document) -> Result<ScanSnapshot, ScanError> {
-        ScanSnapshot::empty().capture_bson_document(document, &[])
+        ScanSnapshot::empty().capture_bson_document(document, &[], 0)
     }
 
     fn diff(
@@ -58,29 +69,50 @@ pub trait MongoScan: MongoDocument {
     ) -> Result<ScanDelta, ScanError>;
 }
 
-/// BSON-level scan policy for one serialized top-level field.
+/// Description of one generated business-field scan unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanFieldStrategy {
+    Whole,
     Map,
+    Flatten,
     Ignore,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanFieldPolicy {
+    pub field_index: Option<usize>,
     pub path: &'static str,
     pub strategy: ScanFieldStrategy,
 }
 
 impl ScanFieldPolicy {
-    pub const fn map(path: &'static str) -> Self {
+    pub const fn whole(field_index: usize, path: &'static str) -> Self {
         Self {
+            field_index: Some(field_index),
+            path,
+            strategy: ScanFieldStrategy::Whole,
+        }
+    }
+
+    pub const fn map(field_index: usize, path: &'static str) -> Self {
+        Self {
+            field_index: Some(field_index),
             path,
             strategy: ScanFieldStrategy::Map,
         }
     }
 
+    pub const fn flatten(field_index: usize) -> Self {
+        Self {
+            field_index: Some(field_index),
+            path: "",
+            strategy: ScanFieldStrategy::Flatten,
+        }
+    }
+
     pub const fn ignore(path: &'static str) -> Self {
         Self {
+            field_index: None,
             path,
             strategy: ScanFieldStrategy::Ignore,
         }
@@ -105,6 +137,7 @@ pub struct ScanSnapshot {
     identity: u64,
     revision: u64,
     fields: BTreeMap<String, FieldSnapshot>,
+    field_groups: BTreeMap<usize, BTreeSet<String>>,
 }
 
 impl ScanSnapshot {
@@ -114,6 +147,7 @@ impl ScanSnapshot {
             identity: NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed),
             revision: 0,
             fields: BTreeMap::new(),
+            field_groups: BTreeMap::new(),
         }
     }
 
@@ -126,8 +160,9 @@ impl ScanSnapshot {
         field: impl Into<String>,
         value: &Bson,
     ) -> Result<Self, ScanError> {
-        self.fields
-            .insert(field.into(), FieldSnapshot::Whole(stable_hash(value)?));
+        let field = field.into();
+        let field_index = self.field_groups.len();
+        self.capture_whole_field(field_index, &field, value)?;
         Ok(self)
     }
 
@@ -143,26 +178,10 @@ impl ScanSnapshot {
         field: impl Into<String>,
         value: &Document,
     ) -> Result<Self, ScanError> {
-        self.fields.insert(
-            field.into(),
-            FieldSnapshot::Map(hash_document_entries(value)?),
-        );
+        let field = field.into();
+        let field_index = self.field_groups.len();
+        self.capture_map_document_field(field_index, &field, value)?;
         Ok(self)
-    }
-
-    pub fn capture_map_value<T>(
-        self,
-        field: impl Into<String>,
-        value: &T,
-    ) -> Result<Self, ScanError>
-    where
-        T: Serialize,
-    {
-        let bson = encode_value(value)?;
-        let Bson::Document(document) = bson else {
-            return Err(ScanError::ExpectedMapDocument);
-        };
-        self.capture_map(field, &document)
     }
 
     pub fn capture_map_entries<'a, K, V>(
@@ -174,54 +193,245 @@ impl ScanSnapshot {
         K: MongoMapKey + 'a,
         V: Serialize + 'a,
     {
-        let encoded = encode_map_entries(entries)?;
-        self.fields.insert(
-            field.into(),
-            FieldSnapshot::Map(hash_encoded_map(&encoded)?),
-        );
+        let field = field.into();
+        let field_index = self.field_groups.len();
+        self.capture_map_entries_field(field_index, &field, entries)?;
         Ok(self)
     }
 
-    /// Captures the same business BSON representation used by inserts and
-    /// replacements. Field policies are applied only after Serde has finished
-    /// renaming, flattening, skipping, and custom serialization.
-    pub fn capture_document<D>(
-        self,
-        value: &D,
-        policies: &[ScanFieldPolicy],
-    ) -> Result<Self, ScanError>
+    #[doc(hidden)]
+    pub fn capture_absent_field(&mut self, field_index: usize) {
+        self.field_groups.entry(field_index).or_default();
+    }
+
+    #[doc(hidden)]
+    pub fn capture_value_field<T>(
+        &mut self,
+        field_index: usize,
+        field: &str,
+        value: &T,
+    ) -> Result<(), ScanError>
     where
-        D: MongoDocument,
+        T: Serialize,
     {
-        let document = encode_scan_document(value)?;
-        self.capture_bson_document(&document, policies)
+        self.capture_whole_field(field_index, field, &encode_value(value)?)
+    }
+
+    #[doc(hidden)]
+    pub fn capture_flattened_value_field<T>(
+        &mut self,
+        field_index: usize,
+        value: &T,
+    ) -> Result<(), ScanError>
+    where
+        T: Serialize,
+    {
+        let bson = encode_value(value)?;
+        let Bson::Document(document) = bson else {
+            return Err(ScanError::ExpectedDocumentFragment);
+        };
+        self.capture_fragment_field(field_index, &document)
+    }
+
+    #[doc(hidden)]
+    pub fn capture_map_entries_field<'entry, K, V>(
+        &mut self,
+        field_index: usize,
+        field: &str,
+        entries: impl IntoIterator<Item = (&'entry K, &'entry V)>,
+    ) -> Result<(), ScanError>
+    where
+        K: MongoMapKey + 'entry,
+        V: Serialize + 'entry,
+    {
+        self.capture_map_entries_with_field(
+            field_index,
+            field,
+            entries,
+            |key| Ok(key.mongo_map_key()),
+            |value| encode_value(value),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn capture_path_key_map_entries_field<'entry, K, V>(
+        &mut self,
+        field_index: usize,
+        field: &str,
+        entries: impl IntoIterator<Item = (&'entry K, &'entry V)>,
+    ) -> Result<(), ScanError>
+    where
+        K: std::fmt::Display + 'entry,
+        V: Serialize + 'entry,
+    {
+        self.capture_map_entries_with_field(
+            field_index,
+            field,
+            entries,
+            |key| Ok(encode_path_key(&key.to_string())),
+            |value| encode_value(value),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn capture_map_entries_with_adapter_field<'entry, A, K, V>(
+        &mut self,
+        field_index: usize,
+        field: &str,
+        entries: impl IntoIterator<Item = (&'entry K, &'entry V)>,
+    ) -> Result<(), ScanError>
+    where
+        A: MongoMapScanAdapter<K, V>,
+        K: 'entry,
+        V: 'entry,
+    {
+        self.capture_map_entries_with_field(
+            field_index,
+            field,
+            entries,
+            A::encode_key,
+            A::encode_value,
+        )
+    }
+
+    fn capture_whole_field(
+        &mut self,
+        field_index: usize,
+        field: &str,
+        value: &Bson,
+    ) -> Result<(), ScanError> {
+        validate_field_path(field)?;
+        self.fields
+            .insert(field.to_owned(), FieldSnapshot::Whole(stable_hash(value)?));
+        self.set_group(field_index, [field.to_owned()])
+    }
+
+    fn capture_map_document_field(
+        &mut self,
+        field_index: usize,
+        field: &str,
+        value: &Document,
+    ) -> Result<(), ScanError> {
+        validate_field_path(field)?;
+        self.fields.insert(
+            field.to_owned(),
+            FieldSnapshot::Map(hash_document_entries(value)?),
+        );
+        self.set_group(field_index, [field.to_owned()])
+    }
+
+    fn capture_map_entries_with_field<'entry, K, V, FK, FV>(
+        &mut self,
+        field_index: usize,
+        field: &str,
+        entries: impl IntoIterator<Item = (&'entry K, &'entry V)>,
+        mut encode_key: FK,
+        mut encode_entry_value: FV,
+    ) -> Result<(), ScanError>
+    where
+        K: 'entry,
+        V: 'entry,
+        FK: FnMut(&K) -> Result<String, ScanError>,
+        FV: FnMut(&V) -> Result<Bson, ScanError>,
+    {
+        validate_field_path(field)?;
+        let mut hashes = BTreeMap::new();
+        for (key, value) in entries {
+            let key = encode_key(key)?;
+            validate_map_key(&key)?;
+            let hash = stable_hash(&encode_entry_value(value)?)?;
+            if hashes.insert(key.clone(), hash).is_some() {
+                return Err(ScanError::DuplicateMapKey(key));
+            }
+        }
+        self.fields
+            .insert(field.to_owned(), FieldSnapshot::Map(hashes));
+        self.set_group(field_index, [field.to_owned()])
+    }
+
+    fn capture_fragment_field(
+        &mut self,
+        field_index: usize,
+        document: &Document,
+    ) -> Result<(), ScanError> {
+        let mut paths = BTreeSet::new();
+        for (field, value) in document {
+            validate_field_path(field)?;
+            self.fields
+                .insert(field.clone(), FieldSnapshot::Whole(stable_hash(value)?));
+            paths.insert(field.clone());
+        }
+        self.set_group(field_index, paths)
+    }
+
+    fn set_group(
+        &mut self,
+        field_index: usize,
+        paths: impl IntoIterator<Item = String>,
+    ) -> Result<(), ScanError> {
+        let paths = paths.into_iter().collect::<BTreeSet<_>>();
+        for path in &paths {
+            if self
+                .field_groups
+                .iter()
+                .any(|(index, fields)| *index != field_index && fields.contains(path))
+            {
+                return Err(ScanError::DuplicateFieldPath(path.clone()));
+            }
+        }
+        self.field_groups.insert(field_index, paths);
+        Ok(())
     }
 
     pub fn capture_bson_document(
         mut self,
         document: &Document,
         policies: &[ScanFieldPolicy],
+        field_count: usize,
     ) -> Result<Self, ScanError> {
+        for field_index in 0..field_count {
+            self.capture_absent_field(field_index);
+        }
+        let flatten_index = policies.iter().find_map(|policy| {
+            (policy.strategy == ScanFieldStrategy::Flatten)
+                .then_some(policy.field_index)
+                .flatten()
+        });
+        let mut extra_paths = BTreeSet::new();
         for (field, value) in document {
             validate_field_path(field)?;
-            match field_strategy(field, policies) {
-                Some(ScanFieldStrategy::Ignore) => {}
-                Some(ScanFieldStrategy::Map) => {
+            match field_policy(field, policies) {
+                Some(ScanFieldPolicy {
+                    strategy: ScanFieldStrategy::Ignore,
+                    ..
+                }) => {}
+                Some(ScanFieldPolicy {
+                    field_index: Some(field_index),
+                    strategy: ScanFieldStrategy::Map,
+                    ..
+                }) => {
                     if let Bson::Document(document) = value {
-                        self.fields.insert(
-                            field.clone(),
-                            FieldSnapshot::Map(hash_document_entries(document)?),
-                        );
+                        self.capture_map_document_field(*field_index, field, document)?;
                     } else {
-                        self.fields
-                            .insert(field.clone(), FieldSnapshot::Whole(stable_hash(value)?));
+                        self.capture_whole_field(*field_index, field, value)?;
                     }
                 }
-                None => {
+                Some(ScanFieldPolicy {
+                    field_index: Some(field_index),
+                    strategy: ScanFieldStrategy::Whole,
+                    ..
+                }) => self.capture_whole_field(*field_index, field, value)?,
+                None if flatten_index.is_some() => {
                     self.fields
                         .insert(field.clone(), FieldSnapshot::Whole(stable_hash(value)?));
+                    extra_paths.insert(field.clone());
                 }
+                None => {}
+                Some(_) => unreachable!("flatten policies have no concrete BSON path"),
             }
+        }
+        if let Some(flatten_index) = flatten_index {
+            self.set_group(flatten_index, extra_paths)?;
         }
         Ok(self)
     }
@@ -241,6 +451,9 @@ impl ScanSnapshot {
         for field in commit.removed_fields {
             self.fields.remove(&field);
         }
+        for (field_index, paths) in commit.field_groups {
+            self.field_groups.insert(field_index, paths);
+        }
         self.revision = self
             .revision
             .checked_add(1)
@@ -258,44 +471,41 @@ impl Default for ScanSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ScanCursor {
     pub field_index: usize,
-    pub map_key: Option<String>,
 }
 
+/// Cooperative document/field scan budget.
+///
+/// A business field is the smallest resumable unit. Map fields consume one
+/// field and compare all entries in that call; their values are encoded one at
+/// a time and only changed BSON values are retained for `$set` operations.
 #[derive(Debug)]
 pub struct ScanBudget {
     remaining_documents: usize,
     remaining_fields: usize,
-    remaining_map_entries: usize,
     deadline: Instant,
     work: ScanWorkMetrics,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ScanWorkMetrics {
-    pub encoded_documents: u64,
+    pub encoded_values: u64,
     pub estimated_encoded_bytes: u64,
     pub encoding_nanos: u64,
     pub map_entries_hashed: u64,
 }
 
 impl ScanBudget {
-    pub fn new(
-        max_documents: usize,
-        max_fields: usize,
-        max_map_entries: usize,
-        max_duration: Duration,
-    ) -> Self {
+    pub fn new(max_documents: usize, max_fields: usize, max_duration: Duration) -> Self {
         Self {
             remaining_documents: max_documents,
             remaining_fields: max_fields,
-            remaining_map_entries: max_map_entries,
             deadline: Instant::now() + max_duration,
             work: ScanWorkMetrics::default(),
         }
     }
 
     pub fn generous() -> Self {
-        Self::new(usize::MAX, usize::MAX, usize::MAX, Duration::from_secs(60))
+        Self::new(usize::MAX, usize::MAX, Duration::from_secs(60))
     }
 
     pub fn begin_document(&mut self) -> bool {
@@ -306,16 +516,12 @@ impl ScanBudget {
         consume(&mut self.remaining_fields) && self.has_time()
     }
 
-    fn map_entry(&mut self) -> bool {
-        consume(&mut self.remaining_map_entries) && self.has_time()
-    }
-
     fn has_time(&self) -> bool {
         Instant::now() <= self.deadline
     }
 
     fn record_encoding(&mut self, duration: Duration, estimated_encoded_bytes: usize) {
-        self.work.encoded_documents = self.work.encoded_documents.saturating_add(1);
+        self.work.encoded_values = self.work.encoded_values.saturating_add(1);
         self.work.estimated_encoded_bytes = self
             .work
             .estimated_encoded_bytes
@@ -355,6 +561,7 @@ pub struct ScanCommit {
     baseline_revision: u64,
     fields: BTreeMap<String, FieldSnapshot>,
     removed_fields: BTreeSet<String>,
+    field_groups: BTreeMap<usize, BTreeSet<String>>,
     next_cursor: ScanCursor,
 }
 
@@ -368,12 +575,13 @@ pub struct ScanDelta {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanError {
-    MissingBaselineField(String),
     BaselineKindMismatch(String),
     InvalidMapKey(String),
+    DuplicateMapKey(String),
+    DuplicateFieldPath(String),
     InvalidFieldPath(String),
     Encoding(String),
-    ExpectedMapDocument,
+    ExpectedDocumentFragment,
     ForeignCommit {
         expected_identity: u64,
         actual_identity: u64,
@@ -386,7 +594,6 @@ pub enum ScanError {
 impl std::fmt::Display for ScanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingBaselineField(field) => write!(f, "missing scan baseline field: {field}"),
             Self::BaselineKindMismatch(field) => {
                 write!(f, "scan baseline kind mismatch for field: {field}")
             }
@@ -394,12 +601,24 @@ impl std::fmt::Display for ScanError {
                 f,
                 "invalid MongoDB map update-path key: {key}; encode dynamic keys with document::bson_serde::path_key_map"
             ),
+            Self::DuplicateMapKey(key) => {
+                write!(
+                    f,
+                    "multiple logical map keys encode as MongoDB path key: {key}"
+                )
+            }
+            Self::DuplicateFieldPath(path) => {
+                write!(
+                    f,
+                    "multiple business fields serialize as MongoDB field path: {path}"
+                )
+            }
             Self::InvalidFieldPath(path) => {
                 write!(f, "invalid MongoDB top-level scan field: {path}")
             }
             Self::Encoding(error) => write!(f, "failed to encode BSON scan value: {error}"),
-            Self::ExpectedMapDocument => {
-                f.write_str("map scan value did not encode as a BSON document")
+            Self::ExpectedDocumentFragment => {
+                f.write_str("flattened scan field did not encode as a BSON document")
             }
             Self::ForeignCommit {
                 expected_identity,
@@ -425,6 +644,7 @@ pub struct ScanBuilder<'a> {
     changes: Vec<FieldChange>,
     fields: BTreeMap<String, FieldSnapshot>,
     removed_fields: BTreeSet<String>,
+    field_groups: BTreeMap<usize, BTreeSet<String>>,
     next_cursor: ScanCursor,
     complete: bool,
     active: bool,
@@ -441,22 +661,26 @@ impl<'a> ScanBuilder<'a> {
             changes: Vec::new(),
             fields: BTreeMap::new(),
             removed_fields: BTreeSet::new(),
+            field_groups: BTreeMap::new(),
             complete: active,
             active,
         }
     }
 
     pub fn whole(&mut self, field_index: usize, field: &str, value: Bson) -> Result<(), ScanError> {
-        if !self.active {
+        if !self.begin_field(field_index) {
             return Ok(());
         }
-        if field_index < self.cursor.field_index {
-            return Ok(());
-        }
-        if !self.budget.field() {
-            self.pause(field_index, None);
-            return Ok(());
-        }
+        self.scan_whole(field_index, field, value)
+    }
+
+    fn scan_whole(
+        &mut self,
+        field_index: usize,
+        field: &str,
+        value: Bson,
+    ) -> Result<(), ScanError> {
+        validate_field_path(field)?;
         let hash = stable_hash(&value)?;
         match self.baseline.fields.get(field) {
             Some(FieldSnapshot::Whole(old)) => {
@@ -470,14 +694,14 @@ impl<'a> ScanBuilder<'a> {
             Some(FieldSnapshot::Map(_)) => {
                 return Err(ScanError::BaselineKindMismatch(field.to_owned()));
             }
-            None => return Err(ScanError::MissingBaselineField(field.to_owned())),
+            None => self.changes.push(FieldChange::Set {
+                path: MongoFieldPath::new(field),
+                value,
+            }),
         }
         self.fields
             .insert(field.to_owned(), FieldSnapshot::Whole(hash));
-        self.next_cursor = ScanCursor {
-            field_index: field_index + 1,
-            map_key: None,
-        };
+        self.complete_field(field_index, [field.to_owned()])?;
         Ok(())
     }
 
@@ -490,7 +714,14 @@ impl<'a> ScanBuilder<'a> {
     where
         T: Serialize,
     {
-        self.whole(field_index, field, encode_value(value)?)
+        if !self.begin_field(field_index) {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let value = encode_value(value)?;
+        self.budget
+            .record_encoding(started.elapsed(), estimated_bson_value_size(&value));
+        self.scan_whole(field_index, field, value)
     }
 
     pub fn map(
@@ -499,91 +730,11 @@ impl<'a> ScanBuilder<'a> {
         field: &str,
         value: Document,
     ) -> Result<(), ScanError> {
-        if !self.active {
+        if !self.begin_field(field_index) {
             return Ok(());
         }
-        if field_index < self.cursor.field_index {
-            return Ok(());
-        }
-        if !self.budget.field() {
-            self.pause(field_index, self.cursor.map_key.clone());
-            return Ok(());
-        }
-        let Some(FieldSnapshot::Map(old)) = self.baseline.fields.get(field) else {
-            return match self.baseline.fields.get(field) {
-                Some(_) => Err(ScanError::BaselineKindMismatch(field.to_owned())),
-                None => Err(ScanError::MissingBaselineField(field.to_owned())),
-            };
-        };
-        self.budget.record_map_hashes(value.len());
-        let current = hash_document_entries(&value)?;
-        let keys = old
-            .keys()
-            .chain(current.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let start_after = if field_index == self.cursor.field_index {
-            self.cursor.map_key.as_deref()
-        } else {
-            None
-        };
-        let mut processed = old.clone();
-        for key in keys {
-            if start_after.is_some_and(|cursor| key.as_str() <= cursor) {
-                continue;
-            }
-            if !self.budget.map_entry() {
-                self.fields
-                    .insert(field.to_owned(), FieldSnapshot::Map(processed));
-                self.pause(field_index, self.next_cursor.map_key.clone());
-                return Ok(());
-            }
-            validate_map_key(&key)?;
-            match (old.get(&key), current.get(&key)) {
-                (Some(previous), Some(now)) if previous == now => {}
-                (_, Some(now)) => {
-                    self.changes.push(FieldChange::Set {
-                        path: MongoFieldPath::new(field).child(&key),
-                        value: value.get(&key).cloned().expect("hashed key exists"),
-                    });
-                    processed.insert(key.clone(), *now);
-                }
-                (Some(_), None) => {
-                    self.changes.push(FieldChange::Unset {
-                        path: MongoFieldPath::new(field).child(&key),
-                    });
-                    processed.remove(&key);
-                }
-                (None, None) => unreachable!(),
-            }
-            self.next_cursor = ScanCursor {
-                field_index,
-                map_key: Some(key),
-            };
-        }
-        self.fields
-            .insert(field.to_owned(), FieldSnapshot::Map(current));
-        self.next_cursor = ScanCursor {
-            field_index: field_index + 1,
-            map_key: None,
-        };
-        Ok(())
-    }
-
-    pub fn map_value<T>(
-        &mut self,
-        field_index: usize,
-        field: &str,
-        value: &T,
-    ) -> Result<(), ScanError>
-    where
-        T: Serialize,
-    {
-        let bson = encode_value(value)?;
-        let Bson::Document(document) = bson else {
-            return Err(ScanError::ExpectedMapDocument);
-        };
-        self.map(field_index, field, document)
+        let entries = value.into_iter().map(|(key, value)| Ok((key, value, None)));
+        self.scan_encoded_map(field_index, field, entries)
     }
 
     pub fn map_entries<'entry, K, V>(
@@ -596,181 +747,212 @@ impl<'a> ScanBuilder<'a> {
         K: MongoMapKey + 'entry,
         V: Serialize + 'entry,
     {
-        self.map_encoded(field_index, field, encode_map_entries(entries)?)
+        self.map_entries_with(
+            field_index,
+            field,
+            entries,
+            |key| Ok(key.mongo_map_key()),
+            |value| encode_value(value),
+        )
     }
 
-    fn map_encoded(
+    #[doc(hidden)]
+    pub fn path_key_map_entries<'entry, K, V>(
         &mut self,
         field_index: usize,
         field: &str,
-        value: BTreeMap<String, Bson>,
-    ) -> Result<(), ScanError> {
-        if !self.active {
+        entries: impl IntoIterator<Item = (&'entry K, &'entry V)>,
+    ) -> Result<(), ScanError>
+    where
+        K: std::fmt::Display + 'entry,
+        V: Serialize + 'entry,
+    {
+        self.map_entries_with(
+            field_index,
+            field,
+            entries,
+            |key| Ok(encode_path_key(&key.to_string())),
+            |value| encode_value(value),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn map_entries_with_adapter<'entry, A, K, V>(
+        &mut self,
+        field_index: usize,
+        field: &str,
+        entries: impl IntoIterator<Item = (&'entry K, &'entry V)>,
+    ) -> Result<(), ScanError>
+    where
+        A: MongoMapScanAdapter<K, V>,
+        K: 'entry,
+        V: 'entry,
+    {
+        self.map_entries_with(field_index, field, entries, A::encode_key, A::encode_value)
+    }
+
+    fn map_entries_with<'entry, K, V, FK, FV>(
+        &mut self,
+        field_index: usize,
+        field: &str,
+        entries: impl IntoIterator<Item = (&'entry K, &'entry V)>,
+        mut encode_key: FK,
+        mut encode_entry_value: FV,
+    ) -> Result<(), ScanError>
+    where
+        K: 'entry,
+        V: 'entry,
+        FK: FnMut(&K) -> Result<String, ScanError>,
+        FV: FnMut(&V) -> Result<Bson, ScanError>,
+    {
+        if !self.begin_field(field_index) {
             return Ok(());
         }
-        if field_index < self.cursor.field_index {
-            return Ok(());
-        }
-        if !self.budget.field() {
-            self.pause(field_index, self.cursor.map_key.clone());
-            return Ok(());
-        }
-        let Some(FieldSnapshot::Map(old)) = self.baseline.fields.get(field) else {
-            return match self.baseline.fields.get(field) {
-                Some(_) => Err(ScanError::BaselineKindMismatch(field.to_owned())),
-                None => Err(ScanError::MissingBaselineField(field.to_owned())),
-            };
-        };
-        self.budget.record_map_hashes(value.len());
-        let current = hash_encoded_map(&value)?;
-        let keys = old
-            .keys()
-            .chain(current.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let start_after = if field_index == self.cursor.field_index {
-            self.cursor.map_key.as_deref()
-        } else {
-            None
-        };
-        let mut processed = old.clone();
-        for key in keys {
-            if start_after.is_some_and(|cursor| key.as_str() <= cursor) {
-                continue;
-            }
-            if !self.budget.map_entry() {
-                self.fields
-                    .insert(field.to_owned(), FieldSnapshot::Map(processed));
-                self.pause(field_index, self.next_cursor.map_key.clone());
-                return Ok(());
-            }
+        let entries = entries.into_iter().map(|(key, value)| {
+            let key = encode_key(key)?;
             validate_map_key(&key)?;
-            match (old.get(&key), current.get(&key)) {
-                (Some(previous), Some(now)) if previous == now => {}
-                (_, Some(now)) => {
-                    self.changes.push(FieldChange::Set {
-                        path: MongoFieldPath::new(field).child(&key),
-                        value: value.get(&key).cloned().expect("hashed key exists"),
-                    });
-                    processed.insert(key.clone(), *now);
-                }
-                (Some(_), None) => {
-                    self.changes.push(FieldChange::Unset {
-                        path: MongoFieldPath::new(field).child(&key),
-                    });
-                    processed.remove(&key);
-                }
-                (None, None) => unreachable!(),
+            let started = Instant::now();
+            let value = encode_entry_value(value)?;
+            Ok((key, value, Some(started.elapsed())))
+        });
+        self.scan_encoded_map(field_index, field, entries)
+    }
+
+    fn scan_encoded_map(
+        &mut self,
+        field_index: usize,
+        field: &str,
+        entries: impl IntoIterator<Item = Result<(String, Bson, Option<Duration>), ScanError>>,
+    ) -> Result<(), ScanError> {
+        validate_field_path(field)?;
+        let old = match self.baseline.fields.get(field) {
+            Some(FieldSnapshot::Map(old)) => Some(old),
+            Some(FieldSnapshot::Whole(_)) => {
+                return Err(ScanError::BaselineKindMismatch(field.to_owned()));
             }
-            self.next_cursor = ScanCursor {
-                field_index,
-                map_key: Some(key),
-            };
+            None => None,
+        };
+        let mut current = BTreeMap::new();
+        let mut changes = BTreeMap::<String, Option<Bson>>::new();
+        for entry in entries {
+            let (key, value, encoding_duration) = entry?;
+            validate_map_key(&key)?;
+            if let Some(duration) = encoding_duration {
+                self.budget
+                    .record_encoding(duration, estimated_bson_value_size(&value));
+            }
+            self.budget.record_map_hashes(1);
+            let hash = stable_hash(&value)?;
+            if current.insert(key.clone(), hash).is_some() {
+                return Err(ScanError::DuplicateMapKey(key));
+            }
+            if old.and_then(|old| old.get(&key)) != Some(&hash) {
+                changes.insert(key, Some(value));
+            }
+        }
+        if let Some(old) = old {
+            for key in old.keys() {
+                if !current.contains_key(key) {
+                    changes.insert(key.clone(), None);
+                }
+            }
+        } else if current.is_empty() {
+            self.changes.push(FieldChange::Set {
+                path: MongoFieldPath::new(field),
+                value: Bson::Document(Document::new()),
+            });
+        }
+        for (key, value) in changes {
+            self.changes.push(match value {
+                Some(value) => FieldChange::Set {
+                    path: MongoFieldPath::new(field).child(&key),
+                    value,
+                },
+                None => FieldChange::Unset {
+                    path: MongoFieldPath::new(field).child(&key),
+                },
+            });
         }
         self.fields
             .insert(field.to_owned(), FieldSnapshot::Map(current));
-        self.next_cursor = ScanCursor {
-            field_index: field_index + 1,
-            map_key: None,
-        };
+        self.complete_field(field_index, [field.to_owned()])?;
         Ok(())
     }
 
-    /// Diffs the exact BSON business document produced by Serde. This is the
-    /// entry point used by the derive macro so partial updates cannot drift
-    /// from insert/replace encoding rules.
-    pub fn document<D>(&mut self, value: &D, policies: &[ScanFieldPolicy]) -> Result<(), ScanError>
-    where
-        D: MongoDocument,
-    {
-        if !self.active {
+    #[doc(hidden)]
+    pub fn absent(&mut self, field_index: usize, field: &str) -> Result<(), ScanError> {
+        if !self.begin_field(field_index) {
             return Ok(());
         }
-        let encode_started = Instant::now();
-        let mut current = encode_scan_document(value)?;
-        self.budget
-            .record_encoding(encode_started.elapsed(), estimated_document_size(&current));
-        let keys = self
-            .baseline
-            .fields
-            .keys()
-            .chain(current.keys())
-            .filter(|field| field_strategy(field, policies) != Some(ScanFieldStrategy::Ignore))
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        if self.baseline.fields.contains_key(field) {
+            self.changes.push(FieldChange::Unset {
+                path: MongoFieldPath::new(field),
+            });
+            self.removed_fields.insert(field.to_owned());
+        }
+        self.complete_field(field_index, [])?;
+        Ok(())
+    }
 
-        for (field_index, field) in keys.into_iter().enumerate() {
+    #[doc(hidden)]
+    pub fn flattened_absent(&mut self, field_index: usize) -> Result<(), ScanError> {
+        if !self.begin_field(field_index) {
+            return Ok(());
+        }
+        self.remove_group_fields(field_index, &BTreeSet::new());
+        self.complete_field(field_index, [])?;
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn flattened_value<T>(&mut self, field_index: usize, value: &T) -> Result<(), ScanError>
+    where
+        T: Serialize,
+    {
+        if !self.begin_field(field_index) {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let value = encode_value(value)?;
+        self.budget
+            .record_encoding(started.elapsed(), estimated_bson_value_size(&value));
+        let Bson::Document(document) = value else {
+            return Err(ScanError::ExpectedDocumentFragment);
+        };
+        let mut paths = BTreeSet::new();
+        for (field, value) in document {
             validate_field_path(&field)?;
-            let current_value = current.remove(&field);
-            let map_strategy = field_strategy(&field, policies) == Some(ScanFieldStrategy::Map);
-            match (self.baseline.fields.get(&field), current_value) {
-                (Some(FieldSnapshot::Whole(_)), Some(value))
-                    if !map_strategy || !matches!(value, Bson::Document(_)) =>
-                {
-                    self.whole(field_index, &field, value)?;
+            let hash = stable_hash(&value)?;
+            match self.baseline.fields.get(&field) {
+                Some(FieldSnapshot::Whole(old)) if old == &hash => {}
+                Some(FieldSnapshot::Whole(_)) | None => {
+                    self.changes.push(FieldChange::Set {
+                        path: MongoFieldPath::new(&field),
+                        value,
+                    });
                 }
-                (Some(FieldSnapshot::Map(_)), Some(Bson::Document(value))) if map_strategy => {
-                    self.map(field_index, &field, value)?;
+                Some(FieldSnapshot::Map(_)) => {
+                    return Err(ScanError::BaselineKindMismatch(field));
                 }
-                (Some(_), Some(value)) | (None, Some(value)) => {
-                    if map_strategy && let Bson::Document(document) = &value {
-                        self.budget.record_map_hashes(document.len());
-                    }
-                    let snapshot = snapshot_for_field(&field, &value, policies)?;
-                    self.replace_field(field_index, field, value, snapshot)?;
-                }
-                (Some(_), None) => {
-                    self.remove_field(field_index, field)?;
-                }
-                (None, None) => {}
+            }
+            self.fields
+                .insert(field.clone(), FieldSnapshot::Whole(hash));
+            paths.insert(field);
+        }
+        self.remove_group_fields(field_index, &paths);
+        self.complete_field(field_index, paths)?;
+        Ok(())
+    }
+
+    fn remove_group_fields(&mut self, field_index: usize, current: &BTreeSet<String>) {
+        if let Some(previous) = self.baseline.field_groups.get(&field_index) {
+            for field in previous.difference(current) {
+                self.changes.push(FieldChange::Unset {
+                    path: MongoFieldPath::new(field),
+                });
+                self.removed_fields.insert(field.clone());
             }
         }
-        Ok(())
-    }
-
-    fn replace_field(
-        &mut self,
-        field_index: usize,
-        field: String,
-        value: Bson,
-        snapshot: FieldSnapshot,
-    ) -> Result<(), ScanError> {
-        if !self.active || field_index < self.cursor.field_index {
-            return Ok(());
-        }
-        if !self.budget.field() {
-            self.pause(field_index, None);
-            return Ok(());
-        }
-        self.changes.push(FieldChange::Set {
-            path: MongoFieldPath::new(field.clone()),
-            value,
-        });
-        self.fields.insert(field, snapshot);
-        self.next_cursor = ScanCursor {
-            field_index: field_index + 1,
-            map_key: None,
-        };
-        Ok(())
-    }
-
-    fn remove_field(&mut self, field_index: usize, field: String) -> Result<(), ScanError> {
-        if !self.active || field_index < self.cursor.field_index {
-            return Ok(());
-        }
-        if !self.budget.field() {
-            self.pause(field_index, None);
-            return Ok(());
-        }
-        self.changes.push(FieldChange::Unset {
-            path: MongoFieldPath::new(field.clone()),
-        });
-        self.removed_fields.insert(field);
-        self.next_cursor = ScanCursor {
-            field_index: field_index + 1,
-            map_key: None,
-        };
-        Ok(())
     }
 
     pub fn finish(mut self) -> ScanDelta {
@@ -784,6 +966,7 @@ impl<'a> ScanBuilder<'a> {
                 baseline_revision: self.baseline.revision,
                 fields: self.fields,
                 removed_fields: self.removed_fields,
+                field_groups: self.field_groups,
                 next_cursor: self.next_cursor.clone(),
             },
             next_cursor: self.next_cursor,
@@ -791,12 +974,48 @@ impl<'a> ScanBuilder<'a> {
         }
     }
 
-    fn pause(&mut self, field_index: usize, map_key: Option<String>) {
-        self.complete = false;
+    fn begin_field(&mut self, field_index: usize) -> bool {
+        if !self.active || field_index < self.cursor.field_index {
+            return false;
+        }
+        if !self.budget.field() {
+            self.pause(field_index);
+            return false;
+        }
+        true
+    }
+
+    fn complete_field(
+        &mut self,
+        field_index: usize,
+        paths: impl IntoIterator<Item = String>,
+    ) -> Result<(), ScanError> {
+        let paths = paths.into_iter().collect::<BTreeSet<_>>();
+        for path in &paths {
+            let conflicts_with_current = self
+                .field_groups
+                .iter()
+                .any(|(index, fields)| *index != field_index && fields.contains(path));
+            let conflicts_with_baseline = self
+                .baseline
+                .field_groups
+                .iter()
+                .any(|(index, fields)| *index != field_index && fields.contains(path));
+            if conflicts_with_current || conflicts_with_baseline {
+                return Err(ScanError::DuplicateFieldPath(path.clone()));
+            }
+        }
+        self.field_groups.insert(field_index, paths);
         self.next_cursor = ScanCursor {
-            field_index,
-            map_key,
+            field_index: field_index + 1,
         };
+        Ok(())
+    }
+
+    fn pause(&mut self, field_index: usize) {
+        self.complete = false;
+        self.active = false;
+        self.next_cursor = ScanCursor { field_index };
     }
 }
 
@@ -808,13 +1027,6 @@ where
     T: Serialize,
 {
     mongodb::bson::to_bson(value).map_err(|error| ScanError::Encoding(error.to_string()))
-}
-
-fn encode_scan_document<D>(value: &D) -> Result<Document, ScanError>
-where
-    D: MongoDocument,
-{
-    encode_business_document(value).map_err(|error| ScanError::Encoding(error.to_string()))
 }
 
 fn estimated_document_size(document: &Document) -> usize {
@@ -864,41 +1076,8 @@ fn estimated_bson_value_size(value: &Bson) -> usize {
     }
 }
 
-fn field_strategy(field: &str, policies: &[ScanFieldPolicy]) -> Option<ScanFieldStrategy> {
-    policies
-        .iter()
-        .find(|policy| policy.path == field)
-        .map(|policy| policy.strategy)
-}
-
-fn snapshot_for_field(
-    field: &str,
-    value: &Bson,
-    policies: &[ScanFieldPolicy],
-) -> Result<FieldSnapshot, ScanError> {
-    if field_strategy(field, policies) == Some(ScanFieldStrategy::Map)
-        && let Bson::Document(document) = value
-    {
-        return Ok(FieldSnapshot::Map(hash_document_entries(document)?));
-    }
-    Ok(FieldSnapshot::Whole(stable_hash(value)?))
-}
-
-fn encode_map_entries<'a, K, V>(
-    entries: impl IntoIterator<Item = (&'a K, &'a V)>,
-) -> Result<BTreeMap<String, Bson>, ScanError>
-where
-    K: MongoMapKey + 'a,
-    V: Serialize + 'a,
-{
-    entries
-        .into_iter()
-        .map(|(key, value)| {
-            let key = key.mongo_map_key();
-            validate_map_key(&key)?;
-            Ok((key, encode_value(value)?))
-        })
-        .collect()
+fn field_policy<'a>(field: &str, policies: &'a [ScanFieldPolicy]) -> Option<&'a ScanFieldPolicy> {
+    policies.iter().find(|policy| policy.path == field)
 }
 
 fn stable_hash(value: &Bson) -> Result<StableHash, ScanError> {
@@ -908,18 +1087,6 @@ fn stable_hash(value: &Bson) -> Result<StableHash, ScanError> {
 }
 
 fn hash_document_entries(value: &Document) -> Result<BTreeMap<String, StableHash>, ScanError> {
-    value
-        .iter()
-        .map(|(key, value)| {
-            validate_map_key(key)?;
-            Ok((key.clone(), stable_hash(value)?))
-        })
-        .collect()
-}
-
-fn hash_encoded_map(
-    value: &BTreeMap<String, Bson>,
-) -> Result<BTreeMap<String, StableHash>, ScanError> {
     value
         .iter()
         .map(|(key, value)| {
@@ -1071,18 +1238,18 @@ mod tests {
     }
 
     #[test]
-    fn partial_map_scan_resumes_without_skips_or_duplicates() {
+    fn field_budget_defers_whole_map_without_splitting_its_entry_diff() {
         let mut baseline = baseline();
         let current = doc! { "1": { "count": 2 }, "2": { "count": 1 }, "3": { "count": 4 } };
-        let mut budget = ScanBudget::new(1, 2, 1, Duration::from_secs(1));
+        let mut budget = ScanBudget::new(1, 1, Duration::from_secs(1));
         let mut scan = ScanBuilder::new(&baseline, ScanCursor::default(), &mut budget);
         scan.whole(0, "profile", Bson::Document(doc! { "name": "old" }))
             .expect("profile scan should encode");
         scan.map(1, "items", current.clone())
-            .expect("partial item scan should encode");
+            .expect("deferred item scan should not encode");
         let first = scan.finish();
         assert!(!first.complete);
-        assert_eq!(first.changes.len(), 1);
+        assert!(first.changes.is_empty());
         let cursor = first.next_cursor.clone();
         assert_eq!(
             baseline
@@ -1097,7 +1264,7 @@ mod tests {
             .expect("resumed item scan should encode");
         let second = scan.finish();
         assert!(second.complete);
-        assert_eq!(second.changes.len(), 2);
+        assert_eq!(second.changes.len(), 3);
     }
 
     #[test]
@@ -1125,6 +1292,7 @@ mod tests {
                 identity: baseline.identity,
                 revision: 0,
                 fields: baseline.fields.clone(),
+                field_groups: baseline.field_groups.clone(),
             },
             ScanCursor::default(),
             &mut budget,
@@ -1151,7 +1319,7 @@ mod tests {
     #[test]
     fn document_budget_defers_scan_without_creating_changes() {
         let baseline = baseline();
-        let mut budget = ScanBudget::new(0, usize::MAX, usize::MAX, Duration::from_secs(1));
+        let mut budget = ScanBudget::new(0, usize::MAX, Duration::from_secs(1));
         let mut scan = ScanBuilder::new(&baseline, ScanCursor::default(), &mut budget);
         scan.whole(0, "profile", Bson::Document(doc! { "name": "new" }))
             .expect("profile scan should encode");
