@@ -28,7 +28,10 @@ pub struct FlushGeneration {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateMode {
+    /// Fails when any document already owns the requested `_id`.
     InsertOnly,
+    /// Inserts when absent and may replace only a version-zero placeholder.
+    /// Existing durable versions are reported as conflicts and never reset.
     UpsertAllowed,
 }
 
@@ -55,6 +58,9 @@ pub struct PreparedDocumentWrite {
     /// be reused as a storage value because typed IDs are not always strings.
     pub document_id: Bson,
     pub expected_version: i64,
+    /// Stable across retries of this exact logical write and persisted in the
+    /// document so an acknowledged timeout can be reconciled safely.
+    pub operation_id: String,
     pub operation: DocumentOperation,
 }
 
@@ -64,7 +70,7 @@ pub struct FlushRequest {
     pub writes: Vec<PreparedDocumentWrite>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DocumentCommit {
     pub key: MongoDocumentKey,
     pub scan: ScanCommit,
@@ -72,16 +78,18 @@ pub struct DocumentCommit {
     /// callers leave this unset.
     pub mutation_epoch: Option<u64>,
     pub scan_complete: bool,
+    pub(crate) changed: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InFlightCommit {
     pub generation: FlushGeneration,
     pub document_commits: BTreeMap<WriteToken, DocumentCommit>,
     pub clean_commits: Vec<DocumentCommit>,
+    pub writes: BTreeMap<WriteToken, PreparedDocumentWrite>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreparedFlush {
     pub request: Option<FlushRequest>,
     pub commit: InFlightCommit,
@@ -187,6 +195,7 @@ mod tests {
                         i64::try_from(*token).expect("test token should fit BSON i64"),
                     ),
                     expected_version: 3,
+                    operation_id: format!("operation-{token}"),
                     operation: DocumentOperation::Update {
                         sets: BTreeMap::from([(
                             MongoFieldPath::new("value"),

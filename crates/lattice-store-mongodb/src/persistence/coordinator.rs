@@ -5,10 +5,13 @@ use std::time::{Duration, Instant};
 
 use crate::document::tracked::Tracked;
 use crate::document::{
-    LoadedDocument, LoadedDocumentMeta, encode_business_document, encode_document_id,
+    LoadedDocument, LoadedDocumentMeta, LoadedScannedDocument, encode_business_document,
+    encode_document_id,
 };
-use crate::error::MongoStoreError;
-use crate::scan::{FieldChange, MongoScan, ScanBudget, ScanCursor, ScanError, ScanSnapshot};
+use crate::error::{MongoStoreError, MongoStoreErrorRecovery};
+use crate::scan::{
+    FieldChange, MongoScan, ScanBudget, ScanCursor, ScanError, ScanSnapshot, ScanWorkMetrics,
+};
 
 use super::request::{
     CreateMode, DocumentCommit, DocumentOperation, DocumentWriteOutcome, FlushGeneration,
@@ -22,9 +25,17 @@ struct DocumentState {
     cursor: ScanCursor,
     acknowledged_mutation_epoch: Option<u64>,
     scanning_mutation_epoch: Option<u64>,
+    scanning_changed: bool,
     version: i64,
     updated_at_ms: i64,
     create_mode: Option<CreateMode>,
+    rejection: Option<DocumentRejection>,
+}
+
+#[derive(Debug)]
+struct DocumentRejection {
+    mutation_epoch: Option<u64>,
+    error: String,
 }
 
 impl DocumentState {
@@ -46,15 +57,31 @@ impl DocumentState {
         }
     }
 
-    fn apply_commit_metadata(&mut self, mutation_epoch: Option<u64>, scan_complete: bool) {
+    fn apply_commit_metadata(
+        &mut self,
+        mutation_epoch: Option<u64>,
+        scan_complete: bool,
+        changed: bool,
+    ) -> bool {
         let Some(mutation_epoch) = mutation_epoch else {
-            return;
+            return false;
+        };
+        let changed = if self.scanning_mutation_epoch == Some(mutation_epoch) {
+            self.scanning_changed || changed
+        } else {
+            changed
         };
         if scan_complete {
+            let false_positive =
+                self.acknowledged_mutation_epoch != Some(mutation_epoch) && !changed;
             self.acknowledged_mutation_epoch = Some(mutation_epoch);
             self.scanning_mutation_epoch = None;
+            self.scanning_changed = false;
+            false_positive
         } else {
             self.scanning_mutation_epoch = Some(mutation_epoch);
+            self.scanning_changed = changed;
+            false
         }
     }
 }
@@ -103,6 +130,39 @@ pub struct PersistenceCounters {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PersistenceScanMetrics {
+    /// Number of business documents encoded for diff scans.
+    pub encoded_documents: u64,
+    /// Estimated BSON bytes produced by business-document encoding.
+    ///
+    /// This is calculated while walking the encoded document and deliberately
+    /// avoids a second BSON serialization solely for metrics.
+    pub estimated_encoded_bytes: u64,
+    /// Nanoseconds spent encoding Rust business documents into BSON.
+    pub encoding_nanos: u64,
+    /// Number of map entries hashed while preparing field-level diffs.
+    pub map_entries_hashed: u64,
+    /// Completed tracked scans triggered by a new mutation epoch that found no
+    /// serialized business change.
+    pub false_positive_scans: u64,
+}
+
+impl PersistenceScanMetrics {
+    fn record_work(&mut self, work: ScanWorkMetrics) {
+        self.encoded_documents = self
+            .encoded_documents
+            .saturating_add(work.encoded_documents);
+        self.estimated_encoded_bytes = self
+            .estimated_encoded_bytes
+            .saturating_add(work.estimated_encoded_bytes);
+        self.encoding_nanos = self.encoding_nanos.saturating_add(work.encoding_nanos);
+        self.map_entries_hashed = self
+            .map_entries_hashed
+            .saturating_add(work.map_entries_hashed);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PersistenceReport {
     pub clean: usize,
     pub applied: usize,
@@ -118,12 +178,14 @@ pub struct MongoPersistenceCoordinator {
     activation_epoch: u64,
     next_sequence: u64,
     in_flight: Option<InFlightCommit>,
+    retry_pending: Option<PreparedFlush>,
     conflict: Option<PersistenceConflict>,
     last_error: Option<String>,
     retry_attempt: u32,
     retry_not_before: Option<Instant>,
     retry_policy: RetryPolicy,
     counters: PersistenceCounters,
+    scan_metrics: PersistenceScanMetrics,
 }
 
 impl MongoPersistenceCoordinator {
@@ -137,12 +199,14 @@ impl MongoPersistenceCoordinator {
             activation_epoch,
             next_sequence: 1,
             in_flight: None,
+            retry_pending: None,
             conflict: None,
             last_error: None,
             retry_attempt: 0,
             retry_not_before: None,
             retry_policy,
             counters: PersistenceCounters::default(),
+            scan_metrics: PersistenceScanMetrics::default(),
         }
     }
 
@@ -181,6 +245,86 @@ impl MongoPersistenceCoordinator {
         Ok(Tracked::clean(value))
     }
 
+    #[doc(hidden)]
+    pub fn track_loaded_scanned<D>(
+        &mut self,
+        loaded: LoadedScannedDocument<D>,
+    ) -> Result<Tracked<D>, PersistenceError>
+    where
+        D: MongoScan,
+    {
+        let (loaded, baseline) = loaded.into_parts();
+        let LoadedDocument {
+            version,
+            updated_at_ms,
+            value,
+        } = loaded;
+        let key = MongoDocumentKey::for_document::<D>(value.id())?;
+        if self.documents.contains_key(&key) {
+            return Err(PersistenceError::DuplicateDocument(key));
+        }
+        self.documents.insert(
+            key,
+            DocumentState {
+                baseline,
+                cursor: ScanCursor::default(),
+                acknowledged_mutation_epoch: Some(0),
+                scanning_mutation_epoch: None,
+                scanning_changed: false,
+                version,
+                updated_at_ms,
+                create_mode: None,
+                rejection: None,
+            },
+        );
+        Ok(Tracked::clean(value))
+    }
+
+    #[doc(hidden)]
+    pub fn track_loaded_scanned_many<D>(
+        &mut self,
+        loaded: Vec<LoadedScannedDocument<D>>,
+    ) -> Result<Vec<Tracked<D>>, PersistenceError>
+    where
+        D: MongoScan,
+    {
+        let mut keys = BTreeSet::new();
+        let mut pending = Vec::with_capacity(loaded.len());
+        for loaded in loaded {
+            let (loaded, baseline) = loaded.into_parts();
+            let LoadedDocument {
+                version,
+                updated_at_ms,
+                value,
+            } = loaded;
+            let key = MongoDocumentKey::for_document::<D>(value.id())?;
+            if self.documents.contains_key(&key) || !keys.insert(key.clone()) {
+                return Err(PersistenceError::DuplicateDocument(key));
+            }
+            pending.push((
+                key,
+                DocumentState {
+                    baseline,
+                    cursor: ScanCursor::default(),
+                    acknowledged_mutation_epoch: Some(0),
+                    scanning_mutation_epoch: None,
+                    scanning_changed: false,
+                    version,
+                    updated_at_ms,
+                    create_mode: None,
+                    rejection: None,
+                },
+                value,
+            ));
+        }
+        let mut tracked = Vec::with_capacity(pending.len());
+        for (key, state, value) in pending {
+            self.documents.insert(key, state);
+            tracked.push(Tracked::clean(value));
+        }
+        Ok(tracked)
+    }
+
     /// Atomically registers a runtime-sized batch of loaded documents of one
     /// type and returns actor-local tracked values in input order.
     pub fn track_loaded_many<D>(
@@ -206,9 +350,11 @@ impl MongoPersistenceCoordinator {
                     cursor: ScanCursor::default(),
                     acknowledged_mutation_epoch: Some(0),
                     scanning_mutation_epoch: None,
+                    scanning_changed: false,
                     version: meta.version,
                     updated_at_ms: meta.updated_at_ms,
                     create_mode: None,
+                    rejection: None,
                 },
                 value,
             ));
@@ -270,9 +416,11 @@ impl MongoPersistenceCoordinator {
                 cursor: ScanCursor::default(),
                 acknowledged_mutation_epoch: mutation_epoch,
                 scanning_mutation_epoch: None,
+                scanning_changed: false,
                 version: meta.version,
                 updated_at_ms: meta.updated_at_ms,
                 create_mode,
+                rejection: None,
             },
         );
         Ok(())
@@ -327,6 +475,7 @@ impl MongoPersistenceCoordinator {
         Ok(!in_flight
             && !conflicted
             && state.create_mode.is_none()
+            && state.rejection.is_none()
             && state.scanning_mutation_epoch.is_none()
             && state.cursor == ScanCursor::default()
             && state.acknowledged_mutation_epoch == Some(tracked.mutation_epoch()))
@@ -363,6 +512,9 @@ impl MongoPersistenceCoordinator {
         if self.conflict.is_some() {
             return Err(PersistenceError::ConflictBlocked);
         }
+        if let Some(prepared) = &self.retry_pending {
+            return Ok(prepared.clone());
+        }
         let generation = FlushGeneration {
             activation_epoch: self.activation_epoch,
             sequence: self.next_sequence,
@@ -378,6 +530,8 @@ impl MongoPersistenceCoordinator {
             .counters
             .changed_paths
             .saturating_add(preparation.changed_paths);
+        self.scan_metrics
+            .record_work(preparation.budget.work_metrics());
         Ok(preparation.finish())
     }
 
@@ -385,6 +539,13 @@ impl MongoPersistenceCoordinator {
         self.validate_generation(commit.generation)?;
         if self.in_flight.is_some() {
             return Err(PersistenceError::FlushInFlight);
+        }
+        if self
+            .retry_pending
+            .as_ref()
+            .is_some_and(|pending| pending.commit.generation == commit.generation)
+        {
+            self.retry_pending = None;
         }
         self.in_flight = Some(commit);
         Ok(())
@@ -400,6 +561,13 @@ impl MongoPersistenceCoordinator {
         }
         let mut report = PersistenceReport::default();
         self.apply_clean_commits(commit.clean_commits, &mut report)?;
+        if !self
+            .documents
+            .values()
+            .any(|document| document.rejection.is_some())
+        {
+            self.last_error = None;
+        }
         Ok(report)
     }
 
@@ -445,14 +613,22 @@ impl MongoPersistenceCoordinator {
         }
 
         let commit = self.in_flight.take().expect("checked in-flight commit");
+        let InFlightCommit {
+            generation: _,
+            document_commits,
+            clean_commits,
+            mut writes,
+        } = commit;
         let mut report = PersistenceReport::default();
-        self.apply_clean_commits(commit.clean_commits, &mut report)?;
+        self.apply_clean_commits(clean_commits, &mut report)?;
         self.counters.attempted_documents = self
             .counters
             .attempted_documents
-            .saturating_add(commit.document_commits.len() as u64);
+            .saturating_add(document_commits.len() as u64);
+        let mut retry_commits = BTreeMap::new();
+        let mut retry_writes = BTreeMap::new();
 
-        for (token, document_commit) in commit.document_commits {
+        for (token, document_commit) in document_commits {
             let outcome = outcome.documents.get(&token).expect("validated token set");
             let state = self
                 .documents
@@ -465,13 +641,19 @@ impl MongoPersistenceCoordinator {
                     ..
                 } => {
                     state.cursor = state.baseline.apply(document_commit.scan)?;
-                    state.apply_commit_metadata(
+                    let false_positive = state.apply_commit_metadata(
                         document_commit.mutation_epoch,
                         document_commit.scan_complete,
+                        document_commit.changed,
                     );
+                    if false_positive {
+                        self.scan_metrics.false_positive_scans =
+                            self.scan_metrics.false_positive_scans.saturating_add(1);
+                    }
                     state.version = *new_version;
                     state.updated_at_ms = *updated_at_ms;
                     state.create_mode = None;
+                    state.rejection = None;
                     report.applied += 1;
                     self.counters.applied_documents =
                         self.counters.applied_documents.saturating_add(1);
@@ -485,10 +667,22 @@ impl MongoPersistenceCoordinator {
                     self.counters.conflicts = self.counters.conflicts.saturating_add(1);
                 }
                 DocumentWriteOutcome::NotFound { expected_version } => {
-                    self.last_error = Some(format!(
-                        "document {} was missing at expected version {expected_version}",
-                        document_commit.key.id
-                    ));
+                    self.conflict = Some(PersistenceConflict {
+                        key: document_commit.key,
+                        expected_version: *expected_version,
+                    });
+                    report.conflicts += 1;
+                    self.counters.conflicts = self.counters.conflicts.saturating_add(1);
+                }
+                DocumentWriteOutcome::Failed { error }
+                    if error.recovery() == MongoStoreErrorRecovery::ReprepareAfterMutation =>
+                {
+                    let error = error.to_string();
+                    self.last_error = Some(error.clone());
+                    state.rejection = Some(DocumentRejection {
+                        mutation_epoch: document_commit.mutation_epoch,
+                        error,
+                    });
                     report.failed += 1;
                     self.counters.failed_documents =
                         self.counters.failed_documents.saturating_add(1);
@@ -498,21 +692,58 @@ impl MongoPersistenceCoordinator {
                     report.failed += 1;
                     self.counters.failed_documents =
                         self.counters.failed_documents.saturating_add(1);
+                    retry_writes.insert(
+                        token,
+                        writes
+                            .remove(&token)
+                            .expect("in-flight write matches commit"),
+                    );
+                    retry_commits.insert(token, document_commit);
                 }
                 DocumentWriteOutcome::NotAttempted => {
                     self.last_error = Some("document write was not attempted".to_owned());
                     report.failed += 1;
                     self.counters.failed_documents =
                         self.counters.failed_documents.saturating_add(1);
+                    retry_writes.insert(
+                        token,
+                        writes
+                            .remove(&token)
+                            .expect("in-flight write matches commit"),
+                    );
+                    retry_commits.insert(token, document_commit);
                 }
             }
         }
-        if report.failed > 0 {
+        if !retry_commits.is_empty() {
+            let scan_complete = retry_commits
+                .values()
+                .all(|document| document.scan_complete);
+            let request_writes = retry_writes.values().cloned().collect();
+            self.retry_pending = Some(PreparedFlush {
+                request: Some(FlushRequest {
+                    generation,
+                    writes: request_writes,
+                }),
+                commit: InFlightCommit {
+                    generation,
+                    document_commits: retry_commits,
+                    clean_commits: Vec::new(),
+                    writes: retry_writes,
+                },
+                scan_complete,
+            });
             self.schedule_retry();
         } else if report.conflicts == 0 {
             self.retry_attempt = 0;
             self.retry_not_before = None;
-            self.last_error = None;
+            if !self
+                .documents
+                .values()
+                .any(|document| document.rejection.is_some())
+            {
+                self.last_error = None;
+            }
         }
         Ok(report)
     }
@@ -533,10 +764,66 @@ impl MongoPersistenceCoordinator {
                 actual: generation,
             });
         }
-        self.in_flight = None;
+        let commit = self.in_flight.take().expect("checked in-flight commit");
+        let writes = commit.writes.values().cloned().collect::<Vec<_>>();
+        let scan_complete = commit
+            .document_commits
+            .values()
+            .chain(commit.clean_commits.iter())
+            .all(|document| document.scan_complete);
+        self.retry_pending = Some(PreparedFlush {
+            request: (!writes.is_empty()).then_some(FlushRequest { generation, writes }),
+            commit,
+            scan_complete,
+        });
         self.last_error = Some(error.into());
         self.schedule_retry();
         Ok(())
+    }
+
+    pub fn dispatch_rejected(
+        &mut self,
+        generation: FlushGeneration,
+        error: impl Into<String>,
+    ) -> Result<PersistenceReport, PersistenceError> {
+        self.validate_generation(generation)?;
+        let expected = self
+            .in_flight
+            .as_ref()
+            .ok_or(PersistenceError::NoFlushInFlight)?;
+        if expected.generation != generation {
+            return Err(PersistenceError::ForeignGeneration {
+                expected: expected.generation,
+                actual: generation,
+            });
+        }
+        let commit = self.in_flight.take().expect("checked in-flight commit");
+        let error = error.into();
+        let mut report = PersistenceReport::default();
+        self.apply_clean_commits(commit.clean_commits, &mut report)?;
+        report.failed = commit.document_commits.len();
+        self.counters.attempted_documents = self
+            .counters
+            .attempted_documents
+            .saturating_add(commit.document_commits.len() as u64);
+        self.counters.failed_documents = self
+            .counters
+            .failed_documents
+            .saturating_add(commit.document_commits.len() as u64);
+        for document_commit in commit.document_commits.into_values() {
+            let state = self
+                .documents
+                .get_mut(&document_commit.key)
+                .ok_or_else(|| PersistenceError::UnknownDocument(document_commit.key.clone()))?;
+            state.rejection = Some(DocumentRejection {
+                mutation_epoch: document_commit.mutation_epoch,
+                error: error.clone(),
+            });
+        }
+        self.retry_attempt = 0;
+        self.retry_not_before = None;
+        self.last_error = Some(error);
+        Ok(report)
     }
 
     pub fn has_in_flight(&self) -> bool {
@@ -550,7 +837,7 @@ impl MongoPersistenceCoordinator {
             + self
                 .documents
                 .values()
-                .filter(|document| document.create_mode.is_some())
+                .filter(|document| document.create_mode.is_some() || document.rejection.is_some())
                 .count()
     }
 
@@ -575,10 +862,21 @@ impl MongoPersistenceCoordinator {
         &self.counters
     }
 
+    pub const fn scan_metrics(&self) -> &PersistenceScanMetrics {
+        &self.scan_metrics
+    }
+
     pub fn document_meta(&self, key: &MongoDocumentKey) -> Option<(i64, i64)> {
         self.documents
             .get(key)
             .map(|state| (state.version, state.updated_at_ms))
+    }
+
+    pub fn document_rejection(&self, key: &MongoDocumentKey) -> Option<&str> {
+        self.documents
+            .get(key)
+            .and_then(|state| state.rejection.as_ref())
+            .map(|rejection| rejection.error.as_str())
     }
 
     fn schedule_retry(&mut self) {
@@ -608,7 +906,18 @@ impl MongoPersistenceCoordinator {
                 .get_mut(&commit.key)
                 .ok_or_else(|| PersistenceError::UnknownDocument(commit.key.clone()))?;
             state.cursor = state.baseline.apply(commit.scan)?;
-            state.apply_commit_metadata(commit.mutation_epoch, commit.scan_complete);
+            let false_positive = state.apply_commit_metadata(
+                commit.mutation_epoch,
+                commit.scan_complete,
+                commit.changed,
+            );
+            if false_positive {
+                self.scan_metrics.false_positive_scans =
+                    self.scan_metrics.false_positive_scans.saturating_add(1);
+            }
+            if commit.scan_complete {
+                state.rejection = None;
+            }
             report.clean += 1;
         }
         Ok(())
@@ -686,6 +995,14 @@ impl<'a> MongoPreparation<'a> {
             .documents
             .get(&key)
             .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
+        if state
+            .rejection
+            .as_ref()
+            .is_some_and(|rejection| rejection.mutation_epoch == mutation_epoch)
+        {
+            self.scan_complete = false;
+            return Ok(());
+        }
         let cursor = state.scan_cursor(mutation_epoch);
         let delta = value.diff(&state.baseline, cursor.clone(), &mut self.budget)?;
         self.scan_complete &= delta.complete;
@@ -696,11 +1013,13 @@ impl<'a> MongoPreparation<'a> {
         if delta.changes.is_empty() && !delta.complete && delta.next_cursor == cursor {
             return Ok(());
         }
+        let changed = !delta.changes.is_empty() || state.create_mode.is_some();
         let commit = DocumentCommit {
             key: key.clone(),
             scan: delta.commit,
             mutation_epoch,
             scan_complete: delta.complete,
+            changed,
         };
         if delta.changes.is_empty() && state.create_mode.is_none() {
             self.clean_commits.push(commit);
@@ -737,6 +1056,7 @@ impl<'a> MongoPreparation<'a> {
             key,
             document_id: encode_document_id::<D>(value.id())?,
             expected_version: state.version,
+            operation_id: uuid::Uuid::new_v4().simple().to_string(),
             operation,
         });
         self.document_commits.insert(token, commit);
@@ -744,10 +1064,17 @@ impl<'a> MongoPreparation<'a> {
     }
 
     fn finish(self) -> PreparedFlush {
+        let writes = self
+            .writes
+            .iter()
+            .cloned()
+            .map(|write| (write.token, write))
+            .collect();
         let commit = InFlightCommit {
             generation: self.generation,
             document_commits: self.document_commits,
             clean_commits: self.clean_commits,
+            writes,
         };
         let request = (!self.writes.is_empty()).then_some(FlushRequest {
             generation: self.generation,
@@ -835,6 +1162,7 @@ mod tests {
         #[mongo(id)]
         id: u64,
         name: String,
+        #[mongo(scan = "map")]
         items: BTreeMap<String, i32>,
     }
 
@@ -952,6 +1280,36 @@ mod tests {
     }
 
     #[test]
+    fn mutable_access_without_a_change_causes_only_a_false_positive_scan() {
+        let mut value = crate::document::tracked::Tracked::clean(document("old"));
+        let mut coordinator = loaded(value.read(), Some(0));
+        let _ = value.write();
+
+        let prepared = coordinator
+            .prepare(ScanBudget::generous(), |preparation| {
+                preparation.scan_tracked(&value)
+            })
+            .expect("false-positive dirty epoch should scan normally");
+
+        assert!(prepared.request.is_none());
+        assert_eq!(coordinator.counters().scans, 1);
+        assert_eq!(coordinator.scan_metrics().encoded_documents, 1);
+        assert!(coordinator.scan_metrics().estimated_encoded_bytes > 0);
+        assert_eq!(coordinator.scan_metrics().map_entries_hashed, 1);
+        coordinator
+            .complete_clean(prepared.commit)
+            .expect("clean scan should acknowledge the newer epoch");
+        assert_eq!(coordinator.scan_metrics().false_positive_scans, 1);
+        let skipped = coordinator
+            .prepare(ScanBudget::generous(), |preparation| {
+                preparation.scan_tracked(&value)
+            })
+            .expect("acknowledged false positive should be skipped");
+        assert!(skipped.request.is_none());
+        assert_eq!(coordinator.counters().scans, 1);
+    }
+
+    #[test]
     fn failed_write_preserves_baseline_and_schedules_retry() {
         let old = document("old");
         let mut value = old.clone();
@@ -981,6 +1339,7 @@ mod tests {
         let request = prepared.request.as_ref().expect("write should exist");
         let generation = request.generation;
         let token = request.writes[0].token;
+        let operation_id = request.writes[0].operation_id.clone();
         coordinator.begin_flush(prepared.commit).unwrap();
         let report = coordinator
             .complete(
@@ -1003,8 +1362,111 @@ mod tests {
             .prepare(ScanBudget::generous(), |preparation| {
                 preparation.scan(&value)
             })
-            .expect("retry should regenerate from old baseline");
-        assert!(retry.request.is_some());
+            .expect("retry should preserve the exact ambiguous write");
+        let retry_write = &retry.request.as_ref().expect("retry should exist").writes[0];
+        assert_eq!(retry_write.operation_id, operation_id);
+        assert_eq!(retry_write.token, token);
+        assert_eq!(retry.commit.generation, generation);
+    }
+
+    #[test]
+    fn rejected_write_waits_for_mutation_then_reprepares_current_state() {
+        let old = document("old");
+        let mut value = crate::document::tracked::Tracked::clean(old.clone());
+        let mut coordinator = loaded(value.read(), Some(0));
+        value.write().items.insert("oversized".to_owned(), 2);
+
+        let rejected = coordinator
+            .prepare(ScanBudget::generous(), |preparation| {
+                preparation.scan_tracked(&value)
+            })
+            .expect("oversized state should prepare once");
+        let rejected_request = rejected.request.as_ref().expect("write should exist");
+        let rejected_generation = rejected_request.generation;
+        let rejected_token = rejected_request.writes[0].token;
+        let rejected_operation_id = rejected_request.writes[0].operation_id.clone();
+        coordinator.begin_flush(rejected.commit).unwrap();
+        let report = coordinator
+            .complete(
+                rejected_generation,
+                FlushOutcome {
+                    documents: BTreeMap::from([(
+                        rejected_token,
+                        DocumentWriteOutcome::Failed {
+                            error: MongoStoreError::rejected(
+                                "document exceeds MongoDB's maximum BSON size",
+                            ),
+                        },
+                    )]),
+                },
+            )
+            .expect("definitive rejection should be recorded");
+        assert_eq!(report.failed, 1);
+        assert_eq!(coordinator.retry_attempt(), 0);
+        assert!(coordinator.retry_delay().is_none());
+        let key = MongoDocumentKey::for_document::<TestDocument>(&42).unwrap();
+        assert!(
+            coordinator
+                .document_rejection(&key)
+                .is_some_and(|error| error.contains("maximum BSON size"))
+        );
+
+        let unchanged = coordinator
+            .prepare(ScanBudget::generous(), |preparation| {
+                preparation.scan_tracked(&value)
+            })
+            .expect("same rejected epoch should remain locally blocked");
+        assert!(unchanged.request.is_none());
+        assert!(!unchanged.scan_complete);
+
+        {
+            let current = value.write();
+            current.items.remove("oversized");
+            current.name = "small".to_owned();
+        }
+        let recovered = coordinator
+            .prepare(ScanBudget::generous(), |preparation| {
+                preparation.scan_tracked(&value)
+            })
+            .expect("new mutation epoch should be reprepared");
+        let recovered_request = recovered
+            .request
+            .as_ref()
+            .expect("fresh write should exist");
+        assert_ne!(recovered_request.generation, rejected_generation);
+        assert_ne!(
+            recovered_request.writes[0].operation_id,
+            rejected_operation_id
+        );
+        let DocumentOperation::Update { sets, .. } = &recovered_request.writes[0].operation else {
+            panic!("loaded document should update");
+        };
+        assert_eq!(
+            sets.get(&crate::persistence::types::MongoFieldPath::new("name")),
+            Some(&Bson::String("small".to_owned())),
+        );
+        assert!(!sets.keys().any(|path| path.0.starts_with("items.")));
+
+        let generation = recovered_request.generation;
+        let token = recovered_request.writes[0].token;
+        coordinator.begin_flush(recovered.commit).unwrap();
+        coordinator
+            .complete(
+                generation,
+                FlushOutcome {
+                    documents: BTreeMap::from([(
+                        token,
+                        DocumentWriteOutcome::Applied {
+                            previous_version: 3,
+                            new_version: 4,
+                            updated_at_ms: 22,
+                        },
+                    )]),
+                },
+            )
+            .expect("smaller current state should apply");
+        assert!(coordinator.document_rejection(&key).is_none());
+        assert!(coordinator.last_error().is_none());
     }
 
     #[test]
@@ -1103,6 +1565,11 @@ mod tests {
             .unwrap();
         assert!(!partial.scan_complete);
         let request = partial.request.as_ref().unwrap();
+        let DocumentOperation::Update { sets, .. } = &request.writes[0].operation else {
+            panic!("partial document should update");
+        };
+        assert!(sets.keys().any(|path| path.0 == "items.two"));
+        assert!(!sets.keys().any(|path| path.0 == "name"));
         let generation = request.generation;
         let token = request.writes[0].token;
         coordinator.begin_flush(partial.commit).unwrap();
@@ -1132,8 +1599,8 @@ mod tests {
         else {
             panic!("resumed document should update");
         };
-        assert!(sets.keys().any(|path| path.0 == "items.two"));
-        assert!(!sets.keys().any(|path| path.0 == "name"));
+        assert!(sets.keys().any(|path| path.0 == "name"));
+        assert!(!sets.keys().any(|path| path.0 == "items.two"));
     }
 
     #[test]

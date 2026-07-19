@@ -2316,6 +2316,7 @@ name = "lattice-store-mongodb"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "criterion",
  "lattice-actor",
  "lattice-store-mongodb-macros",
  "mongodb",
@@ -2324,6 +2325,7 @@ dependencies = [
  "tokio",
  "tracing",
  "trybuild",
+ "uuid",
 ]
 
 [[package]]

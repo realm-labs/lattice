@@ -7,7 +7,7 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::PipeToSelfError;
 use lattice_actor::traits::{Actor, Handler, Message};
 
-use crate::error::MongoStoreError;
+use crate::error::{MongoStoreError, MongoStoreErrorRecovery};
 
 use super::coordinator::{MongoPersistenceCoordinator, PersistenceError, PersistenceReport};
 use super::request::{FlushGeneration, FlushOutcome, PreparedFlush, PreparedWriteStore};
@@ -84,8 +84,9 @@ impl MongoPersistenceCoordinator {
         Ok(PersistenceStatus::InFlight)
     }
 
-    /// Applies a completion in a later actor turn. Transport failures are
-    /// converted into scheduled retries without consuming scan baselines.
+    /// Applies a completion in a later actor turn. Ambiguous transport
+    /// failures retain the exact write for retry; definitive storage
+    /// rejections retain the baseline but wait for a new mutation epoch.
     pub fn apply_completion(
         &mut self,
         completion: MongoFlushCompleted,
@@ -94,6 +95,10 @@ impl MongoPersistenceCoordinator {
             Ok(outcome) => self
                 .complete(completion.generation, outcome)
                 .map(CompletionStatus::Applied),
+            Err(error) if error.recovery() == MongoStoreErrorRecovery::ReprepareAfterMutation => {
+                self.dispatch_rejected(completion.generation, error.to_string())
+                    .map(CompletionStatus::Applied)
+            }
             Err(error) => {
                 self.dispatch_failed(completion.generation, error.to_string())?;
                 Ok(CompletionStatus::RetryScheduled)

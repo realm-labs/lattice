@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use mongodb::bson::doc;
 use serde::{Deserialize, Serialize};
 
 use crate::document::MongoDocument;
@@ -73,24 +74,26 @@ async fn configured_mongo_verifies_direct_and_prepared_version_semantics() {
         ReplaceOutcome::VersionConflict
     );
 
+    let prepared_update = PreparedDocumentWrite {
+        token: WriteToken(1),
+        key: MongoDocumentKey::new(IntegrationDocument::COLLECTION, id.to_string()),
+        document_id: crate::document::encode_document_id::<IntegrationDocument>(&id)
+            .expect("numeric integration id should encode"),
+        expected_version: 1,
+        operation_id: "integration-update-1".to_owned(),
+        operation: DocumentOperation::Update {
+            sets: BTreeMap::from([
+                (
+                    MongoFieldPath::new("name"),
+                    mongodb::bson::Bson::String("prepared".to_owned()),
+                ),
+                (MongoFieldPath::new("score"), mongodb::bson::Bson::Int32(2)),
+            ]),
+            unsets: BTreeSet::new(),
+        },
+    };
     let outcome = store
-        .flush_prepared_writes(vec![PreparedDocumentWrite {
-            token: WriteToken(1),
-            key: MongoDocumentKey::new(IntegrationDocument::COLLECTION, id.to_string()),
-            document_id: crate::document::encode_document_id::<IntegrationDocument>(&id)
-                .expect("numeric integration id should encode"),
-            expected_version: 1,
-            operation: DocumentOperation::Update {
-                sets: BTreeMap::from([
-                    (
-                        MongoFieldPath::new("name"),
-                        mongodb::bson::Bson::String("prepared".to_owned()),
-                    ),
-                    (MongoFieldPath::new("score"), mongodb::bson::Bson::Int32(2)),
-                ]),
-                unsets: BTreeSet::new(),
-            },
-        }])
+        .flush_prepared_writes(vec![prepared_update.clone()])
         .await
         .expect("prepared update should execute");
     assert!(matches!(
@@ -109,6 +112,52 @@ async fn configured_mongo_verifies_direct_and_prepared_version_semantics() {
     assert_eq!(loaded.value.name, "prepared");
     assert_eq!(loaded.value.score, 2);
 
+    let replayed = store
+        .flush_prepared_writes(vec![prepared_update])
+        .await
+        .expect("prepared update replay should reconcile");
+    assert!(matches!(
+        replayed.documents[&WriteToken(1)],
+        DocumentWriteOutcome::Applied {
+            previous_version: 1,
+            new_version: 2,
+            ..
+        }
+    ));
+    let after_replay = DirectDocumentStore::<IntegrationDocument>::load(&store, &id)
+        .await
+        .expect("replayed document should load")
+        .expect("replayed document should remain present");
+    assert_eq!(after_replay.version, 2);
+
+    let stale_upsert = store
+        .flush_prepared_writes(vec![PreparedDocumentWrite {
+            token: WriteToken(3),
+            key: MongoDocumentKey::new(IntegrationDocument::COLLECTION, id.to_string()),
+            document_id: crate::document::encode_document_id::<IntegrationDocument>(&id)
+                .expect("numeric integration id should encode"),
+            expected_version: 0,
+            operation_id: "stale-upsert".to_owned(),
+            operation: DocumentOperation::Create {
+                document: doc! { "name": "overwritten", "score": 99 },
+                mode: crate::persistence::request::CreateMode::UpsertAllowed,
+            },
+        }])
+        .await
+        .expect("stale upsert should resolve as a conflict");
+    assert!(matches!(
+        stale_upsert.documents[&WriteToken(3)],
+        DocumentWriteOutcome::VersionConflict {
+            expected_version: 0
+        }
+    ));
+    let after_upsert = DirectDocumentStore::<IntegrationDocument>::load(&store, &id)
+        .await
+        .expect("conflicted upsert document should load")
+        .expect("conflicted upsert document should remain present");
+    assert_eq!(after_upsert.version, 2);
+    assert_eq!(after_upsert.value.name, "prepared");
+
     let missing = store
         .flush_prepared_writes(vec![PreparedDocumentWrite {
             token: WriteToken(2),
@@ -116,6 +165,7 @@ async fn configured_mongo_verifies_direct_and_prepared_version_semantics() {
             document_id: crate::document::encode_document_id::<IntegrationDocument>(&999)
                 .expect("numeric missing id should encode"),
             expected_version: 1,
+            operation_id: "integration-delete-1".to_owned(),
             operation: DocumentOperation::Delete,
         }])
         .await

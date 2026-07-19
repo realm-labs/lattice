@@ -1,8 +1,9 @@
 //! Conservative actor-local mutation tracking.
 
 /// Wraps an ordinary value and advances an epoch whenever mutable access is
-/// requested. The epoch is a scan candidate hint, not proof that the value
-/// changed; acknowledged scan baselines remain the correctness boundary.
+/// requested. The epoch is a conservative dirty indicator: mutable access may
+/// cause a false-positive scan even when the value is unchanged, but persisted
+/// state must never change without advancing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tracked<T> {
     value: T,

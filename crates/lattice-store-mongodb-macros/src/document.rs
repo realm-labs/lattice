@@ -1,7 +1,9 @@
 use quote::quote;
 use syn::{DeriveInput, Ident, LitStr, Type};
 
-use crate::common::{require_named_struct, store_crate_path};
+use crate::common::{
+    require_named_struct, serde_field_shape, serde_serialize_rename_all, store_crate_path,
+};
 
 struct DocumentOptions {
     collection: LitStr,
@@ -47,6 +49,7 @@ fn document_options(input: &DeriveInput) -> syn::Result<DocumentOptions> {
         })?;
     }
     let fields = require_named_struct(input)?;
+    let rename_all = serde_serialize_rename_all(input)?;
     let mut identity = None;
     for field in &fields.named {
         if !is_document_id_field(field)? {
@@ -59,7 +62,14 @@ fn document_options(input: &DeriveInput) -> syn::Result<DocumentOptions> {
             ));
         }
         let ident = field.ident.clone().expect("named field");
-        let serialized = serialized_field_name(field)?;
+        let serde = serde_field_shape(field, rename_all)?;
+        if serde.skipped || serde.flattened {
+            return Err(syn::Error::new_spanned(
+                field,
+                "Mongo identity field cannot be skipped or flattened by serde",
+            ));
+        }
+        let serialized = serde.serialized_name;
         identity = Some((ident, field.ty.clone(), serialized));
     }
     let (id_field, id_type, serialized_id_field) = identity.ok_or_else(|| {
@@ -111,31 +121,4 @@ fn is_document_id_field(field: &syn::Field) -> syn::Result<bool> {
         })?;
     }
     Ok(identity)
-}
-
-fn serialized_field_name(field: &syn::Field) -> syn::Result<String> {
-    let ident = field.ident.as_ref().expect("named field");
-    let mut name = ident.to_string();
-    for attribute in &field.attrs {
-        if !attribute.path().is_ident("serde") {
-            continue;
-        }
-        attribute.parse_nested_meta(|meta| {
-            if meta.path.is_ident("rename") {
-                name = meta.value()?.parse::<LitStr>()?.value();
-                Ok(())
-            } else if meta.path.is_ident("skip")
-                || meta.path.is_ident("skip_serializing")
-                || meta.path.is_ident("skip_deserializing")
-            {
-                Err(meta.error("Mongo identity field cannot be skipped by serde"))
-            } else if !meta.input.is_empty() {
-                let _ = meta.value()?.parse::<syn::Expr>()?;
-                Ok(())
-            } else {
-                Ok(())
-            }
-        })?;
-    }
-    Ok(name)
 }

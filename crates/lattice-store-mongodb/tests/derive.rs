@@ -26,8 +26,8 @@ struct MacroDoc {
     id: u64,
     #[serde(rename = "display_name")]
     name: String,
+    #[mongo(scan = "map")]
     items: BTreeMap<String, Item>,
-    #[mongo(scan = "whole")]
     small_map: BTreeMap<String, i32>,
     #[serde(skip)]
     cache: usize,
@@ -44,6 +44,68 @@ struct SecondaryDoc {
     #[mongo(id)]
     id: u64,
     enabled: bool,
+}
+
+mod u64_as_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FlattenedFields {
+    region_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, MongoDocument, MongoScan)]
+#[mongo(collection = "serde_shape_docs")]
+#[serde(rename_all = "camelCase")]
+struct SerdeShapeDoc {
+    #[mongo(id)]
+    document_id: u64,
+    display_name: String,
+    #[serde(with = "u64_as_string")]
+    score: u64,
+    #[serde(flatten)]
+    flattened: FlattenedFields,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nickname: Option<String>,
+    #[mongo(scan = "map")]
+    inventory_items: BTreeMap<String, Item>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, MongoDocument, MongoScan)]
+#[mongo(collection = "path_key_docs")]
+struct PathKeyDoc {
+    #[mongo(id)]
+    id: u64,
+    #[serde(with = "lattice_store_mongodb::document::bson_serde::path_key_map")]
+    #[mongo(scan = "map")]
+    values: HashMap<String, i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, MongoDocument, MongoScan)]
+#[mongo(collection = "unsafe_path_key_docs")]
+struct UnsafePathKeyDoc {
+    #[mongo(id)]
+    id: u64,
+    #[mongo(scan = "map")]
+    values: HashMap<String, i32>,
 }
 
 #[derive(Debug, MongoDocumentSet)]
@@ -211,7 +273,7 @@ fn document_identity_field_maps_to_mongo_id_and_round_trips_into_the_entity() {
 }
 
 #[test]
-fn scan_infers_maps_and_respects_serde_and_exception_overrides() {
+fn map_scans_are_explicit_and_respect_serde_overrides() {
     let mut value = MacroDoc {
         id: 42,
         name: "old".to_owned(),
@@ -244,6 +306,135 @@ fn scan_infers_maps_and_respects_serde_and_exception_overrides() {
         })
         .collect::<Vec<_>>();
     assert_eq!(paths, ["display_name", "items.1", "small_map"]);
+}
+
+#[test]
+fn scan_uses_the_exact_serde_business_bson_shape() {
+    let mut value = SerdeShapeDoc {
+        document_id: 42,
+        display_name: "old".to_owned(),
+        score: 7,
+        flattened: FlattenedFields {
+            region_code: "eu".to_owned(),
+        },
+        nickname: Some("first".to_owned()),
+        inventory_items: BTreeMap::from([("one".to_owned(), Item { count: 1 })]),
+    };
+    let encoded = encode_flat_document(&value, 1, 0).expect("serde-shaped document should encode");
+    assert_eq!(encoded.get_i64("_id"), Ok(42));
+    assert!(!encoded.contains_key("documentId"));
+    assert_eq!(encoded.get_str("score"), Ok("7"));
+    assert_eq!(encoded.get_str("regionCode"), Ok("eu"));
+
+    let baseline = value
+        .capture()
+        .expect("serde-shaped baseline should capture");
+    value.display_name = "new".to_owned();
+    value.score = 8;
+    value.flattened.region_code = "us".to_owned();
+    value.nickname = None;
+    value
+        .inventory_items
+        .get_mut("one")
+        .expect("inventory item exists")
+        .count = 2;
+    let delta = value
+        .diff(
+            &baseline,
+            ScanCursor::default(),
+            &mut ScanBudget::generous(),
+        )
+        .expect("serde-shaped document should diff");
+    let changes = delta
+        .changes
+        .iter()
+        .map(|change| match change {
+            FieldChange::Set { path, value } => (path.0.as_str(), Some(value)),
+            FieldChange::Unset { path } => (path.0.as_str(), None),
+        })
+        .collect::<Vec<_>>();
+    assert!(changes.iter().any(|(path, value)| {
+        *path == "displayName" && *value == Some(&mongodb::bson::Bson::String("new".to_owned()))
+    }));
+    assert!(changes.iter().any(|(path, value)| {
+        *path == "score" && *value == Some(&mongodb::bson::Bson::String("8".to_owned()))
+    }));
+    assert!(changes.iter().any(|(path, value)| {
+        *path == "regionCode" && *value == Some(&mongodb::bson::Bson::String("us".to_owned()))
+    }));
+    assert!(
+        changes
+            .iter()
+            .any(|(path, value)| *path == "nickname" && value.is_none())
+    );
+    assert!(
+        changes
+            .iter()
+            .any(|(path, _)| *path == "inventoryItems.one")
+    );
+    assert!(
+        !changes.iter().any(|(path, _)| {
+            matches!(*path, "display_name" | "region_code" | "inventory_items")
+        })
+    );
+}
+
+#[test]
+fn explicit_map_scan_uses_the_same_path_key_encoding_as_full_documents() {
+    let mut value = PathKeyDoc {
+        id: 42,
+        values: HashMap::from([
+            ("a.b".to_owned(), 1),
+            ("a%2Eb".to_owned(), 2),
+            (String::new(), 3),
+        ]),
+    };
+    let encoded = encode_flat_document(&value, 1, 0).expect("path keys should encode");
+    let values = encoded
+        .get_document("values")
+        .expect("path-key map should be stored as a document");
+    assert_eq!(values.get_i32("a%2Eb"), Ok(1));
+    assert_eq!(values.get_i32("a%252Eb"), Ok(2));
+    assert_eq!(values.get_i32("%EMPTY"), Ok(3));
+    assert_eq!(
+        decode_flat_document::<PathKeyDoc>(encoded)
+            .expect("path-key document should decode")
+            .value,
+        value,
+    );
+
+    let baseline = value.capture().expect("path-key baseline should capture");
+    value.values.insert("a.b".to_owned(), 4);
+    value.values.remove("");
+    let paths = value
+        .diff(
+            &baseline,
+            ScanCursor::default(),
+            &mut ScanBudget::generous(),
+        )
+        .expect("path-key map should diff")
+        .changes
+        .into_iter()
+        .map(|change| match change {
+            FieldChange::Set { path, .. } | FieldChange::Unset { path } => path.0,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(paths, ["values.%EMPTY", "values.a%2Eb"]);
+}
+
+#[test]
+fn explicit_map_scan_rejects_unencoded_mongodb_path_keys() {
+    let value = UnsafePathKeyDoc {
+        id: 42,
+        values: HashMap::from([("a.b".to_owned(), 1)]),
+    };
+    let error = value
+        .capture()
+        .expect_err("unencoded path key must not enter an incremental baseline");
+    assert!(matches!(
+        error,
+        lattice_store_mongodb::scan::ScanError::InvalidMapKey(key) if key == "a.b"
+    ));
 }
 
 fn loaded_documents(id: u64) -> LoadedMacroDocuments {

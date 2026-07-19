@@ -126,9 +126,12 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             }
         }
     });
-    let initializers = fields.named.iter().map(|field| {
-        let field_ident = field.ident.as_ref().expect("named field");
-        match document_set_field(field) {
+    let initializers = fields
+        .named
+        .iter()
+        .map(|field| {
+            let field_ident = field.ident.as_ref().expect("named field");
+            match document_set_field(field) {
             Ok(Some(DocumentSetField {
                 kind: DocumentSetFieldKind::One(_) | DocumentSetFieldKind::Many(_),
                 ..
@@ -149,9 +152,10 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 )
             },
             Ok(None) => quote! { #field_ident: ::core::default::Default::default() },
-            Err(_) => unreachable!("document set fields were validated above"),
-        }
-    });
+                Err(_) => unreachable!("document set fields were validated above"),
+            }
+        })
+        .collect::<Vec<_>>();
     let scans = persistent.iter().map(|field| {
         let field_ident = field.ident;
         match &field.kind {
@@ -184,7 +188,7 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         match &field.kind {
             DocumentSetFieldKind::One(document) => quote! {
                 let #field_ident = store
-                    .find_one::<#document>(id.clone())
+                    .find_one_scanned::<#document>(id.clone())
                     .await?
                     .ok_or_else(|| #store::persistence::coordinator::PersistenceError::RequiredDocumentMissing {
                         collection: <#document as #store::document::MongoDocument>::COLLECTION,
@@ -193,10 +197,58 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             },
             DocumentSetFieldKind::Many(collection) => quote! {
                 let #field_ident = store
-                    .find_many::<<#collection as #store::document::set::MongoDocumentCollection<#id>>::Document>(
+                    .find_many_scanned::<<#collection as #store::document::set::MongoDocumentCollection<#id>>::Document>(
                         <#collection as #store::document::set::MongoDocumentCollection<#id>>::load_filter(&id)?,
                     )
                     .await?;
+            },
+            DocumentSetFieldKind::Lazy(_) | DocumentSetFieldKind::Unloadable(_, _) => {
+                unreachable!("lazy fields are not startup-loaded")
+            }
+        }
+    });
+    let scanned_validations = eager.iter().map(|field| {
+        let field_ident = field.ident;
+        match &field.kind {
+            DocumentSetFieldKind::One(document) => quote! {
+                if #field_ident.id() != &id {
+                    return Err(#store::persistence::coordinator::PersistenceError::DocumentIdMismatch {
+                        collection: <#document as #store::document::MongoDocument>::COLLECTION,
+                        expected: ::std::format!("{:?}", id),
+                        actual: ::std::format!("{:?}", #field_ident.id()),
+                    });
+                }
+            },
+            DocumentSetFieldKind::Many(collection) => quote! {
+                for document in &#field_ident {
+                    let actual = <#collection as #store::document::set::MongoDocumentCollection<#id>>::owner_id(
+                        document.value(),
+                    );
+                    if actual != &id {
+                        return Err(#store::persistence::coordinator::PersistenceError::DocumentIdMismatch {
+                            collection: <<#collection as #store::document::set::MongoDocumentCollection<#id>>::Document as #store::document::MongoDocument>::COLLECTION,
+                            expected: ::std::format!("{:?}", id),
+                            actual: ::std::format!("{:?}", actual),
+                        });
+                    }
+                }
+            },
+            DocumentSetFieldKind::Lazy(_) | DocumentSetFieldKind::Unloadable(_, _) => {
+                unreachable!("lazy fields are not startup-loaded")
+            }
+        }
+    });
+    let scanned_attaches = eager.iter().map(|field| {
+        let field_ident = field.ident;
+        match &field.kind {
+            DocumentSetFieldKind::One(_) => quote! {
+                let #field_ident = coordinator.track_loaded_scanned(#field_ident)?;
+            },
+            DocumentSetFieldKind::Many(collection) => quote! {
+                let #field_ident = coordinator.track_loaded_scanned_many(#field_ident)?;
+                let #field_ident = <#collection as #store::document::set::MongoDocumentCollection<#id>>::from_documents(
+                    #field_ident,
+                )?;
             },
             DocumentSetFieldKind::Lazy(_) | DocumentSetFieldKind::Unloadable(_, _) => {
                 unreachable!("lazy fields are not startup-loaded")
@@ -236,11 +288,9 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 let id = id.clone();
                 async move {
                     #(#loads)*
-                    Self::from_loaded(
-                        &id,
-                        #loaded { #(#eager_idents,)* },
-                        coordinator,
-                    )
+                    #(#scanned_validations)*
+                    #(#scanned_attaches)*
+                    Ok(Self { #(#initializers,)* })
                 }
             }
 

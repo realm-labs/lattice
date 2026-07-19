@@ -1,5 +1,7 @@
-error: Mongo identity field cannot be skipped by serde
- --> tests/ui/skipped_document_id.rs:8:13
+error: Mongo identity field cannot be skipped or flattened by serde
+ --> tests/ui/skipped_document_id.rs:7:5
   |
-8 |     #[serde(skip)]
-  |             ^^^^
+7 | /     #[mongo(id)]
+8 | |     #[serde(skip)]
+9 | |     id: u64,
+  | |___________^

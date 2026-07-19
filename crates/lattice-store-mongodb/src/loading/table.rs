@@ -185,11 +185,11 @@ where
             return Ok(true);
         }
         let id = S::document_id(&self.owner_id, key);
-        let Some(loaded) = store.find_one::<S::Document>(id).await? else {
+        let Some(loaded) = store.find_one_scanned::<S::Document>(id).await? else {
             return Ok(false);
         };
-        self.validate_document(&loaded.value, Some(key))?;
-        let tracked = persistence.track_loaded(loaded)?;
+        self.validate_document(loaded.value(), Some(key))?;
+        let tracked = persistence.track_loaded_scanned(loaded)?;
         self.rows.insert(
             key.clone(),
             LoadedTableRow {
@@ -236,7 +236,7 @@ where
             MongoStoreError::invalid_config("page limit", "must be less than u32::MAX")
         })?;
         let mut loaded = store
-            .find_page::<S::Document>(filter, sort, fetch_limit)
+            .find_page_scanned::<S::Document>(filter, sort, fetch_limit)
             .await?;
         let has_more = loaded.len() > limit as usize;
         loaded.truncate(limit as usize);
@@ -244,15 +244,15 @@ where
         let mut new_keys = Vec::new();
         let mut new_documents = Vec::new();
         for document in loaded {
-            self.validate_document(&document.value, None)?;
-            let key = S::key(&document.value).clone();
+            self.validate_document(document.value(), None)?;
+            let key = S::key(document.value()).clone();
             keys.push(key.clone());
             if !self.rows.contains_key(&key) {
                 new_keys.push(key);
                 new_documents.push(document);
             }
         }
-        let tracked = persistence.track_loaded_many(new_documents)?;
+        let tracked = persistence.track_loaded_scanned_many(new_documents)?;
         for (key, document) in new_keys.into_iter().zip(tracked) {
             self.rows.insert(
                 key,

@@ -9,9 +9,19 @@ use mongodb::bson::{Bson, Document};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::scan::{MongoScan, ScanSnapshot};
+
+pub(crate) const WRITE_ID_FIELD: &str = "_lattice_write_id";
+
 /// An identified business entity stored in one MongoDB collection.
-pub trait MongoDocument: Serialize + DeserializeOwned + Send + Sized + 'static {
-    type Id: Clone + Ord + std::fmt::Debug + Serialize + DeserializeOwned + Send + 'static;
+///
+/// Persisted state must only be mutated through exclusive (`&mut`) access so a
+/// surrounding [`tracked::Tracked`] value can conservatively advance its
+/// mutation epoch. Requesting mutable access may produce a false-positive scan;
+/// mutating serialized state through a lock or atomic behind `&self` violates
+/// this contract.
+pub trait MongoDocument: Serialize + DeserializeOwned + Send + Sync + Sized + 'static {
+    type Id: Clone + Ord + std::fmt::Debug + Serialize + DeserializeOwned + Send + Sync + 'static;
 
     const COLLECTION: &'static str;
     const ID_FIELD: &'static str;
@@ -33,6 +43,34 @@ where
     pub version: i64,
     pub updated_at_ms: i64,
     pub value: D,
+}
+
+/// Internal load envelope that carries a baseline captured from the original
+/// MongoDB BSON without serializing the decoded Rust value again.
+#[doc(hidden)]
+pub struct LoadedScannedDocument<D>
+where
+    D: MongoScan,
+{
+    loaded: LoadedDocument<D>,
+    baseline: ScanSnapshot,
+}
+
+impl<D> LoadedScannedDocument<D>
+where
+    D: MongoScan,
+{
+    pub fn value(&self) -> &D {
+        &self.loaded.value
+    }
+
+    pub fn id(&self) -> &D::Id {
+        self.loaded.id()
+    }
+
+    pub(crate) fn into_parts(self) -> (LoadedDocument<D>, ScanSnapshot) {
+        (self.loaded, self.baseline)
+    }
 }
 
 impl<D> LoadedDocument<D>
@@ -133,6 +171,7 @@ where
         .ok_or_else(|| MongoStoreError::new("Mongo document missing `_id`"))?;
     let version = take_i64(&mut document, "version")?;
     let updated_at_ms = take_i64(&mut document, "updated_at_ms")?;
+    document.remove(WRITE_ID_FIELD);
     if document.insert(D::ID_FIELD, id).is_some() {
         return Err(MongoStoreError::new(format!(
             "Mongo document body shadows identity field `{}`",
@@ -148,8 +187,40 @@ where
     })
 }
 
+pub(crate) fn decode_flat_scanned_document<D>(
+    mut document: Document,
+) -> Result<LoadedScannedDocument<D>, MongoStoreError>
+where
+    D: MongoScan,
+{
+    let id = document
+        .remove("_id")
+        .ok_or_else(|| MongoStoreError::new("Mongo document missing `_id`"))?;
+    let version = take_i64(&mut document, "version")?;
+    let updated_at_ms = take_i64(&mut document, "updated_at_ms")?;
+    document.remove(WRITE_ID_FIELD);
+    let baseline = D::capture_bson(&document)
+        .map_err(|error| MongoStoreError::decode("capture Mongo scan baseline", error))?;
+    if document.insert(D::ID_FIELD, id).is_some() {
+        return Err(MongoStoreError::new(format!(
+            "Mongo document body shadows identity field `{}`",
+            D::ID_FIELD
+        )));
+    }
+    let value = mongodb::bson::from_document(document)
+        .map_err(|error| MongoStoreError::decode("decode Mongo business document", error))?;
+    Ok(LoadedScannedDocument {
+        loaded: LoadedDocument {
+            version,
+            updated_at_ms,
+            value,
+        },
+        baseline,
+    })
+}
+
 fn reject_reserved_fields(document: &Document) -> Result<(), MongoStoreError> {
-    for field in ["_id", "version", "updated_at_ms"] {
+    for field in ["_id", "version", "updated_at_ms", WRITE_ID_FIELD] {
         if document.contains_key(field) {
             return Err(MongoStoreError::new(format!(
                 "business document must not contain reserved storage field `{field}`"
@@ -174,12 +245,16 @@ fn take_i64(document: &mut Document, field: &str) -> Result<i64, MongoStoreError
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use mongodb::bson::doc;
-    use serde::{Deserialize, Serialize};
+    use serde::{Deserialize, Serialize, Serializer};
 
-    use super::{LoadedDocument, MongoDocument, decode_flat_document, encode_flat_document};
+    use super::{
+        LoadedDocument, MongoDocument, decode_flat_document, decode_flat_scanned_document,
+        encode_flat_document,
+    };
+    use crate::scan::MongoScan as _;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Profile {
@@ -198,27 +273,23 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Serialize, Deserialize)]
-    struct ActorLocalDocument {
+    static SERIALIZE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_string_serialization<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SERIALIZE_CALLS.fetch_add(1, Ordering::Relaxed);
+        serializer.serialize_str(value)
+    }
+
+    #[derive(Debug, Serialize, Deserialize, crate::MongoDocument, crate::MongoScan)]
+    #[mongo(collection = "raw_baseline_tests")]
+    struct RawBaselineDocument {
+        #[mongo(id)]
         id: u64,
-        mutation_count: Cell<u64>,
-    }
-
-    impl MongoDocument for ActorLocalDocument {
-        type Id = u64;
-        const COLLECTION: &'static str = "actor_local_documents";
-        const ID_FIELD: &'static str = "id";
-
-        fn id(&self) -> &Self::Id {
-            &self.id
-        }
-    }
-
-    #[test]
-    fn document_may_be_send_without_being_sync() {
-        fn assert_document<D: MongoDocument>() {}
-
-        assert_document::<ActorLocalDocument>();
+        #[serde(serialize_with = "count_string_serialization")]
+        value: String,
     }
 
     #[test]
@@ -251,6 +322,25 @@ mod tests {
             decode_flat_document::<Profile>(document).expect("profile envelope should decode"),
             stored
         );
+    }
+
+    #[test]
+    fn scanned_decode_builds_baseline_without_reserializing_the_rust_value() {
+        SERIALIZE_CALLS.store(0, Ordering::Relaxed);
+        let loaded = decode_flat_scanned_document::<RawBaselineDocument>(doc! {
+            "_id": 7_i64,
+            "version": 3_i64,
+            "updated_at_ms": 11_i64,
+            "value": "already encoded",
+        })
+        .expect("raw BSON should decode with a captured baseline");
+        assert_eq!(SERIALIZE_CALLS.load(Ordering::Relaxed), 0);
+
+        loaded
+            .value()
+            .capture()
+            .expect("ordinary capture should serialize the Rust value");
+        assert_eq!(SERIALIZE_CALLS.load(Ordering::Relaxed), 1);
     }
 
     #[derive(Debug, Serialize, Deserialize)]

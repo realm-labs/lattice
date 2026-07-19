@@ -136,10 +136,10 @@ where
         if self.loaded.is_some() {
             return Ok(true);
         }
-        let Some(loaded) = store.find_one::<D>(self.id.clone()).await? else {
+        let Some(loaded) = store.find_one_scanned::<D>(self.id.clone()).await? else {
             return Ok(false);
         };
-        self.loaded = Some(persistence.track_loaded(loaded)?);
+        self.loaded = Some(persistence.track_loaded_scanned(loaded)?);
         Ok(true)
     }
 

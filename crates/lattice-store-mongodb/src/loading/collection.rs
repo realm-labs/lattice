@@ -71,10 +71,10 @@ where
             return Ok(());
         }
         let loaded = store
-            .find_many::<C::Document>(C::load_filter(&self.owner_id)?)
+            .find_many_scanned::<C::Document>(C::load_filter(&self.owner_id)?)
             .await?;
         for document in &loaded {
-            let actual = C::owner_id(&document.value);
+            let actual = C::owner_id(document.value());
             if actual != &self.owner_id {
                 return Err(PersistenceError::DocumentIdMismatch {
                     collection: C::Document::COLLECTION,
@@ -83,7 +83,7 @@ where
                 });
             }
         }
-        let documents = persistence.track_loaded_many(loaded)?;
+        let documents = persistence.track_loaded_scanned_many(loaded)?;
         self.loaded = Some(C::from_documents(documents)?);
         Ok(())
     }

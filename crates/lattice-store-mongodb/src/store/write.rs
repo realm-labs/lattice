@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use mongodb::bson::{Bson, Document, doc};
 
-use crate::document::{MongoDocument, decode_flat_document, encode_flat_document};
+use crate::document::{MongoDocument, WRITE_ID_FIELD, decode_flat_document, encode_flat_document};
 use crate::error::MongoStoreError;
 use crate::persistence::direct::{
     DeleteOutcome, DirectDocumentStore, InsertOutcome, ReplaceOutcome,
@@ -40,6 +40,7 @@ impl MongoStore {
         let collection = self.database.collection::<Document>(write.key.collection);
         let document_id = write.document_id.clone();
         let expected_version = write.expected_version;
+        let operation_id = write.operation_id.clone();
         let new_version = expected_version
             .checked_add(1)
             .ok_or_else(|| MongoStoreError::new("prepared document version overflow"))?;
@@ -52,6 +53,7 @@ impl MongoStore {
                 }
                 set.insert("version", new_version);
                 set.insert("updated_at_ms", updated_at_ms);
+                set.insert(WRITE_ID_FIELD, operation_id.clone());
                 let mut update = doc! { "$set": set };
                 if !unsets.is_empty() {
                     let unset = unsets
@@ -68,17 +70,40 @@ impl MongoStore {
                         update,
                     ),
                 )
-                .await?;
-                if result.matched_count == 1 {
-                    Ok(DocumentWriteOutcome::Applied {
+                .await;
+                match result {
+                    Ok(result) if result.matched_count == 1 => Ok(DocumentWriteOutcome::Applied {
                         previous_version: expected_version,
                         new_version,
                         updated_at_ms,
-                    })
-                } else if direct_document_exists(self, write.key.collection, document_id).await? {
-                    Ok(DocumentWriteOutcome::VersionConflict { expected_version })
-                } else {
-                    Ok(unmatched_prepared_outcome(expected_version, false))
+                    }),
+                    Ok(_) => {
+                        resolve_prepared_outcome(
+                            self,
+                            write.key.collection,
+                            document_id,
+                            expected_version,
+                            new_version,
+                            &operation_id,
+                        )
+                        .await
+                    }
+                    Err(error) => {
+                        if let Ok(Some(applied)) = reconcile_prepared_write(
+                            self,
+                            write.key.collection,
+                            document_id,
+                            expected_version,
+                            new_version,
+                            &operation_id,
+                        )
+                        .await
+                        {
+                            Ok(applied)
+                        } else {
+                            Err(error)
+                        }
+                    }
                 }
             }
             DocumentOperation::Create { mut document, mode } => {
@@ -86,6 +111,7 @@ impl MongoStore {
                 document.insert("_id", document_id.clone());
                 document.insert("version", new_version);
                 document.insert("updated_at_ms", updated_at_ms);
+                document.insert(WRITE_ID_FIELD, operation_id.clone());
                 match mode {
                     CreateMode::InsertOnly => match mongo_timeout(
                         self.operation_timeout,
@@ -99,28 +125,105 @@ impl MongoStore {
                             new_version,
                             updated_at_ms,
                         }),
-                        Err(error) if is_duplicate_key_message(error.message()) => {
-                            Ok(DocumentWriteOutcome::VersionConflict { expected_version })
+                        Err(error) if error.is_write_rejection() => {
+                            match reconcile_insert_rejection(
+                                self,
+                                write.key.collection,
+                                document_id,
+                                expected_version,
+                                new_version,
+                                &operation_id,
+                            )
+                            .await?
+                            {
+                                Some(outcome) => Ok(outcome),
+                                None => Err(error),
+                            }
                         }
-                        Err(error) => Err(error),
+                        Err(error) => {
+                            if let Ok(Some(applied)) = reconcile_prepared_write(
+                                self,
+                                write.key.collection,
+                                document_id,
+                                expected_version,
+                                new_version,
+                                &operation_id,
+                            )
+                            .await
+                            {
+                                Ok(applied)
+                            } else {
+                                Err(error)
+                            }
+                        }
                     },
                     CreateMode::UpsertAllowed => {
                         let result = mongo_timeout(
                             self.operation_timeout,
                             "upsert prepared document",
                             collection
-                                .replace_one(doc! { "_id": document_id }, document)
+                                .replace_one(
+                                    doc! {
+                                        "_id": document_id.clone(),
+                                        "version": expected_version,
+                                    },
+                                    document,
+                                )
                                 .upsert(true),
                         )
-                        .await?;
-                        if result.matched_count == 1 || result.upserted_id.is_some() {
-                            Ok(DocumentWriteOutcome::Applied {
-                                previous_version: expected_version,
-                                new_version,
-                                updated_at_ms,
-                            })
-                        } else {
-                            Ok(DocumentWriteOutcome::VersionConflict { expected_version })
+                        .await;
+                        match result {
+                            Ok(result)
+                                if result.matched_count == 1 || result.upserted_id.is_some() =>
+                            {
+                                Ok(DocumentWriteOutcome::Applied {
+                                    previous_version: expected_version,
+                                    new_version,
+                                    updated_at_ms,
+                                })
+                            }
+                            Ok(_) => {
+                                resolve_prepared_outcome(
+                                    self,
+                                    write.key.collection,
+                                    document_id,
+                                    expected_version,
+                                    new_version,
+                                    &operation_id,
+                                )
+                                .await
+                            }
+                            Err(error) if error.is_write_rejection() => {
+                                match reconcile_upsert_rejection(
+                                    self,
+                                    write.key.collection,
+                                    document_id,
+                                    expected_version,
+                                    new_version,
+                                    &operation_id,
+                                )
+                                .await?
+                                {
+                                    Some(outcome) => Ok(outcome),
+                                    None => Err(error),
+                                }
+                            }
+                            Err(error) => {
+                                if let Ok(Some(applied)) = reconcile_prepared_write(
+                                    self,
+                                    write.key.collection,
+                                    document_id,
+                                    expected_version,
+                                    new_version,
+                                    &operation_id,
+                                )
+                                .await
+                                {
+                                    Ok(applied)
+                                } else {
+                                    Err(error)
+                                }
+                            }
                         }
                     }
                 }
@@ -164,8 +267,7 @@ impl PreparedWriteStore for MongoStore {
 #[async_trait::async_trait]
 impl<D> DirectDocumentStore<D> for MongoStore
 where
-    D: MongoDocument + Sync,
-    D::Id: Sync,
+    D: MongoDocument,
 {
     async fn load(
         &self,
@@ -185,6 +287,8 @@ where
     async fn insert(&self, value: &D) -> Result<InsertOutcome, MongoStoreError> {
         const INITIAL_VERSION: i64 = 1;
         let collection = self.database.collection::<Document>(D::COLLECTION);
+        let id =
+            mongodb::bson::to_bson(value.id()).map_err(store_error("encode direct document id"))?;
         let document = encode_flat_document(value, INITIAL_VERSION, unix_time_ms()?)?;
         match mongo_timeout(
             self.operation_timeout,
@@ -196,8 +300,12 @@ where
             Ok(_) => Ok(InsertOutcome::Inserted {
                 version: INITIAL_VERSION,
             }),
-            Err(error) if is_duplicate_key_message(error.message()) => {
-                Ok(InsertOutcome::AlreadyExists)
+            Err(error) if error.is_write_rejection() => {
+                if direct_document_exists(self, D::COLLECTION, id).await? {
+                    Ok(InsertOutcome::AlreadyExists)
+                } else {
+                    Err(error)
+                }
             }
             Err(error) => Err(error),
         }
@@ -258,6 +366,148 @@ where
     }
 }
 
+#[derive(Debug)]
+struct PreparedWriteState {
+    version: i64,
+    updated_at_ms: i64,
+    operation_id: Option<String>,
+}
+
+async fn resolve_prepared_outcome(
+    store: &MongoStore,
+    collection: &'static str,
+    id: Bson,
+    expected_version: i64,
+    new_version: i64,
+    operation_id: &str,
+) -> Result<DocumentWriteOutcome, MongoStoreError> {
+    let Some(state) = prepared_write_state(store, collection, id).await? else {
+        return Ok(DocumentWriteOutcome::NotFound { expected_version });
+    };
+    if state.version == new_version && state.operation_id.as_deref() == Some(operation_id) {
+        Ok(DocumentWriteOutcome::Applied {
+            previous_version: expected_version,
+            new_version,
+            updated_at_ms: state.updated_at_ms,
+        })
+    } else {
+        Ok(DocumentWriteOutcome::VersionConflict { expected_version })
+    }
+}
+
+async fn reconcile_prepared_write(
+    store: &MongoStore,
+    collection: &'static str,
+    id: Bson,
+    expected_version: i64,
+    new_version: i64,
+    operation_id: &str,
+) -> Result<Option<DocumentWriteOutcome>, MongoStoreError> {
+    let Some(state) = prepared_write_state(store, collection, id).await? else {
+        return Ok(None);
+    };
+    if state.version != new_version || state.operation_id.as_deref() != Some(operation_id) {
+        return Ok(None);
+    }
+    Ok(Some(DocumentWriteOutcome::Applied {
+        previous_version: expected_version,
+        new_version,
+        updated_at_ms: state.updated_at_ms,
+    }))
+}
+
+async fn reconcile_insert_rejection(
+    store: &MongoStore,
+    collection: &'static str,
+    id: Bson,
+    expected_version: i64,
+    new_version: i64,
+    operation_id: &str,
+) -> Result<Option<DocumentWriteOutcome>, MongoStoreError> {
+    let Some(state) = prepared_write_state(store, collection, id).await? else {
+        return Ok(None);
+    };
+    if state.version == new_version && state.operation_id.as_deref() == Some(operation_id) {
+        return Ok(Some(DocumentWriteOutcome::Applied {
+            previous_version: expected_version,
+            new_version,
+            updated_at_ms: state.updated_at_ms,
+        }));
+    }
+    Ok(Some(DocumentWriteOutcome::VersionConflict {
+        expected_version,
+    }))
+}
+
+async fn reconcile_upsert_rejection(
+    store: &MongoStore,
+    collection: &'static str,
+    id: Bson,
+    expected_version: i64,
+    new_version: i64,
+    operation_id: &str,
+) -> Result<Option<DocumentWriteOutcome>, MongoStoreError> {
+    let Some(state) = prepared_write_state(store, collection, id).await? else {
+        return Ok(None);
+    };
+    if state.version == new_version && state.operation_id.as_deref() == Some(operation_id) {
+        return Ok(Some(DocumentWriteOutcome::Applied {
+            previous_version: expected_version,
+            new_version,
+            updated_at_ms: state.updated_at_ms,
+        }));
+    }
+    if state.version != expected_version {
+        return Ok(Some(DocumentWriteOutcome::VersionConflict {
+            expected_version,
+        }));
+    }
+    Ok(None)
+}
+
+async fn prepared_write_state(
+    store: &MongoStore,
+    collection: &'static str,
+    id: Bson,
+) -> Result<Option<PreparedWriteState>, MongoStoreError> {
+    let collection = store.database.collection::<Document>(collection);
+    let mut projection = doc! {
+        "version": 1,
+        "updated_at_ms": 1,
+    };
+    projection.insert(WRITE_ID_FIELD, 1);
+    let document = mongo_timeout(
+        store.operation_timeout,
+        "reconcile prepared document write",
+        collection
+            .find_one(doc! { "_id": id })
+            .projection(projection),
+    )
+    .await?;
+    document
+        .map(|document| {
+            Ok(PreparedWriteState {
+                version: document_i64(&document, "version")?,
+                updated_at_ms: document_i64(&document, "updated_at_ms")?,
+                operation_id: document.get_str(WRITE_ID_FIELD).ok().map(str::to_owned),
+            })
+        })
+        .transpose()
+}
+
+fn document_i64(document: &Document, field: &'static str) -> Result<i64, MongoStoreError> {
+    match document.get(field) {
+        Some(Bson::Int64(value)) => Ok(*value),
+        Some(Bson::Int32(value)) => Ok(i64::from(*value)),
+        Some(value) => Err(MongoStoreError::new(format!(
+            "Mongo `{field}` must be an integer, got {value:?}"
+        ))),
+        None => Err(MongoStoreError::new(format!(
+            "Mongo document missing `{field}`"
+        ))),
+    }
+}
+
 async fn direct_document_exists(
     store: &MongoStore,
     collection: &'static str,
@@ -283,10 +533,6 @@ fn unix_time_ms() -> Result<i64, MongoStoreError> {
         })?;
     i64::try_from(duration.as_millis())
         .map_err(|_| MongoStoreError::clock("system time exceeds persisted i64 milliseconds"))
-}
-
-fn is_duplicate_key_message(message: &str) -> bool {
-    message.contains("E11000") || message.contains("duplicate key")
 }
 
 pub(super) fn unmatched_prepared_outcome(

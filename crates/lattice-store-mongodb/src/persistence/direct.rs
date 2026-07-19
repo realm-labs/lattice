@@ -58,8 +58,7 @@ pub enum DeleteOutcome {
 #[async_trait]
 pub trait DirectDocumentStore<D>: Send + Sync + 'static
 where
-    D: MongoDocument + Sync,
-    D::Id: Sync,
+    D: MongoDocument,
 {
     async fn load(&self, id: &D::Id) -> Result<Option<LoadedDocument<D>>, MongoStoreError>;
 

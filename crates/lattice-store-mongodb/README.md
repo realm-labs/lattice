@@ -131,7 +131,44 @@ The derive also generates `PlayerDocuments::load(&store, &player_id,
 do not occur in the generated `LoadedPlayerDocuments` type and perform no
 startup query. Skipped fields are initialized with `Default::default()`. The
 collection adapter builds custom indexes after the coordinator has converted
-the loaded batch into tracked documents.
+the loaded batch into tracked documents. Store-driven eager, lazy, and table
+loads build their scan baselines directly from the MongoDB business BSON, so
+loaded Rust values are not serialized a second time just to capture a
+baseline.
+
+Map entry scanning is explicit. An ordinary map is treated as one whole BSON
+field; opt in with `#[mongo(scan = "map")]` only when per-key `$set`/`$unset`
+updates are useful. Dynamic keys containing `.`, a leading `$`, NUL, or the
+empty string cannot be used directly as MongoDB update-path segments. Encode
+the stored BSON keys and update paths consistently with the Serde adapter:
+
+```rust
+# use std::collections::HashMap;
+# use lattice_store_mongodb::{MongoDocument, MongoScan};
+# use serde::{Deserialize, Serialize};
+#[derive(Serialize, Deserialize, MongoDocument, MongoScan)]
+#[mongo(collection = "player_bag")]
+struct PlayerBag {
+    #[mongo(id)]
+    id: u64,
+    #[serde(with = "lattice_store_mongodb::document::bson_serde::path_key_map")]
+    #[mongo(scan = "map")]
+    items: HashMap<String, i32>,
+}
+```
+
+The adapter uses reversible percent encoding compatible with Asteria's
+`MongoPath`: `%`, `.`, `$`, NUL, and empty keys remain collision-free and are
+decoded back into their logical Rust keys on load. Use
+`bson_serde::encode_path_key` when building a MongoDB query against one encoded
+map entry.
+
+`MongoPersistenceCoordinator::scan_metrics()` exposes cumulative encoding
+time, estimated encoded bytes, hashed map entries, and false-positive scans.
+The byte count is estimated during the existing BSON walk and does not trigger
+another serialization pass. To measure scan regressions locally, run
+`cargo bench -p lattice-store-mongodb --bench scan`; the benchmark covers
+1 KiB, 10 KiB, and 1 MiB documents plus 1,000- and 10,000-entry maps.
 
 ## Lazy and unloadable state
 
@@ -254,7 +291,9 @@ Call `unload_idle` from an actor timer or maintenance message. Singleton and
 complete-collection unload returns `IdleUnloadStatus`; row tables additionally
 accept `TableEvictionBudget` and report examined, unloaded, and dirty rows.
 Dirty, newly created, scanning, in-flight, or conflicted documents stay
-resident until their persistence state is safe to detach.
+resident until their persistence state is safe to detach. Documents rejected
+by storage also remain resident until current actor state is changed and
+successfully acknowledged.
 
 For efficient row pages, `PAGE_KEY_FIELD` must be unique within one owner and
 must use the same ascending ordering as `Spec::Key`. Create a matching compound
@@ -263,8 +302,19 @@ default index on the complete `_id` value does not replace this owner-prefix
 query index.
 
 Business documents must not define the reserved top-level fields `_id`,
-`version`, or `updated_at_ms`. Prepared multi-document flushes report an exact
+`version`, `updated_at_ms`, or `_lattice_write_id`. The last field is an
+internal idempotency marker used to reconcile writes whose server result became
+ambiguous after a timeout. Prepared multi-document flushes report an exact
 result per document but are not cross-document transactions.
+
+Ambiguous failures such as timeouts retain the exact prepared write and
+operation ID for retry. Definitive storage rejections, including MongoDB's
+maximum-document-size error, do not retry the rejected BSON. The coordinator
+records the document's mutation epoch and returns an incomplete preparation
+while that epoch is unchanged. After business code removes or shrinks data,
+the new epoch causes a fresh diff against the unmodified durable baseline.
+`document_rejection` exposes the retained diagnostic until the current state is
+successfully acknowledged.
 
 ## Coordinated persistence
 
