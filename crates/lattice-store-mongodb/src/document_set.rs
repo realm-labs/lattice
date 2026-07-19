@@ -47,8 +47,10 @@ pub trait MongoDocumentSet: Sized + Send {
         coordinator: &mut MongoPersistenceCoordinator,
     ) -> Result<Self, PersistenceError>;
 
-    /// Loads every declared singleton and `#[mongo(many)]` collection, then
-    /// registers the complete set with `coordinator`.
+    /// Loads every eager singleton and `#[mongo(many)]` collection, then
+    /// registers them with `coordinator`. Fields declared with
+    /// `#[mongo(lazy)]` or `#[mongo(lazy_unload = "...")]` are initialized
+    /// without performing I/O.
     fn load<'a>(
         store: &'a MongoStore,
         id: &Self::Id,

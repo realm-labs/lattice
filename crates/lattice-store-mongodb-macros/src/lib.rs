@@ -261,6 +261,8 @@ struct DocumentSetField<'a> {
 enum DocumentSetFieldKind {
     One(Type),
     Many(Type),
+    Lazy(Type),
+    Unloadable(Type, u64),
 }
 
 fn expand_document_set(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -293,7 +295,16 @@ fn expand_document_set(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStr
     let loaded = options.loaded;
     let id = options.id;
     let document_count = persistent.len();
-    let loaded_fields = persistent.iter().map(|field| {
+    let eager = persistent
+        .iter()
+        .filter(|field| {
+            matches!(
+                field.kind,
+                DocumentSetFieldKind::One(_) | DocumentSetFieldKind::Many(_)
+            )
+        })
+        .collect::<Vec<_>>();
+    let loaded_fields = eager.iter().map(|field| {
         let ident = field.ident;
         let visibility = field.visibility;
         match &field.kind {
@@ -305,9 +316,12 @@ fn expand_document_set(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStr
                     <#collection as #store::document_set::MongoDocumentCollection<#id>>::Document
                 >>
             },
+            DocumentSetFieldKind::Lazy(_) | DocumentSetFieldKind::Unloadable(_, _) => {
+                unreachable!("lazy fields are not startup-loaded")
+            }
         }
     });
-    let validations = persistent.iter().map(|field| {
+    let validations = eager.iter().map(|field| {
         let field_ident = field.ident;
         match &field.kind {
             DocumentSetFieldKind::One(document) => quote! {
@@ -333,13 +347,13 @@ fn expand_document_set(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStr
                     }
                 }
             },
+            DocumentSetFieldKind::Lazy(_) | DocumentSetFieldKind::Unloadable(_, _) => {
+                unreachable!("lazy fields are not startup-loaded")
+            }
         }
     });
-    let persistent_idents = persistent
-        .iter()
-        .map(|field| field.ident)
-        .collect::<Vec<_>>();
-    let splits_and_attaches = persistent.iter().map(|field| {
+    let eager_idents = eager.iter().map(|field| field.ident).collect::<Vec<_>>();
+    let splits_and_attaches = eager.iter().map(|field| {
         let field_ident = field.ident;
         match &field.kind {
             DocumentSetFieldKind::One(_) => quote! {
@@ -351,12 +365,33 @@ fn expand_document_set(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStr
                     #field_ident,
                 )?;
             },
+            DocumentSetFieldKind::Lazy(_) | DocumentSetFieldKind::Unloadable(_, _) => {
+                unreachable!("lazy fields are not startup-loaded")
+            }
         }
     });
     let initializers = fields.named.iter().map(|field| {
         let field_ident = field.ident.as_ref().expect("named field");
         match document_set_field(field) {
-            Ok(Some(_)) => quote! { #field_ident },
+            Ok(Some(DocumentSetField {
+                kind: DocumentSetFieldKind::One(_) | DocumentSetFieldKind::Many(_),
+                ..
+            })) => quote! { #field_ident },
+            Ok(Some(DocumentSetField {
+                kind: DocumentSetFieldKind::Lazy(field_type),
+                ..
+            })) => quote! {
+                #field_ident: <#field_type as #store::lazy::MongoLazyField<#id>>::new_lazy(id.clone())
+            },
+            Ok(Some(DocumentSetField {
+                kind: DocumentSetFieldKind::Unloadable(field_type, idle_millis),
+                ..
+            })) => quote! {
+                #field_ident: <#field_type as #store::lazy::MongoUnloadableField<#id>>::new_unloadable(
+                    id.clone(),
+                    ::std::time::Duration::from_millis(#idle_millis),
+                )
+            },
             Ok(None) => quote! { #field_ident: ::core::default::Default::default() },
             Err(_) => unreachable!("document set fields were validated above"),
         }
@@ -374,9 +409,21 @@ fn expand_document_set(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStr
                     preparation.scan_tracked(document)?;
                 }
             },
+            DocumentSetFieldKind::Lazy(field_type) => quote! {
+                <#field_type as #store::lazy::MongoLazyField<#id>>::scan_loaded(
+                    &self.#field_ident,
+                    preparation,
+                )?;
+            },
+            DocumentSetFieldKind::Unloadable(field_type, _) => quote! {
+                <#field_type as #store::lazy::MongoUnloadableField<#id>>::scan_loaded(
+                    &self.#field_ident,
+                    preparation,
+                )?;
+            },
         }
     });
-    let loads = persistent.iter().map(|field| {
+    let loads = eager.iter().map(|field| {
         let field_ident = field.ident;
         match &field.kind {
             DocumentSetFieldKind::One(document) => quote! {
@@ -395,6 +442,9 @@ fn expand_document_set(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStr
                     )
                     .await?;
             },
+            DocumentSetFieldKind::Lazy(_) | DocumentSetFieldKind::Unloadable(_, _) => {
+                unreachable!("lazy fields are not startup-loaded")
+            }
         }
     });
 
@@ -415,7 +465,7 @@ fn expand_document_set(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStr
                 coordinator: &mut #store::coordinator::MongoPersistenceCoordinator,
             ) -> ::core::result::Result<Self, #store::coordinator::PersistenceError> {
                 #(#validations)*
-                let #loaded { #(#persistent_idents,)* } = loaded;
+                let #loaded { #(#eager_idents,)* } = loaded;
                 #(#splits_and_attaches)*
                 Ok(Self { #(#initializers,)* })
             }
@@ -432,7 +482,7 @@ fn expand_document_set(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStr
                     #(#loads)*
                     Self::from_loaded(
                         &id,
-                        #loaded { #(#persistent_idents,)* },
+                        #loaded { #(#eager_idents,)* },
                         coordinator,
                     )
                 }
@@ -479,38 +529,68 @@ fn document_set_options(input: &DeriveInput) -> syn::Result<DocumentSetOptions> 
 fn document_set_field(field: &syn::Field) -> syn::Result<Option<DocumentSetField<'_>>> {
     let mut skipped = false;
     let mut many = false;
+    let mut lazy = false;
+    let mut lazy_unload = None;
     for attribute in &field.attrs {
         if !attribute.path().is_ident("mongo") {
             continue;
         }
         attribute.parse_nested_meta(|meta| {
             if meta.path.is_ident("skip") {
-                if !meta.input.is_empty() {
+                if meta.input.peek(syn::Token![=]) {
                     return Err(meta.error("#[mongo(skip)] does not accept a value"));
                 }
                 skipped = true;
                 Ok(())
             } else if meta.path.is_ident("many") {
-                if !meta.input.is_empty() {
+                if meta.input.peek(syn::Token![=]) {
                     return Err(meta.error("#[mongo(many)] does not accept a value"));
                 }
                 many = true;
+                Ok(())
+            } else if meta.path.is_ident("lazy") {
+                if meta.input.peek(syn::Token![=]) {
+                    return Err(meta.error("#[mongo(lazy)] does not accept a value"));
+                }
+                lazy = true;
+                Ok(())
+            } else if meta.path.is_ident("lazy_unload") {
+                let duration = meta.value()?.parse::<LitStr>()?;
+                lazy_unload = Some(parse_duration_millis(&duration)?);
                 Ok(())
             } else {
                 Err(meta.error("unsupported Mongo document-set field option"))
             }
         })?;
     }
-    if skipped && many {
+    let strategy_count = usize::from(skipped)
+        + usize::from(many)
+        + usize::from(lazy)
+        + usize::from(lazy_unload.is_some());
+    if strategy_count > 1 {
         return Err(syn::Error::new_spanned(
             field,
-            "MongoDocumentSet field cannot use both #[mongo(skip)] and #[mongo(many)]",
+            "MongoDocumentSet field accepts only one of #[mongo(skip)], #[mongo(many)], #[mongo(lazy)], or #[mongo(lazy_unload = \"...\")]",
         ));
     }
     if skipped {
         return Ok(None);
     }
     let ident = field.ident.as_ref().expect("named field");
+    if lazy {
+        return Ok(Some(DocumentSetField {
+            ident,
+            visibility: &field.vis,
+            kind: DocumentSetFieldKind::Lazy(field.ty.clone()),
+        }));
+    }
+    if let Some(idle_millis) = lazy_unload {
+        return Ok(Some(DocumentSetField {
+            ident,
+            visibility: &field.vis,
+            kind: DocumentSetFieldKind::Unloadable(field.ty.clone(), idle_millis),
+        }));
+    }
     if many {
         return Ok(Some(DocumentSetField {
             ident,
@@ -563,6 +643,44 @@ fn document_set_field(field: &syn::Field) -> syn::Result<Option<DocumentSetField
         visibility: &field.vis,
         kind: DocumentSetFieldKind::One(document),
     }))
+}
+
+fn parse_duration_millis(value: &LitStr) -> syn::Result<u64> {
+    let raw = value.value();
+    let split = raw
+        .find(|character: char| !character.is_ascii_digit())
+        .ok_or_else(|| {
+            syn::Error::new_spanned(value, "duration requires a unit: ms, s, m, h, or d")
+        })?;
+    let (amount, unit) = raw.split_at(split);
+    if amount.is_empty() || amount.starts_with('0') {
+        return Err(syn::Error::new_spanned(
+            value,
+            "duration must be a positive integer without leading zeroes",
+        ));
+    }
+    let amount = amount.parse::<u64>().map_err(|_| {
+        syn::Error::new_spanned(
+            value,
+            "duration amount does not fit in an unsigned 64-bit integer",
+        )
+    })?;
+    let multiplier = match unit {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => {
+            return Err(syn::Error::new_spanned(
+                value,
+                "unsupported duration unit; use ms, s, m, h, or d",
+            ));
+        }
+    };
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| syn::Error::new_spanned(value, "duration is too large"))
 }
 
 fn store_crate_path() -> syn::Result<proc_macro2::TokenStream> {

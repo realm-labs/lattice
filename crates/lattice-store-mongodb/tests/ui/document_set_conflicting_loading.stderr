@@ -1,0 +1,6 @@
+error: MongoDocumentSet field accepts only one of #[mongo(skip)], #[mongo(many)], #[mongo(lazy)], or #[mongo(lazy_unload = "...")]
+ --> tests/ui/document_set_conflicting_loading.rs:6:5
+  |
+6 | /     #[mongo(many, lazy)]
+7 | |     value: String,
+  | |_________________^

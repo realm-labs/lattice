@@ -136,6 +136,44 @@ impl MongoStore {
         Ok(documents)
     }
 
+    pub async fn find_page<D>(
+        &self,
+        filter: Document,
+        sort: Document,
+        limit: u32,
+    ) -> Result<Vec<crate::document::LoadedDocument<D>>, MongoStoreError>
+    where
+        D: MongoDocument,
+    {
+        if limit == 0 {
+            return Err(MongoStoreError::invalid_config(
+                "page limit",
+                "must be positive",
+            ));
+        }
+        let collection = self.database.collection::<Document>(D::COLLECTION);
+        let mut cursor = mongo_timeout(
+            self.operation_timeout,
+            "find typed document page",
+            collection.find(filter).sort(sort).limit(i64::from(limit)),
+        )
+        .await?;
+        let mut documents = Vec::with_capacity(limit as usize);
+        while mongo_timeout(
+            self.operation_timeout,
+            "advance typed document page cursor",
+            cursor.advance(),
+        )
+        .await?
+        {
+            let document = cursor
+                .deserialize_current()
+                .map_err(store_error("decode typed document page"))?;
+            documents.push(decode_flat_document::<D>(document)?);
+        }
+        Ok(documents)
+    }
+
     async fn flush_prepared_writes(
         &self,
         writes: Vec<PreparedDocumentWrite>,

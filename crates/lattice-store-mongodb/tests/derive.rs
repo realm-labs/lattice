@@ -4,10 +4,13 @@ use lattice_store_mongodb::coordinator::{MongoPersistenceCoordinator, Persistenc
 use lattice_store_mongodb::document::{
     LoadedDocument, MongoDocument as _, decode_flat_document, encode_flat_document,
 };
+use lattice_store_mongodb::mongo_store::MongoStore;
 use lattice_store_mongodb::scan::{FieldChange, MongoScan as _, ScanBudget, ScanCursor};
 use lattice_store_mongodb::tracked::Tracked;
 use lattice_store_mongodb::{
-    MongoDocument, MongoDocumentCollection, MongoDocumentSet, MongoScan, MongoStoreError,
+    MongoDocument, MongoDocumentCollection, MongoDocumentSet, MongoLazyCollection,
+    MongoLazyDocument, MongoLazyTable, MongoScan, MongoStoreError, MongoTableSpec,
+    MongoUnloadableCollection, MongoUnloadableDocument, MongoUnloadableTable,
 };
 use mongodb::bson::{doc, to_bson};
 use serde::{Deserialize, Serialize};
@@ -119,6 +122,55 @@ struct WorldDocuments {
     alliance_members: AllianceMembers,
     #[mongo(skip)]
     transient_counter: usize,
+}
+
+struct WorldMemberTable;
+
+impl MongoTableSpec<u64> for WorldMemberTable {
+    type Key = u64;
+    type Document = WorldMemberDocument;
+
+    const PAGE_KEY_FIELD: &'static str = "_id.member_id";
+
+    fn document_id(owner_id: &u64, key: &Self::Key) -> WorldMemberId {
+        WorldMemberId {
+            world_id: *owner_id,
+            member_id: *key,
+        }
+    }
+
+    fn owner_id(document: &Self::Document) -> &u64 {
+        &document.id.world_id
+    }
+
+    fn key(document: &Self::Document) -> &Self::Key {
+        &document.id.member_id
+    }
+
+    fn owner_filter(owner_id: &u64) -> Result<mongodb::bson::Document, MongoStoreError> {
+        Ok(doc! {
+            "_id.world_id": to_bson(owner_id)
+                .map_err(|error| MongoStoreError::encode("encode world owner ID", error))?,
+        })
+    }
+}
+
+#[derive(MongoDocumentSet)]
+#[mongo(id = u64)]
+struct MixedLoadingDocuments {
+    eager: Tracked<MacroDoc>,
+    #[mongo(lazy)]
+    lazy_singleton: MongoLazyDocument<SecondaryDoc>,
+    #[mongo(lazy_unload = "10m")]
+    unloadable_singleton: MongoUnloadableDocument<SecondaryDoc>,
+    #[mongo(lazy)]
+    lazy_collection: MongoLazyCollection<u64, AllianceMembers>,
+    #[mongo(lazy_unload = "1h")]
+    unloadable_collection: MongoUnloadableCollection<u64, AllianceMembers>,
+    #[mongo(lazy)]
+    lazy_rows: MongoLazyTable<u64, WorldMemberTable>,
+    #[mongo(lazy_unload = "30s")]
+    unloadable_rows: MongoUnloadableTable<u64, WorldMemberTable>,
 }
 
 #[test]
@@ -235,6 +287,61 @@ fn document_set_derives_loading_registration_and_tracked_scanning() {
     let request = changed.request.expect("changed set should write");
     assert_eq!(request.writes.len(), 1);
     assert_eq!(request.writes[0].key.collection, "macro_docs");
+}
+
+#[test]
+fn document_set_keeps_lazy_fields_out_of_the_startup_loaded_shape() {
+    assert_eq!(MixedLoadingDocuments::DOCUMENT_COUNT, 7);
+    let mut coordinator = MongoPersistenceCoordinator::new(9);
+    let mut documents = coordinator
+        .attach_loaded_set::<MixedLoadingDocuments>(
+            &42,
+            LoadedMixedLoadingDocuments {
+                eager: LoadedDocument {
+                    version: 3,
+                    updated_at_ms: 11,
+                    value: MacroDoc {
+                        id: 42,
+                        name: "Ada".to_owned(),
+                        items: BTreeMap::new(),
+                        small_map: BTreeMap::new(),
+                        cache: 0,
+                    },
+                },
+            },
+        )
+        .expect("mixed document set should attach its eager subset");
+
+    assert_eq!(documents.eager.name, "Ada");
+    assert!(!documents.lazy_singleton.is_loaded());
+    assert!(!documents.unloadable_singleton.is_loaded());
+    assert!(!documents.lazy_collection.is_loaded());
+    assert!(!documents.unloadable_collection.is_loaded());
+    assert_eq!(documents.lazy_rows.loaded_len(), 0);
+    assert_eq!(documents.unloadable_rows.loaded_len(), 0);
+
+    let unchanged = coordinator
+        .prepare_set(ScanBudget::generous(), &documents)
+        .expect("unloaded lazy fields should be ignored by scanning");
+    assert!(unchanged.request.is_none());
+
+    documents.eager.write().name = "Grace".to_owned();
+    let changed = coordinator
+        .prepare_set(ScanBudget::generous(), &documents)
+        .expect("eager field should retain synchronous tracked semantics");
+    assert_eq!(
+        changed.request.expect("eager field changed").writes.len(),
+        1
+    );
+}
+
+#[allow(dead_code)]
+async fn lazy_access_returns_direct_references<'a>(
+    documents: &'a mut MixedLoadingDocuments,
+    store: &MongoStore,
+    coordinator: &mut MongoPersistenceCoordinator,
+) -> Result<&'a mut SecondaryDoc, PersistenceError> {
+    documents.lazy_singleton.get_mut(store, coordinator).await
 }
 
 #[test]

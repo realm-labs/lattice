@@ -28,6 +28,19 @@ Actor-owned persistence state can derive `MongoDocumentSet`. Plain
 field implements `MongoDocumentCollection` and retains full control over its
 map/vector representation and derived business indexes.
 
+Loading policy is part of the field type, so eager business code never gains
+an unnecessary async API:
+
+| Model | Field type | Access after actor startup |
+| --- | --- | --- |
+| Eager singleton | `Tracked<D>` | synchronous |
+| Eager complete collection | `C` with `#[mongo(many)]` | synchronous, including iteration |
+| Resident lazy singleton | `MongoLazyDocument<D>` with `#[mongo(lazy)]` | first access is async, then resident |
+| Resident lazy complete collection | `MongoLazyCollection<Owner, C>` with `#[mongo(lazy)]` | first access is async, then ordinary `C` APIs |
+| Idle-unloadable singleton/collection | `MongoUnloadableDocument` / `MongoUnloadableCollection` | async acquisition; clean idle state can unload |
+| Row-lazy table | `MongoLazyTable<Owner, Spec>` | async point/page load; synchronous access to resident rows |
+| Idle-unloadable row table | `MongoUnloadableTable<Owner, Spec>` | row-level bounded idle eviction |
+
 ```rust
 # use lattice_store_mongodb::document::LoadedDocument;
 # use lattice_store_mongodb::scan::ScanBudget;
@@ -114,9 +127,138 @@ let prepared = coordinator.prepare_set(budget, &documents)?;
 
 The derive also generates `PlayerDocuments::load(&store, &player_id,
 &mut coordinator)`, which performs singleton `find_one` and collection
-`find_many` queries before registering anything. Skipped fields are initialized
-with `Default::default()`. The collection adapter builds custom indexes after
-the coordinator has converted the loaded batch into tracked documents.
+`find_many` queries for eager fields before registering anything. Lazy fields
+do not occur in the generated `LoadedPlayerDocuments` type and perform no
+startup query. Skipped fields are initialized with `Default::default()`. The
+collection adapter builds custom indexes after the coordinator has converted
+the loaded batch into tracked documents.
+
+## Lazy and unloadable state
+
+The derive only wires loading policy and persistence scanning. The business
+document still owns its ID, and the application still chooses owner filters,
+map layout, and secondary indexes.
+
+```rust
+# use lattice_store_mongodb::coordinator::{MongoPersistenceCoordinator, PersistenceError};
+# use lattice_store_mongodb::mongo_store::MongoStore;
+# use lattice_store_mongodb::tracked::Tracked;
+# use lattice_store_mongodb::{MongoDocument, MongoDocumentSet, MongoLazyDocument,
+#     MongoScan, MongoTableSpec, MongoUnloadableTable, MongoStoreError};
+# use mongodb::bson::{Document, doc, to_bson};
+# use serde::{Deserialize, Serialize};
+# type WorldId = u64;
+# type PlayerId = u64;
+# #[derive(Debug, Serialize, Deserialize, MongoDocument, MongoScan)]
+# #[mongo(collection = "world_settings")]
+# struct WorldSettings { #[mongo(id)] id: WorldId, tick: u64 }
+# #[derive(Debug, Serialize, Deserialize, MongoDocument, MongoScan)]
+# #[mongo(collection = "world_mail")]
+# struct WorldMail { #[mongo(id)] id: WorldId, unread: u32 }
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct WorldPlayerKey {
+    world_id: WorldId,
+    player_id: PlayerId,
+}
+
+#[derive(Debug, Serialize, Deserialize, MongoDocument, MongoScan)]
+#[mongo(collection = "world_players")]
+struct WorldPlayer {
+    #[mongo(id)]
+    id: WorldPlayerKey,
+    level: u32,
+}
+
+struct WorldPlayers;
+
+impl MongoTableSpec<WorldId> for WorldPlayers {
+    type Key = PlayerId;
+    type Document = WorldPlayer;
+
+    const PAGE_KEY_FIELD: &'static str = "_id.player_id";
+
+    fn document_id(world_id: &WorldId, player_id: &PlayerId) -> WorldPlayerKey {
+        WorldPlayerKey { world_id: *world_id, player_id: *player_id }
+    }
+
+    fn owner_id(document: &WorldPlayer) -> &WorldId {
+        &document.id.world_id
+    }
+
+    fn key(document: &WorldPlayer) -> &PlayerId {
+        &document.id.player_id
+    }
+
+    fn owner_filter(world_id: &WorldId) -> Result<Document, MongoStoreError> {
+        Ok(doc! { "_id.world_id": to_bson(world_id)
+            .map_err(|error| MongoStoreError::encode("encode world ID", error))? })
+    }
+}
+
+#[derive(MongoDocumentSet)]
+#[mongo(id = WorldId)]
+struct WorldDocuments {
+    // Loaded during actor startup. Every later access is synchronous.
+    settings: Tracked<WorldSettings>,
+
+    // Loaded on first access and retained for the actor lifetime.
+    #[mongo(lazy)]
+    mail: MongoLazyDocument<WorldMail>,
+
+    // Each player row loads independently and clean rows idle for ten minutes
+    // can be evicted with a bounded maintenance pass.
+    #[mongo(lazy_unload = "10m")]
+    players: MongoUnloadableTable<WorldId, WorldPlayers>,
+}
+
+async fn use_documents(
+    documents: &mut WorldDocuments,
+    store: &MongoStore,
+    persistence: &mut MongoPersistenceCoordinator,
+    player_id: PlayerId,
+) -> Result<(), PersistenceError> {
+    // Eager: no await and no load/get wrapper.
+    documents.settings.write().tick += 1;
+
+    // Lazy singleton: the returned mutable reference is borrowed directly
+    // from the document set and cannot escape it.
+    documents.mail.get_mut(store, persistence).await?.unread += 1;
+
+    // Row-lazy: only this player document is queried.
+    if let Some(player) = documents.players.get_mut(store, persistence, &player_id).await? {
+        player.level += 1;
+    }
+
+    // Fetching a keyset page is async; iterating the fetched page is sync.
+    let page = documents
+        .players
+        .load_page(store, persistence, doc! {}, None, 128)
+        .await?;
+    for player in page.iter() {
+        let _ = player.level;
+    }
+    Ok(())
+}
+```
+
+`MongoLazyCollection` loads the complete owner collection once and returns
+`&C`/`&mut C`, so its maps, arrays, and custom indexes remain normal synchronous
+Rust APIs after the initial `await`. `MongoLazyTable` is the separate model for
+collections too large to keep completely resident. Its `MongoTableSpec`
+defines the owner query, row cache key, document identity, and stable pagination
+field; the framework does not prescribe business ID layout.
+
+Call `unload_idle` from an actor timer or maintenance message. Singleton and
+complete-collection unload returns `IdleUnloadStatus`; row tables additionally
+accept `TableEvictionBudget` and report examined, unloaded, and dirty rows.
+Dirty, newly created, scanning, in-flight, or conflicted documents stay
+resident until their persistence state is safe to detach.
+
+For efficient row pages, `PAGE_KEY_FIELD` must be unique within one owner and
+must use the same ascending ordering as `Spec::Key`. Create a matching compound
+MongoDB index, for example `{ "_id.world_id": 1, "_id.player_id": 1 }`; the
+default index on the complete `_id` value does not replace this owner-prefix
+query index.
 
 Business documents must not define the reserved top-level fields `_id`,
 `version`, or `updated_at_ms`. Prepared multi-document flushes report an exact

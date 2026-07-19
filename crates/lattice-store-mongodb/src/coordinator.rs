@@ -300,6 +300,54 @@ impl MongoPersistenceCoordinator {
         Ok(())
     }
 
+    /// Returns whether a tracked document is durably clean and can be
+    /// detached without losing actor-local state.
+    pub fn tracked_is_clean<D>(&self, tracked: &Tracked<D>) -> Result<bool, PersistenceError>
+    where
+        D: MongoScan,
+    {
+        let value = tracked.read();
+        let key = MongoDocumentKey::for_document::<D>(value.id())?;
+        let state = self
+            .documents
+            .get(&key)
+            .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
+        let in_flight = self.in_flight.as_ref().is_some_and(|commit| {
+            commit
+                .document_commits
+                .values()
+                .chain(commit.clean_commits.iter())
+                .any(|document| document.key == key)
+        });
+        let conflicted = self
+            .conflict
+            .as_ref()
+            .is_some_and(|conflict| conflict.key == key);
+        Ok(!in_flight
+            && !conflicted
+            && state.create_mode.is_none()
+            && state.scanning_mutation_epoch.is_none()
+            && state.cursor == ScanCursor::default()
+            && state.acknowledged_mutation_epoch == Some(tracked.mutation_epoch()))
+    }
+
+    /// Detaches a tracked document only when its current mutation epoch has
+    /// already been acknowledged by storage.
+    pub fn detach_tracked_if_clean<D>(
+        &mut self,
+        tracked: &Tracked<D>,
+    ) -> Result<bool, PersistenceError>
+    where
+        D: MongoScan,
+    {
+        if !self.tracked_is_clean(tracked)? {
+            return Ok(false);
+        }
+        let key = MongoDocumentKey::for_document::<D>(tracked.read().id())?;
+        self.documents.remove(&key);
+        Ok(true)
+    }
+
     pub fn prepare<F>(
         &mut self,
         budget: ScanBudget,

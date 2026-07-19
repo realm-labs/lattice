@@ -7,15 +7,25 @@ pub mod direct;
 pub mod document;
 pub mod document_set;
 pub mod error;
+pub mod lazy;
 pub mod mongo;
 pub mod mongo_store;
 pub mod prepared;
 pub mod scan;
+pub mod table;
 pub mod tracked;
 
 pub use lattice_store_mongodb_macros::{MongoDocument, MongoDocumentSet, MongoScan};
 
 pub use document_set::{MongoDocumentCollection, MongoDocumentSet};
 pub use error::{MongoStoreError, MongoStoreErrorKind};
+pub use lazy::{
+    IdleUnloadStatus, MongoLazyCollection, MongoLazyDocument, MongoUnloadableCollection,
+    MongoUnloadableDocument,
+};
+pub use table::{
+    MongoLazyTable, MongoTablePage, MongoTableSpec, MongoUnloadableTable, TableEvictionBudget,
+    TableEvictionReport,
+};
 
 extern crate self as lattice_store_mongodb;

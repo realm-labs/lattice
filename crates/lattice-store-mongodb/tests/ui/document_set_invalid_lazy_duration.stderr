@@ -1,0 +1,5 @@
+error: duration must be a positive integer without leading zeroes
+ --> tests/ui/document_set_invalid_lazy_duration.rs:6:27
+  |
+6 |     #[mongo(lazy_unload = "ten minutes")]
+  |                           ^^^^^^^^^^^^^
