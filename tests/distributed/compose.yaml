@@ -111,7 +111,7 @@ services:
 
   etcd-single:
     <<: *etcd
-    profiles: [e2e, chaos]
+    profiles: [e2e, chaos, scale]
     command:
       - /usr/local/bin/etcd
       - --name=etcd-single
@@ -167,7 +167,7 @@ services:
 
   domain-membership:
     <<: *runner
-    profiles: [e2e, chaos]
+    profiles: [e2e, chaos, scale]
     depends_on:
       etcd-single: {condition: service_healthy}
     environment:
@@ -265,6 +265,38 @@ services:
       interval: 1s
       timeout: 1s
       retries: 600
+
+  domain-logic-scale:
+    <<: *runner
+    profiles: [scale]
+    depends_on:
+      domain-membership: {condition: service_healthy}
+    environment:
+      LATTICE_SCALE_EXPECTED_MEMBERS: ${LATTICE_SCALE_EXPECTED_MEMBERS:-64}
+    cpus: 0.25
+    mem_limit: 512m
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 1024
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        delay="$$(printf '%s' "$${HOSTNAME}" | cksum | awk '{print $$1 % 90}')";
+        sleep "$${delay}";
+        exec /cargo-target/debug/distributed-node domain-logic
+        --node-id "$${HOSTNAME}"
+        --address-host "$$(hostname -i | awk '{print $$1}')"
+        --port 29310
+        --membership-only
+        --expected-members "$${LATTICE_SCALE_EXPECTED_MEMBERS}"
+        --reference "/artifacts/scale/$${HOSTNAME}.json"
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /artifacts/scale/$${HOSTNAME}.json"]
+      interval: 2s
+      timeout: 1s
+      retries: 180
 
   etcd1:
     <<: *etcd
@@ -385,6 +417,17 @@ services:
       testnet:
         aliases: [aaa-client, aaa-monitor]
     command: ["/cargo-target/debug/testctl", "run", "chaos", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
+
+  runner-scale:
+    <<: *runner
+    profiles: [scale]
+    depends_on:
+      domain-membership: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
+      LATTICE_SCALE_EXPECTED_MEMBERS: ${LATTICE_SCALE_EXPECTED_MEMBERS:-64}
+    command: ["/cargo-target/debug/testctl", "run", "scale", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
 
   runner-soak:
     <<: *runner

@@ -77,8 +77,8 @@ fn node_config(
             ..RemotingConfig::default()
         },
         maximum_actor_protocols: 8,
-        maximum_watches: 32,
-        maximum_supervised_tasks: 32,
+        maximum_watches: 256,
+        maximum_supervised_tasks: 256,
         shutdown_timeout: Duration::from_secs(2),
     }
 }

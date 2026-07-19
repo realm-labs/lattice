@@ -14,6 +14,8 @@ mod testctl_discovery;
 mod testctl_outcomes;
 #[path = "testctl/resources.rs"]
 mod testctl_resources;
+#[path = "testctl/scale.rs"]
+mod testctl_scale;
 #[path = "testctl/scenarios.rs"]
 mod testctl_scenarios;
 
@@ -72,6 +74,7 @@ enum Profile {
     Model,
     E2e,
     E2eHaEtcd,
+    Scale,
     Chaos,
     K8s,
     Soak,
@@ -217,6 +220,9 @@ fn run_profile(
                 )
             });
         }
+        Profile::Scale => runner.run("sixty-four-node-convergence", || {
+            testctl_scale::run(artifacts)
+        }),
         Profile::Chaos => {
             runner.run("multi-domain-failover", || multi_domain_real(artifacts));
             runner.run("docker-fault-sequence", || testctl_chaos::verify(artifacts));
@@ -338,6 +344,7 @@ fn run_profile(
         configuration: serde_json::json!({
             "duration_seconds": duration_seconds,
             "artifact_directory": artifacts,
+            "scale_expected_members": std::env::var("LATTICE_SCALE_EXPECTED_MEMBERS").ok(),
         }),
     };
     write_json(&artifacts.join("manifest.json"), &manifest)?;

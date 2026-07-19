@@ -312,6 +312,11 @@ e2e:
   runner, disposable etcd, concrete-actor server, claimed entity owner and Gateway client
   real child ActorRef ask/watch/stop, Gateway-to-EntityRef routing, TCP/TLS and normal lifecycle
 
+scale:
+  64 real member nodes plus a dedicated membership-coordinator process
+  every member must become Ready and publish the same 64-member term/revision/directory
+  multi-domain placement and failover remain covered by the e2e profile
+
 chaos:
   e2e topology plus dedicated fault orchestration/network proxy
   pause/resume/kill/restart, partitions, delay/loss and failpoint scenarios
@@ -322,6 +327,11 @@ soak:
 k8s:
   disposable local Kubernetes cluster for probes, preStop, rollout, eviction and Service/DNS only
 ```
+
+Installing membership does not eagerly create an all-to-all remoting mesh. The authoritative
+directory is retained locally, routing connects to an exact `Up` peer on demand, and removal closes
+an existing association if one was opened. This keeps idle-cluster connection count linear while
+preserving incarnation-fenced lazy routing.
 
 An additional HA-etcd profile runs a disposable three-member etcd cluster for lease/store failover scenarios. Ordinary PR tests may use one disposable etcd container; final storage/leadership evidence includes the HA profile.
 
@@ -358,6 +368,7 @@ The repository supplies one stable wrapper whose implementation uses Docker Comp
 ./scripts/test-docker.sh model
 ./scripts/test-docker.sh e2e
 ./scripts/test-docker.sh e2e-ha-etcd
+./scripts/test-docker.sh scale
 ./scripts/test-docker.sh chaos
 ./scripts/test-docker.sh k8s
 ./scripts/test-docker.sh soak --duration 4h --seed <seed>

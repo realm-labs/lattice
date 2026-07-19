@@ -1,0 +1,257 @@
+use std::{
+    collections::BTreeSet,
+    path::Path,
+    time::{Duration, Instant},
+};
+
+use serde::Serialize;
+
+use super::testctl_artifacts::{
+    MemberArtifact, MembershipVersionArtifact, ScaleNodeArtifact, write_json,
+};
+
+#[derive(Serialize)]
+struct ConvergenceArtifact {
+    expected_members: usize,
+    membership_coordinator: &'static str,
+    logic_nodes: usize,
+    membership_term: u64,
+    membership_revision: u64,
+    convergence_millis: u128,
+    members: Vec<MemberArtifact>,
+}
+
+pub(super) fn run(artifacts: &Path) -> Result<(), String> {
+    let expected_members = std::env::var("LATTICE_SCALE_EXPECTED_MEMBERS")
+        .unwrap_or_else(|_| "64".to_owned())
+        .parse::<usize>()
+        .map_err(|error| format!("invalid LATTICE_SCALE_EXPECTED_MEMBERS: {error}"))?;
+    if expected_members == 0 {
+        return Err("scale topology needs at least one member".to_owned());
+    }
+    let expected_logic = expected_members;
+    let directory = artifacts.join("scale");
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(600);
+    loop {
+        let nodes = read_nodes(&directory)?;
+        let observation = observation(&nodes, expected_logic, expected_members);
+        if let Some((version, members)) =
+            evaluate_convergence(&nodes, expected_logic, expected_members)?
+        {
+            write_json(
+                &artifacts.join("scale-convergence.json"),
+                &ConvergenceArtifact {
+                    expected_members,
+                    membership_coordinator: "domain-membership",
+                    logic_nodes: expected_logic,
+                    membership_term: version.term,
+                    membership_revision: version.revision,
+                    convergence_millis: started.elapsed().as_millis(),
+                    members,
+                },
+            )?;
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{expected_members}-node cluster did not converge within 600s; {observation}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn read_nodes(directory: &Path) -> Result<Vec<ScaleNodeArtifact>, String> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut nodes = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(encoded) = std::fs::read(entry.path())
+            && let Ok(node) = serde_json::from_slice::<ScaleNodeArtifact>(&encoded)
+        {
+            nodes.push(node);
+        }
+    }
+    nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    Ok(nodes)
+}
+
+fn evaluate_convergence(
+    nodes: &[ScaleNodeArtifact],
+    expected_logic: usize,
+    expected_members: usize,
+) -> Result<Option<(MembershipVersionArtifact, Vec<MemberArtifact>)>, String> {
+    if nodes.len() > expected_logic {
+        return Err(format!(
+            "scale topology published {} logic nodes, expected {expected_logic}",
+            nodes.len()
+        ));
+    }
+    if nodes.len() < expected_logic {
+        return Ok(None);
+    }
+    let identities = nodes
+        .iter()
+        .map(|node| (node.node_id.clone(), node.incarnation))
+        .collect::<BTreeSet<_>>();
+    if identities.len() != expected_logic {
+        return Err("scale logic artifacts contain duplicate node identities".to_owned());
+    }
+
+    let mut expected_version = None;
+    let mut expected_directory = None;
+    for node in nodes {
+        if node.lifecycle != "Ready" || !node.domains.is_empty() {
+            return Ok(None);
+        }
+        let Some(version) = node.membership_version else {
+            return Ok(None);
+        };
+        let directory = node.members.iter().cloned().collect::<BTreeSet<_>>();
+        if node.members.len() != expected_members
+            || directory.len() != expected_members
+            || directory.iter().any(|member| member.status != "Up")
+            || !directory.iter().any(|member| {
+                member.node_id == node.node_id && member.incarnation == node.incarnation
+            })
+        {
+            return Ok(None);
+        }
+        if expected_version.is_some_and(|expected| expected != version)
+            || expected_directory
+                .as_ref()
+                .is_some_and(|expected| expected != &directory)
+        {
+            return Ok(None);
+        }
+        expected_version = Some(version);
+        expected_directory = Some(directory);
+    }
+    let version = expected_version.expect("non-empty scale topology has a version");
+    let directory = expected_directory.expect("non-empty scale topology has a directory");
+    for (node_id, incarnation) in identities {
+        if !directory
+            .iter()
+            .any(|member| member.node_id == node_id && member.incarnation == incarnation)
+        {
+            return Err(format!(
+                "converged membership is missing logic node {node_id}/{incarnation}"
+            ));
+        }
+    }
+    Ok(Some((version, directory.into_iter().collect())))
+}
+
+fn observation(
+    nodes: &[ScaleNodeArtifact],
+    expected_logic: usize,
+    expected_members: usize,
+) -> String {
+    let ready = nodes
+        .iter()
+        .filter(|node| node.lifecycle == "Ready" && node.domains.is_empty())
+        .count();
+    let complete_membership = nodes
+        .iter()
+        .filter(|node| node.members.len() == expected_members)
+        .count();
+    format!(
+        "logic artifacts={}/{expected_logic}, ready={ready}/{expected_logic}, full membership={complete_membership}/{expected_logic}",
+        nodes.len()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn converged_nodes() -> Vec<ScaleNodeArtifact> {
+        let version = MembershipVersionArtifact {
+            term: 3,
+            revision: 64,
+        };
+        let mut members = (0..64)
+            .map(|index| MemberArtifact {
+                node_id: format!("logic-{index:02}"),
+                incarnation: index as u128 + 100,
+                status: "Up".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        members.sort();
+        (0..64)
+            .map(|index| ScaleNodeArtifact {
+                node_id: format!("logic-{index:02}"),
+                incarnation: index as u128 + 100,
+                lifecycle: "Ready".to_owned(),
+                domains: Default::default(),
+                membership_version: Some(version),
+                members: members.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sixty_four_node_oracle_requires_identical_membership() {
+        let nodes = converged_nodes();
+        let converged = evaluate_convergence(&nodes, 64, 64)
+            .expect("valid scale evidence")
+            .expect("all nodes should converge");
+        assert_eq!(converged.0.revision, 64);
+        assert_eq!(converged.1.len(), 64);
+    }
+
+    #[test]
+    fn sixty_four_node_oracle_waits_for_revision_convergence() {
+        let mut nodes = converged_nodes();
+        nodes[0].membership_version = Some(MembershipVersionArtifact {
+            term: 3,
+            revision: 63,
+        });
+        assert!(
+            evaluate_convergence(&nodes, 64, 64)
+                .expect("revision skew is transient")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sixty_four_node_oracle_rejects_duplicate_logic_identity() {
+        let mut nodes = converged_nodes();
+        nodes[1].node_id = nodes[0].node_id.clone();
+        nodes[1].incarnation = nodes[0].incarnation;
+        let error = evaluate_convergence(&nodes, 64, 64)
+            .expect_err("duplicate logic identity must be rejected");
+        assert!(error.contains("duplicate"));
+    }
+
+    #[test]
+    fn convergence_artifact_streams_full_u128_incarnations() {
+        let artifact = ConvergenceArtifact {
+            expected_members: 1,
+            membership_coordinator: "domain-membership",
+            logic_nodes: 1,
+            membership_term: 1,
+            membership_revision: 2,
+            convergence_millis: 3,
+            members: vec![MemberArtifact {
+                node_id: "logic".to_owned(),
+                incarnation: u128::MAX,
+                status: "Up".to_owned(),
+            }],
+        };
+        let encoded = serde_json::to_vec(&artifact).expect("u128 must serialize without Value");
+        assert!(
+            encoded
+                .windows(39)
+                .any(|window| window == b"340282366920938463463374607431768211455")
+        );
+    }
+}

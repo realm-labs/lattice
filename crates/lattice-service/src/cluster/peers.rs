@@ -69,10 +69,8 @@ impl PeerReconciler {
         members: Vec<MemberRecord>,
     ) -> Result<(), PeerError> {
         self.members
-            .install_snapshot(version, members.clone())
-            .map_err(PeerError::Directory)?;
-        self.connect_authoritative_members(&members).await;
-        Ok(())
+            .install_snapshot(version, members)
+            .map_err(PeerError::Directory)
     }
 
     pub async fn apply(&self, event: MemberEvent) -> Result<(), PeerError> {
@@ -87,37 +85,7 @@ impl PeerReconciler {
             self.associations
                 .remove(association.key(), association.id());
         }
-        let connect = match &event.change {
-            MemberChange::Upsert(record) if record.status == MemberStatus::Up => {
-                Some(record.as_ref().clone())
-            }
-            _ => None,
-        };
-        self.members.apply(event).map_err(PeerError::Directory)?;
-        if let Some(member) = connect {
-            self.connect_authoritative_members(&[member]).await;
-        }
-        Ok(())
-    }
-
-    async fn connect_authoritative_members(&self, members: &[MemberRecord]) {
-        for member in members {
-            if member.status != MemberStatus::Up
-                || !self
-                    .associations
-                    .should_dial(&member.node.address, member.node.incarnation)
-            {
-                continue;
-            }
-            if let Err(error) = self.connect(&member.node).await {
-                tracing::warn!(
-                    target: "lattice.cluster.peers",
-                    %error,
-                    node_id = %member.node.node_id,
-                    "failed to reconcile an authoritative peer association"
-                );
-            }
-        }
+        self.members.apply(event).map_err(PeerError::Directory)
     }
 }
 

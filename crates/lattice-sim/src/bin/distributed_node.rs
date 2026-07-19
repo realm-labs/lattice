@@ -77,7 +77,7 @@ use lattice_remoting::{
 };
 use lattice_service::{
     builder::{LatticeService, LatticeServiceBuilder},
-    cluster::{DomainLogicalRouter, LogicalBufferConfig},
+    cluster::{DomainLogicalRouter, LogicalBufferConfig, members::MemberSnapshot},
     config::{ClusterJoinConfig, NodeConfig},
     lifecycle::NodeLifecycleState,
 };
@@ -100,6 +100,12 @@ struct Cli {
     port: u16,
     #[arg(long, default_value = "")]
     domains: String,
+    #[arg(long)]
+    address_host: Option<String>,
+    #[arg(long)]
+    expected_members: Option<usize>,
+    #[arg(long)]
+    membership_only: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -143,8 +149,24 @@ struct MultiDomainHostArtifact {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MultiDomainLogicArtifact {
     node_id: String,
+    incarnation: u128,
     lifecycle: String,
     domains: BTreeMap<String, String>,
+    membership_version: Option<MembershipVersionArtifact>,
+    members: Vec<MemberArtifact>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct MembershipVersionArtifact {
+    term: u64,
+    revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MemberArtifact {
+    node_id: String,
+    incarnation: u128,
+    status: String,
 }
 
 #[derive(Debug, Clone, lattice_actor::Request)]
@@ -349,7 +371,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Role::StaticMember => discovery_member(cli.reference, cli.node_id, cli.port, false).await,
         Role::ConfigMember => discovery_member(cli.reference, cli.node_id, cli.port, true).await,
         Role::DomainHost => domain_host(cli.reference, cli.node_id, cli.port, cli.domains).await,
-        Role::DomainLogic => domain_logic(cli.reference, cli.node_id, cli.port).await,
+        Role::DomainLogic => {
+            let address_host = cli.address_host.unwrap_or_else(|| cli.node_id.clone());
+            domain_logic(
+                cli.reference,
+                cli.node_id,
+                address_host,
+                cli.port,
+                cli.expected_members,
+                cli.membership_only,
+            )
+            .await
+        }
     }
 }
 

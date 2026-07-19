@@ -80,6 +80,7 @@ pub(super) fn for_profile(profile: Profile) -> Vec<&'static str> {
             "leader-recovery-resume",
             "singleton-forward-recovery",
         ],
+        Profile::Scale => vec!["sixty-four-node-convergence"],
         Profile::Chaos => vec![
             "multi-domain-failover",
             "docker-fault-sequence",

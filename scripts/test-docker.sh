@@ -4,7 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 compose="$root/tests/distributed/compose.yaml"
 profile=${1:-}
-[ -n "$profile" ] || { echo "usage: $0 <quality|sim|model|e2e|e2e-ha-etcd|chaos|k8s|soak|replay>" >&2; exit 2; }
+[ -n "$profile" ] || { echo "usage: $0 <quality|sim|model|e2e|e2e-ha-etcd|scale|chaos|k8s|soak|replay>" >&2; exit 2; }
 shift
 
 run_id=${LATTICE_RUN_ID:-"$(date -u +%Y%m%dt%H%M%Sz)-$$"}
@@ -59,6 +59,16 @@ case "$profile" in
   quality|sim|model|e2e|e2e-ha-etcd|chaos|k8s)
     service="runner-$profile"
     ;;
+  scale)
+    service=runner-scale
+    LATTICE_SCALE_EXPECTED_MEMBERS=${LATTICE_SCALE_EXPECTED_MEMBERS:-64}
+    case "$LATTICE_SCALE_EXPECTED_MEMBERS" in
+      ''|*[!0-9]*) echo "invalid scale member count: $LATTICE_SCALE_EXPECTED_MEMBERS" >&2; exit 2 ;;
+    esac
+    [ "$LATTICE_SCALE_EXPECTED_MEMBERS" -gt 0 ] || { echo "scale needs at least one member" >&2; exit 2; }
+    LATTICE_SCALE_LOGIC_NODES=$LATTICE_SCALE_EXPECTED_MEMBERS
+    export LATTICE_SCALE_EXPECTED_MEMBERS LATTICE_SCALE_LOGIC_NODES
+    ;;
   soak)
     service=runner-soak
     while [ "$#" -gt 0 ]; do
@@ -98,7 +108,7 @@ docker build \
   "$root"
 
 case "$profile" in
-  e2e|e2e-ha-etcd|chaos)
+  e2e|e2e-ha-etcd|scale|chaos)
     echo "Preparing shared lattice-sim binaries in the Docker Cargo cache"
     docker run --rm \
       --label "io.lattice.test-run=$run_id" \
@@ -114,5 +124,14 @@ case "$profile" in
     ;;
 esac
 
-docker compose -f "$compose" -p "$project" --profile "$profile" up \
-  --no-build --abort-on-container-exit --exit-code-from "$service" "$service"
+if [ "$profile" = scale ]; then
+  docker compose -f "$compose" -p "$project" --profile "$profile" up \
+    --no-build \
+    --scale "domain-logic-scale=$LATTICE_SCALE_LOGIC_NODES" \
+    --abort-on-container-exit \
+    --exit-code-from "$service" \
+    domain-logic-scale "$service"
+else
+  docker compose -f "$compose" -p "$project" --profile "$profile" up \
+    --no-build --abort-on-container-exit --exit-code-from "$service" "$service"
+fi

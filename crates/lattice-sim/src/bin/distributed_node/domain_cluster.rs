@@ -142,47 +142,69 @@ fn write_domain_host_artifact(
     Ok(())
 }
 
-async fn domain_logic(artifact: PathBuf, node_id: String, port: u16) -> Result<(), Box<dyn Error>> {
+async fn domain_logic(
+    artifact: PathBuf,
+    node_id: String,
+    address_host: String,
+    port: u16,
+    expected_members: Option<usize>,
+    membership_only: bool,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(parent) = artifact.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let cluster = ClusterId::new("docker-domain-e2e")?;
     let incarnation = NodeIncarnation::generate();
-    let mut builder = LatticeService::builder(node_config(
+    let mut config = node_config(
         cluster,
         &node_id,
-        NodeAddress::new(node_id.clone(), port)?,
+        NodeAddress::new(address_host, port)?,
         incarnation,
-    ))?;
-    for (name, entity) in [
-        ("alpha", "distributed-alpha"),
-        ("beta", "distributed-beta"),
-        ("gamma", "distributed-gamma"),
-        ("delta", "distributed-delta"),
-    ] {
-        let domain = distributed_domain(name)?;
-        builder = builder
-            .proxy_entity_config::<FixtureProtocol>(EntityConfig::new(
-                domain.clone(),
-                EntityType::new(entity)?,
-                ProtocolId::new(PROTOCOL_ID)?,
-                16,
-                "weighted-least-load",
-                1,
-                Vec::new(),
-            )?)?
-            .domain_capacity(domain, 1)?;
+    );
+    if membership_only {
+        config.remoting.heartbeat_interval = Duration::from_secs(2);
     }
-    builder = builder
-        .coordinator_discovery(domain_static_discovery(
-            CoordinatorScope::Membership,
-            "membership",
-            &[
-                ("domain-membership", 29300),
-                ("domain-alpha", 29301),
-                ("domain-beta", 29302),
-                ("domain-gamma", 29303),
-                ("domain-standby", 29304),
-            ],
-        )?)?
-        .coordinator_discovery(domain_static_discovery(
+    let mut builder = LatticeService::builder(config)?;
+    if !membership_only {
+        for (name, entity) in [
+            ("alpha", "distributed-alpha"),
+            ("beta", "distributed-beta"),
+            ("gamma", "distributed-gamma"),
+            ("delta", "distributed-delta"),
+        ] {
+            let domain = distributed_domain(name)?;
+            builder = builder
+                .proxy_entity_config::<FixtureProtocol>(EntityConfig::new(
+                    domain.clone(),
+                    EntityType::new(entity)?,
+                    ProtocolId::new(PROTOCOL_ID)?,
+                    16,
+                    "weighted-least-load",
+                    1,
+                    Vec::new(),
+                )?)?
+                .domain_capacity(domain, 1)?;
+        }
+    }
+    let membership_candidates = if membership_only {
+        vec![("domain-membership", 29300)]
+    } else {
+        vec![
+            ("domain-membership", 29300),
+            ("domain-alpha", 29301),
+            ("domain-beta", 29302),
+            ("domain-gamma", 29303),
+            ("domain-standby", 29304),
+        ]
+    };
+    builder = builder.coordinator_discovery(domain_static_discovery(
+        CoordinatorScope::Membership,
+        "membership",
+        &membership_candidates,
+    )?)?;
+    if !membership_only {
+        builder = builder
+            .coordinator_discovery(domain_static_discovery(
             CoordinatorScope::Placement(distributed_domain("alpha")?),
             "alpha",
             &[("domain-alpha", 29301), ("domain-standby", 29304)],
@@ -201,30 +223,41 @@ async fn domain_logic(artifact: PathBuf, node_id: String, port: u16) -> Result<(
             CoordinatorScope::Placement(distributed_domain("delta")?),
             "delta",
             &[("domain-alpha", 29301), ("domain-standby", 29304)],
-        )?)?
-        .join_config(ClusterJoinConfig {
-            retry_initial: Duration::from_millis(25),
-            retry_max: Duration::from_millis(250),
-            join_timeout: Some(Duration::from_secs(240)),
-            ..ClusterJoinConfig::default()
-        });
+        )?)?;
+    }
+    builder = builder.join_config(ClusterJoinConfig {
+        retry_initial: Duration::from_millis(25),
+        retry_max: Duration::from_millis(250),
+        join_timeout: Some(Duration::from_secs(240)),
+        ..ClusterJoinConfig::default()
+    });
     let service = builder.build()?;
     service.start().await?;
     let mut health = service.subscribe_health();
+    let mut artifact_tick = tokio::time::interval(Duration::from_millis(250));
+    artifact_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let ready = tokio::time::timeout(Duration::from_secs(300), async {
         loop {
             let snapshot = health.borrow().clone();
-            write_domain_logic_artifact(&artifact, &node_id, &snapshot)?;
-            if snapshot.node == NodeLifecycleState::Ready
-                && ["alpha", "beta", "gamma", "delta"].into_iter().all(|name| {
-                    snapshot.domains.get(
-                        &distributed_domain(name).expect("static distributed domain must be valid"),
-                    ) == Some(&PlacementDomainState::Ready)
+            let members = service.member_snapshot();
+            write_domain_logic_artifact(&artifact, &node_id, incarnation, &snapshot, &members)?;
+            if domain_logic_ready(&snapshot, membership_only)
+                && expected_members.is_none_or(|expected| {
+                    members.members.len() == expected
+                        && members
+                            .members
+                            .iter()
+                            .all(|member| member.status == MemberStatus::Up)
                 })
             {
                 break;
             }
-            health.changed().await?;
+            tokio::select! {
+                changed = health.changed() => {
+                    changed?;
+                }
+                _ = artifact_tick.tick() => {}
+            }
         }
         Ok::<(), Box<dyn Error>>(())
     })
@@ -233,21 +266,42 @@ async fn domain_logic(artifact: PathBuf, node_id: String, port: u16) -> Result<(
         Ok(result) => result?,
         Err(_) => {
             let snapshot = health.borrow().clone();
-            write_domain_logic_artifact(&artifact, &node_id, &snapshot)?;
+            write_domain_logic_artifact(
+                &artifact,
+                &node_id,
+                incarnation,
+                &snapshot,
+                &service.member_snapshot(),
+            )?;
             return Err(IoError::other(format!(
-                "domain logic {node_id} did not become Ready within 300s; last health snapshot: {snapshot:?}"
+                "domain logic {node_id} did not reach Ready with {expected_members:?} expected members within 300s; last health snapshot: {snapshot:?}"
             ))
             .into());
         }
     }
+    let mut artifact_tick = tokio::time::interval(Duration::from_secs(1));
+    artifact_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             changed = health.changed() => {
                 if changed.is_err() {
                     break;
                 }
-                write_domain_logic_artifact(&artifact, &node_id, &health.borrow().clone())?;
+                write_domain_logic_artifact(
+                    &artifact,
+                    &node_id,
+                    incarnation,
+                    &health.borrow().clone(),
+                    &service.member_snapshot(),
+                )?;
             }
+            _ = artifact_tick.tick() => write_domain_logic_artifact(
+                &artifact,
+                &node_id,
+                incarnation,
+                &health.borrow().clone(),
+                &service.member_snapshot(),
+            )?,
             signal = tokio::signal::ctrl_c() => {
                 signal?;
                 break;
@@ -256,6 +310,18 @@ async fn domain_logic(artifact: PathBuf, node_id: String, port: u16) -> Result<(
     }
     service.shutdown().await?;
     Ok(())
+}
+
+fn domain_logic_ready(health: &ServiceHealthSnapshot, membership_only: bool) -> bool {
+    health.node == NodeLifecycleState::Ready
+        && (membership_only
+            || ["alpha", "beta", "gamma", "delta"]
+            .into_iter()
+            .all(|name| {
+                health.domains.get(
+                    &distributed_domain(name).expect("static distributed domain must be valid"),
+                ) == Some(&PlacementDomainState::Ready)
+            }))
 }
 
 fn domain_static_discovery(
@@ -280,18 +346,38 @@ fn domain_static_discovery(
 fn write_domain_logic_artifact(
     artifact: &Path,
     node_id: &str,
+    incarnation: NodeIncarnation,
     health: &ServiceHealthSnapshot,
+    membership: &MemberSnapshot,
 ) -> Result<(), Box<dyn Error>> {
+    let mut members = membership
+        .members
+        .iter()
+        .map(|member| MemberArtifact {
+            node_id: member.node.node_id.clone(),
+            incarnation: member.node.incarnation.get(),
+            status: format!("{:?}", member.status),
+        })
+        .collect::<Vec<_>>();
+    members.sort_by(|left, right| {
+        (&left.node_id, left.incarnation).cmp(&(&right.node_id, right.incarnation))
+    });
     write_atomic(
         artifact.to_path_buf(),
         &serde_json::to_vec_pretty(&MultiDomainLogicArtifact {
             node_id: node_id.to_owned(),
+            incarnation: incarnation.get(),
             lifecycle: format!("{:?}", health.node),
             domains: health
                 .domains
                 .iter()
                 .map(|(domain, state)| (domain.as_str().to_owned(), format!("{state:?}")))
                 .collect(),
+            membership_version: membership.version.map(|version| MembershipVersionArtifact {
+                term: version.term.get(),
+                revision: version.revision.get(),
+            }),
+            members,
         })?,
     )?;
     Ok(())

@@ -67,6 +67,29 @@ pub(super) struct MultiDomainLogicArtifact {
     pub domains: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub(super) struct MembershipVersionArtifact {
+    pub term: u64,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub(super) struct MemberArtifact {
+    pub node_id: String,
+    pub incarnation: u128,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(super) struct ScaleNodeArtifact {
+    pub node_id: String,
+    pub incarnation: u128,
+    pub lifecycle: String,
+    pub domains: BTreeMap<String, String>,
+    pub membership_version: Option<MembershipVersionArtifact>,
+    pub members: Vec<MemberArtifact>,
+}
+
 pub(super) fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let encoded = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
     std::fs::write(path, encoded).map_err(|error| error.to_string())
