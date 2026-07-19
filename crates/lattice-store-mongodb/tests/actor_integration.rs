@@ -8,16 +8,18 @@ use lattice_actor::error::ActorError;
 use lattice_actor::mailbox::MailboxConfig;
 use lattice_actor::runtime::spawn_actor;
 use lattice_actor::traits::{Actor, Handler, StopReason};
-use lattice_store_mongodb::actor::{CompletionStatus, MongoFlushCompleted, PersistenceStatus};
-use lattice_store_mongodb::coordinator::MongoPersistenceCoordinator;
 use lattice_store_mongodb::document::LoadedDocument;
+use lattice_store_mongodb::document::tracked::Tracked;
 use lattice_store_mongodb::error::MongoStoreError;
-use lattice_store_mongodb::mongo::MongoDocumentKey;
-use lattice_store_mongodb::prepared::{
+use lattice_store_mongodb::persistence::actor::{
+    CompletionStatus, MongoFlushCompleted, PersistenceStatus,
+};
+use lattice_store_mongodb::persistence::coordinator::MongoPersistenceCoordinator;
+use lattice_store_mongodb::persistence::request::{
     DocumentWriteOutcome, FlushOutcome, PreparedDocumentWrite, PreparedWriteStore,
 };
+use lattice_store_mongodb::persistence::types::MongoDocumentKey;
 use lattice_store_mongodb::scan::ScanBudget;
-use lattice_store_mongodb::tracked::Tracked;
 use lattice_store_mongodb::{MongoDocument, MongoScan};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -216,7 +218,7 @@ async fn prepared_flush_returns_through_pipe_to_self_and_commits_metadata() {
         observed.lock().expect("result mutex poisoned").clone(),
         Some(Observed::Completed {
             status: CompletionStatus::Applied(
-                lattice_store_mongodb::coordinator::PersistenceReport {
+                lattice_store_mongodb::persistence::coordinator::PersistenceReport {
                     clean: 0,
                     applied: 1,
                     failed: 0,

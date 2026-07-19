@@ -12,7 +12,7 @@ use mongodb::bson::{Bson, Document};
 use serde::Serialize;
 
 use crate::document::MongoDocument;
-use crate::mongo::MongoFieldPath;
+use crate::persistence::types::MongoFieldPath;
 
 pub trait MongoMapKey {
     fn mongo_map_key(&self) -> String;

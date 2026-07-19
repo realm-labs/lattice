@@ -1,11 +1,14 @@
 //! Strongly typed collections of actor-owned MongoDB documents.
 
-use crate::coordinator::{MongoPersistenceCoordinator, MongoPreparation, PersistenceError};
 use crate::error::MongoStoreError;
-use crate::mongo_store::MongoStore;
-use crate::prepared::PreparedFlush;
+use crate::persistence::coordinator::{
+    MongoPersistenceCoordinator, MongoPreparation, PersistenceError,
+};
+use crate::persistence::request::PreparedFlush;
 use crate::scan::{MongoScan, ScanBudget};
-use crate::tracked::Tracked;
+use crate::store::MongoStore;
+
+use super::tracked::Tracked;
 
 /// A runtime-sized group of documents owned by one aggregate.
 ///

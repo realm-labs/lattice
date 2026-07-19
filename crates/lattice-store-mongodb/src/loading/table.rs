@@ -8,14 +8,17 @@ use std::time::{Duration, Instant};
 use mongodb::bson::{Bson, Document, doc};
 use serde::Serialize;
 
-use crate::coordinator::{MongoPersistenceCoordinator, MongoPreparation, PersistenceError};
 use crate::document::MongoDocument;
+use crate::document::tracked::Tracked;
 use crate::error::MongoStoreError;
-use crate::lazy::{MongoLazyField, MongoUnloadableField};
-use crate::mongo_store::MongoStore;
-use crate::prepared::CreateMode;
+use crate::persistence::coordinator::{
+    MongoPersistenceCoordinator, MongoPreparation, PersistenceError,
+};
+use crate::persistence::request::CreateMode;
 use crate::scan::MongoScan;
-use crate::tracked::Tracked;
+use crate::store::MongoStore;
+
+use super::policy::{MongoLazyField, MongoUnloadableField};
 
 /// Business mapping between an aggregate owner, a row cache key, and the
 /// document identity stored in MongoDB.
@@ -542,9 +545,10 @@ mod tests {
     use super::{
         LoadedTableRow, MongoLazyTable, MongoTableSpec, MongoUnloadableTable, TableEvictionBudget,
     };
-    use crate::coordinator::MongoPersistenceCoordinator;
     use crate::document::LoadedDocument;
-    use crate::{MongoDocument, MongoScan, MongoStoreError};
+    use crate::error::MongoStoreError;
+    use crate::persistence::coordinator::MongoPersistenceCoordinator;
+    use crate::{MongoDocument, MongoScan};
     use mongodb::bson::{Document, doc};
     use serde::{Deserialize, Serialize};
     use std::marker::PhantomData;

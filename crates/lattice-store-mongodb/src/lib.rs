@@ -1,31 +1,12 @@
 //! MongoDB persistence, snapshot-diff boundaries, and actor-local coordination.
 
-pub mod actor;
-pub mod bson_serde;
-pub mod coordinator;
-pub mod direct;
 pub mod document;
-pub mod document_set;
 pub mod error;
-pub mod lazy;
-pub mod mongo;
-pub mod mongo_store;
-pub mod prepared;
+pub mod loading;
+pub mod persistence;
 pub mod scan;
-pub mod table;
-pub mod tracked;
+pub mod store;
 
 pub use lattice_store_mongodb_macros::{MongoDocument, MongoDocumentSet, MongoScan};
-
-pub use document_set::{MongoDocumentCollection, MongoDocumentSet};
-pub use error::{MongoStoreError, MongoStoreErrorKind};
-pub use lazy::{
-    IdleUnloadStatus, MongoLazyCollection, MongoLazyDocument, MongoUnloadableCollection,
-    MongoUnloadableDocument,
-};
-pub use table::{
-    MongoLazyTable, MongoTablePage, MongoTableSpec, MongoUnloadableTable, TableEvictionBudget,
-    TableEvictionReport,
-};
 
 extern crate self as lattice_store_mongodb;

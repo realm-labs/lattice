@@ -44,11 +44,11 @@ an unnecessary async API:
 ```rust
 # use lattice_store_mongodb::document::LoadedDocument;
 # use lattice_store_mongodb::scan::ScanBudget;
-use lattice_store_mongodb::tracked::Tracked;
-use lattice_store_mongodb::{MongoDocumentCollection, MongoDocumentSet};
-# use lattice_store_mongodb::coordinator::MongoPersistenceCoordinator;
-# use lattice_store_mongodb::coordinator::PersistenceError;
-# use lattice_store_mongodb::MongoStoreError;
+use lattice_store_mongodb::document::set::MongoDocumentCollection;
+use lattice_store_mongodb::document::tracked::Tracked;
+use lattice_store_mongodb::MongoDocumentSet;
+# use lattice_store_mongodb::persistence::coordinator::{MongoPersistenceCoordinator, PersistenceError};
+# use lattice_store_mongodb::error::MongoStoreError;
 # use mongodb::bson::{doc, to_bson};
 # use std::collections::HashMap;
 # type PlayerId = u64;
@@ -140,11 +140,13 @@ document still owns its ID, and the application still chooses owner filters,
 map layout, and secondary indexes.
 
 ```rust
-# use lattice_store_mongodb::coordinator::{MongoPersistenceCoordinator, PersistenceError};
-# use lattice_store_mongodb::mongo_store::MongoStore;
-# use lattice_store_mongodb::tracked::Tracked;
-# use lattice_store_mongodb::{MongoDocument, MongoDocumentSet, MongoLazyDocument,
-#     MongoScan, MongoTableSpec, MongoUnloadableTable, MongoStoreError};
+# use lattice_store_mongodb::document::tracked::Tracked;
+# use lattice_store_mongodb::error::MongoStoreError;
+# use lattice_store_mongodb::loading::document::MongoLazyDocument;
+# use lattice_store_mongodb::loading::table::{MongoTableSpec, MongoUnloadableTable};
+# use lattice_store_mongodb::persistence::coordinator::{MongoPersistenceCoordinator, PersistenceError};
+# use lattice_store_mongodb::store::MongoStore;
+# use lattice_store_mongodb::{MongoDocument, MongoDocumentSet, MongoScan};
 # use mongodb::bson::{Document, doc, to_bson};
 # use serde::{Deserialize, Serialize};
 # type WorldId = u64;
@@ -272,7 +274,7 @@ registers loaded or new documents, then enumerates current values in a bounded
 preparation pass:
 
 ```rust
-# use lattice_store_mongodb::coordinator::MongoPersistenceCoordinator;
+# use lattice_store_mongodb::persistence::coordinator::MongoPersistenceCoordinator;
 # use lattice_store_mongodb::document::LoadedDocumentMeta;
 # use lattice_store_mongodb::scan::ScanBudget;
 # use lattice_store_mongodb::{MongoDocument, MongoScan};

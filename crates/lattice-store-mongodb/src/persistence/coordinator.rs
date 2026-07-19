@@ -3,17 +3,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use crate::document::tracked::Tracked;
 use crate::document::{
     LoadedDocument, LoadedDocumentMeta, encode_business_document, encode_document_id,
 };
 use crate::error::MongoStoreError;
-use crate::mongo::MongoDocumentKey;
-use crate::prepared::{
+use crate::scan::{FieldChange, MongoScan, ScanBudget, ScanCursor, ScanError, ScanSnapshot};
+
+use super::request::{
     CreateMode, DocumentCommit, DocumentOperation, DocumentWriteOutcome, FlushGeneration,
     FlushOutcome, FlushRequest, InFlightCommit, PreparedDocumentWrite, PreparedFlush, WriteToken,
 };
-use crate::scan::{FieldChange, MongoScan, ScanBudget, ScanCursor, ScanError, ScanSnapshot};
-use crate::tracked::Tracked;
+use super::types::MongoDocumentKey;
 
 #[derive(Debug)]
 struct DocumentState {
@@ -821,8 +822,10 @@ mod tests {
     use super::{MongoPersistenceCoordinator, PersistenceError, RetryPolicy};
     use crate::document::{LoadedDocument, LoadedDocumentMeta};
     use crate::error::MongoStoreError;
-    use crate::mongo::MongoDocumentKey;
-    use crate::prepared::{CreateMode, DocumentOperation, DocumentWriteOutcome, FlushOutcome};
+    use crate::persistence::request::{
+        CreateMode, DocumentOperation, DocumentWriteOutcome, FlushOutcome,
+    };
+    use crate::persistence::types::MongoDocumentKey;
     use crate::scan::ScanBudget;
     use crate::{MongoDocument as MongoDocumentDerive, MongoScan};
 
@@ -893,7 +896,7 @@ mod tests {
 
     #[test]
     fn tracked_documents_skip_unchanged_epochs_and_commit_metadata_after_ack() {
-        let mut value = crate::tracked::Tracked::clean(document("old"));
+        let mut value = crate::document::tracked::Tracked::clean(document("old"));
         let mut coordinator = loaded(value.read(), Some(0));
         let clean = coordinator
             .prepare(ScanBudget::generous(), |preparation| {

@@ -1,5 +1,9 @@
 //! Typed MongoDB document envelopes.
 
+pub mod bson_serde;
+pub mod set;
+pub mod tracked;
+
 use crate::error::MongoStoreError;
 use mongodb::bson::{Bson, Document};
 use serde::Serialize;

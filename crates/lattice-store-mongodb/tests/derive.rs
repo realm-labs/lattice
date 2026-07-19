@@ -1,17 +1,20 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use lattice_store_mongodb::coordinator::{MongoPersistenceCoordinator, PersistenceError};
+use lattice_store_mongodb::document::set::{MongoDocumentCollection, MongoDocumentSet};
+use lattice_store_mongodb::document::tracked::Tracked;
 use lattice_store_mongodb::document::{
     LoadedDocument, MongoDocument as _, decode_flat_document, encode_flat_document,
 };
-use lattice_store_mongodb::mongo_store::MongoStore;
-use lattice_store_mongodb::scan::{FieldChange, MongoScan as _, ScanBudget, ScanCursor};
-use lattice_store_mongodb::tracked::Tracked;
-use lattice_store_mongodb::{
-    MongoDocument, MongoDocumentCollection, MongoDocumentSet, MongoLazyCollection,
-    MongoLazyDocument, MongoLazyTable, MongoScan, MongoStoreError, MongoTableSpec,
-    MongoUnloadableCollection, MongoUnloadableDocument, MongoUnloadableTable,
+use lattice_store_mongodb::error::MongoStoreError;
+use lattice_store_mongodb::loading::collection::{MongoLazyCollection, MongoUnloadableCollection};
+use lattice_store_mongodb::loading::document::{MongoLazyDocument, MongoUnloadableDocument};
+use lattice_store_mongodb::loading::table::{MongoLazyTable, MongoTableSpec, MongoUnloadableTable};
+use lattice_store_mongodb::persistence::coordinator::{
+    MongoPersistenceCoordinator, PersistenceError,
 };
+use lattice_store_mongodb::scan::{FieldChange, MongoScan as _, ScanBudget, ScanCursor};
+use lattice_store_mongodb::store::MongoStore;
+use lattice_store_mongodb::{MongoDocument, MongoDocumentSet, MongoScan};
 use mongodb::bson::{doc, to_bson};
 use serde::{Deserialize, Serialize};
 

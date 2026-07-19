@@ -5,8 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::error::MongoStoreError;
 use mongodb::bson::{Bson, Document};
 
-use crate::mongo::{MongoDocumentKey, MongoFieldPath};
 use crate::scan::ScanCommit;
+
+use super::types::{MongoDocumentKey, MongoFieldPath};
 
 #[async_trait::async_trait]
 pub trait PreparedWriteStore: Send + Sync + 'static {
@@ -169,7 +170,7 @@ mod tests {
         DocumentOperation, DocumentWriteOutcome, FlushGeneration, FlushOutcome, FlushRequest,
         OutcomeContractError, PreparedDocumentWrite, WriteToken,
     };
-    use crate::mongo::{MongoDocumentKey, MongoFieldPath};
+    use crate::persistence::types::{MongoDocumentKey, MongoFieldPath};
 
     fn request(tokens: &[u64]) -> FlushRequest {
         FlushRequest {

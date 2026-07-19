@@ -7,9 +7,10 @@ use lattice_actor::context::ActorContext;
 use lattice_actor::error::PipeToSelfError;
 use lattice_actor::traits::{Actor, Handler, Message};
 
-use crate::coordinator::{MongoPersistenceCoordinator, PersistenceError, PersistenceReport};
 use crate::error::MongoStoreError;
-use crate::prepared::{FlushGeneration, FlushOutcome, PreparedFlush, PreparedWriteStore};
+
+use super::coordinator::{MongoPersistenceCoordinator, PersistenceError, PersistenceReport};
+use super::request::{FlushGeneration, FlushOutcome, PreparedFlush, PreparedWriteStore};
 
 /// Completion posted back to the owning actor after a prepared flush.
 #[derive(Debug)]
