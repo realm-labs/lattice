@@ -2199,6 +2199,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-id"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "lattice-core",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "lattice-id-etcd"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "etcd-client",
+ "lattice-core",
+ "lattice-id",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "lattice-ops"
 version = "0.1.0"
 dependencies = [

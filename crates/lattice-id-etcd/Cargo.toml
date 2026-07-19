@@ -1,0 +1,19 @@
+[package]
+name = "lattice-id-etcd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+etcd-client.workspace = true
+lattice-id.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+lattice-core.workspace = true
