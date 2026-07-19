@@ -1,0 +1,5 @@
+error: Mongo conflict policy must be `block` or `quarantine`
+ --> tests/ui/invalid_conflict_policy.rs:5:53
+  |
+5 | #[mongo(collection = "invalid_conflict", conflict = "continue")]
+  |                                                     ^^^^^^^^^^

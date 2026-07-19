@@ -12,7 +12,7 @@ use lattice_store_mongodb::loading::collection::{MongoLazyCollection, MongoUnloa
 use lattice_store_mongodb::loading::document::{MongoLazyDocument, MongoUnloadableDocument};
 use lattice_store_mongodb::loading::table::{MongoLazyTable, MongoTableSpec, MongoUnloadableTable};
 use lattice_store_mongodb::persistence::coordinator::{
-    MongoPersistenceCoordinator, PersistenceError,
+    ConflictPolicy, MongoPersistenceCoordinator, PersistenceError,
 };
 use lattice_store_mongodb::scan::{
     FieldChange, MongoMapScanAdapter, MongoScan as _, ScanBudget, ScanCursor, ScanError,
@@ -131,11 +131,23 @@ struct Item {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, MongoDocument, MongoScan)]
-#[mongo(collection = "macro_secondary_docs")]
+#[mongo(collection = "macro_secondary_docs", conflict = "quarantine")]
 struct SecondaryDoc {
     #[mongo(id)]
     id: u64,
     enabled: bool,
+}
+
+#[test]
+fn document_conflict_policy_is_explicit_and_defaults_safe() {
+    assert_eq!(
+        <MacroDoc as lattice_store_mongodb::document::MongoDocument>::CONFLICT_POLICY,
+        ConflictPolicy::BlockCoordinator
+    );
+    assert_eq!(
+        <SecondaryDoc as lattice_store_mongodb::document::MongoDocument>::CONFLICT_POLICY,
+        ConflictPolicy::QuarantineDocument
+    );
 }
 
 mod u64_as_string {

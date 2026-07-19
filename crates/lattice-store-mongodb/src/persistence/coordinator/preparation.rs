@@ -8,7 +8,7 @@ use crate::persistence::request::{
 use crate::persistence::types::MongoDocumentKey;
 use crate::scan::{FieldChange, MongoScan, ScanBudget};
 
-use super::{DocumentState, MongoPreparation, PersistenceError};
+use super::{DocumentRejection, DocumentState, MongoPreparation, PersistenceError};
 
 impl<'a> MongoPreparation<'a> {
     pub(super) fn new(
@@ -24,6 +24,7 @@ impl<'a> MongoPreparation<'a> {
             writes: Vec::new(),
             document_commits: BTreeMap::new(),
             clean_commits: Vec::new(),
+            rejections: BTreeMap::new(),
             scans: 0,
             changed_paths: 0,
             scan_complete: true,
@@ -67,19 +68,30 @@ impl<'a> MongoPreparation<'a> {
             .documents
             .get(&key)
             .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
+        if state.conflict.is_some() {
+            self.scan_complete = false;
+            return Ok(());
+        }
         if state
             .rejection
             .as_ref()
+            .or_else(|| self.rejections.get(&key))
             .is_some_and(|rejection| rejection.mutation_epoch == mutation_epoch)
         {
             self.scan_complete = false;
             return Ok(());
         }
         let cursor = state.scan_cursor();
-        let delta = value.diff(&state.baseline, cursor.clone(), &mut self.budget)?;
+        self.scans = self.scans.saturating_add(1);
+        let delta = match value.diff(&state.baseline, cursor.clone(), &mut self.budget) {
+            Ok(delta) => delta,
+            Err(error) => {
+                self.reject(key, mutation_epoch, error.to_string());
+                return Ok(());
+            }
+        };
         let scan_complete = delta.complete && state.sweep_is_current(mutation_epoch);
         self.scan_complete &= scan_complete;
-        self.scans = self.scans.saturating_add(1);
         self.changed_paths = self
             .changed_paths
             .saturating_add(delta.changes.len() as u64);
@@ -100,16 +112,15 @@ impl<'a> MongoPreparation<'a> {
             return Ok(());
         }
 
-        let token = WriteToken(self.next_token);
-        self.next_token = self
-            .next_token
-            .checked_add(1)
-            .ok_or(PersistenceError::WriteTokenOverflow)?;
         let operation = if let Some(mode) = state.create_mode {
-            DocumentOperation::Create {
-                document: encode_business_document(value)?,
-                mode,
-            }
+            let document = match encode_business_document(value) {
+                Ok(document) => document,
+                Err(error) => {
+                    self.reject(key, mutation_epoch, error.to_string());
+                    return Ok(());
+                }
+            };
+            DocumentOperation::Create { document, mode }
         } else {
             let mut sets = BTreeMap::new();
             let mut unsets = BTreeSet::new();
@@ -125,10 +136,22 @@ impl<'a> MongoPreparation<'a> {
             }
             DocumentOperation::Update { sets, unsets }
         };
+        let document_id = match encode_document_id::<D>(value.id()) {
+            Ok(document_id) => document_id,
+            Err(error) => {
+                self.reject(key, mutation_epoch, error.to_string());
+                return Ok(());
+            }
+        };
+        let token = WriteToken(self.next_token);
+        self.next_token = self
+            .next_token
+            .checked_add(1)
+            .ok_or(PersistenceError::WriteTokenOverflow)?;
         self.writes.push(PreparedDocumentWrite {
             token,
             key,
-            document_id: encode_document_id::<D>(value.id())?,
+            document_id,
             expected_version: state.version,
             operation_id: uuid::Uuid::new_v4().simple().to_string(),
             operation,
@@ -137,7 +160,18 @@ impl<'a> MongoPreparation<'a> {
         Ok(())
     }
 
-    pub(super) fn finish(self) -> PreparedFlush {
+    fn reject(&mut self, key: MongoDocumentKey, mutation_epoch: Option<u64>, error: String) {
+        self.scan_complete = false;
+        self.rejections.insert(
+            key,
+            DocumentRejection {
+                mutation_epoch,
+                error,
+            },
+        );
+    }
+
+    pub(super) fn finish(self) -> (PreparedFlush, BTreeMap<MongoDocumentKey, DocumentRejection>) {
         let writes = self
             .writes
             .iter()
@@ -154,10 +188,13 @@ impl<'a> MongoPreparation<'a> {
             generation: self.generation,
             writes: self.writes,
         });
-        PreparedFlush {
-            request,
-            commit,
-            scan_complete: self.scan_complete,
-        }
+        (
+            PreparedFlush {
+                request,
+                commit,
+                scan_complete: self.scan_complete,
+            },
+            self.rejections,
+        )
     }
 }

@@ -29,6 +29,31 @@ use crate::{
     watch::{ActorTerminated, WatchId},
 };
 
+/// A cancellation handle for work started by [`ActorContext::pipe_to_self`].
+///
+/// Dropping the handle does not cancel the task. Call [`Self::abort`] when the
+/// owning actor state has explicitly abandoned the asynchronous operation.
+/// Actor shutdown still cancels every outstanding pipe task automatically.
+#[derive(Debug, Clone)]
+pub struct PipeTaskHandle {
+    abort: tokio::task::AbortHandle,
+}
+
+impl PipeTaskHandle {
+    /// Requests cancellation of the background future.
+    ///
+    /// Cancellation drops the future at its next cancellation point. It cannot
+    /// prove that an external side effect had not already happened.
+    pub fn abort(&self) {
+        self.abort.abort();
+    }
+
+    /// Returns whether the background task has completed or been cancelled.
+    pub fn is_finished(&self) -> bool {
+        self.abort.is_finished()
+    }
+}
+
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
     self_ref: Option<ActorRef>,
@@ -329,7 +354,9 @@ impl<A: Actor> ActorContext<A> {
     /// The mapping function runs in the scoped background task. The resulting
     /// message is handled in a later actor turn, so other mailbox traffic may
     /// be processed first. The work is bounded by the deferred-operation
-    /// capacity and is aborted when the actor stops.
+    /// capacity and is aborted when the actor stops. The returned handle may
+    /// be discarded for fire-and-forget use or retained for explicit
+    /// cancellation.
     ///
     /// Use [`Self::defer_reply`] when the continuation owns an ask reply token
     /// and must inherit that request's deadline and failure semantics.
@@ -337,7 +364,7 @@ impl<A: Actor> ActorContext<A> {
         &mut self,
         future: Fut,
         map: Map,
-    ) -> Result<(), PipeToSelfError>
+    ) -> Result<PipeTaskHandle, PipeToSelfError>
     where
         A: Handler<M>,
         M: Message,
@@ -347,7 +374,7 @@ impl<A: Actor> ActorContext<A> {
     {
         self.reserve_pipe_task()?;
         let handle = self.handle.clone();
-        self.pipe_tasks.spawn(async move {
+        let abort = self.pipe_tasks.spawn(async move {
             let message = map(future.await);
             if let Err(error) = handle.send_tell_internal(message).await {
                 tracing::debug!(
@@ -357,7 +384,7 @@ impl<A: Actor> ActorContext<A> {
                 );
             }
         });
-        Ok(())
+        Ok(PipeTaskHandle { abort })
     }
 
     /// Defers an ask reply while asynchronous work runs outside the actor turn.

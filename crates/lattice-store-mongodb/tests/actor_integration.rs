@@ -16,7 +16,7 @@ use lattice_store_mongodb::persistence::actor::{
 };
 use lattice_store_mongodb::persistence::coordinator::MongoPersistenceCoordinator;
 use lattice_store_mongodb::persistence::request::{
-    DocumentWriteOutcome, FlushOutcome, PreparedDocumentWrite, PreparedWriteStore,
+    DocumentWriteOutcome, FlushGeneration, FlushOutcome, PreparedDocumentWrite, PreparedWriteStore,
 };
 use lattice_store_mongodb::persistence::types::MongoDocumentKey;
 use lattice_store_mongodb::scan::ScanBudget;
@@ -88,6 +88,9 @@ impl PreparedWriteStore for BlockingStore {
 #[derive(Debug, lattice_actor::Message)]
 struct Persist;
 
+#[derive(Debug, lattice_actor::Message)]
+struct AbortPersist;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Observed {
     Completed {
@@ -105,6 +108,7 @@ struct PersistenceActor {
     store: Arc<dyn PreparedWriteStore>,
     observed: Arc<Mutex<Option<Observed>>>,
     signal: Arc<Semaphore>,
+    generation: Option<FlushGeneration>,
 }
 
 #[async_trait]
@@ -125,6 +129,7 @@ impl Handler<Persist> for PersistenceActor {
                 preparation.scan_tracked(&self.document)
             })
             .map_err(ActorError::from_error)?;
+        self.generation = prepared.request.as_ref().map(|request| request.generation);
         match self
             .coordinator
             .dispatch_prepared(context, self.store.clone(), prepared)
@@ -141,6 +146,24 @@ impl Handler<Persist> for PersistenceActor {
                 Ok(())
             }
         }
+    }
+}
+
+#[async_trait]
+impl Handler<AbortPersist> for PersistenceActor {
+    async fn handle(
+        &mut self,
+        _context: &mut ActorContext<Self>,
+        _message: AbortPersist,
+    ) -> Result<(), Self::Error> {
+        let generation = self
+            .generation
+            .take()
+            .ok_or_else(|| ActorError::new("no persistence generation to abort"))?;
+        self.coordinator
+            .abort_in_flight_as_unknown(generation, "operator intervention")
+            .map_err(ActorError::from_error)?;
+        Ok(())
     }
 }
 
@@ -190,6 +213,7 @@ fn actor(
         store,
         observed,
         signal,
+        generation: None,
     }
 }
 
@@ -292,4 +316,42 @@ async fn stopping_actor_cancels_in_flight_store_future() {
         .expect("actor stop should cancel the pipe future")
         .expect("drop signal should remain open")
         .forget();
+}
+
+#[tokio::test]
+async fn aborting_in_flight_marks_unknown_and_cancels_pipe_task() {
+    let observed = Arc::new(Mutex::new(None));
+    let signal = Arc::new(Semaphore::new(0));
+    let entered = Arc::new(Semaphore::new(0));
+    let dropped = Arc::new(Semaphore::new(0));
+    let handle = spawn_actor(
+        actor(
+            observed.clone(),
+            signal.clone(),
+            Arc::new(BlockingStore {
+                entered: entered.clone(),
+                dropped: dropped.clone(),
+            }),
+        ),
+        MailboxConfig::bounded(8),
+    );
+    handle.tell(Persist).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .expect("store future should start")
+        .expect("entry signal should remain open")
+        .forget();
+
+    handle.tell(AbortPersist).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), dropped.acquire())
+        .await
+        .expect("manual abort should cancel the store future")
+        .expect("drop signal should remain open")
+        .forget();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        observed.lock().expect("result mutex poisoned").clone(),
+        None,
+        "aborting the pipe task must not synthesize a completion"
+    );
 }

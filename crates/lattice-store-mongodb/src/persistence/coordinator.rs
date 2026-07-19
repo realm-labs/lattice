@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use lattice_actor::context::PipeTaskHandle;
+
 use crate::document::tracked::Tracked;
 use crate::document::{LoadedDocument, LoadedDocumentMeta, LoadedScannedDocument};
 use crate::error::{MongoStoreError, MongoStoreErrorRecovery};
@@ -25,6 +27,8 @@ struct DocumentState {
     updated_at_ms: i64,
     create_mode: Option<CreateMode>,
     rejection: Option<DocumentRejection>,
+    conflict_policy: ConflictPolicy,
+    conflict: Option<PersistenceConflict>,
 }
 
 #[derive(Debug)]
@@ -109,14 +113,39 @@ impl RetryPolicy {
 pub struct PersistenceConflict {
     pub key: MongoDocumentKey,
     pub expected_version: i64,
+    pub kind: PersistenceConflictKind,
+    pub policy: ConflictPolicy,
+}
+
+/// How one optimistic-lock conflict affects the other documents registered by
+/// the same actor activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConflictPolicy {
+    /// Stop all later preparation until the application reloads or explicitly
+    /// removes the conflicted document. This is the safe aggregate default.
+    #[default]
+    BlockCoordinator,
+    /// Quarantine only the conflicted document and keep preparing unrelated
+    /// documents owned by the same actor activation.
+    QuarantineDocument,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceConflictKind {
+    VersionConflict,
+    NotFound,
+    /// A previously dispatched operation may or may not have reached MongoDB.
+    OutcomeUnknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PersistenceCounters {
     pub scans: u64,
     pub changed_paths: u64,
+    /// Documents handed to the backing store for an actual write attempt.
     pub attempted_documents: u64,
     pub applied_documents: u64,
+    /// Documents rejected during preparation or failed by the backing store.
     pub failed_documents: u64,
     pub conflicts: u64,
 }
@@ -168,8 +197,9 @@ pub struct MongoPersistenceCoordinator {
     activation_epoch: u64,
     next_sequence: u64,
     in_flight: Option<InFlightCommit>,
+    in_flight_task: Option<(FlushGeneration, PipeTaskHandle)>,
     retry_pending: Option<PreparedFlush>,
-    conflict: Option<PersistenceConflict>,
+    abandoned_generations: BTreeSet<FlushGeneration>,
     last_error: Option<String>,
     retry_attempt: u32,
     retry_not_before: Option<Instant>,
@@ -189,8 +219,9 @@ impl MongoPersistenceCoordinator {
             activation_epoch,
             next_sequence: 1,
             in_flight: None,
+            in_flight_task: None,
             retry_pending: None,
-            conflict: None,
+            abandoned_generations: BTreeSet::new(),
             last_error: None,
             retry_attempt: 0,
             retry_not_before: None,
@@ -265,6 +296,8 @@ impl MongoPersistenceCoordinator {
                 updated_at_ms,
                 create_mode: None,
                 rejection: None,
+                conflict_policy: D::CONFLICT_POLICY,
+                conflict: None,
             },
         );
         Ok(Tracked::clean(value))
@@ -303,6 +336,8 @@ impl MongoPersistenceCoordinator {
                     updated_at_ms,
                     create_mode: None,
                     rejection: None,
+                    conflict_policy: D::CONFLICT_POLICY,
+                    conflict: None,
                 },
                 value,
             ));
@@ -345,6 +380,8 @@ impl MongoPersistenceCoordinator {
                     updated_at_ms: meta.updated_at_ms,
                     create_mode: None,
                     rejection: None,
+                    conflict_policy: D::CONFLICT_POLICY,
+                    conflict: None,
                 },
                 value,
             ));
@@ -411,6 +448,8 @@ impl MongoPersistenceCoordinator {
                 updated_at_ms: meta.updated_at_ms,
                 create_mode,
                 rejection: None,
+                conflict_policy: D::CONFLICT_POLICY,
+                conflict: None,
             },
         );
         Ok(())
@@ -424,7 +463,7 @@ impl MongoPersistenceCoordinator {
         if self.in_flight.is_some() {
             return Err(PersistenceError::FlushInFlight);
         }
-        if self.conflict.is_some() {
+        if self.has_blocking_conflict() {
             return Err(PersistenceError::ConflictBlocked);
         }
         let key = MongoDocumentKey::for_document::<D>(id)?;
@@ -435,8 +474,172 @@ impl MongoPersistenceCoordinator {
         if document.create_mode.is_some() {
             return Err(PersistenceError::CreatePending(key));
         }
+        if document.conflict.is_some() {
+            return Err(PersistenceError::DocumentConflictPending(key));
+        }
+        if document.rejection.is_some() {
+            return Err(PersistenceError::DocumentRejectionPending(key));
+        }
         self.documents.remove(&key);
+        self.clear_last_error_if_recovered();
         Ok(())
+    }
+
+    /// Explicitly discards a conflicted registration after the application has
+    /// decided the missing or remotely changed document is no longer part of
+    /// this actor's persistent state.
+    pub fn detach_conflicted<D>(&mut self, id: &D::Id) -> Result<(), PersistenceError>
+    where
+        D: MongoScan,
+    {
+        if self.in_flight.is_some() {
+            return Err(PersistenceError::FlushInFlight);
+        }
+        let key = MongoDocumentKey::for_document::<D>(id)?;
+        let state = self
+            .documents
+            .get(&key)
+            .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
+        if state.conflict.is_none() {
+            return Err(PersistenceError::DocumentNotConflicted(key));
+        }
+        self.documents.remove(&key);
+        self.clear_last_error_if_recovered();
+        Ok(())
+    }
+
+    /// Replaces a conflicted registration with freshly loaded remote state.
+    ///
+    /// The returned tracked value starts at mutation epoch zero and must
+    /// replace the stale value held by the actor. The old baseline, cursor,
+    /// pending mutation metadata, and conflict are discarded atomically only
+    /// after the replacement baseline has been captured successfully.
+    pub fn resolve_conflict_with_loaded<D>(
+        &mut self,
+        loaded: LoadedDocument<D>,
+    ) -> Result<Tracked<D>, PersistenceError>
+    where
+        D: MongoScan,
+    {
+        if self.in_flight.is_some() {
+            return Err(PersistenceError::FlushInFlight);
+        }
+        let (value, meta) = loaded.split();
+        let key = MongoDocumentKey::for_document::<D>(value.id())?;
+        let state = self
+            .documents
+            .get(&key)
+            .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
+        if state.conflict.is_none() {
+            return Err(PersistenceError::DocumentNotConflicted(key.clone()));
+        }
+        let baseline = value.capture()?;
+        self.documents.insert(
+            key,
+            DocumentState {
+                baseline,
+                cursor: ScanCursor::default(),
+                acknowledged_mutation_epoch: Some(0),
+                scanning_mutation_epoch: None,
+                scanning_changed: false,
+                version: meta.version,
+                updated_at_ms: meta.updated_at_ms,
+                create_mode: None,
+                rejection: None,
+                conflict_policy: D::CONFLICT_POLICY,
+                conflict: None,
+            },
+        );
+        self.clear_last_error_if_recovered();
+        Ok(Tracked::clean(value))
+    }
+
+    /// Clears a definitive document rejection so the current business value is
+    /// scanned again even when its mutation epoch did not change.
+    ///
+    /// This is useful after an external condition such as a MongoDB validation
+    /// rule has been corrected. If the value itself is still invalid, the next
+    /// preparation records the rejection again.
+    pub fn retry_rejected<D>(&mut self, id: &D::Id) -> Result<(), PersistenceError>
+    where
+        D: MongoScan,
+    {
+        if self.in_flight.is_some() {
+            return Err(PersistenceError::FlushInFlight);
+        }
+        let key = MongoDocumentKey::for_document::<D>(id)?;
+        let state = self
+            .documents
+            .get_mut(&key)
+            .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
+        if state.rejection.take().is_none() {
+            return Err(PersistenceError::DocumentNotRejected(key));
+        }
+        self.clear_last_error_if_recovered();
+        Ok(())
+    }
+
+    /// Explicitly discards a rejected registration, including a rejected
+    /// create that would otherwise remain `CreatePending`.
+    pub fn detach_rejected<D>(&mut self, id: &D::Id) -> Result<(), PersistenceError>
+    where
+        D: MongoScan,
+    {
+        if self.in_flight.is_some() {
+            return Err(PersistenceError::FlushInFlight);
+        }
+        let key = MongoDocumentKey::for_document::<D>(id)?;
+        let state = self
+            .documents
+            .get(&key)
+            .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
+        if state.rejection.is_none() {
+            return Err(PersistenceError::DocumentNotRejected(key));
+        }
+        self.documents.remove(&key);
+        self.clear_last_error_if_recovered();
+        Ok(())
+    }
+
+    /// Replaces a rejected registration with freshly loaded remote state.
+    pub fn replace_rejected_with_loaded<D>(
+        &mut self,
+        loaded: LoadedDocument<D>,
+    ) -> Result<Tracked<D>, PersistenceError>
+    where
+        D: MongoScan,
+    {
+        if self.in_flight.is_some() {
+            return Err(PersistenceError::FlushInFlight);
+        }
+        let (value, meta) = loaded.split();
+        let key = MongoDocumentKey::for_document::<D>(value.id())?;
+        let state = self
+            .documents
+            .get(&key)
+            .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
+        if state.rejection.is_none() {
+            return Err(PersistenceError::DocumentNotRejected(key.clone()));
+        }
+        let baseline = value.capture()?;
+        self.documents.insert(
+            key,
+            DocumentState {
+                baseline,
+                cursor: ScanCursor::default(),
+                acknowledged_mutation_epoch: Some(0),
+                scanning_mutation_epoch: None,
+                scanning_changed: false,
+                version: meta.version,
+                updated_at_ms: meta.updated_at_ms,
+                create_mode: None,
+                rejection: None,
+                conflict_policy: D::CONFLICT_POLICY,
+                conflict: None,
+            },
+        );
+        self.clear_last_error_if_recovered();
+        Ok(Tracked::clean(value))
     }
 
     /// Returns whether a tracked document is durably clean and can be
@@ -458,10 +661,7 @@ impl MongoPersistenceCoordinator {
                 .chain(commit.clean_commits.iter())
                 .any(|document| document.key == key)
         });
-        let conflicted = self
-            .conflict
-            .as_ref()
-            .is_some_and(|conflict| conflict.key == key);
+        let conflicted = state.conflict.is_some();
         Ok(!in_flight
             && !conflicted
             && state.create_mode.is_none()
@@ -488,6 +688,13 @@ impl MongoPersistenceCoordinator {
         Ok(true)
     }
 
+    /// Scans registered documents and prepares the next two-phase flush.
+    ///
+    /// A BSON encoding or diff error is isolated to the document that caused
+    /// it. The document keeps its acknowledged baseline, records a rejection,
+    /// and is retried after its tracked mutation epoch changes; other documents
+    /// visited in the same pass can still be flushed. Coordinator invariants
+    /// and errors returned directly by `visit` remain fail-fast.
     pub fn prepare<F>(
         &mut self,
         budget: ScanBudget,
@@ -499,7 +706,7 @@ impl MongoPersistenceCoordinator {
         if self.in_flight.is_some() {
             return Err(PersistenceError::FlushInFlight);
         }
-        if self.conflict.is_some() {
+        if self.has_blocking_conflict() {
             return Err(PersistenceError::ConflictBlocked);
         }
         if let Some(prepared) = &self.retry_pending {
@@ -522,7 +729,21 @@ impl MongoPersistenceCoordinator {
             .saturating_add(preparation.changed_paths);
         self.scan_metrics
             .record_work(preparation.budget.work_metrics());
-        Ok(preparation.finish())
+        let (prepared, rejections) = preparation.finish();
+        if !rejections.is_empty() {
+            self.counters.failed_documents = self
+                .counters
+                .failed_documents
+                .saturating_add(rejections.len() as u64);
+            for (key, rejection) in rejections {
+                self.last_error = Some(rejection.error.clone());
+                self.documents
+                    .get_mut(&key)
+                    .ok_or_else(|| PersistenceError::UnknownDocument(key))?
+                    .rejection = Some(rejection);
+            }
+        }
+        Ok(prepared)
     }
 
     pub fn begin_flush(&mut self, commit: InFlightCommit) -> Result<(), PersistenceError> {
@@ -530,6 +751,7 @@ impl MongoPersistenceCoordinator {
         if self.in_flight.is_some() {
             return Err(PersistenceError::FlushInFlight);
         }
+        debug_assert!(self.in_flight_task.is_none());
         if self
             .retry_pending
             .as_ref()
@@ -538,6 +760,26 @@ impl MongoPersistenceCoordinator {
             self.retry_pending = None;
         }
         self.in_flight = Some(commit);
+        Ok(())
+    }
+
+    pub(super) fn register_in_flight_task(
+        &mut self,
+        generation: FlushGeneration,
+        task: PipeTaskHandle,
+    ) -> Result<(), PersistenceError> {
+        let Some(expected) = self.in_flight.as_ref() else {
+            task.abort();
+            return Err(PersistenceError::NoFlushInFlight);
+        };
+        if expected.generation != generation {
+            task.abort();
+            return Err(PersistenceError::ForeignGeneration {
+                expected: expected.generation,
+                actual: generation,
+            });
+        }
+        self.in_flight_task = Some((generation, task));
         Ok(())
     }
 
@@ -551,13 +793,7 @@ impl MongoPersistenceCoordinator {
         }
         let mut report = PersistenceReport::default();
         self.apply_clean_commits(commit.clean_commits, &mut report)?;
-        if !self
-            .documents
-            .values()
-            .any(|document| document.rejection.is_some())
-        {
-            self.last_error = None;
-        }
+        self.clear_last_error_if_recovered();
         Ok(report)
     }
 
@@ -567,6 +803,9 @@ impl MongoPersistenceCoordinator {
         outcome: FlushOutcome,
     ) -> Result<PersistenceReport, PersistenceError> {
         self.validate_generation(generation)?;
+        if self.abandoned_generations.contains(&generation) {
+            return Err(PersistenceError::AbandonedGeneration(generation));
+        }
         let expected = self
             .in_flight
             .as_ref()
@@ -602,6 +841,7 @@ impl MongoPersistenceCoordinator {
             }
         }
 
+        self.clear_in_flight_task(generation);
         let commit = self.in_flight.take().expect("checked in-flight commit");
         let InFlightCommit {
             generation: _,
@@ -645,22 +885,27 @@ impl MongoPersistenceCoordinator {
                     state.updated_at_ms = *updated_at_ms;
                     state.create_mode = None;
                     state.rejection = None;
+                    state.conflict = None;
                     report.applied += 1;
                     self.counters.applied_documents =
                         self.counters.applied_documents.saturating_add(1);
                 }
                 DocumentWriteOutcome::VersionConflict { expected_version } => {
-                    self.conflict = Some(PersistenceConflict {
+                    state.conflict = Some(PersistenceConflict {
                         key: document_commit.key,
                         expected_version: *expected_version,
+                        kind: PersistenceConflictKind::VersionConflict,
+                        policy: state.conflict_policy,
                     });
                     report.conflicts += 1;
                     self.counters.conflicts = self.counters.conflicts.saturating_add(1);
                 }
                 DocumentWriteOutcome::NotFound { expected_version } => {
-                    self.conflict = Some(PersistenceConflict {
+                    state.conflict = Some(PersistenceConflict {
                         key: document_commit.key,
                         expected_version: *expected_version,
+                        kind: PersistenceConflictKind::NotFound,
+                        policy: state.conflict_policy,
                     });
                     report.conflicts += 1;
                     self.counters.conflicts = self.counters.conflicts.saturating_add(1);
@@ -725,16 +970,10 @@ impl MongoPersistenceCoordinator {
                 scan_complete,
             });
             self.schedule_retry();
-        } else if report.conflicts == 0 {
+        } else {
             self.retry_attempt = 0;
             self.retry_not_before = None;
-            if !self
-                .documents
-                .values()
-                .any(|document| document.rejection.is_some())
-            {
-                self.last_error = None;
-            }
+            self.clear_last_error_if_recovered();
         }
         Ok(report)
     }
@@ -745,6 +984,9 @@ impl MongoPersistenceCoordinator {
         error: impl Into<String>,
     ) -> Result<(), PersistenceError> {
         self.validate_generation(generation)?;
+        if self.abandoned_generations.contains(&generation) {
+            return Err(PersistenceError::AbandonedGeneration(generation));
+        }
         let expected = self
             .in_flight
             .as_ref()
@@ -755,6 +997,7 @@ impl MongoPersistenceCoordinator {
                 actual: generation,
             });
         }
+        self.clear_in_flight_task(generation);
         let commit = self.in_flight.take().expect("checked in-flight commit");
         let writes = commit.writes.values().cloned().collect::<Vec<_>>();
         let scan_complete = commit
@@ -778,6 +1021,9 @@ impl MongoPersistenceCoordinator {
         error: impl Into<String>,
     ) -> Result<PersistenceReport, PersistenceError> {
         self.validate_generation(generation)?;
+        if self.abandoned_generations.contains(&generation) {
+            return Err(PersistenceError::AbandonedGeneration(generation));
+        }
         let expected = self
             .in_flight
             .as_ref()
@@ -788,6 +1034,7 @@ impl MongoPersistenceCoordinator {
                 actual: generation,
             });
         }
+        self.clear_in_flight_task(generation);
         let commit = self.in_flight.take().expect("checked in-flight commit");
         let error = error.into();
         let mut report = PersistenceReport::default();
@@ -817,6 +1064,56 @@ impl MongoPersistenceCoordinator {
         Ok(report)
     }
 
+    /// Stops retrying an exact write whose outcome can no longer be resolved
+    /// automatically and converts every affected document into an explicit
+    /// `OutcomeUnknown` conflict.
+    ///
+    /// The application must reload or detach those documents before using them
+    /// again. This method never assumes that the earlier write failed.
+    pub fn abort_retry_as_unknown(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> Result<PersistenceReport, PersistenceError> {
+        if self.in_flight.is_some() {
+            return Err(PersistenceError::FlushInFlight);
+        }
+        let prepared = self
+            .retry_pending
+            .take()
+            .ok_or(PersistenceError::NoRetryPending)?;
+        self.mark_commit_outcome_unknown(prepared.commit, reason.into())
+    }
+
+    /// Cancels the actor-dispatched future when possible and converts its
+    /// document outcomes to `OutcomeUnknown`.
+    ///
+    /// Cancellation cannot prove that MongoDB did not already apply a command.
+    /// The affected documents therefore remain conflicted and must be reloaded
+    /// or explicitly detached. A late pipe-to-self completion is ignored.
+    pub fn abort_in_flight_as_unknown(
+        &mut self,
+        generation: FlushGeneration,
+        reason: impl Into<String>,
+    ) -> Result<PersistenceReport, PersistenceError> {
+        self.validate_generation(generation)?;
+        let expected = self
+            .in_flight
+            .as_ref()
+            .ok_or(PersistenceError::NoFlushInFlight)?;
+        if expected.generation != generation {
+            return Err(PersistenceError::ForeignGeneration {
+                expected: expected.generation,
+                actual: generation,
+            });
+        }
+        if let Some((_, task)) = self.take_in_flight_task(generation) {
+            task.abort();
+        }
+        self.abandoned_generations.insert(generation);
+        let commit = self.in_flight.take().expect("checked in-flight commit");
+        self.mark_commit_outcome_unknown(commit, reason.into())
+    }
+
     pub fn has_in_flight(&self) -> bool {
         self.in_flight.is_some()
     }
@@ -828,12 +1125,37 @@ impl MongoPersistenceCoordinator {
             + self
                 .documents
                 .values()
-                .filter(|document| document.create_mode.is_some() || document.rejection.is_some())
+                .filter(|document| {
+                    document.create_mode.is_some()
+                        || document.rejection.is_some()
+                        || document.conflict.is_some()
+                })
                 .count()
     }
 
+    /// Returns the first conflict in stable document-key order.
     pub fn conflict(&self) -> Option<&PersistenceConflict> {
-        self.conflict.as_ref()
+        self.conflicts().next()
+    }
+
+    /// Enumerates every quarantined or coordinator-blocking conflict in stable
+    /// document-key order.
+    pub fn conflicts(&self) -> impl Iterator<Item = &PersistenceConflict> {
+        self.documents
+            .values()
+            .filter_map(|document| document.conflict.as_ref())
+    }
+
+    /// Returns the first conflict whose policy blocks the whole coordinator.
+    pub fn blocking_conflict(&self) -> Option<&PersistenceConflict> {
+        self.conflicts()
+            .find(|conflict| conflict.policy == ConflictPolicy::BlockCoordinator)
+    }
+
+    pub fn document_conflict(&self, key: &MongoDocumentKey) -> Option<&PersistenceConflict> {
+        self.documents
+            .get(key)
+            .and_then(|document| document.conflict.as_ref())
     }
 
     pub fn last_error(&self) -> Option<&str> {
@@ -868,6 +1190,85 @@ impl MongoPersistenceCoordinator {
             .get(key)
             .and_then(|state| state.rejection.as_ref())
             .map(|rejection| rejection.error.as_str())
+    }
+
+    fn has_blocking_conflict(&self) -> bool {
+        self.blocking_conflict().is_some()
+    }
+
+    fn clear_last_error_if_recovered(&mut self) {
+        if self.retry_pending.is_none()
+            && self.in_flight.is_none()
+            && !self
+                .documents
+                .values()
+                .any(|document| document.rejection.is_some() || document.conflict.is_some())
+        {
+            self.last_error = None;
+        }
+    }
+
+    fn mark_commit_outcome_unknown(
+        &mut self,
+        commit: InFlightCommit,
+        reason: String,
+    ) -> Result<PersistenceReport, PersistenceError> {
+        let InFlightCommit {
+            generation: _,
+            document_commits,
+            clean_commits,
+            writes,
+        } = commit;
+        let mut report = PersistenceReport::default();
+        self.apply_clean_commits(clean_commits, &mut report)?;
+        for (token, document_commit) in document_commits {
+            let expected_version = writes
+                .get(&token)
+                .expect("prepared write matches document commit")
+                .expected_version;
+            let state = self
+                .documents
+                .get_mut(&document_commit.key)
+                .ok_or_else(|| PersistenceError::UnknownDocument(document_commit.key.clone()))?;
+            state.conflict = Some(PersistenceConflict {
+                key: document_commit.key,
+                expected_version,
+                kind: PersistenceConflictKind::OutcomeUnknown,
+                policy: state.conflict_policy,
+            });
+            report.conflicts += 1;
+        }
+        self.counters.conflicts = self
+            .counters
+            .conflicts
+            .saturating_add(report.conflicts as u64);
+        self.retry_attempt = 0;
+        self.retry_not_before = None;
+        self.last_error = Some(reason);
+        Ok(report)
+    }
+
+    fn take_in_flight_task(
+        &mut self,
+        generation: FlushGeneration,
+    ) -> Option<(FlushGeneration, PipeTaskHandle)> {
+        if self
+            .in_flight_task
+            .as_ref()
+            .is_some_and(|(registered, _)| *registered == generation)
+        {
+            self.in_flight_task.take()
+        } else {
+            None
+        }
+    }
+
+    fn clear_in_flight_task(&mut self, generation: FlushGeneration) {
+        drop(self.take_in_flight_task(generation));
+    }
+
+    pub(super) fn consume_abandoned_generation(&mut self, generation: FlushGeneration) -> bool {
+        self.abandoned_generations.remove(&generation)
     }
 
     fn schedule_retry(&mut self) {
@@ -925,6 +1326,7 @@ pub struct MongoPreparation<'a> {
     writes: Vec<PreparedDocumentWrite>,
     document_commits: BTreeMap<WriteToken, DocumentCommit>,
     clean_commits: Vec<DocumentCommit>,
+    rejections: BTreeMap<MongoDocumentKey, DocumentRejection>,
     scans: u64,
     changed_paths: u64,
     scan_complete: bool,
@@ -955,6 +1357,8 @@ pub enum PersistenceError {
     FlushInFlight,
     #[error("no persistence flush is in flight")]
     NoFlushInFlight,
+    #[error("no exact persistence retry is pending")]
+    NoRetryPending,
     #[error("a version conflict blocks persistence")]
     ConflictBlocked,
     #[error("a clean completion contained document writes")]
@@ -969,6 +1373,16 @@ pub enum PersistenceError {
     InvalidAppliedVersion(MongoDocumentKey),
     #[error("new document has not been durably created: {0:?}")]
     CreatePending(MongoDocumentKey),
+    #[error("document is not conflicted: {0:?}")]
+    DocumentNotConflicted(MongoDocumentKey),
+    #[error("document conflict must be resolved explicitly before detaching: {0:?}")]
+    DocumentConflictPending(MongoDocumentKey),
+    #[error("document is not rejected: {0:?}")]
+    DocumentNotRejected(MongoDocumentKey),
+    #[error("document rejection must be resolved explicitly before detaching: {0:?}")]
+    DocumentRejectionPending(MongoDocumentKey),
+    #[error("persistence generation was explicitly abandoned: {0:?}")]
+    AbandonedGeneration(FlushGeneration),
     #[error("stale activation epoch: expected {expected}, got {actual}")]
     StaleActivation { expected: u64, actual: u64 },
     #[error("foreign flush generation: expected {expected:?}, got {actual:?}")]

@@ -33,6 +33,9 @@ pub enum PersistenceStatus {
 pub enum CompletionStatus {
     Applied(PersistenceReport),
     RetryScheduled,
+    /// The generation was explicitly converted to `OutcomeUnknown`; its late
+    /// asynchronous completion must not mutate coordinator state.
+    IgnoredAbandoned,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,10 +80,14 @@ impl MongoPersistenceCoordinator {
                 outcome,
             }
         };
-        if let Err(error) = context.pipe_to_self(future, |completion| completion) {
-            self.dispatch_failed(generation, error.to_string())?;
-            return Err(error.into());
-        }
+        let task = match context.pipe_to_self(future, |completion| completion) {
+            Ok(task) => task,
+            Err(error) => {
+                self.dispatch_failed(generation, error.to_string())?;
+                return Err(error.into());
+            }
+        };
+        self.register_in_flight_task(generation, task)?;
         Ok(PersistenceStatus::InFlight)
     }
 
@@ -91,6 +98,9 @@ impl MongoPersistenceCoordinator {
         &mut self,
         completion: MongoFlushCompleted,
     ) -> Result<CompletionStatus, PersistenceError> {
+        if self.consume_abandoned_generation(completion.generation) {
+            return Ok(CompletionStatus::IgnoredAbandoned);
+        }
         match completion.outcome {
             Ok(outcome) => self
                 .complete(completion.generation, outcome)

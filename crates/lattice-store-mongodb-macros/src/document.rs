@@ -7,9 +7,15 @@ use crate::common::{
 
 struct DocumentOptions {
     collection: LitStr,
+    conflict_policy: ConflictPolicyOption,
     id_field: Ident,
     id_type: Type,
     serialized_id_field: String,
+}
+
+enum ConflictPolicyOption {
+    Block,
+    Quarantine,
 }
 
 pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -17,6 +23,14 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     let store = store_crate_path()?;
     let ident = &input.ident;
     let collection = options.collection;
+    let conflict_policy = match options.conflict_policy {
+        ConflictPolicyOption::Block => quote! {
+            #store::persistence::coordinator::ConflictPolicy::BlockCoordinator
+        },
+        ConflictPolicyOption::Quarantine => quote! {
+            #store::persistence::coordinator::ConflictPolicy::QuarantineDocument
+        },
+    };
     let id_field = options.id_field;
     let id_type = options.id_type;
     let serialized_id_field = options.serialized_id_field;
@@ -25,6 +39,8 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             type Id = #id_type;
             const COLLECTION: &'static str = #collection;
             const ID_FIELD: &'static str = #serialized_id_field;
+            const CONFLICT_POLICY: #store::persistence::coordinator::ConflictPolicy =
+                #conflict_policy;
 
             fn id(&self) -> &Self::Id {
                 &self.#id_field
@@ -35,6 +51,7 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
 
 fn document_options(input: &DeriveInput) -> syn::Result<DocumentOptions> {
     let mut collection = None;
+    let mut conflict_policy = None;
     for attribute in &input.attrs {
         if !attribute.path().is_ident("mongo") {
             continue;
@@ -42,6 +59,19 @@ fn document_options(input: &DeriveInput) -> syn::Result<DocumentOptions> {
         attribute.parse_nested_meta(|meta| {
             if meta.path.is_ident("collection") {
                 collection = Some(meta.value()?.parse::<LitStr>()?);
+                Ok(())
+            } else if meta.path.is_ident("conflict") {
+                let value = meta.value()?.parse::<LitStr>()?;
+                conflict_policy = Some(match value.value().as_str() {
+                    "block" => ConflictPolicyOption::Block,
+                    "quarantine" => ConflictPolicyOption::Quarantine,
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            value,
+                            "Mongo conflict policy must be `block` or `quarantine`",
+                        ));
+                    }
+                });
                 Ok(())
             } else {
                 Err(meta.error("unsupported Mongo document option"))
@@ -91,6 +121,7 @@ fn document_options(input: &DeriveInput) -> syn::Result<DocumentOptions> {
         collection: collection.ok_or_else(|| {
             syn::Error::new_spanned(input, "missing #[mongo(collection = \"...\")] option")
         })?,
+        conflict_policy: conflict_policy.unwrap_or(ConflictPolicyOption::Block),
         id_field,
         id_type,
         serialized_id_field,

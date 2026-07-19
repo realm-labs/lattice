@@ -25,6 +25,10 @@ pub trait MongoDocument: Serialize + DeserializeOwned + Send + Sync + Sized + 's
 
     const COLLECTION: &'static str;
     const ID_FIELD: &'static str;
+    /// Determines whether an optimistic-lock conflict in this document blocks
+    /// the whole actor-local coordinator or only quarantines this document.
+    const CONFLICT_POLICY: crate::persistence::coordinator::ConflictPolicy =
+        crate::persistence::coordinator::ConflictPolicy::BlockCoordinator;
 
     fn id(&self) -> &Self::Id;
 }

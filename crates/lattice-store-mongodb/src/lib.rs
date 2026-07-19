@@ -31,9 +31,11 @@
 //!
 //! This is an optimistic, per-document protocol. A flush may contain several
 //! documents, but it does not promise transaction atomicity across them.
-//! Version conflicts block further preparation for that document instead of
-//! overwriting remote state; the application must reload or apply a business
-//! conflict policy.
+//! Version conflicts never overwrite remote state. Documents use the safe
+//! aggregate default, which blocks the coordinator until the application
+//! reloads or explicitly removes the conflicted registration. Independent
+//! rows can opt into document-local quarantine so unrelated state continues to
+//! flush.
 //!
 //! # Defining a document
 //!
@@ -81,6 +83,30 @@
 //! maps it to MongoDB `_id`; it is not duplicated in the stored business body.
 //! The flat storage envelope also owns `version` and `updated_at_ms`, which
 //! cannot be shadowed by business fields.
+//!
+//! By default, a version conflict or unexpectedly missing remote document
+//! blocks every document registered in the same coordinator because it may
+//! indicate a stale actor incarnation. Independent child rows can opt into
+//! local quarantine:
+//!
+//! ```ignore
+//! #[derive(Serialize, Deserialize, MongoDocument, MongoScan)]
+//! #[mongo(collection = "world_alliance_members", conflict = "quarantine")]
+//! struct AllianceMemberDocument {
+//!     #[mongo(id)]
+//!     id: WorldMemberKey,
+//!     // ...
+//! }
+//! ```
+//!
+//! A quarantined document retains its acknowledged baseline and is skipped by
+//! later preparations. Inspect it with
+//! [`persistence::coordinator::MongoPersistenceCoordinator::document_conflict`],
+//! then use
+//! [`persistence::coordinator::MongoPersistenceCoordinator::resolve_conflict_with_loaded`]
+//! after reloading remote state, or explicitly remove an optional registration
+//! with
+//! [`persistence::coordinator::MongoPersistenceCoordinator::detach_conflicted`].
 //!
 //! Persisted fields must not change through atomics, locks, or other interior
 //! mutability reachable from `&self`. Such a change would bypass
@@ -183,6 +209,21 @@
 //! an outcome may be retried as-is or must wait for a new mutation and fresh
 //! preparation. Definitive server rejections such as oversized documents do
 //! not loop forever with the same rejected payload.
+//!
+//! Every retained failure state has an explicit intervention path:
+//!
+//! - `retry_rejected` forces a fresh scan after an external problem is fixed;
+//! - `replace_rejected_with_loaded` and `detach_rejected` replace or explicitly
+//!   discard definitively rejected state;
+//! - `resolve_conflict_with_loaded` and `detach_conflicted` resolve optimistic
+//!   lock conflicts and unexpectedly missing documents; and
+//! - `abort_retry_as_unknown` and `abort_in_flight_as_unknown` stop an
+//!   unresolvable ambiguous operation without pretending it failed.
+//!
+//! Aborted ambiguous operations become `OutcomeUnknown` conflicts. Their
+//! baseline is never advanced, and the application must reload or explicitly
+//! detach them. Actor-dispatched in-flight work is cancelled when possible;
+//! any completion already queued for the abandoned generation is ignored.
 //!
 //! # Module guide
 //!
