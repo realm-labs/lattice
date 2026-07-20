@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use lattice_actor::actor_protocol;
 use lattice_actor::error::ActorError;
 use lattice_actor::protocol::ProstCodec;
@@ -22,7 +21,6 @@ actor_protocol! {
 
 struct MissingHandlerActor;
 
-#[async_trait]
 impl Actor for MissingHandlerActor {
     type Error = ActorError;
 }

@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::handle::ActorHandle;
@@ -21,17 +20,14 @@ struct SourceActor {
     forwarder: ActorHandle<ForwarderActor>,
 }
 
-#[async_trait]
 impl Actor for TargetActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Actor for ForwarderActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Actor for SourceActor {
     type Error = ActorError;
 }
@@ -47,7 +43,6 @@ struct Relay {
 #[derive(lattice_actor::Message)]
 struct Delivered;
 
-#[async_trait]
 impl Handler<Start> for SourceActor {
     async fn handle(
         &mut self,
@@ -70,7 +65,6 @@ impl Handler<Start> for SourceActor {
     }
 }
 
-#[async_trait]
 impl Handler<Relay> for ForwarderActor {
     async fn handle(
         &mut self,
@@ -86,7 +80,6 @@ impl Handler<Relay> for ForwarderActor {
     }
 }
 
-#[async_trait]
 impl Handler<Delivered> for TargetActor {
     async fn handle(
         &mut self,

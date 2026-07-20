@@ -1,6 +1,5 @@
-use std::{any::Any, error::Error as StdError, time::Instant};
+use std::{any::Any, error::Error as StdError, future::Future, time::Instant};
 
-use async_trait::async_trait;
 use lattice_core::{
     actor_ref::{EntityId, ProtocolId},
     id::ActorId,
@@ -148,7 +147,6 @@ pub enum ResponderErrorAction<Response, Error> {
     Propagate(Error),
 }
 
-#[async_trait]
 pub trait Actor: Sized + Send + 'static {
     type Error: StdError + Send + Sync + 'static;
 
@@ -167,55 +165,62 @@ pub trait Actor: Sized + Send + 'static {
     ) {
     }
 
-    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
-        Ok(())
+    fn started(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { Ok(()) }
     }
 
-    async fn stopping(
+    fn stopping(
         &mut self,
         _ctx: &mut ActorContext<Self>,
         _reason: StopReason,
-    ) -> Result<(), ActorStopError> {
-        Ok(())
+    ) -> impl Future<Output = Result<(), ActorStopError>> + Send {
+        async { Ok(()) }
     }
 
-    async fn on_error<M>(
+    fn on_error<M>(
         &mut self,
         _ctx: &mut ActorContext<Self>,
         _metadata: &MessageMetadata,
         _error: &Self::Error,
-    ) where
+    ) -> impl Future<Output = ()> + Send
+    where
         M: Send + 'static,
     {
+        async {}
     }
 }
 
-#[async_trait]
 pub trait Handler<M>: Actor
 where
     M: Message,
 {
-    async fn handle(&mut self, ctx: &mut ActorContext<Self>, msg: M) -> Result<(), Self::Error>;
+    fn handle(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        msg: M,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-#[async_trait]
 pub trait Responder<R>: Actor
 where
     R: Request,
 {
-    async fn respond(
+    fn respond(
         &mut self,
         ctx: &mut ActorContext<Self>,
         request: R,
         reply_to: ReplyTo<R::Response>,
-    ) -> Result<(), Self::Error>;
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    async fn respond_error(
+    fn respond_error(
         &mut self,
         _ctx: &mut ActorContext<Self>,
         error: Self::Error,
-    ) -> ResponderErrorAction<R::Response, Self::Error> {
-        ResponderErrorAction::Propagate(error)
+    ) -> impl Future<Output = ResponderErrorAction<R::Response, Self::Error>> + Send {
+        async { ResponderErrorAction::Propagate(error) }
     }
 }
 

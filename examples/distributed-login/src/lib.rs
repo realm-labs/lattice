@@ -5,7 +5,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use lattice_actor::{
     actor_protocol,
     context::ActorContext,
@@ -44,12 +43,10 @@ pub struct WorldActor {
     pub sessions: u64,
 }
 
-#[async_trait]
 impl Actor for WorldActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Responder<LoginRequest> for WorldActor {
     async fn respond(
         &mut self,
@@ -75,12 +72,10 @@ pub struct PlayerActor {
     pub sessions: u64,
 }
 
-#[async_trait]
 impl Actor for PlayerActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Responder<InitSessionRequest> for PlayerActor {
     async fn respond(
         &mut self,

@@ -6,7 +6,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-async-trait.workspace = true
 clap.workspace = true
 http.workspace = true
 lattice-actor.workspace = true

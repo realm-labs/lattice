@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorCallError, ActorError, ActorStopError};
 use lattice_actor::registry::ActorRegistry;
@@ -21,7 +20,6 @@ struct PassivatingActor {
     handled_pings: Arc<AtomicUsize>,
 }
 
-#[async_trait]
 impl Actor for PassivatingActor {
     type Error = ActorError;
 
@@ -40,7 +38,6 @@ impl Actor for PassivatingActor {
 #[request(response = ())]
 struct BeginPassivation;
 
-#[async_trait]
 impl Responder<BeginPassivation> for PassivatingActor {
     async fn respond(
         &mut self,
@@ -58,7 +55,6 @@ impl Responder<BeginPassivation> for PassivatingActor {
 #[request(response = ())]
 struct Ping;
 
-#[async_trait]
 impl Responder<Ping> for PassivatingActor {
     async fn respond(
         &mut self,

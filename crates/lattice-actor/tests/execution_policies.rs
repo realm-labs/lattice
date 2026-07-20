@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorError, ActorSpawnError};
 use lattice_actor::handle::ActorHandle;
@@ -52,17 +51,14 @@ struct RestartingParent {
     started: mpsc::UnboundedSender<String>,
 }
 
-#[async_trait]
 impl Actor for TestActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Actor for OtherActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Actor for ParentActor {
     type Error = ActorError;
 
@@ -106,7 +102,6 @@ impl Actor for ParentActor {
     }
 }
 
-#[async_trait]
 impl Actor for ReportingChild {
     type Error = ActorError;
 
@@ -118,7 +113,6 @@ impl Actor for ReportingChild {
     }
 }
 
-#[async_trait]
 impl Actor for RestartingParent {
     type Error = ActorError;
 
@@ -140,7 +134,6 @@ impl Actor for RestartingParent {
     }
 }
 
-#[async_trait]
 impl Handler<RestartChild> for RestartingParent {
     async fn handle(
         &mut self,
@@ -156,7 +149,6 @@ impl Handler<RestartChild> for RestartingParent {
     }
 }
 
-#[async_trait]
 impl Responder<ChildThreads> for ParentActor {
     async fn respond(
         &mut self,
@@ -178,7 +170,6 @@ impl Responder<ChildThreads> for ParentActor {
     }
 }
 
-#[async_trait]
 impl Responder<Ping> for TestActor {
     async fn respond(
         &mut self,
@@ -192,7 +183,6 @@ impl Responder<Ping> for TestActor {
     }
 }
 
-#[async_trait]
 impl Responder<CurrentThread> for TestActor {
     async fn respond(
         &mut self,
@@ -205,7 +195,6 @@ impl Responder<CurrentThread> for TestActor {
     }
 }
 
-#[async_trait]
 impl Responder<CurrentThread> for OtherActor {
     async fn respond(
         &mut self,

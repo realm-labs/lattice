@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use lattice_actor::{
     context::ActorContext,
     error::{ActorCallError, ActorError, ActorStopError, ActorTellError},
@@ -29,7 +28,6 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 async fn local_actor_watch_sends_typed_termination_notification() {
     struct TargetActor;
 
-    #[async_trait]
     impl Actor for TargetActor {
         type Error = ActorError;
     }
@@ -40,7 +38,6 @@ async fn local_actor_watch_sends_typed_termination_notification() {
         notified: Arc<Semaphore>,
     }
 
-    #[async_trait]
     impl Actor for WatcherActor {
         type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
@@ -49,7 +46,6 @@ async fn local_actor_watch_sends_typed_termination_notification() {
         }
     }
 
-    #[async_trait]
     impl Handler<ActorTerminated> for WatcherActor {
         async fn handle(
             &mut self,
@@ -85,7 +81,6 @@ async fn local_actor_watch_sends_typed_termination_notification() {
 async fn watcher_stop_auto_unwatches_local_target() {
     struct TargetActor;
 
-    #[async_trait]
     impl Actor for TargetActor {
         type Error = ActorError;
     }
@@ -95,7 +90,6 @@ async fn watcher_stop_auto_unwatches_local_target() {
         events: Arc<Mutex<Vec<TerminatedReason>>>,
     }
 
-    #[async_trait]
     impl Actor for WatcherActor {
         type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
@@ -104,7 +98,6 @@ async fn watcher_stop_auto_unwatches_local_target() {
         }
     }
 
-    #[async_trait]
     impl Handler<ActorTerminated> for WatcherActor {
         async fn handle(
             &mut self,
@@ -141,7 +134,6 @@ async fn local_child_actor_stops_with_parent_lifecycle() {
         stopped: Option<Arc<Semaphore>>,
     }
 
-    #[async_trait]
     impl Actor for ChildActor {
         type Error = ActorError;
         async fn stopping(
@@ -160,7 +152,6 @@ async fn local_child_actor_stops_with_parent_lifecycle() {
         child_stopped: Arc<Semaphore>,
     }
 
-    #[async_trait]
     impl Actor for ParentActor {
         type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
@@ -197,7 +188,6 @@ async fn local_child_actor_stops_with_parent_lifecycle() {
 async fn local_child_actor_duplicate_key_is_rejected() {
     struct ChildActor;
 
-    #[async_trait]
     impl Actor for ChildActor {
         type Error = ActorError;
     }
@@ -206,7 +196,6 @@ async fn local_child_actor_duplicate_key_is_rejected() {
         duplicate_rejected: Arc<Semaphore>,
     }
 
-    #[async_trait]
     impl Actor for ParentActor {
         type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
@@ -241,7 +230,6 @@ async fn local_child_actor_duplicate_key_is_rejected() {
 async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
     struct ChildActor;
 
-    #[async_trait]
     impl Actor for ChildActor {
         type Error = ActorError;
     }
@@ -254,7 +242,6 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
         stopped: Option<Arc<Semaphore>>,
     }
 
-    #[async_trait]
     impl Actor for ParentActor {
         type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
@@ -283,7 +270,6 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
         }
     }
 
-    #[async_trait]
     impl Handler<StopChild> for ParentActor {
         async fn handle(
             &mut self,
@@ -321,7 +307,6 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
 async fn child_supervision_restart_child_recreates_child_from_factory() {
     struct ChildActor;
 
-    #[async_trait]
     impl Actor for ChildActor {
         type Error = ActorError;
     }
@@ -334,7 +319,6 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
         child_started: Arc<Semaphore>,
     }
 
-    #[async_trait]
     impl Actor for ParentActor {
         type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
@@ -356,7 +340,6 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
         }
     }
 
-    #[async_trait]
     impl Handler<StopChild> for ParentActor {
         async fn handle(
             &mut self,
@@ -403,12 +386,10 @@ async fn handler_error_returns_to_caller_and_actor_remains_running() {
 
     struct TestActor;
 
-    #[async_trait]
     impl Actor for TestActor {
         type Error = ActorError;
     }
 
-    #[async_trait]
     impl Responder<Ping> for TestActor {
         async fn respond(
             &mut self,
@@ -421,7 +402,6 @@ async fn handler_error_returns_to_caller_and_actor_remains_running() {
         }
     }
 
-    #[async_trait]
     impl Responder<Fail> for TestActor {
         async fn respond(
             &mut self,
@@ -447,7 +427,6 @@ async fn handler_error_returns_to_caller_and_actor_remains_running() {
 async fn stopping_failure_enters_stop_failed_state() {
     struct FailingStopActor;
 
-    #[async_trait]
     impl Actor for FailingStopActor {
         type Error = ActorError;
         async fn stopping(
@@ -492,7 +471,6 @@ async fn stopping_failure_retains_actor_state_and_retry_terminates_once() {
         }
     }
 
-    #[async_trait]
     impl Actor for RetainedActor {
         type Error = ActorError;
 
@@ -517,7 +495,6 @@ async fn stopping_failure_retains_actor_state_and_retry_terminates_once() {
         notified: Arc<Semaphore>,
     }
 
-    #[async_trait]
     impl Actor for RetainedWatcher {
         type Error = ActorError;
 
@@ -528,7 +505,6 @@ async fn stopping_failure_retains_actor_state_and_retry_terminates_once() {
         }
     }
 
-    #[async_trait]
     impl Handler<ActorTerminated> for RetainedWatcher {
         async fn handle(
             &mut self,
@@ -621,7 +597,6 @@ async fn stop_failed_rejects_business_traffic_but_accepts_force_stop() {
 
     struct RetainedActor;
 
-    #[async_trait]
     impl Actor for RetainedActor {
         type Error = ActorError;
 
@@ -634,7 +609,6 @@ async fn stop_failed_rejects_business_traffic_but_accepts_force_stop() {
         }
     }
 
-    #[async_trait]
     impl Handler<BusinessMessage> for RetainedActor {
         async fn handle(
             &mut self,
@@ -683,7 +657,6 @@ async fn passivation_policy_idle_timeout_stops_idle_actor() {
         stopped: Option<Arc<Semaphore>>,
     }
 
-    #[async_trait]
     impl Actor for IdleActor {
         type Error = ActorError;
         async fn stopping(

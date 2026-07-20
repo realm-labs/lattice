@@ -46,12 +46,10 @@ impl Request for EchoRequest {
 
 struct EchoActor;
 
-#[async_trait]
 impl Actor for EchoActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Responder<EchoRequest> for EchoActor {
     async fn respond(
         &mut self,

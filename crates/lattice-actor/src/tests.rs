@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use lattice_core::{
     actor_kind, id::ActorId, instance::InstanceId, service_context::ServiceContext, service_kind,
 };
@@ -115,7 +114,6 @@ struct TestActor {
 #[derive(Debug, crate::Message)]
 struct Fail;
 
-#[async_trait]
 impl Actor for TestActor {
     type Error = ActorError;
     async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
@@ -141,7 +139,6 @@ impl Actor for TestActor {
     }
 }
 
-#[async_trait]
 impl Responder<Ping> for TestActor {
     async fn respond(
         &mut self,
@@ -156,7 +153,6 @@ impl Responder<Ping> for TestActor {
     }
 }
 
-#[async_trait]
 impl Handler<Record> for TestActor {
     async fn handle(
         &mut self,
@@ -171,7 +167,6 @@ impl Handler<Record> for TestActor {
     }
 }
 
-#[async_trait]
 impl Handler<PipeRecord> for TestActor {
     async fn handle(
         &mut self,
@@ -194,7 +189,6 @@ impl Handler<PipeRecord> for TestActor {
     }
 }
 
-#[async_trait]
 impl Responder<ProbePipeCapacity> for TestActor {
     async fn respond(
         &mut self,
@@ -220,7 +214,6 @@ impl Responder<ProbePipeCapacity> for TestActor {
     }
 }
 
-#[async_trait]
 impl Responder<StopAfterReply> for TestActor {
     async fn respond(
         &mut self,
@@ -235,7 +228,6 @@ impl Responder<StopAfterReply> for TestActor {
     }
 }
 
-#[async_trait]
 impl Handler<Tick> for TestActor {
     async fn handle(
         &mut self,
@@ -247,7 +239,6 @@ impl Handler<Tick> for TestActor {
     }
 }
 
-#[async_trait]
 impl Responder<ReadContextInstance> for TestActor {
     async fn respond(
         &mut self,
@@ -260,7 +251,6 @@ impl Responder<ReadContextInstance> for TestActor {
     }
 }
 
-#[async_trait]
 impl Responder<SpawnContextChild> for TestActor {
     async fn respond(
         &mut self,
@@ -287,7 +277,6 @@ impl Responder<SpawnContextChild> for TestActor {
     }
 }
 
-#[async_trait]
 impl Handler<ContextChildResolved> for TestActor {
     async fn handle(
         &mut self,
@@ -302,7 +291,6 @@ impl Handler<ContextChildResolved> for TestActor {
     }
 }
 
-#[async_trait]
 impl Handler<Fail> for TestActor {
     async fn handle(
         &mut self,
@@ -320,7 +308,6 @@ where
 {
 }
 
-#[async_trait]
 impl Responder<DeferredReply> for TestActor {
     async fn respond(
         &mut self,
@@ -342,7 +329,6 @@ impl Responder<DeferredReply> for TestActor {
     }
 }
 
-#[async_trait]
 impl Handler<DeferredReady> for TestActor {
     async fn handle(
         &mut self,
@@ -367,7 +353,6 @@ struct BusinessErrorActor {
     observed_errors: Arc<Mutex<Vec<&'static str>>>,
 }
 
-#[async_trait]
 impl Actor for BusinessErrorActor {
     type Error = BusinessActorError;
 
@@ -399,7 +384,6 @@ fn load_business_state() -> Result<(), BusinessActorError> {
     Err(BusinessActorError::StoreUnavailable)
 }
 
-#[async_trait]
 impl Responder<LoadBusinessState> for BusinessErrorActor {
     async fn respond(
         &mut self,
@@ -413,7 +397,6 @@ impl Responder<LoadBusinessState> for BusinessErrorActor {
     }
 }
 
-#[async_trait]
 impl Responder<RecoverBusinessState> for BusinessErrorActor {
     async fn respond(
         &mut self,
@@ -810,7 +793,6 @@ async fn local_timer_delivers_message_to_actor() {
         events: Arc<Mutex<Vec<&'static str>>>,
     }
 
-    #[async_trait]
     impl Actor for TimerActor {
         type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
@@ -819,7 +801,6 @@ async fn local_timer_delivers_message_to_actor() {
         }
     }
 
-    #[async_trait]
     impl Handler<Tick> for TimerActor {
         async fn handle(
             &mut self,
@@ -859,7 +840,6 @@ async fn scoped_task_is_cancelled_when_actor_stops() {
         }
     }
 
-    #[async_trait]
     impl Actor for TaskActor {
         type Error = ActorError;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {

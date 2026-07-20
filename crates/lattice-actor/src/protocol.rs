@@ -927,7 +927,6 @@ pub fn __protocol_id(value: u64) -> Result<ProtocolId, ProtocolBuildError> {
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
     use lattice_core::actor_ref::{
         ActivationId, ActorPath, ClusterId, NodeAddress, NodeIncarnation,
     };
@@ -943,7 +942,6 @@ mod tests {
         observed_sender: Option<oneshot::Sender<Option<ActorRef>>>,
     }
 
-    #[async_trait]
     impl Actor for TestActor {
         type Error = ActorError;
     }
@@ -1004,7 +1002,6 @@ mod tests {
         Ok(u64::from_be_bytes(bytes))
     }
 
-    #[async_trait]
     impl Handler<Tell> for TestActor {
         async fn handle(
             &mut self,
@@ -1018,7 +1015,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl Responder<Ask> for TestActor {
         async fn respond(
             &mut self,

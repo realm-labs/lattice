@@ -5,7 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_actor::{
     context::ActorContext,
@@ -150,12 +149,10 @@ struct CompletionActor {
     processed_bytes: usize,
 }
 
-#[async_trait]
 impl Actor for CompletionActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Handler<CompletionTell> for CompletionActor {
     async fn handle(
         &mut self,
@@ -168,7 +165,6 @@ impl Handler<CompletionTell> for CompletionActor {
     }
 }
 
-#[async_trait]
 impl Handler<RawCompletionTell> for CompletionActor {
     async fn handle(
         &mut self,
@@ -180,7 +176,6 @@ impl Handler<RawCompletionTell> for CompletionActor {
     }
 }
 
-#[async_trait]
 impl Handler<CompletionBarrier> for CompletionActor {
     async fn handle(
         &mut self,

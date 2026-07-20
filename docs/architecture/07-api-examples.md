@@ -30,7 +30,6 @@ pub struct PlayerProfile {
     pub position: (f32, f32),
 }
 
-#[async_trait::async_trait]
 impl Handler<PositionUpdated> for PlayerActor {
     async fn handle(
         &mut self,
@@ -42,7 +41,6 @@ impl Handler<PositionUpdated> for PlayerActor {
     }
 }
 
-#[async_trait::async_trait]
 impl Responder<GetProfile> for PlayerActor {
     async fn respond(
         &mut self,

@@ -314,7 +314,6 @@ impl EntityFixture {
     }
 }
 
-#[async_trait]
 impl Actor for PingActor {
     type Error = ActorError;
 
@@ -346,7 +345,6 @@ impl Actor for PingActor {
     }
 }
 
-#[async_trait]
 impl Responder<Ping> for PingActor {
     async fn respond(
         &mut self,
@@ -359,7 +357,6 @@ impl Responder<Ping> for PingActor {
     }
 }
 
-#[async_trait]
 impl Handler<StopPing> for PingActor {
     async fn handle(
         &mut self,

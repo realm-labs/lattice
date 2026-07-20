@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::reply::ReplyTo;
@@ -22,7 +21,6 @@ struct MatchActor {
     pending_starts: VecDeque<StartMatch>,
 }
 
-#[async_trait]
 impl Actor for MatchActor {
     type Error = ActorError;
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
@@ -53,7 +51,6 @@ struct WorldTick;
 #[request(response = (MatchState, Vec<u64>))]
 struct InspectState;
 
-#[async_trait]
 impl Responder<StartMatch> for MatchActor {
     async fn respond(
         &mut self,
@@ -86,7 +83,6 @@ impl Responder<StartMatch> for MatchActor {
     }
 }
 
-#[async_trait]
 impl Handler<LoadingFinished> for MatchActor {
     async fn handle(
         &mut self,
@@ -102,7 +98,6 @@ impl Handler<LoadingFinished> for MatchActor {
     }
 }
 
-#[async_trait]
 impl Handler<WorldTick> for MatchActor {
     async fn handle(
         &mut self,
@@ -116,7 +111,6 @@ impl Handler<WorldTick> for MatchActor {
     }
 }
 
-#[async_trait]
 impl Responder<InspectState> for MatchActor {
     async fn respond(
         &mut self,

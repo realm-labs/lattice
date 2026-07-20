@@ -79,12 +79,10 @@ struct WorldActor {
     players: HashSet<u64>,
 }
 
-#[async_trait]
 impl Actor for WorldActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Responder<EnterWorldRequest> for WorldActor {
     async fn respond(
         &mut self,
@@ -135,12 +133,10 @@ struct ClockActor {
     tick: u64,
 }
 
-#[async_trait]
 impl Actor for ClockActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Responder<GetClockRequest> for ClockActor {
     async fn respond(
         &mut self,

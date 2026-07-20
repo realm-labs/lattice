@@ -5,7 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_actor::{
     context::ActorContext,
@@ -55,12 +54,10 @@ struct BenchActor;
 #[derive(lattice_actor::Message)]
 struct BenchTell;
 
-#[async_trait]
 impl Actor for BenchActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Handler<BenchTell> for BenchActor {
     async fn handle(
         &mut self,

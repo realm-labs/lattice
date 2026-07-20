@@ -130,12 +130,10 @@ impl ActorLoader<PingActor> for PingLoader {
     }
 }
 
-#[async_trait]
 impl Actor for PingActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Responder<Ping> for PingActor {
     async fn respond(
         &mut self,
@@ -238,7 +236,6 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
         }
     }
 
-    #[async_trait]
     impl Actor for ForceShutdownActor {
         type Error = ActorError;
 
@@ -251,7 +248,6 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
         }
     }
 
-    #[async_trait]
     impl Responder<Ping> for ForceShutdownActor {
         async fn respond(
             &mut self,
@@ -361,7 +357,6 @@ async fn service_retry_api_resolves_retained_actor_cell() {
         persistence_available: Arc<AtomicBool>,
     }
 
-    #[async_trait]
     impl Actor for RetryShutdownActor {
         type Error = ActorError;
 
@@ -377,7 +372,6 @@ async fn service_retry_api_resolves_retained_actor_cell() {
         }
     }
 
-    #[async_trait]
     impl Responder<Ping> for RetryShutdownActor {
         async fn respond(
             &mut self,

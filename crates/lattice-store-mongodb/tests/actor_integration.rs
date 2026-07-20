@@ -150,12 +150,10 @@ struct PersistenceActor {
     generation: Option<FlushGeneration>,
 }
 
-#[async_trait]
 impl Actor for PersistenceActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Handler<Persist> for PersistenceActor {
     async fn handle(
         &mut self,
@@ -188,7 +186,6 @@ impl Handler<Persist> for PersistenceActor {
     }
 }
 
-#[async_trait]
 impl Handler<AbortPersist> for PersistenceActor {
     async fn handle(
         &mut self,
@@ -206,7 +203,6 @@ impl Handler<AbortPersist> for PersistenceActor {
     }
 }
 
-#[async_trait]
 impl Handler<MongoFlushCompleted> for PersistenceActor {
     async fn handle(
         &mut self,
@@ -265,7 +261,6 @@ struct StoppingDrainActor {
     drain_options: MongoDrainOptions,
 }
 
-#[async_trait]
 impl Actor for StoppingDrainActor {
     type Error = ActorError;
 
@@ -286,7 +281,6 @@ impl Actor for StoppingDrainActor {
     }
 }
 
-#[async_trait]
 impl Handler<Persist> for StoppingDrainActor {
     async fn handle(
         &mut self,
@@ -306,7 +300,6 @@ impl Handler<Persist> for StoppingDrainActor {
     }
 }
 
-#[async_trait]
 impl Handler<MongoFlushCompleted> for StoppingDrainActor {
     async fn handle(
         &mut self,

@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use lattice_actor::{
     context::ActorContext,
     error::{ActorCallError, ActorError},
@@ -25,7 +24,6 @@ struct DeferredActor {
     continuations: Arc<AtomicUsize>,
 }
 
-#[async_trait]
 impl Actor for DeferredActor {
     type Error = ActorError;
 }
@@ -47,7 +45,6 @@ struct QueryReady {
 #[derive(lattice_actor::Message)]
 struct SetValue(u64);
 
-#[async_trait]
 impl Responder<Query> for DeferredActor {
     async fn respond(
         &mut self,
@@ -75,7 +72,6 @@ impl Responder<Query> for DeferredActor {
     }
 }
 
-#[async_trait]
 impl Handler<QueryReady> for DeferredActor {
     async fn handle(
         &mut self,
@@ -88,7 +84,6 @@ impl Handler<QueryReady> for DeferredActor {
     }
 }
 
-#[async_trait]
 impl Handler<SetValue> for DeferredActor {
     async fn handle(
         &mut self,
@@ -107,7 +102,6 @@ struct FailAfterPipe {
     entered: Arc<Semaphore>,
 }
 
-#[async_trait]
 impl Responder<FailAfterPipe> for DeferredActor {
     async fn respond(
         &mut self,
@@ -142,7 +136,6 @@ struct ForgetReply;
 #[request(response = u64)]
 struct ReplyThenFail;
 
-#[async_trait]
 impl Responder<ReplyThenFail> for DeferredActor {
     async fn respond(
         &mut self,
@@ -155,7 +148,6 @@ impl Responder<ReplyThenFail> for DeferredActor {
     }
 }
 
-#[async_trait]
 impl Responder<ForgetReply> for DeferredActor {
     async fn respond(
         &mut self,

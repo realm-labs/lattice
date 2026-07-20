@@ -4,7 +4,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_actor::{
     actor_protocol,
@@ -49,12 +48,10 @@ struct QueuedRequest;
 
 struct ObservedActor;
 
-#[async_trait]
 impl Actor for ObservedActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Handler<WireTell> for ObservedActor {
     async fn handle(
         &mut self,
@@ -65,7 +62,6 @@ impl Handler<WireTell> for ObservedActor {
     }
 }
 
-#[async_trait]
 impl Responder<DeferredRequest> for ObservedActor {
     async fn respond(
         &mut self,
@@ -84,7 +80,6 @@ impl Responder<DeferredRequest> for ObservedActor {
     }
 }
 
-#[async_trait]
 impl Handler<BlockingTell> for ObservedActor {
     async fn handle(
         &mut self,
@@ -99,7 +94,6 @@ impl Handler<BlockingTell> for ObservedActor {
     }
 }
 
-#[async_trait]
 impl Handler<QueuedTell> for ObservedActor {
     async fn handle(
         &mut self,
@@ -110,7 +104,6 @@ impl Handler<QueuedTell> for ObservedActor {
     }
 }
 
-#[async_trait]
 impl Responder<QueuedRequest> for ObservedActor {
     async fn respond(
         &mut self,

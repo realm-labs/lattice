@@ -210,6 +210,27 @@ now points primarily to payload reference-count updates, bounded-channel semapho
 handler-future allocation, and the required enqueue timestamp. Removing those costs would require a
 larger mailbox/API or dispatch representation change rather than another observer fast-path tweak.
 
+### Native Actor handler futures
+
+A second 2026-07-20 follow-up replaced the public `Actor`, `Handler`, and `Responder`
+`async-trait` expansion with native return-position `impl Future + Send`. User implementations keep
+the same `async fn` bodies and only remove the `#[async_trait]` attribute. The internal object-safe
+Actor envelope remains boxed.
+
+After this change, Criterion measured:
+
+| Workload | Batch time | Throughput | Point-estimate change |
+|---|---:|---:|---:|
+| Raw bounded-mailbox completion | 2.6215-2.7297 ms | 3.6634-3.8145M/s | +6.9% |
+| Per-message latency completion | 4.2910-4.3833 ms | 2.2814-2.3305M/s | +15.1% |
+
+The allocator-instrumented run recorded 21,857 allocations for 10,000 successful messages and 1,803
+full-mailbox retries. Subtracting retry envelope allocations leaves approximately 20,054 allocations,
+versus approximately 30,055 in the preceding capture after applying the same normalization. This
+confirms one eliminated handler-future allocation per successful message and reduces the steady
+successful path from approximately three allocations to two. Single-run counting-allocator
+throughput remains diagnostic rather than a timing baseline.
+
 The MongoDB persistence framework baseline was captured with:
 
 ```text

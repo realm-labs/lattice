@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use bytes::BytesMut;
 use lattice_actor::actor_protocol;
 use lattice_actor::context::ActorContext;
@@ -74,12 +73,10 @@ impl WireCodec<Delivered> for DeliveredCodec {
 
 struct SourceActor;
 
-#[async_trait]
 impl Actor for SourceActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Handler<SendTo> for SourceActor {
     async fn handle(
         &mut self,
@@ -96,12 +93,10 @@ struct SinkActor {
     observed: SenderObserver,
 }
 
-#[async_trait]
 impl Actor for SinkActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Handler<Delivered> for SinkActor {
     async fn handle(
         &mut self,

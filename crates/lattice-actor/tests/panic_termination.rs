@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use lattice_actor::{
     context::ActorContext,
     error::{ActorCallError, ActorError, ActorStopError},
@@ -110,7 +109,6 @@ struct PolicyActor {
     stopping_calls: Arc<AtomicUsize>,
 }
 
-#[async_trait]
 impl Actor for PolicyActor {
     type Error = ActorError;
 
@@ -124,7 +122,6 @@ impl Actor for PolicyActor {
     }
 }
 
-#[async_trait]
 impl Handler<Crash> for PolicyActor {
     async fn handle(
         &mut self,
@@ -135,7 +132,6 @@ impl Handler<Crash> for PolicyActor {
     }
 }
 
-#[async_trait]
 impl Responder<Ping> for PolicyActor {
     async fn respond(
         &mut self,
@@ -205,12 +201,10 @@ struct CrashRequest;
 
 struct RequestPanicActor;
 
-#[async_trait]
 impl Actor for RequestPanicActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Responder<CrashRequest> for RequestPanicActor {
     async fn respond(
         &mut self,
@@ -271,7 +265,6 @@ async fn request_panic_completes_ask_and_observation_once() {
 
 struct BeforeHookPanicActor;
 
-#[async_trait]
 impl Actor for BeforeHookPanicActor {
     type Error = ActorError;
 
@@ -280,7 +273,6 @@ impl Actor for BeforeHookPanicActor {
     }
 }
 
-#[async_trait]
 impl Responder<CrashRequest> for BeforeHookPanicActor {
     async fn respond(
         &mut self,
@@ -305,7 +297,6 @@ async fn panic_before_reply_control_registration_returns_actor_panicked() {
 
 struct AfterHookPanicActor;
 
-#[async_trait]
 impl Actor for AfterHookPanicActor {
     type Error = ActorError;
 
@@ -319,7 +310,6 @@ impl Actor for AfterHookPanicActor {
     }
 }
 
-#[async_trait]
 impl Responder<Ping> for AfterHookPanicActor {
     async fn respond(
         &mut self,
@@ -360,12 +350,10 @@ struct QueuedRequest;
 
 struct QueueActor;
 
-#[async_trait]
 impl Actor for QueueActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Handler<BlockingCrash> for QueueActor {
     async fn handle(
         &mut self,
@@ -378,7 +366,6 @@ impl Handler<BlockingCrash> for QueueActor {
     }
 }
 
-#[async_trait]
 impl Responder<QueuedRequest> for QueueActor {
     async fn respond(
         &mut self,
@@ -459,12 +446,10 @@ struct DeferredPanicActor {
     reply: Option<ReplyTo<u32>>,
 }
 
-#[async_trait]
 impl Actor for DeferredPanicActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Responder<HeldRequest> for DeferredPanicActor {
     async fn respond(
         &mut self,
@@ -478,7 +463,6 @@ impl Responder<HeldRequest> for DeferredPanicActor {
     }
 }
 
-#[async_trait]
 impl Handler<Crash> for DeferredPanicActor {
     async fn handle(
         &mut self,
@@ -513,12 +497,10 @@ struct LaunchPanickingTask {
 
 struct ScopedTaskActor;
 
-#[async_trait]
 impl Actor for ScopedTaskActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Handler<LaunchPanickingTask> for ScopedTaskActor {
     async fn handle(
         &mut self,
@@ -533,7 +515,6 @@ impl Handler<LaunchPanickingTask> for ScopedTaskActor {
     }
 }
 
-#[async_trait]
 impl Responder<Ping> for ScopedTaskActor {
     async fn respond(
         &mut self,
@@ -565,7 +546,6 @@ struct StartActor {
     panic_on_start: bool,
 }
 
-#[async_trait]
 impl Actor for StartActor {
     type Error = ActorError;
 
@@ -613,7 +593,6 @@ async fn start_panic_releases_registry_activation_for_replacement() {
 
 struct StoppingPanicActor;
 
-#[async_trait]
 impl Actor for StoppingPanicActor {
     type Error = ActorError;
 
@@ -645,7 +624,6 @@ async fn stopping_panic_terminates_without_entering_stop_failed() {
 
 struct DropPanicActor;
 
-#[async_trait]
 impl Actor for DropPanicActor {
     type Error = ActorError;
 }
@@ -679,7 +657,6 @@ struct PanicChild {
     started: Arc<Semaphore>,
 }
 
-#[async_trait]
 impl Actor for PanicChild {
     type Error = ActorError;
 
@@ -689,7 +666,6 @@ impl Actor for PanicChild {
     }
 }
 
-#[async_trait]
 impl Handler<Crash> for PanicChild {
     async fn handle(
         &mut self,
@@ -706,7 +682,6 @@ struct SupervisingParent {
     supervision: ChildSupervision,
 }
 
-#[async_trait]
 impl Actor for SupervisingParent {
     type Error = ActorError;
 
@@ -728,7 +703,6 @@ impl Actor for SupervisingParent {
     }
 }
 
-#[async_trait]
 impl Handler<CrashChild> for SupervisingParent {
     async fn handle(
         &mut self,

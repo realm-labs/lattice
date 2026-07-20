@@ -187,7 +187,8 @@ This keeps the first version simple while fixing the final scheduling boundary: 
 ### 7.3 Core Traits
 
 ```rust
-#[async_trait::async_trait]
+use std::future::Future;
+
 pub trait Actor: Sized + Send + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -204,23 +205,31 @@ pub trait Actor: Sized + Send + 'static {
         _outcome: MessageOutcome,
     ) {}
 
-    async fn on_error<M>(
+    fn on_error<M>(
         &mut self,
         _ctx: &mut ActorContext<Self>,
         _metadata: &MessageMetadata,
         _error: &Self::Error,
-    ) where M: Send + 'static {}
-
-    async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
-        Ok(())
+    ) -> impl Future<Output = ()> + Send
+    where
+        M: Send + 'static,
+    {
+        async {}
     }
 
-    async fn stopping(
+    fn started(
+        &mut self,
+        _ctx: &mut ActorContext<Self>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { Ok(()) }
+    }
+
+    fn stopping(
         &mut self,
         _ctx: &mut ActorContext<Self>,
         _reason: StopReason,
-    ) -> Result<(), ActorStopError> {
-        Ok(())
+    ) -> impl Future<Output = Result<(), ActorStopError>> + Send {
+        async { Ok(()) }
     }
 }
 
@@ -230,29 +239,27 @@ pub trait Request: Send + 'static {
     type Response: Send + 'static;
 }
 
-#[async_trait::async_trait]
 pub trait Responder<R>: Actor
 where
     R: Request,
 {
-    async fn respond(
+    fn respond(
         &mut self,
         ctx: &mut ActorContext<Self>,
         request: R,
         reply_to: ReplyTo<R::Response>,
-    ) -> Result<(), ActorError>;
+    ) -> impl Future<Output = Result<(), ActorError>> + Send;
 }
 
-#[async_trait::async_trait]
 pub trait Handler<M>: Actor
 where
     M: Message,
 {
-    async fn handle(
+    fn handle(
         &mut self,
         ctx: &mut ActorContext<Self>,
         msg: M,
-    ) -> Result<(), ActorError>;
+    ) -> impl Future<Output = Result<(), ActorError>> + Send;
 }
 ```
 
@@ -299,7 +306,6 @@ An ask does not install a dynamically typed sender in the context. `Responder<R>
 ### 7.5 Handler Examples
 
 ```rust
-#[async_trait::async_trait]
 impl Responder<EnterWorld> for WorldActor {
     async fn respond(
         &mut self,
@@ -315,7 +321,6 @@ impl Responder<EnterWorld> for WorldActor {
     }
 }
 
-#[async_trait::async_trait]
 impl Handler<WorldTick> for WorldActor {
     async fn handle(
         &mut self,
@@ -346,7 +351,6 @@ struct ProfileLoaded {
     reply_to: ReplyTo<GetPlayerViewResponse>,
 }
 
-#[async_trait::async_trait]
 impl Responder<GetPlayerView> for WorldActor {
     async fn respond(
         &mut self,
@@ -364,7 +368,6 @@ impl Responder<GetPlayerView> for WorldActor {
     }
 }
 
-#[async_trait::async_trait]
 impl Handler<ProfileLoaded> for WorldActor {
     async fn handle(
         &mut self,

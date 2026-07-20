@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use lattice_actor::{
     actor_protocol,
     context::ActorContext,
@@ -30,7 +29,6 @@ use tokio::sync::{Semaphore, oneshot};
 
 struct SlowActor;
 
-#[async_trait]
 impl Actor for SlowActor {
     type Error = ActorError;
     async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
@@ -116,7 +114,6 @@ struct Probe {}
 
 impl Message for Probe {}
 
-#[async_trait]
 impl Handler<Probe> for SelfRefActor {
     async fn handle(
         &mut self,
@@ -138,7 +135,6 @@ actor_protocol! {
     }
 }
 
-#[async_trait]
 impl Actor for SelfRefActor {
     type Error = ActorError;
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
@@ -219,7 +215,6 @@ impl Drop for RetainedRegistryActor {
     }
 }
 
-#[async_trait]
 impl Actor for RetainedRegistryActor {
     type Error = ActorError;
 
@@ -512,7 +507,6 @@ async fn authority_loss_during_stopping_finishes_in_non_authoritative_quarantine
         release_stopping: Arc<Semaphore>,
     }
 
-    #[async_trait]
     impl Actor for ConcurrentFenceActor {
         type Error = ActorError;
 

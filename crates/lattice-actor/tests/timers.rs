@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::{ActorError, ActorStopError};
 use lattice_actor::reply::ReplyTo;
@@ -14,7 +13,6 @@ struct WorldActor {
     stopped: Option<Arc<Semaphore>>,
 }
 
-#[async_trait]
 impl Actor for WorldActor {
     type Error = ActorError;
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
@@ -43,7 +41,6 @@ struct WorldTick {
 #[request(response = u64)]
 struct InspectTicks;
 
-#[async_trait]
 impl Handler<WorldTick> for WorldActor {
     async fn handle(
         &mut self,
@@ -60,7 +57,6 @@ impl Handler<WorldTick> for WorldActor {
     }
 }
 
-#[async_trait]
 impl Responder<InspectTicks> for WorldActor {
     async fn respond(
         &mut self,

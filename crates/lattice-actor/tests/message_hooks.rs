@@ -2,7 +2,6 @@ use std::any::type_name;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::mailbox::MailboxConfig;
@@ -53,7 +52,6 @@ struct HookActor {
     after_signal: Arc<Semaphore>,
 }
 
-#[async_trait]
 impl Actor for HookActor {
     type Error = ActorError;
 
@@ -100,7 +98,6 @@ impl Actor for HookActor {
     }
 }
 
-#[async_trait]
 impl Handler<PayloadTell> for HookActor {
     async fn handle(
         &mut self,
@@ -111,7 +108,6 @@ impl Handler<PayloadTell> for HookActor {
     }
 }
 
-#[async_trait]
 impl Responder<PayloadRequest> for HookActor {
     async fn respond(
         &mut self,
@@ -124,7 +120,6 @@ impl Responder<PayloadRequest> for HookActor {
     }
 }
 
-#[async_trait]
 impl Handler<FailingTell> for HookActor {
     async fn handle(
         &mut self,
@@ -135,7 +130,6 @@ impl Handler<FailingTell> for HookActor {
     }
 }
 
-#[async_trait]
 impl Responder<RecoveredRequest> for HookActor {
     async fn respond(
         &mut self,

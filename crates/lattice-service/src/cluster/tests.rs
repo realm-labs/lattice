@@ -113,12 +113,10 @@ struct EntityActor {
     value: u64,
 }
 
-#[async_trait]
 impl Actor for EntityActor {
     type Error = ActorError;
 }
 
-#[async_trait]
 impl Responder<GetValue> for EntityActor {
     async fn respond(
         &mut self,
