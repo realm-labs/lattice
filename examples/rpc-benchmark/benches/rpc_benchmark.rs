@@ -6,12 +6,15 @@ use std::{
 };
 
 use bytes::Bytes;
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lattice_remoting::{
     transport::FramedWriter,
     wire::{Frame, FrameCodec, FrameKind},
 };
-use remoting_benchmark::{BenchmarkConfig, RemotingTopology};
+use remoting_benchmark::{
+    BenchmarkConfig, RemotingTopology, actor_completion::ActorCompletionTopology,
+    end_to_end::RemoteActorTopology,
+};
 use tokio::runtime::Runtime;
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -69,6 +72,74 @@ fn remoting_benchmark(c: &mut Criterion) {
     runtime.block_on(topology.shutdown());
 }
 
+fn actor_completion_benchmark(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("benchmark runtime");
+    let config = BenchmarkConfig::from_env();
+    let topology = runtime
+        .block_on(ActorCompletionTopology::start_timing(1024))
+        .expect("actor completion topology");
+    let mut group = c.benchmark_group("actor_completion");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
+    group.throughput(Throughput::Elements(config.requests as u64));
+    group.bench_with_input(
+        BenchmarkId::new("bounded_mailbox", config.payload_bytes),
+        &config,
+        |bench, config| {
+            let topology = &topology;
+            let requests = config.requests;
+            let payload_bytes = config.payload_bytes;
+            bench
+                .to_async(&runtime)
+                .iter_custom(move |iterations| async move {
+                    topology
+                        .run(requests.saturating_mul(iterations as usize), payload_bytes)
+                        .await
+                        .expect("actor completion workload")
+                        .workload
+                        .elapsed
+                });
+        },
+    );
+    group.finish();
+    runtime
+        .block_on(topology.shutdown())
+        .expect("actor completion shutdown");
+}
+
+fn remote_actor_round_trip_benchmark(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("benchmark runtime");
+    let config = BenchmarkConfig::from_env();
+    let topology = runtime
+        .block_on(RemoteActorTopology::start(config.bulk_stripes))
+        .expect("remote actor topology");
+    let mut group = c.benchmark_group("remote_actor_end_to_end");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
+    group.throughput(Throughput::Elements(config.round_trip_requests as u64));
+    group.bench_with_input(
+        BenchmarkId::new("tcp_ask_round_trip", config.payload_bytes),
+        &config,
+        |bench, config| {
+            let topology = &topology;
+            let requests = config.round_trip_requests;
+            let payload_bytes = config.payload_bytes;
+            bench
+                .to_async(&runtime)
+                .iter_custom(move |iterations| async move {
+                    topology
+                        .run_timing(requests.saturating_mul(iterations as usize), payload_bytes)
+                        .await
+                        .expect("remote actor round-trip workload")
+                });
+        },
+    );
+    group.finish();
+    runtime
+        .block_on(topology.shutdown())
+        .expect("remote actor topology shutdown");
+}
+
 fn wire_codec_benchmark(c: &mut Criterion) {
     let runtime = Runtime::new().expect("benchmark runtime");
     let config = BenchmarkConfig::from_env();
@@ -109,5 +180,11 @@ fn wire_codec_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, remoting_benchmark, wire_codec_benchmark);
+criterion_group!(
+    benches,
+    remoting_benchmark,
+    actor_completion_benchmark,
+    remote_actor_round_trip_benchmark,
+    wire_codec_benchmark
+);
 criterion_main!(benches);

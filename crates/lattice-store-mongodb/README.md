@@ -211,6 +211,13 @@ measure scan regressions locally, run
 `cargo bench -p lattice-store-mongodb --bench scan`; the benchmark covers
 1 KiB, 10 KiB, and 1 MiB documents plus 1,000- and 10,000-entry maps.
 
+`cargo bench -p lattice-store-mongodb --bench persistence` measures the
+acknowledgement-based `prepare -> flush -> complete` pipeline and shutdown
+draining for 1, 100, and 1,000 dirty resident documents. It uses an in-memory
+acknowledging store so the result isolates framework scanning, request
+construction, per-document outcome handling, and baseline advancement from
+MongoDB server and network variance.
+
 ## Lazy and unloadable state
 
 The derive only wires loading policy and persistence scanning. The business

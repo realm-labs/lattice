@@ -14,6 +14,8 @@ use lattice_remoting::{
 };
 use remoting_benchmark::{
     BenchmarkConfig, RemotingTopology,
+    actor_completion::ActorCompletionTopology,
+    end_to_end::RemoteActorTopology,
     matrix::{local_actor_admission, placement_matrix},
 };
 
@@ -48,6 +50,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let frame_write_allocations =
         measure_frame_write(config.requests, config.payload_bytes).await?;
     let local = local_actor_admission(config.requests).await?;
+    let completion_topology = ActorCompletionTopology::start(1024).await?;
+    let local_completion = completion_topology
+        .run(config.requests, config.payload_bytes)
+        .await?;
+    completion_topology.shutdown().await?;
+    let remote_actor = RemoteActorTopology::start(config.bulk_stripes).await?;
+    let remote_round_trip = remote_actor
+        .run(config.round_trip_requests, config.payload_bytes)
+        .await?;
+    remote_actor.shutdown().await?;
     let topology = RemotingTopology::start(&config)?;
     let before_allocations = ALLOCATIONS.load(Ordering::Relaxed);
     let before_deallocations = DEALLOCATIONS.load(Ordering::Relaxed);
@@ -95,6 +107,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "open_fds_after": after_remote_fds,
         "physical_connections": 2 + config.bulk_stripes,
         "frame_write_allocations": frame_write_allocations,
+        "local_actor_completion": {
+            "throughput_per_second": local_completion.workload.throughput_per_second(),
+            "elapsed_nanos": local_completion.workload.elapsed.as_nanos(),
+            "latency_p50_nanos": local_completion.workload.percentile_latency(0.50).as_nanos(),
+            "latency_p95_nanos": local_completion.workload.percentile_latency(0.95).as_nanos(),
+            "latency_p99_nanos": local_completion.workload.percentile_latency(0.99).as_nanos(),
+            "queue_p50_nanos": local_completion.queue_percentile(0.50).as_nanos(),
+            "queue_p95_nanos": local_completion.queue_percentile(0.95).as_nanos(),
+            "queue_p99_nanos": local_completion.queue_percentile(0.99).as_nanos(),
+            "processing_p99_nanos": local_completion.processing_percentile(0.99).as_nanos(),
+            "mailbox_full_retries": local_completion.mailbox_full_retries,
+            "maximum_queue_depth": local_completion.maximum_queue_depth,
+        },
+        "remote_actor_tcp_round_trip": {
+            "requests": remote_round_trip.requests,
+            "throughput_per_second": remote_round_trip.throughput_per_second(),
+            "elapsed_nanos": remote_round_trip.elapsed.as_nanos(),
+            "latency_p50_nanos": remote_round_trip.percentile_latency(0.50).as_nanos(),
+            "latency_p95_nanos": remote_round_trip.percentile_latency(0.95).as_nanos(),
+            "latency_p99_nanos": remote_round_trip.percentile_latency(0.99).as_nanos(),
+        },
         "matrix": matrix,
     });
     println!("{}", serde_json::to_string_pretty(&result)?);

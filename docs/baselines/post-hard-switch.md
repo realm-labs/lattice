@@ -142,3 +142,60 @@ runtime/reducer comparison matrix:
 These are single-process microbenchmarks of the named operation, not end-to-end latency claims. Real
 TCP/TLS adapter latency remains acceptance-test evidence rather than being conflated with queue
 admission or pure reducer cost.
+
+## Actor Completion, TCP Round-Trip, and Persistence Baseline
+
+Captured on 2026-07-20 on Apple M1 Max / Darwin 26.5.2 with `rustc 1.97.1`. These workloads add
+completion boundaries that the Association-admission baseline above deliberately does not include.
+
+The timing-only command was:
+
+```text
+cargo bench -p remoting-benchmark --bench remoting_benchmark
+```
+
+For a 128-byte payload, Criterion measured:
+
+| Workload | Batch time | Throughput |
+|---|---:|---:|
+| Local bounded-mailbox Actor completion, 10,000 tells | 5.7837-5.9951 ms | 1.6680-1.7290M completed/s |
+| Loopback TCP Endpoint to remote Actor and reply, 1,000 sequential asks | 91.492-96.004 ms | 10.416-10.930K round trips/s |
+
+The Actor Criterion case waits for every handler acknowledgement but disables its detailed observer.
+The TCP case includes Association lane scheduling, socket I/O, wire decoding, remote Actor mailbox and
+handler execution, reply encoding, and client correlation completion. It uses plain loopback TCP; TLS
+remains a separate future workload.
+
+The allocator-instrumented `measure` command additionally observed the following distribution for one
+10,000-message local completion workload and 1,000 sequential remote asks:
+
+| Measurement | Observed |
+|---|---:|
+| Local completion throughput | 1,331,381/s |
+| Local completion latency p50 / p95 / p99 | 613 / 1,336 / 1,486 us |
+| Local Actor queue time p50 / p95 / p99 | 613 / 1,335 / 1,485 us |
+| Mailbox-full retries / peak depth | 15,939 / 1,024 |
+| Remote round-trip throughput | 9,080/s |
+| Remote round-trip latency p50 / p95 / p99 | 101 / 181 / 207 us |
+
+The observer intentionally adds per-message metric collection overhead, so its throughput is not used
+as the timing regression baseline. Its percentiles describe the saturated bounded-mailbox workload.
+
+The MongoDB persistence framework baseline was captured with:
+
+```text
+cargo bench -p lattice-store-mongodb --bench persistence
+```
+
+The store is an in-memory acknowledger. The measurements therefore include diff scanning, BSON update
+construction, request and per-document outcome allocation, completion validation, cursor/version update,
+and baseline advancement, but exclude MongoDB server and network variance.
+
+| Dirty documents | Prepare → flush → complete | Shutdown drain |
+|---:|---:|---:|
+| 1 | 4.265-4.285 us (233-234K docs/s) | 4.347-4.370 us (229-230K docs/s) |
+| 100 | 417.31-418.25 us (239-240K docs/s) | 423.79-446.48 us (224-236K docs/s) |
+| 1,000 | 5.046-5.213 ms (192-198K docs/s) | 4.979-5.368 ms (186-201K docs/s) |
+
+This baseline uses one scalar and one two-entry Map mutation per document. Real MongoDB latency, larger
+field shapes, partial failures, and budgeted multi-pass drain remain separate benchmark dimensions.

@@ -8,10 +8,7 @@ use tokio::task::JoinHandle;
 pub mod matrix;
 pub mod metrics;
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use lattice_core::actor_ref::{
@@ -28,11 +25,14 @@ use lattice_remoting::{
 };
 use metrics::WorkloadReport;
 
+pub mod actor_completion;
+pub mod end_to_end;
 pub const BENCH_PROTOCOL_ID: u64 = 0x6265_6e63_6800_0001;
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkConfig {
     pub requests: usize,
+    pub round_trip_requests: usize,
     pub payload_bytes: usize,
     pub bulk_stripes: usize,
 }
@@ -41,6 +41,7 @@ impl BenchmarkConfig {
     pub fn from_env() -> Self {
         Self {
             requests: env_usize("LATTICE_BENCH_REQUESTS", 10_000),
+            round_trip_requests: env_usize("LATTICE_BENCH_ROUND_TRIPS", 1_000),
             payload_bytes: env_usize("LATTICE_BENCH_PAYLOAD_BYTES", 128),
             bulk_stripes: env_usize("LATTICE_BENCH_BULK_STRIPES", 1).clamp(1, 4),
         }
@@ -49,6 +50,7 @@ impl BenchmarkConfig {
     pub fn test_default() -> Self {
         Self {
             requests: 256,
+            round_trip_requests: 16,
             payload_bytes: 128,
             bulk_stripes: 4,
         }
@@ -178,7 +180,9 @@ impl RemotingTopology {
             successes,
             errors: requests - successes,
             elapsed: started.elapsed(),
-            latencies: vec![Duration::ZERO; successes],
+            // Admission is not delivery, so this workload deliberately does
+            // not publish synthetic zero-latency samples.
+            latencies: Vec::new(),
             observed_actor_ids: [1].into_iter().collect(),
         })
     }
@@ -216,7 +220,9 @@ impl RemotingTopology {
             successes,
             errors: requests - successes,
             elapsed: started.elapsed(),
-            latencies: vec![Duration::ZERO; successes],
+            // Admission is not delivery, so this workload deliberately does
+            // not publish synthetic zero-latency samples.
+            latencies: Vec::new(),
             observed_actor_ids: [1].into_iter().collect(),
         })
     }

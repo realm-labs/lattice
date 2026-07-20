@@ -57,7 +57,7 @@ impl fmt::Display for WorkloadReport {
     }
 }
 
-fn percentile_duration(latencies: &[Duration], percentile: f64) -> Duration {
+pub(crate) fn percentile_duration(latencies: &[Duration], percentile: f64) -> Duration {
     if latencies.is_empty() {
         return Duration::ZERO;
     }
