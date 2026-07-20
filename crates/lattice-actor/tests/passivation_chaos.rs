@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -22,6 +23,7 @@ struct PassivatingActor {
 
 impl Actor for PassivatingActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn stopping(
         &mut self,
@@ -41,7 +43,7 @@ struct BeginPassivation;
 impl Responder<BeginPassivation> for PassivatingActor {
     async fn respond(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         _request: BeginPassivation,
         reply_to: ReplyTo<()>,
     ) -> Result<(), ActorError> {
@@ -58,7 +60,7 @@ struct Ping;
 impl Responder<Ping> for PassivatingActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: Ping,
         reply_to: ReplyTo<()>,
     ) -> Result<(), ActorError> {

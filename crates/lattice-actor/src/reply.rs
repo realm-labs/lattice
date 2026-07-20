@@ -547,6 +547,7 @@ fn completion_for_error(error: &ActorCallError) -> RequestCompletion {
         ActorCallError::LifecycleUnavailable { .. } => RequestCompletion::LifecycleUnavailable,
         ActorCallError::ResponseDropped => RequestCompletion::ResponseDropped,
         ActorCallError::DeadlineExceeded => RequestCompletion::DeadlineExceeded,
+        ActorCallError::UnhandledInCurrentState => RequestCompletion::UnhandledInCurrentState,
         ActorCallError::Handler(_) => RequestCompletion::HandlerFailed,
     }
 }

@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -7,7 +8,6 @@ use std::{
 
 use bytes::Bytes;
 use lattice_actor::{
-    context::ActorContext,
     error::{ActorError, ActorTellError},
     mailbox::MailboxConfig,
     registry::{ActorRegistry, ActorRegistryConfig},
@@ -56,12 +56,13 @@ struct BenchTell;
 
 impl Actor for BenchActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Handler<BenchTell> for BenchActor {
     async fn handle(
         &mut self,
-        _context: &mut ActorContext<Self>,
+        _context: &mut HandlerContext<'_, Self>,
         _message: BenchTell,
     ) -> Result<(), Self::Error> {
         Ok(())

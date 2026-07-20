@@ -1,10 +1,10 @@
+use lattice_actor::context::HandlerContext;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::BytesMut;
 use lattice_actor::actor_protocol;
-use lattice_actor::context::ActorContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::protocol::{
     ActorProtocolBinding, CodecDescriptor, DecodeError, EncodeError, Protocol, WireCodec,
@@ -75,12 +75,13 @@ struct SourceActor;
 
 impl Actor for SourceActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Handler<SendTo> for SourceActor {
     async fn handle(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         message: SendTo,
     ) -> Result<(), ActorError> {
         ctx.tell(&message.target, Delivered).await?;
@@ -95,12 +96,13 @@ struct SinkActor {
 
 impl Actor for SinkActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Handler<Delivered> for SinkActor {
     async fn handle(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         _message: Delivered,
     ) -> Result<(), ActorError> {
         if let Some(observed) = self.observed.lock().expect("observer poisoned").take() {

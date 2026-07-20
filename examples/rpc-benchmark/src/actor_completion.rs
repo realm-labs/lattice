@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::{
     error::Error,
     sync::atomic::{AtomicUsize, Ordering},
@@ -7,7 +8,6 @@ use std::{
 
 use bytes::Bytes;
 use lattice_actor::{
-    context::ActorContext,
     error::{ActorError, ActorTellError},
     mailbox::MailboxConfig,
     observation::{ActorMetadata, ActorObserver, ActorObserverHandle},
@@ -151,12 +151,13 @@ struct CompletionActor {
 
 impl Actor for CompletionActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Handler<CompletionTell> for CompletionActor {
     async fn handle(
         &mut self,
-        _context: &mut ActorContext<Self>,
+        _context: &mut HandlerContext<'_, Self>,
         message: CompletionTell,
     ) -> Result<(), Self::Error> {
         self.processed_bytes = self.processed_bytes.wrapping_add(message.payload.len());
@@ -168,7 +169,7 @@ impl Handler<CompletionTell> for CompletionActor {
 impl Handler<RawCompletionTell> for CompletionActor {
     async fn handle(
         &mut self,
-        _context: &mut ActorContext<Self>,
+        _context: &mut HandlerContext<'_, Self>,
         message: RawCompletionTell,
     ) -> Result<(), Self::Error> {
         self.processed_bytes = self.processed_bytes.wrapping_add(message.payload.len());
@@ -179,7 +180,7 @@ impl Handler<RawCompletionTell> for CompletionActor {
 impl Handler<CompletionBarrier> for CompletionActor {
     async fn handle(
         &mut self,
-        _context: &mut ActorContext<Self>,
+        _context: &mut HandlerContext<'_, Self>,
         message: CompletionBarrier,
     ) -> Result<(), Self::Error> {
         message.completed.notify_one();

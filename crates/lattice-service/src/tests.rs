@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::{
     collections::BTreeSet,
     pin::Pin,
@@ -132,12 +133,13 @@ impl ActorLoader<PingActor> for PingLoader {
 
 impl Actor for PingActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Responder<Ping> for PingActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         request: Ping,
         reply_to: ReplyTo<Pong>,
     ) -> Result<(), ActorError> {
@@ -238,6 +240,7 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
 
     impl Actor for ForceShutdownActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
 
         async fn stopping(
             &mut self,
@@ -251,7 +254,7 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
     impl Responder<Ping> for ForceShutdownActor {
         async fn respond(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             request: Ping,
             reply_to: ReplyTo<Pong>,
         ) -> Result<(), ActorError> {
@@ -359,6 +362,7 @@ async fn service_retry_api_resolves_retained_actor_cell() {
 
     impl Actor for RetryShutdownActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
 
         async fn stopping(
             &mut self,
@@ -375,7 +379,7 @@ async fn service_retry_api_resolves_retained_actor_cell() {
     impl Responder<Ping> for RetryShutdownActor {
         async fn respond(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             request: Ping,
             reply_to: ReplyTo<Pong>,
         ) -> Result<(), ActorError> {

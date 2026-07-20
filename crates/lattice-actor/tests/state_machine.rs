@@ -1,32 +1,33 @@
+use lattice_actor::context::HandlerContext;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use lattice_actor::context::ActorContext;
-use lattice_actor::error::ActorError;
+use lattice_actor::actor_behavior;
+use lattice_actor::error::{ActorCallError, ActorError};
 use lattice_actor::reply::ReplyTo;
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
+use lattice_actor::state_machine::Accepts;
 use lattice_actor::traits::{Actor, Handler, Responder};
 
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum MatchState {
+    #[default]
     Loading,
     WaitingPlayers,
-    Running { tick: u64 },
+    Running {
+        tick: u64,
+    },
 }
 
 struct MatchActor {
-    state: MatchState,
     pending_starts: VecDeque<StartMatch>,
 }
 
 impl Actor for MatchActor {
     type Error = ActorError;
-    async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
-        ctx.notify_after(Duration::from_millis(10), LoadingFinished);
-        Ok(())
-    }
+    type Behavior = MatchState;
 }
 
 #[derive(Debug, Clone, Copy, lattice_actor::Request)]
@@ -51,14 +52,31 @@ struct WorldTick;
 #[request(response = (MatchState, Vec<u64>))]
 struct InspectState;
 
+#[derive(Debug, lattice_actor::Request)]
+#[request(response = u64)]
+struct CurrentTick;
+
+actor_behavior! {
+    MatchState {
+        always => [StartMatch, InspectState];
+        MatchState::Loading => [LoadingFinished];
+        MatchState::Running { .. } => [WorldTick, CurrentTick];
+    }
+}
+
+const _: () = {
+    assert!(<MatchState as Accepts<StartMatch>>::ALWAYS);
+    assert!(!<MatchState as Accepts<WorldTick>>::ALWAYS);
+};
+
 impl Responder<StartMatch> for MatchActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         request: StartMatch,
         reply_to: ReplyTo<StartMatchReply>,
     ) -> Result<(), ActorError> {
-        let reply = match self.state {
+        let reply = match ctx.behavior() {
             MatchState::Loading => {
                 self.pending_starts.push_back(request);
                 StartMatchReply {
@@ -67,7 +85,7 @@ impl Responder<StartMatch> for MatchActor {
                 }
             }
             MatchState::WaitingPlayers => {
-                self.state = MatchState::Running { tick: 0 };
+                ctx.transition_to(MatchState::Running { tick: 0 });
                 StartMatchReply {
                     accepted: true,
                     queued: false,
@@ -86,12 +104,12 @@ impl Responder<StartMatch> for MatchActor {
 impl Handler<LoadingFinished> for MatchActor {
     async fn handle(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         _msg: LoadingFinished,
     ) -> Result<(), ActorError> {
-        self.state = MatchState::WaitingPlayers;
+        ctx.transition_to(MatchState::WaitingPlayers);
         if self.pending_starts.pop_front().is_some() {
-            self.state = MatchState::Running { tick: 0 };
+            ctx.transition_to(MatchState::Running { tick: 0 });
             ctx.notify_after(Duration::from_millis(10), WorldTick);
         }
         Ok(())
@@ -101,12 +119,13 @@ impl Handler<LoadingFinished> for MatchActor {
 impl Handler<WorldTick> for MatchActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         _msg: WorldTick,
     ) -> Result<(), ActorError> {
-        if let MatchState::Running { tick } = &mut self.state {
-            *tick += 1;
-        }
+        let MatchState::Running { tick } = ctx.behavior_mut() else {
+            unreachable!("state admission guarantees WorldTick is handled only while running")
+        };
+        *tick += 1;
         Ok(())
     }
 }
@@ -114,12 +133,12 @@ impl Handler<WorldTick> for MatchActor {
 impl Responder<InspectState> for MatchActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         _request: InspectState,
         reply_to: ReplyTo<(MatchState, Vec<u64>)>,
     ) -> Result<(), ActorError> {
         let _ = reply_to.send((
-            self.state,
+            *ctx.behavior(),
             self.pending_starts
                 .iter()
                 .map(|start| start.operation_id)
@@ -129,19 +148,44 @@ impl Responder<InspectState> for MatchActor {
     }
 }
 
+impl Responder<CurrentTick> for MatchActor {
+    async fn respond(
+        &mut self,
+        ctx: &mut HandlerContext<'_, Self>,
+        _request: CurrentTick,
+        reply_to: ReplyTo<u64>,
+    ) -> Result<(), ActorError> {
+        let MatchState::Running { tick } = ctx.behavior() else {
+            unreachable!("state admission guarantees CurrentTick is handled only while running")
+        };
+        let _ = reply_to.send(*tick);
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn business_actor_models_state_machine_with_typed_messages_and_timer() {
+    assert!(!Accepts::<WorldTick>::accepts(&MatchState::Loading));
+    assert!(Accepts::<WorldTick>::accepts(&MatchState::Running {
+        tick: 0
+    }));
+
     let runtime = ActorRuntime::default();
     let handle = runtime
         .spawn_actor(
             MatchActor {
-                state: MatchState::Loading,
                 pending_starts: VecDeque::new(),
             },
             ActorSpawnOptions::default(),
         )
         .await
         .unwrap();
+
+    handle.try_tell(WorldTick).unwrap();
+    assert!(matches!(
+        handle.ask(CurrentTick, ASK_TIMEOUT).await,
+        Err(ActorCallError::UnhandledInCurrentState)
+    ));
 
     let reply = handle
         .ask(StartMatch { operation_id: 7 }, ASK_TIMEOUT)
@@ -158,6 +202,7 @@ async fn business_actor_models_state_machine_with_typed_messages_and_timer() {
         handle.ask(InspectState, ASK_TIMEOUT).await.unwrap(),
         (MatchState::Loading, vec![7])
     );
+    handle.try_tell(LoadingFinished).unwrap();
 
     let (state, pending) = tokio::time::timeout(Duration::from_millis(250), async {
         loop {
@@ -173,4 +218,5 @@ async fn business_actor_models_state_machine_with_typed_messages_and_timer() {
 
     assert!(matches!(state, MatchState::Running { tick } if tick >= 1));
     assert!(pending.is_empty());
+    assert!(handle.ask(CurrentTick, ASK_TIMEOUT).await.unwrap() >= 1);
 }

@@ -513,6 +513,7 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
     pub fn tell<M, C>(mut self, message_id: u64, schema_version: u32, codec: C) -> Self
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
         C: WireCodec<M>,
     {
@@ -546,6 +547,7 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
     ) -> Self
     where
         A: Responder<Q>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<Q>,
         Q: Request,
         C: WireCodec<Q>,
         RC: WireCodec<Q::Response>,
@@ -808,7 +810,12 @@ macro_rules! actor_protocol {
         $crate::actor_protocol!(@collect
             [$($meta)*] [$visibility] [$name] [$protocol_id] [$protocol_name]
             [$($bindings)*]
-            [$($bounds)* A: $crate::traits::Handler<$message>,]
+            [
+                $($bounds)*
+                A: $crate::traits::Handler<$message>,
+                <A as $crate::traits::Actor>::Behavior:
+                    $crate::state_machine::Accepts<$message>,
+            ]
             [$($remaining)*]
         );
     };
@@ -824,7 +831,12 @@ macro_rules! actor_protocol {
         $crate::actor_protocol!(@collect
             [$($meta)*] [$visibility] [$name] [$protocol_id] [$protocol_name]
             [$($bindings)*]
-            [$($bounds)* A: $crate::traits::Responder<$message>,]
+            [
+                $($bounds)*
+                A: $crate::traits::Responder<$message>,
+                <A as $crate::traits::Actor>::Behavior:
+                    $crate::state_machine::Accepts<$message>,
+            ]
             [$($remaining)*]
         );
     };
@@ -934,7 +946,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        context::ActorContext, error::ActorError, mailbox::MailboxConfig, reply::ReplyTo,
+        context::HandlerContext, error::ActorError, mailbox::MailboxConfig, reply::ReplyTo,
         runtime::spawn_actor,
     };
 
@@ -944,6 +956,7 @@ mod tests {
 
     impl Actor for TestActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
     }
 
     #[derive(Clone, crate::Message)]
@@ -1005,7 +1018,7 @@ mod tests {
     impl Handler<Tell> for TestActor {
         async fn handle(
             &mut self,
-            ctx: &mut ActorContext<Self>,
+            ctx: &mut HandlerContext<'_, Self>,
             _msg: Tell,
         ) -> Result<(), Self::Error> {
             if let Some(observed_sender) = self.observed_sender.take() {
@@ -1018,7 +1031,7 @@ mod tests {
     impl Responder<Ask> for TestActor {
         async fn respond(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             request: Ask,
             reply_to: ReplyTo<u64>,
         ) -> Result<(), Self::Error> {

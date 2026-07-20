@@ -1,8 +1,13 @@
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::Span;
-use quote::quote;
-use syn::{Attribute, DeriveInput, Ident, Type, parse_macro_input, parse_quote};
+use quote::{ToTokens, quote};
+use std::collections::BTreeMap;
+use syn::parse::{Parse, ParseStream};
+use syn::{
+    Attribute, DeriveInput, Ident, Pat, Token, Type, braced, bracketed, parse_macro_input,
+    parse_quote, punctuated::Punctuated,
+};
 
 /// Implements `lattice_actor::traits::Message` for a type.
 #[proc_macro_derive(Message)]
@@ -22,6 +27,118 @@ pub fn derive_request(input: TokenStream) -> TokenStream {
     expand_request(&input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
+}
+
+/// Declares the messages accepted by each variant of an actor behavior.
+#[proc_macro]
+pub fn actor_behavior(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as BehaviorInput);
+    expand_actor_behavior(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+struct BehaviorInput {
+    behavior: Type,
+    entries: Vec<BehaviorEntry>,
+}
+
+struct BehaviorEntry {
+    pattern: Option<Pat>,
+    messages: Vec<Type>,
+}
+
+impl Parse for BehaviorInput {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let behavior = input.parse()?;
+        let body;
+        braced!(body in input);
+        let mut entries = Vec::new();
+        while !body.is_empty() {
+            let pattern = if body.peek(Ident) && body.peek2(Token![=>]) {
+                let ident: Ident = body.parse()?;
+                if ident != "always" {
+                    return Err(syn::Error::new_spanned(
+                        ident,
+                        "expected a state pattern or `always`",
+                    ));
+                }
+                None
+            } else {
+                Some(body.call(Pat::parse_multi)?)
+            };
+            body.parse::<Token![=>]>()?;
+            let messages;
+            bracketed!(messages in body);
+            let messages = Punctuated::<Type, Token![,]>::parse_terminated(&messages)?
+                .into_iter()
+                .collect();
+            entries.push(BehaviorEntry { pattern, messages });
+            if body.peek(Token![;]) {
+                body.parse::<Token![;]>()?;
+            } else if !body.is_empty() {
+                return Err(body.error("expected `;` after behavior state entry"));
+            }
+        }
+        Ok(Self { behavior, entries })
+    }
+}
+
+fn expand_actor_behavior(input: BehaviorInput) -> syn::Result<proc_macro2::TokenStream> {
+    let actor = actor_crate_path()?;
+    let behavior = input.behavior;
+    let mut messages: BTreeMap<String, (Type, bool, Vec<Pat>)> = BTreeMap::new();
+    for entry in input.entries {
+        for message in entry.messages {
+            let key = message.to_token_stream().to_string();
+            let definition = messages
+                .entry(key)
+                .or_insert_with(|| (message, false, Vec::new()));
+            match &entry.pattern {
+                None if definition.1 || !definition.2.is_empty() => {
+                    return Err(syn::Error::new_spanned(
+                        &definition.0,
+                        "message may be declared either `always` or in individual states, not both",
+                    ));
+                }
+                None => definition.1 = true,
+                Some(pattern) if definition.1 => {
+                    return Err(syn::Error::new_spanned(
+                        &definition.0,
+                        "message may be declared either `always` or in individual states, not both",
+                    ));
+                }
+                Some(pattern) => definition.2.push(pattern.clone()),
+            }
+        }
+    }
+
+    let filters = messages.into_values().map(|(message, always, patterns)| {
+        if always {
+            quote! {
+                impl #actor::state_machine::Accepts<#message> for #behavior {
+                    const ALWAYS: bool = true;
+
+                    #[inline(always)]
+                    fn accepts(&self) -> bool { true }
+                }
+            }
+        } else {
+            quote! {
+                impl #actor::state_machine::Accepts<#message> for #behavior {
+                    #[inline]
+                    fn accepts(&self) -> bool {
+                        ::core::matches!(self, #(#patterns)|*)
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(quote! {
+        impl #actor::state_machine::Behavior for #behavior {}
+        #(#filters)*
+    })
 }
 
 fn expand_message(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {

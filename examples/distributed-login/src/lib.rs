@@ -1,4 +1,5 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
+use lattice_actor::context::HandlerContext;
 
 use std::{
     collections::BTreeSet, error::Error as StdError, io::Error as IoError, sync::Arc,
@@ -7,7 +8,6 @@ use std::{
 
 use lattice_actor::{
     actor_protocol,
-    context::ActorContext,
     error::ActorError,
     protocol::ProstCodec,
     registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig},
@@ -45,12 +45,13 @@ pub struct WorldActor {
 
 impl Actor for WorldActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Responder<LoginRequest> for WorldActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         request: LoginRequest,
         reply_to: ReplyTo<LoginAcceptedReply>,
     ) -> Result<(), ActorError> {
@@ -74,12 +75,13 @@ pub struct PlayerActor {
 
 impl Actor for PlayerActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Responder<InitSessionRequest> for PlayerActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         request: InitSessionRequest,
         reply_to: ReplyTo<InitSessionReply>,
     ) -> Result<(), ActorError> {

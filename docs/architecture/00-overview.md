@@ -338,6 +338,13 @@ Routing rules:
 
 Tell and ask are protocol modes registered by `ActorProtocol` and distinct typed business interactions. A tell uses `Message` plus `Handler<M>` and has no response capability. Actor-originated tells carry an optional exact sender reference: `tell` uses the current actor, while `forward` preserves the incoming sender. An ask uses `Request` plus `Responder<R>`, registers the codec for `R::Response`, and receives a single-use `ReplyTo<R::Response>`; it does not use the envelope sender as a reply channel. General asynchronous work returns through a bounded `ActorContext::pipe_to_self` continuation. Request-aware work uses `ActorContext::defer_reply` so the continuation preserves the ask deadline and can safely reply using current actor state.
 
+Stateful message admission is opt-in. An actor selects a typed `Behavior`, declares the messages
+accepted by each state with `actor_behavior!`, and changes behavior through its message-scoped
+`HandlerContext`. Admission is generated as `Accepts<M>` for each concrete message type, avoiding
+type-erased lookup. Messages not accepted by the current state do not enter their typed handler;
+rejected asks complete explicitly. Ordinary actors select the zero-sized `Stateless` behavior, whose
+compile-time `ALWAYS` policy removes the admission branch.
+
 ### 4.3 Membership and Placement-Domain State Distribution
 
 ```mermaid

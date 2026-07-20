@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::{
     sync::{
         Arc,
@@ -31,6 +32,7 @@ struct SlowActor;
 
 impl Actor for SlowActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
     async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         Ok(())
     }
@@ -117,7 +119,7 @@ impl Message for Probe {}
 impl Handler<Probe> for SelfRefActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _message: Probe,
     ) -> Result<(), ActorError> {
         Ok(())
@@ -137,6 +139,7 @@ actor_protocol! {
 
 impl Actor for SelfRefActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         if let Some(tx) = self.tx.take() {
             let _ = tx.send(ctx.require_self_ref()?.clone());
@@ -217,6 +220,7 @@ impl Drop for RetainedRegistryActor {
 
 impl Actor for RetainedRegistryActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn stopping(
         &mut self,
@@ -509,6 +513,7 @@ async fn authority_loss_during_stopping_finishes_in_non_authoritative_quarantine
 
     impl Actor for ConcurrentFenceActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
 
         async fn stopping(
             &mut self,

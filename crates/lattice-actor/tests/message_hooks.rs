@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::any::type_name;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -54,6 +55,7 @@ struct HookActor {
 
 impl Actor for HookActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     fn before_message(&mut self, _ctx: &mut ActorContext<Self>, message: MessageView<'_>) {
         let payload = if let Some(message) = message.downcast_ref::<PayloadTell>() {
@@ -101,7 +103,7 @@ impl Actor for HookActor {
 impl Handler<PayloadTell> for HookActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _message: PayloadTell,
     ) -> Result<(), ActorError> {
         Ok(())
@@ -111,7 +113,7 @@ impl Handler<PayloadTell> for HookActor {
 impl Responder<PayloadRequest> for HookActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         request: PayloadRequest,
         reply_to: ReplyTo<String>,
     ) -> Result<(), ActorError> {
@@ -123,7 +125,7 @@ impl Responder<PayloadRequest> for HookActor {
 impl Handler<FailingTell> for HookActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _message: FailingTell,
     ) -> Result<(), ActorError> {
         Err(ActorError::new("expected tell failure"))
@@ -133,7 +135,7 @@ impl Handler<FailingTell> for HookActor {
 impl Responder<RecoveredRequest> for HookActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: RecoveredRequest,
         _reply_to: ReplyTo<&'static str>,
     ) -> Result<(), ActorError> {
@@ -142,7 +144,7 @@ impl Responder<RecoveredRequest> for HookActor {
 
     async fn respond_error(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _error: ActorError,
     ) -> ResponderErrorAction<&'static str, ActorError> {
         ResponderErrorAction::Respond("recovered")

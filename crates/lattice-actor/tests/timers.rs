@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ struct WorldActor {
 
 impl Actor for WorldActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         ctx.notify_interval(Duration::from_millis(5), || WorldTick { delta_ms: 5 });
         Ok(())
@@ -44,7 +46,7 @@ struct InspectTicks;
 impl Handler<WorldTick> for WorldActor {
     async fn handle(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         msg: WorldTick,
     ) -> Result<(), ActorError> {
         assert_eq!(msg.delta_ms, 5);
@@ -60,7 +62,7 @@ impl Handler<WorldTick> for WorldActor {
 impl Responder<InspectTicks> for WorldActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: InspectTicks,
         reply_to: ReplyTo<u64>,
     ) -> Result<(), ActorError> {

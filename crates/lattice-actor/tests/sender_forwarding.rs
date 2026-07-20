@@ -1,4 +1,4 @@
-use lattice_actor::context::ActorContext;
+use lattice_actor::context::HandlerContext;
 use lattice_actor::error::ActorError;
 use lattice_actor::handle::ActorHandle;
 use lattice_actor::runtime::{ActorRuntime, ActorSpawnOptions};
@@ -22,14 +22,17 @@ struct SourceActor {
 
 impl Actor for TargetActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Actor for ForwarderActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Actor for SourceActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 #[derive(lattice_actor::Message)]
@@ -46,7 +49,7 @@ struct Delivered;
 impl Handler<Start> for SourceActor {
     async fn handle(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         _message: Start,
     ) -> Result<(), ActorError> {
         ctx.tell_local(
@@ -68,7 +71,7 @@ impl Handler<Start> for SourceActor {
 impl Handler<Relay> for ForwarderActor {
     async fn handle(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         message: Relay,
     ) -> Result<(), ActorError> {
         if message.preserve_sender {
@@ -83,7 +86,7 @@ impl Handler<Relay> for ForwarderActor {
 impl Handler<Delivered> for TargetActor {
     async fn handle(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         _message: Delivered,
     ) -> Result<(), ActorError> {
         let sender = ctx

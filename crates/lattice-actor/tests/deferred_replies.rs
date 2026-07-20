@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::{
     sync::{
         Arc,
@@ -7,7 +8,6 @@ use std::{
 };
 
 use lattice_actor::{
-    context::ActorContext,
     error::{ActorCallError, ActorError},
     handle::ActorHandle,
     mailbox::MailboxConfig,
@@ -26,6 +26,7 @@ struct DeferredActor {
 
 impl Actor for DeferredActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 #[derive(lattice_actor::Request)]
@@ -48,7 +49,7 @@ struct SetValue(u64);
 impl Responder<Query> for DeferredActor {
     async fn respond(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         request: Query,
         reply_to: ReplyTo<u64>,
     ) -> Result<(), ActorError> {
@@ -75,7 +76,7 @@ impl Responder<Query> for DeferredActor {
 impl Handler<QueryReady> for DeferredActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         message: QueryReady,
     ) -> Result<(), ActorError> {
         self.continuations.fetch_add(1, Ordering::SeqCst);
@@ -87,7 +88,7 @@ impl Handler<QueryReady> for DeferredActor {
 impl Handler<SetValue> for DeferredActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         message: SetValue,
     ) -> Result<(), ActorError> {
         self.value = message.0;
@@ -105,7 +106,7 @@ struct FailAfterPipe {
 impl Responder<FailAfterPipe> for DeferredActor {
     async fn respond(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         request: FailAfterPipe,
         reply_to: ReplyTo<u64>,
     ) -> Result<(), ActorError> {
@@ -139,7 +140,7 @@ struct ReplyThenFail;
 impl Responder<ReplyThenFail> for DeferredActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: ReplyThenFail,
         reply_to: ReplyTo<u64>,
     ) -> Result<(), ActorError> {
@@ -151,7 +152,7 @@ impl Responder<ReplyThenFail> for DeferredActor {
 impl Responder<ForgetReply> for DeferredActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: ForgetReply,
         _reply_to: ReplyTo<()>,
     ) -> Result<(), ActorError> {

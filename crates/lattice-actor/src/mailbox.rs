@@ -6,7 +6,7 @@ use lattice_core::actor_ref::ActorRef;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
-use crate::context::ActorContext;
+use crate::context::{ActorContext, HandlerContext};
 use crate::error::{ActorAdminError, ActorCallError};
 use crate::handle::ForceStopAuthorization;
 use crate::observation::{RequestCompletion, RequestObservation};
@@ -121,6 +121,7 @@ pub(crate) trait ActorEnvelope<A: Actor>: Send {
     async fn handle(
         &mut self,
         actor: &mut A,
+        behavior: &mut A::Behavior,
         ctx: &mut ActorContext<A>,
         metadata: &MessageMetadata,
     ) -> MessageOutcome;
@@ -168,6 +169,7 @@ impl<M: Message> TellEnvelope<M> {
 impl<A, M> ActorEnvelope<A> for TellEnvelope<M>
 where
     A: Handler<M>,
+    <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
     M: Message,
 {
     fn metadata(&self, lane: MailboxLane) -> MessageMetadata {
@@ -183,6 +185,7 @@ where
     async fn handle(
         &mut self,
         actor: &mut A,
+        behavior: &mut A::Behavior,
         ctx: &mut ActorContext<A>,
         metadata: &MessageMetadata,
     ) -> MessageOutcome {
@@ -196,11 +199,23 @@ where
             .as_ref()
             .expect("tell envelope message is present before dispatch");
         actor.before_message(ctx, MessageView::new(metadata, msg));
+        if !<A::Behavior as crate::state_machine::Accepts<M>>::ALWAYS
+            && !crate::state_machine::Accepts::<M>::accepts(behavior)
+        {
+            let outcome = MessageOutcome::Rejected(MessageRejection::UnhandledInCurrentState);
+            actor.after_message(ctx, metadata, outcome);
+            ctx.clear_sender();
+            ctx.set_current_deadline(None);
+            return outcome;
+        }
         let msg = self
             .msg
             .take()
             .expect("tell envelope message is present before dispatch");
-        let outcome = match actor.handle(ctx, msg).await {
+        let outcome = match actor
+            .handle(&mut HandlerContext::new(ctx, behavior), msg)
+            .await
+        {
             Ok(()) => MessageOutcome::Handled,
             Err(error) => {
                 warn!(message.type = type_name::<M>(), %error, "tell handler returned error");
@@ -219,6 +234,7 @@ where
 impl<A, R> ActorEnvelope<A> for RequestEnvelope<R>
 where
     A: Responder<R>,
+    <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<R>,
     R: Request,
 {
     fn metadata(&self, lane: MailboxLane) -> MessageMetadata {
@@ -245,6 +261,7 @@ where
     async fn handle(
         &mut self,
         actor: &mut A,
+        behavior: &mut A::Behavior,
         ctx: &mut ActorContext<A>,
         metadata: &MessageMetadata,
     ) -> MessageOutcome {
@@ -274,6 +291,18 @@ where
             ctx.set_current_deadline(None);
             return outcome;
         }
+        if !<A::Behavior as crate::state_machine::Accepts<R>>::ALWAYS
+            && !crate::state_machine::Accepts::<R>::accepts(behavior)
+        {
+            if let Some(reply_tx) = self.reply_tx.take() {
+                let _ = reply_tx.send(Err(ActorCallError::UnhandledInCurrentState));
+            }
+            observation.complete(RequestCompletion::UnhandledInCurrentState);
+            let outcome = MessageOutcome::Rejected(MessageRejection::UnhandledInCurrentState);
+            actor.after_message(ctx, metadata, outcome);
+            ctx.set_current_deadline(None);
+            return outcome;
+        }
         let reply_tx = self
             .reply_tx
             .take()
@@ -291,7 +320,10 @@ where
             .request
             .take()
             .expect("request envelope message is present");
-        let outcome = match actor.respond(ctx, request, reply_to).await {
+        let outcome = match actor
+            .respond(&mut HandlerContext::new(ctx, behavior), request, reply_to)
+            .await
+        {
             Ok(()) => {
                 control.handler_succeeded();
                 MessageOutcome::Handled
@@ -303,7 +335,10 @@ where
                     "actor responder returned error"
                 );
                 actor.on_error::<R>(ctx, metadata, &error).await;
-                match actor.respond_error(ctx, error).await {
+                match actor
+                    .respond_error(&mut HandlerContext::new(ctx, behavior), error)
+                    .await
+                {
                     ResponderErrorAction::Respond(response) => {
                         debug!(
                             message.type = type_name::<R>(),

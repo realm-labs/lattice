@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -152,12 +153,13 @@ struct PersistenceActor {
 
 impl Actor for PersistenceActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Handler<Persist> for PersistenceActor {
     async fn handle(
         &mut self,
-        context: &mut ActorContext<Self>,
+        context: &mut HandlerContext<'_, Self>,
         _message: Persist,
     ) -> Result<(), Self::Error> {
         let prepared = self
@@ -189,7 +191,7 @@ impl Handler<Persist> for PersistenceActor {
 impl Handler<AbortPersist> for PersistenceActor {
     async fn handle(
         &mut self,
-        _context: &mut ActorContext<Self>,
+        _context: &mut HandlerContext<'_, Self>,
         _message: AbortPersist,
     ) -> Result<(), Self::Error> {
         let generation = self
@@ -206,7 +208,7 @@ impl Handler<AbortPersist> for PersistenceActor {
 impl Handler<MongoFlushCompleted> for PersistenceActor {
     async fn handle(
         &mut self,
-        _context: &mut ActorContext<Self>,
+        _context: &mut HandlerContext<'_, Self>,
         completion: MongoFlushCompleted,
     ) -> Result<(), Self::Error> {
         let status = self
@@ -263,6 +265,7 @@ struct StoppingDrainActor {
 
 impl Actor for StoppingDrainActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn stopping(
         &mut self,
@@ -284,7 +287,7 @@ impl Actor for StoppingDrainActor {
 impl Handler<Persist> for StoppingDrainActor {
     async fn handle(
         &mut self,
-        context: &mut ActorContext<Self>,
+        context: &mut HandlerContext<'_, Self>,
         _message: Persist,
     ) -> Result<(), Self::Error> {
         let prepared = self
@@ -303,7 +306,7 @@ impl Handler<Persist> for StoppingDrainActor {
 impl Handler<MongoFlushCompleted> for StoppingDrainActor {
     async fn handle(
         &mut self,
-        _context: &mut ActorContext<Self>,
+        _context: &mut HandlerContext<'_, Self>,
         completion: MongoFlushCompleted,
     ) -> Result<(), Self::Error> {
         self.coordinator

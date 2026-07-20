@@ -209,6 +209,7 @@ impl<A: Actor> ActorHandle<A> {
     pub async fn ask<R>(&self, request: R, timeout: Duration) -> Result<R::Response, ActorCallError>
     where
         A: Responder<R>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<R>,
         R: Request,
     {
         if timeout.is_zero() {
@@ -227,6 +228,7 @@ impl<A: Actor> ActorHandle<A> {
     ) -> Result<R::Response, ActorCallError>
     where
         A: Responder<R>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<R>,
         R: Request,
     {
         if Instant::now() >= deadline {
@@ -249,6 +251,7 @@ impl<A: Actor> ActorHandle<A> {
     ) -> Result<R::Response, ActorCallError>
     where
         A: Responder<R>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<R>,
         R: Request,
     {
         if Instant::now() >= deadline {
@@ -267,6 +270,7 @@ impl<A: Actor> ActorHandle<A> {
     pub async fn tell<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
         self.try_tell_on_lane(msg, None, MailboxLane::Normal)
@@ -275,6 +279,7 @@ impl<A: Actor> ActorHandle<A> {
     pub fn try_tell<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
         self.try_tell_on_lane(msg, None, MailboxLane::Normal)
@@ -384,6 +389,7 @@ impl<A: Actor> ActorHandle<A> {
     pub(crate) fn try_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
         self.try_tell_on_lane(msg, None, MailboxLane::Normal)
@@ -392,6 +398,7 @@ impl<A: Actor> ActorHandle<A> {
     pub(crate) async fn send_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
         let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg, None)));
@@ -521,6 +528,7 @@ impl<A: Actor> ActorHandle<A> {
     pub(crate) fn try_tell_for_test<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
         self.try_tell_on_lane(msg, None, MailboxLane::Normal)
@@ -530,6 +538,7 @@ impl<A: Actor> ActorHandle<A> {
     pub(crate) fn try_tell_system_for_test<M>(&self, msg: M) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
         self.try_tell_on_lane(msg, None, MailboxLane::System)
@@ -542,6 +551,7 @@ impl<A: Actor> ActorHandle<A> {
     ) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
         self.try_tell_on_lane(msg, sender, MailboxLane::Normal)
@@ -555,6 +565,7 @@ impl<A: Actor> ActorHandle<A> {
     ) -> Result<(), ActorTellError>
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
         let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg, sender)));
@@ -666,6 +677,7 @@ impl From<ActorCallError> for ActorTellError {
             ActorCallError::LifecycleUnavailable { state } => Self::LifecycleUnavailable { state },
             ActorCallError::ResponseDropped
             | ActorCallError::DeadlineExceeded
+            | ActorCallError::UnhandledInCurrentState
             | ActorCallError::Handler(_) => Self::MailboxClosed,
         }
     }

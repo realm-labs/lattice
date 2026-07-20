@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::{
     error::Error,
     sync::Arc,
@@ -7,7 +8,6 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_actor::{
-    context::ActorContext,
     error::{ActorCallError, ActorError},
     handle::ActorHandle,
     registry::{ActorRegistry, ActorRegistryConfig},
@@ -48,12 +48,13 @@ struct EchoActor;
 
 impl Actor for EchoActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Responder<EchoRequest> for EchoActor {
     async fn respond(
         &mut self,
-        _context: &mut ActorContext<Self>,
+        _context: &mut HandlerContext<'_, Self>,
         request: EchoRequest,
         reply_to: ReplyTo<Bytes>,
     ) -> Result<(), Self::Error> {
@@ -128,9 +129,9 @@ fn map_actor_error(error: ActorCallError) -> RemoteMessageError {
         | ActorCallError::MailboxClosed
         | ActorCallError::LifecycleUnavailable { .. } => RemoteMessageError::MailboxRejected,
         ActorCallError::ActorPanicked => RemoteMessageError::ActorPanicked,
-        ActorCallError::ResponseDropped | ActorCallError::Handler(_) => {
-            RemoteMessageError::HandlerFailed
-        }
+        ActorCallError::ResponseDropped
+        | ActorCallError::UnhandledInCurrentState
+        | ActorCallError::Handler(_) => RemoteMessageError::HandlerFailed,
     }
 }
 

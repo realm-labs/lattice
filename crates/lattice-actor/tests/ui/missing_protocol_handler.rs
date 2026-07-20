@@ -23,6 +23,7 @@ struct MissingHandlerActor;
 
 impl Actor for MissingHandlerActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 fn main() {

@@ -1,4 +1,5 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
+use lattice_actor::context::HandlerContext;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -316,6 +317,7 @@ impl EntityFixture {
 
 impl Actor for PingActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, context: &mut ActorContext<Self>) -> Result<(), Self::Error> {
         let Some(reference) = self.child_reference.take() else {
@@ -348,7 +350,7 @@ impl Actor for PingActor {
 impl Responder<Ping> for PingActor {
     async fn respond(
         &mut self,
-        _context: &mut ActorContext<Self>,
+        _context: &mut HandlerContext<'_, Self>,
         request: Ping,
         reply_to: ReplyTo<Pong>,
     ) -> Result<(), ActorError> {
@@ -360,7 +362,7 @@ impl Responder<Ping> for PingActor {
 impl Handler<StopPing> for PingActor {
     async fn handle(
         &mut self,
-        context: &mut ActorContext<Self>,
+        context: &mut HandlerContext<'_, Self>,
         _message: StopPing,
     ) -> Result<(), ActorError> {
         context.request_stop();

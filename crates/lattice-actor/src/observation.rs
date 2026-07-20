@@ -88,6 +88,7 @@ pub enum RequestCompletion {
     RecoveredReplyDelivered,
     InvalidTimeout,
     HandlerFailed,
+    UnhandledInCurrentState,
     ResponseDropped,
     DeadlineExceeded,
     MailboxFull,

@@ -2,7 +2,7 @@
 
 extern crate self as lattice_actor;
 
-pub use lattice_actor_macros::{Message, Request};
+pub use lattice_actor_macros::{Message, Request, actor_behavior};
 
 pub mod context;
 pub mod directory;
@@ -16,6 +16,7 @@ pub mod recipient;
 pub mod registry;
 pub mod reply;
 pub mod runtime;
+pub mod state_machine;
 pub mod traits;
 pub mod watch;
 

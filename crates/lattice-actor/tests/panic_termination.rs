@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::{
     any::type_name,
     sync::{
@@ -111,6 +112,7 @@ struct PolicyActor {
 
 impl Actor for PolicyActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn stopping(
         &mut self,
@@ -125,7 +127,7 @@ impl Actor for PolicyActor {
 impl Handler<Crash> for PolicyActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _message: Crash,
     ) -> Result<(), ActorError> {
         panic!("policy actor crashed")
@@ -135,7 +137,7 @@ impl Handler<Crash> for PolicyActor {
 impl Responder<Ping> for PolicyActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: Ping,
         reply_to: ReplyTo<u32>,
     ) -> Result<(), ActorError> {
@@ -203,12 +205,13 @@ struct RequestPanicActor;
 
 impl Actor for RequestPanicActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Responder<CrashRequest> for RequestPanicActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: CrashRequest,
         _reply_to: ReplyTo<u32>,
     ) -> Result<(), ActorError> {
@@ -267,6 +270,7 @@ struct BeforeHookPanicActor;
 
 impl Actor for BeforeHookPanicActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     fn before_message(&mut self, _ctx: &mut ActorContext<Self>, _message: MessageView<'_>) {
         panic!("before hook crashed")
@@ -276,7 +280,7 @@ impl Actor for BeforeHookPanicActor {
 impl Responder<CrashRequest> for BeforeHookPanicActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: CrashRequest,
         reply_to: ReplyTo<u32>,
     ) -> Result<(), ActorError> {
@@ -299,6 +303,7 @@ struct AfterHookPanicActor;
 
 impl Actor for AfterHookPanicActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     fn after_message(
         &mut self,
@@ -313,7 +318,7 @@ impl Actor for AfterHookPanicActor {
 impl Responder<Ping> for AfterHookPanicActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: Ping,
         reply_to: ReplyTo<u32>,
     ) -> Result<(), ActorError> {
@@ -352,12 +357,13 @@ struct QueueActor;
 
 impl Actor for QueueActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Handler<BlockingCrash> for QueueActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         message: BlockingCrash,
     ) -> Result<(), ActorError> {
         message.entered.add_permits(1);
@@ -369,7 +375,7 @@ impl Handler<BlockingCrash> for QueueActor {
 impl Responder<QueuedRequest> for QueueActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: QueuedRequest,
         reply_to: ReplyTo<u32>,
     ) -> Result<(), ActorError> {
@@ -448,12 +454,13 @@ struct DeferredPanicActor {
 
 impl Actor for DeferredPanicActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Responder<HeldRequest> for DeferredPanicActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         request: HeldRequest,
         reply_to: ReplyTo<u32>,
     ) -> Result<(), ActorError> {
@@ -466,7 +473,7 @@ impl Responder<HeldRequest> for DeferredPanicActor {
 impl Handler<Crash> for DeferredPanicActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _message: Crash,
     ) -> Result<(), ActorError> {
         panic!("deferred actor crashed")
@@ -499,12 +506,13 @@ struct ScopedTaskActor;
 
 impl Actor for ScopedTaskActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Handler<LaunchPanickingTask> for ScopedTaskActor {
     async fn handle(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         message: LaunchPanickingTask,
     ) -> Result<(), ActorError> {
         ctx.spawn_scoped(async move {
@@ -518,7 +526,7 @@ impl Handler<LaunchPanickingTask> for ScopedTaskActor {
 impl Responder<Ping> for ScopedTaskActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: Ping,
         reply_to: ReplyTo<u32>,
     ) -> Result<(), ActorError> {
@@ -548,6 +556,7 @@ struct StartActor {
 
 impl Actor for StartActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         assert!(!self.panic_on_start, "start crashed");
@@ -595,6 +604,7 @@ struct StoppingPanicActor;
 
 impl Actor for StoppingPanicActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn stopping(
         &mut self,
@@ -626,6 +636,7 @@ struct DropPanicActor;
 
 impl Actor for DropPanicActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Drop for DropPanicActor {
@@ -659,6 +670,7 @@ struct PanicChild {
 
 impl Actor for PanicChild {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         self.started.add_permits(1);
@@ -669,7 +681,7 @@ impl Actor for PanicChild {
 impl Handler<Crash> for PanicChild {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _message: Crash,
     ) -> Result<(), ActorError> {
         panic!("child crashed")
@@ -684,6 +696,7 @@ struct SupervisingParent {
 
 impl Actor for SupervisingParent {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         let child_started = self.child_started.clone();
@@ -706,7 +719,7 @@ impl Actor for SupervisingParent {
 impl Handler<CrashChild> for SupervisingParent {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _message: CrashChild,
     ) -> Result<(), ActorError> {
         self.child

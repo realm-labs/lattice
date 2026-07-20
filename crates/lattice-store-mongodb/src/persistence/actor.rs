@@ -57,6 +57,8 @@ impl MongoPersistenceCoordinator {
     ) -> Result<PersistenceStatus, ActorPersistenceError>
     where
         A: Actor + Handler<MongoFlushCompleted>,
+        <A as lattice_actor::traits::Actor>::Behavior:
+            lattice_actor::state_machine::Accepts<MongoFlushCompleted>,
     {
         if let Some(delay) = self.retry_delay() {
             return Ok(PersistenceStatus::Backoff(delay));

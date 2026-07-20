@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::{
     sync::{
         Arc,
@@ -8,7 +9,6 @@ use std::{
 
 use async_trait::async_trait;
 use lattice_actor::{
-    context::ActorContext,
     error::{ActorActivationError, ActorError},
     mailbox::MailboxConfig,
     registry::{ActorCreateContext, ActorLoader, ActorRegistry, ActorRegistryConfig},
@@ -28,12 +28,13 @@ struct LazyActor;
 
 impl Actor for LazyActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Responder<Ping> for LazyActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: Ping,
         reply_to: ReplyTo<&'static str>,
     ) -> Result<(), ActorError> {

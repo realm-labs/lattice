@@ -7,8 +7,12 @@ use lattice_core::{
 use thiserror::Error;
 
 use crate::{
-    context::ActorContext, error::ActorStopError, mailbox::MailboxConfig, reply::ReplyTo,
+    context::{ActorContext, HandlerContext},
+    error::ActorStopError,
+    mailbox::MailboxConfig,
+    reply::ReplyTo,
     runtime::ActorExecutionPolicy,
+    state_machine::Behavior,
 };
 
 /// A one-way message handled without a reply channel.
@@ -106,11 +110,13 @@ impl<'a> MessageView<'a> {
     }
 }
 
-/// Why a dequeued request was not passed to its typed responder.
+/// Why a dequeued message was not passed to its typed handler or responder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRejection {
     DeadlineExceeded,
     DeferredReplyCapacityExceeded,
+    /// The actor's current behavior does not accept this message type.
+    UnhandledInCurrentState,
 }
 
 /// The result of dispatching a dequeued message.
@@ -149,11 +155,17 @@ pub enum ResponderErrorAction<Response, Error> {
 
 pub trait Actor: Sized + Send + 'static {
     type Error: StdError + Send + Sync + 'static;
+    type Behavior: Behavior;
+
+    fn initial_behavior(&self) -> Self::Behavior {
+        Self::Behavior::default()
+    }
 
     /// Observes every dequeued tell and request before typed dispatch.
     ///
-    /// The view exposes the immutable concrete payload through `downcast_ref`. Returning from this
-    /// hook always continues normal dispatch; rejection and transformation belong in typed handlers.
+    /// The view exposes the immutable concrete payload through `downcast_ref`. This observational
+    /// hook cannot reject or transform a message; typed behavior admission runs immediately
+    /// afterwards.
     fn before_message(&mut self, _ctx: &mut ActorContext<Self>, _message: MessageView<'_>) {}
 
     /// Observes the dispatch result after normal error/recovery handling has completed.
@@ -199,7 +211,7 @@ where
 {
     fn handle(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         msg: M,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
@@ -210,14 +222,14 @@ where
 {
     fn respond(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         request: R,
         reply_to: ReplyTo<R::Response>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     fn respond_error(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         error: Self::Error,
     ) -> impl Future<Output = ResponderErrorAction<R::Response, Self::Error>> + Send {
         async { ResponderErrorAction::Propagate(error) }

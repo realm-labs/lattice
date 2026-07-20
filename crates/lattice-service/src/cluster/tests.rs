@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::atomic::{AtomicUsize, Ordering},
@@ -8,7 +9,6 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use lattice_actor::{
     actor_protocol,
-    context::ActorContext,
     error::{ActorCallError, ActorError},
     host::ProtocolHostRegistry,
     protocol::{CodecDescriptor, DecodeError, EncodeError, WireCodec},
@@ -115,12 +115,13 @@ struct EntityActor {
 
 impl Actor for EntityActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Responder<GetValue> for EntityActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         request: GetValue,
         reply_to: ReplyTo<Value>,
     ) -> Result<(), ActorError> {

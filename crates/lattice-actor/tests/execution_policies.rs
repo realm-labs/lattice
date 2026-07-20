@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,14 +54,17 @@ struct RestartingParent {
 
 impl Actor for TestActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Actor for OtherActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Actor for ParentActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
         for (key, execution, scheduler_key) in [
@@ -104,6 +108,7 @@ impl Actor for ParentActor {
 
 impl Actor for ReportingChild {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
         let _ = self
@@ -115,6 +120,7 @@ impl Actor for ReportingChild {
 
 impl Actor for RestartingParent {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), Self::Error> {
         let started = self.started.clone();
@@ -137,7 +143,7 @@ impl Actor for RestartingParent {
 impl Handler<RestartChild> for RestartingParent {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _message: RestartChild,
     ) -> Result<(), ActorError> {
         self.child
@@ -152,7 +158,7 @@ impl Handler<RestartChild> for RestartingParent {
 impl Responder<ChildThreads> for ParentActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: ChildThreads,
         reply_to: ReplyTo<Vec<String>>,
     ) -> Result<(), ActorError> {
@@ -173,7 +179,7 @@ impl Responder<ChildThreads> for ParentActor {
 impl Responder<Ping> for TestActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         request: Ping,
         reply_to: ReplyTo<String>,
     ) -> Result<(), ActorError> {
@@ -186,7 +192,7 @@ impl Responder<Ping> for TestActor {
 impl Responder<CurrentThread> for TestActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: CurrentThread,
         reply_to: ReplyTo<String>,
     ) -> Result<(), ActorError> {
@@ -198,7 +204,7 @@ impl Responder<CurrentThread> for TestActor {
 impl Responder<CurrentThread> for OtherActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: CurrentThread,
         reply_to: ReplyTo<String>,
     ) -> Result<(), ActorError> {

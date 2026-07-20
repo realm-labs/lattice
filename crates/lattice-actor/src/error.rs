@@ -60,6 +60,8 @@ pub enum ActorCallError {
     ResponseDropped,
     #[error("actor ask deadline elapsed before a response completed")]
     DeadlineExceeded,
+    #[error("actor does not handle the message in its current state")]
+    UnhandledInCurrentState,
     #[error("actor handler failed: {0}")]
     Handler(ActorError),
 }

@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::{
     any::type_name,
     sync::{Arc, Mutex},
@@ -7,7 +8,6 @@ use std::{
 use bytes::Bytes;
 use lattice_actor::{
     actor_protocol,
-    context::ActorContext,
     error::{ActorCallError, ActorError, ActorTellError},
     mailbox::MailboxConfig,
     observation::{
@@ -50,12 +50,13 @@ struct ObservedActor;
 
 impl Actor for ObservedActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Handler<WireTell> for ObservedActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _message: WireTell,
     ) -> Result<(), ActorError> {
         Ok(())
@@ -65,7 +66,7 @@ impl Handler<WireTell> for ObservedActor {
 impl Responder<DeferredRequest> for ObservedActor {
     async fn respond(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         request: DeferredRequest,
         reply_to: ReplyTo<&'static str>,
     ) -> Result<(), ActorError> {
@@ -83,7 +84,7 @@ impl Responder<DeferredRequest> for ObservedActor {
 impl Handler<BlockingTell> for ObservedActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         message: BlockingTell,
     ) -> Result<(), ActorError> {
         message.entered.add_permits(1);
@@ -97,7 +98,7 @@ impl Handler<BlockingTell> for ObservedActor {
 impl Handler<QueuedTell> for ObservedActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _message: QueuedTell,
     ) -> Result<(), ActorError> {
         Ok(())
@@ -107,7 +108,7 @@ impl Handler<QueuedTell> for ObservedActor {
 impl Responder<QueuedRequest> for ObservedActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: QueuedRequest,
         reply_to: ReplyTo<()>,
     ) -> Result<(), ActorError> {

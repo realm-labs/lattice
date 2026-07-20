@@ -166,6 +166,7 @@ impl<A: Actor> ActorContext<A> {
     ) -> Result<(), ActorTellError>
     where
         B: Actor + Handler<M>,
+        <B as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
         let sender = self.self_ref.as_ref().map(ActorRef::erase);
@@ -183,6 +184,7 @@ impl<A: Actor> ActorContext<A> {
     ) -> Result<(), ActorTellError>
     where
         B: Actor + Handler<M>,
+        <B as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
         target.try_tell_from(message, self.sender.as_ref().map(ActorRef::erase))
@@ -293,6 +295,7 @@ impl<A: Actor> ActorContext<A> {
     pub fn notify_after<M>(&mut self, delay: Duration, msg: M)
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
         let handle = self.handle.clone();
@@ -315,6 +318,7 @@ impl<A: Actor> ActorContext<A> {
     pub fn notify_interval<M, F>(&mut self, interval: Duration, mut make_msg: F)
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
         F: FnMut() -> M + Send + 'static,
     {
@@ -367,6 +371,7 @@ impl<A: Actor> ActorContext<A> {
     ) -> Result<PipeTaskHandle, PipeToSelfError>
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
@@ -403,6 +408,7 @@ impl<A: Actor> ActorContext<A> {
     ) -> Result<(), PipeToSelfError>
     where
         A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
         T: Send + 'static,
         Fut: Future + Send + 'static,
@@ -463,6 +469,7 @@ impl<A: Actor> ActorContext<A> {
     pub fn watch<B>(&mut self, target: &ActorHandle<B>) -> Result<WatchId, ActorError>
     where
         A: Handler<ActorTerminated>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<ActorTerminated>,
         B: Actor,
     {
         let watch_id = WatchId::new(self.next_watch_id);
@@ -787,6 +794,47 @@ impl<A: Actor> ActorContext<A> {
         )
         .map(Some)
         .map_err(|error| ActorError::new(error.to_string()))
+    }
+}
+
+/// Message-scoped access to the actor runtime and its typed behavior.
+///
+/// This wrapper is created only while a typed handler or responder is running. It dereferences to
+/// [`ActorContext`], so existing context operations remain available without forwarding methods.
+pub struct HandlerContext<'a, A: Actor> {
+    actor: &'a mut ActorContext<A>,
+    behavior: &'a mut A::Behavior,
+}
+
+impl<'a, A: Actor> HandlerContext<'a, A> {
+    pub(crate) fn new(actor: &'a mut ActorContext<A>, behavior: &'a mut A::Behavior) -> Self {
+        Self { actor, behavior }
+    }
+
+    pub fn behavior(&self) -> &A::Behavior {
+        self.behavior
+    }
+
+    pub fn behavior_mut(&mut self) -> &mut A::Behavior {
+        self.behavior
+    }
+
+    pub fn transition_to(&mut self, next: A::Behavior) {
+        *self.behavior = next;
+    }
+}
+
+impl<A: Actor> std::ops::Deref for HandlerContext<'_, A> {
+    type Target = ActorContext<A>;
+
+    fn deref(&self) -> &Self::Target {
+        self.actor
+    }
+}
+
+impl<A: Actor> std::ops::DerefMut for HandlerContext<'_, A> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.actor
     }
 }
 

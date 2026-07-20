@@ -1,3 +1,4 @@
+use lattice_actor::context::HandlerContext;
 use std::{
     sync::{
         Arc,
@@ -30,6 +31,7 @@ async fn local_actor_watch_sends_typed_termination_notification() {
 
     impl Actor for TargetActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
     }
 
     struct WatcherActor {
@@ -40,6 +42,7 @@ async fn local_actor_watch_sends_typed_termination_notification() {
 
     impl Actor for WatcherActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             ctx.watch(&self.target)?;
             Ok(())
@@ -49,7 +52,7 @@ async fn local_actor_watch_sends_typed_termination_notification() {
     impl Handler<ActorTerminated> for WatcherActor {
         async fn handle(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             msg: ActorTerminated,
         ) -> Result<(), ActorError> {
             self.events.lock().await.push(msg.reason);
@@ -83,6 +86,7 @@ async fn watcher_stop_auto_unwatches_local_target() {
 
     impl Actor for TargetActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
     }
 
     struct WatcherActor {
@@ -92,6 +96,7 @@ async fn watcher_stop_auto_unwatches_local_target() {
 
     impl Actor for WatcherActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             ctx.watch(&self.target)?;
             Ok(())
@@ -101,7 +106,7 @@ async fn watcher_stop_auto_unwatches_local_target() {
     impl Handler<ActorTerminated> for WatcherActor {
         async fn handle(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             msg: ActorTerminated,
         ) -> Result<(), ActorError> {
             self.events.lock().await.push(msg.reason);
@@ -136,6 +141,7 @@ async fn local_child_actor_stops_with_parent_lifecycle() {
 
     impl Actor for ChildActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn stopping(
             &mut self,
             _ctx: &mut ActorContext<Self>,
@@ -154,6 +160,7 @@ async fn local_child_actor_stops_with_parent_lifecycle() {
 
     impl Actor for ParentActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             ctx.spawn_child(
                 ChildActorKey::new("child"),
@@ -190,6 +197,7 @@ async fn local_child_actor_duplicate_key_is_rejected() {
 
     impl Actor for ChildActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
     }
 
     struct ParentActor {
@@ -198,6 +206,7 @@ async fn local_child_actor_duplicate_key_is_rejected() {
 
     impl Actor for ParentActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             let key = ChildActorKey::new("child");
             ctx.spawn_child(key.clone(), ChildActor, ChildActorOptions::default())?;
@@ -232,6 +241,7 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
 
     impl Actor for ChildActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
     }
 
     #[derive(Debug, lattice_actor::Message)]
@@ -244,6 +254,7 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
 
     impl Actor for ParentActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             self.child = Some(ctx.spawn_child(
                 ChildActorKey::new("child"),
@@ -273,7 +284,7 @@ async fn child_supervision_stop_parent_stops_parent_when_child_stops() {
     impl Handler<StopChild> for ParentActor {
         async fn handle(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             _msg: StopChild,
         ) -> Result<(), ActorError> {
             self.child
@@ -309,6 +320,7 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
 
     impl Actor for ChildActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
     }
 
     #[derive(Debug, lattice_actor::Message)]
@@ -321,6 +333,7 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
 
     impl Actor for ParentActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             let child_started = self.child_started.clone();
             self.child = Some(ctx.spawn_child_with_factory(
@@ -343,7 +356,7 @@ async fn child_supervision_restart_child_recreates_child_from_factory() {
     impl Handler<StopChild> for ParentActor {
         async fn handle(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             _msg: StopChild,
         ) -> Result<(), ActorError> {
             self.child
@@ -388,12 +401,13 @@ async fn handler_error_returns_to_caller_and_actor_remains_running() {
 
     impl Actor for TestActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
     }
 
     impl Responder<Ping> for TestActor {
         async fn respond(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             request: Ping,
             reply_to: ReplyTo<String>,
         ) -> Result<(), ActorError> {
@@ -405,7 +419,7 @@ async fn handler_error_returns_to_caller_and_actor_remains_running() {
     impl Responder<Fail> for TestActor {
         async fn respond(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             _request: Fail,
             _reply_to: ReplyTo<()>,
         ) -> Result<(), ActorError> {
@@ -429,6 +443,7 @@ async fn stopping_failure_enters_stop_failed_state() {
 
     impl Actor for FailingStopActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn stopping(
             &mut self,
             _ctx: &mut ActorContext<Self>,
@@ -473,6 +488,7 @@ async fn stopping_failure_retains_actor_state_and_retry_terminates_once() {
 
     impl Actor for RetainedActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
 
         async fn stopping(
             &mut self,
@@ -497,6 +513,7 @@ async fn stopping_failure_retains_actor_state_and_retry_terminates_once() {
 
     impl Actor for RetainedWatcher {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
 
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             ctx.watch(&self.target)?;
@@ -508,7 +525,7 @@ async fn stopping_failure_retains_actor_state_and_retry_terminates_once() {
     impl Handler<ActorTerminated> for RetainedWatcher {
         async fn handle(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             notification: ActorTerminated,
         ) -> Result<(), ActorError> {
             self.notifications.lock().await.push(notification.reason);
@@ -599,6 +616,7 @@ async fn stop_failed_rejects_business_traffic_but_accepts_force_stop() {
 
     impl Actor for RetainedActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
 
         async fn stopping(
             &mut self,
@@ -612,7 +630,7 @@ async fn stop_failed_rejects_business_traffic_but_accepts_force_stop() {
     impl Handler<BusinessMessage> for RetainedActor {
         async fn handle(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             _msg: BusinessMessage,
         ) -> Result<(), ActorError> {
             panic!("business message must not reach a retained actor")
@@ -659,6 +677,7 @@ async fn passivation_policy_idle_timeout_stops_idle_actor() {
 
     impl Actor for IdleActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn stopping(
             &mut self,
             _ctx: &mut ActorContext<Self>,

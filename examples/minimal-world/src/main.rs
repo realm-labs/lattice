@@ -1,4 +1,5 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
+use lattice_actor::context::HandlerContext;
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -12,7 +13,6 @@ use std::{
 use async_trait::async_trait;
 use lattice_actor::{
     actor_protocol,
-    context::ActorContext,
     error::ActorError,
     mailbox::MailboxConfig,
     protocol::ProstCodec,
@@ -81,12 +81,13 @@ struct WorldActor {
 
 impl Actor for WorldActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Responder<EnterWorldRequest> for WorldActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         request: EnterWorldRequest,
         reply_to: ReplyTo<EnterWorldReply>,
     ) -> Result<(), ActorError> {
@@ -135,12 +136,13 @@ struct ClockActor {
 
 impl Actor for ClockActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 }
 
 impl Responder<GetClockRequest> for ClockActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: GetClockRequest,
         reply_to: ReplyTo<GetClockReply>,
     ) -> Result<(), ActorError> {

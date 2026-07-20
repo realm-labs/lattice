@@ -690,6 +690,21 @@ where
     let activity_tx = spawn_passivation_monitor(&handle, passivation);
     let actor_type = type_name::<A>();
     let local_ref = handle.local_ref().id();
+    let mut behavior = match std::panic::catch_unwind(AssertUnwindSafe(|| actor.initial_behavior()))
+    {
+        Ok(behavior) => behavior,
+        Err(payload) => {
+            terminate_panicked_actor(
+                actor,
+                &mut ctx,
+                &handle,
+                &mut normal_rx,
+                &mut system_rx,
+                ActorPanic::new("initial_behavior", payload),
+            );
+            return;
+        }
+    };
 
     let started_span = tracing::info_span!(
         "actor.started",
@@ -757,7 +772,10 @@ where
                 command,
                 MailboxLane::System,
                 &handle,
-                &mut actor,
+                ActorInstance {
+                    actor: &mut actor,
+                    behavior: &mut behavior,
+                },
                 &mut ctx,
                 &mut stop_reason,
                 activity_tx.as_ref(),
@@ -787,7 +805,10 @@ where
                             command,
                             MailboxLane::System,
                             &handle,
-                            &mut actor,
+                            ActorInstance {
+                                actor: &mut actor,
+                                behavior: &mut behavior,
+                            },
                             &mut ctx,
                             &mut stop_reason,
                             activity_tx.as_ref(),
@@ -810,7 +831,10 @@ where
                             command,
                             MailboxLane::Normal,
                             &handle,
-                            &mut actor,
+                            ActorInstance {
+                                actor: &mut actor,
+                                behavior: &mut behavior,
+                            },
                             &mut ctx,
                             &mut stop_reason,
                             activity_tx.as_ref(),
@@ -1074,11 +1098,16 @@ where
     }
 }
 
+struct ActorInstance<'a, A: Actor> {
+    actor: &'a mut A,
+    behavior: &'a mut A::Behavior,
+}
+
 async fn handle_command<A>(
     command: ActorCommand<A>,
     lane: MailboxLane,
     handle: &ActorHandle<A>,
-    actor: &mut A,
+    instance: ActorInstance<'_, A>,
     ctx: &mut ActorContext<A>,
     stop_reason: &mut Option<StopReason>,
     activity_tx: Option<&watch::Sender<u64>>,
@@ -1113,31 +1142,32 @@ where
                 mailbox.lane = lane.as_str(),
                 "handling actor message"
             );
-            let outcome =
-                match AssertUnwindSafe(envelope.handle(actor, ctx, &metadata).instrument(span))
-                    .catch_unwind()
-                    .await
-                {
-                    Ok(outcome) => outcome,
-                    Err(payload) => {
-                        if let Some(completion) = envelope.reject_panicked() {
-                            handle.observer().request_completed(
-                                actor_metadata,
-                                &metadata,
-                                completion,
-                            );
-                        }
-                        if let Some(started_at) = observation_started_at {
-                            handle.observer().message_finished(
-                                actor_metadata,
-                                &metadata,
-                                MessageOutcome::Panicked,
-                                started_at.elapsed(),
-                            );
-                        }
-                        return Err(ActorPanic::new("message", payload));
+            let outcome = match AssertUnwindSafe(
+                envelope
+                    .handle(instance.actor, instance.behavior, ctx, &metadata)
+                    .instrument(span),
+            )
+            .catch_unwind()
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(payload) => {
+                    if let Some(completion) = envelope.reject_panicked() {
+                        handle
+                            .observer()
+                            .request_completed(actor_metadata, &metadata, completion);
                     }
-                };
+                    if let Some(started_at) = observation_started_at {
+                        handle.observer().message_finished(
+                            actor_metadata,
+                            &metadata,
+                            MessageOutcome::Panicked,
+                            started_at.elapsed(),
+                        );
+                    }
+                    return Err(ActorPanic::new("message", payload));
+                }
+            };
             if let Some(started_at) = observation_started_at {
                 handle.observer().message_finished(
                     actor_metadata,

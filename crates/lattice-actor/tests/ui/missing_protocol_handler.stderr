@@ -1,23 +1,23 @@
 error[E0277]: the trait bound `MissingHandlerActor: lattice_actor::traits::Handler<Ping>` is not satisfied
-  --> tests/ui/missing_protocol_handler.rs:31:36
+  --> tests/ui/missing_protocol_handler.rs:30:36
    |
-31 |     let _ = ServerProtocol::bind::<MissingHandlerActor>();
+30 |     let _ = ServerProtocol::bind::<MissingHandlerActor>();
    |                                    ^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
    |
 help: the trait `lattice_actor::traits::Handler<Ping>` is not implemented for `MissingHandlerActor`
-  --> tests/ui/missing_protocol_handler.rs:23:1
+  --> tests/ui/missing_protocol_handler.rs:22:1
    |
-23 | struct MissingHandlerActor;
+22 | struct MissingHandlerActor;
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
 note: required by a bound in `ServerProtocol::bind`
-  --> tests/ui/missing_protocol_handler.rs:12:1
+  --> tests/ui/missing_protocol_handler.rs:11:1
    |
-12 | / actor_protocol! {
-13 | |     ServerProtocol {
-14 | |         protocol_id: 103;
-15 | |         name: "compile/server/v1";
+11 | / actor_protocol! {
+12 | |     ServerProtocol {
+13 | |         protocol_id: 103;
+14 | |         name: "compile/server/v1";
 ...  |
-21 | | }
+20 | | }
    | | ^
    | | |
    | |_required by a bound in this associated function

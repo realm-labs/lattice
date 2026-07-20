@@ -1,3 +1,4 @@
+use crate::context::HandlerContext;
 use std::{
     sync::{
         Arc,
@@ -116,6 +117,7 @@ struct Fail;
 
 impl Actor for TestActor {
     type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
     async fn started(&mut self, _ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
         if let Some(gate) = self.start_gate.take() {
             let permit = gate
@@ -142,7 +144,7 @@ impl Actor for TestActor {
 impl Responder<Ping> for TestActor {
     async fn respond(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         request: Ping,
         reply_to: ReplyTo<String>,
     ) -> Result<(), ActorError> {
@@ -156,7 +158,7 @@ impl Responder<Ping> for TestActor {
 impl Handler<Record> for TestActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         msg: Record,
     ) -> Result<(), ActorError> {
         self.events.lock().await.push(msg.value);
@@ -170,7 +172,7 @@ impl Handler<Record> for TestActor {
 impl Handler<PipeRecord> for TestActor {
     async fn handle(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         message: PipeRecord,
     ) -> Result<(), ActorError> {
         message.entered.add_permits(1);
@@ -192,7 +194,7 @@ impl Handler<PipeRecord> for TestActor {
 impl Responder<ProbePipeCapacity> for TestActor {
     async fn respond(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         request: ProbePipeCapacity,
         reply_to: ReplyTo<bool>,
     ) -> Result<(), ActorError> {
@@ -217,7 +219,7 @@ impl Responder<ProbePipeCapacity> for TestActor {
 impl Responder<StopAfterReply> for TestActor {
     async fn respond(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         _request: StopAfterReply,
         reply_to: ReplyTo<&'static str>,
     ) -> Result<(), ActorError> {
@@ -231,7 +233,7 @@ impl Responder<StopAfterReply> for TestActor {
 impl Handler<Tick> for TestActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _msg: Tick,
     ) -> Result<(), ActorError> {
         self.events.lock().await.push("tick");
@@ -242,7 +244,7 @@ impl Handler<Tick> for TestActor {
 impl Responder<ReadContextInstance> for TestActor {
     async fn respond(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         _request: ReadContextInstance,
         reply_to: ReplyTo<InstanceId>,
     ) -> Result<(), ActorError> {
@@ -254,7 +256,7 @@ impl Responder<ReadContextInstance> for TestActor {
 impl Responder<SpawnContextChild> for TestActor {
     async fn respond(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         _request: SpawnContextChild,
         reply_to: ReplyTo<InstanceId>,
     ) -> Result<(), ActorError> {
@@ -280,7 +282,7 @@ impl Responder<SpawnContextChild> for TestActor {
 impl Handler<ContextChildResolved> for TestActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         message: ContextChildResolved,
     ) -> Result<(), ActorError> {
         match message.result {
@@ -294,7 +296,7 @@ impl Handler<ContextChildResolved> for TestActor {
 impl Handler<Fail> for TestActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _msg: Fail,
     ) -> Result<(), ActorError> {
         Err(ActorError::new("handler failed"))
@@ -304,6 +306,7 @@ impl Handler<Fail> for TestActor {
 fn assert_handler_bound<A, M>()
 where
     A: Handler<M>,
+    <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
     M: Message,
 {
 }
@@ -311,7 +314,7 @@ where
 impl Responder<DeferredReply> for TestActor {
     async fn respond(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         request: DeferredReply,
         reply_to: ReplyTo<&'static str>,
     ) -> Result<(), ActorError> {
@@ -332,7 +335,7 @@ impl Responder<DeferredReply> for TestActor {
 impl Handler<DeferredReady> for TestActor {
     async fn handle(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         message: DeferredReady,
     ) -> Result<(), ActorError> {
         self.events.lock().await.push("deferred-ready");
@@ -355,6 +358,7 @@ struct BusinessErrorActor {
 
 impl Actor for BusinessErrorActor {
     type Error = BusinessActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
 
     async fn on_error<M>(
         &mut self,
@@ -387,7 +391,7 @@ fn load_business_state() -> Result<(), BusinessActorError> {
 impl Responder<LoadBusinessState> for BusinessErrorActor {
     async fn respond(
         &mut self,
-        ctx: &mut ActorContext<Self>,
+        ctx: &mut HandlerContext<'_, Self>,
         _request: LoadBusinessState,
         _reply_to: ReplyTo<()>,
     ) -> Result<(), BusinessActorError> {
@@ -400,7 +404,7 @@ impl Responder<LoadBusinessState> for BusinessErrorActor {
 impl Responder<RecoverBusinessState> for BusinessErrorActor {
     async fn respond(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         _request: RecoverBusinessState,
         reply_to: ReplyTo<&'static str>,
     ) -> Result<(), BusinessActorError> {
@@ -411,7 +415,7 @@ impl Responder<RecoverBusinessState> for BusinessErrorActor {
 
     async fn respond_error(
         &mut self,
-        _ctx: &mut ActorContext<Self>,
+        _ctx: &mut HandlerContext<'_, Self>,
         error: BusinessActorError,
     ) -> ResponderErrorAction<&'static str, BusinessActorError> {
         match error {
@@ -427,6 +431,7 @@ fn handler_compile_time_bounds_are_typed() {
     fn assert_responder_bound<A, R>()
     where
         A: Responder<R>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<R>,
         R: Request,
     {
     }
@@ -795,6 +800,7 @@ async fn local_timer_delivers_message_to_actor() {
 
     impl Actor for TimerActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             ctx.notify_after(Duration::from_millis(5), Tick);
             Ok(())
@@ -804,7 +810,7 @@ async fn local_timer_delivers_message_to_actor() {
     impl Handler<Tick> for TimerActor {
         async fn handle(
             &mut self,
-            _ctx: &mut ActorContext<Self>,
+            _ctx: &mut HandlerContext<'_, Self>,
             _msg: Tick,
         ) -> Result<(), ActorError> {
             self.events.lock().await.push("tick");
@@ -842,6 +848,7 @@ async fn scoped_task_is_cancelled_when_actor_stops() {
 
     impl Actor for TaskActor {
         type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
             let signal = DropSignal(self.dropped_tx.take());
             ctx.spawn_scoped(async move {
