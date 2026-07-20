@@ -1,5 +1,5 @@
 # Tab-separated columns: relative path, exact declaration line, justification.
 # Keep this file empty unless a public re-export is required by the API design.
-crates/lattice-actor/src/lib.rs	pub use lattice_actor_macros::{Message, Request};	Derive macros are intentionally available from the lattice-actor facade.
+crates/lattice-actor/src/lib.rs	pub use lattice_actor_macros::{Message, Request, actor_behavior};	Actor macros are intentionally available from the lattice-actor facade.
 crates/lattice-actor/src/protocol.rs	pub use lattice_core::actor_ref::ProtocolTag as __ProtocolTag;	The public derive expansion requires a stable hidden facade path.
 crates/lattice-store-mongodb/src/lib.rs	pub use lattice_store_mongodb_macros::{MongoDocument, MongoDocumentSet, MongoScan};	Derive macros are intentionally available from the lattice-store-mongodb facade.
