@@ -181,6 +181,35 @@ The allocator-instrumented `measure` command additionally observed the following
 The observer intentionally adds per-message metric collection overhead, so its throughput is not used
 as the timing regression baseline. Its percentiles describe the saturated bounded-mailbox workload.
 
+### Local Actor raw completion and Noop observer fast path
+
+A follow-up profile on 2026-07-20 separated the prior completion workload into two Criterion cases:
+
+- `raw_bounded_mailbox` uses one batch-tail barrier and performs no benchmark-side per-message timing
+  or completion-channel send;
+- `per_message_latency` retains the original per-message timestamp and completion notification.
+
+Before changing the runtime, the raw case measured 3.9481-4.0732 ms per 10,000 messages, or
+2.4551-2.5329M completed/s. The per-message case measured 5.6789-6.2160 ms, or
+1.6087-1.7609M completed/s. This established that the old completion number included substantial
+measurement-harness cost and was not the Actor runtime's raw limit.
+
+The profile also showed that the default Noop Actor observer still read the processing start and end
+clocks for every message. After adding a disabled-observer fast path, while preserving full timing for
+custom observers, the same run measured:
+
+| Workload | Batch time | Throughput | Point-estimate change |
+|---|---:|---:|---:|
+| Raw bounded-mailbox completion | 2.8826-2.9788 ms | 3.3570-3.4691M/s | +35.6% |
+| Per-message latency completion | 4.7928-5.2140 ms | 1.9179-2.0865M/s | +21.7% |
+
+The allocator-instrumented raw workload measured 1.623M/s and 39,151 allocations for 10,000
+messages while encountering 9,096 full-mailbox retries. This is not the timing baseline: the counting
+allocator and reconstructing rejected `try_tell` messages both add overhead. The post-change profile
+now points primarily to payload reference-count updates, bounded-channel semaphore work, envelope and
+handler-future allocation, and the required enqueue timestamp. Removing those costs would require a
+larger mailbox/API or dispatch representation change rather than another observer fast-path tweak.
+
 The MongoDB persistence framework baseline was captured with:
 
 ```text

@@ -1089,13 +1089,15 @@ where
     match command {
         ActorCommand::Envelope(mut envelope) => {
             let metadata = envelope.metadata(lane);
-            let started_at = Instant::now();
             let actor_metadata = handle.observation_metadata();
-            handle.observer().message_started(
-                actor_metadata,
-                &metadata,
-                started_at.saturating_duration_since(metadata.enqueued_at()),
-            );
+            let observation_started_at = handle.observer().is_enabled().then(Instant::now);
+            if let Some(started_at) = observation_started_at {
+                handle.observer().message_started(
+                    actor_metadata,
+                    &metadata,
+                    started_at.saturating_duration_since(metadata.enqueued_at()),
+                );
+            }
             let span = tracing::info_span!(
                 "actor.message",
                 otel.kind = "consumer",
@@ -1125,21 +1127,25 @@ where
                                 completion,
                             );
                         }
-                        handle.observer().message_finished(
-                            actor_metadata,
-                            &metadata,
-                            MessageOutcome::Panicked,
-                            started_at.elapsed(),
-                        );
+                        if let Some(started_at) = observation_started_at {
+                            handle.observer().message_finished(
+                                actor_metadata,
+                                &metadata,
+                                MessageOutcome::Panicked,
+                                started_at.elapsed(),
+                            );
+                        }
                         return Err(ActorPanic::new("message", payload));
                     }
                 };
-            handle.observer().message_finished(
-                actor_metadata,
-                &metadata,
-                outcome,
-                started_at.elapsed(),
-            );
+            if let Some(started_at) = observation_started_at {
+                handle.observer().message_finished(
+                    actor_metadata,
+                    &metadata,
+                    outcome,
+                    started_at.elapsed(),
+                );
+            }
             ctx.reap_runtime_work();
             debug!(
                 actor.type = type_name::<A>(),

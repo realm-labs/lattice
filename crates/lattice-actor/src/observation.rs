@@ -180,6 +180,7 @@ pub trait ActorObserver: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct ActorObserverHandle {
     inner: Arc<dyn ActorObserver>,
+    enabled: bool,
 }
 
 impl ActorObserverHandle {
@@ -189,11 +190,19 @@ impl ActorObserverHandle {
     {
         Self {
             inner: Arc::new(observer),
+            enabled: true,
         }
     }
 
     pub fn from_arc(observer: Arc<dyn ActorObserver>) -> Self {
-        Self { inner: observer }
+        Self {
+            inner: observer,
+            enabled: true,
+        }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     pub(crate) fn message_enqueued(
@@ -240,6 +249,9 @@ impl ActorObserverHandle {
         message: &MessageMetadata,
         completion: RequestCompletion,
     ) {
+        if !self.enabled {
+            return;
+        }
         self.inner.request_completed(
             actor,
             message,
@@ -267,7 +279,10 @@ impl ActorObserverHandle {
 
 impl Default for ActorObserverHandle {
     fn default() -> Self {
-        Self::new(NoopActorObserver)
+        Self {
+            inner: Arc::new(NoopActorObserver),
+            enabled: false,
+        }
     }
 }
 
@@ -275,6 +290,7 @@ impl fmt::Debug for ActorObserverHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ActorObserverHandle")
+            .field("enabled", &self.enabled)
             .finish_non_exhaustive()
     }
 }

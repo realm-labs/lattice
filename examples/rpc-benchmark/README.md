@@ -13,11 +13,12 @@ target, sender, protocol decision, and bulk stripe once before the timed loop;
 Admission workloads intentionally publish no latency samples because queue admission is not message
 delivery.
 
-`actor_completion/bounded_mailbox` waits until every tell has run through the local Actor handler,
-so its throughput includes mailbox scheduling and handler completion. The `measure` binary additionally
-records end-to-end p50/p95/p99, Actor-observed queue and processing percentiles, peak queue depth, and
-mailbox-full retries. Criterion disables the detailed observer to keep the timing baseline free from
-per-message metric collection overhead.
+`actor_completion/raw_bounded_mailbox` uses one batch-tail barrier to wait until every tell has run
+through the local Actor handler. It avoids per-message completion channels and benchmark timestamps,
+so it is the runtime throughput baseline. `actor_completion/per_message_latency` retains those
+per-message measurements to quantify their cost. The `measure` binary additionally runs an
+observer-enabled workload and records end-to-end p50/p95/p99, Actor-observed queue and processing
+percentiles, peak queue depth, and mailbox-full retries.
 
 `remote_actor_end_to_end/tcp_ask_round_trip` crosses a real loopback TCP Association, decodes and
 dispatches the request into a remote Actor, encodes its reply, and returns it through the client

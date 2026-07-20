@@ -50,6 +50,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let frame_write_allocations =
         measure_frame_write(config.requests, config.payload_bytes).await?;
     let local = local_actor_admission(config.requests).await?;
+    let raw_completion_topology = ActorCompletionTopology::start_timing(1024).await?;
+    let before_raw_allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let before_raw_deallocations = DEALLOCATIONS.load(Ordering::Relaxed);
+    let raw_local_completion = raw_completion_topology
+        .run_raw(config.requests, config.payload_bytes)
+        .await?;
+    let raw_completion_allocations = ALLOCATIONS.load(Ordering::Relaxed) - before_raw_allocations;
+    let raw_completion_deallocations =
+        DEALLOCATIONS.load(Ordering::Relaxed) - before_raw_deallocations;
+    raw_completion_topology.shutdown().await?;
     let completion_topology = ActorCompletionTopology::start(1024).await?;
     let local_completion = completion_topology
         .run(config.requests, config.payload_bytes)
@@ -108,6 +118,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "physical_connections": 2 + config.bulk_stripes,
         "frame_write_allocations": frame_write_allocations,
         "local_actor_completion": {
+            "raw_throughput_per_second": raw_local_completion.throughput_per_second(),
+            "raw_elapsed_nanos": raw_local_completion.elapsed.as_nanos(),
+            "raw_mailbox_full_retries": raw_local_completion.mailbox_full_retries,
+            "raw_allocations": raw_completion_allocations,
+            "raw_deallocations": raw_completion_deallocations,
             "throughput_per_second": local_completion.workload.throughput_per_second(),
             "elapsed_nanos": local_completion.workload.elapsed.as_nanos(),
             "latency_p50_nanos": local_completion.workload.percentile_latency(0.50).as_nanos(),

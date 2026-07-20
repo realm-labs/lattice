@@ -83,7 +83,25 @@ fn actor_completion_benchmark(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
     group.throughput(Throughput::Elements(config.requests as u64));
     group.bench_with_input(
-        BenchmarkId::new("bounded_mailbox", config.payload_bytes),
+        BenchmarkId::new("raw_bounded_mailbox", config.payload_bytes),
+        &config,
+        |bench, config| {
+            let topology = &topology;
+            let requests = config.requests;
+            let payload_bytes = config.payload_bytes;
+            bench
+                .to_async(&runtime)
+                .iter_custom(move |iterations| async move {
+                    topology
+                        .run_raw(requests.saturating_mul(iterations as usize), payload_bytes)
+                        .await
+                        .expect("raw actor completion workload")
+                        .elapsed
+                });
+        },
+    );
+    group.bench_with_input(
+        BenchmarkId::new("per_message_latency", config.payload_bytes),
         &config,
         |bench, config| {
             let topology = &topology;

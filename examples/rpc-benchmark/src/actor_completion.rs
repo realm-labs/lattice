@@ -16,6 +16,7 @@ use lattice_actor::{
     traits::{Actor, Handler, MessageMetadata, MessageOutcome},
 };
 use lattice_core::{actor_kind, id::ActorId};
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 use crate::metrics::WorkloadReport;
@@ -36,6 +37,19 @@ impl ActorCompletionReport {
 
     pub fn processing_percentile(&self, percentile: f64) -> Duration {
         crate::metrics::percentile_duration(&self.processing_times, percentile)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RawActorCompletionReport {
+    pub requests: usize,
+    pub elapsed: Duration,
+    pub mailbox_full_retries: usize,
+}
+
+impl RawActorCompletionReport {
+    pub fn throughput_per_second(&self) -> f64 {
+        self.requests as f64 / self.elapsed.as_secs_f64()
     }
 }
 
@@ -121,6 +135,16 @@ struct CompletionTell {
     completed: mpsc::UnboundedSender<Duration>,
 }
 
+#[derive(lattice_actor::Message)]
+struct RawCompletionTell {
+    payload: Bytes,
+}
+
+#[derive(lattice_actor::Message)]
+struct CompletionBarrier {
+    completed: Arc<Notify>,
+}
+
 #[derive(Default)]
 struct CompletionActor {
     processed_bytes: usize,
@@ -140,6 +164,30 @@ impl Handler<CompletionTell> for CompletionActor {
     ) -> Result<(), Self::Error> {
         self.processed_bytes = self.processed_bytes.wrapping_add(message.payload.len());
         let _ = message.completed.send(message.admitted_from.elapsed());
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<RawCompletionTell> for CompletionActor {
+    async fn handle(
+        &mut self,
+        _context: &mut ActorContext<Self>,
+        message: RawCompletionTell,
+    ) -> Result<(), Self::Error> {
+        self.processed_bytes = self.processed_bytes.wrapping_add(message.payload.len());
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<CompletionBarrier> for CompletionActor {
+    async fn handle(
+        &mut self,
+        _context: &mut ActorContext<Self>,
+        message: CompletionBarrier,
+    ) -> Result<(), Self::Error> {
+        message.completed.notify_one();
         Ok(())
     }
 }
@@ -256,6 +304,52 @@ impl ActorCompletionTopology {
         })
     }
 
+    pub async fn run_raw(
+        &self,
+        requests: usize,
+        payload_bytes: usize,
+    ) -> Result<RawActorCompletionReport, Box<dyn Error>> {
+        let payload = Bytes::from(vec![0_u8; payload_bytes]);
+        let started = Instant::now();
+        let mut mailbox_full_retries = 0;
+        for _ in 0..requests {
+            loop {
+                let message = RawCompletionTell {
+                    payload: payload.clone(),
+                };
+                match self.handle.try_tell(message) {
+                    Ok(()) => break,
+                    Err(ActorTellError::MailboxFull) => {
+                        mailbox_full_retries += 1;
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => return Err(Box::new(error)),
+                }
+            }
+        }
+
+        let completed = Arc::new(Notify::new());
+        loop {
+            match self.handle.try_tell(CompletionBarrier {
+                completed: completed.clone(),
+            }) {
+                Ok(()) => break,
+                Err(ActorTellError::MailboxFull) => {
+                    mailbox_full_retries += 1;
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(Box::new(error)),
+            }
+        }
+        completed.notified().await;
+
+        Ok(RawActorCompletionReport {
+            requests,
+            elapsed: started.elapsed(),
+            mailbox_full_retries,
+        })
+    }
+
     pub async fn shutdown(&self) -> Result<(), Box<dyn Error>> {
         let drained = self.registry.drain().await;
         if !drained.completed() {
@@ -277,6 +371,15 @@ mod tests {
         assert_eq!(report.queue_times.len(), 16);
         assert_eq!(report.processing_times.len(), 16);
         assert!(report.maximum_queue_depth <= 2);
+        topology.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_completion_workload_waits_for_the_batch_barrier() {
+        let topology = ActorCompletionTopology::start_timing(2).await.unwrap();
+        let report = topology.run_raw(16, 32).await.unwrap();
+        assert_eq!(report.requests, 16);
+        assert!(report.throughput_per_second().is_finite());
         topology.shutdown().await.unwrap();
     }
 }

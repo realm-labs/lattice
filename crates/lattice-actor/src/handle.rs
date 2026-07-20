@@ -395,7 +395,11 @@ impl<A: Actor> ActorHandle<A> {
         M: Message,
     {
         let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg, None)));
-        let metadata = command.metadata(MailboxLane::Normal);
+        let metadata = self
+            .observer
+            .is_enabled()
+            .then(|| command.metadata(MailboxLane::Normal))
+            .flatten();
         match self.normal_tx.send(command).await {
             Ok(()) => {
                 if let Some(metadata) = metadata {
@@ -594,7 +598,11 @@ impl<A: Actor> ActorHandle<A> {
                 return Err(ActorCallError::LifecycleUnavailable { state });
             }
         }
-        let metadata = command.metadata(lane);
+        let metadata = self
+            .observer
+            .is_enabled()
+            .then(|| command.metadata(lane))
+            .flatten();
         let sender = match lane {
             MailboxLane::Normal => &self.normal_tx,
             MailboxLane::System => &self.system_tx,
