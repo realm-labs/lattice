@@ -1,4 +1,4 @@
-use std::{error::Error as StdError, time::Duration};
+use std::{error::Error as StdError, fmt, time::Duration};
 
 use thiserror::Error;
 
@@ -94,15 +94,67 @@ impl From<PipeToSelfError> for ActorError {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum ActorTellError {
-    #[error("actor mailbox is full")]
-    MailboxFull,
-    #[error("actor mailbox is closed")]
-    MailboxClosed,
-    #[error("actor does not admit business traffic while lifecycle state is {state:?}")]
-    LifecycleUnavailable { state: ActorLifecycleState },
+/// A one-way message that could not be admitted to an Actor mailbox.
+///
+/// Every variant retains the original message so callers can retry, reroute,
+/// or handle it without requiring `M: Clone`.
+pub enum ActorTellError<M> {
+    MailboxFull(M),
+    MailboxClosed(M),
+    LifecycleUnavailable {
+        state: ActorLifecycleState,
+        message: M,
+    },
 }
+
+impl<M> ActorTellError<M> {
+    /// Borrows the message that was not delivered.
+    pub fn message(&self) -> &M {
+        match self {
+            Self::MailboxFull(message)
+            | Self::MailboxClosed(message)
+            | Self::LifecycleUnavailable { message, .. } => message,
+        }
+    }
+
+    /// Returns ownership of the message that was not delivered.
+    pub fn into_message(self) -> M {
+        match self {
+            Self::MailboxFull(message)
+            | Self::MailboxClosed(message)
+            | Self::LifecycleUnavailable { message, .. } => message,
+        }
+    }
+}
+
+impl<M> fmt::Debug for ActorTellError<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MailboxFull(_) => formatter.write_str("MailboxFull(..)"),
+            Self::MailboxClosed(_) => formatter.write_str("MailboxClosed(..)"),
+            Self::LifecycleUnavailable { state, .. } => formatter
+                .debug_struct("LifecycleUnavailable")
+                .field("state", state)
+                .field("message", &"..")
+                .finish(),
+        }
+    }
+}
+
+impl<M> fmt::Display for ActorTellError<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MailboxFull(_) => formatter.write_str("actor mailbox is full"),
+            Self::MailboxClosed(_) => formatter.write_str("actor mailbox is closed"),
+            Self::LifecycleUnavailable { state, .. } => write!(
+                formatter,
+                "actor does not admit business traffic while lifecycle state is {state:?}"
+            ),
+        }
+    }
+}
+
+impl<M> StdError for ActorTellError<M> {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ActorAdminError {
@@ -121,8 +173,8 @@ pub enum ActorAdminError {
     ResponseDropped,
 }
 
-impl From<ActorTellError> for ActorError {
-    fn from(value: ActorTellError) -> Self {
+impl<M> From<ActorTellError<M>> for ActorError {
+    fn from(value: ActorTellError<M>) -> Self {
         Self::new(value.to_string())
     }
 }

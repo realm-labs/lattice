@@ -246,15 +246,16 @@ impl ActorCompletionTopology {
         let mut mailbox_full_retries = 0;
         for _ in 0..requests {
             let admitted_from = Instant::now();
+            let mut message = CompletionTell {
+                admitted_from,
+                payload: payload.clone(),
+                completed: completed_tx.clone(),
+            };
             loop {
-                let message = CompletionTell {
-                    admitted_from,
-                    payload: payload.clone(),
-                    completed: completed_tx.clone(),
-                };
                 match self.handle.try_tell(message) {
                     Ok(()) => break,
-                    Err(ActorTellError::MailboxFull) => {
+                    Err(ActorTellError::MailboxFull(returned)) => {
+                        message = returned;
                         mailbox_full_retries += 1;
                         tokio::task::yield_now().await;
                     }
@@ -309,13 +310,14 @@ impl ActorCompletionTopology {
         let started = Instant::now();
         let mut mailbox_full_retries = 0;
         for _ in 0..requests {
+            let mut message = RawCompletionTell {
+                payload: payload.clone(),
+            };
             loop {
-                let message = RawCompletionTell {
-                    payload: payload.clone(),
-                };
                 match self.handle.try_tell(message) {
                     Ok(()) => break,
-                    Err(ActorTellError::MailboxFull) => {
+                    Err(ActorTellError::MailboxFull(returned)) => {
+                        message = returned;
                         mailbox_full_retries += 1;
                         tokio::task::yield_now().await;
                     }
@@ -325,12 +327,14 @@ impl ActorCompletionTopology {
         }
 
         let completed = Arc::new(Notify::new());
+        let mut barrier = CompletionBarrier {
+            completed: completed.clone(),
+        };
         loop {
-            match self.handle.try_tell(CompletionBarrier {
-                completed: completed.clone(),
-            }) {
+            match self.handle.try_tell(barrier) {
                 Ok(()) => break,
-                Err(ActorTellError::MailboxFull) => {
+                Err(ActorTellError::MailboxFull(returned)) => {
+                    barrier = returned;
                     mailbox_full_retries += 1;
                     tokio::task::yield_now().await;
                 }

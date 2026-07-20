@@ -80,10 +80,14 @@ pub async fn local_actor_admission(operations: usize) -> Result<MatrixMeasuremen
     let handle = registry.start(ActorId::U64(1), BenchActor).await?;
     let started = Instant::now();
     for _ in 0..operations {
+        let mut message = BenchTell;
         loop {
-            match handle.try_tell(BenchTell) {
+            match handle.try_tell(message) {
                 Ok(()) => break,
-                Err(ActorTellError::MailboxFull) => tokio::task::yield_now().await,
+                Err(ActorTellError::MailboxFull(returned)) => {
+                    message = returned;
+                    tokio::task::yield_now().await;
+                }
                 Err(error) => return Err(Box::new(error)),
             }
         }

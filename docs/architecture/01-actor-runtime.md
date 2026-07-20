@@ -422,12 +422,22 @@ impl<A: Actor> ActorHandle<A> {
         A: Responder<R>,
         R: Request;
 
-    pub async fn tell<M>(&self, msg: M) -> Result<(), ActorTellError>
+    pub async fn tell<M>(&self, msg: M) -> Result<(), ActorTellError<M>>
+    where
+        A: Handler<M>,
+        M: Message;
+
+    pub fn try_tell<M>(&self, msg: M) -> Result<(), ActorTellError<M>>
     where
         A: Handler<M>,
         M: Message;
 }
 ```
+
+`tell` waits for bounded mailbox capacity; `try_tell` returns immediately when the mailbox is full.
+Every `ActorTellError<M>` variant retains the original message, allowing the caller to retry or
+reroute without requiring `M: Clone`. The runtime constructs the type-erased envelope only for the
+channel operation and recovers `M` from a rejected envelope.
 
 Every ask has an explicit relative timeout. The runtime converts it to one monotonic deadline before mailbox admission; that deadline covers mailbox waiting, handler execution, and deferred reply delivery. A zero timeout returns `DeadlineExceeded`, and a duration that cannot be represented by `Instant` returns `InvalidTimeout`. There is no public unbounded or absolute-deadline ask API.
 

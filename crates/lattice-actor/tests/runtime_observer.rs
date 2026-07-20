@@ -367,8 +367,8 @@ async fn runtime_observer_reports_mailbox_rejection() {
 
     handle.tell(QueuedTell).await.unwrap();
     assert!(matches!(
-        handle.tell(QueuedTell).await,
-        Err(ActorTellError::MailboxFull)
+        handle.try_tell(QueuedTell),
+        Err(ActorTellError::MailboxFull(_))
     ));
     assert!(matches!(
         handle.ask(QueuedRequest, ASK_TIMEOUT).await,

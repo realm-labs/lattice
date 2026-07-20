@@ -652,7 +652,8 @@ async fn stop_failed_rejects_business_traffic_but_accepts_force_stop() {
     assert!(matches!(
         handle.tell(BusinessMessage).await,
         Err(ActorTellError::LifecycleUnavailable {
-            state: ActorLifecycleState::StopFailed
+            state: ActorLifecycleState::StopFailed,
+            ..
         })
     ));
 

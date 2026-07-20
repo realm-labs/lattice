@@ -163,7 +163,7 @@ impl<A: Actor> ActorContext<A> {
         &self,
         target: &ActorHandle<B>,
         message: M,
-    ) -> Result<(), ActorTellError>
+    ) -> Result<(), ActorTellError<M>>
     where
         B: Actor + Handler<M>,
         <B as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
@@ -181,7 +181,7 @@ impl<A: Actor> ActorContext<A> {
         &self,
         target: &ActorHandle<B>,
         message: M,
-    ) -> Result<(), ActorTellError>
+    ) -> Result<(), ActorTellError<M>>
     where
         B: Actor + Handler<M>,
         <B as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,

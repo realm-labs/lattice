@@ -22,7 +22,8 @@ use crate::{
     mailbox::{ActorCommand, MailboxLane, RequestEnvelope, TellEnvelope},
     observation::{ActorMetadata, ActorObserverHandle, MailboxRejection, RequestCompletion},
     traits::{
-        Actor, ActorLifecycleState, Handler, Message, MessageKind, Request, Responder, StopReason,
+        Actor, ActorLifecycleState, Handler, Message, MessageKind, MessageMetadata, Request,
+        Responder, StopReason,
     },
     watch::{ActorTerminated, LocalActorRef},
 };
@@ -267,7 +268,23 @@ impl<A: Actor> ActorHandle<A> {
         }
     }
 
-    pub async fn tell<M>(&self, msg: M) -> Result<(), ActorTellError>
+    /// Waits for normal-mailbox capacity and admits one one-way message.
+    ///
+    /// If the Actor closes or stops admitting business traffic while waiting,
+    /// the error returns ownership of `msg`.
+    pub async fn tell<M>(&self, msg: M) -> Result<(), ActorTellError<M>>
+    where
+        A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
+        M: Message,
+    {
+        self.send_tell_on_lane(msg, None, MailboxLane::Normal).await
+    }
+
+    /// Attempts to admit one one-way message without waiting for capacity.
+    ///
+    /// Full, closed, and lifecycle-rejected results return ownership of `msg`.
+    pub fn try_tell<M>(&self, msg: M) -> Result<(), ActorTellError<M>>
     where
         A: Handler<M>,
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
@@ -276,17 +293,8 @@ impl<A: Actor> ActorHandle<A> {
         self.try_tell_on_lane(msg, None, MailboxLane::Normal)
     }
 
-    pub fn try_tell<M>(&self, msg: M) -> Result<(), ActorTellError>
-    where
-        A: Handler<M>,
-        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
-        M: Message,
-    {
-        self.try_tell_on_lane(msg, None, MailboxLane::Normal)
-    }
-
-    pub async fn stop(&self, reason: StopReason) -> Result<(), ActorTellError> {
-        self.send_system_command(ActorCommand::Stop(reason))
+    pub async fn stop(&self, reason: StopReason) -> Result<(), ActorTellError<StopReason>> {
+        self.try_send_stop(reason)
     }
 
     pub fn inspect_stop_failure(&self) -> Option<StopFailureRecord> {
@@ -357,8 +365,11 @@ impl<A: Actor> ActorHandle<A> {
             .map_err(|_| ActorAdminError::ResponseDropped)?
     }
 
-    pub(crate) fn try_stop_internal(&self, reason: StopReason) -> Result<(), ActorTellError> {
-        self.send_system_command(ActorCommand::Stop(reason))
+    pub(crate) fn try_stop_internal(
+        &self,
+        reason: StopReason,
+    ) -> Result<(), ActorTellError<StopReason>> {
+        self.try_send_stop(reason)
     }
 
     pub(crate) fn mark_external_authority_lost(&self) -> ActorLifecycleState {
@@ -372,7 +383,7 @@ impl<A: Actor> ActorHandle<A> {
         &self,
         previous: ActorLifecycleState,
         reason: StopReason,
-    ) -> Result<(), ActorTellError> {
+    ) -> Result<(), ActorAdminError> {
         if matches!(
             previous,
             ActorLifecycleState::Passivating
@@ -380,13 +391,18 @@ impl<A: Actor> ActorHandle<A> {
                 | ActorLifecycleState::StopFailed
         ) {
             let (result, _response) = oneshot::channel();
-            self.send_system_command(ActorCommand::Quarantine(result))
+            self.send_admin_command(ActorCommand::Quarantine(result))
         } else {
-            self.send_system_command(ActorCommand::Stop(reason))
+            self.try_send_stop(reason).map_err(|error| match error {
+                ActorTellError::MailboxFull(_) => ActorAdminError::MailboxFull,
+                ActorTellError::MailboxClosed(_) | ActorTellError::LifecycleUnavailable { .. } => {
+                    ActorAdminError::MailboxClosed
+                }
+            })
         }
     }
 
-    pub(crate) fn try_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError>
+    pub(crate) fn try_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError<M>>
     where
         A: Handler<M>,
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
@@ -395,40 +411,13 @@ impl<A: Actor> ActorHandle<A> {
         self.try_tell_on_lane(msg, None, MailboxLane::Normal)
     }
 
-    pub(crate) async fn send_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError>
+    pub(crate) async fn send_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError<M>>
     where
         A: Handler<M>,
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
-        let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg, None)));
-        let metadata = self
-            .observer
-            .is_enabled()
-            .then(|| command.metadata(MailboxLane::Normal))
-            .flatten();
-        match self.normal_tx.send(command).await {
-            Ok(()) => {
-                if let Some(metadata) = metadata {
-                    self.observer.message_enqueued(
-                        self.observation_metadata(),
-                        &metadata,
-                        self.normal_tx.max_capacity() - self.normal_tx.capacity(),
-                    );
-                }
-                Ok(())
-            }
-            Err(_) => {
-                if let Some(metadata) = metadata {
-                    self.observer.mailbox_rejected(
-                        self.observation_metadata(),
-                        &metadata,
-                        MailboxRejection::Closed,
-                    );
-                }
-                Err(ActorTellError::MailboxClosed)
-            }
-        }
+        self.send_tell_on_lane(msg, None, MailboxLane::Normal).await
     }
 
     pub fn subscribe_terminated(&self) -> ActorTerminationSubscription {
@@ -525,7 +514,7 @@ impl<A: Actor> ActorHandle<A> {
     }
 
     #[cfg(test)]
-    pub(crate) fn try_tell_for_test<M>(&self, msg: M) -> Result<(), ActorTellError>
+    pub(crate) fn try_tell_for_test<M>(&self, msg: M) -> Result<(), ActorTellError<M>>
     where
         A: Handler<M>,
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
@@ -535,7 +524,7 @@ impl<A: Actor> ActorHandle<A> {
     }
 
     #[cfg(test)]
-    pub(crate) fn try_tell_system_for_test<M>(&self, msg: M) -> Result<(), ActorTellError>
+    pub(crate) fn try_tell_system_for_test<M>(&self, msg: M) -> Result<(), ActorTellError<M>>
     where
         A: Handler<M>,
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
@@ -548,7 +537,7 @@ impl<A: Actor> ActorHandle<A> {
         &self,
         msg: M,
         sender: Option<ActorRef>,
-    ) -> Result<(), ActorTellError>
+    ) -> Result<(), ActorTellError<M>>
     where
         A: Handler<M>,
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
@@ -562,24 +551,157 @@ impl<A: Actor> ActorHandle<A> {
         msg: M,
         sender: Option<ActorRef>,
         lane: MailboxLane,
-    ) -> Result<(), ActorTellError>
+    ) -> Result<(), ActorTellError<M>>
     where
         A: Handler<M>,
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
         M: Message,
     {
+        if let Some(state) = self.unavailable_lifecycle(lane) {
+            return Err(ActorTellError::LifecycleUnavailable {
+                state,
+                message: msg,
+            });
+        }
+        let channel = self.channel(lane);
         let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg, sender)));
-        self.send_command(command, lane)
-            .map_err(ActorTellError::from)
+        let metadata = self.observed_metadata(&command, lane);
+        match channel.try_send(command) {
+            Ok(()) => {
+                self.observe_tell_enqueued(metadata, channel);
+                Ok(())
+            }
+            Err(TrySendError::Full(command)) => {
+                if let Some(metadata) = metadata {
+                    self.observer.mailbox_rejected(
+                        self.observation_metadata(),
+                        &metadata,
+                        MailboxRejection::Full,
+                    );
+                }
+                Err(ActorTellError::MailboxFull(command.into_tell::<M>()))
+            }
+            Err(TrySendError::Closed(command)) => {
+                if let Some(metadata) = metadata {
+                    self.observer.mailbox_rejected(
+                        self.observation_metadata(),
+                        &metadata,
+                        MailboxRejection::Closed,
+                    );
+                }
+                Err(ActorTellError::MailboxClosed(command.into_tell::<M>()))
+            }
+        }
     }
 
-    fn send_system_command(&self, command: ActorCommand<A>) -> Result<(), ActorTellError> {
+    async fn send_tell_on_lane<M>(
+        &self,
+        msg: M,
+        sender: Option<ActorRef>,
+        lane: MailboxLane,
+    ) -> Result<(), ActorTellError<M>>
+    where
+        A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
+        M: Message,
+    {
+        if let Some(state) = self.unavailable_lifecycle(lane) {
+            return Err(ActorTellError::LifecycleUnavailable {
+                state,
+                message: msg,
+            });
+        }
+        let channel = self.channel(lane);
+        let permit = match channel.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.observe_tell_rejection::<M>(lane, MailboxRejection::Closed);
+                return Err(ActorTellError::MailboxClosed(msg));
+            }
+        };
+        if let Some(state) = self.unavailable_lifecycle(lane) {
+            return Err(ActorTellError::LifecycleUnavailable {
+                state,
+                message: msg,
+            });
+        }
+        let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg, sender)));
+        let metadata = self.observed_metadata(&command, lane);
+        permit.send(command);
+        self.observe_tell_enqueued(metadata, channel);
+        Ok(())
+    }
+
+    fn try_send_stop(&self, reason: StopReason) -> Result<(), ActorTellError<StopReason>> {
         self.system_tx
-            .try_send(command)
+            .try_send(ActorCommand::Stop(reason))
             .map_err(|error| match error {
-                TrySendError::Full(_) => ActorTellError::MailboxFull,
-                TrySendError::Closed(_) => ActorTellError::MailboxClosed,
+                TrySendError::Full(_) => ActorTellError::MailboxFull(reason),
+                TrySendError::Closed(_) => ActorTellError::MailboxClosed(reason),
             })
+    }
+
+    fn channel(&self, lane: MailboxLane) -> &mpsc::Sender<ActorCommand<A>> {
+        match lane {
+            MailboxLane::Normal => &self.normal_tx,
+            MailboxLane::System => &self.system_tx,
+        }
+    }
+
+    fn unavailable_lifecycle(&self, lane: MailboxLane) -> Option<ActorLifecycleState> {
+        if lane != MailboxLane::Normal {
+            return None;
+        }
+        let state = self.lifecycle_state();
+        matches!(
+            state,
+            ActorLifecycleState::Passivating
+                | ActorLifecycleState::Stopping
+                | ActorLifecycleState::StopFailed
+                | ActorLifecycleState::Quarantined
+                | ActorLifecycleState::Stopped
+        )
+        .then_some(state)
+    }
+
+    fn observed_metadata(
+        &self,
+        command: &ActorCommand<A>,
+        lane: MailboxLane,
+    ) -> Option<MessageMetadata> {
+        self.observer
+            .is_enabled()
+            .then(|| command.metadata(lane))
+            .flatten()
+    }
+
+    fn observe_tell_enqueued(
+        &self,
+        metadata: Option<MessageMetadata>,
+        channel: &mpsc::Sender<ActorCommand<A>>,
+    ) {
+        if let Some(metadata) = metadata {
+            self.observer.message_enqueued(
+                self.observation_metadata(),
+                &metadata,
+                channel.max_capacity() - channel.capacity(),
+            );
+        }
+    }
+
+    fn observe_tell_rejection<M: Message>(&self, lane: MailboxLane, reason: MailboxRejection) {
+        if !self.observer.is_enabled() {
+            return;
+        }
+        let metadata = MessageMetadata::new(
+            type_name::<M>(),
+            MessageKind::Tell,
+            lane.into(),
+            Instant::now(),
+            None,
+        );
+        self.observer
+            .mailbox_rejected(self.observation_metadata(), &metadata, reason);
     }
 
     fn send_admin_command(&self, command: ActorCommand<A>) -> Result<(), ActorAdminError> {
@@ -663,22 +785,6 @@ impl<A: Actor> ActorHandle<A> {
                 }
                 Err(ActorCallError::MailboxClosed)
             }
-        }
-    }
-}
-
-impl From<ActorCallError> for ActorTellError {
-    fn from(value: ActorCallError) -> Self {
-        match value {
-            ActorCallError::InvalidTimeout => Self::MailboxClosed,
-            ActorCallError::MailboxFull => Self::MailboxFull,
-            ActorCallError::MailboxClosed => Self::MailboxClosed,
-            ActorCallError::ActorPanicked => Self::MailboxClosed,
-            ActorCallError::LifecycleUnavailable { state } => Self::LifecycleUnavailable { state },
-            ActorCallError::ResponseDropped
-            | ActorCallError::DeadlineExceeded
-            | ActorCallError::UnhandledInCurrentState
-            | ActorCallError::Handler(_) => Self::MailboxClosed,
         }
     }
 }

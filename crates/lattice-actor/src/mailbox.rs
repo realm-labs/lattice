@@ -1,4 +1,4 @@
-use std::any::type_name;
+use std::any::{Any, type_name};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -108,11 +108,24 @@ impl<A: Actor> ActorCommand<A> {
             }
         }
     }
+
+    pub(crate) fn into_tell<M: Message>(self) -> M {
+        let Self::Envelope(envelope) = self else {
+            panic!("business tell admission returned a non-envelope command");
+        };
+        let envelope = envelope
+            .into_any()
+            .downcast::<TellEnvelope<M>>()
+            .expect("business tell admission returned a different message type");
+        envelope.into_message()
+    }
 }
 
 #[async_trait]
 pub(crate) trait ActorEnvelope<A: Actor>: Send {
     fn metadata(&self, lane: MailboxLane) -> MessageMetadata;
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
 
     fn reject_panicked(&mut self) -> Option<RequestCompletion> {
         None
@@ -163,6 +176,12 @@ impl<M: Message> TellEnvelope<M> {
             enqueued_at: Instant::now(),
         }
     }
+
+    fn into_message(mut self) -> M {
+        self.msg
+            .take()
+            .expect("tell envelope message is present before dispatch")
+    }
 }
 
 #[async_trait]
@@ -180,6 +199,10 @@ where
             self.enqueued_at,
             None,
         )
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+        self
     }
 
     async fn handle(
@@ -245,6 +268,10 @@ where
             self.enqueued_at,
             self.deadline,
         )
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+        self
     }
 
     fn reject_panicked(&mut self) -> Option<RequestCompletion> {

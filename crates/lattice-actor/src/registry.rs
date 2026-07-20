@@ -21,7 +21,7 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::{
     directory::ActivationDirectory,
-    error::{ActorActivationError, ActorAdminError, ActorError, ActorTellError},
+    error::{ActorActivationError, ActorAdminError, ActorError},
     handle::{ActorHandle, StopFailureRecord},
     mailbox::MailboxConfig,
     observation::ActorObserverHandle,
@@ -465,12 +465,6 @@ impl<A: Actor> ActorRegistry<A> {
         }
         handle
             .begin_fenced_stop(previous, StopReason::AuthorityLost)
-            .map_err(|error| match error {
-                ActorTellError::MailboxFull => ActorAdminError::MailboxFull,
-                ActorTellError::MailboxClosed | ActorTellError::LifecycleUnavailable { .. } => {
-                    ActorAdminError::MailboxClosed
-                }
-            })
             .map_err(ActorQuarantineError::Admin)?;
         if capacity_exhausted {
             tracing::error!(

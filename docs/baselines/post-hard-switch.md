@@ -231,6 +231,27 @@ confirms one eliminated handler-future allocation per successful message and red
 successful path from approximately three allocations to two. Single-run counting-allocator
 throughput remains diagnostic rather than a timing baseline.
 
+### Ownership-preserving tell rejection
+
+A third 2026-07-20 follow-up made `ActorTellError<M>` retain the original business message on full,
+closed, and lifecycle-rejected admission. `try_tell` keeps Tokio's direct `try_send` hot path and
+recovers `M` from the rejected type-erased envelope; `tell` waits for a mailbox permit and rechecks
+lifecycle fencing before constructing the envelope. Saturation benchmarks now retry the returned
+message rather than cloning `Bytes` and its completion sender on every full-mailbox result.
+
+After rebasing the typed state-machine behavior change, Criterion measured:
+
+| Workload | Batch time | Throughput |
+|---|---:|---:|
+| Raw bounded-mailbox completion | 2.4607-2.5818 ms | 3.8733-4.0638M/s |
+| Per-message latency completion | 4.2107-4.3219 ms | 2.3138-2.3749M/s |
+
+The allocator-instrumented raw run recorded 24,010 allocations for 10,000 successful messages and
+3,945 full-mailbox retries. The normalized successful path remains approximately two allocations per
+message. Each rejected `try_tell` still allocates and then recovers one type-erased envelope, but it no
+longer clones or loses the business payload. A `try_reserve`-first prototype removed that rejected
+allocation but reduced saturated Criterion throughput enough that it was not retained.
+
 The MongoDB persistence framework baseline was captured with:
 
 ```text

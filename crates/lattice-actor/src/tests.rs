@@ -765,8 +765,44 @@ async fn mailbox_full_returns_explicit_error() {
     handle.try_tell_for_test(Record::new("first")).unwrap();
     let second = handle.try_tell_for_test(Record::new("second"));
 
-    assert!(matches!(second, Err(ActorTellError::MailboxFull)));
+    let returned = match second {
+        Err(ActorTellError::MailboxFull(message)) => message,
+        other => panic!("expected full mailbox, got {other:?}"),
+    };
+    assert_eq!(returned.value, "second");
     start_gate.add_permits(1);
+}
+
+#[tokio::test]
+async fn tell_waits_for_capacity_without_losing_the_message() {
+    let start_gate = Arc::new(Semaphore::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let actor = TestActor {
+        events: events.clone(),
+        start_gate: Some(start_gate.clone()),
+        stopped: None,
+    };
+    let handle = spawn_actor(actor, MailboxConfig::bounded(1));
+
+    handle.try_tell(Record::new("first")).unwrap();
+    let processed = Arc::new(Semaphore::new(0));
+    let pending_handle = handle.clone();
+    let pending_processed = processed.clone();
+    let pending = tokio::spawn(async move {
+        pending_handle
+            .tell(Record::with_processed_signal("second", pending_processed))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !pending.is_finished(),
+        "tell must wait while the bounded mailbox is full"
+    );
+
+    start_gate.add_permits(1);
+    pending.await.unwrap().unwrap();
+    processed.acquire().await.unwrap().forget();
+    assert_eq!(*events.lock().await, vec!["first", "second"]);
 }
 
 #[tokio::test]
@@ -892,12 +928,14 @@ async fn business_passivation_happens_after_handler_response() {
 
     assert_eq!(reply, "reply-before-stop");
     assert_eq!(*events.lock().await, vec!["handled"]);
-    assert!(matches!(
-        after_stop,
+    let returned = match after_stop {
         Err(ActorTellError::LifecycleUnavailable {
-            state: ActorLifecycleState::Stopped
-        })
-    ));
+            state: ActorLifecycleState::Stopped,
+            message,
+        }) => message,
+        other => panic!("expected stopped lifecycle rejection, got {other:?}"),
+    };
+    assert_eq!(returned.value, "after-stop");
 }
 
 #[tokio::test]
