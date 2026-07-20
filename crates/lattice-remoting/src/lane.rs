@@ -33,6 +33,9 @@ use crate::{
     wire::{Frame, FrameCodec, FrameKind, WireError},
 };
 
+// Coalesce only bulk frames that are already queued; never delay the first frame to fill a batch.
+const MAX_BULK_WRITE_BATCH_FRAMES: usize = 32;
+
 #[derive(Debug, Clone, Copy)]
 pub struct BidirectionalLaneConfig {
     pub maximum_frame_size: usize,
@@ -149,6 +152,8 @@ where
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_received = Instant::now();
+    let mut outbound_candidates = Vec::with_capacity(MAX_BULK_WRITE_BATCH_FRAMES);
+    let mut outbound_batch = Vec::with_capacity(MAX_BULK_WRITE_BATCH_FRAMES);
     let idle = tokio::time::sleep(config.idle_data_connection_timeout);
     tokio::pin!(idle);
 
@@ -172,25 +177,58 @@ where
                 );
             }
             outbound = receiver.recv() => {
-                let Some(mut frame) = outbound else {
+                let Some(frame) = outbound else {
                     return Ok(LaneExit::QueueClosed);
                 };
-                let reserved_bytes = frame.payload_len();
-                if !messaging.prepare_ask_for_socket_write(&mut frame) {
-                    association.release_queued_bytes(reserved_bytes);
+                outbound_candidates.clear();
+                outbound_candidates.push(frame);
+                let batch_limit = if matches!(lane, LaneKind::Bulk(_)) {
+                    MAX_BULK_WRITE_BATCH_FRAMES
+                } else {
+                    1
+                };
+                while outbound_candidates.len() < batch_limit {
+                    let Ok(frame) = receiver.try_recv() else {
+                        break;
+                    };
+                    outbound_candidates.push(frame);
+                }
+                outbound_batch.clear();
+                let mut reserved_bytes = 0;
+                for mut frame in outbound_candidates.drain(..) {
+                    let frame_bytes = frame.payload_len();
+                    if !messaging.prepare_ask_for_socket_write(&mut frame) {
+                        association.release_queued_bytes(frame_bytes);
+                        continue;
+                    }
+                    reserved_bytes += frame_bytes;
+                    outbound_batch.push(frame);
+                }
+                if outbound_batch.is_empty() {
                     continue;
                 }
-                let correlation = ask_correlation(&frame);
-                if frame.kind == FrameKind::ControlEnvelope {
+                if outbound_batch
+                    .iter()
+                    .any(|frame| frame.kind == FrameKind::ControlEnvelope)
+                {
                     lattice_core::failpoint::hit(
                         Failpoint::ControlAfterOutboxBeforeSocketWrite,
                     );
                 }
-                let result = writer.write_frame_with_commit(&frame, || {
-                    if let Some(correlation) = correlation {
-                        messaging.mark_socket_write_started(correlation);
-                    }
-                }).await;
+                let result = if matches!(lane, LaneKind::Bulk(_)) {
+                    writer
+                        .write_frames_with_commit(&outbound_batch, |_| {})
+                        .await
+                } else {
+                    let correlation = ask_correlation(&outbound_batch[0]);
+                    writer
+                        .write_frame_with_commit(&outbound_batch[0], || {
+                            if let Some(correlation) = correlation {
+                                messaging.mark_socket_write_started(correlation);
+                            }
+                        })
+                        .await
+                };
                 association.release_queued_bytes(reserved_bytes);
                 result?;
                 idle.as_mut().reset(
