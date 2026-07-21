@@ -541,14 +541,14 @@ impl Association {
     pub fn release_queued_bytes(&self, bytes: usize) {
         let _ = self
             .queued_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(bytes))
             });
-        let _ =
-            self.node_queued_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    Some(current.saturating_sub(bytes))
-                });
+        let _ = self
+            .node_queued_bytes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(bytes))
+            });
     }
 
     pub fn begin_close(&self) {
@@ -595,24 +595,24 @@ impl Association {
 
     fn reserve_bytes(&self, bytes: usize) -> Result<(), AssociationError> {
         self.queued_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 let next = current.checked_add(bytes)?;
                 (next <= self.config.max_outbound_bytes_per_association).then_some(next)
             })
             .map_err(|_| AssociationError::ByteBudgetExceeded)?;
         if self
             .node_queued_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 let next = current.checked_add(bytes)?;
                 (next <= self.config.max_outbound_bytes_per_node).then_some(next)
             })
             .is_err()
         {
-            let _ =
-                self.queued_bytes
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                        Some(current.saturating_sub(bytes))
-                    });
+            let _ = self
+                .queued_bytes
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_sub(bytes))
+                });
             return Err(AssociationError::NodeByteBudgetExceeded);
         }
         Ok(())

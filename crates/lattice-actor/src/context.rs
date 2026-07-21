@@ -3,7 +3,10 @@ use std::{
     collections::HashMap,
     fmt,
     future::Future,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -18,6 +21,7 @@ use crate::{
     directory::ActivationDirectory,
     error::{ActorCallError, ActorError, ActorTellError, PipeToSelfError},
     handle::ActorHandle,
+    mailbox::continuation::ContinuationEnvelope,
     protocol::{SupportsAsk, SupportsTell},
     recipient::{ActorSystem, RecipientError, deadline_from_timeout},
     reply::{PendingReply, ReplyControl, ReplyTo},
@@ -29,7 +33,8 @@ use crate::{
     watch::{ActorTerminated, WatchId},
 };
 
-/// A cancellation handle for work started by [`ActorContext::pipe_to_self`].
+/// A cancellation handle for work started by [`ActorContext::pipe_to_self`] or
+/// [`ActorContext::continue_with`].
 ///
 /// Dropping the handle does not cancel the task. Call [`Self::abort`] when the
 /// owning actor state has explicitly abandoned the asynchronous operation.
@@ -37,6 +42,28 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct PipeTaskHandle {
     abort: tokio::task::AbortHandle,
+}
+
+struct DeferredTaskPermit {
+    active: Option<Arc<AtomicUsize>>,
+}
+
+impl DeferredTaskPermit {
+    fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if let Some(active) = self.active.take() {
+            active.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for DeferredTaskPermit {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
 }
 
 impl PipeTaskHandle {
@@ -62,7 +89,8 @@ pub struct ActorContext<A: Actor> {
     spawner: ActorSpawner,
     lifecycle_request: Option<StopReason>,
     tasks: JoinSet<()>,
-    pipe_tasks: JoinSet<()>,
+    deferred_tasks: JoinSet<()>,
+    active_deferred_tasks: Arc<AtomicUsize>,
     pending_replies: Vec<Box<dyn PendingReply>>,
     deferred_capacity: usize,
     watches: HashMap<WatchId, JoinHandle<()>>,
@@ -87,7 +115,11 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
             .field("service", &self.service)
             .field("lifecycle_request", &self.lifecycle_request)
             .field("task_count", &self.tasks.len())
-            .field("pipe_task_count", &self.pipe_tasks.len())
+            .field("deferred_task_count", &self.deferred_tasks.len())
+            .field(
+                "active_deferred_task_count",
+                &self.active_deferred_tasks.load(Ordering::Acquire),
+            )
             .field("pending_reply_count", &self.pending_replies.len())
             .field("deferred_capacity", &self.deferred_capacity)
             .field("watch_count", &self.watches.len())
@@ -116,7 +148,8 @@ impl<A: Actor> ActorContext<A> {
             spawner,
             lifecycle_request: None,
             tasks: JoinSet::new(),
-            pipe_tasks: JoinSet::new(),
+            deferred_tasks: JoinSet::new(),
+            active_deferred_tasks: Arc::new(AtomicUsize::new(0)),
             pending_replies: Vec::new(),
             deferred_capacity,
             watches: HashMap::new(),
@@ -377,15 +410,60 @@ impl<A: Actor> ActorContext<A> {
         Fut::Output: Send + 'static,
         Map: FnOnce(Fut::Output) -> M + Send + 'static,
     {
-        self.reserve_pipe_task()?;
+        let permit = self.reserve_deferred_task()?;
         let handle = self.handle.clone();
-        let abort = self.pipe_tasks.spawn(async move {
+        let abort = self.deferred_tasks.spawn(async move {
             let message = map(future.await);
+            permit.release();
             if let Err(error) = handle.send_tell_internal(message).await {
                 tracing::debug!(
                     actor.type = type_name::<A>(),
                     %error,
                     "actor pipe-to-self continuation was not delivered"
+                );
+            }
+        });
+        Ok(PipeTaskHandle { abort })
+    }
+
+    /// Runs asynchronous work outside the actor turn, then resumes directly
+    /// against the actor in a later normal-mailbox turn.
+    ///
+    /// The continuation receives exclusive access to the actor, its
+    /// message-scoped [`HandlerContext`], and the future output. It is
+    /// intentionally synchronous: start another asynchronous step with
+    /// `continue_with` instead of holding actor access across an `.await`.
+    /// Other mailbox traffic may run before the continuation, and concurrently
+    /// started operations have no start-order guarantee.
+    /// Continuations are internal actor work and do not participate in typed
+    /// behavior admission, though they remain observable as
+    /// [`crate::traits::MessageKind::Continuation`].
+    ///
+    /// Use [`Self::pipe_to_self`] when the result should remain an explicit
+    /// typed message handled through [`Handler`].
+    pub fn continue_with<Fut, Continue>(
+        &mut self,
+        future: Fut,
+        continuation: Continue,
+    ) -> Result<PipeTaskHandle, PipeToSelfError>
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+        Continue: FnOnce(&mut A, &mut HandlerContext<'_, A>, Fut::Output) -> Result<(), A::Error>
+            + Send
+            + 'static,
+    {
+        let permit = self.reserve_deferred_task()?;
+        let handle = self.handle.clone();
+        let abort = self.deferred_tasks.spawn(async move {
+            let output = future.await;
+            let envelope = ContinuationEnvelope::new(output, continuation);
+            permit.release();
+            if let Err(error) = handle.send_envelope_internal(envelope).await {
+                tracing::debug!(
+                    actor.type = type_name::<A>(),
+                    %error,
+                    "actor continuation was not delivered"
                 );
             }
         });
@@ -416,14 +494,13 @@ impl<A: Actor> ActorContext<A> {
         Map: FnOnce(Fut::Output, ReplyTo<T>) -> M + Send + 'static,
     {
         let control = reply_to.control();
-        if let Err(error) = self.reserve_pipe_task() {
+        let permit = self.reserve_deferred_task().inspect_err(|_| {
             control.cancel(ActorCallError::MailboxFull);
-            return Err(error);
-        }
+        })?;
 
         let handle = self.handle.clone();
         let deadline = control.deadline();
-        self.pipe_tasks.spawn(async move {
+        self.deferred_tasks.spawn(async move {
             let output = if let Some(deadline) = deadline {
                 match tokio::time::timeout_at(deadline.into(), future).await {
                     Ok(output) => output,
@@ -440,6 +517,7 @@ impl<A: Actor> ActorContext<A> {
                 return;
             }
             let message = map(output, reply_to);
+            permit.release();
             if let Some(deadline) = deadline {
                 match tokio::time::timeout_at(deadline.into(), handle.send_tell_internal(message))
                     .await
@@ -455,15 +533,18 @@ impl<A: Actor> ActorContext<A> {
         Ok(())
     }
 
-    fn reserve_pipe_task(&mut self) -> Result<(), PipeToSelfError> {
+    fn reserve_deferred_task(&mut self) -> Result<DeferredTaskPermit, PipeToSelfError> {
         self.reap_runtime_work();
-        if self.pipe_tasks.len() >= self.deferred_capacity {
-            Err(PipeToSelfError::Capacity {
+        self.active_deferred_tasks
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.deferred_capacity).then_some(active + 1)
+            })
+            .map(|_| DeferredTaskPermit {
+                active: Some(self.active_deferred_tasks.clone()),
+            })
+            .map_err(|_| PipeToSelfError::Capacity {
                 capacity: self.deferred_capacity,
             })
-        } else {
-            Ok(())
-        }
     }
 
     pub fn watch<B>(&mut self, target: &ActorHandle<B>) -> Result<WatchId, ActorError>
@@ -665,12 +746,12 @@ impl<A: Actor> ActorContext<A> {
         for pending in self.pending_replies.drain(..) {
             pending.cancel(&error);
         }
-        self.pipe_tasks.abort_all();
+        self.deferred_tasks.abort_all();
     }
 
     pub(crate) fn reap_runtime_work(&mut self) {
         Self::reap_tasks(&mut self.tasks, "scoped");
-        Self::reap_tasks(&mut self.pipe_tasks, "pipe_to_self");
+        Self::reap_tasks(&mut self.deferred_tasks, "deferred");
         self.pending_replies.retain(|pending| !pending.reap());
     }
 

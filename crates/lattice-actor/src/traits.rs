@@ -23,11 +23,13 @@ pub trait Request: Send + 'static {
     type Response: Send + 'static;
 }
 
-/// Whether a delivered actor message is a one-way tell or a request with a reply channel.
+/// The kind of work delivered through an actor mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
     Tell,
     Request,
+    /// Internal actor work resumed after an asynchronous operation completed.
+    Continuation,
 }
 
 /// The mailbox lane from which a message was delivered.
@@ -78,7 +80,7 @@ impl MessageMetadata {
     }
 }
 
-/// Immutable access to the concrete payload before its typed handler consumes it.
+/// Immutable access to the concrete payload before its typed handler or continuation consumes it.
 #[derive(Clone, Copy)]
 pub struct MessageView<'a> {
     metadata: &'a MessageMetadata,
@@ -154,11 +156,11 @@ pub trait Actor: Sized + Send + 'static {
         Self::Behavior::default()
     }
 
-    /// Observes every dequeued tell and request before typed dispatch.
+    /// Observes every dequeued tell, request, and continuation before dispatch.
     ///
     /// The view exposes the immutable concrete payload through `downcast_ref`. This observational
-    /// hook cannot reject or transform a message; typed behavior admission runs immediately
-    /// afterwards.
+    /// hook cannot reject or transform mailbox work. Typed behavior admission follows for tells and
+    /// requests; internal continuations bypass behavior admission.
     fn before_message(&mut self, _ctx: &mut ActorContext<Self>, _message: MessageView<'_>) {}
 
     /// Observes the dispatch result after normal error/recovery handling has completed.

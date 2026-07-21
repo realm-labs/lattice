@@ -342,6 +342,37 @@ ctx.pipe_to_self(
 )?;
 ```
 
+When the continuation is private workflow logic rather than a domain message, `continue_with`
+resumes directly against the Actor in a later normal-mailbox turn. The callback is synchronous and
+may start the next asynchronous step without defining intermediate message types or handlers:
+
+```rust
+let db = self.db.clone();
+ctx.continue_with(
+    async move { db.load_profile(player_id).await },
+    |actor, ctx, profile| {
+        actor.profile = Some(profile?);
+
+        let db = actor.db.clone();
+        let alliance_id = actor.profile.as_ref().unwrap().alliance_id;
+        ctx.continue_with(
+            async move { db.load_alliance(alliance_id).await },
+            |actor, _ctx, alliance| {
+                actor.alliance = Some(alliance?);
+                Ok(())
+            },
+        )?;
+        Ok(())
+    },
+)?;
+```
+
+The asynchronous futures own their dependencies and cannot borrow Actor state. Other messages may
+interleave before either continuation. Direct continuations bypass typed Behavior admission and run
+against the then-current Actor state; they remain visible to hooks and runtime observers as
+`MessageKind::Continuation`. Use `pipe_to_self` when the result is a meaningful domain message that
+should pass through a typed `Handler` and Behavior admission.
+
 When the work belongs to an ask, the responder uses `defer_reply` so the continuation inherits the request deadline and owns its reply capability. The continuation is a later actor turn, so it can combine the query result with current actor state before replying:
 
 ```rust
@@ -383,7 +414,7 @@ impl Handler<ProfileLoaded> for WorldActor {
 }
 ```
 
-`defer_reply` is bounded by the mailbox's deferred capacity, observes the ask deadline, and is cancelled when the actor stops or passivates. Other messages may interleave before the continuation, which is precisely why it observes current rather than captured actor state. For asynchronous work that is not tied to an ask, `pipe_to_self(future, map)` posts the mapped result back as an ordinary one-way message without reply or deadline semantics.
+`defer_reply` is bounded by the mailbox's deferred capacity, observes the ask deadline, and is cancelled when the actor stops or passivates. Other messages may interleave before the continuation, which is precisely why it observes current rather than captured actor state. For asynchronous work that is not tied to an ask, `pipe_to_self(future, map)` posts the mapped result back as an ordinary one-way message without reply or deadline semantics, while `continue_with(future, callback)` resumes private workflow logic directly against the Actor.
 
 ### 7.6 Mailbox
 
@@ -466,6 +497,7 @@ Actor handlers should not block realtime actor execution with unbounded slow I/O
 ```text
 Small bounded I/O in handler when latency is acceptable.
 ActorContext `pipe_to_self` for bounded asynchronous work that must return to actor state.
+ActorContext `continue_with` for private multi-step asynchronous workflows without intermediate messages.
 ActorContext `defer_reply` for request work that must preserve the ask deadline and reply capability.
 ActorContext scoped task for cancellable background work that has no caller reply.
 Dedicated service-level worker for heavy or shared I/O.

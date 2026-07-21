@@ -16,7 +16,7 @@ use tokio::sync::{broadcast, oneshot, watch};
 use crate::{
     error::{ActorAdminError, ActorCallError, ActorTellError},
     mailbox::{
-        ActorCommand, MailboxLane, RequestEnvelope, TellEnvelope,
+        ActorCommand, ActorEnvelope, MailboxLane, RequestEnvelope, TellEnvelope,
         channel::{Sender, TrySendError},
     },
     observation::{ActorMetadata, ActorObserverHandle, MailboxRejection, RequestCompletion},
@@ -417,6 +417,14 @@ impl<A: Actor> ActorHandle<A> {
         self.send_tell_on_lane(msg, None, MailboxLane::Normal).await
     }
 
+    pub(crate) async fn send_envelope_internal<E>(&self, envelope: E) -> Result<(), ActorCallError>
+    where
+        E: ActorEnvelope<A> + 'static,
+    {
+        self.send_command_wait(ActorCommand::envelope(envelope), MailboxLane::Normal)
+            .await
+    }
+
     pub fn subscribe_terminated(&self) -> ActorTerminationSubscription {
         let receiver = self.terminated_tx.subscribe();
         let retained = self
@@ -581,7 +589,7 @@ impl<A: Actor> ActorHandle<A> {
         let command = ActorCommand::envelope(TellEnvelope::new(msg, sender));
         let metadata = self.observed_metadata(&command, lane);
         permit.send(command);
-        self.observe_tell_enqueued(metadata, channel);
+        self.observe_command_enqueued(metadata, channel);
         Ok(())
     }
 
@@ -619,7 +627,7 @@ impl<A: Actor> ActorHandle<A> {
         let command = ActorCommand::envelope(TellEnvelope::new(msg, sender));
         let metadata = self.observed_metadata(&command, lane);
         permit.send(command);
-        self.observe_tell_enqueued(metadata, channel);
+        self.observe_command_enqueued(metadata, channel);
         Ok(())
     }
 
@@ -666,7 +674,7 @@ impl<A: Actor> ActorHandle<A> {
             .flatten()
     }
 
-    fn observe_tell_enqueued(
+    fn observe_command_enqueued(
         &self,
         metadata: Option<MessageMetadata>,
         channel: &Sender<ActorCommand<A>>,
@@ -771,5 +779,33 @@ impl<A: Actor> ActorHandle<A> {
                 Err(ActorCallError::MailboxClosed)
             }
         }
+    }
+
+    async fn send_command_wait(
+        &self,
+        command: ActorCommand<A>,
+        lane: MailboxLane,
+    ) -> Result<(), ActorCallError> {
+        if let Some(state) = self.unavailable_lifecycle(lane) {
+            return Err(ActorCallError::LifecycleUnavailable { state });
+        }
+        let metadata = self.observed_metadata(&command, lane);
+        let channel = self.channel(lane);
+        let permit = channel.reserve().await.map_err(|_| {
+            if let Some(metadata) = metadata {
+                self.observer.mailbox_rejected(
+                    self.observation_metadata(),
+                    &metadata,
+                    MailboxRejection::Closed,
+                );
+            }
+            ActorCallError::MailboxClosed
+        })?;
+        if let Some(state) = self.unavailable_lifecycle(lane) {
+            return Err(ActorCallError::LifecycleUnavailable { state });
+        }
+        permit.send(command);
+        self.observe_command_enqueued(metadata, channel);
+        Ok(())
     }
 }

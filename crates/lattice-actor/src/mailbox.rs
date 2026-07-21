@@ -16,6 +16,7 @@ use crate::traits::{
 };
 
 pub(crate) mod channel;
+pub(crate) mod continuation;
 mod envelope;
 mod future;
 mod pool;
