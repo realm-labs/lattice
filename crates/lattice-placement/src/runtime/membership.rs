@@ -5,13 +5,13 @@ use lattice_core::{
 use lattice_remoting::{association::AssociationKey, control::ControlDispatchError};
 
 use super::{
-    Association, AssociationState, Bytes, ClaimGrant, ClaimLease, CoordinatorLeaseStore,
-    CoordinatorRuntimeError, HandoffEvent, HandoffPhase, Instant, MemberRecord,
-    MemberRemovalReason, MemberSession, MemberStatus, MembershipStore, MembershipVersion, NodeKey,
-    PlacementControlCommand, PlacementDomainHello, PlacementDomainLeader,
-    PlacementDomainLeaderConfig, PlacementDomainStore, PlacementSlotKey, PlacementSlotState,
-    PlacementVersion, PlanReason, RebalanceTrigger, ScopedElectionStore, SnapshotRecord,
-    build_snapshot, encode_control_command,
+    AllocationError, Association, AssociationState, Bytes, ClaimGrant, ClaimLease,
+    CoordinatorLeaseStore, CoordinatorRuntimeError, HandoffEvent, HandoffPhase, Instant,
+    MemberRecord, MemberRemovalReason, MemberSession, MemberStatus, MembershipStore,
+    MembershipVersion, NodeKey, PlacementControlCommand, PlacementDomainHello,
+    PlacementDomainLeader, PlacementDomainLeaderConfig, PlacementDomainStore, PlacementSlotKey,
+    PlacementSlotState, PlacementVersion, PlanReason, RebalanceTrigger, ScopedElectionStore,
+    SnapshotRecord, build_snapshot, encode_control_command,
 };
 use crate::{
     control::PlacementControlEventKind,
@@ -260,8 +260,14 @@ where
                         }
                         let hello = session.hello.clone();
                         let association = session.association.clone();
-                        self.ensure_shard_allocated(entity_type, shard_id).await?;
-                        self.send_snapshot(hello, association).await?;
+                        match self.ensure_shard_allocated(entity_type, shard_id).await {
+                            Ok(()) => self.send_snapshot(hello, association).await?,
+                            Err(CoordinatorRuntimeError::Allocation(
+                                AllocationError::NoEligibleNode,
+                            ))
+                            | Err(CoordinatorRuntimeError::IneligibleTarget) => {}
+                            Err(error) => return Err(error),
+                        }
                     }
                     PlacementControlCommand::ResolveSingleton { domain, kind, .. } => {
                         if domain != self.version.domain {
@@ -278,8 +284,11 @@ where
                         }
                         let hello = session.hello.clone();
                         let association = session.association.clone();
-                        self.ensure_singleton_allocated(kind).await?;
-                        self.send_snapshot(hello, association).await?;
+                        match self.ensure_singleton_allocated(kind).await {
+                            Ok(()) => self.send_snapshot(hello, association).await?,
+                            Err(CoordinatorRuntimeError::IneligibleTarget) => {}
+                            Err(error) => return Err(error),
+                        }
                     }
                     PlacementControlCommand::SnapshotBegin(_)
                     | PlacementControlCommand::SnapshotChunk(_)

@@ -365,13 +365,17 @@ where
                         let envelope = decode_control_envelope(&frame)?;
                         match association.preview_control(&envelope) {
                             ControlApply::Apply(_) => {
-                                control_dispatch
+                                let result = control_dispatch
                                     .apply(
                                         association.key().clone(),
                                         envelope.command_id,
                                         envelope.payload.clone(),
                                     )
-                                    .await?;
+                                    .await;
+                                match result {
+                                    Ok(()) | Err(ControlDispatchError::InvalidCommand) => {}
+                                    Err(error) => return Err(error.into()),
+                                }
                                 lattice_core::failpoint::hit(
                                     Failpoint::ControlAfterRemoteApplyBeforeAck,
                                 );
