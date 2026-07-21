@@ -124,8 +124,10 @@
 //! - registration of singleton and runtime-sized document collections; and
 //! - `prepare_set`, which enumerates every resident persistent document.
 //!
-//! A plain `Tracked<D>` field is an eager singleton. Mark a business-owned
-//! collection with `#[mongo(many)]` and implement
+//! A plain `Tracked<D>` field is a required eager singleton and a missing row
+//! fails activation with `RequiredDocumentMissing`. Mark an eager singleton
+//! with `#[mongo(default)]` to opt into an owner-aware in-memory default, or
+//! mark a business-owned collection with `#[mongo(many)]` and implement
 //! [`document::set::MongoDocumentCollection`] to control its owner query,
 //! actor-local representation, and derived indexes. The framework validates
 //! ownership and registration, but the collection decides how loaded rows are
@@ -136,7 +138,8 @@
 //!
 //! | State model | Primary type | Access model |
 //! | --- | --- | --- |
-//! | Eager singleton | [`document::tracked::Tracked`] | Loaded at actor start; synchronous access |
+//! | Required eager singleton | [`document::tracked::Tracked`] | Loaded at actor start; missing is an error |
+//! | Default-on-missing eager singleton | `#[mongo(default)] Tracked<D>` | Owner-aware in-memory default; synchronous access |
 //! | Eager complete collection | `#[mongo(many)]` collection | Loaded at actor start; ordinary collection APIs |
 //! | Resident lazy singleton | [`loading::document::MongoLazyDocument`] | First access awaits; then remains resident |
 //! | Idle-unloadable singleton | [`loading::document::MongoUnloadableDocument`] | First access awaits; clean idle state may detach |
@@ -144,6 +147,60 @@
 //! | Idle-unloadable collection | [`loading::collection::MongoUnloadableCollection`] | Clean complete collection may detach |
 //! | Row-lazy table | [`loading::table::MongoLazyTable`] | Point/page loads await; resident rows are synchronous |
 //! | Idle-unloadable table | [`loading::table::MongoUnloadableTable`] | Clean idle rows may detach independently |
+//!
+//! The default factory receives the owner ID because ordinary `Default` cannot
+//! reliably populate document identity:
+//!
+//! ```
+//! use std::collections::BTreeMap;
+//!
+//! use lattice_store_mongodb::document::tracked::Tracked;
+//! use lattice_store_mongodb::{
+//!     MongoDefaultDocument, MongoDocument, MongoDocumentSet, MongoScan,
+//! };
+//! use serde::{Deserialize, Serialize};
+//!
+//! type PlayerId = u64;
+//!
+//! #[derive(Debug, Serialize, Deserialize, MongoDocument, MongoScan)]
+//! #[mongo(collection = "player_core")]
+//! struct PlayerCore {
+//!     #[mongo(id)]
+//!     id: PlayerId,
+//!     level: u32,
+//! }
+//!
+//! #[derive(Debug, Serialize, Deserialize, MongoDocument, MongoScan)]
+//! #[mongo(collection = "player_items")]
+//! struct PlayerItems {
+//!     #[mongo(id)]
+//!     id: PlayerId,
+//!     items: BTreeMap<String, u32>,
+//! }
+//!
+//! impl MongoDefaultDocument<PlayerId> for PlayerItems {
+//!     fn default_for(player_id: &PlayerId) -> Self {
+//!         Self { id: *player_id, items: BTreeMap::new() }
+//!     }
+//! }
+//!
+//! #[derive(MongoDocumentSet)]
+//! #[mongo(id = PlayerId)]
+//! struct PlayerDocuments {
+//!     core: Tracked<PlayerCore>,
+//!     #[mongo(default)]
+//!     items: Tracked<PlayerItems>,
+//! }
+//! ```
+//!
+//! The generated `LoadedPlayerDocuments` keeps `core` required but represents
+//! `items` as `Option<LoadedDocument<PlayerItems>>`. `None` and a missing store
+//! query both call `PlayerItems::default_for`, validate its ID, and register it
+//! as absent. An unchanged absent default produces no write—even after mutable
+//! access or a change restored to the baseline. Its first real BSON change
+//! produces one complete `InsertOnly` Create. A concurrent insert is therefore
+//! a conflict, not an overwrite. After Create acknowledgement, later changes
+//! use ordinary incremental Updates.
 //!
 //! Whole-collection lazy models are appropriate when the collection is used as
 //! one business unit. Use a row-lazy table when a large owner collection needs
@@ -179,6 +236,12 @@
 //! document or `scan_tracked` for mutation-epoch-aware scanning. Generated
 //! document sets normally use
 //! [`persistence::coordinator::MongoPersistenceCoordinator::prepare_set`].
+//!
+//! `track_new(value, mode)` records a pending create: the next progressed scan
+//! must write it. `track_absent(value)` instead records a clean, detachable
+//! in-memory baseline and does not write until a real BSON difference appears.
+//! The document-set derive uses the latter only for explicit
+//! `#[mongo(default)]` fields.
 //!
 //! Preparation has an explicit two-phase lifecycle:
 //!
@@ -274,6 +337,7 @@ pub mod persistence;
 pub mod scan;
 pub mod store;
 
+pub use document::set::MongoDefaultDocument;
 pub use lattice_store_mongodb_macros::{MongoDocument, MongoDocumentSet, MongoScan};
 
 extern crate self as lattice_store_mongodb;

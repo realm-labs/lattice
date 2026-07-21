@@ -10,6 +10,16 @@ use crate::store::MongoStore;
 
 use super::tracked::Tracked;
 
+/// Constructs an explicitly optional eager singleton when storage has no
+/// document for its aggregate owner.
+///
+/// The owner ID is supplied so the in-memory default carries the same document
+/// identity that was queried. Implement this trait only for fields annotated
+/// with `#[mongo(default)]`.
+pub trait MongoDefaultDocument<OwnerId>: MongoScan {
+    fn default_for(owner_id: &OwnerId) -> Self;
+}
+
 /// A runtime-sized group of documents owned by one aggregate.
 ///
 /// Implementations retain full control over their actor-local representation:
@@ -51,7 +61,9 @@ pub trait MongoDocumentSet: Sized + Send {
     ) -> Result<Self, PersistenceError>;
 
     /// Loads every eager singleton and `#[mongo(many)]` collection, then
-    /// registers them with `coordinator`. Fields declared with
+    /// registers them with `coordinator`. A required singleton fails when
+    /// missing; `#[mongo(default)]` constructs and tracks an absent in-memory
+    /// default instead. Fields declared with
     /// `#[mongo(lazy)]` or `#[mongo(lazy_unload = "...")]` are initialized
     /// without performing I/O.
     fn load<'a>(

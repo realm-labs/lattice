@@ -16,6 +16,7 @@ struct DocumentSetField<'a> {
 
 enum DocumentSetFieldKind {
     One(Type),
+    Default(Type),
     Many(Type),
     Lazy(Type),
     Unloadable(Type, u64),
@@ -56,7 +57,9 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         .filter(|field| {
             matches!(
                 field.kind,
-                DocumentSetFieldKind::One(_) | DocumentSetFieldKind::Many(_)
+                DocumentSetFieldKind::One(_)
+                    | DocumentSetFieldKind::Default(_)
+                    | DocumentSetFieldKind::Many(_)
             )
         })
         .collect::<Vec<_>>();
@@ -67,6 +70,9 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             DocumentSetFieldKind::One(document) => {
                 quote! { #visibility #ident: #store::document::LoadedDocument<#document> }
             }
+            DocumentSetFieldKind::Default(document) => quote! {
+                #visibility #ident: ::core::option::Option<#store::document::LoadedDocument<#document>>
+            },
             DocumentSetFieldKind::Many(collection) => quote! {
                 #visibility #ident: ::std::vec::Vec<#store::document::LoadedDocument<
                     <#collection as #store::document::set::MongoDocumentCollection<#id>>::Document
@@ -89,6 +95,17 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                     });
                 }
             },
+            DocumentSetFieldKind::Default(document) => quote! {
+                if let ::core::option::Option::Some(document) = &loaded.#field_ident {
+                    if document.id() != id {
+                        return Err(#store::persistence::coordinator::PersistenceError::DocumentIdMismatch {
+                            collection: <#document as #store::document::MongoDocument>::COLLECTION,
+                            expected: ::std::format!("{:?}", id),
+                            actual: ::std::format!("{:?}", document.id()),
+                        });
+                    }
+                }
+            },
             DocumentSetFieldKind::Many(collection) => quote! {
                 for document in &loaded.#field_ident {
                     let actual = <#collection as #store::document::set::MongoDocumentCollection<#id>>::owner_id(
@@ -108,12 +125,45 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             }
         }
     });
+    let loaded_defaults = eager.iter().filter_map(|field| {
+        let field_ident = field.ident;
+        let DocumentSetFieldKind::Default(document) = &field.kind else {
+            return None;
+        };
+        let absent_ident = format_ident!("__mongo_absent_{}", field_ident);
+        Some(quote! {
+            let #absent_ident = if loaded.#field_ident.is_none() {
+                let document = <#document as #store::document::set::MongoDefaultDocument<#id>>::default_for(id);
+                if <#document as #store::document::MongoDocument>::id(&document) != id {
+                    return Err(#store::persistence::coordinator::PersistenceError::DocumentIdMismatch {
+                        collection: <#document as #store::document::MongoDocument>::COLLECTION,
+                        expected: ::std::format!("{:?}", id),
+                        actual: ::std::format!("{:?}", <#document as #store::document::MongoDocument>::id(&document)),
+                    });
+                }
+                ::core::option::Option::Some(document)
+            } else {
+                ::core::option::Option::None
+            };
+        })
+    });
     let eager_idents = eager.iter().map(|field| field.ident).collect::<Vec<_>>();
     let splits_and_attaches = eager.iter().map(|field| {
         let field_ident = field.ident;
         match &field.kind {
             DocumentSetFieldKind::One(_) => quote! {
                 let #field_ident = coordinator.track_loaded(#field_ident)?;
+            },
+            DocumentSetFieldKind::Default(_) => {
+                let absent_ident = format_ident!("__mongo_absent_{}", field_ident);
+                quote! {
+                    let #field_ident = match #field_ident {
+                        ::core::option::Option::Some(document) => coordinator.track_loaded(document)?,
+                        ::core::option::Option::None => coordinator.track_absent(
+                            #absent_ident.expect("missing default document was constructed before registration"),
+                        )?,
+                    };
+                }
             },
             DocumentSetFieldKind::Many(collection) => quote! {
                 let #field_ident = coordinator.track_loaded_many(#field_ident)?;
@@ -133,7 +183,9 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             let field_ident = field.ident.as_ref().expect("named field");
             match document_set_field(field) {
             Ok(Some(DocumentSetField {
-                kind: DocumentSetFieldKind::One(_) | DocumentSetFieldKind::Many(_),
+                kind: DocumentSetFieldKind::One(_)
+                    | DocumentSetFieldKind::Default(_)
+                    | DocumentSetFieldKind::Many(_),
                 ..
             })) => quote! { #field_ident },
             Ok(Some(DocumentSetField {
@@ -160,6 +212,9 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         let field_ident = field.ident;
         match &field.kind {
             DocumentSetFieldKind::One(_) => quote! {
+                preparation.scan_tracked(&self.#field_ident)?;
+            },
+            DocumentSetFieldKind::Default(_) => quote! {
                 preparation.scan_tracked(&self.#field_ident)?;
             },
             DocumentSetFieldKind::Many(collection) => quote! {
@@ -195,6 +250,11 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                         id: ::std::format!("{:?}", id),
                     })?;
             },
+            DocumentSetFieldKind::Default(document) => quote! {
+                let #field_ident = store
+                    .find_one_scanned::<#document>(id.clone())
+                    .await?;
+            },
             DocumentSetFieldKind::Many(collection) => quote! {
                 let #field_ident = store
                     .find_many_scanned::<<#collection as #store::document::set::MongoDocumentCollection<#id>>::Document>(
@@ -219,6 +279,17 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                     });
                 }
             },
+            DocumentSetFieldKind::Default(document) => quote! {
+                if let ::core::option::Option::Some(document) = &#field_ident {
+                    if document.id() != &id {
+                        return Err(#store::persistence::coordinator::PersistenceError::DocumentIdMismatch {
+                            collection: <#document as #store::document::MongoDocument>::COLLECTION,
+                            expected: ::std::format!("{:?}", id),
+                            actual: ::std::format!("{:?}", document.id()),
+                        });
+                    }
+                }
+            },
             DocumentSetFieldKind::Many(collection) => quote! {
                 for document in &#field_ident {
                     let actual = <#collection as #store::document::set::MongoDocumentCollection<#id>>::owner_id(
@@ -238,11 +309,44 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             }
         }
     });
+    let scanned_defaults = eager.iter().filter_map(|field| {
+        let field_ident = field.ident;
+        let DocumentSetFieldKind::Default(document) = &field.kind else {
+            return None;
+        };
+        let absent_ident = format_ident!("__mongo_absent_{}", field_ident);
+        Some(quote! {
+            let #absent_ident = if #field_ident.is_none() {
+                let document = <#document as #store::document::set::MongoDefaultDocument<#id>>::default_for(&id);
+                if <#document as #store::document::MongoDocument>::id(&document) != &id {
+                    return Err(#store::persistence::coordinator::PersistenceError::DocumentIdMismatch {
+                        collection: <#document as #store::document::MongoDocument>::COLLECTION,
+                        expected: ::std::format!("{:?}", id),
+                        actual: ::std::format!("{:?}", <#document as #store::document::MongoDocument>::id(&document)),
+                    });
+                }
+                ::core::option::Option::Some(document)
+            } else {
+                ::core::option::Option::None
+            };
+        })
+    });
     let scanned_attaches = eager.iter().map(|field| {
         let field_ident = field.ident;
         match &field.kind {
             DocumentSetFieldKind::One(_) => quote! {
                 let #field_ident = coordinator.track_loaded_scanned(#field_ident)?;
+            },
+            DocumentSetFieldKind::Default(_) => {
+                let absent_ident = format_ident!("__mongo_absent_{}", field_ident);
+                quote! {
+                    let #field_ident = match #field_ident {
+                        ::core::option::Option::Some(document) => coordinator.track_loaded_scanned(document)?,
+                        ::core::option::Option::None => coordinator.track_absent(
+                            #absent_ident.expect("missing default document was constructed before registration"),
+                        )?,
+                    };
+                }
             },
             DocumentSetFieldKind::Many(collection) => quote! {
                 let #field_ident = coordinator.track_loaded_scanned_many(#field_ident)?;
@@ -273,6 +377,7 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 coordinator: &mut #store::persistence::coordinator::MongoPersistenceCoordinator,
             ) -> ::core::result::Result<Self, #store::persistence::coordinator::PersistenceError> {
                 #(#validations)*
+                #(#loaded_defaults)*
                 let #loaded { #(#eager_idents,)* } = loaded;
                 #(#splits_and_attaches)*
                 Ok(Self { #(#initializers,)* })
@@ -289,6 +394,7 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 async move {
                     #(#loads)*
                     #(#scanned_validations)*
+                    #(#scanned_defaults)*
                     #(#scanned_attaches)*
                     Ok(Self { #(#initializers,)* })
                 }
@@ -334,6 +440,7 @@ fn document_set_options(input: &DeriveInput) -> syn::Result<DocumentSetOptions> 
 
 fn document_set_field(field: &syn::Field) -> syn::Result<Option<DocumentSetField<'_>>> {
     let mut skipped = false;
+    let mut default_on_missing = false;
     let mut many = false;
     let mut lazy = false;
     let mut lazy_unload = None;
@@ -347,6 +454,12 @@ fn document_set_field(field: &syn::Field) -> syn::Result<Option<DocumentSetField
                     return Err(meta.error("#[mongo(skip)] does not accept a value"));
                 }
                 skipped = true;
+                Ok(())
+            } else if meta.path.is_ident("default") {
+                if meta.input.peek(syn::Token![=]) {
+                    return Err(meta.error("#[mongo(default)] does not accept a value"));
+                }
+                default_on_missing = true;
                 Ok(())
             } else if meta.path.is_ident("many") {
                 if meta.input.peek(syn::Token![=]) {
@@ -370,13 +483,14 @@ fn document_set_field(field: &syn::Field) -> syn::Result<Option<DocumentSetField
         })?;
     }
     let strategy_count = usize::from(skipped)
+        + usize::from(default_on_missing)
         + usize::from(many)
         + usize::from(lazy)
         + usize::from(lazy_unload.is_some());
     if strategy_count > 1 {
         return Err(syn::Error::new_spanned(
             field,
-            "MongoDocumentSet field accepts only one of #[mongo(skip)], #[mongo(many)], #[mongo(lazy)], or #[mongo(lazy_unload = \"...\")]",
+            "MongoDocumentSet field accepts only one of #[mongo(skip)], #[mongo(default)], #[mongo(many)], #[mongo(lazy)], or #[mongo(lazy_unload = \"...\")]",
         ));
     }
     if skipped {
@@ -447,7 +561,11 @@ fn document_set_field(field: &syn::Field) -> syn::Result<Option<DocumentSetField
     Ok(Some(DocumentSetField {
         ident,
         visibility: &field.vis,
-        kind: DocumentSetFieldKind::One(document),
+        kind: if default_on_missing {
+            DocumentSetFieldKind::Default(document)
+        } else {
+            DocumentSetFieldKind::One(document)
+        },
     }))
 }
 

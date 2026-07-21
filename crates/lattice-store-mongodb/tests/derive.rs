@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use lattice_store_mongodb::document::set::{MongoDocumentCollection, MongoDocumentSet};
+use lattice_store_mongodb::document::set::{
+    MongoDefaultDocument, MongoDocumentCollection, MongoDocumentSet,
+};
 use lattice_store_mongodb::document::tracked::Tracked;
 use lattice_store_mongodb::document::{
     LoadedDocument, MongoDocument as _, decode_flat_document, encode_flat_document,
@@ -247,6 +249,52 @@ struct MacroDocuments {
     secondary: Tracked<SecondaryDoc>,
     #[mongo(skip)]
     transient_counter: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, MongoDocument, MongoScan)]
+#[mongo(collection = "macro_default_items")]
+struct DefaultItems {
+    #[mongo(id)]
+    id: u64,
+    slots: BTreeMap<String, i32>,
+}
+
+impl MongoDefaultDocument<u64> for DefaultItems {
+    fn default_for(owner_id: &u64) -> Self {
+        Self {
+            id: *owner_id,
+            slots: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, MongoDocumentSet)]
+#[mongo(id = u64)]
+struct DefaultDocuments {
+    core: Tracked<MacroDoc>,
+    #[mongo(default)]
+    items: Tracked<DefaultItems>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, MongoDocument, MongoScan)]
+#[mongo(collection = "macro_bad_default")]
+struct BadDefaultDocument {
+    #[mongo(id)]
+    id: u64,
+}
+
+impl MongoDefaultDocument<u64> for BadDefaultDocument {
+    fn default_for(owner_id: &u64) -> Self {
+        Self { id: owner_id + 1 }
+    }
+}
+
+#[derive(Debug, MongoDocumentSet)]
+#[mongo(id = u64)]
+struct BadDefaultDocuments {
+    core: Tracked<MacroDoc>,
+    #[mongo(default)]
+    bad: Tracked<BadDefaultDocument>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -742,6 +790,61 @@ fn document_set_derives_loading_registration_and_tracked_scanning() {
     let request = changed.request.expect("changed set should write");
     assert_eq!(request.writes.len(), 1);
     assert_eq!(request.writes[0].key.collection, "macro_docs");
+}
+
+#[test]
+fn document_set_from_loaded_none_tracks_an_in_memory_default() {
+    let mut coordinator = MongoPersistenceCoordinator::new(9);
+    let mut documents = coordinator
+        .attach_loaded_set::<DefaultDocuments>(
+            &42,
+            LoadedDefaultDocuments {
+                core: loaded_documents(42).primary,
+                items: None,
+            },
+        )
+        .expect("missing opted-in singleton should use its owner-aware default");
+    assert_eq!(documents.items.id, 42);
+    assert!(documents.items.slots.is_empty());
+
+    let untouched = coordinator
+        .prepare_set(ScanBudget::generous(), &documents)
+        .expect("untouched default should prepare");
+    assert!(untouched.request.is_none());
+
+    documents.items.write().slots.insert("potion".to_owned(), 3);
+    let changed = coordinator
+        .prepare_set(ScanBudget::generous(), &documents)
+        .expect("changed default should prepare");
+    let request = changed.request.expect("first real change should create");
+    assert_eq!(request.writes.len(), 1);
+    assert_eq!(request.writes[0].key.collection, "macro_default_items");
+}
+
+#[test]
+fn document_set_rejects_a_default_factory_with_the_wrong_owner_id_atomically() {
+    let mut coordinator = MongoPersistenceCoordinator::new(9);
+    let error = coordinator
+        .attach_loaded_set::<BadDefaultDocuments>(
+            &42,
+            LoadedBadDefaultDocuments {
+                core: loaded_documents(42).primary,
+                bad: None,
+            },
+        )
+        .expect_err("default document identity must match its owner");
+    assert!(matches!(
+        error,
+        PersistenceError::DocumentIdMismatch {
+            expected,
+            actual,
+            ..
+        } if expected == "42" && actual == "43"
+    ));
+
+    coordinator
+        .track_loaded(loaded_documents(42).primary)
+        .expect("validation failure must not leave the required field registered");
 }
 
 #[test]

@@ -1,0 +1,11 @@
+error[E0277]: the trait bound `Document: MongoDefaultDocument<u64>` is not satisfied
+  --> tests/ui/document_set_default_missing_trait.rs:16:20
+   |
+16 |     value: Tracked<Document>,
+   |                    ^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `MongoDefaultDocument<u64>` is not implemented for `Document`
+  --> tests/ui/document_set_default_missing_trait.rs:7:1
+   |
+ 7 | struct Document {
+   | ^^^^^^^^^^^^^^^

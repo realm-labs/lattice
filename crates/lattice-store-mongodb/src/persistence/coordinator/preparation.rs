@@ -93,14 +93,20 @@ impl<'a> MongoPreparation<'a> {
             }
         };
         let scan_complete = delta.complete && state.sweep_is_current(mutation_epoch);
-        self.scan_complete &= scan_complete;
         self.changed_paths = self
             .changed_paths
             .saturating_add(delta.changes.len() as u64);
         if delta.changes.is_empty() && !delta.complete && delta.next_cursor == cursor {
+            self.scan_complete &= scan_complete;
             return Ok(());
         }
-        let changed = !delta.changes.is_empty() || state.create_mode.is_some();
+        let changed = !delta.changes.is_empty() || state.presence.is_pending_create();
+        let create_mode = state.presence.pending_create_mode().or_else(|| {
+            (!delta.changes.is_empty())
+                .then(|| state.presence.absent_create_mode())
+                .flatten()
+        });
+        let mut replacement_baseline = None;
         let commit = DocumentCommit {
             key: key.clone(),
             scan: delta.commit,
@@ -108,15 +114,24 @@ impl<'a> MongoPreparation<'a> {
             sweep_complete: delta.complete,
             scan_complete,
             changed,
+            replacement_baseline: None,
         };
-        if delta.changes.is_empty() && state.create_mode.is_none() {
+        if delta.changes.is_empty() && create_mode.is_none() {
+            self.scan_complete &= commit.scan_complete;
             self.clean_commits.push(commit);
             return Ok(());
         }
 
-        let operation = if let Some(mode) = state.create_mode {
+        let operation = if let Some(mode) = create_mode {
             let document = match encode_business_document(value) {
                 Ok(document) => document,
+                Err(error) => {
+                    self.reject(key, mutation_epoch, error.to_string());
+                    return Ok(());
+                }
+            };
+            replacement_baseline = match D::capture_bson(&document) {
+                Ok(baseline) => Some(baseline),
                 Err(error) => {
                     self.reject(key, mutation_epoch, error.to_string());
                     return Ok(());
@@ -158,6 +173,13 @@ impl<'a> MongoPreparation<'a> {
             operation_id: uuid::Uuid::new_v4().simple().to_string(),
             operation,
         });
+        let mut commit = commit;
+        if replacement_baseline.is_some() {
+            commit.scan_complete = true;
+            commit.sweep_complete = true;
+            commit.replacement_baseline = replacement_baseline;
+        }
+        self.scan_complete &= commit.scan_complete;
         self.document_commits.insert(token, commit);
         Ok(())
     }

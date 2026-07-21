@@ -4,6 +4,9 @@ use mongodb::bson::doc;
 use serde::{Deserialize, Serialize};
 
 use crate::document::MongoDocument;
+use crate::document::set::{MongoDefaultDocument, MongoDocumentSet as _};
+use crate::document::tracked::Tracked;
+use crate::persistence::coordinator::{MongoPersistenceCoordinator, PersistenceError};
 use crate::persistence::direct::{
     DeleteOutcome, DirectDocumentStore, InsertOutcome, ReplaceOutcome,
 };
@@ -14,6 +17,60 @@ use crate::persistence::types::{MongoDocumentKey, MongoFieldPath};
 
 use super::write::unmatched_prepared_outcome;
 use super::{MongoStore, MongoStoreConfig, redact_mongo_uri};
+
+#[derive(Debug, Clone, Serialize, Deserialize, crate::MongoDocument, crate::MongoScan)]
+#[mongo(collection = "document_set_required_load")]
+struct RequiredLoadDocument {
+    #[mongo(id)]
+    id: u64,
+    value: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, crate::MongoDocument, crate::MongoScan)]
+#[mongo(collection = "document_set_default_load")]
+struct DefaultLoadDocument {
+    #[mongo(id)]
+    id: u64,
+    value: i32,
+}
+
+impl MongoDefaultDocument<u64> for DefaultLoadDocument {
+    fn default_for(owner_id: &u64) -> Self {
+        Self {
+            id: *owner_id,
+            value: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, crate::MongoDocument, crate::MongoScan)]
+#[mongo(collection = "document_set_broken_load")]
+struct BrokenLoadDocument {
+    #[mongo(id)]
+    id: u64,
+    value: i32,
+}
+
+#[derive(Debug, crate::MongoDocumentSet)]
+#[mongo(id = u64)]
+struct RequiredOnlyDocuments {
+    core: Tracked<RequiredLoadDocument>,
+}
+
+#[derive(Debug, crate::MongoDocumentSet)]
+#[mongo(id = u64)]
+struct DefaultLoadDocuments {
+    core: Tracked<RequiredLoadDocument>,
+    #[mongo(default)]
+    optional: Tracked<DefaultLoadDocument>,
+}
+
+#[derive(Debug, crate::MongoDocumentSet)]
+#[mongo(id = u64)]
+struct QueryFailureDocuments {
+    core: Tracked<RequiredLoadDocument>,
+    broken: Tracked<BrokenLoadDocument>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct IntegrationDocument {
@@ -73,6 +130,34 @@ async fn configured_mongo_verifies_direct_and_prepared_version_semantics() {
             .expect("conflicting replace should resolve"),
         ReplaceOutcome::VersionConflict
     );
+
+    let insert_only_conflict = store
+        .flush_prepared_writes(vec![PreparedDocumentWrite {
+            token: WriteToken(4),
+            key: MongoDocumentKey::new(IntegrationDocument::COLLECTION, id.to_string()),
+            document_id: crate::document::encode_document_id::<IntegrationDocument>(&id)
+                .expect("numeric integration id should encode"),
+            expected_version: 0,
+            operation_id: "insert-only-conflict".to_owned(),
+            operation: DocumentOperation::Create {
+                document: doc! { "name": "must not overwrite", "score": 99 },
+                mode: crate::persistence::request::CreateMode::InsertOnly,
+            },
+        }])
+        .await
+        .expect("insert-only create conflict should resolve");
+    assert!(matches!(
+        insert_only_conflict.documents[&WriteToken(4)],
+        DocumentWriteOutcome::VersionConflict {
+            expected_version: 0
+        }
+    ));
+    let after_insert_only = DirectDocumentStore::<IntegrationDocument>::load(&store, &id)
+        .await
+        .expect("conflicted insert-only document should load")
+        .expect("conflicted insert-only document should remain present");
+    assert_eq!(after_insert_only.value.name, "initial");
+    assert_eq!(after_insert_only.value.score, 1);
 
     let prepared_update = PreparedDocumentWrite {
         token: WriteToken(1),
@@ -201,6 +286,89 @@ async fn configured_mongo_verifies_direct_and_prepared_version_semantics() {
         .drop()
         .await
         .ok();
+}
+
+#[tokio::test]
+async fn configured_mongo_document_sets_distinguish_required_and_default_missing() {
+    let Ok(uri) = std::env::var("LATTICE_MONGODB_TEST_URI") else {
+        return;
+    };
+    let database = std::env::var("LATTICE_MONGODB_TEST_DATABASE")
+        .unwrap_or_else(|_| "lattice_store_mongodb_integration".to_owned());
+    let store = MongoStore::connect(MongoStoreConfig {
+        uri,
+        database,
+        connect_timeout: std::time::Duration::from_secs(2),
+        operation_timeout: std::time::Duration::from_secs(2),
+    })
+    .await
+    .expect("local MongoDB should connect");
+    for collection in [
+        RequiredLoadDocument::COLLECTION,
+        DefaultLoadDocument::COLLECTION,
+        BrokenLoadDocument::COLLECTION,
+    ] {
+        store
+            .database()
+            .collection::<mongodb::bson::Document>(collection)
+            .drop()
+            .await
+            .ok();
+    }
+
+    let id = 42;
+    let mut missing_coordinator = MongoPersistenceCoordinator::new(1);
+    let error = RequiredOnlyDocuments::load(&store, &id, &mut missing_coordinator)
+        .await
+        .expect_err("required singleton must not default");
+    assert!(matches!(
+        error,
+        PersistenceError::RequiredDocumentMissing { .. }
+    ));
+
+    DirectDocumentStore::<RequiredLoadDocument>::insert(
+        &store,
+        &RequiredLoadDocument { id, value: 7 },
+    )
+    .await
+    .expect("required test document should insert");
+    let mut default_coordinator = MongoPersistenceCoordinator::new(2);
+    let documents = DefaultLoadDocuments::load(&store, &id, &mut default_coordinator)
+        .await
+        .expect("missing opted-in singleton should default");
+    assert_eq!(documents.optional.id, id);
+    assert_eq!(documents.optional.value, 0);
+    let untouched = default_coordinator
+        .prepare_set(crate::scan::ScanBudget::generous(), &documents)
+        .expect("untouched default should prepare");
+    assert!(untouched.request.is_none());
+
+    store
+        .database()
+        .collection::<mongodb::bson::Document>(BrokenLoadDocument::COLLECTION)
+        .insert_one(doc! { "_id": id as i64, "value": "wrong type" })
+        .await
+        .expect("malformed test document should insert");
+    let mut atomic_coordinator = MongoPersistenceCoordinator::new(3);
+    QueryFailureDocuments::load(&store, &id, &mut atomic_coordinator)
+        .await
+        .expect_err("later eager query should fail decoding");
+    RequiredOnlyDocuments::load(&store, &id, &mut atomic_coordinator)
+        .await
+        .expect("failed multi-field load must not register its earlier query");
+
+    for collection in [
+        RequiredLoadDocument::COLLECTION,
+        DefaultLoadDocument::COLLECTION,
+        BrokenLoadDocument::COLLECTION,
+    ] {
+        store
+            .database()
+            .collection::<mongodb::bson::Document>(collection)
+            .drop()
+            .await
+            .ok();
+    }
 }
 
 #[test]

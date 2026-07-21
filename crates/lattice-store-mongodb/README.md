@@ -24,8 +24,11 @@ identity from `MongoDocument::id()` rather than requiring a separate ID
 argument.
 
 Actor-owned persistence state can derive `MongoDocumentSet`. Plain
-`Tracked<T>` fields are required singleton documents. A `#[mongo(many)]`
-field implements `MongoDocumentCollection` and retains full control over its
+`Tracked<T>` fields are required singleton documents: activation fails with
+`RequiredDocumentMissing` when MongoDB has no matching row. An explicitly
+annotated `#[mongo(default)] Tracked<T>` field is an eager singleton whose
+absence activates an owner-aware in-memory default. A `#[mongo(many)]` field
+implements `MongoDocumentCollection` and retains full control over its
 map/vector representation and derived business indexes.
 
 Loading policy is part of the field type, so eager business code never gains
@@ -33,13 +36,69 @@ an unnecessary async API:
 
 | Model | Field type | Access after actor startup |
 | --- | --- | --- |
-| Eager singleton | `Tracked<D>` | synchronous |
+| Required eager singleton | `Tracked<D>` | synchronous; missing is an error |
+| Default-on-missing eager singleton | `#[mongo(default)] Tracked<D>` | synchronous; absent default stays in memory until changed |
 | Eager complete collection | `C` with `#[mongo(many)]` | synchronous, including iteration |
 | Resident lazy singleton | `MongoLazyDocument<D>` with `#[mongo(lazy)]` | first access is async, then resident |
 | Resident lazy complete collection | `MongoLazyCollection<Owner, C>` with `#[mongo(lazy)]` | first access is async, then ordinary `C` APIs |
 | Idle-unloadable singleton/collection | `MongoUnloadableDocument` / `MongoUnloadableCollection` | async acquisition; clean idle state can unload |
 | Row-lazy table | `MongoLazyTable<Owner, Spec>` | async point/page load; synchronous access to resident rows |
 | Idle-unloadable row table | `MongoUnloadableTable<Owner, Spec>` | row-level bounded idle eviction |
+
+The default factory receives the aggregate owner ID because ordinary
+`Default` cannot reliably construct the document identity:
+
+```rust
+use std::collections::BTreeMap;
+
+use lattice_store_mongodb::document::tracked::Tracked;
+use lattice_store_mongodb::{
+    MongoDefaultDocument, MongoDocument, MongoDocumentSet, MongoScan,
+};
+use serde::{Deserialize, Serialize};
+
+type PlayerId = u64;
+
+#[derive(Debug, Serialize, Deserialize, MongoDocument, MongoScan)]
+#[mongo(collection = "player_core")]
+struct PlayerCore {
+    #[mongo(id)]
+    id: PlayerId,
+    level: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, MongoDocument, MongoScan)]
+#[mongo(collection = "player_items")]
+struct PlayerItems {
+    #[mongo(id)]
+    id: PlayerId,
+    items: BTreeMap<String, u32>,
+}
+
+impl MongoDefaultDocument<PlayerId> for PlayerItems {
+    fn default_for(player_id: &PlayerId) -> Self {
+        Self {
+            id: *player_id,
+            items: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(MongoDocumentSet)]
+#[mongo(id = PlayerId)]
+struct PlayerDocuments {
+    // Missing is an activation error.
+    core: Tracked<PlayerCore>,
+    // Missing constructs PlayerItems::default_for(player_id) in memory.
+    #[mongo(default)]
+    items: Tracked<PlayerItems>,
+}
+```
+
+`LoadedPlayerDocuments` gives `core` the required
+`LoadedDocument<PlayerCore>` type and gives `items` the optional
+`Option<LoadedDocument<PlayerItems>>` type. Passing `None` follows exactly the
+same default-and-absent registration path as a direct MongoDB load.
 
 ```rust
 # use lattice_store_mongodb::document::LoadedDocument;
@@ -135,6 +194,16 @@ the loaded batch into tracked documents. Store-driven eager, lazy, and table
 loads build their scan baselines directly from the MongoDB business BSON, so
 loaded Rust values are not serialized a second time just to capture a
 baseline.
+
+A missing `#[mongo(default)]` field is not a pending create. The coordinator
+captures its factory value as an absent baseline, and untouched mutable access
+or a value changed and restored to that baseline remains write-free. A bounded
+scan may retain a cursor across passes without creating anything. Once a scan
+finds the first real BSON difference, the coordinator prepares one complete
+`Create` using `CreateMode::InsertOnly`. A concurrent document inserted after
+the missing read therefore becomes a conflict instead of being overwritten.
+After Create acknowledgement, the complete written value becomes the normal
+acknowledged baseline and later changes use incremental `Update` operations.
 
 Map entry scanning is explicit. An ordinary map is treated as one whole BSON
 field; opt in with `#[mongo(scan = "map")]` only when per-key `$set`/`$unset`
@@ -392,6 +461,16 @@ let prepared = persistence.prepare(ScanBudget::generous(), |batch| {
 })?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+There are two intentionally different creation states:
+
+- `track_new(value, mode)` means the business has created a new durable
+  document. It is a pending create and the next progressed scan emits Create
+  even when the value has not changed since registration.
+- `track_absent(value)` means a load proved storage absence and `value` is only
+  an in-memory baseline. It is clean and detachable while unchanged, and emits
+  no operation until a real BSON difference is found. `#[mongo(default)]`
+  selects this path automatically with `InsertOnly`.
 
 The actor adapter sends prepared writes through `ActorContext::pipe_to_self`.
 An actor handles `MongoFlushCompleted` in a later turn and calls

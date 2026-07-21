@@ -28,10 +28,44 @@ struct DocumentState {
     scanning_changed: bool,
     version: i64,
     updated_at_ms: i64,
-    create_mode: Option<CreateMode>,
+    presence: DocumentPresence,
     rejection: Option<DocumentRejection>,
     conflict_policy: ConflictPolicy,
     conflict: Option<PersistenceConflict>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentPresence {
+    Persisted,
+    /// Created explicitly with `track_new`; the next scan must emit Create.
+    PendingCreate {
+        mode: CreateMode,
+    },
+    /// Missing in storage and represented by an in-memory default. It remains
+    /// write-free until a scan finds a real change from that default baseline.
+    Absent {
+        mode: CreateMode,
+    },
+}
+
+impl DocumentPresence {
+    fn pending_create_mode(self) -> Option<CreateMode> {
+        match self {
+            Self::PendingCreate { mode } => Some(mode),
+            Self::Persisted | Self::Absent { .. } => None,
+        }
+    }
+
+    fn absent_create_mode(self) -> Option<CreateMode> {
+        match self {
+            Self::Absent { mode } => Some(mode),
+            Self::Persisted | Self::PendingCreate { .. } => None,
+        }
+    }
+
+    fn is_pending_create(self) -> bool {
+        matches!(self, Self::PendingCreate { .. })
+    }
 }
 
 #[derive(Debug)]
@@ -44,7 +78,7 @@ impl DocumentState {
     fn needs_tracked_scan(&self, mutation_epoch: u64) -> bool {
         self.acknowledged_mutation_epoch != Some(mutation_epoch)
             || self.scanning_mutation_epoch.is_some()
-            || self.create_mode.is_some()
+            || self.presence.is_pending_create()
     }
 
     fn scan_cursor(&self) -> ScanCursor {
@@ -242,7 +276,7 @@ impl MongoPersistenceCoordinator {
     where
         D: MongoScan,
     {
-        self.attach(value, meta, None, None)
+        self.attach(value, meta, None, DocumentPresence::Persisted)
     }
 
     pub fn attach_loaded_tracked<D>(
@@ -254,7 +288,12 @@ impl MongoPersistenceCoordinator {
     where
         D: MongoScan,
     {
-        self.attach(value, meta, Some(mutation_epoch), None)
+        self.attach(
+            value,
+            meta,
+            Some(mutation_epoch),
+            DocumentPresence::Persisted,
+        )
     }
 
     pub fn track_loaded<D>(
@@ -297,7 +336,7 @@ impl MongoPersistenceCoordinator {
                 scanning_changed: false,
                 version,
                 updated_at_ms,
-                create_mode: None,
+                presence: DocumentPresence::Persisted,
                 rejection: None,
                 conflict_policy: D::CONFLICT_POLICY,
                 conflict: None,
@@ -337,7 +376,7 @@ impl MongoPersistenceCoordinator {
                     scanning_changed: false,
                     version,
                     updated_at_ms,
-                    create_mode: None,
+                    presence: DocumentPresence::Persisted,
                     rejection: None,
                     conflict_policy: D::CONFLICT_POLICY,
                     conflict: None,
@@ -381,7 +420,7 @@ impl MongoPersistenceCoordinator {
                     scanning_changed: false,
                     version: meta.version,
                     updated_at_ms: meta.updated_at_ms,
-                    create_mode: None,
+                    presence: DocumentPresence::Persisted,
                     rejection: None,
                     conflict_policy: D::CONFLICT_POLICY,
                     conflict: None,
@@ -409,7 +448,7 @@ impl MongoPersistenceCoordinator {
                 updated_at_ms: 0,
             },
             None,
-            Some(mode),
+            DocumentPresence::PendingCreate { mode },
         )
     }
 
@@ -425,12 +464,33 @@ impl MongoPersistenceCoordinator {
         Ok(Tracked::clean(value))
     }
 
+    /// Tracks a document known to be absent from storage using its current
+    /// value as the in-memory baseline. No Create is prepared until a real BSON
+    /// change from that baseline is found.
+    pub fn track_absent<D>(&mut self, value: D) -> Result<Tracked<D>, PersistenceError>
+    where
+        D: MongoScan,
+    {
+        self.attach(
+            &value,
+            LoadedDocumentMeta {
+                version: 0,
+                updated_at_ms: 0,
+            },
+            Some(0),
+            DocumentPresence::Absent {
+                mode: CreateMode::InsertOnly,
+            },
+        )?;
+        Ok(Tracked::clean(value))
+    }
+
     fn attach<D>(
         &mut self,
         value: &D,
         meta: LoadedDocumentMeta,
         mutation_epoch: Option<u64>,
-        create_mode: Option<CreateMode>,
+        presence: DocumentPresence,
     ) -> Result<(), PersistenceError>
     where
         D: MongoScan,
@@ -449,7 +509,7 @@ impl MongoPersistenceCoordinator {
                 scanning_changed: false,
                 version: meta.version,
                 updated_at_ms: meta.updated_at_ms,
-                create_mode,
+                presence,
                 rejection: None,
                 conflict_policy: D::CONFLICT_POLICY,
                 conflict: None,
@@ -474,7 +534,7 @@ impl MongoPersistenceCoordinator {
             .documents
             .get(&key)
             .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
-        if document.create_mode.is_some() {
+        if document.presence.is_pending_create() {
             return Err(PersistenceError::CreatePending(key));
         }
         if document.conflict.is_some() {
@@ -510,7 +570,7 @@ impl MongoPersistenceCoordinator {
         let conflicted = state.conflict.is_some();
         Ok(!in_flight
             && !conflicted
-            && state.create_mode.is_none()
+            && !state.presence.is_pending_create()
             && state.rejection.is_none()
             && state.scanning_mutation_epoch.is_none()
             && state.cursor == ScanCursor::default()
@@ -721,7 +781,7 @@ impl MongoPersistenceCoordinator {
         let mut retry_commits = BTreeMap::new();
         let mut retry_writes = BTreeMap::new();
 
-        for (token, document_commit) in document_commits {
+        for (token, mut document_commit) in document_commits {
             let outcome = outcome.documents.get(&token).expect("validated token set");
             let state = self
                 .documents
@@ -733,7 +793,12 @@ impl MongoPersistenceCoordinator {
                     updated_at_ms,
                     ..
                 } => {
-                    state.cursor = state.baseline.apply(document_commit.scan)?;
+                    if let Some(baseline) = document_commit.replacement_baseline.take() {
+                        state.baseline = baseline;
+                        state.cursor = ScanCursor::default();
+                    } else {
+                        state.cursor = state.baseline.apply(document_commit.scan)?;
+                    }
                     let false_positive = state.apply_commit_metadata(
                         document_commit.mutation_epoch,
                         document_commit.scan_complete,
@@ -746,7 +811,7 @@ impl MongoPersistenceCoordinator {
                     }
                     state.version = *new_version;
                     state.updated_at_ms = *updated_at_ms;
-                    state.create_mode = None;
+                    state.presence = DocumentPresence::Persisted;
                     state.rejection = None;
                     state.conflict = None;
                     report.applied += 1;
@@ -939,7 +1004,7 @@ impl MongoPersistenceCoordinator {
                 .documents
                 .values()
                 .filter(|document| {
-                    document.create_mode.is_some()
+                    document.presence.is_pending_create()
                         || document.rejection.is_some()
                         || document.conflict.is_some()
                 })
@@ -1017,12 +1082,17 @@ impl MongoPersistenceCoordinator {
         commits: Vec<DocumentCommit>,
         report: &mut PersistenceReport,
     ) -> Result<(), PersistenceError> {
-        for commit in commits {
+        for mut commit in commits {
             let state = self
                 .documents
                 .get_mut(&commit.key)
                 .ok_or_else(|| PersistenceError::UnknownDocument(commit.key.clone()))?;
-            state.cursor = state.baseline.apply(commit.scan)?;
+            if let Some(baseline) = commit.replacement_baseline.take() {
+                state.baseline = baseline;
+                state.cursor = ScanCursor::default();
+            } else {
+                state.cursor = state.baseline.apply(commit.scan)?;
+            }
             let false_positive = state.apply_commit_metadata(
                 commit.mutation_epoch,
                 commit.scan_complete,

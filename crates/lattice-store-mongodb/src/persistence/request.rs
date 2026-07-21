@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::error::MongoStoreError;
 use mongodb::bson::{Bson, Document};
 
-use crate::scan::ScanCommit;
+use crate::scan::{ScanCommit, ScanSnapshot};
 
 use super::types::{MongoDocumentKey, MongoFieldPath};
 
@@ -89,6 +89,10 @@ pub struct DocumentCommit {
     pub(crate) sweep_complete: bool,
     pub scan_complete: bool,
     pub(crate) changed: bool,
+    /// A full baseline captured from a prepared Create. Unlike an incremental
+    /// scan commit, this represents every business field written by the
+    /// operation and is installed only after the Create is acknowledged.
+    pub(crate) replacement_baseline: Option<ScanSnapshot>,
 }
 
 #[derive(Debug, Clone)]
