@@ -1,29 +1,14 @@
-use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::alloc::Layout;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
-use std::sync::OnceLock;
 
-use concurrent_queue::ConcurrentQueue;
-
+use super::pool::BlockPool;
 use super::{ActorEnvelope, EnvelopeFuture, MailboxLane};
 use crate::context::ActorContext;
 use crate::observation::RequestCompletion;
 use crate::traits::{Actor, MessageMetadata};
 
-// These classes cover common tell/request envelopes without imposing a maximum message size.
-// Larger or unusually aligned envelopes transparently use the allocator instead.
-const BLOCK_SIZES: [usize; 5] = [64, 128, 256, 512, 1024];
-const BLOCK_ALIGNMENT: usize = 64;
-const RETAINED_BLOCKS_PER_CLASS: usize = 8_192;
-
-static BLOCK_POOLS: [OnceLock<ConcurrentQueue<FreeBlock>>; BLOCK_SIZES.len()] =
-    [const { OnceLock::new() }; BLOCK_SIZES.len()];
-
-struct FreeBlock(NonNull<u8>);
-
-// SAFETY: a free block contains no initialized value, and ownership is transferred into or out of
-// the concurrent queue. Only the thread that successfully pops it may initialize or deallocate it.
-unsafe impl Send for FreeBlock {}
+static ENVELOPE_POOL: BlockPool = BlockPool::new(8_192);
 
 struct EnvelopeVTable<A: Actor> {
     metadata: unsafe fn(*const u8, MailboxLane) -> MessageMetadata,
@@ -58,7 +43,7 @@ impl<A: Actor> PooledEnvelope<A> {
     where
         T: ActorEnvelope<A> + 'static,
     {
-        let pointer = allocate(Layout::new::<T>());
+        let pointer = ENVELOPE_POOL.allocate(Layout::new::<T>());
         // SAFETY: `allocate` returned storage valid and sufficiently aligned for `T`.
         unsafe { pointer.cast::<T>().as_ptr().write(value) };
         Self {
@@ -149,7 +134,7 @@ where
 
     impl Drop for RecycleGuard {
         fn drop(&mut self) {
-            recycle(self.pointer, self.layout);
+            ENVELOPE_POOL.recycle(self.pointer, self.layout);
         }
     }
 
@@ -162,52 +147,6 @@ where
     // if user-defined drop code unwinds.
     unsafe { ptr::drop_in_place(pointer.cast::<T>()) };
     drop(guard);
-}
-
-fn class_for(layout: Layout) -> Option<usize> {
-    if layout.align() > BLOCK_ALIGNMENT {
-        return None;
-    }
-    BLOCK_SIZES.iter().position(|size| layout.size() <= *size)
-}
-
-fn class_layout(class: usize) -> Layout {
-    Layout::from_size_align(BLOCK_SIZES[class], BLOCK_ALIGNMENT)
-        .expect("envelope pool class has a valid layout")
-}
-
-fn pool(class: usize) -> &'static ConcurrentQueue<FreeBlock> {
-    BLOCK_POOLS[class].get_or_init(|| ConcurrentQueue::bounded(RETAINED_BLOCKS_PER_CLASS))
-}
-
-fn allocate(layout: Layout) -> NonNull<u8> {
-    if let Some(class) = class_for(layout) {
-        if let Ok(FreeBlock(pointer)) = pool(class).pop() {
-            return pointer;
-        }
-        return allocate_fresh(class_layout(class));
-    }
-    allocate_fresh(layout)
-}
-
-fn allocate_fresh(layout: Layout) -> NonNull<u8> {
-    // SAFETY: `layout` is valid and its storage is owned by the returned envelope.
-    let pointer = unsafe { alloc(layout) };
-    NonNull::new(pointer).unwrap_or_else(|| handle_alloc_error(layout))
-}
-
-fn recycle(pointer: NonNull<u8>, layout: Layout) {
-    if let Some(class) = class_for(layout) {
-        let Err(error) = pool(class).push(FreeBlock(pointer)) else {
-            return;
-        };
-        let FreeBlock(pointer) = error.into_inner();
-        // SAFETY: the block was allocated with this class layout and is no longer initialized.
-        unsafe { dealloc(pointer.as_ptr(), class_layout(class)) };
-        return;
-    }
-    // SAFETY: a non-pooled block retains its concrete type's original layout.
-    unsafe { dealloc(pointer.as_ptr(), layout) };
 }
 
 #[cfg(test)]
@@ -257,7 +196,7 @@ mod tests {
             _context: &'a mut ActorContext<TestActor>,
             _metadata: &'a MessageMetadata,
         ) -> EnvelopeFuture<'a> {
-            Box::pin(async { MessageOutcome::Handled })
+            EnvelopeFuture::new(async { MessageOutcome::Handled })
         }
     }
 
@@ -275,13 +214,5 @@ mod tests {
         );
         drop(envelope);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn common_layouts_are_classed_and_oversized_layouts_fall_back() {
-        assert_eq!(class_for(Layout::from_size_align(1, 1).unwrap()), Some(0));
-        assert_eq!(class_for(Layout::from_size_align(129, 8).unwrap()), Some(2));
-        assert_eq!(class_for(Layout::from_size_align(2048, 8).unwrap()), None);
-        assert_eq!(class_for(Layout::from_size_align(128, 128).unwrap()), None);
     }
 }

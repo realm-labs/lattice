@@ -293,6 +293,36 @@ improvement. Separate 10-million-message runs under a 10-second CPU sampler meas
 did not appear as material CPU hotspots; protobuf/frame encoding, `BytesMut` writes, allocator work,
 and socket `writev` remained dominant.
 
+### Thread-local pooled handler futures
+
+A fifth 2026-07-21 follow-up replaced the remaining boxed handler future with a pinned erased future
+stored in a reusable size-class block. Future blocks use a separate thread-local cache rather than
+the process-wide envelope pool: handler futures normally start and finish on runtime workers, so this
+avoids adding an MPMC atomic queue to every dispatch. A future that resumes on another worker leaves
+its block in that worker's cache when it completes. Large and unusually aligned futures retain an
+allocator fallback, and moving the erased wrapper never moves its pinned concrete future.
+
+The allocation-instrumented workload recorded 53 allocations and 35 deallocations for 10,000
+successful tells plus 5,088 full-mailbox retries. The prior pooled-envelope version recorded 10,051
+allocations for the same number of successful messages, confirming that the remaining per-message
+handler-future allocation is gone. The small fixed remainder is runtime and benchmark setup plus
+thread-local pool growth.
+
+An isolated boxed-versus-thread-local-pooled A/B used three independent process captures per variant,
+with two warmup rounds and five measured rounds of five million tells. Machine scheduling made
+absolute throughput lower than the earlier baseline, so only the interleaved same-session comparison
+is used: boxed-future medians averaged 3.2799M/s and pooled-future medians averaged 3.3783M/s, a 3.0%
+improvement (304.89 ns versus 296.01 ns per message).
+
+A separate 1/2/4/8/16-producer comparison found no producer-count-dependent regression from the
+future pool. Both variants decline similarly as producers contend on the single bounded actor
+mailbox; at 16 producers their medians were 1.0915M/s boxed and 1.0963M/s pooled. This identifies the
+mailbox admission path, rather than future pooling, as the multi-producer scaling limit.
+
+Request dispatch also showed no regression. In the alternating window-1 run, after excluding one
+123K/s boxed startup outlier, the steady boxed and pooled captures were 159.2K/s and 160.9K/s. With a
+64-request window, the two-capture means were 542.5K/s boxed and 568.7K/s pooled, a 4.8% improvement.
+
 The MongoDB persistence framework baseline was captured with:
 
 ```text

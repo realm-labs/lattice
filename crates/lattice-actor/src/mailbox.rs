@@ -1,6 +1,4 @@
 use std::any::type_name;
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Instant;
 
 use lattice_core::actor_ref::ActorRef;
@@ -18,8 +16,11 @@ use crate::traits::{
 };
 
 mod envelope;
+mod future;
+mod pool;
 
 use envelope::PooledEnvelope;
+use future::PooledFuture;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailboxConfig {
@@ -122,7 +123,7 @@ impl<A: Actor> ActorCommand<A> {
     }
 }
 
-pub(crate) type EnvelopeFuture<'a> = Pin<Box<dyn Future<Output = MessageOutcome> + Send + 'a>>;
+pub(crate) type EnvelopeFuture<'a> = PooledFuture<'a>;
 
 pub(crate) trait ActorEnvelope<A: Actor>: Send {
     fn metadata(&self, lane: MailboxLane) -> MessageMetadata;
@@ -191,7 +192,7 @@ where
         ctx: &'a mut ActorContext<A>,
         metadata: &'a MessageMetadata,
     ) -> EnvelopeFuture<'a> {
-        Box::pin(async move {
+        PooledFuture::new(async move {
             ctx.clear_sender();
             ctx.set_current_deadline(None);
             if let Some(sender) = self.sender.take() {
@@ -267,7 +268,7 @@ where
         ctx: &'a mut ActorContext<A>,
         metadata: &'a MessageMetadata,
     ) -> EnvelopeFuture<'a> {
-        Box::pin(async move {
+        PooledFuture::new(async move {
             ctx.clear_sender();
             ctx.set_current_deadline(metadata.deadline());
             let request = self
