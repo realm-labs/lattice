@@ -154,10 +154,9 @@
 //! ```
 //! use std::collections::BTreeMap;
 //!
+//! use lattice_store_mongodb::document::set::MongoDefaultDocument;
 //! use lattice_store_mongodb::document::tracked::Tracked;
-//! use lattice_store_mongodb::{
-//!     MongoDefaultDocument, MongoDocument, MongoDocumentSet, MongoScan,
-//! };
+//! use lattice_store_mongodb::{MongoDocument, MongoDocumentSet, MongoScan};
 //! use serde::{Deserialize, Serialize};
 //!
 //! type PlayerId = u64;
@@ -337,7 +336,6 @@ pub mod persistence;
 pub mod scan;
 pub mod store;
 
-pub use document::set::MongoDefaultDocument;
 pub use lattice_store_mongodb_macros::{MongoDocument, MongoDocumentSet, MongoScan};
 
 extern crate self as lattice_store_mongodb;
