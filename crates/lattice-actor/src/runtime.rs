@@ -16,14 +16,17 @@ use lattice_core::{
     id::ActorId,
     service_context::ServiceContext,
 };
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{broadcast, oneshot, watch};
 use tracing::{Instrument, debug, error, info};
 
 use crate::{
     context::ActorContext,
     error::{ActorAdminError, ActorCallError, ActorSpawnError},
     handle::{ActorHandle, ActorHandleInit, ForcedDataLossEvent, StopFailureRecord, TerminalHook},
-    mailbox::{ActorCommand, MailboxConfig, MailboxLane},
+    mailbox::{
+        ActorCommand, MailboxConfig, MailboxLane,
+        channel::{self, Receiver},
+    },
     observation::{ActorLifecycleEvent, ActorObserverHandle},
     recipient::ActorSystem,
     traits::{Actor, ActorLifecycleState, MessageOutcome, PassivationReason, StopReason},
@@ -453,13 +456,14 @@ where
 
 struct ActorRuntimeParts<A: Actor> {
     handle: ActorHandle<A>,
-    normal_rx: mpsc::Receiver<ActorCommand<A>>,
-    system_rx: mpsc::Receiver<ActorCommand<A>>,
+    normal_rx: Receiver<ActorCommand<A>>,
+    system_rx: Receiver<ActorCommand<A>>,
     self_ref: Option<ActorRef>,
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
     spawner: ActorSpawner,
     deferred_capacity: usize,
+    turn_budget: usize,
 }
 
 fn create_actor_parts<A>(
@@ -474,8 +478,8 @@ fn create_actor_parts<A>(
 where
     A: Actor,
 {
-    let (normal_tx, normal_rx) = mpsc::channel(mailbox.normal_capacity());
-    let (system_tx, system_rx) = mpsc::channel(mailbox.system_capacity());
+    let (normal_tx, normal_rx) = channel::channel(mailbox.normal_capacity());
+    let (system_tx, system_rx) = channel::channel(mailbox.system_capacity());
     let local_ref = LocalActorRef::new(NEXT_LOCAL_ACTOR_ID.fetch_add(1, Ordering::Relaxed));
     let (terminated_tx, _terminated_rx) = broadcast::channel(16);
     let (lifecycle_tx, _lifecycle_rx) = watch::channel(ActorLifecycleState::Starting);
@@ -505,6 +509,7 @@ where
         service,
         spawner,
         deferred_capacity: mailbox.deferred_capacity(),
+        turn_budget: mailbox.turn_budget(),
     }
 }
 
@@ -571,6 +576,7 @@ where
         service,
         spawner,
         deferred_capacity,
+        turn_budget,
     } = parts;
     let mut ctx = ActorContext::new(
         handle.clone(),
@@ -719,22 +725,38 @@ where
             }
             command = normal_rx.recv() => {
                 match command {
-                    Some(command) => {
-                        if let Err(panic) = handle_command(
-                            command,
-                            MailboxLane::Normal,
-                            &handle,
-                            ActorInstance {
-                                actor: &mut actor,
-                                behavior: &mut behavior,
-                            },
-                            &mut ctx,
-                            &mut stop_reason,
-                            activity_tx.as_ref(),
-                        )
-                        .await
-                        {
-                            actor_panic = Some(panic);
+                    Some(first_command) => {
+                        let mut command = Some(first_command);
+                        let mut remaining = turn_budget;
+                        while let Some(current) = command.take() {
+                            match handle_command(
+                                current,
+                                MailboxLane::Normal,
+                                &handle,
+                                ActorInstance {
+                                    actor: &mut actor,
+                                    behavior: &mut behavior,
+                                },
+                                &mut ctx,
+                                &mut stop_reason,
+                                activity_tx.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok(_) => {}
+                                Err(panic) => {
+                                    actor_panic = Some(panic);
+                                    break;
+                                }
+                            }
+                            if stop_reason.is_some() {
+                                break;
+                            }
+                            remaining -= 1;
+                            if remaining == 0 {
+                                break;
+                            }
+                            command = normal_rx.try_recv().ok();
                         }
                     }
                     None if system_rx.is_closed() => {
@@ -836,8 +858,8 @@ async fn run_stopping_phase<A>(
     actor: &mut A,
     ctx: &mut ActorContext<A>,
     handle: &ActorHandle<A>,
-    normal_rx: &mut mpsc::Receiver<ActorCommand<A>>,
-    system_rx: &mut mpsc::Receiver<ActorCommand<A>>,
+    normal_rx: &mut Receiver<ActorCommand<A>>,
+    system_rx: &mut Receiver<ActorCommand<A>>,
     reason: StopReason,
     previous_phase: ActorLifecycleState,
 ) -> Result<(bool, Option<oneshot::Sender<Result<(), ActorAdminError>>>), ActorPanic>

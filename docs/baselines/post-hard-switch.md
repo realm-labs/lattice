@@ -323,6 +323,67 @@ Request dispatch also showed no regression. In the alternating window-1 run, aft
 123K/s boxed startup outlier, the steady boxed and pooled captures were 159.2K/s and 160.9K/s. With a
 64-request window, the two-capture means were 542.5K/s boxed and 568.7K/s pooled, a 4.8% improvement.
 
+### Actor-specialized bounded mailbox
+
+A sixth 2026-07-21 follow-up replaced Tokio's general-purpose bounded MPSC channel in local actor
+mailboxes. The actor-specialized channel uses one atomic state word for the closed flag and available
+permits, a fixed-capacity MPSC ring for admitted commands, and a single-consumer `AtomicWaker`. The
+non-blocking path no longer enters an asynchronous semaphore. Capacity waiters are registered only
+after the mailbox is observed full, using stack-based event listeners so `tell().await` does not add
+a per-message waiter allocation. The receiver consults the listener set only on a full-to-available
+capacity transition. This retains strict bounded admission and the existing permit-first behavior,
+so a rejected tell still returns its original typed message before an erased envelope is allocated.
+
+Two stable same-session five-million-message comparisons against the immediately preceding
+pooled-future binary measured 5.137M/s versus 5.730M/s (+11.5%) and 5.109M/s versus 5.585M/s (+9.3%).
+Median local-tell cost fell from 194.68--195.72 ns to 174.52--179.05 ns. Earlier captures experienced
+larger machine-load drift, so they are not used for the final relative result.
+
+The isolated 64-window local-ask workload was unchanged at 781.5K/s versus 781.0K/s. Network
+workloads also remained transport-bound after removing the capacity waiter's heap allocation:
+remote tell measured 419.2K/s versus 421.5K/s (+0.5%), and a mixed-workload remote-ask capture
+measured 42.62K/s versus 42.81K/s (+0.4%).
+
+With 16 concurrent producers, successful throughput rose from 1.116M/s to 1.186M/s (+6.2%). The
+median full-mailbox retry count per two-million-message round fell from 0.84 million to 0.19 million,
+although retry counts remained scheduler-sensitive and one custom-mailbox round reached 1.01
+million. The custom mailbox therefore reduces contention CPU more consistently than it raises the
+single actor's terminal processing rate.
+
+### Bounded normal-message turns
+
+A seventh 2026-07-21 follow-up lets an Actor consume an immediately available batch from its normal
+lane before returning to the outer mailbox selection. The default turn budget is 64 messages and is
+configurable through `MailboxConfig::with_turn_budget`. The system lane is reconsidered at every turn
+boundary. This bounds the number of queued normal messages that can precede a waiting system message,
+but deliberately does not claim a wall-clock bound for slow or suspending handlers.
+
+An interleaved before/after comparison used two warmup rounds and five measured rounds of five
+million tells. The two pre-batch medians were 3.477M/s and 3.303M/s; the two 64-message-turn medians
+were 4.933M/s and 4.895M/s. Averaging each pair gives 3.390M/s versus 4.914M/s, a 45.0% improvement
+under the same machine-load interval. Absolute throughput was lower than earlier captures, so this
+section uses only the interleaved relative result.
+
+The separate producer-task workload, which uses a final barrier message, measured 7.617M/s versus
+8.951M/s with one producer (+17.5%). At 16 producers it measured 1.417M/s versus 1.425M/s (+0.6%);
+the contended admission path therefore did not regress, but batching cannot remove multi-producer
+queue contention. In a second interleaved mixed-workload capture, 64-window local ask improved by
+14.5%, remote tell by 2.2%, and 64-window remote ask by 2.8%. The smaller remote deltas confirm that
+network encoding and transport remain dominant.
+
+The original cross-framework harness runs the Lattice producer inside its main Tokio future, while
+Akka's producer runs outside the Actor dispatcher. Moving only the Lattice producer to a separate
+Tokio task, while retaining the exact `TellMessage`, last-message completion marker, 500,000-message
+round, and 128-byte payload, measured 8.675M/s (115.27 ns/message). The preserved Akka 2.6.21 result
+is 8.850M/s (112.99 ns/message), leaving a 2.0% gap in the comparable producer/consumer topology.
+Lattice retains its bounded 1,024-entry mailbox and full-mailbox retry behavior in that result.
+
+A diagnostic high-budget profile reduced mailbox-related active samples from 30.7% to 23.7%.
+Dynamic envelope dispatch and handler polling accounted for approximately 29.5%, while `Bytes`
+clone/drop reference-count traffic accounted for approximately 28.5%. This profile used a 512-message
+experimental turn to expose the asymptote; 64 remains the production default because higher values
+offered diminishing throughput returns while delaying system-lane reconsideration.
+
 The MongoDB persistence framework baseline was captured with:
 
 ```text

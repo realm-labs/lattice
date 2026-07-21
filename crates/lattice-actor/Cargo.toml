@@ -10,6 +10,7 @@ async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 concurrent-queue.workspace = true
+event-listener.workspace = true
 dashmap.workspace = true
 futures-util.workspace = true
 http.workspace = true

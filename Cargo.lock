@@ -2055,6 +2055,7 @@ dependencies = [
  "bytes",
  "concurrent-queue",
  "dashmap",
+ "event-listener",
  "futures-util",
  "http",
  "lattice-actor-macros",

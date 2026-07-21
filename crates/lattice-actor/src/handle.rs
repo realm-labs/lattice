@@ -11,15 +11,14 @@ use std::{
 
 use broadcast::error::{RecvError, TryRecvError};
 use lattice_core::actor_ref::{ActorRef, ProtocolTag, ReferenceError};
-use tokio::sync::{
-    broadcast,
-    mpsc::{self, error::TrySendError},
-    oneshot, watch,
-};
+use tokio::sync::{broadcast, oneshot, watch};
 
 use crate::{
     error::{ActorAdminError, ActorCallError, ActorTellError},
-    mailbox::{ActorCommand, MailboxLane, RequestEnvelope, TellEnvelope},
+    mailbox::{
+        ActorCommand, MailboxLane, RequestEnvelope, TellEnvelope,
+        channel::{Sender, TrySendError},
+    },
     observation::{ActorMetadata, ActorObserverHandle, MailboxRejection, RequestCompletion},
     traits::{
         Actor, ActorLifecycleState, Handler, Message, MessageKind, MessageMetadata, Request,
@@ -37,8 +36,8 @@ pub(crate) struct ActorHandleInit<A: Actor> {
     pub(crate) stop_failure: Arc<Mutex<Option<StopFailureRecord>>>,
     pub(crate) forced_data_loss_tx: broadcast::Sender<ForcedDataLossEvent>,
     pub(crate) terminal_hook: Arc<Mutex<Option<TerminalHook>>>,
-    pub(crate) normal_tx: mpsc::Sender<ActorCommand<A>>,
-    pub(crate) system_tx: mpsc::Sender<ActorCommand<A>>,
+    pub(crate) normal_tx: Sender<ActorCommand<A>>,
+    pub(crate) system_tx: Sender<ActorCommand<A>>,
     pub(crate) actor_ref: Option<ActorRef>,
     pub(crate) observer: ActorObserverHandle,
 }
@@ -52,8 +51,8 @@ pub struct ActorHandle<A: Actor> {
     stop_failure: Arc<Mutex<Option<StopFailureRecord>>>,
     forced_data_loss_tx: broadcast::Sender<ForcedDataLossEvent>,
     terminal_hook: Arc<Mutex<Option<TerminalHook>>>,
-    normal_tx: mpsc::Sender<ActorCommand<A>>,
-    system_tx: mpsc::Sender<ActorCommand<A>>,
+    normal_tx: Sender<ActorCommand<A>>,
+    system_tx: Sender<ActorCommand<A>>,
     metadata: Arc<ActorMetadata>,
     observer: ActorObserverHandle,
     _marker: PhantomData<fn() -> A>,
@@ -633,7 +632,7 @@ impl<A: Actor> ActorHandle<A> {
             })
     }
 
-    fn channel(&self, lane: MailboxLane) -> &mpsc::Sender<ActorCommand<A>> {
+    fn channel(&self, lane: MailboxLane) -> &Sender<ActorCommand<A>> {
         match lane {
             MailboxLane::Normal => &self.normal_tx,
             MailboxLane::System => &self.system_tx,
@@ -670,7 +669,7 @@ impl<A: Actor> ActorHandle<A> {
     fn observe_tell_enqueued(
         &self,
         metadata: Option<MessageMetadata>,
-        channel: &mpsc::Sender<ActorCommand<A>>,
+        channel: &Sender<ActorCommand<A>>,
     ) {
         if let Some(metadata) = metadata {
             self.observer.message_enqueued(

@@ -15,6 +15,7 @@ use crate::traits::{
     MessageRejection, MessageView, Request, Responder, ResponderErrorAction, StopReason,
 };
 
+pub(crate) mod channel;
 mod envelope;
 mod future;
 mod pool;
@@ -27,14 +28,18 @@ pub struct MailboxConfig {
     normal_capacity: usize,
     system_capacity: usize,
     deferred_capacity: usize,
+    turn_budget: usize,
 }
 
 impl MailboxConfig {
+    const DEFAULT_TURN_BUDGET: usize = 64;
+
     pub fn bounded(capacity: usize) -> Self {
         Self {
             normal_capacity: capacity,
             system_capacity: capacity,
             deferred_capacity: capacity,
+            turn_budget: Self::DEFAULT_TURN_BUDGET,
         }
     }
 
@@ -43,11 +48,23 @@ impl MailboxConfig {
             normal_capacity,
             system_capacity,
             deferred_capacity: normal_capacity,
+            turn_budget: Self::DEFAULT_TURN_BUDGET,
         }
     }
 
     pub fn with_deferred_capacity(mut self, deferred_capacity: usize) -> Self {
         self.deferred_capacity = deferred_capacity;
+        self
+    }
+
+    /// Sets the maximum number of normal-lane messages processed in one Actor turn.
+    ///
+    /// System-lane priority is reconsidered at every turn boundary. A larger budget amortizes
+    /// mailbox polling overhead under load, while a smaller budget bounds the number of normal
+    /// messages that can precede a waiting system message. Handler execution time is not bounded.
+    pub fn with_turn_budget(mut self, turn_budget: usize) -> Self {
+        assert!(turn_budget > 0, "actor mailbox turn budget must be nonzero");
+        self.turn_budget = turn_budget;
         self
     }
 
@@ -61,6 +78,10 @@ impl MailboxConfig {
 
     pub(crate) fn deferred_capacity(&self) -> usize {
         self.deferred_capacity
+    }
+
+    pub(crate) fn turn_budget(&self) -> usize {
+        self.turn_budget
     }
 }
 

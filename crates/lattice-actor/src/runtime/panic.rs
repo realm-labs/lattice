@@ -23,8 +23,8 @@ fn terminate_panicked_actor<A>(
     actor: A,
     ctx: &mut ActorContext<A>,
     handle: &ActorHandle<A>,
-    normal_rx: &mut mpsc::Receiver<ActorCommand<A>>,
-    system_rx: &mut mpsc::Receiver<ActorCommand<A>>,
+    normal_rx: &mut Receiver<ActorCommand<A>>,
+    system_rx: &mut Receiver<ActorCommand<A>>,
     panic: ActorPanic,
 ) where
     A: Actor,
@@ -53,7 +53,7 @@ fn terminate_panicked_actor<A>(
 }
 
 fn reject_queued_commands<A>(
-    receiver: &mut mpsc::Receiver<ActorCommand<A>>,
+    receiver: &mut Receiver<ActorCommand<A>>,
     lane: MailboxLane,
     handle: &ActorHandle<A>,
 ) where
