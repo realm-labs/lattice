@@ -23,17 +23,12 @@ use crate::metrics::WorkloadReport;
 #[derive(Debug, Clone)]
 pub struct ActorCompletionReport {
     pub workload: WorkloadReport,
-    pub queue_times: Vec<Duration>,
     pub processing_times: Vec<Duration>,
     pub mailbox_full_retries: usize,
     pub maximum_queue_depth: usize,
 }
 
 impl ActorCompletionReport {
-    pub fn queue_percentile(&self, percentile: f64) -> Duration {
-        crate::metrics::percentile_duration(&self.queue_times, percentile)
-    }
-
     pub fn processing_percentile(&self, percentile: f64) -> Duration {
         crate::metrics::percentile_duration(&self.processing_times, percentile)
     }
@@ -54,7 +49,6 @@ impl RawActorCompletionReport {
 
 #[derive(Default)]
 struct CompletionObserver {
-    queue_times: Mutex<Vec<Duration>>,
     processing_times: Mutex<Vec<Duration>>,
     maximum_queue_depth: AtomicUsize,
     finished: AtomicUsize,
@@ -62,10 +56,6 @@ struct CompletionObserver {
 
 impl CompletionObserver {
     fn reset(&self) {
-        self.queue_times
-            .lock()
-            .expect("queue-time metrics poisoned")
-            .clear();
         self.processing_times
             .lock()
             .expect("processing-time metrics poisoned")
@@ -74,12 +64,8 @@ impl CompletionObserver {
         self.finished.store(0, Ordering::Release);
     }
 
-    fn snapshot(&self) -> (Vec<Duration>, Vec<Duration>, usize) {
+    fn snapshot(&self) -> (Vec<Duration>, usize) {
         (
-            self.queue_times
-                .lock()
-                .expect("queue-time metrics poisoned")
-                .clone(),
             self.processing_times
                 .lock()
                 .expect("processing-time metrics poisoned")
@@ -98,18 +84,6 @@ impl ActorObserver for CompletionObserver {
     ) {
         self.maximum_queue_depth
             .fetch_max(queue_depth, Ordering::Relaxed);
-    }
-
-    fn message_started(
-        &self,
-        _actor: &ActorMetadata,
-        _message: &MessageMetadata,
-        queue_time: Duration,
-    ) {
-        self.queue_times
-            .lock()
-            .expect("queue-time metrics poisoned")
-            .push(queue_time);
     }
 
     fn message_finished(
@@ -279,11 +253,10 @@ impl ActorCompletionTopology {
             }
         }
         let elapsed = started.elapsed();
-        let (queue_times, processing_times, maximum_queue_depth) =
-            self.observer.as_ref().map_or_else(
-                || (Vec::new(), Vec::new(), 0),
-                |observer| observer.snapshot(),
-            );
+        let (processing_times, maximum_queue_depth) = self
+            .observer
+            .as_ref()
+            .map_or_else(|| (Vec::new(), 0), |observer| observer.snapshot());
         Ok(ActorCompletionReport {
             workload: WorkloadReport {
                 name: "local_actor_tell_completion",
@@ -294,7 +267,6 @@ impl ActorCompletionTopology {
                 latencies,
                 observed_actor_ids: [self.handle.local_ref().id()].into_iter().collect(),
             },
-            queue_times,
             processing_times,
             mailbox_full_retries,
             maximum_queue_depth,
@@ -368,7 +340,6 @@ mod tests {
         let topology = ActorCompletionTopology::start(2).await.unwrap();
         let report = topology.run(16, 32).await.unwrap();
         assert_eq!(report.workload.successes, 16);
-        assert_eq!(report.queue_times.len(), 16);
         assert_eq!(report.processing_times.len(), 16);
         assert!(report.maximum_queue_depth <= 2);
         topology.shutdown().await.unwrap();

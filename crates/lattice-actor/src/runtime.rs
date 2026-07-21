@@ -1013,12 +1013,8 @@ where
             let metadata = envelope.metadata(lane);
             let actor_metadata = handle.observation_metadata();
             let observation_started_at = handle.observer().is_enabled().then(Instant::now);
-            if let Some(started_at) = observation_started_at {
-                handle.observer().message_started(
-                    actor_metadata,
-                    &metadata,
-                    started_at.saturating_duration_since(metadata.enqueued_at()),
-                );
+            if observation_started_at.is_some() {
+                handle.observer().message_started(actor_metadata, &metadata);
             }
             let span = tracing::info_span!(
                 "actor.message",
@@ -1035,14 +1031,14 @@ where
                 mailbox.lane = lane.as_str(),
                 "handling actor message"
             );
-            let outcome = match AssertUnwindSafe(
-                envelope
-                    .handle(instance.actor, instance.behavior, ctx, &metadata)
-                    .instrument(span),
-            )
-            .catch_unwind()
-            .await
-            {
+            let handled = {
+                let future = envelope.handle(instance.actor, instance.behavior, ctx, &metadata);
+                tokio::pin!(future);
+                AssertUnwindSafe(future.as_mut().instrument(span))
+                    .catch_unwind()
+                    .await
+            };
+            let outcome = match handled {
                 Ok(outcome) => outcome,
                 Err(payload) => {
                     if let Some(completion) = envelope.reject_panicked() {

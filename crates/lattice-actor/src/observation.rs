@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use lattice_core::actor_ref::ActorRef;
 
@@ -139,13 +139,7 @@ pub trait ActorObserver: Send + Sync + 'static {
     ) {
     }
 
-    fn message_started(
-        &self,
-        _actor: &ActorMetadata,
-        _message: &MessageMetadata,
-        _queue_time: Duration,
-    ) {
-    }
+    fn message_started(&self, _actor: &ActorMetadata, _message: &MessageMetadata) {}
 
     fn message_finished(
         &self,
@@ -161,7 +155,6 @@ pub trait ActorObserver: Send + Sync + 'static {
         _actor: &ActorMetadata,
         _message: &MessageMetadata,
         _completion: RequestCompletion,
-        _total_time: Duration,
     ) {
     }
 
@@ -224,13 +217,8 @@ impl ActorObserverHandle {
         self.inner.mailbox_rejected(actor, message, reason);
     }
 
-    pub(crate) fn message_started(
-        &self,
-        actor: &ActorMetadata,
-        message: &MessageMetadata,
-        queue_time: Duration,
-    ) {
-        self.inner.message_started(actor, message, queue_time);
+    pub(crate) fn message_started(&self, actor: &ActorMetadata, message: &MessageMetadata) {
+        self.inner.message_started(actor, message);
     }
 
     pub(crate) fn message_finished(
@@ -253,12 +241,7 @@ impl ActorObserverHandle {
         if !self.enabled {
             return;
         }
-        self.inner.request_completed(
-            actor,
-            message,
-            completion,
-            Instant::now().saturating_duration_since(message.enqueued_at()),
-        );
+        self.inner.request_completed(actor, message, completion);
     }
 
     pub(crate) fn lifecycle(&self, actor: &ActorMetadata, event: ActorLifecycleEvent) {

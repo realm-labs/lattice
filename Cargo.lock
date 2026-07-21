@@ -2053,6 +2053,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "concurrent-queue",
  "dashmap",
  "futures-util",
  "http",

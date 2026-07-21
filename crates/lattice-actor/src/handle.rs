@@ -236,8 +236,7 @@ impl<A: Actor> ActorHandle<A> {
             return Err(ActorCallError::DeadlineExceeded);
         }
         let (reply_tx, reply_rx) = oneshot::channel();
-        let command =
-            ActorCommand::Envelope(Box::new(RequestEnvelope::new(request, reply_tx, deadline)));
+        let command = ActorCommand::envelope(RequestEnvelope::new(request, reply_tx, deadline));
         self.send_command(command, MailboxLane::Normal)?;
         match tokio::time::timeout_at(deadline.into(), reply_rx).await {
             Ok(result) => result.map_err(|_| ActorCallError::ResponseDropped)?,
@@ -259,8 +258,7 @@ impl<A: Actor> ActorHandle<A> {
             return Err(ActorCallError::DeadlineExceeded);
         }
         let (reply_tx, reply_rx) = oneshot::channel();
-        let command =
-            ActorCommand::Envelope(Box::new(RequestEnvelope::new(request, reply_tx, deadline)));
+        let command = ActorCommand::envelope(RequestEnvelope::new(request, reply_tx, deadline));
         self.send_command(command, MailboxLane::Normal)?;
         match tokio::time::timeout_at(deadline.into(), reply_rx).await {
             Ok(result) => result.map_err(|_| ActorCallError::ResponseDropped)?,
@@ -564,34 +562,28 @@ impl<A: Actor> ActorHandle<A> {
             });
         }
         let channel = self.channel(lane);
-        let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg, sender)));
-        let metadata = self.observed_metadata(&command, lane);
-        match channel.try_send(command) {
-            Ok(()) => {
-                self.observe_tell_enqueued(metadata, channel);
-                Ok(())
+        let permit = match channel.try_reserve() {
+            Ok(permit) => permit,
+            Err(TrySendError::Full(())) => {
+                self.observe_tell_rejection::<M>(lane, MailboxRejection::Full);
+                return Err(ActorTellError::MailboxFull(msg));
             }
-            Err(TrySendError::Full(command)) => {
-                if let Some(metadata) = metadata {
-                    self.observer.mailbox_rejected(
-                        self.observation_metadata(),
-                        &metadata,
-                        MailboxRejection::Full,
-                    );
-                }
-                Err(ActorTellError::MailboxFull(command.into_tell::<M>()))
+            Err(TrySendError::Closed(())) => {
+                self.observe_tell_rejection::<M>(lane, MailboxRejection::Closed);
+                return Err(ActorTellError::MailboxClosed(msg));
             }
-            Err(TrySendError::Closed(command)) => {
-                if let Some(metadata) = metadata {
-                    self.observer.mailbox_rejected(
-                        self.observation_metadata(),
-                        &metadata,
-                        MailboxRejection::Closed,
-                    );
-                }
-                Err(ActorTellError::MailboxClosed(command.into_tell::<M>()))
-            }
+        };
+        if let Some(state) = self.unavailable_lifecycle(lane) {
+            return Err(ActorTellError::LifecycleUnavailable {
+                state,
+                message: msg,
+            });
         }
+        let command = ActorCommand::envelope(TellEnvelope::new(msg, sender));
+        let metadata = self.observed_metadata(&command, lane);
+        permit.send(command);
+        self.observe_tell_enqueued(metadata, channel);
+        Ok(())
     }
 
     async fn send_tell_on_lane<M>(
@@ -625,7 +617,7 @@ impl<A: Actor> ActorHandle<A> {
                 message: msg,
             });
         }
-        let command = ActorCommand::Envelope(Box::new(TellEnvelope::new(msg, sender)));
+        let command = ActorCommand::envelope(TellEnvelope::new(msg, sender));
         let metadata = self.observed_metadata(&command, lane);
         permit.send(command);
         self.observe_tell_enqueued(metadata, channel);
@@ -693,13 +685,7 @@ impl<A: Actor> ActorHandle<A> {
         if !self.observer.is_enabled() {
             return;
         }
-        let metadata = MessageMetadata::new(
-            type_name::<M>(),
-            MessageKind::Tell,
-            lane.into(),
-            Instant::now(),
-            None,
-        );
+        let metadata = MessageMetadata::new(type_name::<M>(), MessageKind::Tell, lane.into(), None);
         self.observer
             .mailbox_rejected(self.observation_metadata(), &metadata, reason);
     }

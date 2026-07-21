@@ -180,6 +180,8 @@ The allocator-instrumented `measure` command additionally observed the following
 
 The observer intentionally adds per-message metric collection overhead, so its throughput is not used
 as the timing regression baseline. Its percentiles describe the saturated bounded-mailbox workload.
+The queue-time row is a historical capture: the Actor observer no longer records a per-message enqueue
+timestamp, so current runs report handler processing time and mailbox depth but not queue duration.
 
 ### Local Actor raw completion and Noop observer fast path
 
@@ -205,10 +207,10 @@ custom observers, the same run measured:
 
 The allocator-instrumented raw workload measured 1.623M/s and 39,151 allocations for 10,000
 messages while encountering 9,096 full-mailbox retries. This is not the timing baseline: the counting
-allocator and reconstructing rejected `try_tell` messages both add overhead. The post-change profile
-now points primarily to payload reference-count updates, bounded-channel semaphore work, envelope and
-handler-future allocation, and the required enqueue timestamp. Removing those costs would require a
-larger mailbox/API or dispatch representation change rather than another observer fast-path tweak.
+allocator and reconstructing rejected `try_tell` messages both add overhead. At this point the profile
+pointed primarily to payload reference-count updates, bounded-channel semaphore work, envelope and
+handler-future allocation, and the enqueue timestamp. Later sections record the dispatch
+representation change that removed the timestamp and common tell handler-future allocation.
 
 ### Native Actor handler futures
 
@@ -247,10 +249,49 @@ After rebasing the typed state-machine behavior change, Criterion measured:
 | Per-message latency completion | 4.2107-4.3219 ms | 2.3138-2.3749M/s |
 
 The allocator-instrumented raw run recorded 24,010 allocations for 10,000 successful messages and
-3,945 full-mailbox retries. The normalized successful path remains approximately two allocations per
-message. Each rejected `try_tell` still allocates and then recovers one type-erased envelope, but it no
-longer clones or loses the business payload. A `try_reserve`-first prototype removed that rejected
-allocation but reduced saturated Criterion throughput enough that it was not retained.
+3,945 full-mailbox retries. The normalized successful path was approximately two allocations per
+message, while each rejected `try_tell` also allocated and then recovered one type-erased envelope.
+
+### Timestamp-free pooled tell dispatch
+
+A fourth 2026-07-20 follow-up removed the enqueue timestamp from Actor envelopes and
+`MessageMetadata`. Consequently `ActorObserver::message_started` no longer reports queue duration and
+`request_completed` no longer reports total time; processing duration, mailbox depth, outcomes, and
+request completion categories remain available.
+
+The SmallBox handler-future experiment was withdrawn. Handler futures use the direct boxed
+representation again, while type-erased tell and request envelopes now use an internal fixed-size
+allocation pool with transparent allocator fallback for large or unusually aligned messages.
+`try_tell` obtains a Tokio mailbox permit before constructing the envelope, so a full or closed
+mailbox returns the original typed message without an allocation, downcast, or recovery path.
+
+In the allocation-instrumented raw workload, 10,000 successful tells with 5,601 full-mailbox retries
+performed 10,051 allocations. The rejected attempts therefore no longer contribute an envelope
+allocation; the remaining approximately one allocation per successful tell is the boxed handler
+future.
+
+A completion-throughput comparison used two warmup rounds and five measured rounds of 10 million
+tells with a 128-byte `Bytes` payload and a 1,024-entry mailbox:
+
+| Implementation | Median throughput | Median time/message |
+|---|---:|---:|
+| Pre-change exact baseline | 3.6677M/s | 272.65 ns |
+| Withdrawn SmallBox experiment | 4.0378M/s | 247.66 ns |
+| Pooled envelope, representative run | 4.8799M/s | 204.92 ns |
+
+Three independent pooled-envelope captures produced medians from 4.7517M/s to 4.9834M/s. The
+representative median is 20.9% above the withdrawn SmallBox result and 33.1% above the original exact
+baseline.
+
+An isolated same-session remoting A/B kept timestamp removal and direct boxed handler futures in both
+binaries, changing only Box envelope admission versus pooled envelope admission. The execution order
+was Box, pool, pool, Box; each capture used three warmup rounds and seven measured rounds of 100,000
+loopback TCP tells. The two Box medians were 378,523/s and 379,839/s, while the pooled medians were
+387,841/s and 397,736/s. Averaging each pair of medians gives 379,181/s versus 392,789/s, a 3.6%
+improvement. Separate 10-million-message runs under a 10-second CPU sampler measured 347,934/s versus
+358,238/s, a 3.0% improvement despite sampling overhead. Pool allocation, pop, push, and recycle paths
+did not appear as material CPU hotspots; protobuf/frame encoding, `BytesMut` writes, allocator work,
+and socket `writev` remained dominant.
 
 The MongoDB persistence framework baseline was captured with:
 

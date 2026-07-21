@@ -80,7 +80,6 @@ impl ActorObserver for RecordingObserver {
         _actor: &ActorMetadata,
         message: &MessageMetadata,
         completion: RequestCompletion,
-        _total_time: Duration,
     ) {
         self.events
             .lock()

@@ -188,7 +188,6 @@ impl ActorObserver for RecordingObserver {
         _actor: &ActorMetadata,
         message: &MessageMetadata,
         completion: RequestCompletion,
-        _total_time: Duration,
     ) {
         self.record(ObserverEvent::RequestCompleted(
             message.type_name(),

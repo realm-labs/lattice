@@ -43,7 +43,6 @@ pub struct MessageMetadata {
     type_name: &'static str,
     kind: MessageKind,
     lane: MessageLane,
-    enqueued_at: Instant,
     deadline: Option<Instant>,
 }
 
@@ -52,14 +51,12 @@ impl MessageMetadata {
         type_name: &'static str,
         kind: MessageKind,
         lane: MessageLane,
-        enqueued_at: Instant,
         deadline: Option<Instant>,
     ) -> Self {
         Self {
             type_name,
             kind,
             lane,
-            enqueued_at,
             deadline,
         }
     }
@@ -74,10 +71,6 @@ impl MessageMetadata {
 
     pub fn lane(&self) -> MessageLane {
         self.lane
-    }
-
-    pub fn enqueued_at(&self) -> Instant {
-        self.enqueued_at
     }
 
     pub fn deadline(&self) -> Option<Instant> {
