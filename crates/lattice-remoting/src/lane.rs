@@ -33,8 +33,8 @@ use crate::{
     wire::{Frame, FrameCodec, FrameKind, WireError},
 };
 
-// Coalesce only bulk frames that are already queued; never delay the first frame to fill a batch.
-const MAX_BULK_WRITE_BATCH_FRAMES: usize = 32;
+// Coalesce only data frames that are already queued; never delay the first frame to fill a batch.
+const MAX_WRITE_BATCH_FRAMES: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BidirectionalLaneConfig {
@@ -152,8 +152,8 @@ where
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_received = Instant::now();
-    let mut outbound_candidates = Vec::with_capacity(MAX_BULK_WRITE_BATCH_FRAMES);
-    let mut outbound_batch = Vec::with_capacity(MAX_BULK_WRITE_BATCH_FRAMES);
+    let mut outbound_candidates = Vec::with_capacity(MAX_WRITE_BATCH_FRAMES);
+    let mut outbound_batch = Vec::with_capacity(MAX_WRITE_BATCH_FRAMES);
     let idle = tokio::time::sleep(config.idle_data_connection_timeout);
     tokio::pin!(idle);
 
@@ -170,8 +170,21 @@ where
                 let Some(completed) = completed else {
                     continue;
                 };
-                let frame = completed.map_err(LaneError::Join)??;
-                writer.write_frame(&frame).await?;
+                outbound_batch.clear();
+                outbound_batch.push(completed.map_err(LaneError::Join)??);
+                while outbound_batch.len() < MAX_WRITE_BATCH_FRAMES {
+                    let Some(completed) = asks.try_join_next() else {
+                        break;
+                    };
+                    outbound_batch.push(completed.map_err(LaneError::Join)??);
+                }
+                if outbound_batch.len() == 1 {
+                    writer.write_frame(&outbound_batch[0]).await?;
+                } else {
+                    writer
+                        .write_frames_with_commit(&outbound_batch, |_| {})
+                        .await?;
+                }
                 idle.as_mut().reset(
                     TokioInstant::now() + config.idle_data_connection_timeout
                 );
@@ -182,10 +195,10 @@ where
                 };
                 outbound_candidates.clear();
                 outbound_candidates.push(frame);
-                let batch_limit = if matches!(lane, LaneKind::Bulk(_)) {
-                    MAX_BULK_WRITE_BATCH_FRAMES
-                } else {
+                let batch_limit = if lane == LaneKind::Control {
                     1
+                } else {
+                    MAX_WRITE_BATCH_FRAMES
                 };
                 while outbound_candidates.len() < batch_limit {
                     let Ok(frame) = receiver.try_recv() else {
@@ -215,15 +228,19 @@ where
                         Failpoint::ControlAfterOutboxBeforeSocketWrite,
                     );
                 }
-                let result = if matches!(lane, LaneKind::Bulk(_)) {
-                    writer
-                        .write_frames_with_commit(&outbound_batch, |_| {})
-                        .await
-                } else {
+                let result = if outbound_batch.len() == 1 && !matches!(lane, LaneKind::Bulk(_)) {
                     let correlation = ask_correlation(&outbound_batch[0]);
                     writer
                         .write_frame_with_commit(&outbound_batch[0], || {
                             if let Some(correlation) = correlation {
+                                messaging.mark_socket_write_started(correlation);
+                            }
+                        })
+                        .await
+                } else {
+                    writer
+                        .write_frames_with_commit(&outbound_batch, |index| {
+                            if let Some(correlation) = ask_correlation(&outbound_batch[index]) {
                                 messaging.mark_socket_write_started(correlation);
                             }
                         })
@@ -690,17 +707,30 @@ mod tests {
             protocol_id,
         )
         .unwrap();
-        let reply = client_messaging
-            .ask(
-                &client_association,
-                &SenderIdentity::Process(9),
-                &target,
-                OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"echo")),
-                Instant::now() + Duration::from_secs(1),
-            )
-            .await
-            .unwrap();
-        assert_eq!(reply, Bytes::from_static(b"echo"));
+        let mut pending = JoinSet::new();
+        for index in 0_u8..8 {
+            let messaging = client_messaging.clone();
+            let association = client_association.clone();
+            let target = target.clone();
+            pending.spawn(async move {
+                let expected = Bytes::from(vec![index]);
+                let reply = messaging
+                    .ask(
+                        &association,
+                        &SenderIdentity::Process(9),
+                        &target,
+                        OutboundMessage::new(fingerprint, u64::from(index) + 1, expected.clone()),
+                        Instant::now() + Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap();
+                (reply, expected)
+            });
+        }
+        while let Some(completed) = pending.join_next().await {
+            let (reply, expected) = completed.unwrap();
+            assert_eq!(reply, expected);
+        }
         shutdown_tx.send(true).unwrap();
         assert_eq!(client_lane.await.unwrap().unwrap(), LaneExit::Shutdown);
         assert_eq!(server_lane.await.unwrap().unwrap(), LaneExit::Shutdown);

@@ -384,6 +384,30 @@ clone/drop reference-count traffic accounted for approximately 28.5%. This profi
 experimental turn to expose the asymptote; 64 remains the production default because higher values
 offered diminishing throughput returns while delaying system-lane reconsideration.
 
+### Interactive request and reply write batching
+
+An eighth 2026-07-21 follow-up extended bounded socket-write batching to the interactive data lane.
+The writer never waits to fill a batch: after receiving the first request, it takes at most 31 more
+frames that are already queued. Each ask retains its individual socket-write commitment callback, so
+partial writes preserve the distinction between `AssociationLostBeforeWrite` and `UnknownResult`.
+The response side similarly takes at most 31 additional replies that have already completed in the
+inbound `JoinSet`. The control lane remains single-frame, and an isolated request or reply therefore
+does not acquire batching latency.
+
+An isolated loopback TCP comparison used a 128-byte payload, 64 concurrent asks, three warmup rounds,
+seven measured rounds, and 100,000 asks per round. The original single-frame request and reply path
+measured 37.414K/s. Batching only queued requests measured 53.752K/s; a repeated request-only capture
+measured 54.228K/s. Batching both queued requests and completed replies measured 87.958K/s, reducing
+median round-trip cost from 26.73 us to 11.37 us. A separate five-warmup, nine-measurement capture of
+10,000 asks per round measured 89.001K/s with an 86.661--90.937K/s range.
+The single-frame fast path is retained when no second frame is ready. A window-1 capture measured
+10.665K/s versus the preserved 10.583K/s result, so batching did not impose a sequential-ask
+throughput regression.
+
+The concurrent lane test now holds eight asks in flight across an idle timeout shorter than the
+handler delay, validating request batching, reply batching, and the existing in-flight idle fence.
+The transport tests continue to exercise partial vectored writes and per-frame commitment boundaries.
+
 The MongoDB persistence framework baseline was captured with:
 
 ```text
