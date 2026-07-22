@@ -18,9 +18,12 @@ use thiserror::Error;
 use crate::{
     error::ActorCallError,
     handle::ActorHandle,
-    observation::ProtocolFailure,
     traits::{Actor, Handler, Message, MessageKind, Request, Responder},
 };
+
+mod helpers;
+
+use helpers::{bounded_error, canonical_descriptor, protocol_failure};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CodecDescriptor {
@@ -39,6 +42,27 @@ pub trait WireCodec<T>: Send + Sync + 'static {
 
     fn encode(&self, value: &T, output: &mut BytesMut) -> Result<(), EncodeError>;
     fn decode(&self, input: &[u8]) -> Result<T, DecodeError>;
+
+    /// Returns the encoded size when the codec can determine it without
+    /// encoding the value.
+    ///
+    /// The default keeps custom codecs source-compatible. Size-aware codecs
+    /// let the protocol allocate the final payload buffer exactly once.
+    fn encoded_len(&self, _value: &T) -> Option<usize> {
+        None
+    }
+
+    /// Encodes one value into an immutable wire payload.
+    ///
+    /// Codecs with an already-owned immutable representation may override
+    /// this method to avoid copying it into an intermediate buffer.
+    fn encode_to_bytes(&self, value: &T) -> Result<Bytes, EncodeError> {
+        let mut output = self
+            .encoded_len(value)
+            .map_or_else(BytesMut::new, BytesMut::with_capacity);
+        self.encode(value, &mut output)?;
+        Ok(output.freeze())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -60,6 +84,10 @@ where
     fn decode(&self, input: &[u8]) -> Result<T, DecodeError> {
         T::decode(input).map_err(|error| DecodeError::new(error.to_string()))
     }
+
+    fn encoded_len(&self, value: &T) -> Option<usize> {
+        Some(prost::Message::encoded_len(value))
+    }
 }
 
 impl WireCodec<()> for UnitCodec {
@@ -75,6 +103,10 @@ impl WireCodec<()> for UnitCodec {
         } else {
             Err(DecodeError::new("unit payload must be empty"))
         }
+    }
+
+    fn encoded_len(&self, _value: &()) -> Option<usize> {
+        Some(0)
     }
 }
 
@@ -106,11 +138,6 @@ impl DecodeError {
     }
 }
 
-fn bounded_error(mut message: String) -> String {
-    message.truncate(256);
-    message
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DispatchMode {
     Tell,
@@ -129,6 +156,15 @@ type DispatchFn<A> = dyn Fn(ActorHandle<A>, Bytes, Option<Instant>, Option<Actor
     + Send
     + Sync
     + 'static;
+type TellDispatchFn<A> = dyn Fn(ActorHandle<A>, Bytes, Option<ActorRef>) -> Result<DispatchReply, DispatchError>
+    + Send
+    + Sync
+    + 'static;
+
+enum ServerDispatch<A: Actor> {
+    Tell(Arc<TellDispatchFn<A>>),
+    Async(Arc<DispatchFn<A>>),
+}
 type EncodeRequestFn = dyn Fn(&dyn Any) -> Result<Bytes, EncodeError> + Send + Sync;
 type DecodeReplyFn = dyn Fn(&[u8]) -> Result<Box<dyn Any + Send>, DecodeError> + Send + Sync;
 
@@ -293,9 +329,7 @@ impl<P: Protocol> ActorProtocolBuilder<P> {
                     let message = message
                         .downcast_ref::<M>()
                         .ok_or_else(|| EncodeError::new("message type does not match binding"))?;
-                    let mut output = BytesMut::new();
-                    codec.encode(message, &mut output)?;
-                    Ok(output.freeze())
+                    codec.encode_to_bytes(message)
                 })
             },
             decode_reply: None,
@@ -335,9 +369,7 @@ impl<P: Protocol> ActorProtocolBuilder<P> {
                     let message = message
                         .downcast_ref::<Q>()
                         .ok_or_else(|| EncodeError::new("message type does not match binding"))?;
-                    let mut output = BytesMut::new();
-                    codec.encode(message, &mut output)?;
-                    Ok(output.freeze())
+                    codec.encode_to_bytes(message)
                 })
             },
             decode_reply: {
@@ -409,7 +441,7 @@ impl<P: Protocol> ActorProtocolBuilder<P> {
 
 pub struct ActorProtocolBinding<A: Actor, P: Protocol> {
     protocol: Arc<ActorProtocol<P>>,
-    dispatch: BTreeMap<u64, Arc<DispatchFn<A>>>,
+    dispatch: BTreeMap<u64, ServerDispatch<A>>,
 }
 
 impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
@@ -455,13 +487,13 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
         deadline: Option<Instant>,
         sender: Option<ActorRef>,
     ) -> Result<DispatchReply, DispatchError> {
+        if mode == DispatchMode::Tell {
+            return self.try_dispatch_tell_with_sender(handle, message_id, payload, sender);
+        }
         let observer = handle.observer().clone();
         let actor = handle.observation_metadata().clone();
         let payload_size = payload.len();
-        let kind = match mode {
-            DispatchMode::Tell => MessageKind::Tell,
-            DispatchMode::Ask => MessageKind::Request,
-        };
+        let kind = MessageKind::Request;
         let result = async {
             let binding_index = self
                 .protocol
@@ -482,7 +514,12 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
                 .dispatch
                 .get(&message_id)
                 .ok_or(DispatchError::UnknownMessage(message_id))?;
-            dispatch(handle, payload, deadline, sender).await
+            match dispatch {
+                ServerDispatch::Async(dispatch) => {
+                    dispatch(handle, payload, deadline, sender).await
+                }
+                ServerDispatch::Tell(_) => Err(DispatchError::ModeMismatch),
+            }
         }
         .await;
         if let Err(error) = &result {
@@ -496,11 +533,59 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
         }
         result
     }
+
+    #[doc(hidden)]
+    pub fn try_dispatch_tell_with_sender(
+        &self,
+        handle: ActorHandle<A>,
+        message_id: u64,
+        payload: Bytes,
+        sender: Option<ActorRef>,
+    ) -> Result<DispatchReply, DispatchError> {
+        let observer = handle.observer().clone();
+        let actor = handle.observation_metadata().clone();
+        let payload_size = payload.len();
+        let result = (|| {
+            let binding_index = self
+                .protocol
+                .bindings_by_id
+                .get(&message_id)
+                .ok_or(DispatchError::UnknownMessage(message_id))?;
+            let client = &self.protocol.bindings[*binding_index];
+            if client.descriptor.mode != DispatchMode::Tell {
+                return Err(DispatchError::ModeMismatch);
+            }
+            if payload.len() > client.descriptor.max_payload {
+                return Err(DispatchError::PayloadTooLarge {
+                    actual: payload.len(),
+                    maximum: client.descriptor.max_payload,
+                });
+            }
+            match self
+                .dispatch
+                .get(&message_id)
+                .ok_or(DispatchError::UnknownMessage(message_id))?
+            {
+                ServerDispatch::Tell(dispatch) => dispatch(handle, payload, sender),
+                ServerDispatch::Async(_) => Err(DispatchError::ModeMismatch),
+            }
+        })();
+        if let Err(error) = &result {
+            observer.protocol_failed(
+                &actor,
+                message_id,
+                MessageKind::Tell,
+                payload_size,
+                protocol_failure(error),
+            );
+        }
+        result
+    }
 }
 
 pub struct ActorProtocolBindingBuilder<A: Actor, P: Protocol> {
     client: ActorProtocolBuilder<P>,
-    dispatch: Vec<(u64, Arc<DispatchFn<A>>)>,
+    dispatch: Vec<(u64, ServerDispatch<A>)>,
     actor: PhantomData<fn() -> A>,
 }
 
@@ -523,16 +608,13 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
                 .tell::<M, _>(message_id, schema_version, SharedCodec(codec.clone()));
         self.dispatch.push((
             message_id,
-            Arc::new(move |handle, payload, _deadline, sender| {
-                let codec = codec.clone();
-                Box::pin(async move {
-                    let message = codec.decode(&payload).map_err(DispatchError::Decode)?;
-                    handle
-                        .try_tell_from(message, sender)
-                        .map_err(|_| DispatchError::MailboxRejected)?;
-                    Ok(DispatchReply::TellAccepted)
-                })
-            }),
+            ServerDispatch::Tell(Arc::new(move |handle, payload, sender| {
+                let message = codec.decode(&payload).map_err(DispatchError::Decode)?;
+                handle
+                    .try_tell_from(message, sender)
+                    .map_err(|_| DispatchError::MailboxRejected)?;
+                Ok(DispatchReply::TellAccepted)
+            })),
         ));
         self
     }
@@ -563,7 +645,7 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
         );
         self.dispatch.push((
             message_id,
-            Arc::new(move |handle, payload, deadline, _sender| {
+            ServerDispatch::Async(Arc::new(move |handle, payload, deadline, _sender| {
                 let codec = codec.clone();
                 let reply_codec = reply_codec.clone();
                 Box::pin(async move {
@@ -579,7 +661,7 @@ impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
                         .map_err(DispatchError::Encode)?;
                     Ok(DispatchReply::Ask(output.freeze()))
                 })
-            }),
+            })),
         ));
         self
     }
@@ -603,6 +685,14 @@ impl<T, C: WireCodec<T>> WireCodec<T> for SharedCodec<C> {
     fn decode(&self, input: &[u8]) -> Result<T, DecodeError> {
         self.0.decode(input)
     }
+
+    fn encoded_len(&self, value: &T) -> Option<usize> {
+        self.0.encoded_len(value)
+    }
+
+    fn encode_to_bytes(&self, value: &T) -> Result<Bytes, EncodeError> {
+        self.0.encode_to_bytes(value)
+    }
 }
 
 fn protocol_id<P: Protocol>() -> Result<ProtocolId, ProtocolBuildError> {
@@ -610,40 +700,6 @@ fn protocol_id<P: Protocol>() -> Result<ProtocolId, ProtocolBuildError> {
         return Err(ProtocolBuildError::ProtocolTagMismatch);
     }
     __protocol_id(P::ID)
-}
-
-fn canonical_descriptor(
-    protocol_id: ProtocolId,
-    name: &str,
-    bindings: &BTreeMap<u64, ClientBinding>,
-) -> Vec<u8> {
-    let mut output = Vec::new();
-    output.extend_from_slice(&protocol_id.get().to_be_bytes());
-    output.extend_from_slice(&(name.len() as u32).to_be_bytes());
-    output.extend_from_slice(name.as_bytes());
-    output.extend_from_slice(&(bindings.len() as u32).to_be_bytes());
-    for descriptor in bindings.values().map(|binding| &binding.descriptor) {
-        output.extend_from_slice(&descriptor.message_id.to_be_bytes());
-        output.push(match descriptor.mode {
-            DispatchMode::Tell => 0,
-            DispatchMode::Ask => 1,
-        });
-        let response_codec = descriptor
-            .response_codec
-            .unwrap_or(CodecDescriptor::new(0, 0));
-        for value in [
-            descriptor.request_codec.id,
-            u64::from(descriptor.request_codec.version),
-            u64::from(descriptor.request_schema_version),
-            response_codec.id,
-            u64::from(response_codec.version),
-            u64::from(descriptor.response_schema_version.unwrap_or(0)),
-            descriptor.max_payload as u64,
-        ] {
-            output.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-    output
 }
 
 #[derive(Debug, Error)]
@@ -668,22 +724,6 @@ pub enum DispatchError {
     Actor(#[source] ActorCallError),
     #[error("reply codec returned a different Rust type")]
     ReplyTypeMismatch,
-}
-
-fn protocol_failure(error: &DispatchError) -> ProtocolFailure {
-    match error {
-        DispatchError::UnregisteredType | DispatchError::UnknownMessage(_) => {
-            ProtocolFailure::UnknownMessage
-        }
-        DispatchError::ModeMismatch => ProtocolFailure::ModeMismatch,
-        DispatchError::PayloadTooLarge { .. } => ProtocolFailure::PayloadTooLarge,
-        DispatchError::Decode(_) => ProtocolFailure::DecodeFailed,
-        DispatchError::Encode(_) => ProtocolFailure::EncodeFailed,
-        DispatchError::MissingDeadline => ProtocolFailure::MissingDeadline,
-        DispatchError::MailboxRejected => ProtocolFailure::MailboxRejected,
-        DispatchError::Actor(_) => ProtocolFailure::ActorFailed,
-        DispatchError::ReplyTypeMismatch => ProtocolFailure::ReplyTypeMismatch,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

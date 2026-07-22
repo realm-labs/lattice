@@ -9,6 +9,7 @@ use std::{
 
 use bytes::Bytes;
 use lattice_remoting::{
+    association::metrics::AssociationMetricsSnapshot,
     transport::FramedWriter,
     wire::{Frame, FrameCodec, FrameKind},
 };
@@ -66,9 +67,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
     completion_topology.shutdown().await?;
     let remote_actor = RemoteActorTopology::start(config.bulk_stripes).await?;
+    let remote_tell = remote_actor
+        .run_tell(config.requests, config.payload_bytes)
+        .await?;
+    let remote_tell_sender_transport = remote_actor.association_metrics();
+    let remote_tell_receiver_transport = remote_actor.inbound_association_metrics();
     let remote_round_trip = remote_actor
         .run(config.round_trip_requests, config.payload_bytes)
         .await?;
+    let remote_actor_sender_transport = remote_actor.association_metrics();
+    let remote_actor_receiver_transport = remote_actor.inbound_association_metrics();
     remote_actor.shutdown().await?;
     let topology = RemotingTopology::start(&config)?;
     let before_allocations = ALLOCATIONS.load(Ordering::Relaxed);
@@ -80,6 +88,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let remote_allocations = ALLOCATIONS.load(Ordering::Relaxed) - before_allocations;
     let remote_deallocations = DEALLOCATIONS.load(Ordering::Relaxed) - before_deallocations;
     let after_remote_fds = open_file_descriptors();
+    let remoting_transport = topology.association_metrics();
     topology.shutdown().await;
     let mut matrix = vec![serde_json::json!({
         "name": local.name,
@@ -117,6 +126,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "open_fds_after": after_remote_fds,
         "physical_connections": 2 + config.bulk_stripes,
         "frame_write_allocations": frame_write_allocations,
+        "association_transport": association_metrics_value(remoting_transport),
         "local_actor_completion": {
             "raw_throughput_per_second": raw_local_completion.throughput_per_second(),
             "raw_elapsed_nanos": raw_local_completion.elapsed.as_nanos(),
@@ -139,11 +149,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "latency_p50_nanos": remote_round_trip.percentile_latency(0.50).as_nanos(),
             "latency_p95_nanos": remote_round_trip.percentile_latency(0.95).as_nanos(),
             "latency_p99_nanos": remote_round_trip.percentile_latency(0.99).as_nanos(),
+            "sender_association_transport": association_metrics_value(remote_actor_sender_transport),
+            "receiver_association_transport": association_metrics_value(remote_actor_receiver_transport),
+        },
+        "remote_actor_tcp_tell": {
+            "requests": remote_tell.requests,
+            "throughput_per_second": remote_tell.throughput_per_second(),
+            "elapsed_nanos": remote_tell.elapsed.as_nanos(),
+            "sender_association_transport": association_metrics_value(remote_tell_sender_transport),
+            "receiver_association_transport": association_metrics_value(remote_tell_receiver_transport),
         },
         "matrix": matrix,
     });
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+fn association_metrics_value(metrics: AssociationMetricsSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "outbound_queue_rejections": metrics.outbound_queue_rejections,
+        "association_byte_budget_rejections": metrics.association_byte_budget_rejections,
+        "node_byte_budget_rejections": metrics.node_byte_budget_rejections,
+        "outbound_write_batches": metrics.outbound_write_batches,
+        "outbound_written_frames": metrics.outbound_written_frames,
+        "outbound_socket_writes": metrics.outbound_socket_writes,
+        "average_outbound_batch_frames": metrics.average_outbound_batch_frames(),
+        "average_socket_writes_per_batch": metrics.average_socket_writes_per_batch(),
+        "exact_target_cache_hits": metrics.exact_target_cache_hits,
+        "exact_target_cache_misses": metrics.exact_target_cache_misses,
+    })
 }
 
 async fn measure_frame_write(

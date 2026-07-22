@@ -4,6 +4,8 @@ use super::target::{
     InboundSingletonAsk, InboundSingletonTell, InboundTell, LogicalEntityTarget,
     LogicalSingletonTarget, RemoteFailure,
 };
+use super::target_cache::ExactTargetCache;
+use super::target_dictionary::ExactTargetDictionary;
 use super::{
     ActivationId, ActorPath, ActorRef, Bytes, ClusterId, ConfigFingerprint, Duration, EntityId,
     EntityRef, EntityType, Frame, FrameKind, Message, NodeAddress, NodeIncarnation,
@@ -26,6 +28,22 @@ pub fn ask_correlation(frame: &Frame) -> Option<CorrelationId> {
 }
 
 pub fn decode_tell(frame: &Frame) -> Result<InboundTell, RemoteMessageError> {
+    decode_tell_inner(frame, None, None)
+}
+
+pub(crate) fn decode_tell_cached(
+    frame: &Frame,
+    cache: &mut ExactTargetCache,
+    dictionary: &mut ExactTargetDictionary,
+) -> Result<InboundTell, RemoteMessageError> {
+    decode_tell_inner(frame, Some(cache), Some(dictionary))
+}
+
+fn decode_tell_inner(
+    frame: &Frame,
+    mut cache: Option<&mut ExactTargetCache>,
+    dictionary: Option<&mut ExactTargetDictionary>,
+) -> Result<InboundTell, RemoteMessageError> {
     if frame.kind != FrameKind::Tell {
         return Err(RemoteMessageError::InvalidPayload);
     }
@@ -35,15 +53,39 @@ pub fn decode_tell(frame: &Frame) -> Result<InboundTell, RemoteMessageError> {
     if wire.message_id == 0 {
         return Err(RemoteMessageError::InvalidPayload);
     }
+    let sender = decode_sender_with_cache(wire.sender_actor, cache.as_deref_mut())?;
+    let target = match (wire.target_id, wire.target, cache, dictionary) {
+        (0, Some(target), Some(cache), _) => cache.resolve(target)?,
+        (0, Some(target), None, _) => target_from_wire(target)?,
+        (0, None, _, _) => return Err(RemoteMessageError::InvalidPayload),
+        (id, target, Some(cache), Some(dictionary)) => dictionary.resolve(id, target, cache)?,
+        (_, Some(target), Some(cache), None) => cache.resolve(target)?,
+        (_, Some(target), None, _) => target_from_wire(target)?,
+        (_, None, _, _) => return Err(RemoteMessageError::InvalidPayload),
+    };
     Ok(InboundTell {
-        sender: decode_sender(wire.sender_actor)?,
-        target: target_from_wire(wire.target.ok_or(RemoteMessageError::InvalidPayload)?)?,
+        sender,
+        target,
         message_id: wire.message_id,
         payload: wire.payload,
     })
 }
 
 pub fn decode_ask(frame: &Frame) -> Result<InboundAsk, RemoteMessageError> {
+    decode_ask_inner(frame, None)
+}
+
+pub(crate) fn decode_ask_cached(
+    frame: &Frame,
+    cache: &mut ExactTargetCache,
+) -> Result<InboundAsk, RemoteMessageError> {
+    decode_ask_inner(frame, Some(cache))
+}
+
+fn decode_ask_inner(
+    frame: &Frame,
+    cache: Option<&mut ExactTargetCache>,
+) -> Result<InboundAsk, RemoteMessageError> {
     if frame.kind != FrameKind::Ask {
         return Err(RemoteMessageError::InvalidPayload);
     }
@@ -55,8 +97,13 @@ pub fn decode_ask(frame: &Frame) -> Result<InboundAsk, RemoteMessageError> {
     if wire.message_id == 0 || wire.timeout_nanos == 0 {
         return Err(RemoteMessageError::InvalidPayload);
     }
+    let target_wire = wire.target.ok_or(RemoteMessageError::InvalidPayload)?;
     Ok(InboundAsk {
-        target: target_from_wire(wire.target.ok_or(RemoteMessageError::InvalidPayload)?)?,
+        target: if let Some(cache) = cache {
+            cache.resolve(target_wire)?
+        } else {
+            target_from_wire(target_wire)?
+        },
         correlation_id,
         timeout_budget: Duration::from_nanos(wire.timeout_nanos),
         message_id: wire.message_id,
@@ -65,6 +112,20 @@ pub fn decode_ask(frame: &Frame) -> Result<InboundAsk, RemoteMessageError> {
 }
 
 pub fn decode_entity_tell(frame: &Frame) -> Result<InboundEntityTell, RemoteMessageError> {
+    decode_entity_tell_inner(frame, None)
+}
+
+pub(crate) fn decode_entity_tell_cached(
+    frame: &Frame,
+    cache: &mut ExactTargetCache,
+) -> Result<InboundEntityTell, RemoteMessageError> {
+    decode_entity_tell_inner(frame, Some(cache))
+}
+
+fn decode_entity_tell_inner(
+    frame: &Frame,
+    cache: Option<&mut ExactTargetCache>,
+) -> Result<InboundEntityTell, RemoteMessageError> {
     if frame.kind != FrameKind::EntityTell {
         return Err(RemoteMessageError::InvalidPayload);
     }
@@ -75,7 +136,7 @@ pub fn decode_entity_tell(frame: &Frame) -> Result<InboundEntityTell, RemoteMess
         return Err(RemoteMessageError::InvalidPayload);
     }
     Ok(InboundEntityTell {
-        sender: decode_sender(wire.sender_actor)?,
+        sender: decode_sender_with_cache(wire.sender_actor, cache)?,
         target: entity_target_from_wire(wire.target.ok_or(RemoteMessageError::InvalidPayload)?)?,
         message_id: wire.message_id,
         payload: wire.payload,
@@ -103,6 +164,20 @@ pub fn decode_entity_ask(frame: &Frame) -> Result<InboundEntityAsk, RemoteMessag
 }
 
 pub fn decode_singleton_tell(frame: &Frame) -> Result<InboundSingletonTell, RemoteMessageError> {
+    decode_singleton_tell_inner(frame, None)
+}
+
+pub(crate) fn decode_singleton_tell_cached(
+    frame: &Frame,
+    cache: &mut ExactTargetCache,
+) -> Result<InboundSingletonTell, RemoteMessageError> {
+    decode_singleton_tell_inner(frame, Some(cache))
+}
+
+fn decode_singleton_tell_inner(
+    frame: &Frame,
+    cache: Option<&mut ExactTargetCache>,
+) -> Result<InboundSingletonTell, RemoteMessageError> {
     if frame.kind != FrameKind::SingletonTell {
         return Err(RemoteMessageError::InvalidPayload);
     }
@@ -113,7 +188,7 @@ pub fn decode_singleton_tell(frame: &Frame) -> Result<InboundSingletonTell, Remo
         return Err(RemoteMessageError::InvalidPayload);
     }
     Ok(InboundSingletonTell {
-        sender: decode_sender(wire.sender_actor)?,
+        sender: decode_sender_with_cache(wire.sender_actor, cache)?,
         target: singleton_target_from_wire(wire.target.ok_or(RemoteMessageError::InvalidPayload)?)?,
         message_id: wire.message_id,
         payload: wire.payload,
@@ -187,18 +262,18 @@ pub fn decode_failure(frame: &Frame) -> Result<RemoteFailure, RemoteMessageError
     })
 }
 
-#[derive(Clone, PartialEq, Message)]
+#[derive(Clone, PartialEq, Eq, Hash, Message)]
 pub(super) struct ExactActorTargetWire {
-    #[prost(string, tag = "1")]
-    pub(super) cluster_id: String,
-    #[prost(string, tag = "2")]
-    pub(super) host: String,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub(super) cluster_id: Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub(super) host: Bytes,
     #[prost(uint32, tag = "3")]
     pub(super) port: u32,
     #[prost(bytes = "bytes", tag = "4")]
     pub(super) node_incarnation: Bytes,
-    #[prost(string, tag = "5")]
-    pub(super) actor_path: String,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub(super) actor_path: Bytes,
     #[prost(uint64, tag = "6")]
     pub(super) activation_sequence: u64,
     #[prost(uint64, tag = "7")]
@@ -215,6 +290,8 @@ pub(super) struct TellWire {
     pub(super) payload: Bytes,
     #[prost(message, optional, tag = "5")]
     pub(super) sender_actor: Option<ExactActorTargetWire>,
+    #[prost(uint64, tag = "6")]
+    pub(super) target_id: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -352,11 +429,11 @@ pub(super) fn target_to_wire<A: lattice_core::actor_ref::ProtocolTag>(
     target: &ActorRef<A>,
 ) -> ExactActorTargetWire {
     ExactActorTargetWire {
-        cluster_id: target.cluster_id().as_str().to_owned(),
-        host: target.node_address().host().to_owned(),
+        cluster_id: Bytes::copy_from_slice(target.cluster_id().as_str().as_bytes()),
+        host: Bytes::copy_from_slice(target.node_address().host().as_bytes()),
         port: u32::from(target.node_address().port()),
         node_incarnation: Bytes::copy_from_slice(&target.node_incarnation().get().to_be_bytes()),
-        actor_path: target.actor_path().to_string(),
+        actor_path: Bytes::copy_from_slice(target.actor_path().to_string().as_bytes()),
         activation_sequence: target.activation_id().local_sequence(),
         protocol_id: target.protocol_id().get(),
     }
@@ -374,18 +451,22 @@ pub(super) fn target_from_wire(
         .map_err(|_| RemoteMessageError::InvalidPayload)?;
     let port = u16::try_from(wire.port).map_err(|_| RemoteMessageError::InvalidPayload)?;
     Ok(ExactActorTarget {
-        cluster_id: ClusterId::new(wire.cluster_id)
+        cluster_id: ClusterId::new(decode_wire_string(wire.cluster_id)?)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
-        node_address: NodeAddress::new(wire.host, port)
+        node_address: NodeAddress::new(decode_wire_string(wire.host)?, port)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
         node_incarnation,
-        actor_path: ActorPath::try_from(wire.actor_path)
+        actor_path: ActorPath::try_from(decode_wire_string(wire.actor_path)?)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
         activation_id: ActivationId::new(node_incarnation, wire.activation_sequence)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
         protocol_id: ProtocolId::new(wire.protocol_id)
             .map_err(|_| RemoteMessageError::InvalidPayload)?,
     })
+}
+
+fn decode_wire_string(bytes: Bytes) -> Result<String, RemoteMessageError> {
+    String::from_utf8(bytes.to_vec()).map_err(|_| RemoteMessageError::InvalidPayload)
 }
 
 fn decode_sender(
@@ -400,6 +481,20 @@ fn decode_sender(
                 .map_err(|_| RemoteMessageError::InvalidPayload)
         })
         .transpose()
+}
+
+fn decode_sender_with_cache(
+    sender: Option<ExactActorTargetWire>,
+    cache: Option<&mut ExactTargetCache>,
+) -> Result<Option<ActorRef>, RemoteMessageError> {
+    match (sender, cache) {
+        (Some(wire), Some(cache)) => cache
+            .resolve(wire)?
+            .actor_ref()
+            .map(Some)
+            .map_err(|_| RemoteMessageError::InvalidPayload),
+        (sender, _) => decode_sender(sender),
+    }
 }
 
 #[cfg(test)]

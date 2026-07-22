@@ -503,7 +503,7 @@ impl RemotingEndpoint {
             lane,
             connection_nonce: nonce,
             maximum_frame_size: self.config.max_frame_size,
-            features: FeatureBits::REQUIRED_V2,
+            features: FeatureBits::REQUIRED_V3,
         };
         let peer_catalogue = negotiate_outbound(
             &mut connection,
@@ -783,6 +783,11 @@ impl RemotingEndpoint {
             heartbeat_interval: self.config.heartbeat_interval,
             heartbeat_miss_limit: self.config.heartbeat_miss_limit,
             idle_data_connection_timeout: self.config.idle_data_connection_timeout,
+            maximum_cached_exact_targets: self.config.max_cached_exact_targets_per_lane,
+            socket_read_ahead_bytes: self.config.socket_read_ahead_bytes,
+            maximum_ready_write_batch_frames: self.config.max_ready_write_batch_frames,
+            maximum_ready_read_batch_frames: self.config.max_ready_read_batch_frames,
+            maximum_coalesced_write_batch_bytes: self.config.max_coalesced_write_batch_bytes,
         }
     }
 

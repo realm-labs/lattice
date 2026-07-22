@@ -7,7 +7,8 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_actor::{
-    host::ProtocolHostRegistry, recipient::RecipientBackend,
+    host::ProtocolHostRegistry,
+    recipient::{ImmediateRecipientTellDispatch, RecipientBackend, RecipientTell},
     watch::TerminatedReason as WatchTerminatedReason,
 };
 use lattice_core::actor_ref::{
@@ -19,9 +20,12 @@ use lattice_remoting::{
     association::{Association, AssociationError, AssociationId, AssociationManager},
     messaging::{
         error::{AskError, RemoteFailureCode, RemoteMessageError, TellError},
-        inbound::InboundDispatch,
+        inbound::{ImmediateTellDispatch, InboundDispatch},
         outbound::{OutboundMessage, OutboundMessaging},
-        target::{ExactActorTarget, LogicalEntityTarget, LogicalSingletonTarget, SenderIdentity},
+        target::{
+            ExactActorTarget, InboundTell, LogicalEntityTarget, LogicalSingletonTarget,
+            SenderIdentity,
+        },
     },
     protocol::ProtocolFingerprint,
     watch::{
@@ -498,6 +502,18 @@ pub(crate) struct ServiceInboundDispatch {
 
 #[async_trait]
 impl InboundDispatch for ServiceInboundDispatch {
+    fn try_tell_immediate(&self, tell: InboundTell) -> ImmediateTellDispatch {
+        if !self.admission.is_open() {
+            return ImmediateTellDispatch::Complete(Err(RemoteMessageError::Unauthorized));
+        }
+        ImmediateTellDispatch::Complete(self.hosts.try_tell(
+            tell.sender,
+            tell.target,
+            tell.message_id,
+            tell.payload,
+        ))
+    }
+
     async fn tell(
         &self,
         sender: Option<ActorRef>,
@@ -621,10 +637,68 @@ impl ServiceRecipientBackend {
             reference.node_incarnation(),
         )
     }
+
+    fn try_tell_actor(
+        &self,
+        sender: Option<ActorRef>,
+        reference: ActorRef,
+        protocol_fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), TellError> {
+        if self.is_local(&reference) {
+            return self
+                .hosts
+                .try_tell(sender, (&reference).into(), message_id, payload)
+                .map_err(TellError::Remote);
+        }
+        let association = self
+            .association(&reference)
+            .map_err(TellError::Association)?;
+        let sender = sender
+            .as_ref()
+            .map(SenderIdentity::from)
+            .unwrap_or_else(|| SenderIdentity::Process(self.local_incarnation.get()));
+        self.messaging
+            .tell(
+                &association,
+                &sender,
+                &reference,
+                OutboundMessage::new(protocol_fingerprint, message_id, payload),
+            )
+            .map(|_| ())
+    }
 }
 
 #[async_trait]
 impl RecipientBackend for ServiceRecipientBackend {
+    fn try_tell_immediate(&self, tell: RecipientTell) -> ImmediateRecipientTellDispatch {
+        if !self.admission.is_open() {
+            return ImmediateRecipientTellDispatch::Complete(Err(TellError::Remote(
+                RemoteMessageError::Unauthorized,
+            )));
+        }
+        let RecipientTell {
+            sender,
+            target,
+            protocol_fingerprint,
+            message_id,
+            payload,
+        } = tell;
+        match target {
+            RecipientRef::Actor(reference) => ImmediateRecipientTellDispatch::Complete(
+                self.try_tell_actor(sender, reference, protocol_fingerprint, message_id, payload),
+            ),
+            target => ImmediateRecipientTellDispatch::Deferred(RecipientTell {
+                sender,
+                target,
+                protocol_fingerprint,
+                message_id,
+                payload,
+            }),
+        }
+    }
+
     async fn tell(
         &self,
         sender: Option<ActorRef>,
@@ -637,27 +711,8 @@ impl RecipientBackend for ServiceRecipientBackend {
             return Err(TellError::Remote(RemoteMessageError::Unauthorized));
         }
         match target {
-            RecipientRef::Actor(reference) if self.is_local(&reference) => self
-                .hosts
-                .tell(sender, (&reference).into(), message_id, payload)
-                .await
-                .map_err(TellError::Remote),
             RecipientRef::Actor(reference) => {
-                let association = self
-                    .association(&reference)
-                    .map_err(TellError::Association)?;
-                let sender = sender
-                    .as_ref()
-                    .map(SenderIdentity::from)
-                    .unwrap_or_else(|| SenderIdentity::Process(self.local_incarnation.get()));
-                self.messaging
-                    .tell(
-                        &association,
-                        &sender,
-                        &reference,
-                        OutboundMessage::new(protocol_fingerprint, message_id, payload),
-                    )
-                    .map(|_| ())
+                self.try_tell_actor(sender, reference, protocol_fingerprint, message_id, payload)
             }
             RecipientRef::Entity(reference) => self
                 .logical

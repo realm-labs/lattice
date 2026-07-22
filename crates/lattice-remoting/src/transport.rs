@@ -24,8 +24,25 @@ use crate::{
     association::LaneKind,
     handshake::{Handshake, HandshakeAck, HandshakeError, HandshakeValidator, NodeIdentity},
     protocol::{CatalogueError, ProtocolDescriptor, catalogue_frame, decode_catalogue_frame},
-    wire::{Frame, FrameCodec, WireError},
+    wire::{Frame, FrameCodec, MAX_FRAME_PAYLOAD_SEGMENTS, WireError},
 };
+
+mod batch;
+
+use batch::{advance_frame_parts, append_frame_buffers, skip_empty_frame_parts};
+
+const DEFAULT_MAX_WRITE_BATCH_FRAMES: usize = 256;
+const HARD_MAX_WRITE_BATCH_FRAMES: usize = 512;
+const MAX_FRAME_IO_SLICES: usize = 1 + MAX_FRAME_PAYLOAD_SEGMENTS;
+const MAX_WRITE_BATCH_IO_SLICES: usize = HARD_MAX_WRITE_BATCH_FRAMES * MAX_FRAME_IO_SLICES;
+const DEFAULT_MAX_COALESCED_WRITE_BATCH_BYTES: usize = 128 * 1024;
+const DEFAULT_SOCKET_READ_AHEAD_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchWriteOutcome {
+    pub bytes: usize,
+    pub socket_writes: usize,
+}
 
 pub trait RemotingIo: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
@@ -40,6 +57,7 @@ pub struct FramedReader<R> {
     reader: R,
     codec: FrameCodec,
     buffer: BytesMut,
+    read_ahead_bytes: usize,
 }
 
 impl<R> FramedReader<R>
@@ -47,36 +65,32 @@ where
     R: AsyncRead + Send + Unpin,
 {
     pub fn new(reader: R, codec: FrameCodec) -> Self {
+        Self::new_with_read_ahead(reader, codec, DEFAULT_SOCKET_READ_AHEAD_BYTES)
+    }
+
+    pub(crate) fn new_with_read_ahead(
+        reader: R,
+        codec: FrameCodec,
+        read_ahead_bytes: usize,
+    ) -> Self {
+        debug_assert!(read_ahead_bytes > 0);
+        let read_ahead_bytes = read_ahead_bytes.min(codec.max_frame_size().saturating_add(4));
         Self {
             reader,
             codec,
-            buffer: BytesMut::new(),
+            buffer: BytesMut::with_capacity(read_ahead_bytes),
+            read_ahead_bytes,
         }
     }
 
     pub async fn read_frame(&mut self) -> Result<Frame, WireError> {
         loop {
-            let required = if self.buffer.len() < 4 {
-                4
-            } else {
-                let declared = u32::from_be_bytes(
-                    self.buffer[..4]
-                        .try_into()
-                        .expect("frame prefix has exactly four bytes"),
-                ) as usize;
-                if declared > self.codec.max_frame_size() {
-                    return Err(WireError::FrameTooLarge {
-                        actual: declared,
-                        maximum: self.codec.max_frame_size(),
-                    });
-                }
-                let required = 4 + declared;
-                if self.buffer.len() >= required {
-                    return self.codec.decode(self.buffer.split_to(required).freeze());
-                }
-                required
-            };
-            self.buffer.reserve(required - self.buffer.len());
+            if let Some(frame) = self.try_read_frame()? {
+                return Ok(frame);
+            }
+            let required = self.required_buffer_bytes()?;
+            let read_target = required.max(self.read_ahead_bytes);
+            self.buffer.reserve(read_target - self.buffer.len());
             if self.reader.read_buf(&mut self.buffer).await? == 0 {
                 return Err(WireError::Io(Error::new(
                     ErrorKind::UnexpectedEof,
@@ -85,11 +99,42 @@ where
             }
         }
     }
+
+    pub(crate) fn try_read_frame(&mut self) -> Result<Option<Frame>, WireError> {
+        let required = self.required_buffer_bytes()?;
+        if self.buffer.len() < required {
+            return Ok(None);
+        }
+        self.codec
+            .decode(self.buffer.split_to(required).freeze())
+            .map(Some)
+    }
+
+    fn required_buffer_bytes(&self) -> Result<usize, WireError> {
+        if self.buffer.len() < 4 {
+            return Ok(4);
+        }
+        let declared = u32::from_be_bytes(
+            self.buffer[..4]
+                .try_into()
+                .expect("frame prefix has exactly four bytes"),
+        ) as usize;
+        if declared > self.codec.max_frame_size() {
+            return Err(WireError::FrameTooLarge {
+                actual: declared,
+                maximum: self.codec.max_frame_size(),
+            });
+        }
+        Ok(4 + declared)
+    }
 }
 
 pub struct FramedWriter<W> {
     writer: W,
     codec: FrameCodec,
+    write_scratch: BytesMut,
+    maximum_ready_write_batch_frames: usize,
+    maximum_coalesced_write_batch_bytes: usize,
 }
 
 impl<W> FramedWriter<W>
@@ -97,7 +142,31 @@ where
     W: AsyncWrite + Send + Unpin,
 {
     pub fn new(writer: W, codec: FrameCodec) -> Self {
-        Self { writer, codec }
+        Self::new_with_tuning(
+            writer,
+            codec,
+            DEFAULT_MAX_WRITE_BATCH_FRAMES,
+            DEFAULT_MAX_COALESCED_WRITE_BATCH_BYTES,
+        )
+    }
+
+    pub(crate) fn new_with_tuning(
+        writer: W,
+        codec: FrameCodec,
+        maximum_ready_write_batch_frames: usize,
+        maximum_coalesced_write_batch_bytes: usize,
+    ) -> Self {
+        debug_assert!(
+            (1..=HARD_MAX_WRITE_BATCH_FRAMES).contains(&maximum_ready_write_batch_frames)
+        );
+        debug_assert!(maximum_coalesced_write_batch_bytes > 0);
+        Self {
+            writer,
+            codec,
+            write_scratch: BytesMut::new(),
+            maximum_ready_write_batch_frames,
+            maximum_coalesced_write_batch_bytes,
+        }
     }
 
     pub async fn write_frame(&mut self, frame: &Frame) -> Result<usize, WireError> {
@@ -112,6 +181,19 @@ where
     where
         F: FnOnce(),
     {
+        self.write_frame_with_commit_outcome(frame, on_first_socket_write)
+            .await
+            .map(|outcome| outcome.bytes)
+    }
+
+    pub(crate) async fn write_frame_with_commit_outcome<F>(
+        &mut self,
+        frame: &Frame,
+        on_first_socket_write: F,
+    ) -> Result<BatchWriteOutcome, WireError>
+    where
+        F: FnOnce(),
+    {
         write_vectored_frame(&mut self.writer, &self.codec, frame, on_first_socket_write).await
     }
 
@@ -119,16 +201,102 @@ where
         &mut self,
         frames: &[Frame],
         on_first_frame_write: F,
-    ) -> Result<usize, WireError>
+    ) -> Result<BatchWriteOutcome, WireError>
     where
         F: FnMut(usize),
     {
-        write_vectored_frames(&mut self.writer, &self.codec, frames, on_first_frame_write).await
+        if frames.len() > self.maximum_ready_write_batch_frames {
+            return Err(invalid_write_batch_size(
+                frames.len(),
+                self.maximum_ready_write_batch_frames,
+            ));
+        }
+        if should_coalesce_write_batch(frames, self.maximum_coalesced_write_batch_bytes) {
+            write_coalesced_frames(
+                &mut self.writer,
+                &self.codec,
+                &mut self.write_scratch,
+                frames,
+                on_first_frame_write,
+            )
+            .await
+        } else {
+            write_vectored_frames(&mut self.writer, &self.codec, frames, on_first_frame_write).await
+        }
     }
 
     pub async fn flush(&mut self) -> Result<(), WireError> {
         self.writer.flush().await.map_err(WireError::Io)
     }
+}
+
+fn should_coalesce_write_batch(frames: &[Frame], maximum_bytes: usize) -> bool {
+    frames.len() > 1
+        && frames.iter().any(|frame| frame.payload_segment_count() > 1)
+        && frames
+            .iter()
+            .try_fold(0_usize, |total, frame| {
+                total.checked_add(crate::wire::WIRE_HEADER_LEN + frame.payload_len())
+            })
+            .is_some_and(|total| total <= maximum_bytes)
+}
+
+async fn write_coalesced_frames<W, F>(
+    writer: &mut W,
+    codec: &FrameCodec,
+    scratch: &mut BytesMut,
+    frames: &[Frame],
+    mut on_first_frame_write: F,
+) -> Result<BatchWriteOutcome, WireError>
+where
+    W: AsyncWrite + Unpin,
+    F: FnMut(usize),
+{
+    if frames.len() > HARD_MAX_WRITE_BATCH_FRAMES {
+        return Err(invalid_write_batch_size(
+            frames.len(),
+            HARD_MAX_WRITE_BATCH_FRAMES,
+        ));
+    }
+    scratch.clear();
+    let required = frames
+        .iter()
+        .map(|frame| crate::wire::WIRE_HEADER_LEN + frame.payload_len())
+        .sum();
+    scratch.reserve(required);
+    let mut frame_offsets = [0_usize; HARD_MAX_WRITE_BATCH_FRAMES];
+    for (index, frame) in frames.iter().enumerate() {
+        frame_offsets[index] = scratch.len();
+        scratch.extend_from_slice(&codec.header(frame)?);
+        for segment in 0..frame.payload_segment_count() {
+            scratch.extend_from_slice(frame.payload_segment(segment));
+        }
+    }
+    debug_assert_eq!(scratch.len(), required);
+
+    let mut written = 0;
+    let mut next_commit = 0;
+    let mut socket_writes = 0;
+    while written < scratch.len() {
+        let count = writer.write(&scratch[written..]).await?;
+        socket_writes += 1;
+        if count == 0 {
+            return Err(WireError::Io(Error::new(
+                ErrorKind::WriteZero,
+                "remoting socket wrote zero bytes",
+            )));
+        }
+        let next_written = written + count;
+        while next_commit < frames.len() && frame_offsets[next_commit] < next_written {
+            on_first_frame_write(next_commit);
+            next_commit += 1;
+        }
+        written = next_written;
+    }
+    Ok(BatchWriteOutcome {
+        bytes: required,
+        socket_writes,
+    })
 }
 
 impl<S> FramedConnection<S>
@@ -160,7 +328,9 @@ where
     }
 
     pub async fn write_frame(&mut self, frame: &Frame) -> Result<usize, WireError> {
-        write_vectored_frame(&mut self.stream, &self.codec, frame, || {}).await
+        write_vectored_frame(&mut self.stream, &self.codec, frame, || {})
+            .await
+            .map(|outcome| outcome.bytes)
     }
 
     pub async fn write_frame_with_commit<F>(
@@ -171,7 +341,9 @@ where
     where
         F: FnOnce(),
     {
-        write_vectored_frame(&mut self.stream, &self.codec, frame, on_first_socket_write).await
+        write_vectored_frame(&mut self.stream, &self.codec, frame, on_first_socket_write)
+            .await
+            .map(|outcome| outcome.bytes)
     }
 
     pub async fn flush(&mut self) -> Result<(), WireError> {
@@ -192,42 +364,42 @@ async fn write_vectored_frame<W, F>(
     codec: &FrameCodec,
     frame: &Frame,
     on_first_socket_write: F,
-) -> Result<usize, WireError>
+) -> Result<BatchWriteOutcome, WireError>
 where
     W: AsyncWrite + Unpin,
     F: FnOnce(),
 {
     let header = codec.header(frame)?;
-    let payload = frame.payload();
-    let total = header.len() + payload.len();
-    let mut header_written = 0;
-    let mut payload_written = 0;
+    let total = header.len() + frame.payload_len();
+    let mut part_index = 0;
+    let mut part_written = 0;
+    let mut socket_writes = 0;
     let mut on_first_socket_write = Some(on_first_socket_write);
-    while header_written + payload_written < total {
-        let count = if header_written < header.len() {
-            let buffers = [
-                IoSlice::new(&header[header_written..]),
-                IoSlice::new(&payload[payload_written..]),
-            ];
-            writer.write_vectored(&buffers).await?
-        } else {
-            writer.write(&payload[payload_written..]).await?
-        };
+    while part_index < 1 + frame.payload_segment_count() {
+        skip_empty_frame_parts(frame, &header, &mut part_index, &mut part_written);
+        if part_index == 1 + frame.payload_segment_count() {
+            break;
+        }
+        let mut buffers = [IoSlice::new(&[]); MAX_FRAME_IO_SLICES];
+        let buffer_count =
+            append_frame_buffers(&mut buffers, frame, &header, part_index, part_written);
+        let count = writer.write_vectored(&buffers[..buffer_count]).await?;
         if count == 0 {
             return Err(WireError::Io(Error::new(
                 ErrorKind::WriteZero,
                 "remoting socket wrote zero bytes",
             )));
         }
+        socket_writes += 1;
         if let Some(callback) = on_first_socket_write.take() {
             callback();
         }
-        let remaining_header = header.len() - header_written;
-        let header_count = count.min(remaining_header);
-        header_written += header_count;
-        payload_written += count - header_count;
+        advance_frame_parts(frame, &header, &mut part_index, &mut part_written, count);
     }
-    Ok(total)
+    Ok(BatchWriteOutcome {
+        bytes: total,
+        socket_writes,
+    })
 }
 
 async fn write_vectored_frames<W, F>(
@@ -235,39 +407,49 @@ async fn write_vectored_frames<W, F>(
     codec: &FrameCodec,
     frames: &[Frame],
     mut on_first_frame_write: F,
-) -> Result<usize, WireError>
+) -> Result<BatchWriteOutcome, WireError>
 where
     W: AsyncWrite + Unpin,
     F: FnMut(usize),
 {
-    let headers = frames
-        .iter()
-        .map(|frame| codec.header(frame))
-        .collect::<Result<Vec<_>, _>>()?;
-    let total = headers
+    if frames.len() > HARD_MAX_WRITE_BATCH_FRAMES {
+        return Err(invalid_write_batch_size(
+            frames.len(),
+            HARD_MAX_WRITE_BATCH_FRAMES,
+        ));
+    }
+    let mut headers = [[0_u8; crate::wire::WIRE_HEADER_LEN]; HARD_MAX_WRITE_BATCH_FRAMES];
+    for (header, frame) in headers.iter_mut().zip(frames) {
+        *header = codec.header(frame)?;
+    }
+    let total = headers[..frames.len()]
         .iter()
         .zip(frames)
         .map(|(header, frame)| header.len() + frame.payload_len())
         .sum();
     let mut frame_index = 0;
-    let mut header_written = 0;
-    let mut payload_written = 0;
+    let mut part_index = 0;
+    let mut part_written = 0;
+    let mut socket_writes = 0;
     while frame_index < frames.len() {
-        let mut buffers = Vec::with_capacity((frames.len() - frame_index) * 2);
+        let mut buffers = [IoSlice::new(&[]); MAX_WRITE_BATCH_IO_SLICES];
+        let mut buffer_count = 0;
         for index in frame_index..frames.len() {
-            if index == frame_index {
-                buffers.push(IoSlice::new(&headers[index][header_written..]));
-                if payload_written < frames[index].payload_len() {
-                    buffers.push(IoSlice::new(&frames[index].payload()[payload_written..]));
-                }
+            let (first_part, first_part_written) = if index == frame_index {
+                (part_index, part_written)
             } else {
-                buffers.push(IoSlice::new(&headers[index]));
-                if !frames[index].payload().is_empty() {
-                    buffers.push(IoSlice::new(frames[index].payload()));
-                }
-            }
+                (0, 0)
+            };
+            buffer_count += append_frame_buffers(
+                &mut buffers[buffer_count..],
+                &frames[index],
+                &headers[index],
+                first_part,
+                first_part_written,
+            );
         }
-        let count = writer.write_vectored(&buffers).await?;
+        let count = writer.write_vectored(&buffers[..buffer_count]).await?;
+        socket_writes += 1;
         if count == 0 {
             return Err(WireError::Io(Error::new(
                 ErrorKind::WriteZero,
@@ -276,29 +458,41 @@ where
         }
         let mut remaining = count;
         while remaining > 0 {
-            if header_written == 0 && payload_written == 0 {
+            skip_empty_frame_parts(
+                &frames[frame_index],
+                &headers[frame_index],
+                &mut part_index,
+                &mut part_written,
+            );
+            if part_index == 0 && part_written == 0 {
                 on_first_frame_write(frame_index);
             }
-            let header_remaining = headers[frame_index].len() - header_written;
-            let header_count = remaining.min(header_remaining);
-            header_written += header_count;
-            remaining -= header_count;
-            if remaining > 0 {
-                let payload_remaining = frames[frame_index].payload_len() - payload_written;
-                let payload_count = remaining.min(payload_remaining);
-                payload_written += payload_count;
-                remaining -= payload_count;
-            }
-            if header_written == headers[frame_index].len()
-                && payload_written == frames[frame_index].payload_len()
-            {
+            let consumed = advance_frame_parts(
+                &frames[frame_index],
+                &headers[frame_index],
+                &mut part_index,
+                &mut part_written,
+                remaining,
+            );
+            remaining -= consumed;
+            if part_index == 1 + frames[frame_index].payload_segment_count() {
                 frame_index += 1;
-                header_written = 0;
-                payload_written = 0;
+                part_index = 0;
+                part_written = 0;
             }
         }
     }
-    Ok(total)
+    Ok(BatchWriteOutcome {
+        bytes: total,
+        socket_writes,
+    })
+}
+
+fn invalid_write_batch_size(actual: usize, maximum: usize) -> WireError {
+    WireError::Io(Error::new(
+        ErrorKind::InvalidInput,
+        format!("write batch contains {actual} frames, maximum is {maximum}"),
+    ))
 }
 
 pub async fn negotiate_outbound<S>(
@@ -517,7 +711,7 @@ mod tests {
     use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
     use rcgen::{CertificateParams, KeyPair, SanType};
     use tokio::{
-        io::AsyncWrite,
+        io::{AsyncRead, AsyncWrite, ReadBuf},
         net::{TcpListener, TcpStream},
     };
     use tokio_rustls::rustls::{
@@ -532,12 +726,30 @@ mod tests {
         association::{AssociationId, LaneKind},
         handshake::{FeatureBits, Handshake},
         protocol::{ProtocolDescriptor, ProtocolFingerprint},
-        wire::FrameKind,
+        wire::{FrameEnvelope, FrameKind, INLINE_FRAME_SEGMENT_CAPACITY},
     };
 
     struct PartialVectoredWriter {
         bytes: Vec<u8>,
         maximum_write: usize,
+    }
+
+    struct CountingReader {
+        bytes: Bytes,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let count = self.bytes.len().min(buffer.remaining());
+            buffer.put_slice(&self.bytes.split_to(count));
+            Poll::Ready(Ok(()))
+        }
     }
 
     impl AsyncWrite for PartialVectoredWriter {
@@ -668,9 +880,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn framed_reader_reads_ahead_and_decodes_multiple_buffered_frames() {
+        let codec = FrameCodec::new(1024).unwrap();
+        let first = Frame::new(FrameKind::Tell, Bytes::from_static(b"first"));
+        let second = Frame::new(FrameKind::Tell, Bytes::from_static(b"second"));
+        let mut encoded = BytesMut::new();
+        encoded.extend_from_slice(&codec.encode(&first).unwrap());
+        encoded.extend_from_slice(&codec.encode(&second).unwrap());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = CountingReader {
+            bytes: encoded.freeze(),
+            reads: reads.clone(),
+        };
+        let mut reader = FramedReader::new(source, codec);
+
+        assert_eq!(reader.read_frame().await.unwrap(), first);
+        assert_eq!(reader.read_frame().await.unwrap(), second);
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn vectored_frame_write_handles_partial_header_and_payload_writes() {
         let codec = FrameCodec::new(1024).unwrap();
-        let frame = Frame::new(FrameKind::Tell, Bytes::from_static(b"opaque-payload"));
+        let mut inline = [0_u8; INLINE_FRAME_SEGMENT_CAPACITY];
+        inline[..7].copy_from_slice(b"-inline");
+        let frame = Frame::enveloped(
+            FrameKind::Tell,
+            Arc::new(FrameEnvelope::new(
+                Bytes::from_static(b"opaque"),
+                Bytes::from_static(b"-payload"),
+            )),
+            inline,
+            7,
+            Bytes::new(),
+        );
         let expected = codec.encode(&frame).unwrap();
         let mut writer = PartialVectoredWriter {
             bytes: Vec::new(),
@@ -684,7 +927,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(written, expected.len());
+        assert_eq!(written.bytes, expected.len());
+        assert!(written.socket_writes > 1);
         assert_eq!(writer.bytes, expected);
         assert_eq!(commits.load(Ordering::Relaxed), 1);
     }
@@ -692,9 +936,17 @@ mod tests {
     #[tokio::test]
     async fn vectored_batch_write_preserves_frames_and_commit_boundaries() {
         let codec = FrameCodec::new(1024).unwrap();
+        let mut inline = [0_u8; INLINE_FRAME_SEGMENT_CAPACITY];
+        inline[..3].copy_from_slice(b"two");
         let frames = [
             Frame::new(FrameKind::Tell, Bytes::from_static(b"one")),
-            Frame::new(FrameKind::Tell, Bytes::new()),
+            Frame::enveloped(
+                FrameKind::Tell,
+                Arc::new(FrameEnvelope::new(Bytes::new(), Bytes::new())),
+                inline,
+                3,
+                Bytes::new(),
+            ),
             Frame::new(FrameKind::Tell, Bytes::from_static(b"three")),
         ];
         let expected = frames
@@ -713,9 +965,58 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(written, expected.len());
+        assert_eq!(written.bytes, expected.len());
+        assert!(written.socket_writes > 0);
         assert_eq!(writer.bytes, expected);
         assert_eq!(commits, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn coalesced_batch_write_preserves_segmented_frames_and_commit_boundaries() {
+        let codec = FrameCodec::new(1024).unwrap();
+        let mut inline = [0_u8; INLINE_FRAME_SEGMENT_CAPACITY];
+        inline[..4].copy_from_slice(b"meta");
+        let envelope = Arc::new(FrameEnvelope::new(
+            Bytes::from_static(b"prefix"),
+            Bytes::from_static(b"suffix"),
+        ));
+        let frames = [
+            Frame::enveloped(
+                FrameKind::Tell,
+                envelope.clone(),
+                inline,
+                4,
+                Bytes::from_static(b"one"),
+            ),
+            Frame::enveloped(
+                FrameKind::Tell,
+                envelope,
+                inline,
+                4,
+                Bytes::from_static(b"two"),
+            ),
+        ];
+        let expected = frames
+            .iter()
+            .flat_map(|frame| codec.encode(frame).unwrap())
+            .collect::<Vec<_>>();
+        let mut writer = PartialVectoredWriter {
+            bytes: Vec::new(),
+            maximum_write: 5,
+        };
+        let mut scratch = BytesMut::new();
+        let mut commits = Vec::new();
+
+        let outcome = write_coalesced_frames(&mut writer, &codec, &mut scratch, &frames, |index| {
+            commits.push(index)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.bytes, expected.len());
+        assert!(outcome.socket_writes > 1);
+        assert_eq!(writer.bytes, expected);
+        assert_eq!(commits, vec![0, 1]);
     }
 
     #[tokio::test]
@@ -767,7 +1068,7 @@ mod tests {
                 lane: LaneKind::Control,
                 connection_nonce: 10,
                 maximum_frame_size: 4096,
-                features: FeatureBits::REQUIRED_V2,
+                features: FeatureBits::REQUIRED_V3,
             },
             &[client_protocol],
             8,

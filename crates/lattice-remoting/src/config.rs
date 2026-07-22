@@ -3,6 +3,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub const ABSOLUTE_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+pub const ABSOLUTE_MAX_READY_WRITE_BATCH_FRAMES: usize = 512;
+pub const ABSOLUTE_MAX_READY_READ_BATCH_FRAMES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotingConfig {
@@ -18,6 +20,11 @@ pub struct RemotingConfig {
     pub max_control_outbox_frames: usize,
     pub max_control_outbox_bytes: usize,
     pub max_protocols_per_peer: usize,
+    pub max_cached_exact_targets_per_lane: usize,
+    pub socket_read_ahead_bytes: usize,
+    pub max_ready_write_batch_frames: usize,
+    pub max_ready_read_batch_frames: usize,
+    pub max_coalesced_write_batch_bytes: usize,
     pub connect_timeout: Duration,
     pub reconnect_backoff_min: Duration,
     pub reconnect_backoff_max: Duration,
@@ -42,6 +49,11 @@ impl Default for RemotingConfig {
             max_control_outbox_frames: 1024,
             max_control_outbox_bytes: 4 * 1024 * 1024,
             max_protocols_per_peer: 1024,
+            max_cached_exact_targets_per_lane: 1024,
+            socket_read_ahead_bytes: 64 * 1024,
+            max_ready_write_batch_frames: 256,
+            max_ready_read_batch_frames: 1,
+            max_coalesced_write_batch_bytes: 128 * 1024,
             connect_timeout: Duration::from_secs(3),
             reconnect_backoff_min: Duration::from_millis(100),
             reconnect_backoff_max: Duration::from_secs(5),
@@ -76,6 +88,23 @@ impl RemotingConfig {
             ("max_control_outbox_frames", self.max_control_outbox_frames),
             ("max_control_outbox_bytes", self.max_control_outbox_bytes),
             ("max_protocols_per_peer", self.max_protocols_per_peer),
+            (
+                "max_cached_exact_targets_per_lane",
+                self.max_cached_exact_targets_per_lane,
+            ),
+            ("socket_read_ahead_bytes", self.socket_read_ahead_bytes),
+            (
+                "max_ready_write_batch_frames",
+                self.max_ready_write_batch_frames,
+            ),
+            (
+                "max_ready_read_batch_frames",
+                self.max_ready_read_batch_frames,
+            ),
+            (
+                "max_coalesced_write_batch_bytes",
+                self.max_coalesced_write_batch_bytes,
+            ),
         ] {
             if value == 0 {
                 return Err(RemotingConfigError::Zero { name });
@@ -90,6 +119,18 @@ impl RemotingConfig {
             return Err(RemotingConfigError::FrameSize {
                 actual: self.max_frame_size,
                 maximum: ABSOLUTE_MAX_FRAME_SIZE,
+            });
+        }
+        if self.max_ready_write_batch_frames > ABSOLUTE_MAX_READY_WRITE_BATCH_FRAMES {
+            return Err(RemotingConfigError::WriteBatchFrames {
+                actual: self.max_ready_write_batch_frames,
+                maximum: ABSOLUTE_MAX_READY_WRITE_BATCH_FRAMES,
+            });
+        }
+        if self.max_ready_read_batch_frames > ABSOLUTE_MAX_READY_READ_BATCH_FRAMES {
+            return Err(RemotingConfigError::ReadBatchFrames {
+                actual: self.max_ready_read_batch_frames,
+                maximum: ABSOLUTE_MAX_READY_READ_BATCH_FRAMES,
             });
         }
         if self.max_outbound_bytes_per_association > self.max_outbound_bytes_per_node {
@@ -142,6 +183,10 @@ pub enum RemotingConfigError {
     BulkStripeCount { actual: usize },
     #[error("frame size {actual} exceeds absolute maximum {maximum}")]
     FrameSize { actual: usize, maximum: usize },
+    #[error("ready write batch frame count {actual} exceeds maximum {maximum}")]
+    WriteBatchFrames { actual: usize, maximum: usize },
+    #[error("ready read batch frame count {actual} exceeds maximum {maximum}")]
+    ReadBatchFrames { actual: usize, maximum: usize },
     #[error("per-association outbound bytes exceed the node-wide bound")]
     AssociationBytesExceedNodeBytes,
     #[error("minimum reconnect backoff exceeds maximum reconnect backoff")]

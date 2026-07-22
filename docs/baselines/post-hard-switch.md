@@ -435,6 +435,60 @@ significant change. A repeated prepared-remoting admission capture measured 2.78
 messages and likewise reported no significant change. These checks are expected: the optimized code
 is the local Actor execution path rather than transport encoding or socket I/O.
 
+### Segmented tell envelopes and socket read-ahead
+
+A 2026-07-22 remoting profile found two independent costs in the loopback TCP tell path. Prepared
+routes still copied the cached target and business payload into a final contiguous protobuf frame,
+while `FramedReader` initially reserved only the four-byte length prefix and then one declared frame.
+The latter shape commonly issued one receive for the prefix and another for each payload, preventing
+TCP data already available behind that frame from being read ahead.
+
+The retained transport changes are structural:
+
+- exact tell routes reserve queue and byte capacity before envelope construction;
+- prepared tells retain a shared pre-encoded target/sender envelope, inline the small dynamic
+  protobuf metadata, and reference the original payload `Bytes`;
+- the bulk writer drains at most 256 ready frames by default (configurable up to 512) and adaptively copies small segmented batches into a
+  reusable, at-most-128-KiB staging buffer; large batches use stack-backed vectored I/O;
+- lane readers retain a bounded 64-KiB read-ahead buffer; their default ready-frame dispatch budget
+  is one because larger batches reduced executor fairness and did not improve this workload;
+- each lane has a bounded exact-target cache (1,024 entries by default), and exact target text fields
+  decode as zero-copy `Bytes` on a hit. These fields retain protobuf wire type 2, so this is wire
+  compatible; UTF-8/domain validation still occurs on cache insertion;
+- prepared routes register their target in a bounded lane-local dictionary, then send its compact ID;
+  reconnect forces re-registration through a lane epoch, and mandatory feature negotiation prevents
+  old peers from interpreting the new form;
+- exact-actor sender and receiver dispatch avoid the standard `async_trait` boxed Future; logical
+  entity/singleton routing remains asynchronous;
+- `WireCodec` has default size and immutable-output hooks. `ProstCodec` reserves its exact encoded
+  length, while custom codecs can return an already-owned `Bytes` value without an intermediate copy;
+- `Association::metrics()` reports queue/budget rejection, write batching/syscall, and target-cache
+  counters. The tracked `remote_actor_tcp_tell` benchmark now waits for a marker processed by the
+  remote Actor and includes separate sender/receiver snapshots in its JSON output; the older
+  `association_prepared_bulk_tell_admission` row intentionally remains an admission microbenchmark.
+
+The temporary cross-framework harness used a 128-byte Protobuf business payload, one bulk stripe,
+100,000 tells per round, five warmups, nine measured rounds, and a completion marker handled by the
+remote Actor. Before the complete remoting series, a fresh capture measured 412,357 tells/s; the
+fresh baseline immediately before this tuning pass was 1,478,189/s. Three independent final captures
+measured 2,299,408/s, 2,296,761/s, and 2,298,981/s (about 435 ns/message). Their median is 2,298,981/s:
+5.57x the original capture and 55.5% above the start of this pass.
+
+A default 10,000-message tracked-benchmark smoke run completed the full remote Actor path at
+1,947,262/s. Its sender wrote 10,001 frames in 41 batches and 41 socket writes (243.93 frames/batch).
+This short run is retained as a structural/telemetry check rather than a replacement for the
+multi-round comparison above.
+
+The preserved same-harness Akka 2.6.21 and Pekko 1.4.0 medians were 505,471/s and 521,526/s. Relative
+to those historical captures, the final Lattice median is 4.55x Akka and 4.41x Pekko. These are
+single-host loopback completion numbers, not network-latency or multi-node capacity claims, and the
+JVM captures were not rerun during the final low-load interval. Two additional experiments were
+explicitly rejected: a custom bulk queue regressed throughput by 8.5%, while node byte-budget credit
+leasing and packed Association state did not improve repeated A/B runs. A dedicated compact frame
+format also failed to beat the existing Protobuf dictionary envelope. The remaining profile is led by
+business Protobuf allocation, bounded mailbox admission, and bulk socket writes rather than
+per-frame target reconstruction or receive syscalls.
+
 The MongoDB persistence framework baseline was captured with:
 
 ```text

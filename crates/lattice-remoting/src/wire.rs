@@ -1,13 +1,18 @@
-use std::io::Error as IoError;
+use std::{
+    io::Error as IoError,
+    sync::{Arc, OnceLock},
+};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use prost::Message;
 use thiserror::Error;
 
 pub const TRANSPORT_MAJOR: u16 = 1;
-pub const TRANSPORT_MINOR: u16 = 3;
+pub const TRANSPORT_MINOR: u16 = 4;
 const HEADER_LEN: usize = 8;
 pub(crate) const WIRE_HEADER_LEN: usize = 4 + HEADER_LEN;
+pub(crate) const MAX_FRAME_PAYLOAD_SEGMENTS: usize = 4;
+pub(crate) const INLINE_FRAME_SEGMENT_CAPACITY: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
@@ -80,15 +85,73 @@ impl TryFrom<u16> for FrameKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Frame {
     pub kind: FrameKind,
-    payload: Bytes,
+    payload: FramePayload,
+    coalesced: OnceLock<Bytes>,
+}
+
+#[derive(Debug, Clone)]
+enum FramePayload {
+    Contiguous(Bytes),
+    Segmented(SegmentedPayload),
+}
+
+#[derive(Debug, Clone)]
+struct SegmentedPayload {
+    envelope: Arc<FrameEnvelope>,
+    inline: [u8; INLINE_FRAME_SEGMENT_CAPACITY],
+    inline_len: u8,
+    body: Bytes,
+    len: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FrameEnvelope {
+    prefix: Bytes,
+    suffix: Bytes,
+}
+
+impl FrameEnvelope {
+    pub(crate) fn new(prefix: Bytes, suffix: Bytes) -> Self {
+        Self { prefix, suffix }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.prefix.len() + self.suffix.len()
+    }
 }
 
 impl Frame {
     pub fn new(kind: FrameKind, payload: Bytes) -> Self {
-        Self { kind, payload }
+        Self {
+            kind,
+            payload: FramePayload::Contiguous(payload),
+            coalesced: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn enveloped(
+        kind: FrameKind,
+        envelope: Arc<FrameEnvelope>,
+        inline: [u8; INLINE_FRAME_SEGMENT_CAPACITY],
+        inline_len: usize,
+        body: Bytes,
+    ) -> Self {
+        debug_assert!(inline_len <= INLINE_FRAME_SEGMENT_CAPACITY);
+        let len = envelope.len() + inline_len + body.len();
+        Self {
+            kind,
+            payload: FramePayload::Segmented(SegmentedPayload {
+                envelope,
+                inline,
+                inline_len: inline_len as u8,
+                body,
+                len,
+            }),
+            coalesced: OnceLock::new(),
+        }
     }
 
     pub fn encode_message<M: Message>(kind: FrameKind, message: &M) -> Self {
@@ -104,19 +167,61 @@ impl Frame {
     }
 
     pub fn payload(&self) -> &[u8] {
-        &self.payload
+        match &self.payload {
+            FramePayload::Contiguous(payload) => payload,
+            FramePayload::Segmented(payload) => {
+                self.coalesced.get_or_init(|| payload.coalesce()).as_ref()
+            }
+        }
     }
 
     pub fn payload_len(&self) -> usize {
-        self.payload.len()
+        match &self.payload {
+            FramePayload::Contiguous(payload) => payload.len(),
+            FramePayload::Segmented(payload) => payload.len,
+        }
     }
 
     pub fn payload_bytes(&self) -> Bytes {
-        self.payload.clone()
+        match &self.payload {
+            FramePayload::Contiguous(payload) => payload.clone(),
+            FramePayload::Segmented(payload) => {
+                self.coalesced.get_or_init(|| payload.coalesce()).clone()
+            }
+        }
     }
 
     pub fn into_payload(self) -> Bytes {
-        self.payload
+        match self.payload {
+            FramePayload::Contiguous(payload) => payload,
+            FramePayload::Segmented(payload) => self
+                .coalesced
+                .into_inner()
+                .unwrap_or_else(|| payload.coalesce()),
+        }
+    }
+
+    pub(crate) fn payload_segment_count(&self) -> usize {
+        match &self.payload {
+            FramePayload::Contiguous(_) => 1,
+            FramePayload::Segmented(_) => MAX_FRAME_PAYLOAD_SEGMENTS,
+        }
+    }
+
+    pub(crate) fn payload_segment(&self, index: usize) -> &[u8] {
+        match &self.payload {
+            FramePayload::Contiguous(payload) => {
+                debug_assert_eq!(index, 0);
+                payload
+            }
+            FramePayload::Segmented(payload) => match index {
+                0 => &payload.envelope.prefix,
+                1 => &payload.inline[..usize::from(payload.inline_len)],
+                2 => &payload.body,
+                3 => &payload.envelope.suffix,
+                _ => unreachable!("segmented frame exposes four payload segments"),
+            },
+        }
     }
 
     pub(crate) fn encode_payload(
@@ -130,6 +235,35 @@ impl Frame {
         Self::new(kind, payload.freeze())
     }
 }
+
+impl SegmentedPayload {
+    fn coalesce(&self) -> Bytes {
+        let mut output = BytesMut::with_capacity(self.len);
+        output.extend_from_slice(&self.envelope.prefix);
+        output.extend_from_slice(&self.inline[..usize::from(self.inline_len)]);
+        output.extend_from_slice(&self.body);
+        output.extend_from_slice(&self.envelope.suffix);
+        output.freeze()
+    }
+}
+
+impl Clone for Frame {
+    fn clone(&self) -> Self {
+        Self {
+            kind: self.kind,
+            payload: self.payload.clone(),
+            coalesced: OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for Frame {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.payload() == other.payload()
+    }
+}
+
+impl Eq for Frame {}
 
 #[derive(Debug, Clone)]
 pub struct FrameCodec {

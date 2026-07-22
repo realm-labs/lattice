@@ -3,6 +3,7 @@ use std::{
     hash::Hash,
     marker::PhantomData,
     net::{IpAddr, Ipv6Addr},
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize, de::Error as SerdeDeError};
@@ -39,15 +40,13 @@ pub enum ReferenceError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ClusterId(String);
+pub struct ClusterId(Arc<str>);
 
 impl ClusterId {
     pub fn new(value: impl Into<String>) -> Result<Self, ReferenceError> {
-        Ok(Self(validate_token(
-            value.into(),
-            "cluster ID",
-            MAX_CLUSTER_ID_BYTES,
-        )?))
+        Ok(Self(
+            validate_token(value.into(), "cluster ID", MAX_CLUSTER_ID_BYTES)?.into(),
+        ))
     }
 
     pub fn as_str(&self) -> &str {
@@ -63,7 +62,7 @@ impl fmt::Display for ClusterId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeAddress {
-    host: String,
+    host: Arc<str>,
     port: u16,
 }
 
@@ -82,7 +81,10 @@ impl NodeAddress {
                 field: "node address",
             });
         }
-        Ok(Self { host, port })
+        Ok(Self {
+            host: host.into(),
+            port,
+        })
     }
 
     pub fn host(&self) -> &str {
@@ -158,7 +160,7 @@ impl ActivationId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ActorPath {
-    segments: Vec<String>,
+    segments: Arc<[String]>,
 }
 
 impl ActorPath {
@@ -171,7 +173,7 @@ impl ActorPath {
     }
 
     pub fn child(&self, segment: impl Into<String>) -> Result<Self, ReferenceError> {
-        let mut segments = self.segments.clone();
+        let mut segments = self.segments.iter().cloned().collect::<Vec<_>>();
         segments.push(segment.into());
         Self::from_segments(segments, self.is_system())
     }
@@ -219,13 +221,15 @@ impl ActorPath {
                 limit: MAX_ACTOR_PATH_BYTES,
             });
         }
-        Ok(Self { segments })
+        Ok(Self {
+            segments: segments.into(),
+        })
     }
 }
 
 impl fmt::Display for ActorPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for segment in &self.segments {
+        for segment in self.segments.iter() {
             write!(formatter, "/{segment}")?;
         }
         Ok(())
@@ -938,6 +942,27 @@ mod tests {
         );
         assert!(ActorPath::user(["user", ".."]).is_err());
         assert!(ActorPath::user(["user", "child/name"]).is_err());
+    }
+
+    #[test]
+    fn immutable_exact_identity_parts_clone_by_sharing_storage() {
+        let cluster = ClusterId::new("test").unwrap();
+        let cluster_clone = cluster.clone();
+        assert!(Arc::ptr_eq(&cluster.0, &cluster_clone.0));
+
+        let address = NodeAddress::new("127.0.0.1", 25520).unwrap();
+        let address_clone = address.clone();
+        assert!(Arc::ptr_eq(&address.host, &address_clone.host));
+
+        let path = ActorPath::user(["user", "actor"]).unwrap();
+        let path_clone = path.clone();
+        assert!(Arc::ptr_eq(&path.segments, &path_clone.segments));
+
+        assert_eq!(serde_json::to_string(&cluster).unwrap(), "\"test\"");
+        assert_eq!(
+            serde_json::from_str::<ActorPath>("\"/user/actor\"").unwrap(),
+            path
+        );
     }
 
     #[test]

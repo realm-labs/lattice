@@ -24,7 +24,10 @@ use crate::{
 };
 
 mod manager;
+pub mod metrics;
 mod wake;
+
+use metrics::{AssociationMetrics, AssociationMetricsSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AssociationId(u128);
@@ -120,6 +123,8 @@ pub struct Association {
     control: mpsc::Sender<Frame>,
     interactive: mpsc::Sender<Frame>,
     bulk: Vec<mpsc::Sender<Frame>>,
+    bulk_lane_epochs: Vec<AtomicU64>,
+    next_outbound_exact_target_ids: Vec<AtomicU64>,
     receivers: Mutex<AssociationReceiverSlots>,
     queued_bytes: AtomicUsize,
     node_queued_bytes: Arc<AtomicUsize>,
@@ -127,6 +132,32 @@ pub struct Association {
     reliable_control: Mutex<ReliableControl>,
     interactive_wake: Notify,
     bulk_wakes: Vec<Notify>,
+    metrics: AssociationMetrics,
+}
+
+pub(crate) struct BulkAdmission<'a> {
+    association: &'a Association,
+    permit: Option<mpsc::Permit<'a, Frame>>,
+    reserved_bytes: usize,
+}
+
+impl BulkAdmission<'_> {
+    pub(crate) fn send(mut self, frame: Frame) {
+        debug_assert_eq!(frame.payload_len(), self.reserved_bytes);
+        self.permit
+            .take()
+            .expect("bulk admission permit is consumed once")
+            .send(frame);
+        self.reserved_bytes = 0;
+    }
+}
+
+impl Drop for BulkAdmission<'_> {
+    fn drop(&mut self) {
+        if self.reserved_bytes != 0 {
+            self.association.release_queued_bytes(self.reserved_bytes);
+        }
+    }
 }
 
 impl Association {
@@ -174,6 +205,8 @@ impl Association {
             control,
             interactive,
             bulk,
+            bulk_lane_epochs: (0..bulk_stripes).map(|_| AtomicU64::new(0)).collect(),
+            next_outbound_exact_target_ids: (0..bulk_stripes).map(|_| AtomicU64::new(0)).collect(),
             receivers: Mutex::new(AssociationReceiverSlots {
                 control: Some(control_rx),
                 interactive: Some(interactive_rx),
@@ -188,11 +221,17 @@ impl Association {
             ),
             interactive_wake: Notify::new(),
             bulk_wakes: (0..bulk_stripes).map(|_| Notify::new()).collect(),
+            metrics: AssociationMetrics::default(),
         })
     }
 
     pub fn id(&self) -> AssociationId {
         self.id
+    }
+
+    /// Returns cumulative transport counters for this Association generation.
+    pub fn metrics(&self) -> AssociationMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     pub fn key(&self) -> &AssociationKey {
@@ -319,6 +358,11 @@ impl Association {
             }
             Some(_) => AttachmentDecision::RejectedDuplicate,
         };
+        if decision != AttachmentDecision::RejectedDuplicate
+            && let LaneKind::Bulk(index) = attachment.lane
+        {
+            self.bulk_lane_epochs[usize::from(index)].fetch_add(1, Ordering::AcqRel);
+        }
         let lane_mask = lane_mask(attachment.lane);
         self.attached_lanes.fetch_or(lane_mask, Ordering::Release);
         self.wake_pending_lanes
@@ -497,17 +541,17 @@ impl Association {
         self.try_admit(&self.interactive, frame)
     }
 
-    pub(crate) fn try_admit_bulk<F>(
+    pub(crate) fn try_reserve_bulk<F>(
         &self,
         update_route_hash: F,
-        frame: Frame,
-    ) -> Result<usize, AssociationError>
+        bytes: usize,
+    ) -> Result<(usize, BulkAdmission<'_>), AssociationError>
     where
         F: FnOnce(&mut blake3::Hasher),
     {
         let stripe = self.bulk_stripe(update_route_hash)?;
-        self.try_admit_prepared_bulk(stripe, frame)?;
-        Ok(stripe)
+        let admission = self.try_reserve_prepared_bulk(stripe, bytes)?;
+        Ok((stripe, admission))
     }
 
     pub(crate) fn bulk_stripe<F>(&self, update_route_hash: F) -> Result<usize, AssociationError>
@@ -524,18 +568,44 @@ impl Association {
         })
     }
 
-    pub(crate) fn try_admit_prepared_bulk(
+    pub(crate) fn allocate_exact_target_dictionary_id(&self, stripe: usize) -> Option<u64> {
+        let next = self.next_outbound_exact_target_ids.get(stripe)?;
+        next.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current
+                < crate::messaging::target_dictionary::MAX_EXACT_TARGET_DICTIONARY_ENTRIES as u64)
+                .then_some(current + 1)
+        })
+        .ok()
+        .map(|previous| previous + 1)
+    }
+
+    pub(crate) fn bulk_lane_epoch(&self, stripe: usize) -> u64 {
+        self.bulk_lane_epochs
+            .get(stripe)
+            .map_or(0, |epoch| epoch.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn try_reserve_prepared_bulk(
         &self,
         stripe: usize,
-        frame: Frame,
-    ) -> Result<(), AssociationError> {
+        bytes: usize,
+    ) -> Result<BulkAdmission<'_>, AssociationError> {
         if stripe >= self.bulk.len() {
             return Err(AssociationError::InvalidBulkStripe(
                 u8::try_from(stripe).unwrap_or(u8::MAX),
             ));
         }
         self.prepare_data_lane(LaneKind::Bulk(stripe as u8))?;
-        self.try_admit(&self.bulk[stripe], frame)
+        let permit = self.bulk[stripe].try_reserve().map_err(|_| {
+            self.metrics.record_queue_rejection();
+            AssociationError::QueueFull
+        })?;
+        self.reserve_bytes(bytes)?;
+        Ok(BulkAdmission {
+            association: self,
+            permit: Some(permit),
+            reserved_bytes: bytes,
+        })
     }
 
     pub fn release_queued_bytes(&self, bytes: usize) {
@@ -599,7 +669,10 @@ impl Association {
                 let next = current.checked_add(bytes)?;
                 (next <= self.config.max_outbound_bytes_per_association).then_some(next)
             })
-            .map_err(|_| AssociationError::ByteBudgetExceeded)?;
+            .map_err(|_| {
+                self.metrics.record_association_byte_budget_rejection();
+                AssociationError::ByteBudgetExceeded
+            })?;
         if self
             .node_queued_bytes
             .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -608,6 +681,7 @@ impl Association {
             })
             .is_err()
         {
+            self.metrics.record_node_byte_budget_rejection();
             let _ = self
                 .queued_bytes
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -616,6 +690,14 @@ impl Association {
             return Err(AssociationError::NodeByteBudgetExceeded);
         }
         Ok(())
+    }
+
+    pub(crate) fn record_outbound_write(&self, frames: usize, socket_writes: usize) {
+        self.metrics.record_write_batch(frames, socket_writes);
+    }
+
+    pub(crate) fn record_exact_target_cache(&self, hits: u64, misses: u64) {
+        self.metrics.record_exact_target_cache(hits, misses);
     }
 
     fn has_complete_lane_group(&self, lanes: &HashMap<LaneKind, u128>) -> bool {
@@ -775,7 +857,14 @@ mod tests {
 
     #[test]
     fn single_bulk_stripe_skips_route_hashing() {
-        let association = Association::new(key(), RemotingConfig::default()).unwrap();
+        let association = Association::new(
+            key(),
+            RemotingConfig {
+                bulk_queue_frames_per_stripe: 1,
+                ..RemotingConfig::default()
+            },
+        )
+        .unwrap();
         for (lane, nonce) in [
             (LaneKind::Control, 1),
             (LaneKind::Interactive, 2),
@@ -791,14 +880,21 @@ mod tests {
                 .unwrap();
         }
 
-        let stripe = association
-            .try_admit_bulk(
+        let frame = Frame::new(FrameKind::Tell, bytes::Bytes::from_static(b"message"));
+        let (stripe, admission) = association
+            .try_reserve_bulk(
                 |_| panic!("single-stripe admission must not hash the route"),
-                Frame::new(FrameKind::Tell, bytes::Bytes::from_static(b"message")),
+                frame.payload_len(),
             )
             .unwrap();
+        admission.send(frame);
 
         assert_eq!(stripe, 0);
+        assert!(matches!(
+            association.try_reserve_prepared_bulk(0, 1),
+            Err(AssociationError::QueueFull)
+        ));
+        assert_eq!(association.metrics().outbound_queue_rejections, 1);
     }
 
     #[test]
@@ -1050,6 +1146,7 @@ mod tests {
             )),
             Err(AssociationError::NodeByteBudgetExceeded)
         ));
+        assert_eq!(second.metrics().node_byte_budget_rejections, 1);
         first.release_queued_bytes(8);
         second
             .try_admit_interactive(Frame::new(

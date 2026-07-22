@@ -3,13 +3,19 @@ use super::codec::{
 };
 use super::error::{AskError, InboundConnectionError, RemoteFailureCode, RemoteMessageError};
 use super::outbound::OutboundMessaging;
-use super::target::{ExactActorTarget, LogicalEntityTarget, LogicalSingletonTarget, RemoteFailure};
+use super::target::{
+    ExactActorTarget, InboundTell, LogicalEntityTarget, LogicalSingletonTarget, RemoteFailure,
+};
 use super::{
     ActorRef, Arc, Bytes, Frame, FrameKind, FramedConnection, Instant, RemotingIo, async_trait,
 };
 
 #[async_trait]
 pub trait InboundDispatch: Send + Sync + 'static {
+    fn try_tell_immediate(&self, tell: InboundTell) -> ImmediateTellDispatch {
+        ImmediateTellDispatch::Deferred(tell)
+    }
+
     async fn tell(
         &self,
         sender: Option<ActorRef>,
@@ -67,6 +73,29 @@ pub trait InboundDispatch: Send + Sync + 'static {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keeping a deferred tell inline avoids a heap allocation on dispatch fallback"
+)]
+pub enum ImmediateTellDispatch {
+    Complete(Result<(), RemoteMessageError>),
+    Deferred(InboundTell),
+}
+
+pub(crate) async fn dispatch_tell<D: InboundDispatch + ?Sized>(
+    dispatch: &D,
+    tell: InboundTell,
+) -> Result<(), RemoteMessageError> {
+    match dispatch.try_tell_immediate(tell) {
+        ImmediateTellDispatch::Complete(result) => result,
+        ImmediateTellDispatch::Deferred(tell) => {
+            dispatch
+                .tell(tell.sender, tell.target, tell.message_id, tell.payload)
+                .await
+        }
+    }
+}
+
 pub async fn serve_inbound_connection<S, D>(
     mut connection: FramedConnection<S>,
     dispatch: Arc<D>,
@@ -81,9 +110,7 @@ where
         match frame.kind {
             FrameKind::Tell => {
                 let tell = decode_tell(&frame)?;
-                let _ = dispatch
-                    .tell(tell.sender, tell.target, tell.message_id, tell.payload)
-                    .await;
+                let _ = dispatch_tell(dispatch.as_ref(), tell).await;
             }
             FrameKind::Ask => {
                 let ask = decode_ask(&frame)?;

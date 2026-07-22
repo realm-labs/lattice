@@ -20,9 +20,32 @@ use crate::protocol::{
 };
 use crate::traits::{Message, Request};
 
+#[doc(hidden)]
+pub struct RecipientTell {
+    pub sender: Option<ActorRef>,
+    pub target: RecipientRef,
+    pub protocol_fingerprint: ProtocolFingerprint,
+    pub message_id: u64,
+    pub payload: Bytes,
+}
+
+#[doc(hidden)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keeping a deferred tell inline avoids a heap allocation on backend fallback"
+)]
+pub enum ImmediateRecipientTellDispatch {
+    Complete(Result<(), TellError>),
+    Deferred(RecipientTell),
+}
+
 #[async_trait]
 #[doc(hidden)]
 pub trait RecipientBackend: Send + Sync + 'static {
+    fn try_tell_immediate(&self, tell: RecipientTell) -> ImmediateRecipientTellDispatch {
+        ImmediateRecipientTellDispatch::Deferred(tell)
+    }
+
     async fn tell(
         &self,
         sender: Option<ActorRef>,
@@ -118,16 +141,29 @@ impl ActorSystem {
         let (message_id, payload) = protocol
             .encode_request(DispatchMode::Tell, &message)
             .map_err(RecipientError::Dispatch)?;
-        self.backend
-            .tell(
-                sender,
-                target.erase(),
-                protocol.fingerprint(),
-                message_id,
-                payload,
-            )
-            .await
-            .map_err(RecipientError::Tell)
+        let tell = RecipientTell {
+            sender,
+            target: target.erase(),
+            protocol_fingerprint: protocol.fingerprint(),
+            message_id,
+            payload,
+        };
+        match self.backend.try_tell_immediate(tell) {
+            ImmediateRecipientTellDispatch::Complete(result) => {
+                result.map_err(RecipientError::Tell)
+            }
+            ImmediateRecipientTellDispatch::Deferred(tell) => self
+                .backend
+                .tell(
+                    tell.sender,
+                    tell.target,
+                    tell.protocol_fingerprint,
+                    tell.message_id,
+                    tell.payload,
+                )
+                .await
+                .map_err(RecipientError::Tell),
+        }
     }
 
     /// Sends a typed request and waits up to `timeout` for its typed response.

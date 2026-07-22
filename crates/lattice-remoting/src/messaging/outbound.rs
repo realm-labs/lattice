@@ -6,8 +6,9 @@ use super::{
     ProtocolTag,
     codec::{AskWire, EntityAskWire, SingletonAskWire, ask_correlation},
     encode::{
-        PreparedExactTarget, ask_frame, entity_ask_frame, entity_tell_frame, prepared_tell_frame,
-        singleton_ask_frame, singleton_tell_frame, tell_frame,
+        PreparedExactTellEnvelope, ask_frame, entity_ask_frame, entity_tell_frame,
+        entity_tell_frame_len, prepared_tell_frame, prepared_tell_frame_len, singleton_ask_frame,
+        singleton_tell_frame, singleton_tell_frame_len, tell_frame, tell_frame_len,
     },
     error::{AskError, RemoteMessageError, TellError},
     oneshot,
@@ -50,8 +51,9 @@ pub struct OutboundMessaging {
 pub struct PreparedExactTellRoute {
     association: Arc<Association>,
     stripe: usize,
-    target: PreparedExactTarget,
-    sender_actor: Option<PreparedExactTarget>,
+    envelope: PreparedExactTellEnvelope,
+    dictionary_id: Option<u64>,
+    registered_epoch: Arc<AtomicU64>,
 }
 
 impl PreparedExactTellRoute {
@@ -64,17 +66,23 @@ impl PreparedExactTellRoute {
     }
 
     pub fn tell(&self, message_id: u64, payload: Bytes) -> Result<usize, TellError> {
-        self.association
-            .try_admit_prepared_bulk(
-                self.stripe,
-                prepared_tell_frame(
-                    &self.target,
-                    self.sender_actor.as_ref(),
-                    message_id,
-                    payload,
-                ),
-            )
+        let epoch = self.association.bulk_lane_epoch(self.stripe);
+        let compact =
+            self.dictionary_id.is_some() && self.registered_epoch.load(Ordering::Acquire) == epoch;
+        let frame_len = prepared_tell_frame_len(&self.envelope, message_id, payload.len(), compact);
+        let admission = self
+            .association
+            .try_reserve_prepared_bulk(self.stripe, frame_len)
             .map_err(TellError::Association)?;
+        admission.send(prepared_tell_frame(
+            &self.envelope,
+            message_id,
+            payload,
+            compact,
+        ));
+        if self.dictionary_id.is_some() && !compact {
+            self.registered_epoch.store(epoch, Ordering::Release);
+        }
         Ok(self.stripe)
     }
 }
@@ -125,21 +133,28 @@ impl OutboundMessaging {
             message.expected_fingerprint,
         )
         .map_err(TellError::Protocol)?;
-        let frame = tell_frame(
+        let frame_len = tell_frame_len(
             target,
             sender.actor_ref(),
             message.message_id,
-            message.payload,
+            message.payload.len(),
         );
-        association
-            .try_admit_bulk(
+        let (stripe, admission) = association
+            .try_reserve_bulk(
                 |hasher| {
                     sender.update_route_hash(hasher);
                     update_actor_route_hash(hasher, target);
                 },
-                frame,
+                frame_len,
             )
-            .map_err(TellError::Association)
+            .map_err(TellError::Association)?;
+        admission.send(tell_frame(
+            target,
+            sender.actor_ref(),
+            message.message_id,
+            message.payload,
+        ));
+        Ok(stripe)
     }
 
     /// Prepares a stable exact-actor tell route for a hot send loop.
@@ -163,11 +178,13 @@ impl OutboundMessaging {
                 update_actor_route_hash(hasher, target);
             })
             .map_err(TellError::Association)?;
+        let dictionary_id = association.allocate_exact_target_dictionary_id(stripe);
         Ok(PreparedExactTellRoute {
             association,
             stripe,
-            target: PreparedExactTarget::new(target),
-            sender_actor: sender.actor_ref().map(PreparedExactTarget::new),
+            envelope: PreparedExactTellEnvelope::new(target, sender.actor_ref(), dictionary_id),
+            dictionary_id,
+            registered_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -184,20 +201,28 @@ impl OutboundMessaging {
             message.expected_fingerprint,
         )
         .map_err(TellError::Protocol)?;
-        association
-            .try_admit_bulk(
+        let frame_len = entity_tell_frame_len(
+            &target,
+            sender.actor_ref(),
+            message.message_id,
+            message.payload.len(),
+        );
+        let (stripe, admission) = association
+            .try_reserve_bulk(
                 |hasher| {
                     sender.update_route_hash(hasher);
                     target.update_route_hash(hasher);
                 },
-                entity_tell_frame(
-                    &target,
-                    sender.actor_ref(),
-                    message.message_id,
-                    message.payload,
-                ),
+                frame_len,
             )
-            .map_err(TellError::Association)
+            .map_err(TellError::Association)?;
+        admission.send(entity_tell_frame(
+            &target,
+            sender.actor_ref(),
+            message.message_id,
+            message.payload,
+        ));
+        Ok(stripe)
     }
 
     pub fn tell_singleton(
@@ -213,20 +238,28 @@ impl OutboundMessaging {
             message.expected_fingerprint,
         )
         .map_err(TellError::Protocol)?;
-        association
-            .try_admit_bulk(
+        let frame_len = singleton_tell_frame_len(
+            &target,
+            sender.actor_ref(),
+            message.message_id,
+            message.payload.len(),
+        );
+        let (stripe, admission) = association
+            .try_reserve_bulk(
                 |hasher| {
                     sender.update_route_hash(hasher);
                     target.update_route_hash(hasher);
                 },
-                singleton_tell_frame(
-                    &target,
-                    sender.actor_ref(),
-                    message.message_id,
-                    message.payload,
-                ),
+                frame_len,
             )
-            .map_err(TellError::Association)
+            .map_err(TellError::Association)?;
+        admission.send(singleton_tell_frame(
+            &target,
+            sender.actor_ref(),
+            message.message_id,
+            message.payload,
+        ));
+        Ok(stripe)
     }
 
     pub async fn ask<A: ProtocolTag>(

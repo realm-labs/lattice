@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_core::actor_ref::{ActorRef, ProtocolId};
 use lattice_remoting::messaging::{
-    error::RemoteMessageError, inbound::InboundDispatch, target::ExactActorTarget,
+    error::RemoteMessageError,
+    inbound::{ImmediateTellDispatch, InboundDispatch},
+    target::{ExactActorTarget, InboundTell},
 };
 use thiserror::Error;
 
@@ -39,7 +41,7 @@ trait ErasedActorHost: Send + Sync {
         ticket: &str,
     ) -> Option<Result<(), ActorQuarantineError>>;
 
-    async fn tell(
+    fn try_tell(
         &self,
         sender: Option<ActorRef>,
         target: ExactActorTarget,
@@ -145,7 +147,7 @@ impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
             .into()
     }
 
-    async fn tell(
+    fn try_tell(
         &self,
         sender: Option<ActorRef>,
         target: ExactActorTarget,
@@ -161,15 +163,7 @@ impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
         let handle = self.resolve(&target)?;
         match self
             .protocol
-            .dispatch_with_sender(
-                handle,
-                message_id,
-                DispatchMode::Tell,
-                payload,
-                None,
-                sender,
-            )
-            .await
+            .try_dispatch_tell_with_sender(handle, message_id, payload, sender)
             .map_err(map_dispatch)?
         {
             DispatchReply::TellAccepted => Ok(()),
@@ -278,6 +272,19 @@ impl ProtocolHostRegistry {
             .collect()
     }
 
+    pub fn try_tell(
+        &self,
+        sender: Option<ActorRef>,
+        target: ExactActorTarget,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
+        self.hosts
+            .get(&target.protocol_id.get())
+            .ok_or(RemoteMessageError::UnsupportedProtocol)?
+            .try_tell(sender, target, message_id, payload)
+    }
+
     pub async fn retry_stop(&self, local_ref: LocalActorRef) -> Result<(), HostAdminError> {
         for host in self.hosts.values() {
             if let Some(result) = host.retry_stop(local_ref).await {
@@ -304,6 +311,15 @@ impl ProtocolHostRegistry {
 
 #[async_trait]
 impl InboundDispatch for ProtocolHostRegistry {
+    fn try_tell_immediate(&self, tell: InboundTell) -> ImmediateTellDispatch {
+        ImmediateTellDispatch::Complete(self.try_tell(
+            tell.sender,
+            tell.target,
+            tell.message_id,
+            tell.payload,
+        ))
+    }
+
     async fn tell(
         &self,
         sender: Option<ActorRef>,
@@ -311,11 +327,7 @@ impl InboundDispatch for ProtocolHostRegistry {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        self.hosts
-            .get(&target.protocol_id.get())
-            .ok_or(RemoteMessageError::UnsupportedProtocol)?
-            .tell(sender, target, message_id, payload)
-            .await
+        self.try_tell(sender, target, message_id, payload)
     }
 
     async fn ask(

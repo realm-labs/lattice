@@ -68,6 +68,12 @@ pub struct RemotingTopology {
 }
 
 impl RemotingTopology {
+    pub fn association_metrics(
+        &self,
+    ) -> lattice_remoting::association::metrics::AssociationMetricsSnapshot {
+        self.association.metrics()
+    }
+
     pub fn start(config: &BenchmarkConfig) -> Result<Self, Box<dyn StdError>> {
         let cluster_id = ClusterId::new("remoting-benchmark")?;
         let local_incarnation = NodeIncarnation::generate();

@@ -25,6 +25,8 @@ pub mod error;
 pub mod inbound;
 pub mod outbound;
 pub mod target;
+pub(crate) mod target_cache;
+pub(crate) mod target_dictionary;
 
 #[cfg(test)]
 mod tests;

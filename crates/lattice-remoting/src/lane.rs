@@ -14,27 +14,27 @@ use tokio::{
 
 use crate::{
     association::{Association, AssociationError, LaneKind},
+    config::{ABSOLUTE_MAX_READY_READ_BATCH_FRAMES, ABSOLUTE_MAX_READY_WRITE_BATCH_FRAMES},
     control::{
         CommandId, ControlApply, ControlDispatch, ControlDispatchError, ReliableControlError,
         control_ack_frame, decode_control_ack, decode_control_envelope,
     },
     messaging::{
         codec::{
-            ask_correlation, decode_ask, decode_entity_ask, decode_entity_tell, decode_failure,
-            decode_reply, decode_singleton_ask, decode_singleton_tell, decode_tell, failure_frame,
-            reply_frame,
+            ask_correlation, decode_ask_cached, decode_entity_ask, decode_entity_tell_cached,
+            decode_failure, decode_reply, decode_singleton_ask, decode_singleton_tell_cached,
+            decode_tell_cached, failure_frame, reply_frame,
         },
         error::{AskError, RemoteFailureCode, RemoteMessageError},
-        inbound::{InboundDispatch, failure_code},
+        inbound::{InboundDispatch, dispatch_tell, failure_code},
         outbound::OutboundMessaging,
         target::RemoteFailure,
+        target_cache::ExactTargetCache,
+        target_dictionary::ExactTargetDictionary,
     },
     transport::{FramedReader, FramedWriter, RemotingIo},
     wire::{Frame, FrameCodec, FrameKind, WireError},
 };
-
-// Coalesce only data frames that are already queued; never delay the first frame to fill a batch.
-const MAX_WRITE_BATCH_FRAMES: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BidirectionalLaneConfig {
@@ -43,11 +43,25 @@ pub struct BidirectionalLaneConfig {
     pub heartbeat_interval: Duration,
     pub heartbeat_miss_limit: u32,
     pub idle_data_connection_timeout: Duration,
+    pub maximum_cached_exact_targets: usize,
+    pub socket_read_ahead_bytes: usize,
+    pub maximum_ready_write_batch_frames: usize,
+    pub maximum_ready_read_batch_frames: usize,
+    pub maximum_coalesced_write_batch_bytes: usize,
 }
 
 impl BidirectionalLaneConfig {
     fn validate(self) -> Result<Self, LaneError> {
-        if self.maximum_frame_size < 8 || self.maximum_concurrent_inbound_asks == 0 {
+        if self.maximum_frame_size < 8
+            || self.maximum_concurrent_inbound_asks == 0
+            || self.maximum_cached_exact_targets == 0
+            || self.socket_read_ahead_bytes == 0
+            || self.maximum_ready_write_batch_frames == 0
+            || self.maximum_ready_write_batch_frames > ABSOLUTE_MAX_READY_WRITE_BATCH_FRAMES
+            || self.maximum_ready_read_batch_frames == 0
+            || self.maximum_ready_read_batch_frames > ABSOLUTE_MAX_READY_READ_BATCH_FRAMES
+            || self.maximum_coalesced_write_batch_bytes == 0
+        {
             return Err(LaneError::InvalidLimit);
         }
         if self.heartbeat_interval.is_zero()
@@ -115,7 +129,19 @@ impl BidirectionalLane {
     where
         S: RemotingIo,
     {
-        let result = run_bidirectional_lane_inner(&self, receiver, stream, shutdown).await;
+        let mut target_cache = ExactTargetCache::new(self.config.maximum_cached_exact_targets);
+        let mut target_dictionary = ExactTargetDictionary::new();
+        let result = run_bidirectional_lane_inner(
+            &self,
+            receiver,
+            stream,
+            shutdown,
+            &mut target_cache,
+            &mut target_dictionary,
+        )
+        .await;
+        let (hits, misses) = target_cache.take_metrics();
+        self.association.record_exact_target_cache(hits, misses);
         self.association.detach(self.lane, self.connection_nonce);
         if result.is_err() {
             self.services
@@ -131,6 +157,8 @@ async fn run_bidirectional_lane_inner<S>(
     receiver: &mut mpsc::Receiver<Frame>,
     stream: S,
     shutdown: &mut watch::Receiver<bool>,
+    target_cache: &mut ExactTargetCache,
+    target_dictionary: &mut ExactTargetDictionary,
 ) -> Result<LaneExit, LaneError>
 where
     S: RemotingIo,
@@ -146,14 +174,20 @@ where
     }
     let codec = FrameCodec::new(config.maximum_frame_size)?;
     let (read, write) = tokio::io::split(stream);
-    let mut reader = FramedReader::new(read, codec.clone());
-    let mut writer = FramedWriter::new(write, codec);
+    let mut reader =
+        FramedReader::new_with_read_ahead(read, codec.clone(), config.socket_read_ahead_bytes);
+    let mut writer = FramedWriter::new_with_tuning(
+        write,
+        codec,
+        config.maximum_ready_write_batch_frames,
+        config.maximum_coalesced_write_batch_bytes,
+    );
     let mut asks = JoinSet::new();
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_received = Instant::now();
-    let mut outbound_candidates = Vec::with_capacity(MAX_WRITE_BATCH_FRAMES);
-    let mut outbound_batch = Vec::with_capacity(MAX_WRITE_BATCH_FRAMES);
+    let mut outbound_candidates = Vec::with_capacity(config.maximum_ready_write_batch_frames);
+    let mut outbound_batch = Vec::with_capacity(config.maximum_ready_write_batch_frames);
     let idle = tokio::time::sleep(config.idle_data_connection_timeout);
     tokio::pin!(idle);
 
@@ -172,7 +206,7 @@ where
                 };
                 outbound_batch.clear();
                 outbound_batch.push(completed.map_err(LaneError::Join)??);
-                while outbound_batch.len() < MAX_WRITE_BATCH_FRAMES {
+                while outbound_batch.len() < config.maximum_ready_write_batch_frames {
                     let Some(completed) = asks.try_join_next() else {
                         break;
                     };
@@ -198,7 +232,7 @@ where
                 let batch_limit = if lane == LaneKind::Control {
                     1
                 } else {
-                    MAX_WRITE_BATCH_FRAMES
+                    config.maximum_ready_write_batch_frames
                 };
                 while outbound_candidates.len() < batch_limit {
                     let Ok(frame) = receiver.try_recv() else {
@@ -228,10 +262,11 @@ where
                         Failpoint::ControlAfterOutboxBeforeSocketWrite,
                     );
                 }
-                let result = if outbound_batch.len() == 1 && !matches!(lane, LaneKind::Bulk(_)) {
+                let frame_count = outbound_batch.len();
+                let result = if frame_count == 1 && !matches!(lane, LaneKind::Bulk(_)) {
                     let correlation = ask_correlation(&outbound_batch[0]);
                     writer
-                        .write_frame_with_commit(&outbound_batch[0], || {
+                        .write_frame_with_commit_outcome(&outbound_batch[0], || {
                             if let Some(correlation) = correlation {
                                 messaging.mark_socket_write_started(correlation);
                             }
@@ -247,38 +282,39 @@ where
                         .await
                 };
                 association.release_queued_bytes(reserved_bytes);
-                result?;
+                let outcome = result?;
+                association.record_outbound_write(frame_count, outcome.socket_writes);
                 idle.as_mut().reset(
                     TokioInstant::now() + config.idle_data_connection_timeout
                 );
             }
             inbound = reader.read_frame() => {
-                let frame = inbound?;
+                let mut next_frame = Some(inbound?);
+                let mut processed_frames = 0;
+                while let Some(frame) = next_frame {
                 last_received = Instant::now();
                 idle.as_mut().reset(
                     TokioInstant::now() + config.idle_data_connection_timeout
                 );
                 match frame.kind {
                     FrameKind::Tell if matches!(lane, LaneKind::Bulk(_)) => {
-                        let tell = decode_tell(&frame)?;
-                        let _ = dispatch
-                            .tell(tell.sender, tell.target, tell.message_id, tell.payload)
-                            .await;
+                        let tell = decode_tell_cached(&frame, target_cache, target_dictionary)?;
+                        let _ = dispatch_tell(dispatch.as_ref(), tell).await;
                     }
                     FrameKind::EntityTell if matches!(lane, LaneKind::Bulk(_)) => {
-                        let tell = decode_entity_tell(&frame)?;
+                        let tell = decode_entity_tell_cached(&frame, target_cache)?;
                         let _ = dispatch
                             .tell_entity(tell.sender, tell.target, tell.message_id, tell.payload)
                             .await;
                     }
                     FrameKind::SingletonTell if matches!(lane, LaneKind::Bulk(_)) => {
-                        let tell = decode_singleton_tell(&frame)?;
+                        let tell = decode_singleton_tell_cached(&frame, target_cache)?;
                         let _ = dispatch
                             .tell_singleton(tell.sender, tell.target, tell.message_id, tell.payload)
                             .await;
                     }
                     FrameKind::Ask if lane == LaneKind::Interactive => {
-                        let ask = decode_ask(&frame)?;
+                        let ask = decode_ask_cached(&frame, target_cache)?;
                         if asks.len() == config.maximum_concurrent_inbound_asks {
                             writer.write_frame(&failure_frame(&RemoteFailure {
                                 correlation_id: ask.correlation_id,
@@ -442,6 +478,16 @@ where
                     }
                     FrameKind::Close => return Ok(LaneExit::RemoteClose),
                     kind => return Err(LaneError::UnexpectedFrame { lane, kind }),
+                }
+                if let Some((hits, misses)) = target_cache.take_metrics_if_ready() {
+                    association.record_exact_target_cache(hits, misses);
+                }
+                processed_frames += 1;
+                next_frame = if processed_frames < config.maximum_ready_read_batch_frames {
+                    reader.try_read_frame()?
+                } else {
+                    None
+                };
                 }
             }
             _ = heartbeat.tick(), if lane == LaneKind::Control => {
@@ -663,6 +709,11 @@ mod tests {
                         heartbeat_interval: Duration::from_millis(100),
                         heartbeat_miss_limit: 10,
                         idle_data_connection_timeout: Duration::from_millis(25),
+                        maximum_cached_exact_targets: 8,
+                        socket_read_ahead_bytes: 1024,
+                        maximum_ready_write_batch_frames: 8,
+                        maximum_ready_read_batch_frames: 8,
+                        maximum_coalesced_write_batch_bytes: 4096,
                     },
                 )
                 .run(&mut server_receiver, stream, &mut server_shutdown)
@@ -692,6 +743,11 @@ mod tests {
                         heartbeat_interval: Duration::from_millis(100),
                         heartbeat_miss_limit: 10,
                         idle_data_connection_timeout: Duration::from_millis(25),
+                        maximum_cached_exact_targets: 8,
+                        socket_read_ahead_bytes: 1024,
+                        maximum_ready_write_batch_frames: 8,
+                        maximum_ready_read_batch_frames: 8,
+                        maximum_coalesced_write_batch_bytes: 4096,
                     },
                 )
                 .run(&mut client_receiver, stream, &mut client_shutdown)

@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::{codec::*, error::*, inbound::*, outbound::*, target::*, *};
+use super::{target_cache::ExactTargetCache, target_dictionary::ExactTargetDictionary};
 use crate::{
     association::{AssociationKey, AssociationState, LaneAttachment, LaneKind},
     config::RemotingConfig,
@@ -139,6 +140,7 @@ async fn real_tcp_tell_and_ask_dispatch_exact_activation() {
                 message_id: 1,
                 payload: Bytes::from_static(b"tell"),
                 sender_actor: None,
+                target_id: 0,
             },
         ))
         .await
@@ -251,9 +253,18 @@ async fn prepared_exact_tell_preserves_sender_and_is_bound_to_association() {
         .unwrap();
 
     let stripe = route.tell(1, Bytes::from_static(b"tell")).unwrap();
-    let decoded = decode_tell(&receivers.bulk[stripe].recv().await.unwrap()).unwrap();
+    route.tell(1, Bytes::from_static(b"tell")).unwrap();
+    let registration = receivers.bulk[stripe].recv().await.unwrap();
+    let compact = receivers.bulk[stripe].recv().await.unwrap();
+    assert!(compact.payload_len() < registration.payload_len());
+    let mut cache = ExactTargetCache::new(8);
+    let mut dictionary = ExactTargetDictionary::new();
+    let decoded = decode_tell_cached(&registration, &mut cache, &mut dictionary).unwrap();
+    let compact_decoded = decode_tell_cached(&compact, &mut cache, &mut dictionary).unwrap();
     let decoded_target: ActorRef = decoded.target.actor_ref().unwrap();
+    let compact_target: ActorRef = compact_decoded.target.actor_ref().unwrap();
     assert!(decoded_target.same_activation(&recipient));
+    assert!(compact_target.same_activation(&recipient));
     assert!(
         decoded
             .sender

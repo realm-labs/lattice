@@ -48,7 +48,7 @@ impl BootstrapRequest {
             expected_node_id,
             transport_major: TRANSPORT_MAJOR,
             transport_minor: TRANSPORT_MINOR,
-            features: FeatureBits::REQUIRED_V2,
+            features: FeatureBits::REQUIRED_V3,
             nonce,
         }
     }
@@ -89,7 +89,7 @@ impl BootstrapRequest {
         if self.transport_major != TRANSPORT_MAJOR || self.transport_minor > TRANSPORT_MINOR {
             return Some(BootstrapRejectionCode::IncompatibleTransport);
         }
-        if !self.features.contains(FeatureBits::REQUIRED_V2) {
+        if !self.features.contains(FeatureBits::REQUIRED_V3) {
             return Some(BootstrapRejectionCode::MissingRequiredFeature);
         }
         if self.requested_cluster_id != local.cluster_id
@@ -164,7 +164,7 @@ impl BootstrapResponse {
             nonce,
             transport_major: TRANSPORT_MAJOR,
             transport_minor: TRANSPORT_MINOR,
-            features: FeatureBits::REQUIRED_V2,
+            features: FeatureBits::REQUIRED_V3,
             result,
         }
     }
@@ -196,7 +196,7 @@ impl BootstrapResponse {
         }
         if self.transport_major != TRANSPORT_MAJOR
             || self.transport_minor > TRANSPORT_MINOR
-            || !self.features.contains(FeatureBits::REQUIRED_V2)
+            || !self.features.contains(FeatureBits::REQUIRED_V3)
         {
             return Err(BootstrapError::IncompatibleTransport);
         }

@@ -1,7 +1,10 @@
 use lattice_actor::context::HandlerContext;
 use std::{
     error::Error,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -12,7 +15,7 @@ use lattice_actor::{
     handle::ActorHandle,
     registry::{ActorRegistry, ActorRegistryConfig},
     reply::ReplyTo,
-    traits::{Actor, Request, Responder},
+    traits::{Actor, Handler, Request, Responder},
 };
 use lattice_core::{
     actor_kind,
@@ -22,19 +25,21 @@ use lattice_core::{
     id::ActorId,
 };
 use lattice_remoting::{
-    association::{Association, AssociationManager},
+    association::{Association, AssociationError, AssociationManager},
     config::RemotingConfig,
     endpoint::RemotingEndpoint,
     handshake::NodeIdentity,
     messaging::{
-        error::RemoteMessageError,
-        inbound::InboundDispatch,
-        outbound::{OutboundMessage, OutboundMessaging},
-        target::{ExactActorTarget, SenderIdentity},
+        error::{RemoteMessageError, TellError},
+        inbound::{ImmediateTellDispatch, InboundDispatch},
+        outbound::{OutboundMessage, OutboundMessaging, PreparedExactTellRoute},
+        target::{ExactActorTarget, InboundTell, SenderIdentity},
     },
     protocol::{ProtocolDescriptor, ProtocolFingerprint},
 };
+use prost::Message as ProstMessage;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 
 use crate::metrics::WorkloadReport;
 
@@ -44,11 +49,63 @@ impl Request for EchoRequest {
     type Response = Bytes;
 }
 
-struct EchoActor;
+#[derive(Clone, PartialEq, ProstMessage)]
+struct TellWireMessage {
+    #[prost(bytes = "bytes", tag = "1")]
+    payload: Bytes,
+    #[prost(uint64, tag = "2")]
+    completion_generation: u64,
+}
+
+#[derive(lattice_actor::Message)]
+struct EchoTell(TellWireMessage);
+
+#[derive(Default)]
+struct TellCompletion {
+    generation: AtomicU64,
+    changed: Notify,
+}
+
+impl TellCompletion {
+    fn complete(&self, generation: u64) {
+        self.generation.fetch_max(generation, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait(&self, generation: u64) {
+        while self.generation.load(Ordering::Acquire) < generation {
+            let changed = self.changed.notified();
+            if self.generation.load(Ordering::Acquire) >= generation {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct EchoActor {
+    tell_completion: Arc<TellCompletion>,
+    processed_bytes: usize,
+}
 
 impl Actor for EchoActor {
     type Error = ActorError;
     type Behavior = ::lattice_actor::state_machine::Stateless;
+}
+
+impl Handler<EchoTell> for EchoActor {
+    async fn handle(
+        &mut self,
+        _context: &mut HandlerContext<'_, Self>,
+        message: EchoTell,
+    ) -> Result<(), Self::Error> {
+        self.processed_bytes = self.processed_bytes.wrapping_add(message.0.payload.len());
+        if message.0.completion_generation != 0 {
+            self.tell_completion
+                .complete(message.0.completion_generation);
+        }
+        Ok(())
+    }
 }
 
 impl Responder<EchoRequest> for EchoActor {
@@ -68,6 +125,16 @@ struct ActorDispatch {
 
 #[async_trait]
 impl InboundDispatch for ActorDispatch {
+    fn try_tell_immediate(&self, tell: InboundTell) -> ImmediateTellDispatch {
+        let Ok(message) = TellWireMessage::decode(tell.payload.clone()) else {
+            return ImmediateTellDispatch::Complete(Err(RemoteMessageError::InvalidPayload));
+        };
+        match self.handle.try_tell(EchoTell(message)) {
+            Ok(()) => ImmediateTellDispatch::Complete(Ok(())),
+            Err(_) => ImmediateTellDispatch::Deferred(tell),
+        }
+    }
+
     async fn tell(
         &self,
         _sender: Option<ActorRef>,
@@ -75,7 +142,12 @@ impl InboundDispatch for ActorDispatch {
         _message_id: u64,
         _payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        Err(RemoteMessageError::Unauthorized)
+        let message =
+            TellWireMessage::decode(_payload).map_err(|_| RemoteMessageError::InvalidPayload)?;
+        self.handle
+            .tell(EchoTell(message))
+            .await
+            .map_err(|_| RemoteMessageError::MailboxRejected)
     }
 
     async fn ask(
@@ -141,17 +213,42 @@ pub struct RemoteActorTopology {
     server: Arc<RemotingEndpoint>,
     messaging: Arc<OutboundMessaging>,
     association: Arc<Association>,
+    inbound_association: Arc<Association>,
     target: ActorRef,
     fingerprint: ProtocolFingerprint,
+    prepared_tell: PreparedExactTellRoute,
+    tell_completion: Arc<TellCompletion>,
+    tell_generation: AtomicU64,
 }
 
 impl RemoteActorTopology {
+    pub fn association_metrics(
+        &self,
+    ) -> lattice_remoting::association::metrics::AssociationMetricsSnapshot {
+        self.association.metrics()
+    }
+
+    pub fn inbound_association_metrics(
+        &self,
+    ) -> lattice_remoting::association::metrics::AssociationMetricsSnapshot {
+        self.inbound_association.metrics()
+    }
+
     pub async fn start(bulk_stripes: usize) -> Result<Self, Box<dyn Error>> {
         let actor_registry = Arc::new(ActorRegistry::new(
             actor_kind!("BenchmarkRemoteEcho"),
             ActorRegistryConfig::default(),
         ));
-        let actor = actor_registry.start(ActorId::U64(1), EchoActor).await?;
+        let tell_completion = Arc::new(TellCompletion::default());
+        let actor = actor_registry
+            .start(
+                ActorId::U64(1),
+                EchoActor {
+                    tell_completion: tell_completion.clone(),
+                    processed_bytes: 0,
+                },
+            )
+            .await?;
         let cluster_id = ClusterId::new("remoting-end-to-end-benchmark")?;
         let client_identity = available_identity(cluster_id.clone(), "client", 1).await?;
         let server_identity = available_identity(cluster_id.clone(), "server", 2).await?;
@@ -170,14 +267,14 @@ impl RemoteActorTopology {
         };
         let client_messaging = Arc::new(OutboundMessaging::new(4096)?);
         let server_messaging = Arc::new(OutboundMessaging::new(4096)?);
-        let client = endpoint(
+        let (client, _) = endpoint(
             client_identity.clone(),
             config.clone(),
             client_messaging.clone(),
             Arc::new(RejectDispatch),
             descriptor.clone(),
         )?;
-        let server = endpoint(
+        let (server, server_manager) = endpoint(
             server_identity.clone(),
             config,
             server_messaging,
@@ -187,6 +284,13 @@ impl RemoteActorTopology {
         client.bind().await?;
         server.bind().await?;
         let association = client.connect_peer(server_identity.clone()).await?;
+        let inbound_association = server_manager
+            .get_exact(
+                &cluster_id,
+                &client_identity.address,
+                client_identity.incarnation,
+            )
+            .ok_or("server did not register the inbound benchmark association")?;
         let target = ActorRef::new(
             cluster_id,
             server_identity.address,
@@ -195,17 +299,64 @@ impl RemoteActorTopology {
             ActivationId::new(server_identity.incarnation, 1)?,
             protocol_id,
         )?;
+        let prepared_tell = client_messaging.prepare_exact_tell_route(
+            association.clone(),
+            &SenderIdentity::Process(1),
+            &target,
+            fingerprint,
+        )?;
         let topology = Self {
             actor_registry,
             client,
             server,
             messaging: client_messaging,
             association,
+            inbound_association,
             target,
             fingerprint,
+            prepared_tell,
+            tell_completion,
+            tell_generation: AtomicU64::new(0),
         };
         topology.round_trip(Bytes::new()).await?;
         Ok(topology)
+    }
+
+    pub async fn run_tell(
+        &self,
+        requests: usize,
+        payload_bytes: usize,
+    ) -> Result<WorkloadReport, Box<dyn Error>> {
+        let payload = Bytes::from(vec![0_u8; payload_bytes]);
+        let generation = self.tell_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let started = Instant::now();
+        for index in 0..requests {
+            let completion_generation = if index + 1 == requests { generation } else { 0 };
+            let message = TellWireMessage {
+                payload: payload.clone(),
+                completion_generation,
+            };
+            let encoded = Bytes::from(message.encode_to_vec());
+            loop {
+                match self.prepared_tell.tell(1, encoded.clone()) {
+                    Ok(_) => break,
+                    Err(TellError::Association(AssociationError::QueueFull)) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => return Err(Box::new(error)),
+                }
+            }
+        }
+        self.tell_completion.wait(generation).await;
+        Ok(WorkloadReport {
+            name: "remote_actor_tcp_tell",
+            requests,
+            successes: requests,
+            errors: 0,
+            elapsed: started.elapsed(),
+            latencies: Vec::new(),
+            observed_actor_ids: [1].into_iter().collect(),
+        })
     }
 
     pub async fn run(
@@ -281,16 +432,19 @@ fn endpoint(
     messaging: Arc<OutboundMessaging>,
     dispatch: Arc<dyn InboundDispatch>,
     descriptor: ProtocolDescriptor,
-) -> Result<Arc<RemotingEndpoint>, Box<dyn Error>> {
+) -> Result<(Arc<RemotingEndpoint>, Arc<AssociationManager>), Box<dyn Error>> {
     let manager = Arc::new(AssociationManager::new(
         identity.address.clone(),
         identity.incarnation,
         config.clone(),
     )?);
-    Ok(Arc::new(
-        RemotingEndpoint::builder(identity, config, manager, messaging, dispatch)
-            .catalogue(vec![descriptor])
-            .build()?,
+    Ok((
+        Arc::new(
+            RemotingEndpoint::builder(identity, config, manager.clone(), messaging, dispatch)
+                .catalogue(vec![descriptor])
+                .build()?,
+        ),
+        manager,
     ))
 }
 
@@ -317,6 +471,8 @@ mod tests {
     #[tokio::test]
     async fn tcp_round_trip_crosses_remote_endpoint_and_actor() {
         let topology = RemoteActorTopology::start(1).await.unwrap();
+        let tell = topology.run_tell(4, 64).await.unwrap();
+        assert_eq!(tell.successes, 4);
         let report = topology.run(4, 64).await.unwrap();
         assert_eq!(report.successes, 4);
         assert!(report.latencies.iter().all(|latency| !latency.is_zero()));

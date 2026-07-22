@@ -126,6 +126,10 @@ pub trait WireCodec<T>: Send + Sync + 'static {
 
     fn encode(&self, value: &T, dst: &mut BytesMut) -> Result<(), EncodeError>;
     fn decode(&self, src: &[u8]) -> Result<T, DecodeError>;
+    fn encoded_len(&self, value: &T) -> Option<usize> { None }
+    fn encode_to_bytes(&self, value: &T) -> Result<Bytes, EncodeError> {
+        // Default: allocate once from the size hint, encode, then freeze.
+    }
 }
 
 ActorProtocol::<PlayerActor>::builder(
@@ -274,7 +278,44 @@ For an actor sender, identity is `(ActorPath, ActivationId)`. A Gateway adapter,
 
 Messages from one sender to one recipient therefore remain on one TCP stream. Round-robin per frame is forbidden because multiple TCP streams could reorder consecutive tells. Reconnect, reroute, different senders, or shard handoff still provide no global ordering guarantee.
 
-The writer may batch multiple complete frames into one socket write and use vectored I/O or buffer pooling. It must not merge business messages, change mailbox ordering guarantees, or create an unbounded batch. Domain-level coalescing or batching remains an explicit typed business message.
+The bulk writer drains at most 256 already queued frames by default without waiting to fill a batch.
+The limit is configurable up to 512 for dedicated runtimes and different payload distributions. Large payloads
+remain segmented and use vectored I/O. Small segmented batches are copied once into a writer-owned,
+reusable staging buffer (bounded to 128 KiB) to avoid hundreds of iovecs and per-message final-frame
+allocations. Per-frame socket-commit callbacks are advanced from the actual partial-write byte count,
+so batching does not weaken ask uncertainty semantics. It must not merge business messages, change
+mailbox ordering guarantees, or create an unbounded batch. Domain-level coalescing or batching
+remains an explicit typed business message.
+
+A prepared exact-actor tell route caches the encoded target, optional sender, protocol decision, and
+bulk stripe. Admission reserves queue and byte-budget capacity before constructing the envelope. The
+outbound frame then references the cached envelope and the business `Bytes` directly, with only its
+small protobuf metadata stored inline. `Frame::payload()` preserves the contiguous public view by
+coalescing lazily; the socket hot path consumes the segments directly.
+
+The first tell on a prepared route registers its exact target in a bounded, lane-local dictionary;
+later tells carry only the dictionary ID. Reconnect increments the lane epoch and forces registration
+before compact frames resume. Dictionary support is a mandatory transport feature, so an older peer
+fails handshake rather than misinterpreting the compact form. If a lane has already allocated all
+1,024 dictionary entries, newly prepared routes safely fall back to the full target envelope.
+
+Each lane reader keeps a bounded 64 KiB read-ahead buffer (or the negotiated frame limit when
+smaller). A socket read may therefore contain many complete frames. The default dispatch budget is
+one frame per lane poll; increasing it is an explicit throughput-versus-executor-fairness tuning.
+Exact actor targets are cached per lane in a fixed bounded
+1,024-entry cache. Length-delimited target strings are retained as zero-copy `Bytes` on cache hits;
+UTF-8 and domain validation occur when a target first enters the cache. This changes no protobuf wire
+types. Standard exact-actor tell dispatch also completes synchronously through protocol decode and
+mailbox admission, avoiding dynamic `async_trait` Future allocation on both the sender backend and
+receiver host paths; logical entity and singleton routing retain their asynchronous fallback.
+
+`Association::metrics()` exposes cumulative queue and byte-budget rejection counts, write batch/frame
+and socket-write counts, plus exact-target cache hits and misses. Cache counters are amortized into
+the snapshot every 1,024 lookups and when the lane exits; telemetry must therefore treat very recent
+cache values as eventually reported rather than per-message synchronized. The repository benchmark's
+`remote_actor_tcp_tell` workload crosses the loopback TCP transport, receiver decode, target lookup,
+mailbox, and Actor handler before completing; sender and receiver Association snapshots are reported
+separately so an admission-only measurement cannot be mistaken for delivered throughput.
 
 If bulk tell throughput is insufficient, optimize association scheduling, encoding, allocation, batching, or mailbox admission first. Do not restore public Direct Link as a parallel transport.
 
