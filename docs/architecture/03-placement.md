@@ -130,7 +130,7 @@ Each entity type declares a stable configuration:
 ```rust
 EntityType::builder::<PlayerActor>("player")
     .shards(256)
-    .hash_version(ShardHashVersion::Xxh3V1)
+    .shard_mapper(Xxh3V1ShardMapper)
     .max_entities_per_shard(1_024)
     .max_buffered_messages_per_region(10_000)
     .max_buffered_bytes(64 * 1024 * 1024)
@@ -172,7 +172,43 @@ impl EntityKey for PlayerId {
 }
 ```
 
-`EntityId` is at most 256 canonical bytes. `ShardHashVersion::Xxh3V1` is exactly `xxh3_64_with_seed(entity_id_bytes, 0x4c41_5454_4943_4531)`, followed by modulo configured shard count. Rust `Hash`, `DefaultHasher`, platform endianness, type names, and declaration order are forbidden inputs. Shard count, canonical key encoding, hash version, and seed are persistent compatibility decisions; changing any requires an explicit full-stop shard migration.
+`EntityId` is at most 256 canonical bytes. The default `Xxh3V1ShardMapper` is exactly
+`xxh3_64_with_seed(entity_id_bytes, 0x4c41_5454_4943_4531)`, followed by modulo configured shard
+count. Rust `Hash`, `DefaultHasher`, platform endianness, type names, and declaration order are
+forbidden inputs.
+
+Applications may install a deterministic mapper when the business key has a stronger locality
+boundary than the complete entity ID:
+
+```rust
+impl ShardMapper for WorldRegionMapper {
+    fn mapper_id(&self) -> &'static str { "minecraft-world-region" }
+    fn mapper_version(&self) -> u32 { 1 }
+
+    fn shard_for(
+        &self,
+        entity_id: &EntityId,
+        shard_count: u32,
+    ) -> Result<ShardId, ShardMappingError> {
+        let region = RegionKey::decode(entity_id)?;
+        // Hash only world_id for strong per-world affinity. Large worlds can
+        // instead include a coarse region bucket in this canonical input.
+        Ok(ShardId::new(
+            (stable_hash(region.world_id) % u64::from(shard_count)) as u32,
+        ))
+    }
+}
+
+let regions = EntityOptions::new(domain, EntityType::new("region")?, 1024)
+    .shard_mapper(WorldRegionMapper)
+    .allocation_policy("world-region-affinity", 1);
+```
+
+The mapper ID/version is part of the entity configuration fingerprint. Every host and proxy for the
+entity type must install the same implementation. The framework rejects an identity mismatch and a
+mapper result outside `0..shard_count`. Shard count, canonical key encoding, mapper ID/version, and
+mapping behavior are persistent compatibility decisions; changing any requires an explicit
+full-stop shard migration.
 
 A shard record contains the owner node/incarnation, assignment generation, state (`unassigned`, `starting`, `active`, `handoff`, or `stopped`), and optional target. Records are retained rather than deleted during ordinary movement so generations remain monotonic.
 
@@ -197,8 +233,23 @@ Allocation decides the owner of an unassigned shard. Rebalancing decides whether
 
 The Coordinator owns one strategy instance per entity type. Strategy code is pure with respect to cluster state: it receives an immutable bounded view, performs no etcd/network I/O, and returns a proposal that the Coordinator must validate before persistence.
 
+Custom strategies are registered on every Coordinator candidate through `CoordinatorHostConfig`:
+
+```rust
+let host = CoordinatorHostConfig::default()
+    .with_allocation_strategy(Arc::new(WorldRegionAffinity::default()))?;
+```
+
+The registry is installed before recovery and is reused by every later leader election. Setting only
+`EntityOptions::allocation_policy` selects an ID/version; it does not install executable strategy
+code. Use `with_replaced_allocation_strategy` when tuning the built-in `weighted-least-load` ID/version
+rather than registering a new policy identity.
+
 ```rust
 pub trait ShardAllocationStrategy: Send + Sync + 'static {
+    fn policy_id(&self) -> &'static str;
+    fn policy_version(&self) -> u32;
+
     fn allocate(
         &self,
         request: &AllocationRequest,
@@ -207,9 +258,11 @@ pub trait ShardAllocationStrategy: Send + Sync + 'static {
 
     fn rebalance(
         &self,
+        entity_type: &EntityType,
+        required_protocol: ProtocolId,
         trigger: RebalanceTrigger,
         view: &PlacementView,
-        limits: &RebalanceLimits,
+        limits: RebalanceLimits,
     ) -> Result<RebalanceProposal, AllocationError>;
 }
 ```

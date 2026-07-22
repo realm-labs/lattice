@@ -1,11 +1,38 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use lattice_core::coordinator::CoordinatorScope;
+use lattice_remoting::association::AssociationManager;
 
-use crate::storage::ScopedElectionStore;
-use crate::types::{CoordinatorTerm, NodeKey};
+use crate::{
+    storage::{CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore},
+    types::{CoordinatorTerm, NodeKey},
+};
 
 use super::super::CoordinatorRuntimeError;
+use super::{CoordinatorHostConfig, PlacementDomainLeader};
+
+pub(super) async fn elect_domain_leader<S>(
+    store: Arc<S>,
+    associations: Arc<AssociationManager>,
+    node: NodeKey,
+    scope: CoordinatorScope,
+    term: CoordinatorTerm,
+    config: &CoordinatorHostConfig,
+) -> Result<PlacementDomainLeader<S>, CoordinatorRuntimeError>
+where
+    S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
+{
+    PlacementDomainLeader::elect_with_strategies(
+        store,
+        associations,
+        node,
+        scope,
+        term,
+        config.placement.clone(),
+        config.allocation_strategies.clone(),
+    )
+    .await
+}
 
 pub(super) async fn candidate_delay(scope: &CoordinatorScope, node: &NodeKey, maximum: Duration) {
     let delay = candidate_delay_duration(scope, node, maximum);

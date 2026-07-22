@@ -382,8 +382,10 @@ is isolated per ProtocolId so an unrelated actor protocol cannot take down the p
 entity_id -> stable shard_id -> ShardHomeRecord
 ```
 
-EntityId is a maximum 256-byte canonical business-key encoding. V1 shard mapping is
-`xxh3_64_with_seed(bytes, 0x4c41_5454_4943_4531) % shard_count`; Rust DefaultHasher and implicit
+EntityId is a maximum 256-byte canonical business-key encoding. The default V1 shard mapping is
+`xxh3_64_with_seed(bytes, 0x4c41_5454_4943_4531) % shard_count`; a custom deterministic
+ShardMapper may define a business locality boundary, with its ID/version included in the entity
+configuration fingerprint and the same implementation required on every host and proxy. Rust DefaultHasher and implicit
 type/order inputs are forbidden.
 
 There is one persistent, normally non-deleted record per configured shard:
@@ -725,7 +727,7 @@ Status: `[x]` complete within macro batch 2.
 
 Status: `[x]` complete within macro batch 2.
 
-- [x] Add `ShardedActor::Key`, bounded canonical EntityId encoding and immutable entity config with explicit Xxh3V1 seed/hash, stable fingerprint, validated shard count, and fingerprinted allocation-strategy ID/version/hard constraints.
+- [x] Add `ShardedActor::Key`, bounded canonical EntityId encoding and immutable entity config with a stable default Xxh3V1 mapper, fingerprinted custom mapper ID/version, validated shard count, and fingerprinted allocation-strategy ID/version/hard constraints.
 - [x] Add persistent bounded shard-home records for memory and etcd backends.
 - [x] Implement Region host/proxy, home cache, single-flight lookup and bounded buffers.
 - [x] Make local Shard the only component allowed to load/deliver sharded entities.

@@ -31,6 +31,7 @@ use lattice_placement::{
     coordinator::{
         LeaderRecord, MemberChange, MemberEvent, MemberHello, PlacementDomainHello, SingletonConfig,
     },
+    mapping::{ShardMapper, Xxh3V1ShardMapper},
     region::EntityConfig,
     runtime::{
         CoordinatorHandle,
@@ -252,6 +253,7 @@ impl LatticeServiceBuilder {
         L: ActorLoader<A>,
     {
         let protocol = Arc::new(P::bind_actor().map_err(ServiceError::ProtocolBuild)?);
+        let mapper = options.shard_mapper.clone();
         let config = options
             .build(protocol.protocol_id())
             .map_err(ServiceError::EntityConfig)?;
@@ -266,7 +268,7 @@ impl LatticeServiceBuilder {
             registry_config,
             protocol.as_ref(),
         ));
-        self.host_entity_with_registry(config, registry, protocol, loader)
+        self.host_entity_with_registry_and_mapper(config, mapper, registry, protocol, loader)
     }
 
     /// Advanced entity registration using a prebuilt registry and binding.
@@ -275,7 +277,7 @@ impl LatticeServiceBuilder {
     /// installed in the service catalogue, and the loader is re-registered
     /// automatically whenever discovery selects a new Coordinator.
     pub fn host_entity_with_registry<A, L, P>(
-        mut self,
+        self,
         config: EntityConfig,
         registry: Arc<ActorRegistry<A>>,
         protocol: Arc<ActorProtocolBinding<A, P>>,
@@ -286,7 +288,34 @@ impl LatticeServiceBuilder {
         L: ActorLoader<A>,
         P: Protocol,
     {
+        self.host_entity_with_registry_and_mapper(
+            config,
+            Arc::new(Xxh3V1ShardMapper),
+            registry,
+            protocol,
+            loader,
+        )
+    }
+
+    /// Advanced entity registration with an explicit deterministic shard mapper.
+    pub fn host_entity_with_registry_and_mapper<A, L, P>(
+        mut self,
+        config: EntityConfig,
+        mapper: Arc<dyn ShardMapper>,
+        registry: Arc<ActorRegistry<A>>,
+        protocol: Arc<ActorProtocolBinding<A, P>>,
+        loader: L,
+    ) -> Result<Self, ServiceError>
+    where
+        A: Actor,
+        L: ActorLoader<A>,
+        P: Protocol,
+    {
         config.validate().map_err(ServiceError::EntityConfig)?;
+        config
+            .validate_mapper(mapper.as_ref())
+            .map_err(ClusterRouterError::from)
+            .map_err(ServiceError::LogicalRouter)?;
         if config.protocol_id != protocol.protocol_id() {
             return Err(ServiceError::LogicalRouter(
                 ClusterRouterError::ProtocolMismatch,
@@ -312,8 +341,9 @@ impl LatticeServiceBuilder {
         self.entity_installers.push(LogicalEntityInstaller {
             domain: config.domain.clone(),
             install: Arc::new(move |router| {
-                router.register_entity(
+                router.register_entity_with_mapper(
                     config.clone(),
+                    mapper.clone(),
                     registry.clone(),
                     protocol.clone(),
                     loader.clone(),
@@ -327,18 +357,32 @@ impl LatticeServiceBuilder {
     /// own shards or activate entity actors.
     pub fn proxy_entity<P: Protocol>(self, options: EntityOptions) -> Result<Self, ServiceError> {
         let protocol = P::build_protocol().map_err(ServiceError::ProtocolBuild)?;
+        let mapper = options.shard_mapper.clone();
         let config = options
             .build(protocol.protocol_id())
             .map_err(ServiceError::EntityConfig)?;
-        self.proxy_entity_config::<P>(config)
+        self.proxy_entity_config_with_mapper::<P>(config, mapper)
     }
 
     /// Advanced proxy registration using a prebuilt placement configuration.
     pub fn proxy_entity_config<P: Protocol>(
-        mut self,
+        self,
         config: EntityConfig,
     ) -> Result<Self, ServiceError> {
+        self.proxy_entity_config_with_mapper::<P>(config, Arc::new(Xxh3V1ShardMapper))
+    }
+
+    /// Advanced proxy registration with an explicit deterministic shard mapper.
+    pub fn proxy_entity_config_with_mapper<P: Protocol>(
+        mut self,
+        config: EntityConfig,
+        mapper: Arc<dyn ShardMapper>,
+    ) -> Result<Self, ServiceError> {
         config.validate().map_err(ServiceError::EntityConfig)?;
+        config
+            .validate_mapper(mapper.as_ref())
+            .map_err(ClusterRouterError::from)
+            .map_err(ServiceError::LogicalRouter)?;
         let protocol = Arc::new(P::build_protocol().map_err(ServiceError::ProtocolBuild)?);
         if config.protocol_id != protocol.protocol_id() {
             return Err(ServiceError::LogicalRouter(
@@ -366,7 +410,11 @@ impl LatticeServiceBuilder {
         self.entity_installers.push(LogicalEntityInstaller {
             domain: config.domain.clone(),
             install: Arc::new(move |router| {
-                router.register_entity_proxy(config.clone(), fingerprint)
+                router.register_entity_proxy_with_mapper(
+                    config.clone(),
+                    mapper.clone(),
+                    fingerprint,
+                )
             }),
         });
         Ok(self)

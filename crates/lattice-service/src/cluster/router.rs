@@ -4,9 +4,9 @@ use super::{
     EntityConfig, EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
     LogicalBufferConfig, LogicalEntityTarget, LogicalRouter, LogicalSingletonTarget, Mutex,
     NodeKey, OutboundMessaging, PlacementSlotKey, Protocol, ProtocolFingerprint,
-    RemoteMessageError, RouteBuffer, SingletonConfig, SingletonRef, WatchError, async_trait,
-    entity::EntityRouteHost, peers::PeerReconciler, proxy::EntityProxyRoute,
-    singleton::SingletonRouteHost, singleton_proxy::SingletonProxyRoute,
+    RemoteMessageError, RouteBuffer, ShardMapper, SingletonConfig, SingletonRef, WatchError,
+    Xxh3V1ShardMapper, async_trait, entity::EntityRouteHost, peers::PeerReconciler,
+    proxy::EntityProxyRoute, singleton::SingletonRouteHost, singleton_proxy::SingletonProxyRoute,
 };
 
 impl DomainLogicalRouter {
@@ -62,12 +62,35 @@ impl DomainLogicalRouter {
         L: ActorLoader<A>,
         P: Protocol,
     {
+        self.register_entity_with_mapper(
+            config,
+            Arc::new(Xxh3V1ShardMapper),
+            registry,
+            protocol,
+            loader,
+        )
+    }
+
+    pub fn register_entity_with_mapper<A, L, P>(
+        &mut self,
+        config: EntityConfig,
+        mapper: Arc<dyn ShardMapper>,
+        registry: Arc<ActorRegistry<A>>,
+        protocol: Arc<ActorProtocolBinding<A, P>>,
+        loader: L,
+    ) -> Result<(), ClusterRouterError>
+    where
+        A: Actor,
+        L: ActorLoader<A>,
+        P: Protocol,
+    {
         if self.entities.len() + self.singletons.len() == self.maximum_registrations {
             return Err(ClusterRouterError::Capacity);
         }
         if protocol.protocol_id() != config.protocol_id {
             return Err(ClusterRouterError::ProtocolMismatch);
         }
+        let mapper = config.bind_mapper(mapper)?;
         let domain = config.domain.clone();
         let entity_type = config.entity_type.clone();
         let key = (domain.clone(), entity_type.clone());
@@ -83,6 +106,7 @@ impl DomainLogicalRouter {
                     coordinator: self.coordinator.clone(),
                     buffer: RouteBuffer::new(self.buffer_config.clone()),
                     config,
+                    mapper,
                     registry,
                     protocol,
                     loader,
@@ -103,9 +127,19 @@ impl DomainLogicalRouter {
         config: EntityConfig,
         fingerprint: ProtocolFingerprint,
     ) -> Result<(), ClusterRouterError> {
+        self.register_entity_proxy_with_mapper(config, Arc::new(Xxh3V1ShardMapper), fingerprint)
+    }
+
+    pub fn register_entity_proxy_with_mapper(
+        &mut self,
+        config: EntityConfig,
+        mapper: Arc<dyn ShardMapper>,
+        fingerprint: ProtocolFingerprint,
+    ) -> Result<(), ClusterRouterError> {
         if self.entities.len() + self.singletons.len() == self.maximum_registrations {
             return Err(ClusterRouterError::Capacity);
         }
+        let mapper = config.bind_mapper(mapper)?;
         let domain = config.domain.clone();
         let entity_type = config.entity_type.clone();
         let key = (domain.clone(), entity_type.clone());
@@ -122,6 +156,7 @@ impl DomainLogicalRouter {
                     coordinator: self.coordinator.clone(),
                     buffer: RouteBuffer::new(self.buffer_config.clone()),
                     config,
+                    mapper,
                     fingerprint,
                 }),
             )

@@ -25,6 +25,7 @@ use lattice_core::{
 };
 use lattice_placement::{
     coordinator::SingletonConfig,
+    mapping::{ShardMapper, ShardMapperBinding, ShardMappingError, Xxh3V1ShardMapper},
     region::EntityConfig,
     session::LogicPlacementState,
     types::{NodeKey, PlacementSlot, PlacementSlotKey, PlacementSlotState},
@@ -186,6 +187,8 @@ pub enum ClusterRouterError {
     Capacity,
     #[error("cluster logical router protocol does not match its config")]
     ProtocolMismatch,
+    #[error("cluster logical router shard mapper does not match its config")]
+    ShardMapping(#[from] ShardMappingError),
     #[error("entity type {entity_type:?} is already registered in placement domain {domain}")]
     DuplicateEntity {
         domain: PlacementDomainId,

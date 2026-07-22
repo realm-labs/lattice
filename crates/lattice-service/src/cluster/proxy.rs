@@ -9,8 +9,8 @@ use super::{
     EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalEntityTarget,
     Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessage, OutboundMessaging,
     PlacementSlot, PlacementSlotKey, PlacementSlotState, ProtocolFingerprint, RemoteMessageError,
-    RouteBuffer, SenderIdentity, WatchError, async_trait, decode_resolved_actor,
-    entity::EntityRoute, map_tell, peers::PeerReconciler,
+    RouteBuffer, SenderIdentity, ShardMapperBinding, WatchError, async_trait,
+    decode_resolved_actor, entity::EntityRoute, map_tell, peers::PeerReconciler,
 };
 
 pub(super) struct EntityProxyRoute {
@@ -22,6 +22,7 @@ pub(super) struct EntityProxyRoute {
     pub(super) coordinator: AssociationKey,
     pub(super) buffer: RouteBuffer,
     pub(super) config: EntityConfig,
+    pub(super) mapper: ShardMapperBinding,
     pub(super) fingerprint: ProtocolFingerprint,
 }
 
@@ -36,7 +37,10 @@ impl EntityProxyRoute {
         Ok(PlacementSlotKey::Shard {
             domain: self.config.domain.clone(),
             entity_type: self.config.entity_type.clone(),
-            shard_id: self.config.shard_for(target.entity_id()),
+            shard_id: self
+                .mapper
+                .shard_for(target.entity_id())
+                .map_err(|_| RemoteMessageError::InvalidPayload)?,
         })
     }
 

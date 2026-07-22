@@ -19,7 +19,7 @@ fn fixture_entity_slot(
         key: PlacementSlotKey::Shard {
             domain: config.domain.clone(),
             entity_type: config.entity_type.clone(),
-            shard_id: config.shard_for(entity_id),
+            shard_id: config.shard_for(entity_id).expect("fixture uses Xxh3V1"),
         },
         config_fingerprint: config.fingerprint(),
         owner: Some(owner),

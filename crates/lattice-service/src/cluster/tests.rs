@@ -381,7 +381,7 @@ async fn stale_generation_never_reaches_entity_loader() {
     let slot_key = PlacementSlotKey::Shard {
         domain: domain(),
         entity_type: entity_config.entity_type.clone(),
-        shard_id: entity_config.shard_for(&entity_id),
+        shard_id: entity_config.shard_for(&entity_id).unwrap(),
     };
     let hello = test_hello(
         local_node.clone(),
@@ -429,7 +429,7 @@ async fn stale_generation_never_reaches_entity_loader() {
                 "domain/{}/shard/{}/{}",
                 domain().as_str(),
                 entity_config.entity_type.as_str(),
-                entity_config.shard_for(&entity_id).get()
+                entity_config.shard_for(&entity_id).unwrap().get()
             ),
             value: Bytes::from(serde_json::to_vec(&slot).unwrap()),
         }],
@@ -605,7 +605,7 @@ async fn remote_entity_ask_reaches_only_claimed_owner() {
         key: PlacementSlotKey::Shard {
             domain: domain(),
             entity_type: entity_config.entity_type.clone(),
-            shard_id: entity_config.shard_for(&entity_id),
+            shard_id: entity_config.shard_for(&entity_id).unwrap(),
         },
         config_fingerprint: entity_config.fingerprint(),
         owner: Some(owner_node.clone()),

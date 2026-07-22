@@ -5,6 +5,7 @@ pub mod authority;
 pub mod control;
 pub mod coordinator;
 pub mod handoff;
+pub mod mapping;
 pub mod membership_session;
 pub mod plan;
 pub mod region;
@@ -104,7 +105,7 @@ mod tests {
         )
         .unwrap();
         let entity = EntityId::new(b"player-42".to_vec()).unwrap();
-        assert_eq!(config.shard_for(&entity), ShardId::new(17));
+        assert_eq!(config.shard_for(&entity).unwrap(), ShardId::new(17));
         let reference: EntityRef = config
             .entity_ref(ClusterId::new("test").unwrap(), entity)
             .unwrap();

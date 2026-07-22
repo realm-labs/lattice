@@ -9,8 +9,9 @@ use super::{
     DispatchReply, EntityConfig, EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID,
     LogicPlacementState, LogicalEntityTarget, Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering,
     OutboundMessage, OutboundMessaging, PlacementSlot, PlacementSlotKey, PlacementSlotState,
-    Protocol, ProtocolFingerprint, RemoteMessageError, RouteBuffer, SenderIdentity, WatchError,
-    async_trait, decode_resolved_actor, drain_actor_ids, map_ask, map_dispatch, map_tell,
+    Protocol, ProtocolFingerprint, RemoteMessageError, RouteBuffer, SenderIdentity,
+    ShardMapperBinding, WatchError, async_trait, decode_resolved_actor, drain_actor_ids, map_ask,
+    map_dispatch, map_tell,
 };
 
 #[async_trait]
@@ -67,6 +68,7 @@ pub(super) struct EntityRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
     pub(super) coordinator: AssociationKey,
     pub(super) buffer: RouteBuffer,
     pub(super) config: EntityConfig,
+    pub(super) mapper: ShardMapperBinding,
     pub(super) registry: Arc<ActorRegistry<A>>,
     pub(super) protocol: Arc<ActorProtocolBinding<A, P>>,
     pub(super) loader: L,
@@ -83,7 +85,10 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
         Ok(PlacementSlotKey::Shard {
             domain: self.config.domain.clone(),
             entity_type: self.config.entity_type.clone(),
-            shard_id: self.config.shard_for(target.entity_id()),
+            shard_id: self
+                .mapper
+                .shard_for(target.entity_id())
+                .map_err(|_| RemoteMessageError::InvalidPayload)?,
         })
     }
 
@@ -481,8 +486,11 @@ where
             .active_actor_ids()
             .into_iter()
             .filter(|actor_id| match actor_id {
-                ActorId::Bytes(bytes) => EntityId::new(bytes.clone())
-                    .is_ok_and(|entity_id| self.config.shard_for(&entity_id) == shard_id),
+                ActorId::Bytes(bytes) => EntityId::new(bytes.clone()).is_ok_and(|entity_id| {
+                    self.mapper
+                        .shard_for(&entity_id)
+                        .is_ok_and(|mapped| mapped == shard_id)
+                }),
                 ActorId::Str(_) | ActorId::U64(_) | ActorId::I64(_) => false,
             })
             .collect::<Vec<_>>();
@@ -500,8 +508,11 @@ where
             .active_actor_ids()
             .into_iter()
             .filter(|actor_id| match actor_id {
-                ActorId::Bytes(bytes) => EntityId::new(bytes.clone())
-                    .is_ok_and(|entity_id| self.config.shard_for(&entity_id) == shard_id),
+                ActorId::Bytes(bytes) => EntityId::new(bytes.clone()).is_ok_and(|entity_id| {
+                    self.mapper
+                        .shard_for(&entity_id)
+                        .is_ok_and(|mapped| mapped == shard_id)
+                }),
                 ActorId::Str(_) | ActorId::U64(_) | ActorId::I64(_) => false,
             })
             .collect::<Vec<_>>();
@@ -536,8 +547,11 @@ where
             .active_actor_ids()
             .into_iter()
             .filter(|actor_id| match actor_id {
-                ActorId::Bytes(bytes) => EntityId::new(bytes.clone())
-                    .is_ok_and(|entity_id| self.config.shard_for(&entity_id) == shard_id),
+                ActorId::Bytes(bytes) => EntityId::new(bytes.clone()).is_ok_and(|entity_id| {
+                    self.mapper
+                        .shard_for(&entity_id)
+                        .is_ok_and(|mapped| mapped == shard_id)
+                }),
                 ActorId::Str(_) | ActorId::U64(_) | ActorId::I64(_) => false,
             })
             .collect::<Vec<_>>();

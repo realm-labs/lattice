@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    sync::Arc,
     time::Duration,
 };
 
@@ -9,14 +10,14 @@ use lattice_core::actor_ref::{
     PlacementDomainId, ProtocolId, ProtocolTag, ReferenceError,
 };
 use thiserror::Error;
-use xxhash_rust::xxh3::xxh3_64_with_seed;
 
-use crate::types::{
-    AssignmentGeneration, MonotonicTime, NodeKey, PlacementSlotState, Revision, ShardId,
+use crate::{
+    mapping::{
+        ShardMapper, ShardMapperBinding, ShardMappingError, XXH3_V1_MAPPER_ID,
+        XXH3_V1_MAPPER_VERSION, XXH3_V1_SEED, Xxh3V1ShardMapper,
+    },
+    types::{AssignmentGeneration, MonotonicTime, NodeKey, PlacementSlotState, Revision, ShardId},
 };
-
-pub const XXH3_V1_SEED: u64 = 0x4c41_5454_4943_4531;
-pub const XXH3_V1_HASH_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityConfig {
@@ -24,7 +25,19 @@ pub struct EntityConfig {
     pub entity_type: EntityType,
     pub protocol_id: ProtocolId,
     pub shard_count: u32,
-    pub shard_hash_version: u32,
+    #[serde(
+        default = "default_shard_mapper_id",
+        skip_serializing_if = "is_default_shard_mapper_id"
+    )]
+    pub shard_mapper_id: String,
+    // Keep the generation-5 wire field name so default-mapper rolling upgrades
+    // remain readable by older processes. Custom mapper fingerprints are still
+    // rejected by processes that do not understand `shard_mapper_id`.
+    #[serde(
+        rename = "shard_hash_version",
+        default = "default_shard_mapper_version"
+    )]
+    pub shard_mapper_version: u32,
     pub allocation_policy_id: String,
     pub allocation_policy_version: u32,
     pub hard_constraints: Vec<String>,
@@ -39,14 +52,44 @@ impl EntityConfig {
         shard_count: u32,
         allocation_policy_id: impl Into<String>,
         allocation_policy_version: u32,
-        mut hard_constraints: Vec<String>,
+        hard_constraints: Vec<String>,
     ) -> Result<Self, RegionError> {
+        Self::new_with_mapper_identity(
+            domain,
+            entity_type,
+            protocol_id,
+            shard_count,
+            (XXH3_V1_MAPPER_ID, XXH3_V1_MAPPER_VERSION),
+            (allocation_policy_id, allocation_policy_version),
+            hard_constraints,
+        )
+    }
+
+    fn new_with_mapper_identity<M, P>(
+        domain: PlacementDomainId,
+        entity_type: EntityType,
+        protocol_id: ProtocolId,
+        shard_count: u32,
+        mapper: (M, u32),
+        allocation_policy: (P, u32),
+        mut hard_constraints: Vec<String>,
+    ) -> Result<Self, RegionError>
+    where
+        M: Into<String>,
+        P: Into<String>,
+    {
         if shard_count == 0 || shard_count > 1_048_576 {
             return Err(RegionError::InvalidShardCount);
         }
-        let allocation_policy_id = allocation_policy_id.into();
+        let shard_mapper_id = mapper.0.into();
+        let shard_mapper_version = mapper.1;
+        let allocation_policy_id = allocation_policy.0.into();
+        let allocation_policy_version = allocation_policy.1;
         if allocation_policy_id.is_empty()
             || allocation_policy_id.len() > 128
+            || shard_mapper_id.is_empty()
+            || shard_mapper_id.len() > 128
+            || shard_mapper_version == 0
             || allocation_policy_version == 0
             || hard_constraints.len() > 64
             || hard_constraints.iter().any(|value| value.len() > 256)
@@ -62,8 +105,17 @@ impl EntityConfig {
         canonical.extend_from_slice(entity_type.as_str().as_bytes());
         canonical.extend_from_slice(&protocol_id.get().to_be_bytes());
         canonical.extend_from_slice(&shard_count.to_be_bytes());
-        canonical.extend_from_slice(&XXH3_V1_HASH_VERSION.to_be_bytes());
-        canonical.extend_from_slice(&XXH3_V1_SEED.to_be_bytes());
+        if shard_mapper_id == XXH3_V1_MAPPER_ID && shard_mapper_version == XXH3_V1_MAPPER_VERSION {
+            // Preserve the original Xxh3V1 configuration fingerprint.
+            canonical.extend_from_slice(&XXH3_V1_MAPPER_VERSION.to_be_bytes());
+            canonical.extend_from_slice(&XXH3_V1_SEED.to_be_bytes());
+        } else {
+            canonical.extend_from_slice(&0_u32.to_be_bytes());
+            canonical.extend_from_slice(b"custom-shard-mapper");
+            canonical.extend_from_slice(&(shard_mapper_id.len() as u32).to_be_bytes());
+            canonical.extend_from_slice(shard_mapper_id.as_bytes());
+            canonical.extend_from_slice(&shard_mapper_version.to_be_bytes());
+        }
         canonical.extend_from_slice(&(allocation_policy_id.len() as u32).to_be_bytes());
         canonical.extend_from_slice(allocation_policy_id.as_bytes());
         canonical.extend_from_slice(&allocation_policy_version.to_be_bytes());
@@ -78,7 +130,8 @@ impl EntityConfig {
             entity_type,
             protocol_id,
             shard_count,
-            shard_hash_version: XXH3_V1_HASH_VERSION,
+            shard_mapper_id,
+            shard_mapper_version,
             allocation_policy_id,
             allocation_policy_version,
             hard_constraints,
@@ -90,28 +143,74 @@ impl EntityConfig {
         self.fingerprint
     }
 
+    pub fn with_shard_mapper(mut self, mapper: &dyn ShardMapper) -> Result<Self, RegionError> {
+        self.shard_mapper_id = mapper.mapper_id().to_owned();
+        self.shard_mapper_version = mapper.mapper_version();
+        Self::new_with_mapper_identity(
+            self.domain,
+            self.entity_type,
+            self.protocol_id,
+            self.shard_count,
+            (self.shard_mapper_id, self.shard_mapper_version),
+            (self.allocation_policy_id, self.allocation_policy_version),
+            self.hard_constraints,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), RegionError> {
-        let rebuilt = Self::new(
+        let rebuilt = Self::new_with_mapper_identity(
             self.domain.clone(),
             self.entity_type.clone(),
             self.protocol_id,
             self.shard_count,
-            self.allocation_policy_id.clone(),
-            self.allocation_policy_version,
+            (self.shard_mapper_id.clone(), self.shard_mapper_version),
+            (
+                self.allocation_policy_id.clone(),
+                self.allocation_policy_version,
+            ),
             self.hard_constraints.clone(),
         )?;
-        if self.shard_hash_version != XXH3_V1_HASH_VERSION
-            || rebuilt.fingerprint != self.fingerprint
-        {
+        if rebuilt.fingerprint != self.fingerprint {
             return Err(RegionError::InvalidConfig);
         }
         Ok(())
     }
 
-    pub fn shard_for(&self, entity_id: &EntityId) -> ShardId {
-        ShardId::new(
-            (xxh3_64_with_seed(entity_id.as_bytes(), XXH3_V1_SEED) % u64::from(self.shard_count))
-                as u32,
+    pub fn shard_for(&self, entity_id: &EntityId) -> Result<ShardId, ShardMappingError> {
+        self.shard_for_with(&Xxh3V1ShardMapper, entity_id)
+    }
+
+    pub fn shard_for_with(
+        &self,
+        mapper: &dyn ShardMapper,
+        entity_id: &EntityId,
+    ) -> Result<ShardId, ShardMappingError> {
+        self.validate_mapper(mapper)?;
+        let shard_id = mapper.shard_for(entity_id, self.shard_count)?;
+        if shard_id.get() >= self.shard_count {
+            return Err(ShardMappingError::ShardOutOfRange);
+        }
+        Ok(shard_id)
+    }
+
+    pub fn validate_mapper(&self, mapper: &dyn ShardMapper) -> Result<(), ShardMappingError> {
+        if mapper.mapper_id() != self.shard_mapper_id
+            || mapper.mapper_version() != self.shard_mapper_version
+        {
+            return Err(ShardMappingError::MapperMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn bind_mapper(
+        &self,
+        mapper: Arc<dyn ShardMapper>,
+    ) -> Result<ShardMapperBinding, ShardMappingError> {
+        ShardMapperBinding::new(
+            mapper,
+            &self.shard_mapper_id,
+            self.shard_mapper_version,
+            self.shard_count,
         )
     }
 
@@ -130,6 +229,18 @@ impl EntityConfig {
         )?
         .try_typed()
     }
+}
+
+fn default_shard_mapper_id() -> String {
+    XXH3_V1_MAPPER_ID.to_owned()
+}
+
+fn is_default_shard_mapper_id(mapper_id: &str) -> bool {
+    mapper_id == XXH3_V1_MAPPER_ID
+}
+
+const fn default_shard_mapper_version() -> u32 {
+    XXH3_V1_MAPPER_VERSION
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +323,7 @@ pub enum RouteDecision {
 
 pub struct ShardRegion {
     local_incarnation: NodeIncarnation,
-    entity: EntityConfig,
+    mapper: ShardMapperBinding,
     config: RegionConfig,
     homes: BTreeMap<ShardId, ShardHome>,
     inflight: HashSet<ShardId>,
@@ -228,10 +339,25 @@ impl ShardRegion {
         entity: EntityConfig,
         config: RegionConfig,
     ) -> Result<Self, RegionError> {
-        config.validate()?;
-        Ok(Self {
+        Self::with_mapper(
             local_incarnation,
             entity,
+            Arc::new(Xxh3V1ShardMapper),
+            config,
+        )
+    }
+
+    pub fn with_mapper(
+        local_incarnation: NodeIncarnation,
+        entity: EntityConfig,
+        mapper: Arc<dyn ShardMapper>,
+        config: RegionConfig,
+    ) -> Result<Self, RegionError> {
+        config.validate()?;
+        let mapper = entity.bind_mapper(mapper)?;
+        Ok(Self {
+            local_incarnation,
+            mapper,
             config,
             homes: BTreeMap::new(),
             inflight: HashSet::new(),
@@ -291,7 +417,7 @@ impl ShardRegion {
         if message_id == 0 {
             return Err(RegionError::InvalidMessage);
         }
-        let shard_id = self.entity.shard_for(&entity_id);
+        let shard_id = self.mapper.shard_for(&entity_id)?;
         if let Some(home) = self.homes.get(&shard_id)
             && home.state == PlacementSlotState::Running
         {
@@ -431,6 +557,8 @@ pub enum RegionError {
     InvalidShardCount,
     #[error("entity configuration is invalid")]
     InvalidConfig,
+    #[error("entity shard mapping failed")]
+    ShardMapping(#[from] ShardMappingError),
     #[error("Region limit must be nonzero")]
     ZeroLimit,
     #[error("Region home cache is full")]
@@ -456,6 +584,41 @@ mod tests {
     use lattice_core::actor_ref::{NodeAddress, ProtocolId};
 
     use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    struct WorldRegionMapper;
+
+    impl ShardMapper for WorldRegionMapper {
+        fn mapper_id(&self) -> &'static str {
+            "minecraft-world"
+        }
+
+        fn mapper_version(&self) -> u32 {
+            1
+        }
+
+        fn shard_for(
+            &self,
+            entity_id: &EntityId,
+            shard_count: u32,
+        ) -> Result<ShardId, ShardMappingError> {
+            let world = entity_id
+                .as_bytes()
+                .get(..8)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_be_bytes)
+                .ok_or(ShardMappingError::InvalidEntityId)?;
+            Ok(ShardId::new((world % u64::from(shard_count)) as u32))
+        }
+    }
+
+    fn region_id(world: u64, x: i32, z: i32) -> EntityId {
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&world.to_be_bytes());
+        bytes.extend_from_slice(&x.to_be_bytes());
+        bytes.extend_from_slice(&z.to_be_bytes());
+        EntityId::new(bytes).unwrap()
+    }
 
     fn entity() -> EntityConfig {
         EntityConfig::new(
@@ -501,6 +664,113 @@ mod tests {
         )
         .unwrap();
         assert_ne!(config.fingerprint(), another_domain.fingerprint());
+    }
+
+    #[test]
+    fn default_mapper_keeps_the_generation_five_wire_field() {
+        let config = entity();
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(encoded["shard_hash_version"], 1);
+        assert!(encoded.get("shard_mapper_id").is_none());
+        assert!(encoded.get("shard_mapper_version").is_none());
+
+        let decoded: EntityConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.shard_mapper_id, XXH3_V1_MAPPER_ID);
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn custom_mapper_groups_regions_by_world_and_is_part_of_the_fingerprint() {
+        let default = EntityConfig::new(
+            PlacementDomainId::new("minecraft").unwrap(),
+            EntityType::new("region").unwrap(),
+            ProtocolId::new(7).unwrap(),
+            128,
+            "weighted-least-load",
+            1,
+            Vec::new(),
+        )
+        .unwrap();
+        let custom = default
+            .clone()
+            .with_shard_mapper(&WorldRegionMapper)
+            .unwrap();
+        assert_ne!(default.fingerprint(), custom.fingerprint());
+        assert_eq!(
+            custom
+                .shard_for_with(&WorldRegionMapper, &region_id(7, -10, 4))
+                .unwrap(),
+            custom
+                .shard_for_with(&WorldRegionMapper, &region_id(7, 900, -300))
+                .unwrap()
+        );
+        assert_ne!(
+            custom
+                .shard_for_with(&WorldRegionMapper, &region_id(7, 0, 0))
+                .unwrap(),
+            custom
+                .shard_for_with(&WorldRegionMapper, &region_id(8, 0, 0))
+                .unwrap()
+        );
+        assert_eq!(
+            custom.shard_for(&region_id(7, 0, 0)),
+            Err(ShardMappingError::MapperMismatch)
+        );
+    }
+
+    #[test]
+    fn custom_mapper_drives_region_single_flight_by_affinity_group() {
+        let config = EntityConfig::new(
+            PlacementDomainId::new("minecraft").unwrap(),
+            EntityType::new("region").unwrap(),
+            ProtocolId::new(7).unwrap(),
+            128,
+            "weighted-least-load",
+            1,
+            Vec::new(),
+        )
+        .unwrap()
+        .with_shard_mapper(&WorldRegionMapper)
+        .unwrap();
+        let mut region = ShardRegion::with_mapper(
+            NodeIncarnation::new(1).unwrap(),
+            config,
+            Arc::new(WorldRegionMapper),
+            RegionConfig::default(),
+        )
+        .unwrap();
+        let first = region
+            .route(
+                region_id(42, 0, 0),
+                1,
+                BufferedMessageMode::Tell,
+                Bytes::new(),
+                MonotonicTime::from_millis(1),
+            )
+            .unwrap();
+        let second = region
+            .route(
+                region_id(42, 100, -100),
+                2,
+                BufferedMessageMode::Tell,
+                Bytes::new(),
+                MonotonicTime::from_millis(2),
+            )
+            .unwrap();
+        assert_eq!(
+            first,
+            RouteDecision::Buffered {
+                shard_id: ShardId::new(42),
+                start_lookup: true,
+            }
+        );
+        assert_eq!(
+            second,
+            RouteDecision::Buffered {
+                shard_id: ShardId::new(42),
+                start_lookup: false,
+            }
+        );
     }
 
     #[test]

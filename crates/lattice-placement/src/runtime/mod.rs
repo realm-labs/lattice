@@ -22,7 +22,7 @@ use crate::{
     allocation::{
         AllocationError, AllocationRequest, LoadSample, PlacedShard, PlacementNode, PlacementView,
         RebalanceLimits, RebalanceProposal, RebalanceTrigger, ShardAllocationStrategy,
-        WeightedLeastLoad,
+        registry::ShardAllocationStrategies,
     },
     control::{
         DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlError,
@@ -484,6 +484,27 @@ where
         term: CoordinatorTerm,
         config: PlacementDomainLeaderConfig,
     ) -> Result<Self, CoordinatorRuntimeError> {
+        Self::elect_with_strategies(
+            store,
+            associations,
+            node,
+            scope,
+            term,
+            config,
+            ShardAllocationStrategies::default(),
+        )
+        .await
+    }
+
+    pub async fn elect_with_strategies(
+        store: Arc<S>,
+        associations: Arc<AssociationManager>,
+        node: NodeKey,
+        scope: CoordinatorScope,
+        term: CoordinatorTerm,
+        config: PlacementDomainLeaderConfig,
+        strategies: ShardAllocationStrategies,
+    ) -> Result<Self, CoordinatorRuntimeError> {
         config.validate()?;
         store.ensure_schema_generation().await?;
         let leader_lease_id = store.grant_lease(config.leader_lease_ttl).await?;
@@ -545,16 +566,7 @@ where
             .map(|operation| (operation.operation_id.clone(), operation))
             .collect::<BTreeMap<_, _>>();
         let (operations, operation_receiver) = mpsc::channel(config.maximum_operations);
-        let default_strategy: Arc<dyn ShardAllocationStrategy> =
-            Arc::new(WeightedLeastLoad::default());
-        let mut strategies = BTreeMap::new();
-        strategies.insert(
-            (
-                default_strategy.policy_id().to_owned(),
-                default_strategy.policy_version(),
-            ),
-            default_strategy,
-        );
+        let strategies = strategies.into_inner();
         let slot_assigned_at = slots
             .iter()
             .filter(|slot| slot.state == PlacementSlotState::Running)

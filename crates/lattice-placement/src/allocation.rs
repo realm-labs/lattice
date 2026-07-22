@@ -8,6 +8,8 @@ use thiserror::Error;
 
 use crate::types::{AssignmentGeneration, MonotonicTime, NodeKey, PlacementVersion, ShardId};
 
+pub mod registry;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadSample {
     pub boot_incarnation: NodeIncarnation,

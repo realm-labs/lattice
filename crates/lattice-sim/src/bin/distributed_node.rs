@@ -857,7 +857,10 @@ async fn entity_owner(reference: PathBuf) -> Result<(), Box<dyn Error>> {
             "revision": slot.version.revision.get(),
             "slot": {
                 "entity_type": entity_config.entity_type.as_str(),
-                "shard_id": entity_config.shard_for(&entity_id).get(),
+                "shard_id": entity_config
+                    .shard_for(&entity_id)
+                    .expect("simulation uses Xxh3V1")
+                    .get(),
                 "owner_node_id": owner.node_id.clone(),
                 "owner_address": owner.address.to_string(),
                 "owner_incarnation": owner.incarnation.get().to_string(),

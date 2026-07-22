@@ -25,6 +25,10 @@ use super::{
     membership_plane::{MembershipLeader, MembershipLeaderConfig},
 };
 use crate::{
+    allocation::{
+        ShardAllocationStrategy,
+        registry::{ShardAllocationStrategies, StrategyRegistrationError},
+    },
     control::{
         PlacementControlCommand, PlacementControlEvent, PlacementControlEventKind,
         encode_control_command,
@@ -38,8 +42,10 @@ use crate::{
 };
 
 mod election;
+#[cfg(test)]
+mod strategy_tests;
 
-use election::{candidate_delay, next_term};
+use election::{candidate_delay, elect_domain_leader, next_term};
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorHostConfig {
@@ -49,6 +55,7 @@ pub struct CoordinatorHostConfig {
     pub control_capacity_per_domain: usize,
     pub renewal_interval: Duration,
     pub maximum_candidate_jitter: Duration,
+    pub allocation_strategies: ShardAllocationStrategies,
 }
 
 impl Default for CoordinatorHostConfig {
@@ -60,11 +67,28 @@ impl Default for CoordinatorHostConfig {
             control_capacity_per_domain: 256,
             renewal_interval: Duration::from_secs(5),
             maximum_candidate_jitter: Duration::from_millis(25),
+            allocation_strategies: ShardAllocationStrategies::default(),
         }
     }
 }
 
 impl CoordinatorHostConfig {
+    pub fn with_allocation_strategy(
+        mut self,
+        strategy: Arc<dyn ShardAllocationStrategy>,
+    ) -> Result<Self, StrategyRegistrationError> {
+        self.allocation_strategies.register(strategy)?;
+        Ok(self)
+    }
+
+    pub fn with_replaced_allocation_strategy(
+        mut self,
+        strategy: Arc<dyn ShardAllocationStrategy>,
+    ) -> Result<Self, StrategyRegistrationError> {
+        self.allocation_strategies.replace(strategy)?;
+        Ok(self)
+    }
+
     fn validate(
         &self,
         domains: &BTreeSet<PlacementDomainId>,
@@ -167,13 +191,13 @@ where
             let scope = CoordinatorScope::Placement(domain.clone());
             candidate_delay(&scope, &node, config.maximum_candidate_jitter).await;
             let term = next_term(store.as_ref(), &scope).await?;
-            let leader = match PlacementDomainLeader::elect(
+            let leader = match elect_domain_leader(
                 store.clone(),
                 associations.clone(),
                 node.clone(),
                 scope,
                 term,
-                config.placement.clone(),
+                &config,
             )
             .await
             {
@@ -318,13 +342,13 @@ where
                         let scope = CoordinatorScope::Placement(domain.clone());
                         candidate_delay(&scope, &self.node, self.config.maximum_candidate_jitter).await;
                         let term = next_term(self.store.as_ref(), &scope).await?;
-                        match PlacementDomainLeader::elect(
+                        match elect_domain_leader(
                             self.store.clone(),
                             self.associations.clone(),
                             self.node.clone(),
                             scope,
                             term,
-                            self.config.placement.clone(),
+                            &self.config,
                         ).await {
                             Ok(leader) => {
                                 let record = leader.leader().clone();
