@@ -199,9 +199,10 @@ impl ShardMapper for WorldRegionMapper {
     }
 }
 
+let affinity = WorldRegionAffinity::default();
 let regions = EntityOptions::new(domain, EntityType::new("region")?, 1024)
     .shard_mapper(WorldRegionMapper)
-    .allocation_policy("world-region-affinity", 1);
+    .allocation_strategy(&affinity);
 ```
 
 The mapper ID/version is part of the entity configuration fingerprint. Every host and proxy for the
@@ -240,10 +241,12 @@ let host = CoordinatorHostConfig::default()
     .with_allocation_strategy(Arc::new(WorldRegionAffinity::default()))?;
 ```
 
-The registry is installed before recovery and is reused by every later leader election. Setting only
-`EntityOptions::allocation_policy` selects an ID/version; it does not install executable strategy
-code. Use `with_replaced_allocation_strategy` when tuning the built-in `weighted-least-load` ID/version
-rather than registering a new policy identity.
+The registry is installed before recovery and is reused by every later leader election. Calling
+`EntityOptions::allocation_strategy` reads and persists the implementation's ID/version; it does not
+install executable strategy code into a separate Coordinator process. Use
+`allocation_policy_identity` only when the implementation is intentionally unavailable in the
+current process. Use `with_replaced_allocation_strategy` when tuning the built-in
+`weighted-least-load` ID/version rather than registering a new policy identity.
 
 ```rust
 pub trait ShardAllocationStrategy: Send + Sync + 'static {

@@ -6,6 +6,7 @@ use lattice_core::actor_ref::{EntityType, PlacementDomainId, ProtocolId, Singlet
 use lattice_core::kind::ActorKind;
 use lattice_placement::coordinator::SingletonConfig;
 use lattice_placement::{
+    allocation::ShardAllocationStrategy,
     mapping::{ShardMapper, Xxh3V1ShardMapper},
     region::{EntityConfig, RegionError},
 };
@@ -55,7 +56,17 @@ impl EntityOptions {
         self
     }
 
-    pub fn allocation_policy(mut self, id: impl Into<String>, version: u32) -> Self {
+    pub fn allocation_strategy(mut self, strategy: &dyn ShardAllocationStrategy) -> Self {
+        self.allocation_policy_id = strategy.policy_id().to_owned();
+        self.allocation_policy_version = strategy.policy_version();
+        self
+    }
+
+    /// Selects a policy by its durable identity without holding its implementation.
+    ///
+    /// Prefer [`Self::allocation_strategy`] when the strategy implementation is
+    /// available in the current process.
+    pub fn allocation_policy_identity(mut self, id: impl Into<String>, version: u32) -> Self {
         self.allocation_policy_id = id.into();
         self.allocation_policy_version = version;
         self
@@ -146,11 +157,49 @@ impl SingletonOptions {
 #[cfg(test)]
 mod tests {
     use lattice_core::actor_ref::{EntityId, ProtocolId};
-    use lattice_placement::{mapping::ShardMappingError, types::ShardId};
+    use lattice_placement::{
+        allocation::{
+            AllocationDecision, AllocationError, AllocationRequest, PlacementView, RebalanceLimits,
+            RebalanceProposal, RebalanceTrigger,
+        },
+        mapping::ShardMappingError,
+        types::ShardId,
+    };
 
     use super::*;
 
     struct WorldMapper;
+
+    struct WorldAffinity;
+
+    impl ShardAllocationStrategy for WorldAffinity {
+        fn policy_id(&self) -> &'static str {
+            "world-affinity"
+        }
+
+        fn policy_version(&self) -> u32 {
+            3
+        }
+
+        fn allocate(
+            &self,
+            _request: &AllocationRequest,
+            _view: &PlacementView,
+        ) -> Result<AllocationDecision, AllocationError> {
+            Err(AllocationError::NoEligibleNode)
+        }
+
+        fn rebalance(
+            &self,
+            _entity_type: &EntityType,
+            _required_protocol: ProtocolId,
+            _trigger: RebalanceTrigger,
+            _view: &PlacementView,
+            _limits: RebalanceLimits,
+        ) -> Result<RebalanceProposal, AllocationError> {
+            Err(AllocationError::NoEligibleNode)
+        }
+    }
 
     impl ShardMapper for WorldMapper {
         fn mapper_id(&self) -> &'static str {
@@ -183,11 +232,14 @@ mod tests {
             256,
         )
         .shard_mapper(WorldMapper)
+        .allocation_strategy(&WorldAffinity)
         .build(ProtocolId::new(7).unwrap())
         .unwrap();
 
         assert_eq!(config.shard_mapper_id, "world-affinity");
         assert_eq!(config.shard_mapper_version, 3);
+        assert_eq!(config.allocation_policy_id, "world-affinity");
+        assert_eq!(config.allocation_policy_version, 3);
         assert_eq!(
             config
                 .shard_for_with(&WorldMapper, &EntityId::new(vec![42, 1, 2]).unwrap())
