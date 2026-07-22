@@ -750,6 +750,12 @@ impl<A: Actor> ActorContext<A> {
     }
 
     pub(crate) fn reap_runtime_work(&mut self) {
+        if self.tasks.is_empty()
+            && self.deferred_tasks.is_empty()
+            && self.pending_replies.is_empty()
+        {
+            return;
+        }
         Self::reap_tasks(&mut self.tasks, "scoped");
         Self::reap_tasks(&mut self.deferred_tasks, "deferred");
         self.pending_replies.retain(|pending| !pending.reap());

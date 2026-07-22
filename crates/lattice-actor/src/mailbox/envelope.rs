@@ -39,6 +39,7 @@ pub(crate) struct PooledEnvelope<A: Actor> {
 unsafe impl<A: Actor> Send for PooledEnvelope<A> {}
 
 impl<A: Actor> PooledEnvelope<A> {
+    #[inline]
     pub(super) fn new<T>(value: T) -> Self
     where
         T: ActorEnvelope<A> + 'static,

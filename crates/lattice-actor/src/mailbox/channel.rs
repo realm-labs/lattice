@@ -22,7 +22,6 @@ pub(crate) fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         queue: ConcurrentQueue::bounded(capacity),
         capacity,
         state: AtomicUsize::new(capacity),
-        receiver_alive: AtomicBool::new(true),
         sender_count: AtomicUsize::new(1),
         receiver_waiting: AtomicBool::new(false),
         receiver_waker: AtomicWaker::new(),
@@ -40,7 +39,6 @@ struct Inner<T> {
     queue: ConcurrentQueue<T>,
     capacity: usize,
     state: AtomicUsize,
-    receiver_alive: AtomicBool,
     sender_count: AtomicUsize,
     receiver_waiting: AtomicBool,
     receiver_waker: AtomicWaker,
@@ -48,11 +46,8 @@ struct Inner<T> {
 }
 
 impl<T> Inner<T> {
+    #[inline(always)]
     fn try_acquire(&self) -> Result<(), TrySendError<()>> {
-        if !self.receiver_alive.load(Ordering::Acquire) {
-            return Err(TrySendError::Closed(()));
-        }
-
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
             if state & CLOSED_BIT != 0 {
@@ -65,7 +60,7 @@ impl<T> Inner<T> {
             match self.state.compare_exchange_weak(
                 state,
                 state - 1,
-                Ordering::Acquire,
+                Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return Ok(()),
@@ -74,8 +69,12 @@ impl<T> Inner<T> {
         }
     }
 
+    #[inline(always)]
     fn release_slot(&self) {
-        let previous = self.state.fetch_add(1, Ordering::Release);
+        // The queue's push/pop sequence publishes and acquires the message itself. This counter
+        // only reserves capacity and participates in the closed-bit modification order, so it
+        // does not need to carry payload synchronization as well.
+        let previous = self.state.fetch_add(1, Ordering::Relaxed);
         debug_assert!(previous & AVAILABLE_MASK < self.capacity);
         if previous & AVAILABLE_MASK == 0 {
             self.wake_capacity_waiters();
@@ -106,6 +105,7 @@ pub(crate) struct Sender<T> {
 }
 
 impl<T> Sender<T> {
+    #[inline(always)]
     pub(crate) fn try_reserve(&self) -> Result<Permit<'_, T>, TrySendError<()>> {
         self.inner.try_acquire()?;
         Ok(Permit {
@@ -180,13 +180,9 @@ pub(crate) struct Permit<'a, T> {
 }
 
 impl<T> Permit<'_, T> {
+    #[inline(always)]
     pub(crate) fn send(mut self, value: T) {
         self.active = false;
-        if !self.inner.receiver_alive.load(Ordering::Acquire) {
-            self.inner.release_slot();
-            drop(value);
-            return;
-        }
         if let Err(error) = self.inner.queue.push(value) {
             self.inner.release_slot();
             drop(error.into_inner());
@@ -210,6 +206,7 @@ pub(crate) struct Receiver<T> {
 }
 
 impl<T> Receiver<T> {
+    #[inline(always)]
     pub(crate) fn try_recv(&mut self) -> Result<T, TryRecvError> {
         if let Ok(value) = self.inner.queue.pop() {
             self.inner.release_slot();
@@ -264,7 +261,6 @@ impl<T> Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.inner.receiver_alive.store(false, Ordering::Release);
         self.inner.state.fetch_or(CLOSED_BIT, Ordering::Release);
         self.inner.queue.close();
         while self.inner.queue.pop().is_ok() {
@@ -288,6 +284,7 @@ pub(crate) enum TryRecvError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use super::*;
@@ -380,6 +377,24 @@ mod tests {
         permit.send(7);
         assert_eq!(receiver.recv().await, Some(7));
         assert_eq!(receiver.recv().await, None);
+    }
+
+    #[test]
+    fn reserved_value_is_dropped_when_receiver_is_gone() {
+        struct DropValue(Arc<AtomicUsize>);
+
+        impl Drop for DropValue {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver) = channel(1);
+        let permit = sender.try_reserve().unwrap();
+        drop(receiver);
+        permit.send(DropValue(drops.clone()));
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

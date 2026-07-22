@@ -27,6 +27,7 @@ impl BlockPool {
         }
     }
 
+    #[inline]
     pub(super) fn allocate(&self, layout: Layout) -> NonNull<u8> {
         if let Some(class) = class_for(layout) {
             if let Ok(FreeBlock(pointer)) = self.class(class).pop() {
@@ -37,6 +38,7 @@ impl BlockPool {
         allocate_uncached(layout)
     }
 
+    #[inline]
     pub(super) fn recycle(&self, pointer: NonNull<u8>, layout: Layout) {
         if let Some(class) = class_for(layout) {
             let Err(error) = self.class(class).push(FreeBlock(pointer)) else {

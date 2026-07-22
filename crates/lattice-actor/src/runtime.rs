@@ -1056,9 +1056,13 @@ where
             let handled = {
                 let future = envelope.handle(instance.actor, instance.behavior, ctx, &metadata);
                 tokio::pin!(future);
-                AssertUnwindSafe(future.as_mut().instrument(span))
-                    .catch_unwind()
-                    .await
+                if span.is_disabled() {
+                    AssertUnwindSafe(future.as_mut()).catch_unwind().await
+                } else {
+                    AssertUnwindSafe(future.as_mut().instrument(span))
+                        .catch_unwind()
+                        .await
+                }
             };
             let outcome = match handled {
                 Ok(outcome) => outcome,

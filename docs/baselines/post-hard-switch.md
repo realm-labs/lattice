@@ -408,6 +408,33 @@ The concurrent lane test now holds eight asks in flight across an idle timeout s
 handler delay, validating request batching, reply batching, and the existing in-flight idle fence.
 The transport tests continue to exercise partial vectored writes and per-frame commitment boundaries.
 
+### Disabled-observation Actor fast path
+
+A 2026-07-22 Time Profiler capture of the normal 64-message turn found that the benchmark payload's
+`Bytes` reference-count clone was the largest individual leaf (26.1% of active samples). The
+framework-controlled samples were concentrated in mailbox receive/admission and in the generic
+instrumented-future wrapper. Envelope pooling was only about 3% after the preceding pooling work, so
+this pass deliberately did not add a more complex batched allocator.
+
+The retained changes remove a redundant receiver-liveness load after a mailbox permit has already
+been acquired, use the queue itself to reject a send racing receiver destruction, keep the
+capacity-only atomic state relaxed, inline the short mailbox fast paths, skip empty runtime-work
+reaping, and bypass `tracing::Instrumented` when the message span is disabled. Panic isolation,
+observer timing, bounded admission, typed-message recovery, and the 64-message fairness boundary are
+unchanged.
+
+The same-session Criterion workload used 200,000 128-byte tells per sample. Before this pass it
+measured 44.151--46.279 ms (45.209 ms point estimate), or 4.322--4.530M completed tells/s. The final
+candidate measured 35.922--37.114 ms (36.646 ms point estimate), or 5.389--5.568M/s. Point-estimate
+elapsed time fell by 18.9% and throughput rose by 23.4%. The counting-allocator run recorded 479
+allocations for 200,000 completed tells (0.0024/message), which remains fixed pool/runtime warmup
+rather than a per-message allocation shape.
+
+The isolated sequential loopback TCP ask workload measured 10.935K/s with no statistically
+significant change. A repeated prepared-remoting admission capture measured 2.7893 ms per 10,000
+messages and likewise reported no significant change. These checks are expected: the optimized code
+is the local Actor execution path rather than transport encoding or socket I/O.
+
 The MongoDB persistence framework baseline was captured with:
 
 ```text
