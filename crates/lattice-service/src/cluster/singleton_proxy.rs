@@ -6,11 +6,11 @@ use lattice_remoting::{association::Association, messaging::error::RemoteFailure
 
 use super::{
     ActorRef, AskError, AssociationKey, AssociationManager, AssociationState, Bytes, Instant,
-    LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalSingletonTarget, Mutex,
-    NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessage, OutboundMessaging, PlacementSlot,
-    PlacementSlotKey, PlacementSlotState, ProtocolFingerprint, RemoteMessageError, RouteBuffer,
-    SenderIdentity, SingletonConfig, SingletonRef, WatchError, async_trait, decode_resolved_actor,
-    map_tell, peers::PeerReconciler, singleton::SingletonRoute,
+    LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState, LogicalSingletonTarget, Mutex, NodeKey,
+    OutboundMessage, OutboundMessaging, PlacementSlot, PlacementSlotKey, PlacementSlotState,
+    ProtocolFingerprint, RemoteMessageError, RouteBuffer, SenderIdentity, SingletonConfig,
+    SingletonRef, WatchError, async_trait, decode_resolved_actor, map_tell,
+    next_logical_resolution, peers::PeerReconciler, singleton::SingletonRoute,
 };
 
 pub(super) struct SingletonProxyRoute {
@@ -52,7 +52,7 @@ impl SingletonProxyRoute {
         Ok(slot)
     }
 
-    fn request_resolution(&self) -> Result<(), RemoteMessageError> {
+    fn request_resolution(&self, request_id: u128) -> Result<(), RemoteMessageError> {
         let association = self
             .associations
             .get(&self.coordinator)
@@ -60,8 +60,6 @@ impl SingletonProxyRoute {
         if association.state() == AssociationState::Closed {
             return Err(RemoteMessageError::ShardUnavailable);
         }
-        let sequence = NEXT_LOGICAL_RESOLUTION.fetch_add(1, Ordering::Relaxed);
-        let request_id = (self.local_node.incarnation.get() << 64) ^ u128::from(sequence);
         let payload = lattice_placement::control::encode_control_command(
             &CoordinatorScope::Placement(self.config.domain.clone()),
             &PlacementControlCommand::ResolveSingleton {
@@ -91,11 +89,15 @@ impl SingletonProxyRoute {
             domain: self.config.domain.clone(),
             kind: self.config.kind.clone(),
         };
-        let (_admission, deadline, start_resolution) =
-            self.buffer
-                .admit(key.clone(), payload_bytes, requested_deadline)?;
-        if start_resolution {
-            self.request_resolution()?;
+        let candidate_request_id = next_logical_resolution(self.local_node.incarnation);
+        let (_admission, deadline, resolution) = self.buffer.admit(
+            key.clone(),
+            payload_bytes,
+            requested_deadline,
+            candidate_request_id,
+        )?;
+        if resolution.start {
+            self.request_resolution(resolution.request_id)?;
         }
         let changed = self
             .state
@@ -107,6 +109,16 @@ impl SingletonProxyRoute {
             if let Ok(slot) = self.running_slot(target) {
                 self.buffer.resolved(&key);
                 return Ok(slot);
+            }
+            if self
+                .state
+                .lock()
+                .expect("logic placement state poisoned")
+                .resolution_failure(&key, resolution.request_id)
+                .is_some()
+            {
+                self.buffer.resolution_failed(&key, resolution.request_id);
+                return Err(RemoteMessageError::ShardUnavailable);
             }
             if tokio::time::timeout_at(deadline.into(), notified)
                 .await

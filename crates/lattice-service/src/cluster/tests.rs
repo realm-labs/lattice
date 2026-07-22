@@ -27,7 +27,7 @@ use lattice_core::{
 use lattice_placement::{
     control::{
         DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
-        encode_control_command,
+        PlacementResolutionFailure, decode_control_command, encode_control_command,
     },
     coordinator::{
         MemberHello, PlacementDomainHello, SingletonConfig, SnapshotLimits, SnapshotRecord,
@@ -42,7 +42,7 @@ use lattice_placement::{
 use lattice_remoting::{
     association::{AssociationKey, LaneAttachment, LaneKind},
     config::RemotingConfig,
-    control::{CommandId, ControlDispatch},
+    control::{CommandId, ControlDispatch, decode_control_envelope},
     endpoint::RemotingEndpoint,
     handshake::NodeIdentity,
     protocol::ProtocolDescriptor,
@@ -321,6 +321,285 @@ async fn stage_logic_runtime(
             .unwrap();
     }
     (state, control, shutdown, task)
+}
+
+#[tokio::test]
+async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
+    let cluster_id = ClusterId::new("unavailable-route-test").unwrap();
+    let local_incarnation = NodeIncarnation::new(31).unwrap();
+    let coordinator_incarnation = NodeIncarnation::new(32).unwrap();
+    let local_address = unused_address().await;
+    let coordinator_address = unused_address().await;
+    let local_node = NodeKey {
+        node_id: "proxy".to_owned(),
+        address: local_address.clone(),
+        incarnation: local_incarnation,
+    };
+    let associations = Arc::new(
+        AssociationManager::new(local_address, local_incarnation, RemotingConfig::default())
+            .unwrap(),
+    );
+    let coordinator = attach_coordinator(
+        &associations,
+        &cluster_id,
+        local_incarnation,
+        coordinator_address,
+        coordinator_incarnation,
+    );
+    let entity_config = EntityConfig::new(
+        domain(),
+        EntityType::new("unavailable-entity").unwrap(),
+        ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
+        16,
+        "weighted-least-load",
+        1,
+        Vec::new(),
+    )
+    .unwrap();
+    let singleton_config = SingletonConfig::new(
+        domain(),
+        SingletonKind::new("unavailable-singleton").unwrap(),
+        ProtocolId::new(TEST_PROTOCOL_ID).unwrap(),
+    );
+    let hello = test_hello(
+        local_node.clone(),
+        [entity_config.entity_type.clone()].into_iter().collect(),
+        BTreeSet::new(),
+        [singleton_config.kind.clone()].into_iter().collect(),
+    );
+    let (control, controls) =
+        PlacementControlRouter::bounded(32, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
+    let control = Arc::new(control);
+    let (logic, _effects) = PlacementDomainSession::new(
+        hello.domain,
+        coordinator.clone(),
+        associations.clone(),
+        LogicCoordinatorConfig::default(),
+        32,
+    )
+    .unwrap();
+    let state = logic.state();
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let logic_task = tokio::spawn(logic.run(controls, shutdown_rx));
+    let protocol = EntityProtocol::build().unwrap();
+    let fingerprint = protocol.fingerprint();
+    let mut router = DomainLogicalRouter::new(
+        local_node,
+        state,
+        associations.clone(),
+        Arc::new(OutboundMessaging::new(8).unwrap()),
+        coordinator.clone(),
+        LogicalBufferConfig {
+            maximum_residence: Duration::from_secs(10),
+            ..LogicalBufferConfig::default()
+        },
+        4,
+    )
+    .unwrap();
+    router
+        .register_entity_proxy(entity_config.clone(), fingerprint)
+        .unwrap();
+    router
+        .register_singleton_proxy(singleton_config.clone(), fingerprint)
+        .unwrap();
+    let router = Arc::new(router);
+    let association = associations.get(&coordinator).unwrap();
+    let reference = entity_config
+        .entity_ref(
+            cluster_id.clone(),
+            EntityId::new(b"missing-host".to_vec()).unwrap(),
+        )
+        .unwrap();
+    let shard_key = PlacementSlotKey::Shard {
+        domain: domain(),
+        entity_type: entity_config.entity_type.clone(),
+        shard_id: entity_config.shard_for(reference.entity_id()).unwrap(),
+    };
+
+    let find_resolution = |expected_slot: PlacementSlotKey, excluded: Option<u128>| {
+        let association = association.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(1), async move {
+                loop {
+                    for frame in association.replay_control_frames() {
+                        let Ok(envelope) = decode_control_envelope(&frame) else {
+                            continue;
+                        };
+                        let Ok(scoped) =
+                            decode_control_command(&envelope.payload, DEFAULT_MAX_CONTROL_PAYLOAD)
+                        else {
+                            continue;
+                        };
+                        let resolved = match scoped.command {
+                            PlacementControlCommand::ResolveShard {
+                                request_id,
+                                domain,
+                                entity_type,
+                                shard_id,
+                            } => Some((
+                                request_id,
+                                PlacementSlotKey::Shard {
+                                    domain,
+                                    entity_type,
+                                    shard_id,
+                                },
+                            )),
+                            PlacementControlCommand::ResolveSingleton {
+                                request_id,
+                                domain,
+                                kind,
+                            } => Some((request_id, PlacementSlotKey::Singleton { domain, kind })),
+                            _ => None,
+                        };
+                        if let Some((request_id, slot)) = resolved
+                            && slot == expected_slot
+                            && excluded != Some(request_id)
+                        {
+                            return request_id;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let fail_resolution = |request_id, slot: PlacementSlotKey| {
+        let control = control.clone();
+        let coordinator = coordinator.clone();
+        async move {
+            control
+                .apply(
+                    coordinator,
+                    CommandId::generate(),
+                    encode_control_command(
+                        &CoordinatorScope::Placement(domain()),
+                        &PlacementControlCommand::ResolutionFailed {
+                            request_id,
+                            slot,
+                            reason: PlacementResolutionFailure::NoEligibleHost,
+                        },
+                        DEFAULT_MAX_CONTROL_PAYLOAD,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    let first = tokio::spawn({
+        let router = router.clone();
+        let reference = reference.clone();
+        async move {
+            router
+                .tell_entity(None, reference, fingerprint, 1, Bytes::new())
+                .await
+        }
+    });
+    let concurrent = tokio::spawn({
+        let router = router.clone();
+        let reference = reference.clone();
+        async move {
+            router
+                .tell_entity(None, reference, fingerprint, 2, Bytes::new())
+                .await
+        }
+    });
+    let first_request = find_resolution(shard_key.clone(), None).await;
+    tokio::task::yield_now().await;
+    let shard_request_ids = association
+        .replay_control_frames()
+        .into_iter()
+        .filter_map(|frame| decode_control_envelope(&frame).ok())
+        .filter_map(|envelope| {
+            decode_control_command(&envelope.payload, DEFAULT_MAX_CONTROL_PAYLOAD).ok()
+        })
+        .filter_map(|scoped| match scoped.command {
+            PlacementControlCommand::ResolveShard {
+                request_id,
+                domain,
+                entity_type,
+                shard_id,
+            } => (PlacementSlotKey::Shard {
+                domain,
+                entity_type,
+                shard_id,
+            } == shard_key)
+                .then_some(request_id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(shard_request_ids, [first_request].into_iter().collect());
+    fail_resolution(first_request, shard_key.clone()).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(RemoteMessageError::ShardUnavailable)
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), concurrent)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(RemoteMessageError::ShardUnavailable)
+    );
+
+    let second = tokio::spawn({
+        let router = router.clone();
+        let reference = reference.clone();
+        async move {
+            router
+                .tell_entity(None, reference, fingerprint, 3, Bytes::new())
+                .await
+        }
+    });
+    let second_request = find_resolution(shard_key.clone(), Some(first_request)).await;
+    assert_ne!(second_request, first_request);
+    fail_resolution(second_request, shard_key).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(RemoteMessageError::ShardUnavailable)
+    );
+
+    let singleton = SingletonRef::new(
+        cluster_id,
+        domain(),
+        singleton_config.kind.clone(),
+        singleton_config.protocol_id,
+        singleton_config.fingerprint(),
+    )
+    .unwrap();
+    let singleton_key = PlacementSlotKey::Singleton {
+        domain: domain(),
+        kind: singleton_config.kind,
+    };
+    let singleton_call = tokio::spawn({
+        let router = router.clone();
+        async move {
+            router
+                .tell_singleton(None, singleton, fingerprint, 4, Bytes::new())
+                .await
+        }
+    });
+    let singleton_request = find_resolution(singleton_key.clone(), None).await;
+    fail_resolution(singleton_request, singleton_key).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), singleton_call)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(RemoteMessageError::ShardUnavailable)
+    );
+
+    shutdown.send(true).unwrap();
+    logic_task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

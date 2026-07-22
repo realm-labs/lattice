@@ -26,7 +26,7 @@ use crate::{
     },
 };
 
-pub const PLACEMENT_CONTROL_GENERATION: u64 = 5;
+pub const PLACEMENT_CONTROL_GENERATION: u64 = 6;
 pub const DEFAULT_MAX_CONTROL_PAYLOAD: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +62,11 @@ pub enum PlacementControlCommand {
         request_id: u128,
         domain: PlacementDomainId,
         kind: SingletonKind,
+    },
+    ResolutionFailed {
+        request_id: u128,
+        slot: PlacementSlotKey,
+        reason: PlacementResolutionFailure,
     },
     DrainSlot {
         slot: PlacementSlotKey,
@@ -101,6 +106,11 @@ pub enum PlacementControlCommand {
         node_id: String,
         expected_incarnation: NodeIncarnation,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlacementResolutionFailure {
+    NoEligibleHost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -7,7 +7,7 @@ use lattice_core::actor_ref::{
 };
 use lattice_remoting::{
     association::{AssociationKey, LaneAttachment, LaneKind},
-    control::CommandId,
+    control::{CommandId, decode_control_envelope},
     protocol::{ProtocolDescriptor, ProtocolFingerprint},
 };
 use tokio::net::TcpListener;
@@ -30,14 +30,17 @@ use lattice_remoting::{
 
 use crate::{
     authority::AuthorityEffect,
-    control::{InboundPlacementControl, PlacementControlEventKind, PlacementControlRouter},
+    control::{
+        DEFAULT_MAX_CONTROL_PAYLOAD, InboundPlacementControl, PlacementControlEventKind,
+        PlacementControlRouter, PlacementResolutionFailure, decode_control_command,
+    },
     coordinator::{MemberHello, MembershipLeaderGuard},
     session::{LogicCoordinatorConfig, PlacementDomainSession},
     storage::{
         InMemoryPlacementStore, PlacementDomainStore,
         domain::{
             ActivateAuthority, AllocateInitial, CreateDomainMember, CreateMember, CreatePlan,
-            LeasedClaim, PutEntityConfig, ReserveMove,
+            LeasedClaim, PutEntityConfig, PutSingletonConfig, ReserveMove,
         },
     },
     types::{

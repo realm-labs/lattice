@@ -1,13 +1,16 @@
-use super::{
-    BTreeMap, BTreeSet, Instant, LogicalBufferConfig, Mutex, PlacementSlotKey, RemoteMessageError,
-};
+use super::{BTreeMap, Instant, LogicalBufferConfig, Mutex, PlacementSlotKey, RemoteMessageError};
 
 #[derive(Default)]
 pub(super) struct RouteBufferState {
     per_slot: BTreeMap<PlacementSlotKey, usize>,
-    resolving: BTreeSet<PlacementSlotKey>,
+    resolving: BTreeMap<PlacementSlotKey, u128>,
     messages: usize,
     bytes: usize,
+}
+
+pub(super) struct ResolutionAdmission {
+    pub(super) request_id: u128,
+    pub(super) start: bool,
 }
 
 pub(super) struct RouteBuffer {
@@ -28,7 +31,8 @@ impl RouteBuffer {
         slot: PlacementSlotKey,
         bytes: usize,
         requested_deadline: Option<Instant>,
-    ) -> Result<(RouteBufferAdmission<'_>, Instant, bool), RemoteMessageError> {
+        candidate_request_id: u128,
+    ) -> Result<(RouteBufferAdmission<'_>, Instant, ResolutionAdmission), RemoteMessageError> {
         let now = Instant::now();
         let residence_deadline = now + self.config.maximum_residence;
         let deadline = requested_deadline
@@ -48,7 +52,13 @@ impl RouteBuffer {
         state.messages += 1;
         state.bytes += bytes;
         *state.per_slot.entry(slot.clone()).or_default() += 1;
-        let start_resolution = state.resolving.insert(slot.clone());
+        let (request_id, start) = match state.resolving.get(&slot) {
+            Some(request_id) => (*request_id, false),
+            None => {
+                state.resolving.insert(slot.clone(), candidate_request_id);
+                (candidate_request_id, true)
+            }
+        };
         Ok((
             RouteBufferAdmission {
                 buffer: self,
@@ -56,7 +66,7 @@ impl RouteBuffer {
                 bytes,
             },
             deadline,
-            start_resolution,
+            ResolutionAdmission { request_id, start },
         ))
     }
 
@@ -66,6 +76,13 @@ impl RouteBuffer {
             .expect("logical route buffer poisoned")
             .resolving
             .remove(slot);
+    }
+
+    pub(super) fn resolution_failed(&self, slot: &PlacementSlotKey, request_id: u128) {
+        let mut state = self.state.lock().expect("logical route buffer poisoned");
+        if state.resolving.get(slot) == Some(&request_id) {
+            state.resolving.remove(slot);
+        }
     }
 }
 

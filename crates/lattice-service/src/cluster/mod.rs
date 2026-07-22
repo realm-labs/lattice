@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -61,6 +61,11 @@ use singleton::SingletonRoute;
 
 static NEXT_LOGICAL_RESOLUTION: AtomicU64 = AtomicU64::new(1);
 const LOGICAL_RESOLVE_MESSAGE_ID: u64 = u64::MAX;
+
+fn next_logical_resolution(local: NodeIncarnation) -> u128 {
+    let sequence = NEXT_LOGICAL_RESOLUTION.fetch_add(1, Ordering::Relaxed);
+    (local.get() << 64) ^ u128::from(sequence)
+}
 
 #[derive(Debug, Clone)]
 pub struct LogicalBufferConfig {

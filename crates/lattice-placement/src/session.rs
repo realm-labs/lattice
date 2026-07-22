@@ -23,7 +23,8 @@ use crate::{
     authority::{AuthorityEffect, AuthorityError, AuthorityEvent, PlacementAuthority},
     control::{
         DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlError,
-        PlacementControlEvent, PlacementControlEventKind, encode_control_command,
+        PlacementControlEvent, PlacementControlEventKind, PlacementResolutionFailure,
+        encode_control_command,
     },
     coordinator::{
         CoordinatorDelta, CoordinatorError, MemberEvent, MemberRecord, MemberStatus,
@@ -96,6 +97,7 @@ pub struct LogicPlacementState {
     session: PlacementDomainState,
     slots: BTreeMap<PlacementSlotKey, PlacementSlot>,
     authorities: BTreeMap<PlacementSlotKey, PlacementAuthority>,
+    resolution_failures: BTreeMap<PlacementSlotKey, (u128, PlacementResolutionFailure)>,
     domain_up: bool,
     changed: Arc<Notify>,
 }
@@ -109,6 +111,17 @@ impl LogicPlacementState {
         self.authorities
             .get(key)
             .is_some_and(PlacementAuthority::admission_open)
+    }
+
+    pub fn resolution_failure(
+        &self,
+        key: &PlacementSlotKey,
+        request_id: u128,
+    ) -> Option<PlacementResolutionFailure> {
+        self.resolution_failures
+            .get(key)
+            .filter(|(failed_request, _)| *failed_request == request_id)
+            .map(|(_, reason)| *reason)
     }
 
     pub fn ready(&self) -> bool {
@@ -350,6 +363,7 @@ impl PlacementDomainSession {
                     session: PlacementDomainState::new(domain),
                     slots: BTreeMap::new(),
                     authorities: BTreeMap::new(),
+                    resolution_failures: BTreeMap::new(),
                     domain_up: false,
                     changed: Arc::new(Notify::new()),
                 })),
@@ -592,6 +606,31 @@ impl PlacementDomainSession {
                         };
                         self.publish_effects(grant.slot, effects)
                     }
+                    PlacementControlCommand::ResolutionFailed {
+                        request_id,
+                        slot,
+                        reason,
+                    } => {
+                        if request_id == 0 || slot.domain() != &self.domain_hello.domain {
+                            return Err(LogicSessionError::UnauthorizedCommand);
+                        }
+                        let subscribed = match &slot {
+                            PlacementSlotKey::Shard { entity_type, .. } => {
+                                self.domain_hello.subscribes_to(entity_type)
+                            }
+                            PlacementSlotKey::Singleton { kind, .. } => {
+                                self.domain_hello.used_singletons.contains(kind)
+                                    || self.domain_hello.singleton_eligibility.contains(kind)
+                            }
+                        };
+                        if !subscribed {
+                            return Err(LogicSessionError::UnauthorizedCommand);
+                        }
+                        let mut state = self.state.lock().expect("logic placement state poisoned");
+                        state.resolution_failures.insert(slot, (request_id, reason));
+                        state.changed.notify_waiters();
+                        Ok(())
+                    }
                     PlacementControlCommand::DrainReady {
                         operation_id,
                         expected_incarnation,
@@ -725,6 +764,7 @@ impl PlacementDomainSession {
         {
             let mut state = self.state.lock().expect("logic placement state poisoned");
             for (key, slot) in slots {
+                state.resolution_failures.remove(&key);
                 if slot.owner.as_ref() == Some(&state.local_node)
                     && !state.authorities.contains_key(&key)
                 {

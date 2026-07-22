@@ -14,7 +14,7 @@ use super::{
     SnapshotRecord, build_snapshot, encode_control_command,
 };
 use crate::{
-    control::PlacementControlEventKind,
+    control::{PlacementControlEventKind, PlacementResolutionFailure},
     coordinator::{CoordinatorDelta, DomainMemberRecord, DomainMemberStatus, SnapshotVersion},
     storage::domain::{
         CreateDomainMember, LeasedClaim, PutEntityConfig, PutSingletonConfig, RemoveDomainMember,
@@ -243,12 +243,12 @@ where
                             .await?;
                     }
                     PlacementControlCommand::ResolveShard {
+                        request_id,
                         domain,
                         entity_type,
                         shard_id,
-                        ..
                     } => {
-                        if domain != self.version.domain {
+                        if request_id == 0 || domain != self.version.domain {
                             return Err(CoordinatorRuntimeError::UnauthorizedCommand);
                         }
                         let session = self
@@ -260,17 +260,31 @@ where
                         }
                         let hello = session.hello.clone();
                         let association = session.association.clone();
+                        let slot = PlacementSlotKey::Shard {
+                            domain,
+                            entity_type: entity_type.clone(),
+                            shard_id,
+                        };
                         match self.ensure_shard_allocated(entity_type, shard_id).await {
                             Ok(()) => self.send_snapshot(hello, association).await?,
                             Err(CoordinatorRuntimeError::Allocation(
                                 AllocationError::NoEligibleNode,
                             ))
-                            | Err(CoordinatorRuntimeError::IneligibleTarget) => {}
+                            | Err(CoordinatorRuntimeError::IneligibleTarget) => {
+                                self.send_resolution_failure(association, request_id, slot)?
+                            }
+                            Err(CoordinatorRuntimeError::StaleHandoff) => {
+                                self.send_snapshot(hello, association).await?
+                            }
                             Err(error) => return Err(error),
                         }
                     }
-                    PlacementControlCommand::ResolveSingleton { domain, kind, .. } => {
-                        if domain != self.version.domain {
+                    PlacementControlCommand::ResolveSingleton {
+                        request_id,
+                        domain,
+                        kind,
+                    } => {
+                        if request_id == 0 || domain != self.version.domain {
                             return Err(CoordinatorRuntimeError::UnauthorizedCommand);
                         }
                         let session = self
@@ -284,9 +298,18 @@ where
                         }
                         let hello = session.hello.clone();
                         let association = session.association.clone();
+                        let slot = PlacementSlotKey::Singleton {
+                            domain,
+                            kind: kind.clone(),
+                        };
                         match self.ensure_singleton_allocated(kind).await {
                             Ok(()) => self.send_snapshot(hello, association).await?,
-                            Err(CoordinatorRuntimeError::IneligibleTarget) => {}
+                            Err(CoordinatorRuntimeError::IneligibleTarget) => {
+                                self.send_resolution_failure(association, request_id, slot)?
+                            }
+                            Err(CoordinatorRuntimeError::StaleHandoff) => {
+                                self.send_snapshot(hello, association).await?
+                            }
                             Err(error) => return Err(error),
                         }
                     }
@@ -295,6 +318,7 @@ where
                     | PlacementControlCommand::SnapshotEnd(_)
                     | PlacementControlCommand::StateDelta(_)
                     | PlacementControlCommand::ClaimGranted(_)
+                    | PlacementControlCommand::ResolutionFailed { .. }
                     | PlacementControlCommand::MemberUp(_)
                     | PlacementControlCommand::MemberDelta(_)
                     | PlacementControlCommand::DrainReady { .. }
@@ -307,6 +331,28 @@ where
             }
         }
         Ok(())
+    }
+
+    fn send_resolution_failure(
+        &self,
+        association_key: AssociationKey,
+        request_id: u128,
+        slot: PlacementSlotKey,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let association = self
+            .associations
+            .get(&association_key)
+            .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
+        send_control(
+            &association,
+            &self.version.domain,
+            PlacementControlCommand::ResolutionFailed {
+                request_id,
+                slot,
+                reason: PlacementResolutionFailure::NoEligibleHost,
+            },
+            &self.config,
+        )
     }
 
     pub(super) fn now(&self) -> MonotonicTime {

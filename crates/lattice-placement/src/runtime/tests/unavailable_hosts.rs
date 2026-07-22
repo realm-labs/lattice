@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn unresolved_shard_does_not_poison_proxy_session_before_host_joins() {
+async fn unavailable_shard_resolution_fails_fast_and_a_later_request_can_allocate() {
     let cluster_id = ClusterId::new("late-host-test").unwrap();
     let (coordinator_node, _) = node(&cluster_id, "coordinator", 26220, 220);
     let (proxy, _) = node(&cluster_id, "proxy", 26221, 221);
@@ -51,6 +51,8 @@ async fn unresolved_shard_does_not_poison_proxy_session_before_host_joins() {
         Vec::new(),
     )
     .unwrap();
+    let singleton_kind = SingletonKind::new("late-host-singleton").unwrap();
+    let singleton_config = SingletonConfig::new(domain(), singleton_kind.clone(), protocol_id);
     let committed = store
         .put_entity_config(
             &leader.leader_guard,
@@ -65,6 +67,20 @@ async fn unresolved_shard_does_not_poison_proxy_session_before_host_joins() {
     leader
         .entity_configs
         .insert(entity_type.clone(), entity_config.clone());
+    let committed = store
+        .put_singleton_config(
+            &leader.leader_guard,
+            PutSingletonConfig {
+                expected: None,
+                config: singleton_config.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    leader.version = committed.version;
+    leader
+        .singleton_configs
+        .insert(singleton_kind.clone(), singleton_config.clone());
     let descriptor = ProtocolDescriptor {
         protocol_id,
         fingerprint: ProtocolFingerprint::new([10; 32]),
@@ -76,6 +92,7 @@ async fn unresolved_shard_does_not_poison_proxy_session_before_host_joins() {
             TestHelloSpec {
                 capacity_units: 1,
                 proxied_entity_types: [entity_type.clone()].into_iter().collect(),
+                used_singletons: [singleton_kind.clone()].into_iter().collect(),
                 protocols: vec![descriptor.clone()],
                 ..TestHelloSpec::default()
             },
@@ -97,8 +114,21 @@ async fn unresolved_shard_does_not_poison_proxy_session_before_host_joins() {
             },
         }))
     };
+    let resolve_singleton = |request_id| {
+        PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
+            association: proxy_key.clone(),
+            command_id: CommandId::generate(),
+            scope: CoordinatorScope::Placement(domain()),
+            command: PlacementControlCommand::ResolveSingleton {
+                request_id,
+                domain: domain(),
+                kind: singleton_kind.clone(),
+            },
+        }))
+    };
 
     leader.handle_control(resolve(1)).await.unwrap();
+    leader.handle_control(resolve_singleton(11)).await.unwrap();
     assert!(leader.sessions.contains_key(&proxy.incarnation));
     let shard_key = PlacementSlotKey::Shard {
         domain: domain(),
@@ -106,6 +136,43 @@ async fn unresolved_shard_does_not_poison_proxy_session_before_host_joins() {
         shard_id,
     };
     assert_eq!(store.get_slot(&shard_key).await.unwrap(), None);
+    let singleton_key = PlacementSlotKey::Singleton {
+        domain: domain(),
+        kind: singleton_kind.clone(),
+    };
+    assert_eq!(store.get_slot(&singleton_key).await.unwrap(), None);
+    let proxy_association = leader.associations.get(&proxy_key).unwrap();
+    let failure = proxy_association
+        .replay_control_frames()
+        .into_iter()
+        .filter_map(|frame| decode_control_envelope(&frame).ok())
+        .filter_map(|envelope| {
+            decode_control_command(&envelope.payload, DEFAULT_MAX_CONTROL_PAYLOAD).ok()
+        })
+        .filter_map(|scoped| match scoped.command {
+            PlacementControlCommand::ResolutionFailed {
+                request_id,
+                slot,
+                reason,
+            } => Some((request_id, slot, reason)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failure,
+        [
+            (
+                1,
+                shard_key.clone(),
+                PlacementResolutionFailure::NoEligibleHost,
+            ),
+            (
+                11,
+                singleton_key.clone(),
+                PlacementResolutionFailure::NoEligibleHost,
+            ),
+        ]
+    );
 
     register_up(
         &mut leader,
@@ -114,8 +181,10 @@ async fn unresolved_shard_does_not_poison_proxy_session_before_host_joins() {
             TestHelloSpec {
                 capacity_units: 10,
                 hosted_entity_types: [entity_type.clone()].into_iter().collect(),
+                singleton_eligibility: [singleton_kind.clone()].into_iter().collect(),
                 protocols: vec![descriptor],
                 entity_configs: vec![entity_config],
+                singleton_configs: vec![singleton_config],
                 ..TestHelloSpec::default()
             },
         ),
@@ -123,8 +192,12 @@ async fn unresolved_shard_does_not_poison_proxy_session_before_host_joins() {
     )
     .await;
     leader.handle_control(resolve(2)).await.unwrap();
+    leader.handle_control(resolve_singleton(12)).await.unwrap();
 
     let shard = store.get_slot(&shard_key).await.unwrap().unwrap();
     assert_eq!(shard.owner.as_ref(), Some(&host));
     assert_eq!(shard.state, PlacementSlotState::Allocating);
+    let singleton = store.get_slot(&singleton_key).await.unwrap().unwrap();
+    assert_eq!(singleton.owner.as_ref(), Some(&host));
+    assert_eq!(singleton.state, PlacementSlotState::Allocating);
 }

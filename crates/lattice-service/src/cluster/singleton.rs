@@ -9,11 +9,11 @@ use super::{
     Actor, ActorHandle, ActorId, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc,
     AskError, AssociationKey, AssociationManager, AssociationState, Bytes, ConfigFingerprint,
     DispatchMode, DispatchReply, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
-    LogicalSingletonTarget, Mutex, NEXT_LOGICAL_RESOLUTION, NodeKey, Ordering, OutboundMessage,
-    OutboundMessaging, PlacementDomainId, PlacementSlot, PlacementSlotKey, PlacementSlotState,
-    Protocol, ProtocolFingerprint, ProtocolId, RemoteMessageError, RouteBuffer, SenderIdentity,
-    SingletonKind, SingletonRef, WatchError, async_trait, decode_resolved_actor, drain_actor_ids,
-    map_ask, map_dispatch, map_tell,
+    LogicalSingletonTarget, Mutex, NodeKey, OutboundMessage, OutboundMessaging, PlacementDomainId,
+    PlacementSlot, PlacementSlotKey, PlacementSlotState, Protocol, ProtocolFingerprint, ProtocolId,
+    RemoteMessageError, RouteBuffer, SenderIdentity, SingletonKind, SingletonRef, WatchError,
+    async_trait, decode_resolved_actor, drain_actor_ids, map_ask, map_dispatch, map_tell,
+    next_logical_resolution,
 };
 
 #[async_trait]
@@ -105,7 +105,7 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
         Ok(slot)
     }
 
-    fn request_resolution(&self) -> Result<(), RemoteMessageError> {
+    fn request_resolution(&self, request_id: u128) -> Result<(), RemoteMessageError> {
         let association = self
             .associations
             .get(&self.coordinator)
@@ -113,8 +113,6 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
         if association.state() == AssociationState::Closed {
             return Err(RemoteMessageError::ShardUnavailable);
         }
-        let sequence = NEXT_LOGICAL_RESOLUTION.fetch_add(1, Ordering::Relaxed);
-        let request_id = (self.local_node.incarnation.get() << 64) ^ u128::from(sequence);
         let payload = lattice_placement::control::encode_control_command(
             &CoordinatorScope::Placement(self.domain.clone()),
             &PlacementControlCommand::ResolveSingleton {
@@ -148,11 +146,15 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
             domain: self.domain.clone(),
             kind: self.kind.clone(),
         };
-        let (_admission, deadline, start_resolution) =
-            self.buffer
-                .admit(key.clone(), payload_bytes, requested_deadline)?;
-        if start_resolution {
-            self.request_resolution()?;
+        let candidate_request_id = next_logical_resolution(self.local_node.incarnation);
+        let (_admission, deadline, resolution) = self.buffer.admit(
+            key.clone(),
+            payload_bytes,
+            requested_deadline,
+            candidate_request_id,
+        )?;
+        if resolution.start {
+            self.request_resolution(resolution.request_id)?;
         }
         let changed = self
             .state
@@ -164,6 +166,16 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
             if let Ok(slot) = self.running_slot(target) {
                 self.buffer.resolved(&key);
                 return Ok(slot);
+            }
+            if self
+                .state
+                .lock()
+                .expect("logic placement state poisoned")
+                .resolution_failure(&key, resolution.request_id)
+                .is_some()
+            {
+                self.buffer.resolution_failed(&key, resolution.request_id);
+                return Err(RemoteMessageError::ShardUnavailable);
             }
             if tokio::time::timeout_at(deadline.into(), notified)
                 .await
