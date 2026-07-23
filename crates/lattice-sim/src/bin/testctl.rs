@@ -8,6 +8,8 @@ mod testctl_artifacts;
 mod testctl_chaos;
 #[path = "testctl/commands.rs"]
 mod testctl_commands;
+#[path = "testctl/crashes.rs"]
+mod testctl_crashes;
 #[path = "testctl/discovery.rs"]
 mod testctl_discovery;
 #[path = "testctl/outcomes.rs"]
@@ -227,6 +229,15 @@ fn run_profile(
             runner.run("multi-domain-failover", || multi_domain_real(artifacts));
             runner.run("control-plane-store-outage-recovery", || {
                 control_plane_store_outage_real(artifacts)
+            });
+            runner.run("membership-leader-hard-crash-recovery", || {
+                testctl_crashes::membership_leader(artifacts)
+            });
+            runner.run("member-hard-crash-recovery", || {
+                testctl_crashes::member(artifacts)
+            });
+            runner.run("etcd-hard-crash-recovery", || {
+                testctl_crashes::etcd(artifacts)
             });
             runner.run("docker-fault-sequence", || testctl_chaos::verify(artifacts));
             runner.run("one-domain-coordinator-loss", || {
@@ -843,15 +854,7 @@ fn ha_etcd_real(artifacts: &Path) -> Result<(), String> {
         wait_for_coordinator_leadership(artifacts, None, 0, Duration::from_secs(120))?;
 
     run_etcd_acceptance()?;
-    let (leader, stopped_member_id) = members
-        .iter()
-        .find_map(|member| match etcd_member_status(member) {
-            Ok((member_id, leader_id)) if member_id == leader_id => Some(Ok((*member, member_id))),
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .transpose()?
-        .ok_or_else(|| "etcd leader was not discoverable".to_owned())?;
+    let (leader, stopped_member_id) = find_etcd_leader(&members)?;
     require_label("container", leader, &run_id)?;
     command("docker", &["stop", "--time", "5", leader])?;
     wait_for_etcd_failover(&members, leader, stopped_member_id, Duration::from_secs(30))?;
@@ -866,6 +869,37 @@ fn ha_etcd_real(artifacts: &Path) -> Result<(), String> {
     command("docker", &["start", leader])?;
     wait_for_healthy_container(leader, Duration::from_secs(60))?;
     quorum_result?;
+
+    let (hard_killed_leader, hard_killed_member_id) = find_etcd_leader(&members)?;
+    require_label("container", hard_killed_leader, &run_id)?;
+    command("docker", &["kill", hard_killed_leader])?;
+    wait_for_etcd_failover(
+        &members,
+        hard_killed_leader,
+        hard_killed_member_id,
+        Duration::from_secs(30),
+    )?;
+    let hard_kill_surviving_endpoints = ["etcd1", "etcd2", "etcd3"]
+        .into_iter()
+        .filter(|name| !hard_killed_leader.contains(name))
+        .map(|name| format!("http://{name}:2379"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let hard_kill_quorum_result =
+        run_etcd_acceptance_with_endpoints(&hard_kill_surviving_endpoints);
+    require_label("container", hard_killed_leader, &run_id)?;
+    command("docker", &["start", hard_killed_leader])?;
+    wait_for_healthy_container(hard_killed_leader, Duration::from_secs(60))?;
+    hard_kill_quorum_result?;
+    write_json(
+        &artifacts.join("etcd-failover.json"),
+        &serde_json::json!({
+            "gracefully_stopped_leader": leader,
+            "hard_killed_leader": hard_killed_leader,
+            "quorum_remained_writable": true,
+            "restarted_members_healthy": true,
+        }),
+    )?;
 
     let coordinator_container = coordinators
         .iter()
@@ -1041,6 +1075,18 @@ fn wait_for_etcd_failover(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn find_etcd_leader<'a>(members: &[&'a str]) -> Result<(&'a str, u64), String> {
+    members
+        .iter()
+        .find_map(|member| match etcd_member_status(member) {
+            Ok((member_id, leader_id)) if member_id == leader_id => Some(Ok((*member, member_id))),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .transpose()?
+        .ok_or_else(|| "etcd leader was not discoverable".to_owned())
 }
 
 fn run_etcd_acceptance() -> Result<(), String> {

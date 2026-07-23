@@ -84,6 +84,9 @@ pub(super) fn for_profile(profile: Profile) -> Vec<&'static str> {
         Profile::Chaos => vec![
             "multi-domain-failover",
             "control-plane-store-outage-recovery",
+            "membership-leader-hard-crash-recovery",
+            "member-hard-crash-recovery",
+            "etcd-hard-crash-recovery",
             "docker-fault-sequence",
             "one-domain-coordinator-loss",
             "membership-loss",

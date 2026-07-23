@@ -63,6 +63,7 @@ pub(super) struct MultiDomainHostArtifact {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(super) struct MultiDomainLogicArtifact {
     pub node_id: String,
+    pub incarnation: u128,
     pub lifecycle: String,
     pub domains: BTreeMap<String, String>,
     #[serde(default)]
