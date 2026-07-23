@@ -52,7 +52,7 @@ use lattice_placement::{
     types::NodeKey,
 };
 use lattice_remoting::{config::RemotingConfig, handshake::NodeIdentity, watch::WatchStatus};
-use tokio::{net::TcpListener, sync::watch::Receiver, time::Instant};
+use tokio::{sync::watch::Receiver, time::Instant};
 
 use crate::{
     builder::LatticeService,
@@ -60,6 +60,7 @@ use crate::{
     error::ServiceError,
     lifecycle::{NodeLifecycleState, PlacementDomainState},
     registration::EntityOptions,
+    test_support::{network_test_guard, unused_address},
 };
 
 const PROTOCOL_ID: u64 = 0x7465_7374_0000_0001;
@@ -228,6 +229,7 @@ fn actor_registration_rejects_a_registry_bound_to_another_protocol() {
 
 #[tokio::test]
 async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
+    let _network = network_test_guard().await;
     struct ForceShutdownActor {
         dropped: Arc<AtomicUsize>,
     }
@@ -323,6 +325,7 @@ async fn force_shutdown_forces_retained_actor_before_publishing_terminated() {
 
 #[tokio::test]
 async fn terminal_shutdown_drains_local_actors_without_a_migration_target() {
+    let _network = network_test_guard().await;
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
     let registry = Arc::new(ActorRegistry::new_bound(
         actor_kind!("TerminalShutdownActor"),
@@ -356,6 +359,7 @@ async fn terminal_shutdown_drains_local_actors_without_a_migration_target() {
 
 #[tokio::test]
 async fn service_retry_api_resolves_retained_actor_cell() {
+    let _network = network_test_guard().await;
     struct RetryShutdownActor {
         persistence_available: Arc<AtomicBool>,
     }
@@ -541,6 +545,7 @@ async fn coordinator_service_for_domains(
 
 #[tokio::test]
 async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
+    let _network = network_test_guard().await;
     let cluster_id = ClusterId::new("service-test").unwrap();
     let first_address = unused_address().await;
     let second_address = unused_address().await;
@@ -632,15 +637,11 @@ async fn typed_actor_ref_asks_exact_remote_activation_over_tcp() {
 
 #[tokio::test]
 async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
-    let coordinator_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let coordinator_port = coordinator_listener.local_addr().unwrap().port();
-    drop(coordinator_listener);
-    let member_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let member_port = member_listener.local_addr().unwrap().port();
-    drop(member_listener);
+    let _network = network_test_guard().await;
 
     let cluster_id = ClusterId::new("service-join-test").unwrap();
-    let coordinator_address = NodeAddress::new("127.0.0.1", coordinator_port).unwrap();
+    let coordinator_address = unused_address().await;
+    let member_address = unused_address().await;
     let coordinator_incarnation = NodeIncarnation::new(101).unwrap();
     let coordinator_builder = LatticeService::builder(node_config(
         cluster_id.clone(),
@@ -689,7 +690,7 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     let member = LatticeService::builder(node_config(
         cluster_id,
         "member",
-        NodeAddress::new("127.0.0.1", member_port).unwrap(),
+        member_address,
         NodeIncarnation::new(202).unwrap(),
     ))
     .unwrap()
@@ -753,15 +754,9 @@ async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     coordinator.shutdown().await.unwrap();
 }
 
-async fn unused_address() -> NodeAddress {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    NodeAddress::new("127.0.0.1", port).unwrap()
-}
-
 #[tokio::test]
 async fn two_discovered_members_leave_sequentially_without_losing_coordinator_session() {
+    let _network = network_test_guard().await;
     let coordinator_address = unused_address().await;
     let first_address = unused_address().await;
     let second_address = unused_address().await;
@@ -850,6 +845,7 @@ async fn two_discovered_members_leave_sequentially_without_losing_coordinator_se
 
 #[tokio::test]
 async fn one_domain_coordinator_loss_leaves_other_domain_ready() {
+    let _network = network_test_guard().await;
     let membership_address = unused_address().await;
     let coordinator_a_address = unused_address().await;
     let coordinator_b_address = unused_address().await;
@@ -988,19 +984,12 @@ async fn one_domain_coordinator_loss_leaves_other_domain_ready() {
 
 #[tokio::test]
 async fn coordinator_rollover_requires_reconciliation_before_ready() {
-    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port_a = listener_a.local_addr().unwrap().port();
-    drop(listener_a);
-    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port_b = listener_b.local_addr().unwrap().port();
-    drop(listener_b);
-    let member_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let member_port = member_listener.local_addr().unwrap().port();
-    drop(member_listener);
+    let _network = network_test_guard().await;
 
     let cluster_id = ClusterId::new("service-rollover-test").unwrap();
-    let address_a = NodeAddress::new("127.0.0.1", port_a).unwrap();
-    let address_b = NodeAddress::new("127.0.0.1", port_b).unwrap();
+    let address_a = unused_address().await;
+    let address_b = unused_address().await;
+    let member_address = unused_address().await;
     let store = Arc::new(InMemoryPlacementStore::new(32, 32).unwrap());
     let coordinator_a = coordinator_service(
         store.clone(),
@@ -1015,7 +1004,6 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
 
     let (discovery_tx, discovery_rx) =
         tokio::sync::watch::channel(discovery_snapshot(1, "coordinator-a", address_a));
-    let member_address = NodeAddress::new("127.0.0.1", member_port).unwrap();
     let member_incarnation = NodeIncarnation::new(303).unwrap();
     let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
     let registry = Arc::new(ActorRegistry::new_bound(
@@ -1086,7 +1074,10 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
     })
     .await
     .unwrap();
-    assert_eq!(eventually_ping(&member, target.clone(), 1).await, Pong(2));
+    assert_eq!(
+        eventually_ping(&member, target.clone(), 1, "before rollover").await,
+        Pong(2)
+    );
 
     coordinator_a.force_shutdown().await.unwrap();
     let mut health = member.subscribe_health();
@@ -1099,6 +1090,13 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
     })
     .await
     .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *lifecycle.borrow() != NodeLifecycleState::JoiningMembership {
+            lifecycle.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("member did not observe membership loss before Coordinator replacement");
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let coordinator_b = coordinator_service(
@@ -1121,8 +1119,25 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
         }
     })
     .await
-    .unwrap();
-    assert_eq!(eventually_ping(&member, target, 2).await, Pong(3));
+    .unwrap_or_else(|_| {
+        panic!(
+            "placement domain did not return to Ready; lifecycle: {:?}; health: {:?}; members: {:?}",
+            member.node_lifecycle_state(),
+            member.health_snapshot(),
+            member.member_snapshot(),
+        )
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *lifecycle.borrow() != NodeLifecycleState::Ready {
+            lifecycle.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("member did not return to Ready after Coordinator rollover");
+    assert_eq!(
+        eventually_ping(&member, target, 2, "after rollover").await,
+        Pong(3)
+    );
     let members = member.member_snapshot().members;
     assert_eq!(
         members
@@ -1140,18 +1155,28 @@ async fn eventually_ping(
     service: &LatticeService,
     target: EntityRef<PingProtocol>,
     value: u64,
+    phase: &str,
 ) -> Pong {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let mut last_error = None;
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(reply) = service
+            match service
                 .ask(target.clone(), Ping(value), Duration::from_secs(2))
                 .await
             {
-                break reply;
+                Ok(reply) => break reply,
+                Err(error) => last_error = Some(error),
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap()
+    .await;
+    result.unwrap_or_else(|_| {
+        panic!(
+            "{phase} ping did not recover; last error: {last_error:?}; lifecycle: {:?}; health: {:?}; members: {:?}",
+            service.node_lifecycle_state(),
+            service.health_snapshot(),
+            service.member_snapshot(),
+        )
+    })
 }

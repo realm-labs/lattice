@@ -1037,6 +1037,7 @@ fn entity_service(
         associations.clone(),
         LogicCoordinatorConfig::default(),
         64,
+        slot.version.term.get(),
     )?;
     if owns_slot {
         logic.register_authority(slot.key.clone(), Duration::from_secs(2))?;

@@ -379,6 +379,7 @@ where
                 send_control(
                     &association,
                     &self.version.domain,
+                    self.version.term.get(),
                     PlacementControlCommand::ClaimGranted(claim.grant.clone()),
                     &self.config,
                 )?;

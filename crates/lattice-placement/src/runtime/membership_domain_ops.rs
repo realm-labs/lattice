@@ -139,6 +139,7 @@ where
         send_control(
             &association,
             &self.version.domain,
+            self.version.term.get(),
             PlacementControlCommand::DrainReady {
                 operation_id,
                 expected_incarnation: incarnation,
@@ -363,6 +364,7 @@ where
                             send_control(
                                 &association,
                                 &self.version.domain,
+                                self.version.term.get(),
                                 PlacementControlCommand::DrainSlot {
                                     slot: key,
                                     generation: handoff.source_generation,
@@ -441,6 +443,7 @@ where
             send_control(
                 &association,
                 &self.version.domain,
+                self.version.term.get(),
                 PlacementControlCommand::SnapshotBegin(begin),
                 &self.config,
             )?;
@@ -448,6 +451,7 @@ where
                 send_control(
                     &association,
                     &self.version.domain,
+                    self.version.term.get(),
                     PlacementControlCommand::SnapshotChunk(chunk),
                     &self.config,
                 )?;
@@ -455,6 +459,7 @@ where
             send_control(
                 &association,
                 &self.version.domain,
+                self.version.term.get(),
                 PlacementControlCommand::SnapshotEnd(end),
                 &self.config,
             )?;
@@ -551,6 +556,7 @@ where
             send_control(
                 &association,
                 &self.version.domain,
+                self.version.term.get(),
                 PlacementControlCommand::ClaimGranted(grant),
                 &self.config,
             )?;

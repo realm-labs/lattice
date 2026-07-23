@@ -307,6 +307,7 @@ where
         send_control(
             &association,
             &self.version.domain,
+            self.version.term.get(),
             PlacementControlCommand::ClaimGranted(leased_claim.grant),
             &self.config,
         )

@@ -106,6 +106,7 @@ async fn unavailable_shard_resolution_fails_fast_and_a_later_request_can_allocat
             association: proxy_key.clone(),
             command_id: CommandId::generate(),
             scope: CoordinatorScope::Placement(domain()),
+            coordinator_term: None,
             command: PlacementControlCommand::ResolveShard {
                 request_id,
                 domain: domain(),
@@ -119,6 +120,7 @@ async fn unavailable_shard_resolution_fails_fast_and_a_later_request_can_allocat
             association: proxy_key.clone(),
             command_id: CommandId::generate(),
             scope: CoordinatorScope::Placement(domain()),
+            coordinator_term: None,
             command: PlacementControlCommand::ResolveSingleton {
                 request_id,
                 domain: domain(),

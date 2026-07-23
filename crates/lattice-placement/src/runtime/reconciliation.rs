@@ -421,6 +421,7 @@ where
         send_control(
             &association,
             &self.version.domain,
+            self.version.term.get(),
             PlacementControlCommand::ClaimGranted(grant.clone()),
             &self.config,
         )

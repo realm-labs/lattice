@@ -2,6 +2,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 
 use lattice_placement::{
     control::PlacementControlEvent,
@@ -49,6 +50,11 @@ struct MembershipSessionRun {
     effects: mpsc::Receiver<LogicPlacementEffect>,
 }
 
+struct MembershipSessionReturn {
+    controls: mpsc::Receiver<PlacementControlEvent>,
+    retry: bool,
+}
+
 impl MembershipJoinRuntime {
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         let (join_events_tx, mut join_events) = mpsc::channel(8);
@@ -65,35 +71,50 @@ impl MembershipJoinRuntime {
                     association,
                 } => {
                     self.bootstrap_view.install(leader.clone());
-                    let Some(receiver) = controls.take() else {
+                    let Some(mut receiver) = controls.take() else {
                         continue;
                     };
-                    let Ok((session, handle, effects)) = MembershipSession::new(
-                        self.hello.clone(),
-                        association.key().clone(),
-                        self.associations.clone(),
-                        self.config.clone(),
-                        self.effect_capacity,
-                    ) else {
-                        break;
-                    };
-                    *self.handle.lock().expect("membership handle poisoned") = Some(handle);
-                    let state = session.state();
-                    let returned = self
-                        .run_session(
-                            MembershipSessionRun {
-                                leader,
-                                session,
-                                state,
-                                controls: receiver,
-                                effects,
-                            },
-                            &mut join_events,
-                            &mut shutdown,
-                        )
-                        .await;
-                    *self.handle.lock().expect("membership handle poisoned") = None;
-                    controls = Some(returned);
+                    loop {
+                        if association.state()
+                            != lattice_remoting::association::AssociationState::Active
+                        {
+                            controls = Some(receiver);
+                            break;
+                        }
+                        let Ok((session, handle, effects)) = MembershipSession::new(
+                            self.hello.clone(),
+                            association.key().clone(),
+                            self.associations.clone(),
+                            self.config.clone(),
+                            self.effect_capacity,
+                            leader.term,
+                        ) else {
+                            controls = Some(receiver);
+                            break;
+                        };
+                        *self.handle.lock().expect("membership handle poisoned") = Some(handle);
+                        let state = session.state();
+                        let returned = self
+                            .run_session(
+                                MembershipSessionRun {
+                                    leader: leader.clone(),
+                                    session,
+                                    state,
+                                    controls: receiver,
+                                    effects,
+                                },
+                                &mut join_events,
+                                &mut shutdown,
+                            )
+                            .await;
+                        *self.handle.lock().expect("membership handle poisoned") = None;
+                        receiver = returned.controls;
+                        if !returned.retry {
+                            controls = Some(receiver);
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
                 }
                 JoinEvent::CoordinatorLost { .. } => {
                     self.mark_membership_lost();
@@ -119,7 +140,7 @@ impl MembershipJoinRuntime {
         run: MembershipSessionRun,
         join_events: &mut mpsc::Receiver<JoinEvent>,
         shutdown: &mut watch::Receiver<bool>,
-    ) -> mpsc::Receiver<PlacementControlEvent> {
+    ) -> MembershipSessionReturn {
         let MembershipSessionRun {
             leader,
             session,
@@ -158,9 +179,35 @@ impl MembershipJoinRuntime {
             tokio::select! {
                 result = &mut task => {
                     self.mark_membership_lost();
-                    return result
-                        .map(|(_, controls)| controls)
-                        .unwrap_or_else(|_| closed_controls());
+                    return match result {
+                        Ok((Ok(()), controls)) => MembershipSessionReturn {
+                            controls,
+                            retry: false,
+                        },
+                        Ok((Err(error), controls)) => {
+                            let retry = !controls.is_closed();
+                            tracing::warn!(
+                                target: "lattice.cluster.membership",
+                                %error,
+                                "membership session stopped; reconciliation required"
+                            );
+                            MembershipSessionReturn {
+                                controls,
+                                retry,
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "lattice.cluster.membership",
+                                %error,
+                                "membership session task failed; reconciliation required"
+                            );
+                            MembershipSessionReturn {
+                                controls: closed_controls(),
+                                retry: false,
+                            }
+                        }
+                    };
                 }
                 event = join_events.recv() => {
                     match event {
@@ -169,16 +216,22 @@ impl MembershipJoinRuntime {
                         {
                             self.mark_membership_lost();
                             let _ = session_shutdown.send(true);
-                            return task.await
+                            return MembershipSessionReturn {
+                                controls: task.await
                                 .map(|(_, controls)| controls)
-                                .unwrap_or_else(|_| closed_controls());
+                                .unwrap_or_else(|_| closed_controls()),
+                                retry: false,
+                            };
                         }
                         Some(JoinEvent::TerminalFailure(_)) | None => {
                             self.mark_membership_lost();
                             let _ = session_shutdown.send(true);
-                            return task.await
+                            return MembershipSessionReturn {
+                                controls: task.await
                                 .map(|(_, controls)| controls)
-                                .unwrap_or_else(|_| closed_controls());
+                                .unwrap_or_else(|_| closed_controls()),
+                                retry: false,
+                            };
                         }
                         Some(JoinEvent::Coordinator { .. })
                         | Some(JoinEvent::CoordinatorLost { .. }) => {}
@@ -188,25 +241,34 @@ impl MembershipJoinRuntime {
                     let Some(effect) = effect else {
                         self.mark_membership_lost();
                         let _ = session_shutdown.send(true);
-                        return task.await
+                        return MembershipSessionReturn {
+                            controls: task.await
                             .map(|(_, controls)| controls)
-                            .unwrap_or_else(|_| closed_controls());
+                            .unwrap_or_else(|_| closed_controls()),
+                            retry: false,
+                        };
                     };
                     if self.apply_effect(effect).await.is_err() {
                         self.mark_membership_lost();
                         let _ = session_shutdown.send(true);
-                        return task.await
+                        return MembershipSessionReturn {
+                            controls: task.await
                             .map(|(_, controls)| controls)
-                            .unwrap_or_else(|_| closed_controls());
+                            .unwrap_or_else(|_| closed_controls()),
+                            retry: false,
+                        };
                     }
                 }
                 _ = changed.notified() => {}
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         let _ = session_shutdown.send(true);
-                        return task.await
+                        return MembershipSessionReturn {
+                            controls: task.await
                             .map(|(_, controls)| controls)
-                            .unwrap_or_else(|_| closed_controls());
+                            .unwrap_or_else(|_| closed_controls()),
+                            retry: false,
+                        };
                     }
                 }
             }

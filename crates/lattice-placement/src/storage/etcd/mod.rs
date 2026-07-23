@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use etcd_client::{
     Client, Compare, CompareOp, ConnectOptions, GetOptions, SortOrder, SortTarget, Txn, TxnOp,
@@ -35,6 +35,7 @@ mod traits;
 mod transactions;
 
 pub const STORAGE_SCHEMA_GENERATION: u64 = 5;
+pub const DEFAULT_ETCD_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct EtcdPlacementConfig {
@@ -69,19 +70,23 @@ pub struct EtcdPlacementStore {
     pub(super) prefix: String,
     list_page_size: usize,
     pub(super) limits: DurableStorageLimits,
+    operation_timeout: Duration,
 }
 
 impl EtcdPlacementStore {
     pub async fn connect(config: EtcdPlacementConfig) -> Result<Self, StorageError> {
         config.validate()?;
-        let client = Client::connect(&config.endpoints, config.connect_options)
-            .await
-            .map_err(map_etcd_read)?;
+        let client = run_read_deadline(
+            DEFAULT_ETCD_OPERATION_TIMEOUT,
+            Client::connect(&config.endpoints, config.connect_options),
+        )
+        .await?;
         Ok(Self {
             client,
             prefix: config.cluster_prefix,
             list_page_size: config.list_page_size,
             limits: config.limits,
+            operation_timeout: DEFAULT_ETCD_OPERATION_TIMEOUT,
         })
     }
 
@@ -101,7 +106,34 @@ impl EtcdPlacementStore {
             prefix,
             list_page_size,
             limits,
+            operation_timeout: DEFAULT_ETCD_OPERATION_TIMEOUT,
         })
+    }
+
+    pub fn with_operation_timeout(mut self, timeout: Duration) -> Result<Self, StorageError> {
+        if timeout.is_zero() {
+            return Err(StorageError::InvalidConfig);
+        }
+        self.operation_timeout = timeout;
+        Ok(self)
+    }
+
+    pub fn operation_timeout(&self) -> Duration {
+        self.operation_timeout
+    }
+
+    pub(super) async fn read_deadline<T, F>(&self, operation: F) -> Result<T, StorageError>
+    where
+        F: Future<Output = Result<T, etcd_client::Error>>,
+    {
+        run_read_deadline(self.operation_timeout, operation).await
+    }
+
+    pub(super) async fn write_deadline<T, F>(&self, operation: F) -> Result<T, StorageError>
+    where
+        F: Future<Output = Result<T, etcd_client::Error>>,
+    {
+        run_write_deadline(self.operation_timeout, operation).await
     }
 
     async fn ensure_schema_generation_inner(&self) -> Result<(), StorageError> {
@@ -133,10 +165,9 @@ impl EtcdPlacementStore {
         }
         puts.push(TxnOp::put(revision_key, "1", None));
         let mut client = self.client.clone();
-        let response = client
-            .txn(Txn::new().when(compares).and_then(puts))
-            .await
-            .map_err(map_etcd_txn)?;
+        let response = self
+            .write_deadline(client.txn(Txn::new().when(compares).and_then(puts)))
+            .await?;
         if response.succeeded() {
             return Ok(());
         }
@@ -189,39 +220,39 @@ impl EtcdPlacementStore {
             return Err(StorageError::InvalidConfig);
         }
         let mut client = self.client.clone();
-        client
-            .lease_grant(seconds, None)
+        self.write_deadline(client.lease_grant(seconds, None))
             .await
             .map(|response| response.id())
-            .map_err(map_etcd_read)
     }
 
     async fn keep_lease_alive_inner(&self, lease_id: i64) -> Result<(), StorageError> {
         if lease_id <= 0 {
             return Err(StorageError::InvalidConfig);
         }
-        let mut client = self.client.clone();
-        let (mut keeper, mut stream) = client
-            .lease_keep_alive(lease_id)
-            .await
-            .map_err(map_etcd_read)?;
-        keeper.keep_alive().await.map_err(map_etcd_read)?;
-        stream
-            .message()
-            .await
-            .map_err(map_etcd_read)?
-            .filter(|response| response.ttl() > 0)
-            .ok_or(StorageError::Unavailable)
-            .map(|_| ())
+        tokio::time::timeout(self.operation_timeout, async {
+            let mut client = self.client.clone();
+            let (mut keeper, mut stream) = client
+                .lease_keep_alive(lease_id)
+                .await
+                .map_err(map_etcd_read)?;
+            keeper.keep_alive().await.map_err(map_etcd_read)?;
+            stream
+                .message()
+                .await
+                .map_err(map_etcd_read)?
+                .filter(|response| response.ttl() > 0)
+                .ok_or(StorageError::Unavailable)
+                .map(|_| ())
+        })
+        .await
+        .map_err(|_| StorageError::Deadline)?
     }
 
     async fn revoke_lease_inner(&self, lease_id: i64) -> Result<(), StorageError> {
         let mut client = self.client.clone();
-        client
-            .lease_revoke(lease_id)
+        self.write_deadline(client.lease_revoke(lease_id))
             .await
             .map(|_| ())
-            .map_err(map_etcd_read)
     }
 
     async fn campaign_leader_inner(
@@ -253,8 +284,8 @@ impl EtcdPlacementStore {
             None => Compare::version(term_key.clone(), CompareOp::Equal, 0),
         };
         let mut client = self.client.clone();
-        client
-            .txn(
+        self.write_deadline(
+            client.txn(
                 Txn::new()
                     .when([
                         Compare::version(leader_key.clone(), CompareOp::Equal, 0),
@@ -268,10 +299,10 @@ impl EtcdPlacementStore {
                             Some(etcd_client::PutOptions::new().with_lease(lease_id)),
                         ),
                     ]),
-            )
-            .await
-            .map(|response| response.succeeded())
-            .map_err(map_etcd_txn)
+            ),
+        )
+        .await
+        .map(|response| response.succeeded())
     }
 
     pub(super) fn key(&self, suffix: &str) -> String {
@@ -397,18 +428,19 @@ impl EtcdPlacementStore {
         let mut records = Vec::new();
         loop {
             let mut client = self.client.clone();
-            let response = client
-                .get(
-                    start.clone(),
-                    Some(
-                        GetOptions::new()
-                            .with_range(end.clone())
-                            .with_limit(page_limit)
-                            .with_sort(SortTarget::Key, SortOrder::Ascend),
+            let response = self
+                .read_deadline(
+                    client.get(
+                        start.clone(),
+                        Some(
+                            GetOptions::new()
+                                .with_range(end.clone())
+                                .with_limit(page_limit)
+                                .with_sort(SortTarget::Key, SortOrder::Ascend),
+                        ),
                     ),
                 )
-                .await
-                .map_err(map_etcd_read)?;
+                .await?;
             records.extend(
                 response
                     .kvs()
@@ -460,7 +492,7 @@ impl EtcdPlacementStore {
         key: &str,
     ) -> Result<Option<(Vec<u8>, i64, i64)>, StorageError> {
         let mut client = self.client.clone();
-        let response = client.get(key, None).await.map_err(map_etcd_read)?;
+        let response = self.read_deadline(client.get(key, None)).await?;
         Ok(response.kvs().first().map(|record| {
             (
                 record.value().to_vec(),
@@ -645,10 +677,9 @@ impl EtcdPlacementStore {
 
     async fn lease_time_to_live(&self, lease_id: i64) -> Result<Option<Duration>, StorageError> {
         let mut client = self.client.clone();
-        let response = client
-            .lease_time_to_live(lease_id, None)
-            .await
-            .map_err(map_etcd_read)?;
+        let response = self
+            .read_deadline(client.lease_time_to_live(lease_id, None))
+            .await?;
         if response.ttl() <= 0 {
             Ok(None)
         } else {
@@ -954,5 +985,47 @@ pub(super) fn map_etcd_txn(error: etcd_client::Error) -> StorageError {
             _ => StorageError::OutcomeUnknown,
         },
         _ => StorageError::OutcomeUnknown,
+    }
+}
+
+async fn run_read_deadline<T, F>(timeout: Duration, operation: F) -> Result<T, StorageError>
+where
+    F: Future<Output = Result<T, etcd_client::Error>>,
+{
+    tokio::time::timeout(timeout, operation)
+        .await
+        .map_err(|_| StorageError::Deadline)?
+        .map_err(map_etcd_read)
+}
+
+async fn run_write_deadline<T, F>(timeout: Duration, operation: F) -> Result<T, StorageError>
+where
+    F: Future<Output = Result<T, etcd_client::Error>>,
+{
+    tokio::time::timeout(timeout, operation)
+        .await
+        .map_err(|_| StorageError::OutcomeUnknown)?
+        .map_err(map_etcd_txn)
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stalled_reads_and_writes_preserve_distinct_deadline_semantics() {
+        let read = run_read_deadline(
+            Duration::from_millis(5),
+            std::future::pending::<Result<(), etcd_client::Error>>(),
+        )
+        .await;
+        assert_eq!(read, Err(StorageError::Deadline));
+
+        let write = run_write_deadline(
+            Duration::from_millis(5),
+            std::future::pending::<Result<(), etcd_client::Error>>(),
+        )
+        .await;
+        assert_eq!(write, Err(StorageError::OutcomeUnknown));
     }
 }

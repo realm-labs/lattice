@@ -11,14 +11,19 @@ use super::{
     MembershipVersion, NodeKey, PlacementControlCommand, PlacementDomainHello,
     PlacementDomainLeader, PlacementDomainLeaderConfig, PlacementDomainStore, PlacementSlotKey,
     PlacementSlotState, PlacementVersion, PlanReason, RebalanceTrigger, ScopedElectionStore,
-    SnapshotRecord, build_snapshot, encode_control_command,
+    SnapshotRecord, build_snapshot,
 };
 use crate::{
-    control::{PlacementControlEventKind, PlacementResolutionFailure},
+    control::{
+        PlacementControlEventKind, PlacementResolutionFailure, encode_control_command_for_term,
+    },
     coordinator::{CoordinatorDelta, DomainMemberRecord, DomainMemberStatus, SnapshotVersion},
-    storage::domain::{
-        CreateDomainMember, LeasedClaim, PutEntityConfig, PutSingletonConfig, RemoveDomainMember,
-        UpdateDomainMember,
+    storage::{
+        StorageError,
+        domain::{
+            CreateDomainMember, LeasedClaim, PutEntityConfig, PutSingletonConfig,
+            RemoveDomainMember, UpdateDomainMember,
+        },
     },
     types::MonotonicTime,
 };
@@ -346,6 +351,7 @@ where
         send_control(
             &association,
             &self.version.domain,
+            self.version.term.get(),
             PlacementControlCommand::ResolutionFailed {
                 request_id,
                 slot,
@@ -403,6 +409,7 @@ where
                 send_control(
                     &association,
                     &self.version.domain,
+                    self.version.term.get(),
                     PlacementControlCommand::MemberUp(record),
                     &self.config,
                 )?;
@@ -460,6 +467,7 @@ where
             send_control(
                 &association,
                 &self.version.domain,
+                self.version.term.get(),
                 PlacementControlCommand::MemberUp(record),
                 &self.config,
             )?;
@@ -493,6 +501,7 @@ where
                 send_control(
                     &association,
                     &self.version.domain,
+                    self.version.term.get(),
                     PlacementControlCommand::StateDelta(CoordinatorDelta {
                         version: version.clone(),
                         records: Vec::new(),
@@ -673,6 +682,7 @@ where
         send_control(
             &association,
             &self.version.domain,
+            self.version.term.get(),
             PlacementControlCommand::MemberUp(member),
             &self.config,
         )?;
@@ -797,27 +807,35 @@ include!("membership_domain_ops.rs");
 
 pub(super) fn control_dispatch_error(error: &CoordinatorRuntimeError) -> ControlDispatchError {
     match error {
-        CoordinatorRuntimeError::UnauthorizedCommand
-        | CoordinatorRuntimeError::UnknownSession
-        | CoordinatorRuntimeError::Codec
-        | CoordinatorRuntimeError::Coordinator(_)
-        | CoordinatorRuntimeError::Control(_)
-        | CoordinatorRuntimeError::ClaimSequence => ControlDispatchError::InvalidCommand,
-        _ => ControlDispatchError::Unavailable,
+        CoordinatorRuntimeError::NotLeader
+        | CoordinatorRuntimeError::ControlClosed
+        | CoordinatorRuntimeError::OperationClosed
+        | CoordinatorRuntimeError::AssociationUnavailable
+        | CoordinatorRuntimeError::Association(_) => ControlDispatchError::Unavailable,
+        CoordinatorRuntimeError::Storage(
+            StorageError::LeadershipLost
+            | StorageError::Unavailable
+            | StorageError::Deadline
+            | StorageError::OutcomeUnknown
+            | StorageError::Authentication,
+        ) => ControlDispatchError::Unavailable,
+        _ => ControlDispatchError::InvalidCommand,
     }
 }
 
 pub(super) fn send_control(
     association: &Association,
     domain: &PlacementDomainId,
+    coordinator_term: u64,
     command: PlacementControlCommand,
     config: &PlacementDomainLeaderConfig,
 ) -> Result<(), CoordinatorRuntimeError> {
     if association.state() == AssociationState::Closed {
         return Err(CoordinatorRuntimeError::AssociationUnavailable);
     }
-    let payload = encode_control_command(
+    let payload = encode_control_command_for_term(
         &CoordinatorScope::Placement(domain.clone()),
+        coordinator_term,
         &command,
         config.maximum_control_payload,
     )
@@ -850,5 +868,30 @@ pub(super) fn plan_priority(reason: &PlanReason) -> u8 {
         PlanReason::Drain => 1,
         PlanReason::Manual => 2,
         PlanReason::Automatic => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_control_is_acknowledged_while_transient_storage_failure_is_retried() {
+        assert_eq!(
+            control_dispatch_error(&CoordinatorRuntimeError::StaleHandoff),
+            ControlDispatchError::InvalidCommand
+        );
+        assert_eq!(
+            control_dispatch_error(&CoordinatorRuntimeError::Storage(
+                StorageError::CompareFailed
+            )),
+            ControlDispatchError::InvalidCommand
+        );
+        assert_eq!(
+            control_dispatch_error(&CoordinatorRuntimeError::Storage(
+                StorageError::OutcomeUnknown
+            )),
+            ControlDispatchError::Unavailable
+        );
     }
 }

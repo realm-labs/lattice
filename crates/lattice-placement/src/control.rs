@@ -26,7 +26,7 @@ use crate::{
     },
 };
 
-pub const PLACEMENT_CONTROL_GENERATION: u64 = 6;
+pub const PLACEMENT_CONTROL_GENERATION: u64 = 7;
 pub const DEFAULT_MAX_CONTROL_PAYLOAD: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +116,8 @@ pub enum PlacementResolutionFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopedPlacementControlCommand {
     pub scope: CoordinatorScope,
+    #[serde(default)]
+    pub coordinator_term: Option<u64>,
     pub command: PlacementControlCommand,
 }
 
@@ -124,11 +126,33 @@ pub fn encode_control_command(
     command: &PlacementControlCommand,
     maximum_payload: usize,
 ) -> Result<Bytes, PlacementControlError> {
+    encode_control_command_inner(scope, None, command, maximum_payload)
+}
+
+pub fn encode_control_command_for_term(
+    scope: &CoordinatorScope,
+    coordinator_term: u64,
+    command: &PlacementControlCommand,
+    maximum_payload: usize,
+) -> Result<Bytes, PlacementControlError> {
+    if coordinator_term == 0 {
+        return Err(PlacementControlError::InvalidCoordinatorTerm);
+    }
+    encode_control_command_inner(scope, Some(coordinator_term), command, maximum_payload)
+}
+
+fn encode_control_command_inner(
+    scope: &CoordinatorScope,
+    coordinator_term: Option<u64>,
+    command: &PlacementControlCommand,
+    maximum_payload: usize,
+) -> Result<Bytes, PlacementControlError> {
     if maximum_payload == 0 {
         return Err(PlacementControlError::InvalidLimit);
     }
     let payload = serde_json::to_vec(&ScopedPlacementControlCommand {
         scope: scope.clone(),
+        coordinator_term,
         command: command.clone(),
     })
     .map_err(|_| PlacementControlError::Codec)?;
@@ -173,6 +197,7 @@ pub struct InboundPlacementControl {
     pub association: AssociationKey,
     pub command_id: CommandId,
     pub scope: CoordinatorScope,
+    pub coordinator_term: Option<u64>,
     pub command: PlacementControlCommand,
 }
 
@@ -251,6 +276,7 @@ impl ControlDispatch for PlacementControlRouter {
                     association,
                     command_id,
                     scope: scoped.scope,
+                    coordinator_term: scoped.coordinator_term,
                     command: scoped.command,
                 })),
                 completion,
@@ -346,6 +372,7 @@ impl ControlDispatch for PlacementControlDirectory {
                     association,
                     command_id,
                     scope: scoped.scope,
+                    coordinator_term: scoped.coordinator_term,
                     command: scoped.command,
                 })),
                 completion,
@@ -406,6 +433,8 @@ pub enum PlacementControlError {
     Codec,
     #[error("placement control schema generation differs")]
     GenerationMismatch,
+    #[error("placement control Coordinator term must be nonzero")]
+    InvalidCoordinatorTerm,
 }
 
 #[cfg(test)]
@@ -422,11 +451,46 @@ mod tests {
         let payload = encode_control_command(&scope, &command, 1024).unwrap();
         assert_eq!(
             decode_control_command(&payload, 1024).unwrap(),
-            ScopedPlacementControlCommand { scope, command }
+            ScopedPlacementControlCommand {
+                scope,
+                coordinator_term: None,
+                command
+            }
         );
         assert_eq!(
             decode_control_command(&payload, 1).unwrap_err(),
             PlacementControlError::PayloadTooLarge
+        );
+    }
+
+    #[test]
+    fn coordinator_term_round_trips_and_rejects_zero() {
+        let command = PlacementControlCommand::NodeHeartbeat {
+            incarnation: NodeIncarnation::new(1).unwrap(),
+            sequence: 7,
+        };
+        let scope = CoordinatorScope::Membership;
+        let payload = encode_control_command_for_term(&scope, 29, &command, 1024).unwrap();
+        assert_eq!(
+            decode_control_command(&payload, 1024).unwrap(),
+            ScopedPlacementControlCommand {
+                scope: scope.clone(),
+                coordinator_term: Some(29),
+                command,
+            }
+        );
+        assert_eq!(
+            encode_control_command_for_term(
+                &scope,
+                0,
+                &PlacementControlCommand::NodeHeartbeat {
+                    incarnation: NodeIncarnation::new(1).unwrap(),
+                    sequence: 8,
+                },
+                1024,
+            )
+            .unwrap_err(),
+            PlacementControlError::InvalidCoordinatorTerm
         );
     }
 }

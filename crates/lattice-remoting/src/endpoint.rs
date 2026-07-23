@@ -834,6 +834,7 @@ impl RemotingEndpoint {
             maximum_ready_write_batch_frames: self.config.max_ready_write_batch_frames,
             maximum_ready_read_batch_frames: self.config.max_ready_read_batch_frames,
             maximum_coalesced_write_batch_bytes: self.config.max_coalesced_write_batch_bytes,
+            maximum_pending_control_applies: self.config.control_queue_frames,
         }
     }
 
@@ -997,6 +998,18 @@ mod tests {
         applied: Mutex<Vec<Bytes>>,
     }
 
+    #[derive(Default)]
+    struct BlockingControl {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[derive(Default)]
+    struct RecoveringControl {
+        old_attempts: std::sync::atomic::AtomicUsize,
+        applied: Mutex<Vec<Bytes>>,
+    }
+
     #[async_trait]
     impl ControlDispatch for RecordingControl {
         async fn apply(
@@ -1036,6 +1049,62 @@ mod tests {
             self.applied
                 .lock()
                 .expect("recording control poisoned")
+                .push(payload);
+            Ok(())
+        }
+
+        async fn reconcile(
+            &self,
+            _association: AssociationKey,
+            _gap: Option<ControlGap>,
+        ) -> Result<(), ControlDispatchError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ControlDispatch for BlockingControl {
+        async fn apply(
+            &self,
+            _association: AssociationKey,
+            _command_id: CommandId,
+            _payload: Bytes,
+        ) -> Result<(), ControlDispatchError> {
+            self.started.notify_waiters();
+            self.release.notified().await;
+            Ok(())
+        }
+
+        async fn reconcile(
+            &self,
+            _association: AssociationKey,
+            _gap: Option<ControlGap>,
+        ) -> Result<(), ControlDispatchError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ControlDispatch for RecoveringControl {
+        async fn apply(
+            &self,
+            _association: AssociationKey,
+            _command_id: CommandId,
+            payload: Bytes,
+        ) -> Result<(), ControlDispatchError> {
+            if payload == Bytes::from_static(b"term-28-heartbeat") {
+                if self
+                    .old_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                    == 0
+                {
+                    return Err(ControlDispatchError::Unavailable);
+                }
+                return Err(ControlDispatchError::InvalidCommand);
+            }
+            self.applied
+                .lock()
+                .expect("recovering control poisoned")
                 .push(payload);
             Ok(())
         }

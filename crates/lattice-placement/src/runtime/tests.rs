@@ -582,6 +582,7 @@ async fn real_control_session_installs_snapshot_and_matching_claim() {
         logic_associations,
         LogicCoordinatorConfig::default(),
         32,
+        1,
     )
     .unwrap();
     let state = logic.state();

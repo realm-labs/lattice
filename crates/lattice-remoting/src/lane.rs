@@ -48,6 +48,7 @@ pub struct BidirectionalLaneConfig {
     pub maximum_ready_write_batch_frames: usize,
     pub maximum_ready_read_batch_frames: usize,
     pub maximum_coalesced_write_batch_bytes: usize,
+    pub maximum_pending_control_applies: usize,
 }
 
 impl BidirectionalLaneConfig {
@@ -61,6 +62,7 @@ impl BidirectionalLaneConfig {
             || self.maximum_ready_read_batch_frames == 0
             || self.maximum_ready_read_batch_frames > ABSOLUTE_MAX_READY_READ_BATCH_FRAMES
             || self.maximum_coalesced_write_batch_bytes == 0
+            || self.maximum_pending_control_applies == 0
         {
             return Err(LaneError::InvalidLimit);
         }
@@ -188,6 +190,30 @@ where
     let mut last_received = Instant::now();
     let mut outbound_candidates = Vec::with_capacity(config.maximum_ready_write_batch_frames);
     let mut outbound_batch = Vec::with_capacity(config.maximum_ready_write_batch_frames);
+    let (control_apply_tx, mut control_apply_rx, _control_worker) = if lane == LaneKind::Control {
+        let (commands, mut command_rx) =
+            mpsc::channel::<Frame>(config.maximum_pending_control_applies);
+        let (results, result_rx) = mpsc::channel(config.maximum_pending_control_applies);
+        let association = runtime.association.clone();
+        let control_dispatch = control_dispatch.clone();
+        let worker = tokio::spawn(async move {
+            while let Some(frame) = command_rx.recv().await {
+                let result =
+                    apply_control_frame(association.clone(), control_dispatch.clone(), frame).await;
+                let failed = result.is_err();
+                if results.send(result).await.is_err() || failed {
+                    break;
+                }
+            }
+        });
+        (
+            Some(commands),
+            Some(result_rx),
+            Some(ControlWorkerGuard(worker)),
+        )
+    } else {
+        (None, None, None)
+    };
     let idle = tokio::time::sleep(config.idle_data_connection_timeout);
     tokio::pin!(idle);
 
@@ -199,6 +225,30 @@ where
                     writer.flush().await?;
                     return Ok(LaneExit::Shutdown);
                 }
+            }
+            completed = async {
+                control_apply_rx
+                    .as_mut()
+                    .expect("control result branch requires a worker")
+                    .recv()
+                    .await
+            }, if control_apply_rx.is_some() => {
+                let Some(completed) = completed else {
+                    return Err(LaneError::ControlWorkerClosed);
+                };
+                if let Some(frame) = completed? {
+                    writer.write_frame(&frame).await?;
+                }
+            }
+            _ = heartbeat.tick(), if lane == LaneKind::Control => {
+                if Instant::now().duration_since(last_received)
+                    >= config.heartbeat_interval * config.heartbeat_miss_limit
+                {
+                    return Err(LaneError::HeartbeatTimeout);
+                }
+                writer
+                    .write_frame(&Frame::new(FrameKind::Heartbeat, Bytes::new()))
+                    .await?;
             }
             completed = asks.join_next(), if !asks.is_empty() => {
                 let Some(completed) = completed else {
@@ -414,61 +464,19 @@ where
                             .await?;
                     }
                     FrameKind::HeartbeatAck if lane == LaneKind::Control => {}
-                    FrameKind::ControlEnvelope if lane == LaneKind::Control => {
-                        let envelope = decode_control_envelope(&frame)?;
-                        match association.preview_control(&envelope) {
-                            ControlApply::Apply(_) => {
-                                let result = control_dispatch
-                                    .apply(
-                                        association.key().clone(),
-                                        envelope.command_id,
-                                        envelope.payload.clone(),
-                                    )
-                                    .await;
-                                match result {
-                                    Ok(()) | Err(ControlDispatchError::InvalidCommand) => {}
-                                    Err(error) => return Err(error.into()),
-                                }
-                                lattice_core::failpoint::hit(
-                                    Failpoint::ControlAfterRemoteApplyBeforeAck,
-                                );
-                                let ack = association.commit_control(envelope);
-                                writer.write_frame(&control_ack_frame(ack)).await?;
-                            }
-                            ControlApply::Duplicate(anticipated) => {
-                                let ack = if association.current_control_ack().cumulative_sequence
-                                    < anticipated.cumulative_sequence
-                                {
-                                    association.commit_control(envelope)
-                                } else {
-                                    anticipated
-                                };
-                                writer.write_frame(&control_ack_frame(ack)).await?;
-                            }
-                            ControlApply::Gap(gap) => {
-                                control_dispatch
-                                    .reconcile(association.key().clone(), Some(gap))
-                                    .await?;
-                            }
-                            ControlApply::ReconcileEpoch => {
-                                control_dispatch
-                                    .reconcile(association.key().clone(), None)
-                                    .await?;
-                            }
-                        }
-                    }
+                    FrameKind::ControlEnvelope if lane == LaneKind::Control => control_apply_tx
+                        .as_ref()
+                        .expect("control lane requires an apply worker")
+                        .try_send(frame)
+                        .map_err(|_| LaneError::ControlApplyBackpressure)?,
                     FrameKind::ControlAck if lane == LaneKind::Control => {
                         association.acknowledge_control(decode_control_ack(&frame)?)?;
                     }
-                    FrameKind::CoordinatorEvent if lane == LaneKind::Control => {
-                        control_dispatch
-                            .apply(
-                                association.key().clone(),
-                                CommandId::generate(),
-                                frame.into_payload(),
-                            )
-                            .await?;
-                    }
+                    FrameKind::CoordinatorEvent if lane == LaneKind::Control => control_apply_tx
+                        .as_ref()
+                        .expect("control lane requires an apply worker")
+                        .try_send(frame)
+                        .map_err(|_| LaneError::ControlApplyBackpressure)?,
                     FrameKind::Backpressure => {}
                     FrameKind::LaneWake if lane == LaneKind::Control => {
                         let lane = decode_lane_wake(&frame)?;
@@ -490,16 +498,6 @@ where
                 };
                 }
             }
-            _ = heartbeat.tick(), if lane == LaneKind::Control => {
-                if Instant::now().duration_since(last_received)
-                    >= config.heartbeat_interval * config.heartbeat_miss_limit
-                {
-                    return Err(LaneError::HeartbeatTimeout);
-                }
-                writer
-                    .write_frame(&Frame::new(FrameKind::Heartbeat, Bytes::new()))
-                    .await?;
-            }
             () = &mut idle, if lane != LaneKind::Control => {
                 if lane == LaneKind::Interactive
                     && (!asks.is_empty()
@@ -514,6 +512,77 @@ where
                 return Ok(LaneExit::Idle);
             }
         }
+    }
+}
+
+struct ControlWorkerGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ControlWorkerGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn apply_control_frame(
+    association: Arc<Association>,
+    control_dispatch: Arc<dyn ControlDispatch>,
+    frame: Frame,
+) -> Result<Option<Frame>, LaneError> {
+    match frame.kind {
+        FrameKind::ControlEnvelope => {
+            let envelope = decode_control_envelope(&frame)?;
+            match association.preview_control(&envelope) {
+                ControlApply::Apply(_) => {
+                    let result = control_dispatch
+                        .apply(
+                            association.key().clone(),
+                            envelope.command_id,
+                            envelope.payload.clone(),
+                        )
+                        .await;
+                    match result {
+                        Ok(()) | Err(ControlDispatchError::InvalidCommand) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    lattice_core::failpoint::hit(Failpoint::ControlAfterRemoteApplyBeforeAck);
+                    let ack = association.commit_control(envelope);
+                    Ok(Some(control_ack_frame(ack)))
+                }
+                ControlApply::Duplicate(anticipated) => {
+                    let ack = if association.current_control_ack().cumulative_sequence
+                        < anticipated.cumulative_sequence
+                    {
+                        association.commit_control(envelope)
+                    } else {
+                        anticipated
+                    };
+                    Ok(Some(control_ack_frame(ack)))
+                }
+                ControlApply::Gap(gap) => {
+                    control_dispatch
+                        .reconcile(association.key().clone(), Some(gap))
+                        .await?;
+                    Ok(None)
+                }
+                ControlApply::ReconcileEpoch => {
+                    control_dispatch
+                        .reconcile(association.key().clone(), None)
+                        .await?;
+                    Ok(None)
+                }
+            }
+        }
+        FrameKind::CoordinatorEvent => {
+            control_dispatch
+                .apply(
+                    association.key().clone(),
+                    CommandId::generate(),
+                    frame.into_payload(),
+                )
+                .await?;
+            Ok(None)
+        }
+        _ => Err(LaneError::UnexpectedControlWork),
     }
 }
 
@@ -543,6 +612,12 @@ pub enum LaneError {
     InvalidLimit,
     #[error("control lane missed its bounded heartbeat window")]
     HeartbeatTimeout,
+    #[error("control apply worker stopped unexpectedly")]
+    ControlWorkerClosed,
+    #[error("control apply queue is full")]
+    ControlApplyBackpressure,
+    #[error("control apply worker received an unexpected frame")]
+    UnexpectedControlWork,
     #[error("lane received frame kind {kind:?} on {lane:?}")]
     UnexpectedFrame { lane: LaneKind, kind: FrameKind },
     #[error("lane wake frame has an invalid payload")]
@@ -714,6 +789,7 @@ mod tests {
                         maximum_ready_write_batch_frames: 8,
                         maximum_ready_read_batch_frames: 8,
                         maximum_coalesced_write_batch_bytes: 4096,
+                        maximum_pending_control_applies: 8,
                     },
                 )
                 .run(&mut server_receiver, stream, &mut server_shutdown)
@@ -748,6 +824,7 @@ mod tests {
                         maximum_ready_write_batch_frames: 8,
                         maximum_ready_read_batch_frames: 8,
                         maximum_coalesced_write_batch_bytes: 4096,
+                        maximum_pending_control_applies: 8,
                     },
                 )
                 .run(&mut client_receiver, stream, &mut client_shutdown)

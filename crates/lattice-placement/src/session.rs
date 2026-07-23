@@ -24,7 +24,7 @@ use crate::{
     control::{
         DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlError,
         PlacementControlEvent, PlacementControlEventKind, PlacementResolutionFailure,
-        encode_control_command,
+        encode_control_command_for_term,
     },
     coordinator::{
         CoordinatorDelta, CoordinatorError, MemberEvent, MemberRecord, MemberStatus,
@@ -94,6 +94,7 @@ pub enum LogicPlacementEffect {
 
 pub struct LogicPlacementState {
     local_node: NodeKey,
+    coordinator_term: u64,
     session: PlacementDomainState,
     slots: BTreeMap<PlacementSlotKey, PlacementSlot>,
     authorities: BTreeMap<PlacementSlotKey, PlacementAuthority>,
@@ -131,6 +132,10 @@ impl LogicPlacementState {
     pub fn change_notifier(&self) -> Arc<Notify> {
         self.changed.clone()
     }
+
+    pub fn coordinator_term(&self) -> Option<u64> {
+        Some(self.coordinator_term)
+    }
 }
 
 pub struct PlacementDomainSession {
@@ -145,6 +150,7 @@ pub struct PlacementDomainSession {
     local_event_sender: mpsc::Sender<LocalAuthorityEvent>,
     origin: Instant,
     heartbeat_sequence: u64,
+    coordinator_term: u64,
 }
 
 struct LocalAuthorityEvent {
@@ -160,6 +166,7 @@ pub struct LogicCoordinatorHandle {
     maximum_control_payload: usize,
     state: Arc<Mutex<LogicPlacementState>>,
     local_events: mpsc::Sender<LocalAuthorityEvent>,
+    coordinator_term: u64,
 }
 
 impl LogicCoordinatorHandle {
@@ -240,8 +247,9 @@ impl LogicCoordinatorHandle {
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
         let command_id = association.admit_control_command(
-            encode_control_command(
+            encode_control_command_for_term(
                 &CoordinatorScope::Placement(self.domain.clone()),
+                self.coordinator_term,
                 &PlacementControlCommand::DrainComplete {
                     operation_id,
                     expected_incarnation: incarnation,
@@ -262,8 +270,9 @@ impl LogicCoordinatorHandle {
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
         association.admit_ephemeral_control(
-            encode_control_command(
+            encode_control_command_for_term(
                 &CoordinatorScope::Placement(self.domain.clone()),
+                self.coordinator_term,
                 &command,
                 self.maximum_control_payload,
             )
@@ -278,8 +287,9 @@ impl LogicCoordinatorHandle {
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
         association.admit_control_command(
-            encode_control_command(
+            encode_control_command_for_term(
                 &CoordinatorScope::Placement(self.domain.clone()),
+                self.coordinator_term,
                 &command,
                 self.maximum_control_payload,
             )
@@ -322,8 +332,9 @@ impl LogicCoordinatorHandle {
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
         association.admit_control_command(
-            encode_control_command(
+            encode_control_command_for_term(
                 &CoordinatorScope::Placement(self.domain.clone()),
+                self.coordinator_term,
                 &command,
                 self.maximum_control_payload,
             )
@@ -340,9 +351,11 @@ impl PlacementDomainSession {
         associations: Arc<AssociationManager>,
         config: LogicCoordinatorConfig,
         effect_capacity: usize,
+        coordinator_term: u64,
     ) -> Result<(Self, mpsc::Receiver<LogicPlacementEffect>), LogicSessionError> {
         config.validate()?;
         if effect_capacity == 0
+            || coordinator_term == 0
             || domain_hello.node.incarnation != coordinator.local_incarnation
             || domain_hello.node.address == coordinator.remote_address
         {
@@ -360,6 +373,7 @@ impl PlacementDomainSession {
                 config,
                 state: Arc::new(Mutex::new(LogicPlacementState {
                     local_node,
+                    coordinator_term,
                     session: PlacementDomainState::new(domain),
                     slots: BTreeMap::new(),
                     authorities: BTreeMap::new(),
@@ -373,6 +387,7 @@ impl PlacementDomainSession {
                 local_event_sender,
                 origin: Instant::now(),
                 heartbeat_sequence: 0,
+                coordinator_term,
             },
             receiver,
         ))
@@ -390,6 +405,7 @@ impl PlacementDomainSession {
             maximum_control_payload: self.config.maximum_control_payload,
             state: self.state.clone(),
             local_events: self.local_event_sender.clone(),
+            coordinator_term: self.coordinator_term,
         }
     }
 
@@ -538,6 +554,7 @@ impl PlacementDomainSession {
             }
             PlacementControlEventKind::Command(inbound) => {
                 self.require_coordinator(&inbound.association)?;
+                self.require_coordinator_term(inbound.coordinator_term)?;
                 match inbound.command {
                     PlacementControlCommand::SnapshotBegin(begin) => {
                         self.stager = Some(
@@ -845,8 +862,13 @@ impl PlacementDomainSession {
         }
         let scope = CoordinatorScope::Placement(self.domain_hello.domain.clone());
         association.admit_control_command(
-            encode_control_command(&scope, &command, self.config.maximum_control_payload)
-                .map_err(LogicSessionError::Control)?,
+            encode_control_command_for_term(
+                &scope,
+                self.coordinator_term,
+                &command,
+                self.config.maximum_control_payload,
+            )
+            .map_err(LogicSessionError::Control)?,
         )?;
         Ok(())
     }
@@ -856,6 +878,14 @@ impl PlacementDomainSession {
             return Err(LogicSessionError::UnauthorizedCommand);
         }
         Ok(())
+    }
+
+    fn require_coordinator_term(&self, term: Option<u64>) -> Result<(), LogicSessionError> {
+        if term == Some(self.coordinator_term) {
+            Ok(())
+        } else {
+            Err(LogicSessionError::StaleGeneration)
+        }
     }
 
     fn now(&self) -> MonotonicTime {

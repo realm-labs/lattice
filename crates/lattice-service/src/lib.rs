@@ -18,4 +18,6 @@ pub mod registration;
 pub mod supervisor;
 
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;

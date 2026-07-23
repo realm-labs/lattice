@@ -71,6 +71,11 @@ struct LogicSessionRun {
     handle: LogicCoordinatorHandle,
 }
 
+struct LogicSessionReturn {
+    controls: mpsc::Receiver<PlacementControlEvent>,
+    retry: bool,
+}
+
 impl LogicJoinRuntime {
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         let (join_events_tx, mut join_events) = mpsc::channel(8);
@@ -95,79 +100,97 @@ impl LogicJoinRuntime {
                     }
                     self.set_domain_state(PlacementDomainState::Joining);
                     self.bootstrap_view.install(leader.clone());
-                    let Some(receiver) = controls.take() else {
+                    let Some(mut receiver) = controls.take() else {
                         continue;
                     };
-                    let key = association.key().clone();
-                    let Ok((session, effects)) = PlacementDomainSession::new(
-                        self.domain_hello.clone(),
-                        key,
-                        self.associations.clone(),
-                        self.config.clone(),
-                        self.effect_capacity,
-                    ) else {
-                        break;
-                    };
-                    let Ok(mut router) = DomainLogicalRouter::new(
-                        self.domain_hello.node.clone(),
-                        session.state(),
-                        self.associations.clone(),
-                        self.messaging.clone(),
-                        association.key().clone(),
-                        self.buffer_config.clone(),
-                        self.maximum_registrations,
-                    )
-                    .map(|router| router.with_peer_reconciler(self.peers.clone())) else {
-                        let _ = self
-                            .lifecycle_driver
-                            .transition(ServiceLifecycleEvent::CoordinatorLost);
-                        self.set_domain_state(PlacementDomainState::Degraded);
-                        break;
-                    };
-                    if self
-                        .entity_installers
-                        .iter()
-                        .filter(|install| install.domain == self.domain_hello.domain)
-                        .any(|install| (install.install)(&mut router).is_err())
-                    {
-                        let _ = self
-                            .lifecycle_driver
-                            .transition(ServiceLifecycleEvent::CoordinatorLost);
-                        self.set_domain_state(PlacementDomainState::Degraded);
-                        break;
-                    }
-                    let domain = self.domain_hello.domain.clone();
-                    if self.router.install(&domain, Arc::new(router)).is_err() {
-                        let _ = self
-                            .lifecycle_driver
-                            .transition(ServiceLifecycleEvent::CoordinatorLost);
-                        self.set_domain_state(PlacementDomainState::Degraded);
-                        break;
-                    }
-                    let handle = session.control_handle();
-                    self.logic_handles
-                        .lock()
-                        .expect("logic handles poisoned")
-                        .insert(self.domain_hello.domain.clone(), handle.clone());
-                    controls = Some(
-                        self.run_session(
-                            LogicSessionRun {
-                                leader,
-                                session,
-                                controls: receiver,
-                                effects,
-                                handle,
-                            },
-                            &mut join_events,
-                            &mut shutdown,
+                    loop {
+                        if association.state()
+                            != lattice_remoting::association::AssociationState::Active
+                        {
+                            controls = Some(receiver);
+                            break;
+                        }
+                        let key = association.key().clone();
+                        let Ok((session, effects)) = PlacementDomainSession::new(
+                            self.domain_hello.clone(),
+                            key,
+                            self.associations.clone(),
+                            self.config.clone(),
+                            self.effect_capacity,
+                            leader.term,
+                        ) else {
+                            controls = Some(receiver);
+                            break;
+                        };
+                        let Ok(mut router) = DomainLogicalRouter::new(
+                            self.domain_hello.node.clone(),
+                            session.state(),
+                            self.associations.clone(),
+                            self.messaging.clone(),
+                            association.key().clone(),
+                            self.buffer_config.clone(),
+                            self.maximum_registrations,
                         )
-                        .await,
-                    );
-                    self.logic_handles
-                        .lock()
-                        .expect("logic handles poisoned")
-                        .remove(&self.domain_hello.domain);
-                    self.router.clear(&self.domain_hello.domain);
+                        .map(|router| router.with_peer_reconciler(self.peers.clone())) else {
+                            let _ = self
+                                .lifecycle_driver
+                                .transition(ServiceLifecycleEvent::CoordinatorLost);
+                            self.set_domain_state(PlacementDomainState::Degraded);
+                            controls = Some(receiver);
+                            break;
+                        };
+                        if self
+                            .entity_installers
+                            .iter()
+                            .filter(|install| install.domain == self.domain_hello.domain)
+                            .any(|install| (install.install)(&mut router).is_err())
+                        {
+                            let _ = self
+                                .lifecycle_driver
+                                .transition(ServiceLifecycleEvent::CoordinatorLost);
+                            self.set_domain_state(PlacementDomainState::Degraded);
+                            controls = Some(receiver);
+                            break;
+                        }
+                        let domain = self.domain_hello.domain.clone();
+                        if self.router.install(&domain, Arc::new(router)).is_err() {
+                            let _ = self
+                                .lifecycle_driver
+                                .transition(ServiceLifecycleEvent::CoordinatorLost);
+                            self.set_domain_state(PlacementDomainState::Degraded);
+                            controls = Some(receiver);
+                            break;
+                        }
+                        let handle = session.control_handle();
+                        self.logic_handles
+                            .lock()
+                            .expect("logic handles poisoned")
+                            .insert(self.domain_hello.domain.clone(), handle.clone());
+                        let returned = self
+                            .run_session(
+                                LogicSessionRun {
+                                    leader: leader.clone(),
+                                    session,
+                                    controls: receiver,
+                                    effects,
+                                    handle,
+                                },
+                                &mut join_events,
+                                &mut shutdown,
+                            )
+                            .await;
+                        self.logic_handles
+                            .lock()
+                            .expect("logic handles poisoned")
+                            .remove(&self.domain_hello.domain);
+                        self.router.clear(&self.domain_hello.domain);
+                        receiver = returned.controls;
+                        if !returned.retry {
+                            controls = Some(receiver);
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
                 }
                 JoinEvent::CoordinatorLost { .. } => {
                     self.router.clear(&self.domain_hello.domain);
@@ -203,7 +226,7 @@ impl LogicJoinRuntime {
         run: LogicSessionRun,
         join_events: &mut mpsc::Receiver<JoinEvent>,
         shutdown: &mut watch::Receiver<bool>,
-    ) -> mpsc::Receiver<PlacementControlEvent> {
+    ) -> LogicSessionReturn {
         let LogicSessionRun {
             leader,
             session,
@@ -243,9 +266,37 @@ impl LogicJoinRuntime {
                     let _ = self
                         .lifecycle_driver
                         .transition(ServiceLifecycleEvent::CoordinatorLost);
-                    return result
-                        .map(|(_, controls)| controls)
-                        .unwrap_or_else(|_| closed_controls());
+                    return match result {
+                        Ok((Ok(()), controls)) => LogicSessionReturn {
+                            controls,
+                            retry: false,
+                        },
+                        Ok((Err(error), controls)) => {
+                            let retry = !controls.is_closed();
+                            tracing::warn!(
+                                target: "lattice.cluster.logic",
+                                %error,
+                                domain = %self.domain_hello.domain.as_str(),
+                                "logic session stopped; reconciliation required"
+                            );
+                            LogicSessionReturn {
+                                controls,
+                                retry,
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "lattice.cluster.logic",
+                                %error,
+                                domain = %self.domain_hello.domain.as_str(),
+                                "logic session task failed; reconciliation required"
+                            );
+                            LogicSessionReturn {
+                                controls: closed_controls(),
+                                retry: false,
+                            }
+                        }
+                    };
                 }
                 event = join_events.recv() => {
                     match event {
@@ -257,15 +308,21 @@ impl LogicJoinRuntime {
                                 .lifecycle_driver
                                 .transition(ServiceLifecycleEvent::CoordinatorLost);
                             let _ = session_shutdown.send(true);
-                            return task.await
+                            return LogicSessionReturn {
+                                controls: task.await
                                 .map(|(_, controls)| controls)
-                                .unwrap_or_else(|_| closed_controls());
+                                .unwrap_or_else(|_| closed_controls()),
+                                retry: false,
+                            };
                         }
                         Some(JoinEvent::TerminalFailure(_)) | None => {
                             let _ = session_shutdown.send(true);
-                            return task.await
+                            return LogicSessionReturn {
+                                controls: task.await
                                 .map(|(_, controls)| controls)
-                                .unwrap_or_else(|_| closed_controls());
+                                .unwrap_or_else(|_| closed_controls()),
+                                retry: false,
+                            };
                         }
                         Some(JoinEvent::Coordinator { .. })
                         | Some(JoinEvent::CoordinatorLost { .. }) => {}
@@ -274,24 +331,33 @@ impl LogicJoinRuntime {
                 effect = effects.recv() => {
                     let Some(effect) = effect else {
                         let _ = session_shutdown.send(true);
-                        return task.await
+                        return LogicSessionReturn {
+                            controls: task.await
                             .map(|(_, controls)| controls)
-                            .unwrap_or_else(|_| closed_controls());
+                            .unwrap_or_else(|_| closed_controls()),
+                            retry: false,
+                        };
                     };
                     if self.apply_effect(effect, &handle).await.is_err() {
                         let _ = session_shutdown.send(true);
-                        return task.await
+                        return LogicSessionReturn {
+                            controls: task.await
                             .map(|(_, controls)| controls)
-                            .unwrap_or_else(|_| closed_controls());
+                            .unwrap_or_else(|_| closed_controls()),
+                            retry: false,
+                        };
                     }
                 }
                 _ = changed.notified() => {}
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         let _ = session_shutdown.send(true);
-                        return task.await
+                        return LogicSessionReturn {
+                            controls: task.await
                             .map(|(_, controls)| controls)
-                            .unwrap_or_else(|_| closed_controls());
+                            .unwrap_or_else(|_| closed_controls()),
+                            retry: false,
+                        };
                     }
                 }
             }

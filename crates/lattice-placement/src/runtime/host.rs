@@ -22,6 +22,7 @@ use tokio::{
 
 use super::{
     CoordinatorHandle, CoordinatorRuntimeError, PlacementDomainLeader, PlacementDomainLeaderConfig,
+    membership::control_dispatch_error as coordinator_control_dispatch_error,
     membership_plane::{MembershipLeader, MembershipLeaderConfig},
 };
 use crate::{
@@ -31,7 +32,7 @@ use crate::{
     },
     control::{
         PlacementControlCommand, PlacementControlEvent, PlacementControlEventKind,
-        encode_control_command,
+        encode_control_command_for_term,
     },
     coordinator::{
         LeaderRecord, MemberChange, MemberEvent, MemberHello, MemberRemovalReason, MemberStatus,
@@ -333,7 +334,13 @@ where
                         self.membership_state = CoordinatorHostScopeState::Failed;
                         tracing::warn!(target: "lattice.cluster.membership", %error, "membership leader lease renewal failed");
                     }
-                    self.reenter_membership_election().await?;
+                    if let Err(error) = self.reenter_membership_election().await {
+                        tracing::warn!(
+                            target: "lattice.cluster.membership",
+                            %error,
+                            "membership election re-entry deferred after durable store failure"
+                        );
+                    }
                     let inactive = self.domains
                         .iter()
                         .filter_map(|(domain, hosted)| hosted.sender.is_none().then_some(domain.clone()))
@@ -341,7 +348,21 @@ where
                     for domain in inactive {
                         let scope = CoordinatorScope::Placement(domain.clone());
                         candidate_delay(&scope, &self.node, self.config.maximum_candidate_jitter).await;
-                        let term = next_term(self.store.as_ref(), &scope).await?;
+                        let term = match next_term(self.store.as_ref(), &scope).await {
+                            Ok(term) => term,
+                            Err(error) => {
+                                if let Some(hosted) = self.domains.get_mut(&domain) {
+                                    hosted.state = CoordinatorHostScopeState::Failed;
+                                }
+                                tracing::warn!(
+                                    target: "lattice.cluster.placement",
+                                    domain = %domain.as_str(),
+                                    %error,
+                                    "placement-domain election re-entry deferred after durable store failure"
+                                );
+                                continue;
+                            }
+                        };
                         match elect_domain_leader(
                             self.store.clone(),
                             self.associations.clone(),
@@ -376,7 +397,13 @@ where
                             }
                         }
                     }
-                    self.fanout_global_member_removals().await?;
+                    if let Err(error) = self.fanout_global_member_removals().await {
+                        tracing::warn!(
+                            target: "lattice.cluster.membership",
+                            %error,
+                            "global member reconciliation deferred after durable store failure"
+                        );
+                    }
                     self.publish_directory();
                 }
                 Some(result) = tasks.join_next(), if !tasks.is_empty() => {
@@ -432,6 +459,22 @@ where
     async fn route_control(&mut self, event: PlacementControlEvent) {
         match event.kind {
             PlacementControlEventKind::Command(inbound) => {
+                match (inbound.coordinator_term, self.active_term(&inbound.scope)) {
+                    (Some(received_term), Some(expected_term))
+                        if expected_term == received_term => {}
+                    (Some(_), Some(_)) | (None, _) => {
+                        let _ = event
+                            .completion
+                            .send(Err(ControlDispatchError::InvalidCommand));
+                        return;
+                    }
+                    (Some(_), None) => {
+                        let _ = event
+                            .completion
+                            .send(Err(ControlDispatchError::Unavailable));
+                        return;
+                    }
+                }
                 match (&inbound.scope, &inbound.command) {
                     (CoordinatorScope::Membership, PlacementControlCommand::MemberHello(hello)) => {
                         let result = self.admit_member(hello.clone()).await;
@@ -617,6 +660,17 @@ where
         Ok(())
     }
 
+    fn active_term(&self, scope: &CoordinatorScope) -> Option<u64> {
+        let state = match scope {
+            CoordinatorScope::Membership => &self.membership_state,
+            CoordinatorScope::Placement(domain) => &self.domains.get(domain)?.state,
+        };
+        match state {
+            CoordinatorHostScopeState::Active(leader) => Some(leader.term.get()),
+            CoordinatorHostScopeState::Standby | CoordinatorHostScopeState::Failed => None,
+        }
+    }
+
     async fn complete_member_join(
         &mut self,
         incarnation: NodeIncarnation,
@@ -700,8 +754,9 @@ where
             )
             .chain(std::iter::once(PlacementControlCommand::SnapshotEnd(end)))
         {
-            let payload = encode_control_command(
+            let payload = encode_control_command_for_term(
                 &CoordinatorScope::Membership,
+                membership.version().term.get(),
                 &command,
                 self.config.placement.maximum_control_payload,
             )
@@ -719,8 +774,10 @@ where
             MemberChange::Removed { node, .. } => Some(node.incarnation),
             MemberChange::Upsert(_) => None,
         };
-        let payload = encode_control_command(
+        let coordinator_term = event.version.term.get();
+        let payload = encode_control_command_for_term(
             &CoordinatorScope::Membership,
+            coordinator_term,
             &PlacementControlCommand::MemberDelta(event),
             self.config.placement.maximum_control_payload,
         )
@@ -928,24 +985,17 @@ async fn next_membership_event(
 }
 
 fn dispatch_error(error: CoordinatorRuntimeError) -> ControlDispatchError {
-    match error {
-        CoordinatorRuntimeError::UnauthorizedCommand
-        | CoordinatorRuntimeError::StaleMember
-        | CoordinatorRuntimeError::Coordinator(_)
-        | CoordinatorRuntimeError::Control(_)
-        | CoordinatorRuntimeError::InvalidConfig => ControlDispatchError::InvalidCommand,
-        _ => ControlDispatchError::Unavailable,
-    }
+    coordinator_control_dispatch_error(&error)
 }
 
 #[cfg(test)]
 mod tests {
     use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
-    use lattice_remoting::config::RemotingConfig;
+    use lattice_remoting::{config::RemotingConfig, control::CommandId};
 
     use super::*;
     use crate::{
-        control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
+        control::{DEFAULT_MAX_CONTROL_PAYLOAD, InboundPlacementControl, PlacementControlRouter},
         storage::InMemoryPlacementStore,
     };
 
@@ -986,6 +1036,53 @@ mod tests {
             renewal_interval: Duration::from_millis(50),
             ..CoordinatorHostConfig::default()
         }
+    }
+
+    #[test]
+    fn unknown_membership_session_is_acknowledged_as_stale_control() {
+        assert_eq!(
+            dispatch_error(CoordinatorRuntimeError::UnknownSession),
+            ControlDispatchError::InvalidCommand
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_coordinator_term_is_fenced_before_membership_dispatch() {
+        let store = Arc::new(InMemoryPlacementStore::new(32, 32).unwrap());
+        let local = node("membership-host", 20, 33020);
+        let remote = node("member", 21, 33021);
+        let manager = associations(&local);
+        let mut host =
+            CoordinatorHost::elect(store, manager, local.clone(), BTreeSet::new(), config())
+                .await
+                .unwrap();
+        let active_term = host
+            .active_term(&CoordinatorScope::Membership)
+            .expect("membership leader is active");
+        let (completion, result) = oneshot::channel();
+        host.route_control(PlacementControlEvent {
+            kind: PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
+                association: AssociationKey {
+                    cluster_id: lattice_core::actor_ref::ClusterId::new("term-fencing").unwrap(),
+                    local_incarnation: local.incarnation,
+                    remote_address: remote.address,
+                    remote_incarnation: remote.incarnation,
+                },
+                command_id: CommandId::generate(),
+                scope: CoordinatorScope::Membership,
+                coordinator_term: Some(active_term.saturating_add(1)),
+                command: PlacementControlCommand::NodeHeartbeat {
+                    incarnation: remote.incarnation,
+                    sequence: 1,
+                },
+            })),
+            completion,
+        })
+        .await;
+        assert_eq!(
+            result.await.unwrap(),
+            Err(ControlDispatchError::InvalidCommand)
+        );
     }
 
     #[tokio::test]

@@ -212,6 +212,7 @@ where
             send_control(
                 &association,
                 &self.version.domain,
+                self.version.term.get(),
                 PlacementControlCommand::StateDelta(delta),
                 &self.config,
             )?;
@@ -298,6 +299,7 @@ where
             send_control(
                 &association,
                 &self.version.domain,
+                self.version.term.get(),
                 PlacementControlCommand::DrainSlot {
                     slot: key.clone(),
                     generation,
@@ -495,6 +497,7 @@ where
         send_control(
             &association,
             &self.version.domain,
+            self.version.term.get(),
             PlacementControlCommand::ClaimGranted(leased_claim.grant),
             &self.config,
         )?;

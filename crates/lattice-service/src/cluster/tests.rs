@@ -27,7 +27,7 @@ use lattice_core::{
 use lattice_placement::{
     control::{
         DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
-        PlacementResolutionFailure, decode_control_command, encode_control_command,
+        PlacementResolutionFailure, decode_control_command,
     },
     coordinator::{
         MemberHello, PlacementDomainHello, SingletonConfig, SnapshotLimits, SnapshotRecord,
@@ -47,10 +47,14 @@ use lattice_remoting::{
     handshake::NodeIdentity,
     protocol::ProtocolDescriptor,
 };
-use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
+use tokio::{sync::watch, task::JoinHandle};
 
 use super::*;
-use crate::{backend::ServiceInboundDispatch, lifecycle::NodeAdmissionGate};
+use crate::{
+    backend::ServiceInboundDispatch,
+    lifecycle::NodeAdmissionGate,
+    test_support::{network_test_guard, unused_address},
+};
 
 const TEST_PROTOCOL_ID: u64 = 77;
 
@@ -191,13 +195,6 @@ fn attach_coordinator(
     key
 }
 
-async fn unused_address() -> NodeAddress {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    NodeAddress::new("127.0.0.1", port).unwrap()
-}
-
 struct TestHello {
     member: MemberHello,
     domain: PlacementDomainHello,
@@ -245,6 +242,7 @@ async fn stage_logic_runtime(
         associations,
         LogicCoordinatorConfig::default(),
         64,
+        1,
     )
     .unwrap();
     for slot in &slots {
@@ -310,8 +308,9 @@ async fn stage_logic_runtime(
             .apply(
                 coordinator.clone(),
                 CommandId::generate(),
-                encode_control_command(
+                lattice_placement::control::encode_control_command_for_term(
                     &CoordinatorScope::Placement(domain()),
+                    1,
                     &command,
                     DEFAULT_MAX_CONTROL_PAYLOAD,
                 )
@@ -325,6 +324,7 @@ async fn stage_logic_runtime(
 
 #[tokio::test]
 async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
+    let _network = network_test_guard().await;
     let cluster_id = ClusterId::new("unavailable-route-test").unwrap();
     let local_incarnation = NodeIncarnation::new(31).unwrap();
     let coordinator_incarnation = NodeIncarnation::new(32).unwrap();
@@ -376,6 +376,7 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
         associations.clone(),
         LogicCoordinatorConfig::default(),
         32,
+        1,
     )
     .unwrap();
     let state = logic.state();
@@ -473,8 +474,9 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
                 .apply(
                     coordinator,
                     CommandId::generate(),
-                    encode_control_command(
+                    lattice_placement::control::encode_control_command_for_term(
                         &CoordinatorScope::Placement(domain()),
+                        1,
                         &PlacementControlCommand::ResolutionFailed {
                             request_id,
                             slot,
@@ -604,6 +606,7 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
 
 #[tokio::test]
 async fn stale_generation_never_reaches_entity_loader() {
+    let _network = network_test_guard().await;
     let cluster_id = ClusterId::new("router-test").unwrap();
     let local_incarnation = NodeIncarnation::new(1).unwrap();
     let coordinator_incarnation = NodeIncarnation::new(2).unwrap();
@@ -677,6 +680,7 @@ async fn stale_generation_never_reaches_entity_loader() {
         associations.clone(),
         LogicCoordinatorConfig::default(),
         32,
+        1,
     )
     .unwrap();
     let state = logic.state();
@@ -738,8 +742,9 @@ async fn stale_generation_never_reaches_entity_loader() {
             .apply(
                 association_key.clone(),
                 CommandId::generate(),
-                encode_control_command(
+                lattice_placement::control::encode_control_command_for_term(
                     &CoordinatorScope::Placement(domain()),
+                    1,
                     &command,
                     DEFAULT_MAX_CONTROL_PAYLOAD,
                 )
@@ -825,6 +830,7 @@ async fn stale_generation_never_reaches_entity_loader() {
 
 #[tokio::test]
 async fn remote_entity_ask_reaches_only_claimed_owner() {
+    let _network = network_test_guard().await;
     let cluster_id = ClusterId::new("remote-entity-test").unwrap();
     let source_address = unused_address().await;
     let owner_address = unused_address().await;

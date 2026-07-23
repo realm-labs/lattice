@@ -2,7 +2,7 @@ use etcd_client::{Compare, CompareOp, PutOptions, Txn, TxnOp};
 use lattice_core::coordinator::CoordinatorScope;
 use serde::de::DeserializeOwned;
 
-use super::{EtcdPlacementStore, decode, encode, map_etcd_txn, parse_revision_value};
+use super::{EtcdPlacementStore, decode, encode, parse_revision_value};
 use crate::{
     coordinator::{
         DomainMemberRecord, DomainMemberStatus, ExactLeaderGuard, MemberRecord, MemberStatus,
@@ -166,10 +166,9 @@ async fn commit(
 ) -> Result<(), StorageError> {
     compares.extend(guard_compares(store, guard)?);
     let mut client = store.client.clone();
-    let response = client
-        .txn(Txn::new().when(compares).and_then(operations))
-        .await
-        .map_err(map_etcd_txn)?;
+    let response = store
+        .write_deadline(client.txn(Txn::new().when(compares).and_then(operations)))
+        .await?;
     if response.succeeded() {
         Ok(())
     } else {

@@ -17,7 +17,7 @@ use tokio::{
 use crate::{
     control::{
         PlacementControlCommand, PlacementControlEvent, PlacementControlEventKind,
-        encode_control_command,
+        encode_control_command_for_term,
     },
     coordinator::{
         MemberEvent, MemberHello, MemberRecord, MemberStatus, MembershipState, SnapshotRecord,
@@ -56,6 +56,7 @@ pub struct MembershipSession {
     stager: Option<SnapshotStager>,
     effects: mpsc::Sender<LogicPlacementEffect>,
     heartbeat_sequence: u64,
+    coordinator_term: u64,
 }
 
 #[derive(Clone)]
@@ -64,6 +65,7 @@ pub struct MembershipCoordinatorHandle {
     coordinator: AssociationKey,
     associations: Arc<AssociationManager>,
     maximum_control_payload: usize,
+    coordinator_term: u64,
 }
 
 impl MembershipCoordinatorHandle {
@@ -73,8 +75,9 @@ impl MembershipCoordinatorHandle {
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
         let command_id = association.admit_control_command(
-            encode_control_command(
+            encode_control_command_for_term(
                 &CoordinatorScope::Membership,
+                self.coordinator_term,
                 &PlacementControlCommand::MembershipDrainComplete {
                     operation_id,
                     expected_incarnation: self.local_incarnation,
@@ -97,6 +100,7 @@ impl MembershipSession {
         associations: Arc<AssociationManager>,
         config: LogicCoordinatorConfig,
         effect_capacity: usize,
+        coordinator_term: u64,
     ) -> Result<
         (
             Self,
@@ -106,6 +110,7 @@ impl MembershipSession {
         LogicSessionError,
     > {
         if effect_capacity == 0
+            || coordinator_term == 0
             || hello.node.incarnation != coordinator.local_incarnation
             || hello.node.address == coordinator.remote_address
         {
@@ -117,6 +122,7 @@ impl MembershipSession {
             coordinator: coordinator.clone(),
             associations: associations.clone(),
             maximum_control_payload: config.maximum_control_payload,
+            coordinator_term,
         };
         let local_node = hello.node.clone();
         Ok((
@@ -133,6 +139,7 @@ impl MembershipSession {
                 stager: None,
                 effects,
                 heartbeat_sequence: 0,
+                coordinator_term,
             },
             handle,
             receiver,
@@ -212,6 +219,7 @@ impl MembershipSession {
             }
             PlacementControlEventKind::Command(inbound) => {
                 self.require_coordinator(&inbound.association)?;
+                self.require_coordinator_term(inbound.coordinator_term)?;
                 match inbound.command {
                     PlacementControlCommand::SnapshotBegin(begin) => {
                         if !matches!(begin.version, SnapshotVersion::Membership(_)) {
@@ -305,8 +313,9 @@ impl MembershipSession {
             return Err(LogicSessionError::AssociationUnavailable);
         }
         association.admit_control_command(
-            encode_control_command(
+            encode_control_command_for_term(
                 &CoordinatorScope::Membership,
+                self.coordinator_term,
                 &command,
                 self.config.maximum_control_payload,
             )
@@ -320,6 +329,14 @@ impl MembershipSession {
             Ok(())
         } else {
             Err(LogicSessionError::UnauthorizedCommand)
+        }
+    }
+
+    fn require_coordinator_term(&self, term: Option<u64>) -> Result<(), LogicSessionError> {
+        if term == Some(self.coordinator_term) {
+            Ok(())
+        } else {
+            Err(LogicSessionError::StaleGeneration)
         }
     }
 }

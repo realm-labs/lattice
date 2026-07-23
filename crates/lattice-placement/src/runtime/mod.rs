@@ -26,7 +26,7 @@ use crate::{
     },
     control::{
         DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlError,
-        PlacementControlEvent, encode_control_command,
+        PlacementControlEvent,
     },
     coordinator::{
         COORDINATOR_PROTOCOL_GENERATION, CoordinatorError, DomainMemberRecord, DomainMemberStatus,

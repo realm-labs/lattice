@@ -138,8 +138,15 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
         if association.state() == AssociationState::Closed {
             return Err(RemoteMessageError::ShardUnavailable);
         }
-        let payload = lattice_placement::control::encode_control_command(
+        let coordinator_term = self
+            .state
+            .lock()
+            .expect("logic placement state poisoned")
+            .coordinator_term()
+            .ok_or(RemoteMessageError::ShardUnavailable)?;
+        let payload = lattice_placement::control::encode_control_command_for_term(
             &CoordinatorScope::Placement(domain.clone()),
+            coordinator_term,
             &PlacementControlCommand::ResolveShard {
                 request_id,
                 domain: domain.clone(),
