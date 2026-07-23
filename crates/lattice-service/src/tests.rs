@@ -58,7 +58,7 @@ use tokio::{sync::watch::Receiver, time::Instant};
 
 use crate::{
     builder::LatticeService,
-    cluster::ClusterEvent,
+    cluster::api::ClusterEvent,
     config::{ClusterJoinConfig, NodeConfig},
     error::ServiceError,
     lifecycle::{NodeLifecycleState, PlacementDomainState},

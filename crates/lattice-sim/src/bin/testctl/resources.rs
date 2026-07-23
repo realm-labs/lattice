@@ -1,4 +1,4 @@
-use super::ResourceSample;
+use super::testctl_artifacts::ResourceSample;
 use std::time::Duration;
 
 pub(super) fn sample(elapsed: Duration) -> ResourceSample {

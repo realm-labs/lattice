@@ -56,8 +56,6 @@ pub(crate) mod runtime;
 mod singleton;
 mod singleton_proxy;
 
-pub use api::{Cluster, ClusterEvent, ClusterEvents, ClusterState, ClusterWaitError};
-
 use buffer::RouteBuffer;
 use entity::EntityRoute;
 use singleton::SingletonRoute;

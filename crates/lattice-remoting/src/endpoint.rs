@@ -1,13 +1,8 @@
 use std::{
-    io::ErrorKind,
-    sync::{
-        Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
-use broadcast::error::RecvError;
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -25,14 +20,14 @@ use crate::{
         LaneAttachment, LaneKind,
     },
     bootstrap::{
-        AcceptBootstrap, BootstrapError, BootstrapHandler, BootstrapProbeTarget, BootstrapPurpose,
+        BootstrapError, BootstrapHandler, BootstrapProbeTarget, BootstrapPurpose,
         BootstrapRejectionCode, BootstrapRequest, BootstrapResponse, BootstrapResult,
         BootstrapRoute,
     },
     config::RemotingConfig,
-    control::{ControlDispatch, RejectControlDispatch},
+    control::ControlDispatch,
     handshake::{FeatureBits, Handshake, HandshakeError, HandshakeValidator, NodeIdentity},
-    lane::{BidirectionalLane, BidirectionalLaneConfig, LaneError, LaneExit, LaneServices},
+    lane::{BidirectionalLane, LaneError, LaneExit, LaneServices},
     messaging::{inbound::InboundDispatch, outbound::OutboundMessaging},
     protocol::ProtocolDescriptor,
     transport::{
@@ -42,10 +37,15 @@ use crate::{
     wire::{Frame, FrameCodec, FrameKind, WireError},
 };
 
+mod diagnostics;
 mod lifecycle;
 mod reverse_dial;
+mod state;
 mod stream;
 
+#[cfg(test)]
+use diagnostics::is_peer_disconnect;
+use diagnostics::{observe_connection_result, wait_for_disconnect};
 use lifecycle::wait_for_shutdown;
 use stream::EndpointStream;
 
@@ -87,102 +87,7 @@ pub struct RemotingEndpointBuilder {
     security: Option<EndpointSecurity>,
 }
 
-impl RemotingEndpointBuilder {
-    pub fn control_dispatch(mut self, control_dispatch: Arc<dyn ControlDispatch>) -> Self {
-        self.control_dispatch = control_dispatch;
-        self
-    }
-
-    pub fn catalogue(mut self, catalogue: Vec<ProtocolDescriptor>) -> Self {
-        self.catalogue = catalogue;
-        self
-    }
-
-    #[cfg(feature = "tls")]
-    pub fn security(mut self, security: EndpointSecurity) -> Self {
-        self.security = Some(security);
-        self
-    }
-
-    pub fn build(self) -> Result<RemotingEndpoint, EndpointError> {
-        self.config
-            .validate()
-            .map_err(AssociationError::InvalidConfig)?;
-        #[cfg(feature = "tls")]
-        {
-            if self
-                .security
-                .as_ref()
-                .is_some_and(|security| security.server_name.is_empty())
-            {
-                return Err(EndpointError::InvalidSecurity);
-            }
-        }
-        if self.catalogue.len() > self.config.max_protocols_per_peer {
-            return Err(EndpointError::ProtocolLimit);
-        }
-        let connection_limit = self.config.required_socket_budget().saturating_sub(1);
-        let (shutdown_tx, _) = watch::channel(false);
-        let (disconnect_tx, _) = broadcast::channel(self.config.max_associations);
-        Ok(RemotingEndpoint {
-            local: self.local,
-            config: self.config,
-            associations: self.associations,
-            messaging: self.messaging,
-            dispatch: self.dispatch,
-            control_dispatch: self.control_dispatch,
-            catalogue: self.catalogue,
-            connections: Arc::new(Semaphore::new(connection_limit)),
-            shutdown_tx,
-            disconnect_tx,
-            tasks: Mutex::new(Vec::new()),
-            #[cfg(feature = "tls")]
-            security: self.security,
-            connect_lock: AsyncMutex::new(()),
-            bootstrap_handler: RwLock::new(Arc::new(AcceptBootstrap)),
-        })
-    }
-}
-
 impl RemotingEndpoint {
-    pub fn builder(
-        local: NodeIdentity,
-        config: RemotingConfig,
-        associations: Arc<AssociationManager>,
-        messaging: Arc<OutboundMessaging>,
-        dispatch: Arc<dyn InboundDispatch>,
-    ) -> RemotingEndpointBuilder {
-        RemotingEndpointBuilder {
-            local,
-            config,
-            associations,
-            messaging,
-            dispatch,
-            control_dispatch: Arc::new(RejectControlDispatch),
-            catalogue: Vec::new(),
-            #[cfg(feature = "tls")]
-            security: None,
-        }
-    }
-
-    pub fn local_identity(&self) -> &NodeIdentity {
-        &self.local
-    }
-
-    pub fn open_connection_count(&self) -> usize {
-        self.config
-            .required_socket_budget()
-            .saturating_sub(1)
-            .saturating_sub(self.connections.available_permits())
-    }
-
-    pub fn install_bootstrap_handler(&self, handler: Arc<dyn BootstrapHandler>) {
-        *self
-            .bootstrap_handler
-            .write()
-            .expect("bootstrap handler lock poisoned") = handler;
-    }
-
     pub async fn bind(self: &Arc<Self>) -> Result<(), EndpointError> {
         self.ensure_running()?;
         let listener = bind_tcp(&self.local.address).await?;
@@ -349,16 +254,6 @@ impl RemotingEndpoint {
         }
         connection.close().await?;
         Ok(response)
-    }
-
-    pub fn disconnect_association(
-        &self,
-        association_id: AssociationId,
-    ) -> Result<(), EndpointError> {
-        self.disconnect_tx
-            .send(association_id)
-            .map(|_| ())
-            .map_err(|_| EndpointError::NoActiveConnections)
     }
 
     async fn connect_lane(
@@ -833,73 +728,7 @@ impl RemotingEndpoint {
             }
         }
     }
-
-    fn lane_config(&self) -> BidirectionalLaneConfig {
-        BidirectionalLaneConfig {
-            maximum_frame_size: self.config.max_frame_size,
-            maximum_concurrent_inbound_asks: self.config.max_pending_asks,
-            heartbeat_interval: self.config.heartbeat_interval,
-            heartbeat_miss_limit: self.config.heartbeat_miss_limit,
-            idle_data_connection_timeout: self.config.idle_data_connection_timeout,
-            maximum_cached_exact_targets: self.config.max_cached_exact_targets_per_lane,
-            socket_read_ahead_bytes: self.config.socket_read_ahead_bytes,
-            maximum_ready_write_batch_frames: self.config.max_ready_write_batch_frames,
-            maximum_ready_read_batch_frames: self.config.max_ready_read_batch_frames,
-            maximum_coalesced_write_batch_bytes: self.config.max_coalesced_write_batch_bytes,
-            maximum_pending_control_applies: self.config.control_queue_frames,
-        }
-    }
-
-    fn spawn<F>(self: &Arc<Self>, future: F) -> Result<(), EndpointError>
-    where
-        F: Future<Output = Result<(), EndpointError>> + Send + 'static,
-    {
-        let mut tasks = self.tasks.lock().expect("endpoint task list poisoned");
-        self.ensure_running()?;
-        tasks.retain(|task| !task.is_finished());
-        if tasks.len() >= self.config.required_socket_budget() {
-            return Err(EndpointError::TaskLimit);
-        }
-        tasks.push(tokio::spawn(future));
-        Ok(())
-    }
 }
-
-fn observe_connection_result(result: &Result<(), EndpointError>) {
-    static FAILURES: AtomicU64 = AtomicU64::new(0);
-    let Err(error) = result else {
-        return;
-    };
-    if is_peer_disconnect(error) {
-        tracing::debug!(error = ?error, "inbound remoting peer disconnected");
-        return;
-    }
-    let count = FAILURES.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-    if count == 1 || count.is_multiple_of(100) {
-        tracing::warn!(
-            connection_failure_count = count,
-            error = ?error,
-            "inbound remoting connection task failed (subsequent failures are aggregated)"
-        );
-    }
-}
-
-fn is_peer_disconnect(error: &EndpointError) -> bool {
-    let io = match error {
-        EndpointError::Wire(WireError::Io(io))
-        | EndpointError::Lane(LaneError::Wire(WireError::Io(io))) => io,
-        _ => return false,
-    };
-    matches!(
-        io.kind(),
-        ErrorKind::UnexpectedEof
-            | ErrorKind::ConnectionReset
-            | ErrorKind::ConnectionAborted
-            | ErrorKind::BrokenPipe
-    )
-}
-
-use std::future::Future;
 
 #[derive(Debug, Error)]
 pub enum EndpointError {
@@ -943,19 +772,6 @@ pub enum EndpointError {
     InvalidBootstrapTarget,
 }
 
-async fn wait_for_disconnect(
-    receiver: &mut broadcast::Receiver<AssociationId>,
-    association_id: AssociationId,
-) {
-    loop {
-        match receiver.recv().await {
-            Ok(received) if received == association_id => return,
-            Ok(_) => {}
-            Err(RecvError::Lagged(_)) | Err(RecvError::Closed) => return,
-        }
-    }
-}
-
 #[cfg(test)]
 #[path = "endpoint/idle_tests.rs"]
 mod idle_tests;
@@ -989,7 +805,7 @@ mod tests {
 
     use crate::{
         association::AssociationKey,
-        control::{CommandId, ControlDispatchError, ControlGap},
+        control::{CommandId, ControlDispatchError, ControlGap, RejectControlDispatch},
         messaging::{
             error::RemoteMessageError,
             target::{ExactActorTarget, SenderIdentity},
