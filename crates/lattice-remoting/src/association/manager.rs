@@ -1,11 +1,14 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, atomic::AtomicUsize},
+    sync::{Arc, Mutex},
 };
 
 use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
 
-use super::{Association, AssociationError, AssociationId, AssociationKey, AssociationManager};
+use super::{
+    Association, AssociationError, AssociationId, AssociationKey, AssociationManager,
+    OutboundByteBudget,
+};
 use crate::config::RemotingConfig;
 
 impl AssociationManager {
@@ -21,7 +24,7 @@ impl AssociationManager {
             config,
             associations: Mutex::new(HashMap::new()),
             remote_incarnations: Mutex::new(HashMap::new()),
-            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            queued_bytes: Arc::new(OutboundByteBudget::new()),
         })
     }
 

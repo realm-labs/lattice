@@ -90,18 +90,21 @@ allocation traffic rather than retained per-request state.
 
 ### Remote Tell Payload Curve
 
-Every row completed all 100,000 messages. Budget rejections are retry attempts caused by bounded byte
-budgets, not dropped messages.
+Every row completed all 100,000 messages. A queue or byte-budget wait records the transition from
+immediate admission to event-driven capacity waiting; it is not a dropped message or a busy retry.
 
-| Payload | Throughput | CPU ns/op | Allocated bytes/op | Budget rejections | Frames/batch |
-|---:|---:|---:|---:|---:|---:|
-| 0 B | 2.789M/s | 859 | 19 | 0 | 255.75 |
-| 128 B | 1.751M/s | 1,512 | 432 | 0 | 255.75 |
-| 1 KiB | 795.8K/s | 3,066 | 2,501 | 0 | 255.10 |
-| 16 KiB | 122.0K/s | 21,079 | 40,159 | 19,001,923 | 254.45 |
+| Payload | Throughput | CPU ns/op | Allocated bytes/op | Queue waits | Byte-budget waits | Frames/batch |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 B | 2.922M/s | 715 | 71 | 197 | 0 | 255.10 |
+| 128 B | 2.422M/s | 1,007 | 364 | 186 | 0 | 255.10 |
+| 1 KiB | 1.054M/s | 1,861 | 2,469 | 348 | 0 | 255.10 |
+| 16 KiB | 119.4K/s | 14,043 | 40,074 | 0 | 386 | 254.45 |
 
-The 16 KiB workload is dominated by bounded byte-budget backoff. Large-payload optimization should
-therefore focus on reservation and wakeup behavior rather than the small-message envelope path.
+The event-driven byte-budget path replaced the previous `yield_now` retry loop. For 16 KiB payloads,
+byte-budget rejections fell from 19,001,923 to 386 and CPU cost fell from 21,079 to 14,043 ns/op
+(-33.4%), while completion throughput changed from 122.0K/s to 119.4K/s (-2.1%). The remaining
+large-payload cost is primarily data copying, socket work, and remote dispatch rather than sender-side
+budget spinning.
 
 ### Producer and Actor Scaling
 

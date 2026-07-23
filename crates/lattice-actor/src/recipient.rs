@@ -115,6 +115,10 @@ impl ActorSystem {
 
     /// Sends a one-way message from process code. The receiver observes no
     /// actor sender.
+    ///
+    /// Remote exact-actor delivery waits for bounded outbound queue and byte
+    /// capacity when they are temporarily exhausted. Permanent routing,
+    /// protocol, or Association failures are returned without waiting.
     pub async fn tell<P, M>(
         &self,
         target: impl Into<RecipientRef<P>>,

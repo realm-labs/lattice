@@ -65,6 +65,16 @@ pub(crate) struct ExactTellMessage {
     pub(crate) payload: Bytes,
 }
 
+#[derive(Debug)]
+pub(crate) struct RejectedExactTell {
+    pub(crate) error: TellError,
+    pub(crate) sender: SenderIdentity,
+    pub(crate) target: ActorRef,
+    pub(crate) fingerprint: ProtocolFingerprint,
+    pub(crate) message_id: u64,
+    pub(crate) payload: Bytes,
+}
+
 impl ExactTellRouteCache {
     pub(crate) fn new(maximum: usize) -> Self {
         Self {
@@ -82,67 +92,79 @@ impl ExactTellRouteCache {
         target: ActorRef,
         message: ExactTellMessage,
         association: F,
-    ) -> Result<(), TellError>
+    ) -> Result<(), Box<RejectedExactTell>>
     where
         F: FnOnce(&ActorRef) -> Result<Arc<Association>, TellError>,
     {
-        let ExactTellMessage {
-            fingerprint,
-            message_id,
-            payload,
-        } = message;
         let key = ExactTellRouteKey {
             sender,
             target,
-            fingerprint,
+            fingerprint: message.fingerprint,
         };
         if self.maximum == 0 {
-            let association = association(&key.target)?;
+            let association = match association(&key.target) {
+                Ok(association) => association,
+                Err(error) => return Err(rejected_exact_tell(error, &key, message)),
+            };
             return messaging
-                .tell(
+                .try_tell_retained(
                     &association,
                     &key.sender,
                     &key.target,
-                    OutboundMessage::new(key.fingerprint, message_id, payload),
+                    OutboundMessage::new(message.fingerprint, message.message_id, message.payload),
                 )
-                .map(|_| ());
+                .map(|_| ())
+                .map_err(|(error, payload)| {
+                    rejected_exact_tell(
+                        error,
+                        &key,
+                        ExactTellMessage {
+                            fingerprint: message.fingerprint,
+                            message_id: message.message_id,
+                            payload,
+                        },
+                    )
+                });
         }
         if let Some(route) = self.hot.load().as_ref()
             && route.key == key
         {
             let association_id = route.route.association_id();
-            let result = route.route.tell(message_id, payload).map(|_| ());
-            if is_inactive(&result) {
-                self.hot.store(None);
-                self.remove_if_association(&key, association_id);
-            }
+            let result = send_retained(&route.route, &key, message);
+            self.evict_inactive(
+                &key,
+                association_id,
+                result.as_ref().err().map(|error| &error.error),
+            );
             return result;
         }
         if let Some(route) = self.routes.get(&key) {
             let association_id = route.association_id();
-            let result = route.tell(message_id, payload).map(|_| ());
+            let result = send_retained(&route, &key, message);
             drop(route);
-            self.evict_inactive(&key, association_id, &result);
+            self.evict_inactive(
+                &key,
+                association_id,
+                result.as_ref().err().map(|error| &error.error),
+            );
             return result;
         }
 
-        let association = association(&key.target)?;
-        let route = messaging.prepare_exact_tell_route(
-            association,
-            &key.sender,
-            &key.target,
-            key.fingerprint,
-        )?;
+        let (route, message) = prepare_retained(messaging, &key, message, association)?;
         if !self.admit_slot() {
-            return route.tell(message_id, payload).map(|_| ());
+            return send_retained(&route, &key, message);
         }
 
         match self.routes.entry(key) {
             Entry::Occupied(entry) => {
                 self.release_slot();
                 let association_id = entry.get().association_id();
-                let result = entry.get().tell(message_id, payload).map(|_| ());
-                if is_inactive(&result) {
+                let result = send_retained(entry.get(), entry.key(), message);
+                if result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| is_inactive_error(&error.error))
+                {
                     let key = entry.key().clone();
                     drop(entry);
                     self.remove_if_association(&key, association_id);
@@ -152,12 +174,16 @@ impl ExactTellRouteCache {
             Entry::Vacant(entry) => {
                 let route = entry.insert(route);
                 let association_id = route.association_id();
-                let result = route.tell(message_id, payload).map(|_| ());
-                let hot = (!is_inactive(&result)).then(|| HotExactTellRoute {
+                let result = send_retained(&route, route.key(), message);
+                let inactive = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| is_inactive_error(&error.error));
+                let hot = (!inactive).then(|| HotExactTellRoute {
                     key: route.key().clone(),
                     route: route.clone(),
                 });
-                if is_inactive(&result) {
+                if inactive {
                     let key = route.key().clone();
                     drop(route);
                     self.remove_if_association(&key, association_id);
@@ -168,6 +194,58 @@ impl ExactTellRouteCache {
                 result
             }
         }
+    }
+
+    pub(crate) async fn tell_wait<F>(
+        &self,
+        messaging: &OutboundMessaging,
+        sender: SenderIdentity,
+        target: ActorRef,
+        message: ExactTellMessage,
+        association: F,
+    ) -> Result<(), TellError>
+    where
+        F: FnOnce(&ActorRef) -> Result<Arc<Association>, TellError>,
+    {
+        let key = ExactTellRouteKey {
+            sender,
+            target,
+            fingerprint: message.fingerprint,
+        };
+        if self.maximum == 0 {
+            let association = association(&key.target)?;
+            return messaging
+                .tell_wait(
+                    &association,
+                    &key.sender,
+                    &key.target,
+                    OutboundMessage::new(message.fingerprint, message.message_id, message.payload),
+                )
+                .await
+                .map(|_| ());
+        }
+        let route = self
+            .hot
+            .load_full()
+            .filter(|route| route.key == key)
+            .map(|route| route.route.clone())
+            .or_else(|| self.routes.get(&key).map(|route| route.clone()));
+        let route = match route {
+            Some(route) => route,
+            None => messaging.prepare_exact_tell_route(
+                association(&key.target)?,
+                &key.sender,
+                &key.target,
+                key.fingerprint,
+            )?,
+        };
+        let association_id = route.association_id();
+        let result = route
+            .tell_wait(message.message_id, message.payload)
+            .await
+            .map(|_| ());
+        self.evict_inactive(&key, association_id, result.as_ref().err());
+        result
     }
 
     fn reserve_slot(&self) -> bool {
@@ -201,9 +279,17 @@ impl ExactTellRouteCache {
         &self,
         key: &ExactTellRouteKey,
         association_id: AssociationId,
-        result: &Result<(), TellError>,
+        error: Option<&TellError>,
     ) {
-        if is_inactive(result) {
+        if error.is_some_and(is_inactive_error) {
+            if self
+                .hot
+                .load()
+                .as_ref()
+                .is_some_and(|hot| hot.key == *key && hot.route.association_id() == association_id)
+            {
+                self.hot.store(None);
+            }
             self.remove_if_association(key, association_id);
         }
     }
@@ -224,12 +310,66 @@ impl ExactTellRouteCache {
     }
 }
 
-fn is_inactive(result: &Result<(), TellError>) -> bool {
+fn send_retained(
+    route: &PreparedExactTellRoute,
+    key: &ExactTellRouteKey,
+    message: ExactTellMessage,
+) -> Result<(), Box<RejectedExactTell>> {
+    route
+        .try_tell_retained(message.message_id, message.payload)
+        .map(|_| ())
+        .map_err(|(error, payload)| {
+            rejected_exact_tell(
+                error,
+                key,
+                ExactTellMessage {
+                    fingerprint: message.fingerprint,
+                    message_id: message.message_id,
+                    payload,
+                },
+            )
+        })
+}
+
+fn prepare_retained<F>(
+    messaging: &OutboundMessaging,
+    key: &ExactTellRouteKey,
+    message: ExactTellMessage,
+    association: F,
+) -> Result<(PreparedExactTellRoute, ExactTellMessage), Box<RejectedExactTell>>
+where
+    F: FnOnce(&ActorRef) -> Result<Arc<Association>, TellError>,
+{
+    let association = match association(&key.target) {
+        Ok(association) => association,
+        Err(error) => return Err(rejected_exact_tell(error, key, message)),
+    };
+    match messaging.prepare_exact_tell_route(association, &key.sender, &key.target, key.fingerprint)
+    {
+        Ok(route) => Ok((route, message)),
+        Err(error) => Err(rejected_exact_tell(error, key, message)),
+    }
+}
+
+fn rejected_exact_tell(
+    error: TellError,
+    key: &ExactTellRouteKey,
+    message: ExactTellMessage,
+) -> Box<RejectedExactTell> {
+    Box::new(RejectedExactTell {
+        error,
+        sender: key.sender.clone(),
+        target: key.target.clone(),
+        fingerprint: message.fingerprint,
+        message_id: message.message_id,
+        payload: message.payload,
+    })
+}
+
+fn is_inactive_error(error: &TellError) -> bool {
     matches!(
-        result,
-        Err(TellError::Association(
-            AssociationError::NotActive | AssociationError::Closed
-        ))
+        error,
+        TellError::Association(AssociationError::NotActive | AssociationError::Closed)
     )
 }
 
@@ -434,7 +574,11 @@ mod tests {
                 },
                 |_| panic!("cached route must not look up the association"),
             ),
-            Err(TellError::Association(AssociationError::QueueFull))
+            Err(rejected)
+                if matches!(
+                    rejected.error,
+                    TellError::Association(AssociationError::QueueFull)
+                )
         ));
         assert_eq!(cache.len(), 1);
 
@@ -451,8 +595,72 @@ mod tests {
                 },
                 |_| panic!("cached route must fail before another lookup"),
             ),
-            Err(TellError::Association(AssociationError::NotActive))
+            Err(rejected)
+                if matches!(
+                    rejected.error,
+                    TellError::Association(AssociationError::NotActive)
+                )
         ));
         assert_eq!(cache.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_tell_waits_for_cached_route_capacity() {
+        let protocol_id = ProtocolId::new(7).unwrap();
+        let fingerprint = ProtocolFingerprint::digest(b"test");
+        let association = active_association(protocol_id, fingerprint, 1);
+        let messaging = OutboundMessaging::new(8).unwrap();
+        let cache = ExactTellRouteCache::new(1);
+        let target = target(protocol_id, 1);
+
+        cache
+            .tell(
+                &messaging,
+                SenderIdentity::Process(1),
+                target.clone(),
+                ExactTellMessage {
+                    fingerprint,
+                    message_id: 1,
+                    payload: Bytes::from_static(b"first"),
+                },
+                |_| Ok(association.clone()),
+            )
+            .unwrap();
+        let rejected = cache
+            .tell(
+                &messaging,
+                SenderIdentity::Process(1),
+                target.clone(),
+                ExactTellMessage {
+                    fingerprint,
+                    message_id: 2,
+                    payload: Bytes::from_static(b"second"),
+                },
+                |_| panic!("cached route must not look up the association"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            rejected.error,
+            TellError::Association(AssociationError::QueueFull)
+        ));
+
+        let mut receiver = association.take_lane_receiver(LaneKind::Bulk(0)).unwrap();
+        let send = cache.tell_wait(
+            &messaging,
+            rejected.sender,
+            rejected.target,
+            ExactTellMessage {
+                fingerprint: rejected.fingerprint,
+                message_id: rejected.message_id,
+                payload: rejected.payload,
+            },
+            |_| panic!("cached route must not look up the association"),
+        );
+        let release_capacity = receiver.recv();
+        let (result, first) = tokio::join!(send, release_capacity);
+
+        result.unwrap();
+        assert!(first.is_some());
+        assert!(receiver.recv().await.is_some());
     }
 }

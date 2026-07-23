@@ -66,13 +66,54 @@ impl PreparedExactTellRoute {
     }
 
     pub fn tell(&self, message_id: u64, payload: Bytes) -> Result<usize, TellError> {
+        self.try_tell_retained(message_id, payload)
+            .map_err(|(error, _)| error)
+    }
+
+    #[doc(hidden)]
+    pub fn try_tell_retained(
+        &self,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<usize, (TellError, Bytes)> {
+        let epoch = self.association.bulk_lane_epoch(self.stripe);
+        let compact =
+            self.dictionary_id.is_some() && self.registered_epoch.load(Ordering::Acquire) == epoch;
+        let frame_len = prepared_tell_frame_len(&self.envelope, message_id, payload.len(), compact);
+        let admission = match self
+            .association
+            .try_reserve_prepared_bulk(self.stripe, frame_len)
+        {
+            Ok(admission) => admission,
+            Err(error) => return Err((TellError::Association(error), payload)),
+        };
+        admission.send(prepared_tell_frame(
+            &self.envelope,
+            message_id,
+            payload,
+            compact,
+        ));
+        if self.dictionary_id.is_some() && !compact {
+            self.registered_epoch.store(epoch, Ordering::Release);
+        }
+        Ok(self.stripe)
+    }
+
+    /// Sends one message, waiting for bounded queue or byte-budget capacity.
+    ///
+    /// This preserves the same bounded admission limits as [`Self::tell`] but
+    /// parks the calling task instead of requiring a retry loop when capacity
+    /// is temporarily exhausted. Permanent Association errors are returned
+    /// immediately.
+    pub async fn tell_wait(&self, message_id: u64, payload: Bytes) -> Result<usize, TellError> {
         let epoch = self.association.bulk_lane_epoch(self.stripe);
         let compact =
             self.dictionary_id.is_some() && self.registered_epoch.load(Ordering::Acquire) == epoch;
         let frame_len = prepared_tell_frame_len(&self.envelope, message_id, payload.len(), compact);
         let admission = self
             .association
-            .try_reserve_prepared_bulk(self.stripe, frame_len)
+            .reserve_prepared_bulk(self.stripe, frame_len)
+            .await
             .map_err(TellError::Association)?;
         admission.send(prepared_tell_frame(
             &self.envelope,
@@ -127,6 +168,58 @@ impl OutboundMessaging {
         target: &ActorRef<A>,
         message: OutboundMessage,
     ) -> Result<usize, TellError> {
+        self.try_tell_retained(association, sender, target, message)
+            .map_err(|(error, _)| error)
+    }
+
+    #[doc(hidden)]
+    pub fn try_tell_retained<A: ProtocolTag>(
+        &self,
+        association: &Association,
+        sender: &SenderIdentity,
+        target: &ActorRef<A>,
+        message: OutboundMessage,
+    ) -> Result<usize, (TellError, Bytes)> {
+        if let Err(error) = check_protocol(
+            association,
+            target.protocol_id(),
+            message.expected_fingerprint,
+        ) {
+            return Err((TellError::Protocol(error), message.payload));
+        }
+        let frame_len = tell_frame_len(
+            target,
+            sender.actor_ref(),
+            message.message_id,
+            message.payload.len(),
+        );
+        let (stripe, admission) = match association.try_reserve_bulk(
+            |hasher| {
+                sender.update_route_hash(hasher);
+                update_actor_route_hash(hasher, target);
+            },
+            frame_len,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => return Err((TellError::Association(error), message.payload)),
+        };
+        admission.send(tell_frame(
+            target,
+            sender.actor_ref(),
+            message.message_id,
+            message.payload,
+        ));
+        Ok(stripe)
+    }
+
+    #[doc(hidden)]
+    pub async fn tell_wait<A: ProtocolTag>(
+        &self,
+        association: &Association,
+        sender: &SenderIdentity,
+        target: &ActorRef<A>,
+        message: OutboundMessage,
+    ) -> Result<usize, TellError> {
         check_protocol(
             association,
             target.protocol_id(),
@@ -139,14 +232,15 @@ impl OutboundMessaging {
             message.message_id,
             message.payload.len(),
         );
-        let (stripe, admission) = association
-            .try_reserve_bulk(
-                |hasher| {
-                    sender.update_route_hash(hasher);
-                    update_actor_route_hash(hasher, target);
-                },
-                frame_len,
-            )
+        let stripe = association
+            .bulk_stripe(|hasher| {
+                sender.update_route_hash(hasher);
+                update_actor_route_hash(hasher, target);
+            })
+            .map_err(TellError::Association)?;
+        let admission = association
+            .reserve_prepared_bulk(stripe, frame_len)
+            .await
             .map_err(TellError::Association)?;
         admission.send(tell_frame(
             target,

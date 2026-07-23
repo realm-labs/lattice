@@ -26,12 +26,12 @@ use lattice_core::{
     id::ActorId,
 };
 use lattice_remoting::{
-    association::{Association, AssociationError, AssociationManager},
+    association::{Association, AssociationManager},
     config::RemotingConfig,
     endpoint::RemotingEndpoint,
     handshake::NodeIdentity,
     messaging::{
-        error::{RemoteMessageError, TellError},
+        error::RemoteMessageError,
         inbound::{ImmediateTellDispatch, InboundDispatch},
         outbound::{OutboundMessage, OutboundMessaging, PreparedExactTellRoute},
         target::{ExactActorTarget, InboundTell, SenderIdentity},
@@ -338,19 +338,7 @@ impl RemoteActorTopology {
                 completion_generation,
             };
             let encoded = Bytes::from(message.encode_to_vec());
-            loop {
-                match self.prepared_tell.tell(1, encoded.clone()) {
-                    Ok(_) => break,
-                    Err(TellError::Association(
-                        AssociationError::QueueFull
-                        | AssociationError::ByteBudgetExceeded
-                        | AssociationError::NodeByteBudgetExceeded,
-                    )) => {
-                        tokio::task::yield_now().await;
-                    }
-                    Err(error) => return Err(Box::new(error)),
-                }
-            }
+            self.prepared_tell.tell_wait(1, encoded).await?;
         }
         self.tell_completion.wait(generation).await;
         Ok(WorkloadReport {

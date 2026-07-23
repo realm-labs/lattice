@@ -34,7 +34,7 @@ use lattice_remoting::{
 };
 
 use crate::{
-    exact_tell_routes::{ExactTellMessage, ExactTellRouteCache},
+    exact_tell_routes::{ExactTellMessage, ExactTellRouteCache, RejectedExactTell},
     lifecycle::NodeAdmissionGate,
     supervisor::TaskSupervisor,
 };
@@ -640,20 +640,15 @@ impl ServiceRecipientBackend {
         )
     }
 
-    fn try_tell_actor(
+    fn try_tell_remote_actor(
         &self,
         sender: Option<ActorRef>,
         reference: ActorRef,
         protocol_fingerprint: ProtocolFingerprint,
         message_id: u64,
         payload: Bytes,
-    ) -> Result<(), TellError> {
-        if self.is_local(&reference) {
-            return self
-                .hosts
-                .try_tell(sender, (&reference).into(), message_id, payload)
-                .map_err(TellError::Remote);
-        }
+    ) -> Result<(), Box<RejectedExactTell>> {
+        debug_assert!(!self.is_local(&reference));
         let sender = sender
             .map(SenderIdentity::Actor)
             .unwrap_or_else(|| SenderIdentity::Process(self.local_incarnation.get()));
@@ -668,6 +663,32 @@ impl ServiceRecipientBackend {
             },
             |target| self.association(target).map_err(TellError::Association),
         )
+    }
+
+    async fn tell_remote_actor(
+        &self,
+        sender: Option<ActorRef>,
+        reference: ActorRef,
+        protocol_fingerprint: ProtocolFingerprint,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), TellError> {
+        let sender = sender
+            .map(SenderIdentity::Actor)
+            .unwrap_or_else(|| SenderIdentity::Process(self.local_incarnation.get()));
+        self.exact_tell_routes
+            .tell_wait(
+                &self.messaging,
+                sender,
+                reference,
+                ExactTellMessage {
+                    fingerprint: protocol_fingerprint,
+                    message_id,
+                    payload,
+                },
+                |target| self.association(target).map_err(TellError::Association),
+            )
+            .await
     }
 }
 
@@ -687,9 +708,36 @@ impl RecipientBackend for ServiceRecipientBackend {
             payload,
         } = tell;
         match target {
-            RecipientRef::Actor(reference) => ImmediateRecipientTellDispatch::Complete(
-                self.try_tell_actor(sender, reference, protocol_fingerprint, message_id, payload),
-            ),
+            RecipientRef::Actor(reference) if self.is_local(&reference) => {
+                ImmediateRecipientTellDispatch::Complete(
+                    self.hosts
+                        .try_tell(sender, (&reference).into(), message_id, payload)
+                        .map_err(TellError::Remote),
+                )
+            }
+            RecipientRef::Actor(reference) => match self.try_tell_remote_actor(
+                sender,
+                reference,
+                protocol_fingerprint,
+                message_id,
+                payload,
+            ) {
+                Ok(()) => ImmediateRecipientTellDispatch::Complete(Ok(())),
+                Err(rejected) if is_temporary_backpressure(&rejected.error) => {
+                    let sender = match rejected.sender {
+                        SenderIdentity::Actor(sender) => Some(sender),
+                        SenderIdentity::Process(_) => None,
+                    };
+                    ImmediateRecipientTellDispatch::Deferred(RecipientTell {
+                        sender,
+                        target: RecipientRef::Actor(rejected.target),
+                        protocol_fingerprint: rejected.fingerprint,
+                        message_id: rejected.message_id,
+                        payload: rejected.payload,
+                    })
+                }
+                Err(rejected) => ImmediateRecipientTellDispatch::Complete(Err(rejected.error)),
+            },
             target => ImmediateRecipientTellDispatch::Deferred(RecipientTell {
                 sender,
                 target,
@@ -712,8 +760,13 @@ impl RecipientBackend for ServiceRecipientBackend {
             return Err(TellError::Remote(RemoteMessageError::Unauthorized));
         }
         match target {
+            RecipientRef::Actor(reference) if self.is_local(&reference) => self
+                .hosts
+                .try_tell(sender, (&reference).into(), message_id, payload)
+                .map_err(TellError::Remote),
             RecipientRef::Actor(reference) => {
-                self.try_tell_actor(sender, reference, protocol_fingerprint, message_id, payload)
+                self.tell_remote_actor(sender, reference, protocol_fingerprint, message_id, payload)
+                    .await
             }
             RecipientRef::Entity(reference) => self
                 .logical
@@ -923,6 +976,17 @@ impl RecipientBackend for ServiceRecipientBackend {
             .map(|_| ())
             .map_err(|_| WatchError::InvalidCommand)
     }
+}
+
+fn is_temporary_backpressure(error: &TellError) -> bool {
+    matches!(
+        error,
+        TellError::Association(
+            AssociationError::QueueFull
+                | AssociationError::ByteBudgetExceeded
+                | AssociationError::NodeByteBudgetExceeded
+        )
+    )
 }
 
 fn map_remote_ask(error: RemoteMessageError) -> AskError {

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -23,10 +23,12 @@ use crate::{
     wire::{Frame, FrameKind},
 };
 
+mod budget;
 mod manager;
 pub mod metrics;
 mod wake;
 
+use budget::OutboundByteBudget;
 use metrics::{AssociationMetrics, AssociationMetricsSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -126,8 +128,9 @@ pub struct Association {
     bulk_lane_epochs: Vec<AtomicU64>,
     next_outbound_exact_target_ids: Vec<AtomicU64>,
     receivers: Mutex<AssociationReceiverSlots>,
-    queued_bytes: AtomicUsize,
-    node_queued_bytes: Arc<AtomicUsize>,
+    queued_bytes: OutboundByteBudget,
+    node_queued_bytes: Arc<OutboundByteBudget>,
+    admission_changed: Notify,
     peer_catalogue: OnceLock<ProtocolCatalogue>,
     reliable_control: Mutex<ReliableControl>,
     interactive_wake: Notify,
@@ -170,14 +173,14 @@ impl Association {
         id: AssociationId,
         config: RemotingConfig,
     ) -> Result<Self, AssociationError> {
-        Self::new_with_id_and_budget(key, id, config, Arc::new(AtomicUsize::new(0)))
+        Self::new_with_id_and_budget(key, id, config, Arc::new(OutboundByteBudget::new()))
     }
 
     fn new_with_id_and_budget(
         key: AssociationKey,
         id: AssociationId,
         config: RemotingConfig,
-        node_queued_bytes: Arc<AtomicUsize>,
+        node_queued_bytes: Arc<OutboundByteBudget>,
     ) -> Result<Self, AssociationError> {
         config.validate().map_err(AssociationError::InvalidConfig)?;
         let max_control_outbox_frames = config.max_control_outbox_frames;
@@ -212,8 +215,9 @@ impl Association {
                 interactive: Some(interactive_rx),
                 bulk: bulk_rx.into_iter().map(Some).collect(),
             }),
-            queued_bytes: AtomicUsize::new(0),
+            queued_bytes: OutboundByteBudget::new(),
             node_queued_bytes,
+            admission_changed: Notify::new(),
             peer_catalogue: OnceLock::new(),
             reliable_control: Mutex::new(
                 ReliableControl::new(id, max_control_outbox_frames, max_control_outbox_bytes)
@@ -585,42 +589,6 @@ impl Association {
             .map_or(0, |epoch| epoch.load(Ordering::Acquire))
     }
 
-    pub(crate) fn try_reserve_prepared_bulk(
-        &self,
-        stripe: usize,
-        bytes: usize,
-    ) -> Result<BulkAdmission<'_>, AssociationError> {
-        if stripe >= self.bulk.len() {
-            return Err(AssociationError::InvalidBulkStripe(
-                u8::try_from(stripe).unwrap_or(u8::MAX),
-            ));
-        }
-        self.prepare_data_lane(LaneKind::Bulk(stripe as u8))?;
-        let permit = self.bulk[stripe].try_reserve().map_err(|_| {
-            self.metrics.record_queue_rejection();
-            AssociationError::QueueFull
-        })?;
-        self.reserve_bytes(bytes)?;
-        Ok(BulkAdmission {
-            association: self,
-            permit: Some(permit),
-            reserved_bytes: bytes,
-        })
-    }
-
-    pub fn release_queued_bytes(&self, bytes: usize) {
-        let _ = self
-            .queued_bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(bytes))
-            });
-        let _ = self
-            .node_queued_bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(bytes))
-            });
-    }
-
     pub fn begin_close(&self) {
         let mut inner = self.inner.lock().expect("association state poisoned");
         if self.state() != AssociationState::Closed {
@@ -629,6 +597,7 @@ impl Association {
             inner.lanes.clear();
             self.attached_lanes.store(0, Ordering::Release);
             self.wake_pending_lanes.store(0, Ordering::Release);
+            self.admission_changed.notify_waiters();
         }
     }
 
@@ -639,6 +608,7 @@ impl Association {
         inner.lanes.clear();
         self.attached_lanes.store(0, Ordering::Release);
         self.wake_pending_lanes.store(0, Ordering::Release);
+        self.admission_changed.notify_waiters();
     }
 
     fn try_admit(
@@ -659,35 +629,6 @@ impl Association {
     fn ensure_active(&self) -> Result<(), AssociationError> {
         if self.state() != AssociationState::Active {
             return Err(AssociationError::NotActive);
-        }
-        Ok(())
-    }
-
-    fn reserve_bytes(&self, bytes: usize) -> Result<(), AssociationError> {
-        self.queued_bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                let next = current.checked_add(bytes)?;
-                (next <= self.config.max_outbound_bytes_per_association).then_some(next)
-            })
-            .map_err(|_| {
-                self.metrics.record_association_byte_budget_rejection();
-                AssociationError::ByteBudgetExceeded
-            })?;
-        if self
-            .node_queued_bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                let next = current.checked_add(bytes)?;
-                (next <= self.config.max_outbound_bytes_per_node).then_some(next)
-            })
-            .is_err()
-        {
-            self.metrics.record_node_byte_budget_rejection();
-            let _ = self
-                .queued_bytes
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    Some(current.saturating_sub(bytes))
-                });
-            return Err(AssociationError::NodeByteBudgetExceeded);
         }
         Ok(())
     }
@@ -731,7 +672,7 @@ pub struct AssociationManager {
     config: RemotingConfig,
     associations: Mutex<HashMap<AssociationKey, Arc<Association>>>,
     remote_incarnations: Mutex<HashMap<NodeAddress, NodeIncarnation>>,
-    queued_bytes: Arc<AtomicUsize>,
+    queued_bytes: Arc<OutboundByteBudget>,
 }
 
 fn stripe_from_hash(hash: &blake3::Hash, stripes: usize) -> usize {
