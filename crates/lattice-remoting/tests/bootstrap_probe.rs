@@ -505,6 +505,40 @@ async fn validated_probe_does_not_retarget_existing_incarnation() {
     server.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn validated_probe_fences_the_requesters_old_incarnation_on_the_server() {
+    let server_port = free_port().await;
+    let cluster = ClusterId::new("requester-restart-test").unwrap();
+    let server_identity = identity(cluster.clone(), "server", 50, server_port);
+    let old_client = identity(cluster.clone(), "client", 51, server_port + 1);
+    let new_client = identity(cluster.clone(), "client", 52, server_port + 1);
+    let (server, server_manager) = endpoint(server_identity.clone());
+    let old_association = server_manager
+        .get_or_create(
+            cluster.clone(),
+            old_client.address.clone(),
+            old_client.incarnation,
+        )
+        .unwrap();
+    let (client, _) = endpoint(new_client.clone());
+    server.bind().await.unwrap();
+
+    let response = client
+        .probe_candidate(target(&server_identity, Some("server")))
+        .await
+        .unwrap();
+
+    assert_eq!(response.remote_identity(), Some(&server_identity));
+    assert_eq!(old_association.state(), AssociationState::Closed);
+    assert!(
+        server_manager
+            .get_or_create(cluster, new_client.address, new_client.incarnation)
+            .is_ok()
+    );
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+}
+
 #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
 #[tokio::test]
 async fn tls_probe_binds_returned_identity_to_certificate_incarnation() {

@@ -231,6 +231,8 @@ async fn domain_logic(
     builder = builder.join_config(ClusterJoinConfig {
         retry_initial: Duration::from_millis(25),
         retry_max: Duration::from_millis(250),
+        leadership_refresh_interval: Duration::from_secs(1),
+        discovery_stale_grace: Duration::from_secs(5),
         join_timeout: Some(Duration::from_secs(240)),
         ..ClusterJoinConfig::default()
     });

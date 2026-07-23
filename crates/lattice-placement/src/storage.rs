@@ -58,9 +58,10 @@ use domain::{
     CompleteMove, CreateDomainMember, CreateMember, CreatePlan, CreatePlanWithOperation,
     DeletePlan, DomainMemberCommit, DurableStorageLimits, EntityConfigCommit, FenceAuthority,
     FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit, MoveCommit, PlanCommit,
-    PutEntityConfig, PutSingletonConfig, RecordAdminOperation, RemoveDomainMember, RemoveMember,
-    ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit, TransitionSlot,
-    UpdateDomainMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
+    PutEntityConfig, PutSingletonConfig, RecordAdminOperation, RemoveDomainMember,
+    RemoveExpiredMember, RemoveMember, ReserveHandoff, ReserveMove, SingletonConfigCommit,
+    SlotCommit, TransitionSlot, UpdateDomainMember, UpdateMember, UpdatePlan,
+    UpdatePlanWithOperation,
 };
 
 #[async_trait]
@@ -112,6 +113,11 @@ pub trait MembershipStore: CoordinatorLeaseStore {
         &self,
         guard: &MembershipLeaderGuard,
         request: RemoveMember,
+    ) -> Result<MemberCommit, StorageError>;
+    async fn remove_expired_member(
+        &self,
+        guard: &MembershipLeaderGuard,
+        request: RemoveExpiredMember,
     ) -> Result<MemberCommit, StorageError>;
 }
 
@@ -558,6 +564,29 @@ impl InMemoryPlacementStore {
             .map_err(|_| StorageError::CounterExhausted)?;
         set_revision(&mut state, guard.scope(), next);
         state.members.remove(&request.expected.node.node_id);
+        Ok(MemberCommit {
+            revision: next,
+            member: request.expected,
+        })
+    }
+
+    async fn remove_expired_member(
+        &self,
+        guard: &MembershipLeaderGuard,
+        request: RemoveExpiredMember,
+    ) -> Result<MemberCommit, StorageError> {
+        let mut state = self.inner.lock().expect("placement memory store poisoned");
+        validate_guard(&state, guard)?;
+        if guard.scope() != &CoordinatorScope::Membership {
+            return Err(StorageError::InvalidRecord);
+        }
+        if state.members.contains_key(&request.expected.node.node_id) {
+            return Err(StorageError::CompareFailed);
+        }
+        let next = current_revision(&state, guard.scope())
+            .next()
+            .map_err(|_| StorageError::CounterExhausted)?;
+        set_revision(&mut state, guard.scope(), next);
         Ok(MemberCommit {
             revision: next,
             member: request.expected,

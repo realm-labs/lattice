@@ -10,5 +10,6 @@ pub mod network;
 pub mod process;
 pub mod retained_stop;
 pub mod scenario;
+pub mod serde_u128;
 pub mod store;
 pub mod trace;

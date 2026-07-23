@@ -16,8 +16,9 @@ use super::{
         DomainMemberCommit, DurableStorageLimits, EntityConfigCommit, FenceAuthority,
         FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit, MoveCommit, PlanCommit,
         PutEntityConfig, PutSingletonConfig, RecordAdminOperation, RemoveDomainMember,
-        RemoveMember, ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit,
-        TransitionSlot, UpdateDomainMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
+        RemoveExpiredMember, RemoveMember, ReserveHandoff, ReserveMove, SingletonConfigCommit,
+        SlotCommit, TransitionSlot, UpdateDomainMember, UpdateMember, UpdatePlan,
+        UpdatePlanWithOperation,
     },
     initial_revision, set_revision, validate_guard,
 };
@@ -112,6 +113,14 @@ impl MembershipStore for InMemoryPlacementStore {
         request: RemoveMember,
     ) -> Result<MemberCommit, StorageError> {
         InMemoryPlacementStore::remove_member(self, guard, request).await
+    }
+
+    async fn remove_expired_member(
+        &self,
+        guard: &MembershipLeaderGuard,
+        request: RemoveExpiredMember,
+    ) -> Result<MemberCommit, StorageError> {
+        InMemoryPlacementStore::remove_expired_member(self, guard, request).await
     }
 }
 

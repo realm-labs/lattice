@@ -198,8 +198,26 @@ where
         let control_dispatch = control_dispatch.clone();
         let worker = tokio::spawn(async move {
             while let Some(frame) = command_rx.recv().await {
-                let result =
-                    apply_control_frame(association.clone(), control_dispatch.clone(), frame).await;
+                let mut retry_backoff = Duration::from_millis(25);
+                let result = loop {
+                    let result = apply_control_frame(
+                        association.clone(),
+                        control_dispatch.clone(),
+                        frame.clone(),
+                    )
+                    .await;
+                    if matches!(
+                        result,
+                        Err(LaneError::ControlDispatch(
+                            ControlDispatchError::Unavailable
+                        ))
+                    ) {
+                        tokio::time::sleep(retry_backoff).await;
+                        retry_backoff = retry_backoff.saturating_mul(2).min(Duration::from_secs(1));
+                        continue;
+                    }
+                    break result;
+                };
                 let failed = result.is_err();
                 if results.send(result).await.is_err() || failed {
                     break;

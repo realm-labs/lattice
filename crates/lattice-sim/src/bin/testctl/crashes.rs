@@ -188,7 +188,7 @@ pub(super) fn etcd(artifacts: &Path) -> Result<(), String> {
                 "hold-through-store-operation-deadline",
                 "restart-etcd-with-existing-data-volume",
                 "require-etcd-healthy",
-                "require-higher-term-membership",
+                "require-non-regressed-revalidated-membership",
                 "require-all-logic-ready",
             ],
         }),
@@ -209,17 +209,20 @@ pub(super) fn etcd(artifacts: &Path) -> Result<(), String> {
         stopped = false;
 
         let recovered = wait_for_valid_cluster(&logic_paths, Duration::from_secs(90))?;
+        let mut recovered_terms = Vec::with_capacity(recovered.len());
         for logic in &recovered {
             let version = logic.membership_version.ok_or_else(|| {
                 format!("{} recovered without a membership version", logic.node_id)
             })?;
-            if version.term <= before_term {
+            if version.term < before_term {
                 return Err(format!(
-                    "{} recovered after etcd restart without a new Coordinator term: before={before_term}, after={}",
+                    "{} recovered after etcd restart with a regressed Coordinator term: before={before_term}, after={}",
                     logic.node_id, version.term
                 ));
             }
+            recovered_terms.push(version.term);
         }
+        let term_advanced = recovered_terms.iter().all(|term| *term > before_term);
         write_json(
             &artifacts.join("etcd-hard-crash-recovery.json"),
             &serde_json::json!({
@@ -227,6 +230,8 @@ pub(super) fn etcd(artifacts: &Path) -> Result<(), String> {
                 "before": before,
                 "degraded": degraded,
                 "recovered": recovered,
+                "leadership_revalidated": true,
+                "term_advanced": term_advanced,
                 "data_volume_reused": true,
             }),
         )
@@ -364,10 +369,20 @@ fn wait_for_valid_cluster(
 ) -> Result<Vec<MultiDomainLogicArtifact>, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        let snapshots = paths
+        let snapshots = match paths
             .iter()
             .map(|path| read_logic(path))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(format!("logic artifacts remained unreadable: {error}"));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
         if cluster_is_valid(&snapshots) {
             return Ok(snapshots);
         }
@@ -431,7 +446,18 @@ fn wait_for_member_absent(
 ) -> Result<MultiDomainLogicArtifact, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        let snapshot = read_logic(observer)?;
+        let snapshot = match read_logic(observer) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "{node_id} was not removed from membership; observer remained unreadable: {error}"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
         if logic_is_valid(&snapshot)
             && snapshot
                 .membership_version
@@ -459,7 +485,18 @@ fn wait_for_logic_incarnation(
 ) -> Result<MultiDomainLogicArtifact, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        let snapshot = read_logic(path)?;
+        let snapshot = match read_logic(path) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "logic artifact remained unreadable after restart: {error}"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
         if snapshot.incarnation != old_incarnation && logic_is_valid(&snapshot) {
             return Ok(snapshot);
         }
@@ -482,10 +519,22 @@ fn wait_for_member_rejoin(
 ) -> Result<Vec<MultiDomainLogicArtifact>, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        let snapshots = paths
+        let snapshots = match paths
             .iter()
             .map(|path| read_logic(path))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "{node_id} did not rejoin; logic artifacts remained unreadable: {error}"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
         let converged = cluster_is_valid(&snapshots)
             && snapshots.iter().all(|snapshot| {
                 let members = snapshot

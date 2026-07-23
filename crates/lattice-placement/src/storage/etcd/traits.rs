@@ -24,9 +24,9 @@ use crate::{
             CreatePlanWithOperation, DeletePlan, DomainMemberCommit, DurableStorageLimits,
             EntityConfigCommit, FenceAuthority, FenceMissingAuthority, InstallAuthority,
             LeasedClaim, MemberCommit, MoveCommit, PlanCommit, PutEntityConfig, PutSingletonConfig,
-            RecordAdminOperation, RemoveDomainMember, RemoveMember, ReserveHandoff, ReserveMove,
-            SingletonConfigCommit, SlotCommit, TransitionSlot, UpdateDomainMember, UpdateMember,
-            UpdatePlan, UpdatePlanWithOperation,
+            RecordAdminOperation, RemoveDomainMember, RemoveExpiredMember, RemoveMember,
+            ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit, TransitionSlot,
+            UpdateDomainMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
         },
     },
     types::{PlacementSlot, PlacementSlotKey, Revision},
@@ -102,6 +102,14 @@ impl MembershipStore for EtcdPlacementStore {
         request: RemoveMember,
     ) -> Result<MemberCommit, StorageError> {
         EtcdPlacementStore::remove_member(self, guard, request).await
+    }
+
+    async fn remove_expired_member(
+        &self,
+        guard: &MembershipLeaderGuard,
+        request: RemoveExpiredMember,
+    ) -> Result<MemberCommit, StorageError> {
+        EtcdPlacementStore::remove_expired_member(self, guard, request).await
     }
 }
 

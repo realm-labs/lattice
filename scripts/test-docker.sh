@@ -2,10 +2,26 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+docker_workspace_source=$root
+if command -v cygpath >/dev/null 2>&1; then
+  docker_workspace_source=$(cygpath -w "$root")
+fi
 compose="$root/tests/distributed/compose.yaml"
 profile=${1:-}
 [ -n "$profile" ] || { echo "usage: $0 <quality|sim|model|e2e|e2e-ha-etcd|scale|chaos|k8s|soak|replay>" >&2; exit 2; }
 shift
+
+case "$profile" in
+  e2e-ha-etcd|scale|chaos)
+    lattice_cargo_profile=release
+    LATTICE_CARGO_PROFILE_DIR=release
+    ;;
+  *)
+    lattice_cargo_profile=dev
+    LATTICE_CARGO_PROFILE_DIR=debug
+    ;;
+esac
+export LATTICE_CARGO_PROFILE_DIR
 
 run_id=${LATTICE_RUN_ID:-"$(date -u +%Y%m%dt%H%M%Sz)-$$"}
 project="lattice-${run_id}"
@@ -123,18 +139,18 @@ docker build \
 
 case "$profile" in
   e2e|e2e-ha-etcd|scale|chaos)
-    echo "Preparing shared lattice-sim binaries in the Docker Cargo cache"
-    docker run --rm \
+    echo "Preparing shared lattice-sim $LATTICE_CARGO_PROFILE_DIR binaries in the Docker Cargo cache"
+    MSYS2_ARG_CONV_EXCL='*' docker run --rm \
       --label "io.lattice.test-run=$run_id" \
       --init \
       --cpus 4 \
       --memory 4g \
-      -v "$root:/workspace:ro" \
-      -v "$LATTICE_CARGO_HOME_VOLUME:/cargo-home" \
-      -v "$LATTICE_CARGO_TARGET_VOLUME:/cargo-target" \
-      -w /workspace \
+      --mount="type=bind,source=$docker_workspace_source,target=/workspace,readonly" \
+      --mount="type=volume,source=$LATTICE_CARGO_HOME_VOLUME,target=/cargo-home" \
+      --mount="type=volume,source=$LATTICE_CARGO_TARGET_VOLUME,target=/cargo-target" \
+      --workdir=/workspace \
       "$runner_image" \
-      cargo build -p lattice-sim --bin distributed-node --bin testctl
+      cargo build --profile "$lattice_cargo_profile" -p lattice-sim --bin distributed-node --bin testctl
     ;;
 esac
 

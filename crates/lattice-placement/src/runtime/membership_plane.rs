@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use lattice_core::{coordinator::CoordinatorScope, failpoint::Failpoint};
 use tokio::{
@@ -14,7 +14,7 @@ use crate::{
     },
     storage::{
         CoordinatorLeaseStore, MembershipStore, ScopedElectionStore,
-        domain::{CreateMember, RemoveMember, UpdateMember},
+        domain::{CreateMember, RemoveExpiredMember, RemoveMember, UpdateMember},
     },
     types::{CoordinatorTerm, MembershipVersion, NodeKey},
 };
@@ -69,6 +69,7 @@ where
     leader_lease_id: i64,
     config: MembershipLeaderConfig,
     version: MembershipVersion,
+    known_members: BTreeMap<String, MemberRecord>,
     events: broadcast::Sender<MemberEvent>,
 }
 
@@ -96,6 +97,12 @@ where
             return Err(CoordinatorRuntimeError::NotLeader);
         }
         let revision = store.get_membership_revision().await?;
+        let known_members = store
+            .list_members()
+            .await?
+            .into_iter()
+            .map(|member| (member.node.node_id.clone(), member))
+            .collect();
         let (events, _) = broadcast::channel(config.maximum_events);
         Ok(Self {
             store,
@@ -105,6 +112,7 @@ where
             leader_lease_id,
             config,
             version: MembershipVersion::new(term, revision),
+            known_members,
             events,
         })
     }
@@ -142,6 +150,8 @@ where
             if current.node == hello.node && current.hello == hello {
                 self.store.keep_lease_alive(current.lease_id).await?;
                 if current.version.term == self.version.term {
+                    self.known_members
+                        .insert(current.node.node_id.clone(), current.clone());
                     return Ok(current);
                 }
                 let mut member = current.clone();
@@ -159,12 +169,31 @@ where
                     .await?
                     .member;
                 self.version = committed.version;
+                self.known_members
+                    .insert(committed.node.node_id.clone(), committed.clone());
                 self.publish(MemberChange::Upsert(Box::new(committed.clone())));
                 return Ok(committed);
             }
             return Err(CoordinatorRuntimeError::IncarnationPending {
                 predecessor: current.node.incarnation,
                 remaining_ttl: self.store.lease_time_to_live(current.lease_id).await?,
+            });
+        }
+        if let Some(expired) = self.known_members.get(&hello.node.node_id).cloned() {
+            let committed = self
+                .store
+                .remove_expired_member(
+                    &self.guard,
+                    RemoveExpiredMember {
+                        expected: expired.clone(),
+                    },
+                )
+                .await?;
+            self.version = MembershipVersion::new(self.version.term, committed.revision);
+            self.known_members.remove(&expired.node.node_id);
+            self.publish(MemberChange::Removed {
+                node: expired.node,
+                reason: MemberRemovalReason::FailureDetected,
             });
         }
         let lease_id = self.store.grant_lease(self.config.member_lease_ttl).await?;
@@ -193,6 +222,10 @@ where
             }
         };
         self.version = committed.member.version;
+        self.known_members.insert(
+            committed.member.node.node_id.clone(),
+            committed.member.clone(),
+        );
         self.publish(MemberChange::Upsert(Box::new(committed.member.clone())));
         Ok(committed.member)
     }
@@ -247,11 +280,52 @@ where
             .await?;
         self.version = MembershipVersion::new(self.version.term, committed.revision);
         self.store.revoke_lease(member.lease_id).await?;
+        self.known_members.remove(&member.node.node_id);
         self.publish(MemberChange::Removed {
             node: member.node.clone(),
             reason,
         });
         Ok(member)
+    }
+
+    /// Converts lease-driven key deletion into a revisioned membership event.
+    ///
+    /// Etcd removes a member key automatically when its lease expires. Without this guarded
+    /// reconciliation commit, the durable membership revision and remote member directories
+    /// would never observe that deletion.
+    pub async fn reconcile_expired_members(&mut self) -> Result<(), CoordinatorRuntimeError> {
+        let current = self
+            .store
+            .list_members()
+            .await?
+            .into_iter()
+            .map(|member| (member.node.node_id.clone(), member))
+            .collect::<BTreeMap<_, _>>();
+        let expired = self
+            .known_members
+            .iter()
+            .filter(|(node_id, _)| !current.contains_key(*node_id))
+            .map(|(_, member)| member.clone())
+            .collect::<Vec<_>>();
+        self.known_members.extend(current);
+        for member in expired {
+            let committed = self
+                .store
+                .remove_expired_member(
+                    &self.guard,
+                    RemoveExpiredMember {
+                        expected: member.clone(),
+                    },
+                )
+                .await?;
+            self.version = MembershipVersion::new(self.version.term, committed.revision);
+            self.known_members.remove(&member.node.node_id);
+            self.publish(MemberChange::Removed {
+                node: member.node,
+                reason: MemberRemovalReason::FailureDetected,
+            });
+        }
+        Ok(())
     }
 
     pub async fn run(
@@ -294,6 +368,10 @@ where
             .update_member(&self.guard, UpdateMember { expected, member })
             .await?;
         self.version = committed.member.version;
+        self.known_members.insert(
+            committed.member.node.node_id.clone(),
+            committed.member.clone(),
+        );
         self.publish(MemberChange::Upsert(Box::new(committed.member.clone())));
         Ok(committed.member)
     }
@@ -309,5 +387,129 @@ where
             version: self.version,
             change,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
+
+    use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
+
+    use super::{MembershipLeader, MembershipLeaderConfig};
+    use crate::{
+        coordinator::{MemberChange, MemberHello, MemberRemovalReason},
+        storage::{CoordinatorLeaseStore, InMemoryPlacementStore, MembershipStore},
+        types::{CoordinatorTerm, NodeKey},
+    };
+
+    fn node(incarnation: u128) -> NodeKey {
+        NodeKey {
+            node_id: "logic-a".to_owned(),
+            address: NodeAddress::new("127.0.0.1", 29001).unwrap(),
+            incarnation: NodeIncarnation::new(incarnation).unwrap(),
+        }
+    }
+
+    fn hello(node: NodeKey) -> MemberHello {
+        MemberHello {
+            node,
+            roles: BTreeSet::new(),
+            failure_domains: BTreeMap::new(),
+            protocols: Vec::new(),
+            remoting_capabilities: BTreeSet::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_member_key_becomes_a_revisioned_removal_event() {
+        let store = Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
+        let mut leader = MembershipLeader::elect(
+            store.clone(),
+            NodeKey {
+                node_id: "coordinator".to_owned(),
+                address: NodeAddress::new("127.0.0.1", 29000).unwrap(),
+                incarnation: NodeIncarnation::new(1).unwrap(),
+            },
+            CoordinatorTerm::new(1).unwrap(),
+            MembershipLeaderConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut events = leader.subscribe();
+        let member = leader.join(hello(node(2))).await.unwrap();
+        leader.mark_up(&member.node).await.unwrap();
+        let _ = events.recv().await.unwrap();
+        let _ = events.recv().await.unwrap();
+
+        store.revoke_lease(member.lease_id).await.unwrap();
+        assert!(store.get_member("logic-a").await.unwrap().is_none());
+        leader.reconcile_expired_members().await.unwrap();
+
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.version, leader.version());
+        assert!(matches!(
+            event.change,
+            MemberChange::Removed {
+                node,
+                reason: MemberRemovalReason::FailureDetected,
+            } if node == member.node
+        ));
+        assert_eq!(
+            store.get_membership_revision().await.unwrap(),
+            event.version.revision
+        );
+
+        let replacement = leader.join(hello(node(3))).await.unwrap();
+        assert_eq!(replacement.node.incarnation, node(3).incarnation);
+        assert!(replacement.version > event.version);
+    }
+
+    #[tokio::test]
+    async fn immediate_rejoin_commits_expired_predecessor_before_replacement() {
+        let store = Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
+        let mut leader = MembershipLeader::elect(
+            store.clone(),
+            NodeKey {
+                node_id: "coordinator".to_owned(),
+                address: NodeAddress::new("127.0.0.1", 29000).unwrap(),
+                incarnation: NodeIncarnation::new(1).unwrap(),
+            },
+            CoordinatorTerm::new(1).unwrap(),
+            MembershipLeaderConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut events = leader.subscribe();
+        let predecessor = leader.join(hello(node(2))).await.unwrap();
+        leader.mark_up(&predecessor.node).await.unwrap();
+        let _ = events.recv().await.unwrap();
+        let _ = events.recv().await.unwrap();
+
+        store.revoke_lease(predecessor.lease_id).await.unwrap();
+        let replacement = leader.join(hello(node(3))).await.unwrap();
+
+        let removed = events.recv().await.unwrap();
+        assert!(matches!(
+            removed.change,
+            MemberChange::Removed {
+                node,
+                reason: MemberRemovalReason::FailureDetected,
+            } if node == predecessor.node
+        ));
+        let inserted = events.recv().await.unwrap();
+        assert!(matches!(
+            inserted.change,
+            MemberChange::Upsert(member) if member.node == replacement.node
+        ));
+        assert!(removed.version < inserted.version);
+        assert_eq!(inserted.version, replacement.version);
+        assert_eq!(
+            store.get_membership_revision().await.unwrap(),
+            replacement.version.revision
+        );
     }
 }

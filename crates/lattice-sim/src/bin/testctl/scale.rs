@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     time::{Duration, Instant},
 };
@@ -92,7 +92,7 @@ fn read_nodes(directory: &Path) -> Result<Vec<ScaleNodeArtifact>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.to_string()),
     };
-    let mut nodes = Vec::new();
+    let mut nodes_by_artifact = BTreeMap::new();
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
         if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
@@ -101,9 +101,14 @@ fn read_nodes(directory: &Path) -> Result<Vec<ScaleNodeArtifact>, String> {
         if let Ok(encoded) = std::fs::read(entry.path())
             && let Ok(node) = serde_json::from_slice::<ScaleNodeArtifact>(&encoded)
         {
-            nodes.push(node);
+            // Windows bind mounts may surface the same directory entry twice while an atomic
+            // replacement is in flight. Preserve distinct artifact files so the convergence
+            // oracle can still detect duplicate node identities, but collapse duplicate reads
+            // of the same path.
+            nodes_by_artifact.insert(entry.file_name(), node);
         }
     }
+    let mut nodes = nodes_by_artifact.into_values().collect::<Vec<_>>();
     nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     Ok(nodes)
 }
@@ -368,7 +373,8 @@ mod tests {
                 status: "Up".to_owned(),
             }],
         };
-        let encoded = serde_json::to_vec(&artifact).expect("u128 must serialize without Value");
+        let value = serde_json::json!(artifact);
+        let encoded = serde_json::to_vec(&value).expect("string incarnation must fit JSON Value");
         assert!(
             encoded
                 .windows(39)

@@ -128,6 +128,7 @@ enum Role {
 struct ScopedLeadershipArtifact {
     node_id: String,
     term: u64,
+    #[serde(with = "lattice_sim::serde_u128")]
     incarnation: u128,
 }
 
@@ -143,6 +144,7 @@ struct DiscoveryLifecycleArtifact {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MultiDomainHostArtifact {
     node_id: String,
+    #[serde(with = "lattice_sim::serde_u128")]
     incarnation: u128,
     scopes: BTreeMap<String, ScopedLeadershipArtifact>,
 }
@@ -150,6 +152,7 @@ struct MultiDomainHostArtifact {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MultiDomainLogicArtifact {
     node_id: String,
+    #[serde(with = "lattice_sim::serde_u128")]
     incarnation: u128,
     lifecycle: String,
     domains: BTreeMap<String, String>,
@@ -171,6 +174,7 @@ struct MembershipVersionArtifact {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MemberArtifact {
     node_id: String,
+    #[serde(with = "lattice_sim::serde_u128")]
     incarnation: u128,
     status: String,
 }
@@ -389,6 +393,12 @@ actor_protocol! {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .try_init();
     let cli = Cli::parse();
     match cli.role {
         Role::Server => server(cli.reference).await,

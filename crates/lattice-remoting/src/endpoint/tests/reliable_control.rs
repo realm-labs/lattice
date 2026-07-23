@@ -112,7 +112,7 @@ async fn blocked_control_apply_does_not_starve_remoting_heartbeats() {
 }
 
 #[tokio::test]
-async fn stale_control_is_acked_after_reconnect_before_new_session_command() {
+async fn unavailable_control_is_retried_without_disconnecting_before_new_session_command() {
     let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_port = probe.local_addr().unwrap().port();
     drop(probe);
@@ -144,12 +144,17 @@ async fn stale_control_is_acked_after_reconnect_before_new_session_command() {
         .admit_control_command(Bytes::from_static(b"term-28-heartbeat"))
         .unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
-        while association.state() != AssociationState::Reconnecting {
+        while control
+            .old_attempts
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
+    assert_eq!(association.state(), AssociationState::Active);
     association
         .admit_control_command(Bytes::from_static(b"term-29-member-hello"))
         .unwrap();

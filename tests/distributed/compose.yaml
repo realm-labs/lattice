@@ -80,7 +80,7 @@ services:
       - cargo-target:/cargo-target
       - /var/run/docker.sock:/var/run/docker.sock
     command:
-      - /cargo-target/debug/testctl
+      - /cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/testctl
       - run
       - e2e
       - --seed
@@ -92,7 +92,7 @@ services:
     <<: *runner
     profiles: [e2e, chaos]
     cap_add: [NET_ADMIN]
-    command: ["/cargo-target/debug/distributed-node", "server", "--reference", "/artifacts/server-ref.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "server", "--reference", "/artifacts/server-ref.json"]
     healthcheck:
       test: ["CMD", "test", "-s", "/artifacts/server-ref.json"]
       interval: 1s
@@ -102,7 +102,7 @@ services:
   entity-owner:
     <<: *runner
     profiles: [e2e]
-    command: ["/cargo-target/debug/distributed-node", "entity-owner", "--reference", "/artifacts/entity-ref.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "entity-owner", "--reference", "/artifacts/entity-ref.json"]
     healthcheck:
       test: ["CMD", "test", "-s", "/artifacts/entity-ref.json"]
       interval: 1s
@@ -129,7 +129,7 @@ services:
   discovery-coordinator:
     <<: *runner
     profiles: [e2e]
-    command: ["/cargo-target/debug/distributed-node", "discovery-coordinator", "--node-id", "discovery-coordinator", "--port", "29200", "--reference", "/artifacts/discovery-coordinator.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "discovery-coordinator", "--node-id", "discovery-coordinator", "--port", "29200", "--reference", "/artifacts/discovery-coordinator.json"]
     healthcheck:
       test: ["CMD", "test", "-s", "/artifacts/discovery-coordinator.json"]
       interval: 1s
@@ -141,7 +141,7 @@ services:
     profiles: [e2e]
     depends_on:
       discovery-coordinator: {condition: service_healthy}
-    command: ["/cargo-target/debug/distributed-node", "static-member", "--node-id", "static-member", "--port", "29201", "--reference", "/artifacts/discovery-static.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "static-member", "--node-id", "static-member", "--port", "29201", "--reference", "/artifacts/discovery-static.json"]
     healthcheck:
       test: ["CMD-SHELL", "grep -q '\"lifecycle\": \"Ready\"' /artifacts/discovery-static.json"]
       interval: 1s
@@ -158,7 +158,7 @@ services:
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
-    command: ["/cargo-target/debug/distributed-node", "config-member", "--node-id", "config-member", "--port", "29202", "--reference", "/artifacts/discovery-config.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "config-member", "--node-id", "config-member", "--port", "29202", "--reference", "/artifacts/discovery-config.json"]
     healthcheck:
       test: ["CMD-SHELL", "grep -q '\"lifecycle\": \"Ready\"' /artifacts/discovery-config.json"]
       interval: 1s
@@ -173,7 +173,7 @@ services:
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
-    command: ["/cargo-target/debug/distributed-node", "domain-host", "--node-id", "domain-membership", "--port", "29300", "--reference", "/artifacts/domain-membership.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-host", "--node-id", "domain-membership", "--port", "29300", "--reference", "/artifacts/domain-membership.json"]
     healthcheck:
       test: ["CMD-SHELL", "grep -q '\"membership\"' /artifacts/domain-membership.json"]
       interval: 1s
@@ -188,7 +188,7 @@ services:
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
-    command: ["/cargo-target/debug/distributed-node", "domain-host", "--node-id", "domain-alpha", "--port", "29301", "--domains", "alpha,delta", "--reference", "/artifacts/domain-alpha.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-host", "--node-id", "domain-alpha", "--port", "29301", "--domains", "alpha,delta", "--reference", "/artifacts/domain-alpha.json"]
     healthcheck:
       test: ["CMD-SHELL", "grep -q 'placement:domain-alpha' /artifacts/domain-alpha.json"]
       interval: 1s
@@ -203,7 +203,7 @@ services:
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
-    command: ["/cargo-target/debug/distributed-node", "domain-host", "--node-id", "domain-beta", "--port", "29302", "--domains", "beta", "--reference", "/artifacts/domain-beta.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-host", "--node-id", "domain-beta", "--port", "29302", "--domains", "beta", "--reference", "/artifacts/domain-beta.json"]
     healthcheck:
       test: ["CMD-SHELL", "grep -q 'placement:domain-beta' /artifacts/domain-beta.json"]
       interval: 1s
@@ -218,7 +218,7 @@ services:
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
-    command: ["/cargo-target/debug/distributed-node", "domain-host", "--node-id", "domain-gamma", "--port", "29303", "--domains", "gamma", "--reference", "/artifacts/domain-gamma.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-host", "--node-id", "domain-gamma", "--port", "29303", "--domains", "gamma", "--reference", "/artifacts/domain-gamma.json"]
     healthcheck:
       test: ["CMD-SHELL", "grep -q 'placement:domain-gamma' /artifacts/domain-gamma.json"]
       interval: 1s
@@ -235,7 +235,7 @@ services:
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
-    command: ["/cargo-target/debug/distributed-node", "domain-host", "--node-id", "domain-standby", "--port", "29304", "--domains", "alpha,beta,gamma,delta", "--reference", "/artifacts/domain-standby.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-host", "--node-id", "domain-standby", "--port", "29304", "--domains", "alpha,beta,gamma,delta", "--reference", "/artifacts/domain-standby.json"]
     healthcheck:
       test: ["CMD", "test", "-s", "/artifacts/domain-standby.json"]
       interval: 1s
@@ -247,7 +247,7 @@ services:
     profiles: [e2e, chaos]
     depends_on:
       domain-standby: {condition: service_healthy}
-    command: ["/cargo-target/debug/distributed-node", "domain-logic", "--node-id", "domain-logic-a", "--port", "29310", "--reference", "/artifacts/domain-logic-a.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-logic", "--node-id", "domain-logic-a", "--port", "29310", "--reference", "/artifacts/domain-logic-a.json"]
     healthcheck:
       test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and (.domains | length == 4 and all(.[]; . == \"Ready\"))", "/artifacts/domain-logic-a.json"]
       interval: 1s
@@ -259,7 +259,7 @@ services:
     profiles: [e2e, chaos]
     depends_on:
       domain-standby: {condition: service_healthy}
-    command: ["/cargo-target/debug/distributed-node", "domain-logic", "--node-id", "domain-logic-b", "--port", "29311", "--reference", "/artifacts/domain-logic-b.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-logic", "--node-id", "domain-logic-b", "--port", "29311", "--reference", "/artifacts/domain-logic-b.json"]
     healthcheck:
       test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and (.domains | length == 4 and all(.[]; . == \"Ready\"))", "/artifacts/domain-logic-b.json"]
       interval: 1s
@@ -291,7 +291,7 @@ services:
           delay="$$(printf '%s' "$${HOSTNAME}" | cksum | awk -v window="$${window}" '{print $$1 % (window + 1)}')";
         fi;
         sleep "$${delay}";
-        exec /cargo-target/debug/distributed-node domain-logic
+        exec /cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node domain-logic
         --node-id "$${HOSTNAME}"
         --address-host "$$(hostname -i | awk '{print $$1}')"
         --port 29310
@@ -365,7 +365,7 @@ services:
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd1:2379,http://etcd2:2379,http://etcd3:2379
-    command: ["/cargo-target/debug/distributed-node", "coordinator", "--node-id", "coordinator-a", "--port", "29101", "--reference", "/artifacts/coordinator-a.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "coordinator", "--node-id", "coordinator-a", "--port", "29101", "--reference", "/artifacts/coordinator-a.json"]
 
   coordinator-b:
     <<: *runner
@@ -377,7 +377,7 @@ services:
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd1:2379,http://etcd2:2379,http://etcd3:2379
-    command: ["/cargo-target/debug/distributed-node", "coordinator", "--node-id", "coordinator-b", "--port", "29102", "--reference", "/artifacts/coordinator-b.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "coordinator", "--node-id", "coordinator-b", "--port", "29102", "--reference", "/artifacts/coordinator-b.json"]
 
   runner-e2e-ha-etcd:
     <<: *runner
@@ -398,7 +398,7 @@ services:
       - cargo-home:/cargo-home
       - cargo-target:/cargo-target
       - /var/run/docker.sock:/var/run/docker.sock
-    command: ["/cargo-target/debug/testctl", "run", "e2e-ha-etcd", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/testctl", "run", "e2e-ha-etcd", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
 
   runner-chaos:
     <<: *runner
@@ -422,7 +422,7 @@ services:
     networks:
       testnet:
         aliases: [aaa-client, aaa-monitor]
-    command: ["/cargo-target/debug/testctl", "run", "chaos", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/testctl", "run", "chaos", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
 
   runner-scale:
     <<: *runner
@@ -434,7 +434,7 @@ services:
       LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
       LATTICE_SCALE_EXPECTED_MEMBERS: ${LATTICE_SCALE_EXPECTED_MEMBERS:-64}
       LATTICE_SCALE_STARTUP_WINDOW_SECONDS: ${LATTICE_SCALE_STARTUP_WINDOW_SECONDS:-0}
-    command: ["/cargo-target/debug/testctl", "run", "scale", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/testctl", "run", "scale", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
 
   runner-soak:
     <<: *runner

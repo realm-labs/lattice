@@ -330,21 +330,39 @@ impl LogicJoinRuntime {
                 }
                 effect = effects.recv() => {
                     let Some(effect) = effect else {
+                        self.set_domain_state(PlacementDomainState::Degraded);
+                        let _ = self
+                            .lifecycle_driver
+                            .transition(ServiceLifecycleEvent::CoordinatorLost);
                         let _ = session_shutdown.send(true);
-                        return LogicSessionReturn {
-                            controls: task.await
+                        let controls = task.await
                             .map(|(_, controls)| controls)
-                            .unwrap_or_else(|_| closed_controls()),
-                            retry: false,
+                            .unwrap_or_else(|_| closed_controls());
+                        let retry = !controls.is_closed();
+                        return LogicSessionReturn {
+                            controls,
+                            retry,
                         };
                     };
                     if self.apply_effect(effect, &handle).await.is_err() {
+                        self.set_domain_state(PlacementDomainState::Degraded);
+                        let _ = self
+                            .lifecycle_driver
+                            .transition(ServiceLifecycleEvent::CoordinatorLost);
                         let _ = session_shutdown.send(true);
-                        return LogicSessionReturn {
-                            controls: task.await
+                        let controls = task.await
                             .map(|(_, controls)| controls)
-                            .unwrap_or_else(|_| closed_controls()),
-                            retry: false,
+                            .unwrap_or_else(|_| closed_controls());
+                        let retry = !controls.is_closed();
+                        tracing::warn!(
+                            target: "lattice.cluster.logic",
+                            domain = %self.domain_hello.domain.as_str(),
+                            retry,
+                            "logic session effect failed; reconciliation required"
+                        );
+                        return LogicSessionReturn {
+                            controls,
+                            retry,
                         };
                     }
                 }

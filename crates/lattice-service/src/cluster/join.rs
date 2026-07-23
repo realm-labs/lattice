@@ -21,7 +21,7 @@ use lattice_remoting::{
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, watch},
-    time::Instant,
+    time::{Instant, MissedTickBehavior},
 };
 
 use crate::config::{ClusterJoinConfig, ClusterJoinConfigError};
@@ -152,6 +152,11 @@ impl JoinController {
                         {
                             return;
                         }
+                        let mut leadership_refresh =
+                            tokio::time::interval(self.config.leadership_refresh_interval);
+                        leadership_refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                        leadership_refresh.reset();
+                        let mut leadership_confirmed_at = Instant::now();
                         loop {
                             if association.state() != AssociationState::Active {
                                 tracing::warn!(
@@ -176,6 +181,65 @@ impl JoinController {
                                     Some(Ok(snapshot)) => latest = Some(snapshot),
                                     Some(Err(_)) => {}
                                     None => discovery_closed = true,
+                                    }
+                                }
+                                _ = leadership_refresh.tick() => {
+                                    let Some(snapshot) = latest.clone() else {
+                                        continue;
+                                    };
+                                    match refresh_leadership(
+                                        &self.endpoint,
+                                        snapshot,
+                                        &leader,
+                                        self.config.probe_concurrency,
+                                    ).await {
+                                        Ok(LeadershipRefresh::Confirmed) => {
+                                            leadership_confirmed_at = Instant::now();
+                                        }
+                                        Ok(LeadershipRefresh::Replaced(observed)) =>
+                                        {
+                                            tracing::warn!(
+                                                target: "lattice.cluster.join",
+                                                leader_node_id = %leader.identity.node_id,
+                                                coordinator_term = leader.term,
+                                                replacement_node_id = %observed.identity.node_id,
+                                                replacement_term = observed.term,
+                                                "Coordinator leadership changed on an active association; reconciliation required"
+                                            );
+                                            let _ = events
+                                                .send(JoinEvent::CoordinatorLost {
+                                                    leader: leader.clone(),
+                                                })
+                                                .await;
+                                            break;
+                                        }
+                                        Err(JoinError::ConflictingLeaders) => {
+                                            let _ = events
+                                                .send(JoinEvent::TerminalFailure(
+                                                    JoinError::ConflictingLeaders,
+                                                ))
+                                                .await;
+                                            return;
+                                        }
+                                        Ok(LeadershipRefresh::Unconfirmed) | Err(_) => {
+                                            if leadership_confirmed_at.elapsed()
+                                                >= self.config.discovery_stale_grace
+                                            {
+                                                tracing::warn!(
+                                                    target: "lattice.cluster.join",
+                                                    leader_node_id = %leader.identity.node_id,
+                                                    coordinator_term = leader.term,
+                                                    stale_millis = leadership_confirmed_at.elapsed().as_millis() as u64,
+                                                    "Coordinator leadership freshness expired; reconciliation required"
+                                                );
+                                                let _ = events
+                                                    .send(JoinEvent::CoordinatorLost {
+                                                        leader: leader.clone(),
+                                                    })
+                                                    .await;
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                                 () = tokio::time::sleep(Duration::from_millis(100)) => {}
@@ -214,6 +278,53 @@ impl JoinController {
                 () = tokio::time::sleep(delay) => {}
             }
         }
+    }
+}
+
+fn leadership_replaced(current: &BootstrapLeader, observed: &BootstrapLeader) -> bool {
+    observed.term >= current.term && observed != current
+}
+
+enum LeadershipRefresh {
+    Confirmed,
+    Replaced(BootstrapLeader),
+    Unconfirmed,
+}
+
+async fn refresh_leadership(
+    endpoint: &Arc<RemotingEndpoint>,
+    snapshot: CoordinatorDirectorySnapshot,
+    current: &BootstrapLeader,
+    concurrency: usize,
+) -> Result<LeadershipRefresh, JoinError> {
+    let mut current_target = snapshot.clone();
+    current_target.targets.retain(|target| {
+        target.address == current.identity.address
+            && target
+                .expected_node_id
+                .as_ref()
+                .is_none_or(|node_id| node_id == &current.identity.node_id)
+    });
+    if !current_target.targets.is_empty() {
+        match probe_snapshot(endpoint, current_target, 1).await {
+            Ok(observed) if observed == *current => return Ok(LeadershipRefresh::Confirmed),
+            Ok(observed) if leadership_replaced(current, &observed) => {
+                return Ok(LeadershipRefresh::Replaced(observed));
+            }
+            Ok(_) => {}
+            Err(JoinError::ConflictingLeaders) => return Err(JoinError::ConflictingLeaders),
+            Err(_) => {}
+        }
+    }
+    match probe_snapshot(endpoint, snapshot, concurrency).await {
+        Ok(observed) if observed == *current => Ok(LeadershipRefresh::Confirmed),
+        Ok(observed) if leadership_replaced(current, &observed) => {
+            Ok(LeadershipRefresh::Replaced(observed))
+        }
+        Ok(_) | Err(JoinError::NoCandidates | JoinError::NoLeader) => {
+            Ok(LeadershipRefresh::Unconfirmed)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -437,13 +548,35 @@ pub enum JoinError {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use lattice_core::{
-        actor_ref::{ClusterId, NodeAddress, NodeIncarnation},
+        actor_ref::{ActorRef, ClusterId, NodeAddress, NodeIncarnation},
         coordinator::CoordinatorScope,
     };
-    use lattice_remoting::{bootstrap::BootstrapLeader, handshake::NodeIdentity};
+    use lattice_discovery::static_provider::{StaticDiscovery, StaticEndpoint};
+    use lattice_remoting::{
+        association::{AssociationManager, AssociationState},
+        bootstrap::BootstrapLeader,
+        config::RemotingConfig,
+        endpoint::RemotingEndpoint,
+        handshake::NodeIdentity,
+        messaging::{
+            error::RemoteMessageError, inbound::InboundDispatch, outbound::OutboundMessaging,
+            target::ExactActorTarget,
+        },
+    };
+    use tokio::sync::watch;
 
-    use super::{JoinError, select_leader};
+    use super::{
+        BootstrapView, JoinController, JoinError, JoinEvent, leadership_replaced, select_leader,
+    };
+    use crate::{
+        config::ClusterJoinConfig,
+        test_support::{network_test_guard, unused_address},
+    };
 
     fn leader(node: &str, term: u64, generation: u64) -> BootstrapLeader {
         BootstrapLeader {
@@ -476,5 +609,186 @@ mod tests {
             select_leader(vec![leader("a", 2, 1), leader("b", 2, 2)]),
             Err(JoinError::ConflictingLeaders)
         ));
+    }
+
+    #[test]
+    fn active_association_is_reconciled_when_its_leadership_term_changes() {
+        let current = leader("a", 1, 1);
+        assert!(leadership_replaced(&current, &leader("a", 2, 1)));
+        assert!(leadership_replaced(&current, &leader("b", 2, 1)));
+        assert!(!leadership_replaced(&current, &current));
+        assert!(!leadership_replaced(&current, &leader("a", 0, 1)));
+    }
+
+    struct RejectDispatch;
+
+    #[async_trait]
+    impl InboundDispatch for RejectDispatch {
+        async fn tell(
+            &self,
+            _sender: Option<ActorRef>,
+            _target: ExactActorTarget,
+            _message_id: u64,
+            _payload: Bytes,
+        ) -> Result<(), RemoteMessageError> {
+            Err(RemoteMessageError::Unauthorized)
+        }
+
+        async fn ask(
+            &self,
+            _target: ExactActorTarget,
+            _message_id: u64,
+            _payload: Bytes,
+            _deadline: std::time::Instant,
+        ) -> Result<Bytes, RemoteMessageError> {
+            Err(RemoteMessageError::Unauthorized)
+        }
+    }
+
+    fn endpoint(identity: NodeIdentity) -> (Arc<RemotingEndpoint>, Arc<AssociationManager>) {
+        let config = RemotingConfig {
+            heartbeat_interval: Duration::from_millis(50),
+            ..RemotingConfig::default()
+        };
+        let associations = Arc::new(
+            AssociationManager::new(
+                identity.address.clone(),
+                identity.incarnation,
+                config.clone(),
+            )
+            .unwrap(),
+        );
+        let endpoint = Arc::new(
+            RemotingEndpoint::builder(
+                identity,
+                config,
+                associations.clone(),
+                Arc::new(OutboundMessaging::new(16).unwrap()),
+                Arc::new(RejectDispatch),
+            )
+            .build()
+            .unwrap(),
+        );
+        (endpoint, associations)
+    }
+
+    #[tokio::test]
+    async fn refreshes_leadership_while_the_transport_association_stays_active() {
+        let _network = network_test_guard().await;
+        let first = unused_address().await;
+        let second = unused_address().await;
+        let (client_address, server_address) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let cluster_id = ClusterId::new("join-refresh-test").unwrap();
+        let client_identity = NodeIdentity {
+            cluster_id: cluster_id.clone(),
+            node_id: "client".to_owned(),
+            address: client_address,
+            incarnation: NodeIncarnation::new(1).unwrap(),
+        };
+        let server_identity = NodeIdentity {
+            cluster_id,
+            node_id: "coordinator".to_owned(),
+            address: server_address.clone(),
+            incarnation: NodeIncarnation::new(2).unwrap(),
+        };
+        let (client, client_associations) = endpoint(client_identity);
+        let (server, _) = endpoint(server_identity.clone());
+        let view = Arc::new(BootstrapView::new(server_identity.clone()));
+        let current = BootstrapLeader {
+            scope: CoordinatorScope::Membership,
+            identity: server_identity.clone(),
+            term: 1,
+            protocol_generation: 1,
+        };
+        view.install(current.clone());
+        server.install_bootstrap_handler(view.clone());
+        client.bind().await.unwrap();
+        server.bind().await.unwrap();
+
+        let discovery = Arc::new(
+            StaticDiscovery::new(
+                CoordinatorScope::Membership,
+                "join-refresh",
+                vec![StaticEndpoint {
+                    address: server_address,
+                    expected_node_id: Some(server_identity.node_id.clone()),
+                    priority: 1,
+                }],
+            )
+            .unwrap(),
+        );
+        let controller = Arc::new(
+            JoinController::new(
+                discovery,
+                client,
+                client_associations,
+                ClusterJoinConfig {
+                    retry_initial: Duration::from_millis(10),
+                    retry_max: Duration::from_millis(20),
+                    retry_jitter: 0.0,
+                    leadership_refresh_interval: Duration::from_millis(25),
+                    discovery_stale_grace: Duration::from_millis(100),
+                    join_timeout: Some(Duration::from_secs(2)),
+                    ..ClusterJoinConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (events_tx, mut events) = tokio::sync::mpsc::channel(8);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(controller.run(events_tx, shutdown_rx));
+
+        let initial_association = match tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            JoinEvent::Coordinator {
+                leader,
+                association,
+            } => {
+                assert_eq!(leader.term, 1);
+                association
+            }
+            event => panic!("unexpected initial join event: {event:?}"),
+        };
+        view.install(BootstrapLeader { term: 2, ..current });
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap(),
+            Some(JoinEvent::CoordinatorLost { leader }) if leader.term == 1
+        ));
+        match tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            JoinEvent::Coordinator {
+                leader,
+                association,
+            } => {
+                assert_eq!(leader.term, 2);
+                assert!(Arc::ptr_eq(&initial_association, &association));
+            }
+            event => panic!("unexpected refreshed join event: {event:?}"),
+        }
+        view.clear(&CoordinatorScope::Membership);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap(),
+            Some(JoinEvent::CoordinatorLost { leader }) if leader.term == 2
+        ));
+        assert_eq!(initial_association.state(), AssociationState::Active);
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

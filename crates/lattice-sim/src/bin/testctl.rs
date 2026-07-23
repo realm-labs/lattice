@@ -34,7 +34,7 @@ use lattice_sim::{
     scenario::{Scenario, ScenarioConfig},
     trace::TraceJournal,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use testctl_artifacts::{
     Manifest, MonitorCommand, MonitorResult, MultiDomainHostArtifact, MultiDomainLogicArtifact,
     ResourceSample, ScopedLeadershipArtifact, write_json, write_json_atomic, write_junit,
@@ -617,8 +617,17 @@ fn wait_for_host_scope_while_checking_logic(
 }
 
 fn read_logic(path: &Path) -> Result<MultiDomainLogicArtifact, String> {
-    serde_json::from_slice(&std::fs::read(path).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match std::fs::read(path)
+            .map_err(|error| error.to_string())
+            .and_then(|encoded| serde_json::from_slice(&encoded).map_err(|error| error.to_string()))
+        {
+            Ok(logic) => return Ok(logic),
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }
 
 fn require_logic_ready(path: &Path) -> Result<(), String> {
@@ -805,10 +814,22 @@ fn wait_for_logic_unready(
 ) -> Result<Vec<MultiDomainLogicArtifact>, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        let snapshots = paths
+        let snapshots = match paths
             .iter()
             .map(|path| read_logic(path))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "logic artifacts remained unreadable during the control-plane outage: {error}"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
         if snapshots.iter().all(|logic| {
             logic.lifecycle != "Ready" || logic.domains.values().any(|state| state != "Ready")
         }) {
@@ -850,9 +871,6 @@ fn ha_etcd_real(artifacts: &Path) -> Result<(), String> {
             coordinators.len()
         ));
     }
-    let initial_coordinator =
-        wait_for_coordinator_leadership(artifacts, None, 0, Duration::from_secs(120))?;
-
     run_etcd_acceptance()?;
     let (leader, stopped_member_id) = find_etcd_leader(&members)?;
     require_label("container", leader, &run_id)?;
@@ -901,6 +919,11 @@ fn ha_etcd_real(artifacts: &Path) -> Result<(), String> {
         }),
     )?;
 
+    // Coordinator artifact files are diagnostic snapshots and may lag the durable lease
+    // record. Select and observe failover through etcd so the test always stops the leader
+    // that is current after the preceding etcd disruptions.
+    let initial_coordinator =
+        wait_for_coordinator_leadership(leader, &run_id, None, 0, Duration::from_secs(120))?;
     let coordinator_container = coordinators
         .iter()
         .find(|container| container.contains(&initial_coordinator.node_id))
@@ -909,7 +932,8 @@ fn ha_etcd_real(artifacts: &Path) -> Result<(), String> {
     require_label("container", coordinator_container, &run_id)?;
     command("docker", &["stop", "--time", "1", coordinator_container])?;
     let replacement = wait_for_coordinator_leadership(
-        artifacts,
+        leader,
+        &run_id,
         Some(&initial_coordinator.node_id),
         initial_coordinator.term,
         Duration::from_secs(60),
@@ -968,26 +992,19 @@ fn ha_etcd_real(artifacts: &Path) -> Result<(), String> {
 }
 
 fn wait_for_coordinator_leadership(
-    artifacts: &Path,
+    etcd_member: &str,
+    run_id: &str,
     excluded_node: Option<&str>,
     minimum_term: u64,
     timeout: Duration,
 ) -> Result<ScopedLeadershipArtifact, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        for name in ["coordinator-a.json", "coordinator-b.json"] {
-            let path = artifacts.join(name);
-            let Ok(bytes) = std::fs::read(path) else {
-                continue;
-            };
-            let Ok(state) = serde_json::from_slice::<ScopedLeadershipArtifact>(&bytes) else {
-                continue;
-            };
-            if state.term > minimum_term
-                && excluded_node.is_none_or(|excluded| state.node_id != excluded)
-            {
-                return Ok(state);
-            }
+        if let Ok(state) = coordinator_leader_from_etcd(etcd_member, run_id)
+            && state.term > minimum_term
+            && excluded_node.is_none_or(|excluded| state.node_id != excluded)
+        {
+            return Ok(state);
         }
         if Instant::now() >= deadline {
             return Err("Coordinator leadership did not reach the required term".to_owned());
@@ -1005,15 +1022,15 @@ fn assert_coordinator_not_displaced(
     let deadline = Instant::now() + stable_period;
     let mut observed = false;
     while Instant::now() < deadline {
-        let Ok((node_id, term)) = coordinator_leader_from_etcd(etcd_member, run_id) else {
+        let Ok(current) = coordinator_leader_from_etcd(etcd_member, run_id) else {
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
         observed = true;
-        if node_id != expected.node_id || term < expected.term {
+        if current.node_id != expected.node_id || current.term < expected.term {
             return Err(format!(
-                "Coordinator leader changed from {} term {} to {node_id} term {term}",
-                expected.node_id, expected.term
+                "Coordinator leader changed from {} term {} to {} term {}",
+                expected.node_id, expected.term, current.node_id, current.term
             ));
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1025,7 +1042,10 @@ fn assert_coordinator_not_displaced(
     }
 }
 
-fn coordinator_leader_from_etcd(etcd_member: &str, run_id: &str) -> Result<(String, u64), String> {
+fn coordinator_leader_from_etcd(
+    etcd_member: &str,
+    run_id: &str,
+) -> Result<ScopedLeadershipArtifact, String> {
     let key = format!("/lattice-ha/{run_id}/domains/distributed-simulation/leader");
     let encoded = output(
         "docker",
@@ -1039,19 +1059,28 @@ fn coordinator_leader_from_etcd(etcd_member: &str, run_id: &str) -> Result<(Stri
             "--print-value-only",
         ],
     )?;
-    let value: serde_json::Value =
-        serde_json::from_str(&encoded).map_err(|error| error.to_string())?;
-    let node_id = value
-        .pointer("/node/node_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "Coordinator leader record is missing node_id".to_owned())?
-        .to_owned();
-    let term = json_u64(
-        value
-            .get("term")
-            .ok_or_else(|| "Coordinator leader record is missing term".to_owned())?,
-    )?;
-    Ok((node_id, term))
+    decode_coordinator_leader(&encoded)
+}
+
+#[derive(Deserialize)]
+struct DurableNode {
+    node_id: String,
+    incarnation: u128,
+}
+
+#[derive(Deserialize)]
+struct DurableLeader {
+    node: DurableNode,
+    term: u64,
+}
+
+fn decode_coordinator_leader(encoded: &str) -> Result<ScopedLeadershipArtifact, String> {
+    let value: DurableLeader = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+    Ok(ScopedLeadershipArtifact {
+        node_id: value.node.node_id,
+        term: value.term,
+        incarnation: value.node.incarnation,
+    })
 }
 
 fn wait_for_etcd_failover(
@@ -1381,4 +1410,20 @@ fn distributed_node(mode: &str, reference: &Path) -> Result<(), String> {
         "--reference",
         reference,
     ])
+}
+
+#[cfg(test)]
+mod durable_leader_tests {
+    use super::decode_coordinator_leader;
+
+    #[test]
+    fn etcd_leader_record_accepts_a_full_width_numeric_incarnation() {
+        let decoded = decode_coordinator_leader(
+            r#"{"node":{"node_id":"coordinator","incarnation":340282366920938463463374607431768211455},"term":9}"#,
+        )
+        .unwrap();
+        assert_eq!(decoded.node_id, "coordinator");
+        assert_eq!(decoded.term, 9);
+        assert_eq!(decoded.incarnation, u128::MAX);
+    }
 }

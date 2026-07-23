@@ -18,8 +18,9 @@ use super::{
         DomainMemberCommit, DurableStorageLimits, EntityConfigCommit, FenceAuthority,
         FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit, MoveCommit, PlanCommit,
         PutEntityConfig, PutSingletonConfig, RecordAdminOperation, RemoveDomainMember,
-        RemoveMember, ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit,
-        TransitionSlot, UpdateDomainMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
+        RemoveExpiredMember, RemoveMember, ReserveHandoff, ReserveMove, SingletonConfigCommit,
+        SlotCommit, TransitionSlot, UpdateDomainMember, UpdateMember, UpdatePlan,
+        UpdatePlanWithOperation,
     },
 };
 use crate::{
@@ -734,6 +735,14 @@ impl EtcdPlacementStore {
         request: RemoveMember,
     ) -> Result<MemberCommit, StorageError> {
         transactions::remove_member(self, guard, request).await
+    }
+
+    async fn remove_expired_member(
+        &self,
+        guard: &MembershipLeaderGuard,
+        request: RemoveExpiredMember,
+    ) -> Result<MemberCommit, StorageError> {
+        transactions::remove_expired_member(self, guard, request).await
     }
 
     async fn create_domain_member(

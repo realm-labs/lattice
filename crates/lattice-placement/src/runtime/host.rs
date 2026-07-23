@@ -326,13 +326,24 @@ where
                     }
                 }
                 _ = renewal.tick() => {
-                    if let Some(membership) = self.membership.as_ref()
-                        && let Err(error) = membership.renew_leadership().await
-                    {
-                        self.membership = None;
-                        self.membership_events = None;
-                        self.membership_state = CoordinatorHostScopeState::Failed;
-                        tracing::warn!(target: "lattice.cluster.membership", %error, "membership leader lease renewal failed");
+                    let mut membership_failed = false;
+                    if let Some(membership) = self.membership.as_mut() {
+                        let result = match membership.renew_leadership().await {
+                            Ok(()) => membership.reconcile_expired_members().await,
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = result {
+                            self.membership = None;
+                            self.membership_events = None;
+                            self.membership_state = CoordinatorHostScopeState::Failed;
+                            membership_failed = true;
+                            tracing::warn!(target: "lattice.cluster.membership", %error, "membership leader renewal or expiration reconciliation failed");
+                        }
+                    }
+                    if membership_failed {
+                        // Stop advertising stale leadership before potentially blocking on a
+                        // durable-store election retry.
+                        self.publish_directory();
                     }
                     if let Err(error) = self.reenter_membership_election().await {
                         tracing::warn!(
@@ -469,9 +480,14 @@ where
                         return;
                     }
                     (Some(_), None) => {
+                        // This host no longer owns the scope. Retrying an old-term command on
+                        // this association can permanently head-of-line block commands for
+                        // other scopes multiplexed over the same control lane. Fence and
+                        // acknowledge it; discovery/session reconciliation will target the
+                        // current leader and send a fresh hello under its term.
                         let _ = event
                             .completion
-                            .send(Err(ControlDispatchError::Unavailable));
+                            .send(Err(ControlDispatchError::InvalidCommand));
                         return;
                     }
                 }
@@ -1079,6 +1095,65 @@ mod tests {
             completion,
         })
         .await;
+        assert_eq!(
+            result.await.unwrap(),
+            Err(ControlDispatchError::InvalidCommand)
+        );
+    }
+
+    #[tokio::test]
+    async fn standby_scope_fences_old_control_instead_of_retrying_it() {
+        let store = Arc::new(InMemoryPlacementStore::new(32, 32).unwrap());
+        let leader_node = node("leader", 30, 33030);
+        let standby_node = node("standby", 31, 33031);
+        let remote = node("member", 32, 33032);
+        let leader = CoordinatorHost::elect(
+            store.clone(),
+            associations(&leader_node),
+            leader_node,
+            BTreeSet::new(),
+            config(),
+        )
+        .await
+        .unwrap();
+        let mut standby = CoordinatorHost::elect(
+            store,
+            associations(&standby_node),
+            standby_node.clone(),
+            BTreeSet::new(),
+            config(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            standby.scope_state(&CoordinatorScope::Membership),
+            Some(CoordinatorHostScopeState::Standby)
+        ));
+
+        let (completion, result) = oneshot::channel();
+        standby
+            .route_control(PlacementControlEvent {
+                kind: PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
+                    association: AssociationKey {
+                        cluster_id: lattice_core::actor_ref::ClusterId::new("standby-fencing")
+                            .unwrap(),
+                        local_incarnation: standby_node.incarnation,
+                        remote_address: remote.address,
+                        remote_incarnation: remote.incarnation,
+                    },
+                    command_id: CommandId::generate(),
+                    scope: CoordinatorScope::Membership,
+                    coordinator_term: Some(
+                        leader.active_term(&CoordinatorScope::Membership).unwrap(),
+                    ),
+                    command: PlacementControlCommand::NodeHeartbeat {
+                        incarnation: remote.incarnation,
+                        sequence: 1,
+                    },
+                })),
+                completion,
+            })
+            .await;
         assert_eq!(
             result.await.unwrap(),
             Err(ControlDispatchError::InvalidCommand)

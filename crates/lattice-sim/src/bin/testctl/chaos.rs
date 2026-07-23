@@ -6,7 +6,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use super::{
-    MonitorCommand, MonitorResult, cargo, command, labeled_containers, output, require_label,
+    MonitorCommand, MonitorResult, command, labeled_containers, output, require_label,
     wait_for_file, write_json, write_json_atomic,
 };
 
@@ -157,12 +157,6 @@ fn pin_container_host(container: &str, host: &str, run_id: &str) -> Result<IpAdd
 
 fn distributed_client(reference: &Path, expect_failure: bool) -> Result<(), String> {
     let mut arguments = vec![
-        "run",
-        "-p",
-        "lattice-sim",
-        "--bin",
-        "distributed-node",
-        "--",
         "client",
         "--reference",
         reference
@@ -172,7 +166,30 @@ fn distributed_client(reference: &Path, expect_failure: bool) -> Result<(), Stri
     if expect_failure {
         arguments.push("--expect-failure");
     }
-    cargo(&arguments)
+    let status = Command::new(distributed_node_executable()?)
+        .args(arguments)
+        .status()
+        .map_err(|error| format!("failed to start distributed-node client: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("distributed-node client exited with {status}"))
+    }
+}
+
+fn distributed_node_executable() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("failed to locate testctl executable: {error}"))?;
+    let sibling =
+        executable.with_file_name(format!("distributed-node{}", std::env::consts::EXE_SUFFIX));
+    if sibling.is_file() {
+        Ok(sibling)
+    } else {
+        Err(format!(
+            "distributed-node is absent beside testctl at {}",
+            sibling.display()
+        ))
+    }
 }
 
 struct ChaosMonitor {
@@ -191,18 +208,8 @@ impl ChaosMonitor {
         for sequence in 1..=16 {
             let _ = std::fs::remove_file(format!("/artifacts/monitor-result-{sequence}.json"));
         }
-        let child = Command::new("cargo")
-            .args([
-                "run",
-                "-p",
-                "lattice-sim",
-                "--bin",
-                "distributed-node",
-                "--",
-                "monitor",
-                "--reference",
-                "/artifacts/server-ref.json",
-            ])
+        let child = Command::new(distributed_node_executable()?)
+            .args(["monitor", "--reference", "/artifacts/server-ref.json"])
             .spawn()
             .map_err(|error| format!("failed to start chaos monitor: {error}"))?;
         wait_for_file(

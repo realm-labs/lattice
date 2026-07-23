@@ -18,9 +18,9 @@ use crate::{
             CreatePlanWithOperation, DeletePlan, DomainMemberCommit, EntityConfigCommit,
             FenceAuthority, FenceMissingAuthority, InstallAuthority, LeasedClaim, MemberCommit,
             MoveCommit, PlanCommit, PutEntityConfig, PutSingletonConfig, RecordAdminOperation,
-            RemoveDomainMember, RemoveMember, ReserveHandoff, ReserveMove, SingletonConfigCommit,
-            SlotCommit, TransitionSlot, UpdateDomainMember, UpdateMember, UpdatePlan,
-            UpdatePlanWithOperation,
+            RemoveDomainMember, RemoveExpiredMember, RemoveMember, ReserveHandoff, ReserveMove,
+            SingletonConfigCommit, SlotCommit, TransitionSlot, UpdateDomainMember, UpdateMember,
+            UpdatePlan, UpdatePlanWithOperation,
         },
     },
     types::{
@@ -448,6 +448,47 @@ pub(super) async fn remove_member(
             count.compare,
         ],
         vec![TxnOp::delete(key, None), state.put, count.put],
+    )
+    .await?;
+    Ok(MemberCommit {
+        member: request.expected,
+        revision: next,
+    })
+}
+
+pub(super) async fn remove_expired_member(
+    store: &EtcdPlacementStore,
+    guard: &MembershipLeaderGuard,
+    request: RemoveExpiredMember,
+) -> Result<MemberCommit, StorageError> {
+    if guard.scope() != &CoordinatorScope::Membership {
+        return Err(StorageError::InvalidRecord);
+    }
+    ensure_guard_live(store, guard).await?;
+    let current = store.get_membership_revision_inner().await?;
+    let next = current.next().map_err(|_| StorageError::CounterExhausted)?;
+    let state = state_counter(store, guard.scope(), next).await?;
+    let count = cardinality_counter(
+        store,
+        guard.scope(),
+        "members",
+        -1,
+        store.limits.maximum_members,
+    )
+    .await?;
+    let key = store.key(&format!(
+        "membership/members/{}",
+        request.expected.node.node_id
+    ));
+    commit(
+        store,
+        guard,
+        vec![
+            Compare::version(key, CompareOp::Equal, 0),
+            state.compare,
+            count.compare,
+        ],
+        vec![state.put, count.put],
     )
     .await?;
     Ok(MemberCommit {

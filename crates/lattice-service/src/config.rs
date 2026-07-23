@@ -11,6 +11,7 @@ pub struct ClusterJoinConfig {
     pub retry_multiplier: f64,
     pub retry_jitter: f64,
     pub probe_concurrency: usize,
+    pub leadership_refresh_interval: Duration,
     pub join_timeout: Option<Duration>,
     pub discovery_stale_grace: Duration,
     pub leave_timeout: Duration,
@@ -25,6 +26,7 @@ impl Default for ClusterJoinConfig {
             retry_multiplier: 2.0,
             retry_jitter: 0.2,
             probe_concurrency: 4,
+            leadership_refresh_interval: Duration::from_secs(5),
             join_timeout: None,
             discovery_stale_grace: Duration::from_secs(60),
             leave_timeout: Duration::from_secs(30),
@@ -38,6 +40,7 @@ impl ClusterJoinConfig {
         if self.retry_initial.is_zero()
             || self.retry_max.is_zero()
             || self.probe_concurrency == 0
+            || self.leadership_refresh_interval.is_zero()
             || self.discovery_stale_grace.is_zero()
             || self.leave_timeout.is_zero()
             || self.shutdown_timeout.is_zero()
@@ -151,6 +154,10 @@ mod join_tests {
         config = ClusterJoinConfig::default();
         config.retry_jitter = 1.0;
         assert_eq!(config.validate(), Err(ClusterJoinConfigError::RetryJitter));
+
+        config = ClusterJoinConfig::default();
+        config.leadership_refresh_interval = Duration::ZERO;
+        assert_eq!(config.validate(), Err(ClusterJoinConfigError::ZeroLimit));
 
         config = ClusterJoinConfig::default();
         config.leave_timeout = Duration::from_secs(46);

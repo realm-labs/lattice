@@ -408,6 +408,12 @@ impl RemotingEndpoint {
                 if matches!(result, Ok(LaneExit::QueueClosed)) {
                     return Ok(());
                 }
+                if matches!(
+                    association.state(),
+                    AssociationState::Closing | AssociationState::Closed
+                ) {
+                    return Ok(());
+                }
                 if matches!(result, Ok(LaneExit::Idle)) && lane != LaneKind::Control {
                     connection_permit.take();
                     tokio::select! {
@@ -714,6 +720,12 @@ impl RemotingEndpoint {
                     delay: Duration::from_secs(1),
                     reason: "bootstrap route is temporarily unavailable".to_string(),
                 },
+            );
+        }
+        if !matches!(&response.result, BootstrapResult::Rejected { .. }) {
+            self.associations.replace_remote_incarnation(
+                request.local.address.clone(),
+                request.local.incarnation,
             );
         }
         let reverse_peer = match &response.result {

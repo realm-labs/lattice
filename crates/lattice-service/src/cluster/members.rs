@@ -86,9 +86,13 @@ impl MemberDirectory {
         records: Vec<MemberRecord>,
     ) -> Result<(), MemberDirectoryError> {
         let mut members = BTreeMap::new();
+        let mut node_ids = BTreeSet::new();
         for record in records {
             if record.version > version || record.node != record.hello.node {
                 return Err(MemberDirectoryError::InvalidRecord);
+            }
+            if !node_ids.insert(record.node.node_id.clone()) {
+                return Err(MemberDirectoryError::DuplicateMember);
             }
             let key = member_key(&record.node);
             if members.insert(key, record).is_some() {
@@ -96,10 +100,7 @@ impl MemberDirectory {
             }
         }
         let mut state = self.state.lock().expect("member directory poisoned");
-        if state
-            .version
-            .is_some_and(|current| version.term < current.term)
-        {
+        if state.version.is_some_and(|current| version < current) {
             return Err(MemberDirectoryError::StaleRevision);
         }
         members.retain(|(_, incarnation), _| !state.fenced_incarnations.contains(incarnation));
@@ -122,6 +123,9 @@ impl MemberDirectory {
                     return Err(MemberDirectoryError::InvalidRecord);
                 }
                 if !state.fenced_incarnations.contains(&record.node.incarnation) {
+                    state
+                        .members
+                        .retain(|(node_id, _), _| node_id != &record.node.node_id);
                     state
                         .members
                         .insert(member_key(&record.node), *record.clone());
@@ -163,7 +167,7 @@ pub enum MemberDirectoryError {
     StaleRevision,
     #[error("member record is inconsistent with its event or snapshot")]
     InvalidRecord,
-    #[error("member snapshot contains a duplicate node incarnation")]
+    #[error("member snapshot contains a duplicate node identity")]
     DuplicateMember,
 }
 
@@ -206,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_incarnations_do_not_retarget_each_other() {
+    fn replacement_incarnation_supersedes_the_same_node_id() {
         let directory = MemberDirectory::new(4).unwrap();
         let first = member(1, 1);
         directory
@@ -216,10 +220,10 @@ mod tests {
         directory
             .apply(MemberEvent {
                 version: replacement.version,
-                change: MemberChange::Upsert(Box::new(replacement)),
+                change: MemberChange::Upsert(Box::new(replacement.clone())),
             })
             .unwrap();
-        assert_eq!(directory.snapshot().members.len(), 2);
+        assert_eq!(directory.snapshot().members, vec![replacement.clone()]);
         assert_eq!(
             directory
                 .apply(MemberEvent {
@@ -235,6 +239,35 @@ mod tests {
                 .unwrap_err(),
             MemberDirectoryError::StaleRevision
         );
+    }
+
+    #[test]
+    fn stale_snapshot_in_the_same_term_cannot_restore_a_removed_member() {
+        let directory = MemberDirectory::new(4).unwrap();
+        let first = member(1, 1);
+        directory
+            .install_snapshot(first.version, vec![first.clone()])
+            .unwrap();
+        directory
+            .apply(MemberEvent {
+                version: MembershipVersion::new(
+                    CoordinatorTerm::new(1).unwrap(),
+                    Revision::new(2).unwrap(),
+                ),
+                change: MemberChange::Removed {
+                    node: first.node.clone(),
+                    reason: MemberRemovalReason::FailureDetected,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(
+            directory
+                .install_snapshot(first.version, vec![first])
+                .unwrap_err(),
+            MemberDirectoryError::StaleRevision
+        );
+        assert!(directory.snapshot().members.is_empty());
     }
 
     #[test]

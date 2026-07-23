@@ -44,6 +44,11 @@ pub struct RemoveMember {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveExpiredMember {
+    pub expected: MemberRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberCommit {
     pub member: MemberRecord,
     pub revision: Revision,
