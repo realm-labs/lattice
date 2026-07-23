@@ -225,6 +225,9 @@ fn run_profile(
         }),
         Profile::Chaos => {
             runner.run("multi-domain-failover", || multi_domain_real(artifacts));
+            runner.run("control-plane-store-outage-recovery", || {
+                control_plane_store_outage_real(artifacts)
+            });
             runner.run("docker-fault-sequence", || testctl_chaos::verify(artifacts));
             runner.run("one-domain-coordinator-loss", || {
                 cargo(&[
@@ -633,6 +636,177 @@ fn wait_for_logic_ready(path: &Path, timeout: Duration) -> Result<(), String> {
         }
         if Instant::now() >= deadline {
             return require_logic_ready(path);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn control_plane_store_outage_real(artifacts: &Path) -> Result<(), String> {
+    let run_id = std::env::var("LATTICE_RUN_ID")
+        .map_err(|_| "control-plane outage requires LATTICE_RUN_ID".to_owned())?;
+    let containers = labeled_containers(&run_id)?;
+    let container = |needle: &str| {
+        containers
+            .lines()
+            .find(|name| name.contains(needle) && !name.contains("runner"))
+            .ok_or_else(|| format!("missing labeled {needle} container"))
+    };
+    let coordinator_names = [
+        "domain-membership",
+        "domain-alpha",
+        "domain-beta",
+        "domain-gamma",
+        "domain-standby",
+    ];
+    let coordinators = coordinator_names
+        .iter()
+        .map(|name| container(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let etcd = container("etcd-single")?;
+    for name in coordinators.iter().copied().chain(std::iter::once(etcd)) {
+        require_label("container", name, &run_id)?;
+    }
+
+    let logic_paths = [
+        artifacts.join("domain-logic-a.json"),
+        artifacts.join("domain-logic-b.json"),
+    ];
+    for path in &logic_paths {
+        wait_for_logic_ready(path, Duration::from_secs(30))?;
+    }
+    let before = logic_paths
+        .iter()
+        .map(|path| read_logic(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let before_term = before
+        .iter()
+        .filter_map(|logic| logic.membership_version.map(|version| version.term))
+        .max()
+        .ok_or_else(|| "logic nodes did not publish an initial membership term".to_owned())?;
+    write_json(
+        &artifacts.join("control-plane-store-outage-schedule.json"),
+        &serde_json::json!({
+            "coordinators": coordinator_names,
+            "etcd": "etcd-single",
+            "before_membership_term": before_term,
+            "sequence": [
+                "pause-all-coordinators",
+                "wait-for-all-logic-to-revoke-ready",
+                "hold-until-leader-leases-expire",
+                "pause-etcd",
+                "resume-coordinators-while-etcd-is-unavailable",
+                "hold-through-store-operation-deadline",
+                "resume-etcd",
+                "wait-for-higher-term-ready",
+            ],
+        }),
+    )?;
+
+    let mut paused = Vec::new();
+    let scenario = (|| {
+        for coordinator in &coordinators {
+            command("docker", &["pause", coordinator])?;
+            paused.push(*coordinator);
+        }
+        let degraded = wait_for_logic_unready(&logic_paths, Duration::from_secs(20))?;
+
+        // The leader lease TTL is ten seconds. By the time both logic nodes have revoked Ready,
+        // six seconds have normally elapsed; retain the CPU stall long enough for the durable
+        // leases to expire before introducing the store outage.
+        std::thread::sleep(Duration::from_secs(6));
+        command("docker", &["pause", etcd])?;
+        paused.push(etcd);
+        for coordinator in &coordinators {
+            command("docker", &["unpause", coordinator])?;
+            paused.retain(|paused| paused != coordinator);
+        }
+
+        // Etcd operations have a five-second deadline. Keep the store unavailable long enough for
+        // resumed hosts to abandon their old in-memory leaders and sessions.
+        std::thread::sleep(Duration::from_secs(6));
+        command("docker", &["unpause", etcd])?;
+        paused.retain(|paused| *paused != etcd);
+
+        for path in &logic_paths {
+            wait_for_logic_ready(path, Duration::from_secs(90))?;
+        }
+        let recovered = logic_paths
+            .iter()
+            .map(|path| read_logic(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        for logic in &recovered {
+            let version = logic.membership_version.ok_or_else(|| {
+                format!("{} recovered without a membership version", logic.node_id)
+            })?;
+            if version.term <= before_term {
+                return Err(format!(
+                    "{} returned to Ready without a new Coordinator term: before={before_term}, after={}",
+                    logic.node_id, version.term
+                ));
+            }
+            if logic.members.is_empty() || logic.members.iter().any(|member| member.status != "Up")
+            {
+                return Err(format!(
+                    "{} returned to Ready with an invalid member directory: {:?}",
+                    logic.node_id, logic.members
+                ));
+            }
+        }
+        write_json(
+            &artifacts.join("control-plane-store-outage-recovery.json"),
+            &serde_json::json!({
+                "before_membership_term": before_term,
+                "degraded": degraded,
+                "recovered": recovered,
+                "faults": [
+                    "pause-all-coordinators-past-heartbeat-timeout",
+                    "expire-leader-leases",
+                    "resume-coordinators-while-etcd-paused",
+                    "restore-etcd",
+                ],
+            }),
+        )
+    })();
+
+    let mut cleanup_errors = Vec::new();
+    for container in paused.into_iter().rev() {
+        if let Err(error) = command("docker", &["unpause", container]) {
+            cleanup_errors.push(format!("{container}: {error}"));
+        }
+    }
+    match (scenario, cleanup_errors.is_empty()) {
+        (Ok(()), true) => Ok(()),
+        (Err(error), true) => Err(error),
+        (Ok(()), false) => Err(format!(
+            "control-plane outage cleanup failed: {}",
+            cleanup_errors.join("; ")
+        )),
+        (Err(error), false) => Err(format!(
+            "{error}; cleanup failed: {}",
+            cleanup_errors.join("; ")
+        )),
+    }
+}
+
+fn wait_for_logic_unready(
+    paths: &[PathBuf],
+    timeout: Duration,
+) -> Result<Vec<MultiDomainLogicArtifact>, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshots = paths
+            .iter()
+            .map(|path| read_logic(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        if snapshots.iter().all(|logic| {
+            logic.lifecycle != "Ready" || logic.domains.values().any(|state| state != "Ready")
+        }) {
+            return Ok(snapshots);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "logic nodes did not revoke Ready during the control-plane outage: {snapshots:?}"
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
     }

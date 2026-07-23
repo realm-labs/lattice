@@ -27,6 +27,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+lattice-core = { workspace = true, features = ["test-failpoints"] }
 prost.workspace = true
 serde.workspace = true
 trybuild.workspace = true

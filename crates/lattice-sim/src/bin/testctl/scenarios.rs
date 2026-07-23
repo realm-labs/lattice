@@ -83,6 +83,7 @@ pub(super) fn for_profile(profile: Profile) -> Vec<&'static str> {
         Profile::Scale => vec!["sixty-four-node-convergence"],
         Profile::Chaos => vec![
             "multi-domain-failover",
+            "control-plane-store-outage-recovery",
             "docker-fault-sequence",
             "one-domain-coordinator-loss",
             "membership-loss",

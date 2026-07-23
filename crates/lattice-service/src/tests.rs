@@ -3,8 +3,9 @@ use std::{
     collections::BTreeSet,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc as std_mpsc,
     },
     time::Duration,
 };
@@ -31,6 +32,7 @@ use lattice_core::{
         PlacementDomainId, ProtocolId,
     },
     coordinator::CoordinatorScope,
+    failpoint::Failpoint,
     id::ActorId,
 };
 use lattice_discovery::{
@@ -983,8 +985,8 @@ async fn one_domain_coordinator_loss_leaves_other_domain_ready() {
     membership_coordinator.force_shutdown().await.unwrap();
 }
 
-#[tokio::test]
-async fn coordinator_rollover_requires_reconciliation_before_ready() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinator_rollover_recovers_after_blocked_session_registration() {
     let _network = network_test_guard().await;
 
     let cluster_id = ClusterId::new("service-rollover-test").unwrap();
@@ -1104,10 +1106,43 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
         2,
     )
     .await;
+    let (registration_reached_tx, registration_reached_rx) = std_mpsc::sync_channel(1);
+    let (registration_release_tx, registration_release_rx) = std_mpsc::sync_channel(1);
+    let registration_release_rx = Arc::new(Mutex::new(registration_release_rx));
+    let release = registration_release_rx.clone();
+    let block_once = Arc::new(AtomicBool::new(true));
+    let block = block_once.clone();
+    let failpoint = lattice_core::failpoint::install_hook(move |point| {
+        if point == Failpoint::MemberBeforeGuardedCommit && block.swap(false, Ordering::AcqRel) {
+            registration_reached_tx
+                .send(())
+                .expect("blocked registration observer dropped");
+            release
+                .lock()
+                .expect("registration release poisoned")
+                .recv()
+                .expect("blocked registration was not released");
+        }
+    });
     coordinator_b.start().await.unwrap();
     discovery_tx
         .send(discovery_snapshot(2, "coordinator-b", address_b))
         .unwrap();
+    tokio::task::spawn_blocking(move || {
+        registration_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("new-term MemberHello did not reach the guarded store boundary");
+    })
+    .await
+    .unwrap();
+    assert!(
+        !cluster.state().is_ready(),
+        "node published Ready before its new Coordinator session was committed"
+    );
+    registration_release_tx
+        .send(())
+        .expect("blocked registration hook dropped");
+    drop(failpoint);
     cluster
         .wait_ready(Duration::from_secs(5))
     .await

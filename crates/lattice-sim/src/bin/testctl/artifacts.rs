@@ -65,6 +65,14 @@ pub(super) struct MultiDomainLogicArtifact {
     pub node_id: String,
     pub lifecycle: String,
     pub domains: BTreeMap<String, String>,
+    #[serde(default)]
+    pub membership_version: Option<MembershipVersionArtifact>,
+    #[serde(default)]
+    pub members: Vec<MemberArtifact>,
+    #[serde(default)]
+    pub associations: usize,
+    #[serde(default)]
+    pub attached_lanes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
