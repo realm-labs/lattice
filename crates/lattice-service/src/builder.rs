@@ -73,6 +73,7 @@ use crate::{
     config::{ClusterJoinConfig, NodeConfig},
     control::ServiceControlDispatch,
     error::ServiceError,
+    exact_tell_routes::ExactTellRouteCache,
     lifecycle::{
         NodeAdmissionGate, NodeLifecycle, NodeLifecycleState, PlacementDomainState,
         ProductionLifecycleDriver, ServiceHealthSnapshot, ServiceLifecycleEvent,
@@ -897,6 +898,9 @@ impl LatticeServiceBuilder {
             hosts: hosts.clone(),
             associations: associations.clone(),
             messaging: messaging.clone(),
+            exact_tell_routes: ExactTellRouteCache::new(
+                self.config.remoting.max_prepared_exact_tell_routes,
+            ),
             watches: watches.clone(),
             maximum_control_payload: lattice_placement::control::DEFAULT_MAX_CONTROL_PAYLOAD,
             supervisor: supervisor.clone(),

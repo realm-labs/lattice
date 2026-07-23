@@ -33,7 +33,11 @@ use lattice_remoting::{
     },
 };
 
-use crate::{lifecycle::NodeAdmissionGate, supervisor::TaskSupervisor};
+use crate::{
+    exact_tell_routes::{ExactTellMessage, ExactTellRouteCache},
+    lifecycle::NodeAdmissionGate,
+    supervisor::TaskSupervisor,
+};
 
 #[async_trait]
 pub trait LogicalRouter: Send + Sync + 'static {
@@ -506,12 +510,7 @@ impl InboundDispatch for ServiceInboundDispatch {
         if !self.admission.is_open() {
             return ImmediateTellDispatch::Complete(Err(RemoteMessageError::Unauthorized));
         }
-        ImmediateTellDispatch::Complete(self.hosts.try_tell(
-            tell.sender,
-            tell.target,
-            tell.message_id,
-            tell.payload,
-        ))
+        self.hosts.try_tell_immediate(tell)
     }
 
     async fn tell(
@@ -524,7 +523,9 @@ impl InboundDispatch for ServiceInboundDispatch {
         if !self.admission.is_open() {
             return Err(RemoteMessageError::Unauthorized);
         }
-        self.hosts.tell(sender, target, message_id, payload).await
+        self.hosts
+            .tell_wait(sender, target, message_id, payload)
+            .await
     }
 
     async fn ask(
@@ -616,6 +617,7 @@ pub(crate) struct ServiceRecipientBackend {
     pub hosts: Arc<ProtocolHostRegistry>,
     pub associations: Arc<AssociationManager>,
     pub messaging: Arc<OutboundMessaging>,
+    pub exact_tell_routes: ExactTellRouteCache,
     pub watches: Arc<Mutex<WatchRegistry>>,
     pub maximum_control_payload: usize,
     pub supervisor: Arc<TaskSupervisor>,
@@ -652,21 +654,20 @@ impl ServiceRecipientBackend {
                 .try_tell(sender, (&reference).into(), message_id, payload)
                 .map_err(TellError::Remote);
         }
-        let association = self
-            .association(&reference)
-            .map_err(TellError::Association)?;
         let sender = sender
-            .as_ref()
-            .map(SenderIdentity::from)
+            .map(SenderIdentity::Actor)
             .unwrap_or_else(|| SenderIdentity::Process(self.local_incarnation.get()));
-        self.messaging
-            .tell(
-                &association,
-                &sender,
-                &reference,
-                OutboundMessage::new(protocol_fingerprint, message_id, payload),
-            )
-            .map(|_| ())
+        self.exact_tell_routes.tell(
+            &self.messaging,
+            sender,
+            reference,
+            ExactTellMessage {
+                fingerprint: protocol_fingerprint,
+                message_id,
+                payload,
+            },
+            |target| self.association(target).map_err(TellError::Association),
+        )
     }
 }
 

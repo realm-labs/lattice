@@ -13,6 +13,7 @@ pub mod config;
 mod control;
 pub mod deployment;
 pub mod error;
+mod exact_tell_routes;
 pub mod lifecycle;
 pub mod registration;
 pub mod supervisor;

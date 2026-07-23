@@ -66,6 +66,8 @@ use crate::{
     test_support::{network_test_guard, unused_address},
 };
 
+mod remote_tell;
+
 const PROTOCOL_ID: u64 = 0x7465_7374_0000_0001;
 
 fn placement_domain() -> PlacementDomainId {

@@ -18,8 +18,12 @@ use thiserror::Error;
 use crate::{
     error::ActorCallError,
     handle::ActorHandle,
-    traits::{Actor, Handler, Message, MessageKind, Request, Responder},
+    traits::{Actor, Message, MessageKind, Request, Responder},
 };
+
+pub(crate) mod tell;
+
+use tell::ProtocolTellDispatch;
 
 mod helpers;
 
@@ -150,13 +154,13 @@ pub enum DispatchReply {
     Ask(Bytes),
 }
 
-type DispatchFuture =
+pub(crate) type DispatchFuture =
     Pin<Box<dyn Future<Output = Result<DispatchReply, DispatchError>> + Send + 'static>>;
 type DispatchFn<A> = dyn Fn(ActorHandle<A>, Bytes, Option<Instant>, Option<ActorRef>) -> DispatchFuture
     + Send
     + Sync
     + 'static;
-type TellDispatchFn<A> = dyn Fn(ActorHandle<A>, Bytes, Option<ActorRef>) -> Result<DispatchReply, DispatchError>
+type TellDispatchFn<A> = dyn Fn(&ActorHandle<A>, Bytes, Option<ActorRef>) -> ProtocolTellDispatch
     + Send
     + Sync
     + 'static;
@@ -488,7 +492,11 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
         sender: Option<ActorRef>,
     ) -> Result<DispatchReply, DispatchError> {
         if mode == DispatchMode::Tell {
-            return self.try_dispatch_tell_with_sender(handle, message_id, payload, sender);
+            return match self.try_dispatch_tell(&handle, message_id, payload, sender) {
+                ProtocolTellDispatch::Accepted => Ok(DispatchReply::TellAccepted),
+                ProtocolTellDispatch::Deferred { completion, .. } => completion.await,
+                ProtocolTellDispatch::Rejected(error) => Err(error),
+            };
         }
         let observer = handle.observer().clone();
         let actor = handle.observation_metadata().clone();
@@ -542,44 +550,22 @@ impl<A: Actor, P: Protocol> ActorProtocolBinding<A, P> {
         payload: Bytes,
         sender: Option<ActorRef>,
     ) -> Result<DispatchReply, DispatchError> {
-        let observer = handle.observer().clone();
-        let actor = handle.observation_metadata().clone();
         let payload_size = payload.len();
-        let result = (|| {
-            let binding_index = self
-                .protocol
-                .bindings_by_id
-                .get(&message_id)
-                .ok_or(DispatchError::UnknownMessage(message_id))?;
-            let client = &self.protocol.bindings[*binding_index];
-            if client.descriptor.mode != DispatchMode::Tell {
-                return Err(DispatchError::ModeMismatch);
+        match self.try_dispatch_tell(&handle, message_id, payload, sender) {
+            ProtocolTellDispatch::Accepted => Ok(DispatchReply::TellAccepted),
+            ProtocolTellDispatch::Deferred { .. } => {
+                let error = DispatchError::MailboxRejected;
+                handle.observer().protocol_failed(
+                    handle.observation_metadata(),
+                    message_id,
+                    MessageKind::Tell,
+                    payload_size,
+                    protocol_failure(&error),
+                );
+                Err(error)
             }
-            if payload.len() > client.descriptor.max_payload {
-                return Err(DispatchError::PayloadTooLarge {
-                    actual: payload.len(),
-                    maximum: client.descriptor.max_payload,
-                });
-            }
-            match self
-                .dispatch
-                .get(&message_id)
-                .ok_or(DispatchError::UnknownMessage(message_id))?
-            {
-                ServerDispatch::Tell(dispatch) => dispatch(handle, payload, sender),
-                ServerDispatch::Async(_) => Err(DispatchError::ModeMismatch),
-            }
-        })();
-        if let Err(error) = &result {
-            observer.protocol_failed(
-                &actor,
-                message_id,
-                MessageKind::Tell,
-                payload_size,
-                protocol_failure(error),
-            );
+            ProtocolTellDispatch::Rejected(error) => Err(error),
         }
-        result
     }
 }
 
@@ -592,30 +578,6 @@ pub struct ActorProtocolBindingBuilder<A: Actor, P: Protocol> {
 impl<A: Actor, P: Protocol> ActorProtocolBindingBuilder<A, P> {
     pub fn max_payload(mut self, maximum: usize) -> Self {
         self.client = self.client.max_payload(maximum);
-        self
-    }
-
-    pub fn tell<M, C>(mut self, message_id: u64, schema_version: u32, codec: C) -> Self
-    where
-        A: Handler<M>,
-        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
-        M: Message,
-        C: WireCodec<M>,
-    {
-        let codec = Arc::new(codec);
-        self.client =
-            self.client
-                .tell::<M, _>(message_id, schema_version, SharedCodec(codec.clone()));
-        self.dispatch.push((
-            message_id,
-            ServerDispatch::Tell(Arc::new(move |handle, payload, sender| {
-                let message = codec.decode(&payload).map_err(DispatchError::Decode)?;
-                handle
-                    .try_tell_from(message, sender)
-                    .map_err(|_| DispatchError::MailboxRejected)?;
-                Ok(DispatchReply::TellAccepted)
-            })),
-        ));
         self
     }
 
@@ -987,7 +949,7 @@ mod tests {
     use super::*;
     use crate::{
         context::HandlerContext, error::ActorError, mailbox::MailboxConfig, reply::ReplyTo,
-        runtime::spawn_actor,
+        runtime::spawn_actor, traits::Handler,
     };
 
     struct TestActor {

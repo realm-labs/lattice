@@ -12,8 +12,10 @@ rustls-ring = ["tls", "lattice-remoting/rustls-ring"]
 rustls-aws-lc = ["tls", "lattice-remoting/rustls-aws-lc"]
 
 [dependencies]
+arc-swap.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+dashmap.workspace = true
 futures-util.workspace = true
 lattice-actor.workspace = true
 lattice-core.workspace = true

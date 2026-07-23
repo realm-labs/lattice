@@ -11,7 +11,9 @@ use std::{
 use async_trait::async_trait;
 use dashmap::{DashMap, mapref::entry::Entry};
 use lattice_core::{
-    actor_ref::{ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId},
+    actor_ref::{
+        ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
+    },
     id::ActorId,
     kind::ActorKind,
     service_context::ServiceContext,
@@ -74,10 +76,16 @@ pub struct ActorRegistry<A: Actor> {
     config: ActorRegistryConfig,
     protocol_id: Option<ProtocolId>,
     entries: Arc<DashMap<ActorId, RegistryEntry<A>>>,
+    exact_entries: Arc<DashMap<ActivationId, ExactRegistryEntry<A>>>,
     quarantined: Arc<DashMap<LocalActorRef, QuarantinedEntry<A>>>,
     actor_system: Arc<OnceLock<ActorSystem>>,
     observer: ActorObserverHandle,
     spawner: ActorSpawner,
+}
+
+struct ExactRegistryEntry<A: Actor> {
+    handle: ActorHandle<A>,
+    local_ref: LocalActorRef,
 }
 
 impl<A: Actor> fmt::Debug for ActorRegistry<A> {
@@ -189,6 +197,7 @@ impl<A: Actor> ActorRegistry<A> {
             config,
             protocol_id: None,
             entries: Arc::new(DashMap::new()),
+            exact_entries: Arc::new(DashMap::new()),
             quarantined: Arc::new(DashMap::new()),
             actor_system: Arc::new(OnceLock::new()),
             observer: ActorObserverHandle::default(),
@@ -213,6 +222,7 @@ impl<A: Actor> ActorRegistry<A> {
             config,
             protocol_id: Some(protocol.protocol_id()),
             entries: Arc::new(DashMap::new()),
+            exact_entries: Arc::new(DashMap::new()),
             quarantined: Arc::new(DashMap::new()),
             actor_system: Arc::new(OnceLock::new()),
             observer: ActorObserverHandle::default(),
@@ -453,6 +463,7 @@ impl<A: Actor> ActorRegistry<A> {
         {
             directory.remove(&reference.erase());
         }
+        self.remove_exact(&handle);
         let local_ref = handle.local_ref();
         if !capacity_exhausted {
             self.quarantined.insert(
@@ -598,17 +609,17 @@ impl<A: Actor> ActorRegistry<A> {
         {
             return Some(handle);
         }
-        self.entries.iter().find_map(|entry| match entry.value() {
-            RegistryEntry::Running(handle)
-                if is_business_admitted(handle.lifecycle_state())
-                    && handle
-                        .actor_ref()
-                        .is_some_and(|current| current.same_activation(actor_ref)) =>
-            {
-                Some(handle.clone())
-            }
-            RegistryEntry::Running(_) | RegistryEntry::Activating(_) => None,
-        })
+        let exact = self.exact_entries.get(&actor_ref.activation_id())?;
+        if is_business_admitted(exact.handle.lifecycle_state())
+            && exact
+                .handle
+                .actor_ref()
+                .is_some_and(|current| current.same_activation(actor_ref))
+        {
+            Some(exact.handle.clone())
+        } else {
+            None
+        }
     }
 
     pub async fn remove(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
@@ -797,6 +808,7 @@ impl<A: Actor> ActorRegistry<A> {
                     .spawn_actor(actor_id.clone(), actor)
                     .map_err(ActorActivationError::ActivationFailed)?;
                 entry.insert(RegistryEntry::Running(handle.clone()));
+                self.register_exact(&handle);
                 if handle.terminal_cleanup_started() || is_terminal(handle.lifecycle_state()) {
                     self.remove_stopped_running_entry(&actor_id);
                 }
@@ -860,6 +872,7 @@ impl<A: Actor> ActorRegistry<A> {
                     Ok(handle) => {
                         self.entries
                             .insert(actor_id.clone(), RegistryEntry::Running(handle.clone()));
+                        self.register_exact(&handle);
                         if handle.terminal_cleanup_started()
                             || is_terminal(handle.lifecycle_state())
                         {
@@ -964,11 +977,34 @@ impl<A: Actor> ActorRegistry<A> {
                     if is_terminal(handle.lifecycle_state())
             )
         });
-        if let Some((_, RegistryEntry::Running(handle))) = removed
-            && let Some(directory) = self.config.service.extension::<ActivationDirectory>()
-            && let Some(reference) = handle.actor_ref()
-        {
-            directory.remove(&reference.erase());
+        if let Some((_, RegistryEntry::Running(handle))) = removed {
+            self.remove_exact(&handle);
+            if let Some(directory) = self.config.service.extension::<ActivationDirectory>()
+                && let Some(reference) = handle.actor_ref()
+            {
+                directory.remove(&reference.erase());
+            }
+        }
+    }
+
+    fn register_exact(&self, handle: &ActorHandle<A>) {
+        if let Some(reference) = handle.actor_ref() {
+            self.exact_entries.insert(
+                reference.activation_id(),
+                ExactRegistryEntry {
+                    handle: handle.clone(),
+                    local_ref: handle.local_ref(),
+                },
+            );
+        }
+    }
+
+    fn remove_exact(&self, handle: &ActorHandle<A>) {
+        if let Some(reference) = handle.actor_ref() {
+            self.exact_entries
+                .remove_if(&reference.activation_id(), |_, entry| {
+                    entry.local_ref == handle.local_ref()
+                });
         }
     }
 
@@ -1000,10 +1036,12 @@ impl<A: Actor> ActorRegistry<A> {
             .actor_ref_for(actor_id.clone())
             .map(|actor_ref| actor_ref.erase());
         let entries = self.entries.clone();
+        let exact_entries = self.exact_entries.clone();
         let quarantined = self.quarantined.clone();
         let terminal_actor_id = actor_id.clone();
         let directory = self.config.service.extension::<ActivationDirectory>();
         let terminal_reference = self_ref.clone();
+        let terminal_activation = self_ref.as_ref().map(ActorRef::activation_id);
         let terminal_hook = Box::new(move |local_ref| {
             entries.remove_if(&terminal_actor_id, |_, entry| {
                 matches!(entry, RegistryEntry::Running(handle) if handle.local_ref() == local_ref)
@@ -1011,6 +1049,9 @@ impl<A: Actor> ActorRegistry<A> {
             quarantined.remove_if(&local_ref, |_, entry| {
                 entry.actor_id == terminal_actor_id && entry.handle.local_ref() == local_ref
             });
+            if let Some(activation_id) = terminal_activation {
+                exact_entries.remove_if(&activation_id, |_, entry| entry.local_ref == local_ref);
+            }
             if let (Some(directory), Some(reference)) = (&directory, &terminal_reference) {
                 directory.remove(reference);
             }

@@ -41,7 +41,9 @@ trait ErasedActorHost: Send + Sync {
         ticket: &str,
     ) -> Option<Result<(), ActorQuarantineError>>;
 
-    fn try_tell(
+    fn try_tell(&self, tell: InboundTell) -> ImmediateTellDispatch;
+
+    async fn tell(
         &self,
         sender: Option<ActorRef>,
         target: ExactActorTarget,
@@ -147,7 +149,45 @@ impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
             .into()
     }
 
-    fn try_tell(
+    fn try_tell(&self, tell: InboundTell) -> ImmediateTellDispatch {
+        let InboundTell {
+            sender,
+            target,
+            message_id,
+            payload,
+        } = tell;
+        if sender
+            .as_ref()
+            .is_some_and(|sender| sender.cluster_id() != &target.cluster_id)
+        {
+            return ImmediateTellDispatch::Complete(Err(RemoteMessageError::Unauthorized));
+        }
+        let handle = match self.resolve(&target) {
+            Ok(handle) => handle,
+            Err(error) => return ImmediateTellDispatch::Complete(Err(error)),
+        };
+        match self
+            .protocol
+            .try_dispatch_tell(&handle, message_id, payload, sender)
+        {
+            crate::protocol::tell::ProtocolTellDispatch::Accepted => {
+                ImmediateTellDispatch::Complete(Ok(()))
+            }
+            crate::protocol::tell::ProtocolTellDispatch::Deferred {
+                payload, sender, ..
+            } => ImmediateTellDispatch::Deferred(InboundTell {
+                sender,
+                target,
+                message_id,
+                payload,
+            }),
+            crate::protocol::tell::ProtocolTellDispatch::Rejected(error) => {
+                ImmediateTellDispatch::Complete(Err(map_dispatch(error)))
+            }
+        }
+    }
+
+    async fn tell(
         &self,
         sender: Option<ActorRef>,
         target: ExactActorTarget,
@@ -163,7 +203,15 @@ impl<A: Actor, P: Protocol> ErasedActorHost for ActorHost<A, P> {
         let handle = self.resolve(&target)?;
         match self
             .protocol
-            .try_dispatch_tell_with_sender(handle, message_id, payload, sender)
+            .dispatch_with_sender(
+                handle,
+                message_id,
+                DispatchMode::Tell,
+                payload,
+                None,
+                sender,
+            )
+            .await
             .map_err(map_dispatch)?
         {
             DispatchReply::TellAccepted => Ok(()),
@@ -279,10 +327,36 @@ impl ProtocolHostRegistry {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
+        match self.try_tell_immediate(InboundTell {
+            sender,
+            target,
+            message_id,
+            payload,
+        }) {
+            ImmediateTellDispatch::Complete(result) => result,
+            ImmediateTellDispatch::Deferred(_) => Err(RemoteMessageError::MailboxRejected),
+        }
+    }
+
+    pub fn try_tell_immediate(&self, tell: InboundTell) -> ImmediateTellDispatch {
+        let Some(host) = self.hosts.get(&tell.target.protocol_id.get()) else {
+            return ImmediateTellDispatch::Complete(Err(RemoteMessageError::UnsupportedProtocol));
+        };
+        host.try_tell(tell)
+    }
+
+    pub async fn tell_wait(
+        &self,
+        sender: Option<ActorRef>,
+        target: ExactActorTarget,
+        message_id: u64,
+        payload: Bytes,
+    ) -> Result<(), RemoteMessageError> {
         self.hosts
             .get(&target.protocol_id.get())
             .ok_or(RemoteMessageError::UnsupportedProtocol)?
-            .try_tell(sender, target, message_id, payload)
+            .tell(sender, target, message_id, payload)
+            .await
     }
 
     pub async fn retry_stop(&self, local_ref: LocalActorRef) -> Result<(), HostAdminError> {
@@ -312,12 +386,7 @@ impl ProtocolHostRegistry {
 #[async_trait]
 impl InboundDispatch for ProtocolHostRegistry {
     fn try_tell_immediate(&self, tell: InboundTell) -> ImmediateTellDispatch {
-        ImmediateTellDispatch::Complete(self.try_tell(
-            tell.sender,
-            tell.target,
-            tell.message_id,
-            tell.payload,
-        ))
+        self.try_tell_immediate(tell)
     }
 
     async fn tell(
@@ -327,7 +396,7 @@ impl InboundDispatch for ProtocolHostRegistry {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        self.try_tell(sender, target, message_id, payload)
+        self.tell_wait(sender, target, message_id, payload).await
     }
 
     async fn ask(

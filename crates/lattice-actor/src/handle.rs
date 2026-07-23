@@ -551,6 +551,20 @@ impl<A: Actor> ActorHandle<A> {
         self.try_tell_on_lane(msg, sender, MailboxLane::Normal)
     }
 
+    pub(crate) async fn tell_from<M>(
+        &self,
+        msg: M,
+        sender: Option<ActorRef>,
+    ) -> Result<(), ActorTellError<M>>
+    where
+        A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
+        M: Message,
+    {
+        self.send_tell_on_lane(msg, sender, MailboxLane::Normal)
+            .await
+    }
+
     fn try_tell_on_lane<M>(
         &self,
         msg: M,

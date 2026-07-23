@@ -33,6 +33,7 @@ license = "MIT"
 repository = "https://github.com/realm-labs/lattice"
 
 [workspace.dependencies]
+arc-swap = "1.7.1"
 async-stream = "0.3.6"
 async-trait = "0.1.89"
 async-nats = "0.49.1"
