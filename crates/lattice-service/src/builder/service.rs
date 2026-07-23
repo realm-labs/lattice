@@ -15,6 +15,7 @@ use tokio::{
 };
 
 use crate::{
+    cluster::api::Cluster,
     cluster::peers::PeerError,
     lifecycle::{CoordinatorScopeState, LifecycleInterventionReport},
 };
@@ -193,6 +194,22 @@ impl LatticeService {
 
     pub fn subscribe_members(&self) -> Receiver<MemberEvent> {
         self.members.subscribe()
+    }
+
+    /// Returns the user-facing handle for observing this node's cluster.
+    pub fn cluster(&self) -> Cluster {
+        let identity = self.endpoint.local_identity();
+        Cluster::new(
+            self.cluster_id.clone(),
+            NodeKey {
+                node_id: identity.node_id.clone(),
+                address: identity.address.clone(),
+                incarnation: identity.incarnation,
+            },
+            self.health.clone(),
+            self.health_events.clone(),
+            self.members.clone(),
+        )
     }
 
     pub async fn connect_member(&self, node: &NodeKey) -> Result<Arc<Association>, ServiceError> {

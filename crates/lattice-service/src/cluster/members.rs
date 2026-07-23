@@ -58,6 +58,18 @@ impl MemberDirectory {
         self.events.subscribe()
     }
 
+    pub(crate) fn snapshot_and_subscribe(
+        &self,
+    ) -> (MemberSnapshot, broadcast::Receiver<MemberEvent>) {
+        let state = self.state.lock().expect("member directory poisoned");
+        let events = self.events.subscribe();
+        let snapshot = MemberSnapshot {
+            version: state.version,
+            members: state.members.values().cloned().collect(),
+        };
+        (snapshot, events)
+    }
+
     pub(crate) fn lookup_up(&self, node: &NodeKey) -> Option<MemberRecord> {
         self.state
             .lock()

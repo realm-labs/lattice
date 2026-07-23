@@ -56,6 +56,7 @@ use tokio::{sync::watch::Receiver, time::Instant};
 
 use crate::{
     builder::LatticeService,
+    cluster::ClusterEvent,
     config::{ClusterJoinConfig, NodeConfig},
     error::ServiceError,
     lifecycle::{NodeLifecycleState, PlacementDomainState},
@@ -1066,38 +1067,33 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
     .build()
     .unwrap();
     member.start().await.unwrap();
-    let mut lifecycle = member.subscribe_node_lifecycle();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while *lifecycle.borrow() != NodeLifecycleState::Ready {
-            lifecycle.changed().await.unwrap();
-        }
-    })
-    .await
-    .unwrap();
+    let cluster = member.cluster();
+    let ready = cluster.wait_ready(Duration::from_secs(5)).await.unwrap();
     assert_eq!(
-        eventually_ping(&member, target.clone(), 1, "before rollover").await,
+        ready
+            .self_member()
+            .map(|member| member.node.node_id.as_str()),
+        Some("rollover-member")
+    );
+    let mut cluster_events = cluster.subscribe();
+    assert!(matches!(
+        cluster_events.recv().await,
+        Some(ClusterEvent::CurrentState(state)) if state.is_ready()
+    ));
+    assert_eq!(
+        ping(&member, target.clone(), 1, "before rollover").await,
         Pong(2)
     );
 
     coordinator_a.force_shutdown().await.unwrap();
-    let mut health = member.subscribe_health();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while health.borrow().domains.get(&placement_domain())
-            != Some(&PlacementDomainState::Degraded)
-        {
-            health.changed().await.unwrap();
-        }
-    })
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while *lifecycle.borrow() != NodeLifecycleState::JoiningMembership {
-            lifecycle.changed().await.unwrap();
-        }
-    })
-    .await
-    .expect("member did not observe membership loss before Coordinator replacement");
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    cluster
+        .wait_for(Duration::from_secs(5), |state| {
+            state.health.node == NodeLifecycleState::JoiningMembership
+                && state.health.domains.get(&placement_domain())
+                    == Some(&PlacementDomainState::Degraded)
+        })
+        .await
+        .expect("member did not observe membership loss before Coordinator replacement");
 
     let coordinator_b = coordinator_service(
         store,
@@ -1112,12 +1108,8 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
     discovery_tx
         .send(discovery_snapshot(2, "coordinator-b", address_b))
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while health.borrow().domains.get(&placement_domain()) != Some(&PlacementDomainState::Ready)
-        {
-            health.changed().await.unwrap();
-        }
-    })
+    cluster
+        .wait_ready(Duration::from_secs(5))
     .await
     .unwrap_or_else(|_| {
         panic!(
@@ -1127,17 +1119,7 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
             member.member_snapshot(),
         )
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while *lifecycle.borrow() != NodeLifecycleState::Ready {
-            lifecycle.changed().await.unwrap();
-        }
-    })
-    .await
-    .expect("member did not return to Ready after Coordinator rollover");
-    assert_eq!(
-        eventually_ping(&member, target, 2, "after rollover").await,
-        Pong(3)
-    );
+    assert_eq!(ping(&member, target, 2, "after rollover").await, Pong(3));
     let members = member.member_snapshot().members;
     assert_eq!(
         members
@@ -1151,29 +1133,18 @@ async fn coordinator_rollover_requires_reconciliation_before_ready() {
     coordinator_b.shutdown().await.unwrap();
 }
 
-async fn eventually_ping(
+async fn ping(
     service: &LatticeService,
     target: EntityRef<PingProtocol>,
     value: u64,
     phase: &str,
 ) -> Pong {
-    let mut last_error = None;
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match service
-                .ask(target.clone(), Ping(value), Duration::from_secs(2))
-                .await
-            {
-                Ok(reply) => break reply,
-                Err(error) => last_error = Some(error),
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
-    result.unwrap_or_else(|_| {
+    service
+        .ask(target, Ping(value), Duration::from_secs(2))
+        .await
+        .unwrap_or_else(|error| {
         panic!(
-            "{phase} ping did not recover; last error: {last_error:?}; lifecycle: {:?}; health: {:?}; members: {:?}",
+            "{phase} ping failed after Ready; error: {error:?}; lifecycle: {:?}; health: {:?}; members: {:?}",
             service.node_lifecycle_state(),
             service.health_snapshot(),
             service.member_snapshot(),

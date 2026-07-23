@@ -1,9 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -60,7 +57,7 @@ pub(crate) struct LogicJoinRuntime {
     pub drain_ready: watch::Sender<BTreeMap<PlacementDomainId, String>>,
     pub drain_blockers: watch::Sender<BTreeMap<PlacementDomainId, BTreeSet<PlacementSlotKey>>>,
     pub bootstrap_view: Arc<BootstrapView>,
-    pub membership_ready: Arc<AtomicBool>,
+    pub membership_ready: watch::Receiver<bool>,
 }
 
 struct LogicSessionRun {
@@ -92,7 +89,7 @@ impl LogicJoinRuntime {
                     leader,
                     association,
                 } => {
-                    if wait_for_membership(&self.membership_ready, &mut shutdown)
+                    if wait_for_membership(&mut self.membership_ready, &mut shutdown)
                         .await
                         .is_err()
                     {
@@ -238,7 +235,11 @@ impl LogicJoinRuntime {
         let mut task = tokio::spawn(session.run_recoverable(controls, session_shutdown_rx));
         let changed = handle.change_notifier();
         loop {
-            if handle.ready() {
+            // The placement state can become ready while authority effects produced by the
+            // snapshot are still queued. Publishing domain readiness before those effects are
+            // applied exposes a transient Ready state in which logical messages are rejected as
+            // stale authority.
+            if handle.ready_for_admission() && effects.is_empty() {
                 self.set_domain_state(PlacementDomainState::Ready);
                 let state = self
                     .lifecycle
@@ -247,8 +248,7 @@ impl LogicJoinRuntime {
                     .state();
                 let event = match state {
                     NodeLifecycleState::JoiningMembership
-                        if self.membership_ready.load(Ordering::Acquire)
-                            && self.all_domains_ready() =>
+                        if *self.membership_ready.borrow() && self.all_domains_ready() =>
                     {
                         Some(ServiceLifecycleEvent::SnapshotInstalled)
                     }
@@ -503,12 +503,16 @@ fn closed_controls() -> mpsc::Receiver<PlacementControlEvent> {
 }
 
 async fn wait_for_membership(
-    ready: &AtomicBool,
+    ready: &mut watch::Receiver<bool>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), ()> {
-    while !ready.load(Ordering::Acquire) {
+    while !*ready.borrow_and_update() {
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            changed = ready.changed() => {
+                if changed.is_err() {
+                    return Err(());
+                }
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Err(());

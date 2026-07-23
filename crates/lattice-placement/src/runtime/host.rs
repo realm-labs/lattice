@@ -1243,6 +1243,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let domain_a_scope = CoordinatorScope::Placement(domain_a.clone());
+        let mut scope_states = host.subscribe_scope_states();
         let (_router, controls) =
             PlacementControlRouter::bounded(32, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
         let (stop, stop_rx) = watch::channel(false);
@@ -1250,15 +1252,15 @@ mod tests {
         store.revoke_lease(lost_lease).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if store
-                    .get_leader(&CoordinatorScope::Placement(domain_a.clone()))
-                    .await
-                    .unwrap()
-                    .is_some_and(|leader| leader.term > original_a.term)
-                {
+                let reelected = matches!(
+                    scope_states.borrow_and_update().get(&domain_a_scope),
+                    Some(CoordinatorHostScopeState::Active(leader))
+                        if leader.term > original_a.term
+                );
+                if reelected {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                scope_states.changed().await.unwrap();
             }
         })
         .await

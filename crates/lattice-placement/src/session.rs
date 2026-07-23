@@ -32,7 +32,10 @@ use crate::{
         PlacementDomainStateError, ShardLoadReport, SnapshotLimits, SnapshotRecord, SnapshotStager,
         SnapshotVersion,
     },
-    types::{MembershipVersion, MonotonicTime, NodeKey, PlacementSlot, PlacementSlotKey},
+    types::{
+        MembershipVersion, MonotonicTime, NodeKey, PlacementSlot, PlacementSlotKey,
+        PlacementSlotState,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -129,6 +132,21 @@ impl LogicPlacementState {
         self.session.ready() && self.domain_up
     }
 
+    fn ready_for_admission(&self) -> bool {
+        self.ready()
+            && self
+                .slots
+                .iter()
+                .filter(|(_, slot)| slot.owner.as_ref() == Some(&self.local_node))
+                .all(|(key, slot)| {
+                    slot.state == PlacementSlotState::Running
+                        && self
+                            .authorities
+                            .get(key)
+                            .is_some_and(PlacementAuthority::admission_open)
+                })
+    }
+
     pub fn change_notifier(&self) -> Arc<Notify> {
         self.changed.clone()
     }
@@ -179,6 +197,15 @@ impl LogicCoordinatorHandle {
             .lock()
             .expect("logic placement state poisoned")
             .ready()
+    }
+
+    /// Returns true when the domain snapshot is installed and every locally owned slot can admit
+    /// messages.
+    pub fn ready_for_admission(&self) -> bool {
+        self.state
+            .lock()
+            .expect("logic placement state poisoned")
+            .ready_for_admission()
     }
 
     pub fn change_notifier(&self) -> Arc<Notify> {

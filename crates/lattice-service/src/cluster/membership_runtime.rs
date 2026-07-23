@@ -1,7 +1,4 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lattice_placement::{
@@ -38,7 +35,7 @@ pub(crate) struct MembershipJoinRuntime {
     pub health: Arc<Mutex<ServiceHealthSnapshot>>,
     pub health_events: watch::Sender<ServiceHealthSnapshot>,
     pub bootstrap_view: Arc<BootstrapView>,
-    pub ready: Arc<AtomicBool>,
+    pub ready: watch::Sender<bool>,
     pub handle: Arc<Mutex<Option<MembershipCoordinatorHandle>>>,
 }
 
@@ -121,7 +118,7 @@ impl MembershipJoinRuntime {
                     *self.handle.lock().expect("membership handle poisoned") = None;
                 }
                 JoinEvent::TerminalFailure(_) => {
-                    self.ready.store(false, Ordering::Release);
+                    self.ready.send_replace(false);
                     *self.handle.lock().expect("membership handle poisoned") = None;
                     let _ = self
                         .lifecycle_driver
@@ -160,7 +157,7 @@ impl MembershipJoinRuntime {
                 .expect("membership session state poisoned")
                 .ready()
             {
-                self.ready.store(true, Ordering::Release);
+                self.ready.send_replace(true);
                 let recovering = self
                     .lifecycle
                     .lock()
@@ -322,7 +319,7 @@ impl MembershipJoinRuntime {
     }
 
     fn mark_membership_lost(&self) {
-        self.ready.store(false, Ordering::Release);
+        self.ready.send_replace(false);
         let _ = self
             .lifecycle_driver
             .transition(ServiceLifecycleEvent::MembershipLost);

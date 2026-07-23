@@ -1001,7 +1001,7 @@ impl LatticeServiceBuilder {
             health_events.clone(),
             admission,
         );
-        let membership_ready = Arc::new(AtomicBool::new(false));
+        let (membership_ready, _) = watch::channel(false);
         let membership_handle = Arc::new(Mutex::new(None));
         let join_runtimes = auto_join
             .into_iter()
@@ -1037,7 +1037,7 @@ impl LatticeServiceBuilder {
                     drain_ready: drain_ready.clone(),
                     drain_blockers: drain_blockers.clone(),
                     bootstrap_view: bootstrap_view.clone(),
-                    membership_ready: membership_ready.clone(),
+                    membership_ready: membership_ready.subscribe(),
                 })
             })
             .collect::<Result<Vec<_>, ServiceError>>()?;

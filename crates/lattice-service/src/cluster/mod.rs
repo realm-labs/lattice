@@ -43,6 +43,7 @@ use lattice_remoting::{
 
 use crate::backend::LogicalRouter;
 
+pub mod api;
 mod buffer;
 mod entity;
 pub mod join;
@@ -54,6 +55,8 @@ mod router;
 pub(crate) mod runtime;
 mod singleton;
 mod singleton_proxy;
+
+pub use api::{Cluster, ClusterEvent, ClusterEvents, ClusterState, ClusterWaitError};
 
 use buffer::RouteBuffer;
 use entity::EntityRoute;
