@@ -4,11 +4,14 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use lattice_core::failpoint::Failpoint;
 use thiserror::Error;
+#[cfg(test)]
+use tokio::task::JoinSet;
 use tokio::{
     sync::{mpsc, watch},
-    task::{JoinError, JoinSet},
+    task::JoinError,
     time::{Instant as TokioInstant, MissedTickBehavior},
 };
 
@@ -21,14 +24,14 @@ use crate::{
     },
     messaging::{
         codec::{
-            ask_correlation, decode_ask_cached, decode_entity_ask, decode_entity_tell_cached,
-            decode_failure, decode_reply, decode_singleton_ask, decode_singleton_tell_cached,
-            decode_tell_cached, failure_frame, reply_frame,
+            decode_ask_cached, decode_entity_ask, decode_entity_tell_cached, decode_failure,
+            decode_reply, decode_singleton_ask, decode_singleton_tell_cached, decode_tell_cached,
+            failure_frame, reply_frame,
         },
         error::{AskError, RemoteFailureCode, RemoteMessageError},
         inbound::{InboundDispatch, dispatch_tell, failure_code},
-        outbound::OutboundMessaging,
-        target::RemoteFailure,
+        outbound::{OutboundMessaging, PreparedOutboundFrame},
+        target::{CorrelationId, InboundAsk, InboundEntityAsk, InboundSingletonAsk, RemoteFailure},
         target_cache::ExactTargetCache,
         target_dictionary::ExactTargetDictionary,
     },
@@ -184,12 +187,13 @@ where
         config.maximum_ready_write_batch_frames,
         config.maximum_coalesced_write_batch_bytes,
     );
-    let mut asks = JoinSet::new();
+    let mut asks = FuturesUnordered::new();
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_received = Instant::now();
     let mut outbound_candidates = Vec::with_capacity(config.maximum_ready_write_batch_frames);
     let mut outbound_batch = Vec::with_capacity(config.maximum_ready_write_batch_frames);
+    let mut outbound_correlations = Vec::with_capacity(config.maximum_ready_write_batch_frames);
     let (control_apply_tx, mut control_apply_rx, _control_worker) = if lane == LaneKind::Control {
         let (commands, mut command_rx) =
             mpsc::channel::<Frame>(config.maximum_pending_control_applies);
@@ -268,17 +272,17 @@ where
                     .write_frame(&Frame::new(FrameKind::Heartbeat, Bytes::new()))
                     .await?;
             }
-            completed = asks.join_next(), if !asks.is_empty() => {
+            completed = asks.next(), if !asks.is_empty() => {
                 let Some(completed) = completed else {
                     continue;
                 };
                 outbound_batch.clear();
-                outbound_batch.push(completed.map_err(LaneError::Join)??);
+                outbound_batch.push(completed?);
                 while outbound_batch.len() < config.maximum_ready_write_batch_frames {
-                    let Some(completed) = asks.try_join_next() else {
+                    let Some(completed) = asks.next().now_or_never().flatten() else {
                         break;
                     };
-                    outbound_batch.push(completed.map_err(LaneError::Join)??);
+                    outbound_batch.push(completed?);
                 }
                 if outbound_batch.len() == 1 {
                     writer.write_frame(&outbound_batch[0]).await?;
@@ -309,14 +313,21 @@ where
                     outbound_candidates.push(frame);
                 }
                 outbound_batch.clear();
+                outbound_correlations.clear();
                 let mut reserved_bytes = 0;
                 for mut frame in outbound_candidates.drain(..) {
                     let frame_bytes = frame.payload_len();
-                    if !messaging.prepare_ask_for_socket_write(&mut frame) {
+                    let Some(prepared) =
+                        messaging.prepare_outbound_for_socket_write(&mut frame)
+                    else {
                         association.release_queued_bytes(frame_bytes);
                         continue;
-                    }
+                    };
                     reserved_bytes += frame_bytes;
+                    outbound_correlations.push(match prepared {
+                        PreparedOutboundFrame::Other => None,
+                        PreparedOutboundFrame::Ask(correlation) => Some(correlation),
+                    });
                     outbound_batch.push(frame);
                 }
                 if outbound_batch.is_empty() {
@@ -332,7 +343,7 @@ where
                 }
                 let frame_count = outbound_batch.len();
                 let result = if frame_count == 1 && !matches!(lane, LaneKind::Bulk(_)) {
-                    let correlation = ask_correlation(&outbound_batch[0]);
+                    let correlation = outbound_correlations[0];
                     writer
                         .write_frame_with_commit_outcome(&outbound_batch[0], || {
                             if let Some(correlation) = correlation {
@@ -343,7 +354,7 @@ where
                 } else {
                     writer
                         .write_frames_with_commit(&outbound_batch, |index| {
-                            if let Some(correlation) = ask_correlation(&outbound_batch[index]) {
+                            if let Some(correlation) = outbound_correlations[index] {
                                 messaging.mark_socket_write_started(correlation);
                             }
                         })
@@ -390,23 +401,10 @@ where
                                 safe_detail: None,
                             })).await?;
                         } else {
-                            let dispatch = dispatch.clone();
-                            asks.spawn(async move {
-                                let deadline = Instant::now()
-                                    .checked_add(ask.timeout_budget)
-                                    .ok_or(RemoteMessageError::DeadlineExceeded)?;
-                                Ok::<_, RemoteMessageError>(match dispatch
-                                    .ask(ask.target, ask.message_id, ask.payload, deadline)
-                                    .await
-                                {
-                                    Ok(payload) => reply_frame(ask.correlation_id, payload),
-                                    Err(error) => failure_frame(&RemoteFailure {
-                                        correlation_id: ask.correlation_id,
-                                        code: failure_code(&error),
-                                        safe_detail: None,
-                                    }),
-                                })
-                            });
+                            asks.push(dispatch_inbound_ask(
+                                dispatch.clone(),
+                                InboundAskWork::Exact(ask),
+                            ));
                         }
                     }
                     FrameKind::EntityAsk if lane == LaneKind::Interactive => {
@@ -418,23 +416,10 @@ where
                                 safe_detail: None,
                             })).await?;
                         } else {
-                            let dispatch = dispatch.clone();
-                            asks.spawn(async move {
-                                let deadline = Instant::now()
-                                    .checked_add(ask.timeout_budget)
-                                    .ok_or(RemoteMessageError::DeadlineExceeded)?;
-                                Ok::<_, RemoteMessageError>(match dispatch
-                                    .ask_entity(ask.target, ask.message_id, ask.payload, deadline)
-                                    .await
-                                {
-                                    Ok(payload) => reply_frame(ask.correlation_id, payload),
-                                    Err(error) => failure_frame(&RemoteFailure {
-                                        correlation_id: ask.correlation_id,
-                                        code: failure_code(&error),
-                                        safe_detail: None,
-                                    }),
-                                })
-                            });
+                            asks.push(dispatch_inbound_ask(
+                                dispatch.clone(),
+                                InboundAskWork::Entity(ask),
+                            ));
                         }
                     }
                     FrameKind::SingletonAsk if lane == LaneKind::Interactive => {
@@ -446,23 +431,10 @@ where
                                 safe_detail: None,
                             })).await?;
                         } else {
-                            let dispatch = dispatch.clone();
-                            asks.spawn(async move {
-                                let deadline = Instant::now()
-                                    .checked_add(ask.timeout_budget)
-                                    .ok_or(RemoteMessageError::DeadlineExceeded)?;
-                                Ok::<_, RemoteMessageError>(match dispatch
-                                    .ask_singleton(ask.target, ask.message_id, ask.payload, deadline)
-                                    .await
-                                {
-                                    Ok(payload) => reply_frame(ask.correlation_id, payload),
-                                    Err(error) => failure_frame(&RemoteFailure {
-                                        correlation_id: ask.correlation_id,
-                                        code: failure_code(&error),
-                                        safe_detail: None,
-                                    }),
-                                })
-                            });
+                            asks.push(dispatch_inbound_ask(
+                                dispatch.clone(),
+                                InboundAskWork::Singleton(ask),
+                            ));
                         }
                     }
                     FrameKind::Reply if lane == LaneKind::Interactive => {
@@ -530,6 +502,61 @@ where
                 return Ok(LaneExit::Idle);
             }
         }
+    }
+}
+
+enum InboundAskWork {
+    Exact(InboundAsk),
+    Entity(InboundEntityAsk),
+    Singleton(InboundSingletonAsk),
+}
+
+async fn dispatch_inbound_ask(
+    dispatch: Arc<dyn InboundDispatch>,
+    work: InboundAskWork,
+) -> Result<Frame, RemoteMessageError> {
+    match work {
+        InboundAskWork::Exact(ask) => {
+            let deadline = Instant::now()
+                .checked_add(ask.timeout_budget)
+                .ok_or(RemoteMessageError::DeadlineExceeded)?;
+            let result = dispatch
+                .ask(ask.target, ask.message_id, ask.payload, deadline)
+                .await;
+            Ok(inbound_ask_response(ask.correlation_id, result))
+        }
+        InboundAskWork::Entity(ask) => {
+            let deadline = Instant::now()
+                .checked_add(ask.timeout_budget)
+                .ok_or(RemoteMessageError::DeadlineExceeded)?;
+            let result = dispatch
+                .ask_entity(ask.target, ask.message_id, ask.payload, deadline)
+                .await;
+            Ok(inbound_ask_response(ask.correlation_id, result))
+        }
+        InboundAskWork::Singleton(ask) => {
+            let deadline = Instant::now()
+                .checked_add(ask.timeout_budget)
+                .ok_or(RemoteMessageError::DeadlineExceeded)?;
+            let result = dispatch
+                .ask_singleton(ask.target, ask.message_id, ask.payload, deadline)
+                .await;
+            Ok(inbound_ask_response(ask.correlation_id, result))
+        }
+    }
+}
+
+fn inbound_ask_response(
+    correlation_id: CorrelationId,
+    result: Result<Bytes, RemoteMessageError>,
+) -> Frame {
+    match result {
+        Ok(payload) => reply_frame(correlation_id, payload),
+        Err(error) => failure_frame(&RemoteFailure {
+            correlation_id,
+            code: failure_code(&error),
+            safe_detail: None,
+        }),
     }
 }
 

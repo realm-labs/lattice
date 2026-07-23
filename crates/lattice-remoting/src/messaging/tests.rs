@@ -340,6 +340,81 @@ async fn expired_queued_ask_is_dropped_before_socket_write() {
     assert_eq!(messaging.pending_count(), 0);
 }
 
+#[tokio::test]
+async fn cancelling_an_ask_removes_it_from_the_shared_deadline_driver() {
+    let protocol_id = ProtocolId::new(7).unwrap();
+    let fingerprint = ProtocolFingerprint::digest(b"test/v1");
+    let association = active_association(protocol_id, fingerprint);
+    let messaging = Arc::new(OutboundMessaging::new(4).unwrap());
+    let task_messaging = messaging.clone();
+    let task_association = association.clone();
+    let actor_ref = target(protocol_id);
+    let task = tokio::spawn(async move {
+        task_messaging
+            .ask(
+                &task_association,
+                &SenderIdentity::Process(9),
+                &actor_ref,
+                OutboundMessage::new(fingerprint, 1, Bytes::new()),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(messaging.pending_count(), 1);
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(messaging.pending_count(), 0);
+}
+
+#[tokio::test]
+async fn an_earlier_ask_wakes_the_shared_deadline_driver() {
+    let protocol_id = ProtocolId::new(7).unwrap();
+    let fingerprint = ProtocolFingerprint::digest(b"test/v1");
+    let association = active_association(protocol_id, fingerprint);
+    let messaging = Arc::new(OutboundMessaging::new(4).unwrap());
+    let long_messaging = messaging.clone();
+    let long_association = association.clone();
+    let long_target = target(protocol_id);
+    let long = tokio::spawn(async move {
+        long_messaging
+            .ask(
+                &long_association,
+                &SenderIdentity::Process(9),
+                &long_target,
+                OutboundMessage::new(fingerprint, 1, Bytes::new()),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    let short_messaging = messaging.clone();
+    let short_association = association.clone();
+    let short_target = target(protocol_id);
+    let short = tokio::spawn(async move {
+        short_messaging
+            .ask(
+                &short_association,
+                &SenderIdentity::Process(9),
+                &short_target,
+                OutboundMessage::new(fingerprint, 2, Bytes::new()),
+                Instant::now() + Duration::from_millis(10),
+            )
+            .await
+    });
+
+    let result = tokio::time::timeout(Duration::from_millis(200), short)
+        .await
+        .expect("short deadline driver wake timed out")
+        .unwrap();
+    assert_eq!(result.unwrap_err(), AskError::DeadlineExceeded);
+    long.abort();
+    assert!(long.await.unwrap_err().is_cancelled());
+    assert_eq!(messaging.pending_count(), 0);
+}
+
 #[test]
 fn one_protocol_mismatch_does_not_close_the_association() {
     let protocol_id = ProtocolId::new(7).unwrap();

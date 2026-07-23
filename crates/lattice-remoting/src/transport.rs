@@ -2,7 +2,7 @@ use std::io::{Error, ErrorKind, IoSlice};
 #[cfg(feature = "tls")]
 use std::sync::Arc;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use lattice_core::{actor_ref::NodeAddress, failpoint::Failpoint};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -111,9 +111,8 @@ where
         if self.buffer.len() < required {
             return Ok(None);
         }
-        self.codec
-            .decode(self.buffer.split_to(required).freeze())
-            .map(Some)
+        let bytes = self.take_frame_bytes(required);
+        self.codec.decode(bytes).map(Some)
     }
 
     fn required_buffer_bytes(&self) -> Result<usize, WireError> {
@@ -132,6 +131,23 @@ where
             });
         }
         Ok(4 + declared)
+    }
+
+    fn take_frame_bytes(&mut self, required: usize) -> Bytes {
+        // When a socket read contains exactly one small frame, splitting the
+        // BytesMut transfers its oversized read-ahead allocation to the Frame.
+        // Payload slices can outlive dispatch (notably ask/reply payloads), so
+        // that pins a 64 KiB slab for a frame that may only contain a few bytes.
+        //
+        // Copy the small frame instead and retain the slab for the next read.
+        // Batched frames still use split_to and remain zero-copy.
+        if self.buffer.len() == required && required.saturating_mul(2) <= self.buffer.capacity() {
+            let frame = Bytes::copy_from_slice(&self.buffer[..required]);
+            self.buffer.clear();
+            frame
+        } else {
+            self.buffer.split_to(required).freeze()
+        }
     }
 }
 
@@ -845,6 +861,24 @@ mod tests {
         assert_eq!(reader.read_frame().await.unwrap(), first);
         assert_eq!(reader.read_frame().await.unwrap(), second);
         assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn framed_reader_reuses_oversized_read_ahead_after_one_small_frame() {
+        let codec = FrameCodec::new(1024).unwrap();
+        let expected = Frame::new(FrameKind::Tell, Bytes::from_static(b"small"));
+        let source = CountingReader {
+            bytes: codec.encode(&expected).unwrap(),
+            reads: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut reader = FramedReader::new_with_read_ahead(source, codec, 1028);
+        let initial_capacity = reader.buffer.capacity();
+
+        let actual = reader.read_frame().await.unwrap();
+
+        assert_eq!(actual, expected);
+        assert!(reader.buffer.is_empty());
+        assert_eq!(reader.buffer.capacity(), initial_capacity);
     }
 
     #[tokio::test]

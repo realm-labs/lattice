@@ -72,21 +72,24 @@ Environment overrides are documented in
 
 | Workload | Window | Throughput | Latency p50 / p99 / p99.9 | CPU ns/op | Allocations/op | Allocated bytes/op |
 |---|---:|---:|---:|---:|---:|---:|
-| Local tell completion | — | 5.096M/s | not sampled | 391 | ~0 | ~0 |
-| Local ask | 1 | 128.2K/s | 6.0 / 27.8 / 47.8 us | 8,266 | 5.00 | 1,024 |
-| Local ask | 64 | 510.3K/s | 64.5 / 276.8 / 316.0 us | 3,877 | 5.00 | 1,024 |
-| Local ask | 256 | 554.3K/s | 276.5 / 842.1 / 883.6 us | 3,579 | 5.00 | 1,024 |
-| Remote tell completion | — | 1.751M/s | not sampled | 1,512 | 2.02 | 432 |
-| Remote ask | 1 | 10.22K/s | 92.1 / 159.0 / 192.1 us | 78,060 | 17.99 | 133,694 |
-| Remote ask | 64 | 155.2K/s | 381.1 / 576.4 / 635.1 us | 23,238 | 14.24 | 10,667 |
-| Remote ask | 256 | 187.5K/s | 1,233.9 / 1,647.3 / 1,836.9 us | 25,813 | 14.07 | 5,140 |
+| Local tell completion | — | 8.065M/s | not sampled | 248 | ~0 | ~0 |
+| Local ask | 1 | 152.4K/s | 5.4 / 12.9 / 33.2 us | 7,100 | 5.00 | 1,024 |
+| Local ask | 64 | 678.9K/s | 53.8 / 89.7 / 97.5 us | 2,942 | 5.00 | 1,024 |
+| Local ask | 256 | 700.2K/s | 205.7 / 320.0 / 381.7 us | 2,847 | 5.00 | 1,024 |
+| Remote tell completion | — | 2.619M/s | not sampled | 872 | 1.02 | 353 |
+| Remote ask | 1 | 12.11K/s | 79.5 / 133.5 / 176.3 us | 65,736 | 16.00 | 3,821 |
+| Remote ask | 64 | 215.1K/s | 273.2 / 393.0 / 445.3 us | 9,844 | 12.36 | 9,128 |
+| Remote ask | 256 | 258.5K/s | 875.8 / 1,339.3 / 2,063.7 us | 11,021 | 12.16 | 5,923 |
 
-Increasing the ask window from 64 to 256 improves local throughput by 8.6% and remote throughput by
-20.8%, while increasing p99 latency by roughly 3.0x and 2.9x respectively. A window of 64 is the
+Increasing the ask window from 64 to 256 improves local throughput by 3.1% and remote throughput by
+20.2%, while increasing p99 latency by roughly 3.6x and 3.4x respectively. A window of 64 is the
 balanced default for throughput-sensitive workloads that still care about tail latency.
 
-Sequential remote ask allocation bytes include short-lived transport buffer capacity. They are
-allocation traffic rather than retained per-request state.
+The interactive lane polls concurrent inbound asks directly instead of creating one Tokio task per
+request, and outbound asks share one deadline driver. A single small frame is copied out of an
+oversized socket read-ahead slab so a short-lived payload cannot pin 64 KiB of backing capacity. The
+copy is deliberately limited to frames no larger than half of the available slab; batched frames
+remain zero-copy.
 
 ### Remote Tell Payload Curve
 
@@ -95,16 +98,14 @@ immediate admission to event-driven capacity waiting; it is not a dropped messag
 
 | Payload | Throughput | CPU ns/op | Allocated bytes/op | Queue waits | Byte-budget waits | Frames/batch |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0 B | 2.922M/s | 715 | 71 | 197 | 0 | 255.10 |
-| 128 B | 2.422M/s | 1,007 | 364 | 186 | 0 | 255.10 |
-| 1 KiB | 1.054M/s | 1,861 | 2,469 | 348 | 0 | 255.10 |
-| 16 KiB | 119.4K/s | 14,043 | 40,074 | 0 | 386 | 254.45 |
+| 0 B | 2.933M/s | 696 | 70 | 172 | 0 | 255.10 |
+| 128 B | 2.619M/s | 872 | 353 | 107 | 0 | 255.75 |
+| 1 KiB | 1.195M/s | 1,716 | 2,423 | 347 | 0 | 255.10 |
+| 16 KiB | 121.7K/s | 13,358 | 40,237 | 0 | 387 | 253.81 |
 
-The event-driven byte-budget path replaced the previous `yield_now` retry loop. For 16 KiB payloads,
-byte-budget rejections fell from 19,001,923 to 386 and CPU cost fell from 21,079 to 14,043 ns/op
-(-33.4%), while completion throughput changed from 122.0K/s to 119.4K/s (-2.1%). The remaining
-large-payload cost is primarily data copying, socket work, and remote dispatch rather than sender-side
-budget spinning.
+The event-driven byte-budget path parks a sender instead of spinning when a large frame exhausts
+capacity. The remaining large-payload cost is primarily data copying, socket work, and remote
+dispatch rather than sender-side budget retries.
 
 ### Producer and Actor Scaling
 

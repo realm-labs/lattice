@@ -2348,6 +2348,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "futures-util",
  "lattice-core",
  "prost",
  "rcgen",

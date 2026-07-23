@@ -1,10 +1,12 @@
-use tokio::time::Instant as TokioInstant;
+use std::{cmp::Ordering as CmpOrdering, collections::BinaryHeap};
+
+use tokio::{sync::Notify, time::Instant as TokioInstant};
 
 use super::{
     ActorRef, Arc, Association, AssociationId, AtomicU64, Bytes, CatalogueDecision, Duration,
     Frame, FrameKind, HashMap, Instant, Mutex, Ordering, ProtocolFingerprint, ProtocolId,
     ProtocolTag,
-    codec::{AskWire, EntityAskWire, SingletonAskWire, ask_correlation},
+    codec::{AskWire, EntityAskWire, SingletonAskWire},
     encode::{
         PreparedExactTellEnvelope, ask_frame, entity_ask_frame, entity_tell_frame,
         entity_tell_frame_len, prepared_tell_frame, prepared_tell_frame_len, singleton_ask_frame,
@@ -17,6 +19,9 @@ use super::{
         update_actor_route_hash,
     },
 };
+
+const DEADLINE_DRIVER_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+const MAXIMUM_STALE_DEADLINES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Commitment {
@@ -31,8 +36,43 @@ struct PendingAsk {
     completion: oneshot::Sender<Result<Bytes, AskError>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeadlineEntry {
+    deadline: Instant,
+    correlation: CorrelationId,
+}
+
+impl Ord for DeadlineEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other.deadline.cmp(&self.deadline).then_with(|| {
+            other
+                .correlation
+                .sequence()
+                .cmp(&self.correlation.sequence())
+        })
+    }
+}
+
+impl PartialOrd for DeadlineEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct PendingEntries {
+    asks: HashMap<CorrelationId, PendingAsk>,
+    deadlines: BinaryHeap<DeadlineEntry>,
+    deadline_driver_running: bool,
+}
+
+pub(crate) enum PreparedOutboundFrame {
+    Other,
+    Ask(CorrelationId),
+}
+
 struct PendingState {
-    entries: Mutex<HashMap<CorrelationId, PendingAsk>>,
+    entries: Mutex<PendingEntries>,
+    deadline_changed: Notify,
     maximum: usize,
 }
 
@@ -155,7 +195,12 @@ impl OutboundMessaging {
             boot_id: uuid::Uuid::new_v4().as_u128(),
             next_correlation: AtomicU64::new(1),
             pending: Arc::new(PendingState {
-                entries: Mutex::new(HashMap::new()),
+                entries: Mutex::new(PendingEntries {
+                    asks: HashMap::new(),
+                    deadlines: BinaryHeap::new(),
+                    deadline_driver_running: false,
+                }),
+                deadline_changed: Notify::new(),
                 maximum: maximum_pending_asks,
             }),
         })
@@ -375,21 +420,15 @@ impl OutboundMessaging {
         .map_err(AskError::Protocol)?;
         let correlation = self.next_correlation()?;
         let (completion, receiver) = oneshot::channel();
-        {
-            let mut entries = self.pending.entries.lock().expect("pending asks poisoned");
-            if entries.len() == self.pending.maximum {
-                return Err(AskError::PendingLimit);
-            }
-            entries.insert(
-                correlation,
-                PendingAsk {
-                    association_id: association.id(),
-                    commitment: Commitment::Queued,
-                    deadline,
-                    completion,
-                },
-            );
-        }
+        self.pending.insert(
+            correlation,
+            PendingAsk {
+                association_id: association.id(),
+                commitment: Commitment::Queued,
+                deadline,
+                completion,
+            },
+        )?;
         let mut guard = PendingGuard {
             id: correlation,
             pending: self.pending.clone(),
@@ -404,13 +443,10 @@ impl OutboundMessaging {
                 message.payload,
             ))
             .map_err(AskError::from)?;
-        let timeout = tokio::time::sleep_until(TokioInstant::from_std(deadline));
-        tokio::pin!(timeout);
-        let result = tokio::select! {
-            result = receiver => result.unwrap_or(Err(AskError::AssociationLostBeforeWrite)),
-            () = &mut timeout => Err(AskError::DeadlineExceeded),
-        };
-        guard.disarm_and_remove();
+        let result = receiver
+            .await
+            .unwrap_or(Err(AskError::AssociationLostBeforeWrite));
+        guard.disarm();
         result
     }
 
@@ -483,21 +519,15 @@ impl OutboundMessaging {
     {
         let correlation = self.next_correlation()?;
         let (completion, receiver) = oneshot::channel();
-        {
-            let mut entries = self.pending.entries.lock().expect("pending asks poisoned");
-            if entries.len() == self.pending.maximum {
-                return Err(AskError::PendingLimit);
-            }
-            entries.insert(
-                correlation,
-                PendingAsk {
-                    association_id: association.id(),
-                    commitment: Commitment::Queued,
-                    deadline,
-                    completion,
-                },
-            );
-        }
+        self.pending.insert(
+            correlation,
+            PendingAsk {
+                association_id: association.id(),
+                commitment: Commitment::Queued,
+                deadline,
+                completion,
+            },
+        )?;
         let mut guard = PendingGuard {
             id: correlation,
             pending: self.pending.clone(),
@@ -507,19 +537,16 @@ impl OutboundMessaging {
         association
             .try_admit_interactive(frame)
             .map_err(AskError::from)?;
-        let timeout = tokio::time::sleep_until(TokioInstant::from_std(deadline));
-        tokio::pin!(timeout);
-        let result = tokio::select! {
-            result = receiver => result.unwrap_or(Err(AskError::AssociationLostBeforeWrite)),
-            () = &mut timeout => Err(AskError::DeadlineExceeded),
-        };
-        guard.disarm_and_remove();
+        let result = receiver
+            .await
+            .unwrap_or(Err(AskError::AssociationLostBeforeWrite));
+        guard.disarm();
         result
     }
 
     pub fn mark_socket_write_started(&self, correlation: CorrelationId) -> bool {
         let mut entries = self.pending.entries.lock().expect("pending asks poisoned");
-        let Some(pending) = entries.get_mut(&correlation) else {
+        let Some(pending) = entries.asks.get_mut(&correlation) else {
             return false;
         };
         pending.commitment = Commitment::SocketWriteStarted;
@@ -527,31 +554,37 @@ impl OutboundMessaging {
     }
 
     pub fn prepare_ask_for_socket_write(&self, frame: &mut Frame) -> bool {
+        self.prepare_outbound_for_socket_write(frame).is_some()
+    }
+
+    pub(crate) fn prepare_outbound_for_socket_write(
+        &self,
+        frame: &mut Frame,
+    ) -> Option<PreparedOutboundFrame> {
         if !matches!(
             frame.kind,
             FrameKind::Ask | FrameKind::EntityAsk | FrameKind::SingletonAsk
         ) {
-            return true;
+            return Some(PreparedOutboundFrame::Other);
         }
-        let Some(correlation) = ask_correlation(frame) else {
-            return false;
-        };
+        let mut ask = DecodedAsk::decode(frame)?;
+        let correlation = ask.correlation()?;
         let deadline = {
             let entries = self.pending.entries.lock().expect("pending asks poisoned");
-            let Some(pending) = entries.get(&correlation) else {
-                return false;
-            };
+            let pending = entries.asks.get(&correlation)?;
             pending.deadline
         };
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             self.complete_failure(correlation, AskError::DeadlineExceeded);
-            return false;
+            return None;
         };
         if remaining.is_zero() {
             self.complete_failure(correlation, AskError::DeadlineExceeded);
-            return false;
+            return None;
         }
-        rewrite_timeout_budget(frame, duration_nanos(remaining))
+        ask.set_timeout(duration_nanos(remaining));
+        *frame = ask.into_frame();
+        Some(PreparedOutboundFrame::Ask(correlation))
     }
 
     pub fn complete_reply(&self, correlation: CorrelationId, payload: Bytes) -> bool {
@@ -565,18 +598,27 @@ impl OutboundMessaging {
     pub fn fail_association(&self, association_id: AssociationId) -> usize {
         let mut entries = self.pending.entries.lock().expect("pending asks poisoned");
         let ids = entries
+            .asks
             .iter()
             .filter_map(|(id, pending)| (pending.association_id == association_id).then_some(*id))
             .collect::<Vec<_>>();
         let count = ids.len();
-        for id in ids {
-            if let Some(pending) = entries.remove(&id) {
-                let error = match pending.commitment {
-                    Commitment::Queued => AskError::AssociationLostBeforeWrite,
-                    Commitment::SocketWriteStarted => AskError::UnknownResult,
-                };
-                let _ = pending.completion.send(Err(error));
-            }
+        let failed = ids
+            .into_iter()
+            .filter_map(|id| entries.asks.remove(&id))
+            .collect::<Vec<_>>();
+        let became_empty = !failed.is_empty() && entries.asks.is_empty();
+        compact_stale_deadlines(&mut entries);
+        drop(entries);
+        if became_empty {
+            self.pending.deadline_changed.notify_one();
+        }
+        for pending in failed {
+            let error = match pending.commitment {
+                Commitment::Queued => AskError::AssociationLostBeforeWrite,
+                Commitment::SocketWriteStarted => AskError::UnknownResult,
+            };
+            let _ = pending.completion.send(Err(error));
         }
         count
     }
@@ -586,6 +628,7 @@ impl OutboundMessaging {
             .entries
             .lock()
             .expect("pending asks poisoned")
+            .asks
             .len()
     }
 
@@ -594,6 +637,7 @@ impl OutboundMessaging {
             .entries
             .lock()
             .expect("pending asks poisoned")
+            .asks
             .values()
             .any(|pending| pending.association_id == association_id)
     }
@@ -603,18 +647,14 @@ impl OutboundMessaging {
             .entries
             .lock()
             .expect("pending asks poisoned")
+            .asks
             .keys()
             .copied()
             .collect()
     }
 
     fn complete(&self, correlation: CorrelationId, result: Result<Bytes, AskError>) -> bool {
-        let pending = self
-            .pending
-            .entries
-            .lock()
-            .expect("pending asks poisoned")
-            .remove(&correlation);
+        let pending = self.pending.remove(correlation);
         pending.is_some_and(|pending| pending.completion.send(result).is_ok())
     }
 
@@ -631,12 +671,7 @@ struct PendingGuard {
 }
 
 impl PendingGuard {
-    fn disarm_and_remove(&mut self) {
-        self.pending
-            .entries
-            .lock()
-            .expect("pending asks poisoned")
-            .remove(&self.id);
+    fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -644,11 +679,134 @@ impl PendingGuard {
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.pending
-                .entries
-                .lock()
-                .expect("pending asks poisoned")
-                .remove(&self.id);
+            self.pending.remove(self.id);
+        }
+    }
+}
+
+impl PendingState {
+    fn insert(
+        self: &Arc<Self>,
+        correlation: CorrelationId,
+        pending: PendingAsk,
+    ) -> Result<(), AskError> {
+        let deadline = pending.deadline;
+        let (start_driver, wake_driver) = {
+            let mut entries = self.entries.lock().expect("pending asks poisoned");
+            if entries.asks.len() == self.maximum {
+                return Err(AskError::PendingLimit);
+            }
+            let was_empty = entries.asks.is_empty();
+            let earlier_deadline = entries
+                .deadlines
+                .peek()
+                .is_some_and(|entry| deadline < entry.deadline);
+            entries.asks.insert(correlation, pending);
+            entries.deadlines.push(DeadlineEntry {
+                deadline,
+                correlation,
+            });
+            let start_driver = !entries.deadline_driver_running;
+            entries.deadline_driver_running = true;
+            (start_driver, was_empty || earlier_deadline)
+        };
+        if start_driver {
+            tokio::spawn(run_deadline_driver(self.clone()));
+        } else if wake_driver {
+            self.deadline_changed.notify_one();
+        }
+        Ok(())
+    }
+
+    fn remove(&self, correlation: CorrelationId) -> Option<PendingAsk> {
+        let (pending, became_empty) = {
+            let mut entries = self.entries.lock().expect("pending asks poisoned");
+            let pending = entries.asks.remove(&correlation);
+            let became_empty = pending.is_some() && entries.asks.is_empty();
+            if pending.is_some() {
+                compact_stale_deadlines(&mut entries);
+            }
+            (pending, became_empty)
+        };
+        if became_empty {
+            self.deadline_changed.notify_one();
+        }
+        pending
+    }
+}
+
+fn compact_stale_deadlines(entries: &mut PendingEntries) {
+    if entries.asks.is_empty() {
+        entries.deadlines.clear();
+        return;
+    }
+    if entries.deadlines.len() <= entries.asks.len().saturating_add(MAXIMUM_STALE_DEADLINES) {
+        return;
+    }
+    let PendingEntries {
+        asks, deadlines, ..
+    } = entries;
+    deadlines.retain(|entry| {
+        asks.get(&entry.correlation)
+            .is_some_and(|ask| ask.deadline == entry.deadline)
+    });
+}
+
+async fn run_deadline_driver(pending: Arc<PendingState>) {
+    loop {
+        let changed = pending.deadline_changed.notified();
+        let next_deadline = {
+            let mut entries = pending.entries.lock().expect("pending asks poisoned");
+            while entries.deadlines.peek().is_some_and(|entry| {
+                !entries
+                    .asks
+                    .get(&entry.correlation)
+                    .is_some_and(|ask| ask.deadline == entry.deadline)
+            }) {
+                entries.deadlines.pop();
+            }
+            entries.deadlines.peek().map(|entry| entry.deadline)
+        };
+        let Some(next_deadline) = next_deadline else {
+            tokio::select! {
+                () = changed => continue,
+                () = tokio::time::sleep(DEADLINE_DRIVER_IDLE_TIMEOUT) => {}
+            }
+            let mut entries = pending.entries.lock().expect("pending asks poisoned");
+            if entries.asks.is_empty() {
+                entries.deadline_driver_running = false;
+                return;
+            }
+            continue;
+        };
+        tokio::select! {
+            () = changed => continue,
+            () = tokio::time::sleep_until(TokioInstant::from_std(next_deadline)) => {}
+        }
+
+        let expired = {
+            let now = Instant::now();
+            let mut entries = pending.entries.lock().expect("pending asks poisoned");
+            let mut expired = Vec::new();
+            while entries
+                .deadlines
+                .peek()
+                .is_some_and(|entry| entry.deadline <= now)
+            {
+                let entry = entries.deadlines.pop().expect("deadline was present");
+                if entries
+                    .asks
+                    .get(&entry.correlation)
+                    .is_some_and(|ask| ask.deadline == entry.deadline)
+                    && let Some(ask) = entries.asks.remove(&entry.correlation)
+                {
+                    expired.push(ask);
+                }
+            }
+            expired
+        };
+        for ask in expired {
+            let _ = ask.completion.send(Err(AskError::DeadlineExceeded));
         }
     }
 }
@@ -671,36 +829,44 @@ fn duration_nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-fn rewrite_timeout_budget(frame: &mut Frame, timeout_nanos: u64) -> bool {
-    match frame.kind {
-        FrameKind::Ask => frame
-            .decode_message::<AskWire>()
-            .ok()
-            .is_some_and(|mut wire| {
-                wire.timeout_nanos = timeout_nanos;
-                *frame = Frame::encode_message(FrameKind::Ask, &wire);
-                true
-            }),
-        FrameKind::EntityAsk => {
-            frame
-                .decode_message::<EntityAskWire>()
-                .ok()
-                .is_some_and(|mut wire| {
-                    wire.timeout_nanos = timeout_nanos;
-                    *frame = Frame::encode_message(FrameKind::EntityAsk, &wire);
-                    true
-                })
+enum DecodedAsk {
+    Exact(AskWire),
+    Entity(EntityAskWire),
+    Singleton(SingletonAskWire),
+}
+
+impl DecodedAsk {
+    fn decode(frame: &Frame) -> Option<Self> {
+        match frame.kind {
+            FrameKind::Ask => frame.decode_message().ok().map(Self::Exact),
+            FrameKind::EntityAsk => frame.decode_message().ok().map(Self::Entity),
+            FrameKind::SingletonAsk => frame.decode_message().ok().map(Self::Singleton),
+            _ => None,
         }
-        FrameKind::SingletonAsk => {
-            frame
-                .decode_message::<SingletonAskWire>()
-                .ok()
-                .is_some_and(|mut wire| {
-                    wire.timeout_nanos = timeout_nanos;
-                    *frame = Frame::encode_message(FrameKind::SingletonAsk, &wire);
-                    true
-                })
+    }
+
+    fn correlation(&self) -> Option<CorrelationId> {
+        let bytes = match self {
+            Self::Exact(wire) => &wire.correlation_id,
+            Self::Entity(wire) => &wire.correlation_id,
+            Self::Singleton(wire) => &wire.correlation_id,
+        };
+        CorrelationId::from_bytes(bytes)
+    }
+
+    fn set_timeout(&mut self, timeout_nanos: u64) {
+        match self {
+            Self::Exact(wire) => wire.timeout_nanos = timeout_nanos,
+            Self::Entity(wire) => wire.timeout_nanos = timeout_nanos,
+            Self::Singleton(wire) => wire.timeout_nanos = timeout_nanos,
         }
-        _ => false,
+    }
+
+    fn into_frame(self) -> Frame {
+        match self {
+            Self::Exact(wire) => Frame::encode_message(FrameKind::Ask, &wire),
+            Self::Entity(wire) => Frame::encode_message(FrameKind::EntityAsk, &wire),
+            Self::Singleton(wire) => Frame::encode_message(FrameKind::SingletonAsk, &wire),
+        }
     }
 }

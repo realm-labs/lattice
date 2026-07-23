@@ -15,6 +15,7 @@ rustls-aws-lc = ["tls", "tokio-rustls/aws_lc_rs"]
 async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
 lattice-core.workspace = true
 prost.workspace = true
 serde.workspace = true
