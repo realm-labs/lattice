@@ -125,6 +125,45 @@ fn actor_completion_benchmark(c: &mut Criterion) {
         .expect("actor completion shutdown");
 }
 
+fn local_actor_ask_benchmark(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("benchmark runtime");
+    let config = BenchmarkConfig::from_env();
+    let topology = runtime
+        .block_on(ActorCompletionTopology::start_timing(1024))
+        .expect("local ask topology");
+    let mut group = c.benchmark_group("local_actor_ask");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
+    group.throughput(Throughput::Elements(config.round_trip_requests as u64));
+    for window in [1_usize, 64, 256] {
+        group.bench_with_input(
+            BenchmarkId::new(format!("window_{window}"), config.payload_bytes),
+            &config,
+            |bench, config| {
+                let topology = &topology;
+                let requests = config.round_trip_requests;
+                let payload_bytes = config.payload_bytes;
+                bench
+                    .to_async(&runtime)
+                    .iter_custom(move |iterations| async move {
+                        topology
+                            .run_ask_timing(
+                                requests.saturating_mul(iterations as usize),
+                                payload_bytes,
+                                window,
+                            )
+                            .await
+                            .expect("local actor ask workload")
+                    });
+            },
+        );
+    }
+    group.finish();
+    runtime
+        .block_on(topology.shutdown())
+        .expect("local ask topology shutdown");
+}
+
 fn remote_actor_round_trip_benchmark(c: &mut Criterion) {
     let runtime = Runtime::new().expect("benchmark runtime");
     let config = BenchmarkConfig::from_env();
@@ -152,6 +191,29 @@ fn remote_actor_round_trip_benchmark(c: &mut Criterion) {
                 });
         },
     );
+    for window in [64_usize, 256] {
+        group.bench_with_input(
+            BenchmarkId::new(format!("tcp_ask_window_{window}"), config.payload_bytes),
+            &config,
+            |bench, config| {
+                let topology = &topology;
+                let requests = config.round_trip_requests;
+                let payload_bytes = config.payload_bytes;
+                bench
+                    .to_async(&runtime)
+                    .iter_custom(move |iterations| async move {
+                        topology
+                            .run_timing_windowed(
+                                requests.saturating_mul(iterations as usize),
+                                payload_bytes,
+                                window,
+                            )
+                            .await
+                            .expect("remote actor windowed round-trip workload")
+                    });
+            },
+        );
+    }
     group.finish();
     runtime
         .block_on(topology.shutdown())
@@ -202,6 +264,7 @@ criterion_group!(
     benches,
     remoting_benchmark,
     actor_completion_benchmark,
+    local_actor_ask_benchmark,
     remote_actor_round_trip_benchmark,
     wire_codec_benchmark
 );

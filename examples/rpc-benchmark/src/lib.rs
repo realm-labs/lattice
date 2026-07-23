@@ -6,7 +6,11 @@ use lattice_remoting::{association::AssociationError, messaging::error::TellErro
 use tokio::task::JoinHandle;
 
 pub mod matrix;
+pub mod measurement;
 pub mod metrics;
+pub mod saturation;
+pub mod scaling;
+pub mod suite;
 
 use std::{sync::Arc, time::Instant};
 

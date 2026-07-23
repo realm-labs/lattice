@@ -616,9 +616,9 @@ under the explicit five-minute development-test limit.
 - A 30-second bounded-resource soak passed with seed 17 in `20260712t120231z-96913`; the attempted
   four-hour seed-20260712 run was stopped when the five-minute test limit was introduced and is not
   claimed as release evidence.
-- The release benchmark records 661,989 remote admissions/s, 19 allocations/message, stable FDs,
-  and the full local/remote/shard/allocation/rebalance/handoff/reconnect matrix in
-  `docs/baselines/post-hard-switch.md`.
+- The original hard-switch benchmark remains available in Git history. The current reproducible
+  completion, scaling, saturation, resource, and persistence baseline is maintained in
+  `docs/baselines/current-performance.md`.
 
 ### Phase 0: Architecture Reset
 

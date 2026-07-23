@@ -36,13 +36,17 @@ impl WorkloadReport {
     pub fn percentile_latency(&self, percentile: f64) -> Duration {
         percentile_duration(&self.latencies, percentile)
     }
+
+    pub fn latency_sample_count(&self) -> usize {
+        self.latencies.len()
+    }
 }
 
 impl fmt::Display for WorkloadReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{}: requests={} successes={} errors={} throughput={:.2}/s avg={} p50={} p95={} p99={} actors={}",
+            "{}: requests={} successes={} errors={} throughput={:.2}/s avg={} p50={} p95={} p99={} p99.9={} actors={}",
             self.name,
             self.requests,
             self.successes,
@@ -52,6 +56,7 @@ impl fmt::Display for WorkloadReport {
             format_duration(self.percentile_latency(0.50)),
             format_duration(self.percentile_latency(0.95)),
             format_duration(self.percentile_latency(0.99)),
+            format_duration(self.percentile_latency(0.999)),
             self.observed_actor_ids.len()
         )
     }

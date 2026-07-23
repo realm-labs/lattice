@@ -7,12 +7,14 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use lattice_actor::{
     error::{ActorError, ActorTellError},
     mailbox::MailboxConfig,
     observation::{ActorMetadata, ActorObserver, ActorObserverHandle},
     registry::{ActorRegistry, ActorRegistryConfig},
-    traits::{Actor, Handler, MessageMetadata, MessageOutcome},
+    reply::ReplyTo,
+    traits::{Actor, Handler, MessageMetadata, MessageOutcome, Request, Responder},
 };
 use lattice_core::{actor_kind, id::ActorId};
 use tokio::sync::Notify;
@@ -113,6 +115,12 @@ struct RawCompletionTell {
     payload: Bytes,
 }
 
+struct CompletionAsk(Bytes);
+
+impl Request for CompletionAsk {
+    type Response = Bytes;
+}
+
 #[derive(lattice_actor::Message)]
 struct CompletionBarrier {
     completed: Arc<Notify>,
@@ -148,6 +156,18 @@ impl Handler<RawCompletionTell> for CompletionActor {
     ) -> Result<(), Self::Error> {
         self.processed_bytes = self.processed_bytes.wrapping_add(message.payload.len());
         Ok(())
+    }
+}
+
+impl Responder<CompletionAsk> for CompletionActor {
+    async fn respond(
+        &mut self,
+        _context: &mut HandlerContext<'_, Self>,
+        request: CompletionAsk,
+        reply_to: ReplyTo<Bytes>,
+    ) -> Result<(), Self::Error> {
+        self.processed_bytes = self.processed_bytes.wrapping_add(request.0.len());
+        reply_to.send(request.0).map_err(ActorError::from_error)
     }
 }
 
@@ -322,6 +342,83 @@ impl ActorCompletionTopology {
         })
     }
 
+    pub async fn run_ask(
+        &self,
+        requests: usize,
+        payload_bytes: usize,
+        window: usize,
+    ) -> Result<WorkloadReport, Box<dyn Error>> {
+        let payload = Bytes::from(vec![0_u8; payload_bytes]);
+        let window = window.max(1).min(requests.max(1));
+        let mut in_flight = FuturesUnordered::new();
+        let mut sent = 0;
+        let mut latencies = Vec::with_capacity(requests);
+        let started = Instant::now();
+        while sent < requests || !in_flight.is_empty() {
+            while sent < requests && in_flight.len() < window {
+                let handle = self.handle.clone();
+                let request_payload = payload.clone();
+                in_flight.push(async move {
+                    let request_started = Instant::now();
+                    let reply = handle
+                        .ask(CompletionAsk(request_payload), Duration::from_secs(5))
+                        .await;
+                    (request_started.elapsed(), reply)
+                });
+                sent += 1;
+            }
+            let Some((latency, reply)) = in_flight.next().await else {
+                break;
+            };
+            let reply = reply?;
+            if reply.len() != payload_bytes {
+                return Err("local echo returned a different payload length".into());
+            }
+            latencies.push(latency);
+        }
+        Ok(WorkloadReport {
+            name: "local_actor_ask",
+            requests,
+            successes: latencies.len(),
+            errors: requests.saturating_sub(latencies.len()),
+            elapsed: started.elapsed(),
+            latencies,
+            observed_actor_ids: [self.handle.local_ref().id()].into_iter().collect(),
+        })
+    }
+
+    pub async fn run_ask_timing(
+        &self,
+        requests: usize,
+        payload_bytes: usize,
+        window: usize,
+    ) -> Result<Duration, Box<dyn Error>> {
+        let payload = Bytes::from(vec![0_u8; payload_bytes]);
+        let window = window.max(1).min(requests.max(1));
+        let mut in_flight = FuturesUnordered::new();
+        let mut sent = 0;
+        let started = Instant::now();
+        while sent < requests || !in_flight.is_empty() {
+            while sent < requests && in_flight.len() < window {
+                let handle = self.handle.clone();
+                let request_payload = payload.clone();
+                in_flight.push(async move {
+                    handle
+                        .ask(CompletionAsk(request_payload), Duration::from_secs(5))
+                        .await
+                });
+                sent += 1;
+            }
+            let Some(reply) = in_flight.next().await else {
+                break;
+            };
+            if reply?.len() != payload_bytes {
+                return Err("local echo returned a different payload length".into());
+            }
+        }
+        Ok(started.elapsed())
+    }
+
     pub async fn shutdown(&self) -> Result<(), Box<dyn Error>> {
         let drained = self.registry.drain().await;
         if !drained.completed() {
@@ -351,6 +448,15 @@ mod tests {
         let report = topology.run_raw(16, 32).await.unwrap();
         assert_eq!(report.requests, 16);
         assert!(report.throughput_per_second().is_finite());
+        topology.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_ask_window_completes_every_request() {
+        let topology = ActorCompletionTopology::start_timing(8).await.unwrap();
+        let report = topology.run_ask(32, 64, 8).await.unwrap();
+        assert_eq!(report.successes, 32);
+        assert_eq!(report.latency_sample_count(), 32);
         topology.shutdown().await.unwrap();
     }
 }

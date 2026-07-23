@@ -34,6 +34,7 @@ Run:
 ```bash
 cargo bench -p remoting-benchmark --bench remoting_benchmark
 cargo run --release -p remoting-benchmark --bin measure
+cargo run --release -p remoting-benchmark --bin performance_matrix
 ```
 
 Configuration:
@@ -45,7 +46,57 @@ LATTICE_BENCH_PAYLOAD_BYTES=128
 LATTICE_BENCH_BULK_STRIPES=1  # 1..4
 ```
 
-This benchmark is compared with the captured pooled transport baseline in
-`docs/baselines/pre-hard-switch.md`; observed post-switch budgets and allocator/FD measurements are in
-`docs/baselines/post-hard-switch.md`. Real TCP/TLS acceptance remains separate so queue admission is
-not confused with end-to-end delivery.
+## Performance matrix
+
+`performance_matrix` emits one machine-readable JSON document covering four distinct questions:
+
+- local and loopback-TCP tell/ask completion across payload sizes;
+- local and remote ask throughput and latency across in-flight windows;
+- local tell scaling across producer and Actor counts;
+- local tell behavior at fixed offered rates around the calibrated completion peak.
+
+Tell throughput ends when the destination Actor processes a trailing barrier/marker. Ask throughput
+ends when every reply is received. Neither is an admission-only measurement. Per-request ask
+latencies and sampled saturation latencies include queueing and handler completion, and report
+p50/p95/p99/p99.9. The saturation producer is open-loop: mailbox-full attempts are counted as
+rejections instead of being retried. It runs on dedicated producer threads and reports skipped
+scheduled arrivals plus maximum schedule lag, so an underpowered load generator is visible instead
+of silently turning delayed arrivals into an unbounded burst. Catch-up bursts are bounded by both the
+configured burst horizon and one quarter of the mailbox capacity.
+
+Every row also records process user/system CPU time, allocation/deallocation/reallocation calls,
+allocated/deallocated bytes, and per-operation CPU/allocation costs. Process CPU includes all runtime,
+client, server, and transport tasks active during the row. Run the binary in release mode; the output
+records whether debug assertions were enabled to prevent accidental debug/release comparisons.
+The JSON keeps two peak calibrations: the normal local tell completion path and the dedicated-producer
+path used by the saturation test. Fixed offered rates are derived from the latter, so producer
+contention and pacing cost are not hidden behind a faster, structurally different calibration.
+
+Matrix configuration:
+
+```text
+LATTICE_BENCH_TELL_REQUESTS=100000
+LATTICE_BENCH_ASK_REQUESTS=10000
+LATTICE_BENCH_SCALING_REQUESTS=1000000
+LATTICE_BENCH_CALIBRATION_REQUESTS=1000000
+LATTICE_BENCH_CALIBRATION_ROUNDS=3
+LATTICE_BENCH_PAYLOAD_MATRIX=0,128,1024,16384
+LATTICE_BENCH_ASK_WINDOWS=1,64,256
+LATTICE_BENCH_PRODUCERS=1,4,16
+LATTICE_BENCH_ACTORS=1,16,256
+LATTICE_BENCH_MAILBOX_CAPACITY=1024
+LATTICE_BENCH_SATURATION_MILLIS=10000
+LATTICE_BENCH_SATURATION_FRACTIONS=0.25,0.5,0.75,0.9,1.0,1.1
+LATTICE_BENCH_SATURATION_SAMPLE_EVERY=1024
+LATTICE_BENCH_SATURATION_BURST_MICROS=1000
+LATTICE_BENCH_SATURATION_PRODUCERS=4
+```
+
+For a longer multicore scaling capture, increase `LATTICE_BENCH_SCALING_REQUESTS` and include `4096`
+in `LATTICE_BENCH_ACTORS`. Producer/Actor scaling is intentionally kept separate from the
+per-message latency path so timestamp collection does not determine its throughput.
+
+The legacy pooled transport snapshot is retained in `docs/baselines/pre-hard-switch.md`. Current
+completion, scaling, saturation, allocator, and persistence results are maintained in
+`docs/baselines/current-performance.md`. Real TCP/TLS acceptance remains separate so queue admission
+is not confused with end-to-end delivery.

@@ -10,6 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use lattice_actor::{
     error::{ActorCallError, ActorError},
     handle::ActorHandle,
@@ -340,7 +341,11 @@ impl RemoteActorTopology {
             loop {
                 match self.prepared_tell.tell(1, encoded.clone()) {
                     Ok(_) => break,
-                    Err(TellError::Association(AssociationError::QueueFull)) => {
+                    Err(TellError::Association(
+                        AssociationError::QueueFull
+                        | AssociationError::ByteBudgetExceeded
+                        | AssociationError::NodeByteBudgetExceeded,
+                    )) => {
                         tokio::task::yield_now().await;
                     }
                     Err(error) => return Err(Box::new(error)),
@@ -364,22 +369,46 @@ impl RemoteActorTopology {
         requests: usize,
         payload_bytes: usize,
     ) -> Result<WorkloadReport, Box<dyn Error>> {
+        self.run_windowed(requests, payload_bytes, 1).await
+    }
+
+    pub async fn run_windowed(
+        &self,
+        requests: usize,
+        payload_bytes: usize,
+        window: usize,
+    ) -> Result<WorkloadReport, Box<dyn Error>> {
         let payload = Bytes::from(vec![0_u8; payload_bytes]);
+        let window = window.max(1).min(requests.max(1));
+        let mut in_flight = FuturesUnordered::new();
+        let mut sent = 0;
         let mut latencies = Vec::with_capacity(requests);
+        let mut errors = 0;
         let started = Instant::now();
-        for _ in 0..requests {
-            let request_started = Instant::now();
-            let reply = self.round_trip(payload.clone()).await?;
-            if reply.len() != payload_bytes {
-                return Err("remote echo returned a different payload length".into());
+        while sent < requests || !in_flight.is_empty() {
+            while sent < requests && in_flight.len() < window {
+                let request_payload = payload.clone();
+                in_flight.push(async move {
+                    let request_started = Instant::now();
+                    let reply = self.round_trip(request_payload).await;
+                    (request_started.elapsed(), reply)
+                });
+                sent += 1;
             }
-            latencies.push(request_started.elapsed());
+            let Some((latency, reply)) = in_flight.next().await else {
+                break;
+            };
+            match reply {
+                Ok(reply) if reply.len() == payload_bytes => latencies.push(latency),
+                Ok(_) => return Err("remote echo returned a different payload length".into()),
+                Err(_) => errors += 1,
+            }
         }
         Ok(WorkloadReport {
             name: "remote_actor_tcp_ask_round_trip",
             requests,
             successes: latencies.len(),
-            errors: requests.saturating_sub(latencies.len()),
+            errors,
             elapsed: started.elapsed(),
             latencies,
             observed_actor_ids: [1].into_iter().collect(),
@@ -391,10 +420,29 @@ impl RemoteActorTopology {
         requests: usize,
         payload_bytes: usize,
     ) -> Result<Duration, Box<dyn Error>> {
+        self.run_timing_windowed(requests, payload_bytes, 1).await
+    }
+
+    pub async fn run_timing_windowed(
+        &self,
+        requests: usize,
+        payload_bytes: usize,
+        window: usize,
+    ) -> Result<Duration, Box<dyn Error>> {
         let payload = Bytes::from(vec![0_u8; payload_bytes]);
+        let window = window.max(1).min(requests.max(1));
+        let mut in_flight = FuturesUnordered::new();
+        let mut sent = 0;
         let started = Instant::now();
-        for _ in 0..requests {
-            let reply = self.round_trip(payload.clone()).await?;
+        while sent < requests || !in_flight.is_empty() {
+            while sent < requests && in_flight.len() < window {
+                in_flight.push(self.round_trip(payload.clone()));
+                sent += 1;
+            }
+            let Some(reply) = in_flight.next().await else {
+                break;
+            };
+            let reply = reply?;
             if reply.len() != payload_bytes {
                 return Err("remote echo returned a different payload length".into());
             }
@@ -473,8 +521,8 @@ mod tests {
         let topology = RemoteActorTopology::start(1).await.unwrap();
         let tell = topology.run_tell(4, 64).await.unwrap();
         assert_eq!(tell.successes, 4);
-        let report = topology.run(4, 64).await.unwrap();
-        assert_eq!(report.successes, 4);
+        let report = topology.run_windowed(8, 64, 4).await.unwrap();
+        assert_eq!(report.successes, 8);
         assert!(report.latencies.iter().all(|latency| !latency.is_zero()));
         topology.shutdown().await.unwrap();
     }
