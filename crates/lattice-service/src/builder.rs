@@ -44,11 +44,13 @@ use lattice_placement::{
     storage::{CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore},
     types::NodeKey,
 };
+#[cfg(feature = "tls")]
+use lattice_remoting::endpoint::EndpointSecurity;
 use lattice_remoting::{
     association::{Association, AssociationKey, AssociationManager},
     bootstrap::BootstrapLeader,
     control::{ControlDispatch, RejectControlDispatch},
-    endpoint::{EndpointSecurity, RemotingEndpoint},
+    endpoint::RemotingEndpoint,
     handshake::NodeIdentity,
     messaging::outbound::OutboundMessaging,
     protocol::{ProtocolDescriptor, ProtocolFingerprint},
@@ -108,6 +110,7 @@ pub struct LatticeServiceBuilder {
     logic_runtime: Option<LogicRuntimeAssembly>,
     control_scope: Option<AssociationKey>,
     coordinator_runtime: Option<CoordinatorRuntimeAssembly>,
+    #[cfg(feature = "tls")]
     endpoint_security: Option<EndpointSecurity>,
     discoveries: BTreeMap<CoordinatorScope, Arc<dyn CoordinatorDiscovery>>,
     join_config: ClusterJoinConfig,
@@ -165,6 +168,7 @@ impl LatticeServiceBuilder {
             logic_runtime: None,
             control_scope: None,
             coordinator_runtime: None,
+            #[cfg(feature = "tls")]
             endpoint_security: None,
             discoveries: BTreeMap::new(),
             join_config: ClusterJoinConfig::default(),
@@ -590,6 +594,7 @@ impl LatticeServiceBuilder {
         self
     }
 
+    #[cfg(feature = "tls")]
     pub fn endpoint_security(mut self, security: EndpointSecurity) -> Self {
         self.endpoint_security = Some(security);
         self
@@ -944,6 +949,7 @@ impl LatticeServiceBuilder {
                 })
                 .collect(),
         );
+        #[cfg(feature = "tls")]
         let endpoint_builder = match self.endpoint_security {
             Some(security) => endpoint_builder.security(security),
             None => endpoint_builder,

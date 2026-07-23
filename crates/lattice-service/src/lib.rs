@@ -1,3 +1,9 @@
+//! Cluster services and lifecycle assembly for Lattice.
+//!
+//! TLS support follows `lattice-remoting`: the default `rustls-ring` feature enables TLS with
+//! ring, while `rustls-aws-lc` selects AWS-LC when default features are disabled. Building with
+//! default features disabled omits the endpoint TLS configuration API and uses plaintext remoting.
+
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
 pub mod backend;

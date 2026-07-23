@@ -16,8 +16,7 @@ use lattice_remoting::{
         BootstrapRequest, BootstrapResponse, BootstrapResult, BootstrapRoute,
     },
     config::RemotingConfig,
-    control::RejectControlDispatch,
-    endpoint::{EndpointError, EndpointSecurity, RemotingEndpoint},
+    endpoint::{EndpointError, RemotingEndpoint},
     handshake::{FeatureBits, NodeIdentity},
     messaging::{
         error::RemoteMessageError, inbound::InboundDispatch, outbound::OutboundMessaging,
@@ -27,8 +26,12 @@ use lattice_remoting::{
     transport::connect_tcp,
     wire::{Frame, FrameCodec, FrameKind},
 };
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
+use lattice_remoting::{control::RejectControlDispatch, endpoint::EndpointSecurity};
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
 use rcgen::{CertificateParams, KeyPair, SanType};
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
 use tokio_rustls::rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     client::WebPkiServerVerifier,
@@ -38,6 +41,16 @@ use tokio_rustls::rustls::{
 };
 
 struct RejectDispatch;
+
+#[cfg(feature = "rustls-ring")]
+fn test_crypto_provider() -> Arc<CryptoProvider> {
+    Arc::new(tokio_rustls::rustls::crypto::ring::default_provider())
+}
+
+#[cfg(all(not(feature = "rustls-ring"), feature = "rustls-aws-lc"))]
+fn test_crypto_provider() -> Arc<CryptoProvider> {
+    Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider())
+}
 
 #[async_trait]
 impl InboundDispatch for RejectDispatch {
@@ -492,9 +505,9 @@ async fn validated_probe_does_not_retarget_existing_incarnation() {
     server.shutdown().await.unwrap();
 }
 
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
 #[tokio::test]
 async fn tls_probe_binds_returned_identity_to_certificate_incarnation() {
-    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
     let server_port = free_port().await;
     let cluster = ClusterId::new("tls-probe").unwrap();
     let client_identity = identity(cluster.clone(), "client", 11, server_port - 1);
@@ -522,9 +535,9 @@ async fn tls_probe_binds_returned_identity_to_certificate_incarnation() {
     server.shutdown().await.unwrap();
 }
 
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
 #[tokio::test]
 async fn tls_probe_rejects_certificate_for_different_incarnation() {
-    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
     let server_port = free_port().await;
     let cluster = ClusterId::new("tls-mismatch").unwrap();
     let client_identity = identity(cluster.clone(), "client", 21, server_port - 1);
@@ -619,6 +632,7 @@ fn endpoint_with_config(
     (endpoint, manager)
 }
 
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
 fn endpoint_with_security(
     identity: NodeIdentity,
     security: EndpointSecurity,
@@ -657,6 +671,7 @@ fn endpoint_with_security(
     (endpoint, manager)
 }
 
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
 fn tls_security_pair(
     client_identity: &NodeIdentity,
     server_identity: &NodeIdentity,
@@ -664,7 +679,7 @@ fn tls_security_pair(
 ) -> (EndpointSecurity, EndpointSecurity) {
     let (client_certificate, client_key) = test_certificate(client_identity);
     let (server_certificate, server_key) = test_certificate(server_certificate_identity);
-    let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+    let provider = test_crypto_provider();
 
     let outbound_client_config = client_config(
         provider.clone(),
@@ -700,6 +715,7 @@ fn tls_security_pair(
     (client_security, server_security)
 }
 
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
 fn client_config(
     provider: Arc<CryptoProvider>,
     trusted: CertificateDer<'static>,
@@ -708,7 +724,7 @@ fn client_config(
 ) -> ClientConfig {
     let mut roots = RootCertStore::empty();
     roots.add(trusted).unwrap();
-    let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+    let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
         .build()
         .unwrap();
     ClientConfig::builder_with_provider(provider)
@@ -720,6 +736,7 @@ fn client_config(
         .unwrap()
 }
 
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
 fn server_config(
     provider: Arc<CryptoProvider>,
     trusted: CertificateDer<'static>,
@@ -728,7 +745,7 @@ fn server_config(
 ) -> ServerConfig {
     let mut roots = RootCertStore::empty();
     roots.add(trusted).unwrap();
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+    let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
         .build()
         .unwrap();
     ServerConfig::builder_with_provider(provider)
@@ -739,6 +756,7 @@ fn server_config(
         .unwrap()
 }
 
+#[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
 fn test_certificate(identity: &NodeIdentity) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     let mut params = CertificateParams::new(vec!["lattice.test".to_string()]).unwrap();
     params.subject_alt_names.push(SanType::URI(

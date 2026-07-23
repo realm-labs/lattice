@@ -57,7 +57,7 @@ lattice-discovery-k8s = { path = "crates/lattice-discovery-k8s" }
 lattice-actor = { path = "crates/lattice-actor", version = "0.1.0" }
 lattice-actor-macros = { path = "crates/lattice-actor-macros" }
 lattice-codegen = { path = "crates/lattice-codegen" }
-lattice-remoting = { path = "crates/lattice-remoting" }
+lattice-remoting = { path = "crates/lattice-remoting", default-features = false }
 lattice-eventbus = { path = "crates/lattice-eventbus" }
 lattice-gateway = { path = "crates/lattice-gateway" }
 lattice-id = { path = "crates/lattice-id", version = "0.1.0" }
@@ -90,7 +90,7 @@ tempfile = "3.23.0"
 thiserror = "2.0.18"
 tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
-tokio-rustls = "0.26.4"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12"] }
 toml = "1.1.2"
 tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"

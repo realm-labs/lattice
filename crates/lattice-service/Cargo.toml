@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["rustls-ring"]
+tls = ["lattice-remoting/tls"]
+rustls-ring = ["tls", "lattice-remoting/rustls-ring"]
+rustls-aws-lc = ["tls", "lattice-remoting/rustls-aws-lc"]
+
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true

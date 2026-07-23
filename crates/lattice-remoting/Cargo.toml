@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["rustls-ring"]
+tls = ["dep:tokio-rustls", "dep:x509-parser"]
+rustls-ring = ["tls", "tokio-rustls/ring"]
+rustls-aws-lc = ["tls", "tokio-rustls/aws_lc_rs"]
+
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true
@@ -15,10 +21,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-rustls.workspace = true
+tokio-rustls = { workspace = true, optional = true }
 tracing.workspace = true
 uuid.workspace = true
-x509-parser.workspace = true
+x509-parser = { workspace = true, optional = true }
 
 [dev-dependencies]
 rcgen.workspace = true

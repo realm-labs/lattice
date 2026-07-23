@@ -18,10 +18,13 @@ impl RemotingEndpoint {
             .try_acquire_owned()
             .map_err(|_| EndpointError::ConnectionLimit)?;
         let request = BootstrapRequest::direct_peer(self.local.clone(), &peer);
+        #[cfg(feature = "tls")]
         let tls_server_name = self
             .security
             .as_ref()
             .map(|security| security.server_name.clone());
+        #[cfg(not(feature = "tls"))]
+        let tls_server_name = None;
         let response = tokio::time::timeout(
             self.config.connect_timeout,
             self.probe_request_inner(peer.address.clone(), tls_server_name, request),

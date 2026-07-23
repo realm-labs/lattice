@@ -14,8 +14,11 @@ use tokio::{
     sync::{Mutex as AsyncMutex, Semaphore, broadcast, mpsc::Receiver, watch},
     task::{JoinError, JoinHandle, JoinSet},
 };
+#[cfg(feature = "tls")]
 use tokio_rustls::rustls::{ClientConfig, ServerConfig};
 
+#[cfg(feature = "tls")]
+use crate::transport::{connect_tls, connect_tls_candidate, verify_peer_certificate_identity};
 use crate::{
     association::{
         Association, AssociationError, AssociationId, AssociationManager, AssociationState,
@@ -33,9 +36,8 @@ use crate::{
     messaging::{inbound::InboundDispatch, outbound::OutboundMessaging},
     protocol::ProtocolDescriptor,
     transport::{
-        FramedConnection, NegotiationError, bind_tcp, connect_tcp, connect_tls,
-        connect_tls_candidate, negotiate_inbound_from_frame, negotiate_outbound,
-        verify_peer_certificate_identity,
+        FramedConnection, NegotiationError, bind_tcp, connect_tcp, negotiate_inbound_from_frame,
+        negotiate_outbound,
     },
     wire::{Frame, FrameCodec, FrameKind, WireError},
 };
@@ -59,11 +61,13 @@ pub struct RemotingEndpoint {
     shutdown_tx: watch::Sender<bool>,
     disconnect_tx: broadcast::Sender<AssociationId>,
     tasks: Mutex<Vec<JoinHandle<Result<(), EndpointError>>>>,
+    #[cfg(feature = "tls")]
     security: Option<EndpointSecurity>,
     connect_lock: AsyncMutex<()>,
     bootstrap_handler: RwLock<Arc<dyn BootstrapHandler>>,
 }
 
+#[cfg(feature = "tls")]
 #[derive(Clone)]
 pub struct EndpointSecurity {
     pub client: Arc<ClientConfig>,
@@ -79,6 +83,7 @@ pub struct RemotingEndpointBuilder {
     dispatch: Arc<dyn InboundDispatch>,
     control_dispatch: Arc<dyn ControlDispatch>,
     catalogue: Vec<ProtocolDescriptor>,
+    #[cfg(feature = "tls")]
     security: Option<EndpointSecurity>,
 }
 
@@ -93,6 +98,7 @@ impl RemotingEndpointBuilder {
         self
     }
 
+    #[cfg(feature = "tls")]
     pub fn security(mut self, security: EndpointSecurity) -> Self {
         self.security = Some(security);
         self
@@ -102,12 +108,15 @@ impl RemotingEndpointBuilder {
         self.config
             .validate()
             .map_err(AssociationError::InvalidConfig)?;
-        if self
-            .security
-            .as_ref()
-            .is_some_and(|security| security.server_name.is_empty())
+        #[cfg(feature = "tls")]
         {
-            return Err(EndpointError::InvalidSecurity);
+            if self
+                .security
+                .as_ref()
+                .is_some_and(|security| security.server_name.is_empty())
+            {
+                return Err(EndpointError::InvalidSecurity);
+            }
         }
         if self.catalogue.len() > self.config.max_protocols_per_peer {
             return Err(EndpointError::ProtocolLimit);
@@ -127,6 +136,7 @@ impl RemotingEndpointBuilder {
             shutdown_tx,
             disconnect_tx,
             tasks: Mutex::new(Vec::new()),
+            #[cfg(feature = "tls")]
             security: self.security,
             connect_lock: AsyncMutex::new(()),
             bootstrap_handler: RwLock::new(Arc::new(AcceptBootstrap)),
@@ -150,6 +160,7 @@ impl RemotingEndpoint {
             dispatch,
             control_dispatch: Arc::new(RejectControlDispatch),
             catalogue: Vec::new(),
+            #[cfg(feature = "tls")]
             security: None,
         }
     }
@@ -293,6 +304,7 @@ impl RemotingEndpoint {
         request: BootstrapRequest,
     ) -> Result<BootstrapResponse, EndpointError> {
         let codec = FrameCodec::new(self.config.max_frame_size)?;
+        #[cfg(feature = "tls")]
         let (mut connection, peer_certificate) = match &self.security {
             Some(security) => {
                 let server_name = tls_server_name.unwrap_or_else(|| security.server_name.clone());
@@ -315,14 +327,25 @@ impl RemotingEndpoint {
                 None,
             ),
         };
+        #[cfg(not(feature = "tls"))]
+        let mut connection = {
+            let _ = tls_server_name;
+            FramedConnection::new(
+                EndpointStream::Plain(connect_tcp(&address, codec).await?.into_inner()),
+                FrameCodec::new(self.config.max_frame_size)?,
+            )
+        };
         connection.write_frame(&request.to_frame()).await?;
         connection.flush().await?;
         let response = BootstrapResponse::from_frame(&connection.read_frame().await?)?;
         response.validate_for(&request)?;
-        if let (Some(certificate), Some(remote)) =
-            (peer_certificate.as_deref(), response.remote_identity())
+        #[cfg(feature = "tls")]
         {
-            verify_peer_certificate_identity(certificate, remote)?;
+            if let (Some(certificate), Some(remote)) =
+                (peer_certificate.as_deref(), response.remote_identity())
+            {
+                verify_peer_certificate_identity(certificate, remote)?;
+            }
         }
         connection.close().await?;
         Ok(response)
@@ -468,9 +491,12 @@ impl RemotingEndpoint {
         lane: LaneKind,
     ) -> Result<(EndpointStream, u128), EndpointError> {
         let codec = FrameCodec::new(self.config.max_frame_size)?;
+        #[cfg(feature = "tls")]
         let security = self.security.clone();
         let address = peer.address.clone();
+        #[cfg(feature = "tls")]
         let expected_peer = peer.clone();
+        #[cfg(feature = "tls")]
         let mut connection = match security {
             Some(security) => connect_tls(
                 &address,
@@ -495,6 +521,13 @@ impl RemotingEndpoint {
                 )
             }),
         }?;
+        #[cfg(not(feature = "tls"))]
+        let mut connection = connect_tcp(&address, codec).await.map(|connection| {
+            FramedConnection::new(
+                EndpointStream::Plain(connection.into_inner()),
+                FrameCodec::new(self.config.max_frame_size).expect("validated endpoint frame size"),
+            )
+        })?;
         let nonce = uuid::Uuid::new_v4().as_u128();
         let handshake = Handshake {
             source: self.local.clone(),
@@ -567,6 +600,7 @@ impl RemotingEndpoint {
             self.config.bulk_stripes,
         )?;
         stream.set_nodelay(true).map_err(WireError::Io)?;
+        #[cfg(feature = "tls")]
         let (stream, peer_certificate) = if let Some(security) = &self.security {
             let stream = tokio_rustls::TlsAcceptor::from(security.server.clone())
                 .accept(stream)
@@ -583,6 +617,8 @@ impl RemotingEndpoint {
         } else {
             (EndpointStream::Plain(stream), None)
         };
+        #[cfg(not(feature = "tls"))]
+        let (stream, peer_certificate) = (EndpointStream::Plain(stream), Option::<Vec<u8>>::None);
         let mut connection =
             FramedConnection::new(stream, FrameCodec::new(self.config.max_frame_size)?);
         let first_frame = connection.read_frame().await?;
@@ -599,8 +635,11 @@ impl RemotingEndpoint {
             self.config.max_protocols_per_peer,
         )
         .await?;
-        if let Some(certificate) = peer_certificate {
-            verify_peer_certificate_identity(&certificate, &handshake.source)?;
+        #[cfg(feature = "tls")]
+        {
+            if let Some(certificate) = peer_certificate {
+                verify_peer_certificate_identity(&certificate, &handshake.source)?;
+            }
         }
         if self
             .associations
@@ -649,11 +688,18 @@ impl RemotingEndpoint {
         first_frame: Frame,
     ) -> Result<(), EndpointError> {
         let request = BootstrapRequest::from_frame(&first_frame)?;
+        #[cfg(feature = "tls")]
+        let authentication_failed = peer_certificate.is_some_and(|certificate| {
+            verify_peer_certificate_identity(certificate, &request.local).is_err()
+        });
+        #[cfg(not(feature = "tls"))]
+        let authentication_failed = {
+            let _ = peer_certificate;
+            false
+        };
         let mut response = if let Some(code) = request.rejection(&self.local) {
             BootstrapResponse::rejected(request.nonce, code)
-        } else if peer_certificate.is_some_and(|certificate| {
-            verify_peer_certificate_identity(certificate, &request.local).is_err()
-        }) {
+        } else if authentication_failed {
             BootstrapResponse::rejected(
                 request.nonce,
                 BootstrapRejectionCode::AuthenticationFailure,

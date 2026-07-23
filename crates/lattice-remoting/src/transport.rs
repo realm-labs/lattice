@@ -1,7 +1,6 @@
-use std::{
-    io::{Error, ErrorKind, IoSlice},
-    sync::Arc,
-};
+use std::io::{Error, ErrorKind, IoSlice};
+#[cfg(feature = "tls")]
+use std::sync::Arc;
 
 use bytes::{BufMut, BytesMut};
 use lattice_core::{actor_ref::NodeAddress, failpoint::Failpoint};
@@ -9,20 +8,24 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
+#[cfg(feature = "tls")]
 use tokio_rustls::{
     TlsAcceptor, TlsConnector,
     client::TlsStream as ClientTlsStream,
     rustls::{ClientConfig, ServerConfig, pki_types::ServerName},
     server::TlsStream as ServerTlsStream,
 };
+#[cfg(feature = "tls")]
 use x509_parser::{
     extensions::{GeneralName, ParsedExtension},
     parse_x509_certificate,
 };
 
+#[cfg(feature = "tls")]
+use crate::handshake::NodeIdentity;
 use crate::{
     association::LaneKind,
-    handshake::{Handshake, HandshakeAck, HandshakeError, HandshakeValidator, NodeIdentity},
+    handshake::{Handshake, HandshakeAck, HandshakeError, HandshakeValidator},
     protocol::{CatalogueError, ProtocolDescriptor, catalogue_frame, decode_catalogue_frame},
     wire::{Frame, FrameCodec, MAX_FRAME_PAYLOAD_SEGMENTS, WireError},
 };
@@ -591,6 +594,7 @@ pub async fn bind_tcp(address: &NodeAddress) -> Result<TcpListener, WireError> {
         .map_err(WireError::Io)
 }
 
+#[cfg(feature = "tls")]
 pub async fn connect_tls(
     address: &NodeAddress,
     server_name: String,
@@ -618,6 +622,7 @@ pub async fn connect_tls(
     Ok(FramedConnection::new(stream, codec))
 }
 
+#[cfg(feature = "tls")]
 pub async fn connect_tls_candidate(
     address: &NodeAddress,
     server_name: String,
@@ -642,6 +647,7 @@ pub async fn connect_tls_candidate(
     Ok((FramedConnection::new(stream, codec), certificate))
 }
 
+#[cfg(feature = "tls")]
 pub async fn accept_tls(
     stream: TcpStream,
     config: Arc<ServerConfig>,
@@ -665,6 +671,7 @@ pub async fn accept_tls(
     Ok(FramedConnection::new(stream, codec))
 }
 
+#[cfg(feature = "tls")]
 pub fn verify_peer_certificate_identity(
     certificate_der: &[u8],
     expected_peer: &NodeIdentity,
@@ -709,14 +716,17 @@ mod tests {
 
     use bytes::Bytes;
     use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation, ProtocolId};
+    #[cfg(feature = "tls")]
     use rcgen::{CertificateParams, KeyPair, SanType};
     use tokio::{
         io::{AsyncRead, AsyncWrite, ReadBuf},
         net::{TcpListener, TcpStream},
     };
+    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
     use tokio_rustls::rustls::{
         RootCertStore,
         client::WebPkiServerVerifier,
+        crypto::CryptoProvider,
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
         server::WebPkiClientVerifier,
     };
@@ -724,7 +734,7 @@ mod tests {
     use super::*;
     use crate::{
         association::{AssociationId, LaneKind},
-        handshake::{FeatureBits, Handshake},
+        handshake::{FeatureBits, Handshake, NodeIdentity},
         protocol::{ProtocolDescriptor, ProtocolFingerprint},
         wire::{FrameEnvelope, FrameKind, INLINE_FRAME_SEGMENT_CAPACITY},
     };
@@ -737,6 +747,16 @@ mod tests {
     struct CountingReader {
         bytes: Bytes,
         reads: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "rustls-ring")]
+    fn test_crypto_provider() -> Arc<CryptoProvider> {
+        Arc::new(tokio_rustls::rustls::crypto::ring::default_provider())
+    }
+
+    #[cfg(all(not(feature = "rustls-ring"), feature = "rustls-aws-lc"))]
+    fn test_crypto_provider() -> Arc<CryptoProvider> {
+        Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider())
     }
 
     impl AsyncRead for CountingReader {
@@ -801,6 +821,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
     fn test_certificate(
         identity: &NodeIdentity,
     ) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
@@ -1079,6 +1100,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg(feature = "tls")]
     #[test]
     fn certificate_identity_is_bound_to_cluster_node_and_incarnation() {
         let expected = NodeIdentity {
@@ -1107,9 +1129,9 @@ mod tests {
         ));
     }
 
+    #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc"))]
     #[tokio::test]
     async fn real_mutual_tls_socket_verifies_both_node_identities() {
-        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socket = listener.local_addr().unwrap();
         let cluster_id = ClusterId::new("tls-test").unwrap();
@@ -1127,12 +1149,13 @@ mod tests {
         };
         let (client_certificate, client_key) = test_certificate(&client_identity);
         let (server_certificate, server_key) = test_certificate(&server_identity);
+        let provider = test_crypto_provider();
         let mut client_roots = RootCertStore::empty();
         client_roots.add(client_certificate.clone()).unwrap();
-        let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
-            .build()
-            .unwrap();
-        let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+        let client_verifier =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(client_roots), provider.clone())
+                .build()
+                .unwrap();
         let server_config = Arc::new(
             ServerConfig::builder_with_provider(provider.clone())
                 .with_safe_default_protocol_versions()
@@ -1143,9 +1166,10 @@ mod tests {
         );
         let mut server_roots = RootCertStore::empty();
         server_roots.add(server_certificate).unwrap();
-        let server_verifier = WebPkiServerVerifier::builder(Arc::new(server_roots))
-            .build()
-            .unwrap();
+        let server_verifier =
+            WebPkiServerVerifier::builder_with_provider(Arc::new(server_roots), provider.clone())
+                .build()
+                .unwrap();
         let client_config = Arc::new(
             ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
