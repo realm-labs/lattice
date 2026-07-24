@@ -9,7 +9,7 @@ use remoting_benchmark::{
     measurement::{CountingAllocator, ResourceDelta, ResourceSnapshot},
     metrics::WorkloadReport,
     saturation::{SaturationReport, SaturationTopology},
-    scaling::{ActorScaleTopology, ScaleReport},
+    scaling::{ActorScaleTopology, MailboxContentionReport, ScaleReport},
     suite::PerformanceSuiteConfig,
 };
 use serde_json::{Value, json};
@@ -113,6 +113,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     remote.shutdown().await?;
 
+    eprintln!("measuring single-actor mailbox producer contention without capacity pressure");
+    let contention_topology =
+        ActorScaleTopology::start_contention(config.mailbox_contention_requests).await?;
+    contention_topology
+        .run_contention(
+            config.mailbox_contention_requests.min(1_000),
+            config.primary_payload_bytes(),
+            1,
+            1,
+        )
+        .await?;
+    let mut mailbox_contention = Vec::new();
+    for &producer_count in &config.producer_counts {
+        let before = ResourceSnapshot::now();
+        let report = contention_topology
+            .run_contention(
+                config.mailbox_contention_requests,
+                config.primary_payload_bytes(),
+                producer_count,
+                config.mailbox_contention_rounds,
+            )
+            .await?;
+        let resources = ResourceSnapshot::now().delta_since(before);
+        mailbox_contention.push(contention_value(
+            config.primary_payload_bytes(),
+            &report,
+            resources,
+        ));
+    }
+    contention_topology.shutdown().await?;
+
     eprintln!("measuring producer/actor scaling matrix");
     let scale_payload = config.primary_payload_bytes();
     let mut scaling = Vec::new();
@@ -189,6 +220,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "tell_requests": config.tell_requests,
             "ask_requests": config.ask_requests,
             "scaling_requests": config.scaling_requests,
+            "mailbox_contention_requests": config.mailbox_contention_requests,
+            "mailbox_contention_rounds": config.mailbox_contention_rounds,
             "calibration_requests": config.calibration_requests,
             "calibration_rounds": config.calibration_rounds,
             "calibration_throughput_samples": calibration_peaks,
@@ -208,11 +241,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "calibrated_saturation_peak_per_second": saturation_peak,
         },
         "workloads": workloads,
+        "mailbox_contention": mailbox_contention,
         "scaling": scaling,
         "saturation": saturation,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+fn contention_value(
+    payload_bytes: usize,
+    report: &MailboxContentionReport,
+    resources: ResourceDelta,
+) -> Value {
+    json!({
+        "name": "local_mailbox_mpsc_contention",
+        "payload_bytes": payload_bytes,
+        "requests": report.requests,
+        "producer_count": report.producer_count,
+        "rounds": report.rounds,
+        "admission_elapsed_nanos": report.admission_elapsed.as_nanos(),
+        "completion_elapsed_nanos": report.completion_elapsed.as_nanos(),
+        "admission_throughput_per_second": report.admission_throughput_per_second(),
+        "completion_throughput_per_second": report.completion_throughput_per_second(),
+        "resources": resource_value(resources, report.requests),
+    })
 }
 
 fn workload_value(

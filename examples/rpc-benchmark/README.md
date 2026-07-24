@@ -48,10 +48,11 @@ LATTICE_BENCH_BULK_STRIPES=1  # 1..4
 
 ## Performance matrix
 
-`performance_matrix` emits one machine-readable JSON document covering four distinct questions:
+`performance_matrix` emits one machine-readable JSON document covering five distinct questions:
 
 - local and loopback-TCP tell/ask completion across payload sizes;
 - local and remote ask throughput and latency across in-flight windows;
+- single-Actor MPSC admission contention without mailbox capacity pressure;
 - local tell scaling across producer and Actor counts;
 - local tell behavior at fixed offered rates around the calibrated completion peak.
 
@@ -63,6 +64,11 @@ rejections instead of being retried. It runs on dedicated producer threads and r
 scheduled arrivals plus maximum schedule lag, so an underpowered load generator is visible instead
 of silently turning delayed arrivals into an unbounded burst. Catch-up bursts are bounded by both the
 configured burst horizon and one quarter of the mailbox capacity.
+
+The MPSC contention workload is the deliberate exception to the completion-only rule: its mailbox
+can hold the entire round, so it never exercises mailbox-full retry behavior. It records both the
+time for all producers to finish admission and the time for the Actor to process a trailing barrier.
+This separates shared-queue contention from bounded-mailbox backpressure and scheduler yielding.
 
 Every row also records process user/system CPU time, allocation/deallocation/reallocation calls,
 allocated/deallocated bytes, and per-operation CPU/allocation costs. Process CPU includes all runtime,
@@ -78,6 +84,8 @@ Matrix configuration:
 LATTICE_BENCH_TELL_REQUESTS=100000
 LATTICE_BENCH_ASK_REQUESTS=10000
 LATTICE_BENCH_SCALING_REQUESTS=1000000
+LATTICE_BENCH_CONTENTION_REQUESTS=250000
+LATTICE_BENCH_CONTENTION_ROUNDS=3
 LATTICE_BENCH_CALIBRATION_REQUESTS=1000000
 LATTICE_BENCH_CALIBRATION_ROUNDS=3
 LATTICE_BENCH_PAYLOAD_MATRIX=0,128,1024,16384

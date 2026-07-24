@@ -4,7 +4,9 @@ This document is the current reproducible performance baseline for Lattice. It r
 boundaries, commands, workload configuration, results, and operating guidance. It is not a
 chronological optimization log.
 
-Last captured on 2026-07-23.
+Last captured on 2026-07-24. The local mailbox scaling and contention tables were recaptured on
+2026-07-24; the remaining tables retain the 2026-07-23 capture because their runtime paths did not
+change.
 
 ## Measurement Boundaries
 
@@ -56,6 +58,7 @@ The default performance matrix uses:
 
 - 100,000 tell messages and 10,000 ask messages;
 - 1,000,000 messages for producer/Actor scaling;
+- three 250,000-message rounds for single-Actor mailbox contention;
 - payload sizes of 0, 128, 1,024, and 16,384 bytes;
 - ask windows of 1, 64, and 256;
 - producer counts of 1, 4, and 16;
@@ -109,17 +112,37 @@ dispatch rather than sender-side budget retries.
 
 ### Producer and Actor Scaling
 
-The following results use 1,000,000 local tell completions per cell.
+The following results are three-run medians using 1,000,000 local tell completions per cell.
 
 | Actors | 1 producer | 4 producers | 16 producers |
 |---:|---:|---:|---:|
-| 1 | 8.899M/s | 3.384M/s | 1.577M/s |
-| 16 | 3.781M/s | 4.272M/s | 4.062M/s |
-| 256 | 2.258M/s | 4.210M/s | 2.897M/s |
+| 1 | 12.834M/s | 5.882M/s | 2.563M/s |
+| 16 | 3.239M/s | 3.108M/s | 3.070M/s |
+| 256 | 3.127M/s | 3.624M/s | 2.258M/s |
 
-A single hot Actor peaks with one producer. Distributed work reaches approximately 4.2M/s with four
-producers. Sixteen producers add enough contention to reduce throughput, especially when they target
-one Actor.
+A single hot Actor peaks with one producer. Replacing the two lifecycle `watch` reads in every
+successful send with one atomic snapshot raised the single-Actor results by 44% to 74% over the
+previous capture. Sixteen producers still add enough shared-queue and cache-line contention to
+reduce throughput. The multi-Actor rows are scheduler-sensitive and should be compared as a full
+matrix rather than treated as isolated peak numbers.
+
+### Single-Actor Mailbox Contention
+
+This targeted workload gives one Actor a mailbox large enough to hold an entire 250,000-message
+round, so no producer encounters mailbox-full backpressure. The capture uses five rounds per cell
+and reports three-run medians. Admission ends when all producers have enqueued their messages;
+completion additionally waits for the Actor to process a trailing barrier.
+
+| Producers | Admission | Completion | CPU ns/op | Allocations/op |
+|---:|---:|---:|---:|---:|
+| 1 | 23.827M/s | 9.123M/s | 110 | 0.973 |
+| 4 | 6.320M/s | 4.507M/s | 694 | 0.958 |
+| 16 | 3.398M/s | 2.846M/s | 2,472 | 0.804 |
+
+The gap between admission and completion shows the consumer becoming the limit with one producer.
+At 4 and 16 producers, shared producer-side queue access increasingly dominates. Allocations are
+expected in this deliberately oversized burst: unlike the bounded scaling workload, the queue can
+grow far beyond the envelope pool's retained reserve.
 
 ### Sustained Saturation
 

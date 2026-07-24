@@ -70,6 +70,25 @@ impl ScaleReport {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct MailboxContentionReport {
+    pub requests: usize,
+    pub producer_count: usize,
+    pub rounds: usize,
+    pub admission_elapsed: Duration,
+    pub completion_elapsed: Duration,
+}
+
+impl MailboxContentionReport {
+    pub fn admission_throughput_per_second(&self) -> f64 {
+        self.requests as f64 / self.admission_elapsed.as_secs_f64()
+    }
+
+    pub fn completion_throughput_per_second(&self) -> f64 {
+        self.requests as f64 / self.completion_elapsed.as_secs_f64()
+    }
+}
+
 pub struct ActorScaleTopology {
     registry: Arc<ActorRegistry<ScaleActor>>,
     handles: Arc<Vec<ActorHandle<ScaleActor>>>,
@@ -80,11 +99,26 @@ impl ActorScaleTopology {
         actor_count: usize,
         mailbox_capacity: usize,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::start_with_mailbox(actor_count, MailboxConfig::bounded(mailbox_capacity.max(1))).await
+    }
+
+    pub async fn start_contention(requests_per_round: usize) -> Result<Self, Box<dyn Error>> {
+        Self::start_with_mailbox(
+            1,
+            MailboxConfig::with_lanes(requests_per_round.max(1), 8).with_deferred_capacity(8),
+        )
+        .await
+    }
+
+    async fn start_with_mailbox(
+        actor_count: usize,
+        mailbox: MailboxConfig,
+    ) -> Result<Self, Box<dyn Error>> {
         let actor_count = actor_count.max(1);
         let registry = Arc::new(ActorRegistry::new(
             actor_kind!("BenchmarkScale"),
             ActorRegistryConfig {
-                mailbox: MailboxConfig::bounded(mailbox_capacity.max(1)),
+                mailbox,
                 ..ActorRegistryConfig::default()
             },
         ));
@@ -99,6 +133,63 @@ impl ActorScaleTopology {
         Ok(Self {
             registry,
             handles: Arc::new(handles),
+        })
+    }
+
+    pub async fn run_contention(
+        &self,
+        requests_per_round: usize,
+        payload_bytes: usize,
+        producer_count: usize,
+        rounds: usize,
+    ) -> Result<MailboxContentionReport, Box<dyn Error>> {
+        let producer_count = producer_count.max(1);
+        let rounds = rounds.max(1);
+        let payload = Bytes::from(vec![0_u8; payload_bytes]);
+        let mut admission_elapsed = Duration::ZERO;
+        let mut completion_elapsed = Duration::ZERO;
+
+        for _ in 0..rounds {
+            let started = Instant::now();
+            let mut tasks = Vec::with_capacity(producer_count);
+            for producer in 0..producer_count {
+                let handle = self.handles[0].clone();
+                let payload = payload.clone();
+                let producer_requests = requests_per_round / producer_count
+                    + usize::from(producer < requests_per_round % producer_count);
+                tasks.push(tokio::spawn(async move {
+                    for _ in 0..producer_requests {
+                        handle.try_tell(ScaleTell(payload.clone())).map_err(
+                            |error| match error {
+                                ActorTellError::MailboxFull(_) => {
+                                    "contention mailbox unexpectedly reached capacity".to_owned()
+                                }
+                                error => error.to_string(),
+                            },
+                        )?;
+                    }
+                    Ok::<_, String>(())
+                }));
+            }
+            for task in tasks {
+                task.await?.map_err(IoError::other)?;
+            }
+            admission_elapsed += started.elapsed();
+
+            let completed = Arc::new(Notify::new());
+            self.handles[0]
+                .tell(ScaleBarrier(completed.clone()))
+                .await?;
+            completed.notified().await;
+            completion_elapsed += started.elapsed();
+        }
+
+        Ok(MailboxContentionReport {
+            requests: requests_per_round.saturating_mul(rounds),
+            producer_count,
+            rounds,
+            admission_elapsed,
+            completion_elapsed,
         })
     }
 
@@ -171,6 +262,19 @@ impl ActorScaleTopology {
 #[cfg(test)]
 mod tests {
     use super::ActorScaleTopology;
+
+    #[tokio::test]
+    async fn contention_workload_separates_admission_from_completion() {
+        let topology = ActorScaleTopology::start_contention(128).await.unwrap();
+        let report = topology.run_contention(128, 64, 3, 2).await.unwrap();
+        assert_eq!(report.requests, 256);
+        assert_eq!(report.producer_count, 3);
+        assert_eq!(report.rounds, 2);
+        assert!(report.admission_throughput_per_second().is_finite());
+        assert!(report.completion_throughput_per_second().is_finite());
+        assert!(report.admission_elapsed <= report.completion_elapsed);
+        topology.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn scaling_workload_waits_for_every_actor() {

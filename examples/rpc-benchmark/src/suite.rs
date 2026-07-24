@@ -5,6 +5,8 @@ pub struct PerformanceSuiteConfig {
     pub tell_requests: usize,
     pub ask_requests: usize,
     pub scaling_requests: usize,
+    pub mailbox_contention_requests: usize,
+    pub mailbox_contention_rounds: usize,
     pub calibration_requests: usize,
     pub calibration_rounds: usize,
     pub payload_bytes: Vec<usize>,
@@ -26,6 +28,9 @@ impl PerformanceSuiteConfig {
             tell_requests: env_usize("LATTICE_BENCH_TELL_REQUESTS", 100_000).max(1),
             ask_requests: env_usize("LATTICE_BENCH_ASK_REQUESTS", 10_000).max(1),
             scaling_requests: env_usize("LATTICE_BENCH_SCALING_REQUESTS", 1_000_000).max(1),
+            mailbox_contention_requests: env_usize("LATTICE_BENCH_CONTENTION_REQUESTS", 250_000)
+                .max(1),
+            mailbox_contention_rounds: env_usize("LATTICE_BENCH_CONTENTION_ROUNDS", 3).max(1),
             calibration_requests: env_usize("LATTICE_BENCH_CALIBRATION_REQUESTS", 1_000_000).max(1),
             calibration_rounds: env_usize("LATTICE_BENCH_CALIBRATION_ROUNDS", 3).max(1),
             payload_bytes: env_usize_list_allow_zero(

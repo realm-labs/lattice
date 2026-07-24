@@ -4,7 +4,7 @@ use std::{
     marker::PhantomData,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -48,6 +48,7 @@ pub struct ActorHandle<A: Actor> {
     termination: Arc<Mutex<Option<ActorTerminated>>>,
     terminal_cleanup_started: Arc<AtomicBool>,
     lifecycle_tx: watch::Sender<ActorLifecycleState>,
+    lifecycle_state: Arc<AtomicU8>,
     stop_failure: Arc<Mutex<Option<StopFailureRecord>>>,
     forced_data_loss_tx: broadcast::Sender<ForcedDataLossEvent>,
     terminal_hook: Arc<Mutex<Option<TerminalHook>>>,
@@ -140,6 +141,7 @@ impl<A: Actor> Clone for ActorHandle<A> {
             termination: self.termination.clone(),
             terminal_cleanup_started: self.terminal_cleanup_started.clone(),
             lifecycle_tx: self.lifecycle_tx.clone(),
+            lifecycle_state: self.lifecycle_state.clone(),
             stop_failure: self.stop_failure.clone(),
             forced_data_loss_tx: self.forced_data_loss_tx.clone(),
             terminal_hook: self.terminal_hook.clone(),
@@ -160,6 +162,7 @@ impl<A: Actor> ActorHandle<A> {
             termination: Arc::new(Mutex::new(None)),
             terminal_cleanup_started: Arc::new(AtomicBool::new(false)),
             lifecycle_tx: init.lifecycle_tx,
+            lifecycle_state: Arc::new(AtomicU8::new(ActorLifecycleState::Starting as u8)),
             stop_failure: init.stop_failure,
             forced_data_loss_tx: init.forced_data_loss_tx,
             terminal_hook: init.terminal_hook,
@@ -199,7 +202,22 @@ impl<A: Actor> ActorHandle<A> {
     }
 
     pub fn lifecycle_state(&self) -> ActorLifecycleState {
-        *self.lifecycle_tx.borrow()
+        match self.lifecycle_state.load(Ordering::Acquire) {
+            value if value == ActorLifecycleState::Starting as u8 => ActorLifecycleState::Starting,
+            value if value == ActorLifecycleState::Running as u8 => ActorLifecycleState::Running,
+            value if value == ActorLifecycleState::Passivating as u8 => {
+                ActorLifecycleState::Passivating
+            }
+            value if value == ActorLifecycleState::Stopping as u8 => ActorLifecycleState::Stopping,
+            value if value == ActorLifecycleState::StopFailed as u8 => {
+                ActorLifecycleState::StopFailed
+            }
+            value if value == ActorLifecycleState::Quarantined as u8 => {
+                ActorLifecycleState::Quarantined
+            }
+            value if value == ActorLifecycleState::Stopped as u8 => ActorLifecycleState::Stopped,
+            _ => unreachable!("actor lifecycle atomic contains an invalid state"),
+        }
     }
 
     /// Sends a request and waits up to `timeout` for the complete response.
@@ -448,6 +466,7 @@ impl<A: Actor> ActorHandle<A> {
     }
 
     pub(crate) fn set_lifecycle_state(&self, state: ActorLifecycleState) {
+        self.lifecycle_state.store(state as u8, Ordering::Release);
         self.lifecycle_tx.send_replace(state);
     }
 
