@@ -5,7 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
 use lattice_actor::{
     context::HandlerContext,
     error::{ActorError, ActorTellError},
@@ -18,7 +17,7 @@ use lattice_core::{actor_kind, id::ActorId};
 use tokio::sync::Notify;
 
 #[derive(lattice_actor::Message)]
-struct ScaleTell(Bytes);
+struct ScaleTell(&'static [u8]);
 
 #[derive(lattice_actor::Message)]
 struct ScaleBarrier(Arc<Notify>);
@@ -145,7 +144,7 @@ impl ActorScaleTopology {
     ) -> Result<MailboxContentionReport, Box<dyn Error>> {
         let producer_count = producer_count.max(1);
         let rounds = rounds.max(1);
-        let payload = Bytes::from(vec![0_u8; payload_bytes]);
+        let payload = shared_payload(payload_bytes);
         let mut admission_elapsed = Duration::ZERO;
         let mut completion_elapsed = Duration::ZERO;
 
@@ -154,19 +153,18 @@ impl ActorScaleTopology {
             let mut tasks = Vec::with_capacity(producer_count);
             for producer in 0..producer_count {
                 let handle = self.handles[0].clone();
-                let payload = payload.clone();
                 let producer_requests = requests_per_round / producer_count
                     + usize::from(producer < requests_per_round % producer_count);
                 tasks.push(tokio::spawn(async move {
                     for _ in 0..producer_requests {
-                        handle.try_tell(ScaleTell(payload.clone())).map_err(
-                            |error| match error {
+                        handle
+                            .try_tell(ScaleTell(payload))
+                            .map_err(|error| match error {
                                 ActorTellError::MailboxFull(_) => {
                                     "contention mailbox unexpectedly reached capacity".to_owned()
                                 }
                                 error => error.to_string(),
-                            },
-                        )?;
+                            })?;
                     }
                     Ok::<_, String>(())
                 }));
@@ -200,37 +198,26 @@ impl ActorScaleTopology {
         producer_count: usize,
     ) -> Result<ScaleReport, Box<dyn Error>> {
         let producer_count = producer_count.max(1);
-        let payload = Bytes::from(vec![0_u8; payload_bytes]);
+        let payload = shared_payload(payload_bytes);
         let started = Instant::now();
         let mut tasks = Vec::with_capacity(producer_count);
         for producer in 0..producer_count {
             let handles = self.handles.clone();
-            let payload = payload.clone();
             let producer_requests =
                 requests / producer_count + usize::from(producer < requests % producer_count);
             tasks.push(tokio::spawn(async move {
-                let mut retries = 0;
                 for offset in 0..producer_requests {
                     let target = (producer + offset) % handles.len();
-                    let mut message = ScaleTell(payload.clone());
-                    loop {
-                        match handles[target].try_tell(message) {
-                            Ok(()) => break,
-                            Err(ActorTellError::MailboxFull(returned)) => {
-                                message = returned;
-                                retries += 1;
-                                tokio::task::yield_now().await;
-                            }
-                            Err(error) => return Err(error.to_string()),
-                        }
-                    }
+                    handles[target]
+                        .tell(ScaleTell(payload))
+                        .await
+                        .map_err(|error| error.to_string())?;
                 }
-                Ok::<_, String>(retries)
+                Ok::<_, String>(())
             }));
         }
-        let mut mailbox_full_retries = 0;
         for task in tasks {
-            mailbox_full_retries += task.await?.map_err(IoError::other)?;
+            task.await?.map_err(IoError::other)?;
         }
         let mut barriers = Vec::with_capacity(self.handles.len());
         for handle in self.handles.iter() {
@@ -245,7 +232,7 @@ impl ActorScaleTopology {
             requests,
             actor_count: self.handles.len(),
             producer_count,
-            mailbox_full_retries,
+            mailbox_full_retries: 0,
             elapsed: started.elapsed(),
         })
     }
@@ -257,6 +244,14 @@ impl ActorScaleTopology {
         }
         Ok(())
     }
+}
+
+fn shared_payload(payload_bytes: usize) -> &'static [u8] {
+    // Scaling isolates mailbox and scheduler behavior. A shared static slice matches the immutable
+    // reference passed by the JVM comparison harness without adding one contended reference-count
+    // update per message. The benchmark process is short-lived and leaks at most one small payload
+    // per measured run.
+    Box::leak(vec![0_u8; payload_bytes].into_boxed_slice())
 }
 
 #[cfg(test)]

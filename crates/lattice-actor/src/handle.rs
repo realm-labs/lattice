@@ -29,6 +29,8 @@ use crate::{
 
 pub(crate) type TerminalHook = Box<dyn FnOnce(LocalActorRef) + Send + 'static>;
 
+const COOPERATIVE_CAPACITY_WAITER_LIMIT: usize = 2;
+
 pub(crate) struct ActorHandleInit<A: Actor> {
     pub(crate) local_ref: LocalActorRef,
     pub(crate) terminated_tx: broadcast::Sender<ActorTerminated>,
@@ -644,9 +646,27 @@ impl<A: Actor> ActorHandle<A> {
             });
         }
         let channel = self.channel(lane);
-        let permit = match channel.reserve().await {
+        let permit = match channel.try_reserve() {
             Ok(permit) => permit,
-            Err(_) => {
+            Err(TrySendError::Full(())) => {
+                // The first sender parks immediately, preserving the single-producer path. A
+                // small contending cohort yields once so the Actor can drain a batch before those
+                // senders register; larger cohorts park immediately to avoid a scheduler storm.
+                if matches!(
+                    channel.capacity_waiters(),
+                    1..=COOPERATIVE_CAPACITY_WAITER_LIMIT
+                ) {
+                    tokio::task::yield_now().await;
+                }
+                match channel.reserve_after_full().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        self.observe_tell_rejection::<M>(lane, MailboxRejection::Closed);
+                        return Err(ActorTellError::MailboxClosed(msg));
+                    }
+                }
+            }
+            Err(TrySendError::Closed(())) => {
                 self.observe_tell_rejection::<M>(lane, MailboxRejection::Closed);
                 return Err(ActorTellError::MailboxClosed(msg));
             }

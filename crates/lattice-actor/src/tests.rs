@@ -806,6 +806,51 @@ async fn tell_waits_for_capacity_without_losing_the_message() {
     assert_eq!(*events.lock().await, vec!["first", "second"]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn contended_tells_wait_for_capacity_without_losing_messages() {
+    const WAITERS: usize = 16;
+
+    let start_gate = Arc::new(Semaphore::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let actor = TestActor {
+        events: events.clone(),
+        start_gate: Some(start_gate.clone()),
+        stopped: None,
+    };
+    let handle = spawn_actor(actor, MailboxConfig::bounded(1));
+    handle.try_tell(Record::new("first")).unwrap();
+
+    let processed = Arc::new(Semaphore::new(0));
+    let mut pending = Vec::with_capacity(WAITERS);
+    for _ in 0..WAITERS {
+        let handle = handle.clone();
+        let processed = processed.clone();
+        pending.push(tokio::spawn(async move {
+            handle
+                .tell(Record::with_processed_signal("pending", processed))
+                .await
+        }));
+    }
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        pending.iter().all(|task| !task.is_finished()),
+        "contended tells must wait while the bounded mailbox is full"
+    );
+
+    start_gate.add_permits(1);
+    for task in pending {
+        task.await.unwrap().unwrap();
+    }
+    processed
+        .acquire_many(WAITERS as u32)
+        .await
+        .unwrap()
+        .forget();
+    assert_eq!(events.lock().await.len(), WAITERS + 1);
+}
+
 #[tokio::test]
 async fn stop_uses_system_lane_and_closes_actor() {
     let events = Arc::new(Mutex::new(Vec::new()));

@@ -133,6 +133,10 @@ impl<T> Sender<T> {
             Err(TrySendError::Full(())) => {}
         }
 
+        self.reserve_after_full().await
+    }
+
+    pub(crate) async fn reserve_after_full(&self) -> Result<Permit<'_, T>, TrySendError<()>> {
         loop {
             // Registration is synchronous. A concurrent release must therefore either observe
             // this listener or make the state retry succeed.
@@ -161,6 +165,10 @@ impl<T> Sender<T> {
 
     pub(crate) fn capacity(&self) -> usize {
         self.inner.state.load(Ordering::Relaxed) & AVAILABLE_MASK
+    }
+
+    pub(crate) fn capacity_waiters(&self) -> usize {
+        self.inner.capacity_available.total_listeners()
     }
 }
 
@@ -484,6 +492,42 @@ mod tests {
                             Err(TrySendError::Closed(_)) => panic!("receiver closed early"),
                         }
                     }
+                }
+            }));
+        }
+        for producer in producers {
+            producer.await.unwrap();
+        }
+        let seen = consumer.await.unwrap();
+        assert!(seen.into_iter().all(|value| value));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_waiting_senders_deliver_every_value_once() {
+        const PRODUCERS: usize = 16;
+        const VALUES_PER_PRODUCER: usize = 2_000;
+
+        let (sender, mut receiver) = channel::<usize>(64);
+        let consumer = tokio::spawn(async move {
+            let mut seen = vec![false; PRODUCERS * VALUES_PER_PRODUCER];
+            for _ in 0..seen.len() {
+                let value = receiver.recv().await.expect("all values are delivered");
+                assert!(!seen[value], "value {value} was delivered twice");
+                seen[value] = true;
+            }
+            seen
+        });
+
+        let mut producers = Vec::with_capacity(PRODUCERS);
+        for producer in 0..PRODUCERS {
+            let sender = sender.clone();
+            producers.push(tokio::spawn(async move {
+                for offset in 0..VALUES_PER_PRODUCER {
+                    sender
+                        .reserve()
+                        .await
+                        .expect("receiver stays connected")
+                        .send(producer * VALUES_PER_PRODUCER + offset);
                 }
             }));
         }

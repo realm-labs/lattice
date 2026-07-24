@@ -69,6 +69,13 @@ The MPSC contention workload is the deliberate exception to the completion-only 
 can hold the entire round, so it never exercises mailbox-full retry behavior. It records both the
 time for all producers to finish admission and the time for the Actor to process a trailing barrier.
 This separates shared-queue contention from bounded-mailbox backpressure and scheduler yielding.
+The contention and producer/Actor scaling workloads pass a shared immutable payload reference. This
+keeps their producer matrix focused on mailbox contention and matches the JVM comparison harness;
+the local and remote tell/ask workloads retain `Bytes` ownership and reference-count costs.
+The bounded scaling workload uses the production `ActorHandle::tell` capacity-wait path. It performs
+no user-space mailbox retries, so `mailbox_full_retries` is zero and all backpressure time is included
+in elapsed time. When full, the first sender parks immediately, a small contending cohort yields once
+to let the Actor drain a batch, and larger cohorts park immediately to avoid a scheduler storm.
 
 Every row also records process user/system CPU time, allocation/deallocation/reallocation calls,
 allocated/deallocated bytes, and per-operation CPU/allocation costs. Process CPU includes all runtime,
