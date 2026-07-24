@@ -41,6 +41,9 @@ use worker_pool::{ActorWorkerPool, WorkerPoolKind};
 
 static NEXT_LOCAL_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_ACTIVATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+// Match the default turn budget so the common saturated path releases mailbox capacity once per
+// turn instead of once per message. Smaller turn budgets still cap the prefetch.
+const NORMAL_RECEIVE_BATCH_SIZE: usize = 64;
 
 pub(crate) fn next_activation_id(node_incarnation: NodeIncarnation) -> ActivationId {
     let sequence = NEXT_ACTIVATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -665,6 +668,7 @@ where
     };
 
     let mut actor_panic = None;
+    let mut normal_batch = Vec::with_capacity(NORMAL_RECEIVE_BATCH_SIZE.min(turn_budget));
     while stop_reason.is_none() && actor_panic.is_none() {
         while let Ok(command) = system_rx.try_recv() {
             match handle_command(
@@ -726,37 +730,54 @@ where
             command = normal_rx.recv() => {
                 match command {
                     Some(first_command) => {
-                        let mut command = Some(first_command);
                         let mut remaining = turn_budget;
-                        while let Some(current) = command.take() {
-                            match handle_command(
-                                current,
-                                MailboxLane::Normal,
-                                &handle,
-                                ActorInstance {
-                                    actor: &mut actor,
-                                    behavior: &mut behavior,
-                                },
-                                &mut ctx,
-                                &mut stop_reason,
-                                activity_tx.as_ref(),
-                            )
-                            .await
-                            {
-                                Ok(_) => {}
-                                Err(panic) => {
-                                    actor_panic = Some(panic);
+                        normal_batch.push(first_command);
+                        normal_rx.try_recv_batch(
+                            &mut normal_batch,
+                            NORMAL_RECEIVE_BATCH_SIZE
+                                .min(remaining)
+                                .saturating_sub(1),
+                        );
+                        loop {
+                            for current in normal_batch.drain(..) {
+                                match handle_command(
+                                    current,
+                                    MailboxLane::Normal,
+                                    &handle,
+                                    ActorInstance {
+                                        actor: &mut actor,
+                                        behavior: &mut behavior,
+                                    },
+                                    &mut ctx,
+                                    &mut stop_reason,
+                                    activity_tx.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(_) => {}
+                                    Err(panic) => {
+                                        actor_panic = Some(panic);
+                                        break;
+                                    }
+                                }
+                                remaining -= 1;
+                                if stop_reason.is_some() || remaining == 0 {
                                     break;
                                 }
                             }
-                            if stop_reason.is_some() {
+                            if stop_reason.is_some()
+                                || actor_panic.is_some()
+                                || remaining == 0
+                            {
                                 break;
                             }
-                            remaining -= 1;
-                            if remaining == 0 {
+                            let received = normal_rx.try_recv_batch(
+                                &mut normal_batch,
+                                NORMAL_RECEIVE_BATCH_SIZE.min(remaining),
+                            );
+                            if received == 0 {
                                 break;
                             }
-                            command = normal_rx.try_recv().ok();
                         }
                     }
                     None if system_rx.is_closed() => {

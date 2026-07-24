@@ -63,6 +63,8 @@ impl MailboxConfig {
     /// System-lane priority is reconsidered at every turn boundary. A larger budget amortizes
     /// mailbox polling overhead under load, while a smaller budget bounds the number of normal
     /// messages that can precede a waiting system message. Handler execution time is not bounded.
+    /// The runtime may prefetch up to 64 messages for the active turn; prefetched messages no
+    /// longer occupy channel capacity but remain owned by that Actor until handled or stopped.
     pub fn with_turn_budget(mut self, turn_budget: usize) -> Self {
         assert!(turn_budget > 0, "actor mailbox turn budget must be nonzero");
         self.turn_budget = turn_budget;

@@ -71,11 +71,18 @@ impl<T> Inner<T> {
 
     #[inline(always)]
     fn release_slot(&self) {
+        self.release_slots(1);
+    }
+
+    #[inline(always)]
+    fn release_slots(&self, slots: usize) {
+        debug_assert!(slots > 0);
+        debug_assert!(slots <= self.capacity);
         // The queue's push/pop sequence publishes and acquires the message itself. This counter
         // only reserves capacity and participates in the closed-bit modification order, so it
         // does not need to carry payload synchronization as well.
-        let previous = self.state.fetch_add(1, Ordering::Relaxed);
-        debug_assert!(previous & AVAILABLE_MASK < self.capacity);
+        let previous = self.state.fetch_add(slots, Ordering::Relaxed);
+        debug_assert!(previous & AVAILABLE_MASK <= self.capacity - slots);
         if previous & AVAILABLE_MASK == 0 {
             self.wake_capacity_waiters();
         }
@@ -88,7 +95,12 @@ impl<T> Inner<T> {
     }
 
     fn wake_receiver(&self) {
-        if self.receiver_waiting.swap(false, Ordering::AcqRel) {
+        // A blind swap is a locked RMW on x86 even while the receiver is actively draining.
+        // The receiver rechecks the queue after publishing this flag, so a false fast-path load
+        // cannot lose a wake-up.
+        if self.receiver_waiting.load(Ordering::Acquire)
+            && self.receiver_waiting.swap(false, Ordering::AcqRel)
+        {
             self.receiver_waker.wake();
         }
     }
@@ -219,6 +231,24 @@ impl<T> Receiver<T> {
         }
     }
 
+    #[inline]
+    pub(crate) fn try_recv_batch(&mut self, values: &mut Vec<T>, limit: usize) -> usize {
+        // Publish all newly available slots with one RMW. Actor turns consume the returned batch
+        // before polling the mailbox again, preserving the existing turn-budget boundary.
+        let initial_len = values.len();
+        while values.len() - initial_len < limit {
+            let Ok(value) = self.inner.queue.pop() else {
+                break;
+            };
+            values.push(value);
+        }
+        let received = values.len() - initial_len;
+        if received != 0 {
+            self.inner.release_slots(received);
+        }
+        received
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<T> {
         poll_fn(|context| self.poll_recv(context)).await
     }
@@ -300,6 +330,22 @@ mod tests {
             .expect("dropped permit restores capacity");
         assert_eq!(receiver.try_recv(), Ok(7));
         assert_eq!(sender.capacity(), 1);
+    }
+
+    #[test]
+    fn batch_receive_releases_all_consumed_capacity() {
+        let (sender, mut receiver) = channel(4);
+        sender.try_send(1).unwrap();
+        sender.try_send(2).unwrap();
+        sender.try_send(3).unwrap();
+        assert_eq!(sender.capacity(), 1);
+
+        let mut values = Vec::new();
+        assert_eq!(receiver.try_recv_batch(&mut values, 2), 2);
+        assert_eq!(values, [1, 2]);
+        assert_eq!(sender.capacity(), 3);
+        assert_eq!(receiver.try_recv(), Ok(3));
+        assert_eq!(sender.capacity(), 4);
     }
 
     #[tokio::test]
