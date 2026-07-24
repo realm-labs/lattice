@@ -47,7 +47,7 @@ use lattice_discovery::{
 use lattice_placement::{
     control::{
         DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
-        encode_control_command,
+        encode_control_command_for_term,
     },
     coordinator::{
         MemberHello, MemberRecord, MemberStatus, PlacementDomainHello, SnapshotLimits,
@@ -1137,8 +1137,9 @@ async fn install_fixture_snapshot(
             .apply(
                 coordinator.clone(),
                 CommandId::generate(),
-                encode_control_command(
+                encode_control_command_for_term(
                     &CoordinatorScope::Placement(slot.key.domain().clone()),
+                    slot.version.term.get(),
                     &command,
                     DEFAULT_MAX_CONTROL_PAYLOAD,
                 )?,
