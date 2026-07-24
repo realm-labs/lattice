@@ -97,8 +97,8 @@ async fn respond(
         let _ = std::fs::write(DRAIN_ACK, b"acknowledged\n");
     }
     let healthy = match path {
-        "/startup" | "/live" | "/" => true,
-        "/ready" => !draining,
+        "/startupz" | "/livez" | "/" => true,
+        "/readyz" => !draining,
         "/discovery" => !discovery.read().await.targets.is_empty(),
         _ => false,
     };

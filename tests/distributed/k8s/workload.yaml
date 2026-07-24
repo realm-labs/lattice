@@ -50,14 +50,14 @@ spec:
                 fieldRef: {fieldPath: metadata.namespace}
           ports: [{name: http, containerPort: 8080}]
           startupProbe:
-            httpGet: {path: /startup, port: http}
+            httpGet: {path: /startupz, port: http}
             failureThreshold: 30
             periodSeconds: 1
           readinessProbe:
-            httpGet: {path: /ready, port: http}
+            httpGet: {path: /readyz, port: http}
             periodSeconds: 1
           livenessProbe:
-            httpGet: {path: /live, port: http}
+            httpGet: {path: /livez, port: http}
             periodSeconds: 2
           lifecycle:
             preStop:

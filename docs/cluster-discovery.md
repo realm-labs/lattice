@@ -138,6 +138,21 @@ opens only in `Ready`, and a `preStop` hook that starts `leave`. Set
 `terminationGracePeriodSeconds` above `cluster.join.shutdown_timeout`; a Pod that exhausts that
 budget force-fences locally and is removed later through its exact member lease.
 
+`lattice-ops::health` provides the unauthenticated Kubernetes probe surface. Build
+`HealthHttpAdapter::for_application(&application, HealthReadinessPolicy::default())` before starting
+the application, then either merge its router into a management-only Axum server or pass it with a
+pre-bound `TcpListener` to `HealthHttpServer`. The endpoints are `/startupz`, `/livez`, and
+`/readyz`; there is no `/healthz` compatibility alias. Bind the listener on a dedicated management
+port and restrict it with a NetworkPolicy.
+
+The process shutdown handler must keep `HealthHttpServer` running while it awaits
+`application.shutdown()`. Entering drain closes `/readyz` immediately while `/livez` remains open;
+only after the application drain completes should the handler signal the health server to stop.
+Applications that serve only a subset of placement domains can use
+`HealthReadinessPolicy::required_domains(...)`; the default requires every configured logic domain,
+and embedded deployments additionally require every managed Coordinator scope to be `Active` or
+`Standby`.
+
 Use immutable run/commit image tags for acceptance and label every workspace-built test image
 `org.realm-labs.lattice.test=true`. `scripts/docker-image-lifecycle.sh` enforces the shared 72-hour CI
 or seven-day developer retention policy and the 80/90-percent disk watermarks without touching
@@ -146,4 +161,3 @@ unlabeled images.
 Operational diagnosis and force-removal procedure are in
 [the cluster lifecycle runbook](operations/cluster-lifecycle-runbook.md). The accompanying Grafana
 dashboard is stored at `docs/operations/dashboards/cluster-lifecycle.json`.
-

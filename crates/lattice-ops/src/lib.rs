@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod error;
+pub mod health;
 pub mod operation;
 pub mod ops_config;
 pub mod outbox;

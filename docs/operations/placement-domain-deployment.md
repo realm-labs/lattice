@@ -54,6 +54,14 @@ membership only after all domain completions, then stop remoting. Set `terminati
 longer than the configured drain deadline. A PodDisruptionBudget must preserve enough
 CoordinatorHost candidates for each scope, not merely enough total Pods.
 
+Expose the management-only `lattice-ops::health` router on a dedicated port and configure Kubernetes
+to call `/startupz`, `/readyz`, and `/livez`. Keep that listener alive throughout aggregate drain:
+`/readyz` returns `503` as soon as the node leaves `Ready`, while `/livez` continues returning `200`
+until the managed service reaches `Terminated`. Stop the health server only after
+`LatticeApplication::shutdown()` completes. The probe endpoints are intentionally unauthenticated,
+so restrict the management port with a NetworkPolicy and do not expose it through the public
+Service.
+
 ## Full-stop generation-5 rollout
 
 Mixed generation 4/5 rollout is unsupported:

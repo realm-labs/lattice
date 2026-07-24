@@ -2305,10 +2305,12 @@ dependencies = [
  "lattice-core",
  "lattice-eventbus",
  "lattice-placement",
+ "lattice-service",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
 ]
 

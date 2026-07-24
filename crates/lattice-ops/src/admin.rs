@@ -267,8 +267,6 @@ impl AdminHttpAdapter {
 
     pub fn router(self) -> Router {
         Router::new()
-            .route("/healthz", get(|| async { StatusCode::OK }))
-            .route("/readyz", get(|| async { StatusCode::OK }))
             .route("/admin/snapshot", get(snapshot))
             .route("/admin/rebalance/pause", post(pause))
             .route("/admin/rebalance/resume", post(resume))
