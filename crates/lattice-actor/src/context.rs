@@ -264,6 +264,15 @@ impl<A: Actor> ActorContext<A> {
         self.sender.as_ref()
     }
 
+    /// Returns the absolute deadline attached to the current request, if any.
+    ///
+    /// The value is message-scoped and is cleared after dispatch. Callers that
+    /// need to retain deadline information outside the current turn should
+    /// convert it to an owned duration or timestamp first.
+    pub fn current_deadline(&self) -> Option<Instant> {
+        self.current_deadline
+    }
+
     /// Sends to a process-local handle with this actor as the envelope sender.
     pub fn tell_local<B, M>(
         &self,
