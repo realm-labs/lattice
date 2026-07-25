@@ -1,5 +1,5 @@
 use std::{
-    any::type_name,
+    any::{Any, TypeId, type_name},
     collections::HashMap,
     fmt,
     future::Future,
@@ -81,11 +81,74 @@ impl PipeTaskHandle {
     }
 }
 
+/// Type-indexed state owned by one actor activation.
+///
+/// Values are retained for the lifetime of the surrounding [`ActorContext`]. They are not shared,
+/// serialized, persisted, or carried across passivation, termination, or supervision restart.
+#[derive(Default)]
+pub struct ActorLocalExtensions {
+    values: HashMap<TypeId, Box<dyn Any + Send>>,
+}
+
+impl fmt::Debug for ActorLocalExtensions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorLocalExtensions")
+            .field("extension_count", &self.values.len())
+            .finish()
+    }
+}
+
+impl ActorLocalExtensions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get<T: Send + 'static>(&self) -> Option<&T> {
+        self.values
+            .get(&TypeId::of::<T>())
+            .and_then(|value| value.downcast_ref::<T>())
+    }
+
+    pub fn get_mut<T: Send + 'static>(&mut self) -> Option<&mut T> {
+        self.values
+            .get_mut(&TypeId::of::<T>())
+            .and_then(|value| value.downcast_mut::<T>())
+    }
+
+    pub fn insert<T: Send + 'static>(&mut self, value: T) -> Option<T> {
+        self.values
+            .insert(TypeId::of::<T>(), Box::new(value))
+            .map(|previous| {
+                *previous
+                    .downcast::<T>()
+                    .expect("actor-local extension type ID invariant violated")
+            })
+    }
+
+    pub fn remove<T: Send + 'static>(&mut self) -> Option<T> {
+        self.values.remove(&TypeId::of::<T>()).map(|value| {
+            *value
+                .downcast::<T>()
+                .expect("actor-local extension type ID invariant violated")
+        })
+    }
+
+    pub fn get_or_insert_with<T: Send + 'static>(&mut self, create: impl FnOnce() -> T) -> &mut T {
+        self.values
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(create()))
+            .downcast_mut::<T>()
+            .expect("actor-local extension type ID invariant violated")
+    }
+}
+
 pub struct ActorContext<A: Actor> {
     handle: ActorHandle<A>,
     self_ref: Option<ActorRef>,
     actor_system: Option<Arc<OnceLock<ActorSystem>>>,
     service: ServiceContext,
+    local_extensions: ActorLocalExtensions,
     spawner: ActorSpawner,
     lifecycle_request: Option<StopReason>,
     tasks: JoinSet<()>,
@@ -113,6 +176,7 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
                     .map(|actor_ref| actor_ref.actor_path()),
             )
             .field("service", &self.service)
+            .field("local_extensions", &self.local_extensions)
             .field("lifecycle_request", &self.lifecycle_request)
             .field("task_count", &self.tasks.len())
             .field("deferred_task_count", &self.deferred_tasks.len())
@@ -145,6 +209,7 @@ impl<A: Actor> ActorContext<A> {
             self_ref,
             actor_system,
             service,
+            local_extensions: ActorLocalExtensions::new(),
             spawner,
             lifecycle_request: None,
             tasks: JoinSet::new(),
@@ -175,6 +240,14 @@ impl<A: Actor> ActorContext<A> {
 
     pub fn service(&self) -> &ServiceContext {
         &self.service
+    }
+
+    pub fn local_extensions(&self) -> &ActorLocalExtensions {
+        &self.local_extensions
+    }
+
+    pub fn local_extensions_mut(&mut self) -> &mut ActorLocalExtensions {
+        &mut self.local_extensions
     }
 
     pub fn require_self_ref(&self) -> Result<&ActorRef, ActorError> {

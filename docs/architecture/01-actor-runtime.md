@@ -78,6 +78,13 @@ Cross-process messages use ActorRef, EntityRef, or SingletonRef through lattice-
 Async tasks are created through ActorContext so they can be cancelled or isolated during stop/passivation.
 ```
 
+`ActorContext::local_extensions` provides type-indexed, activation-local state for framework adapters
+and actor helpers that must not become fields on the Actor itself. Each concrete Rust type has at
+most one value. Extensions survive `started`, message turns, continuations, `stopping`, and
+`StopFailed` retries because those phases share one `ActorContext`. They are process-local only:
+values are not shared, cloned, serialized, or persisted, and a passivated, terminated, or
+supervision-restarted Actor receives a new empty extension set with its new context.
+
 ### 7.2 Actor Scheduling Model
 
 The actor scheduling model is part of lattice, not an implementation detail left to each feature. The first implementation runs on the service process's Tokio runtime, but all actor execution must go through `ActorRuntime`.
