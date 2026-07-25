@@ -1,15 +1,24 @@
-use std::{cell::Cell, time::Duration};
+use std::{
+    cell::Cell,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use lattice_actor::{
     context::{ActorContext, ActorLocalExtensions, HandlerContext},
     error::{ActorError, ActorStopError},
     handle::ActorHandle,
     mailbox::MailboxConfig,
+    reply::ReplyTo,
     runtime::spawn_actor,
     traits::{
         Actor, ActorLifecycleState, ChildActorKey, ChildActorOptions, ChildSupervision, Handler,
-        StopReason,
+        PassivationReason, Responder, StopReason,
     },
+    watch::TerminatedReason,
 };
 use tokio::sync::mpsc;
 
@@ -53,11 +62,34 @@ fn actor_local_extensions_are_type_indexed_and_lazy() {
     assert!(format!("{extensions:?}").contains("extension_count"));
 }
 
+#[test]
+fn actor_local_extension_can_be_removed_for_a_call_and_restored() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct RuntimeSlot(u64);
+
+    let mut extensions = ActorLocalExtensions::new();
+    extensions.insert(RuntimeSlot(17));
+
+    let runtime = extensions
+        .remove::<RuntimeSlot>()
+        .expect("runtime slot should be available to the call");
+    assert!(extensions.get::<RuntimeSlot>().is_none());
+
+    let temporary_result = runtime.0 + 1;
+    assert_eq!(extensions.insert(runtime), None);
+    assert_eq!(temporary_result, 18);
+    assert_eq!(extensions.get::<RuntimeSlot>(), Some(&RuntimeSlot(17)));
+}
+
 #[derive(Debug, lattice_actor::Message)]
 struct Bump;
 
 #[derive(Debug, lattice_actor::Message)]
 struct ResumeLater;
+
+#[derive(Debug, lattice_actor::Request)]
+#[request(response = u32)]
+struct BumpAndRead;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExtensionEvent {
@@ -150,6 +182,25 @@ impl Handler<ResumeLater> for ExtensionLifecycleActor {
     }
 }
 
+impl Responder<BumpAndRead> for ExtensionLifecycleActor {
+    async fn respond(
+        &mut self,
+        ctx: &mut HandlerContext<'_, Self>,
+        _request: BumpAndRead,
+        reply_to: ReplyTo<u32>,
+    ) -> Result<(), ActorError> {
+        let counter = ctx
+            .local_extensions_mut()
+            .get_mut::<LocalCounter>()
+            .expect("responder should observe actor-local extensions");
+        let value = counter.0.get() + 1;
+        counter.0.set(value);
+        reply_to
+            .send(value)
+            .map_err(|_| ActorError::new("request receiver dropped"))
+    }
+}
+
 async fn next_event(events: &mut mpsc::UnboundedReceiver<ExtensionEvent>) -> ExtensionEvent {
     tokio::time::timeout(TIMEOUT, events.recv())
         .await
@@ -188,13 +239,14 @@ async fn extensions_survive_actor_turns_continuations_and_stop_retries() {
         next_event(&mut events_rx).await,
         ExtensionEvent::Continued(13)
     );
+    assert_eq!(handle.ask(BumpAndRead, TIMEOUT).await.unwrap(), 14);
 
     handle.stop(StopReason::Requested).await.unwrap();
     assert_eq!(
         next_event(&mut events_rx).await,
         ExtensionEvent::Stopping {
             attempt: 1,
-            value: 13,
+            value: 14,
         }
     );
     tokio::time::timeout(TIMEOUT, async {
@@ -210,7 +262,7 @@ async fn extensions_survive_actor_turns_continuations_and_stop_retries() {
         next_event(&mut events_rx).await,
         ExtensionEvent::Stopping {
             attempt: 2,
-            value: 13,
+            value: 14,
         }
     );
     assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopped);
@@ -306,4 +358,117 @@ async fn supervision_restart_starts_with_empty_extensions() {
         "replacement actor context should be empty"
     );
     parent.stop(StopReason::Requested).await.unwrap();
+}
+
+struct DropProbe(Arc<AtomicUsize>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug, lattice_actor::Request)]
+#[request(response = ())]
+struct Passivate;
+
+struct PassivatingExtensionActor {
+    drops: Arc<AtomicUsize>,
+}
+
+impl Actor for PassivatingExtensionActor {
+    type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
+
+    async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+        ctx.local_extensions_mut()
+            .insert(DropProbe(self.drops.clone()));
+        Ok(())
+    }
+}
+
+impl Responder<Passivate> for PassivatingExtensionActor {
+    async fn respond(
+        &mut self,
+        ctx: &mut HandlerContext<'_, Self>,
+        _request: Passivate,
+        reply_to: ReplyTo<()>,
+    ) -> Result<(), ActorError> {
+        ctx.request_passivation(PassivationReason::BusinessIdle)?;
+        reply_to
+            .send(())
+            .map_err(|_| ActorError::new("request receiver dropped"))
+    }
+}
+
+#[tokio::test]
+async fn passivation_drops_actor_local_extensions() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let handle = spawn_actor(
+        PassivatingExtensionActor {
+            drops: drops.clone(),
+        },
+        MailboxConfig::bounded(8),
+    );
+    let mut lifecycle = handle.subscribe_lifecycle();
+
+    handle.ask(Passivate, TIMEOUT).await.unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        while *lifecycle.borrow() != ActorLifecycleState::Stopped {
+            lifecycle.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Debug, lattice_actor::Message)]
+struct PanicNow;
+
+struct PanickingExtensionActor {
+    drops: Arc<AtomicUsize>,
+}
+
+impl Actor for PanickingExtensionActor {
+    type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
+
+    async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+        ctx.local_extensions_mut()
+            .insert(DropProbe(self.drops.clone()));
+        Ok(())
+    }
+}
+
+impl Handler<PanicNow> for PanickingExtensionActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut HandlerContext<'_, Self>,
+        _message: PanicNow,
+    ) -> Result<(), ActorError> {
+        panic!("extension cleanup panic fixture")
+    }
+}
+
+#[tokio::test]
+async fn panic_drops_actor_local_extensions() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let handle = spawn_actor(
+        PanickingExtensionActor {
+            drops: drops.clone(),
+        },
+        MailboxConfig::bounded(8),
+    );
+    let mut terminated = handle.subscribe_terminated();
+
+    handle.tell(PanicNow).await.unwrap();
+    let event = tokio::time::timeout(TIMEOUT, terminated.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(event.reason, TerminatedReason::Panicked);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
