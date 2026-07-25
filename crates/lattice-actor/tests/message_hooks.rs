@@ -1,5 +1,6 @@
 use lattice_actor::context::HandlerContext;
 use std::any::type_name;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -51,11 +52,40 @@ enum HookEvent {
 struct HookActor {
     events: Arc<Mutex<Vec<HookEvent>>>,
     after_signal: Arc<Semaphore>,
+    handler_dispatches: Arc<AtomicUsize>,
+    responder_dispatches: Arc<AtomicUsize>,
 }
 
 impl Actor for HookActor {
     type Error = ActorError;
     type Behavior = ::lattice_actor::state_machine::Stateless;
+
+    async fn dispatch_handler<M>(
+        &mut self,
+        ctx: &mut HandlerContext<'_, Self>,
+        msg: M,
+    ) -> Result<(), ActorError>
+    where
+        Self: Handler<M>,
+        M: lattice_actor::traits::Message,
+    {
+        self.handler_dispatches.fetch_add(1, Ordering::Relaxed);
+        <Self as Handler<M>>::handle(self, ctx, msg).await
+    }
+
+    async fn dispatch_responder<R>(
+        &mut self,
+        ctx: &mut HandlerContext<'_, Self>,
+        request: R,
+        reply_to: ReplyTo<R::Response>,
+    ) -> Result<(), ActorError>
+    where
+        Self: Responder<R>,
+        R: lattice_actor::traits::Request,
+    {
+        self.responder_dispatches.fetch_add(1, Ordering::Relaxed);
+        <Self as Responder<R>>::respond(self, ctx, request, reply_to).await
+    }
 
     fn before_message(&mut self, _ctx: &mut ActorContext<Self>, message: MessageView<'_>) {
         let payload = if let Some(message) = message.downcast_ref::<PayloadTell>() {
@@ -155,10 +185,14 @@ impl Responder<RecoveredRequest> for HookActor {
 async fn actor_hooks_can_downcast_tell_and_request_payloads() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let after_signal = Arc::new(Semaphore::new(0));
+    let handler_dispatches = Arc::new(AtomicUsize::new(0));
+    let responder_dispatches = Arc::new(AtomicUsize::new(0));
     let handle = spawn_actor(
         HookActor {
             events: events.clone(),
             after_signal: after_signal.clone(),
+            handler_dispatches: handler_dispatches.clone(),
+            responder_dispatches: responder_dispatches.clone(),
         },
         MailboxConfig::bounded(16),
     );
@@ -189,6 +223,8 @@ async fn actor_hooks_can_downcast_tell_and_request_payloads() {
         .expect("all after-message hooks should run")
         .expect("after-message signal should remain open");
     permits.forget();
+    assert_eq!(handler_dispatches.load(Ordering::Relaxed), 2);
+    assert_eq!(responder_dispatches.load(Ordering::Relaxed), 2);
 
     assert_eq!(
         *events.lock().expect("hook events mutex is not poisoned"),

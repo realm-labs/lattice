@@ -241,7 +241,7 @@ where
                 .take()
                 .expect("tell envelope message is present before dispatch");
             let outcome = match actor
-                .handle(&mut HandlerContext::new(ctx, behavior), msg)
+                .dispatch_handler(&mut HandlerContext::new(ctx, behavior), msg)
                 .await
             {
                 Ok(()) => MessageOutcome::Handled,
@@ -350,7 +350,7 @@ where
                 .take()
                 .expect("request envelope message is present");
             let outcome = match actor
-                .respond(&mut HandlerContext::new(ctx, behavior), request, reply_to)
+                .dispatch_responder(&mut HandlerContext::new(ctx, behavior), request, reply_to)
                 .await
             {
                 Ok(()) => {

@@ -198,6 +198,43 @@ pub trait Actor: Sized + Send + 'static {
     {
         async {}
     }
+
+    /// Dispatches one admitted tell to its authored [`Handler`] implementation.
+    ///
+    /// The default is a direct trait call. Actor integrations may override this
+    /// generic boundary to select generated middleware or hot-patch roots
+    /// without changing individual `Handler<M>` bodies. An override must call
+    /// the authored handler at most once when it selects the default path.
+    fn dispatch_handler<M>(
+        &mut self,
+        ctx: &mut HandlerContext<'_, Self>,
+        msg: M,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        Self: Handler<M>,
+        M: Message,
+    {
+        <Self as Handler<M>>::handle(self, ctx, msg)
+    }
+
+    /// Dispatches one admitted request to its authored [`Responder`]
+    /// implementation.
+    ///
+    /// The default is a direct trait call. Actor integrations may override this
+    /// generic boundary to select generated middleware or hot-patch roots
+    /// without changing individual `Responder<R>` bodies.
+    fn dispatch_responder<R>(
+        &mut self,
+        ctx: &mut HandlerContext<'_, Self>,
+        request: R,
+        reply_to: ReplyTo<R::Response>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send
+    where
+        Self: Responder<R>,
+        R: Request,
+    {
+        <Self as Responder<R>>::respond(self, ctx, request, reply_to)
+    }
 }
 
 pub trait Handler<M>: Actor
