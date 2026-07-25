@@ -10,6 +10,7 @@ use lattice_core::{
         SingletonKind,
     },
     coordinator::CoordinatorScope,
+    release::ReleaseManifest,
 };
 use lattice_remoting::protocol::ProtocolDescriptor;
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,7 @@ use crate::{
     },
 };
 
-pub const COORDINATOR_PROTOCOL_GENERATION: u64 = 5;
+pub const COORDINATOR_PROTOCOL_GENERATION: u64 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SingletonConfig {
@@ -161,6 +162,8 @@ impl LeaderRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberHello {
     pub node: NodeKey,
+    pub release: ReleaseManifest,
+    pub rollout_participant: bool,
     pub roles: BTreeSet<String>,
     pub failure_domains: BTreeMap<String, String>,
     pub protocols: Vec<ProtocolDescriptor>,
@@ -258,6 +261,9 @@ pub struct MemberEvent {
 
 impl MemberHello {
     pub fn validate(&self, limits: &SessionLimits) -> Result<(), CoordinatorError> {
+        self.release
+            .validate()
+            .map_err(|_| CoordinatorError::InvalidHello)?;
         self.node
             .validate()
             .map_err(|_| CoordinatorError::InvalidHello)?;

@@ -260,11 +260,33 @@ where
         {
             return Err(CoordinatorRuntimeError::StaleProposal);
         }
+        let target_release = self
+            .sessions
+            .values()
+            .filter(|session| {
+                session.placement_up()
+                    && !session.draining
+                    && session
+                        .hello
+                        .hosted_entity_types
+                        .contains(&request.entity_type)
+                    && session
+                        .record
+                        .hello
+                        .protocols
+                        .iter()
+                        .any(|protocol| protocol.protocol_id == config.protocol_id)
+            })
+            .map(|session| session.record.hello.release.release_id)
+            .max();
         let target = self
             .sessions
             .values()
             .find(|session| {
-                session.placement_up() && session.hello.node.node_id == request.target_node_id
+                session.placement_up()
+                    && !session.draining
+                    && Some(session.record.hello.release.release_id) == target_release
+                    && session.hello.node.node_id == request.target_node_id
             })
             .map(|session| session.hello.node.clone())
             .ok_or(CoordinatorRuntimeError::IneligibleTarget)?;
@@ -777,6 +799,29 @@ where
                 }
             }
         }
+        let config = self
+            .entity_configs
+            .get(&plan.entity_type)
+            .ok_or(CoordinatorRuntimeError::UnknownEntityConfig)?;
+        let target_release = self
+            .sessions
+            .values()
+            .filter(|session| {
+                session.placement_up()
+                    && !session.draining
+                    && session
+                        .hello
+                        .hosted_entity_types
+                        .contains(&plan.entity_type)
+                    && session
+                        .record
+                        .hello
+                        .protocols
+                        .iter()
+                        .any(|protocol| protocol.protocol_id == config.protocol_id)
+            })
+            .map(|session| session.record.hello.release.release_id)
+            .max();
         for movement in &plan.moves {
             let key = PlacementSlotKey::Shard {
                 domain: plan.domain.clone(),
@@ -801,11 +846,19 @@ where
                 .get(&movement.target.incarnation)
                 .filter(|session| {
                     session.placement_up()
+                        && !session.draining
+                        && Some(session.record.hello.release.release_id) == target_release
                         && session.hello.node == movement.target
                         && session
                             .hello
                             .hosted_entity_types
                             .contains(&plan.entity_type)
+                        && session
+                            .record
+                            .hello
+                            .protocols
+                            .iter()
+                            .any(|protocol| protocol.protocol_id == config.protocol_id)
                 })
                 .ok_or(CoordinatorRuntimeError::IneligibleTarget)?;
             let reservation = target_reservations

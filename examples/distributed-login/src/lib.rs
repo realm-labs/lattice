@@ -154,6 +154,7 @@ pub async fn run_demo() -> Result<LoginAcceptedReply, Box<dyn StdError>> {
         .typed_actor_ref()?
         .ok_or_else(|| IoError::other("missing exact World ActorRef"))?;
     let service = LatticeService::builder(NodeConfig {
+        release: lattice_core::release::ReleaseManifest::development(1),
         cluster_id,
         node_id: "world-a".to_owned(),
         address,

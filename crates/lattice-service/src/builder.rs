@@ -788,6 +788,9 @@ impl LatticeServiceBuilder {
             };
             let member_hello = MemberHello {
                 node: node.clone(),
+                release: self.config.release.clone(),
+                rollout_participant: !self.entity_configs.is_empty()
+                    || !self.singleton_configs.is_empty(),
                 roles: self.config.roles.clone(),
                 failure_domains: BTreeMap::new(),
                 protocols,
@@ -1075,6 +1078,7 @@ impl LatticeServiceBuilder {
             .transpose()?;
         Ok(LatticeService {
             cluster_id: self.config.cluster_id.clone(),
+            release: self.config.release.clone(),
             actor_system,
             hosts,
             associations,

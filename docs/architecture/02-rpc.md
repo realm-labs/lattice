@@ -196,7 +196,13 @@ Rules:
 13. The fingerprint is BLAKE3 over the canonical descriptor fields: protocol ID/name, ordered message IDs/modes, codec descriptors, and request/response schema versions.
 14. After the transport Association is established, a bounded control exchange advertises the supported `(ProtocolId, ProtocolFingerprint)` catalogue. References carry only `ProtocolId`; frames carry protocol and message IDs.
 
-V1 requires an exact fingerprint for a given ProtocolId. A compatible rolling business-protocol upgrade registers old and new major protocols under distinct explicit ProtocolIds and keeps both during the rollout. Reusing one ProtocolId with a changed fingerprint is rejected; silent additive compatibility guesses are forbidden.
+V1 requires an exact fingerprint for a given `ProtocolId`. Business-protocol
+changes are a full-stop deployment boundary, including adding a parallel major
+`ProtocolId`: stop and drain the application deployment, install the complete
+new catalogue, then restart it as one release. Code-only rolling upgrades
+require the entire catalogue fingerprint to remain unchanged. Reusing one
+`ProtocolId` with a changed fingerprint is rejected; silent additive
+compatibility guesses are forbidden.
 
 Transport compatibility and business-protocol compatibility are separate fault domains. The initial handshake negotiates only transport version, node identity, limits, security, and mandatory transport features. The protocol catalogue is exchanged afterward over the reliable control channel and is bounded/chunked like other control state. An unsupported or mismatched `ProtocolId` disables delivery for that protocol and excludes the node from hosting dependent entity/singleton types; it does not close an otherwise compatible Association or disable unrelated protocols.
 

@@ -244,6 +244,7 @@ fn allocation_fixture(
 ) -> Result<(AllocationRequest, PlacementView), Box<dyn Error>> {
     let placement_node = |key: NodeKey, weight| PlacementNode {
         key: key.clone(),
+        release_id: lattice_core::release::ReleaseId::new(1).unwrap(),
         ready: true,
         eligible_entity_types: BTreeSet::from([entity_type.clone()]),
         protocols: BTreeSet::from([protocol]),

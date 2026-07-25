@@ -1,6 +1,8 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use lattice_core::{coordinator::CoordinatorScope, failpoint::Failpoint};
+use lattice_core::{
+    coordinator::CoordinatorScope, failpoint::Failpoint, release::ClusterReleaseState,
+};
 use tokio::{
     sync::{broadcast, watch},
     time::MissedTickBehavior,
@@ -146,6 +148,21 @@ where
         hello
             .validate(&self.config.session_limits)
             .map_err(CoordinatorRuntimeError::Coordinator)?;
+        hello.release.validate_framework_generations(
+            u64::from(lattice_remoting::wire::TRANSPORT_MAJOR),
+            COORDINATOR_PROTOCOL_GENERATION,
+            crate::storage::etcd::STORAGE_SCHEMA_GENERATION,
+        )?;
+        if hello.rollout_participant {
+            let active_members = self.store.list_members().await?;
+            ClusterReleaseState::from_manifests(
+                active_members
+                    .iter()
+                    .filter(|member| member.hello.rollout_participant)
+                    .map(|member| &member.hello.release),
+            )?
+            .admit(&hello.release)?;
+        }
         if let Some(current) = self.store.get_member(&hello.node.node_id).await? {
             if current.node == hello.node && current.hello == hello {
                 self.store.keep_lease_alive(current.lease_id).await?;
@@ -397,9 +414,12 @@ mod tests {
         sync::Arc,
     };
 
-    use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
+    use lattice_core::{
+        actor_ref::{NodeAddress, NodeIncarnation},
+        release::{ReleaseError, ReleaseManifest},
+    };
 
-    use super::{MembershipLeader, MembershipLeaderConfig};
+    use super::{CoordinatorRuntimeError, MembershipLeader, MembershipLeaderConfig};
     use crate::{
         coordinator::{MemberChange, MemberHello, MemberRemovalReason},
         storage::{CoordinatorLeaseStore, InMemoryPlacementStore, MembershipStore},
@@ -416,12 +436,24 @@ mod tests {
 
     fn hello(node: NodeKey) -> MemberHello {
         MemberHello {
+            release: lattice_core::release::ReleaseManifest::development(1),
+            rollout_participant: true,
             node,
             roles: BTreeSet::new(),
             failure_domains: BTreeMap::new(),
             protocols: Vec::new(),
             remoting_capabilities: BTreeSet::new(),
         }
+    }
+
+    fn versioned_hello(node_id: &str, incarnation: u128, release: u64) -> MemberHello {
+        let mut value = hello(NodeKey {
+            node_id: node_id.to_owned(),
+            address: NodeAddress::new("127.0.0.1", 29_000 + incarnation as u16).unwrap(),
+            incarnation: NodeIncarnation::new(incarnation).unwrap(),
+        });
+        value.release = ReleaseManifest::development(release);
+        value
     }
 
     #[tokio::test]
@@ -511,5 +543,72 @@ mod tests {
             store.get_membership_revision().await.unwrap(),
             replacement.version.revision
         );
+    }
+
+    #[tokio::test]
+    async fn membership_admits_only_exactly_compatible_n_and_n_plus_one() {
+        let store = Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
+        let mut leader = MembershipLeader::elect(
+            store,
+            NodeKey {
+                node_id: "coordinator".to_owned(),
+                address: NodeAddress::new("127.0.0.1", 29000).unwrap(),
+                incarnation: NodeIncarnation::new(1).unwrap(),
+            },
+            CoordinatorTerm::new(1).unwrap(),
+            MembershipLeaderConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        leader
+            .join(versioned_hello("logic-n", 2, 10))
+            .await
+            .unwrap();
+        let mut gateway = versioned_hello("gateway", 5, 99);
+        gateway.rollout_participant = false;
+        leader.join(gateway).await.unwrap();
+        leader
+            .join(versioned_hello("logic-next", 3, 11))
+            .await
+            .unwrap();
+        assert!(matches!(
+            leader.join(versioned_hello("logic-third", 4, 12)).await,
+            Err(CoordinatorRuntimeError::Release(
+                ReleaseError::TooManyActiveReleases
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn membership_rejects_a_schema_change_during_rollout() {
+        let store = Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
+        let mut leader = MembershipLeader::elect(
+            store,
+            NodeKey {
+                node_id: "coordinator".to_owned(),
+                address: NodeAddress::new("127.0.0.1", 29000).unwrap(),
+                incarnation: NodeIncarnation::new(1).unwrap(),
+            },
+            CoordinatorTerm::new(1).unwrap(),
+            MembershipLeaderConfig::default(),
+        )
+        .await
+        .unwrap();
+        leader
+            .join(versioned_hello("logic-n", 2, 10))
+            .await
+            .unwrap();
+        let mut incompatible = versioned_hello("logic-next", 3, 11);
+        incompatible
+            .release
+            .compatibility
+            .actor_protocol_fingerprint = [8; 32];
+        assert!(matches!(
+            leader.join(incompatible).await,
+            Err(CoordinatorRuntimeError::Release(
+                ReleaseError::FullRestartRequired { .. }
+            ))
+        ));
     }
 }

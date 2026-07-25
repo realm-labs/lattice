@@ -3,7 +3,10 @@ use std::{sync::atomic::Ordering, time::Duration};
 use lattice_actor::{
     registry::ActorCellDiagnostics, traits::ActorLifecycleState, watch::LocalActorRef,
 };
-use lattice_core::actor_ref::ClusterId;
+use lattice_core::{
+    actor_ref::ClusterId,
+    release::{ClusterReleaseState, ReleaseError, ReleaseManifest},
+};
 use lattice_placement::{
     membership_session::MembershipCoordinatorHandle, session::LogicSessionError,
     types::PlacementSlotKey,
@@ -22,6 +25,7 @@ use crate::{
 
 pub struct LatticeService {
     cluster_id: ClusterId,
+    release: ReleaseManifest,
     actor_system: ActorSystem,
     hosts: Arc<ProtocolHostRegistry>,
     associations: Arc<AssociationManager>,
@@ -61,6 +65,21 @@ impl LatticeService {
 
     pub fn actor_system(&self) -> &ActorSystem {
         &self.actor_system
+    }
+
+    pub fn release_manifest(&self) -> &ReleaseManifest {
+        &self.release
+    }
+
+    pub fn cluster_release_state(&self) -> Result<ClusterReleaseState, ReleaseError> {
+        let snapshot = self.members.snapshot();
+        ClusterReleaseState::from_manifests(
+            snapshot
+                .members
+                .iter()
+                .filter(|member| member.hello.rollout_participant)
+                .map(|member| &member.hello.release),
+        )
     }
 
     pub fn retained_actor_cells(&self) -> Vec<ActorCellDiagnostics> {
@@ -194,6 +213,28 @@ impl LatticeService {
 
     pub fn subscribe_members(&self) -> Receiver<MemberEvent> {
         self.members.subscribe()
+    }
+
+    /// Closes readiness and external actor admission without stopping runtimes.
+    ///
+    /// Call [`Self::leave`] afterwards to migrate placement ownership and stop
+    /// the service. Repeated calls are idempotent once draining has started.
+    pub fn cordon(&self) -> Result<(), ServiceError> {
+        match self.node_lifecycle_state() {
+            NodeLifecycleState::JoiningMembership | NodeLifecycleState::Ready => {
+                self.transition(ServiceLifecycleEvent::BeginDrain)?;
+                Ok(())
+            }
+            NodeLifecycleState::Draining => Ok(()),
+            NodeLifecycleState::Booting
+            | NodeLifecycleState::Stopping
+            | NodeLifecycleState::Terminated => Err(ServiceError::Lifecycle(
+                crate::lifecycle::ServiceLifecycleError {
+                    state: self.node_lifecycle_state(),
+                    event: ServiceLifecycleEvent::BeginDrain,
+                },
+            )),
+        }
     }
 
     /// Returns the user-facing handle for observing this node's cluster.

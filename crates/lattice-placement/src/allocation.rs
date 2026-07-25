@@ -3,7 +3,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
-use lattice_core::actor_ref::{EntityType, NodeIncarnation, PlacementDomainId, ProtocolId};
+use lattice_core::{
+    actor_ref::{EntityType, NodeIncarnation, PlacementDomainId, ProtocolId},
+    release::ReleaseId,
+};
 use thiserror::Error;
 
 use crate::types::{AssignmentGeneration, MonotonicTime, NodeKey, PlacementVersion, ShardId};
@@ -21,6 +24,7 @@ pub struct LoadSample {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementNode {
     pub key: NodeKey,
+    pub release_id: ReleaseId,
     pub ready: bool,
     pub eligible_entity_types: BTreeSet<EntityType>,
     pub protocols: BTreeSet<ProtocolId>,
@@ -306,6 +310,7 @@ impl ShardAllocationStrategy for WeightedLeastLoad {
                 continue;
             }
             if !bypasses_improvement(&trigger)
+                && source.is_some_and(|source| source.release_id == target.release_id)
                 && !self.improves(
                     source.ok_or(AllocationError::InvalidView)?,
                     target,
@@ -408,8 +413,21 @@ fn eligible_nodes<'a>(
     entity_type: &EntityType,
     protocol: ProtocolId,
 ) -> impl Iterator<Item = &'a PlacementNode> {
+    let target_release = view
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.ready
+                && !node.draining
+                && node.capacity_units > 0
+                && node.eligible_entity_types.contains(entity_type)
+                && node.protocols.contains(&protocol)
+        })
+        .map(|node| node.release_id)
+        .max();
     view.nodes.iter().filter(move |node| {
-        node.ready
+        Some(node.release_id) == target_release
+            && node.ready
             && !node.draining
             && node.capacity_units > 0
             && node.eligible_entity_types.contains(entity_type)
@@ -554,6 +572,7 @@ mod tests {
         let target = node("target", 2);
         let placement_node = |key: NodeKey, weight| PlacementNode {
             key: key.clone(),
+            release_id: lattice_core::release::ReleaseId::new(1).unwrap(),
             ready: true,
             eligible_entity_types: [entity.clone()].into_iter().collect(),
             protocols: [protocol].into_iter().collect(),
@@ -764,5 +783,46 @@ mod tests {
                 .moves
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn rolling_upgrade_allocates_and_rebalances_only_to_the_new_release() {
+        let strategy = WeightedLeastLoad::default();
+        let (entity, protocol, source, target, mut view) = automatic_view();
+        view.nodes[0].load.as_mut().unwrap().weight = 1;
+        view.nodes[1].load.as_mut().unwrap().weight = 100;
+        view.nodes[1].release_id = lattice_core::release::ReleaseId::new(2).unwrap();
+        let mut unrelated_proxy = view.nodes[1].clone();
+        unrelated_proxy.key = node("proxy", 3);
+        unrelated_proxy.load.as_mut().unwrap().boot_incarnation = unrelated_proxy.key.incarnation;
+        unrelated_proxy.release_id = lattice_core::release::ReleaseId::new(99).unwrap();
+        unrelated_proxy.eligible_entity_types.clear();
+        view.nodes.push(unrelated_proxy);
+
+        let allocation = strategy
+            .allocate(
+                &AllocationRequest {
+                    domain: view.domain.clone(),
+                    entity_type: entity.clone(),
+                    shard_id: ShardId::new(9),
+                    required_protocol: protocol,
+                },
+                &view,
+            )
+            .unwrap();
+        assert_eq!(allocation.target, target);
+
+        let proposal = strategy
+            .rebalance(
+                &entity,
+                protocol,
+                RebalanceTrigger::Automatic,
+                &view,
+                limits(),
+            )
+            .unwrap();
+        assert_eq!(proposal.moves.len(), 1);
+        assert_eq!(proposal.moves[0].source, source);
+        assert_eq!(proposal.moves[0].target, target);
     }
 }

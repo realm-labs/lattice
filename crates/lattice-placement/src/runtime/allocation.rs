@@ -140,10 +140,29 @@ where
         config: &SingletonConfig,
         exclude: Option<&NodeKey>,
     ) -> Result<NodeKey, CoordinatorRuntimeError> {
-        self.sessions
+        let target_release = self
+            .sessions
             .values()
             .filter(|session| {
                 session.placement_up()
+                    && !session.draining
+                    && exclude != Some(&session.hello.node)
+                    && session.hello.singleton_eligibility.contains(kind)
+                    && session.hello.singleton_configs.contains(config)
+                    && session
+                        .record
+                        .hello
+                        .protocols
+                        .iter()
+                        .any(|protocol| protocol.protocol_id == config.protocol_id)
+            })
+            .map(|session| session.record.hello.release.release_id)
+            .max();
+        self.sessions
+            .values()
+            .filter(|session| {
+                Some(session.record.hello.release.release_id) == target_release
+                    && session.placement_up()
                     && !session.draining
                     && exclude != Some(&session.hello.node)
                     && session.hello.singleton_eligibility.contains(kind)
@@ -373,6 +392,7 @@ where
             .filter(|session| session.placement_up())
             .map(|session| PlacementNode {
                 key: session.hello.node.clone(),
+                release_id: session.record.hello.release.release_id,
                 ready: true,
                 eligible_entity_types: session.hello.hosted_entity_types.clone(),
                 protocols: session

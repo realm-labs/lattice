@@ -78,7 +78,7 @@ async fn persist_authority_records(
     let membership_leader = LeaderRecord {
         scope: CoordinatorScope::Membership,
         node: node("membership", 91, 32991),
-        protocol_generation: 5,
+        protocol_generation: 6,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(
@@ -92,6 +92,8 @@ async fn persist_authority_records(
     let global = MemberRecord {
         node: owner.clone(),
         hello: MemberHello {
+            release: lattice_core::release::ReleaseManifest::development(1),
+            rollout_participant: true,
             node: owner.clone(),
             roles: BTreeSet::new(),
             failure_domains: BTreeMap::new(),
@@ -157,7 +159,7 @@ async fn election_adopts_committed_claim_without_changing_owner_or_generation() 
     let record = LeaderRecord {
         scope: CoordinatorScope::Placement(domain()),
         node: old_leader,
-        protocol_generation: 5,
+        protocol_generation: 6,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&record, old_lease).await.unwrap());

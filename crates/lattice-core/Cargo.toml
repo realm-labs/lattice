@@ -11,6 +11,7 @@ test-failpoints = []
 
 [dependencies]
 async-trait.workspace = true
+blake3.workspace = true
 http.workspace = true
 lattice-config.workspace = true
 prost.workspace = true

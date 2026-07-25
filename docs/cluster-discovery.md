@@ -126,6 +126,13 @@ the documented offline migration with an explicit type-to-domain mapping, and th
 new release. Mixed handshake versions, dual record formats, fallback routing, and rolling
 generation-4/generation-5 membership are unsupported.
 
+The application-level exception is the strict
+[`CodeOnlyRollingUpgrade`](operations/code-only-rolling-upgrade.md) contract.
+Coordinator control generation 6 carries a required `ReleaseManifest` in
+membership. It permits at most two Logic releases with exactly equal protocol,
+state, placement, transport, control, storage, and service-ABI compatibility
+data. This does not make generation or protocol changes rolling-compatible.
+
 Bootstrap is two-stage. A node first exchanges `MembershipHello` and becomes locally ready only
 after the admitted incarnation appears as `Up` in an installed membership snapshot. It then
 exchanges a scoped `PlacementHello` with each configured placement domain; actors in that domain

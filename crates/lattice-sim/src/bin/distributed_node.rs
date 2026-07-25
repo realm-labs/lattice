@@ -1016,6 +1016,8 @@ fn entity_service(
         })?;
     }
     let member_hello = MemberHello {
+        release: lattice_core::release::ReleaseManifest::development(1),
+        rollout_participant: true,
         node: node.clone(),
         roles: BTreeSet::from([if owns_slot { "entity" } else { "gateway" }.to_owned()]),
         failure_domains: BTreeMap::new(),

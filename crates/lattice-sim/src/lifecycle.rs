@@ -243,6 +243,8 @@ fn member(node_id: &str, incarnation: u128, port: u16, revision: u64) -> MemberR
     MemberRecord {
         node: node.clone(),
         hello: MemberHello {
+            release: lattice_core::release::ReleaseManifest::development(1),
+            rollout_participant: true,
             node,
             roles: BTreeSet::new(),
             failure_domains: BTreeMap::new(),

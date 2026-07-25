@@ -196,6 +196,7 @@ async fn deserialized_actor_ref_sends_without_binding() {
         serde_json::from_slice(&serde_json::to_vec(&sink_ref).unwrap()).unwrap();
 
     let service = LatticeService::builder(NodeConfig {
+        release: lattice_core::release::ReleaseManifest::development(1),
         cluster_id,
         node_id: "reference-node".to_owned(),
         address,

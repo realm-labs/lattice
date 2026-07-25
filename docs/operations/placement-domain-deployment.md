@@ -62,6 +62,13 @@ until the managed service reaches `Terminated`. Stop the health server only afte
 so restrict the management port with a NetworkPolicy and do not expose it through the public
 Service.
 
+For application bug-fix rollouts that do not change any protocol, state,
+placement, service-ABI, or framework generation, follow the strict
+[`CodeOnlyRollingUpgrade`](code-only-rolling-upgrade.md) runbook. Cordon an old
+Logic node before drain; while N and N+1 coexist, placement sends all new shard
+and singleton targets to N+1. The full-stop generation migration below remains
+unchanged.
+
 ## Full-stop generation-5 rollout
 
 Mixed generation 4/5 rollout is unsupported:

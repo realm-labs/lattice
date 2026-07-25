@@ -41,6 +41,8 @@ fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
 
 fn hello(node: NodeKey) -> MemberHello {
     MemberHello {
+        release: lattice_core::release::ReleaseManifest::development(1),
+        rollout_participant: true,
         node,
         roles: BTreeSet::new(),
         failure_domains: BTreeMap::new(),
@@ -86,7 +88,7 @@ async fn persist_authority_records(
     let membership_leader = LeaderRecord {
         scope: CoordinatorScope::Membership,
         node: node("membership-leader", 90, 31990),
-        protocol_generation: 5,
+        protocol_generation: 6,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(
@@ -154,7 +156,7 @@ async fn elected_placement(
     let leader = LeaderRecord {
         scope: CoordinatorScope::Placement(domain),
         node: node("leader", 1, 31001),
-        protocol_generation: 5,
+        protocol_generation: 6,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&leader, lease).await.unwrap());
@@ -168,7 +170,7 @@ async fn elected_membership() -> (InMemoryPlacementStore, MembershipLeaderGuard,
     let leader = LeaderRecord {
         scope: CoordinatorScope::Membership,
         node: node("leader", 1, 31001),
-        protocol_generation: 5,
+        protocol_generation: 6,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&leader, lease).await.unwrap());
@@ -651,7 +653,7 @@ async fn domain_configuration_is_durable_revisioned_and_exactly_scoped() {
     let leader = LeaderRecord {
         scope: CoordinatorScope::Placement(domain()),
         node: node("config-leader", 60, 31600),
-        protocol_generation: 5,
+        protocol_generation: 6,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&leader, lease).await.unwrap());

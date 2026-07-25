@@ -6,6 +6,7 @@ pub mod failpoint;
 pub mod id;
 pub mod instance;
 pub mod kind;
+pub mod release;
 pub mod service_context;
 pub mod trace;
 pub mod uri_serde;

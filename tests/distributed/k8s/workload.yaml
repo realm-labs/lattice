@@ -33,7 +33,7 @@ spec:
   selector:
     matchLabels: {app: lattice-probe}
   strategy:
-    rollingUpdate: {maxUnavailable: 1, maxSurge: 1}
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
   template:
     metadata:
       labels: {app: lattice-probe}

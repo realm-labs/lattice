@@ -1,6 +1,9 @@
 use std::{collections::BTreeSet, time::Duration};
 
-use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
+use lattice_core::{
+    actor_ref::{ClusterId, NodeAddress, NodeIncarnation},
+    release::ReleaseManifest,
+};
 use lattice_remoting::config::{RemotingConfig, RemotingConfigError};
 use thiserror::Error;
 
@@ -84,6 +87,7 @@ pub struct NodeConfig {
     pub node_id: String,
     pub address: NodeAddress,
     pub incarnation: NodeIncarnation,
+    pub release: ReleaseManifest,
     pub roles: BTreeSet<String>,
     pub remoting: RemotingConfig,
     pub maximum_actor_protocols: usize,
@@ -94,6 +98,18 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     pub fn validate(&self) -> Result<(), NodeConfigError> {
+        self.release
+            .validate_framework_generations(
+                u64::from(lattice_remoting::wire::TRANSPORT_MAJOR),
+                lattice_placement::coordinator::COORDINATOR_PROTOCOL_GENERATION,
+                lattice_placement::storage::etcd::STORAGE_SCHEMA_GENERATION,
+            )
+            .map_err(|error| match error {
+                lattice_core::release::ReleaseError::FrameworkGenerationMismatch => {
+                    NodeConfigError::ReleaseGenerationMismatch
+                }
+                _ => NodeConfigError::InvalidRelease,
+            })?;
         if self.node_id.is_empty()
             || self.node_id.len() > 128
             || self.node_id.contains(['/', '\\'])
@@ -122,6 +138,10 @@ impl NodeConfig {
 
 #[derive(Debug, Error)]
 pub enum NodeConfigError {
+    #[error("node release manifest is invalid")]
+    InvalidRelease,
+    #[error("node release manifest does not match the linked lattice generations")]
+    ReleaseGenerationMismatch,
     #[error("node ID is not canonical")]
     InvalidNodeId,
     #[error("node roles exceed their bounds or are invalid")]
