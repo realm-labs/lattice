@@ -1,6 +1,254 @@
 use super::*;
 use crate::runtime::membership_plane::{MembershipLeader, MembershipLeaderConfig};
 
+/// A member that hosts nothing drains for free, so the drain that matters is the one that has to
+/// hand a shard over first. Marking the member `Leaving` must not take it out of the placement view
+/// the drain rebalance reads: the shard it still owns would then have an owner no node in the view
+/// matches, which the strategy is entitled to call a corrupt view.
+#[tokio::test]
+async fn draining_a_member_that_owns_a_shard_plans_the_handoff_off_it() {
+    let cluster_id = ClusterId::new("drain-handoff").unwrap();
+    let (coordinator_node, _) = node(&cluster_id, "coordinator", 26500, 500);
+    let (source, _) = node(&cluster_id, "source", 26501, 501);
+    let (target, _) = node(&cluster_id, "target", 26502, 502);
+    let associations = Arc::new(
+        AssociationManager::new(
+            coordinator_node.address.clone(),
+            coordinator_node.incarnation,
+            RemotingConfig::default(),
+        )
+        .unwrap(),
+    );
+    let source_key = attach_test_session(
+        &associations,
+        &cluster_id,
+        coordinator_node.incarnation,
+        &source,
+        5_000,
+    );
+    let target_key = attach_test_session(
+        &associations,
+        &cluster_id,
+        coordinator_node.incarnation,
+        &target,
+        6_000,
+    );
+    let entity_type = EntityType::new("drained-entity").unwrap();
+    let shard_id = ShardId::new(0);
+    let slot_key = PlacementSlotKey::Shard {
+        domain: domain(),
+        entity_type: entity_type.clone(),
+        shard_id,
+    };
+    let store = Arc::new(InMemoryPlacementStore::new(16, 16).unwrap());
+    let mut leader = PlacementDomainLeader::elect(
+        store.clone(),
+        associations,
+        coordinator_node,
+        CoordinatorScope::Placement(domain()),
+        CoordinatorTerm::new(1).unwrap(),
+        PlacementDomainLeaderConfig::default(),
+    )
+    .await
+    .unwrap();
+    let protocol_id = ProtocolId::new(91).unwrap();
+    let entity_config = EntityConfig::new(
+        domain(),
+        entity_type.clone(),
+        protocol_id,
+        1,
+        "weighted-least-load",
+        1,
+        Vec::new(),
+    )
+    .unwrap();
+    let descriptor = ProtocolDescriptor {
+        protocol_id,
+        fingerprint: ProtocolFingerprint::new([11; 32]),
+    };
+    let hello = |node: NodeKey| {
+        test_hello(
+            node,
+            TestHelloSpec {
+                capacity_units: 1,
+                hosted_entity_types: [entity_type.clone()].into_iter().collect(),
+                protocols: vec![descriptor.clone()],
+                entity_configs: vec![entity_config.clone()],
+                ..TestHelloSpec::default()
+            },
+        )
+    };
+    let source_hello = hello(source.clone());
+    seed_running_slot(
+        &mut leader,
+        PlacementSlot {
+            key: slot_key.clone(),
+            config_fingerprint: entity_config.fingerprint(),
+            owner: Some(source.clone()),
+            target: None,
+            assignment_generation: AssignmentGeneration::new(1).unwrap(),
+            version: PlacementVersion::new(
+                domain(),
+                CoordinatorTerm::new(1).unwrap(),
+                Revision::new(1).unwrap(),
+            ),
+            state: PlacementSlotState::Running,
+            active_move: None,
+            barrier_sessions: Default::default(),
+        },
+        Some(&source_hello),
+    )
+    .await;
+    register_up(&mut leader, source_hello, source_key).await;
+    register_up(&mut leader, hello(target.clone()), target_key).await;
+
+    leader
+        .begin_member_drain(
+            source.incarnation,
+            "drain-shard".to_owned(),
+            source.incarnation,
+        )
+        .await
+        .unwrap();
+
+    let handed_over = store.get_slot(&slot_key).await.unwrap().unwrap();
+    assert_eq!(handed_over.state, PlacementSlotState::BeginHandoff);
+    assert_eq!(handed_over.owner.as_ref(), Some(&source));
+    assert_eq!(handed_over.target.as_ref(), Some(&target));
+    assert_eq!(
+        leader
+            .plans
+            .values()
+            .filter(|plan| plan.reason == PlanReason::Drain)
+            .count(),
+        1
+    );
+    assert!(
+        handed_over.barrier_sessions.contains(&source.incarnation),
+        "the drained member still has to acknowledge the barrier its own handoff installs"
+    );
+    let barrier_version = leader.handoffs[&slot_key].barrier_version();
+    assert!(
+        sent_commands(&leader, &source).iter().any(|command| matches!(
+            command,
+            PlacementControlCommand::StateDelta(delta) if delta.version.satisfies(&barrier_version)
+        )),
+        "a leaving member that never receives the barrier revision can never acknowledge it"
+    );
+
+    // A leaving member re-sends its request while it waits, so a repeat of the same operation must
+    // rejoin the drain already in flight rather than start or refuse a second one.
+    leader
+        .begin_member_drain(
+            source.incarnation,
+            "drain-shard".to_owned(),
+            source.incarnation,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        leader
+            .plans
+            .values()
+            .filter(|plan| plan.reason == PlanReason::Drain)
+            .count(),
+        1
+    );
+    assert_eq!(
+        leader.handoffs[&slot_key].barrier_version(),
+        barrier_version
+    );
+    assert!(matches!(
+        leader
+            .begin_member_drain(
+                source.incarnation,
+                "another-drain".to_owned(),
+                source.incarnation,
+            )
+            .await,
+        Err(CoordinatorRuntimeError::IdempotencyConflict)
+    ));
+
+    for member in [&source, &target] {
+        leader
+            .transition_handoff(
+                slot_key.clone(),
+                HandoffEvent::AppliedRevision {
+                    session: member.incarnation,
+                    version: barrier_version.clone(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store.get_slot(&slot_key).await.unwrap().unwrap().state,
+        PlacementSlotState::Stopping
+    );
+    assert!(
+        sent_commands(&leader, &source)
+            .iter()
+            .any(|command| matches!(command, PlacementControlCommand::DrainSlot { slot, .. } if slot == &slot_key))
+    );
+
+    leader
+        .transition_handoff(
+            slot_key.clone(),
+            HandoffEvent::SourceDrained {
+                source: source.clone(),
+                generation: AssignmentGeneration::new(1).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    let replaced = store.get_slot(&slot_key).await.unwrap().unwrap();
+    assert_eq!(replaced.owner.as_ref(), Some(&target));
+    leader
+        .transition_handoff(
+            slot_key.clone(),
+            HandoffEvent::TargetReady {
+                target: target.clone(),
+                generation: replaced.assignment_generation,
+            },
+        )
+        .await
+        .unwrap();
+    let running = store.get_slot(&slot_key).await.unwrap().unwrap();
+    assert_eq!(running.state, PlacementSlotState::Running);
+    assert_eq!(running.owner.as_ref(), Some(&target));
+
+    leader
+        .maybe_send_drain_ready(source.incarnation)
+        .await
+        .unwrap();
+    assert!(
+        sent_commands(&leader, &source).iter().any(|command| matches!(
+            command,
+            PlacementControlCommand::DrainReady { operation_id, .. } if operation_id == "drain-shard"
+        )),
+        "the graceful leave never completes unless the coordinator releases the drained member"
+    );
+}
+
+fn sent_commands(
+    leader: &PlacementDomainLeader<InMemoryPlacementStore>,
+    node: &NodeKey,
+) -> Vec<PlacementControlCommand> {
+    let association = leader
+        .associations
+        .get(&leader.sessions[&node.incarnation].association)
+        .unwrap();
+    association
+        .replay_control_frames()
+        .into_iter()
+        .filter_map(|frame| decode_control_envelope(&frame).ok())
+        .filter_map(|envelope| {
+            decode_control_command(&envelope.payload, DEFAULT_MAX_CONTROL_PAYLOAD).ok()
+        })
+        .map(|scoped| scoped.command)
+        .collect()
+}
+
 #[tokio::test]
 async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
     let cluster = ClusterId::new("member-lifecycle").unwrap();

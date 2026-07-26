@@ -37,8 +37,8 @@ use lattice_placement::{
         PlacementDomainLeaderConfig,
         host::{CoordinatorHost, CoordinatorHostConfig},
     },
-    storage::{InMemoryPlacementStore, MembershipStore},
-    types::NodeKey,
+    storage::{InMemoryPlacementStore, MembershipStore, PlacementDomainStore},
+    types::{NodeKey, PlacementSlotKey},
 };
 use tokio::{sync::watch::Receiver, time::Instant};
 
@@ -706,4 +706,154 @@ async fn coordinator_rollover_recovers_after_blocked_session_registration() {
 
     member.force_shutdown().await.unwrap();
     coordinator_b.shutdown().await.unwrap();
+}
+
+/// A member that hosts nothing drains for free, so the leave that proves anything is the one that
+/// has to hand a live shard over first. It has to finish inside its own deadline: a graceful leave
+/// that falls back on the failure detector is slower than the crash it replaces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_hosting_a_shard_leaves_by_handing_it_over_rather_than_timing_out() {
+    let _network = network_test_guard().await;
+    let coordinator_address = unused_address().await;
+    let first_address = unused_address().await;
+    let second_address = unused_address().await;
+    let cluster_id = ClusterId::new("service-drain-handover-test").unwrap();
+    let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
+    let coordinator = coordinator_service(
+        store.clone(),
+        cluster_id.clone(),
+        "coordinator",
+        coordinator_address.clone(),
+        NodeIncarnation::new(501).unwrap(),
+        1,
+    )
+    .await;
+    coordinator.start().await.unwrap();
+    let discovery = |scope| {
+        Arc::new(
+            StaticDiscovery::new(
+                scope,
+                "drain-handover",
+                vec![StaticEndpoint {
+                    address: coordinator_address.clone(),
+                    expected_node_id: Some("coordinator".to_owned()),
+                    priority: 1,
+                }],
+            )
+            .unwrap(),
+        )
+    };
+    let entity_type = EntityType::new("drained-ping").unwrap();
+    let entity_config = EntityConfig::new(
+        placement_domain(),
+        entity_type.clone(),
+        ProtocolId::new(PROTOCOL_ID).unwrap(),
+        1,
+        "weighted-least-load",
+        1,
+        Vec::new(),
+    )
+    .unwrap();
+    let host = |node_id: &str, address: NodeAddress, incarnation: u128| {
+        let incarnation = NodeIncarnation::new(incarnation).unwrap();
+        let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+        let registry = Arc::new(ActorRegistry::new_bound(
+            actor_kind!("DrainedPing"),
+            ActorRegistryConfig {
+                actor_ref: Some(ActorRefConfig {
+                    cluster_id: cluster_id.clone(),
+                    node_address: address.clone(),
+                    node_incarnation: incarnation,
+                }),
+                ..ActorRegistryConfig::default()
+            },
+            binding.as_ref(),
+        ));
+        LatticeService::builder(node_config(
+            cluster_id.clone(),
+            node_id,
+            address,
+            incarnation,
+        ))
+        .unwrap()
+        .host_entity_with_registry(entity_config.clone(), registry, binding, PingLoader)
+        .unwrap()
+        .domain_capacity(placement_domain(), 1)
+        .unwrap()
+        .coordinator_discovery(discovery(CoordinatorScope::Membership))
+        .unwrap()
+        .coordinator_discovery(discovery(CoordinatorScope::Placement(placement_domain())))
+        .unwrap()
+        .join_config(ClusterJoinConfig {
+            retry_initial: Duration::from_millis(10),
+            retry_max: Duration::from_millis(100),
+            leadership_refresh_interval: Duration::from_millis(200),
+            join_timeout: Some(Duration::from_secs(10)),
+            leave_timeout: Duration::from_secs(15),
+            shutdown_timeout: Duration::from_secs(20),
+            ..ClusterJoinConfig::default()
+        })
+        .member_event_capacity(64)
+        .build()
+        .unwrap()
+    };
+    let first = host("first", first_address, 502);
+    let second = host("second", second_address, 503);
+    for member in [&first, &second] {
+        member.start().await.unwrap();
+        member
+            .cluster()
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .unwrap();
+    }
+    let entity_id = EntityId::new(b"drained-entity".to_vec()).unwrap();
+    let target = entity_config
+        .entity_ref::<PingProtocol>(cluster_id.clone(), entity_id.clone())
+        .unwrap();
+    assert_eq!(
+        ping(&first, target.clone(), 1, "before drain").await,
+        Pong(2)
+    );
+
+    let slot_key = PlacementSlotKey::Shard {
+        domain: placement_domain(),
+        entity_type,
+        shard_id: entity_config.shard_for(&entity_id).unwrap(),
+    };
+    let owner = store
+        .get_slot(&slot_key)
+        .await
+        .unwrap()
+        .expect("the probe must have allocated the shard")
+        .owner
+        .expect("an allocated shard has an owner");
+    let (leaving, observer) = if owner.node_id == "first" {
+        (&first, &second)
+    } else {
+        (&second, &first)
+    };
+
+    leaving
+        .leave(Instant::now() + Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert_eq!(
+        leaving.node_lifecycle_state(),
+        NodeLifecycleState::Terminated
+    );
+    let moved = store
+        .get_slot(&slot_key)
+        .await
+        .unwrap()
+        .expect("the shard must survive the handover");
+    assert_ne!(
+        moved.owner.as_ref(),
+        Some(&owner),
+        "the drained member left while still owning its shard"
+    );
+    assert_eq!(ping(observer, target, 5, "after drain").await, Pong(6));
+
+    observer.force_shutdown().await.unwrap();
+    coordinator.shutdown().await.unwrap();
 }

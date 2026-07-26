@@ -548,7 +548,7 @@ where
         let sessions = self
             .sessions
             .values()
-            .filter(|session| session.placement_up())
+            .filter(|session| session.placement_attached())
             .map(|session| {
                 (
                     session.hello.clone(),

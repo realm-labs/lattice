@@ -609,10 +609,48 @@ impl LatticeService {
                 self.transition(ServiceLifecycleEvent::DrainComplete)?;
                 return self.stop_components().await;
             }
-            tokio::time::timeout_at(deadline, ready.changed())
-                .await
-                .map_err(|_| self.drain_timeout_error())?
-                .map_err(|_| ServiceError::CoordinatorUnavailable)?;
+            let retry_at =
+                (Instant::now() + self.join_config.leadership_refresh_interval).min(deadline);
+            match tokio::time::timeout_at(retry_at, ready.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(ServiceError::CoordinatorUnavailable),
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        return Err(self.drain_timeout_error());
+                    }
+                    self.redrive_drain(&operation_id);
+                }
+            }
+        }
+    }
+
+    /// A drain the Coordinator refused, or one whose command was lost with the session that carried
+    /// it, is indistinguishable from a slow one until the leave deadline expires. Waiting it out
+    /// turns a graceful leave into the crash path it exists to avoid, so the command is re-driven
+    /// on whichever sessions are live while the deadline lasts. It is idempotent on its operation
+    /// ID, and a domain that already reported ready is left alone.
+    fn redrive_drain(&self, operation_id: &str) {
+        let handles = self
+            .logic_handles
+            .lock()
+            .expect("logic handles poisoned")
+            .clone();
+        let completed = self.drain_ready.borrow().clone();
+        for (domain, handle) in &handles {
+            if completed
+                .get(domain)
+                .is_some_and(|current| current == operation_id)
+            {
+                continue;
+            }
+            if let Err(error) = handle.begin_drain(operation_id.to_owned()) {
+                tracing::warn!(
+                    target: "lattice.cluster.lifecycle",
+                    domain = %domain.as_str(),
+                    %error,
+                    "graceful leave could not re-send its drain request"
+                );
+            }
         }
     }
 

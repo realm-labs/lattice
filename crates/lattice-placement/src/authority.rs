@@ -82,8 +82,16 @@ impl PlacementAuthority {
         self.slot.as_ref()
     }
 
-    pub fn admission_open(&self) -> bool {
+    /// Admission is decided against the installed grant deadline rather than the cached flag: the
+    /// fencing tick only runs while the process runs, so a freeze longer than the claim TTL would
+    /// otherwise let a retired owner answer one more request before the next tick fences it. `now`
+    /// must come from the same monotonic base that installed the grant.
+    pub fn admission_open_at(&self, now: MonotonicTime) -> bool {
         self.admission_open
+            && self
+                .grant
+                .as_ref()
+                .is_some_and(|grant| now < grant.deadline)
     }
 
     fn apply(&mut self, event: AuthorityEvent) -> Result<Vec<AuthorityEffect>, AuthorityError> {

@@ -326,6 +326,7 @@ where
                         tracing::warn!(
                             target: "lattice.cluster.coordinator",
                             %error,
+                            cause = %error_cause(&error),
                             "Coordinator rejected a member control command"
                         );
                     }
@@ -469,6 +470,7 @@ fn report_automatic_rebalance_error(
             domain = %domain.as_str(),
             entity_type = %entity_type.as_str(),
             %error,
+            cause = %error_cause(error),
             "automatic rebalance round declined"
         );
     } else {
@@ -477,8 +479,26 @@ fn report_automatic_rebalance_error(
             domain = %domain.as_str(),
             entity_type = %entity_type.as_str(),
             %error,
+            cause = %error_cause(error),
             "automatic rebalance round failed"
         );
+    }
+}
+
+/// Every runtime error variant renders only its own message, so a rejection that wraps a strategy,
+/// plan, or storage verdict reaches the log as a category with the part an operator can act on
+/// discarded. The wrapped chain is what names which gate refused.
+fn error_cause(error: &CoordinatorRuntimeError) -> String {
+    let mut chain = Vec::new();
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        chain.push(current.to_string());
+        source = current.source();
+    }
+    if chain.is_empty() {
+        "none".to_owned()
+    } else {
+        chain.join(": ")
     }
 }
 
@@ -573,5 +593,16 @@ mod tests {
         assert!(!declined_automatic_round(
             &CoordinatorRuntimeError::Storage(StorageError::Unavailable)
         ));
+    }
+
+    #[test]
+    fn a_rejected_command_reports_which_gate_refused_it_and_not_only_its_category() {
+        let rejected = CoordinatorRuntimeError::Allocation(AllocationError::InvalidView);
+        assert_eq!(
+            rejected.to_string(),
+            "allocation strategy rejected the placement view"
+        );
+        assert_eq!(error_cause(&rejected), "placement view is invalid");
+        assert_eq!(error_cause(&CoordinatorRuntimeError::DrainNotReady), "none");
     }
 }

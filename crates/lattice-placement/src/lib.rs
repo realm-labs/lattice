@@ -60,10 +60,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn external_claim_loss_fences_even_after_stop_failed() {
-        let local = node("a", 1, 1001);
-        let slot = running_slot(local.clone());
+    fn granted_authority(
+        local: &NodeKey,
+        slot: &PlacementSlot,
+        ttl: Duration,
+    ) -> PlacementAuthority {
         let mut authority = PlacementAuthority::new(local.clone(), Duration::from_secs(2)).unwrap();
         authority
             .transition(AuthorityEvent::ReconcileSlot(slot.clone()))
@@ -73,23 +74,70 @@ mod tests {
                 grant: ClaimGrant {
                     domain: slot.key.domain().clone(),
                     slot: slot.key.clone(),
-                    owner: local,
+                    owner: local.clone(),
                     coordinator_term: slot.version.term,
                     assignment_generation: slot.assignment_generation,
                     grant_sequence: GrantSequence::new(1).unwrap(),
-                    ttl: Duration::from_secs(15),
+                    ttl,
                 },
                 now: MonotonicTime::from_millis(100),
             })
             .unwrap();
-        assert!(authority.admission_open());
+        authority
+    }
+
+    #[test]
+    fn external_claim_loss_fences_even_after_stop_failed() {
+        let local = node("a", 1, 1001);
+        let slot = running_slot(local.clone());
+        let mut authority = granted_authority(&local, &slot, Duration::from_secs(15));
+        let inside = MonotonicTime::from_millis(200);
+        assert!(authority.admission_open_at(inside));
         authority.transition(AuthorityEvent::StopFailed).unwrap();
         let effects = authority
             .transition(AuthorityEvent::ExternalClaimLost)
             .unwrap();
-        assert!(!authority.admission_open());
+        assert!(!authority.admission_open_at(inside));
         assert_eq!(effects[0], AuthorityEffect::FenceAdmission);
         assert!(effects.contains(&AuthorityEffect::StateLossPossible));
+    }
+
+    /// A process that stops running stops ticking, so the periodic fence cannot be what keeps a
+    /// retired owner quiet. Admission must go shut on the deadline the grant installed, before any
+    /// `Tick` observes it.
+    #[test]
+    fn admission_closes_on_the_grant_deadline_without_any_tick() {
+        let local = node("a", 1, 1001);
+        let slot = running_slot(local.clone());
+        let authority = granted_authority(&local, &slot, Duration::from_secs(15));
+        // deadline = 100ms + 15s ttl - 2s safety margin
+        assert!(authority.admission_open_at(MonotonicTime::from_millis(13_099)));
+        assert!(!authority.admission_open_at(MonotonicTime::from_millis(13_100)));
+        assert!(!authority.admission_open_at(MonotonicTime::from_millis(38_600)));
+    }
+
+    #[test]
+    fn a_reinstalled_grant_reopens_admission_against_the_new_deadline() {
+        let local = node("a", 1, 1001);
+        let slot = running_slot(local.clone());
+        let mut authority = granted_authority(&local, &slot, Duration::from_secs(15));
+        assert!(!authority.admission_open_at(MonotonicTime::from_millis(20_000)));
+        authority
+            .transition(AuthorityEvent::InstallGrant {
+                grant: ClaimGrant {
+                    domain: slot.key.domain().clone(),
+                    slot: slot.key.clone(),
+                    owner: local,
+                    coordinator_term: slot.version.term,
+                    assignment_generation: slot.assignment_generation,
+                    grant_sequence: GrantSequence::new(2).unwrap(),
+                    ttl: Duration::from_secs(15),
+                },
+                now: MonotonicTime::from_millis(20_000),
+            })
+            .unwrap();
+        assert!(authority.admission_open_at(MonotonicTime::from_millis(20_001)));
+        assert!(!authority.admission_open_at(MonotonicTime::from_millis(33_000)));
     }
 
     #[test]

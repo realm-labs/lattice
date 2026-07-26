@@ -189,7 +189,7 @@ where
             ),
         };
         for session in self.sessions.values() {
-            if !session.placement_up() {
+            if !session.placement_attached() {
                 continue;
             }
             let include = match &slot.key {

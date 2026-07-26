@@ -77,6 +77,10 @@ where
         session.drain_operation = Some(operation_id);
         session.drain_ready = false;
         self.version = version;
+        // Marking the member Leaving advanced the shared placement revision. Sessions must observe
+        // it before the handoff deltas below, otherwise their strict reducer sees a gap and tears
+        // down the Coordinator association in the middle of the drain that revision started.
+        self.synchronize_sessions().await?;
         for entity_type in entity_types {
             let _ = self
                 .evaluate_rebalance(

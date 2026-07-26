@@ -204,6 +204,20 @@ impl MemberSession {
                 .as_ref()
                 .is_some_and(|member| member.status == DomainMemberStatus::Up)
     }
+
+    /// A leaving member is no longer a placement target, but it still owns the slots its drain has
+    /// to move and still has to apply the revisions and acknowledge the barrier those moves
+    /// install. It therefore stays in the placement view and on the delta path until removal;
+    /// dropping it there strands the drain until the failure detector removes the member instead.
+    fn placement_attached(&self) -> bool {
+        self.record.status == MemberStatus::Up
+            && self.domain_record.as_ref().is_some_and(|member| {
+                matches!(
+                    member.status,
+                    DomainMemberStatus::Up | DomainMemberStatus::Leaving
+                )
+            })
+    }
 }
 
 struct ClaimLease {

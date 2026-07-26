@@ -43,8 +43,8 @@ impl SingletonManager {
             .map_err(SingletonError::Authority)
     }
 
-    pub fn accepts_messages(&self) -> bool {
-        self.authority.admission_open()
+    pub fn accepts_messages(&self, now: MonotonicTime) -> bool {
+        self.authority.admission_open_at(now)
     }
 }
 
