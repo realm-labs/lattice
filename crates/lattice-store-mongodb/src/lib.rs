@@ -256,7 +256,9 @@
 //! through `ActorContext::pipe_to_self`; the actor's
 //! [`lattice_actor::traits::Handler`] for
 //! [`persistence::actor::MongoFlushCompleted`] later calls `apply_completion`.
-//! The default retry policy starts at 50 ms, doubles, and caps at 2 seconds.
+//! The default retry policy starts at 50 ms, doubles, caps at 2 seconds, and
+//! removes up to half of each step at random so that actors recovering from one
+//! outage do not retry in lockstep.
 //!
 //! Actor shutdown uses the mailbox-independent
 //! [`persistence::coordinator::MongoPersistenceCoordinator::drain_set`]
@@ -303,7 +305,10 @@
 //! clock failures. Its recovery classification tells the coordinator whether
 //! an outcome may be retried as-is or must wait for a new mutation and fresh
 //! preparation. Definitive server rejections such as oversized documents do
-//! not loop forever with the same rejected payload.
+//! not loop forever with the same rejected payload. Step-down, election, and
+//! shutdown codes reported by a failing replica set primary stay ambiguous and
+//! keep their exact operation ID, so a failover does not quarantine state that
+//! storage never refused.
 //!
 //! Every retained failure state has an explicit intervention path:
 //!

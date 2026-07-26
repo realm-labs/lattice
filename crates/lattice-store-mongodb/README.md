@@ -407,8 +407,8 @@ field; the framework does not prescribe business ID layout.
 Call `unload_idle` from an actor timer or maintenance message. Singleton and
 complete-collection unload returns `IdleUnloadStatus`; row tables additionally
 accept `TableEvictionBudget` and report examined, unloaded, and dirty rows.
-Dirty, newly created, scanning, in-flight, or conflicted documents stay
-resident until their persistence state is safe to detach. Documents rejected
+Dirty, newly created, scanning, in-flight, retrying, or conflicted documents
+stay resident until their persistence state is safe to detach. Documents rejected
 by storage also remain resident until current actor state is changed and
 successfully acknowledged.
 
@@ -425,13 +425,17 @@ ambiguous after a timeout. Prepared multi-document flushes report an exact
 result per document but are not cross-document transactions.
 
 Ambiguous failures such as timeouts retain the exact prepared write and
-operation ID for retry. Definitive storage rejections, including MongoDB's
-maximum-document-size error, do not retry the rejected BSON. The coordinator
-records the document's mutation epoch and returns an incomplete preparation
-while that epoch is unchanged. After business code removes or shrinks data,
-the new epoch causes a fresh diff against the unmodified durable baseline.
-`document_rejection` exposes the retained diagnostic until the current state is
-successfully acknowledged.
+operation ID for retry. Replica set step-down, election, and shutdown codes
+(`NotWritablePrimary`, `InterruptedDueToReplStateChange`, `PrimarySteppedDown`,
+and the rest of the driver's retryable-write set) and any error carrying the
+`RetryableWriteError` label are ambiguous as well, so a failover replays the
+same operation instead of quarantining the document. Definitive storage
+rejections, including MongoDB's maximum-document-size error, do not retry the
+rejected BSON. The coordinator records the document's mutation epoch and
+returns an incomplete preparation while that epoch is unchanged. After business
+code removes or shrinks data, the new epoch causes a fresh diff against the
+unmodified durable baseline. `document_rejection` exposes the retained
+diagnostic until the current state is successfully acknowledged.
 
 ## Coordinated persistence
 

@@ -125,6 +125,10 @@ pub struct RetryPolicy {
     pub initial_delay: Duration,
     pub max_delay: Duration,
     pub max_exponent: u32,
+    /// Percentage of each backoff step that may be removed at random so that
+    /// actors recovering from one storage outage do not retry in lockstep.
+    /// Zero keeps the delay of every attempt exactly deterministic.
+    pub jitter_percent: u32,
 }
 
 impl Default for RetryPolicy {
@@ -133,16 +137,29 @@ impl Default for RetryPolicy {
             initial_delay: Duration::from_millis(50),
             max_delay: Duration::from_secs(2),
             max_exponent: 6,
+            jitter_percent: 50,
         }
     }
 }
 
 impl RetryPolicy {
-    fn delay(self, attempt: u32) -> Duration {
+    fn delay(self, attempt: u32, entropy: u64) -> Duration {
         let exponent = attempt.saturating_sub(1).min(self.max_exponent);
-        self.initial_delay
+        let step = self
+            .initial_delay
             .saturating_mul(1_u32.checked_shl(exponent).unwrap_or(u32::MAX))
-            .min(self.max_delay)
+            .min(self.max_delay);
+        self.jittered(step, entropy)
+    }
+
+    fn jittered(self, step: Duration, entropy: u64) -> Duration {
+        let percent = u128::from(self.jitter_percent.min(100));
+        if percent == 0 {
+            return step;
+        }
+        let span = step.as_nanos().saturating_mul(percent) / 100;
+        let removed = u64::try_from(u128::from(entropy) % (span + 1)).unwrap_or(u64::MAX);
+        step.saturating_sub(Duration::from_nanos(removed))
     }
 }
 
@@ -241,6 +258,7 @@ pub struct MongoPersistenceCoordinator {
     retry_attempt: u32,
     retry_not_before: Option<Instant>,
     retry_policy: RetryPolicy,
+    retry_entropy: u64,
     counters: PersistenceCounters,
     scan_metrics: PersistenceScanMetrics,
 }
@@ -263,6 +281,7 @@ impl MongoPersistenceCoordinator {
             retry_attempt: 0,
             retry_not_before: None,
             retry_policy,
+            retry_entropy: uuid::Uuid::new_v4().as_u64_pair().0 | 1,
             counters: PersistenceCounters::default(),
             scan_metrics: PersistenceScanMetrics::default(),
         }
@@ -543,9 +562,26 @@ impl MongoPersistenceCoordinator {
         if document.rejection.is_some() {
             return Err(PersistenceError::DocumentRejectionPending(key));
         }
+        if self.retry_pending_contains(&key) {
+            return Err(PersistenceError::DocumentRetryPending(key));
+        }
         self.documents.remove(&key);
         self.clear_last_error_if_recovered();
         Ok(())
+    }
+
+    /// Returns whether a pending exact retry still replays a commit for this
+    /// document. Its completion resolves against the registration, so the
+    /// document must stay registered until the retry is applied or aborted.
+    fn retry_pending_contains(&self, key: &MongoDocumentKey) -> bool {
+        self.retry_pending.as_ref().is_some_and(|pending| {
+            pending
+                .commit
+                .document_commits
+                .values()
+                .chain(pending.commit.clean_commits.iter())
+                .any(|commit| commit.key == *key)
+        })
     }
 
     /// Returns whether a tracked document is durably clean and can be
@@ -570,6 +606,7 @@ impl MongoPersistenceCoordinator {
         let conflicted = state.conflict.is_some();
         Ok(!in_flight
             && !conflicted
+            && !self.retry_pending_contains(&key)
             && !state.presence.is_pending_create()
             && state.rejection.is_none()
             && state.scanning_mutation_epoch.is_none()
@@ -1063,7 +1100,19 @@ impl MongoPersistenceCoordinator {
 
     fn schedule_retry(&mut self) {
         self.retry_attempt = self.retry_attempt.saturating_add(1);
-        self.retry_not_before = Some(Instant::now() + self.retry_policy.delay(self.retry_attempt));
+        let entropy = self.next_retry_entropy();
+        self.retry_not_before =
+            Some(Instant::now() + self.retry_policy.delay(self.retry_attempt, entropy));
+    }
+
+    /// Advances the activation-local xorshift sequence seeded when the
+    /// coordinator was created. Every activation therefore spreads its backoff
+    /// differently without a shared random source.
+    fn next_retry_entropy(&mut self) -> u64 {
+        self.retry_entropy ^= self.retry_entropy << 13;
+        self.retry_entropy ^= self.retry_entropy >> 7;
+        self.retry_entropy ^= self.retry_entropy << 17;
+        self.retry_entropy
     }
 
     fn validate_generation(&self, generation: FlushGeneration) -> Result<(), PersistenceError> {
@@ -1177,6 +1226,8 @@ pub enum PersistenceError {
     DocumentNotRejected(MongoDocumentKey),
     #[error("document rejection must be resolved explicitly before detaching: {0:?}")]
     DocumentRejectionPending(MongoDocumentKey),
+    #[error("document write retry must be applied or aborted before detaching: {0:?}")]
+    DocumentRetryPending(MongoDocumentKey),
     #[error("persistence generation was explicitly abandoned: {0:?}")]
     AbandonedGeneration(FlushGeneration),
     #[error("stale activation epoch: expected {expected}, got {actual}")]

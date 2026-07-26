@@ -732,6 +732,7 @@ fn failed_write_preserves_baseline_and_schedules_retry() {
             initial_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(2),
             max_exponent: 6,
+            jitter_percent: 0,
         },
     );
     coordinator
@@ -779,6 +780,89 @@ fn failed_write_preserves_baseline_and_schedules_retry() {
     assert_eq!(retry_write.operation_id, operation_id);
     assert_eq!(retry_write.token, token);
     assert_eq!(retry.commit.generation, generation);
+}
+
+#[test]
+fn document_cannot_detach_while_an_exact_retry_still_replays_it() {
+    let old = document("old");
+    let mut value = old.clone();
+    value.name = "new".to_owned();
+    let mut coordinator = loaded(&old, None);
+    let prepared = coordinator
+        .prepare(ScanBudget::generous(), |preparation| {
+            preparation.scan(&value)
+        })
+        .unwrap();
+    let request = prepared.request.as_ref().unwrap();
+    let generation = request.generation;
+    let token = request.writes[0].token;
+    coordinator.begin_flush(prepared.commit).unwrap();
+    coordinator
+        .complete(
+            generation,
+            FlushOutcome {
+                documents: BTreeMap::from([(
+                    token,
+                    DocumentWriteOutcome::Failed {
+                        error: MongoStoreError::new("replica set failover"),
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        coordinator.detach::<TestDocument>(&42),
+        Err(PersistenceError::DocumentRetryPending(_))
+    ));
+
+    let retry = coordinator
+        .prepare(ScanBudget::generous(), |preparation| {
+            preparation.scan(&value)
+        })
+        .unwrap();
+    let retry_request = retry.request.as_ref().unwrap();
+    let retry_generation = retry_request.generation;
+    let retry_token = retry_request.writes[0].token;
+    coordinator.begin_flush(retry.commit).unwrap();
+    coordinator
+        .complete(
+            retry_generation,
+            FlushOutcome {
+                documents: BTreeMap::from([(
+                    retry_token,
+                    DocumentWriteOutcome::Applied {
+                        previous_version: 3,
+                        new_version: 4,
+                        updated_at_ms: 60,
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+    coordinator.detach::<TestDocument>(&42).unwrap();
+}
+
+#[test]
+fn retry_backoff_spreads_inside_its_exponential_step() {
+    let policy = RetryPolicy::default();
+    let deterministic = RetryPolicy {
+        jitter_percent: 0,
+        ..policy
+    };
+    for attempt in 1..=8 {
+        let step = deterministic.delay(attempt, u64::MAX);
+        assert_eq!(policy.delay(attempt, 0), step);
+        for entropy in [1, u64::MAX / 3, u64::MAX] {
+            let delay = policy.delay(attempt, entropy);
+            assert!(delay <= step, "attempt {attempt} must not exceed its step");
+            assert!(
+                delay >= step / 2,
+                "attempt {attempt} must keep half of its step"
+            );
+        }
+    }
+    assert_eq!(deterministic.delay(9, 0), policy.max_delay);
+    assert_ne!(policy.delay(3, 0), policy.delay(3, u64::MAX));
 }
 
 #[test]
