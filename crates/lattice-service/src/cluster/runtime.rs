@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use lattice_core::actor_ref::PlacementDomainId;
+use lattice_core::actor_ref::{NodeIncarnation, PlacementDomainId};
 use lattice_placement::{
     authority::AuthorityEffect,
     control::PlacementControlEvent,
@@ -33,6 +33,7 @@ use crate::{
         NodeLifecycle, NodeLifecycleState, PlacementDomainState, ProductionLifecycleDriver,
         ServiceHealthSnapshot, ServiceLifecycleEvent,
     },
+    supervisor::TaskSupervisor,
 };
 
 pub(crate) struct LogicJoinRuntime {
@@ -52,12 +53,173 @@ pub(crate) struct LogicJoinRuntime {
     pub lifecycle: Arc<Mutex<NodeLifecycle>>,
     pub lifecycle_driver: ProductionLifecycleDriver,
     pub health: Arc<Mutex<ServiceHealthSnapshot>>,
-    pub health_events: watch::Sender<ServiceHealthSnapshot>,
     pub logic_handles: Arc<Mutex<BTreeMap<PlacementDomainId, LogicCoordinatorHandle>>>,
     pub drain_ready: watch::Sender<BTreeMap<PlacementDomainId, String>>,
     pub drain_blockers: watch::Sender<BTreeMap<PlacementDomainId, BTreeSet<PlacementSlotKey>>>,
     pub bootstrap_view: Arc<BootstrapView>,
     pub membership_ready: watch::Receiver<bool>,
+    pub supervisor: Arc<TaskSupervisor>,
+}
+
+/// Applies the placement effects produced by one logic domain session.
+///
+/// Both the discovery-driven join runtime and the pre-assembled cluster runtime share this
+/// applier so authority effects cannot diverge between the two assembly paths.
+pub(crate) struct LogicEffectApplier {
+    pub domain: PlacementDomainId,
+    pub incarnation: NodeIncarnation,
+    pub router: Arc<dyn LogicalRouter>,
+    pub peers: Arc<PeerReconciler>,
+    pub watches: Arc<Mutex<WatchRegistry>>,
+    pub drain_ready: watch::Sender<BTreeMap<PlacementDomainId, String>>,
+    pub drain_blockers: watch::Sender<BTreeMap<PlacementDomainId, BTreeSet<PlacementSlotKey>>>,
+    pub supervisor: Arc<TaskSupervisor>,
+}
+
+impl LogicEffectApplier {
+    pub async fn apply(
+        &self,
+        effect: LogicPlacementEffect,
+        handle: &LogicCoordinatorHandle,
+    ) -> Result<(), ()> {
+        match effect {
+            LogicPlacementEffect::MemberSnapshot { version, members } => self
+                .peers
+                .install_snapshot(version, members)
+                .await
+                .map_err(|_| ()),
+            LogicPlacementEffect::MemberEvent(event) => {
+                let MemberEvent { version, change } = event.as_ref();
+                match change {
+                    MemberChange::Removed { node, reason } => {
+                        tracing::info!(
+                            target: "lattice.cluster.members",
+                            node_id = %node.node_id,
+                            incarnation = node.incarnation.get(),
+                            term = version.term.get(),
+                            revision = version.revision.get(),
+                            ?reason,
+                            "authoritative member removed"
+                        );
+                        self.watches
+                            .lock()
+                            .expect("watch registry poisoned")
+                            .node_down(node.incarnation);
+                    }
+                    MemberChange::Upsert(record) => tracing::info!(
+                        target: "lattice.cluster.members",
+                        node_id = %record.node.node_id,
+                        incarnation = record.node.incarnation.get(),
+                        term = version.term.get(),
+                        revision = version.revision.get(),
+                        status = ?record.status,
+                        "authoritative member upserted"
+                    ),
+                }
+                self.peers.apply(*event).await.map_err(|_| ())
+            }
+            LogicPlacementEffect::DrainReady {
+                operation_id,
+                incarnation,
+            } => {
+                if incarnation != self.incarnation {
+                    return Err(());
+                }
+                handle
+                    .complete_member_drain(operation_id.clone())
+                    .await
+                    .map_err(|_| ())?;
+                self.drain_ready.send_modify(|ready| {
+                    ready.insert(self.domain.clone(), operation_id);
+                });
+                Ok(())
+            }
+            LogicPlacementEffect::Authority { slot, effect } => {
+                self.apply_authority(slot, effect, handle).await
+            }
+        }
+    }
+
+    async fn apply_authority(
+        &self,
+        slot: PlacementSlotKey,
+        effect: AuthorityEffect,
+        handle: &LogicCoordinatorHandle,
+    ) -> Result<(), ()> {
+        match effect {
+            AuthorityEffect::DrainSlot => {
+                let succeeded = self.router.drain_slot(slot.clone()).await.unwrap_or(false);
+                handle.complete_drain(slot, succeeded).await.map_err(|_| ())
+            }
+            AuthorityEffect::PublishReady => handle.publish_ready(&slot).map_err(|_| ()),
+            AuthorityEffect::PublishDrained => {
+                let result = handle.publish_drained(&slot).map_err(|_| ());
+                self.release_blocker(&slot);
+                result
+            }
+            AuthorityEffect::PublishStopFailed => {
+                let result = handle.publish_stop_failed(&slot).map_err(|_| ());
+                let mut inserted = false;
+                self.drain_blockers.send_modify(|blockers| {
+                    inserted = blockers
+                        .entry(self.domain.clone())
+                        .or_default()
+                        .insert(slot.clone());
+                });
+                if result.is_ok() && inserted {
+                    self.watch_stop_failed_slot(slot, handle);
+                }
+                result
+            }
+            AuthorityEffect::StopSlot => {
+                let result = self
+                    .router
+                    .stop_fenced_slot(slot.clone())
+                    .await
+                    .map_err(|_| ());
+                self.release_blocker(&slot);
+                result
+            }
+            AuthorityEffect::FenceAdmission
+            | AuthorityEffect::OpenAdmission
+            | AuthorityEffect::StartSlot
+            | AuthorityEffect::StateLossPossible => Ok(()),
+        }
+    }
+
+    fn release_blocker(&self, slot: &PlacementSlotKey) {
+        self.drain_blockers.send_modify(|blockers| {
+            if let Some(slots) = blockers.get_mut(&self.domain) {
+                slots.remove(slot);
+            }
+        });
+    }
+
+    pub(super) fn watch_stop_failed_slot(
+        &self,
+        slot: PlacementSlotKey,
+        handle: &LogicCoordinatorHandle,
+    ) {
+        let router = self.router.clone();
+        let handle = handle.clone();
+        let watched = slot.clone();
+        if self
+            .supervisor
+            .spawn(async move {
+                if router.wait_slot_drained(watched.clone()).await.is_ok() {
+                    let _ = handle.complete_drain(watched, true).await;
+                }
+            })
+            .is_err()
+        {
+            tracing::warn!(
+                target: "lattice.cluster.logic",
+                domain = %self.domain.as_str(),
+                ?slot,
+                "stop-failed slot keeps blocking the drain because no supervised task was available"
+            );
+        }
+    }
 }
 
 struct LogicSessionRun {
@@ -233,6 +395,7 @@ impl LogicJoinRuntime {
         } = run;
         let (session_shutdown, session_shutdown_rx) = watch::channel(false);
         let mut task = tokio::spawn(session.run_recoverable(controls, session_shutdown_rx));
+        let applier = self.effect_applier();
         let changed = handle.change_notifier();
         loop {
             // The placement state can become ready while authority effects produced by the
@@ -257,7 +420,6 @@ impl LogicJoinRuntime {
                 };
                 if let Some(event) = event {
                     let _ = self.lifecycle_driver.transition(event);
-                    self.sync_node_health();
                 }
             }
             tokio::select! {
@@ -344,7 +506,7 @@ impl LogicJoinRuntime {
                             retry,
                         };
                     };
-                    if self.apply_effect(effect, &handle).await.is_err() {
+                    if applier.apply(effect, &handle).await.is_err() {
                         self.set_domain_state(PlacementDomainState::Degraded);
                         let _ = self
                             .lifecycle_driver
@@ -382,99 +544,16 @@ impl LogicJoinRuntime {
         }
     }
 
-    async fn apply_effect(
-        &self,
-        effect: LogicPlacementEffect,
-        handle: &LogicCoordinatorHandle,
-    ) -> Result<(), ()> {
-        match effect {
-            LogicPlacementEffect::MemberSnapshot { version, members } => self
-                .peers
-                .install_snapshot(version, members)
-                .await
-                .map_err(|_| ()),
-            LogicPlacementEffect::MemberEvent(event) => {
-                if let MemberEvent {
-                    change: MemberChange::Removed { node, .. },
-                    ..
-                } = event.as_ref()
-                {
-                    self.watches
-                        .lock()
-                        .expect("watch registry poisoned")
-                        .node_down(node.incarnation);
-                }
-                self.peers.apply(*event).await.map_err(|_| ())
-            }
-            LogicPlacementEffect::DrainReady {
-                operation_id,
-                incarnation,
-            } => {
-                if incarnation != self.domain_hello.node.incarnation {
-                    return Err(());
-                }
-                handle
-                    .complete_member_drain(operation_id.clone())
-                    .await
-                    .map_err(|_| ())?;
-                self.drain_ready.send_modify(|ready| {
-                    ready.insert(self.domain_hello.domain.clone(), operation_id);
-                });
-                Ok(())
-            }
-            LogicPlacementEffect::Authority { slot, effect } => match effect {
-                AuthorityEffect::DrainSlot => {
-                    let succeeded = self.router.drain_slot(slot.clone()).await.unwrap_or(false);
-                    handle.complete_drain(slot, succeeded).await.map_err(|_| ())
-                }
-                AuthorityEffect::PublishReady => handle.publish_ready(&slot).map_err(|_| ()),
-                AuthorityEffect::PublishDrained => {
-                    let result = handle.publish_drained(&slot).map_err(|_| ());
-                    self.drain_blockers.send_modify(|blockers| {
-                        if let Some(slots) = blockers.get_mut(&self.domain_hello.domain) {
-                            slots.remove(&slot);
-                        }
-                    });
-                    result
-                }
-                AuthorityEffect::PublishStopFailed => {
-                    let result = handle.publish_stop_failed(&slot).map_err(|_| ());
-                    let mut inserted = false;
-                    self.drain_blockers.send_modify(|blockers| {
-                        inserted = blockers
-                            .entry(self.domain_hello.domain.clone())
-                            .or_default()
-                            .insert(slot.clone());
-                    });
-                    if result.is_ok() && inserted {
-                        let router = self.router.clone();
-                        let handle = handle.clone();
-                        tokio::spawn(async move {
-                            if router.wait_slot_drained(slot.clone()).await.is_ok() {
-                                let _ = handle.complete_drain(slot, true).await;
-                            }
-                        });
-                    }
-                    result
-                }
-                AuthorityEffect::StopSlot => {
-                    let result = self
-                        .router
-                        .stop_fenced_slot(slot.clone())
-                        .await
-                        .map_err(|_| ());
-                    self.drain_blockers.send_modify(|blockers| {
-                        if let Some(slots) = blockers.get_mut(&self.domain_hello.domain) {
-                            slots.remove(&slot);
-                        }
-                    });
-                    result
-                }
-                AuthorityEffect::FenceAdmission
-                | AuthorityEffect::OpenAdmission
-                | AuthorityEffect::StartSlot
-                | AuthorityEffect::StateLossPossible => Ok(()),
-            },
+    fn effect_applier(&self) -> LogicEffectApplier {
+        LogicEffectApplier {
+            domain: self.domain_hello.domain.clone(),
+            incarnation: self.domain_hello.node.incarnation,
+            router: self.router.clone(),
+            peers: self.peers.clone(),
+            watches: self.watches.clone(),
+            drain_ready: self.drain_ready.clone(),
+            drain_blockers: self.drain_blockers.clone(),
+            supervisor: self.supervisor.clone(),
         }
     }
 
@@ -490,17 +569,6 @@ impl LogicJoinRuntime {
             .domains
             .values()
             .all(|state| *state == PlacementDomainState::Ready)
-    }
-
-    fn sync_node_health(&self) {
-        let node = self
-            .lifecycle
-            .lock()
-            .expect("service lifecycle poisoned")
-            .state();
-        let mut health = self.health.lock().expect("service health poisoned");
-        health.node = node;
-        self.health_events.send_replace(health.clone());
     }
 }
 

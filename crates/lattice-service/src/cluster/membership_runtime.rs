@@ -33,7 +33,6 @@ pub(crate) struct MembershipJoinRuntime {
     pub lifecycle: Arc<Mutex<NodeLifecycle>>,
     pub lifecycle_driver: ProductionLifecycleDriver,
     pub health: Arc<Mutex<ServiceHealthSnapshot>>,
-    pub health_events: watch::Sender<ServiceHealthSnapshot>,
     pub bootstrap_view: Arc<BootstrapView>,
     pub ready: watch::Sender<bool>,
     pub handle: Arc<Mutex<Option<MembershipCoordinatorHandle>>>,
@@ -170,7 +169,6 @@ impl MembershipJoinRuntime {
                     let _ = self
                         .lifecycle_driver
                         .transition(ServiceLifecycleEvent::SnapshotInstalled);
-                    self.sync_node_health();
                 }
             }
             tokio::select! {
@@ -307,17 +305,6 @@ impl MembershipJoinRuntime {
         }
     }
 
-    fn sync_node_health(&self) {
-        let node = self
-            .lifecycle
-            .lock()
-            .expect("service lifecycle poisoned")
-            .state();
-        let mut health = self.health.lock().expect("service health poisoned");
-        health.node = node;
-        self.health_events.send_replace(health.clone());
-    }
-
     fn all_domains_ready(&self) -> bool {
         self.health
             .lock()
@@ -332,7 +319,6 @@ impl MembershipJoinRuntime {
         let _ = self
             .lifecycle_driver
             .transition(ServiceLifecycleEvent::MembershipLost);
-        self.sync_node_health();
     }
 }
 

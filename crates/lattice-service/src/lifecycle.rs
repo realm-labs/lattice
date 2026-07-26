@@ -12,14 +12,13 @@ use lattice_placement::types::PlacementSlotKey;
 use thiserror::Error;
 use tokio::sync::watch::Sender;
 
-static LIFECYCLE_TRANSITION_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
-static TERMINATION_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
-static LATEST_TERMINATION_LATENCY_MILLIS: AtomicU64 = AtomicU64::new(0);
-static BLOCKED_DRAIN_REPORTS_TOTAL: AtomicU64 = AtomicU64::new(0);
-static ACTIVE_BLOCKED_DRAIN_SLOTS: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Lifecycle metrics for one service component.
+///
+/// A process can host several `LatticeService` instances, so the counters belong to the
+/// component that owns them instead of to the crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceLifecycleMetricsSnapshot {
+    pub component: String,
     pub lifecycle_transition_failures_total: u64,
     pub termination_completed_total: u64,
     pub latest_termination_latency_millis: u64,
@@ -27,24 +26,13 @@ pub struct ServiceLifecycleMetricsSnapshot {
     pub active_blocked_drain_slots: u64,
 }
 
-pub fn service_lifecycle_metrics() -> ServiceLifecycleMetricsSnapshot {
-    ServiceLifecycleMetricsSnapshot {
-        lifecycle_transition_failures_total: LIFECYCLE_TRANSITION_FAILURES_TOTAL
-            .load(Ordering::Relaxed),
-        termination_completed_total: TERMINATION_COMPLETED_TOTAL.load(Ordering::Relaxed),
-        latest_termination_latency_millis: LATEST_TERMINATION_LATENCY_MILLIS
-            .load(Ordering::Relaxed),
-        blocked_drain_reports_total: BLOCKED_DRAIN_REPORTS_TOTAL.load(Ordering::Relaxed),
-        active_blocked_drain_slots: ACTIVE_BLOCKED_DRAIN_SLOTS.load(Ordering::Relaxed),
-    }
-}
-
-pub(crate) fn record_blocked_drain_slots(count: usize) {
-    let count = u64::try_from(count).unwrap_or(u64::MAX);
-    ACTIVE_BLOCKED_DRAIN_SLOTS.store(count, Ordering::Relaxed);
-    if count > 0 {
-        BLOCKED_DRAIN_REPORTS_TOTAL.fetch_add(1, Ordering::Relaxed);
-    }
+#[derive(Debug, Default)]
+struct ServiceLifecycleMetrics {
+    transition_failures_total: AtomicU64,
+    termination_completed_total: AtomicU64,
+    latest_termination_latency_millis: AtomicU64,
+    blocked_drain_reports_total: AtomicU64,
+    active_blocked_drain_slots: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +145,7 @@ impl NodeAdmissionGate {
 
 #[derive(Clone)]
 pub struct ProductionLifecycleDriver {
+    component: Arc<str>,
     lifecycle: Arc<Mutex<NodeLifecycle>>,
     lifecycle_events: Sender<NodeLifecycleState>,
     health: Arc<Mutex<ServiceHealthSnapshot>>,
@@ -166,10 +155,12 @@ pub struct ProductionLifecycleDriver {
     identity_released: Arc<AtomicBool>,
     runtime_shutdowns: Arc<Mutex<Vec<Sender<bool>>>>,
     termination_started_at: Arc<Mutex<Option<Instant>>>,
+    metrics: Arc<ServiceLifecycleMetrics>,
 }
 
 impl ProductionLifecycleDriver {
     pub fn new(
+        component: impl Into<Arc<str>>,
         lifecycle: Arc<Mutex<NodeLifecycle>>,
         lifecycle_events: Sender<NodeLifecycleState>,
         health: Arc<Mutex<ServiceHealthSnapshot>>,
@@ -177,6 +168,7 @@ impl ProductionLifecycleDriver {
         admission: NodeAdmissionGate,
     ) -> Self {
         Self {
+            component: component.into(),
             lifecycle,
             lifecycle_events,
             health,
@@ -186,6 +178,45 @@ impl ProductionLifecycleDriver {
             identity_released: Arc::new(AtomicBool::new(false)),
             runtime_shutdowns: Arc::new(Mutex::new(Vec::new())),
             termination_started_at: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(ServiceLifecycleMetrics::default()),
+        }
+    }
+
+    pub fn metrics(&self) -> ServiceLifecycleMetricsSnapshot {
+        ServiceLifecycleMetricsSnapshot {
+            component: self.component.to_string(),
+            lifecycle_transition_failures_total: self
+                .metrics
+                .transition_failures_total
+                .load(Ordering::Relaxed),
+            termination_completed_total: self
+                .metrics
+                .termination_completed_total
+                .load(Ordering::Relaxed),
+            latest_termination_latency_millis: self
+                .metrics
+                .latest_termination_latency_millis
+                .load(Ordering::Relaxed),
+            blocked_drain_reports_total: self
+                .metrics
+                .blocked_drain_reports_total
+                .load(Ordering::Relaxed),
+            active_blocked_drain_slots: self
+                .metrics
+                .active_blocked_drain_slots
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn record_blocked_drain_slots(&self, count: usize) {
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        self.metrics
+            .active_blocked_drain_slots
+            .store(count, Ordering::Relaxed);
+        if count > 0 {
+            self.metrics
+                .blocked_drain_reports_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -228,9 +259,12 @@ impl ProductionLifecycleDriver {
         let effects = match lifecycle.transition(event) {
             Ok(effects) => effects,
             Err(error) => {
-                LIFECYCLE_TRANSITION_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .transition_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     target: "lattice.cluster.lifecycle",
+                    component = %self.component,
                     ?event,
                     ?previous,
                     error = %error,
@@ -258,17 +292,24 @@ impl ProductionLifecycleDriver {
         let next = lifecycle.state();
         {
             let mut health = self.health.lock().expect("service health poisoned");
-            health.node = next;
-            self.health_events.send_replace(health.clone());
+            if health.node != next {
+                health.node = next;
+                self.health_events.send_replace(health.clone());
+            }
         }
         tracing::info!(
             target: "lattice.cluster.lifecycle",
+            component = %self.component,
             ?event,
             ?previous,
             ?next,
             "production lifecycle driver committed transition"
         );
-        self.lifecycle_events.send_replace(next);
+        self.lifecycle_events.send_if_modified(|current| {
+            let changed = *current != next;
+            *current = next;
+            changed
+        });
         if event == ServiceLifecycleEvent::ShutdownComplete {
             if let Some(started) = self
                 .termination_started_at
@@ -277,10 +318,16 @@ impl ProductionLifecycleDriver {
                 .take()
             {
                 let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                LATEST_TERMINATION_LATENCY_MILLIS.store(millis, Ordering::Relaxed);
+                self.metrics
+                    .latest_termination_latency_millis
+                    .store(millis, Ordering::Relaxed);
             }
-            TERMINATION_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
-            ACTIVE_BLOCKED_DRAIN_SLOTS.store(0, Ordering::Relaxed);
+            self.metrics
+                .termination_completed_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .active_blocked_drain_slots
+                .store(0, Ordering::Relaxed);
         }
         Ok(next)
     }
@@ -302,6 +349,9 @@ impl ProductionLifecycleDriver {
             return;
         }
         let mut health = self.health.lock().expect("service health poisoned");
+        if health.domains.get(&domain) == Some(&state) {
+            return;
+        }
         health.domains.insert(domain, state);
         self.health_events.send_replace(health.clone());
     }
@@ -312,12 +362,19 @@ impl ProductionLifecycleDriver {
             ServiceLifecycleEffect::CloseExternalAdmission => self.admission.close(),
             ServiceLifecycleEffect::BeginPlacementDrain => {
                 let mut health = self.health.lock().expect("service health poisoned");
+                let mut changed = false;
                 for state in health.domains.values_mut() {
-                    if *state != PlacementDomainState::Terminated {
+                    if !matches!(
+                        state,
+                        PlacementDomainState::Terminated | PlacementDomainState::Draining
+                    ) {
                         *state = PlacementDomainState::Draining;
+                        changed = true;
                     }
                 }
-                self.health_events.send_replace(health.clone());
+                if changed {
+                    self.health_events.send_replace(health.clone());
+                }
             }
             ServiceLifecycleEffect::FenceClaimsAndStopRuntime => {
                 self.admission.close();
@@ -458,12 +515,88 @@ mod tests {
         }));
         let (health_events, _) = tokio::sync::watch::channel(health.lock().unwrap().clone());
         ProductionLifecycleDriver::new(
+            "driver-test-node",
             lifecycle,
             lifecycle_events,
             health,
             health_events,
             NodeAdmissionGate::closed(),
         )
+    }
+
+    fn observed_driver(
+        domain: &PlacementDomainId,
+    ) -> (
+        ProductionLifecycleDriver,
+        tokio::sync::watch::Receiver<ServiceHealthSnapshot>,
+    ) {
+        let lifecycle = Arc::new(Mutex::new(NodeLifecycle::default()));
+        let (lifecycle_events, _) = tokio::sync::watch::channel(NodeLifecycleState::Booting);
+        let health = Arc::new(Mutex::new(ServiceHealthSnapshot {
+            node: NodeLifecycleState::Booting,
+            domains: [(domain.clone(), PlacementDomainState::Joining)]
+                .into_iter()
+                .collect(),
+            coordinator_scopes: BTreeMap::new(),
+        }));
+        let (health_events, health_rx) =
+            tokio::sync::watch::channel(health.lock().unwrap().clone());
+        let driver = ProductionLifecycleDriver::new(
+            "observed-node",
+            lifecycle,
+            lifecycle_events,
+            health,
+            health_events,
+            NodeAdmissionGate::closed(),
+        );
+        (driver, health_rx)
+    }
+
+    #[test]
+    fn repeated_domain_and_node_states_do_not_republish_health() {
+        let domain = PlacementDomainId::new("republish-test").unwrap();
+        let (driver, mut health) = observed_driver(&domain);
+        driver
+            .transition(ServiceLifecycleEvent::RemotingReady)
+            .unwrap();
+        driver.set_domain_state(domain.clone(), PlacementDomainState::Ready);
+        assert!(health.has_changed().unwrap());
+        health.mark_unchanged();
+
+        for _ in 0..8 {
+            driver.set_domain_state(domain.clone(), PlacementDomainState::Ready);
+        }
+        driver
+            .transition(ServiceLifecycleEvent::MembershipLost)
+            .unwrap();
+
+        assert!(!health.has_changed().unwrap());
+    }
+
+    #[test]
+    fn lifecycle_metrics_are_scoped_to_one_component() {
+        let logic = production_driver([]);
+        let coordinator = production_driver([]);
+        assert!(
+            logic
+                .transition(ServiceLifecycleEvent::DrainComplete)
+                .is_err()
+        );
+
+        assert_eq!(logic.metrics().lifecycle_transition_failures_total, 1);
+        assert_eq!(coordinator.metrics().lifecycle_transition_failures_total, 0);
+
+        logic.transition(ServiceLifecycleEvent::ForceStop).unwrap();
+        logic.record_blocked_drain_slots(3);
+        logic
+            .transition(ServiceLifecycleEvent::ShutdownComplete)
+            .unwrap();
+
+        assert_eq!(logic.metrics().termination_completed_total, 1);
+        assert_eq!(logic.metrics().blocked_drain_reports_total, 1);
+        assert_eq!(logic.metrics().active_blocked_drain_slots, 0);
+        assert_eq!(coordinator.metrics().termination_completed_total, 0);
+        assert_eq!(coordinator.metrics().blocked_drain_reports_total, 0);
     }
 
     #[test]

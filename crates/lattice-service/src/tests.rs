@@ -441,6 +441,160 @@ async fn service_retry_api_resolves_retained_actor_cell() {
     service.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn repeated_start_is_rejected_without_stopping_a_ready_node() {
+    let _network = network_test_guard().await;
+    let binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let registry = Arc::new(ActorRegistry::new_bound(
+        actor_kind!("RepeatedStartActor"),
+        ActorRegistryConfig::default(),
+        binding.as_ref(),
+    ));
+    let handle = registry.start(ActorId::U64(1), PingActor).await.unwrap();
+    let address = unused_address().await;
+    let config = node_config(
+        ClusterId::new("repeated-start-test").unwrap(),
+        "repeated-start",
+        address.clone(),
+        NodeIncarnation::new(1).unwrap(),
+    );
+    let service = LatticeService::builder(config)
+        .unwrap()
+        .register_actor(registry.clone(), binding)
+        .unwrap()
+        .build()
+        .unwrap();
+    service.start().await.unwrap();
+    assert_eq!(service.node_lifecycle_state(), NodeLifecycleState::Ready);
+
+    let rejected = service.start().await.unwrap_err();
+
+    assert!(matches!(rejected, ServiceError::Lifecycle(_)));
+    assert_eq!(service.node_lifecycle_state(), NodeLifecycleState::Ready);
+    assert!(matches!(
+        handle.lifecycle_state(),
+        ActorLifecycleState::Starting | ActorLifecycleState::Running
+    ));
+    assert!(!registry.live_cells().is_empty());
+    let socket = format!("{}:{}", address.host(), address.port());
+    assert!(
+        tokio::net::TcpListener::bind(socket).await.is_err(),
+        "a rejected second start must not release remoting"
+    );
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn startup_failure_rolls_back_partially_started_components() {
+    let _network = network_test_guard().await;
+    let address = unused_address().await;
+    let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
+    let mut config = node_config(
+        ClusterId::new("startup-rollback-test").unwrap(),
+        "startup-rollback",
+        address.clone(),
+        NodeIncarnation::new(1).unwrap(),
+    );
+    config.maximum_supervised_tasks = 1;
+    let builder = LatticeService::builder(config).unwrap();
+    let host = CoordinatorHost::elect(
+        store,
+        builder.association_manager(),
+        NodeKey {
+            node_id: "startup-rollback".to_owned(),
+            address: address.clone(),
+            incarnation: NodeIncarnation::new(1).unwrap(),
+        },
+        BTreeSet::from([placement_domain()]),
+        CoordinatorHostConfig::default(),
+    )
+    .await
+    .unwrap();
+    let (control, controls) =
+        PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
+    let service = builder
+        .coordinator_host(Arc::new(control), host, controls)
+        .build()
+        .unwrap();
+
+    let error = service.start().await.unwrap_err();
+
+    assert!(matches!(error, ServiceError::TaskCapacity));
+    assert_eq!(
+        service.node_lifecycle_state(),
+        NodeLifecycleState::Terminated
+    );
+    let socket = format!("{}:{}", address.host(), address.port());
+    tokio::net::TcpListener::bind(socket)
+        .await
+        .expect("a failed start must release the remoting endpoint");
+}
+
+#[tokio::test]
+async fn supervised_task_panic_stops_the_node() {
+    let _network = network_test_guard().await;
+    let config = node_config(
+        ClusterId::new("task-panic-test").unwrap(),
+        "task-panic",
+        unused_address().await,
+        NodeIncarnation::new(1).unwrap(),
+    );
+    let service = LatticeService::builder(config).unwrap().build().unwrap();
+    service.start().await.unwrap();
+    assert_eq!(service.node_lifecycle_state(), NodeLifecycleState::Ready);
+
+    service
+        .supervisor()
+        .spawn(async { panic!("supervised task under test") })
+        .unwrap();
+
+    let mut lifecycle = service.subscribe_node_lifecycle();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while *lifecycle.borrow_and_update() != NodeLifecycleState::Stopping {
+            lifecycle.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("a panicking supervised task must stop reporting readiness");
+    assert_eq!(service.supervisor().failed_tasks(), 1);
+    service.shutdown().await.unwrap();
+    assert_eq!(
+        service.node_lifecycle_state(),
+        NodeLifecycleState::Terminated
+    );
+}
+
+#[tokio::test]
+async fn shutdown_completes_after_aborting_a_stuck_supervised_task() {
+    let _network = network_test_guard().await;
+    let config = node_config(
+        ClusterId::new("stuck-task-test").unwrap(),
+        "stuck-task",
+        unused_address().await,
+        NodeIncarnation::new(1).unwrap(),
+    );
+    let service = LatticeService::builder(config)
+        .unwrap()
+        .join_config(ClusterJoinConfig {
+            leave_timeout: Duration::from_millis(100),
+            shutdown_timeout: Duration::from_millis(200),
+            ..ClusterJoinConfig::default()
+        })
+        .build()
+        .unwrap();
+    service.start().await.unwrap();
+    service.supervisor().spawn(std::future::pending()).unwrap();
+
+    service.shutdown().await.unwrap();
+
+    assert_eq!(
+        service.node_lifecycle_state(),
+        NodeLifecycleState::Terminated
+    );
+    assert_eq!(service.supervisor().failed_tasks(), 0);
+    assert_eq!(service.lifecycle_metrics().termination_completed_total, 1);
+}
+
 struct WatchDiscovery {
     scope: CoordinatorScope,
     snapshots: Receiver<CoordinatorDirectorySnapshot>,

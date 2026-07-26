@@ -5,8 +5,12 @@ use super::{
     LogicalBufferConfig, LogicalEntityTarget, LogicalRouter, LogicalSingletonTarget, Mutex,
     NodeKey, OutboundMessaging, PlacementSlotKey, Protocol, ProtocolFingerprint,
     RemoteMessageError, RouteBuffer, ShardMapper, SingletonConfig, SingletonRef, WatchError,
-    Xxh3V1ShardMapper, async_trait, entity::EntityRouteHost, peers::PeerReconciler,
-    proxy::EntityProxyRoute, singleton::SingletonRouteHost, singleton_proxy::SingletonProxyRoute,
+    Xxh3V1ShardMapper, async_trait,
+    entity::{EntityRouteHost, RouteFailureLog},
+    peers::PeerReconciler,
+    proxy::EntityProxyRoute,
+    singleton::SingletonRouteHost,
+    singleton_proxy::SingletonProxyRoute,
 };
 
 impl DomainLogicalRouter {
@@ -110,6 +114,7 @@ impl DomainLogicalRouter {
                     registry,
                     protocol,
                     loader,
+                    route_failures: RouteFailureLog::default(),
                 }),
             )
             .is_some()

@@ -60,6 +60,40 @@ pub(super) trait EntityRoute: Send + Sync {
     }
 }
 
+const ROUTE_FAILURE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Rate limits logical routing failure logs so one broken entity cannot flood the log.
+#[derive(Default)]
+pub(super) struct RouteFailureLog {
+    window: Mutex<RouteFailureWindow>,
+}
+
+#[derive(Default)]
+struct RouteFailureWindow {
+    opened_at: Option<Instant>,
+    suppressed: u64,
+}
+
+impl RouteFailureLog {
+    /// Returns the number of failures suppressed since the last log when this one may be logged.
+    fn admit(&self) -> Option<u64> {
+        let mut window = self
+            .window
+            .lock()
+            .expect("logical entity route failure log poisoned");
+        let now = Instant::now();
+        if window
+            .opened_at
+            .is_some_and(|opened| now.duration_since(opened) < ROUTE_FAILURE_LOG_INTERVAL)
+        {
+            window.suppressed += 1;
+            return None;
+        }
+        window.opened_at = Some(now);
+        Some(std::mem::take(&mut window.suppressed))
+    }
+}
+
 pub(super) struct EntityRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
     pub(super) local_node: NodeKey,
     pub(super) state: Arc<Mutex<LogicPlacementState>>,
@@ -72,6 +106,7 @@ pub(super) struct EntityRouteHost<A: Actor, L: ActorLoader<A>, P: Protocol> {
     pub(super) registry: Arc<ActorRegistry<A>>,
     pub(super) protocol: Arc<ActorProtocolBinding<A, P>>,
     pub(super) loader: L,
+    pub(super) route_failures: RouteFailureLog,
 }
 
 impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
@@ -376,12 +411,16 @@ where
             return Err(RemoteMessageError::Unauthorized);
         }
         let handle = self.activate(&target).await.map_err(|error| {
-            tracing::warn!(
-                message_id,
-                target = ?target,
-                error = ?error,
-                "logical entity tell activation failed"
-            );
+            if let Some(suppressed) = self.route_failures.admit() {
+                tracing::warn!(
+                    target: "lattice.cluster.logic",
+                    message_id,
+                    entity = ?target,
+                    %error,
+                    suppressed,
+                    "logical entity tell activation failed"
+                );
+            }
             error
         })?;
         match self
@@ -395,8 +434,19 @@ where
                 sender,
             )
             .await
-            .map_err(map_dispatch)?
-        {
+            .map_err(|error| {
+                if let Some(suppressed) = self.route_failures.admit() {
+                    tracing::warn!(
+                        target: "lattice.cluster.logic",
+                        message_id,
+                        entity = ?target,
+                        %error,
+                        suppressed,
+                        "logical entity tell dispatch failed"
+                    );
+                }
+                map_dispatch(error)
+            })? {
             DispatchReply::TellAccepted => Ok(()),
             DispatchReply::Ask(_) => Err(RemoteMessageError::InvalidPayload),
         }
@@ -413,12 +463,16 @@ where
             return Err(RemoteMessageError::DeadlineExceeded);
         }
         let handle = self.activate(&target).await.map_err(|error| {
-            tracing::warn!(
-                message_id,
-                target = ?target,
-                error = ?error,
-                "logical entity ask activation failed"
-            );
+            if let Some(suppressed) = self.route_failures.admit() {
+                tracing::warn!(
+                    target: "lattice.cluster.logic",
+                    message_id,
+                    entity = ?target,
+                    %error,
+                    suppressed,
+                    "logical entity ask activation failed"
+                );
+            }
             error
         })?;
         match self
@@ -432,12 +486,16 @@ where
             )
             .await
             .map_err(|error| {
-                tracing::warn!(
-                    message_id,
-                    target = ?target,
-                    error = ?error,
-                    "logical entity ask dispatch failed"
-                );
+                if let Some(suppressed) = self.route_failures.admit() {
+                    tracing::warn!(
+                        target: "lattice.cluster.logic",
+                        message_id,
+                        entity = ?target,
+                        %error,
+                        suppressed,
+                        "logical entity ask dispatch failed"
+                    );
+                }
                 map_dispatch(error)
             })? {
             DispatchReply::Ask(reply) => Ok(reply),

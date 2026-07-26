@@ -7,7 +7,7 @@ use std::{
 use futures_util::{StreamExt, stream};
 use lattice_core::coordinator::CoordinatorScope;
 use lattice_discovery::provider::{
-    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryOrigin, DiscoveryTarget,
+    CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryTarget,
 };
 use lattice_remoting::{
     association::{Association, AssociationManager, AssociationState},
@@ -370,12 +370,7 @@ async fn probe_snapshot(
 }
 
 fn probe_target(scope: CoordinatorScope, target: DiscoveryTarget) -> BootstrapProbeTarget {
-    let tls_server_name = target.source.origins().find_map(|origin| match origin {
-        DiscoveryOrigin::Dns { server_name, .. } => Some(server_name.clone()),
-        DiscoveryOrigin::Static { .. }
-        | DiscoveryOrigin::ConfigStore { .. }
-        | DiscoveryOrigin::KubernetesEndpointSlice { .. } => None,
-    });
+    let tls_server_name = target.tls_server_name().map(str::to_string);
     BootstrapProbeTarget {
         scope,
         address: target.address,
