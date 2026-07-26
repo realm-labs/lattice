@@ -22,13 +22,23 @@ pub(super) struct ScenarioOutcome {
 
 pub(super) struct ScenarioRunner {
     outcomes: Vec<ScenarioOutcome>,
+    selected: bool,
 }
 
 impl ScenarioRunner {
-    pub fn new(names: &[&str]) -> Self {
-        Self {
+    /// Restricts a profile to named scenarios so one long fault injection can be re-run on its own.
+    /// An empty selection keeps the whole profile, which is what continuous integration runs.
+    pub fn select(names: &[&str], only: &[String]) -> Result<Self, String> {
+        if let Some(unknown) = only
+            .iter()
+            .find(|name| !names.iter().any(|declared| declared == name))
+        {
+            return Err(format!("{unknown} is not a scenario of this profile"));
+        }
+        Ok(Self {
             outcomes: names
                 .iter()
+                .filter(|name| only.is_empty() || only.iter().any(|chosen| chosen == *name))
                 .map(|name| ScenarioOutcome {
                     name: (*name).to_owned(),
                     status: ScenarioStatus::NotRun,
@@ -36,10 +46,14 @@ impl ScenarioRunner {
                     error: None,
                 })
                 .collect(),
-        }
+            selected: !only.is_empty(),
+        })
     }
 
     pub fn run(&mut self, name: &str, test: impl FnOnce() -> Result<(), String>) {
+        if self.selected && !self.outcomes.iter().any(|outcome| outcome.name == name) {
+            return;
+        }
         let started = Instant::now();
         let result = catch_unwind(AssertUnwindSafe(test)).unwrap_or_else(|panic| {
             let message = panic
@@ -94,12 +108,29 @@ mod tests {
 
     #[test]
     fn records_all_results_after_a_failure() {
-        let mut runner = ScenarioRunner::new(&["first", "second"]);
+        let mut runner = ScenarioRunner::select(&["first", "second"], &[]).unwrap();
         runner.run("first", || Err("broken".to_owned()));
         runner.run("second", || Ok(()));
 
         assert!(runner.finish().is_err());
         assert_eq!(runner.outcomes()[0].status, ScenarioStatus::Failed);
         assert_eq!(runner.outcomes()[1].status, ScenarioStatus::Passed);
+    }
+
+    #[test]
+    fn a_selection_reports_only_the_named_scenarios() {
+        let mut runner = ScenarioRunner::select(&["first", "second"], &["second".to_owned()])
+            .expect("second is declared");
+        runner.run("first", || Err("must not run".to_owned()));
+        runner.run("second", || Ok(()));
+
+        assert!(runner.finish().is_ok());
+        assert_eq!(runner.outcomes().len(), 1);
+        assert_eq!(runner.outcomes()[0].name, "second");
+    }
+
+    #[test]
+    fn an_undeclared_selection_is_rejected() {
+        assert!(ScenarioRunner::select(&["first"], &["third".to_owned()]).is_err());
     }
 }

@@ -95,6 +95,10 @@ pub(super) fn for_profile(profile: Profile) -> Vec<&'static str> {
             "multi-domain-trace-replay",
             "seed-corpus",
         ],
+        Profile::Partition => vec![
+            "entity-partition-single-activation",
+            "entity-owner-loss-reassignment",
+        ],
         Profile::K8s => vec!["k8s-lifecycle"],
         Profile::Soak => vec!["bounded-seeded-soak"],
     }
