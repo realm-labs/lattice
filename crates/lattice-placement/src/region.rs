@@ -326,6 +326,8 @@ pub struct ShardRegion {
     mapper: ShardMapperBinding,
     config: RegionConfig,
     homes: BTreeMap<ShardId, ShardHome>,
+    home_uses: BTreeMap<ShardId, u64>,
+    home_clock: u64,
     inflight: HashSet<ShardId>,
     buffers: BTreeMap<ShardId, VecDeque<BufferedMessage>>,
     buffered_messages: usize,
@@ -360,6 +362,8 @@ impl ShardRegion {
             mapper,
             config,
             homes: BTreeMap::new(),
+            home_uses: BTreeMap::new(),
+            home_clock: 0,
             inflight: HashSet::new(),
             buffers: BTreeMap::new(),
             buffered_messages: 0,
@@ -379,15 +383,36 @@ impl ShardRegion {
         {
             return Err(RegionError::StaleRevision);
         }
-        if self.homes.len() == self.config.maximum_cached_homes
+        if self.homes.len() >= self.config.maximum_cached_homes
             && !self.homes.contains_key(&shard_id)
         {
-            return Err(RegionError::HomeCacheFull);
+            self.evict_least_recently_used_home();
         }
         self.applied_revision = Some(home.revision);
         self.homes.insert(shard_id, home);
+        self.touch_home(shard_id);
         self.inflight.remove(&shard_id);
         Ok(self.take_buffer(shard_id))
+    }
+
+    /// Home entries are rebuildable soft state: a proxy that touches more shards than the cache
+    /// holds must lose its coldest route rather than reject every later authoritative update.
+    fn evict_least_recently_used_home(&mut self) {
+        let Some(victim) = self
+            .home_uses
+            .iter()
+            .min_by_key(|(shard, used_at)| (**used_at, **shard))
+            .map(|(shard, _)| *shard)
+        else {
+            return;
+        };
+        self.homes.remove(&victim);
+        self.home_uses.remove(&victim);
+    }
+
+    fn touch_home(&mut self, shard_id: ShardId) {
+        self.home_clock = self.home_clock.saturating_add(1);
+        self.home_uses.insert(shard_id, self.home_clock);
     }
 
     pub fn invalidate_for_handoff(
@@ -403,6 +428,7 @@ impl ShardRegion {
         }
         self.applied_revision = Some(revision);
         self.homes.remove(&shard_id);
+        self.home_uses.remove(&shard_id);
         Ok(())
     }
 
@@ -418,19 +444,17 @@ impl ShardRegion {
             return Err(RegionError::InvalidMessage);
         }
         let shard_id = self.mapper.shard_for(&entity_id)?;
-        if let Some(home) = self.homes.get(&shard_id)
+        if let Some(home) = self.homes.get(&shard_id).cloned()
             && home.state == PlacementSlotState::Running
         {
+            self.touch_home(shard_id);
             return if home.owner.incarnation == self.local_incarnation {
                 Ok(RouteDecision::Local {
                     shard_id,
                     generation: home.generation,
                 })
             } else {
-                Ok(RouteDecision::Remote {
-                    shard_id,
-                    home: home.clone(),
-                })
+                Ok(RouteDecision::Remote { shard_id, home })
             };
         }
         self.expire_buffers(now);
@@ -561,8 +585,6 @@ pub enum RegionError {
     ShardMapping(#[from] ShardMappingError),
     #[error("Region limit must be nonzero")]
     ZeroLimit,
-    #[error("Region home cache is full")]
-    HomeCacheFull,
     #[error("Region lookup concurrency limit reached")]
     LookupLimit,
     #[error("Region message buffer is full")]
@@ -830,6 +852,72 @@ mod tests {
         assert_eq!(flushed[0].mode, BufferedMessageMode::Ask { deadline });
         assert_eq!(flushed[1].message_id, 42);
         assert_eq!(flushed[1].mode, BufferedMessageMode::Tell);
+    }
+
+    #[test]
+    fn a_full_home_cache_evicts_the_coldest_route_instead_of_rejecting_the_update() {
+        let local = NodeIncarnation::new(1).unwrap();
+        let remote = NodeIncarnation::new(2).unwrap();
+        let config = EntityConfig::new(
+            PlacementDomainId::new("home-cache").unwrap(),
+            EntityType::new("home-cache").unwrap(),
+            ProtocolId::new(7).unwrap(),
+            64,
+            "test",
+            1,
+            Vec::new(),
+        )
+        .unwrap();
+        let mut region = ShardRegion::new(
+            local,
+            config,
+            RegionConfig {
+                maximum_cached_homes: 2,
+                ..RegionConfig::default()
+            },
+        )
+        .unwrap();
+        let home = |revision: u64| ShardHome {
+            owner: NodeKey {
+                node_id: "remote".to_owned(),
+                address: NodeAddress::new("127.0.0.1", 2552).unwrap(),
+                incarnation: remote,
+            },
+            generation: AssignmentGeneration::new(1).unwrap(),
+            revision: Revision::new(revision).unwrap(),
+            state: PlacementSlotState::Running,
+        };
+        region.apply_home(ShardId::new(1), home(1)).unwrap();
+        region.apply_home(ShardId::new(2), home(2)).unwrap();
+        region
+            .route(
+                EntityId::new(1_u64.to_be_bytes().to_vec()).unwrap(),
+                1,
+                BufferedMessageMode::Tell,
+                Bytes::new(),
+                MonotonicTime::from_millis(1),
+            )
+            .unwrap();
+        let touched = region
+            .homes
+            .keys()
+            .copied()
+            .find(|shard| region.home_uses[shard] == region.home_clock)
+            .unwrap();
+        let coldest = region
+            .homes
+            .keys()
+            .copied()
+            .find(|shard| *shard != touched)
+            .unwrap();
+
+        region.apply_home(ShardId::new(3), home(3)).unwrap();
+
+        assert!(region.homes.contains_key(&ShardId::new(3)));
+        assert!(region.homes.contains_key(&touched));
+        assert!(!region.homes.contains_key(&coldest));
+        assert!(!region.home_uses.contains_key(&coldest));
+        assert_eq!(region.homes.len(), 2);
     }
 
     #[test]

@@ -52,6 +52,15 @@ where
             self.reconciliation.cursor = 0;
             self.reconciliation.focused = false;
         }
+        let focus = std::mem::take(&mut self.reconciliation.focus);
+        for key in focus {
+            let Some(slot) = self.store.get_slot(&key).await? else {
+                continue;
+            };
+            self.validate_slot_move_relationship(&slot);
+            let claim = self.store.get_claim(&key).await?;
+            self.reconcile_authority_record(slot, claim).await?;
+        }
         let limit = self
             .config
             .reconciliation_page_size

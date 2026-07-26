@@ -58,6 +58,8 @@ pub struct CoordinatorHostConfig {
     pub maximum_domains: usize,
     pub control_capacity_per_domain: usize,
     pub renewal_interval: Duration,
+    pub election_interval: Duration,
+    pub member_reconciliation_interval: Duration,
     pub maximum_candidate_jitter: Duration,
     pub allocation_strategies: ShardAllocationStrategies,
 }
@@ -70,6 +72,8 @@ impl Default for CoordinatorHostConfig {
             maximum_domains: 64,
             control_capacity_per_domain: 256,
             renewal_interval: Duration::from_secs(5),
+            election_interval: Duration::from_secs(5),
+            member_reconciliation_interval: Duration::from_secs(60),
             maximum_candidate_jitter: Duration::from_millis(25),
             allocation_strategies: ShardAllocationStrategies::default(),
         }
@@ -100,6 +104,8 @@ impl CoordinatorHostConfig {
         if self.maximum_domains == 0
             || self.control_capacity_per_domain == 0
             || self.renewal_interval.is_zero()
+            || self.election_interval.is_zero()
+            || self.member_reconciliation_interval.is_zero()
             || self.maximum_candidate_jitter >= self.membership.leader_lease_ttl
             || self.maximum_candidate_jitter >= self.placement.leader_lease_ttl
             || domains.len() > self.maximum_domains
@@ -319,8 +325,18 @@ where
             tasks.spawn(async move { (domain, leader.run(receiver, stop_rx).await) });
         }
 
+        // Membership renewal, placement-domain campaigning, and full member reconciliation each own
+        // an independent cadence. A slow durable store must not let campaigning starve the
+        // membership lease or stall control routing for every domain.
         let mut renewal = tokio::time::interval(self.config.renewal_interval);
         renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut election = tokio::time::interval(self.config.election_interval);
+        election.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut member_reconciliation =
+            tokio::time::interval(self.config.member_reconciliation_interval);
+        member_reconciliation.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut elections = JoinSet::new();
+        let mut campaigning = BTreeSet::new();
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -329,88 +345,16 @@ where
                     }
                 }
                 _ = renewal.tick() => {
-                    let mut membership_failed = false;
-                    if let Some(membership) = self.membership.as_mut() {
-                        let result = match membership.renew_leadership().await {
-                            Ok(()) => membership.reconcile_expired_members().await,
-                            Err(error) => Err(error),
-                        };
-                        if let Err(error) = result {
-                            self.membership = None;
-                            self.membership_events = None;
-                            self.membership_state = CoordinatorHostScopeState::Failed;
-                            membership_failed = true;
-                            tracing::warn!(target: "lattice.cluster.membership", %error, "membership leader renewal or expiration reconciliation failed");
-                        }
-                    }
-                    if membership_failed {
-                        // Stop advertising stale leadership before potentially blocking on a
-                        // durable-store election retry.
-                        self.publish_directory();
-                    }
-                    if let Err(error) = self.reenter_membership_election().await {
-                        tracing::warn!(
-                            target: "lattice.cluster.membership",
-                            %error,
-                            "membership election re-entry deferred after durable store failure"
-                        );
-                    }
+                    self.renew_membership().await;
+                }
+                _ = election.tick() => {
                     let inactive = self.domains
                         .iter()
                         .filter_map(|(domain, hosted)| hosted.sender.is_none().then_some(domain.clone()))
                         .collect::<Vec<_>>();
-                    for domain in inactive {
-                        let scope = CoordinatorScope::Placement(domain.clone());
-                        candidate_delay(&scope, &self.node, self.config.maximum_candidate_jitter).await;
-                        let term = match next_term(self.store.as_ref(), &scope).await {
-                            Ok(term) => term,
-                            Err(error) => {
-                                if let Some(hosted) = self.domains.get_mut(&domain) {
-                                    hosted.state = CoordinatorHostScopeState::Failed;
-                                }
-                                tracing::warn!(
-                                    target: "lattice.cluster.placement",
-                                    domain = %domain.as_str(),
-                                    %error,
-                                    "placement-domain election re-entry deferred after durable store failure"
-                                );
-                                continue;
-                            }
-                        };
-                        match elect_domain_leader(
-                            self.store.clone(),
-                            self.associations.clone(),
-                            self.node.clone(),
-                            scope,
-                            term,
-                            &self.config,
-                        ).await {
-                            Ok(leader) => {
-                                let record = leader.leader().clone();
-                                let handle = leader.handle();
-                                let (sender, receiver) = mpsc::channel(self.config.control_capacity_per_domain);
-                                let (stop, stop_rx) = watch::channel(false);
-                                if let Some(hosted) = self.domains.get_mut(&domain) {
-                                    hosted.sender = Some(sender);
-                                    hosted.shutdown = Some(stop);
-                                    hosted.handle = Some(handle);
-                                    hosted.state = CoordinatorHostScopeState::Active(record);
-                                }
-                                tasks.spawn(async move { (domain, leader.run(receiver, stop_rx).await) });
-                            }
-                            Err(CoordinatorRuntimeError::NotLeader) => {
-                                if let Some(hosted) = self.domains.get_mut(&domain) {
-                                    hosted.state = CoordinatorHostScopeState::Standby;
-                                }
-                            }
-                            Err(error) => {
-                                if let Some(hosted) = self.domains.get_mut(&domain) {
-                                    hosted.state = CoordinatorHostScopeState::Failed;
-                                }
-                                tracing::warn!(target: "lattice.cluster.placement", domain = %domain.as_str(), %error, "placement-domain election re-entry failed");
-                            }
-                        }
-                    }
+                    self.spawn_campaigns(inactive, &mut campaigning, &mut elections);
+                }
+                _ = member_reconciliation.tick() => {
                     if let Err(error) = self.fanout_global_member_removals().await {
                         tracing::warn!(
                             target: "lattice.cluster.membership",
@@ -418,7 +362,13 @@ where
                             "global member reconciliation deferred after durable store failure"
                         );
                     }
-                    self.publish_directory();
+                }
+                Some(result) = elections.join_next(), if !elections.is_empty() => {
+                    if let Ok((domain, outcome)) = result {
+                        campaigning.remove(&domain);
+                        self.install_campaign_outcome(domain, outcome, &mut tasks);
+                        self.publish_directory();
+                    }
                 }
                 Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                     if let Ok((domain, result)) = result {
@@ -431,11 +381,14 @@ where
                             tracing::warn!(target: "lattice.cluster.placement", domain = %domain.as_str(), %error, "placement-domain leader task stopped");
                         }
                         self.publish_directory();
+                        if !*shutdown.borrow() {
+                            self.spawn_campaigns([domain], &mut campaigning, &mut elections);
+                        }
                     }
                 }
                 event = next_membership_event(&mut self.membership_events), if self.membership_events.is_some() => {
                     match event {
-                        Ok(event) => self.broadcast_membership_event(event)?,
+                        Ok(event) => self.apply_membership_event(event).await?,
                         Err(RecvError::Lagged(_)) => {
                             let associations = self
                                 .membership_associations
@@ -458,14 +411,123 @@ where
             }
         }
 
+        elections.abort_all();
         for hosted in self.domains.values() {
             if let Some(stop) = &hosted.shutdown {
                 let _ = stop.send(true);
             }
         }
         while tasks.join_next().await.is_some() {}
+        while elections.join_next().await.is_some() {}
         if let Some(membership) = self.membership.take() {
             membership.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    async fn renew_membership(&mut self) {
+        let mut membership_failed = false;
+        if let Some(membership) = self.membership.as_mut() {
+            let result = match membership.renew_leadership().await {
+                Ok(()) => membership.reconcile_expired_members().await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                self.membership = None;
+                self.membership_events = None;
+                self.membership_state = CoordinatorHostScopeState::Failed;
+                membership_failed = true;
+                tracing::warn!(target: "lattice.cluster.membership", %error, "membership leader renewal or expiration reconciliation failed");
+            }
+        }
+        if membership_failed {
+            // Stop advertising stale leadership before potentially blocking on a
+            // durable-store election retry.
+            self.publish_directory();
+        }
+        if let Err(error) = self.reenter_membership_election().await {
+            tracing::warn!(
+                target: "lattice.cluster.membership",
+                %error,
+                "membership election re-entry deferred after durable store failure"
+            );
+        }
+        self.publish_directory();
+    }
+
+    fn spawn_campaigns(
+        &self,
+        domains: impl IntoIterator<Item = PlacementDomainId>,
+        campaigning: &mut BTreeSet<PlacementDomainId>,
+        elections: &mut JoinSet<(
+            PlacementDomainId,
+            Result<PlacementDomainLeader<S>, CoordinatorRuntimeError>,
+        )>,
+    ) {
+        for domain in domains {
+            if !self.domains.contains_key(&domain) || !campaigning.insert(domain.clone()) {
+                continue;
+            }
+            let store = self.store.clone();
+            let associations = self.associations.clone();
+            let node = self.node.clone();
+            let config = self.config.clone();
+            elections.spawn(async move {
+                let outcome =
+                    campaign_for_domain(store, associations, node, domain.clone(), &config).await;
+                (domain, outcome)
+            });
+        }
+    }
+
+    fn install_campaign_outcome(
+        &mut self,
+        domain: PlacementDomainId,
+        outcome: Result<PlacementDomainLeader<S>, CoordinatorRuntimeError>,
+        tasks: &mut JoinSet<(PlacementDomainId, Result<(), CoordinatorRuntimeError>)>,
+    ) {
+        match outcome {
+            Ok(leader) => {
+                let record = leader.leader().clone();
+                let handle = leader.handle();
+                let (sender, receiver) = mpsc::channel(self.config.control_capacity_per_domain);
+                let (stop, stop_rx) = watch::channel(false);
+                let Some(hosted) = self.domains.get_mut(&domain) else {
+                    return;
+                };
+                hosted.sender = Some(sender);
+                hosted.shutdown = Some(stop);
+                hosted.handle = Some(handle);
+                hosted.state = CoordinatorHostScopeState::Active(record);
+                tasks.spawn(async move { (domain, leader.run(receiver, stop_rx).await) });
+            }
+            Err(CoordinatorRuntimeError::NotLeader) => {
+                if let Some(hosted) = self.domains.get_mut(&domain) {
+                    hosted.state = CoordinatorHostScopeState::Standby;
+                }
+            }
+            Err(error) => {
+                if let Some(hosted) = self.domains.get_mut(&domain) {
+                    hosted.state = CoordinatorHostScopeState::Failed;
+                }
+                tracing::warn!(target: "lattice.cluster.placement", domain = %domain.as_str(), %error, "placement-domain election re-entry failed");
+            }
+        }
+    }
+
+    /// Removal is fanned out from the ordered membership stream so a departed member reaches every
+    /// domain immediately; the periodic full scan only closes gaps a dropped event would leave.
+    async fn apply_membership_event(
+        &mut self,
+        event: MemberEvent,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let removed = match &event.change {
+            MemberChange::Removed { node, reason } => Some((node.clone(), *reason)),
+            MemberChange::Upsert(_) => None,
+        };
+        self.broadcast_membership_event(event)?;
+        if let Some((node, reason)) = removed {
+            self.fanout_global_member_removal(node, reason).await?;
         }
         Ok(())
     }
@@ -993,6 +1055,24 @@ where
     }
 }
 
+/// Campaigning owns its jitter and term read so a slow durable store delays only this domain.
+/// Term monotonicity still comes from the guarded campaign transaction, not from serialization.
+async fn campaign_for_domain<S>(
+    store: Arc<S>,
+    associations: Arc<AssociationManager>,
+    node: NodeKey,
+    domain: PlacementDomainId,
+    config: &CoordinatorHostConfig,
+) -> Result<PlacementDomainLeader<S>, CoordinatorRuntimeError>
+where
+    S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
+{
+    let scope = CoordinatorScope::Placement(domain);
+    candidate_delay(&scope, &node, config.maximum_candidate_jitter).await;
+    let term = next_term(store.as_ref(), &scope).await?;
+    elect_domain_leader(store, associations, node, scope, term, config).await
+}
+
 #[cfg(test)]
 mod tests {
     use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
@@ -1046,6 +1126,57 @@ mod tests {
             dispatch_error(CoordinatorRuntimeError::UnknownSession),
             ControlDispatchError::InvalidCommand
         );
+    }
+
+    #[tokio::test]
+    async fn membership_removal_reaches_domains_from_the_event_stream() {
+        let store = Arc::new(InMemoryPlacementStore::new(32, 32).unwrap());
+        let local = node("removal-host", 50, 33050);
+        let departed = node("departed", 51, 33051);
+        let domain = PlacementDomainId::new("removal-domain").unwrap();
+        let mut host = CoordinatorHost::elect(
+            store,
+            associations(&local),
+            local,
+            BTreeSet::from([domain.clone()]),
+            CoordinatorHostConfig {
+                member_reconciliation_interval: Duration::from_secs(3600),
+                ..config()
+            },
+        )
+        .await
+        .unwrap();
+        let (sender, mut receiver) = mpsc::channel(4);
+        host.domains.get_mut(&domain).unwrap().sender = Some(sender);
+        let expected = departed.clone();
+        let observer = tokio::spawn(async move {
+            let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("domain receives the removal without the periodic scan")
+                .expect("removal event is delivered");
+            let matched = matches!(
+                &event.kind,
+                PlacementControlEventKind::GlobalMemberRemoved { node, reason }
+                    if node == &expected && *reason == MemberRemovalReason::FailureDetected
+            );
+            let _ = event.completion.send(Ok(()));
+            matched
+        });
+
+        host.apply_membership_event(MemberEvent {
+            version: MembershipVersion::new(
+                crate::types::CoordinatorTerm::new(1).unwrap(),
+                crate::types::Revision::new(2).unwrap(),
+            ),
+            change: MemberChange::Removed {
+                node: departed,
+                reason: MemberRemovalReason::FailureDetected,
+            },
+        })
+        .await
+        .unwrap();
+
+        assert!(observer.await.unwrap());
     }
 
     #[tokio::test]

@@ -2,15 +2,20 @@ use std::{collections::BTreeSet, time::Duration};
 
 use tokio::time::MissedTickBehavior;
 
+use lattice_core::actor_ref::{EntityType, PlacementDomainId};
+
 use super::{
-    CoordinatorLeaseStore, CoordinatorRuntimeError, HandoffEvent, HandoffMachine, Instant,
-    MembershipStore, MoveProgress, PlacementControlEvent, PlacementDomainLeader,
+    AllocationError, CoordinatorLeaseStore, CoordinatorRuntimeError, HandoffEvent, HandoffMachine,
+    Instant, MembershipStore, MoveProgress, PlacementControlEvent, PlacementDomainLeader,
     PlacementDomainStore, PlacementSlotKey, PlacementSlotState, PlanStatus, RebalanceTrigger,
     ScopedElectionStore, membership::control_dispatch_error, mpsc, watch,
 };
 use crate::{
     coordinator::MemberRemovalReason,
-    storage::domain::{DeletePlan, ReserveMove, UpdatePlan},
+    storage::{
+        StorageError,
+        domain::{DeletePlan, ReserveMove, UpdatePlan},
+    },
     types::AssignmentGeneration,
 };
 
@@ -337,9 +342,16 @@ where
                 _ = rebalance.tick() => {
                     let entity_types = self.entity_configs.keys().cloned().collect::<Vec<_>>();
                     for entity_type in entity_types {
-                        let _ = self
-                            .evaluate_rebalance(entity_type, RebalanceTrigger::Automatic)
-                            .await;
+                        if let Err(error) = self
+                            .evaluate_rebalance(entity_type.clone(), RebalanceTrigger::Automatic)
+                            .await
+                        {
+                            report_automatic_rebalance_error(
+                                &self.version.domain,
+                                &entity_type,
+                                &error,
+                            );
+                        }
                     }
                 }
             }
@@ -347,7 +359,7 @@ where
     }
 
     pub(super) async fn renew(&mut self) -> Result<(), CoordinatorRuntimeError> {
-        self.store.keep_lease_alive(self.leader_lease_id).await?;
+        self.renew_leader_lease().await?;
         let now = Instant::now();
         let expired = self
             .sessions
@@ -369,10 +381,197 @@ where
         for incarnation in leaving {
             self.maybe_send_drain_ready(incarnation).await?;
         }
-        for claim in self.claims.values() {
-            self.store.keep_lease_alive(claim.lease_id).await?;
-            self.replay_claim_if_connected(&claim.grant)?;
+        let claims = self
+            .claims
+            .values()
+            .map(|claim| (claim.lease_id, claim.grant.clone()))
+            .collect::<Vec<_>>();
+        for (lease_id, grant) in claims {
+            match self.store.keep_lease_alive(lease_id).await {
+                Ok(()) => self.replay_claim_if_connected(&grant)?,
+                Err(StorageError::LeadershipLost) => {
+                    self.leadership_loss_count = self.leadership_loss_count.saturating_add(1);
+                    return Err(StorageError::LeadershipLost.into());
+                }
+                Err(error) => {
+                    self.focus_reconciliation(&grant.slot);
+                    tracing::warn!(
+                        target: "lattice.cluster.placement",
+                        domain = %self.version.domain.as_str(),
+                        slot = ?grant.slot,
+                        %error,
+                        "claim lease keep-alive failed; scheduling focused slot reconciliation"
+                    );
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Leader keep-alive is retried only inside the remaining lease budget: a single transport
+    /// deadline must not surrender a domain whose lease is still valid, and an expired budget must
+    /// not pretend the lease survived.
+    async fn renew_leader_lease(&mut self) -> Result<(), CoordinatorRuntimeError> {
+        let mut attempt = 0_u32;
+        loop {
+            let error = match self.store.keep_lease_alive(self.leader_lease_id).await {
+                Ok(()) => {
+                    self.leader_lease_deadline = Instant::now() + self.config.leader_lease_ttl;
+                    return Ok(());
+                }
+                Err(error) => error,
+            };
+            let remaining = self
+                .leader_lease_deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            match classify_lease_renewal(&error, remaining, self.config.renewal_interval, attempt) {
+                LeaseRenewal::Retry(backoff) => {
+                    tracing::warn!(
+                        target: "lattice.cluster.placement",
+                        domain = %self.version.domain.as_str(),
+                        %error,
+                        remaining_millis = remaining.as_millis(),
+                        "leader lease keep-alive failed; retrying inside the remaining lease budget"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt = attempt.saturating_add(1);
+                }
+                LeaseRenewal::Surrender => {
+                    if error == StorageError::LeadershipLost {
+                        self.leadership_loss_count = self.leadership_loss_count.saturating_add(1);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+    }
+
+    fn focus_reconciliation(&mut self, key: &PlacementSlotKey) {
+        if self.reconciliation.focus.len() >= self.config.maximum_reconciliation_work_per_pass {
+            self.reconciliation.focused = true;
+            return;
+        }
+        self.reconciliation.focus.insert(key.clone());
+    }
+}
+
+/// Automatic rebalancing routinely declines a round; only an input the operator can act on is a
+/// warning. Silently discarding both kinds hides a permanently stalled balancer.
+fn report_automatic_rebalance_error(
+    domain: &PlacementDomainId,
+    entity_type: &EntityType,
+    error: &CoordinatorRuntimeError,
+) {
+    if declined_automatic_round(error) {
+        tracing::debug!(
+            target: "lattice.cluster.placement",
+            domain = %domain.as_str(),
+            entity_type = %entity_type.as_str(),
+            %error,
+            "automatic rebalance round declined"
+        );
+    } else {
+        tracing::warn!(
+            target: "lattice.cluster.placement",
+            domain = %domain.as_str(),
+            entity_type = %entity_type.as_str(),
+            %error,
+            "automatic rebalance round failed"
+        );
+    }
+}
+
+fn declined_automatic_round(error: &CoordinatorRuntimeError) -> bool {
+    matches!(
+        error,
+        CoordinatorRuntimeError::Allocation(
+            AllocationError::AutomaticPaused
+                | AllocationError::Cooldown
+                | AllocationError::ConcurrencyLimit
+                | AllocationError::NoEligibleNode
+                | AllocationError::Unreconciled
+        )
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseRenewal {
+    Retry(Duration),
+    Surrender,
+}
+
+/// Losing the exact lease-backed leader record is authority loss and is always fatal. A transport
+/// deadline or unavailability is not: it may be retried while the lease it renews is still valid.
+fn classify_lease_renewal(
+    error: &StorageError,
+    remaining: Duration,
+    renewal_interval: Duration,
+    attempt: u32,
+) -> LeaseRenewal {
+    let transient = matches!(
+        error,
+        StorageError::Unavailable | StorageError::Deadline | StorageError::OutcomeUnknown
+    );
+    if !transient || remaining.is_zero() {
+        return LeaseRenewal::Surrender;
+    }
+    LeaseRenewal::Retry(
+        renewal_interval
+            .checked_div(16)
+            .unwrap_or(Duration::ZERO)
+            .saturating_mul(1_u32 << attempt.min(4))
+            .min(remaining),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_transient_lease_failures_are_retried_and_only_inside_the_lease_budget() {
+        let renewal = Duration::from_secs(4);
+        let budget = Duration::from_secs(4);
+        assert_eq!(
+            classify_lease_renewal(&StorageError::Deadline, budget, renewal, 0),
+            LeaseRenewal::Retry(Duration::from_millis(250))
+        );
+        assert_eq!(
+            classify_lease_renewal(&StorageError::Unavailable, budget, renewal, 3),
+            LeaseRenewal::Retry(Duration::from_secs(2))
+        );
+        assert_eq!(
+            classify_lease_renewal(
+                &StorageError::Deadline,
+                Duration::from_millis(20),
+                renewal,
+                4
+            ),
+            LeaseRenewal::Retry(Duration::from_millis(20))
+        );
+        assert_eq!(
+            classify_lease_renewal(&StorageError::Deadline, Duration::ZERO, renewal, 0),
+            LeaseRenewal::Surrender
+        );
+        assert_eq!(
+            classify_lease_renewal(&StorageError::LeadershipLost, budget, renewal, 0),
+            LeaseRenewal::Surrender
+        );
+        assert_eq!(
+            classify_lease_renewal(&StorageError::CompareFailed, budget, renewal, 0),
+            LeaseRenewal::Surrender
+        );
+    }
+
+    #[test]
+    fn automatic_rebalance_separates_declined_rounds_from_actionable_failures() {
+        let paused = CoordinatorRuntimeError::Allocation(AllocationError::AutomaticPaused);
+        let stale = CoordinatorRuntimeError::Allocation(AllocationError::StaleLoad);
+        assert!(declined_automatic_round(&paused));
+        assert!(!declined_automatic_round(&stale));
+        assert!(!declined_automatic_round(
+            &CoordinatorRuntimeError::Storage(StorageError::Unavailable)
+        ));
     }
 }

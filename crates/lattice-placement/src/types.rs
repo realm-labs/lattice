@@ -16,6 +16,8 @@ macro_rules! nonzero_counter {
         pub struct $name(u64);
 
         impl $name {
+            pub const MIN: Self = Self(1);
+
             pub fn new(value: u64) -> Result<Self, PlacementTypeError> {
                 if value == 0 {
                     Err(PlacementTypeError::Zero($field))

@@ -223,6 +223,10 @@ where
     ) -> Result<(), CoordinatorRuntimeError> {
         let incarnation = node.incarnation;
         self.sessions.remove(&incarnation);
+        self.loads.forget_incarnation(incarnation);
+        self.node_load_received.remove(&incarnation);
+        self.shard_load_received
+            .retain(|(owner, _, _), _| owner != &incarnation);
         let owned_claims = self
             .claims
             .iter()
@@ -478,6 +482,9 @@ where
         Ok(())
     }
 
+    /// A member acknowledges every delta, so this full authority sweep runs once per session as it
+    /// first reaches the leader's revision. Later adoption is the periodic reconciliation pass's
+    /// job, and later grants replay from the renewal tick.
     pub(super) async fn reconcile_claims_for(
         &mut self,
         hello: &PlacementDomainHello,
@@ -558,6 +565,9 @@ where
             let grant = committed.claim.grant;
             self.remember_claim(lease_id, grant.clone());
             self.grant_authority(&grant)?;
+        }
+        if let Some(session) = self.sessions.get_mut(&hello.node.incarnation) {
+            session.claims_reconciled = true;
         }
         Ok(())
     }

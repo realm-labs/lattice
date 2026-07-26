@@ -118,7 +118,8 @@ where
                             .await?;
                         }
                         let ready_member = self.sessions.get(&remote).and_then(|session| {
-                            (session.placement_up()
+                            (!session.claims_reconciled
+                                && session.placement_up()
                                 && session
                                     .applied_version
                                     .as_ref()
@@ -271,7 +272,11 @@ where
                             shard_id,
                         };
                         match self.ensure_shard_allocated(entity_type, shard_id).await {
-                            Ok(()) => self.send_snapshot(hello, association).await?,
+                            Ok(published) => {
+                                if !self.resolution_delta_reached(remote, published) {
+                                    self.send_snapshot(hello, association).await?;
+                                }
+                            }
                             Err(CoordinatorRuntimeError::Allocation(
                                 AllocationError::NoEligibleNode,
                             ))
@@ -308,7 +313,11 @@ where
                             kind: kind.clone(),
                         };
                         match self.ensure_singleton_allocated(kind).await {
-                            Ok(()) => self.send_snapshot(hello, association).await?,
+                            Ok(published) => {
+                                if !self.resolution_delta_reached(remote, published) {
+                                    self.send_snapshot(hello, association).await?;
+                                }
+                            }
                             Err(CoordinatorRuntimeError::IneligibleTarget) => {
                                 self.send_resolution_failure(association, request_id, slot)?
                             }
@@ -336,6 +345,17 @@ where
             }
         }
         Ok(())
+    }
+
+    /// A resolution that allocated the slot already published its delta to every subscribed live
+    /// session. Re-encoding the whole domain snapshot for the requester would make cold start cost
+    /// one full snapshot per unknown shard per region.
+    fn resolution_delta_reached(&self, remote: NodeIncarnation, published: bool) -> bool {
+        published
+            && self
+                .sessions
+                .get(&remote)
+                .is_some_and(MemberSession::placement_up)
     }
 
     fn send_resolution_failure(
@@ -486,6 +506,7 @@ where
                 last_heartbeat: Instant::now(),
                 applied_version: None,
                 snapshot_version: Some(self.membership_version),
+                claims_reconciled: false,
                 draining: record.status == MemberStatus::Leaving,
                 drain_operation: None,
                 drain_ready: false,
@@ -733,11 +754,13 @@ where
             PlacementControlCommand::MemberUp(member),
             &self.config,
         )?;
-        let placement_ready = self
-            .sessions
-            .get(&incarnation)
-            .and_then(|session| session.applied_version.as_ref())
-            .is_some_and(|applied| applied.satisfies(&self.version));
+        let placement_ready = self.sessions.get(&incarnation).is_some_and(|session| {
+            !session.claims_reconciled
+                && session
+                    .applied_version
+                    .as_ref()
+                    .is_some_and(|applied| applied.satisfies(&self.version))
+        });
         if placement_ready {
             self.reconcile_claims_for(&hello).await?;
         }

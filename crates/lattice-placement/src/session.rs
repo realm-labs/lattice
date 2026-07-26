@@ -46,6 +46,7 @@ pub struct LogicCoordinatorConfig {
     pub heartbeat_interval: Duration,
     pub maximum_authorities: usize,
     pub claim_safety_margin: Duration,
+    pub drain_acknowledgement_timeout: Duration,
 }
 
 impl Default for LogicCoordinatorConfig {
@@ -60,6 +61,7 @@ impl Default for LogicCoordinatorConfig {
             heartbeat_interval: Duration::from_secs(5),
             maximum_authorities: 65_536,
             claim_safety_margin: Duration::from_secs(2),
+            drain_acknowledgement_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -71,6 +73,7 @@ impl LogicCoordinatorConfig {
             || self.heartbeat_interval.is_zero()
             || self.maximum_authorities == 0
             || self.claim_safety_margin.is_zero()
+            || self.drain_acknowledgement_timeout.is_zero()
         {
             return Err(LogicSessionError::InvalidConfig);
         }
@@ -185,6 +188,8 @@ pub struct LogicCoordinatorHandle {
     state: Arc<Mutex<LogicPlacementState>>,
     local_events: mpsc::Sender<LocalAuthorityEvent>,
     coordinator_term: u64,
+    drain_poll_interval: Duration,
+    drain_acknowledgement_timeout: Duration,
 }
 
 impl LogicCoordinatorHandle {
@@ -285,8 +290,14 @@ impl LogicCoordinatorHandle {
             )
             .map_err(LogicSessionError::Control)?,
         )?;
+        // Reliable control has no completion signal, so the acknowledgement is polled. The wait is
+        // bounded: an unbounded poll turns a lost Coordinator into a drain that never returns.
+        let deadline = Instant::now() + self.drain_acknowledgement_timeout;
         while association.control_command_pending(command_id) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            if Instant::now() >= deadline {
+                return Err(LogicSessionError::DrainNotAcknowledged);
+            }
+            tokio::time::sleep(self.drain_poll_interval).await;
         }
         Ok(())
     }
@@ -433,6 +444,8 @@ impl PlacementDomainSession {
             state: self.state.clone(),
             local_events: self.local_event_sender.clone(),
             coordinator_term: self.coordinator_term,
+            drain_poll_interval: self.config.tick_interval,
+            drain_acknowledgement_timeout: self.config.drain_acknowledgement_timeout,
         }
     }
 
@@ -1020,6 +1033,8 @@ pub enum LogicSessionError {
     StaleGeneration,
     #[error("logic Coordinator heartbeat sequence exhausted")]
     HeartbeatSequenceExhausted,
+    #[error("logic Coordinator did not acknowledge drain completion inside its bound")]
+    DrainNotAcknowledged,
     #[error("logic Coordinator effect queue is full or closed")]
     EffectBackpressure,
     #[error("logic Coordinator state reducer rejected input")]
@@ -1034,4 +1049,97 @@ pub enum LogicSessionError {
     Control(#[source] PlacementControlError),
     #[error("logic Coordinator Association rejected control admission")]
     Association(#[from] AssociationError),
+}
+
+#[cfg(test)]
+mod tests {
+    use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
+    use lattice_remoting::{
+        association::{LaneAttachment, LaneKind},
+        config::RemotingConfig,
+    };
+
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unacknowledged_drain_completion_gives_up_instead_of_polling_forever() {
+        let cluster_id = ClusterId::new("drain-timeout").unwrap();
+        let local = NodeKey {
+            node_id: "logic".to_owned(),
+            address: NodeAddress::new("127.0.0.1", 34100).unwrap(),
+            incarnation: NodeIncarnation::new(1).unwrap(),
+        };
+        let remote_address = NodeAddress::new("127.0.0.1", 34101).unwrap();
+        let remote_incarnation = NodeIncarnation::new(2).unwrap();
+        let associations = Arc::new(
+            AssociationManager::new(
+                local.address.clone(),
+                local.incarnation,
+                RemotingConfig::default(),
+            )
+            .unwrap(),
+        );
+        let association = associations
+            .get_or_create(
+                cluster_id.clone(),
+                remote_address.clone(),
+                remote_incarnation,
+            )
+            .unwrap();
+        let coordinator = AssociationKey {
+            cluster_id,
+            local_incarnation: local.incarnation,
+            remote_address,
+            remote_incarnation,
+        };
+        for (lane, nonce) in [
+            (LaneKind::Control, 1_u128),
+            (LaneKind::Interactive, 2),
+            (LaneKind::Bulk(0), 3),
+        ] {
+            association
+                .attach(LaneAttachment {
+                    association_id: association.id(),
+                    key: coordinator.clone(),
+                    lane,
+                    connection_nonce: nonce,
+                })
+                .unwrap();
+        }
+        let config = LogicCoordinatorConfig {
+            drain_acknowledgement_timeout: Duration::from_secs(4),
+            ..LogicCoordinatorConfig::default()
+        };
+        let (session, _effects) = PlacementDomainSession::new(
+            PlacementDomainHello::builder(
+                local,
+                PlacementDomainId::new("drain-timeout").unwrap(),
+                1,
+            )
+            .build(),
+            coordinator,
+            associations,
+            config.clone(),
+            8,
+            1,
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            config.drain_acknowledgement_timeout * 4,
+            session
+                .control_handle()
+                .complete_member_drain("drain-operation".to_owned()),
+        )
+        .await
+        .expect("an unacknowledged drain must not poll forever");
+
+        assert!(matches!(
+            outcome,
+            Err(LogicSessionError::DrainNotAcknowledged)
+        ));
+        assert!(started.elapsed() >= config.drain_acknowledgement_timeout);
+        assert!(started.elapsed() < config.drain_acknowledgement_timeout * 2);
+    }
 }

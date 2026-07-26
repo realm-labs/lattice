@@ -1105,4 +1105,5 @@ mod claim_expiry;
 mod history;
 mod lifecycle_tests;
 mod recovery_tests;
+mod resilience;
 mod unavailable_hosts;

@@ -167,6 +167,8 @@ impl PlacementDomainLeaderConfig {
     }
 }
 
+const UNOBSERVED_MEMBERSHIP_TERM: CoordinatorTerm = CoordinatorTerm::MIN;
+
 struct MemberSession {
     hello: PlacementDomainHello,
     record: MemberRecord,
@@ -177,6 +179,7 @@ struct MemberSession {
     last_heartbeat: Instant,
     applied_version: Option<PlacementVersion>,
     snapshot_version: Option<MembershipVersion>,
+    claims_reconciled: bool,
     draining: bool,
     drain_operation: Option<String>,
     drain_ready: bool,
@@ -244,6 +247,7 @@ struct ReconciliationState {
     last_success: Option<Instant>,
     quarantined: BTreeMap<String, String>,
     focused: bool,
+    focus: BTreeSet<PlacementSlotKey>,
 }
 
 enum CoordinatorOperation {
@@ -450,6 +454,7 @@ where
     leader: LeaderRecord,
     leader_guard: PlacementLeaderGuard,
     leader_lease_id: i64,
+    leader_lease_deadline: Instant,
     config: PlacementDomainLeaderConfig,
     membership_version: MembershipVersion,
     version: PlacementVersion,
@@ -538,9 +543,11 @@ where
             .await?
             .map(|leader| leader.term);
         let persisted_membership_term = store.get_leader_term(&membership_scope).await?;
+        // A placement term never orders membership. Without an observed membership authority the
+        // scope starts at the lowest valid term so the first real member record supersedes it.
         let membership_term = active_membership_term
             .or_else(|| CoordinatorTerm::new(persisted_membership_term).ok())
-            .unwrap_or(term);
+            .unwrap_or(UNOBSERVED_MEMBERSHIP_TERM);
         let slots = store.list_slots(&domain).await?;
         let entity_configs = store
             .list_entity_configs(&domain)
@@ -580,12 +587,14 @@ where
             .filter(|slot| slot.state == PlacementSlotState::Running)
             .map(|slot| (slot.key.clone(), MonotonicTime::from_millis(0)))
             .collect();
+        let leader_lease_deadline = Instant::now() + config.leader_lease_ttl;
         let mut leader = Self {
             store,
             associations,
             leader,
             leader_guard,
             leader_lease_id,
+            leader_lease_deadline,
             config,
             membership_version,
             version,
