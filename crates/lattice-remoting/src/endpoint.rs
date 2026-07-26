@@ -45,9 +45,15 @@ mod stream;
 
 #[cfg(test)]
 use diagnostics::is_peer_disconnect;
-use diagnostics::{observe_connection_result, wait_for_disconnect};
+use diagnostics::{
+    AcceptDiagnostics, AcceptRecovery, classify_accept_failure, observe_connection_result,
+    wait_for_disconnect,
+};
 use lifecycle::wait_for_shutdown;
 use stream::EndpointStream;
+
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 pub struct RemotingEndpoint {
     local: NodeIdentity,
@@ -58,6 +64,7 @@ pub struct RemotingEndpoint {
     control_dispatch: Arc<dyn ControlDispatch>,
     catalogue: Vec<ProtocolDescriptor>,
     connections: Arc<Semaphore>,
+    accept_diagnostics: AcceptDiagnostics,
     shutdown_tx: watch::Sender<bool>,
     disconnect_tx: broadcast::Sender<AssociationId>,
     tasks: Mutex<Vec<JoinHandle<Result<(), EndpointError>>>>,
@@ -464,6 +471,7 @@ impl RemotingEndpoint {
             return Ok(());
         }
         let mut connections = JoinSet::new();
+        let mut accept_backoff = ACCEPT_BACKOFF_MIN;
         loop {
             tokio::select! {
                 biased;
@@ -479,9 +487,36 @@ impl RemotingEndpoint {
                     }
                 }
                 accepted = listener.accept() => {
-                    let (stream, _) = accepted.map_err(WireError::Io)?;
-                    let permit = self.connections.clone().try_acquire_owned()
-                        .map_err(|_| EndpointError::ConnectionLimit)?;
+                    let (stream, peer) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            let recovery = classify_accept_failure(error.kind());
+                            self.accept_diagnostics.observe_accept_failure(&error, recovery);
+                            if recovery == AcceptRecovery::Fatal {
+                                return Err(WireError::Io(error).into());
+                            }
+                            if recovery == AcceptRecovery::Delayed {
+                                tokio::select! {
+                                    biased;
+                                    changed = shutdown.changed() => {
+                                        if changed.is_err() || *shutdown.borrow() {
+                                            break;
+                                        }
+                                    }
+                                    () = tokio::time::sleep(accept_backoff) => {}
+                                }
+                                accept_backoff =
+                                    accept_backoff.saturating_mul(2).min(ACCEPT_BACKOFF_MAX);
+                            }
+                            continue;
+                        }
+                    };
+                    accept_backoff = ACCEPT_BACKOFF_MIN;
+                    let Ok(permit) = self.connections.clone().try_acquire_owned() else {
+                        drop(stream);
+                        self.accept_diagnostics.observe_connection_limit_rejection(peer);
+                        continue;
+                    };
                     let endpoint = self.clone();
                     connections.spawn(async move {
                         let _permit = permit;
@@ -986,6 +1021,15 @@ mod tests {
             shutdown_timeout: Duration::from_secs(2),
             ..RemotingConfig::default()
         };
+        endpoint_with_config(identity, protocol, control, config)
+    }
+
+    fn endpoint_with_config(
+        identity: NodeIdentity,
+        protocol: ProtocolDescriptor,
+        control: Arc<dyn ControlDispatch>,
+        config: RemotingConfig,
+    ) -> Arc<RemotingEndpoint> {
         let manager = Arc::new(
             AssociationManager::new(
                 identity.address.clone(),
@@ -1007,6 +1051,92 @@ mod tests {
             .build()
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn classifies_accept_failures_by_recoverability() {
+        assert_eq!(
+            classify_accept_failure(ErrorKind::ConnectionAborted),
+            AcceptRecovery::Immediate
+        );
+        assert_eq!(
+            classify_accept_failure(ErrorKind::Interrupted),
+            AcceptRecovery::Immediate
+        );
+        assert_eq!(
+            classify_accept_failure(Error::from_raw_os_error(24).kind()),
+            AcceptRecovery::Delayed
+        );
+        assert_eq!(
+            classify_accept_failure(ErrorKind::OutOfMemory),
+            AcceptRecovery::Delayed
+        );
+        assert_eq!(
+            classify_accept_failure(ErrorKind::InvalidInput),
+            AcceptRecovery::Fatal
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_loop_sheds_connections_at_the_cap_and_keeps_accepting() {
+        use tokio::{io::AsyncReadExt, net::TcpStream};
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_address = probe.local_addr().unwrap();
+        drop(probe);
+        let config = RemotingConfig {
+            max_associations: 1,
+            heartbeat_interval: Duration::from_millis(100),
+            shutdown_timeout: Duration::from_secs(2),
+            ..RemotingConfig::default()
+        };
+        let limit = config.required_socket_budget() - 1;
+        let server_identity = NodeIdentity {
+            cluster_id: ClusterId::new("accept-cap-test").unwrap(),
+            node_id: "server".to_owned(),
+            address: NodeAddress::new("127.0.0.1", server_address.port()).unwrap(),
+            incarnation: NodeIncarnation::new(1).unwrap(),
+        };
+        let descriptor = ProtocolDescriptor {
+            protocol_id: ProtocolId::new(7).unwrap(),
+            fingerprint: ProtocolFingerprint::digest(b"accept-cap-test/v1"),
+        };
+        let server = endpoint_with_config(
+            server_identity,
+            descriptor,
+            Arc::new(RejectControlDispatch),
+            config,
+        );
+        server.bind().await.unwrap();
+
+        let mut held = Vec::new();
+        for _ in 0..limit {
+            held.push(TcpStream::connect(server_address).await.unwrap());
+        }
+        wait_until(|| server.open_connection_count() == limit).await;
+
+        let mut shed = TcpStream::connect(server_address).await.unwrap();
+        wait_until(|| server.shed_connection_count() == 1).await;
+        let mut byte = [0_u8; 1];
+        assert_eq!(shed.read(&mut byte).await.unwrap(), 0);
+
+        held.pop();
+        wait_until(|| server.open_connection_count() == limit - 1).await;
+        let _resumed = TcpStream::connect(server_address).await.unwrap();
+        wait_until(|| server.open_connection_count() == limit).await;
+        assert_eq!(server.shed_connection_count(), 1);
+        assert_eq!(server.accept_failure_count(), 0);
+        server.shutdown().await.unwrap();
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("endpoint did not reach the expected accept state");
     }
 
     #[tokio::test]
