@@ -173,7 +173,7 @@ where
                 }
                 let mut member = current.clone();
                 member.version = self.next_version()?;
-                lattice_core::failpoint::hit(Failpoint::MemberBeforeGuardedCommit);
+                super::guarded_commit_failpoint(Failpoint::MemberBeforeGuardedCommit)?;
                 let committed = self
                     .store
                     .update_member(
@@ -221,7 +221,7 @@ where
             version: self.next_version()?,
             lease_id,
         };
-        lattice_core::failpoint::hit(Failpoint::MemberBeforeGuardedCommit);
+        super::guarded_commit_failpoint(Failpoint::MemberBeforeGuardedCommit)?;
         let committed = match self
             .store
             .create_member(
@@ -285,7 +285,7 @@ where
             .await?
             .filter(|member| &member.node == node)
             .ok_or(CoordinatorRuntimeError::StaleMember)?;
-        lattice_core::failpoint::hit(Failpoint::MemberBeforeGuardedCommit);
+        super::guarded_commit_failpoint(Failpoint::MemberBeforeGuardedCommit)?;
         let committed = self
             .store
             .remove_member(
@@ -379,7 +379,7 @@ where
         let mut member = expected.clone();
         member.status = status;
         member.version = self.next_version()?;
-        lattice_core::failpoint::hit(Failpoint::MemberBeforeGuardedCommit);
+        super::guarded_commit_failpoint(Failpoint::MemberBeforeGuardedCommit)?;
         let committed = self
             .store
             .update_member(&self.guard, UpdateMember { expected, member })

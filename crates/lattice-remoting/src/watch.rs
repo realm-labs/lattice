@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lattice_core::{
     actor_ref::{ActorRef, EntityRef, NodeIncarnation, ProtocolTag, SingletonRef},
-    failpoint::Failpoint,
+    failpoint::{Failpoint, FailpointAction},
 };
 use thiserror::Error;
 
@@ -256,7 +256,11 @@ impl WatchRegistry {
         let Some(watches) = self.target_watches.remove(&target.actor_path.to_string()) else {
             return Vec::new();
         };
-        lattice_core::failpoint::hit(Failpoint::WatchAfterTerminatedBeforeAck);
+        if lattice_core::failpoint::hit_decision(Failpoint::WatchAfterTerminatedBeforeAck)
+            == FailpointAction::Drop
+        {
+            return Vec::new();
+        }
         watches
             .into_iter()
             .filter(|(_, watched)| watched == target)

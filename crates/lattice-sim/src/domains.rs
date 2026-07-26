@@ -10,8 +10,10 @@ use lattice_placement::types::{CoordinatorTerm, PlacementVersion, Revision};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::clock::{SimClock, SimScheduler};
+use crate::clock::{SimClock, SimRandom, SimScheduler};
 use crate::trace::{TraceEvent, TraceJournal};
+
+const WORKLOAD_STREAM: u64 = 0x1405_7B7E_F767_814F;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum SimDomain {
@@ -28,6 +30,20 @@ impl SimDomain {
             Self::Beta => "simulation-beta",
         })
         .expect("static simulation domain must be valid")
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Alpha => "alpha",
+            Self::Beta => "beta",
+        }
+    }
+}
+
+fn other_domain(domain: SimDomain) -> SimDomain {
+    match domain {
+        SimDomain::Alpha => SimDomain::Beta,
+        SimDomain::Beta => SimDomain::Alpha,
     }
 }
 
@@ -142,30 +158,55 @@ impl MultiDomainScenario {
     }
 
     pub fn schedule_acceptance(&mut self) {
-        self.schedule(1, MultiDomainEvent::ApplyDelta(SimDomain::Alpha));
-        self.schedule(1, MultiDomainEvent::ApplyDelta(SimDomain::Beta));
-        self.schedule(2, MultiDomainEvent::LoseLeader(SimDomain::Alpha));
-        self.schedule(3, MultiDomainEvent::ApplyDelta(SimDomain::Beta));
+        let mut random = SimRandom::new(self.config.seed ^ WORKLOAD_STREAM);
+        let mut last = 0;
+        for domain in SimDomain::ALL {
+            let mut at = 1 + u64::try_from(random.below(3)).unwrap_or(0);
+            for _ in 0..=random.below(2) {
+                self.schedule(at, MultiDomainEvent::ApplyDelta(domain));
+                at += 1;
+            }
+            if random.chance(2, 3) {
+                self.schedule(at, MultiDomainEvent::LoseLeader(domain));
+                at += 1;
+                self.schedule(
+                    at,
+                    MultiDomainEvent::Campaign {
+                        domain,
+                        host: format!("host-{}-successor", domain.label()),
+                    },
+                );
+                at += 1;
+                self.schedule(at, MultiDomainEvent::InstallSnapshot(domain));
+                at += 1;
+                for _ in 0..random.below(2) {
+                    self.schedule(at, MultiDomainEvent::ApplyDelta(domain));
+                    at += 1;
+                }
+            }
+            last = last.max(at);
+        }
+        let target = SimDomain::ALL[random.below(SimDomain::ALL.len())];
+        let source = SimDomain::ALL[(random.below(SimDomain::ALL.len()) + 1) % 2];
         self.schedule(
-            4,
-            MultiDomainEvent::Campaign {
-                domain: SimDomain::Alpha,
-                host: "host-c".to_owned(),
-            },
-        );
-        self.schedule(5, MultiDomainEvent::InstallSnapshot(SimDomain::Alpha));
-        self.schedule(
-            6,
+            last,
             MultiDomainEvent::RejectCrossDomainDelta {
-                target: SimDomain::Alpha,
-                source: SimDomain::Beta,
+                target,
+                source: if source == target {
+                    other_domain(target)
+                } else {
+                    source
+                },
             },
         );
-        self.schedule(7, MultiDomainEvent::MembershipLost);
-        self.schedule(8, MultiDomainEvent::ApplyDelta(SimDomain::Beta));
-        self.schedule(9, MultiDomainEvent::MembershipRecovered);
-        self.schedule(10, MultiDomainEvent::AdvanceHandoff(SimDomain::Alpha));
-        self.schedule(10, MultiDomainEvent::AdvanceHandoff(SimDomain::Beta));
+        self.schedule(last + 1, MultiDomainEvent::MembershipLost);
+        let mut handoffs = SimDomain::ALL;
+        random.shuffle(&mut handoffs);
+        for (index, domain) in handoffs.into_iter().enumerate() {
+            let at = last + 2 + u64::try_from(index * random.below(2)).unwrap_or(0);
+            self.schedule(at, MultiDomainEvent::AdvanceHandoff(domain));
+        }
+        self.schedule(last + 4, MultiDomainEvent::MembershipRecovered);
     }
 
     pub fn run(&mut self) -> Result<&MultiDomainScenarioState, MultiDomainScenarioError> {
@@ -474,149 +515,219 @@ mod tests {
         assert_eq!(first.state(), second.state());
         assert_eq!(first.trace, second.trace);
         assert_eq!(first.state().cross_domain_rejections, 1);
-        let alpha = &first.state().domains[&SimDomain::Alpha];
-        let beta = &first.state().domains[&SimDomain::Beta];
-        assert_eq!(alpha.leader.as_deref(), Some("host-c"));
-        assert_eq!(alpha.leader_term, 2);
-        assert_eq!(beta.leader.as_deref(), Some("host-b"));
-        assert_eq!(beta.leader_term, 1);
-        assert_eq!(alpha.handoff_generation, 2);
-        assert_eq!(beta.handoff_generation, 2);
+        for domain in SimDomain::ALL {
+            let view = &first.state().domains[&domain];
+            assert!(view.leader.is_some());
+            assert_eq!(view.leader_term, view.snapshot_term);
+            assert_eq!(view.handoff_generation, 2);
+        }
+    }
+
+    #[test]
+    fn seeded_multi_domain_workloads_explore_independent_election_orders() {
+        let mut elected = 0;
+        let signatures = (1..=32)
+            .map(|seed| {
+                let scenario = run(seed);
+                elected += scenario
+                    .state()
+                    .domains
+                    .values()
+                    .filter(|view| view.leader_term > 1)
+                    .count();
+                scenario
+                    .trace
+                    .events
+                    .iter()
+                    .map(|event| format!("{}@{}", event.kind, event.time_millis))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(signatures.len() >= 24, "only {} traces", signatures.len());
+        assert!(elected > 0);
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    struct DomainModel {
-        phase: u8,
-        leader: u8,
-        leader_term: u8,
-        snapshot_term: u8,
-        revision: u8,
-        handoff_generation: u8,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-    struct MultiDomainModel {
-        membership_phase: u8,
-        domains: [DomainModel; 2],
+    struct DomainView {
+        leader_term: u64,
+        installed_term: u64,
+        revision: u64,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    enum ModelEvent {
-        Lose(usize),
+    struct MultiDomainExploration {
+        domains: [DomainView; 2],
+        cross_domain_rejections: u8,
+        gate_rejections: u8,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum ReducerEvent {
+        Progress(usize),
         Elect(usize),
         InstallSnapshot(usize),
-        Progress(usize),
-        Handoff(usize),
-        LoseMembership,
-        RecoverMembership,
+        CrossDomainDelta(usize),
+        StaleDelta(usize),
     }
 
-    impl Explorable for MultiDomainModel {
-        type Event = ModelEvent;
+    impl MultiDomainExploration {
+        fn materialize(&self, index: usize) -> PlacementDomainState {
+            let domain = SimDomain::ALL[index];
+            let view = self.domains[index];
+            let mut reducer = PlacementDomainState::new(domain.id());
+            reducer
+                .install(snapshot(domain, view.installed_term, view.revision, "host"))
+                .expect("materialized domain snapshot is installable");
+            reducer
+        }
+    }
+
+    impl Explorable for MultiDomainExploration {
+        type Event = ReducerEvent;
         type Error = ();
 
         fn enabled(&self) -> Vec<Self::Event> {
             let mut events = Vec::new();
-            for (index, domain) in self.domains.iter().enumerate() {
-                match domain.phase {
-                    0 => events.push(ModelEvent::Lose(index)),
-                    1 if self.membership_phase != 1 => events.push(ModelEvent::Elect(index)),
-                    2 => events.push(ModelEvent::InstallSnapshot(index)),
-                    _ => {}
+            for (index, view) in self.domains.iter().enumerate() {
+                if view.revision < 4 {
+                    events.push(ReducerEvent::Progress(index));
+                    events.push(ReducerEvent::StaleDelta(index));
                 }
-                if matches!(domain.phase, 0 | 3) && domain.revision < 4 {
-                    events.push(ModelEvent::Progress(index));
+                if view.leader_term < 2 {
+                    events.push(ReducerEvent::Elect(index));
                 }
-                if matches!(domain.phase, 0 | 3) && domain.handoff_generation < 2 {
-                    events.push(ModelEvent::Handoff(index));
+                if view.installed_term < view.leader_term && view.revision < 4 {
+                    events.push(ReducerEvent::InstallSnapshot(index));
                 }
-            }
-            match self.membership_phase {
-                0 => events.push(ModelEvent::LoseMembership),
-                1 => events.push(ModelEvent::RecoverMembership),
-                _ => {}
+                if self.cross_domain_rejections < 2 {
+                    events.push(ReducerEvent::CrossDomainDelta(index));
+                }
             }
             events
         }
 
         fn step(&self, event: &Self::Event) -> Result<Self, Self::Error> {
-            let mut next = self.clone();
+            let mut next = *self;
+            let index = match *event {
+                ReducerEvent::Progress(index)
+                | ReducerEvent::Elect(index)
+                | ReducerEvent::InstallSnapshot(index)
+                | ReducerEvent::CrossDomainDelta(index)
+                | ReducerEvent::StaleDelta(index) => index,
+            };
+            let domain = SimDomain::ALL[index];
+            let view = self.domains[index];
+            let other = self.materialize(1 - index);
+            let mut reducer = self.materialize(index);
             match *event {
-                ModelEvent::Lose(index) => {
-                    next.domains[index].phase = 1;
-                    next.domains[index].leader = 0;
+                ReducerEvent::Elect(_) => next.domains[index].leader_term += 1,
+                ReducerEvent::Progress(_) => {
+                    let result = reducer.apply(CoordinatorDelta {
+                        version: placement_version(domain, view.leader_term, view.revision + 1),
+                        records: vec![record("progress", view.revision + 1)],
+                    });
+                    if view.leader_term == view.installed_term {
+                        result.map_err(|_| ())?;
+                        if !reducer.ready() {
+                            return Err(());
+                        }
+                        next.domains[index].revision += 1;
+                    } else {
+                        if result != Err(PlacementDomainStateError::SnapshotRequired)
+                            || reducer.ready()
+                        {
+                            return Err(());
+                        }
+                        next.gate_rejections = next.gate_rejections.saturating_add(1);
+                    }
                 }
-                ModelEvent::Elect(index) => {
-                    let domain = &mut next.domains[index];
-                    domain.phase = 2;
-                    domain.leader = 3 + index as u8;
-                    domain.leader_term += 1;
+                ReducerEvent::StaleDelta(_) => {
+                    if reducer.apply(CoordinatorDelta {
+                        version: placement_version(domain, view.installed_term, view.revision),
+                        records: Vec::new(),
+                    }) != Err(PlacementDomainStateError::RevisionGap)
+                        || reducer.ready()
+                    {
+                        return Err(());
+                    }
+                    next.gate_rejections = next.gate_rejections.saturating_add(1);
                 }
-                ModelEvent::InstallSnapshot(index) => {
-                    let domain = &mut next.domains[index];
-                    domain.phase = 3;
-                    domain.snapshot_term = domain.leader_term;
-                    domain.revision += 1;
+                ReducerEvent::InstallSnapshot(_) => {
+                    reducer
+                        .install(snapshot(
+                            domain,
+                            view.leader_term,
+                            view.revision + 1,
+                            "successor",
+                        ))
+                        .map_err(|_| ())?;
+                    next.domains[index].installed_term = view.leader_term;
+                    next.domains[index].revision += 1;
                 }
-                ModelEvent::Progress(index) => next.domains[index].revision += 1,
-                ModelEvent::Handoff(index) => next.domains[index].handoff_generation += 1,
-                ModelEvent::LoseMembership => next.membership_phase = 1,
-                ModelEvent::RecoverMembership => next.membership_phase = 2,
+                ReducerEvent::CrossDomainDelta(_) => {
+                    if reducer.apply(CoordinatorDelta {
+                        version: placement_version(
+                            other_domain(domain),
+                            view.installed_term,
+                            view.revision + 1,
+                        ),
+                        records: vec![record("cross-domain", 1)],
+                    }) != Err(PlacementDomainStateError::DomainMismatch)
+                        || !reducer.ready()
+                    {
+                        return Err(());
+                    }
+                    next.cross_domain_rejections = next.cross_domain_rejections.saturating_add(1);
+                }
             }
-            if let Some(index) = match *event {
-                ModelEvent::Lose(index)
-                | ModelEvent::Elect(index)
-                | ModelEvent::InstallSnapshot(index)
-                | ModelEvent::Progress(index)
-                | ModelEvent::Handoff(index) => Some(index),
-                ModelEvent::LoseMembership | ModelEvent::RecoverMembership => None,
-            } {
-                let other = 1 - index;
-                if next.domains[other] != self.domains[other] {
-                    return Err(());
-                }
+            let installed = reducer.version().ok_or(())?;
+            if installed.term.get() != next.domains[index].installed_term
+                || installed.revision.get() != next.domains[index].revision
+                || installed.domain != domain.id()
+            {
+                return Err(());
+            }
+            if other.version() != self.materialize(1 - index).version() {
+                return Err(());
             }
             Ok(next)
         }
 
         fn invariant(&self) -> Result<(), String> {
-            for domain in self.domains {
-                if matches!(domain.phase, 0 | 3)
-                    && (domain.leader == 0 || domain.leader_term != domain.snapshot_term)
-                {
-                    return Err("live domain lacks its exact-term leader snapshot".to_owned());
+            for view in self.domains {
+                if view.installed_term > view.leader_term {
+                    return Err("a domain installed a snapshot beyond its elected term".to_owned());
                 }
-                if domain.phase == 2 && domain.leader_term == domain.snapshot_term {
-                    return Err("successor became ready without a new-term snapshot".to_owned());
+                if view.revision == 0 || view.revision > 4 {
+                    return Err("domain revision escaped its bounded range".to_owned());
                 }
-                if domain.handoff_generation == 0 || domain.handoff_generation > 2 {
-                    return Err("handoff generation escaped its domain bound".to_owned());
-                }
+            }
+            if self.cross_domain_rejections > 4 {
+                return Err("cross-domain rejections escaped their bound".to_owned());
             }
             Ok(())
         }
     }
 
     #[test]
-    fn multi_domain_bounded_state_explorer_checks_every_transition() {
-        let initial_domain = DomainModel {
-            phase: 0,
-            leader: 1,
+    fn multi_domain_bounded_state_explorer_checks_every_production_reducer_transition() {
+        let initial = DomainView {
             leader_term: 1,
-            snapshot_term: 1,
+            installed_term: 1,
             revision: 1,
-            handoff_generation: 1,
         };
         let report = StateExplorer {
             maximum_states: 50_000,
             maximum_depth: 10,
         }
-        .explore(MultiDomainModel {
-            membership_phase: 0,
-            domains: [initial_domain, initial_domain],
+        .explore(MultiDomainExploration {
+            domains: [initial, initial],
+            cross_domain_rejections: 0,
+            gate_rejections: 0,
         })
         .unwrap();
-        assert!(report.visited_states > 1_000);
+        assert!(report.visited_states > 100, "{report:?}");
+        assert!(report.explored_transitions > 1_000, "{report:?}");
         assert_eq!(report.maximum_depth_reached, 10);
     }
 }

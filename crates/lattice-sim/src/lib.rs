@@ -1,6 +1,5 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
-pub mod adapters;
 pub mod clock;
 pub mod domains;
 pub mod explorer;

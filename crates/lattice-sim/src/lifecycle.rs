@@ -13,8 +13,10 @@ use lattice_service::lifecycle::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::clock::{SimClock, SimScheduler};
+use crate::clock::{SimClock, SimRandom, SimScheduler};
 use crate::trace::{TraceEvent, TraceJournal};
+
+const WORKLOAD_STREAM: u64 = 0x2545_F491_4F6C_DD1D;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleScenarioConfig {
@@ -25,6 +27,7 @@ pub struct LifecycleScenarioConfig {
 #[derive(Debug, Clone)]
 pub enum LifecycleEvent {
     RemotingReady,
+    InstallMembershipSnapshot,
     DiscoveryCandidate(NodeKey),
     Member(MemberEvent),
     CoordinatorPartition,
@@ -42,9 +45,12 @@ pub struct LifecycleScenarioState {
     pub accepted_member_events: usize,
     pub rejected_stale_events: usize,
     pub discovered_candidates: usize,
+    pub installed_snapshots: usize,
+    pub live_members: usize,
 }
 
 pub struct LifecycleScenario {
+    pub config: LifecycleScenarioConfig,
     pub trace: TraceJournal,
     pub state: LifecycleScenarioState,
     clock: SimClock,
@@ -73,32 +79,59 @@ impl LifecycleScenario {
                 accepted_member_events: 0,
                 rejected_stale_events: 0,
                 discovered_candidates: 0,
+                installed_snapshots: 0,
+                live_members: 0,
             },
             clock: SimClock::new(),
             scheduler: SimScheduler::new(config.seed),
             lifecycle: NodeLifecycle::default(),
             members: MemberDirectory::new(32)?,
+            config,
         })
     }
 
     pub fn schedule_acceptance(&mut self) {
+        let mut random = SimRandom::new(self.config.seed ^ WORKLOAD_STREAM);
         let local = member("member", 11, 29301, 1);
         let peer_old = member("peer", 21, 29302, 2);
         let peer_new = member("peer", 22, 29302, 4);
         self.schedule(0, LifecycleEvent::RemotingReady);
-        self.schedule(1, LifecycleEvent::DiscoveryCandidate(peer_old.node.clone()));
-        self.schedule(2, LifecycleEvent::Member(upsert(local.clone())));
-        self.schedule(3, LifecycleEvent::Member(upsert(peer_old.clone())));
-        self.schedule(4, LifecycleEvent::CoordinatorPartition);
-        self.schedule(5, LifecycleEvent::DiscoveryOutage);
-        self.schedule(6, LifecycleEvent::Member(removed(&peer_old, 3)));
-        self.schedule(7, LifecycleEvent::Member(upsert(peer_new)));
-        self.schedule(8, LifecycleEvent::Member(upsert(peer_old)));
-        self.schedule(9, LifecycleEvent::Reconciled);
-        self.schedule(10, LifecycleEvent::BeginDrain);
-        self.schedule(11, LifecycleEvent::Member(removed(&local, 5)));
-        self.schedule(12, LifecycleEvent::DrainComplete);
-        self.schedule(13, LifecycleEvent::ShutdownComplete);
+        self.schedule(1, LifecycleEvent::InstallMembershipSnapshot);
+        let mut deltas = vec![
+            upsert(peer_old.clone()),
+            removed(&peer_old, 3),
+            upsert(peer_new),
+            upsert(member("peer", 21, 29302, 5)),
+            removed(&local, 6),
+        ];
+        if random.chance(1, 2) {
+            deltas.push(upsert(peer_old.clone()));
+        }
+        random.shuffle(&mut deltas);
+        let partition_index = random.below(deltas.len());
+        let reconciled_index = partition_index + 1 + random.below(2);
+        let mut at = 2;
+        for (index, delta) in deltas.into_iter().enumerate() {
+            if index == partition_index {
+                self.schedule(at, LifecycleEvent::CoordinatorPartition);
+                at += 1;
+                self.schedule(at, LifecycleEvent::DiscoveryOutage);
+            }
+            if index == reconciled_index {
+                self.schedule(at, LifecycleEvent::Reconciled);
+                at += 1;
+            }
+            self.schedule(at, LifecycleEvent::Member(delta));
+            at += u64::try_from(random.below(2)).unwrap_or(0);
+        }
+        at += 1;
+        self.schedule(at, LifecycleEvent::DiscoveryCandidate(peer_old.node));
+        at += 1;
+        self.schedule(at, LifecycleEvent::BeginDrain);
+        at += 1;
+        self.schedule(at, LifecycleEvent::DrainComplete);
+        at += 1;
+        self.schedule(at, LifecycleEvent::ShutdownComplete);
     }
 
     pub fn run(&mut self) -> Result<&LifecycleScenarioState, LifecycleScenarioError> {
@@ -120,6 +153,14 @@ impl LifecycleScenario {
         match event {
             LifecycleEvent::RemotingReady => {
                 self.apply_lifecycle(ServiceLifecycleEvent::RemotingReady)?;
+            }
+            LifecycleEvent::InstallMembershipSnapshot => {
+                let local = member("member", 11, 29301, 1);
+                self.members.install_snapshot(local.version, vec![local])?;
+                self.state.installed_snapshots += 1;
+                if self.lifecycle.state() == NodeLifecycleState::JoiningMembership {
+                    self.apply_lifecycle(ServiceLifecycleEvent::SnapshotInstalled)?;
+                }
             }
             LifecycleEvent::DiscoveryCandidate(_) => {
                 self.state.discovered_candidates += 1;
@@ -154,6 +195,7 @@ impl LifecycleScenario {
             }
         }
         self.state.lifecycle = format!("{:?}", self.lifecycle.state());
+        self.state.live_members = self.members.snapshot().members.len();
         if !self.trace.push(TraceEvent {
             index: 0,
             causal_parents: self
@@ -219,9 +261,9 @@ impl LifecycleScenario {
         {
             return Err(LifecycleInvariantViolation::AdmissionWithoutReady);
         }
-        if self.state.discovered_candidates > 0
+        if !snapshot.members.is_empty()
             && self.state.accepted_member_events == 0
-            && !snapshot.members.is_empty()
+            && self.state.installed_snapshots == 0
         {
             return Err(LifecycleInvariantViolation::DiscoveryMutatedMembership);
         }
@@ -325,16 +367,53 @@ mod tests {
 
     #[test]
     fn reorder_duplicate_partition_lease_expiry_and_leave_preserve_lifecycle() {
-        let scenario = run(20260713);
-        assert_eq!(scenario.state.lifecycle, "Terminated");
-        assert!(!scenario.state.admission_open);
-        // Strict MembershipVersion sequencing rejects every reordered gap, not
-        // only the formerly record-local stale revision.
-        assert_eq!(scenario.state.rejected_stale_events, 6);
+        let mut rejected = 0;
+        let mut accepted = 0;
+        for seed in 1..=64 {
+            let scenario = run(seed);
+            assert_eq!(scenario.state.lifecycle, "Terminated");
+            assert!(!scenario.state.admission_open);
+            assert_eq!(scenario.state.live_members, 0);
+            assert_eq!(scenario.state.installed_snapshots, 1);
+            assert_eq!(
+                scenario.state.accepted_member_events + scenario.state.rejected_stale_events,
+                scenario
+                    .trace
+                    .events
+                    .iter()
+                    .filter(|event| event.kind.starts_with("Member("))
+                    .count()
+            );
+            rejected += scenario.state.rejected_stale_events;
+            accepted += scenario.state.accepted_member_events;
+        }
+        assert!(
+            rejected > 0 && accepted > 0,
+            "{accepted} accepted {rejected} rejected"
+        );
     }
 
     #[test]
     fn lifecycle_trace_is_seed_replayable() {
         assert_eq!(run(77).trace, run(77).trace);
+    }
+
+    #[test]
+    fn seeded_lifecycle_workloads_reorder_membership_deltas_differently() {
+        let signatures = (1..=32)
+            .map(|seed| {
+                let scenario = run(seed);
+                (
+                    scenario
+                        .trace
+                        .events
+                        .iter()
+                        .map(|event| format!("{}@{}", event.kind, event.time_millis))
+                        .collect::<Vec<_>>(),
+                    scenario.state.accepted_member_events,
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(signatures.len() >= 24, "only {} traces", signatures.len());
     }
 }

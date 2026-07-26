@@ -114,8 +114,36 @@ impl Failpoint {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FailpointAction {
+    #[default]
+    Continue,
+    Crash,
+    Pause,
+    Drop,
+    Duplicate,
+    StoreFailure,
+}
+
+impl FailpointAction {
+    pub const fn is_continue(self) -> bool {
+        matches!(self, Self::Continue)
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Crash => "crash",
+            Self::Pause => "pause",
+            Self::Drop => "drop",
+            Self::Duplicate => "duplicate",
+            Self::StoreFailure => "store-failure",
+        }
+    }
+}
+
 #[cfg(feature = "test-failpoints")]
-type Hook = Arc<dyn Fn(Failpoint) + Send + Sync>;
+type Hook = Arc<dyn Fn(Failpoint) -> FailpointAction + Send + Sync>;
 
 #[cfg(feature = "test-failpoints")]
 fn hook() -> &'static RwLock<Option<Hook>> {
@@ -124,12 +152,17 @@ fn hook() -> &'static RwLock<Option<Hook>> {
 }
 
 pub fn hit(point: Failpoint) {
+    let _ = hit_decision(point);
+}
+
+pub fn hit_decision(point: Failpoint) -> FailpointAction {
     #[cfg(feature = "test-failpoints")]
     if let Some(hook) = hook().read().expect("failpoint hook poisoned").clone() {
-        hook(point);
+        return hook(point);
     }
     #[cfg(not(feature = "test-failpoints"))]
     let _ = point;
+    FailpointAction::Continue
 }
 
 #[cfg(feature = "test-failpoints")]
@@ -146,6 +179,16 @@ impl Drop for FailpointGuard {
 
 #[cfg(feature = "test-failpoints")]
 pub fn install_hook(hook_fn: impl Fn(Failpoint) + Send + Sync + 'static) -> FailpointGuard {
+    install_decision_hook(move |point| {
+        hook_fn(point);
+        FailpointAction::Continue
+    })
+}
+
+#[cfg(feature = "test-failpoints")]
+pub fn install_decision_hook(
+    hook_fn: impl Fn(Failpoint) -> FailpointAction + Send + Sync + 'static,
+) -> FailpointGuard {
     let mut active = hook().write().expect("failpoint hook poisoned");
     let previous = active.replace(Arc::new(hook_fn));
     FailpointGuard { previous }
