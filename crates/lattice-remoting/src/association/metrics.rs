@@ -11,6 +11,8 @@ pub struct AssociationMetricsSnapshot {
     pub outbound_socket_writes: u64,
     pub exact_target_cache_hits: u64,
     pub exact_target_cache_misses: u64,
+    pub discarded_replies: u64,
+    pub dropped_inbound_frames: u64,
 }
 
 impl AssociationMetricsSnapshot {
@@ -41,6 +43,8 @@ pub(crate) struct AssociationMetrics {
     outbound_socket_writes: AtomicU64,
     exact_target_cache_hits: AtomicU64,
     exact_target_cache_misses: AtomicU64,
+    discarded_replies: AtomicU64,
+    dropped_inbound_frames: AtomicU64,
 }
 
 impl AssociationMetrics {
@@ -74,6 +78,14 @@ impl AssociationMetrics {
             .fetch_add(misses, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_discarded_reply(&self) {
+        self.discarded_replies.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_dropped_inbound_frame(&self) {
+        self.dropped_inbound_frames.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn snapshot(&self) -> AssociationMetricsSnapshot {
         AssociationMetricsSnapshot {
             outbound_queue_rejections: self.outbound_queue_rejections.load(Ordering::Relaxed),
@@ -86,6 +98,8 @@ impl AssociationMetrics {
             outbound_socket_writes: self.outbound_socket_writes.load(Ordering::Relaxed),
             exact_target_cache_hits: self.exact_target_cache_hits.load(Ordering::Relaxed),
             exact_target_cache_misses: self.exact_target_cache_misses.load(Ordering::Relaxed),
+            discarded_replies: self.discarded_replies.load(Ordering::Relaxed),
+            dropped_inbound_frames: self.dropped_inbound_frames.load(Ordering::Relaxed),
         }
     }
 }

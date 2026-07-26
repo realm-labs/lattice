@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -63,6 +63,12 @@ pub enum LaneKind {
     Bulk(u8),
 }
 
+impl LaneKind {
+    pub(crate) fn fails_pending_asks(self) -> bool {
+        !matches!(self, Self::Bulk(_))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaneAttachment {
     pub association_id: AssociationId,
@@ -119,6 +125,8 @@ pub struct Association {
     key: AssociationKey,
     config: RemotingConfig,
     state: AtomicU8,
+    ever_active: AtomicBool,
+    state_changed: Notify,
     attached_lanes: AtomicU64,
     wake_pending_lanes: AtomicU64,
     inner: Mutex<AssociationInner>,
@@ -200,6 +208,8 @@ impl Association {
             key,
             config,
             state: AtomicU8::new(AssociationState::Establishing as u8),
+            ever_active: AtomicBool::new(false),
+            state_changed: Notify::new(),
             attached_lanes: AtomicU64::new(0),
             wake_pending_lanes: AtomicU64::new(0),
             inner: Mutex::new(AssociationInner {
@@ -244,6 +254,26 @@ impl Association {
 
     pub fn state(&self) -> AssociationState {
         AssociationState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    pub fn has_activated(&self) -> bool {
+        self.ever_active.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_until_active(&self) -> Result<(), AssociationError> {
+        loop {
+            let changed = self.state_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self.state() {
+                AssociationState::Active => return Ok(()),
+                AssociationState::Closing | AssociationState::Closed => {
+                    return Err(AssociationError::Closed);
+                }
+                _ => {}
+            }
+            changed.await;
+        }
     }
 
     pub fn take_receivers(&self) -> Option<AssociationReceivers> {
@@ -376,6 +406,8 @@ impl Association {
         if activated {
             self.state
                 .store(AssociationState::Active as u8, Ordering::Release);
+            self.ever_active.store(true, Ordering::Release);
+            self.state_changed.notify_waiters();
         }
         Ok((decision, activated))
     }
@@ -408,6 +440,7 @@ impl Association {
         if lane == LaneKind::Control || self.state() != AssociationState::Active {
             self.state
                 .store(AssociationState::Reconnecting as u8, Ordering::Release);
+            self.state_changed.notify_waiters();
         }
         if lane == LaneKind::Control {
             self.wake_pending_lanes.store(0, Ordering::Release);
@@ -598,6 +631,7 @@ impl Association {
             self.attached_lanes.store(0, Ordering::Release);
             self.wake_pending_lanes.store(0, Ordering::Release);
             self.admission_changed.notify_waiters();
+            self.state_changed.notify_waiters();
         }
     }
 
@@ -609,6 +643,7 @@ impl Association {
         self.attached_lanes.store(0, Ordering::Release);
         self.wake_pending_lanes.store(0, Ordering::Release);
         self.admission_changed.notify_waiters();
+        self.state_changed.notify_waiters();
     }
 
     fn try_admit(
@@ -639,6 +674,14 @@ impl Association {
 
     pub(crate) fn record_exact_target_cache(&self, hits: u64, misses: u64) {
         self.metrics.record_exact_target_cache(hits, misses);
+    }
+
+    pub(crate) fn record_discarded_reply(&self) {
+        self.metrics.record_discarded_reply();
+    }
+
+    pub(crate) fn record_dropped_inbound_frame(&self) {
+        self.metrics.record_dropped_inbound_frame();
     }
 
     fn has_complete_lane_group(&self, lanes: &HashMap<LaneKind, u128>) -> bool {

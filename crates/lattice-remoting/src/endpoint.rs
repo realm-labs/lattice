@@ -1,8 +1,10 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use lattice_core::actor_ref::{ClusterId, NodeAddress, NodeIncarnation};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -70,8 +72,52 @@ pub struct RemotingEndpoint {
     tasks: Mutex<Vec<JoinHandle<Result<(), EndpointError>>>>,
     #[cfg(feature = "tls")]
     security: Option<EndpointSecurity>,
-    connect_lock: AsyncMutex<()>,
+    connect_locks: Mutex<HashMap<PeerConnectKey, Arc<AsyncMutex<()>>>>,
     bootstrap_handler: RwLock<Arc<dyn BootstrapHandler>>,
+}
+
+type PeerConnectKey = (ClusterId, NodeAddress, NodeIncarnation);
+
+/// Serializes concurrent dials of one exact peer without serializing unrelated peers.
+struct PeerConnectLease {
+    endpoint: Arc<RemotingEndpoint>,
+    key: PeerConnectKey,
+    lock: Arc<AsyncMutex<()>>,
+}
+
+impl PeerConnectLease {
+    fn acquire(endpoint: &Arc<RemotingEndpoint>, peer: &NodeIdentity) -> Self {
+        let key = (
+            peer.cluster_id.clone(),
+            peer.address.clone(),
+            peer.incarnation,
+        );
+        let lock = endpoint
+            .connect_locks
+            .lock()
+            .expect("endpoint connect lock registry poisoned")
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        Self {
+            endpoint: endpoint.clone(),
+            key,
+            lock,
+        }
+    }
+}
+
+impl Drop for PeerConnectLease {
+    fn drop(&mut self) {
+        let mut locks = self
+            .endpoint
+            .connect_locks
+            .lock()
+            .expect("endpoint connect lock registry poisoned");
+        if Arc::strong_count(&self.lock) == 2 {
+            locks.remove(&self.key);
+        }
+    }
 }
 
 #[cfg(feature = "tls")]
@@ -109,12 +155,23 @@ impl RemotingEndpoint {
     ) -> Result<Arc<Association>, EndpointError> {
         let mut shutdown = self.shutdown_tx.subscribe();
         self.ensure_running()?;
+        let lease = PeerConnectLease::acquire(self, &peer);
+        self.connect_peer_single_flight(&lease.lock, &peer, &mut shutdown)
+            .await
+    }
+
+    async fn connect_peer_single_flight(
+        self: &Arc<Self>,
+        peer_lock: &AsyncMutex<()>,
+        peer: &NodeIdentity,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<Arc<Association>, EndpointError> {
         let _connection_guard = tokio::select! {
             biased;
-            () = wait_for_shutdown(&mut shutdown) => {
+            () = wait_for_shutdown(shutdown) => {
                 return Err(EndpointError::ShuttingDown);
             }
-            guard = self.connect_lock.lock() => guard,
+            guard = peer_lock.lock() => guard,
         };
         self.ensure_running()?;
         if let Some(association) =
@@ -130,8 +187,8 @@ impl RemotingEndpoint {
         {
             return tokio::select! {
                 biased;
-                () = wait_for_shutdown(&mut shutdown) => Err(EndpointError::ShuttingDown),
-                result = self.request_reverse_peer(peer) => result,
+                () = wait_for_shutdown(shutdown) => Err(EndpointError::ShuttingDown),
+                result = self.request_reverse_peer(peer.clone()) => result,
             };
         }
         let association = self.associations.get_or_create(
@@ -147,18 +204,25 @@ impl RemotingEndpoint {
         }
         tokio::select! {
             biased;
-            () = wait_for_shutdown(&mut shutdown) => {
+            () = wait_for_shutdown(shutdown) => {
                 return Err(EndpointError::ShuttingDown);
             }
-            result = tokio::time::timeout(self.config.connect_timeout, async {
-                while association.state() != AssociationState::Active {
-                    tokio::task::yield_now().await;
-                }
-            }) => {
-                result.map_err(|_| EndpointError::ConnectTimeout)?;
+            result = tokio::time::timeout(
+                self.config.connect_timeout,
+                association.wait_until_active(),
+            ) => {
+                result.map_err(|_| EndpointError::ConnectTimeout)??;
             }
         }
         Ok(association)
+    }
+
+    #[cfg(test)]
+    fn connect_lock_count(&self) -> usize {
+        self.connect_locks
+            .lock()
+            .expect("endpoint connect lock registry poisoned")
+            .len()
     }
 
     pub async fn probe_candidate(
@@ -292,6 +356,7 @@ impl RemotingEndpoint {
             let mut connection_permit = Some(permit);
             let mut current = Some((stream, nonce));
             let mut backoff = endpoint.config.reconnect_backoff_min;
+            let attached_at = Instant::now();
             loop {
                 let (stream, nonce) = current.take().expect("lane connection is installed");
                 let result = endpoint
@@ -334,6 +399,12 @@ impl RemotingEndpoint {
                     backoff = endpoint.config.reconnect_backoff_min;
                 }
                 loop {
+                    if !association.has_activated()
+                        && attached_at.elapsed() >= endpoint.config.establishing_timeout
+                    {
+                        endpoint.abandon_association(&association);
+                        return Ok(());
+                    }
                     tokio::select! {
                         changed = shutdown.changed() => {
                             if changed.is_err() || *shutdown.borrow() {
@@ -758,10 +829,19 @@ impl RemotingEndpoint {
             ).run(receiver, stream, shutdown) => result,
             () = wait_for_disconnect(&mut disconnect, association_id) => {
                 association.detach(lane, nonce);
-                self.messaging.fail_association(association_id);
+                if lane.fails_pending_asks() {
+                    self.messaging.fail_association(association_id);
+                }
                 Ok(LaneExit::RemoteClose)
             }
         }
+    }
+
+    fn abandon_association(&self, association: &Association) {
+        association.begin_close();
+        association.finish_close();
+        self.associations
+            .remove(association.key(), association.id());
     }
 }
 
@@ -1127,6 +1207,144 @@ mod tests {
         assert_eq!(server.shed_connection_count(), 1);
         assert_eq!(server.accept_failure_count(), 0);
         server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_peer_dial_does_not_block_other_peers() {
+        use tokio::net::TcpStream;
+
+        let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blackhole_port = blackhole.local_addr().unwrap().port();
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let client_port = server_port.min(blackhole_port).saturating_sub(1).max(1024);
+        let cluster_id = ClusterId::new("connect-fairness-test").unwrap();
+        let identity = |node_id: &str, port: u16, incarnation: u128| NodeIdentity {
+            cluster_id: cluster_id.clone(),
+            node_id: node_id.to_owned(),
+            address: NodeAddress::new("127.0.0.1", port).unwrap(),
+            incarnation: NodeIncarnation::new(incarnation).unwrap(),
+        };
+        let client_identity = identity("client", client_port, 1);
+        let blackhole_identity = identity("blackhole", blackhole_port, 2);
+        let server_identity = identity("server", server_port, 3);
+        let descriptor = ProtocolDescriptor {
+            protocol_id: ProtocolId::new(7).unwrap(),
+            fingerprint: ProtocolFingerprint::digest(b"connect-fairness-test/v1"),
+        };
+        let config = RemotingConfig {
+            connect_timeout: Duration::from_secs(2),
+            heartbeat_interval: Duration::from_millis(100),
+            shutdown_timeout: Duration::from_secs(2),
+            ..RemotingConfig::default()
+        };
+        let client = endpoint_with_config(
+            client_identity,
+            descriptor.clone(),
+            Arc::new(RejectControlDispatch),
+            config.clone(),
+        );
+        let server = endpoint_with_config(
+            server_identity.clone(),
+            descriptor,
+            Arc::new(RejectControlDispatch),
+            config,
+        );
+        server.bind().await.unwrap();
+        let stalled = {
+            let client = client.clone();
+            tokio::spawn(async move { client.connect_peer(blackhole_identity).await })
+        };
+        let _stalled_socket: (TcpStream, _) = blackhole.accept().await.unwrap();
+
+        let association = tokio::time::timeout(
+            Duration::from_millis(750),
+            client.connect_peer(server_identity),
+        )
+        .await
+        .expect("a stalled peer dial must not block an unrelated peer")
+        .unwrap();
+
+        assert_eq!(association.state(), AssociationState::Active);
+        assert!(!stalled.is_finished());
+        stalled.abort();
+        let _ = stalled.await;
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_association_that_never_activates_is_abandoned_and_releases_its_permit() {
+        use crate::transport::negotiate_inbound;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        let client_port = server_port.saturating_sub(1).max(1024);
+        let cluster_id = ClusterId::new("abandon-test").unwrap();
+        let client_identity = NodeIdentity {
+            cluster_id: cluster_id.clone(),
+            node_id: "client".to_owned(),
+            address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+            incarnation: NodeIncarnation::new(1).unwrap(),
+        };
+        let server_identity = NodeIdentity {
+            cluster_id: cluster_id.clone(),
+            node_id: "server".to_owned(),
+            address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+            incarnation: NodeIncarnation::new(2).unwrap(),
+        };
+        let descriptor = ProtocolDescriptor {
+            protocol_id: ProtocolId::new(7).unwrap(),
+            fingerprint: ProtocolFingerprint::digest(b"abandon-test/v1"),
+        };
+        let config = RemotingConfig {
+            connect_timeout: Duration::from_millis(300),
+            establishing_timeout: Duration::from_millis(100),
+            reconnect_backoff_min: Duration::from_millis(20),
+            reconnect_backoff_max: Duration::from_millis(40),
+            heartbeat_interval: Duration::from_millis(100),
+            shutdown_timeout: Duration::from_secs(2),
+            ..RemotingConfig::default()
+        };
+        let validator = HandshakeValidator::new(
+            server_identity.clone(),
+            config.max_frame_size,
+            config.bulk_stripes,
+        )
+        .unwrap();
+        let max_frame_size = config.max_frame_size;
+        let server_catalogue = vec![descriptor.clone()];
+        let control_only_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut connection =
+                FramedConnection::new(stream, FrameCodec::new(max_frame_size).unwrap());
+            let _ = negotiate_inbound(&mut connection, &validator, &server_catalogue, 8).await;
+        });
+        let client = endpoint_with_config(
+            client_identity,
+            descriptor,
+            Arc::new(RejectControlDispatch),
+            config,
+        );
+
+        assert!(client.connect_peer(server_identity.clone()).await.is_err());
+        control_only_server.await.unwrap();
+        wait_until(|| {
+            client
+                .associations
+                .get_exact(
+                    &cluster_id,
+                    &server_identity.address,
+                    server_identity.incarnation,
+                )
+                .is_none()
+        })
+        .await;
+
+        assert_eq!(client.open_connection_count(), 0);
+        assert_eq!(client.connect_lock_count(), 0);
+        client.shutdown().await.unwrap();
     }
 
     async fn wait_until(mut condition: impl FnMut() -> bool) {

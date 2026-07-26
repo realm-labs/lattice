@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     future::Future,
     sync::{Arc, Mutex, RwLock},
 };
@@ -13,7 +14,7 @@ use crate::{
     messaging::{inbound::InboundDispatch, outbound::OutboundMessaging},
     protocol::ProtocolDescriptor,
 };
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, broadcast, watch};
+use tokio::sync::{Semaphore, broadcast, watch};
 
 #[cfg(feature = "tls")]
 use super::EndpointSecurity;
@@ -73,7 +74,7 @@ impl RemotingEndpointBuilder {
             tasks: Mutex::new(Vec::new()),
             #[cfg(feature = "tls")]
             security: self.security,
-            connect_lock: AsyncMutex::new(()),
+            connect_locks: Mutex::new(HashMap::new()),
             bootstrap_handler: RwLock::new(Arc::new(AcceptBootstrap)),
         })
     }

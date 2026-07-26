@@ -131,7 +131,7 @@ impl PreparedExactTellRoute {
             &self.envelope,
             message_id,
             payload,
-            compact,
+            compact.then_some(epoch),
         ));
         if self.dictionary_id.is_some() && !compact {
             self.registered_epoch.store(epoch, Ordering::Release);
@@ -159,7 +159,7 @@ impl PreparedExactTellRoute {
             &self.envelope,
             message_id,
             payload,
-            compact,
+            compact.then_some(epoch),
         ));
         if self.dictionary_id.is_some() && !compact {
             self.registered_epoch.store(epoch, Ordering::Release);

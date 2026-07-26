@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -148,7 +149,7 @@ impl BidirectionalLane {
         let (hits, misses) = target_cache.take_metrics();
         self.association.record_exact_target_cache(hits, misses);
         self.association.detach(self.lane, self.connection_nonce);
-        if result.is_err() {
+        if self.lane.fails_pending_asks() && matches!(result, Err(_) | Ok(LaneExit::RemoteClose)) {
             self.services
                 .messaging
                 .fail_association(self.association.id());
@@ -187,6 +188,12 @@ where
         config.maximum_ready_write_batch_frames,
         config.maximum_coalesced_write_batch_bytes,
     );
+    let write_timeout = (lane == LaneKind::Control)
+        .then(|| config.heartbeat_interval * config.heartbeat_miss_limit);
+    let bulk_stripe = match lane {
+        LaneKind::Bulk(index) => Some(usize::from(index)),
+        _ => None,
+    };
     let mut asks = FuturesUnordered::new();
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -244,7 +251,14 @@ where
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    writer.flush().await?;
+                    if lane == LaneKind::Control {
+                        let _ = write_within(
+                            write_timeout,
+                            writer.write_frame(&Frame::new(FrameKind::Close, Bytes::new())),
+                        )
+                        .await;
+                    }
+                    write_within(write_timeout, writer.flush()).await?;
                     return Ok(LaneExit::Shutdown);
                 }
             }
@@ -259,7 +273,7 @@ where
                     return Err(LaneError::ControlWorkerClosed);
                 };
                 if let Some(frame) = completed? {
-                    writer.write_frame(&frame).await?;
+                    write_within(write_timeout, writer.write_frame(&frame)).await?;
                 }
             }
             _ = heartbeat.tick(), if lane == LaneKind::Control => {
@@ -268,9 +282,11 @@ where
                 {
                     return Err(LaneError::HeartbeatTimeout);
                 }
-                writer
-                    .write_frame(&Frame::new(FrameKind::Heartbeat, Bytes::new()))
-                    .await?;
+                write_within(
+                    write_timeout,
+                    writer.write_frame(&Frame::new(FrameKind::Heartbeat, Bytes::new())),
+                )
+                .await?;
             }
             completed = asks.next(), if !asks.is_empty() => {
                 let Some(completed) = completed else {
@@ -285,11 +301,13 @@ where
                     outbound_batch.push(completed?);
                 }
                 if outbound_batch.len() == 1 {
-                    writer.write_frame(&outbound_batch[0]).await?;
+                    write_within(write_timeout, writer.write_frame(&outbound_batch[0])).await?;
                 } else {
-                    writer
-                        .write_frames_with_commit(&outbound_batch, |_| {})
-                        .await?;
+                    write_within(
+                        write_timeout,
+                        writer.write_frames_with_commit(&outbound_batch, |_| {}),
+                    )
+                    .await?;
                 }
                 idle.as_mut().reset(
                     TokioInstant::now() + config.idle_data_connection_timeout
@@ -317,6 +335,9 @@ where
                 let mut reserved_bytes = 0;
                 for mut frame in outbound_candidates.drain(..) {
                     let frame_bytes = frame.payload_len();
+                    if let Some(stripe) = bulk_stripe {
+                        frame.expand_stale_compact_target(association.bulk_lane_epoch(stripe));
+                    }
                     let Some(prepared) =
                         messaging.prepare_outbound_for_socket_write(&mut frame)
                     else {
@@ -344,21 +365,25 @@ where
                 let frame_count = outbound_batch.len();
                 let result = if frame_count == 1 && !matches!(lane, LaneKind::Bulk(_)) {
                     let correlation = outbound_correlations[0];
-                    writer
-                        .write_frame_with_commit_outcome(&outbound_batch[0], || {
+                    write_within(
+                        write_timeout,
+                        writer.write_frame_with_commit_outcome(&outbound_batch[0], || {
                             if let Some(correlation) = correlation {
                                 messaging.mark_socket_write_started(correlation);
                             }
-                        })
-                        .await
+                        }),
+                    )
+                    .await
                 } else {
-                    writer
-                        .write_frames_with_commit(&outbound_batch, |index| {
+                    write_within(
+                        write_timeout,
+                        writer.write_frames_with_commit(&outbound_batch, |index| {
                             if let Some(correlation) = outbound_correlations[index] {
                                 messaging.mark_socket_write_started(correlation);
                             }
-                        })
-                        .await
+                        }),
+                    )
+                    .await
                 };
                 association.release_queued_bytes(reserved_bytes);
                 let outcome = result?;
@@ -377,29 +402,51 @@ where
                 );
                 match frame.kind {
                     FrameKind::Tell if matches!(lane, LaneKind::Bulk(_)) => {
-                        let tell = decode_tell_cached(&frame, target_cache, target_dictionary)?;
-                        let _ = dispatch_tell(dispatch.as_ref(), tell).await;
+                        match decode_tell_cached(&frame, target_cache, target_dictionary) {
+                            Ok(tell) => {
+                                let _ = dispatch_tell(dispatch.as_ref(), tell).await;
+                            }
+                            Err(_) => association.record_dropped_inbound_frame(),
+                        }
                     }
                     FrameKind::EntityTell if matches!(lane, LaneKind::Bulk(_)) => {
-                        let tell = decode_entity_tell_cached(&frame, target_cache)?;
-                        let _ = dispatch
-                            .tell_entity(tell.sender, tell.target, tell.message_id, tell.payload)
-                            .await;
+                        match decode_entity_tell_cached(&frame, target_cache) {
+                            Ok(tell) => {
+                                let _ = dispatch
+                                    .tell_entity(
+                                        tell.sender,
+                                        tell.target,
+                                        tell.message_id,
+                                        tell.payload,
+                                    )
+                                    .await;
+                            }
+                            Err(_) => association.record_dropped_inbound_frame(),
+                        }
                     }
                     FrameKind::SingletonTell if matches!(lane, LaneKind::Bulk(_)) => {
-                        let tell = decode_singleton_tell_cached(&frame, target_cache)?;
-                        let _ = dispatch
-                            .tell_singleton(tell.sender, tell.target, tell.message_id, tell.payload)
-                            .await;
+                        match decode_singleton_tell_cached(&frame, target_cache) {
+                            Ok(tell) => {
+                                let _ = dispatch
+                                    .tell_singleton(
+                                        tell.sender,
+                                        tell.target,
+                                        tell.message_id,
+                                        tell.payload,
+                                    )
+                                    .await;
+                            }
+                            Err(_) => association.record_dropped_inbound_frame(),
+                        }
                     }
                     FrameKind::Ask if lane == LaneKind::Interactive => {
                         let ask = decode_ask_cached(&frame, target_cache)?;
                         if asks.len() == config.maximum_concurrent_inbound_asks {
-                            writer.write_frame(&failure_frame(&RemoteFailure {
+                            write_within(write_timeout, writer.write_frame(&failure_frame(&RemoteFailure {
                                 correlation_id: ask.correlation_id,
                                 code: RemoteFailureCode::MailboxFull,
                                 safe_detail: None,
-                            })).await?;
+                            }))).await?;
                         } else {
                             asks.push(dispatch_inbound_ask(
                                 dispatch.clone(),
@@ -410,11 +457,11 @@ where
                     FrameKind::EntityAsk if lane == LaneKind::Interactive => {
                         let ask = decode_entity_ask(&frame)?;
                         if asks.len() == config.maximum_concurrent_inbound_asks {
-                            writer.write_frame(&failure_frame(&RemoteFailure {
+                            write_within(write_timeout, writer.write_frame(&failure_frame(&RemoteFailure {
                                 correlation_id: ask.correlation_id,
                                 code: RemoteFailureCode::MailboxFull,
                                 safe_detail: None,
-                            })).await?;
+                            }))).await?;
                         } else {
                             asks.push(dispatch_inbound_ask(
                                 dispatch.clone(),
@@ -425,11 +472,11 @@ where
                     FrameKind::SingletonAsk if lane == LaneKind::Interactive => {
                         let ask = decode_singleton_ask(&frame)?;
                         if asks.len() == config.maximum_concurrent_inbound_asks {
-                            writer.write_frame(&failure_frame(&RemoteFailure {
+                            write_within(write_timeout, writer.write_frame(&failure_frame(&RemoteFailure {
                                 correlation_id: ask.correlation_id,
                                 code: RemoteFailureCode::MailboxFull,
                                 safe_detail: None,
-                            })).await?;
+                            }))).await?;
                         } else {
                             asks.push(dispatch_inbound_ask(
                                 dispatch.clone(),
@@ -439,19 +486,25 @@ where
                     }
                     FrameKind::Reply if lane == LaneKind::Interactive => {
                         let (correlation, payload) = decode_reply(&frame)?;
-                        messaging.complete_reply(correlation, payload);
+                        if !messaging.complete_reply(correlation, payload) {
+                            association.record_discarded_reply();
+                        }
                     }
                     FrameKind::Failure if lane == LaneKind::Interactive => {
                         let failure = decode_failure(&frame)?;
-                        messaging.complete_failure(
+                        if !messaging.complete_failure(
                             failure.correlation_id,
                             AskError::Remote(failure.code),
-                        );
+                        ) {
+                            association.record_discarded_reply();
+                        }
                     }
                     FrameKind::Heartbeat if lane == LaneKind::Control => {
-                        writer
-                            .write_frame(&Frame::new(FrameKind::HeartbeatAck, Bytes::new()))
-                            .await?;
+                        write_within(
+                            write_timeout,
+                            writer.write_frame(&Frame::new(FrameKind::HeartbeatAck, Bytes::new())),
+                        )
+                        .await?;
                     }
                     FrameKind::HeartbeatAck if lane == LaneKind::Control => {}
                     FrameKind::ControlEnvelope if lane == LaneKind::Control => control_apply_tx
@@ -498,10 +551,23 @@ where
                     );
                     continue;
                 }
-                writer.flush().await?;
+                write_within(write_timeout, writer.flush()).await?;
                 return Ok(LaneExit::Idle);
             }
         }
+    }
+}
+
+async fn write_within<T, F>(limit: Option<Duration>, write: F) -> Result<T, LaneError>
+where
+    F: Future<Output = Result<T, WireError>>,
+{
+    match limit {
+        Some(limit) => tokio::time::timeout(limit, write)
+            .await
+            .map_err(|_| LaneError::WriteTimeout)?
+            .map_err(LaneError::from),
+        None => write.await.map_err(LaneError::from),
     }
 }
 
@@ -657,6 +723,8 @@ pub enum LaneError {
     InvalidLimit,
     #[error("control lane missed its bounded heartbeat window")]
     HeartbeatTimeout,
+    #[error("control lane socket write exceeded its bounded window")]
+    WriteTimeout,
     #[error("control apply worker stopped unexpectedly")]
     ControlWorkerClosed,
     #[error("control apply queue is full")]
@@ -706,10 +774,43 @@ mod tests {
             target::{ExactActorTarget, SenderIdentity},
         },
         protocol::{ProtocolDescriptor, ProtocolFingerprint},
+        transport::FramedConnection,
     };
 
     struct EchoDispatch {
         delay: Duration,
+    }
+
+    #[derive(Default)]
+    struct RecordingDispatch {
+        tells: std::sync::Mutex<Vec<ExactActorTarget>>,
+    }
+
+    #[async_trait]
+    impl InboundDispatch for RecordingDispatch {
+        async fn tell(
+            &self,
+            _sender: Option<ActorRef>,
+            target: ExactActorTarget,
+            _message_id: u64,
+            _payload: Bytes,
+        ) -> Result<(), RemoteMessageError> {
+            self.tells
+                .lock()
+                .expect("recording dispatch poisoned")
+                .push(target);
+            Ok(())
+        }
+
+        async fn ask(
+            &self,
+            _target: ExactActorTarget,
+            _message_id: u64,
+            payload: Bytes,
+            _deadline: Instant,
+        ) -> Result<Bytes, RemoteMessageError> {
+            Ok(payload)
+        }
     }
 
     #[async_trait]
@@ -912,5 +1013,505 @@ mod tests {
         shutdown_tx.send(true).unwrap();
         assert_eq!(client_lane.await.unwrap().unwrap(), LaneExit::Shutdown);
         assert_eq!(server_lane.await.unwrap().unwrap(), LaneExit::Shutdown);
+    }
+
+    fn duplex_lane_config() -> BidirectionalLaneConfig {
+        BidirectionalLaneConfig {
+            maximum_frame_size: 4096,
+            maximum_concurrent_inbound_asks: 8,
+            heartbeat_interval: Duration::from_millis(50),
+            heartbeat_miss_limit: 2,
+            idle_data_connection_timeout: Duration::from_secs(5),
+            maximum_cached_exact_targets: 8,
+            socket_read_ahead_bytes: 1024,
+            maximum_ready_write_batch_frames: 8,
+            maximum_ready_read_batch_frames: 8,
+            maximum_coalesced_write_batch_bytes: 4096,
+            maximum_pending_control_applies: 8,
+        }
+    }
+
+    fn lane_services(
+        messaging: Arc<OutboundMessaging>,
+        dispatch: Arc<dyn InboundDispatch>,
+    ) -> LaneServices {
+        LaneServices::new(messaging, dispatch, Arc::new(RejectControlDispatch))
+    }
+
+    fn lane_target(
+        address: &NodeAddress,
+        incarnation: NodeIncarnation,
+        protocol_id: ProtocolId,
+    ) -> ActorRef {
+        ActorRef::new(
+            ClusterId::new("lane-test").unwrap(),
+            address.clone(),
+            incarnation,
+            ActorPath::user(["user", "echo"]).unwrap(),
+            ActivationId::new(incarnation, 1).unwrap(),
+            protocol_id,
+        )
+        .unwrap()
+    }
+
+    async fn wait_for(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("lane did not reach the expected state");
+    }
+
+    #[tokio::test]
+    async fn a_bulk_stripe_failure_keeps_interactive_asks_pending() {
+        let client_incarnation = NodeIncarnation::new(1).unwrap();
+        let server_incarnation = NodeIncarnation::new(2).unwrap();
+        let protocol_id = ProtocolId::new(7).unwrap();
+        let fingerprint = ProtocolFingerprint::digest(b"lane-test/v1");
+        let server_address = NodeAddress::new("127.0.0.1", 25551).unwrap();
+        let association = active_association(
+            client_incarnation,
+            server_incarnation,
+            server_address.clone(),
+            protocol_id,
+            fingerprint,
+        );
+        let messaging = Arc::new(OutboundMessaging::new(8).unwrap());
+        let target = lane_target(&server_address, server_incarnation, protocol_id);
+        let ask = {
+            let messaging = messaging.clone();
+            let association = association.clone();
+            tokio::spawn(async move {
+                messaging
+                    .ask(
+                        &association,
+                        &SenderIdentity::Process(9),
+                        &target,
+                        OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"ask")),
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        wait_for(|| messaging.pending_count() == 1).await;
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let mut bulk = association.take_lane_receiver(LaneKind::Bulk(0)).unwrap();
+        let (peer, lane_io) = tokio::io::duplex(1024);
+        drop(peer);
+        let bulk_result = BidirectionalLane::new(
+            association.clone(),
+            LaneKind::Bulk(0),
+            3,
+            lane_services(messaging.clone(), Arc::new(RecordingDispatch::default())),
+            duplex_lane_config(),
+        )
+        .run(&mut bulk, lane_io, &mut shutdown_rx)
+        .await;
+
+        assert!(bulk_result.is_err());
+        assert_eq!(messaging.pending_count(), 1);
+        assert!(!ask.is_finished());
+
+        let mut interactive = association
+            .take_lane_receiver(LaneKind::Interactive)
+            .unwrap();
+        let (peer, lane_io) = tokio::io::duplex(1024);
+        drop(peer);
+        let interactive_result = BidirectionalLane::new(
+            association.clone(),
+            LaneKind::Interactive,
+            2,
+            lane_services(messaging.clone(), Arc::new(RecordingDispatch::default())),
+            duplex_lane_config(),
+        )
+        .run(&mut interactive, lane_io, &mut shutdown_rx)
+        .await;
+
+        assert!(interactive_result.is_err());
+        assert_eq!(messaging.pending_count(), 0);
+        assert_eq!(
+            ask.await.unwrap().unwrap_err(),
+            AskError::AssociationLostBeforeWrite
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_control_write_fails_within_the_heartbeat_window() {
+        let association = active_association(
+            NodeIncarnation::new(1).unwrap(),
+            NodeIncarnation::new(2).unwrap(),
+            NodeAddress::new("127.0.0.1", 25554).unwrap(),
+            ProtocolId::new(7).unwrap(),
+            ProtocolFingerprint::digest(b"lane-test/v1"),
+        );
+        let mut control = association.take_lane_receiver(LaneKind::Control).unwrap();
+        let (_peer, lane_io) = tokio::io::duplex(16);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            BidirectionalLane::new(
+                association.clone(),
+                LaneKind::Control,
+                1,
+                lane_services(
+                    Arc::new(OutboundMessaging::new(8).unwrap()),
+                    Arc::new(RecordingDispatch::default()),
+                ),
+                duplex_lane_config(),
+            )
+            .run(&mut control, lane_io, &mut shutdown_rx),
+        )
+        .await
+        .expect("a control lane write must not outlive its heartbeat window");
+
+        assert!(matches!(result, Err(LaneError::WriteTimeout)));
+    }
+
+    #[tokio::test]
+    async fn a_queued_compact_tell_is_expanded_after_the_stripe_reconnects() {
+        let client_incarnation = NodeIncarnation::new(1).unwrap();
+        let server_incarnation = NodeIncarnation::new(2).unwrap();
+        let protocol_id = ProtocolId::new(7).unwrap();
+        let fingerprint = ProtocolFingerprint::digest(b"lane-test/v1");
+        let server_address = NodeAddress::new("127.0.0.1", 25555).unwrap();
+        let client_address = NodeAddress::new("127.0.0.1", 25556).unwrap();
+        let client_association = active_association(
+            client_incarnation,
+            server_incarnation,
+            server_address.clone(),
+            protocol_id,
+            fingerprint,
+        );
+        let server_association = active_association(
+            server_incarnation,
+            client_incarnation,
+            client_address,
+            protocol_id,
+            fingerprint,
+        );
+        let messaging = Arc::new(OutboundMessaging::new(8).unwrap());
+        let target = lane_target(&server_address, server_incarnation, protocol_id);
+        let route = messaging
+            .prepare_exact_tell_route(
+                client_association.clone(),
+                &SenderIdentity::Process(9),
+                &target,
+                fingerprint,
+            )
+            .unwrap();
+        let mut client_bulk = client_association
+            .take_lane_receiver(LaneKind::Bulk(0))
+            .unwrap();
+        route.tell(1, Bytes::from_static(b"registration")).unwrap();
+        let registration = client_bulk.recv().await.unwrap();
+        route.tell(1, Bytes::from_static(b"compact")).unwrap();
+        client_association.release_queued_bytes(registration.payload_len());
+
+        client_association.detach(LaneKind::Bulk(0), 3);
+        client_association
+            .attach(LaneAttachment {
+                association_id: client_association.id(),
+                key: client_association.key().clone(),
+                lane: LaneKind::Bulk(0),
+                connection_nonce: 4,
+            })
+            .unwrap();
+
+        let mut server_bulk = server_association
+            .take_lane_receiver(LaneKind::Bulk(0))
+            .unwrap();
+        let dispatch = Arc::new(RecordingDispatch::default());
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut client_shutdown = shutdown_rx.clone();
+        let mut server_shutdown = shutdown_rx;
+        let server_lane = {
+            let association = server_association.clone();
+            let dispatch = dispatch.clone();
+            let messaging = messaging.clone();
+            tokio::spawn(async move {
+                BidirectionalLane::new(
+                    association,
+                    LaneKind::Bulk(0),
+                    3,
+                    lane_services(messaging, dispatch),
+                    duplex_lane_config(),
+                )
+                .run(&mut server_bulk, server_io, &mut server_shutdown)
+                .await
+            })
+        };
+        let client_lane = {
+            let association = client_association.clone();
+            let messaging = messaging.clone();
+            tokio::spawn(async move {
+                BidirectionalLane::new(
+                    association,
+                    LaneKind::Bulk(0),
+                    4,
+                    lane_services(messaging, Arc::new(RecordingDispatch::default())),
+                    duplex_lane_config(),
+                )
+                .run(&mut client_bulk, client_io, &mut client_shutdown)
+                .await
+            })
+        };
+
+        wait_for(|| {
+            dispatch
+                .tells
+                .lock()
+                .expect("recording dispatch poisoned")
+                .len()
+                == 1
+        })
+        .await;
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(client_lane.await.unwrap().unwrap(), LaneExit::Shutdown);
+        assert_eq!(server_lane.await.unwrap().unwrap(), LaneExit::Shutdown);
+        let dispatched = dispatch.tells.lock().expect("recording dispatch poisoned");
+        let dispatched: ActorRef = dispatched[0].actor_ref().unwrap();
+        assert!(dispatched.same_activation(&target));
+        assert_eq!(server_association.metrics().dropped_inbound_frames, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_dictionary_id_drops_one_frame_and_keeps_the_lane() {
+        let client_incarnation = NodeIncarnation::new(1).unwrap();
+        let server_incarnation = NodeIncarnation::new(2).unwrap();
+        let protocol_id = ProtocolId::new(7).unwrap();
+        let fingerprint = ProtocolFingerprint::digest(b"lane-test/v1");
+        let server_address = NodeAddress::new("127.0.0.1", 25557).unwrap();
+        let client_address = NodeAddress::new("127.0.0.1", 25558).unwrap();
+        let client_association = active_association(
+            client_incarnation,
+            server_incarnation,
+            server_address.clone(),
+            protocol_id,
+            fingerprint,
+        );
+        let server_association = active_association(
+            server_incarnation,
+            client_incarnation,
+            client_address,
+            protocol_id,
+            fingerprint,
+        );
+        let messaging = Arc::new(OutboundMessaging::new(8).unwrap());
+        let target = lane_target(&server_address, server_incarnation, protocol_id);
+        let route = messaging
+            .prepare_exact_tell_route(
+                client_association.clone(),
+                &SenderIdentity::Process(9),
+                &target,
+                fingerprint,
+            )
+            .unwrap();
+        route.tell(1, Bytes::from_static(b"registration")).unwrap();
+        route.tell(1, Bytes::from_static(b"compact")).unwrap();
+        let mut client_bulk = client_association
+            .take_lane_receiver(LaneKind::Bulk(0))
+            .unwrap();
+        let registration = client_bulk.recv().await.unwrap();
+        let compact = client_bulk.recv().await.unwrap();
+        assert!(compact.payload_len() < registration.payload_len());
+
+        let mut server_bulk = server_association
+            .take_lane_receiver(LaneKind::Bulk(0))
+            .unwrap();
+        let dispatch = Arc::new(RecordingDispatch::default());
+        let (peer, lane_io) = tokio::io::duplex(4096);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut lane_shutdown = shutdown_rx;
+        let lane = {
+            let association = server_association.clone();
+            let dispatch = dispatch.clone();
+            let messaging = messaging.clone();
+            tokio::spawn(async move {
+                BidirectionalLane::new(
+                    association,
+                    LaneKind::Bulk(0),
+                    3,
+                    lane_services(messaging, dispatch),
+                    duplex_lane_config(),
+                )
+                .run(&mut server_bulk, lane_io, &mut lane_shutdown)
+                .await
+            })
+        };
+        let mut peer = FramedConnection::new(peer, FrameCodec::new(4096).unwrap());
+        peer.write_frame(&compact).await.unwrap();
+        peer.write_frame(&registration).await.unwrap();
+
+        wait_for(|| {
+            dispatch
+                .tells
+                .lock()
+                .expect("recording dispatch poisoned")
+                .len()
+                == 1
+        })
+        .await;
+        assert_eq!(server_association.metrics().dropped_inbound_frames, 1);
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(lane.await.unwrap().unwrap(), LaneExit::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_a_pending_ask_is_discarded_and_counted() {
+        let association = active_association(
+            NodeIncarnation::new(1).unwrap(),
+            NodeIncarnation::new(2).unwrap(),
+            NodeAddress::new("127.0.0.1", 25559).unwrap(),
+            ProtocolId::new(7).unwrap(),
+            ProtocolFingerprint::digest(b"lane-test/v1"),
+        );
+        let mut interactive = association
+            .take_lane_receiver(LaneKind::Interactive)
+            .unwrap();
+        let (peer, lane_io) = tokio::io::duplex(4096);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut lane_shutdown = shutdown_rx;
+        let lane = {
+            let association = association.clone();
+            tokio::spawn(async move {
+                BidirectionalLane::new(
+                    association,
+                    LaneKind::Interactive,
+                    2,
+                    lane_services(
+                        Arc::new(OutboundMessaging::new(8).unwrap()),
+                        Arc::new(RecordingDispatch::default()),
+                    ),
+                    duplex_lane_config(),
+                )
+                .run(&mut interactive, lane_io, &mut lane_shutdown)
+                .await
+            })
+        };
+        let mut peer = FramedConnection::new(peer, FrameCodec::new(4096).unwrap());
+        peer.write_frame(&reply_frame(
+            CorrelationId::new(9, 1).unwrap(),
+            Bytes::from_static(b"late"),
+        ))
+        .await
+        .unwrap();
+
+        wait_for(|| association.metrics().discarded_replies == 1).await;
+        shutdown_tx.send(true).unwrap();
+        assert_eq!(lane.await.unwrap().unwrap(), LaneExit::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn the_control_lane_announces_close_before_shutdown() {
+        let association = active_association(
+            NodeIncarnation::new(1).unwrap(),
+            NodeIncarnation::new(2).unwrap(),
+            NodeAddress::new("127.0.0.1", 25560).unwrap(),
+            ProtocolId::new(7).unwrap(),
+            ProtocolFingerprint::digest(b"lane-test/v1"),
+        );
+        let mut control = association.take_lane_receiver(LaneKind::Control).unwrap();
+        let (peer, lane_io) = tokio::io::duplex(4096);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut lane_shutdown = shutdown_rx;
+        let lane = {
+            let association = association.clone();
+            tokio::spawn(async move {
+                BidirectionalLane::new(
+                    association,
+                    LaneKind::Control,
+                    1,
+                    lane_services(
+                        Arc::new(OutboundMessaging::new(8).unwrap()),
+                        Arc::new(RecordingDispatch::default()),
+                    ),
+                    duplex_lane_config(),
+                )
+                .run(&mut control, lane_io, &mut lane_shutdown)
+                .await
+            })
+        };
+        let mut peer = FramedConnection::new(peer, FrameCodec::new(4096).unwrap());
+        assert_eq!(peer.read_frame().await.unwrap().kind, FrameKind::Heartbeat);
+        shutdown_tx.send(true).unwrap();
+
+        let announced = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if peer.read_frame().await.unwrap().kind == FrameKind::Close {
+                    return;
+                }
+            }
+        })
+        .await;
+
+        assert!(announced.is_ok());
+        assert_eq!(lane.await.unwrap().unwrap(), LaneExit::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn a_remote_close_completes_pending_asks_by_dispatch_knowledge() {
+        let client_incarnation = NodeIncarnation::new(1).unwrap();
+        let server_incarnation = NodeIncarnation::new(2).unwrap();
+        let protocol_id = ProtocolId::new(7).unwrap();
+        let fingerprint = ProtocolFingerprint::digest(b"lane-test/v1");
+        let server_address = NodeAddress::new("127.0.0.1", 25561).unwrap();
+        let association = active_association(
+            client_incarnation,
+            server_incarnation,
+            server_address.clone(),
+            protocol_id,
+            fingerprint,
+        );
+        let messaging = Arc::new(OutboundMessaging::new(8).unwrap());
+        let target = lane_target(&server_address, server_incarnation, protocol_id);
+        let ask = {
+            let messaging = messaging.clone();
+            let association = association.clone();
+            tokio::spawn(async move {
+                messaging
+                    .ask(
+                        &association,
+                        &SenderIdentity::Process(9),
+                        &target,
+                        OutboundMessage::new(fingerprint, 1, Bytes::from_static(b"ask")),
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        wait_for(|| messaging.pending_count() == 1).await;
+
+        let mut control = association.take_lane_receiver(LaneKind::Control).unwrap();
+        let (peer, lane_io) = tokio::io::duplex(4096);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let mut peer = FramedConnection::new(peer, FrameCodec::new(4096).unwrap());
+        peer.write_frame(&Frame::new(FrameKind::Close, Bytes::new()))
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            BidirectionalLane::new(
+                association.clone(),
+                LaneKind::Control,
+                1,
+                lane_services(messaging.clone(), Arc::new(RecordingDispatch::default())),
+                duplex_lane_config(),
+            )
+            .run(&mut control, lane_io, &mut shutdown_rx),
+        )
+        .await
+        .expect("a remote close must exit the control lane");
+
+        assert_eq!(result.unwrap(), LaneExit::RemoteClose);
+        assert_eq!(
+            ask.await.unwrap().unwrap_err(),
+            AskError::AssociationLostBeforeWrite
+        );
     }
 }
