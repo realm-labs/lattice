@@ -389,11 +389,11 @@ where
         let nodes = self
             .sessions
             .values()
-            .filter(|session| session.placement_up())
+            .filter(|session| session.placement_attached())
             .map(|session| PlacementNode {
                 key: session.hello.node.clone(),
                 release_id: session.record.hello.release.release_id,
-                ready: true,
+                ready: session.placement_up(),
                 eligible_entity_types: session.hello.hosted_entity_types.clone(),
                 protocols: session
                     .record

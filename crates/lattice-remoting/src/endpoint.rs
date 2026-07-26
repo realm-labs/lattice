@@ -235,16 +235,23 @@ impl RemotingEndpoint {
             .clone()
             .try_acquire_owned()
             .map_err(|_| EndpointError::ConnectionLimit)?;
-        let (stream, nonce) = tokio::select! {
-            biased;
-            () = wait_for_shutdown(&mut shutdown) => {
-                return Err(EndpointError::ShuttingDown);
-            }
-            result = self.open_outbound_lane(&association, &peer, lane) => result?,
-        };
+        // The dial attaches the lane, so this task has to already own the lane receiver:
+        // an attachment that no running lane can detach would pin the association forever.
         let mut receiver = association
             .take_lane_receiver(lane)
             .ok_or(EndpointError::LaneAlreadyRunning(lane))?;
+        let opened = tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown) => Err(EndpointError::ShuttingDown),
+            result = self.open_outbound_lane(&association, &peer, lane) => result,
+        };
+        let (stream, nonce) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                let _ = association.return_lane_receiver(lane, receiver);
+                return Err(error);
+            }
+        };
         let endpoint = self.clone();
         let mut disconnect = self.disconnect_tx.subscribe();
         self.spawn(async move {
@@ -422,12 +429,15 @@ impl RemotingEndpoint {
         if lane == LaneKind::Control {
             association.install_peer_catalogue(peer_catalogue)?;
         }
-        association.attach_and_replay(LaneAttachment {
+        if let Err(error) = association.attach_and_replay(LaneAttachment {
             association_id: association.id(),
             key: association.key().clone(),
             lane,
             connection_nonce: nonce,
-        })?;
+        }) {
+            association.detach(lane, nonce);
+            return Err(error.into());
+        }
         Ok((connection.into_inner(), nonce))
     }
 
@@ -558,15 +568,23 @@ impl RemotingEndpoint {
         if handshake.lane == LaneKind::Control {
             association.install_peer_catalogue(peer_catalogue)?;
         }
-        association.attach_and_replay(LaneAttachment {
-            association_id: handshake.association_id,
-            key: association.key().clone(),
-            lane: handshake.lane,
-            connection_nonce: handshake.connection_nonce,
-        })?;
+        // Overlapping inbound connections for one lane are routine after a peer unfreezes,
+        // because every dial it made while frozen is still queued in the accept backlog.
+        // Only the connection that claims the lane receiver may attach, so a loser can
+        // never leave behind an attachment that no running lane will ever detach.
         let mut receiver = association
-            .take_lane_receiver(handshake.lane)
-            .ok_or(EndpointError::LaneAlreadyRunning(handshake.lane))?;
+            .attach_owned_lane(LaneAttachment {
+                association_id: handshake.association_id,
+                key: association.key().clone(),
+                lane: handshake.lane,
+                connection_nonce: handshake.connection_nonce,
+            })
+            .map_err(|error| match error {
+                AssociationError::LaneReceiverConflict => {
+                    EndpointError::LaneAlreadyRunning(handshake.lane)
+                }
+                error => EndpointError::Association(error),
+            })?;
         let mut shutdown = self.shutdown_tx.subscribe();
         let result = self
             .run_lane_connection(

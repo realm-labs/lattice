@@ -309,6 +309,16 @@ fn run_profile(
             runner.run("entity-owner-loss-reassignment", || {
                 testctl_partition::owner_loss_reassignment(artifacts)
             });
+            runner.run("entity-paused-owner-lease-expiry", || {
+                testctl_partition::paused_owner_lease_expiry(artifacts)
+            });
+            runner.run("entity-egress-blackhole-reassignment", || {
+                testctl_partition::egress_blackhole_reassignment(artifacts)
+            });
+            // The drained host exits, so nothing that needs both split hosts can follow it.
+            runner.run("entity-drain-message-conservation", || {
+                testctl_partition::drain_message_conservation(artifacts)
+            });
         }
         Profile::K8s => runner.run("k8s-lifecycle", || {
             command("sh", &["tests/distributed/k8s/verify.sh"])
