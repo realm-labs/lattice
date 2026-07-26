@@ -10,6 +10,7 @@ use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
 use lattice_core::trace::TraceContext;
 use prost::Message as ProstMessage;
+use uuid::Uuid;
 
 use crate::error::EventBusError;
 use crate::local::{EventBus, EventSubscriptionHandle};
@@ -20,6 +21,7 @@ pub struct EventPublisher<B> {
     bus: B,
     source_service: ServiceKind,
     source_instance: InstanceId,
+    incarnation: Arc<str>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -103,6 +105,7 @@ where
             bus,
             source_service,
             source_instance,
+            incarnation: Uuid::new_v4().simple().to_string().into(),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -115,9 +118,10 @@ where
         trace: TraceContext,
     ) -> Result<EventId, EventBusError> {
         let event_id = EventId::new(format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{}",
             self.source_service.as_str(),
             self.source_instance.as_str(),
+            self.incarnation,
             self.next_id.fetch_add(1, Ordering::SeqCst)
         ));
         self.bus
