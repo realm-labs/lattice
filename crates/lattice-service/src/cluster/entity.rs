@@ -375,7 +375,15 @@ where
         {
             return Err(RemoteMessageError::Unauthorized);
         }
-        let handle = self.activate(&target).await?;
+        let handle = self.activate(&target).await.map_err(|error| {
+            tracing::warn!(
+                message_id,
+                target = ?target,
+                error = ?error,
+                "logical entity tell activation failed"
+            );
+            error
+        })?;
         match self
             .protocol
             .dispatch_with_sender(
@@ -404,7 +412,15 @@ where
         if Instant::now() >= deadline {
             return Err(RemoteMessageError::DeadlineExceeded);
         }
-        let handle = self.activate(&target).await?;
+        let handle = self.activate(&target).await.map_err(|error| {
+            tracing::warn!(
+                message_id,
+                target = ?target,
+                error = ?error,
+                "logical entity ask activation failed"
+            );
+            error
+        })?;
         match self
             .protocol
             .dispatch(
@@ -415,8 +431,15 @@ where
                 Some(deadline),
             )
             .await
-            .map_err(map_dispatch)?
-        {
+            .map_err(|error| {
+                tracing::warn!(
+                    message_id,
+                    target = ?target,
+                    error = ?error,
+                    "logical entity ask dispatch failed"
+                );
+                map_dispatch(error)
+            })? {
             DispatchReply::Ask(reply) => Ok(reply),
             DispatchReply::TellAccepted => Err(RemoteMessageError::InvalidPayload),
         }
