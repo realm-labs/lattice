@@ -14,14 +14,15 @@ use lattice_core::{
     actor_ref::{ActorRef, ProtocolId, RecipientRef},
     service_context::ServiceContext,
 };
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tracing::Instrument;
 
 use crate::{
     directory::ActivationDirectory,
     error::{ActorCallError, ActorError, ActorTellError, PipeToSelfError},
-    handle::ActorHandle,
+    handle::{ActorHandle, TerminalHook},
     mailbox::continuation::ContinuationEnvelope,
+    observation::ActorObserverHandle,
     protocol::{SupportsAsk, SupportsTell},
     recipient::{ActorSystem, RecipientError, deadline_from_timeout},
     reply::{PendingReply, ReplyControl, ReplyTo},
@@ -32,6 +33,12 @@ use crate::{
     },
     watch::{ActorTerminated, WatchId},
 };
+
+/// Upper bound on concurrently registered DeathWatch subscriptions per activation.
+///
+/// Watches are runtime-owned tasks, so they are bounded like every other actor resource. Completed
+/// watches are reclaimed before the limit is enforced.
+const MAX_ACTIVE_WATCHES: usize = 1_024;
 
 /// A cancellation handle for work started by [`ActorContext::pipe_to_self`] or
 /// [`ActorContext::continue_with`].
@@ -541,8 +548,14 @@ impl<A: Actor> ActorContext<A> {
                 let mut ticker = tokio::time::interval(interval);
                 loop {
                     ticker.tick().await;
-                    if handle.try_tell_internal(make_msg()).is_err() {
-                        break;
+                    // A momentarily full mailbox drops one tick; only a mailbox that can never
+                    // accept the message again retires the timer.
+                    match handle.try_tell_internal(make_msg()) {
+                        Ok(()) | Err(ActorTellError::MailboxFull(_)) => {}
+                        Err(
+                            ActorTellError::MailboxClosed(_)
+                            | ActorTellError::LifecycleUnavailable { .. },
+                        ) => break,
                     }
                 }
             }
@@ -554,8 +567,15 @@ impl<A: Actor> ActorContext<A> {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.spawn_scoped_task(future);
+    }
+
+    fn spawn_scoped_task<F>(&mut self, future: F) -> AbortHandle
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         Self::reap_tasks(&mut self.tasks, "scoped");
-        self.tasks.spawn(future);
+        self.tasks.spawn(future)
     }
 
     /// Runs asynchronous work outside the actor turn and posts its result back
@@ -726,6 +746,12 @@ impl<A: Actor> ActorContext<A> {
         <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<ActorTerminated>,
         B: Actor,
     {
+        self.watches.retain(|_watch_id, task| !task.is_finished());
+        if self.watches.len() >= MAX_ACTIVE_WATCHES {
+            return Err(ActorError::new(format!(
+                "actor watch capacity {MAX_ACTIVE_WATCHES} is exhausted"
+            )));
+        }
         let watch_id = WatchId::new(self.next_watch_id);
         self.next_watch_id += 1;
 
@@ -789,41 +815,10 @@ impl<A: Actor> ActorContext<A> {
         );
         let _entered = span.enter();
         let child_ref = self.child_actor_ref(&key, options.protocol_id)?;
-        let handle = crate::runtime::spawn_actor_with_self_ref(
-            actor,
-            ActorSpawnContext {
-                options: ActorSpawnOptions {
-                    mailbox: options.mailbox,
-                    execution: Some(options.execution),
-                    scheduler_key: options.scheduler_key.clone(),
-                    passivation: PassivationPolicy::Disabled,
-                    self_ref: child_ref.as_ref().map(ActorRef::erase),
-                    service: self.service.clone(),
-                },
-                actor_system: self.actor_system.clone(),
-                observer: self.handle.observer().clone(),
-                terminal_hook: None,
-                spawner: self.spawner.clone(),
-            },
-        )
-        .map_err(|error| ActorError::new(error.to_string()))?;
-        let directory = self.service.extension::<ActivationDirectory>();
-        if let Some(directory) = &directory
-            && let Err(error) = directory.register(&handle)
-        {
-            let _ = handle.try_stop_internal(StopReason::StartFailed);
-            return Err(ActorError::new(error.to_string()));
-        }
-        let slot = Arc::new(ChildSlot::new(handle.clone()));
-        self.children.insert(
-            key,
-            Box::new(ChildSlotStopper {
-                slot: slot.clone(),
-                directory,
-                reference: child_ref.map(|reference| reference.erase()),
-            }),
-        );
-        self.spawn_supervision_task(slot, options, None::<fn() -> C>);
+        let handle = self
+            .child_spawn_env()
+            .spawn(actor, &options, child_ref.clone())?;
+        self.adopt_child(key, &options, handle.clone(), child_ref, None::<fn() -> C>);
         Ok(handle)
     }
 
@@ -853,42 +848,42 @@ impl<A: Actor> ActorContext<A> {
         );
         let _entered = span.enter();
         let child_ref = self.child_actor_ref(&key, options.protocol_id)?;
-        let handle = crate::runtime::spawn_actor_with_self_ref(
-            factory(),
-            ActorSpawnContext {
-                options: ActorSpawnOptions {
-                    mailbox: options.mailbox,
-                    execution: Some(options.execution),
-                    scheduler_key: options.scheduler_key.clone(),
-                    passivation: PassivationPolicy::Disabled,
-                    self_ref: child_ref.as_ref().map(ActorRef::erase),
-                    service: self.service.clone(),
-                },
-                actor_system: self.actor_system.clone(),
-                observer: self.handle.observer().clone(),
-                terminal_hook: None,
-                spawner: self.spawner.clone(),
-            },
-        )
-        .map_err(|error| ActorError::new(error.to_string()))?;
-        let directory = self.service.extension::<ActivationDirectory>();
-        if let Some(directory) = &directory
-            && let Err(error) = directory.register(&handle)
-        {
-            let _ = handle.try_stop_internal(StopReason::StartFailed);
-            return Err(ActorError::new(error.to_string()));
+        let handle = self
+            .child_spawn_env()
+            .spawn(factory(), &options, child_ref.clone())?;
+        self.adopt_child(key, &options, handle.clone(), child_ref, Some(factory));
+        Ok(handle)
+    }
+
+    fn child_spawn_env(&self) -> ChildSpawnEnv {
+        ChildSpawnEnv {
+            service: self.service.clone(),
+            actor_system: self.actor_system.clone(),
+            observer: self.handle.observer().clone(),
+            spawner: self.spawner.clone(),
         }
-        let slot = Arc::new(ChildSlot::new(handle.clone()));
+    }
+
+    fn adopt_child<C, F>(
+        &mut self,
+        key: ChildActorKey,
+        options: &ChildActorOptions,
+        handle: ActorHandle<C>,
+        reference: Option<ActorRef>,
+        factory: Option<F>,
+    ) where
+        C: Actor,
+        F: FnMut() -> C + Send + 'static,
+    {
+        let slot = Arc::new(ChildSlot::new(handle, reference));
         self.children.insert(
             key,
             Box::new(ChildSlotStopper {
                 slot: slot.clone(),
-                directory,
-                reference: child_ref.map(|reference| reference.erase()),
+                directory: self.service.extension::<ActivationDirectory>(),
             }),
         );
-        self.spawn_supervision_task(slot, options, Some(factory));
-        Ok(handle)
+        self.spawn_supervision_task(slot, options, factory);
     }
 
     pub fn stop_child(&mut self, key: &ChildActorKey) -> bool {
@@ -957,57 +952,55 @@ impl<A: Actor> ActorContext<A> {
     fn spawn_supervision_task<C, F>(
         &mut self,
         slot: Arc<ChildSlot<C>>,
-        options: ChildActorOptions,
+        options: &ChildActorOptions,
         mut factory: Option<F>,
     ) where
         C: Actor,
         F: FnMut() -> C + Send + 'static,
     {
-        match options.supervision {
-            ChildSupervision::StopChild => {}
+        let supervision = match options.supervision {
+            ChildSupervision::StopChild => return,
             ChildSupervision::StopParent => {
-                let parent = self.handle.clone();
-                if let Some(child) = slot.current() {
-                    let mut terminations = child.subscribe_terminated();
-                    self.spawn_scoped(async move {
-                        if terminations.recv().await.is_ok() {
-                            let _ = parent.try_stop_internal(StopReason::Requested);
-                        }
-                    });
-                }
-            }
-            ChildSupervision::RestartChild => {
-                let (Some(mut factory), Some(child)) = (factory.take(), slot.current()) else {
+                let Some(activation) = slot.snapshot() else {
                     return;
                 };
-                let mut terminations = child.subscribe_terminated();
-                let service = self.service.clone();
-                let actor_system = self.actor_system.clone();
-                let child_ref = child.actor_ref().map(ActorRef::erase);
-                let observer = child.observer().clone();
-                let spawner = self.spawner.clone();
-                self.spawn_scoped(async move {
+                let parent = self.handle.clone();
+                let mut terminations = activation.handle.subscribe_terminated();
+                self.spawn_scoped_task(async move {
+                    if terminations.recv().await.is_ok() {
+                        let _ = parent.try_stop_internal(StopReason::Requested);
+                    }
+                })
+            }
+            ChildSupervision::RestartChild => {
+                let (Some(mut factory), Some(activation)) = (factory.take(), slot.snapshot())
+                else {
+                    return;
+                };
+                let mut terminations = activation.handle.subscribe_terminated();
+                let mut reference = activation.reference;
+                let env = self.child_spawn_env();
+                let options = options.clone();
+                let supervised = slot.clone();
+                self.spawn_scoped_task(async move {
                     loop {
                         if terminations.recv().await.is_err() {
                             break;
                         }
-                        let replacement = match crate::runtime::spawn_actor_with_self_ref(
-                            factory(),
-                            ActorSpawnContext {
-                                options: ActorSpawnOptions {
-                                    mailbox: options.mailbox,
-                                    execution: Some(options.execution),
-                                    scheduler_key: options.scheduler_key.clone(),
-                                    passivation: PassivationPolicy::Disabled,
-                                    self_ref: child_ref.as_ref().map(ActorRef::erase),
-                                    service: service.clone(),
-                                },
-                                actor_system: actor_system.clone(),
-                                observer: observer.clone(),
-                                terminal_hook: None,
-                                spawner: spawner.clone(),
-                            },
-                        ) {
+                        // The replacement is a distinct activation, so it takes a fresh activation
+                        // ID. References to the dead child must never resolve to it.
+                        reference = match reference.as_ref().map(next_child_activation).transpose()
+                        {
+                            Ok(reference) => reference,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "supervised child replacement reference could not be derived"
+                                );
+                                break;
+                            }
+                        };
+                        let replacement = match env.spawn(factory(), &options, reference.clone()) {
                             Ok(replacement) => replacement,
                             Err(error) => {
                                 tracing::warn!(
@@ -1017,18 +1010,13 @@ impl<A: Actor> ActorContext<A> {
                                 break;
                             }
                         };
-                        if let Some(directory) = service.extension::<ActivationDirectory>()
-                            && directory.register(&replacement).is_err()
-                        {
-                            let _ = replacement.try_stop_internal(StopReason::StartFailed);
-                            break;
-                        }
                         terminations = replacement.subscribe_terminated();
-                        slot.replace(replacement);
+                        supervised.replace(replacement, reference.clone());
                     }
-                });
+                })
             }
-        }
+        };
+        slot.set_supervision(supervision);
     }
 
     fn child_actor_ref(
@@ -1108,46 +1096,157 @@ trait ChildStop: Send {
     fn stop(self: Box<Self>, reason: StopReason);
 }
 
+/// Shared spawn inputs for a parent's children, usable from a supervision task
+/// that no longer holds the [`ActorContext`].
+struct ChildSpawnEnv {
+    service: ServiceContext,
+    actor_system: Option<Arc<OnceLock<ActorSystem>>>,
+    observer: ActorObserverHandle,
+    spawner: ActorSpawner,
+}
+
+impl ChildSpawnEnv {
+    fn spawn<C>(
+        &self,
+        actor: C,
+        options: &ChildActorOptions,
+        reference: Option<ActorRef>,
+    ) -> Result<ActorHandle<C>, ActorError>
+    where
+        C: Actor,
+    {
+        let directory = self.service.extension::<ActivationDirectory>();
+        let terminal_hook: Option<TerminalHook> = match (directory.clone(), reference.clone()) {
+            (Some(directory), Some(reference)) => Some(Box::new(move |_local_ref| {
+                directory.remove(&reference);
+            })),
+            _ => None,
+        };
+        let handle = crate::runtime::spawn_actor_with_self_ref(
+            actor,
+            ActorSpawnContext {
+                options: ActorSpawnOptions {
+                    mailbox: options.mailbox,
+                    execution: Some(options.execution),
+                    scheduler_key: options.scheduler_key.clone(),
+                    passivation: PassivationPolicy::Disabled,
+                    self_ref: reference.clone(),
+                    service: self.service.clone(),
+                },
+                actor_system: self.actor_system.clone(),
+                observer: self.observer.clone(),
+                terminal_hook,
+                spawner: self.spawner.clone(),
+            },
+        )
+        .map_err(|error| ActorError::new(error.to_string()))?;
+        if let Some(directory) = &directory {
+            if let Err(error) = directory.register(&handle) {
+                let _ = handle.try_stop_internal(StopReason::StartFailed);
+                return Err(ActorError::new(error.to_string()));
+            }
+            if handle.terminal_cleanup_started()
+                && let Some(reference) = &reference
+            {
+                directory.remove(reference);
+            }
+        }
+        Ok(handle)
+    }
+}
+
+fn next_child_activation(previous: &ActorRef) -> Result<ActorRef, ActorError> {
+    ActorRef::new(
+        previous.cluster_id().clone(),
+        previous.node_address().clone(),
+        previous.node_incarnation(),
+        previous.actor_path().clone(),
+        crate::runtime::next_activation_id(previous.node_incarnation()),
+        previous.protocol_id(),
+    )
+    .map_err(|error| ActorError::new(error.to_string()))
+}
+
+fn request_child_stop<C>(handle: ActorHandle<C>, reason: StopReason)
+where
+    C: Actor,
+{
+    let Err(ActorTellError::MailboxFull(reason)) = handle.try_stop_internal(reason) else {
+        return;
+    };
+    // The parent has already released this child, so a full system lane would otherwise leave it
+    // running with no owner able to retry.
+    tokio::spawn(async move {
+        let _ = handle.stop_when_capacity_internal(reason).await;
+    });
+}
+
+struct ChildActivation<C: Actor> {
+    handle: ActorHandle<C>,
+    reference: Option<ActorRef>,
+}
+
 struct ChildSlot<C: Actor> {
-    current: Mutex<Option<ActorHandle<C>>>,
+    current: Mutex<Option<ChildActivation<C>>>,
+    supervision: Mutex<Option<AbortHandle>>,
 }
 
 impl<C: Actor> ChildSlot<C> {
-    fn new(handle: ActorHandle<C>) -> Self {
+    fn new(handle: ActorHandle<C>, reference: Option<ActorRef>) -> Self {
         Self {
-            current: Mutex::new(Some(handle)),
+            current: Mutex::new(Some(ChildActivation { handle, reference })),
+            supervision: Mutex::new(None),
         }
     }
 
-    fn current(&self) -> Option<ActorHandle<C>> {
-        self.current.lock().expect("child slot poisoned").clone()
+    fn snapshot(&self) -> Option<ChildActivation<C>> {
+        self.current
+            .lock()
+            .expect("child slot poisoned")
+            .as_ref()
+            .map(|activation| ChildActivation {
+                handle: activation.handle.clone(),
+                reference: activation.reference.clone(),
+            })
     }
 
-    fn replace(&self, handle: ActorHandle<C>) {
-        *self.current.lock().expect("child slot poisoned") = Some(handle);
+    fn take(&self) -> Option<ChildActivation<C>> {
+        self.current.lock().expect("child slot poisoned").take()
+    }
+
+    fn replace(&self, handle: ActorHandle<C>, reference: Option<ActorRef>) {
+        *self.current.lock().expect("child slot poisoned") =
+            Some(ChildActivation { handle, reference });
+    }
+
+    fn set_supervision(&self, task: AbortHandle) {
+        *self.supervision.lock().expect("child slot poisoned") = Some(task);
+    }
+
+    fn abort_supervision(&self) {
+        if let Some(task) = self.supervision.lock().expect("child slot poisoned").take() {
+            task.abort();
+        }
     }
 }
 
 struct ChildSlotStopper<C: Actor> {
     slot: Arc<ChildSlot<C>>,
     directory: Option<Arc<ActivationDirectory>>,
-    reference: Option<ActorRef>,
 }
 
 impl<C: Actor> ChildStop for ChildSlotStopper<C> {
     fn stop(self: Box<Self>, reason: StopReason) {
-        if let (Some(directory), Some(reference)) = (&self.directory, &self.reference) {
+        // Releasing a child also ends its supervision: a replacement would belong to no parent,
+        // would not be stopped with one, and would keep its own mailbox alive forever.
+        self.slot.abort_supervision();
+        let Some(activation) = self.slot.take() else {
+            return;
+        };
+        if let (Some(directory), Some(reference)) = (&self.directory, &activation.reference) {
             directory.remove(reference);
         }
-        if let Some(handle) = self
-            .slot
-            .current
-            .lock()
-            .expect("child slot poisoned")
-            .take()
-        {
-            let _ = handle.try_stop_internal(reason);
-        }
+        request_child_stop(activation.handle, reason);
     }
 }
 

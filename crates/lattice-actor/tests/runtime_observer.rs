@@ -40,6 +40,12 @@ struct BlockingTell {
 }
 
 #[derive(lattice_actor::Message)]
+struct BlockingStop {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[derive(lattice_actor::Message)]
 struct QueuedTell;
 
 #[derive(lattice_actor::Request)]
@@ -101,6 +107,19 @@ impl Handler<QueuedTell> for ObservedActor {
         _ctx: &mut HandlerContext<'_, Self>,
         _message: QueuedTell,
     ) -> Result<(), ActorError> {
+        Ok(())
+    }
+}
+
+impl Handler<BlockingStop> for ObservedActor {
+    async fn handle(
+        &mut self,
+        ctx: &mut HandlerContext<'_, Self>,
+        message: BlockingStop,
+    ) -> Result<(), ActorError> {
+        message.entered.add_permits(1);
+        message.release.acquire().await.unwrap().forget();
+        ctx.request_stop();
         Ok(())
     }
 }
@@ -386,4 +405,71 @@ async fn runtime_observer_reports_mailbox_rejection() {
     })
     .await;
     release.add_permits(1);
+}
+
+#[tokio::test]
+async fn stop_completes_every_message_left_in_the_mailbox() {
+    let (runtime, events, signal) = observed_runtime();
+    let handle = runtime
+        .spawn_actor(
+            ObservedActor,
+            ActorSpawnOptions {
+                mailbox: MailboxConfig::bounded(8),
+                ..ActorSpawnOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    handle
+        .tell(BlockingStop {
+            entered: entered.clone(),
+            release: release.clone(),
+        })
+        .await
+        .unwrap();
+    entered.acquire().await.unwrap().forget();
+
+    // Both are admitted while the Actor is parked, so the stop that its handler requests leaves
+    // them queued and never dispatched.
+    let ask = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.ask(QueuedRequest, ASK_TIMEOUT).await }
+    });
+    wait_for_event(&events, &signal, |event| {
+        *event == ObserverEvent::Enqueued(type_name::<QueuedRequest>())
+    })
+    .await;
+    handle.tell(QueuedTell).await.unwrap();
+    wait_for_event(&events, &signal, |event| {
+        *event == ObserverEvent::Enqueued(type_name::<QueuedTell>())
+    })
+    .await;
+    release.add_permits(1);
+
+    assert_eq!(ask.await.unwrap(), Err(ActorCallError::MailboxClosed));
+    wait_for_event(&events, &signal, |event| {
+        *event
+            == ObserverEvent::RequestCompleted(
+                type_name::<QueuedRequest>(),
+                RequestCompletion::MailboxClosed,
+            )
+    })
+    .await;
+    wait_for_event(&events, &signal, |event| {
+        *event
+            == ObserverEvent::MailboxRejected(type_name::<QueuedTell>(), MailboxRejection::Closed)
+    })
+    .await;
+
+    let completions = events
+        .lock()
+        .expect("observer events mutex is not poisoned")
+        .iter()
+        .filter(|event| {
+            matches!(event, ObserverEvent::RequestCompleted(name, _) if *name == type_name::<QueuedRequest>())
+        })
+        .count();
+    assert_eq!(completions, 1);
 }

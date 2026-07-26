@@ -1,13 +1,29 @@
-use std::any::Any;
+use std::{
+    any::{Any, type_name},
+    panic::AssertUnwindSafe,
+};
+
+use tracing::error;
+
+use super::rejection::reject_queued_commands;
+use crate::{
+    context::ActorContext,
+    error::ActorCallError,
+    handle::ActorHandle,
+    mailbox::{ActorCommand, MailboxLane, QueuedRejection, channel::Receiver},
+    observation::ActorLifecycleEvent,
+    traits::{Actor, ActorLifecycleState, StopReason},
+    watch::{ActorIncarnation, ActorTerminated, TerminatedReason},
+};
 
 #[derive(Debug)]
-struct ActorPanic {
+pub(super) struct ActorPanic {
     phase: &'static str,
     message: String,
 }
 
 impl ActorPanic {
-    fn new(phase: &'static str, payload: Box<dyn Any + Send>) -> Self {
+    pub(super) fn new(phase: &'static str, payload: Box<dyn Any + Send>) -> Self {
         let message = match payload.downcast::<String>() {
             Ok(message) => *message,
             Err(payload) => match payload.downcast::<&'static str>() {
@@ -19,7 +35,7 @@ impl ActorPanic {
     }
 }
 
-fn terminate_panicked_actor<A>(
+pub(super) fn terminate_panicked_actor<A>(
     actor: A,
     ctx: &mut ActorContext<A>,
     handle: &ActorHandle<A>,
@@ -35,8 +51,18 @@ fn terminate_panicked_actor<A>(
     ctx.cancel_deferred_replies(ActorCallError::ActorPanicked);
     ctx.cancel_all_tasks();
     ctx.stop_all_children(StopReason::Requested);
-    reject_queued_commands(normal_rx, MailboxLane::Normal, handle);
-    reject_queued_commands(system_rx, MailboxLane::System, handle);
+    reject_queued_commands(
+        normal_rx,
+        MailboxLane::Normal,
+        handle,
+        QueuedRejection::ActorPanicked,
+    );
+    reject_queued_commands(
+        system_rx,
+        MailboxLane::System,
+        handle,
+        QueuedRejection::ActorPanicked,
+    );
 
     if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(actor))) {
         let secondary = ActorPanic::new("drop", payload);
@@ -52,36 +78,7 @@ fn terminate_panicked_actor<A>(
     finalize_panicked_actor(handle, panic);
 }
 
-fn reject_queued_commands<A>(
-    receiver: &mut Receiver<ActorCommand<A>>,
-    lane: MailboxLane,
-    handle: &ActorHandle<A>,
-) where
-    A: Actor,
-{
-    while let Ok(command) = receiver.try_recv() {
-        match command {
-            ActorCommand::Envelope(mut envelope) => {
-                let metadata = envelope.metadata(lane);
-                if let Some(completion) = envelope.reject_panicked() {
-                    handle.observer().request_completed(
-                        handle.observation_metadata(),
-                        &metadata,
-                        completion,
-                    );
-                }
-            }
-            ActorCommand::RetryStop(result)
-            | ActorCommand::Quarantine(result)
-            | ActorCommand::ForceStop { result, .. } => {
-                let _ = result.send(Err(ActorAdminError::MailboxClosed));
-            }
-            ActorCommand::Stop(_) => {}
-        }
-    }
-}
-
-fn finalize_panicked_actor<A>(handle: &ActorHandle<A>, panic: ActorPanic)
+pub(super) fn finalize_panicked_actor<A>(handle: &ActorHandle<A>, panic: ActorPanic)
 where
     A: Actor,
 {
@@ -98,10 +95,9 @@ where
         crate::observation::record_abandoned_stop_failure();
     }
     handle.set_lifecycle_state(ActorLifecycleState::Stopped);
-    handle.observer().lifecycle(
-        handle.observation_metadata(),
-        ActorLifecycleEvent::Panicked,
-    );
+    handle
+        .observer()
+        .lifecycle(handle.observation_metadata(), ActorLifecycleEvent::Panicked);
     handle.publish_terminated(ActorTerminated {
         target: handle.local_ref(),
         incarnation: ActorIncarnation::new(handle.local_ref().id()),

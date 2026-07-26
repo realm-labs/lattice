@@ -389,6 +389,23 @@ impl<A: Actor> ActorHandle<A> {
         self.try_send_stop(reason)
     }
 
+    /// Waits for system-lane capacity before admitting a stop request.
+    ///
+    /// Used when losing the request would strand an Actor that no longer has an
+    /// owner able to retry.
+    pub(crate) async fn stop_when_capacity_internal(
+        &self,
+        reason: StopReason,
+    ) -> Result<(), ActorTellError<StopReason>> {
+        match self.system_tx.reserve().await {
+            Ok(permit) => {
+                permit.send(ActorCommand::Stop(reason));
+                Ok(())
+            }
+            Err(_) => Err(ActorTellError::MailboxClosed(reason)),
+        }
+    }
+
     pub(crate) fn mark_external_authority_lost(&self) -> ActorLifecycleState {
         let previous = self.lifecycle_state();
         self.mark_stop_failure_quarantined();

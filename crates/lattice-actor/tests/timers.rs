@@ -95,3 +95,87 @@ async fn interval_timer_drives_tick_and_business_request_stop() {
 
     assert_eq!(*ticks.lock().await, 2);
 }
+
+#[tokio::test]
+async fn interval_timer_survives_a_transiently_full_mailbox() {
+    struct TickActor {
+        ticks: Arc<Mutex<u64>>,
+    }
+
+    impl Actor for TickActor {
+        type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
+        async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+            ctx.notify_interval(Duration::from_millis(2), || Tick);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, lattice_actor::Message)]
+    struct Tick;
+
+    #[derive(Debug, lattice_actor::Message)]
+    struct Block {
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    impl Handler<Tick> for TickActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut HandlerContext<'_, Self>,
+            _msg: Tick,
+        ) -> Result<(), ActorError> {
+            *self.ticks.lock().await += 1;
+            Ok(())
+        }
+    }
+
+    impl Handler<Block> for TickActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut HandlerContext<'_, Self>,
+            msg: Block,
+        ) -> Result<(), ActorError> {
+            msg.entered.add_permits(1);
+            msg.release.acquire().await.unwrap().forget();
+            Ok(())
+        }
+    }
+
+    let ticks = Arc::new(Mutex::new(0));
+    let handle = ActorRuntime::default()
+        .spawn_actor(
+            TickActor {
+                ticks: ticks.clone(),
+            },
+            ActorSpawnOptions {
+                mailbox: lattice_actor::mailbox::MailboxConfig::with_lanes(1, 8),
+                ..ActorSpawnOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Park the Actor so the single normal slot fills and the timer observes backpressure.
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    handle
+        .tell(Block {
+            entered: entered.clone(),
+            release: release.clone(),
+        })
+        .await
+        .unwrap();
+    entered.acquire().await.unwrap().forget();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    release.add_permits(1);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *ticks.lock().await < 5 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("interval timer keeps ticking after mailbox backpressure");
+}

@@ -822,3 +822,191 @@ async fn watch_notification_is_delivered_while_the_normal_mailbox_is_full() {
         .forget();
     assert_eq!(*events.lock().await, vec![TerminatedReason::Stopped]);
 }
+
+#[tokio::test]
+async fn stop_child_ends_restart_supervision() {
+    struct ChildActor {
+        stopped: Arc<Semaphore>,
+    }
+
+    impl Actor for ChildActor {
+        type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
+
+        async fn stopping(
+            &mut self,
+            _ctx: &mut ActorContext<Self>,
+            _reason: StopReason,
+        ) -> Result<(), ActorStopError> {
+            self.stopped.add_permits(1);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, lattice_actor::Message)]
+    struct ReleaseChild;
+
+    struct ParentActor {
+        created: Arc<AtomicUsize>,
+        stopped: Arc<Semaphore>,
+    }
+
+    impl Actor for ParentActor {
+        type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
+
+        async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+            let created = self.created.clone();
+            let stopped = self.stopped.clone();
+            ctx.spawn_child_with_factory(
+                ChildActorKey::new("child"),
+                move || {
+                    created.fetch_add(1, Ordering::SeqCst);
+                    ChildActor {
+                        stopped: stopped.clone(),
+                    }
+                },
+                ChildActorOptions {
+                    mailbox: MailboxConfig::bounded(8),
+                    supervision: ChildSupervision::RestartChild,
+                    ..ChildActorOptions::default()
+                },
+            )?;
+            Ok(())
+        }
+    }
+
+    impl Handler<ReleaseChild> for ParentActor {
+        async fn handle(
+            &mut self,
+            ctx: &mut HandlerContext<'_, Self>,
+            _msg: ReleaseChild,
+        ) -> Result<(), ActorError> {
+            assert!(ctx.stop_child(&ChildActorKey::new("child")));
+            Ok(())
+        }
+    }
+
+    let created = Arc::new(AtomicUsize::new(0));
+    let stopped = Arc::new(Semaphore::new(0));
+    let parent = spawn_actor(
+        ParentActor {
+            created: created.clone(),
+            stopped: stopped.clone(),
+        },
+        MailboxConfig::bounded(8),
+    );
+
+    parent.tell(ReleaseChild).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), stopped.acquire())
+        .await
+        .expect("released child stops")
+        .unwrap()
+        .forget();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        created.load(Ordering::SeqCst),
+        1,
+        "a released child must not be restarted into an unowned activation"
+    );
+}
+
+#[tokio::test]
+async fn watch_capacity_is_bounded_and_reclaimed() {
+    struct TargetActor;
+
+    impl Actor for TargetActor {
+        type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
+    }
+
+    #[derive(Debug, lattice_actor::Request)]
+    #[request(response = usize)]
+    struct AddWatches(usize);
+
+    #[derive(Debug, lattice_actor::Request)]
+    #[request(response = usize)]
+    struct TerminatedCount;
+
+    struct WatcherActor {
+        target: ActorHandle<TargetActor>,
+        terminated: usize,
+    }
+
+    impl Actor for WatcherActor {
+        type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
+    }
+
+    impl Handler<ActorTerminated> for WatcherActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut HandlerContext<'_, Self>,
+            _notification: ActorTerminated,
+        ) -> Result<(), ActorError> {
+            self.terminated += 1;
+            Ok(())
+        }
+    }
+
+    impl Responder<AddWatches> for WatcherActor {
+        async fn respond(
+            &mut self,
+            ctx: &mut HandlerContext<'_, Self>,
+            request: AddWatches,
+            reply_to: ReplyTo<usize>,
+        ) -> Result<(), ActorError> {
+            let target = self.target.clone();
+            let granted = (0..request.0)
+                .filter(|_| ctx.watch(&target).is_ok())
+                .count();
+            reply_to.send(granted)?;
+            Ok(())
+        }
+    }
+
+    impl Responder<TerminatedCount> for WatcherActor {
+        async fn respond(
+            &mut self,
+            _ctx: &mut HandlerContext<'_, Self>,
+            _request: TerminatedCount,
+            reply_to: ReplyTo<usize>,
+        ) -> Result<(), ActorError> {
+            reply_to.send(self.terminated)?;
+            Ok(())
+        }
+    }
+
+    const WATCH_LIMIT: usize = 1_024;
+
+    let target = spawn_actor(TargetActor, MailboxConfig::bounded(1));
+    let watcher = spawn_actor(
+        WatcherActor {
+            target: target.clone(),
+            terminated: 0,
+        },
+        MailboxConfig::with_lanes(8, WATCH_LIMIT),
+    );
+
+    assert_eq!(
+        watcher.ask(AddWatches(WATCH_LIMIT), ASK_TIMEOUT).await,
+        Ok(WATCH_LIMIT)
+    );
+    assert_eq!(watcher.ask(AddWatches(1), ASK_TIMEOUT).await, Ok(0));
+
+    target.stop(StopReason::Requested).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while watcher.ask(TerminatedCount, ASK_TIMEOUT).await != Ok(WATCH_LIMIT) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every watch notification is delivered");
+
+    assert_eq!(
+        watcher.ask(AddWatches(1), ASK_TIMEOUT).await,
+        Ok(1),
+        "completed watches must return capacity"
+    );
+}

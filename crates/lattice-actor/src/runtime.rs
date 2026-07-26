@@ -24,18 +24,24 @@ use crate::{
     error::{ActorAdminError, ActorCallError, ActorSpawnError},
     handle::{ActorHandle, ActorHandleInit, ForcedDataLossEvent, StopFailureRecord, TerminalHook},
     mailbox::{
-        ActorCommand, MailboxConfig, MailboxLane,
+        ActorCommand, MailboxConfig, MailboxLane, QueuedRejection,
         channel::{self, Receiver},
     },
     observation::{ActorLifecycleEvent, ActorObserverHandle},
     recipient::ActorSystem,
-    traits::{Actor, ActorLifecycleState, MessageOutcome, PassivationReason, StopReason},
+    traits::{Actor, ActorLifecycleState, MessageOutcome, StopReason},
     watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason},
 };
 
+mod panic;
+mod passivation;
+mod rejection;
 pub(crate) mod spawner;
 mod worker_pool;
 
+use panic::{ActorPanic, finalize_panicked_actor, terminate_panicked_actor};
+use passivation::{record_activity, spawn_passivation_monitor};
+use rejection::{reject_prefetched_commands, reject_queued_commands};
 use spawner::ActorSpawner;
 use worker_pool::{ActorWorkerPool, WorkerPoolKind};
 
@@ -739,7 +745,8 @@ where
                                 .saturating_sub(1),
                         );
                         loop {
-                            for current in normal_batch.drain(..) {
+                            let mut prefetched = normal_batch.drain(..);
+                            for current in prefetched.by_ref() {
                                 match handle_command(
                                     current,
                                     MailboxLane::Normal,
@@ -765,6 +772,19 @@ where
                                     break;
                                 }
                             }
+                            // Messages already taken out of the channel can no longer be rejected
+                            // by the shutdown drain, so they are completed here with the same
+                            // reason their still-queued peers receive.
+                            reject_prefetched_commands(
+                                prefetched,
+                                MailboxLane::Normal,
+                                &handle,
+                                if actor_panic.is_some() {
+                                    QueuedRejection::ActorPanicked
+                                } else {
+                                    QueuedRejection::MailboxClosed
+                                },
+                            );
                             if stop_reason.is_some()
                                 || actor_panic.is_some()
                                 || remaining == 0
@@ -839,11 +859,23 @@ where
     };
 
     handle.clear_stop_failure();
+    // A stopped Actor never dispatches what is still queued, so both lanes are closed and drained
+    // here instead of being discarded silently when the receivers drop.
+    normal_rx.close();
+    system_rx.close();
+    reject_queued_commands(
+        &mut normal_rx,
+        MailboxLane::Normal,
+        &handle,
+        QueuedRejection::MailboxClosed,
+    );
+    reject_queued_commands(
+        &mut system_rx,
+        MailboxLane::System,
+        &handle,
+        QueuedRejection::MailboxClosed,
+    );
     if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(actor))) {
-        normal_rx.close();
-        system_rx.close();
-        reject_queued_commands(&mut normal_rx, MailboxLane::Normal, &handle);
-        reject_queued_commands(&mut system_rx, MailboxLane::System, &handle);
         finalize_panicked_actor(&handle, ActorPanic::new("drop", payload));
         return;
     }
@@ -965,7 +997,12 @@ where
                     ActorLifecycleEvent::StopFailed(reason),
                 );
                 normal_rx.close();
-                while normal_rx.try_recv().is_ok() {}
+                reject_queued_commands(
+                    normal_rx,
+                    MailboxLane::Normal,
+                    handle,
+                    QueuedRejection::MailboxClosed,
+                );
                 if let Some(result) = retry_result.take() {
                     let _ = result.send(Err(ActorAdminError::StopFailed(stop_error)));
                 }
@@ -1088,7 +1125,7 @@ where
             let outcome = match handled {
                 Ok(outcome) => outcome,
                 Err(payload) => {
-                    if let Some(completion) = envelope.reject_panicked() {
+                    if let Some(completion) = envelope.reject(QueuedRejection::ActorPanicked) {
                         handle
                             .observer()
                             .request_completed(actor_metadata, &metadata, completion);
@@ -1159,6 +1196,3 @@ where
 
     Ok(false)
 }
-
-include!("runtime/panic.rs");
-include!("runtime/passivation.rs");
