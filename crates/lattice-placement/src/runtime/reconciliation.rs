@@ -1,10 +1,9 @@
 use lattice_core::failpoint::Failpoint;
 
 use super::{
-    AllocationRequest, ClaimGrant, ClaimLease, CoordinatorLeaseStore, CoordinatorRuntimeError,
-    GrantSequence, HandoffEvent, Instant, MembershipStore, PlacementControlCommand,
-    PlacementDomainLeader, PlacementDomainStore, PlacementSlot, PlacementSlotKey,
-    PlacementSlotState, ScopedElectionStore, membership::send_control,
+    AllocationRequest, ClaimGrant, CoordinatorLeaseStore, CoordinatorRuntimeError, GrantSequence,
+    HandoffEvent, Instant, MembershipStore, PlacementDomainLeader, PlacementDomainStore,
+    PlacementSlot, PlacementSlotKey, PlacementSlotState, ScopedElectionStore,
 };
 use crate::{
     allocation::AllocationError,
@@ -203,6 +202,11 @@ where
         slot: PlacementSlot,
         previous: LeasedClaim,
     ) -> Result<(), CoordinatorRuntimeError> {
+        let members = match self.assignment_members(&previous.grant.owner).await {
+            Ok(members) => members,
+            Err(CoordinatorRuntimeError::IneligibleTarget) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let lease_id = self.store.grant_lease(self.config.claim_ttl).await?;
         let mut adopted = slot.clone();
         adopted.version = self.next_version()?;
@@ -219,8 +223,7 @@ where
                 .map_err(|_| CoordinatorRuntimeError::ClaimSequence)?,
             ttl: self.config.claim_ttl,
         };
-        let (expected_global_member, expected_domain_member) =
-            self.assignment_members(&previous.grant.owner).await?;
+        let (expected_global_member, expected_domain_member) = members;
         let result = self
             .store
             .adopt_authority(
@@ -243,13 +246,7 @@ where
                 lattice_core::failpoint::hit(Failpoint::ReconciliationAfterCommitBeforeEffect);
                 let _ = self.store.revoke_lease(previous.lease_id).await;
                 self.version = committed.slot.version.clone();
-                self.claims.insert(
-                    committed.slot.key.clone(),
-                    ClaimLease {
-                        lease_id: committed.claim.lease_id,
-                        grant: committed.claim.grant.clone(),
-                    },
-                );
+                self.remember_claim(committed.claim.lease_id, committed.claim.grant.clone());
                 self.publish_slot_delta(&committed.slot).await?;
                 self.replay_claim_if_connected(&committed.claim.grant)?;
             }
@@ -279,7 +276,7 @@ where
             )
             .await?;
         self.version = committed.slot.version.clone();
-        self.claims.remove(&committed.slot.key);
+        self.release_claim(&committed.slot.key);
         self.publish_slot_delta(&committed.slot).await
     }
 
@@ -379,13 +376,7 @@ where
         match result {
             Ok(committed) => {
                 self.version = committed.slot.version.clone();
-                self.claims.insert(
-                    committed.slot.key.clone(),
-                    ClaimLease {
-                        lease_id,
-                        grant: grant.clone(),
-                    },
-                );
+                self.remember_claim(lease_id, grant.clone());
                 self.publish_slot_delta(&committed.slot).await?;
                 self.replay_claim_if_connected(&grant)?;
                 Ok(true)
@@ -401,30 +392,24 @@ where
         &mut self,
         claim: LeasedClaim,
     ) -> Result<(), CoordinatorRuntimeError> {
-        self.claims.insert(
-            claim.grant.slot.clone(),
-            ClaimLease {
-                lease_id: claim.lease_id,
-                grant: claim.grant.clone(),
-            },
-        );
+        if self.claim_is_expiring(&claim.grant.slot, claim.lease_id) {
+            return Ok(());
+        }
+        self.remember_claim(claim.lease_id, claim.grant.clone());
         self.replay_claim_if_connected(&claim.grant)
     }
 
-    fn replay_claim_if_connected(&self, grant: &ClaimGrant) -> Result<(), CoordinatorRuntimeError> {
-        let Some(session) = self.sessions.get(&grant.owner.incarnation) else {
-            return Ok(());
-        };
-        let Some(association) = self.associations.get(&session.association) else {
-            return Ok(());
-        };
-        send_control(
-            &association,
-            &self.version.domain,
-            self.version.term.get(),
-            PlacementControlCommand::ClaimGranted(grant.clone()),
-            &self.config,
-        )
+    pub(super) fn replay_claim_if_connected(
+        &self,
+        grant: &ClaimGrant,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        match self.grant_authority(grant) {
+            Err(
+                CoordinatorRuntimeError::UnknownSession
+                | CoordinatorRuntimeError::AssociationUnavailable,
+            ) => Ok(()),
+            result => result,
+        }
     }
 
     fn quarantine(&mut self, key: &PlacementSlotKey, reason: &str) {

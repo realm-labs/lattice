@@ -6,11 +6,10 @@ use lattice_core::{
 };
 
 use super::{
-    AllocationRequest, BTreeMap, ClaimGrant, ClaimLease, CoordinatorLeaseStore,
-    CoordinatorRuntimeError, GrantSequence, HandoffMachine, LoadSample, MembershipStore,
-    MoveProgress, NodeKey, PlacedShard, PlacementControlCommand, PlacementDomainLeader,
-    PlacementDomainStore, PlacementNode, PlacementSlot, PlacementSlotKey, PlacementSlotState,
-    PlacementView, ScopedElectionStore, SingletonConfig, membership::send_control,
+    AllocationRequest, BTreeMap, ClaimGrant, CoordinatorLeaseStore, CoordinatorRuntimeError,
+    GrantSequence, HandoffMachine, LoadSample, MembershipStore, MoveProgress, NodeKey, PlacedShard,
+    PlacementDomainLeader, PlacementDomainStore, PlacementNode, PlacementSlot, PlacementSlotKey,
+    PlacementSlotState, PlacementView, ScopedElectionStore, SingletonConfig,
 };
 use crate::{
     storage::{
@@ -306,30 +305,9 @@ where
         let leased_claim = committed.claim;
         lattice_core::failpoint::hit(Failpoint::InitialAuthorityAfterCommitBeforeEffect);
         self.version = slot.version.clone();
-        self.claims.insert(
-            slot.key.clone(),
-            ClaimLease {
-                lease_id: leased_claim.lease_id,
-                grant: leased_claim.grant.clone(),
-            },
-        );
+        self.remember_claim(leased_claim.lease_id, leased_claim.grant.clone());
         self.publish_slot_delta(&slot).await?;
-        let session = self
-            .sessions
-            .get(&owner.incarnation)
-            .filter(|session| session.hello.node == owner)
-            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
-        let association = self
-            .associations
-            .get(&session.association)
-            .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-        send_control(
-            &association,
-            &self.version.domain,
-            self.version.term.get(),
-            PlacementControlCommand::ClaimGranted(leased_claim.grant),
-            &self.config,
-        )
+        self.grant_authority(&leased_claim.grant)
     }
 
     pub(super) async fn complete_initial_ready(

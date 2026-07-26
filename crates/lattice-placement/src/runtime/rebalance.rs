@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use lattice_core::failpoint::Failpoint;
 
 use super::{
-    Bytes, ClaimGrant, ClaimLease, CoordinatorLeaseStore, CoordinatorRuntimeError, GrantSequence,
+    Bytes, ClaimGrant, CoordinatorLeaseStore, CoordinatorRuntimeError, GrantSequence,
     HandoffEffect, HandoffEvent, HandoffMachine, MembershipStore, MoveProgress, NodeIncarnation,
     PlacementControlCommand, PlacementDomainLeader, PlacementDomainStore, PlacementSlot,
     PlacementSlotKey, PlacementSlotState, PlanReason, ScopedElectionStore, SnapshotRecord,
@@ -407,7 +407,7 @@ where
                 .slot;
             lattice_core::failpoint::hit(Failpoint::FenceAuthorityAfterCommitBeforeEffect);
             self.version = slot.version.clone();
-            let old_lease = self.claims.remove(key).map(|claim| claim.lease_id);
+            let old_lease = self.release_claim(key).map(|claim| claim.lease_id);
             self.publish_slot_delta(&slot).await?;
             if let Some(lease_id) = old_lease {
                 let _ = self.store.revoke_lease(lease_id).await;
@@ -477,30 +477,9 @@ where
         let leased_claim = committed.claim;
         self.version = slot.version.clone();
         lattice_core::failpoint::hit(Failpoint::HandoffAfterNewClaimBeforeGrantSend);
-        self.claims.insert(
-            key.clone(),
-            ClaimLease {
-                lease_id: leased_claim.lease_id,
-                grant: leased_claim.grant.clone(),
-            },
-        );
+        self.remember_claim(leased_claim.lease_id, leased_claim.grant.clone());
         self.publish_slot_delta(&slot).await?;
-        let session = self
-            .sessions
-            .get(&handoff.target.incarnation)
-            .filter(|session| session.hello.node == handoff.target)
-            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
-        let association = self
-            .associations
-            .get(&session.association)
-            .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-        send_control(
-            &association,
-            &self.version.domain,
-            self.version.term.get(),
-            PlacementControlCommand::ClaimGranted(leased_claim.grant),
-            &self.config,
-        )?;
+        self.grant_authority(&leased_claim.grant)?;
         lattice_core::failpoint::hit(Failpoint::HandoffAfterGrantBeforeShardReady);
         let effects = self
             .handoffs

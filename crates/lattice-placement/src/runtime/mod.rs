@@ -64,6 +64,7 @@ pub struct PlacementDomainLeaderConfig {
     pub member_lease_ttl: Duration,
     pub claim_ttl: Duration,
     pub renewal_interval: Duration,
+    pub member_heartbeat_interval: Duration,
     pub member_heartbeat_timeout: Duration,
     pub session_limits: SessionLimits,
     pub snapshot_limits: SnapshotLimits,
@@ -93,7 +94,8 @@ impl Default for PlacementDomainLeaderConfig {
             member_lease_ttl: Duration::from_secs(15),
             claim_ttl: Duration::from_secs(15),
             renewal_interval: Duration::from_secs(5),
-            member_heartbeat_timeout: Duration::from_secs(15),
+            member_heartbeat_interval: Duration::from_secs(5),
+            member_heartbeat_timeout: Duration::from_secs(25),
             session_limits: SessionLimits::default(),
             snapshot_limits: SnapshotLimits {
                 maximum_chunk_bytes: 192 * 1024,
@@ -132,10 +134,15 @@ impl PlacementDomainLeaderConfig {
             || self.member_lease_ttl.is_zero()
             || self.claim_ttl.is_zero()
             || self.renewal_interval.is_zero()
+            || self.member_heartbeat_interval.is_zero()
             || self.member_heartbeat_timeout.is_zero()
             || self.renewal_interval >= self.leader_lease_ttl
             || self.renewal_interval >= self.member_lease_ttl
             || self.renewal_interval >= self.claim_ttl
+            || self
+                .claim_ttl
+                .checked_add(self.member_heartbeat_interval)
+                .is_none_or(|floor| floor >= self.member_heartbeat_timeout)
             || self.maximum_sessions == 0
             || self.maximum_node_loads == 0
             || self.maximum_shard_loads == 0
@@ -448,6 +455,7 @@ where
     version: PlacementVersion,
     sessions: BTreeMap<NodeIncarnation, MemberSession>,
     claims: BTreeMap<PlacementSlotKey, ClaimLease>,
+    expiring_claims: BTreeMap<PlacementSlotKey, i64>,
     loads: LoadTable,
     plans: BTreeMap<u128, RebalancePlan>,
     handoffs: BTreeMap<PlacementSlotKey, HandoffMachine>,
@@ -583,6 +591,7 @@ where
             version,
             sessions: BTreeMap::new(),
             claims: BTreeMap::new(),
+            expiring_claims: BTreeMap::new(),
             loads,
             plans,
             handoffs: BTreeMap::new(),

@@ -4,11 +4,9 @@ use tokio::time::MissedTickBehavior;
 
 use super::{
     CoordinatorLeaseStore, CoordinatorRuntimeError, HandoffEvent, HandoffMachine, Instant,
-    MembershipStore, MoveProgress, PlacementControlCommand, PlacementControlEvent,
-    PlacementDomainLeader, PlacementDomainStore, PlacementSlotKey, PlacementSlotState, PlanStatus,
-    RebalanceTrigger, ScopedElectionStore,
-    membership::{control_dispatch_error, send_control},
-    mpsc, watch,
+    MembershipStore, MoveProgress, PlacementControlEvent, PlacementDomainLeader,
+    PlacementDomainStore, PlacementSlotKey, PlacementSlotState, PlanStatus, RebalanceTrigger,
+    ScopedElectionStore, membership::control_dispatch_error, mpsc, watch,
 };
 use crate::{
     coordinator::MemberRemovalReason,
@@ -373,17 +371,7 @@ where
         }
         for claim in self.claims.values() {
             self.store.keep_lease_alive(claim.lease_id).await?;
-            if let Some(session) = self.sessions.get(&claim.grant.owner.incarnation)
-                && let Some(association) = self.associations.get(&session.association)
-            {
-                send_control(
-                    &association,
-                    &self.version.domain,
-                    self.version.term.get(),
-                    PlacementControlCommand::ClaimGranted(claim.grant.clone()),
-                    &self.config,
-                )?;
-            }
+            self.replay_claim_if_connected(&claim.grant)?;
         }
         Ok(())
     }
