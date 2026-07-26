@@ -182,8 +182,14 @@ passivate_after_secs = 600
 url = "nats://nats:4222"
 
 [admin_http]
-bind = "0.0.0.0:19090"
+bind = "10.0.0.11:19090"
+bearer_token_file = "/var/run/secrets/lattice/admin-token"
 ```
+
+Admin mutation routes are mounted only when a credential is configured. Without
+`bearer_token_file` (or the development-only `bearer_token`) the adapter serves inspection alone,
+so an unauthenticated deployment cannot relocate shards or cancel plans. `allow_unauthenticated_admin`
+exists for local development and is rejected unless the adapter binds a loopback address.
 
 Only CoordinatorHost processes consume generation-5 control-store configuration. Other nodes use
 scoped discovery to locate/authenticate membership and each required placement-domain leader.
