@@ -22,14 +22,6 @@ pub struct MongoDocumentKey {
     pub id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MongoIndexSpec {
-    pub collection: &'static str,
-    pub name: &'static str,
-    pub fields: &'static [&'static str],
-    pub unique: bool,
-}
-
 impl MongoDocumentKey {
     pub fn new(collection: &'static str, id: impl Into<String>) -> Self {
         Self {

@@ -5,9 +5,9 @@ use lattice_core::{
 use lattice_remoting::{association::AssociationKey, control::ControlDispatchError};
 
 use super::{
-    AllocationError, Association, AssociationState, Bytes, ClaimGrant, ClaimLease,
-    CoordinatorLeaseStore, CoordinatorRuntimeError, HandoffEvent, HandoffPhase, Instant,
-    MemberRecord, MemberRemovalReason, MemberSession, MemberStatus, MembershipStore,
+    AllocationError, Association, AssociationError, AssociationState, Bytes, ClaimGrant,
+    ClaimLease, CoordinatorLeaseStore, CoordinatorRuntimeError, HandoffEvent, HandoffPhase,
+    Instant, MemberRecord, MemberRemovalReason, MemberSession, MemberStatus, MembershipStore,
     MembershipVersion, NodeKey, PlacementControlCommand, PlacementDomainHello,
     PlacementDomainLeader, PlacementDomainLeaderConfig, PlacementDomainStore, PlacementSlotKey,
     PlacementSlotState, PlacementVersion, PlanReason, RebalanceTrigger, ScopedElectionStore,
@@ -118,7 +118,8 @@ where
                             .await?;
                         }
                         let ready_member = self.sessions.get(&remote).and_then(|session| {
-                            (session.placement_up()
+                            (!session.claims_reconciled
+                                && session.placement_up()
                                 && session
                                     .applied_version
                                     .as_ref()
@@ -271,7 +272,11 @@ where
                             shard_id,
                         };
                         match self.ensure_shard_allocated(entity_type, shard_id).await {
-                            Ok(()) => self.send_snapshot(hello, association).await?,
+                            Ok(published) => {
+                                if !self.resolution_delta_reached(remote, published) {
+                                    self.send_snapshot(hello, association).await?;
+                                }
+                            }
                             Err(CoordinatorRuntimeError::Allocation(
                                 AllocationError::NoEligibleNode,
                             ))
@@ -308,7 +313,11 @@ where
                             kind: kind.clone(),
                         };
                         match self.ensure_singleton_allocated(kind).await {
-                            Ok(()) => self.send_snapshot(hello, association).await?,
+                            Ok(published) => {
+                                if !self.resolution_delta_reached(remote, published) {
+                                    self.send_snapshot(hello, association).await?;
+                                }
+                            }
                             Err(CoordinatorRuntimeError::IneligibleTarget) => {
                                 self.send_resolution_failure(association, request_id, slot)?
                             }
@@ -338,6 +347,17 @@ where
         Ok(())
     }
 
+    /// A resolution that allocated the slot already published its delta to every subscribed live
+    /// session. Re-encoding the whole domain snapshot for the requester would make cold start cost
+    /// one full snapshot per unknown shard per region.
+    fn resolution_delta_reached(&self, remote: NodeIncarnation, published: bool) -> bool {
+        published
+            && self
+                .sessions
+                .get(&remote)
+                .is_some_and(MemberSession::placement_up)
+    }
+
     fn send_resolution_failure(
         &self,
         association_key: AssociationKey,
@@ -364,6 +384,53 @@ where
     pub(super) fn now(&self) -> MonotonicTime {
         MonotonicTime::from_millis(
             u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX),
+        )
+    }
+
+    pub(super) fn remember_claim(&mut self, lease_id: i64, grant: ClaimGrant) {
+        self.expiring_claims.remove(&grant.slot);
+        self.claims
+            .insert(grant.slot.clone(), ClaimLease { lease_id, grant });
+    }
+
+    pub(super) fn release_claim(&mut self, key: &PlacementSlotKey) -> Option<ClaimLease> {
+        self.expiring_claims.remove(key);
+        self.claims.remove(key)
+    }
+
+    pub(super) fn claim_is_expiring(&self, key: &PlacementSlotKey, lease_id: i64) -> bool {
+        self.expiring_claims.get(key) == Some(&lease_id)
+    }
+
+    fn grant_window_open(&self, session: &MemberSession) -> bool {
+        self.config
+            .member_heartbeat_timeout
+            .checked_sub(self.config.claim_ttl)
+            .is_some_and(|window| Instant::now().duration_since(session.last_heartbeat) <= window)
+    }
+
+    pub(super) fn grant_authority(
+        &self,
+        grant: &ClaimGrant,
+    ) -> Result<(), CoordinatorRuntimeError> {
+        let session = self
+            .sessions
+            .get(&grant.owner.incarnation)
+            .filter(|session| session.hello.node == grant.owner)
+            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
+        if !self.grant_window_open(session) {
+            return Ok(());
+        }
+        let association = self
+            .associations
+            .get(&session.association)
+            .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
+        send_claim_grant(
+            &association,
+            &self.version.domain,
+            self.version.term.get(),
+            grant.clone(),
+            &self.config,
         )
     }
 
@@ -439,6 +506,7 @@ where
                 last_heartbeat: Instant::now(),
                 applied_version: None,
                 snapshot_version: Some(self.membership_version),
+                claims_reconciled: false,
                 draining: record.status == MemberStatus::Leaving,
                 drain_operation: None,
                 drain_ready: false,
@@ -686,11 +754,13 @@ where
             PlacementControlCommand::MemberUp(member),
             &self.config,
         )?;
-        let placement_ready = self
-            .sessions
-            .get(&incarnation)
-            .and_then(|session| session.applied_version.as_ref())
-            .is_some_and(|applied| applied.satisfies(&self.version));
+        let placement_ready = self.sessions.get(&incarnation).is_some_and(|session| {
+            !session.claims_reconciled
+                && session
+                    .applied_version
+                    .as_ref()
+                    .is_some_and(|applied| applied.satisfies(&self.version))
+        });
         if placement_ready {
             self.reconcile_claims_for(&hello).await?;
         }
@@ -736,7 +806,8 @@ where
                             .get_placement_revision(&self.version.domain)
                             .await?,
                     );
-                    self.finish_node_removal(predecessor).await?;
+                    self.finish_node_removal(predecessor, MemberRemovalReason::IncarnationReplaced)
+                        .await?;
                     let member = DomainMemberRecord {
                         node: hello.node.clone(),
                         hello,
@@ -842,6 +913,45 @@ pub(super) fn send_control(
     .map_err(CoordinatorRuntimeError::Control)?;
     association.admit_control_command(payload)?;
     Ok(())
+}
+
+/// Grants are latest-value renewals replayed by the next renewal tick, never by the reliable
+/// control outbox: an outbox replay would extend an owner deadline past the claim-lease keepalive
+/// that backs it.
+pub(super) fn send_claim_grant(
+    association: &Association,
+    domain: &PlacementDomainId,
+    coordinator_term: u64,
+    grant: ClaimGrant,
+    config: &PlacementDomainLeaderConfig,
+) -> Result<(), CoordinatorRuntimeError> {
+    let payload = encode_control_command_for_term(
+        &CoordinatorScope::Placement(domain.clone()),
+        coordinator_term,
+        &PlacementControlCommand::ClaimGranted(grant),
+        config.maximum_control_payload,
+    )
+    .map_err(CoordinatorRuntimeError::Control)?;
+    match association.admit_ephemeral_control(payload) {
+        Ok(())
+        | Err(
+            AssociationError::NotActive
+            | AssociationError::Closed
+            | AssociationError::QueueFull
+            | AssociationError::ByteBudgetExceeded
+            | AssociationError::NodeByteBudgetExceeded,
+        ) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) fn revokes_claim_leases_on_removal(reason: MemberRemovalReason) -> bool {
+    match reason {
+        MemberRemovalReason::GracefulLeave => true,
+        MemberRemovalReason::FailureDetected
+        | MemberRemovalReason::ForceRemoved
+        | MemberRemovalReason::IncarnationReplaced => false,
+    }
 }
 
 pub(super) fn slot_record_key(key: &PlacementSlotKey) -> String {

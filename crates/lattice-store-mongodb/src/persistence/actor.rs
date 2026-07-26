@@ -93,6 +93,76 @@ impl MongoPersistenceCoordinator {
         Ok(PersistenceStatus::InFlight)
     }
 
+    /// Dispatches a prepared flush and arms a self-addressed wakeup whenever
+    /// the attempt enters a new backoff.
+    ///
+    /// Without a wakeup, a failed flush is only retried when the actor happens
+    /// to receive another message, so the dirty state it retains is the actor's
+    /// only copy and can remain unwritten indefinitely. `retry_message` is the
+    /// actor's own "prepare and flush" message; handling it must repeat the
+    /// preparation and dispatch that produced `prepared`.
+    ///
+    /// One wakeup is outstanding per backoff deadline, so repeated dispatches
+    /// during one backoff window do not accumulate timers. Delivery uses the
+    /// normal mailbox lane and is therefore best effort: a saturated mailbox
+    /// drops the notification, and the next dispatch after the deadline has
+    /// passed arms a replacement.
+    pub fn dispatch_prepared_with_retry<A, M>(
+        &mut self,
+        context: &mut ActorContext<A>,
+        store: Arc<dyn PreparedWriteStore>,
+        prepared: PreparedFlush,
+        retry_message: M,
+    ) -> Result<PersistenceStatus, ActorPersistenceError>
+    where
+        A: Actor + Handler<MongoFlushCompleted> + Handler<M>,
+        <A as lattice_actor::traits::Actor>::Behavior: lattice_actor::state_machine::Accepts<MongoFlushCompleted>
+            + lattice_actor::state_machine::Accepts<M>,
+        M: Message,
+    {
+        let status = self.dispatch_prepared(context, store, prepared);
+        self.schedule_retry_wakeup(context, retry_message);
+        status
+    }
+
+    /// Applies a completion and arms a self-addressed wakeup whenever the
+    /// outcome retained work for a later retry. See
+    /// [`Self::dispatch_prepared_with_retry`] for the delivery contract.
+    pub fn apply_completion_with_retry<A, M>(
+        &mut self,
+        context: &mut ActorContext<A>,
+        completion: MongoFlushCompleted,
+        retry_message: M,
+    ) -> Result<CompletionStatus, PersistenceError>
+    where
+        A: Actor + Handler<M>,
+        <A as lattice_actor::traits::Actor>::Behavior: lattice_actor::state_machine::Accepts<M>,
+        M: Message,
+    {
+        let status = self.apply_completion(completion);
+        self.schedule_retry_wakeup(context, retry_message);
+        status
+    }
+
+    /// Posts `retry_message` back to the owning actor when the retained retry
+    /// backoff expires. Returns whether a wakeup was armed.
+    pub fn schedule_retry_wakeup<A, M>(
+        &mut self,
+        context: &mut ActorContext<A>,
+        retry_message: M,
+    ) -> bool
+    where
+        A: Actor + Handler<M>,
+        <A as lattice_actor::traits::Actor>::Behavior: lattice_actor::state_machine::Accepts<M>,
+        M: Message,
+    {
+        let Some(delay) = self.arm_retry_wakeup() else {
+            return false;
+        };
+        context.notify_after(delay, retry_message);
+        true
+    }
+
     /// Applies a completion in a later actor turn. Ambiguous transport
     /// failures retain the exact write for retry; definitive storage
     /// rejections retain the baseline but wait for a new mutation epoch.

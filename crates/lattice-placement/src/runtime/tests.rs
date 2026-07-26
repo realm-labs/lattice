@@ -1101,7 +1101,9 @@ async fn resolution_reassigns_fenced_slots_after_owner_restart() {
 }
 
 mod admin;
+mod claim_expiry;
 mod history;
 mod lifecycle_tests;
 mod recovery_tests;
+mod resilience;
 mod unavailable_hosts;

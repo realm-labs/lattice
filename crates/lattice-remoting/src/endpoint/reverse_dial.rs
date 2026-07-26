@@ -1,11 +1,13 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use super::{EndpointError, RemotingEndpoint};
 use crate::{
-    association::{Association, AssociationState},
+    association::Association,
     bootstrap::{BootstrapRequest, BootstrapResult},
     handshake::NodeIdentity,
 };
+
+const REVERSE_DIAL_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 impl RemotingEndpoint {
     pub(super) async fn request_reverse_peer(
@@ -42,11 +44,11 @@ impl RemotingEndpoint {
                 if let Some(association) =
                     self.associations
                         .get_exact(&peer.cluster_id, &peer.address, peer.incarnation)
-                    && association.state() == AssociationState::Active
+                    && association.wait_until_active().await.is_ok()
                 {
                     return association;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(REVERSE_DIAL_POLL_INTERVAL).await;
             }
         })
         .await

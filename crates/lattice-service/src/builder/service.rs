@@ -7,10 +7,7 @@ use lattice_core::{
     actor_ref::ClusterId,
     release::{ClusterReleaseState, ReleaseError, ReleaseManifest},
 };
-use lattice_placement::{
-    membership_session::MembershipCoordinatorHandle, session::LogicSessionError,
-    types::PlacementSlotKey,
-};
+use lattice_placement::{membership_session::MembershipCoordinatorHandle, types::PlacementSlotKey};
 use lattice_remoting::watch::{WatchId, WatchStatus};
 use tokio::{
     sync::broadcast::{Receiver, error::RecvError},
@@ -20,42 +17,59 @@ use tokio::{
 use crate::{
     cluster::api::Cluster,
     cluster::peers::PeerError,
-    lifecycle::{CoordinatorScopeState, LifecycleInterventionReport},
+    cluster::runtime::LogicEffectApplier,
+    lifecycle::{
+        CoordinatorScopeState, LifecycleInterventionReport, ServiceLifecycleMetricsSnapshot,
+    },
+};
+
+use super::{
+    ActorRef, ActorSystem, Arc, Association, AssociationManager, AtomicBool, BTreeMap, BTreeSet,
+    BootstrapLeader, BootstrapView, ClusterJoinConfig, CoordinatorHandle,
+    CoordinatorHostScopeState, CoordinatorRuntimeAssembly, EntityRef, LatticeServiceBuilder,
+    LogicCoordinatorHandle, LogicJoinRuntime, LogicRuntimeAssembly, MemberDirectory, MemberEvent,
+    MemberSnapshot, MembershipJoinRuntime, Message, Mutex, NodeConfig, NodeIdentity, NodeKey,
+    NodeLifecycleState, OutboundMessaging, PeerReconciler, PlacementDomainId, PlacementDomainState,
+    ProductionLifecycleDriver, ProtocolHostRegistry, ProtocolTag, RecipientError, RecipientRef,
+    RemotingEndpoint, Request, ServiceError, ServiceHealthSnapshot, ServiceLifecycleEvent,
+    SingletonRef, SupportsAsk, SupportsTell, TaskSupervisor, WatchRegistry, watch,
 };
 
 pub struct LatticeService {
-    cluster_id: ClusterId,
-    release: ReleaseManifest,
-    actor_system: ActorSystem,
-    hosts: Arc<ProtocolHostRegistry>,
-    associations: Arc<AssociationManager>,
-    messaging: Arc<OutboundMessaging>,
-    endpoint: Arc<RemotingEndpoint>,
-    supervisor: Arc<TaskSupervisor>,
-    logic_runtime: Mutex<Option<LogicRuntimeAssembly>>,
-    join_runtimes: Mutex<Vec<LogicJoinRuntime>>,
-    membership_join_runtime: Mutex<Option<MembershipJoinRuntime>>,
-    membership_handle: Arc<Mutex<Option<MembershipCoordinatorHandle>>>,
-    logic_shutdown: Mutex<Option<watch::Sender<bool>>>,
-    join_shutdown: Mutex<Option<watch::Sender<bool>>>,
-    logic_handles: Arc<Mutex<BTreeMap<PlacementDomainId, LogicCoordinatorHandle>>>,
-    watches: Arc<Mutex<WatchRegistry>>,
-    coordinator_runtime: Mutex<Option<CoordinatorRuntimeAssembly>>,
-    coordinator_shutdown: Mutex<Option<watch::Sender<bool>>>,
-    coordinator_handles: Mutex<BTreeMap<PlacementDomainId, CoordinatorHandle>>,
-    lifecycle_driver: ProductionLifecycleDriver,
-    lifecycle_events: watch::Sender<NodeLifecycleState>,
-    health: Arc<Mutex<ServiceHealthSnapshot>>,
-    health_events: watch::Sender<ServiceHealthSnapshot>,
-    members: Arc<MemberDirectory>,
-    peers: Arc<PeerReconciler>,
-    bootstrap_view: Arc<BootstrapView>,
-    drain_ready: watch::Sender<BTreeMap<PlacementDomainId, String>>,
-    drain_blockers: watch::Sender<BTreeMap<PlacementDomainId, BTreeSet<PlacementSlotKey>>>,
-    configured_domains: BTreeSet<PlacementDomainId>,
-    drain_operation: Mutex<Option<String>>,
-    join_config: ClusterJoinConfig,
-    force_actor_shutdown: AtomicBool,
+    pub(super) cluster_id: ClusterId,
+    pub(super) release: ReleaseManifest,
+    pub(super) actor_system: ActorSystem,
+    pub(super) hosts: Arc<ProtocolHostRegistry>,
+    pub(super) associations: Arc<AssociationManager>,
+    pub(super) messaging: Arc<OutboundMessaging>,
+    pub(super) endpoint: Arc<RemotingEndpoint>,
+    pub(super) supervisor: Arc<TaskSupervisor>,
+    pub(super) logic_runtime: Mutex<Option<LogicRuntimeAssembly>>,
+    pub(super) join_runtimes: Mutex<Vec<LogicJoinRuntime>>,
+    pub(super) membership_join_runtime: Mutex<Option<MembershipJoinRuntime>>,
+    pub(super) membership_handle: Arc<Mutex<Option<MembershipCoordinatorHandle>>>,
+    pub(super) logic_shutdown: Mutex<Option<watch::Sender<bool>>>,
+    pub(super) join_shutdown: Mutex<Option<watch::Sender<bool>>>,
+    pub(super) logic_handles: Arc<Mutex<BTreeMap<PlacementDomainId, LogicCoordinatorHandle>>>,
+    pub(super) watches: Arc<Mutex<WatchRegistry>>,
+    pub(super) coordinator_runtime: Mutex<Option<CoordinatorRuntimeAssembly>>,
+    pub(super) coordinator_shutdown: Mutex<Option<watch::Sender<bool>>>,
+    pub(super) coordinator_handles: Mutex<BTreeMap<PlacementDomainId, CoordinatorHandle>>,
+    pub(super) lifecycle_driver: ProductionLifecycleDriver,
+    pub(super) lifecycle_events: watch::Sender<NodeLifecycleState>,
+    pub(super) health: Arc<Mutex<ServiceHealthSnapshot>>,
+    pub(super) health_events: watch::Sender<ServiceHealthSnapshot>,
+    pub(super) members: Arc<MemberDirectory>,
+    pub(super) peers: Arc<PeerReconciler>,
+    pub(super) bootstrap_view: Arc<BootstrapView>,
+    pub(super) drain_ready: watch::Sender<BTreeMap<PlacementDomainId, String>>,
+    pub(super) drain_blockers:
+        watch::Sender<BTreeMap<PlacementDomainId, BTreeSet<PlacementSlotKey>>>,
+    pub(super) configured_domains: BTreeSet<PlacementDomainId>,
+    pub(super) drain_operation: Mutex<Option<String>>,
+    pub(super) join_config: ClusterJoinConfig,
+    pub(super) force_actor_shutdown: AtomicBool,
+    pub(super) start_requested: AtomicBool,
 }
 
 impl LatticeService {
@@ -195,6 +209,11 @@ impl LatticeService {
         self.lifecycle_driver.state()
     }
 
+    /// Lifecycle metrics for this service instance only.
+    pub fn lifecycle_metrics(&self) -> ServiceLifecycleMetricsSnapshot {
+        self.lifecycle_driver.metrics()
+    }
+
     pub fn subscribe_node_lifecycle(&self) -> watch::Receiver<NodeLifecycleState> {
         self.lifecycle_events.subscribe()
     }
@@ -270,12 +289,43 @@ impl LatticeService {
         Ok(())
     }
 
+    /// Binds remoting and starts every configured runtime exactly once.
+    ///
+    /// Starting is only legal while the node is still `Booting`. A repeated call is rejected
+    /// without touching any component, and a failure part way through starting rolls the node
+    /// back through `StartupFailed` so it never reports readiness with stopped components.
     pub async fn start(&self) -> Result<(), ServiceError> {
-        if let Err(error) = self.endpoint.bind().await {
-            let _ = self.transition(ServiceLifecycleEvent::StartupFailed);
-            let _ = self.stop_components().await;
-            return Err(ServiceError::Endpoint(error));
+        let state = self.node_lifecycle_state();
+        if state != NodeLifecycleState::Booting || self.start_requested.swap(true, Ordering::AcqRel)
+        {
+            return Err(ServiceError::Lifecycle(
+                crate::lifecycle::ServiceLifecycleError {
+                    state,
+                    event: ServiceLifecycleEvent::RemotingReady,
+                },
+            ));
         }
+        if let Err(error) = self.start_components().await {
+            let rollback = match self.node_lifecycle_state() {
+                NodeLifecycleState::Booting | NodeLifecycleState::JoiningMembership => {
+                    ServiceLifecycleEvent::StartupFailed
+                }
+                _ => ServiceLifecycleEvent::ForceStop,
+            };
+            tracing::error!(
+                target: "lattice.cluster.lifecycle",
+                %error,
+                "service startup failed; stopping partially started components"
+            );
+            let _ = self.transition(rollback);
+            let _ = self.stop_components().await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn start_components(&self) -> Result<(), ServiceError> {
+        self.endpoint.bind().await.map_err(ServiceError::Endpoint)?;
         self.transition(ServiceLifecycleEvent::RemotingReady)?;
         if let Some(runtime) = self
             .coordinator_runtime
@@ -435,126 +485,28 @@ impl LatticeService {
             self.supervisor.spawn(async move {
                 let _ = session.run(controls, shutdown_rx).await;
             })?;
-            let watches = self.watches.clone();
-            let peers = self.peers.clone();
-            let drain_ready = self.drain_ready.clone();
-            let drain_blockers = self.drain_blockers.clone();
+            let applier = LogicEffectApplier {
+                domain: domain.clone(),
+                incarnation: self.endpoint.local_identity().incarnation,
+                router,
+                peers: self.peers.clone(),
+                watches: self.watches.clone(),
+                drain_ready: self.drain_ready.clone(),
+                drain_blockers: self.drain_blockers.clone(),
+                supervisor: self.supervisor.clone(),
+            };
+            let lifecycle_driver = self.lifecycle_driver.clone();
             self.supervisor.spawn(async move {
                 while let Some(effect) = effects.recv().await {
-                    let (slot, effect) = match effect {
-                        LogicPlacementEffect::MemberEvent(event) => {
-                            if let MemberEvent {
-                                version,
-                                change: MemberChange::Removed { node, reason },
-                            } = event.as_ref()
-                            {
-                                tracing::info!(
-                                    target: "lattice.cluster.members",
-                                    node_id = %node.node_id,
-                                    incarnation = node.incarnation.get(),
-                                    term = version.term.get(),
-                                    revision = version.revision.get(),
-                                    ?reason,
-                                    "authoritative member removed"
-                                );
-                                watches
-                                    .lock()
-                                    .expect("watch registry poisoned")
-                                    .node_down(node.incarnation);
-                            } else if let MemberEvent {
-                                version,
-                                change: MemberChange::Upsert(record),
-                            } = event.as_ref()
-                            {
-                                tracing::info!(
-                                    target: "lattice.cluster.members",
-                                    node_id = %record.node.node_id,
-                                    incarnation = record.node.incarnation.get(),
-                                    term = version.term.get(),
-                                    revision = version.revision.get(),
-                                    status = ?record.status,
-                                    "authoritative member upserted"
-                                );
-                            }
-                            let _ = peers.apply(*event).await;
-                            continue;
-                        }
-                        LogicPlacementEffect::MemberSnapshot {
-                            version,
-                            members: snapshot,
-                        } => {
-                            let _ = peers.install_snapshot(version, snapshot).await;
-                            continue;
-                        }
-                        LogicPlacementEffect::DrainReady {
-                            operation_id,
-                            incarnation: _,
-                        } => {
-                            if handle
-                                .complete_member_drain(operation_id.clone())
-                                .await
-                                .is_ok()
-                            {
-                                let mut completed = drain_ready.borrow().clone();
-                                completed.insert(domain.clone(), operation_id);
-                                drain_ready.send_replace(completed);
-                            }
-                            continue;
-                        }
-                        LogicPlacementEffect::Authority { slot, effect } => (slot, effect),
-                    };
-                    let result = match effect {
-                        AuthorityEffect::DrainSlot => {
-                            let succeeded = router.drain_slot(slot.clone()).await.unwrap_or(false);
-                            handle.complete_drain(slot, succeeded).await
-                        }
-                        AuthorityEffect::PublishReady => handle.publish_ready(&slot),
-                        AuthorityEffect::PublishDrained => {
-                            let result = handle.publish_drained(&slot);
-                            let mut blockers = drain_blockers.borrow().clone();
-                            if let Some(slots) = blockers.get_mut(&domain) {
-                                slots.remove(&slot);
-                            }
-                            drain_blockers.send_replace(blockers);
-                            result
-                        }
-                        AuthorityEffect::PublishStopFailed => {
-                            let result = handle.publish_stop_failed(&slot);
-                            let mut blockers = drain_blockers.borrow().clone();
-                            let inserted = blockers
-                                .entry(domain.clone())
-                                .or_default()
-                                .insert(slot.clone());
-                            drain_blockers.send_replace(blockers);
-                            if result.is_ok() && inserted {
-                                let router = router.clone();
-                                let handle = handle.clone();
-                                tokio::spawn(async move {
-                                    if router.wait_slot_drained(slot.clone()).await.is_ok() {
-                                        let _ = handle.complete_drain(slot, true).await;
-                                    }
-                                });
-                            }
-                            result
-                        }
-                        AuthorityEffect::StopSlot => {
-                            let result = router
-                                .stop_fenced_slot(slot.clone())
-                                .await
-                                .map_err(|_| LogicSessionError::ControlClosed);
-                            let mut blockers = drain_blockers.borrow().clone();
-                            if let Some(slots) = blockers.get_mut(&domain) {
-                                slots.remove(&slot);
-                            }
-                            drain_blockers.send_replace(blockers);
-                            result
-                        }
-                        AuthorityEffect::FenceAdmission
-                        | AuthorityEffect::OpenAdmission
-                        | AuthorityEffect::StartSlot
-                        | AuthorityEffect::StateLossPossible => Ok(()),
-                    };
-                    if result.is_err() {
+                    if applier.apply(effect, &handle).await.is_err() {
+                        tracing::warn!(
+                            target: "lattice.cluster.logic",
+                            domain = %domain.as_str(),
+                            "logic placement effect failed; reconciliation required"
+                        );
+                        lifecycle_driver
+                            .set_domain_state(domain.clone(), PlacementDomainState::Degraded);
+                        let _ = lifecycle_driver.transition(ServiceLifecycleEvent::CoordinatorLost);
                         break;
                     }
                 }
@@ -583,12 +535,12 @@ impl LatticeService {
             NodeLifecycleState::JoiningMembership => {
                 self.transition(ServiceLifecycleEvent::BeginDrain)?;
                 self.drain_blockers.send_replace(BTreeMap::new());
-                crate::lifecycle::record_blocked_drain_slots(0);
+                self.lifecycle_driver.record_blocked_drain_slots(0);
             }
             NodeLifecycleState::Ready => {
                 self.transition(ServiceLifecycleEvent::BeginDrain)?;
                 self.drain_blockers.send_replace(BTreeMap::new());
-                crate::lifecycle::record_blocked_drain_slots(0);
+                self.lifecycle_driver.record_blocked_drain_slots(0);
             }
             NodeLifecycleState::Draining => {}
             NodeLifecycleState::Stopping => return self.stop_components().await,
@@ -820,9 +772,8 @@ impl LatticeService {
         if report.blocked_slots.is_empty() {
             ServiceError::LeaveTimeout
         } else {
-            crate::lifecycle::record_blocked_drain_slots(
-                report.blocked_slots.values().map(Vec::len).sum(),
-            );
+            self.lifecycle_driver
+                .record_blocked_drain_slots(report.blocked_slots.values().map(Vec::len).sum());
             ServiceError::InterventionRequired(report)
         }
     }

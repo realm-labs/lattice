@@ -129,6 +129,29 @@ pub(crate) enum ActorCommand<A: Actor> {
     },
 }
 
+/// Why a command that the mailbox already admitted is being discarded instead of dispatched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueuedRejection {
+    MailboxClosed,
+    ActorPanicked,
+}
+
+impl QueuedRejection {
+    pub(crate) fn call_error(self) -> ActorCallError {
+        match self {
+            Self::MailboxClosed => ActorCallError::MailboxClosed,
+            Self::ActorPanicked => ActorCallError::ActorPanicked,
+        }
+    }
+
+    pub(crate) fn completion(self) -> RequestCompletion {
+        match self {
+            Self::MailboxClosed => RequestCompletion::MailboxClosed,
+            Self::ActorPanicked => RequestCompletion::ActorPanicked,
+        }
+    }
+}
+
 impl<A: Actor> ActorCommand<A> {
     pub(crate) fn envelope<T>(envelope: T) -> Self
     where
@@ -152,7 +175,9 @@ pub(crate) type EnvelopeFuture<'a> = PooledFuture<'a>;
 pub(crate) trait ActorEnvelope<A: Actor>: Send {
     fn metadata(&self, lane: MailboxLane) -> MessageMetadata;
 
-    fn reject_panicked(&mut self) -> Option<RequestCompletion> {
+    /// Completes an admitted but never dispatched message and reports how its
+    /// request, if any, ended.
+    fn reject(&mut self, _rejection: QueuedRejection) -> Option<RequestCompletion> {
         None
     }
 
@@ -274,15 +299,13 @@ where
         )
     }
 
-    fn reject_panicked(&mut self) -> Option<RequestCompletion> {
+    fn reject(&mut self, rejection: QueuedRejection) -> Option<RequestCompletion> {
         let reply_tx = self.reply_tx.take()?;
-        Some(
-            if reply_tx.send(Err(ActorCallError::ActorPanicked)).is_ok() {
-                RequestCompletion::ActorPanicked
-            } else {
-                RequestCompletion::CallerDropped
-            },
-        )
+        Some(if reply_tx.send(Err(rejection.call_error())).is_ok() {
+            rejection.completion()
+        } else {
+            RequestCompletion::CallerDropped
+        })
     }
 
     fn handle<'a>(

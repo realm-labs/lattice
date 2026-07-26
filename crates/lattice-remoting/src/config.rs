@@ -27,6 +27,7 @@ pub struct RemotingConfig {
     pub max_ready_read_batch_frames: usize,
     pub max_coalesced_write_batch_bytes: usize,
     pub connect_timeout: Duration,
+    pub establishing_timeout: Duration,
     pub reconnect_backoff_min: Duration,
     pub reconnect_backoff_max: Duration,
     pub heartbeat_interval: Duration,
@@ -57,6 +58,7 @@ impl Default for RemotingConfig {
             max_ready_read_batch_frames: 1,
             max_coalesced_write_batch_bytes: 128 * 1024,
             connect_timeout: Duration::from_secs(3),
+            establishing_timeout: Duration::from_secs(30),
             reconnect_backoff_min: Duration::from_millis(100),
             reconnect_backoff_max: Duration::from_secs(5),
             heartbeat_interval: Duration::from_secs(2),
@@ -143,6 +145,7 @@ impl RemotingConfig {
         }
         for (name, value) in [
             ("connect_timeout", self.connect_timeout),
+            ("establishing_timeout", self.establishing_timeout),
             ("reconnect_backoff_min", self.reconnect_backoff_min),
             ("reconnect_backoff_max", self.reconnect_backoff_max),
             ("heartbeat_interval", self.heartbeat_interval),

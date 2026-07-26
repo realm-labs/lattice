@@ -187,6 +187,12 @@ fn parse_update(
     has_previous: bool,
 ) -> Result<Option<(u64, Vec<DiscoveryTarget>)>, DiscoveryError> {
     let Some(value) = value else {
+        if has_previous {
+            return Err(DiscoveryError::Provider {
+                provider: "config_store",
+                message: format!("key {key} was deleted; the last valid targets are retained"),
+            });
+        }
         return Ok(None);
     };
     let document: EndpointDocument =

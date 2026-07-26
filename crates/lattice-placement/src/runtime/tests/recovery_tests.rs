@@ -170,7 +170,10 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
         CoordinatorScope::Placement(domain()),
         CoordinatorTerm::new(1).unwrap(),
         PlacementDomainLeaderConfig {
-            member_heartbeat_timeout: Duration::from_millis(10),
+            renewal_interval: Duration::from_millis(10),
+            claim_ttl: Duration::from_millis(50),
+            member_heartbeat_interval: Duration::from_millis(10),
+            member_heartbeat_timeout: Duration::from_millis(100),
             ..PlacementDomainLeaderConfig::default()
         },
     )
@@ -222,7 +225,8 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
     let persisted = store.get_slot(&slot_key).await.unwrap().unwrap();
     assert_eq!(persisted.state, PlacementSlotState::BeginHandoff);
     assert_eq!(persisted.target.as_ref(), Some(&target));
-    assert!(store.get_claim(&slot_key).await.unwrap().is_none());
+    let leased_claim = store.get_claim(&slot_key).await.unwrap().unwrap();
+    assert_eq!(leased_claim.grant.owner, source);
 
     leader.handoffs.clear();
     leader.recover_persisted_plans().await.unwrap();
@@ -237,6 +241,18 @@ async fn singleton_owner_loss_recovers_forward_after_leader_restart() {
         )
         .await
         .unwrap();
+    let draining = store.get_slot(&slot_key).await.unwrap().unwrap();
+    assert_eq!(draining.state, PlacementSlotState::Stopping);
+    assert_eq!(draining.owner.as_ref(), Some(&source));
+    leader.reconcile_bounded_pass().await.unwrap();
+    assert_eq!(
+        store.get_slot(&slot_key).await.unwrap().unwrap().state,
+        PlacementSlotState::Stopping
+    );
+    assert_eq!(leader.handoffs[&slot_key].phase, HandoffPhase::Draining);
+
+    store.revoke_lease(leased_claim.lease_id).await.unwrap();
+    leader.reconcile_bounded_pass().await.unwrap();
     let allocating = store.get_slot(&slot_key).await.unwrap().unwrap();
     assert_eq!(allocating.state, PlacementSlotState::Allocating);
     assert_eq!(allocating.owner.as_ref(), Some(&target));

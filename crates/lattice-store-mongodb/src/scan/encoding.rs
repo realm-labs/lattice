@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use mongodb::bson::{Bson, Document};
 use serde::Serialize;
+use xxhash_rust::xxh3::Xxh3;
 
 use super::{ScanError, ScanFieldPolicy};
 
@@ -144,22 +146,86 @@ fn tagged(hasher: &mut StableHasher, tag: u8, bytes: &[u8]) {
     hasher.write(bytes);
 }
 
-struct StableHasher(u128);
+/// Per-process seed for baseline hashing.
+///
+/// Baselines never leave the process that captured them: a [`super::ScanSnapshot`]
+/// is identified by a process-local counter and lives only in actor memory. A
+/// fresh random seed therefore costs no migration while making the hashes used
+/// for change detection unpredictable, so business values cannot be crafted to
+/// collide with their own baseline and suppress a durable write.
+fn hash_seed() -> u64 {
+    static SEED: OnceLock<u64> = OnceLock::new();
+    *SEED.get_or_init(|| uuid::Uuid::new_v4().as_u64_pair().0 | 1)
+}
+
+struct StableHasher(Xxh3);
 
 impl StableHasher {
     fn new() -> Self {
-        Self(0x6c62_272e_07bb_0142_62b8_2175_6295_c58d)
+        Self(Xxh3::with_seed(hash_seed()))
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
-        for byte in bytes {
-            self.0 ^= u128::from(*byte);
-            self.0 = self.0.wrapping_mul(PRIME);
-        }
+        self.0.update(bytes);
     }
 
     fn finish(self) -> u128 {
-        self.0
+        self.0.digest128()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mongodb::bson::{Bson, doc};
+    use xxhash_rust::xxh3::Xxh3;
+
+    use super::stable_hash;
+
+    /// Byte stream that `hash_bson` frames for one BSON string.
+    fn framed_string(value: &str) -> Vec<u8> {
+        let mut bytes = vec![2_u8];
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+        bytes
+    }
+
+    fn fnv1a_128(bytes: &[u8]) -> u128 {
+        const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+        let mut state = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d_u128;
+        for byte in bytes {
+            state ^= u128::from(*byte);
+            state = state.wrapping_mul(PRIME);
+        }
+        state
+    }
+
+    #[test]
+    fn change_detection_never_uses_a_hash_an_attacker_can_reproduce() {
+        let value = "business value chosen by a user";
+        let framed = framed_string(value);
+        let hash = stable_hash(&Bson::String(value.to_owned())).expect("string should hash");
+
+        assert_ne!(
+            hash.0,
+            fnv1a_128(&framed),
+            "a published non-cryptographic construction lets a crafted value collide with its own baseline, so the change would never be written"
+        );
+        let mut unseeded = Xxh3::new();
+        unseeded.update(&framed);
+        assert_ne!(
+            hash.0,
+            unseeded.digest128(),
+            "baseline hashing must be seeded per process, not reproducible from the algorithm alone"
+        );
+    }
+
+    #[test]
+    fn baseline_hashes_stay_stable_inside_one_process() {
+        let value = Bson::Document(doc! { "name": "ada", "level": 9_i64 });
+        assert_eq!(
+            stable_hash(&value).expect("document should hash"),
+            stable_hash(&value).expect("document should hash again"),
+            "a per-call seed would report every unchanged field as changed"
+        );
     }
 }

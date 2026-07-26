@@ -38,6 +38,40 @@ fn service_config(range: WorkerIdRange) -> DistributedIdConfig {
     }
 }
 
+#[tokio::test]
+async fn real_etcd_leases_report_the_granted_ttl_from_acquisition() {
+    let Some(endpoints) = endpoints() else {
+        eprintln!("LATTICE_ETCD_ENDPOINTS is absent; Docker acceptance owns this test");
+        return;
+    };
+    let key_prefix = format!("/lattice-worker-id-tests/{}", uuid::Uuid::new_v4().simple());
+    let store = EtcdWorkerIdLeaseStore::connect(EtcdWorkerIdStoreConfig {
+        endpoints,
+        key_prefix,
+    })
+    .await
+    .unwrap();
+    let range = WorkerIdRange::new(0, 0).unwrap();
+
+    let acquired = store
+        .acquire(
+            &owner("granted-ttl-cluster", 1),
+            range,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .into_lease();
+    let renewed = store
+        .renew(&acquired, Duration::from_secs(1))
+        .await
+        .unwrap()
+        .expect("a fresh Etcd lease must renew");
+
+    assert_eq!(acquired.valid_for(), renewed.valid_for());
+    assert!(store.release(&acquired).await.unwrap());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_etcd_fences_and_reuses_worker_ids_across_64_services() {
     let Some(endpoints) = endpoints() else {

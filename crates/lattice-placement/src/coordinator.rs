@@ -1007,6 +1007,13 @@ impl LoadTable {
         self.shards.clear();
     }
 
+    /// Load entries are keyed by incarnation, so a departed member would otherwise hold its slot in
+    /// the bounded table forever and eventually deny every later incarnation a load sample.
+    pub fn forget_incarnation(&mut self, incarnation: NodeIncarnation) {
+        self.nodes.remove(&incarnation);
+        self.shards.retain(|(owner, _, _), _| owner != &incarnation);
+    }
+
     pub fn node(&self, incarnation: NodeIncarnation) -> Option<&NodeLoadReport> {
         self.nodes.get(&incarnation)
     }

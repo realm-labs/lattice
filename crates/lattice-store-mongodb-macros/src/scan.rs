@@ -70,8 +70,16 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<TokenStream> {
         .collect::<Vec<_>>();
     let ident = &input.ident;
     let field_count = next_field_index;
+    let path_key_map_assertions = scan_fields
+        .iter()
+        .filter(|field| field.adapter.is_none() && is_path_key_map(field))
+        .filter_map(|field| field.serde.serialize_with_module.as_ref())
+        .map(|module| quote! { const _: () = #module::LATTICE_PATH_KEY_MAP_ADAPTER; })
+        .collect::<Vec<_>>();
 
     Ok(quote! {
+        #(#path_key_map_assertions)*
+
         impl #store::scan::MongoScan for #ident {
             fn capture(&self) -> Result<#store::scan::ScanSnapshot, #store::scan::ScanError> {
                 let mut snapshot = #store::scan::ScanSnapshot::empty();
@@ -282,6 +290,10 @@ fn validate_map_serializer(field: &ScanField) -> syn::Result<()> {
     ))
 }
 
+/// Recognizes `#[serde(with = "...path_key_map")]` by name only. The written
+/// path cannot be resolved here, so every acceptance is backed by a generated
+/// reference to `LATTICE_PATH_KEY_MAP_ADAPTER`, which fails to compile for a
+/// same-named module that encodes keys differently.
 fn is_path_key_map(field: &ScanField) -> bool {
     field
         .serde

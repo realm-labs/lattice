@@ -56,8 +56,15 @@ impl MongoPersistenceCoordinator {
             .documents
             .get(&key)
             .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
-        if state.conflict.is_none() {
-            return Err(PersistenceError::DocumentNotConflicted(key.clone()));
+        match state.conflict.as_ref().map(|conflict| conflict.kind) {
+            None => return Err(PersistenceError::DocumentNotConflicted(key.clone())),
+            Some(PersistenceConflictKind::Fenced { observed_epoch }) => {
+                return Err(PersistenceError::ActivationFenced {
+                    activation_epoch: self.activation_epoch,
+                    observed_epoch,
+                });
+            }
+            Some(_) => {}
         }
         let baseline = value.capture()?;
         self.documents.insert(
@@ -211,6 +218,18 @@ impl MongoPersistenceCoordinator {
         self.conflicts().next()
     }
 
+    /// Returns the highest activation epoch that storage reported while
+    /// refusing a write. Any value means a newer activation owns this state and
+    /// the actor must stop rather than reload and retry.
+    pub fn fenced_by_epoch(&self) -> Option<i64> {
+        self.conflicts()
+            .filter_map(|conflict| match conflict.kind {
+                PersistenceConflictKind::Fenced { observed_epoch } => Some(observed_epoch),
+                _ => None,
+            })
+            .max()
+    }
+
     pub fn conflicts(&self) -> impl Iterator<Item = &PersistenceConflict> {
         self.documents
             .values()
@@ -287,6 +306,7 @@ impl MongoPersistenceCoordinator {
             .saturating_add(report.conflicts as u64);
         self.retry_attempt = 0;
         self.retry_not_before = None;
+        self.retry_wakeup_armed = None;
         self.last_error = Some(reason);
         Ok(report)
     }

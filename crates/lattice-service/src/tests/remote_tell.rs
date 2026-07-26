@@ -24,8 +24,8 @@ use lattice_core::{
 use lattice_remoting::handshake::NodeIdentity;
 use tokio::sync::Notify;
 
-use super::{PROTOCOL_ID, node_config, unused_address};
-use crate::builder::LatticeService;
+use super::support::{PROTOCOL_ID, node_config};
+use crate::{builder::LatticeService, test_support::unused_address};
 
 #[derive(Debug, Clone, lattice_actor::Message)]
 struct FloodTell(u64);

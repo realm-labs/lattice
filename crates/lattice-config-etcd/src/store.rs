@@ -7,6 +7,7 @@ use std::fmt;
 use crate::client::{EtcdConfigClient, RealEtcdConfigClient};
 use crate::codec::{decode_value, encode_value, normalize_prefix};
 use crate::config::EtcdConfigStoreConfig;
+use crate::watch::{ConfigStalenessWatch, WATCH_TARGET};
 
 #[derive(Debug, Clone)]
 pub struct EtcdConfigStore {
@@ -28,12 +29,15 @@ impl EtcdConfigStore {
     ) -> Result<Self, ConfigStoreError> {
         let client = RealEtcdConfigClient::connect(config.endpoints, options).await?;
         Ok(Self {
-            inner: EtcdConfigStoreInner::new(client, config.key_prefix),
+            inner: EtcdConfigStoreInner::new(client, config.key_prefix)?,
         })
     }
 
-    pub async fn from_options(config: EtcdConfigStoreConfig) -> Result<Self, ConfigStoreError> {
-        Self::connect(config).await
+    pub async fn watch_with_staleness(
+        &self,
+        key: &str,
+    ) -> Result<(ConfigWatch, ConfigStalenessWatch), ConfigStoreError> {
+        self.inner.watch_with_staleness(key).await
     }
 }
 
@@ -68,15 +72,60 @@ impl<C> fmt::Debug for EtcdConfigStoreInner<C> {
 }
 
 impl<C> EtcdConfigStoreInner<C> {
-    pub(crate) fn new(client: C, key_prefix: impl Into<String>) -> Self {
-        Self {
+    pub(crate) fn new(client: C, key_prefix: impl Into<String>) -> Result<Self, ConfigStoreError> {
+        Ok(Self {
             client,
-            key_prefix: normalize_prefix(&key_prefix.into()),
-        }
+            key_prefix: normalize_prefix(&key_prefix.into())?,
+        })
     }
 
     pub(crate) fn storage_key(&self, key: &str) -> String {
         format!("{}/{}", self.key_prefix, key.trim_start_matches('/'))
+    }
+}
+
+impl<C> EtcdConfigStoreInner<C>
+where
+    C: EtcdConfigClient,
+{
+    pub(crate) async fn watch_with_staleness(
+        &self,
+        key: &str,
+    ) -> Result<(ConfigWatch, ConfigStalenessWatch), ConfigStoreError> {
+        let storage_key = self.storage_key(key);
+        let raw_watch = self.client.watch(&storage_key).await?;
+        let mut values = raw_watch.values;
+        let initial = values.borrow().as_deref().map(decode_value).transpose()?;
+        let (tx, watch) = ConfigWatch::channel(initial);
+
+        tokio::spawn(async move {
+            loop {
+                let changed = tokio::select! {
+                    () = tx.closed() => return,
+                    changed = values.changed() => changed,
+                };
+                if changed.is_err() {
+                    return;
+                }
+                let decoded = values.borrow().as_deref().map(decode_value).transpose();
+                match decoded {
+                    Ok(value) => {
+                        tx.send_replace(value);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: WATCH_TARGET,
+                            key = %storage_key,
+                            error = %error,
+                            "config watch update failed to decode; closing the watch",
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok((watch, ConfigStalenessWatch::new(raw_watch.staleness)))
     }
 }
 
@@ -99,24 +148,6 @@ where
     }
 
     async fn watch(&self, key: &str) -> Result<ConfigWatch, ConfigStoreError> {
-        let mut raw_watch = self.client.watch(&self.storage_key(key)).await?;
-        let initial = raw_watch
-            .borrow()
-            .as_deref()
-            .map(decode_value)
-            .transpose()?;
-        let (tx, watch) = ConfigWatch::channel(initial);
-
-        tokio::spawn(async move {
-            while raw_watch.changed().await.is_ok() {
-                let value = match raw_watch.borrow().as_deref().map(decode_value).transpose() {
-                    Ok(value) => value,
-                    Err(_) => break,
-                };
-                tx.send_replace(value);
-            }
-        });
-
-        Ok(watch)
+        Ok(self.watch_with_staleness(key).await?.0)
     }
 }

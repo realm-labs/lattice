@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 
 use super::pool::BlockPool;
-use super::{ActorEnvelope, EnvelopeFuture, MailboxLane};
+use super::{ActorEnvelope, EnvelopeFuture, MailboxLane, QueuedRejection};
 use crate::context::ActorContext;
 use crate::observation::RequestCompletion;
 use crate::traits::{Actor, MessageMetadata};
@@ -12,7 +12,7 @@ static ENVELOPE_POOL: BlockPool = BlockPool::new(8_192);
 
 struct EnvelopeVTable<A: Actor> {
     metadata: unsafe fn(*const u8, MailboxLane) -> MessageMetadata,
-    reject_panicked: unsafe fn(*mut u8) -> Option<RequestCompletion>,
+    reject: unsafe fn(*mut u8, QueuedRejection) -> Option<RequestCompletion>,
     handle: for<'a> unsafe fn(
         *mut u8,
         &'a mut A,
@@ -51,7 +51,7 @@ impl<A: Actor> PooledEnvelope<A> {
             pointer,
             vtable: EnvelopeVTable {
                 metadata: metadata::<A, T>,
-                reject_panicked: reject_panicked::<A, T>,
+                reject: reject::<A, T>,
                 handle: handle::<A, T>,
                 drop_and_recycle: drop_and_recycle::<A, T>,
             },
@@ -64,9 +64,9 @@ impl<A: Actor> PooledEnvelope<A> {
         unsafe { (self.vtable.metadata)(self.pointer.as_ptr(), lane) }
     }
 
-    pub(crate) fn reject_panicked(&mut self) -> Option<RequestCompletion> {
+    pub(crate) fn reject(&mut self, rejection: QueuedRejection) -> Option<RequestCompletion> {
         // SAFETY: `&mut self` guarantees exclusive access to the initialized value.
-        unsafe { (self.vtable.reject_panicked)(self.pointer.as_ptr()) }
+        unsafe { (self.vtable.reject)(self.pointer.as_ptr(), rejection) }
     }
 
     pub(crate) fn handle<'a>(
@@ -98,13 +98,13 @@ where
     unsafe { (&*pointer.cast::<T>()).metadata(lane) }
 }
 
-unsafe fn reject_panicked<A, T>(pointer: *mut u8) -> Option<RequestCompletion>
+unsafe fn reject<A, T>(pointer: *mut u8, rejection: QueuedRejection) -> Option<RequestCompletion>
 where
     A: Actor,
     T: ActorEnvelope<A>,
 {
     // SAFETY: guaranteed by `PooledEnvelope`'s construction and access invariants.
-    unsafe { (&mut *pointer.cast::<T>()).reject_panicked() }
+    unsafe { (&mut *pointer.cast::<T>()).reject(rejection) }
 }
 
 unsafe fn handle<'a, A, T>(

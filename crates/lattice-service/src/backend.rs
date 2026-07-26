@@ -504,6 +504,22 @@ pub(crate) struct ServiceInboundDispatch {
     pub admission: NodeAdmissionGate,
 }
 
+impl ServiceInboundDispatch {
+    fn admitted<E: FromClosedAdmission>(&self) -> Result<(), E> {
+        if self.admission.is_open() {
+            Ok(())
+        } else {
+            Err(E::closed_admission())
+        }
+    }
+
+    fn logical(&self) -> Result<&Arc<dyn LogicalRouter>, RemoteMessageError> {
+        self.logical
+            .as_ref()
+            .ok_or(RemoteMessageError::Unauthorized)
+    }
+}
+
 #[async_trait]
 impl InboundDispatch for ServiceInboundDispatch {
     fn try_tell_immediate(&self, tell: InboundTell) -> ImmediateTellDispatch {
@@ -520,9 +536,7 @@ impl InboundDispatch for ServiceInboundDispatch {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        if !self.admission.is_open() {
-            return Err(RemoteMessageError::Unauthorized);
-        }
+        self.admitted::<RemoteMessageError>()?;
         self.hosts
             .tell_wait(sender, target, message_id, payload)
             .await
@@ -535,9 +549,7 @@ impl InboundDispatch for ServiceInboundDispatch {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
-        if !self.admission.is_open() {
-            return Err(RemoteMessageError::Unauthorized);
-        }
+        self.admitted::<RemoteMessageError>()?;
         self.hosts.ask(target, message_id, payload, deadline).await
     }
 
@@ -548,12 +560,8 @@ impl InboundDispatch for ServiceInboundDispatch {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        if !self.admission.is_open() {
-            return Err(RemoteMessageError::Unauthorized);
-        }
-        self.logical
-            .as_ref()
-            .ok_or(RemoteMessageError::Unauthorized)?
+        self.admitted::<RemoteMessageError>()?;
+        self.logical()?
             .receive_entity_tell(sender, target, message_id, payload)
             .await
     }
@@ -565,12 +573,8 @@ impl InboundDispatch for ServiceInboundDispatch {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
-        if !self.admission.is_open() {
-            return Err(RemoteMessageError::Unauthorized);
-        }
-        self.logical
-            .as_ref()
-            .ok_or(RemoteMessageError::Unauthorized)?
+        self.admitted::<RemoteMessageError>()?;
+        self.logical()?
             .receive_entity_ask(target, message_id, payload, deadline)
             .await
     }
@@ -582,12 +586,8 @@ impl InboundDispatch for ServiceInboundDispatch {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        if !self.admission.is_open() {
-            return Err(RemoteMessageError::Unauthorized);
-        }
-        self.logical
-            .as_ref()
-            .ok_or(RemoteMessageError::Unauthorized)?
+        self.admitted::<RemoteMessageError>()?;
+        self.logical()?
             .receive_singleton_tell(sender, target, message_id, payload)
             .await
     }
@@ -599,12 +599,8 @@ impl InboundDispatch for ServiceInboundDispatch {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
-        if !self.admission.is_open() {
-            return Err(RemoteMessageError::Unauthorized);
-        }
-        self.logical
-            .as_ref()
-            .ok_or(RemoteMessageError::Unauthorized)?
+        self.admitted::<RemoteMessageError>()?;
+        self.logical()?
             .receive_singleton_ask(target, message_id, payload, deadline)
             .await
     }
@@ -625,7 +621,38 @@ pub(crate) struct ServiceRecipientBackend {
     pub admission: NodeAdmissionGate,
 }
 
+/// Maps a closed node admission gate onto each dispatch surface's error type.
+trait FromClosedAdmission {
+    fn closed_admission() -> Self;
+}
+
+impl FromClosedAdmission for RemoteMessageError {
+    fn closed_admission() -> Self {
+        RemoteMessageError::Unauthorized
+    }
+}
+
+impl FromClosedAdmission for TellError {
+    fn closed_admission() -> Self {
+        TellError::Remote(RemoteMessageError::Unauthorized)
+    }
+}
+
+impl FromClosedAdmission for AskError {
+    fn closed_admission() -> Self {
+        AskError::Protocol(RemoteMessageError::Unauthorized)
+    }
+}
+
 impl ServiceRecipientBackend {
+    fn admitted<E: FromClosedAdmission>(&self) -> Result<(), E> {
+        if self.admission.is_open() {
+            Ok(())
+        } else {
+            Err(E::closed_admission())
+        }
+    }
+
     fn is_local(&self, reference: &ActorRef) -> bool {
         reference.cluster_id() == &self.local_cluster
             && reference.node_address() == &self.local_address
@@ -756,9 +783,7 @@ impl RecipientBackend for ServiceRecipientBackend {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), TellError> {
-        if !self.admission.is_open() {
-            return Err(TellError::Remote(RemoteMessageError::Unauthorized));
-        }
+        self.admitted::<TellError>()?;
         match target {
             RecipientRef::Actor(reference) if self.is_local(&reference) => self
                 .hosts
@@ -793,9 +818,7 @@ impl RecipientBackend for ServiceRecipientBackend {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, AskError> {
-        if !self.admission.is_open() {
-            return Err(AskError::Protocol(RemoteMessageError::Unauthorized));
-        }
+        self.admitted::<AskError>()?;
         match target {
             RecipientRef::Actor(reference) if self.is_local(&reference) => self
                 .hosts

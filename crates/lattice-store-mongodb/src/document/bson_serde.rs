@@ -116,6 +116,14 @@ pub mod path_key_map {
 
     use super::{decode_path_key, encode_path_key};
 
+    /// Proves to `#[derive(MongoScan)]` that a `#[serde(with = "...")]` module
+    /// really is this adapter. The derive matches on the written path, which
+    /// cannot resolve imports, so it emits a reference to this item instead:
+    /// an unrelated module named `path_key_map` fails to compile rather than
+    /// silently bypassing the explicit-adapter requirement.
+    #[doc(hidden)]
+    pub const LATTICE_PATH_KEY_MAP_ADAPTER: () = ();
+
     pub fn serialize<S, C, K, V>(value: &C, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,

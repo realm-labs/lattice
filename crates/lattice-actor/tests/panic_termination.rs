@@ -776,3 +776,95 @@ async fn stop_parent_supervision_observes_panicked_child() {
         TerminatedReason::Stopped
     );
 }
+
+#[derive(lattice_actor::Message)]
+struct Hold {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[derive(lattice_actor::Message)]
+struct PrefetchCrash;
+
+impl Handler<Hold> for QueueActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut HandlerContext<'_, Self>,
+        message: Hold,
+    ) -> Result<(), ActorError> {
+        message.entered.add_permits(1);
+        message.release.acquire().await.unwrap().forget();
+        Ok(())
+    }
+}
+
+impl Handler<PrefetchCrash> for QueueActor {
+    async fn handle(
+        &mut self,
+        _ctx: &mut HandlerContext<'_, Self>,
+        _message: PrefetchCrash,
+    ) -> Result<(), ActorError> {
+        panic!("prefetched batch crashed")
+    }
+}
+
+#[tokio::test]
+async fn prefetched_ask_is_rejected_with_actor_panicked() {
+    let observer = RecordingObserver::default();
+    let runtime = ActorRuntime::new(ActorRuntimeConfig {
+        default_execution: ActorExecutionPolicy::TaskPerActor,
+        observer: ActorObserverHandle::new(observer.clone()),
+    });
+    let handle = runtime
+        .spawn_actor(QueueActor, ActorSpawnOptions::default())
+        .await
+        .unwrap();
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    handle
+        .tell(Hold {
+            entered: entered.clone(),
+            release: release.clone(),
+        })
+        .await
+        .unwrap();
+    entered.acquire().await.unwrap().forget();
+
+    // Both are admitted while the Actor is parked, so the next turn prefetches them into one
+    // batch and the ask is still owned by that batch when the panic unwinds.
+    handle.tell(PrefetchCrash).await.unwrap();
+    let ask = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.ask(QueuedRequest, TIMEOUT).await }
+    });
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            if observer
+                .snapshot()
+                .contains(&ObserverEvent::MessageEnqueued(type_name::<QueuedRequest>()))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    release.add_permits(1);
+
+    assert_eq!(ask.await.unwrap(), Err(ActorCallError::ActorPanicked));
+    assert_eq!(
+        observer
+            .snapshot()
+            .iter()
+            .filter(|event| {
+                **event
+                    == ObserverEvent::RequestCompleted(
+                        type_name::<QueuedRequest>(),
+                        RequestCompletion::ActorPanicked,
+                    )
+            })
+            .count(),
+        1
+    );
+}

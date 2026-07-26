@@ -15,4 +15,5 @@ lattice-core.workspace = true
 lattice-discovery.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 

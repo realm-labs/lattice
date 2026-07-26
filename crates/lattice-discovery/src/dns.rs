@@ -30,6 +30,10 @@ pub enum DnsMode {
 pub struct DnsDiscoveryConfig {
     pub scope: CoordinatorScope,
     pub mode: DnsMode,
+    /// The provider's base priority in the aggregate candidate order. SRV
+    /// records add their own RFC 2782 priority to it; host mode uses it
+    /// directly.
+    pub priority: u16,
     pub min_refresh: Duration,
     pub max_refresh: Duration,
     pub retry_delay: Duration,
@@ -108,17 +112,23 @@ impl CoordinatorDiscovery for DnsDiscovery {
             let mut emitted_initial = false;
             loop {
                 match resolve_once(self.resolver.as_ref(), &self.config).await {
-                    Ok((targets, ttl)) if !targets.is_empty() => {
+                    Ok(resolution) if !resolution.targets.is_empty() => {
                         generation += 1;
                         emitted_initial = true;
-                        yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets });
-                        tokio::time::sleep(ttl.clamp(self.config.min_refresh, self.config.max_refresh)).await;
+                        yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets: resolution.targets });
+                        for failure in resolution.failures {
+                            yield Err(failure);
+                        }
+                        tokio::time::sleep(resolution.ttl.clamp(self.config.min_refresh, self.config.max_refresh)).await;
                     }
-                    Ok(_) => {
+                    Ok(resolution) => {
                         if !emitted_initial {
                             generation += 1;
                             emitted_initial = true;
                             yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets: Vec::new() });
+                        }
+                        for failure in resolution.failures {
+                            yield Err(failure);
                         }
                         yield Err(provider_error("DNS lookup returned no reachable targets"));
                         tokio::time::sleep(self.config.retry_delay).await;
@@ -204,35 +214,56 @@ impl DnsResolver for HickoryDnsResolver {
     }
 }
 
+struct DnsResolution {
+    targets: Vec<DiscoveryTarget>,
+    ttl: Duration,
+    failures: Vec<DiscoveryError>,
+}
+
 async fn resolve_once(
     resolver: &dyn DnsResolver,
     config: &DnsDiscoveryConfig,
-) -> Result<(Vec<DiscoveryTarget>, Duration), DiscoveryError> {
+) -> Result<DnsResolution, DiscoveryError> {
     let mut targets = BTreeMap::<NodeAddress, DiscoveryTarget>::new();
+    let mut failures = Vec::new();
     let mut ttl = config.max_refresh;
     match &config.mode {
         DnsMode::Host { hostname, port } => {
             let lookup = resolver.lookup_ip(hostname).await.map_err(provider_error)?;
             ttl = ttl.min(lookup.ttl);
             for ip in lookup.records {
-                insert_dns_target(&mut targets, ip, *port, 0, hostname, hostname, 0)?;
+                insert_dns_target(
+                    &mut targets,
+                    ip,
+                    *port,
+                    config.priority,
+                    hostname,
+                    hostname,
+                    0,
+                )?;
             }
         }
         DnsMode::Srv { service } => {
             let lookup = resolver.lookup_srv(service).await.map_err(provider_error)?;
             ttl = ttl.min(lookup.ttl);
             for record in lookup.records {
-                let addresses = resolver
-                    .lookup_ip(&record.target)
-                    .await
-                    .map_err(provider_error)?;
+                let addresses = match resolver.lookup_ip(&record.target).await {
+                    Ok(addresses) => addresses,
+                    Err(error) => {
+                        failures.push(provider_error(format!(
+                            "SRV target {} of {service} did not resolve: {error}",
+                            record.target
+                        )));
+                        continue;
+                    }
+                };
                 ttl = ttl.min(addresses.ttl);
                 for ip in addresses.records {
                     insert_dns_target(
                         &mut targets,
                         ip,
                         record.port,
-                        record.priority,
+                        config.priority.saturating_add(record.priority),
                         service,
                         &record.target,
                         record.weight,
@@ -241,7 +272,11 @@ async fn resolve_once(
             }
         }
     }
-    Ok((targets.into_values().collect(), ttl))
+    Ok(DnsResolution {
+        targets: targets.into_values().collect(),
+        ttl,
+        failures,
+    })
 }
 
 fn insert_dns_target(

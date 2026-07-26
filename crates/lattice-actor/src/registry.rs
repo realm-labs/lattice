@@ -860,18 +860,25 @@ impl<A: Actor> ActorRegistry<A> {
 
         let result = match activate().await {
             Ok(actor) => {
-                let still_activating = self.entries.remove_if(&actor_id, |_, entry| {
-                    matches!(entry, RegistryEntry::Activating(existing) if Arc::ptr_eq(existing, &activation))
-                });
-                if still_activating.is_none() {
-                    return Err(ActorActivationError::ActivationFailed(ActorError::new(
+                let spawned = match self.entries.entry(actor_id.clone()) {
+                    Entry::Occupied(mut entry) if matches!(entry.get(), RegistryEntry::Activating(existing) if Arc::ptr_eq(existing, &activation)) => {
+                        match self.spawn_actor(actor_id.clone(), actor) {
+                            Ok(handle) => {
+                                entry.insert(RegistryEntry::Running(handle.clone()));
+                                Ok(handle)
+                            }
+                            Err(error) => {
+                                entry.remove();
+                                Err(ActorActivationError::ActivationFailed(error))
+                            }
+                        }
+                    }
+                    _ => Err(ActorActivationError::ActivationFailed(ActorError::new(
                         "actor registry entry removed during activation",
-                    )));
-                }
-                match self.spawn_actor(actor_id.clone(), actor) {
+                    ))),
+                };
+                match spawned {
                     Ok(handle) => {
-                        self.entries
-                            .insert(actor_id.clone(), RegistryEntry::Running(handle.clone()));
                         self.register_exact(&handle);
                         if handle.terminal_cleanup_started()
                             || is_terminal(handle.lifecycle_state())
@@ -880,7 +887,7 @@ impl<A: Actor> ActorRegistry<A> {
                         }
                         Ok(handle)
                     }
-                    Err(error) => Err(ActorActivationError::ActivationFailed(error)),
+                    Err(error) => Err(error),
                 }
             }
             Err(error) => {

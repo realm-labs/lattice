@@ -26,11 +26,8 @@ use lattice_core::{
 };
 use lattice_discovery::provider::CoordinatorDiscovery;
 use lattice_placement::{
-    authority::AuthorityEffect,
     control::{PlacementControlDirectory, PlacementControlEvent, PlacementControlRouter},
-    coordinator::{
-        LeaderRecord, MemberChange, MemberEvent, MemberHello, PlacementDomainHello, SingletonConfig,
-    },
+    coordinator::{LeaderRecord, MemberEvent, MemberHello, PlacementDomainHello, SingletonConfig},
     mapping::{ShardMapper, Xxh3V1ShardMapper},
     region::EntityConfig,
     runtime::{
@@ -1002,12 +999,24 @@ impl LatticeServiceBuilder {
         }));
         let (health_events, _) = watch::channel(health.lock().expect("health poisoned").clone());
         let lifecycle_driver = ProductionLifecycleDriver::new(
+            self.config.node_id.as_str(),
             lifecycle.clone(),
             lifecycle_events.clone(),
             health.clone(),
             health_events.clone(),
             admission,
         );
+        let failure_driver = lifecycle_driver.clone();
+        supervisor.on_task_failure(Arc::new(move || {
+            if matches!(
+                failure_driver.state(),
+                NodeLifecycleState::JoiningMembership
+                    | NodeLifecycleState::Ready
+                    | NodeLifecycleState::Draining
+            ) {
+                let _ = failure_driver.transition(ServiceLifecycleEvent::RuntimeTerminated);
+            }
+        }));
         let (membership_ready, _) = watch::channel(false);
         let membership_handle = Arc::new(Mutex::new(None));
         let join_runtimes = auto_join
@@ -1039,12 +1048,12 @@ impl LatticeServiceBuilder {
                     lifecycle: lifecycle.clone(),
                     lifecycle_driver: lifecycle_driver.clone(),
                     health: health.clone(),
-                    health_events: health_events.clone(),
                     logic_handles: logic_handles.clone(),
                     drain_ready: drain_ready.clone(),
                     drain_blockers: drain_blockers.clone(),
                     bootstrap_view: bootstrap_view.clone(),
                     membership_ready: membership_ready.subscribe(),
+                    supervisor: supervisor.clone(),
                 })
             })
             .collect::<Result<Vec<_>, ServiceError>>()?;
@@ -1069,7 +1078,6 @@ impl LatticeServiceBuilder {
                     lifecycle: lifecycle.clone(),
                     lifecycle_driver: lifecycle_driver.clone(),
                     health: health.clone(),
-                    health_events: health_events.clone(),
                     bootstrap_view: bootstrap_view.clone(),
                     ready: membership_ready,
                     handle: membership_handle.clone(),
@@ -1109,8 +1117,11 @@ impl LatticeServiceBuilder {
             drain_operation: Mutex::new(None),
             join_config: self.join_config,
             force_actor_shutdown: AtomicBool::new(false),
+            start_requested: AtomicBool::new(false),
         })
     }
 }
 
-include!("builder/service.rs");
+mod service;
+
+pub use service::LatticeService;

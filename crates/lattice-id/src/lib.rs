@@ -64,6 +64,32 @@
 //! to reacquire a worker ID in the background, and existing generator clones
 //! resume after it becomes active again. Reused worker IDs observe a clock-skew
 //! cooldown before generation is enabled.
+//!
+//! # Lifecycle and failure modes
+//!
+//! Lease deadlines are anchored at the instant each acquire or renew request is
+//! sent, so backend latency consumes the lease TTL rather than the safety
+//! margin. Generation also fails closed once that deadline passes even if the
+//! background task is never scheduled, so a starved or blocked runtime cannot
+//! keep an expired worker ID in service.
+//!
+//! If the background task itself stops (a panic, or an external abort), the
+//! service enters the terminal [`service::DistributedIdState::Failed`] state:
+//! generation and [`service::DistributedIdService::wait_until_active`] fail with
+//! [`service::DistributedIdError::RuntimeFailed`] instead of waiting for a
+//! reacquisition that will never happen. Recovery is the application's decision:
+//! call `shutdown` and start a new service.
+//!
+//! Dropping a [`service::DistributedIdService`] cannot release the lease,
+//! because releasing it is an async backend call. A dropped service only stops
+//! generation and aborts its background task; the worker ID slot stays occupied
+//! until the backend lease TTL expires. Call
+//! [`service::DistributedIdService::shutdown`] to return the slot immediately.
+//!
+//! [`service::DistributedIdGenerator::clock_regressions`] counts generation
+//! attempts rejected because the system clock moved backwards. A large NTP step
+//! backwards fails every generation until wall-clock time catches up; the
+//! counter and the accompanying error-level log identify that failure mode.
 
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 

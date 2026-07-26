@@ -28,6 +28,10 @@ impl PreparedExactTellEnvelope {
         }
     }
 
+    fn full(&self) -> &Arc<FrameEnvelope> {
+        &self.full
+    }
+
     fn frame(&self, compact: bool) -> &Arc<FrameEnvelope> {
         if compact {
             self.compact
@@ -111,7 +115,7 @@ pub(super) fn prepared_tell_frame(
     envelope: &PreparedExactTellEnvelope,
     message_id: u64,
     payload: Bytes,
-    compact: bool,
+    compact: Option<u64>,
 ) -> Frame {
     let mut metadata = [0_u8; INLINE_FRAME_SEGMENT_CAPACITY];
     let metadata_len = {
@@ -122,13 +126,17 @@ pub(super) fn prepared_tell_frame(
         }
         INLINE_FRAME_SEGMENT_CAPACITY - output.len()
     };
-    Frame::enveloped(
+    let frame = Frame::enveloped(
         FrameKind::Tell,
-        envelope.frame(compact).clone(),
+        envelope.frame(compact.is_some()).clone(),
         metadata,
         metadata_len,
         payload,
-    )
+    );
+    match compact {
+        Some(epoch) => frame.with_compact_expansion(envelope.full().clone(), epoch),
+        None => frame,
+    }
 }
 
 pub(super) fn prepared_tell_frame_len(
@@ -585,7 +593,7 @@ mod tests {
                 &PreparedExactTellEnvelope::new(&target, Some(&sender), None),
                 31,
                 payload.clone(),
-                false,
+                None,
             ),
             tell_frame(&target, Some(&sender), 31, payload.clone())
         );

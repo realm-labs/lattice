@@ -1,0 +1,11 @@
+error: Mongo collection can only be declared once
+ --> tests/ui/duplicate_collection_option.rs:5:31
+  |
+5 | #[mongo(collection = "first", collection = "second")]
+  |                               ^^^^^^^^^^
+
+error: Mongo conflict policy can only be declared once
+  --> tests/ui/duplicate_collection_option.rs:14:9
+   |
+14 | #[mongo(conflict = "quarantine")]
+   |         ^^^^^^^^

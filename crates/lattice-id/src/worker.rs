@@ -219,6 +219,9 @@ impl WorkerIdAcquisition {
 
 #[async_trait]
 pub trait WorkerIdLeaseStore: Send + Sync + 'static {
+    /// Claims a worker ID for `owner`. `ttl` is a request: a backend may grant a
+    /// different window, and the returned lease must report the window the
+    /// backend actually applied.
     async fn acquire(
         &self,
         owner: &WorkerIdOwner,
@@ -226,6 +229,11 @@ pub trait WorkerIdLeaseStore: Send + Sync + 'static {
         ttl: Duration,
     ) -> Result<WorkerIdAcquisition, WorkerIdStoreError>;
 
+    /// Extends `lease`, returning `Ok(None)` only when ownership is proven lost.
+    /// Transient backend problems must return `Err` so the caller can retry
+    /// inside its remaining safety window. `ttl` is a request that a backend may
+    /// ignore; the Etcd backend always resets keepalives to the TTL granted at
+    /// acquisition.
     async fn renew(
         &self,
         lease: &WorkerIdLease,

@@ -64,6 +64,7 @@ pub struct PlacementDomainLeaderConfig {
     pub member_lease_ttl: Duration,
     pub claim_ttl: Duration,
     pub renewal_interval: Duration,
+    pub member_heartbeat_interval: Duration,
     pub member_heartbeat_timeout: Duration,
     pub session_limits: SessionLimits,
     pub snapshot_limits: SnapshotLimits,
@@ -93,7 +94,8 @@ impl Default for PlacementDomainLeaderConfig {
             member_lease_ttl: Duration::from_secs(15),
             claim_ttl: Duration::from_secs(15),
             renewal_interval: Duration::from_secs(5),
-            member_heartbeat_timeout: Duration::from_secs(15),
+            member_heartbeat_interval: Duration::from_secs(5),
+            member_heartbeat_timeout: Duration::from_secs(25),
             session_limits: SessionLimits::default(),
             snapshot_limits: SnapshotLimits {
                 maximum_chunk_bytes: 192 * 1024,
@@ -132,10 +134,15 @@ impl PlacementDomainLeaderConfig {
             || self.member_lease_ttl.is_zero()
             || self.claim_ttl.is_zero()
             || self.renewal_interval.is_zero()
+            || self.member_heartbeat_interval.is_zero()
             || self.member_heartbeat_timeout.is_zero()
             || self.renewal_interval >= self.leader_lease_ttl
             || self.renewal_interval >= self.member_lease_ttl
             || self.renewal_interval >= self.claim_ttl
+            || self
+                .claim_ttl
+                .checked_add(self.member_heartbeat_interval)
+                .is_none_or(|floor| floor >= self.member_heartbeat_timeout)
             || self.maximum_sessions == 0
             || self.maximum_node_loads == 0
             || self.maximum_shard_loads == 0
@@ -160,6 +167,8 @@ impl PlacementDomainLeaderConfig {
     }
 }
 
+const UNOBSERVED_MEMBERSHIP_TERM: CoordinatorTerm = CoordinatorTerm::MIN;
+
 struct MemberSession {
     hello: PlacementDomainHello,
     record: MemberRecord,
@@ -170,6 +179,7 @@ struct MemberSession {
     last_heartbeat: Instant,
     applied_version: Option<PlacementVersion>,
     snapshot_version: Option<MembershipVersion>,
+    claims_reconciled: bool,
     draining: bool,
     drain_operation: Option<String>,
     drain_ready: bool,
@@ -237,6 +247,7 @@ struct ReconciliationState {
     last_success: Option<Instant>,
     quarantined: BTreeMap<String, String>,
     focused: bool,
+    focus: BTreeSet<PlacementSlotKey>,
 }
 
 enum CoordinatorOperation {
@@ -443,11 +454,13 @@ where
     leader: LeaderRecord,
     leader_guard: PlacementLeaderGuard,
     leader_lease_id: i64,
+    leader_lease_deadline: Instant,
     config: PlacementDomainLeaderConfig,
     membership_version: MembershipVersion,
     version: PlacementVersion,
     sessions: BTreeMap<NodeIncarnation, MemberSession>,
     claims: BTreeMap<PlacementSlotKey, ClaimLease>,
+    expiring_claims: BTreeMap<PlacementSlotKey, i64>,
     loads: LoadTable,
     plans: BTreeMap<u128, RebalancePlan>,
     handoffs: BTreeMap<PlacementSlotKey, HandoffMachine>,
@@ -530,9 +543,11 @@ where
             .await?
             .map(|leader| leader.term);
         let persisted_membership_term = store.get_leader_term(&membership_scope).await?;
+        // A placement term never orders membership. Without an observed membership authority the
+        // scope starts at the lowest valid term so the first real member record supersedes it.
         let membership_term = active_membership_term
             .or_else(|| CoordinatorTerm::new(persisted_membership_term).ok())
-            .unwrap_or(term);
+            .unwrap_or(UNOBSERVED_MEMBERSHIP_TERM);
         let slots = store.list_slots(&domain).await?;
         let entity_configs = store
             .list_entity_configs(&domain)
@@ -572,17 +587,20 @@ where
             .filter(|slot| slot.state == PlacementSlotState::Running)
             .map(|slot| (slot.key.clone(), MonotonicTime::from_millis(0)))
             .collect();
+        let leader_lease_deadline = Instant::now() + config.leader_lease_ttl;
         let mut leader = Self {
             store,
             associations,
             leader,
             leader_guard,
             leader_lease_id,
+            leader_lease_deadline,
             config,
             membership_version,
             version,
             sessions: BTreeMap::new(),
             claims: BTreeMap::new(),
+            expiring_claims: BTreeMap::new(),
             loads,
             plans,
             handoffs: BTreeMap::new(),

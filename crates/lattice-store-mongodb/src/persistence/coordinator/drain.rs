@@ -185,7 +185,6 @@ impl MongoPersistenceCoordinator {
             {
                 let remaining = self.drain_remaining(deadline, options.timeout)?;
                 if delay >= remaining {
-                    tokio::time::sleep(remaining).await;
                     return Err(self.drain_timeout(options.timeout));
                 }
                 tokio::time::sleep(delay).await;
@@ -548,6 +547,7 @@ mod tests {
             initial_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(1),
             max_exponent: 0,
+            jitter_percent: 0,
         };
         let (mut coordinator, mut documents) = fixture(retry_policy);
         documents.document.write().first = 10;
@@ -699,6 +699,7 @@ mod tests {
             initial_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(1),
             max_exponent: 0,
+            jitter_percent: 0,
         };
         let mut coordinator = MongoPersistenceCoordinator::with_retry_policy(10, retry_policy);
         let mut first = coordinator

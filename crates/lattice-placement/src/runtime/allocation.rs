@@ -6,11 +6,10 @@ use lattice_core::{
 };
 
 use super::{
-    AllocationRequest, BTreeMap, ClaimGrant, ClaimLease, CoordinatorLeaseStore,
-    CoordinatorRuntimeError, GrantSequence, HandoffMachine, LoadSample, MembershipStore,
-    MoveProgress, NodeKey, PlacedShard, PlacementControlCommand, PlacementDomainLeader,
-    PlacementDomainStore, PlacementNode, PlacementSlot, PlacementSlotKey, PlacementSlotState,
-    PlacementView, ScopedElectionStore, SingletonConfig, membership::send_control,
+    AllocationRequest, BTreeMap, ClaimGrant, CoordinatorLeaseStore, CoordinatorRuntimeError,
+    GrantSequence, HandoffMachine, LoadSample, MembershipStore, MoveProgress, NodeKey, PlacedShard,
+    PlacementDomainLeader, PlacementDomainStore, PlacementNode, PlacementSlot, PlacementSlotKey,
+    PlacementSlotState, PlacementView, ScopedElectionStore, SingletonConfig,
 };
 use crate::{
     storage::{
@@ -22,15 +21,31 @@ use crate::{
     types::{AssignmentGeneration, ShardId},
 };
 
+/// Singleton kinds share one eligibility set, so a plain node ordering would land every kind on the
+/// same node. The rank is a pure function of kind and node, so re-election reproduces it.
+fn singleton_placement_rank(kind: &SingletonKind, node: &NodeKey) -> [u8; 16] {
+    let mut input = Vec::new();
+    input.extend_from_slice(kind.as_str().as_bytes());
+    input.push(0);
+    input.extend_from_slice(node.node_id.as_bytes());
+    input.extend_from_slice(&node.incarnation.get().to_be_bytes());
+    let digest = blake3::hash(&input);
+    let mut rank = [0_u8; 16];
+    rank.copy_from_slice(&digest.as_bytes()[..16]);
+    rank
+}
+
 impl<S> PlacementDomainLeader<S>
 where
     S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
 {
+    /// Returns whether the resolution itself published the slot, so a caller only falls back to a
+    /// full snapshot when the requester was not already brought current by that delta.
     pub(super) async fn ensure_shard_allocated(
         &mut self,
         entity_type: EntityType,
         shard_id: ShardId,
-    ) -> Result<(), CoordinatorRuntimeError> {
+    ) -> Result<bool, CoordinatorRuntimeError> {
         let config = self
             .entity_configs
             .get(&entity_type)
@@ -46,10 +61,10 @@ where
         };
         if let Some(slot) = self.store.get_slot(&key).await? {
             return match slot.state {
-                PlacementSlotState::Allocating | PlacementSlotState::Running => Ok(()),
+                PlacementSlotState::Allocating | PlacementSlotState::Running => Ok(false),
                 PlacementSlotState::Fenced if slot.active_move.is_none() => {
                     if self.reinstall_fenced_authority(slot).await? {
-                        Ok(())
+                        Ok(true)
                     } else {
                         Err(CoordinatorRuntimeError::IneligibleTarget)
                     }
@@ -89,13 +104,14 @@ where
             active_move: None,
             barrier_sessions: Default::default(),
         };
-        self.persist_initial_allocation(slot).await
+        self.persist_initial_allocation(slot).await?;
+        Ok(true)
     }
 
     pub(super) async fn ensure_singleton_allocated(
         &mut self,
         kind: SingletonKind,
-    ) -> Result<(), CoordinatorRuntimeError> {
+    ) -> Result<bool, CoordinatorRuntimeError> {
         let config = self
             .singleton_configs
             .get(&kind)
@@ -107,10 +123,10 @@ where
         };
         if let Some(slot) = self.store.get_slot(&key).await? {
             return match slot.state {
-                PlacementSlotState::Allocating | PlacementSlotState::Running => Ok(()),
+                PlacementSlotState::Allocating | PlacementSlotState::Running => Ok(false),
                 PlacementSlotState::Fenced if slot.active_move.is_none() => {
                     if self.reinstall_fenced_authority(slot).await? {
-                        Ok(())
+                        Ok(true)
                     } else {
                         Err(CoordinatorRuntimeError::IneligibleTarget)
                     }
@@ -131,7 +147,8 @@ where
             active_move: None,
             barrier_sessions: Default::default(),
         };
-        self.persist_initial_allocation(slot).await
+        self.persist_initial_allocation(slot).await?;
+        Ok(true)
     }
 
     pub(super) fn select_singleton_target(
@@ -175,7 +192,11 @@ where
                         .any(|protocol| protocol.protocol_id == config.protocol_id)
             })
             .map(|session| session.hello.node.clone())
-            .min()
+            .min_by(|left, right| {
+                singleton_placement_rank(kind, left)
+                    .cmp(&singleton_placement_rank(kind, right))
+                    .then_with(|| left.cmp(right))
+            })
             .ok_or(CoordinatorRuntimeError::IneligibleTarget)
     }
 
@@ -306,30 +327,9 @@ where
         let leased_claim = committed.claim;
         lattice_core::failpoint::hit(Failpoint::InitialAuthorityAfterCommitBeforeEffect);
         self.version = slot.version.clone();
-        self.claims.insert(
-            slot.key.clone(),
-            ClaimLease {
-                lease_id: leased_claim.lease_id,
-                grant: leased_claim.grant.clone(),
-            },
-        );
+        self.remember_claim(leased_claim.lease_id, leased_claim.grant.clone());
         self.publish_slot_delta(&slot).await?;
-        let session = self
-            .sessions
-            .get(&owner.incarnation)
-            .filter(|session| session.hello.node == owner)
-            .ok_or(CoordinatorRuntimeError::UnknownSession)?;
-        let association = self
-            .associations
-            .get(&session.association)
-            .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-        send_control(
-            &association,
-            &self.version.domain,
-            self.version.term.get(),
-            PlacementControlCommand::ClaimGranted(leased_claim.grant),
-            &self.config,
-        )
+        self.grant_authority(&leased_claim.grant)
     }
 
     pub(super) async fn complete_initial_ready(

@@ -114,6 +114,38 @@ async fn config_store_absent_key_starts_empty_and_watch_populates() {
 }
 
 #[tokio::test]
+async fn config_store_reports_a_deleted_key_and_retains_its_targets() {
+    let store = RacingStore::new(
+        document(1, vec![("a", 7447, "node-a", 10)]),
+        document(2, vec![("b", 7448, "node-b", 20)]),
+    );
+    let discovery = ConfigStoreDiscovery::with_reconnect_delay(
+        scope(),
+        store.clone(),
+        "/discovery",
+        Duration::from_millis(1),
+    )
+    .unwrap();
+    let mut snapshots = discovery.snapshots();
+
+    snapshots.next().await.unwrap().unwrap();
+    snapshots.next().await.unwrap().unwrap();
+    store.tx.send_replace(None);
+
+    let deleted = tokio::time::timeout(Duration::from_secs(1), snapshots.next())
+        .await
+        .expect("a deleted key must be reported")
+        .unwrap();
+    assert!(matches!(deleted, Err(DiscoveryError::Provider { .. })));
+
+    store
+        .tx
+        .send_replace(Some(document(3, vec![("c", 7450, "node-c", 5)])));
+    let recovered = snapshots.next().await.unwrap().unwrap();
+    assert_eq!(recovered.targets[0].address.host(), "c");
+}
+
+#[tokio::test]
 async fn config_store_reconnects_after_closed_watch() {
     let store = ReconnectingStore::new(document(1, vec![("node-a", 7447, "node-a", 10)]));
     let discovery = ConfigStoreDiscovery::with_reconnect_delay(
@@ -214,11 +246,85 @@ async fn dns_srv_preserves_priority_weight_and_tls_server_name() {
     .unwrap();
     let snapshot = discovery.snapshots().next().await.unwrap().unwrap();
 
-    assert_eq!(snapshot.targets[0].priority, 12);
+    assert_eq!(snapshot.targets[0].priority, 42);
+    assert_eq!(
+        snapshot.targets[0].tls_server_name(),
+        Some("node-a.example")
+    );
     assert!(snapshot.targets[0].source.origins().any(|origin| matches!(
         origin,
         DiscoveryOrigin::Dns { server_name, weight: 9, .. } if server_name == "node-a.example"
     )));
+}
+
+#[tokio::test]
+async fn dns_host_mode_uses_the_configured_provider_priority() {
+    let resolver = FakeDnsResolver::new(
+        vec![Ok(DnsLookup {
+            records: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3))],
+            ttl: Duration::from_secs(30),
+        })],
+        Vec::new(),
+    );
+    let discovery = DnsDiscovery::with_resolver(
+        dns_config(DnsMode::Host {
+            hostname: "nodes.example".to_string(),
+            port: 7447,
+        }),
+        Arc::new(resolver),
+    )
+    .unwrap();
+    let snapshot = discovery.snapshots().next().await.unwrap().unwrap();
+
+    assert_eq!(snapshot.targets[0].priority, 30);
+    assert_eq!(snapshot.targets[0].tls_server_name(), Some("nodes.example"));
+}
+
+#[tokio::test]
+async fn dns_srv_publishes_healthy_targets_when_one_record_fails_to_resolve() {
+    let resolver = FakeDnsResolver::new(
+        vec![
+            Err("SERVFAIL".to_string()),
+            Ok(DnsLookup {
+                records: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8))],
+                ttl: Duration::from_secs(30),
+            }),
+        ],
+        vec![Ok(DnsLookup {
+            records: vec![
+                SrvRecord {
+                    target: "removed.example".to_string(),
+                    port: 7447,
+                    priority: 1,
+                    weight: 1,
+                },
+                SrvRecord {
+                    target: "live.example".to_string(),
+                    port: 7447,
+                    priority: 2,
+                    weight: 1,
+                },
+            ],
+            ttl: Duration::from_secs(20),
+        })],
+    );
+    let discovery = DnsDiscovery::with_resolver(
+        dns_config(DnsMode::Srv {
+            service: "_lattice._tcp.example".to_string(),
+        }),
+        Arc::new(resolver),
+    )
+    .unwrap();
+    let mut snapshots = discovery.snapshots();
+
+    let snapshot = snapshots.next().await.unwrap().unwrap();
+    assert_eq!(snapshot.targets.len(), 1);
+    assert_eq!(snapshot.targets[0].address.host(), "10.0.0.8");
+    assert_eq!(snapshot.targets[0].tls_server_name(), Some("live.example"));
+    assert!(matches!(
+        snapshots.next().await.unwrap(),
+        Err(DiscoveryError::Provider { .. })
+    ));
 }
 
 #[tokio::test]
@@ -274,6 +380,69 @@ async fn aggregate_deduplicates_merges_sources_and_rotates_equal_priority() {
         .map(|target| target.address.host())
         .collect::<Vec<_>>();
     assert_ne!(equal_priority_first, equal_priority_second);
+}
+
+#[tokio::test(start_paused = true)]
+async fn aggregate_bootstraps_from_answering_providers_after_the_grace() {
+    let ready = Arc::new(SequenceDiscovery::new(vec![Ok(
+        CoordinatorDirectorySnapshot {
+            scope: scope(),
+            generation: 1,
+            targets: vec![target("a", 7447, Some("node-a"), 10)],
+        },
+    )]));
+    let stalled = Arc::new(StalledDiscovery { scope: scope() });
+    let aggregate =
+        AggregateDiscovery::with_first_snapshot_grace(vec![ready, stalled], Duration::from_secs(2))
+            .unwrap();
+    let mut snapshots = aggregate.snapshots();
+
+    let snapshot = tokio::time::timeout(Duration::from_secs(30), snapshots.next())
+        .await
+        .expect("a stalled provider must not block bootstrap")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(snapshot.targets.len(), 1);
+    assert_eq!(snapshot.targets[0].address.host(), "a");
+}
+
+#[tokio::test]
+async fn aggregate_suppresses_snapshots_that_do_not_change_the_targets() {
+    let repeating = Arc::new(SequenceDiscovery::new(vec![
+        Ok(CoordinatorDirectorySnapshot {
+            scope: scope(),
+            generation: 1,
+            targets: vec![target("a", 7447, None, 10), target("b", 7447, None, 10)],
+        }),
+        Ok(CoordinatorDirectorySnapshot {
+            scope: scope(),
+            generation: 2,
+            targets: vec![target("b", 7447, None, 10), target("a", 7447, None, 10)],
+        }),
+    ]));
+    let aggregate = AggregateDiscovery::new(vec![repeating]).unwrap();
+    let values = aggregate.snapshots().collect::<Vec<_>>().await;
+
+    assert_eq!(values.iter().filter(|value| value.is_ok()).count(), 1);
+}
+
+#[derive(Clone)]
+struct StalledDiscovery {
+    scope: CoordinatorScope,
+}
+
+impl CoordinatorDiscovery for StalledDiscovery {
+    fn scope(&self) -> &CoordinatorScope {
+        &self.scope
+    }
+
+    fn snapshots(
+        &self,
+    ) -> Pin<Box<dyn Stream<Item = Result<CoordinatorDirectorySnapshot, DiscoveryError>> + Send + '_>>
+    {
+        Box::pin(futures_util::stream::pending())
+    }
 }
 
 #[derive(Clone)]
@@ -407,6 +576,7 @@ fn dns_config(mode: DnsMode) -> DnsDiscoveryConfig {
     DnsDiscoveryConfig {
         scope: scope(),
         mode,
+        priority: 30,
         min_refresh: Duration::from_secs(5),
         max_refresh: Duration::from_secs(30),
         retry_delay: Duration::from_secs(3),

@@ -1,123 +1,29 @@
 //! Reusable actor-local coordination for scanned MongoDB documents.
 
+mod completion;
 pub mod drain;
+mod flush;
+mod preparation;
 mod recovery;
+mod registration;
+mod retry;
+mod state;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use lattice_actor::context::PipeTaskHandle;
 
-use crate::document::tracked::Tracked;
-use crate::document::{LoadedDocument, LoadedDocumentMeta, LoadedScannedDocument};
-use crate::error::{MongoStoreError, MongoStoreErrorRecovery};
-use crate::scan::{MongoScan, ScanBudget, ScanCursor, ScanError, ScanSnapshot, ScanWorkMetrics};
+use crate::error::MongoStoreError;
+use crate::scan::{ScanBudget, ScanError, ScanWorkMetrics};
+
+use self::state::{DocumentPresence, DocumentRejection, DocumentState};
 
 use super::request::{
-    CreateMode, DocumentCommit, DocumentWriteOutcome, FlushGeneration, FlushOutcome, FlushRequest,
-    InFlightCommit, PreparedDocumentWrite, PreparedFlush, WriteToken,
+    DocumentCommit, FlushGeneration, InFlightCommit, PreparedDocumentWrite, PreparedFlush,
+    WriteToken,
 };
 use super::types::MongoDocumentKey;
-
-#[derive(Debug)]
-struct DocumentState {
-    baseline: ScanSnapshot,
-    cursor: ScanCursor,
-    acknowledged_mutation_epoch: Option<u64>,
-    scanning_mutation_epoch: Option<u64>,
-    scanning_changed: bool,
-    version: i64,
-    updated_at_ms: i64,
-    presence: DocumentPresence,
-    rejection: Option<DocumentRejection>,
-    conflict_policy: ConflictPolicy,
-    conflict: Option<PersistenceConflict>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DocumentPresence {
-    Persisted,
-    /// Created explicitly with `track_new`; the next scan must emit Create.
-    PendingCreate {
-        mode: CreateMode,
-    },
-    /// Missing in storage and represented by an in-memory default. It remains
-    /// write-free until a scan finds a real change from that default baseline.
-    Absent {
-        mode: CreateMode,
-    },
-}
-
-impl DocumentPresence {
-    fn pending_create_mode(self) -> Option<CreateMode> {
-        match self {
-            Self::PendingCreate { mode } => Some(mode),
-            Self::Persisted | Self::Absent { .. } => None,
-        }
-    }
-
-    fn absent_create_mode(self) -> Option<CreateMode> {
-        match self {
-            Self::Absent { mode } => Some(mode),
-            Self::Persisted | Self::PendingCreate { .. } => None,
-        }
-    }
-
-    fn is_pending_create(self) -> bool {
-        matches!(self, Self::PendingCreate { .. })
-    }
-}
-
-#[derive(Debug)]
-struct DocumentRejection {
-    mutation_epoch: Option<u64>,
-    error: String,
-}
-
-impl DocumentState {
-    fn needs_tracked_scan(&self, mutation_epoch: u64) -> bool {
-        self.acknowledged_mutation_epoch != Some(mutation_epoch)
-            || self.scanning_mutation_epoch.is_some()
-            || self.presence.is_pending_create()
-    }
-
-    fn scan_cursor(&self) -> ScanCursor {
-        self.cursor.clone()
-    }
-
-    fn sweep_is_current(&self, mutation_epoch: Option<u64>) -> bool {
-        mutation_epoch.is_none()
-            || self.scanning_mutation_epoch.is_none()
-            || self.scanning_mutation_epoch == mutation_epoch
-    }
-
-    fn apply_commit_metadata(
-        &mut self,
-        mutation_epoch: Option<u64>,
-        scan_complete: bool,
-        sweep_complete: bool,
-        changed: bool,
-    ) -> bool {
-        let Some(mutation_epoch) = mutation_epoch else {
-            return false;
-        };
-        let changed = self.scanning_changed || changed;
-        if scan_complete {
-            let false_positive =
-                self.acknowledged_mutation_epoch != Some(mutation_epoch) && !changed;
-            self.acknowledged_mutation_epoch = Some(mutation_epoch);
-            self.scanning_mutation_epoch = None;
-            self.scanning_changed = false;
-            false_positive
-        } else {
-            if sweep_complete || self.scanning_mutation_epoch.is_none() {
-                self.scanning_mutation_epoch = Some(mutation_epoch);
-            }
-            self.scanning_changed = changed;
-            false
-        }
-    }
-}
 
 /// Retry timing for failed persistence dispatches and document writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +31,10 @@ pub struct RetryPolicy {
     pub initial_delay: Duration,
     pub max_delay: Duration,
     pub max_exponent: u32,
+    /// Percentage of each backoff step that may be removed at random so that
+    /// actors recovering from one storage outage do not retry in lockstep.
+    /// Zero keeps the delay of every attempt exactly deterministic.
+    pub jitter_percent: u32,
 }
 
 impl Default for RetryPolicy {
@@ -133,16 +43,8 @@ impl Default for RetryPolicy {
             initial_delay: Duration::from_millis(50),
             max_delay: Duration::from_secs(2),
             max_exponent: 6,
+            jitter_percent: 50,
         }
-    }
-}
-
-impl RetryPolicy {
-    fn delay(self, attempt: u32) -> Duration {
-        let exponent = attempt.saturating_sub(1).min(self.max_exponent);
-        self.initial_delay
-            .saturating_mul(1_u32.checked_shl(exponent).unwrap_or(u32::MAX))
-            .min(self.max_delay)
     }
 }
 
@@ -173,6 +75,12 @@ pub enum PersistenceConflictKind {
     NotFound,
     /// A previously dispatched operation may or may not have reached MongoDB.
     OutcomeUnknown,
+    /// Storage refused the write because a strictly newer activation owns the
+    /// document. This activation has lost the entity and must stop writing;
+    /// it always blocks the coordinator regardless of [`ConflictPolicy`].
+    Fenced {
+        observed_epoch: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -240,7 +148,9 @@ pub struct MongoPersistenceCoordinator {
     last_error: Option<String>,
     retry_attempt: u32,
     retry_not_before: Option<Instant>,
+    retry_wakeup_armed: Option<Instant>,
     retry_policy: RetryPolicy,
+    retry_entropy: u64,
     counters: PersistenceCounters,
     scan_metrics: PersistenceScanMetrics,
 }
@@ -262,734 +172,12 @@ impl MongoPersistenceCoordinator {
             last_error: None,
             retry_attempt: 0,
             retry_not_before: None,
+            retry_wakeup_armed: None,
             retry_policy,
+            retry_entropy: uuid::Uuid::new_v4().as_u64_pair().0 | 1,
             counters: PersistenceCounters::default(),
             scan_metrics: PersistenceScanMetrics::default(),
         }
-    }
-
-    pub fn attach_loaded<D>(
-        &mut self,
-        value: &D,
-        meta: LoadedDocumentMeta,
-    ) -> Result<(), PersistenceError>
-    where
-        D: MongoScan,
-    {
-        self.attach(value, meta, None, DocumentPresence::Persisted)
-    }
-
-    pub fn attach_loaded_tracked<D>(
-        &mut self,
-        value: &D,
-        mutation_epoch: u64,
-        meta: LoadedDocumentMeta,
-    ) -> Result<(), PersistenceError>
-    where
-        D: MongoScan,
-    {
-        self.attach(
-            value,
-            meta,
-            Some(mutation_epoch),
-            DocumentPresence::Persisted,
-        )
-    }
-
-    pub fn track_loaded<D>(
-        &mut self,
-        loaded: LoadedDocument<D>,
-    ) -> Result<Tracked<D>, PersistenceError>
-    where
-        D: MongoScan,
-    {
-        let (value, meta) = loaded.split();
-        self.attach_loaded_tracked(&value, 0, meta)?;
-        Ok(Tracked::clean(value))
-    }
-
-    #[doc(hidden)]
-    pub fn track_loaded_scanned<D>(
-        &mut self,
-        loaded: LoadedScannedDocument<D>,
-    ) -> Result<Tracked<D>, PersistenceError>
-    where
-        D: MongoScan,
-    {
-        let (loaded, baseline) = loaded.into_parts();
-        let LoadedDocument {
-            version,
-            updated_at_ms,
-            value,
-        } = loaded;
-        let key = MongoDocumentKey::for_document::<D>(value.id())?;
-        if self.documents.contains_key(&key) {
-            return Err(PersistenceError::DuplicateDocument(key));
-        }
-        self.documents.insert(
-            key,
-            DocumentState {
-                baseline,
-                cursor: ScanCursor::default(),
-                acknowledged_mutation_epoch: Some(0),
-                scanning_mutation_epoch: None,
-                scanning_changed: false,
-                version,
-                updated_at_ms,
-                presence: DocumentPresence::Persisted,
-                rejection: None,
-                conflict_policy: D::CONFLICT_POLICY,
-                conflict: None,
-            },
-        );
-        Ok(Tracked::clean(value))
-    }
-
-    #[doc(hidden)]
-    pub fn track_loaded_scanned_many<D>(
-        &mut self,
-        loaded: Vec<LoadedScannedDocument<D>>,
-    ) -> Result<Vec<Tracked<D>>, PersistenceError>
-    where
-        D: MongoScan,
-    {
-        let mut keys = BTreeSet::new();
-        let mut pending = Vec::with_capacity(loaded.len());
-        for loaded in loaded {
-            let (loaded, baseline) = loaded.into_parts();
-            let LoadedDocument {
-                version,
-                updated_at_ms,
-                value,
-            } = loaded;
-            let key = MongoDocumentKey::for_document::<D>(value.id())?;
-            if self.documents.contains_key(&key) || !keys.insert(key.clone()) {
-                return Err(PersistenceError::DuplicateDocument(key));
-            }
-            pending.push((
-                key,
-                DocumentState {
-                    baseline,
-                    cursor: ScanCursor::default(),
-                    acknowledged_mutation_epoch: Some(0),
-                    scanning_mutation_epoch: None,
-                    scanning_changed: false,
-                    version,
-                    updated_at_ms,
-                    presence: DocumentPresence::Persisted,
-                    rejection: None,
-                    conflict_policy: D::CONFLICT_POLICY,
-                    conflict: None,
-                },
-                value,
-            ));
-        }
-        let mut tracked = Vec::with_capacity(pending.len());
-        for (key, state, value) in pending {
-            self.documents.insert(key, state);
-            tracked.push(Tracked::clean(value));
-        }
-        Ok(tracked)
-    }
-
-    /// Atomically registers a runtime-sized batch of loaded documents of one
-    /// type and returns actor-local tracked values in input order.
-    pub fn track_loaded_many<D>(
-        &mut self,
-        loaded: Vec<LoadedDocument<D>>,
-    ) -> Result<Vec<Tracked<D>>, PersistenceError>
-    where
-        D: MongoScan,
-    {
-        let mut pending = Vec::with_capacity(loaded.len());
-        let mut keys = BTreeSet::new();
-
-        for loaded in loaded {
-            let (value, meta) = loaded.split();
-            let key = MongoDocumentKey::for_document::<D>(value.id())?;
-            if self.documents.contains_key(&key) || !keys.insert(key.clone()) {
-                return Err(PersistenceError::DuplicateDocument(key));
-            }
-            pending.push((
-                key,
-                DocumentState {
-                    baseline: value.capture()?,
-                    cursor: ScanCursor::default(),
-                    acknowledged_mutation_epoch: Some(0),
-                    scanning_mutation_epoch: None,
-                    scanning_changed: false,
-                    version: meta.version,
-                    updated_at_ms: meta.updated_at_ms,
-                    presence: DocumentPresence::Persisted,
-                    rejection: None,
-                    conflict_policy: D::CONFLICT_POLICY,
-                    conflict: None,
-                },
-                value,
-            ));
-        }
-
-        let mut tracked = Vec::with_capacity(pending.len());
-        for (key, state, value) in pending {
-            self.documents.insert(key, state);
-            tracked.push(Tracked::clean(value));
-        }
-        Ok(tracked)
-    }
-
-    pub fn attach_new<D>(&mut self, value: &D, mode: CreateMode) -> Result<(), PersistenceError>
-    where
-        D: MongoScan,
-    {
-        self.attach(
-            value,
-            LoadedDocumentMeta {
-                version: 0,
-                updated_at_ms: 0,
-            },
-            None,
-            DocumentPresence::PendingCreate { mode },
-        )
-    }
-
-    pub fn track_new<D>(
-        &mut self,
-        value: D,
-        mode: CreateMode,
-    ) -> Result<Tracked<D>, PersistenceError>
-    where
-        D: MongoScan,
-    {
-        self.attach_new(&value, mode)?;
-        Ok(Tracked::clean(value))
-    }
-
-    /// Tracks a document known to be absent from storage using its current
-    /// value as the in-memory baseline. No Create is prepared until a real BSON
-    /// change from that baseline is found.
-    pub fn track_absent<D>(&mut self, value: D) -> Result<Tracked<D>, PersistenceError>
-    where
-        D: MongoScan,
-    {
-        self.attach(
-            &value,
-            LoadedDocumentMeta {
-                version: 0,
-                updated_at_ms: 0,
-            },
-            Some(0),
-            DocumentPresence::Absent {
-                mode: CreateMode::InsertOnly,
-            },
-        )?;
-        Ok(Tracked::clean(value))
-    }
-
-    fn attach<D>(
-        &mut self,
-        value: &D,
-        meta: LoadedDocumentMeta,
-        mutation_epoch: Option<u64>,
-        presence: DocumentPresence,
-    ) -> Result<(), PersistenceError>
-    where
-        D: MongoScan,
-    {
-        let key = MongoDocumentKey::for_document::<D>(value.id())?;
-        if self.documents.contains_key(&key) {
-            return Err(PersistenceError::DuplicateDocument(key));
-        }
-        self.documents.insert(
-            key,
-            DocumentState {
-                baseline: value.capture()?,
-                cursor: ScanCursor::default(),
-                acknowledged_mutation_epoch: mutation_epoch,
-                scanning_mutation_epoch: None,
-                scanning_changed: false,
-                version: meta.version,
-                updated_at_ms: meta.updated_at_ms,
-                presence,
-                rejection: None,
-                conflict_policy: D::CONFLICT_POLICY,
-                conflict: None,
-            },
-        );
-        Ok(())
-    }
-
-    /// Unregisters a document without deleting it from MongoDB.
-    pub fn detach<D>(&mut self, id: &D::Id) -> Result<(), PersistenceError>
-    where
-        D: MongoScan,
-    {
-        if self.in_flight.is_some() {
-            return Err(PersistenceError::FlushInFlight);
-        }
-        if self.has_blocking_conflict() {
-            return Err(PersistenceError::ConflictBlocked);
-        }
-        let key = MongoDocumentKey::for_document::<D>(id)?;
-        let document = self
-            .documents
-            .get(&key)
-            .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
-        if document.presence.is_pending_create() {
-            return Err(PersistenceError::CreatePending(key));
-        }
-        if document.conflict.is_some() {
-            return Err(PersistenceError::DocumentConflictPending(key));
-        }
-        if document.rejection.is_some() {
-            return Err(PersistenceError::DocumentRejectionPending(key));
-        }
-        self.documents.remove(&key);
-        self.clear_last_error_if_recovered();
-        Ok(())
-    }
-
-    /// Returns whether a tracked document is durably clean and can be
-    /// detached without losing actor-local state.
-    pub fn tracked_is_clean<D>(&self, tracked: &Tracked<D>) -> Result<bool, PersistenceError>
-    where
-        D: MongoScan,
-    {
-        let value = tracked.read();
-        let key = MongoDocumentKey::for_document::<D>(value.id())?;
-        let state = self
-            .documents
-            .get(&key)
-            .ok_or_else(|| PersistenceError::UnknownDocument(key.clone()))?;
-        let in_flight = self.in_flight.as_ref().is_some_and(|commit| {
-            commit
-                .document_commits
-                .values()
-                .chain(commit.clean_commits.iter())
-                .any(|document| document.key == key)
-        });
-        let conflicted = state.conflict.is_some();
-        Ok(!in_flight
-            && !conflicted
-            && !state.presence.is_pending_create()
-            && state.rejection.is_none()
-            && state.scanning_mutation_epoch.is_none()
-            && state.cursor == ScanCursor::default()
-            && state.acknowledged_mutation_epoch == Some(tracked.mutation_epoch()))
-    }
-
-    /// Detaches a tracked document only when its current mutation epoch has
-    /// already been acknowledged by storage.
-    pub fn detach_tracked_if_clean<D>(
-        &mut self,
-        tracked: &Tracked<D>,
-    ) -> Result<bool, PersistenceError>
-    where
-        D: MongoScan,
-    {
-        if !self.tracked_is_clean(tracked)? {
-            return Ok(false);
-        }
-        let key = MongoDocumentKey::for_document::<D>(tracked.read().id())?;
-        self.documents.remove(&key);
-        Ok(true)
-    }
-
-    /// Scans registered documents and prepares the next two-phase flush.
-    ///
-    /// A BSON encoding or diff error is isolated to the document that caused
-    /// it. The document keeps its acknowledged baseline, records a rejection,
-    /// and is retried after its tracked mutation epoch changes; other documents
-    /// visited in the same pass can still be flushed. Coordinator invariants
-    /// and errors returned directly by `visit` remain fail-fast.
-    pub fn prepare<F>(
-        &mut self,
-        budget: ScanBudget,
-        visit: F,
-    ) -> Result<PreparedFlush, PersistenceError>
-    where
-        F: FnOnce(&mut MongoPreparation<'_>) -> Result<(), PersistenceError>,
-    {
-        self.prepare_with_document_failure_mode(budget, visit, false)
-    }
-
-    fn prepare_with_document_failure_mode<F>(
-        &mut self,
-        budget: ScanBudget,
-        visit: F,
-        continue_after_document_failures: bool,
-    ) -> Result<PreparedFlush, PersistenceError>
-    where
-        F: FnOnce(&mut MongoPreparation<'_>) -> Result<(), PersistenceError>,
-    {
-        if self.in_flight.is_some() {
-            return Err(PersistenceError::FlushInFlight);
-        }
-        if !continue_after_document_failures && self.has_blocking_conflict() {
-            return Err(PersistenceError::ConflictBlocked);
-        }
-        if let Some(prepared) = &self.retry_pending {
-            return Ok(prepared.clone());
-        }
-        let generation = FlushGeneration {
-            activation_epoch: self.activation_epoch,
-            sequence: self.next_sequence,
-        };
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or(PersistenceError::GenerationOverflow)?;
-        let mut preparation = MongoPreparation::new(
-            &self.documents,
-            generation,
-            budget,
-            continue_after_document_failures,
-        );
-        visit(&mut preparation)?;
-        self.counters.scans = self.counters.scans.saturating_add(preparation.scans);
-        self.counters.changed_paths = self
-            .counters
-            .changed_paths
-            .saturating_add(preparation.changed_paths);
-        self.scan_metrics
-            .record_work(preparation.budget.work_metrics());
-        let (prepared, rejections) = preparation.finish();
-        if !rejections.is_empty() {
-            self.counters.failed_documents = self
-                .counters
-                .failed_documents
-                .saturating_add(rejections.len() as u64);
-            for (key, rejection) in rejections {
-                self.last_error = Some(rejection.error.clone());
-                self.documents
-                    .get_mut(&key)
-                    .ok_or_else(|| PersistenceError::UnknownDocument(key))?
-                    .rejection = Some(rejection);
-            }
-        }
-        Ok(prepared)
-    }
-
-    pub fn begin_flush(&mut self, commit: InFlightCommit) -> Result<(), PersistenceError> {
-        self.validate_generation(commit.generation)?;
-        if self.in_flight.is_some() {
-            return Err(PersistenceError::FlushInFlight);
-        }
-        debug_assert!(self.in_flight_task.is_none());
-        if self
-            .retry_pending
-            .as_ref()
-            .is_some_and(|pending| pending.commit.generation == commit.generation)
-        {
-            self.retry_pending = None;
-        }
-        self.in_flight = Some(commit);
-        Ok(())
-    }
-
-    pub(super) fn register_in_flight_task(
-        &mut self,
-        generation: FlushGeneration,
-        task: PipeTaskHandle,
-    ) -> Result<(), PersistenceError> {
-        let Some(expected) = self.in_flight.as_ref() else {
-            task.abort();
-            return Err(PersistenceError::NoFlushInFlight);
-        };
-        if expected.generation != generation {
-            task.abort();
-            return Err(PersistenceError::ForeignGeneration {
-                expected: expected.generation,
-                actual: generation,
-            });
-        }
-        self.in_flight_task = Some((generation, task));
-        Ok(())
-    }
-
-    pub fn complete_clean(
-        &mut self,
-        commit: InFlightCommit,
-    ) -> Result<PersistenceReport, PersistenceError> {
-        self.validate_generation(commit.generation)?;
-        if !commit.document_commits.is_empty() {
-            return Err(PersistenceError::ExpectedCleanCommit);
-        }
-        let mut report = PersistenceReport::default();
-        self.apply_clean_commits(commit.clean_commits, &mut report)?;
-        self.clear_last_error_if_recovered();
-        Ok(report)
-    }
-
-    pub fn complete(
-        &mut self,
-        generation: FlushGeneration,
-        outcome: FlushOutcome,
-    ) -> Result<PersistenceReport, PersistenceError> {
-        self.validate_generation(generation)?;
-        if self.abandoned_generations.contains(&generation) {
-            return Err(PersistenceError::AbandonedGeneration(generation));
-        }
-        let expected = self
-            .in_flight
-            .as_ref()
-            .ok_or(PersistenceError::NoFlushInFlight)?;
-        if expected.generation != generation {
-            return Err(PersistenceError::ForeignGeneration {
-                expected: expected.generation,
-                actual: generation,
-            });
-        }
-        let expected_tokens = expected
-            .document_commits
-            .keys()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let actual_tokens = outcome.documents.keys().copied().collect::<BTreeSet<_>>();
-        if expected_tokens != actual_tokens {
-            return Err(PersistenceError::OutcomeTokenMismatch);
-        }
-        for (token, commit) in &expected.document_commits {
-            let state = self
-                .documents
-                .get(&commit.key)
-                .ok_or_else(|| PersistenceError::UnknownDocument(commit.key.clone()))?;
-            if let DocumentWriteOutcome::Applied {
-                previous_version,
-                new_version,
-                ..
-            } = outcome.documents.get(token).expect("validated token set")
-                && (*previous_version != state.version || *new_version != state.version + 1)
-            {
-                return Err(PersistenceError::InvalidAppliedVersion(commit.key.clone()));
-            }
-        }
-
-        self.clear_in_flight_task(generation);
-        let commit = self.in_flight.take().expect("checked in-flight commit");
-        let InFlightCommit {
-            generation: _,
-            document_commits,
-            clean_commits,
-            mut writes,
-        } = commit;
-        let mut report = PersistenceReport::default();
-        self.apply_clean_commits(clean_commits, &mut report)?;
-        self.counters.attempted_documents = self
-            .counters
-            .attempted_documents
-            .saturating_add(document_commits.len() as u64);
-        let mut retry_commits = BTreeMap::new();
-        let mut retry_writes = BTreeMap::new();
-
-        for (token, mut document_commit) in document_commits {
-            let outcome = outcome.documents.get(&token).expect("validated token set");
-            let state = self
-                .documents
-                .get_mut(&document_commit.key)
-                .ok_or_else(|| PersistenceError::UnknownDocument(document_commit.key.clone()))?;
-            match outcome {
-                DocumentWriteOutcome::Applied {
-                    new_version,
-                    updated_at_ms,
-                    ..
-                } => {
-                    if let Some(baseline) = document_commit.replacement_baseline.take() {
-                        state.baseline = baseline;
-                        state.cursor = ScanCursor::default();
-                    } else {
-                        state.cursor = state.baseline.apply(document_commit.scan)?;
-                    }
-                    let false_positive = state.apply_commit_metadata(
-                        document_commit.mutation_epoch,
-                        document_commit.scan_complete,
-                        document_commit.sweep_complete,
-                        document_commit.changed,
-                    );
-                    if false_positive {
-                        self.scan_metrics.false_positive_scans =
-                            self.scan_metrics.false_positive_scans.saturating_add(1);
-                    }
-                    state.version = *new_version;
-                    state.updated_at_ms = *updated_at_ms;
-                    state.presence = DocumentPresence::Persisted;
-                    state.rejection = None;
-                    state.conflict = None;
-                    report.applied += 1;
-                    self.counters.applied_documents =
-                        self.counters.applied_documents.saturating_add(1);
-                }
-                DocumentWriteOutcome::VersionConflict { expected_version } => {
-                    state.conflict = Some(PersistenceConflict {
-                        key: document_commit.key,
-                        expected_version: *expected_version,
-                        kind: PersistenceConflictKind::VersionConflict,
-                        policy: state.conflict_policy,
-                    });
-                    report.conflicts += 1;
-                    self.counters.conflicts = self.counters.conflicts.saturating_add(1);
-                }
-                DocumentWriteOutcome::NotFound { expected_version } => {
-                    state.conflict = Some(PersistenceConflict {
-                        key: document_commit.key,
-                        expected_version: *expected_version,
-                        kind: PersistenceConflictKind::NotFound,
-                        policy: state.conflict_policy,
-                    });
-                    report.conflicts += 1;
-                    self.counters.conflicts = self.counters.conflicts.saturating_add(1);
-                }
-                DocumentWriteOutcome::Failed { error }
-                    if error.recovery() == MongoStoreErrorRecovery::ReprepareAfterMutation =>
-                {
-                    let error = error.to_string();
-                    self.last_error = Some(error.clone());
-                    state.rejection = Some(DocumentRejection {
-                        mutation_epoch: document_commit.mutation_epoch,
-                        error,
-                    });
-                    report.failed += 1;
-                    self.counters.failed_documents =
-                        self.counters.failed_documents.saturating_add(1);
-                }
-                DocumentWriteOutcome::Failed { error } => {
-                    self.last_error = Some(error.to_string());
-                    report.failed += 1;
-                    self.counters.failed_documents =
-                        self.counters.failed_documents.saturating_add(1);
-                    retry_writes.insert(
-                        token,
-                        writes
-                            .remove(&token)
-                            .expect("in-flight write matches commit"),
-                    );
-                    retry_commits.insert(token, document_commit);
-                }
-                DocumentWriteOutcome::NotAttempted => {
-                    self.last_error = Some("document write was not attempted".to_owned());
-                    report.failed += 1;
-                    self.counters.failed_documents =
-                        self.counters.failed_documents.saturating_add(1);
-                    retry_writes.insert(
-                        token,
-                        writes
-                            .remove(&token)
-                            .expect("in-flight write matches commit"),
-                    );
-                    retry_commits.insert(token, document_commit);
-                }
-            }
-        }
-        if !retry_commits.is_empty() {
-            let scan_complete = retry_commits
-                .values()
-                .all(|document| document.scan_complete);
-            let request_writes = retry_writes.values().cloned().collect();
-            self.retry_pending = Some(PreparedFlush {
-                request: Some(FlushRequest {
-                    generation,
-                    writes: request_writes,
-                }),
-                commit: InFlightCommit {
-                    generation,
-                    document_commits: retry_commits,
-                    clean_commits: Vec::new(),
-                    writes: retry_writes,
-                },
-                scan_complete,
-            });
-            self.schedule_retry();
-        } else {
-            self.retry_attempt = 0;
-            self.retry_not_before = None;
-            self.clear_last_error_if_recovered();
-        }
-        Ok(report)
-    }
-
-    pub fn dispatch_failed(
-        &mut self,
-        generation: FlushGeneration,
-        error: impl Into<String>,
-    ) -> Result<(), PersistenceError> {
-        self.validate_generation(generation)?;
-        if self.abandoned_generations.contains(&generation) {
-            return Err(PersistenceError::AbandonedGeneration(generation));
-        }
-        let expected = self
-            .in_flight
-            .as_ref()
-            .ok_or(PersistenceError::NoFlushInFlight)?;
-        if expected.generation != generation {
-            return Err(PersistenceError::ForeignGeneration {
-                expected: expected.generation,
-                actual: generation,
-            });
-        }
-        self.clear_in_flight_task(generation);
-        let commit = self.in_flight.take().expect("checked in-flight commit");
-        let writes = commit.writes.values().cloned().collect::<Vec<_>>();
-        let scan_complete = commit
-            .document_commits
-            .values()
-            .chain(commit.clean_commits.iter())
-            .all(|document| document.scan_complete);
-        self.retry_pending = Some(PreparedFlush {
-            request: (!writes.is_empty()).then_some(FlushRequest { generation, writes }),
-            commit,
-            scan_complete,
-        });
-        self.last_error = Some(error.into());
-        self.schedule_retry();
-        Ok(())
-    }
-
-    pub fn dispatch_rejected(
-        &mut self,
-        generation: FlushGeneration,
-        error: impl Into<String>,
-    ) -> Result<PersistenceReport, PersistenceError> {
-        self.validate_generation(generation)?;
-        if self.abandoned_generations.contains(&generation) {
-            return Err(PersistenceError::AbandonedGeneration(generation));
-        }
-        let expected = self
-            .in_flight
-            .as_ref()
-            .ok_or(PersistenceError::NoFlushInFlight)?;
-        if expected.generation != generation {
-            return Err(PersistenceError::ForeignGeneration {
-                expected: expected.generation,
-                actual: generation,
-            });
-        }
-        self.clear_in_flight_task(generation);
-        let commit = self.in_flight.take().expect("checked in-flight commit");
-        let error = error.into();
-        let mut report = PersistenceReport::default();
-        self.apply_clean_commits(commit.clean_commits, &mut report)?;
-        report.failed = commit.document_commits.len();
-        self.counters.attempted_documents = self
-            .counters
-            .attempted_documents
-            .saturating_add(commit.document_commits.len() as u64);
-        self.counters.failed_documents = self
-            .counters
-            .failed_documents
-            .saturating_add(commit.document_commits.len() as u64);
-        for document_commit in commit.document_commits.into_values() {
-            let state = self
-                .documents
-                .get_mut(&document_commit.key)
-                .ok_or_else(|| PersistenceError::UnknownDocument(document_commit.key.clone()))?;
-            state.rejection = Some(DocumentRejection {
-                mutation_epoch: document_commit.mutation_epoch,
-                error: error.clone(),
-            });
-        }
-        self.retry_attempt = 0;
-        self.retry_not_before = None;
-        self.last_error = Some(error);
-        Ok(report)
     }
 
     pub fn has_in_flight(&self) -> bool {
@@ -1015,15 +203,6 @@ impl MongoPersistenceCoordinator {
         self.last_error.as_deref()
     }
 
-    pub fn retry_delay(&self) -> Option<Duration> {
-        self.retry_not_before
-            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
-    }
-
-    pub const fn retry_attempt(&self) -> u32 {
-        self.retry_attempt
-    }
-
     pub const fn counters(&self) -> &PersistenceCounters {
         &self.counters
     }
@@ -1036,79 +215,6 @@ impl MongoPersistenceCoordinator {
         self.documents
             .get(key)
             .map(|state| (state.version, state.updated_at_ms))
-    }
-
-    fn take_in_flight_task(
-        &mut self,
-        generation: FlushGeneration,
-    ) -> Option<(FlushGeneration, PipeTaskHandle)> {
-        if self
-            .in_flight_task
-            .as_ref()
-            .is_some_and(|(registered, _)| *registered == generation)
-        {
-            self.in_flight_task.take()
-        } else {
-            None
-        }
-    }
-
-    fn clear_in_flight_task(&mut self, generation: FlushGeneration) {
-        drop(self.take_in_flight_task(generation));
-    }
-
-    pub(super) fn consume_abandoned_generation(&mut self, generation: FlushGeneration) -> bool {
-        self.abandoned_generations.remove(&generation)
-    }
-
-    fn schedule_retry(&mut self) {
-        self.retry_attempt = self.retry_attempt.saturating_add(1);
-        self.retry_not_before = Some(Instant::now() + self.retry_policy.delay(self.retry_attempt));
-    }
-
-    fn validate_generation(&self, generation: FlushGeneration) -> Result<(), PersistenceError> {
-        if generation.activation_epoch == self.activation_epoch {
-            Ok(())
-        } else {
-            Err(PersistenceError::StaleActivation {
-                expected: self.activation_epoch,
-                actual: generation.activation_epoch,
-            })
-        }
-    }
-
-    fn apply_clean_commits(
-        &mut self,
-        commits: Vec<DocumentCommit>,
-        report: &mut PersistenceReport,
-    ) -> Result<(), PersistenceError> {
-        for mut commit in commits {
-            let state = self
-                .documents
-                .get_mut(&commit.key)
-                .ok_or_else(|| PersistenceError::UnknownDocument(commit.key.clone()))?;
-            if let Some(baseline) = commit.replacement_baseline.take() {
-                state.baseline = baseline;
-                state.cursor = ScanCursor::default();
-            } else {
-                state.cursor = state.baseline.apply(commit.scan)?;
-            }
-            let false_positive = state.apply_commit_metadata(
-                commit.mutation_epoch,
-                commit.scan_complete,
-                commit.sweep_complete,
-                commit.changed,
-            );
-            if false_positive {
-                self.scan_metrics.false_positive_scans =
-                    self.scan_metrics.false_positive_scans.saturating_add(1);
-            }
-            if commit.scan_complete {
-                state.rejection = None;
-            }
-            report.clean += 1;
-        }
-        Ok(())
     }
 }
 
@@ -1127,8 +233,6 @@ pub struct MongoPreparation<'a> {
     scan_complete: bool,
     continue_after_document_failures: bool,
 }
-
-mod preparation;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PersistenceError {
@@ -1177,10 +281,19 @@ pub enum PersistenceError {
     DocumentNotRejected(MongoDocumentKey),
     #[error("document rejection must be resolved explicitly before detaching: {0:?}")]
     DocumentRejectionPending(MongoDocumentKey),
+    #[error("document write retry must be applied or aborted before detaching: {0:?}")]
+    DocumentRetryPending(MongoDocumentKey),
     #[error("persistence generation was explicitly abandoned: {0:?}")]
     AbandonedGeneration(FlushGeneration),
     #[error("stale activation epoch: expected {expected}, got {actual}")]
     StaleActivation { expected: u64, actual: u64 },
+    #[error(
+        "activation epoch {activation_epoch} was fenced by activation epoch {observed_epoch}; this activation must stop instead of reloading"
+    )]
+    ActivationFenced {
+        activation_epoch: u64,
+        observed_epoch: i64,
+    },
     #[error("foreign flush generation: expected {expected:?}, got {actual:?}")]
     ForeignGeneration {
         expected: FlushGeneration,

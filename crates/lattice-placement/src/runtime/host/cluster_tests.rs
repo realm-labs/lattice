@@ -5,11 +5,11 @@ use lattice_core::{
     coordinator::CoordinatorScope,
 };
 use lattice_remoting::{association::AssociationManager, config::RemotingConfig};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use super::{
     CoordinatorHost, CoordinatorHostConfig, CoordinatorHostScopeState, MembershipLeaderConfig,
-    PlacementDomainLeaderConfig,
+    PlacementDomainLeaderConfig, election::candidate_delay_duration,
 };
 use crate::{
     control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
@@ -54,6 +54,104 @@ fn config() -> CoordinatorHostConfig {
         renewal_interval: Duration::from_millis(50),
         ..CoordinatorHostConfig::default()
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn placement_domain_campaigns_run_concurrently_off_the_host_loop() {
+    let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
+    let holder = node("campaign-holder", 40, 33140);
+    let candidate = node("campaign-candidate", 41, 33141);
+    let domains = (0..16)
+        .map(|index| PlacementDomainId::new(format!("campaign-{index}")).unwrap())
+        .collect::<BTreeSet<_>>();
+    let config = CoordinatorHostConfig {
+        membership: MembershipLeaderConfig {
+            leader_lease_ttl: Duration::from_secs(30),
+            member_lease_ttl: Duration::from_secs(30),
+            renewal_interval: Duration::from_secs(5),
+            ..MembershipLeaderConfig::default()
+        },
+        placement: PlacementDomainLeaderConfig {
+            leader_lease_ttl: Duration::from_secs(30),
+            member_lease_ttl: Duration::from_secs(30),
+            claim_ttl: Duration::from_secs(15),
+            renewal_interval: Duration::from_secs(5),
+            ..PlacementDomainLeaderConfig::default()
+        },
+        maximum_candidate_jitter: Duration::from_millis(300),
+        ..CoordinatorHostConfig::default()
+    };
+    let delays = domains
+        .iter()
+        .map(|domain| {
+            candidate_delay_duration(
+                &CoordinatorScope::Placement(domain.clone()),
+                &candidate,
+                config.maximum_candidate_jitter,
+            )
+        })
+        .collect::<Vec<_>>();
+    let serialized = delays.iter().copied().sum::<Duration>();
+    let concurrent = delays.iter().copied().max().unwrap()
+        + candidate_delay_duration(
+            &CoordinatorScope::Membership,
+            &candidate,
+            config.maximum_candidate_jitter,
+        );
+    assert!(serialized > concurrent * 2);
+
+    let holder_host = CoordinatorHost::elect(
+        store.clone(),
+        associations(&holder),
+        holder,
+        domains.clone(),
+        config.clone(),
+    )
+    .await
+    .unwrap();
+    let candidate_host = CoordinatorHost::elect(
+        store.clone(),
+        associations(&candidate),
+        candidate,
+        domains.clone(),
+        config,
+    )
+    .await
+    .unwrap();
+    let mut scope_states = candidate_host.subscribe_scope_states();
+    for hosted in holder_host.domains.values() {
+        let lease = hosted.leader.as_ref().unwrap().leader_lease_id;
+        store.revoke_lease(lease).await.unwrap();
+    }
+
+    let (_controls, control_receiver) = mpsc::channel(8);
+    let (stop, stop_rx) = watch::channel(false);
+    let started = tokio::time::Instant::now();
+    let task = tokio::spawn(candidate_host.run(control_receiver, stop_rx));
+    loop {
+        let elected = scope_states
+            .borrow_and_update()
+            .iter()
+            .filter(|(scope, state)| {
+                matches!(scope, CoordinatorScope::Placement(_))
+                    && matches!(state, CoordinatorHostScopeState::Active(_))
+            })
+            .count();
+        if elected == domains.len() {
+            break;
+        }
+        scope_states.changed().await.unwrap();
+    }
+    let settled = started.elapsed();
+
+    assert!(
+        settled <= concurrent,
+        "{} campaigns took {settled:?}; concurrent campaigning bounds them by {concurrent:?} \
+         while serial campaigning costs {serialized:?}",
+        domains.len()
+    );
+    let _ = stop.send(true);
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

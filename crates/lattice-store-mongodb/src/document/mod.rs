@@ -12,6 +12,10 @@ use serde::de::DeserializeOwned;
 use crate::scan::{MongoScan, ScanSnapshot};
 
 pub(crate) const WRITE_ID_FIELD: &str = "_lattice_write_id";
+/// Highest activation epoch that has written this document. Coordinated writes
+/// filter on it so a superseded activation cannot mutate state a newer one has
+/// already claimed.
+pub(crate) const ACTIVATION_EPOCH_FIELD: &str = "_lattice_epoch";
 
 /// An identified business entity stored in one MongoDB collection.
 ///
@@ -176,6 +180,7 @@ where
     let version = take_i64(&mut document, "version")?;
     let updated_at_ms = take_i64(&mut document, "updated_at_ms")?;
     document.remove(WRITE_ID_FIELD);
+    document.remove(ACTIVATION_EPOCH_FIELD);
     if document.insert(D::ID_FIELD, id).is_some() {
         return Err(MongoStoreError::new(format!(
             "Mongo document body shadows identity field `{}`",
@@ -203,6 +208,7 @@ where
     let version = take_i64(&mut document, "version")?;
     let updated_at_ms = take_i64(&mut document, "updated_at_ms")?;
     document.remove(WRITE_ID_FIELD);
+    document.remove(ACTIVATION_EPOCH_FIELD);
     let baseline = D::capture_bson(&document)
         .map_err(|error| MongoStoreError::decode("capture Mongo scan baseline", error))?;
     if document.insert(D::ID_FIELD, id).is_some() {
@@ -224,7 +230,13 @@ where
 }
 
 fn reject_reserved_fields(document: &Document) -> Result<(), MongoStoreError> {
-    for field in ["_id", "version", "updated_at_ms", WRITE_ID_FIELD] {
+    for field in [
+        "_id",
+        "version",
+        "updated_at_ms",
+        WRITE_ID_FIELD,
+        ACTIVATION_EPOCH_FIELD,
+    ] {
         if document.contains_key(field) {
             return Err(MongoStoreError::new(format!(
                 "business document must not contain reserved storage field `{field}`"

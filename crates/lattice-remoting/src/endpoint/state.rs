@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     future::Future,
     sync::{Arc, Mutex, RwLock},
 };
@@ -13,11 +14,13 @@ use crate::{
     messaging::{inbound::InboundDispatch, outbound::OutboundMessaging},
     protocol::ProtocolDescriptor,
 };
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, broadcast, watch};
+use tokio::sync::{Semaphore, broadcast, watch};
 
 #[cfg(feature = "tls")]
 use super::EndpointSecurity;
-use super::{EndpointError, RemotingEndpoint, RemotingEndpointBuilder};
+use super::{
+    EndpointError, RemotingEndpoint, RemotingEndpointBuilder, diagnostics::AcceptDiagnostics,
+};
 
 impl RemotingEndpointBuilder {
     pub fn control_dispatch(mut self, control_dispatch: Arc<dyn ControlDispatch>) -> Self {
@@ -65,12 +68,13 @@ impl RemotingEndpointBuilder {
             control_dispatch: self.control_dispatch,
             catalogue: self.catalogue,
             connections: Arc::new(Semaphore::new(connection_limit)),
+            accept_diagnostics: AcceptDiagnostics::default(),
             shutdown_tx,
             disconnect_tx,
             tasks: Mutex::new(Vec::new()),
             #[cfg(feature = "tls")]
             security: self.security,
-            connect_lock: AsyncMutex::new(()),
+            connect_locks: Mutex::new(HashMap::new()),
             bootstrap_handler: RwLock::new(Arc::new(AcceptBootstrap)),
         })
     }
@@ -106,6 +110,14 @@ impl RemotingEndpoint {
             .required_socket_budget()
             .saturating_sub(1)
             .saturating_sub(self.connections.available_permits())
+    }
+
+    pub fn shed_connection_count(&self) -> u64 {
+        self.accept_diagnostics.connection_limit_rejections()
+    }
+
+    pub fn accept_failure_count(&self) -> u64 {
+        self.accept_diagnostics.accept_failures()
     }
 
     pub fn install_bootstrap_handler(&self, handler: Arc<dyn BootstrapHandler>) {

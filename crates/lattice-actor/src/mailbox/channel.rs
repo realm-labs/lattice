@@ -95,10 +95,30 @@ impl<T> Inner<T> {
     }
 
     fn wake_receiver(&self) {
-        // A blind swap is a locked RMW on x86 even while the receiver is actively draining.
-        // The receiver rechecks the queue after publishing this flag, so a false fast-path load
-        // cannot lose a wake-up.
-        if self.receiver_waiting.load(Ordering::Acquire)
+        // Sender and receiver run the store/load halves of a Dekker pattern over two different
+        // locations: this side pushes onto `queue` and then reads `receiver_waiting`, while
+        // `poll_recv` writes `receiver_waiting` and then rechecks `queue`. Release/Acquire alone
+        // permits both reads to miss both writes, which parks the receiver with a queued message
+        // and no pending wake-up. x86 only hides that because every RMW is a full barrier there;
+        // AArch64 does not, and the queue's internal ordering is not part of this module's
+        // contract.
+        //
+        // The sequentially consistent fence on each side is what forbids it. Let P be the poll
+        // that returns `Pending`. For any sender that reads `false` here, that `false` precedes
+        // P's `true` in the flag's modification order: the only writes after it are this swap,
+        // which consumes the flag and wakes, and `poll_recv`'s own reset, which P did not reach.
+        // Were this fence ordered after P's fence, the read would have had to observe P's `true`
+        // or later, so this fence precedes P's, and the push sequenced before it is therefore
+        // visible to the recheck sequenced after P's fence. Symmetrically, a receiver that misses
+        // the push must observe the flag as taken and wake.
+        //
+        // The remaining race is a wake-up that lands before `register` installs a waker.
+        // `AtomicWaker` resolves it internally: `register` observes the in-flight `WAKING` state
+        // and wakes its own task instead of parking.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        // The guard load only avoids a contended RMW while the receiver is draining; the fence
+        // above, not this load, carries the ordering.
+        if self.receiver_waiting.load(Ordering::Relaxed)
             && self.receiver_waiting.swap(false, Ordering::AcqRel)
         {
             self.receiver_waker.wake();
@@ -270,7 +290,11 @@ impl<T> Receiver<T> {
             return Poll::Ready(None);
         }
 
-        self.inner.receiver_waiting.store(true, Ordering::Release);
+        self.inner.receiver_waiting.store(true, Ordering::Relaxed);
+        // Pairs with the fence in `wake_receiver`: publishing the intent before the recheck below
+        // is what makes a concurrent sender either observe this flag or be observed by the
+        // recheck. See that function for the full argument.
+        std::sync::atomic::fence(Ordering::SeqCst);
         self.inner.receiver_waker.register(context.waker());
 
         if let Ok(value) = self.inner.queue.pop() {
@@ -458,6 +482,33 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1)).await;
         drop(sender);
         assert_eq!(waiting.await.unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn low_traffic_sends_always_wake_a_parked_receiver() {
+        // A one-slot channel forces the receiver to park between messages, which is the shape that
+        // loses a wake-up when the flag and the queue are not ordered against each other.
+        const MESSAGES: usize = 50_000;
+
+        let (sender, mut receiver) = channel::<usize>(1);
+        let producer = tokio::spawn(async move {
+            for value in 0..MESSAGES {
+                sender
+                    .reserve()
+                    .await
+                    .expect("receiver stays connected")
+                    .send(value);
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            for expected in 0..MESSAGES {
+                assert_eq!(receiver.recv().await, Some(expected));
+            }
+        })
+        .await
+        .expect("every send wakes the parked receiver");
+        producer.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

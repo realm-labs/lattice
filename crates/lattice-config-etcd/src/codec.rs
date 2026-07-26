@@ -10,18 +10,23 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<serde_json::Value, ConfigStor
     serde_json::from_slice(bytes).map_err(codec_error)
 }
 
-pub(crate) fn normalize_prefix(prefix: &str) -> String {
+pub(crate) fn normalize_prefix(prefix: &str) -> Result<String, ConfigStoreError> {
     let trimmed = prefix.trim_matches('/');
     if trimmed.is_empty() {
-        "/lattice/config".to_string()
-    } else {
-        format!("/{trimmed}")
+        return Err(backend_error(
+            "etcd config store key prefix must not be empty",
+        ));
     }
+    Ok(format!("/{trimmed}"))
 }
 
 pub(crate) fn etcd_error(error: etcd_client::Error) -> ConfigStoreError {
+    backend_error(error)
+}
+
+pub(crate) fn backend_error(message: impl Display) -> ConfigStoreError {
     ConfigStoreError::Backend {
-        message: error.to_string(),
+        message: message.to_string(),
     }
 }
 

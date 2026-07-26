@@ -15,8 +15,8 @@ pub enum EventBusError {
     Backend { reason: String },
     #[error("event bus backend does not support {operation}")]
     Unsupported { operation: &'static str },
-    #[error("event is missing actor routing field {field}")]
-    MissingActorTarget { field: &'static str },
+    #[error("invalid event bus configuration: {reason}")]
+    Config { reason: String },
     #[error("event actor delivery failed: {0}")]
     ActorDelivery(String),
 }

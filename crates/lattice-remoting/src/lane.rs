@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -18,26 +19,29 @@ use tokio::{
 use crate::{
     association::{Association, AssociationError, LaneKind},
     config::{ABSOLUTE_MAX_READY_READ_BATCH_FRAMES, ABSOLUTE_MAX_READY_WRITE_BATCH_FRAMES},
-    control::{
-        CommandId, ControlApply, ControlDispatch, ControlDispatchError, ReliableControlError,
-        control_ack_frame, decode_control_ack, decode_control_envelope,
-    },
+    control::{ControlDispatch, ControlDispatchError, ReliableControlError, decode_control_ack},
     messaging::{
         codec::{
             decode_ask_cached, decode_entity_ask, decode_entity_tell_cached, decode_failure,
             decode_reply, decode_singleton_ask, decode_singleton_tell_cached, decode_tell_cached,
-            failure_frame, reply_frame,
+            failure_frame,
         },
         error::{AskError, RemoteFailureCode, RemoteMessageError},
-        inbound::{InboundDispatch, dispatch_tell, failure_code},
+        inbound::{InboundDispatch, dispatch_tell},
         outbound::{OutboundMessaging, PreparedOutboundFrame},
-        target::{CorrelationId, InboundAsk, InboundEntityAsk, InboundSingletonAsk, RemoteFailure},
+        target::RemoteFailure,
         target_cache::ExactTargetCache,
         target_dictionary::ExactTargetDictionary,
     },
     transport::{FramedReader, FramedWriter, RemotingIo},
     wire::{Frame, FrameCodec, FrameKind, WireError},
 };
+
+mod ask;
+mod control;
+
+use ask::{InboundAskWork, dispatch_inbound_ask};
+use control::{ControlWorkerGuard, apply_control_frame, decode_lane_wake};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BidirectionalLaneConfig {
@@ -148,7 +152,7 @@ impl BidirectionalLane {
         let (hits, misses) = target_cache.take_metrics();
         self.association.record_exact_target_cache(hits, misses);
         self.association.detach(self.lane, self.connection_nonce);
-        if result.is_err() {
+        if self.lane.fails_pending_asks() && matches!(result, Err(_) | Ok(LaneExit::RemoteClose)) {
             self.services
                 .messaging
                 .fail_association(self.association.id());
@@ -187,6 +191,12 @@ where
         config.maximum_ready_write_batch_frames,
         config.maximum_coalesced_write_batch_bytes,
     );
+    let write_timeout = (lane == LaneKind::Control)
+        .then(|| config.heartbeat_interval * config.heartbeat_miss_limit);
+    let bulk_stripe = match lane {
+        LaneKind::Bulk(index) => Some(usize::from(index)),
+        _ => None,
+    };
     let mut asks = FuturesUnordered::new();
     let mut heartbeat = tokio::time::interval(config.heartbeat_interval);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -244,7 +254,14 @@ where
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    writer.flush().await?;
+                    if lane == LaneKind::Control {
+                        let _ = write_within(
+                            write_timeout,
+                            writer.write_frame(&Frame::new(FrameKind::Close, Bytes::new())),
+                        )
+                        .await;
+                    }
+                    write_within(write_timeout, writer.flush()).await?;
                     return Ok(LaneExit::Shutdown);
                 }
             }
@@ -259,7 +276,7 @@ where
                     return Err(LaneError::ControlWorkerClosed);
                 };
                 if let Some(frame) = completed? {
-                    writer.write_frame(&frame).await?;
+                    write_within(write_timeout, writer.write_frame(&frame)).await?;
                 }
             }
             _ = heartbeat.tick(), if lane == LaneKind::Control => {
@@ -268,9 +285,11 @@ where
                 {
                     return Err(LaneError::HeartbeatTimeout);
                 }
-                writer
-                    .write_frame(&Frame::new(FrameKind::Heartbeat, Bytes::new()))
-                    .await?;
+                write_within(
+                    write_timeout,
+                    writer.write_frame(&Frame::new(FrameKind::Heartbeat, Bytes::new())),
+                )
+                .await?;
             }
             completed = asks.next(), if !asks.is_empty() => {
                 let Some(completed) = completed else {
@@ -285,11 +304,13 @@ where
                     outbound_batch.push(completed?);
                 }
                 if outbound_batch.len() == 1 {
-                    writer.write_frame(&outbound_batch[0]).await?;
+                    write_within(write_timeout, writer.write_frame(&outbound_batch[0])).await?;
                 } else {
-                    writer
-                        .write_frames_with_commit(&outbound_batch, |_| {})
-                        .await?;
+                    write_within(
+                        write_timeout,
+                        writer.write_frames_with_commit(&outbound_batch, |_| {}),
+                    )
+                    .await?;
                 }
                 idle.as_mut().reset(
                     TokioInstant::now() + config.idle_data_connection_timeout
@@ -317,6 +338,9 @@ where
                 let mut reserved_bytes = 0;
                 for mut frame in outbound_candidates.drain(..) {
                     let frame_bytes = frame.payload_len();
+                    if let Some(stripe) = bulk_stripe {
+                        frame.expand_stale_compact_target(association.bulk_lane_epoch(stripe));
+                    }
                     let Some(prepared) =
                         messaging.prepare_outbound_for_socket_write(&mut frame)
                     else {
@@ -344,21 +368,25 @@ where
                 let frame_count = outbound_batch.len();
                 let result = if frame_count == 1 && !matches!(lane, LaneKind::Bulk(_)) {
                     let correlation = outbound_correlations[0];
-                    writer
-                        .write_frame_with_commit_outcome(&outbound_batch[0], || {
+                    write_within(
+                        write_timeout,
+                        writer.write_frame_with_commit_outcome(&outbound_batch[0], || {
                             if let Some(correlation) = correlation {
                                 messaging.mark_socket_write_started(correlation);
                             }
-                        })
-                        .await
+                        }),
+                    )
+                    .await
                 } else {
-                    writer
-                        .write_frames_with_commit(&outbound_batch, |index| {
+                    write_within(
+                        write_timeout,
+                        writer.write_frames_with_commit(&outbound_batch, |index| {
                             if let Some(correlation) = outbound_correlations[index] {
                                 messaging.mark_socket_write_started(correlation);
                             }
-                        })
-                        .await
+                        }),
+                    )
+                    .await
                 };
                 association.release_queued_bytes(reserved_bytes);
                 let outcome = result?;
@@ -377,29 +405,51 @@ where
                 );
                 match frame.kind {
                     FrameKind::Tell if matches!(lane, LaneKind::Bulk(_)) => {
-                        let tell = decode_tell_cached(&frame, target_cache, target_dictionary)?;
-                        let _ = dispatch_tell(dispatch.as_ref(), tell).await;
+                        match decode_tell_cached(&frame, target_cache, target_dictionary) {
+                            Ok(tell) => {
+                                let _ = dispatch_tell(dispatch.as_ref(), tell).await;
+                            }
+                            Err(_) => association.record_dropped_inbound_frame(),
+                        }
                     }
                     FrameKind::EntityTell if matches!(lane, LaneKind::Bulk(_)) => {
-                        let tell = decode_entity_tell_cached(&frame, target_cache)?;
-                        let _ = dispatch
-                            .tell_entity(tell.sender, tell.target, tell.message_id, tell.payload)
-                            .await;
+                        match decode_entity_tell_cached(&frame, target_cache) {
+                            Ok(tell) => {
+                                let _ = dispatch
+                                    .tell_entity(
+                                        tell.sender,
+                                        tell.target,
+                                        tell.message_id,
+                                        tell.payload,
+                                    )
+                                    .await;
+                            }
+                            Err(_) => association.record_dropped_inbound_frame(),
+                        }
                     }
                     FrameKind::SingletonTell if matches!(lane, LaneKind::Bulk(_)) => {
-                        let tell = decode_singleton_tell_cached(&frame, target_cache)?;
-                        let _ = dispatch
-                            .tell_singleton(tell.sender, tell.target, tell.message_id, tell.payload)
-                            .await;
+                        match decode_singleton_tell_cached(&frame, target_cache) {
+                            Ok(tell) => {
+                                let _ = dispatch
+                                    .tell_singleton(
+                                        tell.sender,
+                                        tell.target,
+                                        tell.message_id,
+                                        tell.payload,
+                                    )
+                                    .await;
+                            }
+                            Err(_) => association.record_dropped_inbound_frame(),
+                        }
                     }
                     FrameKind::Ask if lane == LaneKind::Interactive => {
                         let ask = decode_ask_cached(&frame, target_cache)?;
                         if asks.len() == config.maximum_concurrent_inbound_asks {
-                            writer.write_frame(&failure_frame(&RemoteFailure {
+                            write_within(write_timeout, writer.write_frame(&failure_frame(&RemoteFailure {
                                 correlation_id: ask.correlation_id,
                                 code: RemoteFailureCode::MailboxFull,
                                 safe_detail: None,
-                            })).await?;
+                            }))).await?;
                         } else {
                             asks.push(dispatch_inbound_ask(
                                 dispatch.clone(),
@@ -410,11 +460,11 @@ where
                     FrameKind::EntityAsk if lane == LaneKind::Interactive => {
                         let ask = decode_entity_ask(&frame)?;
                         if asks.len() == config.maximum_concurrent_inbound_asks {
-                            writer.write_frame(&failure_frame(&RemoteFailure {
+                            write_within(write_timeout, writer.write_frame(&failure_frame(&RemoteFailure {
                                 correlation_id: ask.correlation_id,
                                 code: RemoteFailureCode::MailboxFull,
                                 safe_detail: None,
-                            })).await?;
+                            }))).await?;
                         } else {
                             asks.push(dispatch_inbound_ask(
                                 dispatch.clone(),
@@ -425,11 +475,11 @@ where
                     FrameKind::SingletonAsk if lane == LaneKind::Interactive => {
                         let ask = decode_singleton_ask(&frame)?;
                         if asks.len() == config.maximum_concurrent_inbound_asks {
-                            writer.write_frame(&failure_frame(&RemoteFailure {
+                            write_within(write_timeout, writer.write_frame(&failure_frame(&RemoteFailure {
                                 correlation_id: ask.correlation_id,
                                 code: RemoteFailureCode::MailboxFull,
                                 safe_detail: None,
-                            })).await?;
+                            }))).await?;
                         } else {
                             asks.push(dispatch_inbound_ask(
                                 dispatch.clone(),
@@ -439,19 +489,25 @@ where
                     }
                     FrameKind::Reply if lane == LaneKind::Interactive => {
                         let (correlation, payload) = decode_reply(&frame)?;
-                        messaging.complete_reply(correlation, payload);
+                        if !messaging.complete_reply(correlation, payload) {
+                            association.record_discarded_reply();
+                        }
                     }
                     FrameKind::Failure if lane == LaneKind::Interactive => {
                         let failure = decode_failure(&frame)?;
-                        messaging.complete_failure(
+                        if !messaging.complete_failure(
                             failure.correlation_id,
                             AskError::Remote(failure.code),
-                        );
+                        ) {
+                            association.record_discarded_reply();
+                        }
                     }
                     FrameKind::Heartbeat if lane == LaneKind::Control => {
-                        writer
-                            .write_frame(&Frame::new(FrameKind::HeartbeatAck, Bytes::new()))
-                            .await?;
+                        write_within(
+                            write_timeout,
+                            writer.write_frame(&Frame::new(FrameKind::HeartbeatAck, Bytes::new())),
+                        )
+                        .await?;
                     }
                     FrameKind::HeartbeatAck if lane == LaneKind::Control => {}
                     FrameKind::ControlEnvelope if lane == LaneKind::Control => control_apply_tx
@@ -498,147 +554,24 @@ where
                     );
                     continue;
                 }
-                writer.flush().await?;
+                write_within(write_timeout, writer.flush()).await?;
                 return Ok(LaneExit::Idle);
             }
         }
     }
 }
 
-enum InboundAskWork {
-    Exact(InboundAsk),
-    Entity(InboundEntityAsk),
-    Singleton(InboundSingletonAsk),
-}
-
-async fn dispatch_inbound_ask(
-    dispatch: Arc<dyn InboundDispatch>,
-    work: InboundAskWork,
-) -> Result<Frame, RemoteMessageError> {
-    match work {
-        InboundAskWork::Exact(ask) => {
-            let deadline = Instant::now()
-                .checked_add(ask.timeout_budget)
-                .ok_or(RemoteMessageError::DeadlineExceeded)?;
-            let result = dispatch
-                .ask(ask.target, ask.message_id, ask.payload, deadline)
-                .await;
-            Ok(inbound_ask_response(ask.correlation_id, result))
-        }
-        InboundAskWork::Entity(ask) => {
-            let deadline = Instant::now()
-                .checked_add(ask.timeout_budget)
-                .ok_or(RemoteMessageError::DeadlineExceeded)?;
-            let result = dispatch
-                .ask_entity(ask.target, ask.message_id, ask.payload, deadline)
-                .await;
-            Ok(inbound_ask_response(ask.correlation_id, result))
-        }
-        InboundAskWork::Singleton(ask) => {
-            let deadline = Instant::now()
-                .checked_add(ask.timeout_budget)
-                .ok_or(RemoteMessageError::DeadlineExceeded)?;
-            let result = dispatch
-                .ask_singleton(ask.target, ask.message_id, ask.payload, deadline)
-                .await;
-            Ok(inbound_ask_response(ask.correlation_id, result))
-        }
+async fn write_within<T, F>(limit: Option<Duration>, write: F) -> Result<T, LaneError>
+where
+    F: Future<Output = Result<T, WireError>>,
+{
+    match limit {
+        Some(limit) => tokio::time::timeout(limit, write)
+            .await
+            .map_err(|_| LaneError::WriteTimeout)?
+            .map_err(LaneError::from),
+        None => write.await.map_err(LaneError::from),
     }
-}
-
-fn inbound_ask_response(
-    correlation_id: CorrelationId,
-    result: Result<Bytes, RemoteMessageError>,
-) -> Frame {
-    match result {
-        Ok(payload) => reply_frame(correlation_id, payload),
-        Err(error) => failure_frame(&RemoteFailure {
-            correlation_id,
-            code: failure_code(&error),
-            safe_detail: None,
-        }),
-    }
-}
-
-struct ControlWorkerGuard(tokio::task::JoinHandle<()>);
-
-impl Drop for ControlWorkerGuard {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-async fn apply_control_frame(
-    association: Arc<Association>,
-    control_dispatch: Arc<dyn ControlDispatch>,
-    frame: Frame,
-) -> Result<Option<Frame>, LaneError> {
-    match frame.kind {
-        FrameKind::ControlEnvelope => {
-            let envelope = decode_control_envelope(&frame)?;
-            match association.preview_control(&envelope) {
-                ControlApply::Apply(_) => {
-                    let result = control_dispatch
-                        .apply(
-                            association.key().clone(),
-                            envelope.command_id,
-                            envelope.payload.clone(),
-                        )
-                        .await;
-                    match result {
-                        Ok(()) | Err(ControlDispatchError::InvalidCommand) => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                    lattice_core::failpoint::hit(Failpoint::ControlAfterRemoteApplyBeforeAck);
-                    let ack = association.commit_control(envelope);
-                    Ok(Some(control_ack_frame(ack)))
-                }
-                ControlApply::Duplicate(anticipated) => {
-                    let ack = if association.current_control_ack().cumulative_sequence
-                        < anticipated.cumulative_sequence
-                    {
-                        association.commit_control(envelope)
-                    } else {
-                        anticipated
-                    };
-                    Ok(Some(control_ack_frame(ack)))
-                }
-                ControlApply::Gap(gap) => {
-                    control_dispatch
-                        .reconcile(association.key().clone(), Some(gap))
-                        .await?;
-                    Ok(None)
-                }
-                ControlApply::ReconcileEpoch => {
-                    control_dispatch
-                        .reconcile(association.key().clone(), None)
-                        .await?;
-                    Ok(None)
-                }
-            }
-        }
-        FrameKind::CoordinatorEvent => {
-            control_dispatch
-                .apply(
-                    association.key().clone(),
-                    CommandId::generate(),
-                    frame.into_payload(),
-                )
-                .await?;
-            Ok(None)
-        }
-        _ => Err(LaneError::UnexpectedControlWork),
-    }
-}
-
-fn decode_lane_wake(frame: &Frame) -> Result<LaneKind, LaneError> {
-    let [encoded] = frame.payload() else {
-        return Err(LaneError::InvalidLaneWake);
-    };
-    if *encoded == 0 {
-        return Ok(LaneKind::Interactive);
-    }
-    Ok(LaneKind::Bulk(encoded.saturating_sub(1)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -657,6 +590,8 @@ pub enum LaneError {
     InvalidLimit,
     #[error("control lane missed its bounded heartbeat window")]
     HeartbeatTimeout,
+    #[error("control lane socket write exceeded its bounded window")]
+    WriteTimeout,
     #[error("control apply worker stopped unexpectedly")]
     ControlWorkerClosed,
     #[error("control apply queue is full")]
@@ -688,229 +623,4 @@ impl From<WireError> for LaneError {
 }
 
 #[cfg(test)]
-mod tests {
-    use async_trait::async_trait;
-    use lattice_core::actor_ref::{
-        ActivationId, ActorPath, ActorRef, ClusterId, NodeAddress, NodeIncarnation, ProtocolId,
-    };
-    use tokio::net::{TcpListener, TcpStream};
-
-    use super::*;
-    use crate::{
-        association::{AssociationKey, LaneAttachment},
-        config::RemotingConfig,
-        control::RejectControlDispatch,
-        messaging::{
-            error::RemoteMessageError,
-            outbound::OutboundMessage,
-            target::{ExactActorTarget, SenderIdentity},
-        },
-        protocol::{ProtocolDescriptor, ProtocolFingerprint},
-    };
-
-    struct EchoDispatch {
-        delay: Duration,
-    }
-
-    #[async_trait]
-    impl InboundDispatch for EchoDispatch {
-        async fn tell(
-            &self,
-            _sender: Option<ActorRef>,
-            _target: ExactActorTarget,
-            _message_id: u64,
-            _payload: Bytes,
-        ) -> Result<(), RemoteMessageError> {
-            Ok(())
-        }
-
-        async fn ask(
-            &self,
-            _target: ExactActorTarget,
-            _message_id: u64,
-            payload: Bytes,
-            deadline: Instant,
-        ) -> Result<Bytes, RemoteMessageError> {
-            tokio::time::sleep(self.delay).await;
-            if Instant::now() >= deadline {
-                return Err(RemoteMessageError::DeadlineExceeded);
-            }
-            Ok(payload)
-        }
-    }
-
-    fn active_association(
-        local: NodeIncarnation,
-        remote: NodeIncarnation,
-        remote_address: NodeAddress,
-        protocol_id: ProtocolId,
-        fingerprint: ProtocolFingerprint,
-    ) -> Arc<Association> {
-        let key = AssociationKey {
-            cluster_id: ClusterId::new("lane-test").unwrap(),
-            local_incarnation: local,
-            remote_address,
-            remote_incarnation: remote,
-        };
-        let association =
-            Arc::new(Association::new(key.clone(), RemotingConfig::default()).unwrap());
-        for (lane, nonce) in [
-            (LaneKind::Control, 1),
-            (LaneKind::Interactive, 2),
-            (LaneKind::Bulk(0), 3),
-        ] {
-            association
-                .attach(LaneAttachment {
-                    association_id: association.id(),
-                    key: key.clone(),
-                    lane,
-                    connection_nonce: nonce,
-                })
-                .unwrap();
-        }
-        association
-            .install_peer_catalogue([ProtocolDescriptor {
-                protocol_id,
-                fingerprint,
-            }])
-            .unwrap();
-        association
-    }
-
-    #[tokio::test]
-    async fn interactive_lane_stays_awake_while_ask_is_in_flight() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socket = listener.local_addr().unwrap();
-        let client_incarnation = NodeIncarnation::new(1).unwrap();
-        let server_incarnation = NodeIncarnation::new(2).unwrap();
-        let protocol_id = ProtocolId::new(7).unwrap();
-        let fingerprint = ProtocolFingerprint::digest(b"lane-test/v1");
-        let server_address = NodeAddress::new("127.0.0.1", socket.port()).unwrap();
-        let client_address = NodeAddress::new("127.0.0.1", 25549).unwrap();
-        let client_association = active_association(
-            client_incarnation,
-            server_incarnation,
-            server_address.clone(),
-            protocol_id,
-            fingerprint,
-        );
-        let server_association = active_association(
-            server_incarnation,
-            client_incarnation,
-            client_address,
-            protocol_id,
-            fingerprint,
-        );
-        let mut client_receiver = client_association.take_receivers().unwrap().interactive;
-        let mut server_receiver = server_association.take_receivers().unwrap().interactive;
-        let client_messaging = Arc::new(OutboundMessaging::new(8).unwrap());
-        let server_messaging = Arc::new(OutboundMessaging::new(8).unwrap());
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut server_shutdown = shutdown_rx.clone();
-        let server_lane = {
-            let association = server_association.clone();
-            let messaging = server_messaging.clone();
-            tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                BidirectionalLane::new(
-                    association,
-                    LaneKind::Interactive,
-                    2,
-                    LaneServices::new(
-                        messaging,
-                        Arc::new(EchoDispatch {
-                            delay: Duration::from_millis(125),
-                        }),
-                        Arc::new(RejectControlDispatch),
-                    ),
-                    BidirectionalLaneConfig {
-                        maximum_frame_size: 4096,
-                        maximum_concurrent_inbound_asks: 8,
-                        heartbeat_interval: Duration::from_millis(100),
-                        heartbeat_miss_limit: 10,
-                        idle_data_connection_timeout: Duration::from_millis(25),
-                        maximum_cached_exact_targets: 8,
-                        socket_read_ahead_bytes: 1024,
-                        maximum_ready_write_batch_frames: 8,
-                        maximum_ready_read_batch_frames: 8,
-                        maximum_coalesced_write_batch_bytes: 4096,
-                        maximum_pending_control_applies: 8,
-                    },
-                )
-                .run(&mut server_receiver, stream, &mut server_shutdown)
-                .await
-            })
-        };
-        let stream = TcpStream::connect(socket).await.unwrap();
-        let mut client_shutdown = shutdown_rx;
-        let client_lane = {
-            let association = client_association.clone();
-            let messaging = client_messaging.clone();
-            tokio::spawn(async move {
-                BidirectionalLane::new(
-                    association,
-                    LaneKind::Interactive,
-                    2,
-                    LaneServices::new(
-                        messaging,
-                        Arc::new(EchoDispatch {
-                            delay: Duration::from_millis(125),
-                        }),
-                        Arc::new(RejectControlDispatch),
-                    ),
-                    BidirectionalLaneConfig {
-                        maximum_frame_size: 4096,
-                        maximum_concurrent_inbound_asks: 8,
-                        heartbeat_interval: Duration::from_millis(100),
-                        heartbeat_miss_limit: 10,
-                        idle_data_connection_timeout: Duration::from_millis(25),
-                        maximum_cached_exact_targets: 8,
-                        socket_read_ahead_bytes: 1024,
-                        maximum_ready_write_batch_frames: 8,
-                        maximum_ready_read_batch_frames: 8,
-                        maximum_coalesced_write_batch_bytes: 4096,
-                        maximum_pending_control_applies: 8,
-                    },
-                )
-                .run(&mut client_receiver, stream, &mut client_shutdown)
-                .await
-            })
-        };
-        let target = ActorRef::new(
-            ClusterId::new("lane-test").unwrap(),
-            server_address,
-            server_incarnation,
-            ActorPath::user(["user", "echo"]).unwrap(),
-            ActivationId::new(server_incarnation, 1).unwrap(),
-            protocol_id,
-        )
-        .unwrap();
-        let mut pending = JoinSet::new();
-        for index in 0_u8..8 {
-            let messaging = client_messaging.clone();
-            let association = client_association.clone();
-            let target = target.clone();
-            pending.spawn(async move {
-                let expected = Bytes::from(vec![index]);
-                let reply = messaging
-                    .ask(
-                        &association,
-                        &SenderIdentity::Process(9),
-                        &target,
-                        OutboundMessage::new(fingerprint, u64::from(index) + 1, expected.clone()),
-                        Instant::now() + Duration::from_secs(1),
-                    )
-                    .await
-                    .unwrap();
-                (reply, expected)
-            });
-        }
-        while let Some(completed) = pending.join_next().await {
-            let (reply, expected) = completed.unwrap();
-            assert_eq!(reply, expected);
-        }
-        shutdown_tx.send(true).unwrap();
-        assert_eq!(client_lane.await.unwrap().unwrap(), LaneExit::Shutdown);
-        assert_eq!(server_lane.await.unwrap().unwrap(), LaneExit::Shutdown);
-    }
-}
+mod tests;

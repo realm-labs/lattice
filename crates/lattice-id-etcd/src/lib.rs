@@ -28,6 +28,19 @@
 //! native Etcd leases, while history keys deliberately remain so a later owner
 //! applies the reuse cooldown. Fencing tokens are redacted from `Debug`; do not
 //! expose them through application logging.
+//!
+//! # Request cost
+//!
+//! Etcd decides the lease window: a granted TTL below the server's minimum
+//! (1.5 times the election timeout) is raised, and every keepalive resets the
+//! lease to that granted TTL. The `ttl` argument of
+//! [`lattice_id::worker::WorkerIdLeaseStore::renew`] therefore has no effect on
+//! this backend, and the returned lease always reports the granted window.
+//!
+//! One renewal costs four round trips: a fenced slot read, a keepalive stream,
+//! the keepalive exchange, and a second fenced slot read that proves the slot
+//! was not taken during the renewal. Size `renew_interval` accordingly for large
+//! clusters that share one Etcd cluster.
 
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 

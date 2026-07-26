@@ -101,10 +101,17 @@ enum FramePayload {
 #[derive(Debug, Clone)]
 struct SegmentedPayload {
     envelope: Arc<FrameEnvelope>,
+    expansion: Option<CompactExpansion>,
     inline: [u8; INLINE_FRAME_SEGMENT_CAPACITY],
     inline_len: u8,
     body: Bytes,
     len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CompactExpansion {
+    lane_epoch: u64,
+    envelope: Arc<FrameEnvelope>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +152,7 @@ impl Frame {
             kind,
             payload: FramePayload::Segmented(SegmentedPayload {
                 envelope,
+                expansion: None,
                 inline,
                 inline_len: inline_len as u8,
                 body,
@@ -152,6 +160,39 @@ impl Frame {
             }),
             coalesced: OnceLock::new(),
         }
+    }
+
+    /// Binds a compact frame to the lane epoch whose peer dictionary registered it.
+    pub(crate) fn with_compact_expansion(
+        mut self,
+        envelope: Arc<FrameEnvelope>,
+        epoch: u64,
+    ) -> Self {
+        if let FramePayload::Segmented(payload) = &mut self.payload {
+            payload.expansion = Some(CompactExpansion {
+                lane_epoch: epoch,
+                envelope,
+            });
+        }
+        self
+    }
+
+    /// Restores the full target envelope when the frame was compacted for an older lane epoch.
+    pub(crate) fn expand_stale_compact_target(&mut self, epoch: u64) -> bool {
+        let FramePayload::Segmented(payload) = &mut self.payload else {
+            return false;
+        };
+        let Some(expansion) = payload.expansion.take() else {
+            return false;
+        };
+        if expansion.lane_epoch == epoch {
+            payload.expansion = Some(expansion);
+            return false;
+        }
+        payload.len = payload.len - payload.envelope.len() + expansion.envelope.len();
+        payload.envelope = expansion.envelope;
+        self.coalesced = OnceLock::new();
+        true
     }
 
     pub fn encode_message<M: Message>(kind: FrameKind, message: &M) -> Self {

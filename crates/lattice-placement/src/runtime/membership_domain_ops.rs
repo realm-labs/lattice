@@ -178,7 +178,7 @@ where
     pub(super) async fn remove_member(
         &mut self,
         member: MemberRecord,
-        _reason: MemberRemovalReason,
+        reason: MemberRemovalReason,
     ) -> Result<(), CoordinatorRuntimeError> {
         if let Some(domain_member) = self
             .store
@@ -201,33 +201,48 @@ where
                     .await?,
             );
         }
-        self.finish_member_removal(member).await
+        self.finish_member_removal(member, reason).await
     }
 
     pub(super) async fn finish_member_removal(
         &mut self,
         member: MemberRecord,
+        reason: MemberRemovalReason,
     ) -> Result<(), CoordinatorRuntimeError> {
-        self.finish_node_removal(member.node).await
+        self.finish_node_removal(member.node, reason).await
     }
 
-    async fn finish_node_removal(&mut self, node: NodeKey) -> Result<(), CoordinatorRuntimeError> {
+    /// Only a removal reason that proves the owner stopped may revoke its claim leases. Timeout,
+    /// operator force removal, and incarnation replacement leave the lease to expire on its own so
+    /// that a missing claim record stays an independent fencing proof rather than a leader-authored
+    /// one.
+    async fn finish_node_removal(
+        &mut self,
+        node: NodeKey,
+        reason: MemberRemovalReason,
+    ) -> Result<(), CoordinatorRuntimeError> {
         let incarnation = node.incarnation;
         self.sessions.remove(&incarnation);
-        let expired_claims = self
+        self.loads.forget_incarnation(incarnation);
+        self.node_load_received.remove(&incarnation);
+        self.shard_load_received
+            .retain(|(owner, _, _), _| owner != &incarnation);
+        let owned_claims = self
             .claims
             .iter()
             .filter_map(|(key, claim)| {
-                (claim.grant.owner.incarnation == incarnation).then_some((
-                    key.clone(),
-                    claim.lease_id,
-                    claim.grant.clone(),
-                ))
+                (claim.grant.owner.incarnation == incarnation)
+                    .then_some((key.clone(), claim.lease_id))
             })
             .collect::<Vec<_>>();
-        for (key, claim_lease, _grant) in expired_claims {
-            self.store.revoke_lease(claim_lease).await?;
+        for (key, claim_lease) in owned_claims {
             self.claims.remove(&key);
+            if revokes_claim_leases_on_removal(reason) {
+                self.expiring_claims.remove(&key);
+                self.store.revoke_lease(claim_lease).await?;
+            } else {
+                self.expiring_claims.insert(key, claim_lease);
+            }
         }
         let barriers = self
             .handoffs
@@ -292,7 +307,7 @@ where
     async fn remove_global_member_participation(
         &mut self,
         node: NodeKey,
-        _reason: MemberRemovalReason,
+        reason: MemberRemovalReason,
     ) -> Result<(), CoordinatorRuntimeError> {
         let Some(domain_member) = self
             .store
@@ -317,7 +332,7 @@ where
                 .get_placement_revision(&self.version.domain)
                 .await?,
         );
-        self.finish_node_removal(node).await
+        self.finish_node_removal(node, reason).await
     }
 
     pub(super) async fn resume_handoffs_for(
@@ -467,12 +482,14 @@ where
         Ok(())
     }
 
+    /// A member acknowledges every delta, so this full authority sweep runs once per session as it
+    /// first reaches the leader's revision. Later adoption is the periodic reconciliation pass's
+    /// job, and later grants replay from the renewal tick.
     pub(super) async fn reconcile_claims_for(
         &mut self,
         hello: &PlacementDomainHello,
     ) -> Result<(), CoordinatorRuntimeError> {
-        let association = self
-            .sessions
+        self.sessions
             .get(&hello.node.incarnation)
             .and_then(|session| self.associations.get(&session.association))
             .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
@@ -546,20 +563,11 @@ where
             };
             let lease_id = committed.claim.lease_id;
             let grant = committed.claim.grant;
-            self.claims.insert(
-                slot.key.clone(),
-                ClaimLease {
-                    lease_id,
-                    grant: grant.clone(),
-                },
-            );
-            send_control(
-                &association,
-                &self.version.domain,
-                self.version.term.get(),
-                PlacementControlCommand::ClaimGranted(grant),
-                &self.config,
-            )?;
+            self.remember_claim(lease_id, grant.clone());
+            self.grant_authority(&grant)?;
+        }
+        if let Some(session) = self.sessions.get_mut(&hello.node.incarnation) {
+            session.claims_reconciled = true;
         }
         Ok(())
     }
