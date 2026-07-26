@@ -294,7 +294,7 @@ where
                 lease_id,
             },
         };
-        lattice_core::failpoint::hit(Failpoint::AuthorityBeforeGuardedCommit);
+        super::guarded_commit_failpoint(Failpoint::AuthorityBeforeGuardedCommit)?;
         let committed = match self
             .store
             .allocate_initial(&self.leader_guard, request)
@@ -325,7 +325,7 @@ where
         };
         let slot = committed.slot;
         let leased_claim = committed.claim;
-        lattice_core::failpoint::hit(Failpoint::InitialAuthorityAfterCommitBeforeEffect);
+        super::post_commit_failpoint(Failpoint::InitialAuthorityAfterCommitBeforeEffect)?;
         self.version = slot.version.clone();
         self.remember_claim(leased_claim.lease_id, leased_claim.grant.clone());
         self.publish_slot_delta(&slot).await?;

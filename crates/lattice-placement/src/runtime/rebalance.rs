@@ -156,8 +156,8 @@ where
             .await?;
         let plan = committed.plan;
         let slot = committed.slot;
-        lattice_core::failpoint::hit(Failpoint::RebalanceAfterReservationBeforeHandoff);
-        lattice_core::failpoint::hit(Failpoint::HandoffAfterBeginPersist);
+        super::post_commit_failpoint(Failpoint::RebalanceAfterReservationBeforeHandoff)?;
+        super::post_commit_failpoint(Failpoint::HandoffAfterBeginPersist)?;
         self.version = barrier_version.clone();
         let mut handoff = HandoffMachine::begin(
             key.clone(),
@@ -173,7 +173,7 @@ where
         self.plans.insert(plan_id, plan);
         self.handoffs.insert(key.clone(), handoff);
         self.publish_slot_delta(&slot).await?;
-        lattice_core::failpoint::hit(Failpoint::HandoffAfterPartialBarrier);
+        super::post_commit_failpoint(Failpoint::HandoffAfterPartialBarrier)?;
         Box::pin(self.apply_handoff_effects(key, effects)).await
     }
 
@@ -181,7 +181,9 @@ where
         &self,
         slot: &PlacementSlot,
     ) -> Result<(), CoordinatorRuntimeError> {
-        lattice_core::failpoint::hit(Failpoint::CoordinatorAfterEtcdCommitBeforeDelta);
+        if super::dropped_by_failpoint(Failpoint::CoordinatorAfterEtcdCommitBeforeDelta) {
+            return Ok(());
+        }
         let record = SnapshotRecord {
             key: slot_record_key(&slot.key),
             value: Bytes::from(
@@ -296,18 +298,19 @@ where
                 .associations
                 .get(&session.association)
                 .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-            send_control(
-                &association,
-                &self.version.domain,
-                self.version.term.get(),
-                PlacementControlCommand::DrainSlot {
-                    slot: key.clone(),
-                    generation,
-                    version: slot.version.clone(),
-                },
-                &self.config,
-            )?;
-            lattice_core::failpoint::hit(Failpoint::HandoffAfterDrainSend);
+            if !super::dropped_by_failpoint(Failpoint::HandoffAfterDrainSend) {
+                send_control(
+                    &association,
+                    &self.version.domain,
+                    self.version.term.get(),
+                    PlacementControlCommand::DrainSlot {
+                        slot: key.clone(),
+                        generation,
+                        version: slot.version.clone(),
+                    },
+                    &self.config,
+                )?;
+            }
         }
         let recovery = self
             .plans
@@ -372,7 +375,7 @@ where
             .await?
             .ok_or(CoordinatorRuntimeError::UnknownSlot)?;
         if slot.state != PlacementSlotState::Fenced {
-            lattice_core::failpoint::hit(Failpoint::HandoffAfterShardDrainedBeforeClaimRevoke);
+            super::guarded_commit_failpoint(Failpoint::HandoffAfterShardDrainedBeforeClaimRevoke)?;
             let old_claim = self.store.get_claim(key).await?;
             if let Some(old_claim) = &old_claim
                 && (old_claim.grant.owner != handoff.source
@@ -405,7 +408,7 @@ where
                 )
                 .await?
                 .slot;
-            lattice_core::failpoint::hit(Failpoint::FenceAuthorityAfterCommitBeforeEffect);
+            super::post_commit_failpoint(Failpoint::FenceAuthorityAfterCommitBeforeEffect)?;
             self.version = slot.version.clone();
             let old_lease = self.release_claim(key).map(|claim| claim.lease_id);
             self.publish_slot_delta(&slot).await?;
@@ -476,11 +479,11 @@ where
         let slot = committed.slot;
         let leased_claim = committed.claim;
         self.version = slot.version.clone();
-        lattice_core::failpoint::hit(Failpoint::HandoffAfterNewClaimBeforeGrantSend);
+        super::post_commit_failpoint(Failpoint::HandoffAfterNewClaimBeforeGrantSend)?;
         self.remember_claim(leased_claim.lease_id, leased_claim.grant.clone());
         self.publish_slot_delta(&slot).await?;
         self.grant_authority(&leased_claim.grant)?;
-        lattice_core::failpoint::hit(Failpoint::HandoffAfterGrantBeforeShardReady);
+        super::post_commit_failpoint(Failpoint::HandoffAfterGrantBeforeShardReady)?;
         let effects = self
             .handoffs
             .get_mut(key)
@@ -569,7 +572,7 @@ where
                 .await?;
             (committed.slot, None)
         };
-        lattice_core::failpoint::hit(Failpoint::HandoffAfterActivePersistBeforeDelta);
+        super::post_commit_failpoint(Failpoint::HandoffAfterActivePersistBeforeDelta)?;
         self.version = slot.version.clone();
         self.slot_assigned_at.insert(key.clone(), self.now());
         self.handoffs.remove(key);

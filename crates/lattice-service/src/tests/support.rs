@@ -1,6 +1,6 @@
 //! Fixtures shared by the `lattice-service` node-level test modules.
 
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -16,9 +16,18 @@ use lattice_actor::{
 use lattice_core::actor_ref::{
     ClusterId, EntityType, NodeAddress, NodeIncarnation, PlacementDomainId,
 };
+use lattice_placement::{
+    control::{DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlRouter},
+    runtime::{
+        PlacementDomainLeaderConfig,
+        host::{CoordinatorHost, CoordinatorHostConfig},
+    },
+    storage::InMemoryPlacementStore,
+    types::NodeKey,
+};
 use lattice_remoting::config::RemotingConfig;
 
-use crate::{config::NodeConfig, registration::EntityOptions};
+use crate::{builder::LatticeService, config::NodeConfig, registration::EntityOptions};
 
 pub(super) const PROTOCOL_ID: u64 = 0x7465_7374_0000_0001;
 
@@ -155,4 +164,65 @@ pub(super) fn node_config(
         maximum_supervised_tasks: 32,
         shutdown_timeout: Duration::from_secs(2),
     }
+}
+
+pub(super) async fn coordinator_service(
+    store: Arc<InMemoryPlacementStore>,
+    cluster_id: ClusterId,
+    node_id: &str,
+    address: NodeAddress,
+    incarnation: NodeIncarnation,
+    _term: u64,
+) -> LatticeService {
+    coordinator_service_for_domains(
+        store,
+        cluster_id,
+        node_id,
+        address,
+        incarnation,
+        BTreeSet::from([placement_domain()]),
+    )
+    .await
+}
+
+pub(super) async fn coordinator_service_for_domains(
+    store: Arc<InMemoryPlacementStore>,
+    cluster_id: ClusterId,
+    node_id: &str,
+    address: NodeAddress,
+    incarnation: NodeIncarnation,
+    domains: BTreeSet<PlacementDomainId>,
+) -> LatticeService {
+    let builder = LatticeService::builder(node_config(
+        cluster_id,
+        node_id,
+        address.clone(),
+        incarnation,
+    ))
+    .unwrap();
+    let host = CoordinatorHost::elect(
+        store,
+        builder.association_manager(),
+        NodeKey {
+            node_id: node_id.to_string(),
+            address,
+            incarnation,
+        },
+        domains,
+        CoordinatorHostConfig {
+            placement: PlacementDomainLeaderConfig {
+                renewal_interval: Duration::from_millis(100),
+                ..PlacementDomainLeaderConfig::default()
+            },
+            ..CoordinatorHostConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (control, controls) =
+        PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
+    builder
+        .coordinator_host(Arc::new(control), host, controls)
+        .build()
+        .unwrap()
 }

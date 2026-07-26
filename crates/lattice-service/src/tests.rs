@@ -1,5 +1,6 @@
 //! Node-level integration tests for `lattice-service`, grouped by the behaviour under test.
 
+mod admission;
 mod membership;
 mod node_lifecycle;
 mod remote_routing;

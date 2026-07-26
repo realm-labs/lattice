@@ -4,8 +4,29 @@ use lattice_core::failpoint::Failpoint;
 
 const PRODUCTION_CRATES: [&str; 3] = ["lattice-remoting", "lattice-placement", "lattice-service"];
 
-const DECISION_CAPABLE: [&str; 2] = [
+/// Every entry is a production call site that turns an injected decision into an outcome the
+/// caller can observe: a refused commit, an unknown outcome after the commit landed, or a control
+/// command that never leaves the coordinator. A call site that only announces the boundary belongs
+/// nowhere on this list.
+const DECISION_CAPABLE: [&str; 19] = [
+    "coordinator_after_etcd_commit_before_delta",
     "member_before_guarded_commit",
+    "plan_before_guarded_commit",
+    "authority_before_guarded_commit",
+    "admin_before_guarded_commit",
+    "initial_authority_after_commit_before_effect",
+    "fence_authority_after_commit_before_effect",
+    "admin_after_commit_before_response",
+    "reconciliation_after_commit_before_effect",
+    "rebalance_after_plan_persist",
+    "rebalance_after_reservation_before_handoff",
+    "handoff_after_begin_persist",
+    "handoff_after_partial_barrier",
+    "handoff_after_drain_send",
+    "handoff_after_shard_drained_before_claim_revoke",
+    "handoff_after_new_claim_before_grant_send",
+    "handoff_after_grant_before_shard_ready",
+    "handoff_after_active_persist_before_delta",
     "watch_after_terminated_before_ack",
 ];
 
@@ -36,7 +57,14 @@ fn failpoints_that_can_inject_a_decision_are_an_explicit_ledger() {
 }
 
 fn decision_call(production: &str, point: Failpoint) -> bool {
-    calls(production, "hit_decision", point) || calls(production, "guarded_commit_failpoint", point)
+    [
+        "hit_decision",
+        "guarded_commit_failpoint",
+        "post_commit_failpoint",
+        "dropped_by_failpoint",
+    ]
+    .into_iter()
+    .any(|function| calls(production, function, point))
 }
 
 fn calls(production: &str, function: &str, point: Failpoint) -> bool {

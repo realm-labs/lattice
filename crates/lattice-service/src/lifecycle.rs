@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -91,8 +91,12 @@ pub enum ServiceLifecycleEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceLifecycleEffect {
-    OpenExternalAdmission,
+    /// Opens every admission scope. Only a node that installed a membership snapshot may do this.
+    OpenAdmission,
+    /// Closes external ingress only, leaving cluster-internal routes that govern themselves.
     CloseExternalAdmission,
+    /// Closes every admission scope. Every termination path must use this and never the narrow one.
+    CloseAllAdmission,
     BeginPlacementDrain,
     FenceClaimsAndStopRuntime,
     ReleaseRuntimeIdentity,
@@ -111,35 +115,112 @@ pub struct NodeLifecycle {
     recovering_membership: bool,
 }
 
+/// The class of traffic one admission decision covers.
+///
+/// A single node-wide gate cannot express the cluster's failure model: losing the membership
+/// session says nothing about whether an exact activation still exists or whether a placement
+/// claim is still valid, so a gate that covers all three at once turns one coordinator failure
+/// into a total traffic outage. Each scope names the mechanism that actually decides whether its
+/// traffic is safe, which is what lets the lifecycle close only the scope a failure invalidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AdmissionScope {
+    /// Traffic entering the actor world from outside the cluster mesh (gateways, HTTP edges).
+    ///
+    /// Nothing outside the node vouches for this traffic, so membership is the only thing that
+    /// says the node should still be taking new work on the cluster's behalf.
+    External,
+    /// Logical destinations (`EntityRef`, `SingletonRef`) resolved through placement.
+    ///
+    /// Governed by the placement domain session plus the installed claim deadline, which fences
+    /// itself without any membership input.
+    Logical,
+    /// Exact activations addressed by a fully bound `ActorRef`.
+    ///
+    /// Governed by the `(node incarnation, actor path, ActivationId)` binding: a stale reference
+    /// resolves to nothing rather than to a replacement.
+    Exact,
+}
+
+impl AdmissionScope {
+    pub const ALL: [Self; 3] = [Self::External, Self::Logical, Self::Exact];
+
+    const fn bit(self) -> u8 {
+        match self {
+            Self::External => 0b001,
+            Self::Logical => 0b010,
+            Self::Exact => 0b100,
+        }
+    }
+}
+
+const ALL_ADMISSION_SCOPES: u8 = 0b111;
+
+/// Which admission scopes are currently open, for health reporting and edge admission checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeAdmissionSnapshot {
+    pub external: bool,
+    pub logical: bool,
+    pub exact: bool,
+}
+
+impl NodeAdmissionSnapshot {
+    /// True while the node still serves traffic that other cluster members address to it.
+    pub fn serves_cluster_traffic(&self) -> bool {
+        self.logical || self.exact
+    }
+
+    /// True only when every scope is open, which is the node's fully participating state.
+    pub fn fully_open(&self) -> bool {
+        self.external && self.logical && self.exact
+    }
+}
+
+/// Per-scope admission control for one node.
+///
+/// The scopes share one atomic word so that "close everything" is a single store: a termination
+/// path must never be able to interleave with a narrower close and leave one scope open.
 #[derive(Debug, Clone)]
 pub struct NodeAdmissionGate {
-    open: Arc<AtomicBool>,
+    open: Arc<AtomicU8>,
 }
 
 impl NodeAdmissionGate {
     pub fn closed() -> Self {
         Self {
-            open: Arc::new(AtomicBool::new(false)),
+            open: Arc::new(AtomicU8::new(0)),
         }
     }
 
-    pub fn is_open(&self) -> bool {
-        self.open.load(Ordering::Acquire)
+    pub fn is_open(&self, scope: AdmissionScope) -> bool {
+        self.open.load(Ordering::Acquire) & scope.bit() != 0
+    }
+
+    pub fn snapshot(&self) -> NodeAdmissionSnapshot {
+        let open = self.open.load(Ordering::Acquire);
+        NodeAdmissionSnapshot {
+            external: open & AdmissionScope::External.bit() != 0,
+            logical: open & AdmissionScope::Logical.bit() != 0,
+            exact: open & AdmissionScope::Exact.bit() != 0,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn opened() -> Self {
         Self {
-            open: Arc::new(AtomicBool::new(true)),
+            open: Arc::new(AtomicU8::new(ALL_ADMISSION_SCOPES)),
         }
     }
 
-    fn open(&self) {
-        self.open.store(true, Ordering::Release);
+    fn open_all(&self) {
+        self.open.store(ALL_ADMISSION_SCOPES, Ordering::Release);
     }
 
-    fn close(&self) {
-        self.open.store(false, Ordering::Release);
+    fn close_all(&self) {
+        self.open.store(0, Ordering::Release);
+    }
+
+    fn close(&self, scope: AdmissionScope) {
+        self.open.fetch_and(!scope.bit(), Ordering::AcqRel);
     }
 }
 
@@ -229,6 +310,18 @@ impl ProductionLifecycleDriver {
 
     pub fn admission_gate(&self) -> NodeAdmissionGate {
         self.admission.clone()
+    }
+
+    /// True while the node is re-joining after losing a membership session it had already used.
+    ///
+    /// This is what separates a node that never served traffic from one that is still serving
+    /// exact and logical traffic while its membership session recovers; both report
+    /// `JoiningMembership`.
+    pub fn recovering_membership(&self) -> bool {
+        self.lifecycle
+            .lock()
+            .expect("service lifecycle poisoned")
+            .recovering_membership()
     }
 
     pub fn runtime_stop_requested(&self) -> bool {
@@ -358,8 +451,11 @@ impl ProductionLifecycleDriver {
 
     fn apply_effect(&self, effect: ServiceLifecycleEffect) {
         match effect {
-            ServiceLifecycleEffect::OpenExternalAdmission => self.admission.open(),
-            ServiceLifecycleEffect::CloseExternalAdmission => self.admission.close(),
+            ServiceLifecycleEffect::OpenAdmission => self.admission.open_all(),
+            ServiceLifecycleEffect::CloseExternalAdmission => {
+                self.admission.close(AdmissionScope::External);
+            }
+            ServiceLifecycleEffect::CloseAllAdmission => self.admission.close_all(),
             ServiceLifecycleEffect::BeginPlacementDrain => {
                 let mut health = self.health.lock().expect("service health poisoned");
                 let mut changed = false;
@@ -377,7 +473,7 @@ impl ProductionLifecycleDriver {
                 }
             }
             ServiceLifecycleEffect::FenceClaimsAndStopRuntime => {
-                self.admission.close();
+                self.admission.close_all();
                 self.runtime_stop_requested.store(true, Ordering::Release);
                 let mut shutdowns = self
                     .runtime_shutdowns
@@ -421,8 +517,12 @@ impl NodeLifecycle {
         let (next, effects): (State, &[Effect]) = match (self.state, event) {
             (State::Booting, Event::RemotingReady) => (State::JoiningMembership, &[]),
             (State::JoiningMembership, Event::SnapshotInstalled) => {
-                (State::Ready, &[Effect::OpenExternalAdmission])
+                (State::Ready, &[Effect::OpenAdmission])
             }
+            // Losing the membership session revokes nothing that exact-activation binding or a
+            // placement claim deadline proves on its own, so only the scope membership actually
+            // vouches for is closed. Closing more would turn one coordinator failover into a
+            // node-wide outage for traffic that stayed provably safe throughout.
             (State::Ready, Event::MembershipLost) => {
                 (State::JoiningMembership, &[Effect::CloseExternalAdmission])
             }
@@ -440,7 +540,7 @@ impl NodeLifecycle {
             ) => (self.state, &[]),
             (State::JoiningMembership | State::Ready, Event::BeginDrain) => (
                 State::Draining,
-                &[Effect::CloseExternalAdmission, Effect::BeginPlacementDrain],
+                &[Effect::CloseAllAdmission, Effect::BeginPlacementDrain],
             ),
             (State::Draining, Event::DrainComplete) => {
                 (State::Stopping, &[Effect::FenceClaimsAndStopRuntime])
@@ -450,23 +550,17 @@ impl NodeLifecycle {
                 Event::ForceStop,
             ) => (
                 State::Stopping,
-                &[
-                    Effect::CloseExternalAdmission,
-                    Effect::FenceClaimsAndStopRuntime,
-                ],
+                &[Effect::CloseAllAdmission, Effect::FenceClaimsAndStopRuntime],
             ),
             (State::Booting | State::JoiningMembership, Event::StartupFailed) => {
-                (State::Stopping, &[Effect::CloseExternalAdmission])
+                (State::Stopping, &[Effect::CloseAllAdmission])
             }
             (
                 State::JoiningMembership | State::Ready | State::Draining,
                 Event::RuntimeTerminated,
             ) => (
                 State::Stopping,
-                &[
-                    Effect::CloseExternalAdmission,
-                    Effect::FenceClaimsAndStopRuntime,
-                ],
+                &[Effect::CloseAllAdmission, Effect::FenceClaimsAndStopRuntime],
             ),
             (
                 State::Stopping,
@@ -660,7 +754,7 @@ mod tests {
             lifecycle
                 .transition(ServiceLifecycleEvent::SnapshotInstalled)
                 .unwrap(),
-            vec![ServiceLifecycleEffect::OpenExternalAdmission]
+            vec![ServiceLifecycleEffect::OpenAdmission]
         );
     }
 
@@ -686,6 +780,113 @@ mod tests {
         assert_eq!(lifecycle.state(), NodeLifecycleState::Ready);
     }
 
+    /// Every path that gives up this node's cluster authority has to close every scope. The
+    /// narrow close exists for one event only, so the table is asserted exhaustively rather than
+    /// per-path: a future transition that reaches for `CloseExternalAdmission` instead of
+    /// `CloseAllAdmission` would leave a terminating node still serving traffic.
+    #[test]
+    fn only_membership_loss_narrows_admission_and_every_termination_closes_all() {
+        use ServiceLifecycleEvent as Event;
+
+        let ready = || {
+            let mut lifecycle = NodeLifecycle::default();
+            lifecycle.transition(Event::RemotingReady).unwrap();
+            lifecycle.transition(Event::SnapshotInstalled).unwrap();
+            lifecycle
+        };
+
+        for event in [
+            Event::BeginDrain,
+            Event::ForceStop,
+            Event::RuntimeTerminated,
+        ] {
+            let effects = ready().transition(event).unwrap();
+            assert!(
+                effects.contains(&ServiceLifecycleEffect::CloseAllAdmission),
+                "{event:?} must close every admission scope"
+            );
+            assert!(
+                !effects.contains(&ServiceLifecycleEffect::CloseExternalAdmission),
+                "{event:?} must not settle for closing external admission only"
+            );
+        }
+
+        let mut booting = NodeLifecycle::default();
+        booting.transition(Event::RemotingReady).unwrap();
+        assert_eq!(
+            booting.transition(Event::StartupFailed).unwrap(),
+            vec![ServiceLifecycleEffect::CloseAllAdmission]
+        );
+
+        let mut draining = ready();
+        draining.transition(Event::BeginDrain).unwrap();
+        assert_eq!(
+            draining.transition(Event::DrainComplete).unwrap(),
+            vec![ServiceLifecycleEffect::FenceClaimsAndStopRuntime]
+        );
+
+        assert_eq!(
+            ready().transition(Event::MembershipLost).unwrap(),
+            vec![ServiceLifecycleEffect::CloseExternalAdmission]
+        );
+    }
+
+    /// The availability property the split exists for: a membership session this node already
+    /// used can be lost and regained without the traffic that governs itself ever being refused.
+    #[test]
+    fn membership_loss_keeps_cluster_traffic_admitted_and_closes_only_the_edge() {
+        let driver = production_driver([]);
+        driver
+            .transition(ServiceLifecycleEvent::RemotingReady)
+            .unwrap();
+        driver
+            .transition(ServiceLifecycleEvent::SnapshotInstalled)
+            .unwrap();
+        assert!(driver.admission_gate().snapshot().fully_open());
+        assert!(!driver.recovering_membership());
+
+        driver
+            .transition(ServiceLifecycleEvent::MembershipLost)
+            .unwrap();
+        let admission = driver.admission_gate().snapshot();
+        assert!(!admission.external, "external admission must be shed");
+        assert!(
+            admission.logical,
+            "placement claims fence logical traffic on their own deadline"
+        );
+        assert!(
+            admission.exact,
+            "an ActorRef is fenced by the incarnation and activation it names"
+        );
+        assert!(admission.serves_cluster_traffic());
+        assert!(
+            driver.recovering_membership(),
+            "recovery must be distinguishable from a first join"
+        );
+
+        driver
+            .transition(ServiceLifecycleEvent::SnapshotInstalled)
+            .unwrap();
+        assert_eq!(driver.state(), NodeLifecycleState::Ready);
+        assert!(driver.admission_gate().snapshot().fully_open());
+        assert!(!driver.recovering_membership());
+    }
+
+    /// A first join admits nothing. Membership recovery is the only reason `JoiningMembership`
+    /// serves traffic, so the two must not be conflated by anything reading the gate.
+    #[test]
+    fn a_node_that_never_joined_admits_nothing_while_joining() {
+        let driver = production_driver([]);
+        driver
+            .transition(ServiceLifecycleEvent::RemotingReady)
+            .unwrap();
+        assert_eq!(driver.state(), NodeLifecycleState::JoiningMembership);
+        let admission = driver.admission_gate().snapshot();
+        assert!(!admission.external);
+        assert!(!admission.serves_cluster_traffic());
+        assert!(!driver.recovering_membership());
+    }
+
     #[test]
     fn production_driver_consumes_admission_drain_and_identity_effects() {
         let domain = PlacementDomainId::new("driver-test").unwrap();
@@ -698,12 +899,12 @@ mod tests {
         driver
             .transition(ServiceLifecycleEvent::SnapshotInstalled)
             .unwrap();
-        assert!(driver.admission_gate().is_open());
+        assert!(driver.admission_gate().snapshot().fully_open());
 
         driver
             .transition(ServiceLifecycleEvent::MembershipLost)
             .unwrap();
-        assert!(!driver.admission_gate().is_open());
+        assert!(!driver.admission_gate().is_open(AdmissionScope::External));
         assert_eq!(driver.state(), NodeLifecycleState::JoiningMembership);
         driver
             .transition(ServiceLifecycleEvent::SnapshotInstalled)
@@ -711,7 +912,15 @@ mod tests {
         driver
             .transition(ServiceLifecycleEvent::BeginDrain)
             .unwrap();
-        assert!(!driver.admission_gate().is_open());
+        assert_eq!(
+            driver.admission_gate().snapshot(),
+            NodeAdmissionSnapshot {
+                external: false,
+                logical: false,
+                exact: false,
+            },
+            "a draining node must admit nothing"
+        );
         driver
             .transition(ServiceLifecycleEvent::DrainComplete)
             .unwrap();
@@ -737,7 +946,12 @@ mod tests {
             .unwrap();
         driver.transition(ServiceLifecycleEvent::ForceStop).unwrap();
         assert_eq!(driver.state(), NodeLifecycleState::Stopping);
-        assert!(!driver.admission_gate().is_open());
+        assert!(
+            AdmissionScope::ALL
+                .iter()
+                .all(|scope| !driver.admission_gate().is_open(*scope)),
+            "a force-stopped node must admit nothing"
+        );
         assert!(driver.runtime_stop_requested());
         driver
             .transition(ServiceLifecycleEvent::ShutdownComplete)

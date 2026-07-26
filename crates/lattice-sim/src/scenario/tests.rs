@@ -23,6 +23,7 @@ use crate::{
     store::{SimEtcd, SimWatchEvent},
 };
 
+mod coordinator;
 mod exploration;
 
 use exploration::HandoffExploration;
@@ -375,6 +376,9 @@ async fn fault_matrix_records_only_injected_and_observed_boundaries() {
     for evidence in injected_membership_evidence().await {
         assert!(matrix.record(evidence));
     }
+    for evidence in coordinator::injected_leader_evidence().await {
+        assert!(matrix.record(evidence));
+    }
     let covered = matrix
         .covered()
         .map(|(pair, origin)| format!("{} {:?} {origin:?}", pair.0.name(), pair.1))
@@ -386,26 +390,65 @@ async fn fault_matrix_records_only_injected_and_observed_boundaries() {
     );
 }
 
-const EXPECTED_COVERAGE: [&str; 21] = [
+const EXPECTED_COVERAGE: [&str; 60] = [
     "control_after_outbox_before_socket_write Network SimulatedExecutor",
     "control_after_remote_apply_before_ack Target SimulatedExecutor",
     "control_after_remote_apply_before_ack Network SimulatedExecutor",
+    "coordinator_after_etcd_commit_before_delta Source ProductionCallSite",
+    "coordinator_after_etcd_commit_before_delta Target ProductionCallSite",
+    "coordinator_after_etcd_commit_before_delta Network ProductionCallSite",
     "member_before_guarded_commit Coordinator ProductionCallSite",
     "member_before_guarded_commit Store ProductionCallSite",
-    "handoff_after_partial_barrier Coordinator SimulatedExecutor",
-    "handoff_after_partial_barrier Store SimulatedExecutor",
+    "plan_before_guarded_commit Coordinator ProductionCallSite",
+    "plan_before_guarded_commit Store ProductionCallSite",
+    "authority_before_guarded_commit Coordinator ProductionCallSite",
+    "authority_before_guarded_commit Store ProductionCallSite",
+    "admin_before_guarded_commit Coordinator ProductionCallSite",
+    "admin_before_guarded_commit Store ProductionCallSite",
+    "initial_authority_after_commit_before_effect Coordinator ProductionCallSite",
+    "initial_authority_after_commit_before_effect Target ProductionCallSite",
+    "initial_authority_after_commit_before_effect Store ProductionCallSite",
+    "initial_authority_after_commit_before_effect Network ProductionCallSite",
+    "fence_authority_after_commit_before_effect Coordinator ProductionCallSite",
+    "fence_authority_after_commit_before_effect Source ProductionCallSite",
+    "fence_authority_after_commit_before_effect Store ProductionCallSite",
+    "admin_after_commit_before_response Coordinator ProductionCallSite",
+    "admin_after_commit_before_response Store ProductionCallSite",
+    "reconciliation_after_commit_before_effect Coordinator ProductionCallSite",
+    "reconciliation_after_commit_before_effect Store ProductionCallSite",
+    "rebalance_after_plan_persist Coordinator ProductionCallSite",
+    "rebalance_after_plan_persist Store ProductionCallSite",
+    "rebalance_after_reservation_before_handoff Coordinator ProductionCallSite",
+    "rebalance_after_reservation_before_handoff Source ProductionCallSite",
+    "rebalance_after_reservation_before_handoff Target ProductionCallSite",
+    "rebalance_after_reservation_before_handoff Store ProductionCallSite",
+    "rebalance_after_reservation_before_handoff Network ProductionCallSite",
+    "handoff_after_begin_persist Coordinator ProductionCallSite",
+    "handoff_after_begin_persist Source ProductionCallSite",
+    "handoff_after_begin_persist Target ProductionCallSite",
+    "handoff_after_begin_persist Store ProductionCallSite",
+    "handoff_after_begin_persist Network ProductionCallSite",
+    "handoff_after_partial_barrier Coordinator ProductionCallSite",
+    "handoff_after_partial_barrier Store ProductionCallSite",
     "handoff_after_partial_barrier Network SimulatedExecutor",
-    "handoff_after_shard_drained_before_claim_revoke Coordinator SimulatedExecutor",
+    "handoff_after_drain_send Source ProductionCallSite",
+    "handoff_after_drain_send Network ProductionCallSite",
+    "handoff_after_shard_drained_before_claim_revoke Coordinator ProductionCallSite",
+    "handoff_after_shard_drained_before_claim_revoke Source ProductionCallSite",
     "handoff_after_shard_drained_before_claim_revoke Target SimulatedExecutor",
-    "handoff_after_shard_drained_before_claim_revoke Store SimulatedExecutor",
-    "handoff_after_new_claim_before_grant_send Coordinator SimulatedExecutor",
-    "handoff_after_new_claim_before_grant_send Store SimulatedExecutor",
-    "handoff_after_new_claim_before_grant_send Network SimulatedExecutor",
-    "handoff_after_grant_before_shard_ready Coordinator SimulatedExecutor",
-    "handoff_after_grant_before_shard_ready Target SimulatedExecutor",
+    "handoff_after_shard_drained_before_claim_revoke Store ProductionCallSite",
+    "handoff_after_new_claim_before_grant_send Coordinator ProductionCallSite",
+    "handoff_after_new_claim_before_grant_send Target ProductionCallSite",
+    "handoff_after_new_claim_before_grant_send Store ProductionCallSite",
+    "handoff_after_new_claim_before_grant_send Network ProductionCallSite",
+    "handoff_after_grant_before_shard_ready Coordinator ProductionCallSite",
+    "handoff_after_grant_before_shard_ready Target ProductionCallSite",
     "handoff_after_grant_before_shard_ready Network SimulatedExecutor",
-    "handoff_after_active_persist_before_delta Coordinator SimulatedExecutor",
-    "handoff_after_active_persist_before_delta Store SimulatedExecutor",
+    "handoff_after_active_persist_before_delta Coordinator ProductionCallSite",
+    "handoff_after_active_persist_before_delta Source ProductionCallSite",
+    "handoff_after_active_persist_before_delta Target ProductionCallSite",
+    "handoff_after_active_persist_before_delta Store ProductionCallSite",
+    "handoff_after_active_persist_before_delta Network ProductionCallSite",
     "watch_after_install_before_ack Network SimulatedExecutor",
     "watch_after_terminated_before_ack Network ProductionCallSite",
 ];

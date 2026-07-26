@@ -240,9 +240,15 @@ can currently do the latter.
 
 The fault matrix records a boundary as covered only against evidence that an action was injected and
 its consequence observed, and it distinguishes a production call site changing its own behaviour
-from the simulated executor applying the consequence. It is therefore a coverage measurement rather
-than a gate: most required pairs are still missing, because driving them needs a full
-`PlacementDomainLeader`, a real endpoint, or real etcd. `FaultMatrix::missing` enumerates them.
+from the simulated executor applying the consequence. It is a coverage measurement rather than a
+gate, and `FaultMatrix::missing` enumerates what is absent.
+
+Coordinator boundaries are driven through `lattice-placement`'s `test-harness` feature, which
+exposes a real `PlacementDomainLeader` over an in-memory store and directly attached lane sessions.
+What remains uncovered needs a bind listener, real etcd, the member-side session pipeline, or live
+task shutdown — or is a target axis the boundary cannot reach at all, such as a source or network
+fault at a commit that is refused before any message exists. Those are recorded as missing rather
+than padded.
 
 ```text
 Coordinator crash/re-election

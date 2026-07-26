@@ -14,6 +14,7 @@ mod control;
 pub mod deployment;
 pub mod error;
 mod exact_tell_routes;
+pub mod ingress;
 pub mod lifecycle;
 pub mod registration;
 pub mod supervisor;
