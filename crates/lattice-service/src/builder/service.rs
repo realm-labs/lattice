@@ -18,8 +18,10 @@ use crate::{
     cluster::api::Cluster,
     cluster::peers::PeerError,
     cluster::runtime::LogicEffectApplier,
+    ingress::ExternalIngress,
     lifecycle::{
-        CoordinatorScopeState, LifecycleInterventionReport, ServiceLifecycleMetricsSnapshot,
+        CoordinatorScopeState, LifecycleInterventionReport, NodeAdmissionSnapshot,
+        ServiceLifecycleMetricsSnapshot,
     },
 };
 
@@ -77,8 +79,36 @@ impl LatticeService {
         LatticeServiceBuilder::new(config)
     }
 
+    /// Cluster-internal messaging. Actors, and process code acting on the cluster's behalf, send
+    /// through this handle; it is governed by exact-activation and placement-claim admission only.
     pub fn actor_system(&self) -> &ActorSystem {
         &self.actor_system
+    }
+
+    /// The edge handle for traffic originating outside the cluster.
+    ///
+    /// Gateways and other process edges should send through this rather than
+    /// [`Self::actor_system`] so that a node which lost its membership session sheds external load
+    /// while it keeps serving the cluster-internal traffic it can still prove is safe.
+    pub fn external_ingress(&self) -> ExternalIngress {
+        ExternalIngress::new(
+            self.lifecycle_driver.admission_gate(),
+            self.actor_system.clone(),
+        )
+    }
+
+    /// Which classes of traffic this node currently admits.
+    ///
+    /// A node recovering a membership session reports external admission closed while logical and
+    /// exact admission stay open; that pair is what distinguishes it from a node that is booting
+    /// or draining, both of which admit nothing.
+    pub fn admission_snapshot(&self) -> NodeAdmissionSnapshot {
+        self.lifecycle_driver.admission_gate().snapshot()
+    }
+
+    /// True while the node is re-joining after losing a membership session it had already used.
+    pub fn recovering_membership(&self) -> bool {
+        self.lifecycle_driver.recovering_membership()
     }
 
     pub fn release_manifest(&self) -> &ReleaseManifest {
@@ -128,6 +158,10 @@ impl LatticeService {
             .map_err(ServiceError::ActorLifecycleAdmin)
     }
 
+    /// Cluster-internal send, equivalent to [`Self::actor_system`].
+    ///
+    /// Traffic arriving from outside the cluster should go through [`Self::external_ingress`]
+    /// instead, so that a node without a membership session sheds it.
     pub async fn tell<P, M>(
         &self,
         target: impl Into<RecipientRef<P>>,
@@ -140,6 +174,10 @@ impl LatticeService {
         self.actor_system.tell(target, message).await
     }
 
+    /// Cluster-internal request, equivalent to [`Self::actor_system`].
+    ///
+    /// Traffic arriving from outside the cluster should go through [`Self::external_ingress`]
+    /// instead, so that a node without a membership session sheds it.
     pub async fn ask<P, R>(
         &self,
         target: impl Into<RecipientRef<P>>,

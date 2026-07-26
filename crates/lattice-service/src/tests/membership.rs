@@ -16,8 +16,7 @@ use lattice_actor::registry::{ActorRefConfig, ActorRegistry, ActorRegistryConfig
 use lattice_core::{
     actor_kind,
     actor_ref::{
-        ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation,
-        PlacementDomainId, ProtocolId,
+        ClusterId, EntityId, EntityRef, EntityType, NodeAddress, NodeIncarnation, ProtocolId,
     },
     coordinator::CoordinatorScope,
     failpoint::Failpoint,
@@ -96,67 +95,6 @@ fn discovery_snapshot(
             priority: 1,
         }],
     }
-}
-
-async fn coordinator_service(
-    store: Arc<InMemoryPlacementStore>,
-    cluster_id: ClusterId,
-    node_id: &str,
-    address: NodeAddress,
-    incarnation: NodeIncarnation,
-    _term: u64,
-) -> LatticeService {
-    coordinator_service_for_domains(
-        store,
-        cluster_id,
-        node_id,
-        address,
-        incarnation,
-        BTreeSet::from([placement_domain()]),
-    )
-    .await
-}
-
-async fn coordinator_service_for_domains(
-    store: Arc<InMemoryPlacementStore>,
-    cluster_id: ClusterId,
-    node_id: &str,
-    address: NodeAddress,
-    incarnation: NodeIncarnation,
-    domains: BTreeSet<PlacementDomainId>,
-) -> LatticeService {
-    let builder = LatticeService::builder(node_config(
-        cluster_id,
-        node_id,
-        address.clone(),
-        incarnation,
-    ))
-    .unwrap();
-    let host = CoordinatorHost::elect(
-        store,
-        builder.association_manager(),
-        NodeKey {
-            node_id: node_id.to_string(),
-            address,
-            incarnation,
-        },
-        domains,
-        CoordinatorHostConfig {
-            placement: PlacementDomainLeaderConfig {
-                renewal_interval: Duration::from_millis(100),
-                ..PlacementDomainLeaderConfig::default()
-            },
-            ..CoordinatorHostConfig::default()
-        },
-    )
-    .await
-    .unwrap();
-    let (control, controls) =
-        PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
-    builder
-        .coordinator_host(Arc::new(control), host, controls)
-        .build()
-        .unwrap()
 }
 
 async fn ping(

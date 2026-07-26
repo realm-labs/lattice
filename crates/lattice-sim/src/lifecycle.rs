@@ -222,10 +222,11 @@ impl LifecycleScenario {
     ) -> Result<(), LifecycleScenarioError> {
         for effect in self.lifecycle.transition(event)? {
             match effect {
-                ServiceLifecycleEffect::OpenExternalAdmission => {
+                ServiceLifecycleEffect::OpenAdmission => {
                     self.state.admission_open = true;
                 }
                 ServiceLifecycleEffect::CloseExternalAdmission
+                | ServiceLifecycleEffect::CloseAllAdmission
                 | ServiceLifecycleEffect::FenceClaimsAndStopRuntime => {
                     self.state.admission_open = false;
                 }

@@ -42,6 +42,15 @@ endpoints, and current membership/domain snapshots before taking a mutating acti
    after the exact local `Up` record is installed; a `Joining` snapshot is insufficient.
 5. Check required domains separately. Membership recovery can restore node readiness while one
    domain remains visibly `Degraded`.
+6. Expect exact-reference and local traffic to keep serving, and entity/singleton traffic to keep
+   serving for as long as its own claims remain valid. Losing membership closes the external edge
+   only. A node reporting `JoiningMembership` with traffic still flowing is the designed behaviour,
+   not a stale readiness signal.
+
+Readiness is an edge signal. A Kubernetes Service that carries cluster-internal traffic must not
+gate on `/readyz`, because membership recovery would then withdraw the internal traffic this
+narrowing exists to preserve. Peers reach each other from the member directory and never through a
+Service.
 
 ## Partial placement-domain degradation
 

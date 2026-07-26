@@ -35,7 +35,7 @@ use lattice_remoting::{
 
 use crate::{
     exact_tell_routes::{ExactTellMessage, ExactTellRouteCache, RejectedExactTell},
-    lifecycle::NodeAdmissionGate,
+    lifecycle::{AdmissionScope, NodeAdmissionGate},
     supervisor::TaskSupervisor,
 };
 
@@ -505,8 +505,10 @@ pub(crate) struct ServiceInboundDispatch {
 }
 
 impl ServiceInboundDispatch {
-    fn admitted<E: FromClosedAdmission>(&self) -> Result<(), E> {
-        if self.admission.is_open() {
+    /// Peer traffic never carries the external scope: the remoting handshake already proved the
+    /// sender is a member of this cluster, so what arrives here is only ever exact or logical.
+    fn admitted<E: FromClosedAdmission>(&self, scope: AdmissionScope) -> Result<(), E> {
+        if self.admission.is_open(scope) {
             Ok(())
         } else {
             Err(E::closed_admission())
@@ -523,7 +525,7 @@ impl ServiceInboundDispatch {
 #[async_trait]
 impl InboundDispatch for ServiceInboundDispatch {
     fn try_tell_immediate(&self, tell: InboundTell) -> ImmediateTellDispatch {
-        if !self.admission.is_open() {
+        if !self.admission.is_open(AdmissionScope::Exact) {
             return ImmediateTellDispatch::Complete(Err(RemoteMessageError::Unauthorized));
         }
         self.hosts.try_tell_immediate(tell)
@@ -536,7 +538,7 @@ impl InboundDispatch for ServiceInboundDispatch {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        self.admitted::<RemoteMessageError>()?;
+        self.admitted::<RemoteMessageError>(AdmissionScope::Exact)?;
         self.hosts
             .tell_wait(sender, target, message_id, payload)
             .await
@@ -549,7 +551,7 @@ impl InboundDispatch for ServiceInboundDispatch {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
-        self.admitted::<RemoteMessageError>()?;
+        self.admitted::<RemoteMessageError>(AdmissionScope::Exact)?;
         self.hosts.ask(target, message_id, payload, deadline).await
     }
 
@@ -560,7 +562,7 @@ impl InboundDispatch for ServiceInboundDispatch {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        self.admitted::<RemoteMessageError>()?;
+        self.admitted::<RemoteMessageError>(AdmissionScope::Logical)?;
         self.logical()?
             .receive_entity_tell(sender, target, message_id, payload)
             .await
@@ -573,7 +575,7 @@ impl InboundDispatch for ServiceInboundDispatch {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
-        self.admitted::<RemoteMessageError>()?;
+        self.admitted::<RemoteMessageError>(AdmissionScope::Logical)?;
         self.logical()?
             .receive_entity_ask(target, message_id, payload, deadline)
             .await
@@ -586,7 +588,7 @@ impl InboundDispatch for ServiceInboundDispatch {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), RemoteMessageError> {
-        self.admitted::<RemoteMessageError>()?;
+        self.admitted::<RemoteMessageError>(AdmissionScope::Logical)?;
         self.logical()?
             .receive_singleton_tell(sender, target, message_id, payload)
             .await
@@ -599,7 +601,7 @@ impl InboundDispatch for ServiceInboundDispatch {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, RemoteMessageError> {
-        self.admitted::<RemoteMessageError>()?;
+        self.admitted::<RemoteMessageError>(AdmissionScope::Logical)?;
         self.logical()?
             .receive_singleton_ask(target, message_id, payload, deadline)
             .await
@@ -644,9 +646,24 @@ impl FromClosedAdmission for AskError {
     }
 }
 
+/// The admission scope a recipient target belongs to.
+///
+/// This is a property of the destination, not of the caller: an `ActorRef` names one activation
+/// and is fenced by its own incarnation, while an `EntityRef`/`SingletonRef` names a logical
+/// destination whose validity comes from a placement claim. The scope is the same whether the
+/// message is being admitted from a peer or originated locally.
+fn recipient_scope(target: &RecipientRef) -> AdmissionScope {
+    match target {
+        RecipientRef::Actor(_) => AdmissionScope::Exact,
+        RecipientRef::Entity(_) | RecipientRef::Singleton(_) => AdmissionScope::Logical,
+    }
+}
+
 impl ServiceRecipientBackend {
-    fn admitted<E: FromClosedAdmission>(&self) -> Result<(), E> {
-        if self.admission.is_open() {
+    /// Egress admission. A node that is draining or stopping must stop originating traffic as
+    /// well as stop accepting it, which is why the same scoped gate governs both directions.
+    fn admitted<E: FromClosedAdmission>(&self, scope: AdmissionScope) -> Result<(), E> {
+        if self.admission.is_open(scope) {
             Ok(())
         } else {
             Err(E::closed_admission())
@@ -722,7 +739,7 @@ impl ServiceRecipientBackend {
 #[async_trait]
 impl RecipientBackend for ServiceRecipientBackend {
     fn try_tell_immediate(&self, tell: RecipientTell) -> ImmediateRecipientTellDispatch {
-        if !self.admission.is_open() {
+        if !self.admission.is_open(recipient_scope(&tell.target)) {
             return ImmediateRecipientTellDispatch::Complete(Err(TellError::Remote(
                 RemoteMessageError::Unauthorized,
             )));
@@ -783,7 +800,7 @@ impl RecipientBackend for ServiceRecipientBackend {
         message_id: u64,
         payload: Bytes,
     ) -> Result<(), TellError> {
-        self.admitted::<TellError>()?;
+        self.admitted::<TellError>(recipient_scope(&target))?;
         match target {
             RecipientRef::Actor(reference) if self.is_local(&reference) => self
                 .hosts
@@ -818,7 +835,7 @@ impl RecipientBackend for ServiceRecipientBackend {
         payload: Bytes,
         deadline: Instant,
     ) -> Result<Bytes, AskError> {
-        self.admitted::<AskError>()?;
+        self.admitted::<AskError>(recipient_scope(&target))?;
         match target {
             RecipientRef::Actor(reference) if self.is_local(&reference) => self
                 .hosts
