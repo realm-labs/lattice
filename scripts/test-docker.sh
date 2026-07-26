@@ -8,11 +8,11 @@ if command -v cygpath >/dev/null 2>&1; then
 fi
 compose="$root/tests/distributed/compose.yaml"
 profile=${1:-}
-[ -n "$profile" ] || { echo "usage: $0 <quality|sim|model|e2e|e2e-ha-etcd|scale|chaos|k8s|soak|replay>" >&2; exit 2; }
+[ -n "$profile" ] || { echo "usage: $0 <quality|sim|model|e2e|e2e-ha-etcd|scale|chaos|partition|k8s|soak|replay>" >&2; exit 2; }
 shift
 
 case "$profile" in
-  e2e-ha-etcd|scale|chaos)
+  e2e-ha-etcd|scale|chaos|partition)
     lattice_cargo_profile=release
     LATTICE_CARGO_PROFILE_DIR=release
     ;;
@@ -72,7 +72,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 case "$profile" in
-  quality|sim|model|e2e|e2e-ha-etcd|chaos|k8s)
+  quality|sim|model|e2e|e2e-ha-etcd|chaos|partition|k8s)
     service="runner-$profile"
     ;;
   scale)
@@ -138,7 +138,7 @@ docker build \
   "$root"
 
 case "$profile" in
-  e2e|e2e-ha-etcd|scale|chaos)
+  e2e|e2e-ha-etcd|scale|chaos|partition)
     echo "Preparing shared lattice-sim $LATTICE_CARGO_PROFILE_DIR binaries in the Docker Cargo cache"
     MSYS2_ARG_CONV_EXCL='*' docker run --rm \
       --label "io.lattice.test-run=$run_id" \

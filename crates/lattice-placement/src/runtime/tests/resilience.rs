@@ -503,3 +503,47 @@ async fn singleton_kinds_spread_across_one_eligibility_set() {
         );
     }
 }
+
+#[tokio::test]
+async fn member_removal_survives_a_surviving_session_whose_association_is_gone() {
+    let mut fixture = domain_fixture(
+        "removal-association-loss",
+        26760,
+        760,
+        PlacementDomainLeaderConfig::default(),
+    )
+    .await;
+    let proxy_association = fixture.leader.associations.get(&fixture.proxy_key).unwrap();
+    assert!(
+        fixture
+            .leader
+            .associations
+            .remove(&fixture.proxy_key, proxy_association.id())
+    );
+
+    let record = fixture
+        .leader
+        .sessions
+        .get(&fixture.host.incarnation)
+        .unwrap()
+        .record
+        .clone();
+    fixture
+        .leader
+        .remove_member(record, MemberRemovalReason::FailureDetected)
+        .await
+        .expect("an unreachable surviving session must not end the domain leader");
+
+    assert!(
+        !fixture
+            .leader
+            .sessions
+            .contains_key(&fixture.host.incarnation)
+    );
+    assert!(
+        fixture
+            .leader
+            .sessions
+            .contains_key(&fixture.proxy.incarnation)
+    );
+}

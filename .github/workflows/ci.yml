@@ -110,6 +110,52 @@ jobs:
         if: always()
         run: ./scripts/docker-image-lifecycle.sh cleanup
 
+  docker-partition:
+    name: Docker partition
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LATTICE_DOCKER_CACHE_ROOT: target/docker-cache/current
+      LATTICE_DOCKER_CACHE_PROFILE: partition
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Restore Docker cargo cache
+        id: docker-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: target/docker-cache/current
+          key: ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-${{ hashFiles('Cargo.lock') }}-
+            ${{ runner.os }}-${{ runner.arch }}-docker-${{ env.LATTICE_DOCKER_CACHE_ABI }}-${{ env.LATTICE_DOCKER_CACHE_PROFILE }}-
+
+      - name: Run pinned profile
+        run: ./scripts/test-docker.sh partition
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-partition-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/test-artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Save Docker cargo cache
+        if: success() && steps.docker-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target/docker-cache/current
+          key: ${{ steps.docker-cache.outputs.cache-primary-key }}
+
+      - name: Enforce scoped image retention
+        if: always()
+        run: ./scripts/docker-image-lifecycle.sh cleanup
+
   docker-ha-etcd:
     name: Docker HA etcd
     if: github.event_name == 'push' || github.event_name == 'schedule'

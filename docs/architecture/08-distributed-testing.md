@@ -230,9 +230,19 @@ shutdown_after_fence_before_task_join
 Failpoint behavior is test-only and cannot be enabled by unauthenticated production traffic. Each critical boundary is exercised against the relevant fault set:
 
 The stable names live in `lattice-core::failpoint::Failpoint` behind the `test-failpoints` feature.
-Production remoting, placement, watch, and shutdown code calls this shared catalogue at all 17
-boundaries; `lattice-sim` consumes the enum and machine-checks both source presence and the required
-failpoint/fault-target matrix.
+Production remoting, placement, watch, and shutdown code calls this shared catalogue at all 27
+boundaries, and `lattice-sim` machine-checks that every name has a call site.
+
+Reaching a boundary is weaker than injecting at it. `hit` only observes, so a hook can block or
+panic but cannot change what the caller does; `hit_decision` returns a `FailpointAction` the call
+site honours. Only the boundaries listed in the ledger in `lattice-sim/tests/failpoint_boundaries.rs`
+can currently do the latter.
+
+The fault matrix records a boundary as covered only against evidence that an action was injected and
+its consequence observed, and it distinguishes a production call site changing its own behaviour
+from the simulated executor applying the consequence. It is therefore a coverage measurement rather
+than a gate: most required pairs are still missing, because driving them needs a full
+`PlacementDomainLeader`, a real endpoint, or real etcd. `FaultMatrix::missing` enumerates them.
 
 ```text
 Coordinator crash/re-election
@@ -324,6 +334,12 @@ chaos:
   e2e topology plus dedicated fault orchestration/network proxy
   pause/resume/kill/restart, partitions, delay/loss and failpoint scenarios
 
+partition:
+  the domain topology plus two hosts of one single-shard placement-managed entity
+  the owner is cut off from its Coordinator and its peer while both keep probing the entity
+  one activation may answer at a time, and the fenced owner must stop before any replacement starts
+  it runs on its own membership so the chaos oracles keep their exact member counts
+
 soak:
   long deterministic seed sequence, rolling replay trace and FD/RSS/thread growth sampling
 
@@ -376,6 +392,7 @@ The repository supplies one stable wrapper whose implementation uses Docker Comp
 ./scripts/test-docker.sh scale
 ./scripts/test-docker.sh scale --startup-window 90
 ./scripts/test-docker.sh chaos
+./scripts/test-docker.sh partition
 ./scripts/test-docker.sh k8s
 ./scripts/test-docker.sh soak --duration 4h --seed <seed>
 ./scripts/test-docker.sh replay --artifact <trace.json>
@@ -428,7 +445,14 @@ snapshot gates, progress, and handoffs under bounded interleavings.
 
 The chaos profile reuses that topology and adds `tc netem` delay/loss, network detach/reattach,
 process pause/kill/restart, real etcd lease expiry, cross-domain drain, and simultaneous independent
-handoff replay.
+handoff replay. Its membership oracles assert an exact member count, so hosts that exist only to be
+partitioned live in the separate `partition` profile rather than in the chaos membership.
+
+The partition profile shares the domain topology but replaces the logic nodes with two hosts of one
+single-shard entity type, each probing that entity through the router and journalling which
+activation answered. Cutting the owner off proves local fencing inside the claim deadline; holding
+the outage past the member heartbeat timeout proves the Coordinator reinstalls the slot elsewhere
+and that the replacement only ever answers after the fenced activation stopped.
 
 ### 7.7 Kubernetes Boundary
 
@@ -516,7 +540,10 @@ Flaky tests cannot be silently retried to green. A retry must preserve the first
 ## 10. Completion Criteria
 
 - All documented safety invariants are executable in `InvariantChecker` or mapped to an explicit real-process assertion.
-- Every critical control/persistence boundary has named failpoint coverage and appears in the fault matrix.
+- Every critical control/persistence boundary has a named failpoint and a checked call site, and can
+  honour an injected decision rather than only observing that it was reached.
+- The fault matrix reports no missing required pair, counting only evidence of an injected action and
+  its observed consequence.
 - Every randomized failure is seed-replayable; shrinking/minimization is available for simulator traces.
 - Small-cluster state exploration terminates under documented bounds with no invariant violation.
 - Docker profiles build from pinned dependencies and require no host test toolchain beyond Docker/Compose.

@@ -58,6 +58,16 @@ pub mod membership_plane;
 mod rebalance;
 mod reconciliation;
 
+pub(crate) fn guarded_commit_failpoint(
+    point: lattice_core::failpoint::Failpoint,
+) -> Result<(), StorageError> {
+    match lattice_core::failpoint::hit_decision(point) {
+        lattice_core::failpoint::FailpointAction::StoreFailure => Err(StorageError::Unavailable),
+        lattice_core::failpoint::FailpointAction::Crash => Err(StorageError::OutcomeUnknown),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PlacementDomainLeaderConfig {
     pub leader_lease_ttl: Duration,

@@ -111,7 +111,7 @@ services:
 
   etcd-single:
     <<: *etcd
-    profiles: [e2e, chaos, scale]
+    profiles: [e2e, chaos, scale, partition]
     command:
       - /usr/local/bin/etcd
       - --name=etcd-single
@@ -167,7 +167,7 @@ services:
 
   domain-membership:
     <<: *runner
-    profiles: [e2e, chaos, scale]
+    profiles: [e2e, chaos, scale, partition]
     depends_on:
       etcd-single: {condition: service_healthy}
     environment:
@@ -182,7 +182,7 @@ services:
 
   domain-alpha:
     <<: *runner
-    profiles: [e2e, chaos]
+    profiles: [e2e, chaos, partition]
     depends_on:
       domain-membership: {condition: service_healthy}
     environment:
@@ -197,7 +197,7 @@ services:
 
   domain-beta:
     <<: *runner
-    profiles: [e2e, chaos]
+    profiles: [e2e, chaos, partition]
     depends_on:
       domain-membership: {condition: service_healthy}
     environment:
@@ -212,7 +212,7 @@ services:
 
   domain-gamma:
     <<: *runner
-    profiles: [e2e, chaos]
+    profiles: [e2e, chaos, partition]
     depends_on:
       domain-membership: {condition: service_healthy}
     environment:
@@ -227,7 +227,7 @@ services:
 
   domain-standby:
     <<: *runner
-    profiles: [e2e, chaos]
+    profiles: [e2e, chaos, partition]
     depends_on:
       domain-alpha: {condition: service_healthy}
       domain-beta: {condition: service_healthy}
@@ -235,7 +235,7 @@ services:
     environment:
       LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
       LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
-    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-host", "--node-id", "domain-standby", "--port", "29304", "--domains", "alpha,beta,gamma,delta", "--reference", "/artifacts/domain-standby.json"]
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-host", "--node-id", "domain-standby", "--port", "29304", "--domains", "alpha,beta,gamma,delta,split", "--reference", "/artifacts/domain-standby.json"]
     healthcheck:
       test: ["CMD", "test", "-s", "/artifacts/domain-standby.json"]
       interval: 1s
@@ -262,6 +262,32 @@ services:
     command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "domain-logic", "--node-id", "domain-logic-b", "--port", "29311", "--reference", "/artifacts/domain-logic-b.json"]
     healthcheck:
       test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and (.domains | length == 4 and all(.[]; . == \"Ready\"))", "/artifacts/domain-logic-b.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
+
+  split-node-a:
+    <<: *runner
+    profiles: [partition]
+    cap_add: [NET_ADMIN]
+    depends_on:
+      domain-standby: {condition: service_healthy}
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "split-entity-host", "--node-id", "split-node-a", "--port", "29306", "--domains", "split", "--reference", "/artifacts/partition/split-node-a.json"]
+    healthcheck:
+      test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and .served > 0", "/artifacts/partition/split-node-a.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
+
+  split-node-b:
+    <<: *runner
+    profiles: [partition]
+    cap_add: [NET_ADMIN]
+    depends_on:
+      domain-standby: {condition: service_healthy}
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "split-entity-host", "--node-id", "split-node-b", "--port", "29307", "--domains", "split", "--reference", "/artifacts/partition/split-node-b.json"]
+    healthcheck:
+      test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and .served > 0", "/artifacts/partition/split-node-b.json"]
       interval: 1s
       timeout: 1s
       retries: 600
@@ -424,6 +450,26 @@ services:
         aliases: [aaa-client, aaa-monitor]
     command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/testctl", "run", "chaos", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
 
+  runner-partition:
+    <<: *runner
+    profiles: [partition]
+    depends_on:
+      etcd-single: {condition: service_healthy}
+      split-node-a: {condition: service_healthy}
+      split-node-b: {condition: service_healthy}
+    volumes:
+      - ../..:/workspace:ro
+      - ../../target/test-artifacts/${LATTICE_RUN_ID:-local}:/artifacts
+      - cargo-home:/cargo-home
+      - cargo-target:/cargo-target
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_TEST_SEED: ${LATTICE_TEST_SEED:-1}
+      LATTICE_DOCKER_NETWORK: ${LATTICE_DOCKER_NETWORK:-bridge}
+      LATTICE_ETCD_ENDPOINTS: http://etcd-single:2379
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/testctl", "run", "partition", "--seed", "${LATTICE_TEST_SEED:-1}", "--artifacts", "/artifacts"]
+
   runner-scale:
     <<: *runner
     profiles: [scale]
@@ -465,6 +511,12 @@ networks:
   testnet:
     labels:
       io.lattice.test-run: ${LATTICE_RUN_ID:-local}
+    # Healing a partition reattaches the container on the address it had. Docker only accepts a
+    # requested address on a network whose subnet was configured rather than assigned, so this is
+    # declared even though nothing depends on the particular range.
+    ipam:
+      config:
+        - subnet: 10.153.7.0/24
 
 volumes:
   cargo-home:

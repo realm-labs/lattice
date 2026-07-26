@@ -122,6 +122,7 @@ enum Role {
     ConfigMember,
     DomainHost,
     DomainLogic,
+    SplitEntityHost,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,6 +425,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 cli.membership_only,
             )
             .await
+        }
+        Role::SplitEntityHost => {
+            split_entity_host(cli.reference, cli.node_id, cli.port, cli.domains).await
         }
     }
 }
@@ -801,8 +805,16 @@ async fn monitor(reference: PathBuf) -> Result<(), Box<dyn Error>> {
     let command_path = PathBuf::from("/artifacts/monitor-command.json");
     let mut applied = 0;
     loop {
+        // The orchestrator replaces this file while the loop polls it, so an absent or
+        // incompletely visible command is the next instruction arriving rather than a fault.
         let command = match std::fs::read(&command_path) {
-            Ok(encoded) => serde_json::from_slice::<MonitorCommand>(&encoded)?,
+            Ok(encoded) => match serde_json::from_slice::<MonitorCommand>(&encoded) {
+                Ok(command) => command,
+                Err(_) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            },
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 tokio::task::yield_now().await;
                 continue;
@@ -1165,4 +1177,5 @@ async fn wait_for_node_ready(service: &LatticeService) -> Result<(), Box<dyn Err
 
 include!("distributed_node/helpers.rs");
 include!("distributed_node/domain_cluster.rs");
+include!("distributed_node/split_entity.rs");
 include!("distributed_node/ha_coordinator.rs");

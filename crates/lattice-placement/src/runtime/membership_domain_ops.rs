@@ -227,6 +227,12 @@ where
         self.node_load_received.remove(&incarnation);
         self.shard_load_received
             .retain(|(owner, _, _), _| owner != &incarnation);
+        // Removing the departing domain member advanced the shared placement
+        // revision. Surviving sessions must observe it before the recovery
+        // deltas below, otherwise their strict reducer sees a gap, tears down
+        // the Coordinator association, and leaves the handoff barrier waiting
+        // on a session that can no longer register.
+        self.synchronize_sessions().await?;
         let owned_claims = self
             .claims
             .iter()

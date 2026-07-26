@@ -16,6 +16,8 @@ mod testctl_discovery;
 mod testctl_etcd;
 #[path = "testctl/outcomes.rs"]
 mod testctl_outcomes;
+#[path = "testctl/partition.rs"]
+mod testctl_partition;
 #[path = "testctl/resources.rs"]
 mod testctl_resources;
 #[path = "testctl/scale.rs"]
@@ -65,6 +67,8 @@ enum TestCommand {
         artifacts: PathBuf,
         #[arg(long, default_value_t = 30)]
         duration_seconds: u64,
+        #[arg(long)]
+        only: Vec<String>,
     },
     Replay {
         #[arg(long)]
@@ -82,6 +86,7 @@ enum Profile {
     E2eHaEtcd,
     Scale,
     Chaos,
+    Partition,
     K8s,
     Soak,
 }
@@ -104,7 +109,8 @@ fn run(cli: Cli) -> Result<(), String> {
             seed,
             artifacts,
             duration_seconds,
-        } => run_profile(profile, seed, &artifacts, duration_seconds),
+            only,
+        } => run_profile(profile, seed, &artifacts, duration_seconds, &only),
     }
 }
 
@@ -113,6 +119,7 @@ fn run_profile(
     seed: u64,
     artifacts: &Path,
     duration_seconds: u64,
+    only: &[String],
 ) -> Result<(), String> {
     std::fs::create_dir_all(artifacts).map_err(|error| error.to_string())?;
     let started = SystemTime::now()
@@ -122,7 +129,7 @@ fn run_profile(
     let timer = Instant::now();
     let mut resource_samples = vec![testctl_resources::sample(timer.elapsed())];
     let scenario_names = testctl_scenarios::for_profile(profile);
-    let mut runner = ScenarioRunner::new(&scenario_names);
+    let mut runner = ScenarioRunner::select(&scenario_names, only)?;
     match profile {
         Profile::Quality => {
             runner.run("structure", || command("scripts/check-structure.sh", &[]));
@@ -295,6 +302,14 @@ fn run_profile(
                 Ok(())
             });
         }
+        Profile::Partition => {
+            runner.run("entity-partition-single-activation", || {
+                testctl_partition::symmetric(artifacts)
+            });
+            runner.run("entity-owner-loss-reassignment", || {
+                testctl_partition::owner_loss_reassignment(artifacts)
+            });
+        }
         Profile::K8s => runner.run("k8s-lifecycle", || {
             command("sh", &["tests/distributed/k8s/verify.sh"])
         }),
@@ -309,8 +324,10 @@ fn run_profile(
         }),
     }
     let scenario_result = runner.finish();
-    let cleanup_result = if matches!(profile, Profile::E2eHaEtcd | Profile::Chaos | Profile::K8s)
-        && Path::new("/var/run/docker.sock").exists()
+    let cleanup_result = if matches!(
+        profile,
+        Profile::E2eHaEtcd | Profile::Chaos | Profile::Partition | Profile::K8s
+    ) && Path::new("/var/run/docker.sock").exists()
     {
         command("sh", &["scripts/docker-image-lifecycle.sh", "cleanup"])
     } else {
