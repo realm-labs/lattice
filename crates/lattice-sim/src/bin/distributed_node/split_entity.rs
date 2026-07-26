@@ -34,6 +34,7 @@ struct ActivationEvent<'a> {
 #[derive(Debug, Serialize)]
 struct ProbeEvent<'a> {
     sequence: u64,
+    requested_unix_millis: u128,
     unix_millis: u128,
     outcome: &'a str,
     served_by: Option<&'a ActivationIdentity>,
@@ -324,19 +325,25 @@ async fn split_entity_host(
     let mut sequence = 0_u64;
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The interrupt is subscribed to once and held across every probe. Building it inside the
+    // select would register a fresh listener per iteration, and an interrupt that arrives while the
+    // probe body runs is delivered to nobody and never replayed: the host would keep serving as if
+    // it had never been asked to leave.
+    let mut drain = std::pin::pin!(tokio::signal::ctrl_c());
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
+            signal = &mut drain => {
                 signal?;
                 break;
             }
             _ = ticker.tick() => {
                 connect_split_peers(&service, &node_id).await;
                 sequence = sequence.saturating_add(1);
+                let requested = unix_millis();
                 let reply = service
                     .ask(&reference, SplitProbe { sequence }, Duration::from_millis(1_500))
                     .await;
-                counters.record(&probes, sequence, reply)?;
+                counters.record(&probes, sequence, requested, reply)?;
                 write_atomic(
                     artifact.clone(),
                     &serde_json::to_vec_pretty(&SplitHostArtifact {
@@ -374,10 +381,14 @@ struct SplitProbeCounters {
 }
 
 impl SplitProbeCounters {
+    /// `requested` is taken before the request is issued. A frozen or descheduled process can only
+    /// be told apart from one that answered late by knowing when the request was admitted, so both
+    /// ends of the round trip are recorded.
     fn record(
         &mut self,
         journal: &Path,
         sequence: u64,
+        requested: u128,
         reply: Result<SplitProbeReply, RecipientError>,
     ) -> Result<(), Box<dyn Error>> {
         self.probes = self.probes.saturating_add(1);
@@ -388,6 +399,7 @@ impl SplitProbeCounters {
                 self.last_served_by = Some(reply.activation.clone());
                 ProbeEvent {
                     sequence,
+                    requested_unix_millis: requested,
                     unix_millis: unix_millis(),
                     outcome: "served",
                     served_by: Some(&reply.activation),
@@ -399,6 +411,7 @@ impl SplitProbeCounters {
                 self.last_outcome = "rejected".to_owned();
                 ProbeEvent {
                     sequence,
+                    requested_unix_millis: requested,
                     unix_millis: unix_millis(),
                     outcome: "rejected",
                     served_by: None,

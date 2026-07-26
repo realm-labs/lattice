@@ -98,6 +98,9 @@ pub(super) fn for_profile(profile: Profile) -> Vec<&'static str> {
         Profile::Partition => vec![
             "entity-partition-single-activation",
             "entity-owner-loss-reassignment",
+            "entity-paused-owner-lease-expiry",
+            "entity-egress-blackhole-reassignment",
+            "entity-drain-message-conservation",
         ],
         Profile::K8s => vec!["k8s-lifecycle"],
         Profile::Soak => vec!["bounded-seeded-soak"],
