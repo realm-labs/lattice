@@ -10,6 +10,26 @@ use crate::scan::MongoScan;
 
 use super::{MongoStore, mongo_timeout, store_error};
 
+/// Owner queries have no server-side bound: the whole result set is decoded
+/// into activation memory. Crossing this many rows is a strong signal that the
+/// state belongs in a row-lazy table instead of a complete collection.
+const LARGE_OWNER_LOAD: usize = 1_000;
+
+pub(super) const fn owner_load_is_large(loaded: usize) -> bool {
+    loaded >= LARGE_OWNER_LOAD
+}
+
+fn warn_large_owner_load(collection: &'static str, loaded: usize) {
+    if owner_load_is_large(loaded) {
+        tracing::warn!(
+            collection,
+            loaded,
+            threshold = LARGE_OWNER_LOAD,
+            "mongo.load.unbounded_owner_collection"
+        );
+    }
+}
+
 impl MongoStore {
     #[doc(hidden)]
     pub async fn find_one_scanned<D>(
@@ -75,6 +95,7 @@ impl MongoStore {
                 .map_err(store_error("decode typed document"))?;
             documents.push(decode_flat_document::<D>(document)?);
         }
+        warn_large_owner_load(D::COLLECTION, documents.len());
         Ok(documents)
     }
 
@@ -106,6 +127,7 @@ impl MongoStore {
                 .map_err(store_error("decode scanned document"))?;
             documents.push(decode_flat_scanned_document::<D>(document)?);
         }
+        warn_large_owner_load(D::COLLECTION, documents.len());
         Ok(documents)
     }
 

@@ -17,7 +17,9 @@
 //! A persisted value moves through the following lifecycle:
 //!
 //! 1. [`store::MongoStore`] loads a typed document and its optimistic-lock
-//!    metadata.
+//!    metadata. One store owns one connection pool; applications that hold
+//!    several stores should build them with [`store::MongoStore::from_database`]
+//!    so they share a single `Client`.
 //! 2. [`persistence::coordinator::MongoPersistenceCoordinator`] registers the
 //!    document and owns its last storage-acknowledged [`scan::ScanSnapshot`].
 //! 3. Business code mutates a [`document::tracked::Tracked`] value through
@@ -251,14 +253,21 @@
 //! - a version conflict remains blocked until application intervention.
 //!
 //! Actor code normally uses
-//! [`persistence::coordinator::MongoPersistenceCoordinator::dispatch_prepared`]
+//! [`persistence::coordinator::MongoPersistenceCoordinator::dispatch_prepared_with_retry`]
 //! instead of calling those methods individually. It submits the store future
 //! through `ActorContext::pipe_to_self`; the actor's
 //! [`lattice_actor::traits::Handler`] for
-//! [`persistence::actor::MongoFlushCompleted`] later calls `apply_completion`.
-//! The default retry policy starts at 50 ms, doubles, caps at 2 seconds, and
-//! removes up to half of each step at random so that actors recovering from one
-//! outage do not retry in lockstep.
+//! [`persistence::actor::MongoFlushCompleted`] later calls
+//! `apply_completion_with_retry`. The default retry policy starts at 50 ms,
+//! doubles, caps at 2 seconds, and removes up to half of each step at random so
+//! that actors recovering from one outage do not retry in lockstep.
+//!
+//! A retained retry is the actor's only copy of that dirty state, so both
+//! methods also post a caller-chosen message back to the actor when the backoff
+//! expires. Handling it must repeat the same preparation and dispatch. The
+//! plain `dispatch_prepared` and `apply_completion` do not schedule anything:
+//! use them only when the application already owns a flush timer, because
+//! otherwise a failed flush waits for unrelated mailbox traffic.
 //!
 //! Actor shutdown uses the mailbox-independent
 //! [`persistence::coordinator::MongoPersistenceCoordinator::drain_set`]
@@ -297,6 +306,40 @@
 //! [`persistence::direct::DirectDocumentStore`] for explicit whole-document
 //! insert, replace, and delete operations. Coordinated writes execute through
 //! [`persistence::request::PreparedWriteStore`].
+//!
+//! # Activation fencing
+//!
+//! Lattice guarantees one activation per entity, but a partition can break that
+//! guarantee briefly. Optimistic versions alone are not enough: they prove that
+//! a late write never overwrites newer state, yet when two activations both
+//! hold version *N* the **first** writer wins, even when it is the older one.
+//! The newer activation would then serve stale state until its first write.
+//!
+//! The storage envelope therefore also owns `_lattice_epoch`, the highest
+//! activation epoch that has written the document. Every coordinated write
+//! filters on `_id`, `version`, **and** an epoch no newer than its own, then
+//! stamps its own epoch. A superseded activation is reported as
+//! [`persistence::request::DocumentWriteOutcome::Fenced`]. That outcome always
+//! blocks the coordinator, whatever the document's [`persistence::coordinator::ConflictPolicy`]
+//! says, and `resolve_conflict_with_loaded` refuses it: the activation has lost
+//! the entity and must stop rather than reload and retry.
+//!
+//! An activation claims ownership implicitly with its first write. Use
+//! [`store::MongoStore::fence_document`] or
+//! [`store::MongoStore::fence_documents`] straight after loading to claim it
+//! before serving any request, which fences a still-running older activation
+//! without waiting for business traffic.
+//!
+//! This changes no existing field and needs no migration: documents written
+//! before the field existed carry no epoch, match the filter, and are claimed by
+//! the next write. Reconciliation order is also unchanged, so the exact-replay
+//! semantics of an ambiguous timeout survive: `_lattice_write_id` is compared
+//! first, and an acknowledged write is still reported as applied even when a
+//! newer activation claimed the document in between.
+//!
+//! [`persistence::direct::DirectDocumentStore`] is deliberately outside this
+//! protocol. It carries no activation identity, and its whole-document replace
+//! clears the field, so it must not target coordinator-owned collections.
 //!
 //! # Error and recovery model
 //!
@@ -342,5 +385,10 @@ pub mod scan;
 pub mod store;
 
 pub use lattice_store_mongodb_macros::{MongoDocument, MongoDocumentSet, MongoScan};
+
+/// Concurrency primitive used by the generated `MongoDocumentSet::load` so
+/// callers do not need their own async runtime dependency.
+#[doc(hidden)]
+pub use tokio::try_join;
 
 extern crate self as lattice_store_mongodb;

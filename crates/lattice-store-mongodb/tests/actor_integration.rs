@@ -16,8 +16,8 @@ use lattice_store_mongodb::error::MongoStoreError;
 use lattice_store_mongodb::persistence::actor::{
     CompletionStatus, MongoFlushCompleted, PersistenceStatus,
 };
-use lattice_store_mongodb::persistence::coordinator::MongoPersistenceCoordinator;
 use lattice_store_mongodb::persistence::coordinator::drain::{MongoDrainOptions, MongoDrainReport};
+use lattice_store_mongodb::persistence::coordinator::{MongoPersistenceCoordinator, RetryPolicy};
 use lattice_store_mongodb::persistence::request::{
     DocumentWriteOutcome, FlushGeneration, FlushOutcome, PreparedDocumentWrite, PreparedWriteStore,
 };
@@ -122,6 +122,41 @@ impl PreparedWriteStore for BlockingThenAcknowledgingStore {
                     .collect(),
             })
         }
+    }
+}
+
+#[derive(Clone)]
+struct FailUntilStore {
+    failures: usize,
+    attempts: Arc<AtomicUsize>,
+    applied: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl PreparedWriteStore for FailUntilStore {
+    async fn flush(
+        &self,
+        writes: Vec<PreparedDocumentWrite>,
+    ) -> Result<FlushOutcome, MongoStoreError> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) < self.failures {
+            return Err(MongoStoreError::new("transient storage failure"));
+        }
+        self.applied.add_permits(1);
+        Ok(FlushOutcome {
+            documents: writes
+                .into_iter()
+                .map(|write| {
+                    (
+                        write.token,
+                        DocumentWriteOutcome::Applied {
+                            previous_version: write.expected_version,
+                            new_version: write.expected_version + 1,
+                            updated_at_ms: 55,
+                        },
+                    )
+                })
+                .collect(),
+        })
     }
 }
 
@@ -252,6 +287,107 @@ fn actor(
         signal,
         generation: None,
     }
+}
+
+/// Drives persistence exactly like `PersistenceActor`, but through the
+/// self-scheduling API so a failed flush is retried without any further
+/// external message.
+struct SelfSchedulingActor {
+    coordinator: MongoPersistenceCoordinator,
+    document: Tracked<TestDocument>,
+    store: Arc<dyn PreparedWriteStore>,
+}
+
+impl Actor for SelfSchedulingActor {
+    type Error = ActorError;
+    type Behavior = ::lattice_actor::state_machine::Stateless;
+}
+
+impl Handler<Persist> for SelfSchedulingActor {
+    async fn handle(
+        &mut self,
+        context: &mut HandlerContext<'_, Self>,
+        _message: Persist,
+    ) -> Result<(), Self::Error> {
+        let prepared = self
+            .coordinator
+            .prepare(ScanBudget::generous(), |preparation| {
+                preparation.scan_tracked(&self.document)
+            })
+            .map_err(ActorError::from_error)?;
+        self.coordinator
+            .dispatch_prepared_with_retry(context, self.store.clone(), prepared, Persist)
+            .map_err(ActorError::from_error)?;
+        Ok(())
+    }
+}
+
+impl Handler<MongoFlushCompleted> for SelfSchedulingActor {
+    async fn handle(
+        &mut self,
+        context: &mut HandlerContext<'_, Self>,
+        completion: MongoFlushCompleted,
+    ) -> Result<(), Self::Error> {
+        self.coordinator
+            .apply_completion_with_retry(context, completion, Persist)
+            .map_err(ActorError::from_error)?;
+        Ok(())
+    }
+}
+
+fn self_scheduling_actor(store: Arc<dyn PreparedWriteStore>) -> SelfSchedulingActor {
+    let mut coordinator = MongoPersistenceCoordinator::with_retry_policy(
+        5,
+        RetryPolicy {
+            initial_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(20),
+            max_exponent: 2,
+            jitter_percent: 0,
+        },
+    );
+    let mut document = coordinator
+        .track_loaded(LoadedDocument {
+            version: 2,
+            updated_at_ms: 7,
+            value: TestDocument {
+                id: 42,
+                value: "old".to_owned(),
+            },
+        })
+        .expect("fixture document should attach");
+    document.write().value = "new".to_owned();
+    SelfSchedulingActor {
+        coordinator,
+        document,
+        store,
+    }
+}
+
+#[tokio::test]
+async fn a_failed_flush_retries_itself_without_any_further_external_message() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let applied = Arc::new(Semaphore::new(0));
+    let store = Arc::new(FailUntilStore {
+        failures: 3,
+        attempts: attempts.clone(),
+        applied: applied.clone(),
+    });
+    let handle = spawn_actor(
+        self_scheduling_actor(store),
+        MailboxConfig::bounded(8).with_deferred_capacity(4),
+    );
+
+    handle
+        .tell(Persist)
+        .await
+        .expect("the single external persist should enqueue");
+
+    tokio::time::timeout(Duration::from_secs(5), applied.acquire())
+        .await
+        .expect("the retained dirty write must reach storage without further traffic")
+        .expect("apply signal should remain open")
+        .forget();
+    assert_eq!(attempts.load(Ordering::SeqCst), 4);
 }
 
 struct StoppingDrainActor {

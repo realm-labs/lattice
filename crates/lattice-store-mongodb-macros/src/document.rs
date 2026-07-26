@@ -58,9 +58,15 @@ fn document_options(input: &DeriveInput) -> syn::Result<DocumentOptions> {
         }
         attribute.parse_nested_meta(|meta| {
             if meta.path.is_ident("collection") {
+                if collection.is_some() {
+                    return Err(meta.error("Mongo collection can only be declared once"));
+                }
                 collection = Some(meta.value()?.parse::<LitStr>()?);
                 Ok(())
             } else if meta.path.is_ident("conflict") {
+                if conflict_policy.is_some() {
+                    return Err(meta.error("Mongo conflict policy can only be declared once"));
+                }
                 let value = meta.value()?.parse::<LitStr>()?;
                 conflict_policy = Some(match value.value().as_str() {
                     "block" => ConflictPolicyOption::Block,

@@ -1,5 +1,6 @@
 //! Complete owner collections loaded as one lazy unit.
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use crate::document::MongoDocument;
@@ -7,6 +8,7 @@ use crate::document::set::MongoDocumentCollection;
 use crate::persistence::coordinator::{
     MongoPersistenceCoordinator, MongoPreparation, PersistenceError,
 };
+use crate::persistence::types::MongoDocumentKey;
 use crate::store::MongoStore;
 
 use super::policy::{IdleUnloadStatus, MongoLazyField, MongoUnloadableField};
@@ -189,7 +191,17 @@ where
         if now.saturating_duration_since(last_access) < self.idle_after {
             return Ok(IdleUnloadStatus::NotIdle);
         }
+        // `documents()` is business-controlled, so the same registration may be
+        // enumerated twice. Detaching is not idempotent: the second visit would
+        // fail an already-detached document and leave the collection resident
+        // with a partially unregistered set. Prove uniqueness and cleanliness
+        // before detaching anything.
+        let mut keys = BTreeSet::new();
         for document in collection.documents() {
+            let key = MongoDocumentKey::for_document::<C::Document>(document.read().id())?;
+            if !keys.insert(key.clone()) {
+                return Err(PersistenceError::DuplicateDocument(key));
+            }
             if !persistence.tracked_is_clean(document)? {
                 return Ok(IdleUnloadStatus::NeedsFlush);
             }
@@ -216,5 +228,97 @@ where
 
     fn scan_loaded(&self, preparation: &mut MongoPreparation<'_>) -> Result<(), PersistenceError> {
         self.inner.scan_loaded(preparation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use serde::{Deserialize, Serialize};
+
+    use super::{MongoLazyCollection, MongoUnloadableCollection};
+    use crate::document::LoadedDocument;
+    use crate::document::set::MongoDocumentCollection;
+    use crate::document::tracked::Tracked;
+    use crate::persistence::coordinator::{MongoPersistenceCoordinator, PersistenceError};
+    use crate::{MongoDocument, MongoScan};
+
+    #[derive(Debug, Serialize, Deserialize, MongoDocument, MongoScan)]
+    #[mongo(collection = "lazy_collection_tests")]
+    struct TestDocument {
+        #[mongo(id)]
+        id: u64,
+        value: i32,
+    }
+
+    /// A business collection that enumerates its only row twice, which the
+    /// trait permits because `documents()` is entirely business-controlled.
+    struct DuplicateEnumeratingCollection {
+        rows: Vec<Tracked<TestDocument>>,
+    }
+
+    impl MongoDocumentCollection<u64> for DuplicateEnumeratingCollection {
+        type Document = TestDocument;
+
+        fn load_filter(
+            _owner_id: &u64,
+        ) -> Result<mongodb::bson::Document, crate::error::MongoStoreError> {
+            Ok(mongodb::bson::doc! {})
+        }
+
+        fn owner_id(document: &Self::Document) -> &u64 {
+            &document.id
+        }
+
+        fn from_documents(
+            documents: Vec<Tracked<Self::Document>>,
+        ) -> Result<Self, PersistenceError> {
+            Ok(Self { rows: documents })
+        }
+
+        fn documents(&self) -> impl Iterator<Item = &Tracked<Self::Document>> {
+            self.rows.iter().chain(self.rows.iter())
+        }
+    }
+
+    #[test]
+    fn a_collection_that_repeats_a_document_is_rejected_before_anything_detaches() {
+        let mut coordinator = MongoPersistenceCoordinator::new(3);
+        let tracked = coordinator
+            .track_loaded(LoadedDocument {
+                version: 1,
+                updated_at_ms: 0,
+                value: TestDocument { id: 42, value: 7 },
+            })
+            .expect("fixture row should attach");
+        let mut collection = MongoUnloadableCollection {
+            inner: MongoLazyCollection {
+                owner_id: 42,
+                loaded: Some(DuplicateEnumeratingCollection {
+                    rows: vec![tracked],
+                }),
+            },
+            idle_after: Duration::from_secs(1),
+            last_access: Some(Instant::now() - Duration::from_secs(10)),
+        };
+
+        let error = collection
+            .unload_idle(Instant::now(), &mut coordinator)
+            .expect_err("a repeated document must not be detached twice");
+        assert!(matches!(error, PersistenceError::DuplicateDocument(_)));
+        assert!(
+            collection.is_loaded(),
+            "a rejected unload must leave the collection resident"
+        );
+        let resident = collection
+            .get_loaded()
+            .expect("the collection should stay loaded");
+        assert!(
+            coordinator
+                .tracked_is_clean(&resident.rows[0])
+                .expect("the row must still be registered"),
+            "no document may be detached while the enumeration is rejected"
+        );
     }
 }

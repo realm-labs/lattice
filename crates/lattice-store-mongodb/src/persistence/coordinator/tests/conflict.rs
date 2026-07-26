@@ -190,3 +190,88 @@ fn quarantined_conflicts_preserve_all_documents_and_allow_healthy_progress() {
         .unwrap();
     assert!(coordinator.conflicts().next().is_none());
 }
+
+#[test]
+fn a_storage_fence_blocks_the_whole_activation_and_cannot_be_resolved_by_reloading() {
+    let mut quarantined = crate::document::tracked::Tracked::clean(RejectingDocument {
+        id: 42,
+        payload: RejectingString {
+            value: "old".to_owned(),
+            reject: false,
+        },
+    });
+    let mut coordinator = MongoPersistenceCoordinator::new(7);
+    coordinator
+        .attach_loaded_tracked(
+            quarantined.read(),
+            0,
+            LoadedDocumentMeta {
+                version: 3,
+                updated_at_ms: 10,
+            },
+        )
+        .unwrap();
+    quarantined.write().payload.value = "local".to_owned();
+
+    let prepared = coordinator
+        .prepare(ScanBudget::generous(), |preparation| {
+            preparation.scan_tracked(&quarantined)
+        })
+        .unwrap();
+    let request = prepared.request.as_ref().unwrap();
+    assert_eq!(request.writes[0].activation_epoch, 7);
+    let generation = request.generation;
+    let token = request.writes[0].token;
+    coordinator.begin_flush(prepared.commit).unwrap();
+    coordinator
+        .complete(
+            generation,
+            FlushOutcome {
+                documents: BTreeMap::from([(
+                    token,
+                    DocumentWriteOutcome::Fenced {
+                        expected_version: 3,
+                        observed_epoch: 11,
+                    },
+                )]),
+            },
+        )
+        .unwrap();
+
+    let key = MongoDocumentKey::for_document::<RejectingDocument>(&42).unwrap();
+    let conflict = coordinator.document_conflict(&key).unwrap();
+    assert_eq!(
+        conflict.kind,
+        PersistenceConflictKind::Fenced { observed_epoch: 11 }
+    );
+    assert_eq!(
+        conflict.policy,
+        ConflictPolicy::BlockCoordinator,
+        "losing the entity must not be quarantined to one document"
+    );
+    assert_eq!(coordinator.fenced_by_epoch(), Some(11));
+    assert!(matches!(
+        coordinator.prepare(ScanBudget::generous(), |_| Ok(())),
+        Err(PersistenceError::ConflictBlocked)
+    ));
+    assert!(matches!(
+        coordinator.resolve_conflict_with_loaded(LoadedDocument {
+            version: 8,
+            updated_at_ms: 30,
+            value: RejectingDocument {
+                id: 42,
+                payload: RejectingString {
+                    value: "remote".to_owned(),
+                    reject: false,
+                },
+            },
+        }),
+        Err(PersistenceError::ActivationFenced {
+            activation_epoch: 7,
+            observed_epoch: 11,
+        })
+    ));
+    coordinator
+        .detach_conflicted::<RejectingDocument>(&42)
+        .expect("a fenced document may still be given up explicitly");
+}

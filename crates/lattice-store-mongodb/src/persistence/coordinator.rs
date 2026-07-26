@@ -190,6 +190,12 @@ pub enum PersistenceConflictKind {
     NotFound,
     /// A previously dispatched operation may or may not have reached MongoDB.
     OutcomeUnknown,
+    /// Storage refused the write because a strictly newer activation owns the
+    /// document. This activation has lost the entity and must stop writing;
+    /// it always blocks the coordinator regardless of [`ConflictPolicy`].
+    Fenced {
+        observed_epoch: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -257,6 +263,7 @@ pub struct MongoPersistenceCoordinator {
     last_error: Option<String>,
     retry_attempt: u32,
     retry_not_before: Option<Instant>,
+    retry_wakeup_armed: Option<Instant>,
     retry_policy: RetryPolicy,
     retry_entropy: u64,
     counters: PersistenceCounters,
@@ -280,6 +287,7 @@ impl MongoPersistenceCoordinator {
             last_error: None,
             retry_attempt: 0,
             retry_not_before: None,
+            retry_wakeup_armed: None,
             retry_policy,
             retry_entropy: uuid::Uuid::new_v4().as_u64_pair().0 | 1,
             counters: PersistenceCounters::default(),
@@ -875,6 +883,21 @@ impl MongoPersistenceCoordinator {
                     report.conflicts += 1;
                     self.counters.conflicts = self.counters.conflicts.saturating_add(1);
                 }
+                DocumentWriteOutcome::Fenced {
+                    expected_version,
+                    observed_epoch,
+                } => {
+                    state.conflict = Some(PersistenceConflict {
+                        key: document_commit.key,
+                        expected_version: *expected_version,
+                        kind: PersistenceConflictKind::Fenced {
+                            observed_epoch: *observed_epoch,
+                        },
+                        policy: ConflictPolicy::BlockCoordinator,
+                    });
+                    report.conflicts += 1;
+                    self.counters.conflicts = self.counters.conflicts.saturating_add(1);
+                }
                 DocumentWriteOutcome::Failed { error }
                     if error.recovery() == MongoStoreErrorRecovery::ReprepareAfterMutation =>
                 {
@@ -938,6 +961,7 @@ impl MongoPersistenceCoordinator {
         } else {
             self.retry_attempt = 0;
             self.retry_not_before = None;
+            self.retry_wakeup_armed = None;
             self.clear_last_error_if_recovered();
         }
         Ok(report)
@@ -1025,6 +1049,7 @@ impl MongoPersistenceCoordinator {
         }
         self.retry_attempt = 0;
         self.retry_not_before = None;
+        self.retry_wakeup_armed = None;
         self.last_error = Some(error);
         Ok(report)
     }
@@ -1055,6 +1080,33 @@ impl MongoPersistenceCoordinator {
     pub fn retry_delay(&self) -> Option<Duration> {
         self.retry_not_before
             .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+    }
+
+    /// Whether a failed flush is retained and waiting for its backoff to
+    /// expire. Unlike [`Self::retry_delay`] this stays true once the deadline
+    /// has already passed.
+    pub fn has_pending_retry(&self) -> bool {
+        self.retry_not_before.is_some()
+    }
+
+    /// Reserves the next self-addressed retry wakeup and returns how long the
+    /// owner should wait before re-preparing.
+    ///
+    /// `None` means no wakeup is needed: nothing is retained, a flush is
+    /// already in flight and will drive the next step, or a wakeup for the same
+    /// deadline is still pending. An elapsed deadline always yields a wakeup so
+    /// an undelivered notification cannot strand the retained write.
+    pub(super) fn arm_retry_wakeup(&mut self) -> Option<Duration> {
+        if self.in_flight.is_some() {
+            return None;
+        }
+        let deadline = self.retry_not_before?;
+        let delay = deadline.checked_duration_since(Instant::now());
+        if delay.is_some() && self.retry_wakeup_armed == Some(deadline) {
+            return None;
+        }
+        self.retry_wakeup_armed = Some(deadline);
+        Some(delay.unwrap_or_default())
     }
 
     pub const fn retry_attempt(&self) -> u32 {
@@ -1232,6 +1284,13 @@ pub enum PersistenceError {
     AbandonedGeneration(FlushGeneration),
     #[error("stale activation epoch: expected {expected}, got {actual}")]
     StaleActivation { expected: u64, actual: u64 },
+    #[error(
+        "activation epoch {activation_epoch} was fenced by activation epoch {observed_epoch}; this activation must stop instead of reloading"
+    )]
+    ActivationFenced {
+        activation_epoch: u64,
+        observed_epoch: i64,
+    },
     #[error("foreign flush generation: expected {expected:?}, got {actual:?}")]
     ForeignGeneration {
         expected: FlushGeneration,

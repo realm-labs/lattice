@@ -14,12 +14,20 @@ mod write;
 #[cfg(test)]
 mod tests;
 
+pub use write::{ActivationFence, ActivationFenceSummary};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MongoStoreConfig {
     pub uri: String,
     pub database: String,
     pub connect_timeout: Duration,
     pub operation_timeout: Duration,
+    /// Maximum connections the driver keeps per host. `None` keeps the value
+    /// carried by the URI, or the driver default when the URI omits it.
+    pub max_pool_size: Option<u32>,
+    /// Connections the driver keeps warm per host. `None` behaves like
+    /// [`Self::max_pool_size`].
+    pub min_pool_size: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -51,6 +59,20 @@ impl MongoStore {
                 "must be positive",
             ));
         }
+        if config.max_pool_size == Some(0) {
+            return Err(MongoStoreError::invalid_config(
+                "max_pool_size",
+                "must be positive",
+            ));
+        }
+        if let (Some(max), Some(min)) = (config.max_pool_size, config.min_pool_size)
+            && min > max
+        {
+            return Err(MongoStoreError::invalid_config(
+                "min_pool_size",
+                "cannot exceed max_pool_size",
+            ));
+        }
 
         info!(
             database = %config.database,
@@ -61,8 +83,7 @@ impl MongoStore {
         let mut options = ClientOptions::parse(&config.uri)
             .await
             .map_err(store_error("parse mongo uri"))?;
-        options.connect_timeout = Some(config.connect_timeout);
-        options.server_selection_timeout = Some(config.connect_timeout);
+        apply_client_options(&mut options, &config);
         let client = Client::with_options(options).map_err(store_error("create mongo client"))?;
         let database = client.database(&config.database);
         mongo_timeout(
@@ -79,12 +100,47 @@ impl MongoStore {
         })
     }
 
+    /// Builds a store over an already configured [`Database`].
+    ///
+    /// Applications that own several stores should share one [`Client`], and
+    /// therefore one connection pool, instead of connecting once per store.
+    /// No handshake is performed; the caller has already established the
+    /// client.
+    pub fn from_database(
+        database: Database,
+        operation_timeout: Duration,
+    ) -> Result<Self, MongoStoreError> {
+        if operation_timeout.is_zero() {
+            return Err(MongoStoreError::invalid_config(
+                "operation_timeout",
+                "must be positive",
+            ));
+        }
+        Ok(Self {
+            database,
+            operation_timeout,
+        })
+    }
+
     pub fn database(&self) -> &Database {
         &self.database
     }
 
     pub fn operation_timeout(&self) -> Duration {
         self.operation_timeout
+    }
+}
+
+/// Overrides only the options this crate owns. Pool sizes left unset keep
+/// whatever the URI or the driver default supplies.
+fn apply_client_options(options: &mut ClientOptions, config: &MongoStoreConfig) {
+    options.connect_timeout = Some(config.connect_timeout);
+    options.server_selection_timeout = Some(config.connect_timeout);
+    if config.max_pool_size.is_some() {
+        options.max_pool_size = config.max_pool_size;
+    }
+    if config.min_pool_size.is_some() {
+        options.min_pool_size = config.min_pool_size;
     }
 }
 

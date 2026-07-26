@@ -52,6 +52,17 @@ pub enum DocumentOperation {
         document: Document,
         mode: CreateMode,
     },
+    /// Removes the document under the same optimistic filter as an Update.
+    ///
+    /// Scanning never produces this operation: a coordinator-registered
+    /// document is detached, not deleted, and whole-document removal belongs to
+    /// [`super::direct::DirectDocumentStore`]. It exists for callers that drive
+    /// [`PreparedWriteStore`] directly, and its reconciliation is weaker than
+    /// every other operation. A successful delete leaves nothing behind that
+    /// carries `_lattice_write_id`, so an ambiguous transport failure cannot be
+    /// distinguished from a delete that never ran: the replay reports
+    /// `NotFound`, which becomes a conflict requiring explicit intervention
+    /// even though the delete did succeed.
     Delete,
 }
 
@@ -68,6 +79,12 @@ pub struct PreparedDocumentWrite {
     /// Stable across retries of this exact logical write and persisted in the
     /// document so an acknowledged timeout can be reconciled safely.
     pub operation_id: String,
+    /// Activation epoch that owns this write, copied from the flush generation.
+    ///
+    /// It is persisted alongside the document and included in the write filter,
+    /// so an activation that a newer one has already fenced cannot mutate the
+    /// document even when it still holds a matching `expected_version`.
+    pub activation_epoch: u64,
     pub operation: DocumentOperation,
 }
 
@@ -124,6 +141,12 @@ pub enum DocumentWriteOutcome {
     },
     NotFound {
         expected_version: i64,
+    },
+    /// The document records a strictly newer activation epoch, so this write
+    /// was refused by storage without inspecting the business state.
+    Fenced {
+        expected_version: i64,
+        observed_epoch: i64,
     },
     Failed {
         error: MongoStoreError,
@@ -210,6 +233,7 @@ mod tests {
                     ),
                     expected_version: 3,
                     operation_id: format!("operation-{token}"),
+                    activation_epoch: 7,
                     operation: DocumentOperation::Update {
                         sets: BTreeMap::from([(
                             MongoFieldPath::new("value"),

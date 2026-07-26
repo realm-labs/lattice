@@ -15,8 +15,9 @@ use crate::persistence::request::{
 };
 use crate::persistence::types::{MongoDocumentKey, MongoFieldPath};
 
-use super::write::unmatched_prepared_outcome;
-use super::{MongoStore, MongoStoreConfig, redact_mongo_uri};
+use super::read::owner_load_is_large;
+use super::write::{fenced_filter, unmatched_prepared_outcome};
+use super::{ActivationFence, MongoStore, MongoStoreConfig, redact_mongo_uri};
 
 #[derive(Debug, Clone, Serialize, Deserialize, crate::MongoDocument, crate::MongoScan)]
 #[mongo(collection = "document_set_required_load")]
@@ -90,21 +91,31 @@ impl MongoDocument for IntegrationDocument {
     }
 }
 
-#[tokio::test]
-async fn configured_mongo_verifies_direct_and_prepared_version_semantics() {
-    let Ok(uri) = std::env::var("LATTICE_MONGODB_TEST_URI") else {
-        return;
-    };
+/// Connects to the MongoDB instance named by `LATTICE_MONGODB_TEST_URI`.
+/// Tests that need real storage are skipped when it is unset.
+async fn configured_store() -> Option<MongoStore> {
+    let uri = std::env::var("LATTICE_MONGODB_TEST_URI").ok()?;
     let database = std::env::var("LATTICE_MONGODB_TEST_DATABASE")
         .unwrap_or_else(|_| "lattice_store_mongodb_integration".to_owned());
-    let store = MongoStore::connect(MongoStoreConfig {
-        uri,
-        database,
-        connect_timeout: std::time::Duration::from_secs(2),
-        operation_timeout: std::time::Duration::from_secs(2),
-    })
-    .await
-    .expect("local MongoDB should connect");
+    Some(
+        MongoStore::connect(MongoStoreConfig {
+            uri,
+            database,
+            connect_timeout: std::time::Duration::from_secs(2),
+            operation_timeout: std::time::Duration::from_secs(2),
+            max_pool_size: None,
+            min_pool_size: None,
+        })
+        .await
+        .expect("configured MongoDB should connect"),
+    )
+}
+
+#[tokio::test]
+async fn configured_mongo_verifies_direct_and_prepared_version_semantics() {
+    let Some(store) = configured_store().await else {
+        return;
+    };
     store
         .database()
         .collection::<mongodb::bson::Document>(IntegrationDocument::COLLECTION)
@@ -139,6 +150,7 @@ async fn configured_mongo_verifies_direct_and_prepared_version_semantics() {
                 .expect("numeric integration id should encode"),
             expected_version: 0,
             operation_id: "insert-only-conflict".to_owned(),
+            activation_epoch: 5,
             operation: DocumentOperation::Create {
                 document: doc! { "name": "must not overwrite", "score": 99 },
                 mode: crate::persistence::request::CreateMode::InsertOnly,
@@ -166,6 +178,7 @@ async fn configured_mongo_verifies_direct_and_prepared_version_semantics() {
             .expect("numeric integration id should encode"),
         expected_version: 1,
         operation_id: "integration-update-1".to_owned(),
+        activation_epoch: 5,
         operation: DocumentOperation::Update {
             sets: BTreeMap::from([
                 (
@@ -223,6 +236,7 @@ async fn configured_mongo_verifies_direct_and_prepared_version_semantics() {
                 .expect("numeric integration id should encode"),
             expected_version: 0,
             operation_id: "stale-upsert".to_owned(),
+            activation_epoch: 5,
             operation: DocumentOperation::Create {
                 document: doc! { "name": "overwritten", "score": 99 },
                 mode: crate::persistence::request::CreateMode::UpsertAllowed,
@@ -251,6 +265,7 @@ async fn configured_mongo_verifies_direct_and_prepared_version_semantics() {
                 .expect("numeric missing id should encode"),
             expected_version: 1,
             operation_id: "integration-delete-1".to_owned(),
+            activation_epoch: 5,
             operation: DocumentOperation::Delete,
         }])
         .await
@@ -290,19 +305,9 @@ async fn configured_mongo_verifies_direct_and_prepared_version_semantics() {
 
 #[tokio::test]
 async fn configured_mongo_document_sets_distinguish_required_and_default_missing() {
-    let Ok(uri) = std::env::var("LATTICE_MONGODB_TEST_URI") else {
+    let Some(store) = configured_store().await else {
         return;
     };
-    let database = std::env::var("LATTICE_MONGODB_TEST_DATABASE")
-        .unwrap_or_else(|_| "lattice_store_mongodb_integration".to_owned());
-    let store = MongoStore::connect(MongoStoreConfig {
-        uri,
-        database,
-        connect_timeout: std::time::Duration::from_secs(2),
-        operation_timeout: std::time::Duration::from_secs(2),
-    })
-    .await
-    .expect("local MongoDB should connect");
     for collection in [
         RequiredLoadDocument::COLLECTION,
         DefaultLoadDocument::COLLECTION,
@@ -371,6 +376,346 @@ async fn configured_mongo_document_sets_distinguish_required_and_default_missing
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, crate::MongoDocument, crate::MongoScan)]
+#[mongo(collection = "activation_fence_test")]
+struct FenceDocument {
+    #[mongo(id)]
+    id: u64,
+    value: String,
+}
+
+/// Fence tests share one collection but never the same document, so they clean
+/// up by identity instead of dropping state a parallel test still needs.
+async fn fence_collection(
+    store: &MongoStore,
+    id: u64,
+) -> mongodb::Collection<mongodb::bson::Document> {
+    let collection = store
+        .database()
+        .collection::<mongodb::bson::Document>(FenceDocument::COLLECTION);
+    drop_fence_document(&collection, id).await;
+    collection
+}
+
+async fn drop_fence_document(collection: &mongodb::Collection<mongodb::bson::Document>, id: u64) {
+    collection
+        .delete_one(doc! { "_id": id as i64 })
+        .await
+        .expect("fence test document should be removable");
+}
+
+fn fence_write(
+    token: u64,
+    id: u64,
+    expected_version: i64,
+    activation_epoch: u64,
+    operation_id: &str,
+    operation: DocumentOperation,
+) -> PreparedDocumentWrite {
+    PreparedDocumentWrite {
+        token: WriteToken(token),
+        key: MongoDocumentKey::new(FenceDocument::COLLECTION, id.to_string()),
+        document_id: crate::document::encode_document_id::<FenceDocument>(&id)
+            .expect("numeric fence id should encode"),
+        expected_version,
+        operation_id: operation_id.to_owned(),
+        activation_epoch,
+        operation,
+    }
+}
+
+fn fence_update(value: &str) -> DocumentOperation {
+    DocumentOperation::Update {
+        sets: BTreeMap::from([(
+            MongoFieldPath::new("value"),
+            mongodb::bson::Bson::String(value.to_owned()),
+        )]),
+        unsets: BTreeSet::new(),
+    }
+}
+
+#[tokio::test]
+async fn configured_mongo_refuses_writes_from_an_activation_a_newer_one_fenced() {
+    let Some(store) = configured_store().await else {
+        return;
+    };
+    let id = 7_u64;
+    let collection = fence_collection(&store, id).await;
+    let created = store
+        .flush_prepared_writes(vec![fence_write(
+            1,
+            id,
+            0,
+            5,
+            "old-create",
+            DocumentOperation::Create {
+                document: doc! { "value": "first" },
+                mode: crate::persistence::request::CreateMode::InsertOnly,
+            },
+        )])
+        .await
+        .expect("create should execute");
+    assert!(matches!(
+        created.documents[&WriteToken(1)],
+        DocumentWriteOutcome::Applied { new_version: 1, .. }
+    ));
+
+    let owned = store
+        .flush_prepared_writes(vec![fence_write(
+            2,
+            id,
+            1,
+            5,
+            "old-update",
+            fence_update("second"),
+        )])
+        .await
+        .expect("update from the owning activation should execute");
+    assert!(matches!(
+        owned.documents[&WriteToken(2)],
+        DocumentWriteOutcome::Applied { new_version: 2, .. }
+    ));
+
+    assert_eq!(
+        store
+            .fence_document::<FenceDocument>(&id, 9)
+            .await
+            .expect("a newer activation should claim the document"),
+        ActivationFence::Claimed
+    );
+
+    let fenced = store
+        .flush_prepared_writes(vec![fence_write(
+            3,
+            id,
+            2,
+            5,
+            "old-fenced-update",
+            fence_update("must not land"),
+        )])
+        .await
+        .expect("the superseded write should resolve");
+    assert!(
+        matches!(
+            fenced.documents[&WriteToken(3)],
+            DocumentWriteOutcome::Fenced {
+                expected_version: 2,
+                observed_epoch: 9,
+            }
+        ),
+        "a matching version must not let a fenced activation write: {:?}",
+        fenced.documents[&WriteToken(3)]
+    );
+    let untouched = DirectDocumentStore::<FenceDocument>::load(&store, &id)
+        .await
+        .expect("fenced document should load")
+        .expect("fenced document should remain present");
+    assert_eq!(untouched.version, 2);
+    assert_eq!(untouched.value.value, "second");
+
+    let taken_over = store
+        .flush_prepared_writes(vec![fence_write(
+            4,
+            id,
+            2,
+            9,
+            "new-update",
+            fence_update("third"),
+        )])
+        .await
+        .expect("the owning activation should execute");
+    assert!(matches!(
+        taken_over.documents[&WriteToken(4)],
+        DocumentWriteOutcome::Applied {
+            previous_version: 2,
+            new_version: 3,
+            ..
+        }
+    ));
+
+    assert_eq!(
+        store
+            .fence_document::<FenceDocument>(&id, 4)
+            .await
+            .expect("an older claim should resolve"),
+        ActivationFence::Superseded { observed_epoch: 9 }
+    );
+    assert_eq!(
+        store
+            .fence_document::<FenceDocument>(&999, 9)
+            .await
+            .expect("claiming a missing document should resolve"),
+        ActivationFence::Absent
+    );
+
+    drop_fence_document(&collection, id).await;
+}
+
+#[tokio::test]
+async fn configured_mongo_claims_an_owner_collection_and_reports_rows_it_lost() {
+    let Some(store) = configured_store().await else {
+        return;
+    };
+    let ids = [41_u64, 42, 43];
+    let collection = fence_collection(&store, ids[0]).await;
+    for id in ids {
+        drop_fence_document(&collection, id).await;
+        DirectDocumentStore::<FenceDocument>::insert(
+            &store,
+            &FenceDocument {
+                id,
+                value: "owned".to_owned(),
+            },
+        )
+        .await
+        .expect("collection row should insert");
+    }
+    let owner_filter = doc! { "_id": { "$in": ids.map(|id| id as i64).to_vec() } };
+
+    assert_eq!(
+        store
+            .fence_documents::<FenceDocument>(owner_filter.clone(), 5)
+            .await
+            .expect("the collection should be claimed as one unit"),
+        super::ActivationFenceSummary {
+            claimed: 3,
+            superseded: 0,
+        }
+    );
+    store
+        .fence_document::<FenceDocument>(&ids[1], 9)
+        .await
+        .expect("a newer activation should claim one row");
+    assert_eq!(
+        store
+            .fence_documents::<FenceDocument>(owner_filter, 5)
+            .await
+            .expect("a partially lost collection should be reported"),
+        super::ActivationFenceSummary {
+            claimed: 2,
+            superseded: 1,
+        }
+    );
+
+    for id in ids {
+        drop_fence_document(&collection, id).await;
+    }
+}
+
+#[tokio::test]
+async fn configured_mongo_replays_an_acknowledged_write_even_after_being_fenced() {
+    let Some(store) = configured_store().await else {
+        return;
+    };
+    let id = 11_u64;
+    let collection = fence_collection(&store, id).await;
+    store
+        .flush_prepared_writes(vec![fence_write(
+            1,
+            id,
+            0,
+            5,
+            "create",
+            DocumentOperation::Create {
+                document: doc! { "value": "first" },
+                mode: crate::persistence::request::CreateMode::InsertOnly,
+            },
+        )])
+        .await
+        .expect("create should execute");
+    let ambiguous = fence_write(2, id, 1, 5, "ambiguous-update", fence_update("second"));
+    store
+        .flush_prepared_writes(vec![ambiguous.clone()])
+        .await
+        .expect("the first attempt should execute");
+
+    assert_eq!(
+        store
+            .fence_document::<FenceDocument>(&id, 9)
+            .await
+            .expect("a newer activation should claim the document"),
+        ActivationFence::Claimed
+    );
+
+    let replayed = store
+        .flush_prepared_writes(vec![ambiguous])
+        .await
+        .expect("the exact replay should reconcile");
+    assert!(
+        matches!(
+            replayed.documents[&WriteToken(2)],
+            DocumentWriteOutcome::Applied {
+                previous_version: 1,
+                new_version: 2,
+                ..
+            }
+        ),
+        "fencing must not reclassify an already acknowledged write: {:?}",
+        replayed.documents[&WriteToken(2)]
+    );
+
+    drop_fence_document(&collection, id).await;
+}
+
+#[tokio::test]
+async fn configured_mongo_claims_documents_written_before_fencing_existed() {
+    let Some(store) = configured_store().await else {
+        return;
+    };
+    let id = 21_u64;
+    let collection = fence_collection(&store, id).await;
+    collection
+        .insert_one(doc! {
+            "_id": id as i64,
+            "version": 4_i64,
+            "updated_at_ms": 1_i64,
+            "value": "legacy",
+        })
+        .await
+        .expect("legacy document should insert");
+
+    let claimed = store
+        .flush_prepared_writes(vec![fence_write(
+            1,
+            id,
+            4,
+            3,
+            "claiming-update",
+            fence_update("migrated"),
+        )])
+        .await
+        .expect("a document without an epoch should be writable");
+    assert!(matches!(
+        claimed.documents[&WriteToken(1)],
+        DocumentWriteOutcome::Applied { new_version: 5, .. }
+    ));
+    let stored = collection
+        .find_one(doc! { "_id": id as i64 })
+        .await
+        .expect("claimed document should load")
+        .expect("claimed document should remain present");
+    assert_eq!(stored.get_i64("_lattice_epoch").ok(), Some(3));
+
+    drop_fence_document(&collection, id).await;
+}
+
+#[test]
+fn prepared_write_filters_pin_the_version_and_the_activation_epoch() {
+    let filter = fenced_filter(mongodb::bson::Bson::Int64(3), 7, 5);
+    assert_eq!(filter.get_i64("version").ok(), Some(7));
+    assert_eq!(
+        filter.get_document("_lattice_epoch").ok(),
+        Some(&doc! { "$not": { "$gt": 5_i64 } }),
+        "a prepared write must refuse documents owned by a newer activation"
+    );
+}
+
+#[test]
+fn owner_collection_loads_warn_once_they_stop_being_activation_sized() {
+    assert!(!owner_load_is_large(999));
+    assert!(owner_load_is_large(1_000));
+}
+
 #[test]
 fn unmatched_prepared_write_distinguishes_missing_from_conflict() {
     assert!(matches!(
@@ -385,6 +730,79 @@ fn unmatched_prepared_write_distinguishes_missing_from_conflict() {
             expected_version: 7
         }
     ));
+}
+
+fn pool_config(max_pool_size: Option<u32>, min_pool_size: Option<u32>) -> MongoStoreConfig {
+    MongoStoreConfig {
+        uri: "mongodb://127.0.0.1:27017".to_owned(),
+        database: "lattice_pool_config".to_owned(),
+        connect_timeout: std::time::Duration::from_secs(3),
+        operation_timeout: std::time::Duration::from_secs(4),
+        max_pool_size,
+        min_pool_size,
+    }
+}
+
+#[test]
+fn configured_pool_bounds_reach_the_driver_without_erasing_uri_defaults() {
+    let mut options = mongodb::options::ClientOptions::default();
+    options.max_pool_size = Some(99);
+    options.min_pool_size = Some(7);
+    super::apply_client_options(&mut options, &pool_config(None, None));
+    assert_eq!(options.max_pool_size, Some(99));
+    assert_eq!(options.min_pool_size, Some(7));
+    assert_eq!(
+        options.connect_timeout,
+        Some(std::time::Duration::from_secs(3))
+    );
+
+    super::apply_client_options(&mut options, &pool_config(Some(32), Some(4)));
+    assert_eq!(options.max_pool_size, Some(32));
+    assert_eq!(options.min_pool_size, Some(4));
+}
+
+#[tokio::test]
+async fn invalid_pool_bounds_are_rejected_before_any_client_is_built() {
+    let Err(zero) = MongoStore::connect(pool_config(Some(0), None)).await else {
+        panic!("a zero-sized pool cannot serve any operation");
+    };
+    assert!(zero.message().contains("max_pool_size"));
+    let Err(inverted) = MongoStore::connect(pool_config(Some(2), Some(8))).await else {
+        panic!("a minimum above the maximum cannot be satisfied");
+    };
+    assert!(inverted.message().contains("min_pool_size"));
+}
+
+#[tokio::test]
+async fn configured_mongo_serves_several_stores_from_one_client_pool() {
+    let Some(store) = configured_store().await else {
+        return;
+    };
+    let shared =
+        MongoStore::from_database(store.database().clone(), std::time::Duration::from_secs(2))
+            .expect("an existing database should build a store");
+    let id = 31_u64;
+    let collection = fence_collection(&store, id).await;
+    DirectDocumentStore::<FenceDocument>::insert(
+        &store,
+        &FenceDocument {
+            id,
+            value: "shared".to_owned(),
+        },
+    )
+    .await
+    .expect("the first store should write");
+    let loaded = DirectDocumentStore::<FenceDocument>::load(&shared, &id)
+        .await
+        .expect("the shared store should read")
+        .expect("the document written through the shared client should exist");
+    assert_eq!(loaded.value.value, "shared");
+
+    assert!(
+        MongoStore::from_database(store.database().clone(), std::time::Duration::ZERO).is_err(),
+        "a store must not be built without an operation timeout"
+    );
+    drop_fence_document(&collection, id).await;
 }
 
 #[test]

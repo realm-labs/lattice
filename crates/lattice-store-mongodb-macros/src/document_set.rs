@@ -238,35 +238,68 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             },
         }
     });
-    let loads = eager.iter().map(|field| {
+    let mut load_preludes = Vec::new();
+    let mut load_futures = Vec::new();
+    for field in &eager {
         let field_ident = field.ident;
-        match &field.kind {
+        load_futures.push(match &field.kind {
             DocumentSetFieldKind::One(document) => quote! {
-                let #field_ident = store
-                    .find_one_scanned::<#document>(id.clone())
-                    .await?
-                    .ok_or_else(|| #store::persistence::coordinator::PersistenceError::RequiredDocumentMissing {
-                        collection: <#document as #store::document::MongoDocument>::COLLECTION,
-                        id: ::std::format!("{:?}", id),
-                    })?;
+                async {
+                    match store.find_one_scanned::<#document>(id.clone()).await? {
+                        ::core::option::Option::Some(document) => ::core::result::Result::Ok(document),
+                        ::core::option::Option::None => ::core::result::Result::Err(
+                            #store::persistence::coordinator::PersistenceError::RequiredDocumentMissing {
+                                collection: <#document as #store::document::MongoDocument>::COLLECTION,
+                                id: ::std::format!("{:?}", id),
+                            },
+                        ),
+                    }
+                }
             },
             DocumentSetFieldKind::Default(document) => quote! {
-                let #field_ident = store
-                    .find_one_scanned::<#document>(id.clone())
-                    .await?;
+                async {
+                    ::core::result::Result::<
+                        _,
+                        #store::persistence::coordinator::PersistenceError,
+                    >::Ok(store.find_one_scanned::<#document>(id.clone()).await?)
+                }
             },
-            DocumentSetFieldKind::Many(collection) => quote! {
-                let #field_ident = store
-                    .find_many_scanned::<<#collection as #store::document::set::MongoDocumentCollection<#id>>::Document>(
-                        <#collection as #store::document::set::MongoDocumentCollection<#id>>::load_filter(&id)?,
-                    )
-                    .await?;
-            },
+            DocumentSetFieldKind::Many(collection) => {
+                let filter_ident = format_ident!("__mongo_filter_{}", field_ident);
+                load_preludes.push(quote! {
+                    let #filter_ident = <#collection as #store::document::set::MongoDocumentCollection<#id>>::load_filter(&id)?;
+                });
+                quote! {
+                    async {
+                        ::core::result::Result::<
+                            _,
+                            #store::persistence::coordinator::PersistenceError,
+                        >::Ok(
+                            store
+                                .find_many_scanned::<<#collection as #store::document::set::MongoDocumentCollection<#id>>::Document>(
+                                    #filter_ident,
+                                )
+                                .await?,
+                        )
+                    }
+                }
+            }
             DocumentSetFieldKind::Lazy(_) | DocumentSetFieldKind::Unloadable(_, _) => {
                 unreachable!("lazy fields are not startup-loaded")
             }
+        });
+    }
+    // Eager queries are independent, so activation latency is one round trip
+    // rather than their sum. The first failure cancels the rest, and nothing is
+    // registered with the coordinator until every query has succeeded.
+    let loads = if eager.is_empty() {
+        proc_macro2::TokenStream::new()
+    } else {
+        quote! {
+            #(#load_preludes)*
+            let (#(#eager_idents,)*) = #store::try_join!(#(#load_futures),*)?;
         }
-    });
+    };
     let scanned_validations = eager.iter().map(|field| {
         let field_ident = field.ident;
         match &field.kind {
@@ -392,7 +425,7 @@ pub(crate) fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             > + Send + 'a {
                 let id = id.clone();
                 async move {
-                    #(#loads)*
+                    #loads
                     #(#scanned_validations)*
                     #(#scanned_defaults)*
                     #(#scanned_attaches)*

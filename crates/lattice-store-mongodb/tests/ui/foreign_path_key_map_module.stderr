@@ -1,0 +1,7 @@
+error[E0425]: cannot find value `LATTICE_PATH_KEY_MAP_ADAPTER` in module `path_key_map`
+  --> tests/ui/foreign_path_key_map_module.rs:30:49
+   |
+30 | #[derive(Serialize, Deserialize, MongoDocument, MongoScan)]
+   |                                                 ^^^^^^^^^ not found in `path_key_map`
+   |
+   = note: this error originates in the derive macro `MongoScan` (in Nightly builds, run with -Z macro-backtrace for more info)

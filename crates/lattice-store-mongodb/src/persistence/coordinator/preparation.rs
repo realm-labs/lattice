@@ -171,6 +171,7 @@ impl<'a> MongoPreparation<'a> {
             document_id,
             expected_version: state.version,
             operation_id: uuid::Uuid::new_v4().simple().to_string(),
+            activation_epoch: self.generation.activation_epoch,
             operation,
         });
         let mut commit = commit;

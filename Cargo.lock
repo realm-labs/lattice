@@ -2437,6 +2437,7 @@ dependencies = [
  "tracing",
  "trybuild",
  "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
