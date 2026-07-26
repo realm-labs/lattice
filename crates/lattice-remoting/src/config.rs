@@ -176,6 +176,16 @@ impl RemotingConfig {
             .saturating_mul(self.physical_connections_per_association())
             .saturating_add(1)
     }
+
+    /// The longest silence a healthy peer may produce before its own control lane fails.
+    ///
+    /// Every control lane both sends a heartbeat each `heartbeat_interval` and gives up
+    /// once `heartbeat_miss_limit` of them go unanswered, so an association that has seen
+    /// no peer bytes for this long is one whose lane bookkeeping can no longer be trusted.
+    pub fn peer_liveness_window(&self) -> Duration {
+        self.heartbeat_interval
+            .saturating_mul(self.heartbeat_miss_limit)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

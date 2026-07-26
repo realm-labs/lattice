@@ -397,6 +397,7 @@ where
             }
             inbound = reader.read_frame() => {
                 let mut next_frame = Some(inbound?);
+                association.record_peer_activity();
                 let mut processed_frames = 0;
                 while let Some(frame) = next_frame {
                 last_received = Instant::now();

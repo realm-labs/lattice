@@ -450,6 +450,211 @@ async fn an_association_that_never_activates_is_abandoned_and_releases_its_permi
     client.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn an_accepting_peer_admits_a_new_association_after_the_dialer_dropped_its_own() {
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let client_port = server_port.saturating_sub(1).max(1024);
+    let cluster_id = ClusterId::new("stale-association-test").unwrap();
+    let client_identity = NodeIdentity {
+        cluster_id: cluster_id.clone(),
+        node_id: "client".to_owned(),
+        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        incarnation: NodeIncarnation::new(1).unwrap(),
+    };
+    let server_identity = NodeIdentity {
+        cluster_id: cluster_id.clone(),
+        node_id: "server".to_owned(),
+        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        incarnation: NodeIncarnation::new(2).unwrap(),
+    };
+    assert!(
+        (&client_identity.address, client_identity.incarnation.get())
+            < (&server_identity.address, server_identity.incarnation.get())
+    );
+    let descriptor = ProtocolDescriptor {
+        protocol_id: ProtocolId::new(7).unwrap(),
+        fingerprint: ProtocolFingerprint::digest(b"stale-association-test/v1"),
+    };
+    let config = RemotingConfig {
+        connect_timeout: Duration::from_secs(2),
+        establishing_timeout: Duration::from_secs(5),
+        reconnect_backoff_min: Duration::from_millis(20),
+        reconnect_backoff_max: Duration::from_millis(40),
+        heartbeat_interval: Duration::from_millis(100),
+        shutdown_timeout: Duration::from_secs(2),
+        ..RemotingConfig::default()
+    };
+    let client = endpoint_with_config(
+        client_identity.clone(),
+        descriptor.clone(),
+        Arc::new(RejectControlDispatch),
+        config.clone(),
+    );
+    let server = endpoint_with_config(
+        server_identity.clone(),
+        descriptor,
+        Arc::new(RejectControlDispatch),
+        config,
+    );
+    server.bind().await.unwrap();
+    let stale = client.connect_peer(server_identity.clone()).await.unwrap();
+    assert_eq!(stale.state(), AssociationState::Active);
+    wait_until(|| server.associations.len() == 1).await;
+
+    stale.begin_close();
+    stale.finish_close();
+    assert!(client.associations.remove(stale.key(), stale.id()));
+    wait_until(|| {
+        let _ = client.disconnect_association(stale.id());
+        server.associations.attached_lane_count() == 0
+    })
+    .await;
+    let accepted_id = || {
+        server
+            .associations
+            .get_exact(
+                &cluster_id,
+                &client_identity.address,
+                client_identity.incarnation,
+            )
+            .map(|association| association.id())
+    };
+    assert_eq!(accepted_id(), Some(stale.id()));
+
+    let reconnected = client.connect_peer(server_identity).await.unwrap();
+
+    assert_ne!(reconnected.id(), stale.id());
+    assert_eq!(reconnected.state(), AssociationState::Active);
+    assert_eq!(accepted_id(), Some(reconnected.id()));
+    assert_eq!(server.associations.len(), 1);
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+}
+
+/// A peer that is frozen or blackholed and then recovers keeps its `NodeIncarnation`, so
+/// the association key is byte-identical on both sides and the accepting node can only
+/// tell the rejoin apart by the `AssociationId`. Meanwhile every dial the peer made while
+/// it was unreachable is still sitting in the accept backlog, so the recovering node sees
+/// a burst of overlapping inbound connections for one lane. Losing one of those must not
+/// leave the association looking permanently live, or the rejoin is fenced forever.
+#[tokio::test]
+async fn backlogged_duplicate_dials_do_not_fence_a_same_incarnation_rejoin() {
+    use crate::transport::negotiate_outbound;
+    use tokio::net::TcpStream;
+
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let client_port = server_port.saturating_sub(1).max(1024);
+    let cluster_id = ClusterId::new("frozen-peer-rejoin-test").unwrap();
+    let client_identity = NodeIdentity {
+        cluster_id: cluster_id.clone(),
+        node_id: "client".to_owned(),
+        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        incarnation: NodeIncarnation::new(1).unwrap(),
+    };
+    let server_identity = NodeIdentity {
+        cluster_id: cluster_id.clone(),
+        node_id: "server".to_owned(),
+        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        incarnation: NodeIncarnation::new(2).unwrap(),
+    };
+    let descriptor = ProtocolDescriptor {
+        protocol_id: ProtocolId::new(7).unwrap(),
+        fingerprint: ProtocolFingerprint::digest(b"frozen-peer-rejoin-test/v1"),
+    };
+    let config = RemotingConfig {
+        heartbeat_interval: Duration::from_secs(30),
+        shutdown_timeout: Duration::from_secs(2),
+        ..RemotingConfig::default()
+    };
+    let server = endpoint_with_config(
+        server_identity.clone(),
+        descriptor.clone(),
+        Arc::new(RejectControlDispatch),
+        config.clone(),
+    );
+    server.bind().await.unwrap();
+
+    let dial_control_lane = |association_id: AssociationId, connection_nonce: u128| {
+        let client_identity = client_identity.clone();
+        let server_identity = server_identity.clone();
+        let descriptor = descriptor.clone();
+        let max_frame_size = config.max_frame_size;
+        async move {
+            let stream = TcpStream::connect(("127.0.0.1", server_port))
+                .await
+                .unwrap();
+            let mut connection =
+                FramedConnection::new(stream, FrameCodec::new(max_frame_size).unwrap());
+            negotiate_outbound(
+                &mut connection,
+                &Handshake {
+                    source: client_identity,
+                    expected_remote: server_identity,
+                    association_id,
+                    lane: LaneKind::Control,
+                    connection_nonce,
+                    maximum_frame_size: max_frame_size,
+                    features: FeatureBits::REQUIRED_V3,
+                },
+                &[descriptor],
+                8,
+            )
+            .await
+            .unwrap();
+            connection
+        }
+    };
+    let accepted_id = || {
+        server
+            .associations
+            .get_exact(
+                &cluster_id,
+                &client_identity.address,
+                client_identity.incarnation,
+            )
+            .map(|association| association.id())
+    };
+
+    // The generation the peer owned before it went away, plus the backlogged retries it
+    // issued while unreachable. Descending nonces make every retry win the duplicate
+    // tie-break against the connection that is actually running the lane.
+    let frozen_id = AssociationId::generate();
+    let running = dial_control_lane(frozen_id, 1_000).await;
+    wait_until(|| server.associations.attached_lane_count() == 1).await;
+    let mut backlog = Vec::new();
+    for nonce in (1..=3).rev() {
+        backlog.push(dial_control_lane(frozen_id, nonce).await);
+    }
+    wait_until(|| accepted_id() == Some(frozen_id)).await;
+
+    // The peer gave up on that generation: it dropped the association and every socket.
+    drop(backlog);
+    drop(running);
+    let stale = server
+        .associations
+        .get_exact(
+            &cluster_id,
+            &client_identity.address,
+            client_identity.incarnation,
+        )
+        .unwrap();
+    wait_until(|| !stale.has_live_connection()).await;
+    assert_eq!(stale.attached_lane_count(), 0);
+
+    // It rejoins under the same incarnation with a fresh association generation.
+    let rejoined_id = AssociationId::generate();
+    let _rejoined = dial_control_lane(rejoined_id, 500).await;
+
+    wait_until(|| accepted_id() == Some(rejoined_id)).await;
+    assert_eq!(server.associations.len(), 1);
+    assert_eq!(stale.state(), AssociationState::Closed);
+    server.shutdown().await.unwrap();
+}
+
 async fn wait_until(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !condition() {

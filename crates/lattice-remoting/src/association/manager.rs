@@ -107,12 +107,28 @@ impl AssociationManager {
             .associations
             .lock()
             .expect("association registry poisoned");
-        if let Some(existing) = associations.get(&key) {
-            return if existing.id() == association_id {
-                Ok(existing.clone())
-            } else {
-                Err(AssociationError::IncomingAssociationConflict)
-            };
+        if let Some(existing) = associations.get(&key).cloned() {
+            if existing.id() == association_id {
+                return Ok(existing);
+            }
+            // The key pins the peer incarnation, so a differing id is a newer connection
+            // generation from that same peer; it may only take over an entry that no longer
+            // runs a live lane connection.
+            //
+            // A peer that freezes or is blackholed and then rejoins keeps its incarnation,
+            // so the key alone proves nothing about whether the entry is still real. Local
+            // lane bookkeeping is therefore only believed while the peer keeps proving it:
+            // a healthy association exchanges a control heartbeat every heartbeat interval,
+            // so one that has been silent past the control lane's own liveness window is
+            // stale no matter how many lanes it still claims.
+            if existing.has_live_connection()
+                && existing.peer_silence() < self.config.peer_liveness_window()
+            {
+                return Err(AssociationError::IncomingAssociationConflict);
+            }
+            associations.remove(&key);
+            existing.begin_close();
+            existing.finish_close();
         }
         if associations.len() == self.config.max_associations {
             return Err(AssociationError::AssociationLimit);
