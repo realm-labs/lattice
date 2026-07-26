@@ -85,6 +85,62 @@ async fn expired_watch_error_retains_snapshot_then_relist_replaces_it() {
     assert_eq!(relisted.targets[0].address.host(), "10.0.0.2");
 }
 
+#[tokio::test]
+async fn unusable_address_is_skipped_and_the_remaining_targets_survive() {
+    let mut slice = endpoint_slice("a", "cluster", "10.0.0.1");
+    slice.endpoints.push(Endpoint {
+        addresses: vec!["10.0.0.2/32".to_string(), "10.0.0.3".to_string()],
+        conditions: Some(EndpointConditions {
+            ready: Some(true),
+            terminating: Some(false),
+            ..EndpointConditions::default()
+        }),
+        ..Endpoint::default()
+    });
+    let source = FakeEndpointSliceSource::new(vec![
+        Ok(SliceEvent::Init),
+        Ok(SliceEvent::InitApply(slice)),
+        Ok(SliceEvent::InitDone),
+    ]);
+    let discovery =
+        KubernetesEndpointSliceDiscovery::with_source(config(), Arc::new(source)).unwrap();
+    let mut snapshots = discovery.snapshots();
+
+    let snapshot = snapshots.next().await.unwrap().unwrap();
+    let hosts = snapshot
+        .targets
+        .iter()
+        .map(|target| target.address.host())
+        .collect::<Vec<_>>();
+    assert_eq!(hosts, vec!["10.0.0.1", "10.0.0.3"]);
+}
+
+#[test]
+fn service_name_must_be_a_valid_label_value() {
+    let long = "a".repeat(64);
+    for service in [
+        "cluster,app=lattice",
+        "cluster=core",
+        "-cluster",
+        "cluster.",
+        "clu ster",
+        long.as_str(),
+    ] {
+        let candidate = KubernetesEndpointSliceConfig {
+            service: service.to_string(),
+            ..config()
+        };
+        assert!(
+            matches!(
+                candidate.validate(),
+                Err(DiscoveryError::InvalidConfiguration { .. })
+            ),
+            "{service} was accepted"
+        );
+    }
+    assert!(config().validate().is_ok());
+}
+
 #[derive(Clone)]
 struct FakeEndpointSliceSource {
     events: Vec<Result<SliceEvent, String>>,

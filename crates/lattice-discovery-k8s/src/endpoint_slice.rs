@@ -3,12 +3,17 @@ use std::{
     fmt::{Debug, Display, Formatter, Result as FmtResult},
     pin::Pin,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures_util::{Stream, StreamExt};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use kube::{Client, ResourceExt, api::Api, config::KubeConfigOptions, runtime::watcher};
+use kube::{
+    Client, ResourceExt,
+    api::Api,
+    config::KubeConfigOptions,
+    runtime::{WatchStreamExt, watcher},
+};
 use lattice_core::{actor_ref::NodeAddress, coordinator::CoordinatorScope};
 use lattice_discovery::provider::{
     CoordinatorDirectorySnapshot, CoordinatorDiscovery, DiscoveryError, DiscoveryOrigin,
@@ -16,6 +21,8 @@ use lattice_discovery::provider::{
 };
 
 const SERVICE_LABEL: &str = "kubernetes.io/service-name";
+const MAX_LABEL_VALUE_BYTES: usize = 63;
+const REJECTED_ADDRESS_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KubernetesCredentials {
@@ -40,6 +47,14 @@ impl KubernetesEndpointSliceConfig {
             return Err(DiscoveryError::InvalidConfiguration {
                 message: "Kubernetes namespace, service and port name must not be empty"
                     .to_string(),
+            });
+        }
+        if !is_label_value(&self.service) {
+            return Err(DiscoveryError::InvalidConfiguration {
+                message: format!(
+                    "Kubernetes service name is not a valid label value: {}",
+                    self.service
+                ),
             });
         }
         if self
@@ -147,20 +162,19 @@ impl CoordinatorDiscovery for KubernetesEndpointSliceDiscovery {
                         Ok(event) => match state.apply(event) {
                             Err(error) => yield Err(error),
                             Ok(false) => {}
-                            Ok(true) => match state.targets(&self.config) {
-                                Ok(targets) if !targets.is_empty() || !emitted_initial => {
-                                    generation += 1;
-                                    emitted_initial = true;
-                                    yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets });
-                                }
-                                Ok(_) => {
+                            Ok(true) => {
+                                let targets = state.targets(&self.config);
+                                if targets.is_empty() && emitted_initial {
                                     yield Err(DiscoveryError::Provider {
                                         provider: "kubernetes_endpoint_slice",
                                         message: "empty update retained the last valid snapshot".to_string(),
                                     });
+                                } else {
+                                    generation += 1;
+                                    emitted_initial = true;
+                                    yield Ok(CoordinatorDirectorySnapshot { scope: scope.clone(), generation, targets });
                                 }
-                                Err(error) => yield Err(error),
-                            },
+                            }
                         },
                     }
                 }
@@ -197,17 +211,21 @@ impl EndpointSliceSource for KubeEndpointSliceSource {
     fn events(&self) -> Pin<Box<dyn Stream<Item = Result<SliceEvent, String>> + Send + '_>> {
         let api = Api::<EndpointSlice>::namespaced(self.client.clone(), &self.namespace);
         let config = watcher::Config::default().labels(&self.selector);
-        Box::pin(watcher::watcher(api, config).map(|event| {
-            event
-                .map(|event| match event {
-                    watcher::Event::Apply(slice) => SliceEvent::Apply(slice),
-                    watcher::Event::Delete(slice) => SliceEvent::Delete(slice),
-                    watcher::Event::Init => SliceEvent::Init,
-                    watcher::Event::InitApply(slice) => SliceEvent::InitApply(slice),
-                    watcher::Event::InitDone => SliceEvent::InitDone,
-                })
-                .map_err(|error| error.to_string())
-        }))
+        Box::pin(
+            watcher::watcher(api, config)
+                .default_backoff()
+                .map(|event| {
+                    event
+                        .map(|event| match event {
+                            watcher::Event::Apply(slice) => SliceEvent::Apply(slice),
+                            watcher::Event::Delete(slice) => SliceEvent::Delete(slice),
+                            watcher::Event::Init => SliceEvent::Init,
+                            watcher::Event::InitApply(slice) => SliceEvent::InitApply(slice),
+                            watcher::Event::InitDone => SliceEvent::InitDone,
+                        })
+                        .map_err(|error| error.to_string())
+                }),
+        )
     }
 }
 
@@ -215,6 +233,7 @@ impl EndpointSliceSource for KubeEndpointSliceSource {
 struct EndpointSliceState {
     live: BTreeMap<String, EndpointSlice>,
     staging: Option<BTreeMap<String, EndpointSlice>>,
+    last_rejection_warning: Option<Instant>,
 }
 
 impl EndpointSliceState {
@@ -256,11 +275,10 @@ impl EndpointSliceState {
         }
     }
 
-    fn targets(
-        &self,
-        config: &KubernetesEndpointSliceConfig,
-    ) -> Result<Vec<DiscoveryTarget>, DiscoveryError> {
+    fn targets(&mut self, config: &KubernetesEndpointSliceConfig) -> Vec<DiscoveryTarget> {
         let mut targets = BTreeMap::<NodeAddress, DiscoveryTarget>::new();
+        let mut rejected = 0_usize;
+        let mut sample = None;
         for slice in self.live.values() {
             if slice
                 .metadata
@@ -287,12 +305,11 @@ impl EndpointSliceState {
                     continue;
                 }
                 for host in &endpoint.addresses {
-                    let address = NodeAddress::new(host.clone(), port).map_err(|error| {
-                        DiscoveryError::Provider {
-                            provider: "kubernetes_endpoint_slice",
-                            message: format!("invalid EndpointSlice address: {error}"),
-                        }
-                    })?;
+                    let Ok(address) = NodeAddress::new(host.clone(), port) else {
+                        rejected += 1;
+                        sample.get_or_insert_with(|| host.clone());
+                        continue;
+                    };
                     let source =
                         DiscoverySource::single(DiscoveryOrigin::KubernetesEndpointSlice {
                             namespace: config.namespace.clone(),
@@ -307,8 +324,48 @@ impl EndpointSliceState {
                 }
             }
         }
-        Ok(targets.into_values().collect())
+        if let Some(sample) = sample {
+            self.warn_rejected_addresses(config, rejected, &sample);
+        }
+        targets.into_values().collect()
     }
+
+    fn warn_rejected_addresses(
+        &mut self,
+        config: &KubernetesEndpointSliceConfig,
+        rejected: usize,
+        sample: &str,
+    ) {
+        let now = Instant::now();
+        if self
+            .last_rejection_warning
+            .is_some_and(|last| now.duration_since(last) < REJECTED_ADDRESS_WARN_INTERVAL)
+        {
+            return;
+        }
+        self.last_rejection_warning = Some(now);
+        tracing::warn!(
+            target: "lattice.cluster.discovery",
+            namespace = %config.namespace,
+            service = %config.service,
+            rejected,
+            %sample,
+            "skipped unusable EndpointSlice addresses"
+        );
+    }
+}
+
+fn is_label_value(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_LABEL_VALUE_BYTES {
+        return false;
+    }
+    if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn slice_name(slice: &EndpointSlice) -> Result<String, DiscoveryError> {

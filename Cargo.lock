@@ -2235,6 +2235,7 @@ dependencies = [
  "lattice-discovery",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
