@@ -495,9 +495,9 @@ impl LatticeService {
                                 .await
                                 .is_ok()
                             {
-                                let mut completed = drain_ready.borrow().clone();
-                                completed.insert(domain.clone(), operation_id);
-                                drain_ready.send_replace(completed);
+                                drain_ready.send_modify(|completed| {
+                                    completed.insert(domain.clone(), operation_id);
+                                });
                             }
                             continue;
                         }
@@ -511,21 +511,22 @@ impl LatticeService {
                         AuthorityEffect::PublishReady => handle.publish_ready(&slot),
                         AuthorityEffect::PublishDrained => {
                             let result = handle.publish_drained(&slot);
-                            let mut blockers = drain_blockers.borrow().clone();
-                            if let Some(slots) = blockers.get_mut(&domain) {
-                                slots.remove(&slot);
-                            }
-                            drain_blockers.send_replace(blockers);
+                            drain_blockers.send_modify(|blockers| {
+                                if let Some(slots) = blockers.get_mut(&domain) {
+                                    slots.remove(&slot);
+                                }
+                            });
                             result
                         }
                         AuthorityEffect::PublishStopFailed => {
                             let result = handle.publish_stop_failed(&slot);
-                            let mut blockers = drain_blockers.borrow().clone();
-                            let inserted = blockers
-                                .entry(domain.clone())
-                                .or_default()
-                                .insert(slot.clone());
-                            drain_blockers.send_replace(blockers);
+                            let mut inserted = false;
+                            drain_blockers.send_modify(|blockers| {
+                                inserted = blockers
+                                    .entry(domain.clone())
+                                    .or_default()
+                                    .insert(slot.clone());
+                            });
                             if result.is_ok() && inserted {
                                 let router = router.clone();
                                 let handle = handle.clone();
@@ -542,11 +543,11 @@ impl LatticeService {
                                 .stop_fenced_slot(slot.clone())
                                 .await
                                 .map_err(|_| LogicSessionError::ControlClosed);
-                            let mut blockers = drain_blockers.borrow().clone();
-                            if let Some(slots) = blockers.get_mut(&domain) {
-                                slots.remove(&slot);
-                            }
-                            drain_blockers.send_replace(blockers);
+                            drain_blockers.send_modify(|blockers| {
+                                if let Some(slots) = blockers.get_mut(&domain) {
+                                    slots.remove(&slot);
+                                }
+                            });
                             result
                         }
                         AuthorityEffect::FenceAdmission

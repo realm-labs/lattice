@@ -417,9 +417,9 @@ impl LogicJoinRuntime {
                     .complete_member_drain(operation_id.clone())
                     .await
                     .map_err(|_| ())?;
-                let mut ready = self.drain_ready.borrow().clone();
-                ready.insert(self.domain_hello.domain.clone(), operation_id);
-                self.drain_ready.send_replace(ready);
+                self.drain_ready.send_modify(|ready| {
+                    ready.insert(self.domain_hello.domain.clone(), operation_id);
+                });
                 Ok(())
             }
             LogicPlacementEffect::Authority { slot, effect } => match effect {
@@ -430,21 +430,22 @@ impl LogicJoinRuntime {
                 AuthorityEffect::PublishReady => handle.publish_ready(&slot).map_err(|_| ()),
                 AuthorityEffect::PublishDrained => {
                     let result = handle.publish_drained(&slot).map_err(|_| ());
-                    let mut blockers = self.drain_blockers.borrow().clone();
-                    if let Some(slots) = blockers.get_mut(&self.domain_hello.domain) {
-                        slots.remove(&slot);
-                    }
-                    self.drain_blockers.send_replace(blockers);
+                    self.drain_blockers.send_modify(|blockers| {
+                        if let Some(slots) = blockers.get_mut(&self.domain_hello.domain) {
+                            slots.remove(&slot);
+                        }
+                    });
                     result
                 }
                 AuthorityEffect::PublishStopFailed => {
                     let result = handle.publish_stop_failed(&slot).map_err(|_| ());
-                    let mut blockers = self.drain_blockers.borrow().clone();
-                    let inserted = blockers
-                        .entry(self.domain_hello.domain.clone())
-                        .or_default()
-                        .insert(slot.clone());
-                    self.drain_blockers.send_replace(blockers);
+                    let mut inserted = false;
+                    self.drain_blockers.send_modify(|blockers| {
+                        inserted = blockers
+                            .entry(self.domain_hello.domain.clone())
+                            .or_default()
+                            .insert(slot.clone());
+                    });
                     if result.is_ok() && inserted {
                         let router = self.router.clone();
                         let handle = handle.clone();
@@ -462,11 +463,11 @@ impl LogicJoinRuntime {
                         .stop_fenced_slot(slot.clone())
                         .await
                         .map_err(|_| ());
-                    let mut blockers = self.drain_blockers.borrow().clone();
-                    if let Some(slots) = blockers.get_mut(&self.domain_hello.domain) {
-                        slots.remove(&slot);
-                    }
-                    self.drain_blockers.send_replace(blockers);
+                    self.drain_blockers.send_modify(|blockers| {
+                        if let Some(slots) = blockers.get_mut(&self.domain_hello.domain) {
+                            slots.remove(&slot);
+                        }
+                    });
                     result
                 }
                 AuthorityEffect::FenceAdmission
