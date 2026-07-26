@@ -154,23 +154,19 @@ impl SharedFaultInjector {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .hit(point)
         });
-        InstalledFaultInjector {
-            hook,
-            exclusive: Some(exclusive),
-        }
+        InstalledFaultInjector { hook, exclusive }
     }
 }
 
+/// Field order is load bearing. Fields drop in declaration order, so the hook is restored before
+/// the exclusive lock is released. Releasing the lock first lets the next installer capture this
+/// hook as its predecessor, and restoring it afterwards then erases the hook that installer just
+/// put in place. A manual `Drop` cannot express this: its body runs before any field is dropped.
 pub struct InstalledFaultInjector {
     #[allow(dead_code)]
     hook: FailpointGuard,
-    exclusive: Option<MutexGuard<'static, ()>>,
-}
-
-impl Drop for InstalledFaultInjector {
-    fn drop(&mut self) {
-        self.exclusive.take();
-    }
+    #[allow(dead_code)]
+    exclusive: MutexGuard<'static, ()>,
 }
 
 fn exclusive() -> &'static Mutex<()> {
@@ -344,5 +340,26 @@ mod tests {
         );
         drop(installed);
         assert!(failpoint::hit_decision(Failpoint::HandoffAfterDrainSend).is_continue());
+    }
+
+    #[test]
+    fn concurrent_installers_never_observe_another_injector_hook() {
+        let threads = (0..4)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let point = Failpoint::ALL[index];
+                    for _ in 0..200 {
+                        let injector = SharedFaultInjector::default();
+                        let installed = injector.install();
+                        injector.arm(point, FailAction::StoreFailure);
+                        assert_eq!(failpoint::hit_decision(point), FailAction::StoreFailure);
+                        drop(installed);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
     }
 }

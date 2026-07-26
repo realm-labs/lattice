@@ -511,6 +511,12 @@ networks:
   testnet:
     labels:
       io.lattice.test-run: ${LATTICE_RUN_ID:-local}
+    # Healing a partition reattaches the container on the address it had. Docker only accepts a
+    # requested address on a network whose subnet was configured rather than assigned, so this is
+    # declared even though nothing depends on the particular range.
+    ipam:
+      config:
+        - subnet: 10.153.7.0/24
 
 volumes:
   cargo-home:
