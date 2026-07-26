@@ -205,12 +205,20 @@ impl WorkerIdLeaseStore for EtcdWorkerIdLeaseStore {
     ) -> Result<WorkerIdAcquisition, WorkerIdStoreError> {
         let ttl_seconds = ttl_seconds(ttl)?;
         let mut client = self.client.clone();
-        let lease_id = client
+        let granted = client
             .lease_grant(ttl_seconds, None)
             .await
-            .map_err(|error| backend_error("grant lease", error))?
-            .id();
-        let valid_for = Duration::from_secs(ttl_seconds as u64);
+            .map_err(|error| backend_error("grant lease", error))?;
+        let lease_id = granted.id();
+        let valid_for = match granted_validity(granted.ttl()) {
+            Some(valid_for) => valid_for,
+            None => {
+                let _ = client.lease_revoke(lease_id).await;
+                return Err(WorkerIdStoreError::Backend {
+                    message: format!("Etcd granted a lease with TTL {}", granted.ttl()),
+                });
+            }
+        };
         let occupied = match self.occupied_ids(owner).await {
             Ok(occupied) => occupied,
             Err(error) => {
@@ -232,6 +240,9 @@ impl WorkerIdLeaseStore for EtcdWorkerIdLeaseStore {
         Err(WorkerIdStoreError::unavailable(owner, range))
     }
 
+    /// Keeps the Etcd lease alive. Etcd always resets a keepalive to the TTL it
+    /// granted, so `_ttl` cannot change the window; the returned lease reports
+    /// the TTL Etcd actually applied.
     async fn renew(
         &self,
         lease: &WorkerIdLease,
@@ -250,21 +261,21 @@ impl WorkerIdLeaseStore for EtcdWorkerIdLeaseStore {
             .keep_alive()
             .await
             .map_err(|error| backend_error("send lease keepalive", error))?;
-        let Some(response) = stream
+        let response = stream
             .message()
             .await
-            .map_err(|error| backend_error("receive lease keepalive", error))?
-        else {
+            .map_err(|error| backend_error("receive lease keepalive", error))?;
+        let Some(valid_for) = keepalive_validity(response.map(|response| response.ttl()))? else {
             return Ok(None);
         };
-        if response.ttl() <= 0 || self.matching_record(lease, lease_id).await?.is_none() {
+        if self.matching_record(lease, lease_id).await?.is_none() {
             return Ok(None);
         }
         WorkerIdLease::new(
             lease.id(),
             lease.owner().clone(),
             lease.token().clone(),
-            Duration::from_secs(response.ttl() as u64),
+            valid_for,
         )
         .map(Some)
         .map_err(|_| codec_error("renewed lease"))
@@ -289,11 +300,12 @@ impl WorkerIdLeaseStore for EtcdWorkerIdLeaseStore {
         if !deleted {
             return Ok(false);
         }
-        client
+        let revoked = client
             .lease_revoke(lease_id)
             .await
-            .map_err(|error| backend_error("revoke released lease", error))?;
-        Ok(true)
+            .map(|_| ())
+            .map_err(|error| backend_error("revoke released lease", error));
+        release_outcome(revoked, lease)
     }
 }
 
@@ -335,6 +347,36 @@ fn lease_id(token: &WorkerIdLeaseToken) -> Result<i64, WorkerIdStoreError> {
         .ok_or_else(|| codec_error("lease token ID"))
 }
 
+fn granted_validity(granted_ttl: i64) -> Option<Duration> {
+    u64::try_from(granted_ttl)
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+}
+
+fn keepalive_validity(granted_ttl: Option<i64>) -> Result<Option<Duration>, WorkerIdStoreError> {
+    match granted_ttl {
+        None => Err(WorkerIdStoreError::Backend {
+            message: "Etcd closed the lease keepalive stream before reporting a TTL".to_string(),
+        }),
+        Some(granted_ttl) => Ok(granted_validity(granted_ttl)),
+    }
+}
+
+fn release_outcome(
+    revoked: Result<(), WorkerIdStoreError>,
+    lease: &WorkerIdLease,
+) -> Result<bool, WorkerIdStoreError> {
+    if let Err(error) = revoked {
+        tracing::warn!(
+            error = %error,
+            worker_id = %lease.id(),
+            "released the Etcd worker ID slot but could not revoke its lease; the lease expires on its own"
+        );
+    }
+    Ok(true)
+}
+
 fn ttl_seconds(ttl: Duration) -> Result<i64, WorkerIdStoreError> {
     if ttl.is_zero() {
         return Err(WorkerIdStoreError::InvalidConfiguration {
@@ -365,12 +407,66 @@ fn codec_error(context: &'static str) -> WorkerIdStoreError {
 mod tests {
     use std::time::Duration;
 
-    use super::ttl_seconds;
+    use lattice_core::actor_ref::{ClusterId, NodeIncarnation};
+    use lattice_id::worker::{
+        WorkerId, WorkerIdLease, WorkerIdLeaseToken, WorkerIdOwner, WorkerIdStoreError,
+    };
+
+    use super::{granted_validity, keepalive_validity, release_outcome, ttl_seconds};
+
+    fn lease() -> WorkerIdLease {
+        let owner = WorkerIdOwner::for_node(
+            ClusterId::new("etcd-store-test").unwrap(),
+            "node-a",
+            NodeIncarnation::new(1).unwrap(),
+        )
+        .unwrap();
+        WorkerIdLease::new(
+            WorkerId::new(3),
+            owner,
+            WorkerIdLeaseToken::new("7:fence").unwrap(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn lease_ttl_rounds_up_to_etcd_seconds() {
         assert_eq!(ttl_seconds(Duration::from_millis(1)).unwrap(), 1);
         assert_eq!(ttl_seconds(Duration::from_secs(5)).unwrap(), 5);
         assert_eq!(ttl_seconds(Duration::from_millis(5_001)).unwrap(), 6);
+    }
+
+    #[test]
+    fn the_granted_ttl_bounds_the_validity_window() {
+        assert_eq!(granted_validity(7), Some(Duration::from_secs(7)));
+        assert_eq!(granted_validity(0), None);
+        assert_eq!(granted_validity(-1), None);
+    }
+
+    #[test]
+    fn a_closed_keepalive_stream_is_retryable_and_a_zero_ttl_is_lost() {
+        assert!(matches!(
+            keepalive_validity(None),
+            Err(WorkerIdStoreError::Backend { .. })
+        ));
+        assert_eq!(keepalive_validity(Some(0)).unwrap(), None);
+        assert_eq!(
+            keepalive_validity(Some(5)).unwrap(),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn a_deleted_slot_is_released_even_when_the_lease_revoke_fails() {
+        assert!(
+            release_outcome(
+                Err(WorkerIdStoreError::Backend {
+                    message: "revoke failed".to_string(),
+                }),
+                &lease(),
+            )
+            .unwrap()
+        );
     }
 }

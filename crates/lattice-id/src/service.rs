@@ -23,6 +23,8 @@ use crate::{
     },
 };
 
+const RUNTIME_EXIT_MESSAGE: &str = "distributed ID runtime stopped unexpectedly";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistributedIdConfig {
     pub snowflake: SnowflakeConfig,
@@ -115,6 +117,9 @@ pub enum DistributedIdState {
         attempt: u64,
         last_error: Option<String>,
     },
+    Failed {
+        message: String,
+    },
     Stopped,
 }
 
@@ -126,6 +131,8 @@ pub enum DistributedIdError {
     LeaseUnavailable,
     #[error("the distributed ID service is stopped")]
     Stopped,
+    #[error("the distributed ID runtime failed and cannot recover: {message}")]
+    RuntimeFailed { message: String },
     #[error("system time is before the Unix epoch or cannot fit in milliseconds")]
     SystemClock,
     #[error(transparent)]
@@ -162,7 +169,15 @@ impl DistributedIdGenerator {
         if !self.gate.generation_is_current(version) {
             return Err(self.gate.unavailable_error());
         }
-        generated.map_err(DistributedIdError::Snowflake)
+        generated
+            .map_err(|error| DistributedIdError::Snowflake(self.gate.observe(worker_id, error)))
+    }
+
+    /// Counts generation attempts rejected because the system clock moved
+    /// backwards. A nonzero and growing value means wall-clock time regressed
+    /// and every generation fails until it catches up.
+    pub fn clock_regressions(&self) -> u64 {
+        self.gate.clock_regressions.load(Ordering::Relaxed)
     }
 
     pub async fn next_id(&self) -> Result<u64, DistributedIdError> {
@@ -203,6 +218,7 @@ impl DistributedIdService {
         config: DistributedIdConfig,
     ) -> Result<Self, DistributedIdError> {
         config.validate()?;
+        let requested_at = Instant::now();
         let acquisition = store
             .acquire(&owner, config.worker_range, config.lease_ttl)
             .await?;
@@ -210,6 +226,14 @@ impl DistributedIdService {
             let _ = store.release(acquisition.lease()).await;
             return Err(error);
         }
+        let Some(safe_until) = lease_safe_deadline(
+            requested_at,
+            acquisition.lease(),
+            config.lease_safety_margin,
+        ) else {
+            let _ = store.release(acquisition.lease()).await;
+            return Err(DistributedIdError::LeaseUnavailable);
+        };
 
         let gate = Arc::new(GenerationGate::new(config.snowflake));
         let initial_state = if acquisition.is_reused() {
@@ -218,7 +242,7 @@ impl DistributedIdService {
                 cooldown: config.reuse_cooldown()?,
             }
         } else {
-            let generation = gate.activate(acquisition.lease().id())?;
+            let generation = gate.activate(acquisition.lease().id(), safe_until)?;
             DistributedIdState::Active {
                 worker_id: acquisition.lease().id(),
                 lease_generation: generation,
@@ -241,7 +265,7 @@ impl DistributedIdService {
         };
         let task = tokio::spawn(async move {
             let _runtime_guard = runtime_guard;
-            runtime.run(acquisition, shutdown_rx).await;
+            runtime.run(acquisition, requested_at, shutdown_rx).await;
         });
         Ok(Self {
             store,
@@ -272,6 +296,9 @@ impl DistributedIdService {
             match state.borrow_and_update().clone() {
                 DistributedIdState::Active { worker_id, .. } => return Ok(worker_id),
                 DistributedIdState::Stopped => return Err(DistributedIdError::Stopped),
+                DistributedIdState::Failed { message } => {
+                    return Err(DistributedIdError::RuntimeFailed { message });
+                }
                 DistributedIdState::CoolingDown { .. } | DistributedIdState::Reacquiring { .. } => {
                 }
             }
@@ -316,7 +343,11 @@ struct GenerationGate {
     snowflake: SnowflakeState,
     worker_id: AtomicU64,
     lease_generation: AtomicU64,
+    safe_until_ms: AtomicU64,
+    clock_regressions: AtomicU64,
+    base: Instant,
     stopped: AtomicBool,
+    failed: AtomicBool,
     transition: Mutex<()>,
 }
 
@@ -327,21 +358,31 @@ impl GenerationGate {
             snowflake: SnowflakeState::new(),
             worker_id: AtomicU64::new(0),
             lease_generation: AtomicU64::new(0),
+            safe_until_ms: AtomicU64::new(0),
+            clock_regressions: AtomicU64::new(0),
+            base: Instant::now(),
             stopped: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
             transition: Mutex::new(()),
         }
     }
 
-    fn activate(&self, worker_id: WorkerId) -> Result<u64, DistributedIdError> {
+    fn activate(
+        &self,
+        worker_id: WorkerId,
+        safe_until: Instant,
+    ) -> Result<u64, DistributedIdError> {
         let _transition = self.transition.lock().expect("ID generation gate poisoned");
         if self.stopped.load(Ordering::Acquire) {
             return Err(DistributedIdError::Stopped);
         }
         let current = self.lease_generation.load(Ordering::Acquire);
         if current & 1 == 1 {
+            self.store_safe_until(safe_until);
             return Ok(current);
         }
         self.worker_id.store(worker_id.get(), Ordering::Release);
+        self.store_safe_until(safe_until);
         let next =
             current
                 .checked_add(1)
@@ -350,6 +391,45 @@ impl GenerationGate {
                 })?;
         self.lease_generation.store(next, Ordering::Release);
         Ok(next)
+    }
+
+    fn extend(&self, safe_until: Instant) {
+        let _transition = self.transition.lock().expect("ID generation gate poisoned");
+        if self.lease_generation.load(Ordering::Acquire) & 1 == 1 {
+            self.store_safe_until(safe_until);
+        }
+    }
+
+    fn store_safe_until(&self, safe_until: Instant) {
+        self.safe_until_ms
+            .store(self.millis_since_base(safe_until), Ordering::Release);
+    }
+
+    fn millis_since_base(&self, instant: Instant) -> u64 {
+        u64::try_from(instant.saturating_duration_since(self.base).as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn fail(&self) {
+        let _transition = self.transition.lock().expect("ID generation gate poisoned");
+        self.failed.store(true, Ordering::Release);
+        let current = self.lease_generation.load(Ordering::Acquire);
+        if current & 1 == 1 {
+            self.lease_generation
+                .store(current.wrapping_add(1), Ordering::Release);
+        }
+    }
+
+    fn observe(&self, worker_id: u64, error: SnowflakeError) -> SnowflakeError {
+        if let SnowflakeError::ClockMovedBackwards { last_ms, now_ms } = error {
+            self.clock_regressions.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                worker_id,
+                last_ms,
+                now_ms,
+                "system clock moved backwards; distributed ID generation fails until wall clock time catches up"
+            );
+        }
+        error
     }
 
     fn deactivate(&self) {
@@ -376,6 +456,9 @@ impl GenerationGate {
         if version & 1 == 0 {
             return Err(self.unavailable_error());
         }
+        if self.millis_since_base(Instant::now()) > self.safe_until_ms.load(Ordering::Acquire) {
+            return Err(self.unavailable_error());
+        }
         Ok(version)
     }
 
@@ -391,6 +474,10 @@ impl GenerationGate {
     fn unavailable_error(&self) -> DistributedIdError {
         if self.stopped.load(Ordering::Acquire) {
             DistributedIdError::Stopped
+        } else if self.failed.load(Ordering::Acquire) {
+            DistributedIdError::RuntimeFailed {
+                message: RUNTIME_EXIT_MESSAGE.to_string(),
+            }
         } else {
             DistributedIdError::LeaseUnavailable
         }
@@ -416,27 +503,34 @@ impl Drop for RuntimeGuard {
         if self.gate.stopped.load(Ordering::Acquire) {
             return;
         }
-        self.gate.deactivate();
-        self.state_tx.send_replace(DistributedIdState::Reacquiring {
-            previous_worker_id: None,
-            attempt: 0,
-            last_error: Some("distributed ID runtime stopped unexpectedly".to_string()),
+        self.gate.fail();
+        tracing::error!("{RUNTIME_EXIT_MESSAGE}");
+        self.state_tx.send_replace(DistributedIdState::Failed {
+            message: RUNTIME_EXIT_MESSAGE.to_string(),
         });
     }
 }
 
 impl Runtime {
-    async fn run(self, mut acquisition: WorkerIdAcquisition, mut shutdown: watch::Receiver<bool>) {
+    async fn run(
+        self,
+        mut acquisition: WorkerIdAcquisition,
+        mut requested_at: Instant,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
         loop {
-            match self.hold(acquisition, &mut shutdown).await {
+            match self.hold(acquisition, requested_at, &mut shutdown).await {
                 HoldResult::Shutdown => return,
                 HoldResult::Lost(previous_worker_id) => {
                     self.gate.deactivate();
                     *self.lease.lock().await = None;
-                    let Some(next) = self.reacquire(previous_worker_id, &mut shutdown).await else {
+                    let Some((next, next_requested_at)) =
+                        self.reacquire(previous_worker_id, &mut shutdown).await
+                    else {
                         return;
                     };
                     acquisition = next;
+                    requested_at = next_requested_at;
                 }
             }
         }
@@ -445,17 +539,19 @@ impl Runtime {
     async fn hold(
         &self,
         acquisition: WorkerIdAcquisition,
+        requested_at: Instant,
         shutdown: &mut watch::Receiver<bool>,
     ) -> HoldResult {
         let reused = acquisition.is_reused();
         let mut current = acquisition.into_lease();
         let worker_id = current.id();
         *self.lease.lock().await = Some(current.clone());
-        let mut safe_until = match lease_safe_deadline(&current, self.config.lease_safety_margin) {
-            Some(deadline) => deadline,
-            None => return HoldResult::Lost(worker_id),
-        };
-        let mut next_renew = Instant::now() + self.config.renew_interval;
+        let mut safe_until =
+            match lease_safe_deadline(requested_at, &current, self.config.lease_safety_margin) {
+                Some(deadline) => deadline,
+                None => return HoldResult::Lost(worker_id),
+            };
+        let mut next_renew = requested_at + self.config.renew_interval;
         let cooldown_deadline = reused
             .then(|| Instant::now() + self.config.reuse_cooldown().expect("validated cooldown"));
         let mut active = !reused;
@@ -476,17 +572,19 @@ impl Runtime {
                 }
                 () = tokio::time::sleep_until(next_renew) => {
                     match self.renew_until(&current, safe_until, shutdown).await {
-                        RenewResult::Renewed(renewed) => {
+                        RenewResult::Renewed(renewed, renewed_at) => {
                             current = renewed;
                             *self.lease.lock().await = Some(current.clone());
                             let Some(deadline) = lease_safe_deadline(
+                                renewed_at,
                                 &current,
                                 self.config.lease_safety_margin,
                             ) else {
                                 return HoldResult::Lost(worker_id);
                             };
                             safe_until = deadline;
-                            next_renew = Instant::now() + self.config.renew_interval;
+                            self.gate.extend(safe_until);
+                            next_renew = renewed_at + self.config.renew_interval;
                         }
                         RenewResult::Lost => return HoldResult::Lost(worker_id),
                         RenewResult::Shutdown => return HoldResult::Shutdown,
@@ -496,7 +594,7 @@ impl Runtime {
                     if Instant::now() >= safe_until {
                         return HoldResult::Lost(worker_id);
                     }
-                    match self.gate.activate(worker_id) {
+                    match self.gate.activate(worker_id, safe_until) {
                         Ok(generation) => {
                             active = true;
                             self.state_tx.send_replace(DistributedIdState::Active {
@@ -519,6 +617,7 @@ impl Runtime {
     ) -> RenewResult {
         let mut backoff = self.config.reacquire_backoff_initial;
         loop {
+            let requested_at = Instant::now();
             let renewal = tokio::time::timeout_at(
                 safe_deadline,
                 self.store.renew(lease, self.config.lease_ttl),
@@ -535,7 +634,7 @@ impl Runtime {
             match result {
                 Ok(Ok(Some(renewed))) => {
                     if validate_renewal(lease, &renewed, &self.config) {
-                        return RenewResult::Renewed(renewed);
+                        return RenewResult::Renewed(renewed, requested_at);
                     }
                     tracing::error!(
                         worker_id = %lease.id(),
@@ -571,7 +670,7 @@ impl Runtime {
         &self,
         previous_worker_id: WorkerId,
         shutdown: &mut watch::Receiver<bool>,
-    ) -> Option<WorkerIdAcquisition> {
+    ) -> Option<(WorkerIdAcquisition, Instant)> {
         let mut attempt = 0_u64;
         let mut backoff = self.config.reacquire_backoff_initial;
         loop {
@@ -581,6 +680,7 @@ impl Runtime {
                 attempt,
                 last_error: None,
             });
+            let requested_at = Instant::now();
             let result = tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
@@ -606,13 +706,21 @@ impl Runtime {
                             last_error: Some(error.to_string()),
                         });
                     } else {
+                        let Some(safe_until) = lease_safe_deadline(
+                            requested_at,
+                            acquisition.lease(),
+                            self.config.lease_safety_margin,
+                        ) else {
+                            let _ = self.store.release(acquisition.lease()).await;
+                            return None;
+                        };
                         let state = if acquisition.is_reused() {
                             DistributedIdState::CoolingDown {
                                 worker_id: acquisition.lease().id(),
                                 cooldown: self.config.reuse_cooldown().expect("validated cooldown"),
                             }
                         } else {
-                            match self.gate.activate(acquisition.lease().id()) {
+                            match self.gate.activate(acquisition.lease().id(), safe_until) {
                                 Ok(generation) => DistributedIdState::Active {
                                     worker_id: acquisition.lease().id(),
                                     lease_generation: generation,
@@ -624,7 +732,7 @@ impl Runtime {
                             }
                         };
                         self.state_tx.send_replace(state);
-                        return Some(acquisition);
+                        return Some((acquisition, requested_at));
                     }
                 }
                 Err(error) => {
@@ -656,7 +764,7 @@ enum HoldResult {
 }
 
 enum RenewResult {
-    Renewed(WorkerIdLease),
+    Renewed(WorkerIdLease, Instant),
     Lost,
     Shutdown,
 }
@@ -691,11 +799,15 @@ fn validate_renewal(
         && renewed.valid_for() > config.lease_safety_margin
 }
 
-fn lease_safe_deadline(lease: &WorkerIdLease, margin: Duration) -> Option<Instant> {
+fn lease_safe_deadline(
+    requested_at: Instant,
+    lease: &WorkerIdLease,
+    margin: Duration,
+) -> Option<Instant> {
     lease
         .valid_for()
         .checked_sub(margin)
-        .map(|usable| Instant::now() + usable)
+        .map(|usable| requested_at + usable)
 }
 
 fn unix_time_ms() -> Result<i64, DistributedIdError> {
@@ -721,9 +833,10 @@ mod tests {
 
     use super::{
         DistributedIdConfig, DistributedIdError, DistributedIdService, DistributedIdState,
+        unix_time_ms,
     };
     use crate::{
-        snowflake::SnowflakeConfig,
+        snowflake::{SnowflakeConfig, SnowflakeError},
         worker::{
             InMemoryWorkerIdLeaseStore, WorkerIdAcquisition, WorkerIdLease, WorkerIdLeaseStore,
             WorkerIdOwner, WorkerIdRange, WorkerIdStoreError,
@@ -770,7 +883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unexpected_runtime_exit_fails_closed() {
+    async fn unexpected_runtime_exit_fails_closed_and_terminates_waiters() {
         let store = Arc::new(InMemoryWorkerIdLeaseStore::default());
         let mut service = DistributedIdService::start(store, owner(1), config())
             .await
@@ -783,13 +896,88 @@ mod tests {
 
         assert!(matches!(
             generator.try_next_id(),
-            Err(DistributedIdError::LeaseUnavailable)
+            Err(DistributedIdError::RuntimeFailed { .. })
         ));
+        assert!(matches!(service.state(), DistributedIdState::Failed { .. }));
         assert!(matches!(
-            service.state(),
-            DistributedIdState::Reacquiring { attempt: 0, .. }
+            tokio::time::timeout(Duration::from_millis(250), service.wait_until_active())
+                .await
+                .expect("a failed runtime must not hang its waiters"),
+            Err(DistributedIdError::RuntimeFailed { .. })
         ));
         assert!(service.shutdown().await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lease_deadlines_are_anchored_at_the_request_instead_of_the_response() {
+        let store = Arc::new(SlowAcquireStore::new(Duration::from_millis(400)));
+        let started = tokio::time::Instant::now();
+        let service = DistributedIdService::start(store, owner(1), config())
+            .await
+            .unwrap();
+        let mut states = service.subscribe_state();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    &*states.borrow_and_update(),
+                    DistributedIdState::Reacquiring { .. }
+                ) {
+                    break;
+                }
+                states.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(600), "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_starved_runtime_still_closes_the_gate_at_the_lease_deadline() {
+        let store = Arc::new(InMemoryWorkerIdLeaseStore::default());
+        let service = DistributedIdService::start(store, owner(1), config())
+            .await
+            .unwrap();
+        let generator = service.generator();
+        assert!(generator.try_next_id().is_ok());
+
+        std::thread::sleep(Duration::from_millis(700));
+
+        assert!(matches!(
+            generator.try_next_id(),
+            Err(DistributedIdError::LeaseUnavailable)
+        ));
+        let _ = service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn backwards_clock_movement_is_counted_for_operators() {
+        let store = Arc::new(InMemoryWorkerIdLeaseStore::default());
+        let service = DistributedIdService::start(store, owner(1), config())
+            .await
+            .unwrap();
+        let generator = service.generator();
+        let gate = &generator.gate;
+        gate.snowflake
+            .next_at(
+                gate.config,
+                gate.worker_id.load(Ordering::Acquire),
+                unix_time_ms().unwrap() + 60_000,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            generator.try_next_id(),
+            Err(DistributedIdError::Snowflake(
+                SnowflakeError::ClockMovedBackwards { .. }
+            ))
+        ));
+        assert_eq!(generator.clock_regressions(), 1);
+        service.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -859,6 +1047,53 @@ mod tests {
         assert_ne!(initial_worker, recovered_worker);
         assert!(generator.try_next_id().is_ok());
         service.shutdown().await.unwrap();
+    }
+
+    #[derive(Debug)]
+    struct SlowAcquireStore {
+        inner: InMemoryWorkerIdLeaseStore,
+        acquire_delay: Duration,
+        acquisitions: AtomicUsize,
+    }
+
+    impl SlowAcquireStore {
+        fn new(acquire_delay: Duration) -> Self {
+            Self {
+                inner: InMemoryWorkerIdLeaseStore::default(),
+                acquire_delay,
+                acquisitions: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorkerIdLeaseStore for SlowAcquireStore {
+        async fn acquire(
+            &self,
+            owner: &WorkerIdOwner,
+            range: WorkerIdRange,
+            ttl: Duration,
+        ) -> Result<WorkerIdAcquisition, WorkerIdStoreError> {
+            tokio::time::sleep(self.acquire_delay).await;
+            if self.acquisitions.fetch_add(1, Ordering::AcqRel) > 0 {
+                return Err(WorkerIdStoreError::unavailable(owner, range));
+            }
+            self.inner.acquire(owner, range, ttl).await
+        }
+
+        async fn renew(
+            &self,
+            _lease: &WorkerIdLease,
+            _ttl: Duration,
+        ) -> Result<Option<WorkerIdLease>, WorkerIdStoreError> {
+            Err(WorkerIdStoreError::Backend {
+                message: "renewal is unreachable".to_string(),
+            })
+        }
+
+        async fn release(&self, lease: &WorkerIdLease) -> Result<bool, WorkerIdStoreError> {
+            self.inner.release(lease).await
+        }
     }
 
     #[derive(Debug, Default)]

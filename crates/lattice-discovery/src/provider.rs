@@ -27,13 +27,33 @@ pub enum DiscoveryOrigin {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiscoverySource {
     origins: BTreeSet<DiscoveryOrigin>,
+    tls_server_name: Option<String>,
 }
 
 impl DiscoverySource {
     pub fn single(origin: DiscoveryOrigin) -> Self {
+        let tls_server_name = match &origin {
+            DiscoveryOrigin::Dns { server_name, .. } => Some(server_name.clone()),
+            DiscoveryOrigin::Static { .. }
+            | DiscoveryOrigin::ConfigStore { .. }
+            | DiscoveryOrigin::KubernetesEndpointSlice { .. } => None,
+        };
         Self {
             origins: BTreeSet::from([origin]),
+            tls_server_name,
         }
+    }
+
+    /// Declares the certificate hostname a probe must validate against. Any
+    /// provider can set it, including implementations outside this crate whose
+    /// addresses are resolved IPs.
+    pub fn with_tls_server_name(mut self, server_name: impl Into<String>) -> Self {
+        self.tls_server_name = Some(server_name.into());
+        self
+    }
+
+    pub fn tls_server_name(&self) -> Option<&str> {
+        self.tls_server_name.as_deref()
     }
 
     pub fn origins(&self) -> impl ExactSizeIterator<Item = &DiscoveryOrigin> {
@@ -42,6 +62,9 @@ impl DiscoverySource {
 
     pub fn merge(&mut self, other: &Self) {
         self.origins.extend(other.origins.iter().cloned());
+        if self.tls_server_name.is_none() {
+            self.tls_server_name.clone_from(&other.tls_server_name);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -55,6 +78,14 @@ pub struct DiscoveryTarget {
     pub expected_node_id: Option<String>,
     pub source: DiscoverySource,
     pub priority: u16,
+}
+
+impl DiscoveryTarget {
+    /// The certificate hostname this candidate must be validated against. A
+    /// resolved IP address never replaces it.
+    pub fn tls_server_name(&self) -> Option<&str> {
+        self.source.tls_server_name()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
