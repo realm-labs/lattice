@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), deny(clippy::wildcard_imports))]
 
 pub mod binding;
+pub mod config;
 pub mod error;
 pub mod frame;
 pub mod rate_limit;

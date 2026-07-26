@@ -1,3 +1,7 @@
+use std::io;
+
+use crate::config::GatewayServerConfigError;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum GatewayError {
     #[error("client frame is too short")]
@@ -30,10 +34,46 @@ pub enum GatewayError {
     RateLimited,
     #[error("gateway load shed: concurrency limit exceeded")]
     LoadShed,
-    #[error("gateway io error: {0}")]
-    Io(String),
+    #[error("invalid gateway server configuration: {0}")]
+    InvalidConfig(#[from] GatewayServerConfigError),
+    #[error("gateway io error: {message}")]
+    Io {
+        kind: io::ErrorKind,
+        message: String,
+    },
     #[error("gateway background task {task} exited unexpectedly")]
     BackgroundTaskExited { task: String },
     #[error("gateway background task {task} failed: {error}")]
     BackgroundTaskFailed { task: String, error: String },
+}
+
+impl GatewayError {
+    pub fn io_kind(&self) -> Option<io::ErrorKind> {
+        match self {
+            Self::Io { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    pub fn is_peer_disconnect(&self) -> bool {
+        matches!(
+            self.io_kind(),
+            Some(
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+            )
+        )
+    }
+}
+
+impl From<io::Error> for GatewayError {
+    fn from(error: io::Error) -> Self {
+        Self::Io {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
 }
