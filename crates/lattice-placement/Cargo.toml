@@ -7,6 +7,7 @@ repository.workspace = true
 
 [features]
 test-failpoints = ["lattice-core/test-failpoints"]
+test-harness = []
 
 [dependencies]
 async-trait.workspace = true

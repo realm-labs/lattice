@@ -51,6 +51,9 @@ use crate::{
 
 mod admin;
 mod allocation;
+#[cfg(feature = "test-harness")]
+#[doc(hidden)]
+pub mod harness;
 pub mod host;
 mod lifecycle;
 mod membership;
@@ -66,6 +69,27 @@ pub(crate) fn guarded_commit_failpoint(
         lattice_core::failpoint::FailpointAction::Crash => Err(StorageError::OutcomeUnknown),
         _ => Ok(()),
     }
+}
+
+/// The commit already landed, so the caller cannot claim the write was refused. Both failing
+/// decisions therefore surface as an unknown outcome: durable truth advanced while the in-memory
+/// effect, the published delta and the outbound grant did not, which is exactly the divergence
+/// reconciliation has to repair.
+pub(crate) fn post_commit_failpoint(
+    point: lattice_core::failpoint::Failpoint,
+) -> Result<(), StorageError> {
+    match lattice_core::failpoint::hit_decision(point) {
+        lattice_core::failpoint::FailpointAction::StoreFailure
+        | lattice_core::failpoint::FailpointAction::Crash => Err(StorageError::OutcomeUnknown),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn dropped_by_failpoint(point: lattice_core::failpoint::Failpoint) -> bool {
+    matches!(
+        lattice_core::failpoint::hit_decision(point),
+        lattice_core::failpoint::FailpointAction::Drop
+    )
 }
 
 #[derive(Debug, Clone)]

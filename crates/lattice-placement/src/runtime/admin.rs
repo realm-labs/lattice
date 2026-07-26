@@ -195,7 +195,7 @@ where
             AdminOperationResult::AutomaticBalanceUpdated,
             self.version.clone(),
         )?;
-        lattice_core::failpoint::hit(Failpoint::AdminBeforeGuardedCommit);
+        super::guarded_commit_failpoint(Failpoint::AdminBeforeGuardedCommit)?;
         let settings = self
             .store
             .commit_automatic_settings(
@@ -207,7 +207,7 @@ where
                 },
             )
             .await?;
-        lattice_core::failpoint::hit(Failpoint::AdminAfterCommitBeforeResponse);
+        super::post_commit_failpoint(Failpoint::AdminAfterCommitBeforeResponse)?;
         self.automatic_globally_paused = settings.globally_paused;
         self.paused_entity_types = settings.paused_entity_types.clone();
         self.automatic_settings = Some(settings);
@@ -708,7 +708,7 @@ where
                 )
             })
             .transpose()?;
-        lattice_core::failpoint::hit(Failpoint::PlanBeforeGuardedCommit);
+        super::guarded_commit_failpoint(Failpoint::PlanBeforeGuardedCommit)?;
         if let Some(operation) = operation.clone() {
             self.store
                 .create_plan_with_operation(
@@ -726,7 +726,7 @@ where
                 .create_plan(&self.leader_guard, CreatePlan { plan: plan.clone() })
                 .await?;
         }
-        lattice_core::failpoint::hit(Failpoint::RebalanceAfterPlanPersist);
+        super::post_commit_failpoint(Failpoint::RebalanceAfterPlanPersist)?;
         self.plans.insert(plan_id, plan);
         self.start_pending_moves(plan_id).await?;
         if operation.is_some() {

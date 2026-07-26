@@ -252,7 +252,7 @@ where
             .await;
         match result {
             Ok(committed) => {
-                lattice_core::failpoint::hit(Failpoint::ReconciliationAfterCommitBeforeEffect);
+                super::post_commit_failpoint(Failpoint::ReconciliationAfterCommitBeforeEffect)?;
                 let _ = self.store.revoke_lease(previous.lease_id).await;
                 self.version = committed.slot.version.clone();
                 self.remember_claim(committed.claim.lease_id, committed.claim.grant.clone());
