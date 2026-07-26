@@ -741,7 +741,7 @@ impl<A: Actor> ActorContext<A> {
         let task = tokio::spawn(
             async move {
                 if let Ok(notification) = terminations.recv().await {
-                    let _ = self_handle.try_tell_internal(notification);
+                    let _ = self_handle.send_system_tell_internal(notification).await;
                 }
             }
             .instrument(span),

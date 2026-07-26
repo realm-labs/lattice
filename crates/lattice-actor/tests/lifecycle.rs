@@ -722,3 +722,103 @@ async fn passivation_policy_idle_timeout_stops_idle_actor() {
 
     assert_eq!(handle.lifecycle_state(), ActorLifecycleState::Stopped);
 }
+
+#[tokio::test]
+async fn watch_notification_is_delivered_while_the_normal_mailbox_is_full() {
+    #[derive(lattice_actor::Message)]
+    struct Block;
+
+    struct TargetActor;
+
+    impl Actor for TargetActor {
+        type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
+    }
+
+    struct WatcherActor {
+        target: ActorHandle<TargetActor>,
+        entered: Arc<Semaphore>,
+        gate: Arc<Semaphore>,
+        ready: Arc<Semaphore>,
+        events: Arc<Mutex<Vec<TerminatedReason>>>,
+        notified: Arc<Semaphore>,
+    }
+
+    impl Actor for WatcherActor {
+        type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
+
+        async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
+            ctx.watch(&self.target)?;
+            self.ready.add_permits(1);
+            Ok(())
+        }
+    }
+
+    impl Handler<Block> for WatcherActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut HandlerContext<'_, Self>,
+            _msg: Block,
+        ) -> Result<(), ActorError> {
+            self.entered.add_permits(1);
+            self.gate.acquire().await.unwrap().forget();
+            Ok(())
+        }
+    }
+
+    impl Handler<ActorTerminated> for WatcherActor {
+        async fn handle(
+            &mut self,
+            _ctx: &mut HandlerContext<'_, Self>,
+            notification: ActorTerminated,
+        ) -> Result<(), ActorError> {
+            self.events.lock().await.push(notification.reason);
+            self.notified.add_permits(1);
+            Ok(())
+        }
+    }
+
+    let target = spawn_actor(TargetActor, MailboxConfig::bounded(8));
+    let entered = Arc::new(Semaphore::new(0));
+    let gate = Arc::new(Semaphore::new(0));
+    let ready = Arc::new(Semaphore::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let notified = Arc::new(Semaphore::new(0));
+    let watcher = spawn_actor(
+        WatcherActor {
+            target: target.clone(),
+            entered: entered.clone(),
+            gate: gate.clone(),
+            ready: ready.clone(),
+            events: events.clone(),
+            notified: notified.clone(),
+        },
+        MailboxConfig::with_lanes(2, 8),
+    );
+    ready.acquire().await.unwrap().forget();
+
+    // Park the actor inside a handler first, then fill the normal lane it can no longer drain.
+    watcher.try_tell(Block).unwrap();
+    entered.acquire().await.unwrap().forget();
+    let mut queued = 1usize;
+    while watcher.try_tell(Block).is_ok() {
+        queued += 1;
+        assert!(queued < 64, "normal lane never reported backpressure");
+    }
+
+    target.stop(StopReason::Requested).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        watcher.try_tell(Block).is_err(),
+        "normal lane drained before the watch notification was delivered"
+    );
+    gate.add_permits(queued);
+
+    tokio::time::timeout(Duration::from_secs(5), notified.acquire())
+        .await
+        .expect("watch notification was dropped by a full normal mailbox")
+        .unwrap()
+        .forget();
+    assert_eq!(*events.lock().await, vec![TerminatedReason::Stopped]);
+}

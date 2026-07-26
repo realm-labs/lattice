@@ -437,6 +437,15 @@ impl<A: Actor> ActorHandle<A> {
         self.send_tell_on_lane(msg, None, MailboxLane::Normal).await
     }
 
+    pub(crate) async fn send_system_tell_internal<M>(&self, msg: M) -> Result<(), ActorTellError<M>>
+    where
+        A: Handler<M>,
+        <A as crate::traits::Actor>::Behavior: crate::state_machine::Accepts<M>,
+        M: Message,
+    {
+        self.send_tell_on_lane(msg, None, MailboxLane::System).await
+    }
+
     pub(crate) async fn send_envelope_internal<E>(&self, envelope: E) -> Result<(), ActorCallError>
     where
         E: ActorEnvelope<A> + 'static,

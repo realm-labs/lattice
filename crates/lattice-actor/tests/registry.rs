@@ -617,3 +617,53 @@ async fn idle_passivation_eagerly_releases_registry_and_directory_capacity() {
     assert!(second.actor_ref().is_some());
     assert_eq!(directory.len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_activation_never_produces_a_second_cell() {
+    struct CountedActor;
+
+    impl Actor for CountedActor {
+        type Error = ActorError;
+        type Behavior = ::lattice_actor::state_machine::Stateless;
+    }
+
+    let registry = Arc::new(ActorRegistry::<CountedActor>::new(
+        actor_kind!("Counted"),
+        ActorRegistryConfig::default(),
+    ));
+
+    for round in 0..256u64 {
+        let actor_id = ActorId::U64(round);
+        let activations = Arc::new(AtomicUsize::new(0));
+        let mut callers = Vec::new();
+        for _ in 0..4 {
+            let registry = registry.clone();
+            let actor_id = actor_id.clone();
+            let activations = activations.clone();
+            callers.push(tokio::spawn(async move {
+                registry
+                    .get_or_activate(actor_id, || async move {
+                        tokio::task::yield_now().await;
+                        activations.fetch_add(1, Ordering::SeqCst);
+                        Ok(CountedActor)
+                    })
+                    .await
+                    .map(|handle| handle.local_ref())
+            }));
+        }
+
+        let mut cells = Vec::new();
+        for caller in callers {
+            if let Ok(local_ref) = caller.await.unwrap() {
+                cells.push(local_ref);
+            }
+        }
+        assert!(!cells.is_empty(), "round {round} activated nothing");
+        assert!(
+            cells.iter().all(|local_ref| *local_ref == cells[0]),
+            "round {round} produced {} distinct cells from {} activations",
+            cells.iter().collect::<std::collections::HashSet<_>>().len(),
+            activations.load(Ordering::SeqCst)
+        );
+    }
+}
