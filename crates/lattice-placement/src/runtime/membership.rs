@@ -561,6 +561,13 @@ where
             })
             .collect::<Vec<_>>();
         for (hello, association_key, accepts_delta) in sessions {
+            // A session whose association has already gone cannot be synchronized. It will observe
+            // a revision gap and re-register, which is the documented recovery. Failing here would
+            // instead abort the caller, and this runs on the renewal path where that ends the
+            // domain leader.
+            if self.associations.get(&association_key).is_none() {
+                continue;
+            }
             if accepts_delta {
                 let association = self
                     .associations
