@@ -178,6 +178,13 @@ where
         let mut stale = Vec::new();
         let mut reconcile = Vec::new();
         for (incarnation, key) in &self.membership_associations {
+            // A snapshot is one atomic logical replacement even though it is transported as
+            // several reliable frames. Never interleave a delta between Begin and End; remember
+            // that the in-flight snapshot became stale and cut a fresh one after it completes.
+            if self.snapshotting_associations.contains(key) {
+                self.pending_snapshot_replays.insert(key.clone());
+                continue;
+            }
             let Some(association) = self.associations.get(key) else {
                 stale.push(*incarnation);
                 continue;
