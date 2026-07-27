@@ -948,6 +948,15 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
         .complete_initial_ready(&shard_key, &host, shard.assignment_generation)
         .await
         .unwrap();
+    let running_shard = store.get_slot(&shard_key).await.unwrap().unwrap();
+    leader
+        .complete_initial_ready(&shard_key, &host, shard.assignment_generation)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_slot(&shard_key).await.unwrap().unwrap(),
+        running_shard
+    );
     leader
         .ensure_singleton_allocated(singleton_kind.clone())
         .await
@@ -962,6 +971,15 @@ async fn first_resolution_allocates_shard_and_singleton_to_declared_host() {
         .complete_initial_ready(&singleton_key, &host, singleton.assignment_generation)
         .await
         .unwrap();
+    let running_singleton = store.get_slot(&singleton_key).await.unwrap().unwrap();
+    leader
+        .complete_initial_ready(&singleton_key, &host, singleton.assignment_generation)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_slot(&singleton_key).await.unwrap().unwrap(),
+        running_singleton
+    );
     assert_eq!(
         store.get_slot(&shard_key).await.unwrap().unwrap().state,
         PlacementSlotState::Running
