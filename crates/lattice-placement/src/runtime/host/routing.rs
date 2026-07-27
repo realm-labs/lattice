@@ -184,7 +184,14 @@ where
                 }
             }
             PlacementControlEventKind::Reconcile { association, gap } => {
-                for hosted in self.domains.values() {
+                for (domain, hosted) in &self.domains {
+                    if gap.is_some_and(|gap| {
+                        crate::control::control_stream_id(&CoordinatorScope::Placement(
+                            domain.clone(),
+                        )) != gap.stream_id
+                    }) {
+                        continue;
+                    }
                     if let Some(sender) = &hosted.sender {
                         let (completion, _) = oneshot::channel();
                         let _ = sender

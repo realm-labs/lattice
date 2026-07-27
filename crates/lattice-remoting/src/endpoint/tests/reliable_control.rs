@@ -237,3 +237,63 @@ async fn retry_backoff_yields_to_ephemeral_control_messages() {
     client.shutdown().await.unwrap();
     server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn retrying_stream_does_not_block_an_independent_reliable_stream() {
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let client_port = server_port.saturating_sub(1).max(1024);
+    let cluster_id = ClusterId::new("control-stream-isolation-test").unwrap();
+    let client_identity = NodeIdentity {
+        cluster_id: cluster_id.clone(),
+        node_id: "client".to_owned(),
+        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        incarnation: NodeIncarnation::new(51).unwrap(),
+    };
+    let server_identity = NodeIdentity {
+        cluster_id,
+        node_id: "server".to_owned(),
+        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        incarnation: NodeIncarnation::new(52).unwrap(),
+    };
+    let descriptor = ProtocolDescriptor {
+        protocol_id: ProtocolId::new(12).unwrap(),
+        fingerprint: ProtocolFingerprint::digest(b"control-stream-isolation-test/v1"),
+    };
+    let control = Arc::new(StreamIsolatingControl::default());
+    let client = endpoint(client_identity, descriptor.clone());
+    let server = endpoint_with_control(server_identity.clone(), descriptor, control.clone());
+    server.bind().await.unwrap();
+    let association = client.connect_peer(server_identity).await.unwrap();
+
+    let blocked_started = control.blocked_started.notified();
+    association
+        .admit_control_command(Bytes::from_static(b"blocked"))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), blocked_started)
+        .await
+        .unwrap();
+
+    let independent_applied = control.independent_applied.notified();
+    association
+        .admit_control_command_in(
+            crate::control::ControlStreamId::new(99).unwrap(),
+            Bytes::from_static(b"independent"),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), independent_applied)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while association.control_outbox_len() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(association.state(), AssociationState::Active);
+
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+}

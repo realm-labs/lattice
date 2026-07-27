@@ -2,7 +2,10 @@ use lattice_core::actor_ref::ProtocolId;
 
 use super::{Association, AssociationError, AssociationState};
 use crate::{
-    control::{CommandId, ControlAck, ControlApply, ControlEnvelope, control_envelope_frame},
+    control::{
+        CommandId, ControlAck, ControlApply, ControlEnvelope, ControlStreamId,
+        control_envelope_frame,
+    },
     protocol::{
         CatalogueDecision, CatalogueError, ProtocolCatalogue, ProtocolDescriptor,
         ProtocolFingerprint,
@@ -19,13 +22,21 @@ impl Association {
         &self,
         payload: bytes::Bytes,
     ) -> Result<CommandId, AssociationError> {
+        self.admit_control_command_in(ControlStreamId::DEFAULT, payload)
+    }
+
+    pub fn admit_control_command_in(
+        &self,
+        stream_id: ControlStreamId,
+        payload: bytes::Bytes,
+    ) -> Result<CommandId, AssociationError> {
         let command_id = CommandId::generate();
         let mut reliable_control = self
             .reliable_control
             .lock()
             .expect("reliable control state poisoned");
         let envelope = reliable_control
-            .enqueue(command_id, payload)
+            .enqueue_in(stream_id, command_id, payload)
             .map_err(AssociationError::ReliableControl)?;
         if self.state() == AssociationState::Active
             && let Err(error) = self.try_admit_control(control_envelope_frame(&envelope))
@@ -86,11 +97,11 @@ impl Association {
             .map_err(AssociationError::ReliableControl)
     }
 
-    pub fn current_control_ack(&self) -> ControlAck {
+    pub fn current_control_ack(&self, stream_id: ControlStreamId) -> ControlAck {
         self.reliable_control
             .lock()
             .expect("reliable control state poisoned")
-            .current_ack()
+            .current_ack(stream_id)
     }
 
     pub fn install_peer_catalogue<I>(&self, descriptors: I) -> Result<(), AssociationError>

@@ -17,7 +17,7 @@ use tokio::{
 use crate::{
     control::{
         PlacementControlCommand, PlacementControlEvent, PlacementControlEventKind,
-        encode_control_command_for_term,
+        control_stream_id, encode_control_command_for_term,
     },
     coordinator::{
         MemberEvent, MemberHello, MemberRecord, MemberStatus, MembershipState, SnapshotRecord,
@@ -74,7 +74,8 @@ impl MembershipCoordinatorHandle {
             .associations
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
-        let command_id = association.admit_control_command(
+        let command_id = association.admit_control_command_in(
+            control_stream_id(&CoordinatorScope::Membership),
             encode_control_command_for_term(
                 &CoordinatorScope::Membership,
                 self.coordinator_term,
@@ -312,7 +313,8 @@ impl MembershipSession {
         if association.state() == AssociationState::Closed {
             return Err(LogicSessionError::AssociationUnavailable);
         }
-        association.admit_control_command(
+        association.admit_control_command_in(
+            control_stream_id(&CoordinatorScope::Membership),
             encode_control_command_for_term(
                 &CoordinatorScope::Membership,
                 self.coordinator_term,

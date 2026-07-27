@@ -85,7 +85,10 @@ where
                 self.config.placement.maximum_control_payload,
             )
             .map_err(CoordinatorRuntimeError::Control)?;
-            association.admit_control_command(payload)?;
+            association.admit_control_command_in(
+                crate::control::control_stream_id(&CoordinatorScope::Membership),
+                payload,
+            )?;
         }
         Ok(())
     }
@@ -112,7 +115,13 @@ where
                 stale.push(*incarnation);
                 continue;
             };
-            if association.admit_control_command(payload.clone()).is_err() {
+            if association
+                .admit_control_command_in(
+                    crate::control::control_stream_id(&CoordinatorScope::Membership),
+                    payload.clone(),
+                )
+                .is_err()
+            {
                 stale.push(*incarnation);
             }
         }

@@ -10,7 +10,7 @@ use lattice_remoting::{
     association::{Association, AssociationError, AssociationKey, AssociationManager},
     control::{
         CommandId, ControlDispatch, ControlDispatchError, ControlGap, ControlRejectReason,
-        ControlRetryReason, ReliableControlError,
+        ControlRetryReason, ControlStreamId, ReliableControlError,
     },
     messaging::target::ExactActorTarget,
     watch::{
@@ -81,7 +81,7 @@ impl ServiceControlDispatch {
         let payload = encode_watch_command(command, self.maximum_payload)
             .map_err(|_| ControlDispatchError::InvalidCommand)?;
         association
-            .admit_control_command(payload)
+            .admit_control_command_in(ControlStreamId::WATCH, payload)
             .map(|_| ())
             .map_err(map_association_admission)
     }
@@ -118,7 +118,7 @@ impl ServiceControlDispatch {
                     let Ok(payload) = encode_watch_command(&command, maximum_payload) else {
                         continue;
                     };
-                    let _ = association.admit_control_command(payload);
+                    let _ = association.admit_control_command_in(ControlStreamId::WATCH, payload);
                 }
             })
             .map_err(|_| ControlDispatchError::RetryLater(ControlRetryReason::ConsumerBusy))
@@ -200,10 +200,14 @@ impl ControlDispatch for ServiceControlDispatch {
     async fn apply(
         &self,
         association: AssociationKey,
+        stream_id: ControlStreamId,
         command_id: CommandId,
         payload: Bytes,
     ) -> Result<(), ControlDispatchError> {
         if is_watch_control(&payload) {
+            if stream_id != ControlStreamId::WATCH {
+                return Err(ControlDispatchError::InvalidCommand);
+            }
             let command = decode_watch_command(&payload, self.maximum_payload)
                 .map_err(|_| ControlDispatchError::InvalidCommand)?;
             self.apply_watch(association, command).await
@@ -216,7 +220,7 @@ impl ControlDispatch for ServiceControlDispatch {
                 return Err(ControlDispatchError::InvalidCommand);
             }
             self.application
-                .apply(association, command_id, payload)
+                .apply(association, stream_id, command_id, payload)
                 .await
         }
     }
@@ -228,7 +232,9 @@ impl ControlDispatch for ServiceControlDispatch {
         payload: Bytes,
     ) -> Result<(), ControlDispatchError> {
         if is_watch_control(&payload) {
-            return self.apply(association, command_id, payload).await;
+            return self
+                .apply(association, ControlStreamId::WATCH, command_id, payload)
+                .await;
         }
         if self
             .application_scope

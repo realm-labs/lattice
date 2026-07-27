@@ -442,7 +442,8 @@ impl PlacementDomainSession {
             return Err(LogicSessionError::AssociationUnavailable);
         }
         let scope = CoordinatorScope::Placement(self.domain_hello.domain.clone());
-        association.admit_control_command(
+        association.admit_control_command_in(
+            crate::control::control_stream_id(&scope),
             encode_control_command_for_term(
                 &scope,
                 self.coordinator_term,

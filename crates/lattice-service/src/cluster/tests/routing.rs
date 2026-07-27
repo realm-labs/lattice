@@ -190,6 +190,9 @@ async fn unavailable_resolution_fails_fast_and_clears_route_single_flight() {
             control
                 .apply(
                     coordinator,
+                    lattice_placement::control::control_stream_id(&CoordinatorScope::Placement(
+                        domain(),
+                    )),
                     CommandId::generate(),
                     lattice_placement::control::encode_control_command_for_term(
                         &CoordinatorScope::Placement(domain()),
@@ -458,6 +461,9 @@ async fn stale_generation_never_reaches_entity_loader() {
         control_router
             .apply(
                 association_key.clone(),
+                lattice_placement::control::control_stream_id(&CoordinatorScope::Placement(
+                    domain(),
+                )),
                 CommandId::generate(),
                 lattice_placement::control::encode_control_command_for_term(
                     &CoordinatorScope::Placement(domain()),

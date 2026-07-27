@@ -193,6 +193,9 @@ impl Association {
         config.validate().map_err(AssociationError::InvalidConfig)?;
         let max_control_outbox_frames = config.max_control_outbox_frames;
         let max_control_outbox_bytes = config.max_control_outbox_bytes;
+        let max_control_streams = config.max_control_streams;
+        let max_control_outbox_frames_per_stream = config.max_control_outbox_frames_per_stream;
+        let max_control_outbox_bytes_per_stream = config.max_control_outbox_bytes_per_stream;
         let bulk_stripes = config.bulk_stripes;
         let (control, control_rx) = mpsc::channel(config.control_queue_frames);
         let (interactive, interactive_rx) = mpsc::channel(config.interactive_queue_frames);
@@ -232,8 +235,15 @@ impl Association {
             admission_changed: Notify::new(),
             peer_catalogue: OnceLock::new(),
             reliable_control: Mutex::new(
-                ReliableControl::new(id, max_control_outbox_frames, max_control_outbox_bytes)
-                    .expect("validated reliable control limits"),
+                ReliableControl::new_with_limits(
+                    id,
+                    max_control_outbox_frames,
+                    max_control_outbox_bytes,
+                    max_control_outbox_frames_per_stream,
+                    max_control_outbox_bytes_per_stream,
+                    max_control_streams,
+                )
+                .expect("validated reliable control limits"),
             ),
             interactive_wake: Notify::new(),
             bulk_wakes: (0..bulk_stripes).map(|_| Notify::new()).collect(),

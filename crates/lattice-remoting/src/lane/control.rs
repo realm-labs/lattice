@@ -6,8 +6,8 @@ use super::LaneError;
 use crate::{
     association::{Association, LaneKind},
     control::{
-        CommandId, ControlApply, ControlDispatch, ControlDispatchError, control_ack_frame,
-        decode_control_envelope,
+        CommandId, ControlApply, ControlDispatch, ControlDispatchError, ReliableControlError,
+        control_ack_frame, decode_control_envelope,
     },
     wire::{Frame, FrameKind},
 };
@@ -33,13 +33,13 @@ pub(super) async fn apply_control_frame(
                     let result = control_dispatch
                         .apply(
                             association.key().clone(),
+                            envelope.stream_id,
                             envelope.command_id,
                             envelope.payload.clone(),
                         )
                         .await;
                     match result {
-                        Ok(())
-                        | Err(ControlDispatchError::InvalidCommand) => {}
+                        Ok(()) | Err(ControlDispatchError::InvalidCommand) => {}
                         Err(ControlDispatchError::Rejected(_)) => {
                             association.record_rejected_control_command();
                         }
@@ -50,7 +50,9 @@ pub(super) async fn apply_control_frame(
                     Ok(Some(control_ack_frame(ack)))
                 }
                 ControlApply::Duplicate(anticipated) => {
-                    let ack = if association.current_control_ack().cumulative_sequence
+                    let ack = if association
+                        .current_control_ack(envelope.stream_id)
+                        .cumulative_sequence
                         < anticipated.cumulative_sequence
                     {
                         association.commit_control(envelope)
@@ -71,6 +73,7 @@ pub(super) async fn apply_control_frame(
                         .await?;
                     Ok(None)
                 }
+                ControlApply::StreamLimit => Err(ReliableControlError::StreamLimit.into()),
             }
         }
         FrameKind::CoordinatorEvent => {

@@ -9,7 +9,7 @@ use lattice_remoting::{
     association::AssociationKey,
     control::{
         CommandId, ControlDispatch, ControlDispatchError, ControlGap, ControlRejectReason,
-        ControlRetryReason,
+        ControlRetryReason, ControlStreamId,
     },
 };
 use prost::Message;
@@ -31,6 +31,23 @@ use crate::{
 
 pub const PLACEMENT_CONTROL_GENERATION: u64 = 7;
 pub const DEFAULT_MAX_CONTROL_PAYLOAD: usize = 256 * 1024;
+
+pub fn control_stream_id(scope: &CoordinatorScope) -> ControlStreamId {
+    match scope {
+        CoordinatorScope::Membership => {
+            ControlStreamId::new(3).expect("membership control stream ID is nonzero")
+        }
+        CoordinatorScope::Placement(domain) => {
+            let mut canonical = b"lattice-placement-control-stream-v1\0".to_vec();
+            canonical.extend_from_slice(domain.as_str().as_bytes());
+            let digest = blake3::hash(&canonical);
+            let mut encoded = [0_u8; 16];
+            encoded.copy_from_slice(&digest.as_bytes()[..16]);
+            let value = u128::from_be_bytes(encoded) | (1_u128 << 127);
+            ControlStreamId::new(value).expect("placement control stream hash is nonzero")
+        }
+    }
+}
 
 fn map_try_send_error<T>(error: mpsc::error::TrySendError<T>) -> ControlDispatchError {
     match error {
@@ -286,11 +303,15 @@ impl ControlDispatch for PlacementControlRouter {
     async fn apply(
         &self,
         association: AssociationKey,
+        stream_id: ControlStreamId,
         command_id: CommandId,
         payload: Bytes,
     ) -> Result<(), ControlDispatchError> {
         let scoped = decode_control_command(&payload, self.maximum_payload)
             .map_err(|_| ControlDispatchError::InvalidCommand)?;
+        if stream_id != control_stream_id(&scoped.scope) {
+            return Err(ControlDispatchError::InvalidCommand);
+        }
         let (completion, applied) = oneshot::channel();
         self.sender
             .try_send(PlacementControlEvent {
@@ -398,11 +419,15 @@ impl ControlDispatch for PlacementControlDirectory {
     async fn apply(
         &self,
         association: AssociationKey,
+        stream_id: ControlStreamId,
         command_id: CommandId,
         payload: Bytes,
     ) -> Result<(), ControlDispatchError> {
         let scoped = decode_control_command(&payload, self.maximum_payload)
             .map_err(|_| ControlDispatchError::InvalidCommand)?;
+        if stream_id != control_stream_id(&scoped.scope) {
+            return Err(ControlDispatchError::InvalidCommand);
+        }
         let sender = self
             .senders
             .read()
@@ -472,11 +497,16 @@ impl ControlDispatch for PlacementControlDirectory {
             .senders
             .read()
             .expect("control directory poisoned")
-            .values()
-            .cloned()
+            .iter()
+            .filter(|(scope, _)| gap.is_none_or(|gap| control_stream_id(scope) == gap.stream_id))
+            .map(|(_, sender)| sender.clone())
             .collect::<Vec<_>>();
         if senders.is_empty() {
-            return Err(ControlDispatchError::Unsupported);
+            return if gap.is_some() {
+                Err(ControlDispatchError::InvalidCommand)
+            } else {
+                Err(ControlDispatchError::Unsupported)
+            };
         }
         let mut completions = Vec::with_capacity(senders.len());
         for sender in senders {
@@ -571,5 +601,26 @@ mod tests {
             .unwrap_err(),
             PlacementControlError::InvalidCoordinatorTerm
         );
+    }
+
+    #[test]
+    fn control_stream_ids_are_stable_and_domain_scoped() {
+        let membership = control_stream_id(&CoordinatorScope::Membership);
+        let world = control_stream_id(&CoordinatorScope::Placement(
+            PlacementDomainId::new("world").unwrap(),
+        ));
+        let player = control_stream_id(&CoordinatorScope::Placement(
+            PlacementDomainId::new("player").unwrap(),
+        ));
+
+        assert_eq!(membership, ControlStreamId::new(3).unwrap());
+        assert_eq!(
+            world,
+            control_stream_id(&CoordinatorScope::Placement(
+                PlacementDomainId::new("world").unwrap()
+            ))
+        );
+        assert_ne!(world, player);
+        assert_ne!(world, membership);
     }
 }

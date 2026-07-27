@@ -78,7 +78,12 @@ impl SingletonProxyRoute {
         )
         .map_err(|_| RemoteMessageError::InvalidPayload)?;
         association
-            .admit_control_command(payload)
+            .admit_control_command_in(
+                lattice_placement::control::control_stream_id(&CoordinatorScope::Placement(
+                    self.config.domain.clone(),
+                )),
+                payload,
+            )
             .map(|_| ())
             .map_err(|_| RemoteMessageError::ShardUnavailable)
     }

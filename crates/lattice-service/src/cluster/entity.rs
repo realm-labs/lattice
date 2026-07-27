@@ -192,7 +192,12 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
         )
         .map_err(|_| RemoteMessageError::InvalidPayload)?;
         association
-            .admit_control_command(payload)
+            .admit_control_command_in(
+                lattice_placement::control::control_stream_id(&CoordinatorScope::Placement(
+                    domain.clone(),
+                )),
+                payload,
+            )
             .map(|_| ())
             .map_err(|_| RemoteMessageError::ShardUnavailable)
     }

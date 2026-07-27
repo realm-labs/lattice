@@ -931,7 +931,10 @@ pub(super) fn send_control(
         config.maximum_control_payload,
     )
     .map_err(CoordinatorRuntimeError::Control)?;
-    association.admit_control_command(payload)?;
+    association.admit_control_command_in(
+        crate::control::control_stream_id(&CoordinatorScope::Placement(domain.clone())),
+        payload,
+    )?;
     Ok(())
 }
 
