@@ -1104,7 +1104,14 @@ impl<A: Actor> ActorRegistry<A> {
             encode_segment(self.kind.as_str().as_bytes()),
             encode_actor_id(&actor_id),
         ])
-        .expect("registry-generated actor path is canonical");
+        .inspect_err(|error| {
+            tracing::warn!(
+                actor_kind = self.kind.as_str(),
+                %error,
+                "actor identity does not fit an addressable actor path; the activation stays node-local"
+            );
+        })
+        .ok()?;
         ActorRef::new(
             config.cluster_id.clone(),
             config.node_address.clone(),

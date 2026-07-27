@@ -207,6 +207,30 @@ async fn registry_injects_exact_actor_ref_into_context() {
     );
 }
 
+#[tokio::test]
+async fn registry_keeps_unaddressable_identities_node_local() {
+    let protocol = SelfRefProtocol::bind::<SelfRefActor>().unwrap();
+    let registry = ActorRegistry::<SelfRefActor>::new_bound(
+        actor_kind!("GatewaySession"),
+        ActorRegistryConfig {
+            actor_ref: Some(ActorRefConfig {
+                cluster_id: ClusterId::new("test").unwrap(),
+                node_address: NodeAddress::new("127.0.0.1", 19090).unwrap(),
+                node_incarnation: NodeIncarnation::new(7).unwrap(),
+            }),
+            ..ActorRegistryConfig::default()
+        },
+        &protocol,
+    );
+
+    let handle = registry
+        .start(ActorId::Str("s".repeat(64)), SelfRefActor { tx: None })
+        .await
+        .unwrap();
+
+    assert!(handle.actor_ref().is_none());
+}
+
 struct RetainedRegistryActor {
     persistence_available: Arc<AtomicBool>,
     dropped: Arc<AtomicUsize>,

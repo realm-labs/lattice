@@ -9,7 +9,6 @@ pub mod kind;
 pub mod release;
 pub mod service_context;
 pub mod trace;
-pub mod uri_serde;
 
 #[cfg(test)]
 mod tests;

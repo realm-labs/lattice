@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use etcd_client::ConnectOptions;
 use lattice_config::store::{ConfigStore, ConfigStoreError, ConfigWatch};
-use lattice_core::service_context::ConfiguredComponent;
 use std::fmt;
 
 use crate::client::{EtcdConfigClient, RealEtcdConfigClient};
@@ -15,10 +14,6 @@ pub struct EtcdConfigStore {
 }
 
 impl EtcdConfigStore {
-    pub fn from_config() -> ConfiguredComponent<Self> {
-        ConfiguredComponent::from_section("config_store", Self::connect)
-    }
-
     pub async fn connect(config: EtcdConfigStoreConfig) -> Result<Self, ConfigStoreError> {
         Self::connect_with_options(config, None).await
     }

@@ -17,7 +17,6 @@ use jetstream::{
     message::PublishMessage,
     stream::{Config as StreamConfig, RetentionPolicy, Stream},
 };
-use lattice_core::service_context::ConfiguredComponent;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OnceCell};
 use tracing::{Instrument, warn};
@@ -49,12 +48,6 @@ impl NatsEventBus {
         let bus = Self::from_client(client, config);
         bus.stream().await?;
         Ok(bus)
-    }
-
-    pub fn from_config() -> ConfiguredComponent<Self> {
-        ConfiguredComponent::from_section("event_bus", |config| async move {
-            Self::connect(config).await
-        })
     }
 
     pub fn from_client(client: async_nats::Client, config: NatsEventBusConfig) -> Self {

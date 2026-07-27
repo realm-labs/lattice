@@ -10,11 +10,7 @@ default = []
 test-failpoints = []
 
 [dependencies]
-async-trait.workspace = true
 blake3.workspace = true
-http.workspace = true
-lattice-config.workspace = true
-prost.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

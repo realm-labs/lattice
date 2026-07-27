@@ -7,3 +7,5 @@ crates/lattice-service/src/builder.rs	pub use service::LatticeService;	The servi
 crates/lattice-store-mongodb/src/lib.rs	pub use tokio::try_join;	Generated document-set loads join their queries without forcing callers to depend on tokio.
 crates/lattice-store-mongodb/src/store/mod.rs	pub use write::{ActivationFence, ActivationFenceSummary};	Activation fencing results are part of the store API and are defined next to the write path.
 crates/lattice-sim/src/fault.rs	pub use lattice_core::failpoint::FailpointAction as FailAction;	The simulator names the shared injection decision rather than defining a second enum that could drift.
+crates/lattice-core/src/actor_ref/mod.rs	pub use identity::*;	The addressing module is split into identity primitives and reference types; the facade keeps the published path.
+crates/lattice-core/src/actor_ref/mod.rs	pub use refs::*;	The addressing module is split into identity primitives and reference types; the facade keeps the published path.

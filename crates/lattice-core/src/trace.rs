@@ -1,5 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+use crate::instance::InstanceId;
+use crate::kind::ServiceKind;
+
+/// Identity every telemetry backend attaches to the spans and metrics it emits.
+///
+/// Backends translate this into their own resource encoding; the workspace keeps
+/// a single definition so exporters cannot drift apart on service labelling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryResource {
+    pub service_kind: ServiceKind,
+    pub instance_id: InstanceId,
+    pub service_version: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TraceContext {
     #[serde(default)]
