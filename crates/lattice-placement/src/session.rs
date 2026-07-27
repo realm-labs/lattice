@@ -510,7 +510,9 @@ fn session_dispatch_error(error: &LogicSessionError) -> ControlDispatchError {
         | LogicSessionError::PlacementState(_)
         | LogicSessionError::Authority(_)
         | LogicSessionError::UnknownAuthority => ControlDispatchError::InvalidCommand,
-        _ => ControlDispatchError::Unavailable,
+        _ => ControlDispatchError::RetryLater(
+            lattice_remoting::control::ControlRetryReason::AssociationStarting,
+        ),
     }
 }
 

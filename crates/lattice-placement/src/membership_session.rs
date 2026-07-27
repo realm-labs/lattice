@@ -371,6 +371,8 @@ fn membership_dispatch_error(error: &LogicSessionError) -> ControlDispatchError 
         | LogicSessionError::StaleGeneration
         | LogicSessionError::Coordinator(_)
         | LogicSessionError::MembershipState(_) => ControlDispatchError::InvalidCommand,
-        _ => ControlDispatchError::Unavailable,
+        _ => ControlDispatchError::RetryLater(
+            lattice_remoting::control::ControlRetryReason::AssociationStarting,
+        ),
     }
 }

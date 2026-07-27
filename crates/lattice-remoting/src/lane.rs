@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -19,7 +20,10 @@ use tokio::{
 use crate::{
     association::{Association, AssociationError, LaneKind},
     config::{ABSOLUTE_MAX_READY_READ_BATCH_FRAMES, ABSOLUTE_MAX_READY_WRITE_BATCH_FRAMES},
-    control::{ControlDispatch, ControlDispatchError, ReliableControlError, decode_control_ack},
+    control::{
+        ControlDispatch, ControlDispatchError, ControlFatalReason, ReliableControlError,
+        decode_control_ack,
+    },
     messaging::{
         codec::{
             decode_ask_cached, decode_entity_ask, decode_entity_tell_cached, decode_failure,
@@ -41,7 +45,9 @@ mod ask;
 mod control;
 
 use ask::{InboundAskWork, dispatch_inbound_ask};
-use control::{ControlWorkerGuard, apply_control_frame, decode_lane_wake};
+use control::{
+    ControlWorkerGuard, apply_control_frame, apply_ephemeral_control_frame, decode_lane_wake,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BidirectionalLaneConfig {
@@ -49,6 +55,7 @@ pub struct BidirectionalLaneConfig {
     pub maximum_concurrent_inbound_asks: usize,
     pub heartbeat_interval: Duration,
     pub heartbeat_miss_limit: u32,
+    pub control_apply_retry_timeout: Duration,
     pub idle_data_connection_timeout: Duration,
     pub maximum_cached_exact_targets: usize,
     pub socket_read_ahead_bytes: usize,
@@ -75,6 +82,7 @@ impl BidirectionalLaneConfig {
         }
         if self.heartbeat_interval.is_zero()
             || self.heartbeat_miss_limit == 0
+            || self.control_apply_retry_timeout.is_zero()
             || self.idle_data_connection_timeout.is_zero()
         {
             return Err(LaneError::InvalidHeartbeat);
@@ -210,10 +218,36 @@ where
         let (results, result_rx) = mpsc::channel(config.maximum_pending_control_applies);
         let association = runtime.association.clone();
         let control_dispatch = control_dispatch.clone();
+        let retry_timeout = config.control_apply_retry_timeout;
+        let maximum_deferred = config.maximum_pending_control_applies;
         let worker = tokio::spawn(async move {
-            while let Some(frame) = command_rx.recv().await {
+            let mut deferred = VecDeque::with_capacity(maximum_deferred);
+            loop {
+                let frame = match deferred.pop_front() {
+                    Some(frame) => frame,
+                    None => {
+                        let Some(frame) = command_rx.recv().await else {
+                            break;
+                        };
+                        frame
+                    }
+                };
+                if frame.kind == FrameKind::CoordinatorEvent {
+                    if let Err(error) = apply_ephemeral_control_frame(
+                        association.clone(),
+                        control_dispatch.clone(),
+                        frame,
+                    )
+                    .await
+                    {
+                        let _ = results.send(Err(error)).await;
+                        break;
+                    }
+                    continue;
+                }
                 let mut retry_backoff = Duration::from_millis(25);
-                let result = loop {
+                let retry_started = TokioInstant::now();
+                let result = 'retry: loop {
                     let result = apply_control_frame(
                         association.clone(),
                         control_dispatch.clone(),
@@ -223,23 +257,46 @@ where
                     if matches!(
                         result,
                         Err(LaneError::ControlDispatch(
-                            ControlDispatchError::Unavailable
+                            ControlDispatchError::RetryLater(_)
                         ))
                     ) {
-                        // CoordinatorEvent is deliberately best-effort (for example, a claim
-                        // grant is renewed by the next coordinator tick). A stale event can
-                        // target a placement consumer that is paused until membership recovers.
-                        // Retrying it here would head-of-line block the reliable membership
-                        // snapshot queued behind it and make that recovery impossible.
-                        if frame.kind == FrameKind::CoordinatorEvent {
-                            tracing::debug!(
-                                target: "lattice_remoting::control",
-                                association_id = association.id().get(),
-                                "dropping ephemeral coordinator event while its consumer is unavailable"
-                            );
-                            break Ok(None);
+                        if retry_started.elapsed() >= retry_timeout {
+                            association.record_control_retry_exhaustion();
+                            break Err(LaneError::ControlDispatch(ControlDispatchError::Fatal(
+                                ControlFatalReason::RetryDeadlineExceeded,
+                            )));
                         }
-                        tokio::time::sleep(retry_backoff).await;
+                        association.record_control_apply_retry();
+                        let retry_at = TokioInstant::now() + retry_backoff;
+                        loop {
+                            if deferred.len() == maximum_deferred {
+                                tokio::time::sleep_until(retry_at).await;
+                                break;
+                            }
+                            tokio::select! {
+                                biased;
+                                inbound = command_rx.recv() => {
+                                    let Some(inbound) = inbound else {
+                                        tokio::time::sleep_until(retry_at).await;
+                                        break;
+                                    };
+                                    if inbound.kind == FrameKind::CoordinatorEvent {
+                                        if let Err(error) = apply_ephemeral_control_frame(
+                                            association.clone(),
+                                            control_dispatch.clone(),
+                                            inbound,
+                                        )
+                                        .await
+                                        {
+                                            break 'retry Err(error);
+                                        }
+                                    } else {
+                                        deferred.push_back(inbound);
+                                    }
+                                }
+                                _ = tokio::time::sleep_until(retry_at) => break,
+                            }
+                        }
                         retry_backoff = retry_backoff.saturating_mul(2).min(Duration::from_secs(1));
                         continue;
                     }
@@ -529,14 +586,14 @@ where
                         .expect("control lane requires an apply worker")
                         .try_send(frame)
                         .map_err(|_| LaneError::ControlApplyBackpressure)?,
-                    FrameKind::ControlAck if lane == LaneKind::Control => {
-                        association.acknowledge_control(decode_control_ack(&frame)?)?;
-                    }
                     FrameKind::CoordinatorEvent if lane == LaneKind::Control => control_apply_tx
                         .as_ref()
                         .expect("control lane requires an apply worker")
                         .try_send(frame)
                         .map_err(|_| LaneError::ControlApplyBackpressure)?,
+                    FrameKind::ControlAck if lane == LaneKind::Control => {
+                        association.acknowledge_control(decode_control_ack(&frame)?)?;
+                    }
                     FrameKind::Backpressure => {}
                     FrameKind::LaneWake if lane == LaneKind::Control => {
                         let lane = decode_lane_wake(&frame)?;

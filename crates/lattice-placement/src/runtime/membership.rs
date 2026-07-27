@@ -894,17 +894,22 @@ include!("membership_domain_ops.rs");
 pub(super) fn control_dispatch_error(error: &CoordinatorRuntimeError) -> ControlDispatchError {
     match error {
         CoordinatorRuntimeError::NotLeader
-        | CoordinatorRuntimeError::ControlClosed
-        | CoordinatorRuntimeError::OperationClosed
         | CoordinatorRuntimeError::AssociationUnavailable
-        | CoordinatorRuntimeError::Association(_) => ControlDispatchError::Unavailable,
+        | CoordinatorRuntimeError::Association(_) => ControlDispatchError::RetryLater(
+            lattice_remoting::control::ControlRetryReason::AssociationStarting,
+        ),
+        CoordinatorRuntimeError::ControlClosed | CoordinatorRuntimeError::OperationClosed => {
+            ControlDispatchError::consumer_closed()
+        }
         CoordinatorRuntimeError::Storage(
             StorageError::LeadershipLost
             | StorageError::Unavailable
             | StorageError::Deadline
             | StorageError::OutcomeUnknown
             | StorageError::Authentication,
-        ) => ControlDispatchError::Unavailable,
+        ) => ControlDispatchError::RetryLater(
+            lattice_remoting::control::ControlRetryReason::ConsumerBusy,
+        ),
         _ => ControlDispatchError::InvalidCommand,
     }
 }
@@ -1016,7 +1021,9 @@ mod tests {
             control_dispatch_error(&CoordinatorRuntimeError::Storage(
                 StorageError::OutcomeUnknown
             )),
-            ControlDispatchError::Unavailable
+            ControlDispatchError::RetryLater(
+                lattice_remoting::control::ControlRetryReason::ConsumerBusy
+            )
         );
     }
 }

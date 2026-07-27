@@ -13,6 +13,10 @@ pub struct AssociationMetricsSnapshot {
     pub exact_target_cache_misses: u64,
     pub discarded_replies: u64,
     pub dropped_inbound_frames: u64,
+    pub control_apply_retries: u64,
+    pub control_retry_exhaustions: u64,
+    pub rejected_control_commands: u64,
+    pub dropped_ephemeral_control: u64,
 }
 
 impl AssociationMetricsSnapshot {
@@ -45,6 +49,10 @@ pub(crate) struct AssociationMetrics {
     exact_target_cache_misses: AtomicU64,
     discarded_replies: AtomicU64,
     dropped_inbound_frames: AtomicU64,
+    control_apply_retries: AtomicU64,
+    control_retry_exhaustions: AtomicU64,
+    rejected_control_commands: AtomicU64,
+    dropped_ephemeral_control: AtomicU64,
 }
 
 impl AssociationMetrics {
@@ -86,6 +94,25 @@ impl AssociationMetrics {
         self.dropped_inbound_frames.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_control_apply_retry(&self) {
+        self.control_apply_retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_control_retry_exhaustion(&self) {
+        self.control_retry_exhaustions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_rejected_control_command(&self) {
+        self.rejected_control_commands
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_dropped_ephemeral_control(&self) {
+        self.dropped_ephemeral_control
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn snapshot(&self) -> AssociationMetricsSnapshot {
         AssociationMetricsSnapshot {
             outbound_queue_rejections: self.outbound_queue_rejections.load(Ordering::Relaxed),
@@ -100,6 +127,10 @@ impl AssociationMetrics {
             exact_target_cache_misses: self.exact_target_cache_misses.load(Ordering::Relaxed),
             discarded_replies: self.discarded_replies.load(Ordering::Relaxed),
             dropped_inbound_frames: self.dropped_inbound_frames.load(Ordering::Relaxed),
+            control_apply_retries: self.control_apply_retries.load(Ordering::Relaxed),
+            control_retry_exhaustions: self.control_retry_exhaustions.load(Ordering::Relaxed),
+            rejected_control_commands: self.rejected_control_commands.load(Ordering::Relaxed),
+            dropped_ephemeral_control: self.dropped_ephemeral_control.load(Ordering::Relaxed),
         }
     }
 }

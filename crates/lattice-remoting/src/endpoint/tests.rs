@@ -56,6 +56,12 @@ struct RecoveringControl {
     applied: Mutex<Vec<Bytes>>,
 }
 
+#[derive(Default)]
+struct RetryingWithEphemeralControl {
+    retry_started: tokio::sync::Notify,
+    ephemeral_applied: tokio::sync::Notify,
+}
+
 #[async_trait]
 impl ControlDispatch for RecordingControl {
     async fn apply(
@@ -144,7 +150,9 @@ impl ControlDispatch for RecoveringControl {
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
                 == 0
             {
-                return Err(ControlDispatchError::Unavailable);
+                return Err(ControlDispatchError::RetryLater(
+                    crate::control::ControlRetryReason::ConsumerBusy,
+                ));
             }
             return Err(ControlDispatchError::InvalidCommand);
         }
@@ -152,6 +160,39 @@ impl ControlDispatch for RecoveringControl {
             .lock()
             .expect("recovering control poisoned")
             .push(payload);
+        Ok(())
+    }
+
+    async fn reconcile(
+        &self,
+        _association: AssociationKey,
+        _gap: Option<ControlGap>,
+    ) -> Result<(), ControlDispatchError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ControlDispatch for RetryingWithEphemeralControl {
+    async fn apply(
+        &self,
+        _association: AssociationKey,
+        _command_id: CommandId,
+        _payload: Bytes,
+    ) -> Result<(), ControlDispatchError> {
+        self.retry_started.notify_waiters();
+        Err(ControlDispatchError::RetryLater(
+            crate::control::ControlRetryReason::ConsumerBusy,
+        ))
+    }
+
+    async fn apply_ephemeral(
+        &self,
+        _association: AssociationKey,
+        _command_id: CommandId,
+        _payload: Bytes,
+    ) -> Result<(), ControlDispatchError> {
+        self.ephemeral_applied.notify_waiters();
         Ok(())
     }
 

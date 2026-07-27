@@ -196,6 +196,17 @@ impl WatchRegistry {
     where
         F: FnOnce(&ExactActorTarget) -> bool,
     {
+        let key = TargetWatchKey {
+            association_id,
+            watch_id,
+        };
+        let replay = self
+            .target_watches
+            .values()
+            .find_map(|watches| watches.get(&key));
+        if replay.is_some_and(|existing| existing != &target) {
+            return Err(WatchError::ConflictingReplay);
+        }
         if !is_current(&target) {
             return Ok(WatchCommand::Terminated {
                 watch_id,
@@ -203,17 +214,17 @@ impl WatchRegistry {
                 reason: TerminatedReason::ActivationChanged,
             });
         }
-        if self.target_count() == self.maximum_target {
+        if replay.is_some() {
+            return Ok(WatchCommand::WatchAck { watch_id, target });
+        }
+        if self.target_count() >= self.maximum_target {
             return Err(WatchError::TargetCapacity);
         }
         let path = target.actor_path.to_string();
-        self.target_watches.entry(path).or_default().insert(
-            TargetWatchKey {
-                association_id,
-                watch_id,
-            },
-            target.clone(),
-        );
+        self.target_watches
+            .entry(path)
+            .or_default()
+            .insert(key, target.clone());
         lattice_core::failpoint::hit(Failpoint::WatchAfterInstallBeforeAck);
         Ok(WatchCommand::WatchAck { watch_id, target })
     }
@@ -385,6 +396,8 @@ pub enum WatchError {
     DesiredCapacity,
     #[error("target watch registry is full")]
     TargetCapacity,
+    #[error("watch replay changed the original target")]
+    ConflictingReplay,
     #[error("watch ID sequence is exhausted")]
     IdExhausted,
     #[error("logical entity has no current activation")]
@@ -453,6 +466,42 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn idempotent_watch_replay_succeeds_when_target_registry_is_full() {
+        let association = AssociationId::new(9).unwrap();
+        let target = actor(1);
+        let exact = ExactActorTarget::from(&target);
+        let watch_id = WatchId::new(7, 9).unwrap();
+        let mut registry = WatchRegistry::new(8, 1).unwrap();
+
+        assert!(matches!(
+            registry
+                .receive_watch(association, watch_id, exact.clone(), |_| true)
+                .unwrap(),
+            WatchCommand::WatchAck { .. }
+        ));
+        assert_eq!(registry.target_count(), 1);
+        assert!(matches!(
+            registry
+                .receive_watch(association, watch_id, exact, |_| true)
+                .unwrap(),
+            WatchCommand::WatchAck { .. }
+        ));
+        assert_eq!(registry.target_count(), 1);
+
+        assert_eq!(
+            registry
+                .receive_watch(
+                    association,
+                    WatchId::new(7, 10).unwrap(),
+                    ExactActorTarget::from(&actor(2)),
+                    |_| true,
+                )
+                .unwrap_err(),
+            WatchError::TargetCapacity
+        );
     }
 
     #[test]

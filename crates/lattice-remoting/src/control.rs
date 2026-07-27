@@ -194,8 +194,66 @@ pub enum ControlDispatchError {
     Unsupported,
     #[error("reliable control command is invalid")]
     InvalidCommand,
-    #[error("reliable control consumer is unavailable")]
-    Unavailable,
+    #[error("reliable control command was rejected: {0}")]
+    Rejected(ControlRejectReason),
+    #[error("reliable control command should be retried later: {0}")]
+    RetryLater(ControlRetryReason),
+    #[error("reliable control scope must be reconciled: {0}")]
+    ResetRequired(ControlResetReason),
+    #[error("reliable control consumer failed: {0}")]
+    Fatal(ControlFatalReason),
+}
+
+impl ControlDispatchError {
+    pub const fn retry_later(reason: ControlRetryReason) -> Self {
+        Self::RetryLater(reason)
+    }
+
+    pub const fn consumer_closed() -> Self {
+        Self::Fatal(ControlFatalReason::ConsumerClosed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ControlRejectReason {
+    #[error("consumer capacity is exhausted")]
+    Capacity,
+    #[error("the target scope is not registered")]
+    UnknownScope,
+    #[error("the command belongs to a stale generation")]
+    StaleGeneration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ControlRetryReason {
+    #[error("consumer mailbox is full")]
+    ConsumerBusy,
+    #[error("consumer did not complete before its application deadline")]
+    ApplicationTimeout,
+    #[error("association is not ready")]
+    AssociationStarting,
+    #[error("reliable control outbox is full")]
+    OutboxFull,
+    #[error("downstream effect queue is applying backpressure")]
+    EffectBackpressure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ControlResetReason {
+    #[error("association epoch changed")]
+    AssociationChanged,
+    #[error("scope generation changed")]
+    ScopeChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ControlFatalReason {
+    #[error("consumer mailbox is closed")]
+    ConsumerClosed,
+    #[error("control task supervisor is unavailable")]
+    SupervisorUnavailable,
+    #[error("control retry deadline was exhausted")]
+    RetryDeadlineExceeded,
 }
 
 #[derive(Debug)]

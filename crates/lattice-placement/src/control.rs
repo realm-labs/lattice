@@ -7,7 +7,10 @@ use lattice_core::{
 };
 use lattice_remoting::{
     association::AssociationKey,
-    control::{CommandId, ControlDispatch, ControlDispatchError, ControlGap},
+    control::{
+        CommandId, ControlDispatch, ControlDispatchError, ControlGap, ControlRejectReason,
+        ControlRetryReason,
+    },
 };
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -28,6 +31,25 @@ use crate::{
 
 pub const PLACEMENT_CONTROL_GENERATION: u64 = 7;
 pub const DEFAULT_MAX_CONTROL_PAYLOAD: usize = 256 * 1024;
+
+fn map_try_send_error<T>(error: mpsc::error::TrySendError<T>) -> ControlDispatchError {
+    match error {
+        mpsc::error::TrySendError::Full(_) => {
+            ControlDispatchError::RetryLater(ControlRetryReason::ConsumerBusy)
+        }
+        mpsc::error::TrySendError::Closed(_) => {
+            ControlDispatchError::RetryLater(ControlRetryReason::AssociationStarting)
+        }
+    }
+}
+
+fn application_timeout() -> ControlDispatchError {
+    ControlDispatchError::RetryLater(ControlRetryReason::ApplicationTimeout)
+}
+
+fn completion_closed() -> ControlDispatchError {
+    ControlDispatchError::RetryLater(ControlRetryReason::AssociationStarting)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlacementControlCommand {
@@ -281,11 +303,11 @@ impl ControlDispatch for PlacementControlRouter {
                 })),
                 completion,
             })
-            .map_err(|_| ControlDispatchError::Unavailable)?;
+            .map_err(map_try_send_error)?;
         tokio::time::timeout(self.application_timeout, applied)
             .await
-            .map_err(|_| ControlDispatchError::Unavailable)?
-            .map_err(|_| ControlDispatchError::Unavailable)?
+            .map_err(|_| application_timeout())?
+            .map_err(|_| completion_closed())?
     }
 
     async fn apply_ephemeral(
@@ -308,7 +330,7 @@ impl ControlDispatch for PlacementControlRouter {
                 })),
                 completion,
             })
-            .map_err(|_| ControlDispatchError::Unavailable)
+            .map_err(map_try_send_error)
     }
 
     async fn reconcile(
@@ -322,11 +344,11 @@ impl ControlDispatch for PlacementControlRouter {
                 kind: PlacementControlEventKind::Reconcile { association, gap },
                 completion,
             })
-            .map_err(|_| ControlDispatchError::Unavailable)?;
+            .map_err(map_try_send_error)?;
         tokio::time::timeout(self.application_timeout, reconciled)
             .await
-            .map_err(|_| ControlDispatchError::Unavailable)?
-            .map_err(|_| ControlDispatchError::Unavailable)?
+            .map_err(|_| application_timeout())?
+            .map_err(|_| completion_closed())?
     }
 }
 
@@ -387,7 +409,9 @@ impl ControlDispatch for PlacementControlDirectory {
             .expect("control directory poisoned")
             .get(&scoped.scope)
             .cloned()
-            .ok_or(ControlDispatchError::Unavailable)?;
+            .ok_or(ControlDispatchError::Rejected(
+                ControlRejectReason::UnknownScope,
+            ))?;
         let (completion, applied) = oneshot::channel();
         sender
             .try_send(PlacementControlEvent {
@@ -400,11 +424,11 @@ impl ControlDispatch for PlacementControlDirectory {
                 })),
                 completion,
             })
-            .map_err(|_| ControlDispatchError::Unavailable)?;
+            .map_err(map_try_send_error)?;
         tokio::time::timeout(self.application_timeout, applied)
             .await
-            .map_err(|_| ControlDispatchError::Unavailable)?
-            .map_err(|_| ControlDispatchError::Unavailable)?
+            .map_err(|_| application_timeout())?
+            .map_err(|_| completion_closed())?
     }
 
     async fn apply_ephemeral(
@@ -421,7 +445,9 @@ impl ControlDispatch for PlacementControlDirectory {
             .expect("control directory poisoned")
             .get(&scoped.scope)
             .cloned()
-            .ok_or(ControlDispatchError::Unavailable)?;
+            .ok_or(ControlDispatchError::Rejected(
+                ControlRejectReason::UnknownScope,
+            ))?;
         let (completion, _applied) = oneshot::channel();
         sender
             .try_send(PlacementControlEvent {
@@ -434,7 +460,7 @@ impl ControlDispatch for PlacementControlDirectory {
                 })),
                 completion,
             })
-            .map_err(|_| ControlDispatchError::Unavailable)
+            .map_err(map_try_send_error)
     }
 
     async fn reconcile(
@@ -450,7 +476,7 @@ impl ControlDispatch for PlacementControlDirectory {
             .cloned()
             .collect::<Vec<_>>();
         if senders.is_empty() {
-            return Err(ControlDispatchError::Unavailable);
+            return Err(ControlDispatchError::Unsupported);
         }
         let mut completions = Vec::with_capacity(senders.len());
         for sender in senders {
@@ -463,14 +489,14 @@ impl ControlDispatch for PlacementControlDirectory {
                     },
                     completion,
                 })
-                .map_err(|_| ControlDispatchError::Unavailable)?;
+                .map_err(map_try_send_error)?;
             completions.push(reconciled);
         }
         for completion in completions {
             tokio::time::timeout(self.application_timeout, completion)
                 .await
-                .map_err(|_| ControlDispatchError::Unavailable)?
-                .map_err(|_| ControlDispatchError::Unavailable)??;
+                .map_err(|_| application_timeout())?
+                .map_err(|_| completion_closed())??;
         }
         Ok(())
     }

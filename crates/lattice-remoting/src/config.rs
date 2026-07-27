@@ -32,6 +32,7 @@ pub struct RemotingConfig {
     pub reconnect_backoff_max: Duration,
     pub heartbeat_interval: Duration,
     pub heartbeat_miss_limit: u32,
+    pub control_apply_retry_timeout: Duration,
     pub idle_data_connection_timeout: Duration,
     pub shutdown_timeout: Duration,
 }
@@ -63,6 +64,7 @@ impl Default for RemotingConfig {
             reconnect_backoff_max: Duration::from_secs(5),
             heartbeat_interval: Duration::from_secs(2),
             heartbeat_miss_limit: 3,
+            control_apply_retry_timeout: Duration::from_secs(30),
             idle_data_connection_timeout: Duration::from_secs(60),
             shutdown_timeout: Duration::from_secs(10),
         }
@@ -149,6 +151,10 @@ impl RemotingConfig {
             ("reconnect_backoff_min", self.reconnect_backoff_min),
             ("reconnect_backoff_max", self.reconnect_backoff_max),
             ("heartbeat_interval", self.heartbeat_interval),
+            (
+                "control_apply_retry_timeout",
+                self.control_apply_retry_timeout,
+            ),
             (
                 "idle_data_connection_timeout",
                 self.idle_data_connection_timeout,

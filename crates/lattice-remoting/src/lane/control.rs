@@ -38,7 +38,11 @@ pub(super) async fn apply_control_frame(
                         )
                         .await;
                     match result {
-                        Ok(()) | Err(ControlDispatchError::InvalidCommand) => {}
+                        Ok(())
+                        | Err(ControlDispatchError::InvalidCommand) => {}
+                        Err(ControlDispatchError::Rejected(_)) => {
+                            association.record_rejected_control_command();
+                        }
                         Err(error) => return Err(error.into()),
                     }
                     lattice_core::failpoint::hit(Failpoint::ControlAfterRemoteApplyBeforeAck);
@@ -80,6 +84,28 @@ pub(super) async fn apply_control_frame(
             Ok(None)
         }
         _ => Err(LaneError::UnexpectedControlWork),
+    }
+}
+
+pub(super) async fn apply_ephemeral_control_frame(
+    association: Arc<Association>,
+    control_dispatch: Arc<dyn ControlDispatch>,
+    frame: Frame,
+) -> Result<(), LaneError> {
+    match apply_control_frame(association.clone(), control_dispatch, frame).await {
+        Ok(_) => Ok(()),
+        Err(error @ LaneError::ControlDispatch(ControlDispatchError::RetryLater(_)))
+        | Err(error @ LaneError::ControlDispatch(ControlDispatchError::Rejected(_))) => {
+            association.record_dropped_ephemeral_control();
+            tracing::debug!(
+                target: "lattice_remoting::control",
+                association_id = association.id().get(),
+                error = %error,
+                "dropping ephemeral coordinator event"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 

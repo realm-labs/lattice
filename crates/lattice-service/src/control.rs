@@ -7,16 +7,37 @@ use lattice_actor::{
     watch::TerminatedReason as WatchTerminatedReason,
 };
 use lattice_remoting::{
-    association::{Association, AssociationKey, AssociationManager},
-    control::{CommandId, ControlDispatch, ControlDispatchError, ControlGap},
+    association::{Association, AssociationError, AssociationKey, AssociationManager},
+    control::{
+        CommandId, ControlDispatch, ControlDispatchError, ControlGap, ControlRejectReason,
+        ControlRetryReason, ReliableControlError,
+    },
     messaging::target::ExactActorTarget,
     watch::{
-        TerminatedReason, WatchCommand, WatchRegistry, decode_watch_command, encode_watch_command,
-        is_watch_control,
+        TerminatedReason, WatchCommand, WatchError, WatchRegistry, decode_watch_command,
+        encode_watch_command, is_watch_control,
     },
 };
 
 use crate::supervisor::TaskSupervisor;
+
+fn map_association_admission(error: AssociationError) -> ControlDispatchError {
+    match error {
+        AssociationError::ReliableControl(ReliableControlError::OutboxFull) => {
+            ControlDispatchError::RetryLater(ControlRetryReason::OutboxFull)
+        }
+        AssociationError::NotActive
+        | AssociationError::QueueFull
+        | AssociationError::ByteBudgetExceeded
+        | AssociationError::NodeByteBudgetExceeded => {
+            ControlDispatchError::RetryLater(ControlRetryReason::AssociationStarting)
+        }
+        AssociationError::Closed => {
+            ControlDispatchError::RetryLater(ControlRetryReason::AssociationStarting)
+        }
+        _ => ControlDispatchError::RetryLater(ControlRetryReason::AssociationStarting),
+    }
+}
 
 pub(crate) struct ServiceControlDispatch {
     application: Arc<dyn ControlDispatch>,
@@ -62,7 +83,7 @@ impl ServiceControlDispatch {
         association
             .admit_control_command(payload)
             .map(|_| ())
-            .map_err(|_| ControlDispatchError::Unavailable)
+            .map_err(map_association_admission)
     }
 
     fn supervise_termination(
@@ -100,7 +121,7 @@ impl ServiceControlDispatch {
                     let _ = association.admit_control_command(payload);
                 }
             })
-            .map_err(|_| ControlDispatchError::Unavailable)
+            .map_err(|_| ControlDispatchError::RetryLater(ControlRetryReason::ConsumerBusy))
     }
 
     async fn apply_watch(
@@ -108,10 +129,12 @@ impl ServiceControlDispatch {
         association_key: AssociationKey,
         command: WatchCommand,
     ) -> Result<(), ControlDispatchError> {
-        let association = self
-            .associations
-            .get(&association_key)
-            .ok_or(ControlDispatchError::Unavailable)?;
+        let association =
+            self.associations
+                .get(&association_key)
+                .ok_or(ControlDispatchError::RetryLater(
+                    ControlRetryReason::AssociationStarting,
+                ))?;
         match command {
             WatchCommand::Watch { watch_id, target } => {
                 let terminated = self.hosts.subscribe_terminated(&target);
@@ -122,7 +145,12 @@ impl ServiceControlDispatch {
                     .receive_watch(association.id(), watch_id, target.clone(), |candidate| {
                         self.hosts.is_current(candidate)
                     })
-                    .map_err(|_| ControlDispatchError::Unavailable)?;
+                    .map_err(|error| match error {
+                        WatchError::TargetCapacity => {
+                            ControlDispatchError::Rejected(ControlRejectReason::Capacity)
+                        }
+                        _ => ControlDispatchError::InvalidCommand,
+                    })?;
                 if matches!(response, WatchCommand::WatchAck { .. })
                     && let Some(terminated) = terminated
                 {
@@ -229,10 +257,12 @@ impl ControlDispatch for ServiceControlDispatch {
                 Err(error) => return Err(error),
             }
         }
-        let target = self
-            .associations
-            .get(&association)
-            .ok_or(ControlDispatchError::Unavailable)?;
+        let target =
+            self.associations
+                .get(&association)
+                .ok_or(ControlDispatchError::RetryLater(
+                    ControlRetryReason::AssociationStarting,
+                ))?;
         let commands = self
             .watches
             .lock()

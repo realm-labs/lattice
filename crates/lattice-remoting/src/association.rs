@@ -365,6 +365,22 @@ impl Association {
         self.metrics.record_dropped_inbound_frame();
     }
 
+    pub(crate) fn record_control_apply_retry(&self) {
+        self.metrics.record_control_apply_retry();
+    }
+
+    pub(crate) fn record_control_retry_exhaustion(&self) {
+        self.metrics.record_control_retry_exhaustion();
+    }
+
+    pub(crate) fn record_rejected_control_command(&self) {
+        self.metrics.record_rejected_control_command();
+    }
+
+    pub(crate) fn record_dropped_ephemeral_control(&self) {
+        self.metrics.record_dropped_ephemeral_control();
+    }
+
     fn has_complete_lane_group(&self, lanes: &HashMap<LaneKind, u128>) -> bool {
         lanes.contains_key(&LaneKind::Control)
             && lanes.contains_key(&LaneKind::Interactive)

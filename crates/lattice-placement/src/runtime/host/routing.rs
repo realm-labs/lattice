@@ -1,5 +1,8 @@
 use lattice_core::{actor_ref::NodeIncarnation, coordinator::CoordinatorScope};
-use lattice_remoting::{association::AssociationKey, control::ControlDispatchError};
+use lattice_remoting::{
+    association::AssociationKey,
+    control::{ControlDispatchError, ControlRetryReason},
+};
 use tokio::sync::oneshot;
 
 use super::{
@@ -110,14 +113,16 @@ where
                         CoordinatorScope::Placement(domain),
                         PlacementControlCommand::PlacementDomainHello(hello),
                     ) => {
-                        let Some(sender) = self
-                            .domains
-                            .get(domain)
-                            .and_then(|entry| entry.sender.clone())
-                        else {
-                            let _ = event
-                                .completion
-                                .send(Err(ControlDispatchError::Unavailable));
+                        let Some(hosted) = self.domains.get(domain) else {
+                            let _ = event.completion.send(Err(ControlDispatchError::RetryLater(
+                                ControlRetryReason::AssociationStarting,
+                            )));
+                            return;
+                        };
+                        let Some(sender) = hosted.sender.clone() else {
+                            let _ = event.completion.send(Err(ControlDispatchError::RetryLater(
+                                ControlRetryReason::AssociationStarting,
+                            )));
                             return;
                         };
                         let member_is_up = self
@@ -165,9 +170,10 @@ where
                                 })
                                 .await;
                         } else {
-                            let _ = event
-                                .completion
-                                .send(Err(ControlDispatchError::Unavailable));
+                            let error = ControlDispatchError::RetryLater(
+                                ControlRetryReason::AssociationStarting,
+                            );
+                            let _ = event.completion.send(Err(error));
                         }
                     }
                     _ => {

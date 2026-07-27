@@ -186,3 +186,54 @@ async fn unavailable_control_is_retried_without_disconnecting_before_new_session
     client.shutdown().await.unwrap();
     server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn retry_backoff_yields_to_ephemeral_control_messages() {
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let client_port = server_port.saturating_sub(1).max(1024);
+    let cluster_id = ClusterId::new("control-retry-mailbox-test").unwrap();
+    let client_identity = NodeIdentity {
+        cluster_id: cluster_id.clone(),
+        node_id: "client".to_owned(),
+        address: NodeAddress::new("127.0.0.1", client_port).unwrap(),
+        incarnation: NodeIncarnation::new(41).unwrap(),
+    };
+    let server_identity = NodeIdentity {
+        cluster_id,
+        node_id: "server".to_owned(),
+        address: NodeAddress::new("127.0.0.1", server_port).unwrap(),
+        incarnation: NodeIncarnation::new(42).unwrap(),
+    };
+    let descriptor = ProtocolDescriptor {
+        protocol_id: ProtocolId::new(11).unwrap(),
+        fingerprint: ProtocolFingerprint::digest(b"control-retry-mailbox-test/v1"),
+    };
+    let control = Arc::new(RetryingWithEphemeralControl::default());
+    let client = endpoint(client_identity, descriptor.clone());
+    let server = endpoint_with_control(server_identity.clone(), descriptor, control.clone());
+    server.bind().await.unwrap();
+    let association = client.connect_peer(server_identity).await.unwrap();
+
+    let retry_started = control.retry_started.notified();
+    association
+        .admit_control_command(Bytes::from_static(b"reliable"))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), retry_started)
+        .await
+        .unwrap();
+
+    let ephemeral_applied = control.ephemeral_applied.notified();
+    association
+        .admit_ephemeral_control(Bytes::from_static(b"ephemeral"))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), ephemeral_applied)
+        .await
+        .unwrap();
+    assert_eq!(association.state(), AssociationState::Active);
+    assert_eq!(association.control_outbox_len(), 1);
+
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+}
