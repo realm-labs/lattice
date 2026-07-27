@@ -7,16 +7,37 @@ use lattice_actor::{
     watch::TerminatedReason as WatchTerminatedReason,
 };
 use lattice_remoting::{
-    association::{Association, AssociationKey, AssociationManager},
-    control::{CommandId, ControlDispatch, ControlDispatchError, ControlGap},
+    association::{Association, AssociationError, AssociationKey, AssociationManager},
+    control::{
+        CommandId, ControlDispatch, ControlDispatchError, ControlGap, ControlRejectReason,
+        ControlRetryReason, ControlStreamId, ReliableControlError,
+    },
     messaging::target::ExactActorTarget,
     watch::{
-        TerminatedReason, WatchCommand, WatchRegistry, decode_watch_command, encode_watch_command,
-        is_watch_control,
+        TerminatedReason, WatchCommand, WatchError, WatchRegistry, decode_watch_command,
+        encode_watch_command, is_watch_control,
     },
 };
 
 use crate::supervisor::TaskSupervisor;
+
+fn map_association_admission(error: AssociationError) -> ControlDispatchError {
+    match error {
+        AssociationError::ReliableControl(ReliableControlError::OutboxFull) => {
+            ControlDispatchError::RetryLater(ControlRetryReason::OutboxFull)
+        }
+        AssociationError::NotActive
+        | AssociationError::QueueFull
+        | AssociationError::ByteBudgetExceeded
+        | AssociationError::NodeByteBudgetExceeded => {
+            ControlDispatchError::RetryLater(ControlRetryReason::AssociationStarting)
+        }
+        AssociationError::Closed => {
+            ControlDispatchError::RetryLater(ControlRetryReason::AssociationStarting)
+        }
+        _ => ControlDispatchError::RetryLater(ControlRetryReason::AssociationStarting),
+    }
+}
 
 pub(crate) struct ServiceControlDispatch {
     application: Arc<dyn ControlDispatch>,
@@ -60,9 +81,9 @@ impl ServiceControlDispatch {
         let payload = encode_watch_command(command, self.maximum_payload)
             .map_err(|_| ControlDispatchError::InvalidCommand)?;
         association
-            .admit_control_command(payload)
+            .admit_control_command_in(ControlStreamId::WATCH, payload)
             .map(|_| ())
-            .map_err(|_| ControlDispatchError::Unavailable)
+            .map_err(map_association_admission)
     }
 
     fn supervise_termination(
@@ -97,10 +118,10 @@ impl ServiceControlDispatch {
                     let Ok(payload) = encode_watch_command(&command, maximum_payload) else {
                         continue;
                     };
-                    let _ = association.admit_control_command(payload);
+                    let _ = association.admit_control_command_in(ControlStreamId::WATCH, payload);
                 }
             })
-            .map_err(|_| ControlDispatchError::Unavailable)
+            .map_err(|_| ControlDispatchError::RetryLater(ControlRetryReason::ConsumerBusy))
     }
 
     async fn apply_watch(
@@ -108,10 +129,12 @@ impl ServiceControlDispatch {
         association_key: AssociationKey,
         command: WatchCommand,
     ) -> Result<(), ControlDispatchError> {
-        let association = self
-            .associations
-            .get(&association_key)
-            .ok_or(ControlDispatchError::Unavailable)?;
+        let association =
+            self.associations
+                .get(&association_key)
+                .ok_or(ControlDispatchError::RetryLater(
+                    ControlRetryReason::AssociationStarting,
+                ))?;
         match command {
             WatchCommand::Watch { watch_id, target } => {
                 let terminated = self.hosts.subscribe_terminated(&target);
@@ -122,7 +145,12 @@ impl ServiceControlDispatch {
                     .receive_watch(association.id(), watch_id, target.clone(), |candidate| {
                         self.hosts.is_current(candidate)
                     })
-                    .map_err(|_| ControlDispatchError::Unavailable)?;
+                    .map_err(|error| match error {
+                        WatchError::TargetCapacity => {
+                            ControlDispatchError::Rejected(ControlRejectReason::Capacity)
+                        }
+                        _ => ControlDispatchError::InvalidCommand,
+                    })?;
                 if matches!(response, WatchCommand::WatchAck { .. })
                     && let Some(terminated) = terminated
                 {
@@ -172,10 +200,14 @@ impl ControlDispatch for ServiceControlDispatch {
     async fn apply(
         &self,
         association: AssociationKey,
+        stream_id: ControlStreamId,
         command_id: CommandId,
         payload: Bytes,
     ) -> Result<(), ControlDispatchError> {
         if is_watch_control(&payload) {
+            if stream_id != ControlStreamId::WATCH {
+                return Err(ControlDispatchError::InvalidCommand);
+            }
             let command = decode_watch_command(&payload, self.maximum_payload)
                 .map_err(|_| ControlDispatchError::InvalidCommand)?;
             self.apply_watch(association, command).await
@@ -188,9 +220,32 @@ impl ControlDispatch for ServiceControlDispatch {
                 return Err(ControlDispatchError::InvalidCommand);
             }
             self.application
-                .apply(association, command_id, payload)
+                .apply(association, stream_id, command_id, payload)
                 .await
         }
+    }
+
+    async fn apply_ephemeral(
+        &self,
+        association: AssociationKey,
+        command_id: CommandId,
+        payload: Bytes,
+    ) -> Result<(), ControlDispatchError> {
+        if is_watch_control(&payload) {
+            return self
+                .apply(association, ControlStreamId::WATCH, command_id, payload)
+                .await;
+        }
+        if self
+            .application_scope
+            .as_ref()
+            .is_some_and(|scope| scope != &association)
+        {
+            return Err(ControlDispatchError::InvalidCommand);
+        }
+        self.application
+            .apply_ephemeral(association, command_id, payload)
+            .await
     }
 
     async fn reconcile(
@@ -208,10 +263,12 @@ impl ControlDispatch for ServiceControlDispatch {
                 Err(error) => return Err(error),
             }
         }
-        let target = self
-            .associations
-            .get(&association)
-            .ok_or(ControlDispatchError::Unavailable)?;
+        let target =
+            self.associations
+                .get(&association)
+                .ok_or(ControlDispatchError::RetryLater(
+                    ControlRetryReason::AssociationStarting,
+                ))?;
         let commands = self
             .watches
             .lock()

@@ -393,14 +393,21 @@ fn leader_config_rejects_a_claim_ttl_that_outlives_the_member_heartbeat_timeout(
     let base = PlacementDomainLeaderConfig::default();
     base.validate().unwrap();
     let floor = base.claim_ttl + base.member_heartbeat_interval;
+    let error = PlacementDomainLeaderConfig {
+        member_heartbeat_timeout: floor,
+        ..base.clone()
+    }
+    .validate()
+    .unwrap_err();
     assert!(matches!(
-        PlacementDomainLeaderConfig {
-            member_heartbeat_timeout: floor,
-            ..base.clone()
-        }
-        .validate(),
-        Err(CoordinatorRuntimeError::InvalidConfig)
+        error,
+        CoordinatorRuntimeError::InvalidConfig { .. }
     ));
+    assert_eq!(
+        error.to_string(),
+        "Coordinator runtime configuration is invalid: member_heartbeat_timeout=20s must be \
+         greater than claim_ttl=15s plus member_heartbeat_interval=5s (20s)"
+    );
     PlacementDomainLeaderConfig {
         member_heartbeat_timeout: floor + Duration::from_millis(1),
         ..base.clone()
@@ -413,6 +420,6 @@ fn leader_config_rejects_a_claim_ttl_that_outlives_the_member_heartbeat_timeout(
             ..base
         }
         .validate(),
-        Err(CoordinatorRuntimeError::InvalidConfig)
+        Err(CoordinatorRuntimeError::InvalidConfig { .. })
     ));
 }

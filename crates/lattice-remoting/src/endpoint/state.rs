@@ -143,6 +143,7 @@ impl RemotingEndpoint {
             maximum_concurrent_inbound_asks: self.config.max_pending_asks,
             heartbeat_interval: self.config.heartbeat_interval,
             heartbeat_miss_limit: self.config.heartbeat_miss_limit,
+            control_apply_retry_timeout: self.config.control_apply_retry_timeout,
             idle_data_connection_timeout: self.config.idle_data_connection_timeout,
             maximum_cached_exact_targets: self.config.max_cached_exact_targets_per_lane,
             socket_read_ahead_bytes: self.config.socket_read_ahead_bytes,

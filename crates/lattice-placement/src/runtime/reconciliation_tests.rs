@@ -78,7 +78,7 @@ async fn persist_authority_records(
     let membership_leader = LeaderRecord {
         scope: CoordinatorScope::Membership,
         node: node("membership", 91, 32991),
-        protocol_generation: 6,
+        protocol_generation: 7,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(
@@ -159,7 +159,7 @@ async fn election_adopts_committed_claim_without_changing_owner_or_generation() 
     let record = LeaderRecord {
         scope: CoordinatorScope::Placement(domain()),
         node: old_leader,
-        protocol_generation: 6,
+        protocol_generation: 7,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&record, old_lease).await.unwrap());

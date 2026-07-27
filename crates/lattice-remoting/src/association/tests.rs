@@ -280,6 +280,61 @@ fn queued_reliable_control_replays_when_a_non_control_lane_activates() {
     assert_eq!(envelope.payload, bytes::Bytes::from_static(b"queued"));
 }
 
+#[tokio::test]
+async fn reliable_admission_waits_for_the_matching_ack_to_release_outbox_capacity() {
+    let config = RemotingConfig {
+        max_control_outbox_frames: 1,
+        max_control_outbox_frames_per_stream: 1,
+        ..RemotingConfig::default()
+    };
+    let association = Arc::new(Association::new(key(), config).unwrap());
+    for (lane, nonce) in [
+        (LaneKind::Control, 1),
+        (LaneKind::Interactive, 2),
+        (LaneKind::Bulk(0), 3),
+    ] {
+        association
+            .attach(LaneAttachment {
+                association_id: association.id(),
+                key: key(),
+                lane,
+                connection_nonce: nonce,
+            })
+            .unwrap();
+    }
+    let mut control = association.take_lane_receiver(LaneKind::Control).unwrap();
+    association
+        .admit_control_command(bytes::Bytes::from_static(b"first"))
+        .unwrap();
+    let first = crate::control::decode_control_envelope(&control.try_recv().unwrap()).unwrap();
+
+    let waiting = {
+        let association = association.clone();
+        tokio::spawn(async move {
+            association
+                .admit_control_command_in_wait(
+                    crate::control::ControlStreamId::DEFAULT,
+                    bytes::Bytes::from_static(b"second"),
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+
+    association
+        .acknowledge_control(crate::control::ControlAck {
+            association_epoch: association.id(),
+            stream_id: first.stream_id,
+            cumulative_sequence: first.sequence,
+        })
+        .unwrap();
+    waiting.await.unwrap().unwrap();
+    let second = crate::control::decode_control_envelope(&control.try_recv().unwrap()).unwrap();
+    assert_eq!(second.sequence, 2);
+}
+
 #[test]
 fn concurrent_reliable_admission_preserves_control_sequence_order() {
     let config = RemotingConfig {

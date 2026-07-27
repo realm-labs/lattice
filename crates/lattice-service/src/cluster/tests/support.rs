@@ -283,6 +283,9 @@ pub(super) async fn stage_logic_runtime(
         control
             .apply(
                 coordinator.clone(),
+                lattice_placement::control::control_stream_id(&CoordinatorScope::Placement(
+                    domain(),
+                )),
                 CommandId::generate(),
                 lattice_placement::control::encode_control_command_for_term(
                     &CoordinatorScope::Placement(domain()),

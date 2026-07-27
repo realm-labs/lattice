@@ -139,6 +139,7 @@ pub struct Association {
     queued_bytes: OutboundByteBudget,
     node_queued_bytes: Arc<OutboundByteBudget>,
     admission_changed: Notify,
+    control_outbox_changed: Notify,
     peer_catalogue: OnceLock<ProtocolCatalogue>,
     reliable_control: Mutex<ReliableControl>,
     interactive_wake: Notify,
@@ -193,6 +194,9 @@ impl Association {
         config.validate().map_err(AssociationError::InvalidConfig)?;
         let max_control_outbox_frames = config.max_control_outbox_frames;
         let max_control_outbox_bytes = config.max_control_outbox_bytes;
+        let max_control_streams = config.max_control_streams;
+        let max_control_outbox_frames_per_stream = config.max_control_outbox_frames_per_stream;
+        let max_control_outbox_bytes_per_stream = config.max_control_outbox_bytes_per_stream;
         let bulk_stripes = config.bulk_stripes;
         let (control, control_rx) = mpsc::channel(config.control_queue_frames);
         let (interactive, interactive_rx) = mpsc::channel(config.interactive_queue_frames);
@@ -230,10 +234,18 @@ impl Association {
             queued_bytes: OutboundByteBudget::new(),
             node_queued_bytes,
             admission_changed: Notify::new(),
+            control_outbox_changed: Notify::new(),
             peer_catalogue: OnceLock::new(),
             reliable_control: Mutex::new(
-                ReliableControl::new(id, max_control_outbox_frames, max_control_outbox_bytes)
-                    .expect("validated reliable control limits"),
+                ReliableControl::new_with_limits(
+                    id,
+                    max_control_outbox_frames,
+                    max_control_outbox_bytes,
+                    max_control_outbox_frames_per_stream,
+                    max_control_outbox_bytes_per_stream,
+                    max_control_streams,
+                )
+                .expect("validated reliable control limits"),
             ),
             interactive_wake: Notify::new(),
             bulk_wakes: (0..bulk_stripes).map(|_| Notify::new()).collect(),
@@ -312,6 +324,7 @@ impl Association {
             self.attached_lanes.store(0, Ordering::Release);
             self.wake_pending_lanes.store(0, Ordering::Release);
             self.admission_changed.notify_waiters();
+            self.control_outbox_changed.notify_waiters();
             self.state_changed.notify_waiters();
         }
     }
@@ -324,6 +337,7 @@ impl Association {
         self.attached_lanes.store(0, Ordering::Release);
         self.wake_pending_lanes.store(0, Ordering::Release);
         self.admission_changed.notify_waiters();
+        self.control_outbox_changed.notify_waiters();
         self.state_changed.notify_waiters();
     }
 
@@ -363,6 +377,22 @@ impl Association {
 
     pub(crate) fn record_dropped_inbound_frame(&self) {
         self.metrics.record_dropped_inbound_frame();
+    }
+
+    pub(crate) fn record_control_apply_retry(&self) {
+        self.metrics.record_control_apply_retry();
+    }
+
+    pub(crate) fn record_control_retry_exhaustion(&self) {
+        self.metrics.record_control_retry_exhaustion();
+    }
+
+    pub(crate) fn record_rejected_control_command(&self) {
+        self.metrics.record_rejected_control_command();
+    }
+
+    pub(crate) fn record_dropped_ephemeral_control(&self) {
+        self.metrics.record_dropped_ephemeral_control();
     }
 
     fn has_complete_lane_group(&self, lanes: &HashMap<LaneKind, u128>) -> bool {

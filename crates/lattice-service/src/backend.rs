@@ -970,7 +970,7 @@ impl RecipientBackend for ServiceRecipientBackend {
             .watch(association.id(), &target)?;
         let payload = encode_watch_command(&command, self.maximum_control_payload)?;
         association
-            .admit_control_command(payload)
+            .admit_control_command_in(lattice_remoting::control::ControlStreamId::WATCH, payload)
             .map_err(|_| WatchError::InvalidCommand)?;
         Ok(watch_id)
     }
@@ -1009,10 +1009,10 @@ impl RecipientBackend for ServiceRecipientBackend {
             .get_by_id(association_id)
             .ok_or(WatchError::InvalidCommand)?;
         association
-            .admit_control_command(encode_watch_command(
-                &command,
-                self.maximum_control_payload,
-            )?)
+            .admit_control_command_in(
+                lattice_remoting::control::ControlStreamId::WATCH,
+                encode_watch_command(&command, self.maximum_control_payload)?,
+            )
             .map(|_| ())
             .map_err(|_| WatchError::InvalidCommand)
     }

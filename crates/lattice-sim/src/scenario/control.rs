@@ -10,8 +10,8 @@ use bytes::Bytes;
 use lattice_core::failpoint::{self, Failpoint};
 use lattice_remoting::{
     control::{
-        CommandId, ControlApply, ReliableControlError, control_ack_frame, control_envelope_frame,
-        decode_control_ack, decode_control_envelope,
+        CommandId, ControlApply, ControlStreamId, ReliableControlError, control_ack_frame,
+        control_envelope_frame, decode_control_ack, decode_control_envelope,
     },
     wire::FrameKind,
 };
@@ -106,16 +106,20 @@ impl Scenario {
         match decoded.kind {
             FrameKind::ControlEnvelope => {
                 let envelope = decode_control_envelope(&decoded).map_err(ScenarioError::Control)?;
+                let stream_id = envelope.stream_id;
                 match self.member.receive(envelope) {
                     ControlApply::Apply(_) => {
                         self.state.applied_control_commands += 1;
-                        self.acknowledge();
+                        self.acknowledge(stream_id);
                     }
                     ControlApply::Duplicate(_) => {
                         self.state.duplicate_control_commands += 1;
-                        self.acknowledge();
+                        self.acknowledge(stream_id);
                     }
                     ControlApply::Gap(_) | ControlApply::ReconcileEpoch => {}
+                    ControlApply::StreamLimit => {
+                        return Err(ScenarioError::Control(ReliableControlError::StreamLimit));
+                    }
                 }
             }
             FrameKind::ControlAck => {
@@ -129,7 +133,7 @@ impl Scenario {
         Ok(())
     }
 
-    fn acknowledge(&mut self) {
+    fn acknowledge(&mut self, stream_id: ControlStreamId) {
         let action = failpoint::hit_decision(Failpoint::ControlAfterRemoteApplyBeforeAck);
         if !action.is_continue() {
             let (target, outcome) = match action {
@@ -150,7 +154,7 @@ impl Scenario {
             );
             return;
         }
-        let ack = self.member.current_ack();
+        let ack = self.member.current_ack(stream_id);
         let Ok(encoded) = self.codec.encode(&control_ack_frame(ack)) else {
             return;
         };

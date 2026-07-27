@@ -421,7 +421,7 @@ impl DomainHarness {
 }
 
 fn rejected<E>(_: E) -> CoordinatorRuntimeError {
-    CoordinatorRuntimeError::InvalidConfig
+    CoordinatorRuntimeError::invalid_config("test harness input is invalid")
 }
 
 fn node(id: &str, port: u16, incarnation: u128) -> Result<NodeKey, CoordinatorRuntimeError> {

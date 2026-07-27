@@ -14,7 +14,7 @@ use crate::{
 };
 
 impl PlacementDomainSession {
-    pub(super) fn handle_local_event(
+    pub(super) async fn handle_local_event(
         &self,
         event: LocalAuthorityEvent,
     ) -> Result<(), LogicSessionError> {
@@ -31,7 +31,7 @@ impl PlacementDomainSession {
                 })
                 .map_err(LogicSessionError::Authority)?
         };
-        self.publish_effects(event.slot, effects)
+        self.publish_effects(event.slot, effects).await
     }
 
     pub(super) async fn handle(
@@ -89,7 +89,7 @@ impl PlacementDomainSession {
                             }
                             SnapshotVersion::Placement(version) => {
                                 let slots = decode_slots(&install.records)?;
-                                self.install_snapshot_slots(slots)?;
+                                self.install_snapshot_slots(slots).await?;
                                 self.state
                                     .lock()
                                     .expect("logic placement state poisoned")
@@ -100,7 +100,7 @@ impl PlacementDomainSession {
                             }
                         }
                     }
-                    PlacementControlCommand::StateDelta(delta) => self.apply_delta(delta),
+                    PlacementControlCommand::StateDelta(delta) => self.apply_delta(delta).await,
                     PlacementControlCommand::MemberDelta(_) => {
                         Err(LogicSessionError::UnauthorizedCommand)
                     }
@@ -119,7 +119,7 @@ impl PlacementDomainSession {
                                 })
                                 .map_err(LogicSessionError::Authority)?
                         };
-                        self.publish_effects(grant.slot, effects)
+                        self.publish_effects(grant.slot, effects).await
                     }
                     PlacementControlCommand::ResolutionFailed {
                         request_id,
@@ -160,10 +160,11 @@ impl PlacementDomainSession {
                             return Err(LogicSessionError::StaleGeneration);
                         }
                         self.effects
-                            .try_send(LogicPlacementEffect::DrainReady {
+                            .send(LogicPlacementEffect::DrainReady {
                                 operation_id,
                                 incarnation: expected_incarnation,
                             })
+                            .await
                             .map_err(|_| LogicSessionError::EffectBackpressure)
                     }
                     PlacementControlCommand::DrainSlot {
@@ -195,7 +196,7 @@ impl PlacementDomainSession {
                                 .transition(AuthorityEvent::BeginDrain)
                                 .map_err(LogicSessionError::Authority)?
                         };
-                        self.publish_effects(key, effects)
+                        self.publish_effects(key, effects).await
                     }
                     PlacementControlCommand::MemberHello(_)
                     | PlacementControlCommand::PlacementDomainHello(_)
@@ -222,7 +223,7 @@ impl PlacementDomainSession {
         }
     }
 
-    fn apply_delta(&self, delta: CoordinatorDelta) -> Result<(), LogicSessionError> {
+    async fn apply_delta(&self, delta: CoordinatorDelta) -> Result<(), LogicSessionError> {
         let slots = decode_slots(&delta.records)?;
         {
             let mut state = self.state.lock().expect("logic placement state poisoned");
@@ -231,7 +232,7 @@ impl PlacementDomainSession {
                 .apply(delta.clone())
                 .map_err(LogicSessionError::PlacementState)?;
         }
-        self.install_slots(slots)?;
+        self.install_slots(slots).await?;
         self.send(PlacementControlCommand::AppliedRevision(delta.version))
     }
 
@@ -245,7 +246,7 @@ impl PlacementDomainSession {
         Ok(())
     }
 
-    fn install_snapshot_slots(
+    async fn install_snapshot_slots(
         &self,
         slots: BTreeMap<PlacementSlotKey, PlacementSlot>,
     ) -> Result<(), LogicSessionError> {
@@ -257,7 +258,7 @@ impl PlacementDomainSession {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        self.install_slots(slots.clone())?;
+        self.install_slots(slots.clone()).await?;
         let changed = {
             let mut state = self.state.lock().expect("logic placement state poisoned");
             for key in existing {
@@ -271,7 +272,7 @@ impl PlacementDomainSession {
         Ok(())
     }
 
-    fn install_slots(
+    async fn install_slots(
         &self,
         slots: BTreeMap<PlacementSlotKey, PlacementSlot>,
     ) -> Result<(), LogicSessionError> {
@@ -303,7 +304,7 @@ impl PlacementDomainSession {
             }
         }
         for (key, effects) in all_effects {
-            self.publish_effects(key, effects)?;
+            self.publish_effects(key, effects).await?;
         }
         self.state
             .lock()
@@ -313,7 +314,7 @@ impl PlacementDomainSession {
         Ok(())
     }
 
-    pub(super) fn tick_authorities(&self) -> Result<(), LogicSessionError> {
+    pub(super) async fn tick_authorities(&self) -> Result<(), LogicSessionError> {
         let now = self.now();
         let effects = {
             let mut state = self.state.lock().expect("logic placement state poisoned");
@@ -329,22 +330,23 @@ impl PlacementDomainSession {
                 .map_err(LogicSessionError::Authority)?
         };
         for (key, effects) in effects {
-            self.publish_effects(key, effects)?;
+            self.publish_effects(key, effects).await?;
         }
         Ok(())
     }
 
-    fn publish_effects(
+    pub(super) async fn publish_effects(
         &self,
         slot: PlacementSlotKey,
         effects: Vec<AuthorityEffect>,
     ) -> Result<(), LogicSessionError> {
         for effect in effects {
             self.effects
-                .try_send(LogicPlacementEffect::Authority {
+                .send(LogicPlacementEffect::Authority {
                     slot: slot.clone(),
                     effect,
                 })
+                .await
                 .map_err(|_| LogicSessionError::EffectBackpressure)?;
         }
         Ok(())

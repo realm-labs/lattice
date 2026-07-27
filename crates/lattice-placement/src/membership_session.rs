@@ -17,7 +17,7 @@ use tokio::{
 use crate::{
     control::{
         PlacementControlCommand, PlacementControlEvent, PlacementControlEventKind,
-        encode_control_command_for_term,
+        control_stream_id, encode_control_command_for_term,
     },
     coordinator::{
         MemberEvent, MemberHello, MemberRecord, MemberStatus, MembershipState, SnapshotRecord,
@@ -74,7 +74,8 @@ impl MembershipCoordinatorHandle {
             .associations
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
-        let command_id = association.admit_control_command(
+        let command_id = association.admit_control_command_in(
+            control_stream_id(&CoordinatorScope::Membership),
             encode_control_command_for_term(
                 &CoordinatorScope::Membership,
                 self.coordinator_term,
@@ -264,21 +265,24 @@ impl MembershipSession {
                             state.changed.clone()
                         };
                         self.effects
-                            .try_send(LogicPlacementEffect::MemberSnapshot { version, members })
+                            .send(LogicPlacementEffect::MemberSnapshot { version, members })
+                            .await
                             .map_err(|_| LogicSessionError::EffectBackpressure)?;
                         changed.notify_waiters();
                         self.send(PlacementControlCommand::JoinReady {
                             snapshot_version: version,
                         })
                     }
-                    PlacementControlCommand::MemberDelta(event) => self.apply_member_event(event),
+                    PlacementControlCommand::MemberDelta(event) => {
+                        self.apply_member_event(event).await
+                    }
                     _ => Err(LogicSessionError::UnauthorizedCommand),
                 }
             }
         }
     }
 
-    fn apply_member_event(&self, event: MemberEvent) -> Result<(), LogicSessionError> {
+    async fn apply_member_event(&self, event: MemberEvent) -> Result<(), LogicSessionError> {
         let changed = {
             let mut state = self
                 .state
@@ -298,7 +302,8 @@ impl MembershipSession {
             state.changed.clone()
         };
         self.effects
-            .try_send(LogicPlacementEffect::MemberEvent(Box::new(event)))
+            .send(LogicPlacementEffect::MemberEvent(Box::new(event)))
+            .await
             .map_err(|_| LogicSessionError::EffectBackpressure)?;
         changed.notify_waiters();
         Ok(())
@@ -312,7 +317,8 @@ impl MembershipSession {
         if association.state() == AssociationState::Closed {
             return Err(LogicSessionError::AssociationUnavailable);
         }
-        association.admit_control_command(
+        association.admit_control_command_in(
+            control_stream_id(&CoordinatorScope::Membership),
             encode_control_command_for_term(
                 &CoordinatorScope::Membership,
                 self.coordinator_term,
@@ -371,6 +377,8 @@ fn membership_dispatch_error(error: &LogicSessionError) -> ControlDispatchError 
         | LogicSessionError::StaleGeneration
         | LogicSessionError::Coordinator(_)
         | LogicSessionError::MembershipState(_) => ControlDispatchError::InvalidCommand,
-        _ => ControlDispatchError::Unavailable,
+        _ => ControlDispatchError::RetryLater(
+            lattice_remoting::control::ControlRetryReason::AssociationStarting,
+        ),
     }
 }

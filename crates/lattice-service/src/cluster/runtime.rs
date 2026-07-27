@@ -251,9 +251,15 @@ impl LogicJoinRuntime {
                     leader,
                     association,
                 } => {
-                    if wait_for_membership(&mut self.membership_ready, &mut shutdown)
-                        .await
-                        .is_err()
+                    let recovering_membership = self
+                        .lifecycle
+                        .lock()
+                        .expect("service lifecycle poisoned")
+                        .recovering_membership();
+                    if !recovering_membership
+                        && wait_for_membership(&mut self.membership_ready, &mut shutdown)
+                            .await
+                            .is_err()
                     {
                         break;
                     }
@@ -397,12 +403,13 @@ impl LogicJoinRuntime {
         let mut task = tokio::spawn(session.run_recoverable(controls, session_shutdown_rx));
         let applier = self.effect_applier();
         let changed = handle.change_notifier();
+        let mut membership_ready = self.membership_ready.clone();
         loop {
             // The placement state can become ready while authority effects produced by the
             // snapshot are still queued. Publishing domain readiness before those effects are
             // applied exposes a transient Ready state in which logical messages are rejected as
             // stale authority.
-            if handle.ready_for_admission() && effects.is_empty() {
+            if handle.ready_for_admission() && effects.is_empty() && *membership_ready.borrow() {
                 self.set_domain_state(PlacementDomainState::Ready);
                 let state = self
                     .lifecycle
@@ -410,9 +417,7 @@ impl LogicJoinRuntime {
                     .expect("service lifecycle poisoned")
                     .state();
                 let event = match state {
-                    NodeLifecycleState::JoiningMembership
-                        if *self.membership_ready.borrow() && self.all_domains_ready() =>
-                    {
+                    NodeLifecycleState::JoiningMembership if self.all_domains_ready() => {
                         Some(ServiceLifecycleEvent::SnapshotInstalled)
                     }
                     NodeLifecycleState::Ready => None,
@@ -471,9 +476,10 @@ impl LogicJoinRuntime {
                                 .transition(ServiceLifecycleEvent::CoordinatorLost);
                             let _ = session_shutdown.send(true);
                             return LogicSessionReturn {
-                                controls: task.await
-                                .map(|(_, controls)| controls)
-                                .unwrap_or_else(|_| closed_controls()),
+                                controls: task
+                                    .await
+                                    .map(|(_, controls)| controls)
+                                    .unwrap_or_else(|_| closed_controls()),
                                 retry: false,
                             };
                         }
@@ -529,6 +535,17 @@ impl LogicJoinRuntime {
                     }
                 }
                 _ = changed.notified() => {}
+                changed = membership_ready.changed() => {
+                    if changed.is_err() {
+                        let _ = session_shutdown.send(true);
+                        return LogicSessionReturn {
+                            controls: task.await
+                            .map(|(_, controls)| controls)
+                            .unwrap_or_else(|_| closed_controls()),
+                            retry: false,
+                        };
+                    }
+                }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         let _ = session_shutdown.send(true);

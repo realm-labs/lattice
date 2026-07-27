@@ -6,8 +6,8 @@ use super::LaneError;
 use crate::{
     association::{Association, LaneKind},
     control::{
-        CommandId, ControlApply, ControlDispatch, ControlDispatchError, control_ack_frame,
-        decode_control_envelope,
+        CommandId, ControlApply, ControlDispatch, ControlDispatchError, ReliableControlError,
+        control_ack_frame, decode_control_envelope,
     },
     wire::{Frame, FrameKind},
 };
@@ -33,12 +33,16 @@ pub(super) async fn apply_control_frame(
                     let result = control_dispatch
                         .apply(
                             association.key().clone(),
+                            envelope.stream_id,
                             envelope.command_id,
                             envelope.payload.clone(),
                         )
                         .await;
                     match result {
                         Ok(()) | Err(ControlDispatchError::InvalidCommand) => {}
+                        Err(ControlDispatchError::Rejected(_)) => {
+                            association.record_rejected_control_command();
+                        }
                         Err(error) => return Err(error.into()),
                     }
                     lattice_core::failpoint::hit(Failpoint::ControlAfterRemoteApplyBeforeAck);
@@ -46,7 +50,9 @@ pub(super) async fn apply_control_frame(
                     Ok(Some(control_ack_frame(ack)))
                 }
                 ControlApply::Duplicate(anticipated) => {
-                    let ack = if association.current_control_ack().cumulative_sequence
+                    let ack = if association
+                        .current_control_ack(envelope.stream_id)
+                        .cumulative_sequence
                         < anticipated.cumulative_sequence
                     {
                         association.commit_control(envelope)
@@ -67,11 +73,12 @@ pub(super) async fn apply_control_frame(
                         .await?;
                     Ok(None)
                 }
+                ControlApply::StreamLimit => Err(ReliableControlError::StreamLimit.into()),
             }
         }
         FrameKind::CoordinatorEvent => {
             control_dispatch
-                .apply(
+                .apply_ephemeral(
                     association.key().clone(),
                     CommandId::generate(),
                     frame.into_payload(),
@@ -80,6 +87,28 @@ pub(super) async fn apply_control_frame(
             Ok(None)
         }
         _ => Err(LaneError::UnexpectedControlWork),
+    }
+}
+
+pub(super) async fn apply_ephemeral_control_frame(
+    association: Arc<Association>,
+    control_dispatch: Arc<dyn ControlDispatch>,
+    frame: Frame,
+) -> Result<(), LaneError> {
+    match apply_control_frame(association.clone(), control_dispatch, frame).await {
+        Ok(_) => Ok(()),
+        Err(error @ LaneError::ControlDispatch(ControlDispatchError::RetryLater(_)))
+        | Err(error @ LaneError::ControlDispatch(ControlDispatchError::Rejected(_))) => {
+            association.record_dropped_ephemeral_control();
+            tracing::debug!(
+                target: "lattice_remoting::control",
+                association_id = association.id().get(),
+                error = %error,
+                "dropping ephemeral coordinator event"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 

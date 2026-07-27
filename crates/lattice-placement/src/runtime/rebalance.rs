@@ -7,7 +7,7 @@ use super::{
     HandoffEffect, HandoffEvent, HandoffMachine, MembershipStore, MoveProgress, NodeIncarnation,
     PlacementControlCommand, PlacementDomainLeader, PlacementDomainStore, PlacementSlot,
     PlacementSlotKey, PlacementSlotState, PlanReason, ScopedElectionStore, SnapshotRecord,
-    membership::{send_control, slot_record_key},
+    membership::{send_control_with_backpressure, slot_record_key},
 };
 use crate::{
     coordinator::CoordinatorDelta,
@@ -214,13 +214,14 @@ where
                 .associations
                 .get(&session.association)
                 .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-            send_control(
+            send_control_with_backpressure(
                 &association,
                 &self.version.domain,
                 self.version.term.get(),
                 PlacementControlCommand::StateDelta(delta),
                 &self.config,
-            )?;
+            )
+            .await?;
         }
         Ok(())
     }
@@ -302,7 +303,7 @@ where
                 .get(&session.association)
                 .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
             if !super::dropped_by_failpoint(Failpoint::HandoffAfterDrainSend) {
-                send_control(
+                send_control_with_backpressure(
                     &association,
                     &self.version.domain,
                     self.version.term.get(),
@@ -312,7 +313,8 @@ where
                         version: slot.version.clone(),
                     },
                     &self.config,
-                )?;
+                )
+                .await?;
             }
         }
         let recovery = self

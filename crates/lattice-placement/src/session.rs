@@ -25,8 +25,9 @@ use crate::{
         PlacementControlEvent, PlacementResolutionFailure, encode_control_command_for_term,
     },
     coordinator::{
-        CoordinatorError, MemberEvent, MemberRecord, MembershipStateError, PlacementDomainHello,
-        PlacementDomainState, PlacementDomainStateError, SnapshotLimits, SnapshotStager,
+        CoordinatorError, MemberEvent, MemberRecord, MembershipStateError, NodeLoadReport,
+        PlacementDomainHello, PlacementDomainState, PlacementDomainStateError, SnapshotLimits,
+        SnapshotStager,
     },
     types::{
         MembershipVersion, MonotonicTime, NodeKey, PlacementSlot, PlacementSlotKey,
@@ -44,6 +45,11 @@ pub struct LogicCoordinatorConfig {
     pub maximum_control_payload: usize,
     pub tick_interval: Duration,
     pub heartbeat_interval: Duration,
+    /// Publishes a unit-weight fallback derived from the locally owned placement slots.
+    ///
+    /// Applications that publish their own measured `NodeLoadReport` sequence must disable this
+    /// fallback so the two independent sequence sources cannot supersede one another.
+    pub automatic_node_load_reporting: bool,
     pub maximum_authorities: usize,
     pub claim_safety_margin: Duration,
     pub drain_acknowledgement_timeout: Duration,
@@ -59,6 +65,7 @@ impl Default for LogicCoordinatorConfig {
             maximum_control_payload: DEFAULT_MAX_CONTROL_PAYLOAD,
             tick_interval: Duration::from_millis(100),
             heartbeat_interval: Duration::from_secs(5),
+            automatic_node_load_reporting: true,
             maximum_authorities: 65_536,
             claim_safety_margin: Duration::from_secs(2),
             drain_acknowledgement_timeout: Duration::from_secs(30),
@@ -166,6 +173,28 @@ impl LogicPlacementState {
 
     pub fn coordinator_term(&self) -> Option<u64> {
         Some(self.coordinator_term)
+    }
+
+    fn baseline_node_load(&self, sequence: u64) -> NodeLoadReport {
+        let total_weight = u64::try_from(
+            self.slots
+                .values()
+                .filter(|slot| {
+                    slot.owner.as_ref() == Some(&self.local_node)
+                        && !matches!(
+                            slot.state,
+                            PlacementSlotState::Unallocated | PlacementSlotState::Fenced
+                        )
+                })
+                .count(),
+        )
+        .unwrap_or(u64::MAX);
+        NodeLoadReport {
+            node: self.local_node.clone(),
+            sequence,
+            observed_at: self.now(),
+            total_weight,
+        }
     }
 }
 
@@ -365,10 +394,10 @@ impl PlacementDomainSession {
                     let Some(event) = event else {
                         return Err(LogicSessionError::ControlClosed);
                     };
-                    self.handle_local_event(event)?;
+                    self.handle_local_event(event).await?;
                 }
                 _ = tick.tick() => {
-                    self.tick_authorities()?;
+                    self.tick_authorities().await?;
                 }
                 _ = heartbeat.tick() => {
                     self.heartbeat_sequence = self
@@ -379,6 +408,26 @@ impl PlacementDomainSession {
                         incarnation: self.domain_hello.node.incarnation,
                         sequence: self.heartbeat_sequence,
                     })?;
+                    if self.config.automatic_node_load_reporting {
+                        let report = self
+                            .state
+                            .lock()
+                            .expect("logic placement state poisoned")
+                            .baseline_node_load(self.heartbeat_sequence);
+                        if let Err(error) =
+                            self.send_ephemeral(PlacementControlCommand::NodeLoad(report))
+                        {
+                            // Load samples are intentionally latest-value and lossy. A full
+                            // ephemeral lane must not terminate the reliable heartbeat session.
+                            tracing::debug!(
+                                target: "lattice.cluster.logic",
+                                domain = %self.domain_hello.domain.as_str(),
+                                sequence = self.heartbeat_sequence,
+                                %error,
+                                "automatic node load sample was dropped"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -393,7 +442,29 @@ impl PlacementDomainSession {
             return Err(LogicSessionError::AssociationUnavailable);
         }
         let scope = CoordinatorScope::Placement(self.domain_hello.domain.clone());
-        association.admit_control_command(
+        association.admit_control_command_in(
+            crate::control::control_stream_id(&scope),
+            encode_control_command_for_term(
+                &scope,
+                self.coordinator_term,
+                &command,
+                self.config.maximum_control_payload,
+            )
+            .map_err(LogicSessionError::Control)?,
+        )?;
+        Ok(())
+    }
+
+    fn send_ephemeral(&self, command: PlacementControlCommand) -> Result<(), LogicSessionError> {
+        let association = self
+            .associations
+            .get(&self.coordinator)
+            .ok_or(LogicSessionError::AssociationUnavailable)?;
+        if association.state() == AssociationState::Closed {
+            return Err(LogicSessionError::AssociationUnavailable);
+        }
+        let scope = CoordinatorScope::Placement(self.domain_hello.domain.clone());
+        association.admit_ephemeral_control(
             encode_control_command_for_term(
                 &scope,
                 self.coordinator_term,
@@ -440,7 +511,9 @@ fn session_dispatch_error(error: &LogicSessionError) -> ControlDispatchError {
         | LogicSessionError::PlacementState(_)
         | LogicSessionError::Authority(_)
         | LogicSessionError::UnknownAuthority => ControlDispatchError::InvalidCommand,
-        _ => ControlDispatchError::Unavailable,
+        _ => ControlDispatchError::RetryLater(
+            lattice_remoting::control::ControlRetryReason::AssociationStarting,
+        ),
     }
 }
 
@@ -470,7 +543,7 @@ pub enum LogicSessionError {
     HeartbeatSequenceExhausted,
     #[error("logic Coordinator did not acknowledge drain completion inside its bound")]
     DrainNotAcknowledged,
-    #[error("logic Coordinator effect queue is full or closed")]
+    #[error("logic Coordinator effect consumer is closed")]
     EffectBackpressure,
     #[error("logic Coordinator state reducer rejected input")]
     Coordinator(#[source] CoordinatorError),

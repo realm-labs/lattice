@@ -602,7 +602,7 @@ mod tests {
         let rejected = CoordinatorRuntimeError::Allocation(AllocationError::InvalidView);
         assert_eq!(
             rejected.to_string(),
-            "allocation strategy rejected the placement view"
+            "allocation strategy rejected the placement view: placement view is invalid"
         );
         assert_eq!(error_cause(&rejected), "placement view is invalid");
         assert_eq!(error_cause(&CoordinatorRuntimeError::DrainNotReady), "none");

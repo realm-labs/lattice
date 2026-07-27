@@ -19,6 +19,9 @@ pub struct RemotingConfig {
     pub max_pending_asks: usize,
     pub max_control_outbox_frames: usize,
     pub max_control_outbox_bytes: usize,
+    pub max_control_streams: usize,
+    pub max_control_outbox_frames_per_stream: usize,
+    pub max_control_outbox_bytes_per_stream: usize,
     pub max_protocols_per_peer: usize,
     pub max_cached_exact_targets_per_lane: usize,
     pub max_prepared_exact_tell_routes: usize,
@@ -32,6 +35,7 @@ pub struct RemotingConfig {
     pub reconnect_backoff_max: Duration,
     pub heartbeat_interval: Duration,
     pub heartbeat_miss_limit: u32,
+    pub control_apply_retry_timeout: Duration,
     pub idle_data_connection_timeout: Duration,
     pub shutdown_timeout: Duration,
 }
@@ -50,6 +54,9 @@ impl Default for RemotingConfig {
             max_pending_asks: 4096,
             max_control_outbox_frames: 1024,
             max_control_outbox_bytes: 4 * 1024 * 1024,
+            max_control_streams: 1024,
+            max_control_outbox_frames_per_stream: 512,
+            max_control_outbox_bytes_per_stream: 2 * 1024 * 1024,
             max_protocols_per_peer: 1024,
             max_cached_exact_targets_per_lane: 1024,
             max_prepared_exact_tell_routes: 16 * 1024,
@@ -63,6 +70,7 @@ impl Default for RemotingConfig {
             reconnect_backoff_max: Duration::from_secs(5),
             heartbeat_interval: Duration::from_secs(2),
             heartbeat_miss_limit: 3,
+            control_apply_retry_timeout: Duration::from_secs(30),
             idle_data_connection_timeout: Duration::from_secs(60),
             shutdown_timeout: Duration::from_secs(10),
         }
@@ -91,6 +99,15 @@ impl RemotingConfig {
             ("max_pending_asks", self.max_pending_asks),
             ("max_control_outbox_frames", self.max_control_outbox_frames),
             ("max_control_outbox_bytes", self.max_control_outbox_bytes),
+            ("max_control_streams", self.max_control_streams),
+            (
+                "max_control_outbox_frames_per_stream",
+                self.max_control_outbox_frames_per_stream,
+            ),
+            (
+                "max_control_outbox_bytes_per_stream",
+                self.max_control_outbox_bytes_per_stream,
+            ),
             ("max_protocols_per_peer", self.max_protocols_per_peer),
             (
                 "max_cached_exact_targets_per_lane",
@@ -140,6 +157,11 @@ impl RemotingConfig {
         if self.max_outbound_bytes_per_association > self.max_outbound_bytes_per_node {
             return Err(RemotingConfigError::AssociationBytesExceedNodeBytes);
         }
+        if self.max_control_outbox_frames_per_stream > self.max_control_outbox_frames
+            || self.max_control_outbox_bytes_per_stream > self.max_control_outbox_bytes
+        {
+            return Err(RemotingConfigError::StreamOutboxExceedsAssociation);
+        }
         if self.reconnect_backoff_min > self.reconnect_backoff_max {
             return Err(RemotingConfigError::ReconnectBackoffOrder);
         }
@@ -149,6 +171,10 @@ impl RemotingConfig {
             ("reconnect_backoff_min", self.reconnect_backoff_min),
             ("reconnect_backoff_max", self.reconnect_backoff_max),
             ("heartbeat_interval", self.heartbeat_interval),
+            (
+                "control_apply_retry_timeout",
+                self.control_apply_retry_timeout,
+            ),
             (
                 "idle_data_connection_timeout",
                 self.idle_data_connection_timeout,
@@ -204,6 +230,8 @@ pub enum RemotingConfigError {
     ReadBatchFrames { actual: usize, maximum: usize },
     #[error("per-association outbound bytes exceed the node-wide bound")]
     AssociationBytesExceedNodeBytes,
+    #[error("per-stream reliable control outbox exceeds its association-wide bound")]
+    StreamOutboxExceedsAssociation,
     #[error("minimum reconnect backoff exceeds maximum reconnect backoff")]
     ReconnectBackoffOrder,
 }

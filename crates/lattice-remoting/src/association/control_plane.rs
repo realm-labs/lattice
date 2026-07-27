@@ -2,7 +2,10 @@ use lattice_core::actor_ref::ProtocolId;
 
 use super::{Association, AssociationError, AssociationState};
 use crate::{
-    control::{CommandId, ControlAck, ControlApply, ControlEnvelope, control_envelope_frame},
+    control::{
+        CommandId, ControlAck, ControlApply, ControlEnvelope, ControlStreamId,
+        ReliableControlError, control_envelope_frame,
+    },
     protocol::{
         CatalogueDecision, CatalogueError, ProtocolCatalogue, ProtocolDescriptor,
         ProtocolFingerprint,
@@ -19,13 +22,21 @@ impl Association {
         &self,
         payload: bytes::Bytes,
     ) -> Result<CommandId, AssociationError> {
+        self.admit_control_command_in(ControlStreamId::DEFAULT, payload)
+    }
+
+    pub fn admit_control_command_in(
+        &self,
+        stream_id: ControlStreamId,
+        payload: bytes::Bytes,
+    ) -> Result<CommandId, AssociationError> {
         let command_id = CommandId::generate();
         let mut reliable_control = self
             .reliable_control
             .lock()
             .expect("reliable control state poisoned");
         let envelope = reliable_control
-            .enqueue(command_id, payload)
+            .enqueue_in(stream_id, command_id, payload)
             .map_err(AssociationError::ReliableControl)?;
         if self.state() == AssociationState::Active
             && let Err(error) = self.try_admit_control(control_envelope_frame(&envelope))
@@ -34,6 +45,47 @@ impl Association {
             return Err(error);
         }
         Ok(command_id)
+    }
+
+    /// Waits for reliable-control outbox capacity without rebuilding or restarting the logical
+    /// operation that produced `payload`. The timeout is an inactivity bound: every caller can
+    /// renew it for the next frame after making progress.
+    pub async fn admit_control_command_in_wait(
+        &self,
+        stream_id: ControlStreamId,
+        payload: bytes::Bytes,
+        wait_timeout: std::time::Duration,
+    ) -> Result<CommandId, AssociationError> {
+        let deadline = tokio::time::Instant::now() + wait_timeout;
+        loop {
+            let outbox_changed = self.control_outbox_changed.notified();
+            tokio::pin!(outbox_changed);
+            outbox_changed.as_mut().enable();
+            match self.admit_control_command_in(stream_id, payload.clone()) {
+                Ok(command_id) => return Ok(command_id),
+                Err(AssociationError::ReliableControl(ReliableControlError::OutboxFull)) => {
+                    tokio::select! {
+                        () = outbox_changed.as_mut() => {}
+                        () = tokio::time::sleep_until(deadline) => {
+                            return Err(AssociationError::ReliableControl(
+                                ReliableControlError::OutboxFull,
+                            ));
+                        }
+                    }
+                }
+                Err(AssociationError::QueueFull) => {
+                    tokio::select! {
+                        permit = self.control.reserve() => {
+                            drop(permit.map_err(|_| AssociationError::Closed)?);
+                        }
+                        () = tokio::time::sleep_until(deadline) => {
+                            return Err(AssociationError::QueueFull);
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn admit_ephemeral_control(&self, payload: bytes::Bytes) -> Result<(), AssociationError> {
@@ -83,14 +135,16 @@ impl Association {
             .lock()
             .expect("reliable control state poisoned")
             .acknowledge(ack)
-            .map_err(AssociationError::ReliableControl)
+            .map_err(AssociationError::ReliableControl)?;
+        self.control_outbox_changed.notify_waiters();
+        Ok(())
     }
 
-    pub fn current_control_ack(&self) -> ControlAck {
+    pub fn current_control_ack(&self, stream_id: ControlStreamId) -> ControlAck {
         self.reliable_control
             .lock()
             .expect("reliable control state poisoned")
-            .current_ack()
+            .current_ack(stream_id)
     }
 
     pub fn install_peer_catalogue<I>(&self, descriptors: I) -> Result<(), AssociationError>

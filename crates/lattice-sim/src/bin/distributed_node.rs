@@ -47,7 +47,7 @@ use lattice_discovery::{
 use lattice_placement::{
     control::{
         DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlRouter,
-        encode_control_command_for_term,
+        control_stream_id, encode_control_command_for_term,
     },
     coordinator::{
         MemberHello, MemberRecord, MemberStatus, PlacementDomainHello, SnapshotLimits,
@@ -1152,12 +1152,14 @@ async fn install_fixture_snapshot(
         }));
     }
     for command in commands {
+        let scope = CoordinatorScope::Placement(slot.key.domain().clone());
         control
             .apply(
                 coordinator.clone(),
+                control_stream_id(&scope),
                 CommandId::generate(),
                 encode_control_command_for_term(
-                    &CoordinatorScope::Placement(slot.key.domain().clone()),
+                    &scope,
                     slot.version.term.get(),
                     &command,
                     DEFAULT_MAX_CONTROL_PAYLOAD,

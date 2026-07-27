@@ -5,7 +5,7 @@ use tokio::{sync::Notify, time::Instant};
 
 use super::{LocalAuthorityEvent, LogicCoordinatorHandle, LogicSessionError};
 use crate::{
-    control::{PlacementControlCommand, encode_control_command_for_term},
+    control::{PlacementControlCommand, control_stream_id, encode_control_command_for_term},
     coordinator::{NodeLoadReport, ShardLoadReport},
     types::PlacementSlotKey,
 };
@@ -96,7 +96,8 @@ impl LogicCoordinatorHandle {
             .associations
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
-        let command_id = association.admit_control_command(
+        let command_id = association.admit_control_command_in(
+            control_stream_id(&CoordinatorScope::Placement(self.domain.clone())),
             encode_control_command_for_term(
                 &CoordinatorScope::Placement(self.domain.clone()),
                 self.coordinator_term,
@@ -142,7 +143,8 @@ impl LogicCoordinatorHandle {
             .associations
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
-        association.admit_control_command(
+        association.admit_control_command_in(
+            control_stream_id(&CoordinatorScope::Placement(self.domain.clone())),
             encode_control_command_for_term(
                 &CoordinatorScope::Placement(self.domain.clone()),
                 self.coordinator_term,
@@ -187,7 +189,8 @@ impl LogicCoordinatorHandle {
             .associations
             .get(&self.coordinator)
             .ok_or(LogicSessionError::AssociationUnavailable)?;
-        association.admit_control_command(
+        association.admit_control_command_in(
+            control_stream_id(&CoordinatorScope::Placement(self.domain.clone())),
             encode_control_command_for_term(
                 &CoordinatorScope::Placement(self.domain.clone()),
                 self.coordinator_term,

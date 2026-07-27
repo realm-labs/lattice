@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, VecDeque},
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -19,7 +20,10 @@ use tokio::{
 use crate::{
     association::{Association, AssociationError, LaneKind},
     config::{ABSOLUTE_MAX_READY_READ_BATCH_FRAMES, ABSOLUTE_MAX_READY_WRITE_BATCH_FRAMES},
-    control::{ControlDispatch, ControlDispatchError, ReliableControlError, decode_control_ack},
+    control::{
+        ControlDispatch, ControlDispatchError, ControlFatalReason, ControlStreamId,
+        ReliableControlError, decode_control_ack, decode_control_envelope,
+    },
     messaging::{
         codec::{
             decode_ask_cached, decode_entity_ask, decode_entity_tell_cached, decode_failure,
@@ -41,7 +45,22 @@ mod ask;
 mod control;
 
 use ask::{InboundAskWork, dispatch_inbound_ask};
-use control::{ControlWorkerGuard, apply_control_frame, decode_lane_wake};
+use control::{
+    ControlWorkerGuard, apply_control_frame, apply_ephemeral_control_frame, decode_lane_wake,
+};
+
+#[derive(Debug, Clone, Copy)]
+struct ControlRetryState {
+    started: TokioInstant,
+    next_backoff: Duration,
+}
+
+#[derive(Debug)]
+struct PendingControlRetry {
+    frame: Frame,
+    state: ControlRetryState,
+    retry_at: TokioInstant,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct BidirectionalLaneConfig {
@@ -49,6 +68,7 @@ pub struct BidirectionalLaneConfig {
     pub maximum_concurrent_inbound_asks: usize,
     pub heartbeat_interval: Duration,
     pub heartbeat_miss_limit: u32,
+    pub control_apply_retry_timeout: Duration,
     pub idle_data_connection_timeout: Duration,
     pub maximum_cached_exact_targets: usize,
     pub socket_read_ahead_bytes: usize,
@@ -75,6 +95,7 @@ impl BidirectionalLaneConfig {
         }
         if self.heartbeat_interval.is_zero()
             || self.heartbeat_miss_limit == 0
+            || self.control_apply_retry_timeout.is_zero()
             || self.idle_data_connection_timeout.is_zero()
         {
             return Err(LaneError::InvalidHeartbeat);
@@ -210,31 +231,155 @@ where
         let (results, result_rx) = mpsc::channel(config.maximum_pending_control_applies);
         let association = runtime.association.clone();
         let control_dispatch = control_dispatch.clone();
+        let retry_timeout = config.control_apply_retry_timeout;
+        let maximum_deferred = config.maximum_pending_control_applies;
         let worker = tokio::spawn(async move {
-            while let Some(frame) = command_rx.recv().await {
-                let mut retry_backoff = Duration::from_millis(25);
-                let result = loop {
-                    let result = apply_control_frame(
+            let mut ready = VecDeque::<(Frame, Option<ControlRetryState>)>::new();
+            let mut deferred = VecDeque::with_capacity(maximum_deferred);
+            let mut pending = BTreeMap::<ControlStreamId, PendingControlRetry>::new();
+            let mut command_closed = false;
+            loop {
+                let (frame, retry_state) = if let Some(work) = ready.pop_front() {
+                    work
+                } else if pending.is_empty() {
+                    if command_closed {
+                        break;
+                    }
+                    let Some(frame) = command_rx.recv().await else {
+                        command_closed = true;
+                        continue;
+                    };
+                    (frame, None)
+                } else {
+                    let retry_at = pending
+                        .values()
+                        .map(|retry| retry.retry_at)
+                        .min()
+                        .expect("nonempty pending retry map");
+                    if deferred.len() == maximum_deferred || command_closed {
+                        tokio::time::sleep_until(retry_at).await;
+                        let stream_id = pending
+                            .iter()
+                            .min_by_key(|(_, retry)| retry.retry_at)
+                            .map(|(stream_id, _)| *stream_id)
+                            .expect("nonempty pending retry map");
+                        let retry = pending
+                            .remove(&stream_id)
+                            .expect("selected pending retry exists");
+                        (retry.frame, Some(retry.state))
+                    } else {
+                        tokio::select! {
+                            biased;
+                            inbound = command_rx.recv() => {
+                                let Some(inbound) = inbound else {
+                                    command_closed = true;
+                                    continue;
+                                };
+                                if inbound.kind == FrameKind::CoordinatorEvent {
+                                    (inbound, None)
+                                } else {
+                                    let stream_id = match decode_control_envelope(&inbound) {
+                                        Ok(envelope) => envelope.stream_id,
+                                        Err(error) => {
+                                            let _ = results.send(Err(error.into())).await;
+                                            break;
+                                        }
+                                    };
+                                    if pending.contains_key(&stream_id) {
+                                        deferred.push_back(inbound);
+                                        continue;
+                                    }
+                                    (inbound, None)
+                                }
+                            }
+                            _ = tokio::time::sleep_until(retry_at) => {
+                                let stream_id = pending
+                                    .iter()
+                                    .min_by_key(|(_, retry)| retry.retry_at)
+                                    .map(|(stream_id, _)| *stream_id)
+                                    .expect("nonempty pending retry map");
+                                let retry = pending
+                                    .remove(&stream_id)
+                                    .expect("selected pending retry exists");
+                                (retry.frame, Some(retry.state))
+                            }
+                        }
+                    }
+                };
+                if frame.kind == FrameKind::CoordinatorEvent {
+                    if let Err(error) = apply_ephemeral_control_frame(
                         association.clone(),
                         control_dispatch.clone(),
-                        frame.clone(),
+                        frame,
                     )
-                    .await;
-                    if matches!(
-                        result,
-                        Err(LaneError::ControlDispatch(
-                            ControlDispatchError::Unavailable
-                        ))
-                    ) {
-                        tokio::time::sleep(retry_backoff).await;
-                        retry_backoff = retry_backoff.saturating_mul(2).min(Duration::from_secs(1));
-                        continue;
+                    .await
+                    {
+                        let _ = results.send(Err(error)).await;
+                        break;
                     }
-                    break result;
+                    continue;
+                }
+                let stream_id = match decode_control_envelope(&frame) {
+                    Ok(envelope) => envelope.stream_id,
+                    Err(error) => {
+                        let _ = results.send(Err(error.into())).await;
+                        break;
+                    }
                 };
+                let result = apply_control_frame(
+                    association.clone(),
+                    control_dispatch.clone(),
+                    frame.clone(),
+                )
+                .await;
+                if matches!(
+                    result,
+                    Err(LaneError::ControlDispatch(
+                        ControlDispatchError::RetryLater(_)
+                    ))
+                ) {
+                    let state = retry_state.unwrap_or(ControlRetryState {
+                        started: TokioInstant::now(),
+                        next_backoff: Duration::from_millis(25),
+                    });
+                    if state.started.elapsed() >= retry_timeout {
+                        association.record_control_retry_exhaustion();
+                        let error = LaneError::ControlDispatch(ControlDispatchError::Fatal(
+                            ControlFatalReason::RetryDeadlineExceeded,
+                        ));
+                        let _ = results.send(Err(error)).await;
+                        break;
+                    }
+                    association.record_control_apply_retry();
+                    let retry_at = TokioInstant::now() + state.next_backoff;
+                    pending.insert(
+                        stream_id,
+                        PendingControlRetry {
+                            frame,
+                            state: ControlRetryState {
+                                started: state.started,
+                                next_backoff: state
+                                    .next_backoff
+                                    .saturating_mul(2)
+                                    .min(Duration::from_secs(1)),
+                            },
+                            retry_at,
+                        },
+                    );
+                    continue;
+                }
                 let failed = result.is_err();
                 if results.send(result).await.is_err() || failed {
                     break;
+                }
+                if let Some(index) = deferred.iter().position(|candidate| {
+                    decode_control_envelope(candidate)
+                        .is_ok_and(|envelope| envelope.stream_id == stream_id)
+                }) {
+                    let next = deferred
+                        .remove(index)
+                        .expect("selected deferred control frame exists");
+                    ready.push_back((next, None));
                 }
             }
         });
@@ -516,14 +661,14 @@ where
                         .expect("control lane requires an apply worker")
                         .try_send(frame)
                         .map_err(|_| LaneError::ControlApplyBackpressure)?,
-                    FrameKind::ControlAck if lane == LaneKind::Control => {
-                        association.acknowledge_control(decode_control_ack(&frame)?)?;
-                    }
                     FrameKind::CoordinatorEvent if lane == LaneKind::Control => control_apply_tx
                         .as_ref()
                         .expect("control lane requires an apply worker")
                         .try_send(frame)
                         .map_err(|_| LaneError::ControlApplyBackpressure)?,
+                    FrameKind::ControlAck if lane == LaneKind::Control => {
+                        association.acknowledge_control(decode_control_ack(&frame)?)?;
+                    }
                     FrameKind::Backpressure => {}
                     FrameKind::LaneWake if lane == LaneKind::Control => {
                         let lane = decode_lane_wake(&frame)?;

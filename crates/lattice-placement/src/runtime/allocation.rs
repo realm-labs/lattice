@@ -343,6 +343,13 @@ where
             .get_slot(key)
             .await?
             .ok_or(CoordinatorRuntimeError::UnknownSlot)?;
+        if slot.state == PlacementSlotState::Running
+            && slot.owner.as_ref() == Some(owner)
+            && slot.assignment_generation == generation
+            && slot.active_move.is_none()
+        {
+            return Ok(());
+        }
         if slot.state != PlacementSlotState::Allocating
             || slot.owner.as_ref() != Some(owner)
             || slot.assignment_generation != generation

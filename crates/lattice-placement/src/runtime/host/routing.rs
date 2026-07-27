@@ -1,6 +1,9 @@
 use lattice_core::{actor_ref::NodeIncarnation, coordinator::CoordinatorScope};
-use lattice_remoting::{association::AssociationKey, control::ControlDispatchError};
-use tokio::sync::oneshot;
+use lattice_remoting::{
+    association::AssociationKey,
+    control::{ControlDispatchError, ControlRetryReason},
+};
+use tokio::sync::{mpsc, oneshot};
 
 use super::{
     CoordinatorHost, CoordinatorHostScopeState, CoordinatorRuntimeError, helpers::dispatch_error,
@@ -51,11 +54,15 @@ where
                                 inbound.association.clone(),
                             );
                         }
-                        let result = match result {
-                            Ok(()) => self.send_membership_snapshot(&inbound.association).await,
-                            Err(error) => Err(error),
-                        };
-                        let _ = event.completion.send(result.map_err(dispatch_error));
+                        match result {
+                            Ok(()) => self.spawn_membership_snapshot(
+                                inbound.association.clone(),
+                                Some(event.completion),
+                            ),
+                            Err(error) => {
+                                let _ = event.completion.send(Err(dispatch_error(error)));
+                            }
+                        }
                     }
                     (
                         CoordinatorScope::Membership,
@@ -108,48 +115,28 @@ where
                     }
                     (
                         CoordinatorScope::Placement(domain),
-                        PlacementControlCommand::PlacementDomainHello(hello),
+                        PlacementControlCommand::PlacementDomainHello(_),
                     ) => {
-                        let Some(sender) = self
-                            .domains
-                            .get(domain)
-                            .and_then(|entry| entry.sender.clone())
-                        else {
-                            let _ = event
-                                .completion
-                                .send(Err(ControlDispatchError::Unavailable));
+                        let Some(hosted) = self.domains.get(domain) else {
+                            let _ = event.completion.send(Err(ControlDispatchError::RetryLater(
+                                ControlRetryReason::AssociationStarting,
+                            )));
                             return;
                         };
-                        let member_is_up = self
-                            .store
-                            .get_member(&hello.node.node_id)
-                            .await
-                            .ok()
-                            .flatten()
-                            .filter(|member| {
-                                member.node == hello.node
-                                    && member.status == MemberStatus::Up
-                                    && hello.node.incarnation
-                                        == inbound.association.remote_incarnation
-                                    && hello.node.address == inbound.association.remote_address
-                            })
-                            .is_some();
-                        if !member_is_up {
-                            let _ = event
-                                .completion
-                                .send(Err(ControlDispatchError::InvalidCommand));
+                        let Some(sender) = hosted.sender.clone() else {
+                            let _ = event.completion.send(Err(ControlDispatchError::RetryLater(
+                                ControlRetryReason::AssociationStarting,
+                            )));
                             return;
-                        }
-                        if sender
-                            .send(PlacementControlEvent {
+                        };
+                        if let Err(error) = try_route_to_domain(
+                            &sender,
+                            PlacementControlEvent {
                                 kind: PlacementControlEventKind::Command(inbound),
                                 completion: event.completion,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            // The original completion is dropped on a closed queue and the
-                            // remoting caller observes Unavailable.
+                            },
+                        ) {
+                            complete_route_error(error);
                         }
                     }
                     (CoordinatorScope::Placement(domain), _) => {
@@ -158,16 +145,20 @@ where
                             .get(domain)
                             .and_then(|entry| entry.sender.clone())
                         {
-                            let _ = sender
-                                .send(PlacementControlEvent {
+                            if let Err(error) = try_route_to_domain(
+                                &sender,
+                                PlacementControlEvent {
                                     kind: PlacementControlEventKind::Command(inbound),
                                     completion: event.completion,
-                                })
-                                .await;
+                                },
+                            ) {
+                                complete_route_error(error);
+                            }
                         } else {
-                            let _ = event
-                                .completion
-                                .send(Err(ControlDispatchError::Unavailable));
+                            let error = ControlDispatchError::RetryLater(
+                                ControlRetryReason::AssociationStarting,
+                            );
+                            let _ = event.completion.send(Err(error));
                         }
                     }
                     _ => {
@@ -178,18 +169,33 @@ where
                 }
             }
             PlacementControlEventKind::Reconcile { association, gap } => {
-                for hosted in self.domains.values() {
+                for (domain, hosted) in &self.domains {
+                    if gap.is_some_and(|gap| {
+                        crate::control::control_stream_id(&CoordinatorScope::Placement(
+                            domain.clone(),
+                        )) != gap.stream_id
+                    }) {
+                        continue;
+                    }
                     if let Some(sender) = &hosted.sender {
                         let (completion, _) = oneshot::channel();
-                        let _ = sender
-                            .send(PlacementControlEvent {
+                        if try_route_to_domain(
+                            sender,
+                            PlacementControlEvent {
                                 kind: PlacementControlEventKind::Reconcile {
                                     association: association.clone(),
                                     gap,
                                 },
                                 completion,
-                            })
-                            .await;
+                            },
+                        )
+                        .is_err()
+                        {
+                            let _ = event.completion.send(Err(ControlDispatchError::RetryLater(
+                                ControlRetryReason::ConsumerBusy,
+                            )));
+                            return;
+                        }
                     }
                 }
                 let _ = event.completion.send(Ok(()));
@@ -321,8 +327,82 @@ where
         let removed = membership
             .remove(&member.node, MemberRemovalReason::GracefulLeave)
             .await?;
-        self.fanout_global_member_removal(removed.node, MemberRemovalReason::GracefulLeave)
-            .await?;
+        if let Err(error) = self
+            .fanout_global_member_removal(removed.node, MemberRemovalReason::GracefulLeave)
+            .await
+        {
+            tracing::warn!(
+                target: "lattice.cluster.membership",
+                %error,
+                "graceful member removal fanout deferred to reconciliation"
+            );
+        }
         Ok(())
+    }
+}
+
+fn try_route_to_domain(
+    sender: &mpsc::Sender<PlacementControlEvent>,
+    event: PlacementControlEvent,
+) -> Result<(), mpsc::error::TrySendError<PlacementControlEvent>> {
+    sender.try_send(event)
+}
+
+fn complete_route_error(error: mpsc::error::TrySendError<PlacementControlEvent>) {
+    let (event, error) = match error {
+        mpsc::error::TrySendError::Full(event) => (
+            event,
+            ControlDispatchError::RetryLater(ControlRetryReason::ConsumerBusy),
+        ),
+        mpsc::error::TrySendError::Closed(event) => {
+            (event, ControlDispatchError::consumer_closed())
+        }
+    };
+    let _ = event.completion.send(Err(error));
+}
+
+#[cfg(test)]
+mod routing_backpressure_tests {
+    use lattice_core::actor_ref::{NodeAddress, NodeIncarnation};
+
+    use super::*;
+    use crate::types::NodeKey;
+
+    fn removal_event() -> (
+        PlacementControlEvent,
+        oneshot::Receiver<Result<(), ControlDispatchError>>,
+    ) {
+        let (completion, completed) = oneshot::channel();
+        (
+            PlacementControlEvent {
+                kind: PlacementControlEventKind::GlobalMemberRemoved {
+                    node: NodeKey {
+                        node_id: "node".to_owned(),
+                        address: NodeAddress::new("127.0.0.1", 25520).unwrap(),
+                        incarnation: NodeIncarnation::new(1).unwrap(),
+                    },
+                    reason: MemberRemovalReason::FailureDetected,
+                },
+                completion,
+            },
+            completed,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_full_domain_mailbox_returns_retry_without_waiting_on_that_domain() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (first, _first_completed) = removal_event();
+        sender.try_send(first).unwrap();
+        let (second, second_completed) = removal_event();
+
+        let error = try_route_to_domain(&sender, second).unwrap_err();
+        complete_route_error(error);
+        assert!(matches!(
+            second_completed.await.unwrap(),
+            Err(ControlDispatchError::RetryLater(
+                ControlRetryReason::ConsumerBusy
+            ))
+        ));
     }
 }
