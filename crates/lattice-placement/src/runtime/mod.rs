@@ -850,6 +850,8 @@ pub enum CoordinatorRuntimeError {
     UnknownSession,
     #[error("Coordinator member transition is stale or invalid")]
     StaleMember,
+    #[error("Coordinator member has not completed the global membership join")]
+    MemberNotReady,
     #[error("predecessor incarnation {predecessor:?} is still leased for {remaining_ttl:?}")]
     IncarnationPending {
         predecessor: NodeIncarnation,

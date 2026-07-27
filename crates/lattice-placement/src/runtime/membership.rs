@@ -458,7 +458,7 @@ where
             .get_member(&hello.node.node_id)
             .await?
             .filter(|record| record.node == hello.node && record.status == MemberStatus::Up)
-            .ok_or(CoordinatorRuntimeError::StaleMember)?;
+            .ok_or(CoordinatorRuntimeError::MemberNotReady)?;
         if let Some(session) = self.sessions.get_mut(&hello.node.incarnation) {
             if session.record != record
                 || session.hello != hello
@@ -902,7 +902,8 @@ pub(super) fn control_dispatch_error(error: &CoordinatorRuntimeError) -> Control
     match error {
         CoordinatorRuntimeError::NotLeader
         | CoordinatorRuntimeError::AssociationUnavailable
-        | CoordinatorRuntimeError::Association(_) => ControlDispatchError::RetryLater(
+        | CoordinatorRuntimeError::Association(_)
+        | CoordinatorRuntimeError::MemberNotReady => ControlDispatchError::RetryLater(
             lattice_remoting::control::ControlRetryReason::AssociationStarting,
         ),
         CoordinatorRuntimeError::ControlClosed | CoordinatorRuntimeError::OperationClosed => {
@@ -1024,6 +1025,12 @@ mod tests {
 
     #[test]
     fn stale_control_is_acknowledged_while_transient_storage_failure_is_retried() {
+        assert_eq!(
+            control_dispatch_error(&CoordinatorRuntimeError::MemberNotReady),
+            ControlDispatchError::RetryLater(
+                lattice_remoting::control::ControlRetryReason::AssociationStarting
+            )
+        );
         assert_eq!(
             control_dispatch_error(&CoordinatorRuntimeError::StaleHandoff),
             ControlDispatchError::InvalidCommand
