@@ -129,15 +129,13 @@ where
                             )));
                             return;
                         };
-                        if let Err(error) = try_route_to_domain(
+                        route_to_domain(
                             &sender,
                             PlacementControlEvent {
                                 kind: PlacementControlEventKind::Command(inbound),
                                 completion: event.completion,
                             },
-                        ) {
-                            complete_route_error(error);
-                        }
+                        );
                     }
                     (CoordinatorScope::Placement(domain), _) => {
                         if let Some(sender) = self
@@ -145,15 +143,13 @@ where
                             .get(domain)
                             .and_then(|entry| entry.sender.clone())
                         {
-                            if let Err(error) = try_route_to_domain(
+                            route_to_domain(
                                 &sender,
                                 PlacementControlEvent {
                                     kind: PlacementControlEventKind::Command(inbound),
                                     completion: event.completion,
                                 },
-                            ) {
-                                complete_route_error(error);
-                            }
+                            );
                         } else {
                             let error = ControlDispatchError::RetryLater(
                                 ControlRetryReason::AssociationStarting,
@@ -179,7 +175,7 @@ where
                     }
                     if let Some(sender) = &hosted.sender {
                         let (completion, _) = oneshot::channel();
-                        if try_route_to_domain(
+                        if !route_to_domain(
                             sender,
                             PlacementControlEvent {
                                 kind: PlacementControlEventKind::Reconcile {
@@ -188,9 +184,7 @@ where
                                 },
                                 completion,
                             },
-                        )
-                        .is_err()
-                        {
+                        ) {
                             let _ = event.completion.send(Err(ControlDispatchError::RetryLater(
                                 ControlRetryReason::ConsumerBusy,
                             )));
@@ -341,11 +335,17 @@ where
     }
 }
 
-fn try_route_to_domain(
+fn route_to_domain(
     sender: &mpsc::Sender<PlacementControlEvent>,
     event: PlacementControlEvent,
-) -> Result<(), mpsc::error::TrySendError<PlacementControlEvent>> {
-    sender.try_send(event)
+) -> bool {
+    match sender.try_send(event) {
+        Ok(()) => true,
+        Err(error) => {
+            complete_route_error(error);
+            false
+        }
+    }
 }
 
 fn complete_route_error(error: mpsc::error::TrySendError<PlacementControlEvent>) {
@@ -396,8 +396,7 @@ mod routing_backpressure_tests {
         sender.try_send(first).unwrap();
         let (second, second_completed) = removal_event();
 
-        let error = try_route_to_domain(&sender, second).unwrap_err();
-        complete_route_error(error);
+        assert!(!route_to_domain(&sender, second));
         assert!(matches!(
             second_completed.await.unwrap(),
             Err(ControlDispatchError::RetryLater(
