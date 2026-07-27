@@ -204,7 +204,7 @@ async fn transient_claim_lease_failure_focuses_one_slot_instead_of_ending_leader
 }
 
 #[tokio::test]
-async fn member_removal_frees_its_bounded_load_table_entry() {
+async fn logic_session_replacement_and_member_removal_clear_the_bounded_load_entry() {
     let mut fixture = domain_fixture(
         "load-table-eviction",
         26720,
@@ -215,11 +215,13 @@ async fn member_removal_frees_its_bounded_load_table_entry() {
         },
     )
     .await;
+    let cluster_id = fixture.host_key.cluster_id.clone();
+    let local_incarnation = fixture.host_key.local_incarnation;
     let report = |node: NodeKey| {
         PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
             association: AssociationKey {
-                cluster_id: fixture.host_key.cluster_id.clone(),
-                local_incarnation: fixture.host_key.local_incarnation,
+                cluster_id: cluster_id.clone(),
+                local_incarnation,
                 remote_address: node.address.clone(),
                 remote_incarnation: node.incarnation,
             },
@@ -245,6 +247,34 @@ async fn member_removal_frees_its_bounded_load_table_entry() {
             .loads
             .node(fixture.host.incarnation)
             .is_some()
+    );
+
+    fixture
+        .leader
+        .register(fixture.host_hello.domain.clone(), fixture.host_key.clone())
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .leader
+            .loads
+            .node(fixture.host.incarnation)
+            .is_none(),
+        "a replacement logic session must not inherit a stale sequence"
+    );
+    fixture
+        .leader
+        .handle_control(report(fixture.host.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .leader
+            .loads
+            .node(fixture.host.incarnation)
+            .unwrap()
+            .sequence,
+        1
     );
 
     let record = fixture

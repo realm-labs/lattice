@@ -47,11 +47,26 @@ impl MembershipLeaderConfig {
         if self.leader_lease_ttl.is_zero()
             || self.member_lease_ttl.is_zero()
             || self.renewal_interval.is_zero()
-            || self.renewal_interval >= self.leader_lease_ttl
-            || self.renewal_interval >= self.member_lease_ttl
-            || self.maximum_events == 0
         {
-            return Err(CoordinatorRuntimeError::InvalidConfig);
+            return Err(CoordinatorRuntimeError::invalid_config(format!(
+                "membership lease durations must be positive \
+                 (leader_lease_ttl={:?}, member_lease_ttl={:?}, renewal_interval={:?})",
+                self.leader_lease_ttl, self.member_lease_ttl, self.renewal_interval,
+            )));
+        }
+        if self.renewal_interval >= self.leader_lease_ttl
+            || self.renewal_interval >= self.member_lease_ttl
+        {
+            return Err(CoordinatorRuntimeError::invalid_config(format!(
+                "membership renewal_interval={:?} must be shorter than leader_lease_ttl={:?} \
+                 and member_lease_ttl={:?}",
+                self.renewal_interval, self.leader_lease_ttl, self.member_lease_ttl,
+            )));
+        }
+        if self.maximum_events == 0 {
+            return Err(CoordinatorRuntimeError::invalid_config(
+                "membership maximum_events must be nonzero",
+            ));
         }
         Ok(())
     }

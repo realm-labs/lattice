@@ -170,32 +170,89 @@ impl PlacementDomainLeaderConfig {
             || self.renewal_interval.is_zero()
             || self.member_heartbeat_interval.is_zero()
             || self.member_heartbeat_timeout.is_zero()
-            || self.renewal_interval >= self.leader_lease_ttl
+        {
+            return Err(CoordinatorRuntimeError::invalid_config(format!(
+                "placement lease and heartbeat durations must be positive \
+                 (leader_lease_ttl={:?}, member_lease_ttl={:?}, claim_ttl={:?}, \
+                 renewal_interval={:?}, member_heartbeat_interval={:?}, \
+                 member_heartbeat_timeout={:?})",
+                self.leader_lease_ttl,
+                self.member_lease_ttl,
+                self.claim_ttl,
+                self.renewal_interval,
+                self.member_heartbeat_interval,
+                self.member_heartbeat_timeout,
+            )));
+        }
+        if self.renewal_interval >= self.leader_lease_ttl
             || self.renewal_interval >= self.member_lease_ttl
             || self.renewal_interval >= self.claim_ttl
-            || self
-                .claim_ttl
-                .checked_add(self.member_heartbeat_interval)
-                .is_none_or(|floor| floor >= self.member_heartbeat_timeout)
-            || self.maximum_sessions == 0
+        {
+            return Err(CoordinatorRuntimeError::invalid_config(format!(
+                "placement renewal_interval={:?} must be shorter than leader_lease_ttl={:?}, \
+                 member_lease_ttl={:?}, and claim_ttl={:?}",
+                self.renewal_interval, self.leader_lease_ttl, self.member_lease_ttl, self.claim_ttl,
+            )));
+        }
+        let heartbeat_floor = self
+            .claim_ttl
+            .checked_add(self.member_heartbeat_interval)
+            .ok_or_else(|| {
+                CoordinatorRuntimeError::invalid_config(format!(
+                    "claim_ttl={:?} plus member_heartbeat_interval={:?} overflows Duration",
+                    self.claim_ttl, self.member_heartbeat_interval,
+                ))
+            })?;
+        if heartbeat_floor >= self.member_heartbeat_timeout {
+            return Err(CoordinatorRuntimeError::invalid_config(format!(
+                "member_heartbeat_timeout={:?} must be greater than claim_ttl={:?} plus \
+                 member_heartbeat_interval={:?} ({:?})",
+                self.member_heartbeat_timeout,
+                self.claim_ttl,
+                self.member_heartbeat_interval,
+                heartbeat_floor,
+            )));
+        }
+        if self.maximum_sessions == 0
             || self.maximum_node_loads == 0
             || self.maximum_shard_loads == 0
             || self.maximum_control_payload == 0
             || self.maximum_operations == 0
             || self.maximum_admin_operation_records == 0
-            || self.admin_operation_retention.is_zero()
             || self.maximum_plan_moves == 0
             || self.maximum_completed_plan_history == 0
             || self.maximum_entity_configs == 0
             || self.maximum_singleton_configs == 0
-            || self.rebalance_limits.validate().is_err()
+        {
+            return Err(CoordinatorRuntimeError::invalid_config(
+                "placement capacity limits must be nonzero",
+            ));
+        }
+        if self.admin_operation_retention.is_zero()
             || self.rebalance_interval.is_zero()
             || self.reconciliation_interval.is_zero()
-            || self.reconciliation_page_size == 0
+        {
+            return Err(CoordinatorRuntimeError::invalid_config(format!(
+                "placement retention and maintenance intervals must be positive \
+                 (admin_operation_retention={:?}, rebalance_interval={:?}, \
+                 reconciliation_interval={:?})",
+                self.admin_operation_retention,
+                self.rebalance_interval,
+                self.reconciliation_interval,
+            )));
+        }
+        if let Err(error) = self.rebalance_limits.validate() {
+            return Err(CoordinatorRuntimeError::invalid_config(format!(
+                "placement rebalance limits are invalid: {error}"
+            )));
+        }
+        if self.reconciliation_page_size == 0
             || self.maximum_reconciliation_work_per_pass == 0
             || self.maximum_quarantined_records == 0
         {
-            return Err(CoordinatorRuntimeError::InvalidConfig);
+            return Err(CoordinatorRuntimeError::invalid_config(
+                "placement reconciliation limits must be nonzero",
+            ));
         }
         Ok(())
     }
@@ -571,7 +628,11 @@ where
         let leader_lease_id = store.grant_lease(config.leader_lease_ttl).await?;
         let domain = match &scope {
             CoordinatorScope::Placement(domain) => domain.clone(),
-            CoordinatorScope::Membership => return Err(CoordinatorRuntimeError::InvalidConfig),
+            CoordinatorScope::Membership => {
+                return Err(CoordinatorRuntimeError::invalid_config(
+                    "a placement-domain leader requires a placement scope",
+                ));
+            }
         };
         let leader = LeaderRecord {
             scope,
@@ -731,17 +792,17 @@ where
 
 #[derive(Debug, Error)]
 pub enum CoordinatorRuntimeError {
-    #[error("Coordinator runtime configuration is invalid")]
-    InvalidConfig,
+    #[error("Coordinator runtime configuration is invalid: {reason}")]
+    InvalidConfig { reason: String },
     #[error("Coordinator leadership campaign lost")]
     NotLeader,
-    #[error("Coordinator durable store failed")]
+    #[error("Coordinator durable store failed: {0}")]
     Storage(#[from] StorageError),
-    #[error("Coordinator reducer rejected state")]
+    #[error("Coordinator reducer rejected state: {0}")]
     Coordinator(#[source] CoordinatorError),
-    #[error("application release is not eligible for a code-only rolling upgrade")]
+    #[error("application release is not eligible for a code-only rolling upgrade: {0}")]
     Release(#[from] lattice_core::release::ReleaseError),
-    #[error("Coordinator control codec failed")]
+    #[error("Coordinator control codec failed: {0}")]
     Control(#[source] PlacementControlError),
     #[error("Coordinator snapshot record codec failed")]
     Codec,
@@ -794,7 +855,7 @@ pub enum CoordinatorRuntimeError {
     UnknownStrategy,
     #[error("allocation strategy ID/version is already registered")]
     DuplicateStrategy,
-    #[error("allocation strategy rejected the placement view")]
+    #[error("allocation strategy rejected the placement view: {0}")]
     Allocation(#[source] AllocationError),
     #[error("placement slot does not exist")]
     UnknownSlot,
@@ -808,12 +869,20 @@ pub enum CoordinatorRuntimeError {
     ClaimNotProven,
     #[error("Coordinator revision exhausted")]
     RevisionExhausted,
-    #[error("rebalance plan reducer rejected a transition")]
+    #[error("rebalance plan reducer rejected a transition: {0}")]
     Plan(#[source] PlanError),
-    #[error("handoff reducer rejected a transition")]
+    #[error("handoff reducer rejected a transition: {0}")]
     Handoff(#[source] HandoffError),
-    #[error("Coordinator Association rejected reliable control admission")]
+    #[error("Coordinator Association rejected reliable control admission: {0}")]
     Association(#[from] AssociationError),
+}
+
+impl CoordinatorRuntimeError {
+    pub(crate) fn invalid_config(reason: impl Into<String>) -> Self {
+        Self::InvalidConfig {
+            reason: reason.into(),
+        }
+    }
 }
 
 #[cfg(test)]

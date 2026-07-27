@@ -4,6 +4,8 @@ use lattice_core::actor_ref::{
 use lattice_remoting::{
     association::{LaneAttachment, LaneKind},
     config::RemotingConfig,
+    control::decode_control_envelope,
+    wire::FrameKind,
 };
 
 use super::*;
@@ -64,7 +66,7 @@ async fn admission_closes_on_the_installed_deadline_even_though_no_tick_ran() {
         })
         .unwrap();
     let state = LogicPlacementState {
-        local_node: local,
+        local_node: local.clone(),
         coordinator_term: 1,
         session: PlacementDomainState::new(domain),
         slots: [(key.clone(), slot)].into_iter().collect(),
@@ -75,6 +77,10 @@ async fn admission_closes_on_the_installed_deadline_even_though_no_tick_ran() {
         changed: Arc::new(Notify::new()),
     };
 
+    let load = state.baseline_node_load(7);
+    assert_eq!(load.node, local);
+    assert_eq!(load.sequence, 7);
+    assert_eq!(load.total_weight, 1);
     assert!(state.admission_open(&key));
     tokio::time::advance(Duration::from_secs(12)).await;
     assert!(state.admission_open(&key));
@@ -160,4 +166,99 @@ async fn an_unacknowledged_drain_completion_gives_up_instead_of_polling_forever(
     ));
     assert!(started.elapsed() >= config.drain_acknowledgement_timeout);
     assert!(started.elapsed() < config.drain_acknowledgement_timeout * 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn heartbeat_publishes_a_fresh_baseline_node_load_sample() {
+    let cluster_id = ClusterId::new("automatic-node-load").unwrap();
+    let local = NodeKey {
+        node_id: "logic".to_owned(),
+        address: NodeAddress::new("127.0.0.1", 34300).unwrap(),
+        incarnation: NodeIncarnation::new(11).unwrap(),
+    };
+    let remote_address = NodeAddress::new("127.0.0.1", 34301).unwrap();
+    let remote_incarnation = NodeIncarnation::new(12).unwrap();
+    let associations = Arc::new(
+        AssociationManager::new(
+            local.address.clone(),
+            local.incarnation,
+            RemotingConfig::default(),
+        )
+        .unwrap(),
+    );
+    let association = associations
+        .get_or_create(
+            cluster_id.clone(),
+            remote_address.clone(),
+            remote_incarnation,
+        )
+        .unwrap();
+    let coordinator = AssociationKey {
+        cluster_id,
+        local_incarnation: local.incarnation,
+        remote_address,
+        remote_incarnation,
+    };
+    for (lane, nonce) in [
+        (LaneKind::Control, 1_u128),
+        (LaneKind::Interactive, 2),
+        (LaneKind::Bulk(0), 3),
+    ] {
+        association
+            .attach(LaneAttachment {
+                association_id: association.id(),
+                key: coordinator.clone(),
+                lane,
+                connection_nonce: nonce,
+            })
+            .unwrap();
+    }
+    let mut outbound = association.take_lane_receiver(LaneKind::Control).unwrap();
+    let config = LogicCoordinatorConfig {
+        heartbeat_interval: Duration::from_secs(5),
+        ..LogicCoordinatorConfig::default()
+    };
+    let (session, _effects) = PlacementDomainSession::new(
+        PlacementDomainHello::builder(
+            local.clone(),
+            PlacementDomainId::new("automatic-node-load").unwrap(),
+            1,
+        )
+        .build(),
+        coordinator,
+        associations,
+        config.clone(),
+        8,
+        1,
+    )
+    .unwrap();
+    let (_controls, control_rx) = mpsc::channel(1);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(session.run(control_rx, shutdown_rx));
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(config.heartbeat_interval).await;
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    let mut load = None;
+    while let Ok(frame) = outbound.try_recv() {
+        let payload = match frame.kind {
+            FrameKind::CoordinatorEvent => frame.payload().to_vec(),
+            FrameKind::ControlEnvelope => decode_control_envelope(&frame).unwrap().payload.to_vec(),
+            _ => continue,
+        };
+        let scoped =
+            crate::control::decode_control_command(&payload, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
+        if let PlacementControlCommand::NodeLoad(report) = scoped.command {
+            load = Some(report);
+        }
+    }
+
+    let load = load.expect("heartbeat must publish a baseline node load sample");
+    assert_eq!(load.node, local);
+    assert_eq!(load.sequence, 1);
+    assert_eq!(load.total_weight, 0);
+    shutdown.send(true).unwrap();
+    assert!(task.await.unwrap().is_ok());
 }

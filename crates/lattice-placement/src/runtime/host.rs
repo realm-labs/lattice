@@ -100,11 +100,28 @@ impl CoordinatorHostConfig {
             || self.renewal_interval.is_zero()
             || self.election_interval.is_zero()
             || self.member_reconciliation_interval.is_zero()
-            || self.maximum_candidate_jitter >= self.membership.leader_lease_ttl
-            || self.maximum_candidate_jitter >= self.placement.leader_lease_ttl
-            || domains.len() > self.maximum_domains
         {
-            return Err(CoordinatorRuntimeError::InvalidConfig);
+            return Err(CoordinatorRuntimeError::invalid_config(
+                "Coordinator host capacities and maintenance intervals must be positive",
+            ));
+        }
+        if self.maximum_candidate_jitter >= self.membership.leader_lease_ttl
+            || self.maximum_candidate_jitter >= self.placement.leader_lease_ttl
+        {
+            return Err(CoordinatorRuntimeError::invalid_config(format!(
+                "maximum_candidate_jitter={:?} must be shorter than membership \
+                 leader_lease_ttl={:?} and placement leader_lease_ttl={:?}",
+                self.maximum_candidate_jitter,
+                self.membership.leader_lease_ttl,
+                self.placement.leader_lease_ttl,
+            )));
+        }
+        if domains.len() > self.maximum_domains {
+            return Err(CoordinatorRuntimeError::invalid_config(format!(
+                "configured placement domain count {} exceeds maximum_domains={}",
+                domains.len(),
+                self.maximum_domains,
+            )));
         }
         Ok(())
     }

@@ -31,7 +31,7 @@ pub enum ServiceError {
     MemberDirectory(#[source] MemberDirectoryError),
     #[error("placement control router construction failed")]
     PlacementControl(#[source] PlacementControlError),
-    #[error("Coordinator runtime construction failed")]
+    #[error("Coordinator runtime construction failed: {0}")]
     CoordinatorRuntime(#[from] CoordinatorRuntimeError),
     #[error("Coordinator discovery construction failed")]
     Discovery(#[from] DiscoveryError),
@@ -87,4 +87,21 @@ pub enum ServiceError {
         #[source]
         source: Box<ServiceError>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coordinator_construction_error_keeps_the_actionable_configuration_reason() {
+        let error = ServiceError::CoordinatorRuntime(CoordinatorRuntimeError::InvalidConfig {
+            reason: "member_heartbeat_timeout is too short".to_owned(),
+        });
+        assert_eq!(
+            error.to_string(),
+            "Coordinator runtime construction failed: Coordinator runtime configuration is \
+             invalid: member_heartbeat_timeout is too short"
+        );
+    }
 }

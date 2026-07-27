@@ -464,9 +464,17 @@ where
                 return Err(CoordinatorRuntimeError::UnauthorizedCommand);
             }
             session.last_heartbeat = Instant::now();
+            session.heartbeat_sequence = 0;
             session.snapshot_version = Some(self.membership_version);
             let status = session.record.status;
             let record = session.record.clone();
+            // A new hello starts a new logic-session sequence even when the node incarnation and
+            // transport association are unchanged. Discard the previous latest-value samples so
+            // the first heartbeat-scoped report from the replacement session is accepted.
+            self.loads.forget_incarnation(hello.node.incarnation);
+            self.node_load_received.remove(&hello.node.incarnation);
+            self.shard_load_received
+                .retain(|(owner, _, _), _| owner != &hello.node.incarnation);
             self.send_snapshot(hello, association_key.clone()).await?;
             if status == MemberStatus::Up {
                 let association = self
