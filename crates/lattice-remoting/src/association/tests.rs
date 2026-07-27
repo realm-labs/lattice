@@ -575,6 +575,42 @@ fn an_inbound_takeover_still_fences_unreconciled_peer_incarnations() {
 }
 
 #[test]
+fn a_retired_incarnation_releases_its_address_to_the_next_one() {
+    let manager = manager();
+    let address = key().remote_address;
+    accept(&manager, AssociationId::generate());
+    // The successor of a peer that restarted reuses its address, and nothing but releasing the
+    // binding the retired incarnation left behind can let it in.
+    assert!(matches!(
+        manager.get_or_accept(
+            key().cluster_id,
+            address.clone(),
+            NodeIncarnation::new(9).unwrap(),
+            AssociationId::generate(),
+        ),
+        Err(AssociationError::OldOrUnreconciledIncarnation)
+    ));
+    assert!(manager.forget_remote_incarnation(&address, key().remote_incarnation));
+    assert_eq!(manager.remote_incarnation(&address), None);
+    assert!(
+        manager
+            .get_or_accept(
+                key().cluster_id,
+                address.clone(),
+                NodeIncarnation::new(9).unwrap(),
+                AssociationId::generate(),
+            )
+            .is_ok()
+    );
+    // Retiring an incarnation the address has already moved past must not unbind its successor.
+    assert!(!manager.forget_remote_incarnation(&address, key().remote_incarnation));
+    assert_eq!(
+        manager.remote_incarnation(&address),
+        Some(NodeIncarnation::new(9).unwrap())
+    );
+}
+
+#[test]
 fn node_byte_budget_is_shared_across_associations() {
     let config = RemotingConfig {
         max_associations: 2,

@@ -2,6 +2,7 @@
 
 mod effect_applier;
 mod error_mapping;
+mod peers;
 mod remote_dispatch;
 mod routing;
 mod support;

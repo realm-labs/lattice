@@ -199,6 +199,38 @@ impl AssociationManager {
             .cloned()
     }
 
+    /// The incarnation this address is currently bound to, if it is bound at all.
+    pub fn remote_incarnation(&self, address: &NodeAddress) -> Option<NodeIncarnation> {
+        self.remote_incarnations
+            .lock()
+            .expect("remote incarnation registry poisoned")
+            .get(address)
+            .copied()
+    }
+
+    /// Releases an address that is still bound to `incarnation`, and only then.
+    ///
+    /// The binding exists to keep an old or unreconciled incarnation from taking an address over
+    /// from the one in use. Once the incarnation it names has been retired by an authority, keeping
+    /// it would instead refuse that address' successor, so the address is released rather than left
+    /// pointing at something that no longer exists. A binding that has already moved on belongs to
+    /// a later incarnation and is left alone.
+    pub fn forget_remote_incarnation(
+        &self,
+        address: &NodeAddress,
+        incarnation: NodeIncarnation,
+    ) -> bool {
+        let mut incarnations = self
+            .remote_incarnations
+            .lock()
+            .expect("remote incarnation registry poisoned");
+        if incarnations.get(address) == Some(&incarnation) {
+            incarnations.remove(address);
+            return true;
+        }
+        false
+    }
+
     pub fn replace_remote_incarnation(
         &self,
         address: NodeAddress,
