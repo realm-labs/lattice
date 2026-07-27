@@ -265,21 +265,24 @@ impl MembershipSession {
                             state.changed.clone()
                         };
                         self.effects
-                            .try_send(LogicPlacementEffect::MemberSnapshot { version, members })
+                            .send(LogicPlacementEffect::MemberSnapshot { version, members })
+                            .await
                             .map_err(|_| LogicSessionError::EffectBackpressure)?;
                         changed.notify_waiters();
                         self.send(PlacementControlCommand::JoinReady {
                             snapshot_version: version,
                         })
                     }
-                    PlacementControlCommand::MemberDelta(event) => self.apply_member_event(event),
+                    PlacementControlCommand::MemberDelta(event) => {
+                        self.apply_member_event(event).await
+                    }
                     _ => Err(LogicSessionError::UnauthorizedCommand),
                 }
             }
         }
     }
 
-    fn apply_member_event(&self, event: MemberEvent) -> Result<(), LogicSessionError> {
+    async fn apply_member_event(&self, event: MemberEvent) -> Result<(), LogicSessionError> {
         let changed = {
             let mut state = self
                 .state
@@ -299,7 +302,8 @@ impl MembershipSession {
             state.changed.clone()
         };
         self.effects
-            .try_send(LogicPlacementEffect::MemberEvent(Box::new(event)))
+            .send(LogicPlacementEffect::MemberEvent(Box::new(event)))
+            .await
             .map_err(|_| LogicSessionError::EffectBackpressure)?;
         changed.notify_waiters();
         Ok(())

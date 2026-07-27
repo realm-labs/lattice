@@ -381,6 +381,9 @@ impl ReliableControl {
         command_id: CommandId,
         payload: Bytes,
     ) -> Result<ControlEnvelope, ReliableControlError> {
+        if payload.len() > self.max_bytes || payload.len() > self.max_bytes_per_stream {
+            return Err(ReliableControlError::FrameTooLarge);
+        }
         if self.outbox.len() == self.max_frames
             || self.outbox_bytes.saturating_add(payload.len()) > self.max_bytes
         {
@@ -572,6 +575,8 @@ pub enum ReliableControlError {
     ZeroLimit,
     #[error("reliable control outbox is full")]
     OutboxFull,
+    #[error("reliable control frame exceeds its outbox byte bound")]
+    FrameTooLarge,
     #[error("reliable control sequence is exhausted")]
     SequenceExhausted,
     #[error("control acknowledgement belongs to another association epoch")]
@@ -744,6 +749,18 @@ mod tests {
         assert_eq!(
             receiver.preview(&second_envelope),
             ControlApply::StreamLimit
+        );
+    }
+
+    #[test]
+    fn an_oversized_frame_is_rejected_without_waiting_for_outbox_progress() {
+        let epoch = AssociationId::new(1).unwrap();
+        let mut sender = ReliableControl::new_with_stream_limits(epoch, 4, 8, 4, 4).unwrap();
+        assert_eq!(
+            sender
+                .enqueue(CommandId::new(1).unwrap(), Bytes::from_static(b"12345"))
+                .unwrap_err(),
+            ReliableControlError::FrameTooLarge
         );
     }
 }

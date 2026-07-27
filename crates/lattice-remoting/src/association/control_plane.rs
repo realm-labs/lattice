@@ -4,7 +4,7 @@ use super::{Association, AssociationError, AssociationState};
 use crate::{
     control::{
         CommandId, ControlAck, ControlApply, ControlEnvelope, ControlStreamId,
-        control_envelope_frame,
+        ReliableControlError, control_envelope_frame,
     },
     protocol::{
         CatalogueDecision, CatalogueError, ProtocolCatalogue, ProtocolDescriptor,
@@ -45,6 +45,47 @@ impl Association {
             return Err(error);
         }
         Ok(command_id)
+    }
+
+    /// Waits for reliable-control outbox capacity without rebuilding or restarting the logical
+    /// operation that produced `payload`. The timeout is an inactivity bound: every caller can
+    /// renew it for the next frame after making progress.
+    pub async fn admit_control_command_in_wait(
+        &self,
+        stream_id: ControlStreamId,
+        payload: bytes::Bytes,
+        wait_timeout: std::time::Duration,
+    ) -> Result<CommandId, AssociationError> {
+        let deadline = tokio::time::Instant::now() + wait_timeout;
+        loop {
+            let outbox_changed = self.control_outbox_changed.notified();
+            tokio::pin!(outbox_changed);
+            outbox_changed.as_mut().enable();
+            match self.admit_control_command_in(stream_id, payload.clone()) {
+                Ok(command_id) => return Ok(command_id),
+                Err(AssociationError::ReliableControl(ReliableControlError::OutboxFull)) => {
+                    tokio::select! {
+                        () = outbox_changed.as_mut() => {}
+                        () = tokio::time::sleep_until(deadline) => {
+                            return Err(AssociationError::ReliableControl(
+                                ReliableControlError::OutboxFull,
+                            ));
+                        }
+                    }
+                }
+                Err(AssociationError::QueueFull) => {
+                    tokio::select! {
+                        permit = self.control.reserve() => {
+                            drop(permit.map_err(|_| AssociationError::Closed)?);
+                        }
+                        () = tokio::time::sleep_until(deadline) => {
+                            return Err(AssociationError::QueueFull);
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn admit_ephemeral_control(&self, payload: bytes::Bytes) -> Result<(), AssociationError> {
@@ -94,7 +135,9 @@ impl Association {
             .lock()
             .expect("reliable control state poisoned")
             .acknowledge(ack)
-            .map_err(AssociationError::ReliableControl)
+            .map_err(AssociationError::ReliableControl)?;
+        self.control_outbox_changed.notify_waiters();
+        Ok(())
     }
 
     pub fn current_control_ack(&self, stream_id: ControlStreamId) -> ControlAck {

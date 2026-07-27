@@ -6,9 +6,9 @@ use lattice_remoting::{association::AssociationKey, control::ControlDispatchErro
 
 use super::{
     AllocationError, Association, AssociationError, AssociationState, Bytes, ClaimGrant,
-    ClaimLease, CoordinatorLeaseStore, CoordinatorRuntimeError, HandoffEvent, HandoffPhase,
-    Instant, MemberRecord, MemberRemovalReason, MemberSession, MemberStatus, MembershipStore,
-    MembershipVersion, NodeKey, PlacementControlCommand, PlacementDomainHello,
+    ClaimLease, CoordinatorLeaseStore, CoordinatorRuntimeError, Duration, HandoffEvent,
+    HandoffPhase, Instant, MemberRecord, MemberRemovalReason, MemberSession, MemberStatus,
+    MembershipStore, MembershipVersion, NodeKey, PlacementControlCommand, PlacementDomainHello,
     PlacementDomainLeader, PlacementDomainLeaderConfig, PlacementDomainStore, PlacementSlotKey,
     PlacementSlotState, PlacementVersion, PlanReason, RebalanceTrigger, ScopedElectionStore,
     SnapshotRecord, build_snapshot,
@@ -281,7 +281,8 @@ where
                                 AllocationError::NoEligibleNode,
                             ))
                             | Err(CoordinatorRuntimeError::IneligibleTarget) => {
-                                self.send_resolution_failure(association, request_id, slot)?
+                                self.send_resolution_failure(association, request_id, slot)
+                                    .await?
                             }
                             Err(CoordinatorRuntimeError::StaleHandoff) => {
                                 self.send_snapshot(hello, association).await?
@@ -319,7 +320,8 @@ where
                                 }
                             }
                             Err(CoordinatorRuntimeError::IneligibleTarget) => {
-                                self.send_resolution_failure(association, request_id, slot)?
+                                self.send_resolution_failure(association, request_id, slot)
+                                    .await?
                             }
                             Err(CoordinatorRuntimeError::StaleHandoff) => {
                                 self.send_snapshot(hello, association).await?
@@ -358,7 +360,7 @@ where
                 .is_some_and(MemberSession::placement_up)
     }
 
-    fn send_resolution_failure(
+    async fn send_resolution_failure(
         &self,
         association_key: AssociationKey,
         request_id: u128,
@@ -368,7 +370,7 @@ where
             .associations
             .get(&association_key)
             .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-        send_control(
+        send_control_with_backpressure(
             &association,
             &self.version.domain,
             self.version.term.get(),
@@ -379,6 +381,7 @@ where
             },
             &self.config,
         )
+        .await
     }
 
     pub(super) fn now(&self) -> MonotonicTime {
@@ -481,13 +484,14 @@ where
                     .associations
                     .get(&association_key)
                     .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-                send_control(
+                send_control_with_backpressure(
                     &association,
                     &self.version.domain,
                     self.version.term.get(),
                     PlacementControlCommand::MemberUp(record),
                     &self.config,
-                )?;
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -540,13 +544,14 @@ where
                 .associations
                 .get(&session.association)
                 .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-            send_control(
+            send_control_with_backpressure(
                 &association,
                 &self.version.domain,
                 self.version.term.get(),
                 PlacementControlCommand::MemberUp(record),
                 &self.config,
-            )?;
+            )
+            .await?;
         }
         Ok(())
     }
@@ -581,7 +586,7 @@ where
                     .associations
                     .get(&association_key)
                     .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-                send_control(
+                send_control_with_backpressure(
                     &association,
                     &self.version.domain,
                     self.version.term.get(),
@@ -590,7 +595,8 @@ where
                         records: Vec::new(),
                     }),
                     &self.config,
-                )?;
+                )
+                .await?;
             } else {
                 self.send_snapshot(hello, association_key).await?;
             }
@@ -762,13 +768,14 @@ where
             .associations
             .get(association_key)
             .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-        send_control(
+        send_control_with_backpressure(
             &association,
             &self.version.domain,
             self.version.term.get(),
             PlacementControlCommand::MemberUp(member),
             &self.config,
-        )?;
+        )
+        .await?;
         let placement_ready = self.sessions.get(&incarnation).is_some_and(|session| {
             !session.claims_reconciled
                 && session
@@ -901,6 +908,9 @@ pub(super) fn control_dispatch_error(error: &CoordinatorRuntimeError) -> Control
         CoordinatorRuntimeError::ControlClosed | CoordinatorRuntimeError::OperationClosed => {
             ControlDispatchError::consumer_closed()
         }
+        CoordinatorRuntimeError::ControlBackpressure => ControlDispatchError::RetryLater(
+            lattice_remoting::control::ControlRetryReason::ConsumerBusy,
+        ),
         CoordinatorRuntimeError::Storage(
             StorageError::LeadershipLost
             | StorageError::Unavailable
@@ -914,7 +924,7 @@ pub(super) fn control_dispatch_error(error: &CoordinatorRuntimeError) -> Control
     }
 }
 
-pub(super) fn send_control(
+pub(super) async fn send_control_with_backpressure(
     association: &Association,
     domain: &PlacementDomainId,
     coordinator_term: u64,
@@ -924,17 +934,21 @@ pub(super) fn send_control(
     if association.state() == AssociationState::Closed {
         return Err(CoordinatorRuntimeError::AssociationUnavailable);
     }
+    let scope = CoordinatorScope::Placement(domain.clone());
     let payload = encode_control_command_for_term(
-        &CoordinatorScope::Placement(domain.clone()),
+        &scope,
         coordinator_term,
         &command,
         config.maximum_control_payload,
     )
     .map_err(CoordinatorRuntimeError::Control)?;
-    association.admit_control_command_in(
-        crate::control::control_stream_id(&CoordinatorScope::Placement(domain.clone())),
-        payload,
-    )?;
+    association
+        .admit_control_command_in_wait(
+            crate::control::control_stream_id(&scope),
+            payload,
+            Duration::from_millis(config.snapshot_limits.staging_timeout_millis),
+        )
+        .await?;
     Ok(())
 }
 

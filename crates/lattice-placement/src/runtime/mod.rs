@@ -808,6 +808,8 @@ pub enum CoordinatorRuntimeError {
     Codec,
     #[error("Coordinator control stream closed")]
     ControlClosed,
+    #[error("Coordinator control stream is temporarily full")]
+    ControlBackpressure,
     #[error("Coordinator operation stream closed")]
     OperationClosed,
     #[error("Coordinator admin operation is invalid")]

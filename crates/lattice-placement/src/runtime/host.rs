@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -145,6 +145,11 @@ where
     state: CoordinatorHostScopeState,
 }
 
+enum HostBackgroundCompletion {
+    MembershipSnapshot(AssociationKey),
+    DomainReconciliation(PlacementDomainId),
+}
+
 /// Supervises independent membership and placement-domain candidates in one process.
 ///
 /// A domain task owns its own lease, input queue and shutdown signal. Task loss is
@@ -164,6 +169,10 @@ where
     membership_associations: BTreeMap<NodeIncarnation, AssociationKey>,
     directory_events: watch::Sender<BTreeMap<CoordinatorScope, LeaderRecord>>,
     scope_events: watch::Sender<BTreeMap<CoordinatorScope, CoordinatorHostScopeState>>,
+    background_tasks: JoinSet<HostBackgroundCompletion>,
+    snapshotting_associations: HashSet<AssociationKey>,
+    pending_snapshot_replays: HashSet<AssociationKey>,
+    reconciling_domains: BTreeSet<PlacementDomainId>,
     config: CoordinatorHostConfig,
 }
 
@@ -274,6 +283,10 @@ where
             membership_associations: BTreeMap::new(),
             directory_events,
             scope_events,
+            background_tasks: JoinSet::new(),
+            snapshotting_associations: HashSet::new(),
+            pending_snapshot_replays: HashSet::new(),
+            reconciling_domains: BTreeSet::new(),
             config,
         })
     }
@@ -366,13 +379,7 @@ where
                     self.spawn_campaigns(inactive, &mut campaigning, &mut elections);
                 }
                 _ = member_reconciliation.tick() => {
-                    if let Err(error) = self.fanout_global_member_removals().await {
-                        tracing::warn!(
-                            target: "lattice.cluster.membership",
-                            %error,
-                            "global member reconciliation deferred after durable store failure"
-                        );
-                    }
+                    self.spawn_global_member_reconciliation();
                 }
                 Some(result) = elections.join_next(), if !elections.is_empty() => {
                     if let Ok((domain, outcome)) = result {
@@ -397,6 +404,22 @@ where
                         }
                     }
                 }
+                Some(result) = self.background_tasks.join_next(),
+                    if !self.background_tasks.is_empty() => {
+                        if let Ok(completion) = result {
+                            match completion {
+                                HostBackgroundCompletion::MembershipSnapshot(association) => {
+                                    self.snapshotting_associations.remove(&association);
+                                    if self.pending_snapshot_replays.remove(&association) {
+                                        self.spawn_membership_snapshot(association, None);
+                                    }
+                                }
+                                HostBackgroundCompletion::DomainReconciliation(domain) => {
+                                    self.reconciling_domains.remove(&domain);
+                                }
+                            }
+                        }
+                    }
                 event = next_membership_event(&mut self.membership_events), if self.membership_events.is_some() => {
                     match event {
                         Ok(event) => self.apply_membership_event(event).await?,
@@ -407,7 +430,7 @@ where
                                 .cloned()
                                 .collect::<Vec<_>>();
                             for association in associations {
-                                self.send_membership_snapshot(&association).await?;
+                                self.spawn_membership_snapshot(association, None);
                             }
                         }
                         Err(RecvError::Closed) => {
@@ -423,6 +446,7 @@ where
         }
 
         elections.abort_all();
+        self.background_tasks.abort_all();
         for hosted in self.domains.values() {
             if let Some(stop) = &hosted.shutdown {
                 let _ = stop.send(true);
@@ -430,6 +454,7 @@ where
         }
         while tasks.join_next().await.is_some() {}
         while elections.join_next().await.is_some() {}
+        while self.background_tasks.join_next().await.is_some() {}
         if let Some(membership) = self.membership.take() {
             membership.shutdown().await?;
         }

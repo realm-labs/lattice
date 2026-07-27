@@ -668,6 +668,9 @@ impl SnapshotStager {
         self.next_chunk += 1;
         self.bytes += chunk_bytes;
         self.records.extend(chunk.records);
+        self.deadline = now
+            .checked_add(Duration::from_millis(self.limits.staging_timeout_millis))
+            .ok_or(CoordinatorError::SnapshotLimit)?;
         Ok(())
     }
 
@@ -1169,5 +1172,42 @@ mod state_version_tests {
             PlacementDomainStateError::StaleTerm
         );
         assert!(!session.ready());
+    }
+
+    #[test]
+    fn snapshot_staging_timeout_is_renewed_by_chunk_progress() {
+        let limits = SnapshotLimits {
+            maximum_records: 2,
+            maximum_bytes: 4,
+            maximum_chunks: 2,
+            maximum_chunk_bytes: 2,
+            staging_timeout_millis: 10,
+        };
+        let (begin, chunks, end) = build_snapshot(
+            SnapshotVersion::Placement(version(1, 1)),
+            vec![
+                SnapshotRecord {
+                    key: "a".to_owned(),
+                    value: Bytes::from_static(b"x"),
+                },
+                SnapshotRecord {
+                    key: "b".to_owned(),
+                    value: Bytes::from_static(b"y"),
+                },
+            ],
+            &limits,
+        )
+        .unwrap();
+        assert_eq!(chunks.len(), 2);
+
+        let mut stager =
+            SnapshotStager::begin(begin, limits, MonotonicTime::from_millis(0)).unwrap();
+        stager
+            .push(chunks[0].clone(), MonotonicTime::from_millis(9))
+            .unwrap();
+        stager
+            .push(chunks[1].clone(), MonotonicTime::from_millis(18))
+            .unwrap();
+        stager.finish(end, MonotonicTime::from_millis(19)).unwrap();
     }
 }

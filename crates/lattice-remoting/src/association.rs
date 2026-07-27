@@ -139,6 +139,7 @@ pub struct Association {
     queued_bytes: OutboundByteBudget,
     node_queued_bytes: Arc<OutboundByteBudget>,
     admission_changed: Notify,
+    control_outbox_changed: Notify,
     peer_catalogue: OnceLock<ProtocolCatalogue>,
     reliable_control: Mutex<ReliableControl>,
     interactive_wake: Notify,
@@ -233,6 +234,7 @@ impl Association {
             queued_bytes: OutboundByteBudget::new(),
             node_queued_bytes,
             admission_changed: Notify::new(),
+            control_outbox_changed: Notify::new(),
             peer_catalogue: OnceLock::new(),
             reliable_control: Mutex::new(
                 ReliableControl::new_with_limits(
@@ -322,6 +324,7 @@ impl Association {
             self.attached_lanes.store(0, Ordering::Release);
             self.wake_pending_lanes.store(0, Ordering::Release);
             self.admission_changed.notify_waiters();
+            self.control_outbox_changed.notify_waiters();
             self.state_changed.notify_waiters();
         }
     }
@@ -334,6 +337,7 @@ impl Association {
         self.attached_lanes.store(0, Ordering::Release);
         self.wake_pending_lanes.store(0, Ordering::Release);
         self.admission_changed.notify_waiters();
+        self.control_outbox_changed.notify_waiters();
         self.state_changed.notify_waiters();
     }
 

@@ -9,7 +9,7 @@ use lattice_remoting::{
 };
 
 use super::*;
-use crate::authority::AuthorityEvent;
+use crate::authority::{AuthorityEffect, AuthorityEvent};
 use crate::types::{
     AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, PlacementVersion, Revision,
     ShardId,
@@ -88,6 +88,74 @@ async fn admission_closes_on_the_installed_deadline_even_though_no_tick_ran() {
     assert!(!state.admission_open(&key));
     tokio::time::advance(Duration::from_secs(26)).await;
     assert!(!state.admission_open(&key));
+}
+
+#[tokio::test]
+async fn effect_backpressure_waits_for_capacity_without_terminating_the_session() {
+    let cluster_id = ClusterId::new("effect-backpressure").unwrap();
+    let domain = PlacementDomainId::new("effect-backpressure").unwrap();
+    let local = NodeKey {
+        node_id: "logic".to_owned(),
+        address: NodeAddress::new("127.0.0.1", 34080).unwrap(),
+        incarnation: NodeIncarnation::new(1).unwrap(),
+    };
+    let remote_address = NodeAddress::new("127.0.0.1", 34081).unwrap();
+    let remote_incarnation = NodeIncarnation::new(2).unwrap();
+    let associations = Arc::new(
+        AssociationManager::new(
+            local.address.clone(),
+            local.incarnation,
+            RemotingConfig::default(),
+        )
+        .unwrap(),
+    );
+    let coordinator = AssociationKey {
+        cluster_id,
+        local_incarnation: local.incarnation,
+        remote_address,
+        remote_incarnation,
+    };
+    let (session, mut effects) = PlacementDomainSession::new(
+        PlacementDomainHello::builder(local, domain.clone(), 1).build(),
+        coordinator,
+        associations,
+        LogicCoordinatorConfig::default(),
+        1,
+        1,
+    )
+    .unwrap();
+    let slot = PlacementSlotKey::Shard {
+        domain,
+        entity_type: EntityType::new("entity").unwrap(),
+        shard_id: ShardId::new(0),
+    };
+
+    session
+        .publish_effects(slot.clone(), vec![AuthorityEffect::FenceAdmission])
+        .await
+        .unwrap();
+    let mut blocked =
+        Box::pin(session.publish_effects(slot.clone(), vec![AuthorityEffect::StopSlot]));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), blocked.as_mut())
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        effects.recv().await,
+        Some(LogicPlacementEffect::Authority {
+            effect: AuthorityEffect::FenceAdmission,
+            ..
+        })
+    ));
+    blocked.await.unwrap();
+    assert!(matches!(
+        effects.recv().await,
+        Some(LogicPlacementEffect::Authority {
+            effect: AuthorityEffect::StopSlot,
+            ..
+        })
+    ));
 }
 
 #[tokio::test(start_paused = true)]

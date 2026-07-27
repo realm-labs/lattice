@@ -394,10 +394,10 @@ impl PlacementDomainSession {
                     let Some(event) = event else {
                         return Err(LogicSessionError::ControlClosed);
                     };
-                    self.handle_local_event(event)?;
+                    self.handle_local_event(event).await?;
                 }
                 _ = tick.tick() => {
-                    self.tick_authorities()?;
+                    self.tick_authorities().await?;
                 }
                 _ = heartbeat.tick() => {
                     self.heartbeat_sequence = self
@@ -543,7 +543,7 @@ pub enum LogicSessionError {
     HeartbeatSequenceExhausted,
     #[error("logic Coordinator did not acknowledge drain completion inside its bound")]
     DrainNotAcknowledged,
-    #[error("logic Coordinator effect queue is full or closed")]
+    #[error("logic Coordinator effect consumer is closed")]
     EffectBackpressure,
     #[error("logic Coordinator state reducer rejected input")]
     Coordinator(#[source] CoordinatorError),

@@ -140,7 +140,7 @@ where
             .associations
             .get(&association_key)
             .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-        send_control(
+        send_control_with_backpressure(
             &association,
             &self.version.domain,
             self.version.term.get(),
@@ -149,7 +149,8 @@ where
                 expected_incarnation: incarnation,
             },
             &self.config,
-        )?;
+        )
+        .await?;
         self.sessions
             .get_mut(&incarnation)
             .ok_or(CoordinatorRuntimeError::UnknownSession)?
@@ -386,7 +387,7 @@ where
                                 .associations
                                 .get(&session.association)
                                 .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-                            send_control(
+                            send_control_with_backpressure(
                                 &association,
                                 &self.version.domain,
                                 self.version.term.get(),
@@ -396,7 +397,8 @@ where
                                     version: slot.version,
                                 },
                                 &self.config,
-                            )?;
+                            )
+                            .await?;
                         } else if self.store.get_claim(&key).await?.is_none() {
                             self.transition_handoff(
                                 key,
@@ -465,29 +467,32 @@ where
             .get(&association_key)
             .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
         for (begin, chunks, end) in [placement] {
-            send_control(
+            send_control_with_backpressure(
                 &association,
                 &self.version.domain,
                 self.version.term.get(),
                 PlacementControlCommand::SnapshotBegin(begin),
                 &self.config,
-            )?;
+            )
+            .await?;
             for chunk in chunks {
-                send_control(
+                send_control_with_backpressure(
                     &association,
                     &self.version.domain,
                     self.version.term.get(),
                     PlacementControlCommand::SnapshotChunk(chunk),
                     &self.config,
-                )?;
+                )
+                .await?;
             }
-            send_control(
+            send_control_with_backpressure(
                 &association,
                 &self.version.domain,
                 self.version.term.get(),
                 PlacementControlCommand::SnapshotEnd(end),
                 &self.config,
-            )?;
+            )
+            .await?;
         }
         Ok(())
     }
