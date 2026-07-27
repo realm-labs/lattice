@@ -193,6 +193,27 @@ impl ControlDispatch for ServiceControlDispatch {
         }
     }
 
+    async fn apply_ephemeral(
+        &self,
+        association: AssociationKey,
+        command_id: CommandId,
+        payload: Bytes,
+    ) -> Result<(), ControlDispatchError> {
+        if is_watch_control(&payload) {
+            return self.apply(association, command_id, payload).await;
+        }
+        if self
+            .application_scope
+            .as_ref()
+            .is_some_and(|scope| scope != &association)
+        {
+            return Err(ControlDispatchError::InvalidCommand);
+        }
+        self.application
+            .apply_ephemeral(association, command_id, payload)
+            .await
+    }
+
     async fn reconcile(
         &self,
         association: AssociationKey,

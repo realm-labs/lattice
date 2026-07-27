@@ -144,6 +144,20 @@ pub trait ControlDispatch: Send + Sync + 'static {
         payload: Bytes,
     ) -> Result<(), ControlDispatchError>;
 
+    /// Offers a best-effort command without waiting for the application to finish it.
+    ///
+    /// Implementations that can enqueue independently should override this method so ephemeral
+    /// traffic cannot head-of-line block reliable control recovery. The default preserves the
+    /// original behavior for dispatchers that do not distinguish delivery classes.
+    async fn apply_ephemeral(
+        &self,
+        association: AssociationKey,
+        command_id: CommandId,
+        payload: Bytes,
+    ) -> Result<(), ControlDispatchError> {
+        self.apply(association, command_id, payload).await
+    }
+
     async fn reconcile(
         &self,
         association: AssociationKey,

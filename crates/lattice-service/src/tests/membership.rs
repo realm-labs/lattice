@@ -116,6 +116,25 @@ async fn ping(
     })
 }
 
+async fn ping_other(
+    service: &LatticeService,
+    target: EntityRef<OtherPingProtocol>,
+    value: u64,
+    phase: &str,
+) -> Pong {
+    service
+        .ask(target, Ping(value), Duration::from_secs(2))
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "{phase} ping failed after Ready; error: {error:?}; lifecycle: {:?}; health: {:?}; members: {:?}",
+                service.node_lifecycle_state(),
+                service.health_snapshot(),
+                service.member_snapshot(),
+            )
+        })
+}
+
 #[tokio::test]
 async fn static_discovery_joins_and_leaves_without_manual_peer_connection() {
     let _network = network_test_guard().await;
@@ -644,6 +663,235 @@ async fn coordinator_rollover_recovers_after_blocked_session_registration() {
 
     member.force_shutdown().await.unwrap();
     coordinator_b.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_active_shard_recovers_after_a_transient_association_loss() {
+    let _network = network_test_guard().await;
+    let coordinator_address = unused_address().await;
+    let member_address = unused_address().await;
+    let cluster_id = ClusterId::new("service-association-recovery-test").unwrap();
+    let store = Arc::new(InMemoryPlacementStore::new(64, 64).unwrap());
+    let coordinator_incarnation = NodeIncarnation::new(451).unwrap();
+    let member_incarnation = NodeIncarnation::new(452).unwrap();
+    let primary_domain = placement_domain();
+    let secondary_domain = secondary_domain();
+    let coordinator = coordinator_service_for_domains(
+        store.clone(),
+        cluster_id.clone(),
+        "coordinator",
+        coordinator_address.clone(),
+        coordinator_incarnation,
+        BTreeSet::from([primary_domain.clone(), secondary_domain.clone()]),
+    )
+    .await;
+    coordinator.start().await.unwrap();
+    let discovery = |scope| {
+        Arc::new(
+            StaticDiscovery::new(
+                scope,
+                "association-recovery",
+                vec![StaticEndpoint {
+                    address: coordinator_address.clone(),
+                    expected_node_id: Some("coordinator".to_owned()),
+                    priority: 1,
+                }],
+            )
+            .unwrap(),
+        )
+    };
+    let primary_entity_type = EntityType::new("association-recovery-primary").unwrap();
+    let primary_config = EntityConfig::new(
+        primary_domain.clone(),
+        primary_entity_type.clone(),
+        ProtocolId::new(PROTOCOL_ID).unwrap(),
+        1,
+        "weighted-least-load",
+        1,
+        Vec::new(),
+    )
+    .unwrap();
+    let secondary_entity_type = EntityType::new("association-recovery-secondary").unwrap();
+    let secondary_config = EntityConfig::new(
+        secondary_domain.clone(),
+        secondary_entity_type.clone(),
+        ProtocolId::new(PROTOCOL_ID + 1).unwrap(),
+        1,
+        "weighted-least-load",
+        1,
+        Vec::new(),
+    )
+    .unwrap();
+    let primary_binding = Arc::new(PingProtocol::bind::<PingActor>().unwrap());
+    let primary_registry = Arc::new(ActorRegistry::new_bound(
+        actor_kind!("AssociationRecoveryPrimary"),
+        ActorRegistryConfig {
+            actor_ref: Some(ActorRefConfig {
+                cluster_id: cluster_id.clone(),
+                node_address: member_address.clone(),
+                node_incarnation: member_incarnation,
+            }),
+            ..ActorRegistryConfig::default()
+        },
+        primary_binding.as_ref(),
+    ));
+    let secondary_binding = Arc::new(OtherPingProtocol::bind::<PingActor>().unwrap());
+    let secondary_registry = Arc::new(ActorRegistry::new_bound(
+        actor_kind!("AssociationRecoverySecondary"),
+        ActorRegistryConfig {
+            actor_ref: Some(ActorRefConfig {
+                cluster_id: cluster_id.clone(),
+                node_address: member_address.clone(),
+                node_incarnation: member_incarnation,
+            }),
+            ..ActorRegistryConfig::default()
+        },
+        secondary_binding.as_ref(),
+    ));
+    let member = LatticeService::builder(node_config(
+        cluster_id.clone(),
+        "member",
+        member_address.clone(),
+        member_incarnation,
+    ))
+    .unwrap()
+    .host_entity_with_registry(
+        primary_config.clone(),
+        primary_registry,
+        primary_binding,
+        PingLoader,
+    )
+    .unwrap()
+    .host_entity_with_registry(
+        secondary_config.clone(),
+        secondary_registry,
+        secondary_binding,
+        PingLoader,
+    )
+    .unwrap()
+    .domain_capacity(primary_domain.clone(), 1)
+    .unwrap()
+    .domain_capacity(secondary_domain.clone(), 1)
+    .unwrap()
+    .coordinator_discovery(discovery(CoordinatorScope::Membership))
+    .unwrap()
+    .coordinator_discovery(discovery(CoordinatorScope::Placement(
+        primary_domain.clone(),
+    )))
+    .unwrap()
+    .coordinator_discovery(discovery(CoordinatorScope::Placement(
+        secondary_domain.clone(),
+    )))
+    .unwrap()
+    .join_config(ClusterJoinConfig {
+        retry_initial: Duration::from_millis(10),
+        retry_max: Duration::from_millis(100),
+        leadership_refresh_interval: Duration::from_millis(100),
+        join_timeout: Some(Duration::from_secs(5)),
+        leave_timeout: Duration::from_secs(2),
+        shutdown_timeout: Duration::from_secs(3),
+        ..ClusterJoinConfig::default()
+    })
+    .build()
+    .unwrap();
+    member.start().await.unwrap();
+    let cluster = member.cluster();
+    cluster.wait_ready(Duration::from_secs(5)).await.unwrap();
+    let primary_entity_id = EntityId::new(b"association-recovery-primary".to_vec()).unwrap();
+    let secondary_entity_id = EntityId::new(b"association-recovery-secondary".to_vec()).unwrap();
+    let primary_target = primary_config
+        .entity_ref::<PingProtocol>(cluster_id.clone(), primary_entity_id.clone())
+        .unwrap();
+    let secondary_target = secondary_config
+        .entity_ref::<OtherPingProtocol>(cluster_id.clone(), secondary_entity_id.clone())
+        .unwrap();
+    assert_eq!(
+        ping(
+            &member,
+            primary_target.clone(),
+            1,
+            "primary before association loss",
+        )
+        .await,
+        Pong(2)
+    );
+    assert_eq!(
+        ping_other(
+            &member,
+            secondary_target.clone(),
+            2,
+            "secondary before association loss",
+        )
+        .await,
+        Pong(3)
+    );
+    let primary_slot_key = PlacementSlotKey::Shard {
+        domain: primary_domain.clone(),
+        entity_type: primary_entity_type,
+        shard_id: primary_config.shard_for(&primary_entity_id).unwrap(),
+    };
+    let secondary_slot_key = PlacementSlotKey::Shard {
+        domain: secondary_domain.clone(),
+        entity_type: secondary_entity_type,
+        shard_id: secondary_config.shard_for(&secondary_entity_id).unwrap(),
+    };
+
+    // Freeze the single-threaded runtime long enough for both endpoints to observe the real
+    // default heartbeat timeout, then verify that membership and placement recover together.
+    std::thread::sleep(Duration::from_secs(7));
+    cluster
+        .wait_for(Duration::from_secs(5), |state| {
+            state.health.domains.get(&primary_domain) == Some(&PlacementDomainState::Degraded)
+                && state.health.domains.get(&secondary_domain)
+                    == Some(&PlacementDomainState::Degraded)
+        })
+        .await
+        .expect("placement domain did not observe the transient association loss");
+    cluster
+        .wait_ready(Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "member did not recover; lifecycle: {:?}; health: {:?}; members: {:?}",
+                member.node_lifecycle_state(),
+                member.health_snapshot(),
+                member.member_snapshot(),
+            )
+        });
+    assert_eq!(
+        ping(
+            &member,
+            primary_target,
+            3,
+            "primary after association recovery",
+        )
+        .await,
+        Pong(4)
+    );
+    assert_eq!(
+        ping_other(
+            &member,
+            secondary_target,
+            4,
+            "secondary after association recovery",
+        )
+        .await,
+        Pong(5)
+    );
+    for slot_key in [primary_slot_key, secondary_slot_key] {
+        let slot = store
+            .get_slot(&slot_key)
+            .await
+            .unwrap()
+            .expect("the active shard must survive association recovery");
+        assert_eq!(
+            slot.owner.as_ref().map(|owner| owner.node_id.as_str()),
+            Some("member")
+        );
+    }
+
+    member.force_shutdown().await.unwrap();
+    coordinator.force_shutdown().await.unwrap();
 }
 
 /// A member that hosts nothing drains for free, so the leave that proves anything is the one that

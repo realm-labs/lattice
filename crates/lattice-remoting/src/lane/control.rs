@@ -71,7 +71,7 @@ pub(super) async fn apply_control_frame(
         }
         FrameKind::CoordinatorEvent => {
             control_dispatch
-                .apply(
+                .apply_ephemeral(
                     association.key().clone(),
                     CommandId::generate(),
                     frame.into_payload(),

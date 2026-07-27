@@ -288,6 +288,29 @@ impl ControlDispatch for PlacementControlRouter {
             .map_err(|_| ControlDispatchError::Unavailable)?
     }
 
+    async fn apply_ephemeral(
+        &self,
+        association: AssociationKey,
+        command_id: CommandId,
+        payload: Bytes,
+    ) -> Result<(), ControlDispatchError> {
+        let scoped = decode_control_command(&payload, self.maximum_payload)
+            .map_err(|_| ControlDispatchError::InvalidCommand)?;
+        let (completion, _applied) = oneshot::channel();
+        self.sender
+            .try_send(PlacementControlEvent {
+                kind: PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
+                    association,
+                    command_id,
+                    scope: scoped.scope,
+                    coordinator_term: scoped.coordinator_term,
+                    command: scoped.command,
+                })),
+                completion,
+            })
+            .map_err(|_| ControlDispatchError::Unavailable)
+    }
+
     async fn reconcile(
         &self,
         association: AssociationKey,
@@ -382,6 +405,36 @@ impl ControlDispatch for PlacementControlDirectory {
             .await
             .map_err(|_| ControlDispatchError::Unavailable)?
             .map_err(|_| ControlDispatchError::Unavailable)?
+    }
+
+    async fn apply_ephemeral(
+        &self,
+        association: AssociationKey,
+        command_id: CommandId,
+        payload: Bytes,
+    ) -> Result<(), ControlDispatchError> {
+        let scoped = decode_control_command(&payload, self.maximum_payload)
+            .map_err(|_| ControlDispatchError::InvalidCommand)?;
+        let sender = self
+            .senders
+            .read()
+            .expect("control directory poisoned")
+            .get(&scoped.scope)
+            .cloned()
+            .ok_or(ControlDispatchError::Unavailable)?;
+        let (completion, _applied) = oneshot::channel();
+        sender
+            .try_send(PlacementControlEvent {
+                kind: PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
+                    association,
+                    command_id,
+                    scope: scoped.scope,
+                    coordinator_term: scoped.coordinator_term,
+                    command: scoped.command,
+                })),
+                completion,
+            })
+            .map_err(|_| ControlDispatchError::Unavailable)
     }
 
     async fn reconcile(

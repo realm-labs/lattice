@@ -226,6 +226,19 @@ where
                             ControlDispatchError::Unavailable
                         ))
                     ) {
+                        // CoordinatorEvent is deliberately best-effort (for example, a claim
+                        // grant is renewed by the next coordinator tick). A stale event can
+                        // target a placement consumer that is paused until membership recovers.
+                        // Retrying it here would head-of-line block the reliable membership
+                        // snapshot queued behind it and make that recovery impossible.
+                        if frame.kind == FrameKind::CoordinatorEvent {
+                            tracing::debug!(
+                                target: "lattice_remoting::control",
+                                association_id = association.id().get(),
+                                "dropping ephemeral coordinator event while its consumer is unavailable"
+                            );
+                            break Ok(None);
+                        }
                         tokio::time::sleep(retry_backoff).await;
                         retry_backoff = retry_backoff.saturating_mul(2).min(Duration::from_secs(1));
                         continue;
