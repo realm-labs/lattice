@@ -284,7 +284,8 @@ async fn seed_running_slot(
         )
         .await
         .unwrap();
-    leader.version = committed.slot.version;
+    leader.version = committed.slot.version.clone();
+    leader.observe_slot(&committed.slot);
 }
 
 struct NoActors;
@@ -1104,6 +1105,7 @@ mod admin;
 mod claim_expiry;
 mod history;
 mod lifecycle_tests;
+mod read_amplification;
 mod recovery_tests;
 mod resilience;
 mod unavailable_hosts;

@@ -52,6 +52,8 @@ use tokio::{sync::Barrier, task::JoinSet, time::Instant};
 
 #[path = "etcd_acceptance/bounded_migration.rs"]
 mod bounded_migration;
+#[path = "etcd_acceptance/paged_reads.rs"]
+mod paged_reads;
 
 fn domain() -> PlacementDomainId {
     PlacementDomainId::new("etcd-acceptance").unwrap()

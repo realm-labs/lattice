@@ -422,10 +422,9 @@ where
             })
             .collect();
         let shards = self
-            .store
-            .list_slots(&self.version.domain)
-            .await?
-            .into_iter()
+            .slots
+            .values()
+            .cloned()
             .filter_map(|slot| {
                 if slot.key.domain() != domain {
                     return None;

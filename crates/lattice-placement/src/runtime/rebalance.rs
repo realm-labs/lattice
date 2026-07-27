@@ -177,10 +177,13 @@ where
         Box::pin(self.apply_handoff_effects(key, effects)).await
     }
 
+    /// Called after every guarded slot commit, which is why the slot mirror is refreshed here: a
+    /// dropped delta still leaves the leader's own view of durable truth current.
     pub(super) async fn publish_slot_delta(
-        &self,
+        &mut self,
         slot: &PlacementSlot,
     ) -> Result<(), CoordinatorRuntimeError> {
+        self.observe_slot(slot);
         if super::dropped_by_failpoint(Failpoint::CoordinatorAfterEtcdCommitBeforeDelta) {
             return Ok(());
         }

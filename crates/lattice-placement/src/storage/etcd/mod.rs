@@ -32,6 +32,7 @@ use crate::{
 };
 
 pub mod migration;
+mod page;
 mod traits;
 mod transactions;
 

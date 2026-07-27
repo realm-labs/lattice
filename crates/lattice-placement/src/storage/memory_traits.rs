@@ -20,7 +20,9 @@ use super::{
         SlotCommit, TransitionSlot, UpdateDomainMember, UpdateMember, UpdatePlan,
         UpdatePlanWithOperation,
     },
-    initial_revision, set_revision, validate_guard,
+    initial_revision,
+    page::{PageCursor, StorePage},
+    set_revision, validate_guard,
 };
 use crate::{
     coordinator::{
@@ -29,7 +31,7 @@ use crate::{
     },
     plan::RebalancePlan,
     region::EntityConfig,
-    types::{PlacementSlot, PlacementSlotKey, PlacementVersion, Revision},
+    types::{PlacementSlot, PlacementSlotKey, PlacementSlotState, PlacementVersion, Revision},
 };
 
 #[async_trait]
@@ -89,6 +91,14 @@ impl MembershipStore for InMemoryPlacementStore {
 
     async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError> {
         InMemoryPlacementStore::list_members(self).await
+    }
+
+    async fn list_members_page(
+        &self,
+        cursor: Option<&PageCursor>,
+        limit: usize,
+    ) -> Result<StorePage<MemberRecord>, StorageError> {
+        self.list_members_page_inner(cursor, limit).await
     }
 
     async fn create_member(
@@ -357,6 +367,35 @@ impl PlacementDomainStore for InMemoryPlacementStore {
         domain: &PlacementDomainId,
     ) -> Result<Vec<LeasedClaim>, StorageError> {
         InMemoryPlacementStore::list_claims(self, domain).await
+    }
+
+    async fn list_slots_page(
+        &self,
+        domain: &PlacementDomainId,
+        states: &[PlacementSlotState],
+        cursor: Option<&PageCursor>,
+        limit: usize,
+    ) -> Result<StorePage<PlacementSlot>, StorageError> {
+        self.list_slots_page_inner(domain, states, cursor, limit)
+            .await
+    }
+
+    async fn list_plans_page(
+        &self,
+        domain: &PlacementDomainId,
+        cursor: Option<&PageCursor>,
+        limit: usize,
+    ) -> Result<StorePage<RebalancePlan>, StorageError> {
+        self.list_plans_page_inner(domain, cursor, limit).await
+    }
+
+    async fn list_claims_page(
+        &self,
+        domain: &PlacementDomainId,
+        cursor: Option<&PageCursor>,
+        limit: usize,
+    ) -> Result<StorePage<LeasedClaim>, StorageError> {
+        self.list_claims_page_inner(domain, cursor, limit).await
     }
 
     async fn get_automatic_settings(

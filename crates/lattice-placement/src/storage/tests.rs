@@ -494,37 +494,170 @@ async fn member_store_allows_one_incarnation_and_exact_record_cas_only() {
         .unwrap();
 }
 
-#[tokio::test]
-async fn reconciliation_pages_never_exceed_the_requested_bound() {
-    let store = InMemoryPlacementStore::new(8, 8).unwrap();
-    store.ensure_schema_generation().await.unwrap();
-    for shard in 0..5 {
+fn paged_shard_key(shard: u32) -> PlacementSlotKey {
+    PlacementSlotKey::Shard {
+        domain: domain(),
+        entity_type: EntityType::new("paged").unwrap(),
+        shard_id: ShardId::new(shard),
+    }
+}
+
+fn seed_paged_slots(store: &InMemoryPlacementStore, shards: impl Iterator<Item = u32>) {
+    for shard in shards {
         let mut slot = allocating_slot(
-            PlacementSlotKey::Shard {
-                domain: domain(),
-                entity_type: EntityType::new("paged").unwrap(),
-                shard_id: ShardId::new(shard),
-            },
+            paged_shard_key(shard),
             node("owner", 30, 31300),
             u64::from(shard) + 1,
         );
         slot.state = PlacementSlotState::Fenced;
         store.insert_generation_three_slot(slot);
     }
+}
+
+/// Drives a whole sweep and reports every shard the sweep handed back, in order, so a duplicate is
+/// as visible as a skip.
+async fn sweep_shards(store: &InMemoryPlacementStore, limit: usize) -> Vec<u32> {
+    let mut cursor = None;
+    let mut seen = Vec::new();
+    loop {
+        let page = store
+            .list_slots_page(&domain(), &[], cursor.as_ref(), limit)
+            .await
+            .unwrap();
+        assert!(page.records.len() <= limit);
+        seen.extend(page.records.iter().map(shard_of));
+        let Some(next) = page.next_cursor else {
+            return seen;
+        };
+        cursor = Some(next);
+    }
+}
+
+fn shard_of(slot: &PlacementSlot) -> u32 {
+    match &slot.key {
+        PlacementSlotKey::Shard { shard_id, .. } => shard_id.get(),
+        PlacementSlotKey::Singleton { .. } => unreachable!("paged fixtures only seed shards"),
+    }
+}
+
+#[tokio::test]
+async fn reconciliation_pages_never_exceed_the_requested_bound() {
+    let store = InMemoryPlacementStore::new(8, 8).unwrap();
+    store.ensure_schema_generation().await.unwrap();
+    seed_paged_slots(&store, 0..5);
     let placement_domain = domain();
     let first = store
-        .list_slots_page(&placement_domain, &[], 0, 2)
+        .list_slots_page(&placement_domain, &[], None, 2)
         .await
         .unwrap();
     assert_eq!(first.records.len(), 2);
-    assert_eq!(first.total, 5);
+    assert_eq!(first.remaining, 3);
     let second = store
-        .list_slots_page(&placement_domain, &[], first.next_offset.unwrap(), 2)
+        .list_slots_page(&placement_domain, &[], first.next_cursor.as_ref(), 2)
         .await
         .unwrap();
     assert_eq!(second.records.len(), 2);
-    assert_eq!(second.total, 5);
-    assert!(second.next_offset.is_some());
+    assert_eq!(second.remaining, 1);
+    assert!(second.next_cursor.is_some());
+    let third = store
+        .list_slots_page(&placement_domain, &[], second.next_cursor.as_ref(), 2)
+        .await
+        .unwrap();
+    assert_eq!(third.records.len(), 1);
+    assert_eq!(third.remaining, 0);
+    assert!(third.next_cursor.is_none());
+    assert_eq!(sweep_shards(&store, 2).await, vec![0, 1, 2, 3, 4]);
+}
+
+/// A record removed behind the cursor moves every later offset down by one, so an offset-based
+/// resume silently skips the record that slid into the position already consumed. A key cursor
+/// names a position in the key space instead, so nothing that stayed put moves.
+#[tokio::test]
+async fn removing_a_record_behind_the_cursor_skips_no_later_record() {
+    let store = InMemoryPlacementStore::new(8, 8).unwrap();
+    store.ensure_schema_generation().await.unwrap();
+    seed_paged_slots(&store, 0..6);
+    let placement_domain = domain();
+    let first = store
+        .list_slots_page(&placement_domain, &[], None, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.records.iter().map(shard_of).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    store.remove_slot_record(&paged_shard_key(0));
+
+    let mut cursor = first.next_cursor;
+    let mut seen = Vec::new();
+    while let Some(position) = cursor {
+        let page = store
+            .list_slots_page(&placement_domain, &[], Some(&position), 2)
+            .await
+            .unwrap();
+        seen.extend(page.records.iter().map(shard_of));
+        cursor = page.next_cursor;
+    }
+    assert_eq!(seen, vec![2, 3, 4, 5]);
+}
+
+/// The mirror image: a record inserted behind the cursor shifts every later offset up by one, so an
+/// offset-based resume hands the same record back twice.
+#[tokio::test]
+async fn inserting_a_record_behind_the_cursor_repeats_no_later_record() {
+    let store = InMemoryPlacementStore::new(8, 8).unwrap();
+    store.ensure_schema_generation().await.unwrap();
+    seed_paged_slots(&store, [1, 2, 4, 5, 6].into_iter());
+    let placement_domain = domain();
+    let first = store
+        .list_slots_page(&placement_domain, &[], None, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.records.iter().map(shard_of).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    seed_paged_slots(&store, [0].into_iter());
+
+    let mut cursor = first.next_cursor;
+    let mut seen = Vec::new();
+    while let Some(position) = cursor {
+        let page = store
+            .list_slots_page(&placement_domain, &[], Some(&position), 2)
+            .await
+            .unwrap();
+        seen.extend(page.records.iter().map(shard_of));
+        cursor = page.next_cursor;
+    }
+    assert_eq!(seen, vec![4, 5, 6]);
+}
+
+#[tokio::test]
+async fn a_paged_sweep_reads_only_the_records_of_the_pages_it_asked_for() {
+    let store = InMemoryPlacementStore::new(64, 8).unwrap();
+    store.ensure_schema_generation().await.unwrap();
+    seed_paged_slots(&store, 0..40);
+    store.reset_read_counts();
+    let page = store
+        .list_slots_page(&domain(), &[], None, 4)
+        .await
+        .unwrap();
+    let counts = store.read_counts();
+    assert_eq!(page.records.len(), 4);
+    assert_eq!(counts.list_slots, 0);
+    assert_eq!(counts.list_slots_page, 1);
+    assert_eq!(counts.slot_records, 4);
+}
+
+#[tokio::test]
+async fn a_zero_width_page_is_rejected_rather_than_looping_forever() {
+    let store = InMemoryPlacementStore::new(8, 8).unwrap();
+    store.ensure_schema_generation().await.unwrap();
+    seed_paged_slots(&store, 0..2);
+    assert!(matches!(
+        store.list_slots_page(&domain(), &[], None, 0).await,
+        Err(StorageError::BackendArgument)
+    ));
 }
 
 #[tokio::test]
