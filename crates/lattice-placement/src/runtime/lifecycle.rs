@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, time::Duration};
 
 use tokio::time::MissedTickBehavior;
 
-use lattice_core::actor_ref::{EntityType, PlacementDomainId};
+use lattice_core::actor_ref::{EntityType, NodeIncarnation, PlacementDomainId};
 
 use super::{
     AllocationError, CoordinatorLeaseStore, CoordinatorRuntimeError, HandoffEvent, HandoffMachine,
@@ -11,6 +11,7 @@ use super::{
     ScopedElectionStore, membership::control_dispatch_error, mpsc, watch,
 };
 use crate::{
+    control::PlacementControlEventKind,
     coordinator::MemberRemovalReason,
     storage::{
         StorageError,
@@ -18,6 +19,32 @@ use crate::{
     },
     types::AssignmentGeneration,
 };
+
+struct ControlEventContext {
+    event_kind: &'static str,
+    command: Option<&'static str>,
+    remote_incarnation: Option<NodeIncarnation>,
+}
+
+fn control_event_context(event: &PlacementControlEventKind) -> ControlEventContext {
+    match event {
+        PlacementControlEventKind::Command(inbound) => ControlEventContext {
+            event_kind: "command",
+            command: Some(inbound.command.name()),
+            remote_incarnation: Some(inbound.association.remote_incarnation),
+        },
+        PlacementControlEventKind::Reconcile { association, .. } => ControlEventContext {
+            event_kind: "reconcile",
+            command: None,
+            remote_incarnation: Some(association.remote_incarnation),
+        },
+        PlacementControlEventKind::GlobalMemberRemoved { node, .. } => ControlEventContext {
+            event_kind: "global_member_removed",
+            command: None,
+            remote_incarnation: Some(node.incarnation),
+        },
+    }
+}
 
 impl<S> PlacementDomainLeader<S>
 where
@@ -318,6 +345,7 @@ where
                     let Some(event) = event else {
                         return Err(CoordinatorRuntimeError::ControlClosed);
                     };
+                    let context = control_event_context(&event.kind);
                     let result = self.handle_control(event.kind).await;
                     let acknowledgement = result
                         .as_ref()
@@ -325,12 +353,35 @@ where
                         .map_err(control_dispatch_error);
                     let _ = event.completion.send(acknowledgement);
                     if let Err(error) = result {
-                        tracing::warn!(
-                            target: "lattice.cluster.coordinator",
-                            %error,
-                            cause = %error_cause(&error),
-                            "Coordinator rejected a member control command"
-                        );
+                        let expected_late_command = matches!(
+                            &error,
+                            CoordinatorRuntimeError::UnknownSession
+                        ) && context.command.is_some()
+                            && context.remote_incarnation.is_some_and(|incarnation| {
+                                self.gracefully_removed_sessions.contains(&incarnation)
+                            });
+                        if expected_late_command {
+                            tracing::debug!(
+                                target: "lattice.cluster.coordinator",
+                                event = context.event_kind,
+                                command = context.command.unwrap_or("none"),
+                                domain = %self.version.domain,
+                                remote_incarnation = ?context.remote_incarnation,
+                                %error,
+                                "Coordinator rejected an expected late control command from a gracefully removed member"
+                            );
+                        } else {
+                            tracing::warn!(
+                                target: "lattice.cluster.coordinator",
+                                event = context.event_kind,
+                                command = context.command.unwrap_or("none"),
+                                domain = %self.version.domain,
+                                remote_incarnation = ?context.remote_incarnation,
+                                %error,
+                                cause = %error_cause(&error),
+                                "Coordinator rejected a member control command"
+                            );
+                        }
                     }
                 }
                 operation = self.operation_receiver.recv() => {

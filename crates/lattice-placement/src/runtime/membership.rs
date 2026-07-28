@@ -459,6 +459,8 @@ where
             .await?
             .filter(|record| record.node == hello.node && record.status == MemberStatus::Up)
             .ok_or(CoordinatorRuntimeError::MemberNotReady)?;
+        self.gracefully_removed_sessions
+            .remove(&hello.node.incarnation);
         if let Some(session) = self.sessions.get_mut(&hello.node.incarnation) {
             if session.record != record
                 || session.hello != hello

@@ -565,6 +565,9 @@ where
     membership_version: MembershipVersion,
     version: PlacementVersion,
     sessions: BTreeMap<NodeIncarnation, MemberSession>,
+    // Bounded diagnostic tombstones distinguish shutdown tail traffic from live-session faults.
+    // They never authorize a command or change its acknowledgement.
+    gracefully_removed_sessions: BTreeSet<NodeIncarnation>,
     claims: BTreeMap<PlacementSlotKey, ClaimLease>,
     expiring_claims: BTreeMap<PlacementSlotKey, i64>,
     loads: LoadTable,
@@ -723,6 +726,7 @@ where
             membership_version,
             version,
             sessions: BTreeMap::new(),
+            gracefully_removed_sessions: BTreeSet::new(),
             claims: BTreeMap::new(),
             expiring_claims: BTreeMap::new(),
             loads,

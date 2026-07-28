@@ -264,7 +264,18 @@ where
         reason: MemberRemovalReason,
     ) -> Result<(), CoordinatorRuntimeError> {
         let incarnation = node.incarnation;
-        self.sessions.remove(&incarnation);
+        if self.sessions.remove(&incarnation).is_some() {
+            if reason == MemberRemovalReason::GracefulLeave {
+                if !self.gracefully_removed_sessions.contains(&incarnation)
+                    && self.gracefully_removed_sessions.len() >= self.config.maximum_sessions
+                {
+                    self.gracefully_removed_sessions.pop_first();
+                }
+                self.gracefully_removed_sessions.insert(incarnation);
+            } else {
+                self.gracefully_removed_sessions.remove(&incarnation);
+            }
+        }
         self.loads.forget_incarnation(incarnation);
         self.node_load_received.remove(&incarnation);
         self.shard_load_received

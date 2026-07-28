@@ -147,6 +147,41 @@ pub enum PlacementControlCommand {
     },
 }
 
+impl PlacementControlCommand {
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::MemberHello(_) => "MemberHello",
+            Self::PlacementDomainHello(_) => "PlacementDomainHello",
+            Self::NodeHeartbeat { .. } => "NodeHeartbeat",
+            Self::JoinReady { .. } => "JoinReady",
+            Self::MemberUp(_) => "MemberUp",
+            Self::MemberDelta(_) => "MemberDelta",
+            Self::SubscribeEntity(_) => "SubscribeEntity",
+            Self::SubscribeSingleton(_) => "SubscribeSingleton",
+            Self::SnapshotBegin(_) => "SnapshotBegin",
+            Self::SnapshotChunk(_) => "SnapshotChunk",
+            Self::SnapshotEnd(_) => "SnapshotEnd",
+            Self::StateDelta(_) => "StateDelta",
+            Self::AppliedRevision(_) => "AppliedRevision",
+            Self::ClaimGranted(_) => "ClaimGranted",
+            Self::NodeLoad(_) => "NodeLoad",
+            Self::ShardLoad(_) => "ShardLoad",
+            Self::ResolveShard { .. } => "ResolveShard",
+            Self::ResolveSingleton { .. } => "ResolveSingleton",
+            Self::ResolutionFailed { .. } => "ResolutionFailed",
+            Self::DrainSlot { .. } => "DrainSlot",
+            Self::SlotDrained { .. } => "SlotDrained",
+            Self::SlotStopFailed { .. } => "SlotStopFailed",
+            Self::SlotReady { .. } => "SlotReady",
+            Self::BeginDrain { .. } => "BeginDrain",
+            Self::DrainReady { .. } => "DrainReady",
+            Self::DrainComplete { .. } => "DrainComplete",
+            Self::MembershipDrainComplete { .. } => "MembershipDrainComplete",
+            Self::ForceRemove { .. } => "ForceRemove",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlacementResolutionFailure {
     NoEligibleHost,
@@ -600,6 +635,26 @@ mod tests {
             )
             .unwrap_err(),
             PlacementControlError::InvalidCoordinatorTerm
+        );
+    }
+
+    #[test]
+    fn control_command_names_do_not_include_payloads() {
+        assert_eq!(
+            PlacementControlCommand::NodeHeartbeat {
+                incarnation: NodeIncarnation::new(1).unwrap(),
+                sequence: 7,
+            }
+            .name(),
+            "NodeHeartbeat"
+        );
+        assert_eq!(
+            PlacementControlCommand::MembershipDrainComplete {
+                operation_id: "terminal-leave-1".to_string(),
+                expected_incarnation: NodeIncarnation::new(1).unwrap(),
+            }
+            .name(),
+            "MembershipDrainComplete"
         );
     }
 

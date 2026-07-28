@@ -387,6 +387,11 @@ async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
         .await
         .unwrap();
     assert!(
+        leader
+            .gracefully_removed_sessions
+            .contains(&joining.incarnation)
+    );
+    assert!(
         store
             .get_domain_member(&domain(), "joining")
             .await
@@ -423,6 +428,11 @@ async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
             .is_err()
     );
     leader.force_remove(request.clone()).await.unwrap();
+    assert!(
+        !leader
+            .gracefully_removed_sessions
+            .contains(&forced.incarnation)
+    );
     leader.force_remove(request).await.unwrap();
     assert!(
         store
