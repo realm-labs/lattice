@@ -59,6 +59,11 @@ fn write_atomic(path: PathBuf, contents: &[u8]) -> Result<(), IoError> {
     std::fs::rename(temporary, path)
 }
 
+/// The release every fixture role runs unless it resolves its own. Entity hosts are the only roles
+/// a rolling upgrade moves, so a Coordinator host stays on this release for a whole run: that is
+/// what makes it the older half of every upgrade it decides.
+const FIXTURE_RELEASE_ID: u64 = 1;
+
 fn node_config(
     cluster_id: ClusterId,
     node_id: &str,
@@ -66,7 +71,7 @@ fn node_config(
     incarnation: NodeIncarnation,
 ) -> NodeConfig {
     NodeConfig {
-        release: lattice_core::release::ReleaseManifest::development(1),
+        release: lattice_core::release::ReleaseManifest::development(FIXTURE_RELEASE_ID),
         cluster_id,
         node_id: node_id.to_owned(),
         address,

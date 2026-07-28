@@ -18,30 +18,31 @@ where
     pub(super) async fn reconcile_initial_inventory(
         &mut self,
     ) -> Result<(), CoordinatorRuntimeError> {
-        let mut offset = 0;
+        let mut cursor = None;
         loop {
             let page = self
                 .store
                 .list_slots_page(
                     &self.version.domain,
                     &[],
-                    offset,
+                    cursor.as_ref(),
                     self.config.reconciliation_page_size,
                 )
                 .await?;
             for slot in page.records {
+                self.observe_slot(&slot);
                 self.validate_slot_move_relationship(&slot);
                 let claim = self.store.get_claim(&slot.key).await?;
                 self.reconcile_authority_record(slot, claim).await?;
             }
-            let Some(next) = page.next_offset else {
+            let Some(next) = page.next_cursor else {
                 break;
             };
-            offset = next;
+            cursor = Some(next);
         }
         self.validate_plan_move_relationships().await?;
         self.reconciliation.initial_complete = true;
-        self.reconciliation.cursor = 0;
+        self.reconciliation.cursor = None;
         self.reconciliation.backlog = 0;
         self.reconciliation.last_success = Some(Instant::now());
         Ok(())
@@ -49,7 +50,7 @@ where
 
     pub(super) async fn reconcile_bounded_pass(&mut self) -> Result<(), CoordinatorRuntimeError> {
         if self.reconciliation.focused {
-            self.reconciliation.cursor = 0;
+            self.reconciliation.cursor = None;
             self.reconciliation.focused = false;
         }
         let focus = std::mem::take(&mut self.reconciliation.focus);
@@ -57,6 +58,7 @@ where
             let Some(slot) = self.store.get_slot(&key).await? else {
                 continue;
             };
+            self.observe_slot(&slot);
             self.validate_slot_move_relationship(&slot);
             let claim = self.store.get_claim(&key).await?;
             self.reconcile_authority_record(slot, claim).await?;
@@ -67,24 +69,30 @@ where
             .min(self.config.maximum_reconciliation_work_per_pass);
         let page = self
             .store
-            .list_slots_page(&self.version.domain, &[], self.reconciliation.cursor, limit)
+            .list_slots_page(
+                &self.version.domain,
+                &[],
+                self.reconciliation.cursor.as_ref(),
+                limit,
+            )
             .await?;
-        let total = page.total;
+        let remaining = page.remaining;
         for slot in page.records {
+            self.observe_slot(&slot);
             self.validate_slot_move_relationship(&slot);
             let claim = self.store.get_claim(&slot.key).await?;
             self.reconcile_authority_record(slot, claim).await?;
         }
-        match page.next_offset {
+        match page.next_cursor {
             Some(next) => {
-                self.reconciliation.cursor = next;
-                self.reconciliation.backlog = total.saturating_sub(next);
+                self.reconciliation.cursor = Some(next);
+                self.reconciliation.backlog = remaining;
                 if self.reconciliation.oldest_pending.is_none() {
                     self.reconciliation.oldest_pending = Some(Instant::now());
                 }
             }
             None => {
-                self.reconciliation.cursor = 0;
+                self.reconciliation.cursor = None;
                 self.reconciliation.backlog = 0;
                 self.reconciliation.oldest_pending = None;
                 self.reconciliation.last_success = Some(Instant::now());

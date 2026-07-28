@@ -36,14 +36,14 @@ where
             MemberChange::Upsert(_) => None,
         };
         self.broadcast_membership_event(event)?;
-        if let Some((node, reason)) = removed {
-            if let Err(error) = self.fanout_global_member_removal(node, reason).await {
-                tracing::warn!(
-                    target: "lattice.cluster.membership",
-                    %error,
-                    "global member removal fanout deferred to reconciliation"
-                );
-            }
+        if let Some((node, reason)) = removed
+            && let Err(error) = self.fanout_global_member_removal(node, reason).await
+        {
+            tracing::warn!(
+                target: "lattice.cluster.membership",
+                %error,
+                "global member removal fanout deferred to reconciliation"
+            );
         }
         Ok(())
     }

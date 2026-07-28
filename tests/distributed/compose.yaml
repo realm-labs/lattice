@@ -266,12 +266,18 @@ services:
       timeout: 1s
       retries: 600
 
+  # The entity hosts read the release they must run from a file the scenarios rewrite while they are
+  # live, so one image presents whichever release a rolling upgrade needs: the cluster admits
+  # release manifests, not binaries. Without a file they run the release named in the environment.
   split-node-a:
     <<: *runner
     profiles: [partition]
     cap_add: [NET_ADMIN]
     depends_on:
       domain-standby: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_RELEASE_FILE: /artifacts/partition/split-node-a-release.json
     command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "split-entity-host", "--node-id", "split-node-a", "--port", "29306", "--domains", "split", "--reference", "/artifacts/partition/split-node-a.json"]
     healthcheck:
       test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and .served > 0", "/artifacts/partition/split-node-a.json"]
@@ -285,9 +291,32 @@ services:
     cap_add: [NET_ADMIN]
     depends_on:
       domain-standby: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_RELEASE_FILE: /artifacts/partition/split-node-b-release.json
     command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "split-entity-host", "--node-id", "split-node-b", "--port", "29307", "--domains", "split", "--reference", "/artifacts/partition/split-node-b.json"]
     healthcheck:
       test: ["CMD", "jq", "-e", ".lifecycle == \"Ready\" and .served > 0", "/artifacts/partition/split-node-b.json"]
+      interval: 1s
+      timeout: 1s
+      retries: 600
+
+  # A spare entity host that stays out of the cluster until a scenario writes it a release. Release
+  # zero means "do not join", so the fault scenarios see the same two-host cluster they always have,
+  # and the upgrade scenarios get a host that can be offered a release and taken back out without
+  # ever stopping a container: an exited container aborts the whole compose run.
+  split-node-c:
+    <<: *runner
+    profiles: [partition]
+    depends_on:
+      domain-standby: {condition: service_healthy}
+    environment:
+      LATTICE_RUN_ID: ${LATTICE_RUN_ID:-local}
+      LATTICE_RELEASE_FILE: /artifacts/partition/split-node-c-release.json
+      LATTICE_RELEASE_ID: "0"
+    command: ["/cargo-target/${LATTICE_CARGO_PROFILE_DIR:-debug}/distributed-node", "split-entity-host", "--node-id", "split-node-c", "--port", "29308", "--domains", "split", "--reference", "/artifacts/partition/split-node-c.json"]
+    healthcheck:
+      test: ["CMD", "test", "-s", "/artifacts/partition/split-node-c.json"]
       interval: 1s
       timeout: 1s
       retries: 600
@@ -457,6 +486,7 @@ services:
       etcd-single: {condition: service_healthy}
       split-node-a: {condition: service_healthy}
       split-node-b: {condition: service_healthy}
+      split-node-c: {condition: service_healthy}
     volumes:
       - ../..:/workspace:ro
       - ../../target/test-artifacts/${LATTICE_RUN_ID:-local}:/artifacts

@@ -41,6 +41,7 @@ use crate::{
         CoordinatorLeaseStore, MembershipStore, PlacementDomainStore, ScopedElectionStore,
         StorageError,
         domain::{AdminOperationRecord, AutomaticBalanceSettings, DurableStorageLimits},
+        page::PageCursor,
     },
     types::{
         AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, MembershipVersion,
@@ -346,7 +347,7 @@ pub struct CoordinatorInspection {
 #[derive(Default)]
 struct ReconciliationState {
     initial_complete: bool,
-    cursor: usize,
+    cursor: Option<PageCursor>,
     backlog: usize,
     oldest_pending: Option<Instant>,
     last_success: Option<Instant>,
@@ -568,6 +569,16 @@ where
     expiring_claims: BTreeMap<PlacementSlotKey, i64>,
     loads: LoadTable,
     plans: BTreeMap<u128, RebalancePlan>,
+    /// Every slot this leader has read or committed in its own term, seeded from the election scan
+    /// and refreshed by every commit and every reconciliation read.
+    ///
+    /// It exists so the balancer stops paying a full durable scan per allocation, and it is only
+    /// ever a proposal input: a decision taken from it still commits behind an `expected_slot`
+    /// predicate read from the durable store, so a mirror that lags a commit can cost a wasted
+    /// round but cannot install a placement the durable record does not agree with. The one other
+    /// reader, the drain readiness check, uses it exclusively to skip work, never to release a
+    /// member.
+    slots: BTreeMap<PlacementSlotKey, PlacementSlot>,
     handoffs: BTreeMap<PlacementSlotKey, HandoffMachine>,
     operations: mpsc::Sender<CoordinatorOperation>,
     operation_receiver: mpsc::Receiver<CoordinatorOperation>,
@@ -696,6 +707,10 @@ where
             .filter(|slot| slot.state == PlacementSlotState::Running)
             .map(|slot| (slot.key.clone(), MonotonicTime::from_millis(0)))
             .collect();
+        let slot_mirror = slots
+            .into_iter()
+            .map(|slot| (slot.key.clone(), slot))
+            .collect();
         let leader_lease_deadline = Instant::now() + config.leader_lease_ttl;
         let mut leader = Self {
             store,
@@ -712,6 +727,7 @@ where
             expiring_claims: BTreeMap::new(),
             loads,
             plans,
+            slots: slot_mirror,
             handoffs: BTreeMap::new(),
             operations,
             operation_receiver,
@@ -765,6 +781,16 @@ where
             })
             .ok_or(CoordinatorRuntimeError::IneligibleTarget)?;
         Ok((global, domain))
+    }
+
+    /// Records the durable slot the caller just read or committed. Every guarded slot commit
+    /// returns the record it wrote, so routing the commit results through here is what keeps the
+    /// mirror converging on durable truth rather than on the leader's intent.
+    pub(super) fn observe_slot(&mut self, slot: &PlacementSlot) {
+        if slot.key.domain() != &self.version.domain {
+            return;
+        }
+        self.slots.insert(slot.key.clone(), slot.clone());
     }
 
     pub fn leader(&self) -> &LeaderRecord {
@@ -824,6 +850,8 @@ pub enum CoordinatorRuntimeError {
     UnknownSession,
     #[error("Coordinator member transition is stale or invalid")]
     StaleMember,
+    #[error("Coordinator member has not completed the global membership join")]
+    MemberNotReady,
     #[error("predecessor incarnation {predecessor:?} is still leased for {remaining_ttl:?}")]
     IncarnationPending {
         predecessor: NodeIncarnation,

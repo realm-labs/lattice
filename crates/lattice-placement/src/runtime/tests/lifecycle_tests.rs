@@ -312,6 +312,12 @@ async fn join_drain_and_force_remove_are_revisioned_idempotent_and_fenced() {
 
     let joining_hello = empty_hello(joining.clone());
     membership.join(joining_hello.member.clone()).await.unwrap();
+    assert!(matches!(
+        leader
+            .register(joining_hello.domain.clone(), joining_key.clone())
+            .await,
+        Err(CoordinatorRuntimeError::MemberNotReady)
+    ));
     membership.mark_up(&joining).await.unwrap();
     leader
         .register(joining_hello.domain, joining_key.clone())

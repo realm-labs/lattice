@@ -2181,7 +2181,6 @@ dependencies = [
  "async-trait",
  "etcd-client",
  "lattice-config",
- "lattice-core",
  "serde",
  "serde_json",
  "tokio",
@@ -2193,11 +2192,7 @@ dependencies = [
 name = "lattice-core"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "blake3",
- "http",
- "lattice-config",
- "prost",
  "serde",
  "serde_json",
  "thiserror",
@@ -2247,7 +2242,6 @@ dependencies = [
  "base64",
  "futures-util",
  "lattice-actor",
- "lattice-config",
  "lattice-core",
  "prost",
  "serde",
@@ -2308,9 +2302,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "lattice-config",
  "lattice-core",
- "lattice-eventbus",
  "lattice-placement",
  "lattice-service",
  "serde",

@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::client::EtcdConfigClient;
 use crate::codec::normalize_prefix;
-use crate::store::{EtcdConfigStore, EtcdConfigStoreInner};
+use crate::store::EtcdConfigStoreInner;
 use crate::watch::{
     ConfigStaleness, ConfigStalenessWatch, EtcdSnapshot, EtcdWatchBackend, EtcdWatchSession,
     RawConfigWatch, RetryBackoff, WatchRetryPolicy, spawn_config_watch,
@@ -242,7 +242,6 @@ fn config_builds_from_normalized_prefix() {
         store.storage_key("/feature/foo"),
         "/lattice/test/config/feature/foo"
     );
-    assert_eq!(EtcdConfigStore::from_config().section(), "config_store");
 }
 
 #[test]

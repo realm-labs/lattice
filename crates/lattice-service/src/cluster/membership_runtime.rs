@@ -183,7 +183,7 @@ impl MembershipJoinRuntime {
                             let retry = !controls.is_closed();
                             tracing::warn!(
                                 target: "lattice.cluster.membership",
-                                %error,
+                                error = ?error,
                                 "membership session stopped; reconciliation required"
                             );
                             MembershipSessionReturn {

@@ -113,6 +113,7 @@ where
                                 .await?;
                             plan = committed.plan;
                             slot = committed.slot;
+                            self.observe_slot(&slot);
                             self.version = barrier_version.clone();
                             (barrier_version, barrier_sessions)
                         } else {
@@ -152,6 +153,7 @@ where
             }
         }
         for slot in self.store.list_slots(&self.version.domain).await? {
+            self.observe_slot(&slot);
             if !matches!(slot.key, PlacementSlotKey::Singleton { .. })
                 || slot.active_move.is_none()
                 || self.handoffs.contains_key(&slot.key)

@@ -7,11 +7,22 @@ impl InMemoryPlacementStore {
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(MemoryState::default())),
+            counters: Arc::new(StoreReadCounters::default()),
             maximum_slots,
             maximum_plans,
             maximum_members: maximum_slots,
             maximum_admin_operations: maximum_plans,
         })
+    }
+
+    /// Reports the reads this store served. Clones share one set of counters, so a leader that
+    /// holds the store behind an `Arc` is measured through any handle to it.
+    pub fn read_counts(&self) -> StoreReadCounts {
+        self.counters.snapshot()
+    }
+
+    pub fn reset_read_counts(&self) {
+        self.counters.reset();
     }
 
     #[cfg(test)]
@@ -21,6 +32,15 @@ impl InMemoryPlacementStore {
             .placement_revisions
             .insert(slot.version.domain.clone(), slot.version.revision);
         state.slots.insert(slot.key.clone(), slot);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_slot_record(&self, key: &PlacementSlotKey) {
+        self.inner
+            .lock()
+            .expect("placement memory store poisoned")
+            .slots
+            .remove(key);
     }
 
     async fn fence_missing_authority_inner(
@@ -259,6 +279,10 @@ impl InMemoryPlacementStore {
         &self,
         key: &PlacementSlotKey,
     ) -> Result<Option<PlacementSlot>, StorageError> {
+        self.counters.record(|counts| {
+            counts.get_slot += 1;
+            counts.slot_records += 1;
+        });
         Ok(self
             .inner
             .lock()
@@ -283,6 +307,7 @@ impl InMemoryPlacementStore {
     }
 
     async fn get_claim(&self, key: &PlacementSlotKey) -> Result<Option<LeasedClaim>, StorageError> {
+        self.counters.record(|counts| counts.get_claim += 1);
         Ok(self
             .inner
             .lock()
@@ -303,6 +328,7 @@ impl InMemoryPlacementStore {
     }
 
     async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError> {
+        self.counters.record(|counts| counts.list_members += 1);
         Ok(self
             .inner
             .lock()
@@ -331,6 +357,8 @@ impl InMemoryPlacementStore {
         &self,
         domain: &PlacementDomainId,
     ) -> Result<Vec<DomainMemberRecord>, StorageError> {
+        self.counters
+            .record(|counts| counts.list_domain_members += 1);
         Ok(self
             .inner
             .lock()
@@ -346,7 +374,7 @@ impl InMemoryPlacementStore {
         &self,
         domain: &PlacementDomainId,
     ) -> Result<Vec<PlacementSlot>, StorageError> {
-        Ok(self
+        let slots = self
             .inner
             .lock()
             .expect("placement memory store poisoned")
@@ -354,13 +382,19 @@ impl InMemoryPlacementStore {
             .values()
             .filter(|slot| slot.key.domain() == domain)
             .cloned()
-            .collect())
+            .collect::<Vec<_>>();
+        self.counters.record(|counts| {
+            counts.list_slots += 1;
+            counts.slot_records += u64::try_from(slots.len()).unwrap_or(u64::MAX);
+        });
+        Ok(slots)
     }
 
     async fn list_plans(
         &self,
         domain: &PlacementDomainId,
     ) -> Result<Vec<RebalancePlan>, StorageError> {
+        self.counters.record(|counts| counts.list_plans += 1);
         Ok(self
             .inner
             .lock()
@@ -376,6 +410,7 @@ impl InMemoryPlacementStore {
         &self,
         domain: &PlacementDomainId,
     ) -> Result<Vec<LeasedClaim>, StorageError> {
+        self.counters.record(|counts| counts.list_claims += 1);
         Ok(self
             .inner
             .lock()

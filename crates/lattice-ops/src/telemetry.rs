@@ -3,16 +3,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lattice_core::actor_ref::PlacementDomainId;
-use lattice_core::instance::InstanceId;
-use lattice_core::kind::ServiceKind;
-use lattice_core::trace::TraceContext;
+use lattice_core::trace::{TelemetryResource, TraceContext};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::error::OpsError;
 
+/// Lattice subsystem a recorded span originated from.
+///
+/// This is orthogonal to `lattice_core::trace::TraceSpanKind`, which carries the
+/// OpenTelemetry client/server/producer/consumer role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub enum TraceSpanKind {
+pub enum TraceSpanSubsystem {
     Rpc,
     EventBus,
     Scheduler,
@@ -23,7 +25,7 @@ pub enum TraceSpanKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TraceSpan {
     pub name: String,
-    pub kind: TraceSpanKind,
+    pub subsystem: TraceSpanSubsystem,
     pub context: TraceContext,
     pub links: Vec<TraceContext>,
 }
@@ -60,13 +62,6 @@ pub struct CrossDomainDrainTelemetry {
     pub domain: PlacementDomainId,
     pub state: String,
     pub remaining_authorities: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct TelemetryResource {
-    pub service_kind: ServiceKind,
-    pub instance_id: InstanceId,
-    pub service_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

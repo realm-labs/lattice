@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use lattice_core::instance::InstanceId;
 use lattice_core::kind::ServiceKind;
+use lattice_core::trace::TelemetryResource;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -12,7 +13,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::config::{OtlpTraceConfig, TelemetryConfig};
 use crate::error::TelemetryInitError;
 use crate::guard::TelemetryGuard;
-use crate::resource::TelemetryResource;
+use crate::resource::to_otel_resource;
 
 #[derive(Debug, Clone)]
 pub struct LatticeTelemetry {
@@ -134,7 +135,7 @@ impl LatticeTelemetry {
             })?;
 
         Ok(SdkTracerProvider::builder()
-            .with_resource(self.resource.to_otel_resource())
+            .with_resource(to_otel_resource(&self.resource))
             .with_batch_exporter(exporter)
             .build())
     }

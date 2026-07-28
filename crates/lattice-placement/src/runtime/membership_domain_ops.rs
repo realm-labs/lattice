@@ -122,13 +122,7 @@ where
             return Ok(());
         }
         let node = session.record.node.clone();
-        if self
-            .store
-            .list_slots(&self.version.domain)
-            .await?
-            .iter()
-            .any(|slot| slot.owner.as_ref() == Some(&node))
-        {
+        if self.tracks_owned_slot(&node) || self.owns_persisted_slot(&node).await? {
             return Ok(());
         }
         let operation_id = session
@@ -156,6 +150,49 @@ where
             .ok_or(CoordinatorRuntimeError::UnknownSession)?
             .drain_ready = true;
         Ok(())
+    }
+
+    /// A claim or a mirrored slot that still names the node proves the drain is unfinished, so the
+    /// durable sweep is skipped for this tick. The converse is deliberately not taken: only the
+    /// durable scan may release a member, because leader state that lags a commit would otherwise
+    /// let a node leave a slot it still owns.
+    fn tracks_owned_slot(&self, node: &NodeKey) -> bool {
+        self.claims
+            .values()
+            .any(|claim| &claim.grant.owner == node)
+            || self
+                .slots
+                .values()
+                .any(|slot| slot.owner.as_ref() == Some(node))
+    }
+
+    async fn owns_persisted_slot(
+        &self,
+        node: &NodeKey,
+    ) -> Result<bool, CoordinatorRuntimeError> {
+        let mut cursor = None;
+        loop {
+            let page = self
+                .store
+                .list_slots_page(
+                    &self.version.domain,
+                    &[],
+                    cursor.as_ref(),
+                    self.config.reconciliation_page_size,
+                )
+                .await?;
+            if page
+                .records
+                .iter()
+                .any(|slot| slot.owner.as_ref() == Some(node))
+            {
+                return Ok(true);
+            }
+            let Some(next) = page.next_cursor else {
+                return Ok(false);
+            };
+            cursor = Some(next);
+        }
     }
 
     pub(super) async fn complete_member_drain(

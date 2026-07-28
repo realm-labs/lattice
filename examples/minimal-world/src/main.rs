@@ -29,7 +29,7 @@ use lattice_core::{
     },
     instance::InstanceId,
     service_kind,
-    trace::TraceContext,
+    trace::{TelemetryResource, TraceContext},
 };
 use lattice_eventbus::{
     local::{EventBus, LocalEventBus},
@@ -45,7 +45,7 @@ use lattice_ops::{
     scheduler::ServiceScheduler,
     telemetry::{
         InMemoryTelemetryExporter, OpenTelemetryPipeline, PlacementDomainTelemetry,
-        TelemetryRecorder, TelemetryResource,
+        TelemetryRecorder,
     },
 };
 use lattice_placement::storage::InMemoryPlacementStore;

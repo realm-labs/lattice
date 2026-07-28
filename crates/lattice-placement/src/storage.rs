@@ -21,24 +21,20 @@ use crate::{
     types::{PlacementSlot, PlacementSlotKey, PlacementSlotState, Revision},
 };
 
+pub mod counters;
 pub mod domain;
 pub mod etcd;
 mod memory_admin;
 mod memory_coordination;
+mod memory_page;
 mod memory_traits;
-mod page;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StorePage<T> {
-    pub records: Vec<T>,
-    pub next_offset: Option<usize>,
-    pub total: usize,
-}
+pub mod page;
 
 #[cfg(test)]
 mod tests;
 
-use page::bounded_page;
+use counters::{StoreReadCounters, StoreReadCounts};
+use page::{PageCursor, StorePage};
 
 use domain::{
     ActivateAuthority, AdminOperationRecord, AdoptAuthority, AllocateInitial, AuthorityCommit,
@@ -80,13 +76,14 @@ pub trait MembershipStore: CoordinatorLeaseStore {
     async fn get_membership_revision(&self) -> Result<Revision, StorageError>;
     async fn get_member(&self, node_id: &str) -> Result<Option<MemberRecord>, StorageError>;
     async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError>;
+    /// Reads one bounded page starting strictly after `cursor`. A backend has to answer this from a
+    /// bounded range request: a full scan that slices its own result in memory bounds the caller's
+    /// memory but not the read the durable store performs.
     async fn list_members_page(
         &self,
-        offset: usize,
+        cursor: Option<&PageCursor>,
         limit: usize,
-    ) -> Result<StorePage<MemberRecord>, StorageError> {
-        bounded_page(&self.list_members().await?, offset, limit)
-    }
+    ) -> Result<StorePage<MemberRecord>, StorageError>;
     async fn create_member(
         &self,
         guard: &MembershipLeaderGuard,
@@ -201,37 +198,28 @@ pub trait PlacementDomainStore: CoordinatorLeaseStore {
         &self,
         domain: &PlacementDomainId,
     ) -> Result<Vec<AdminOperationRecord>, StorageError>;
+    /// Reads one bounded page of slots starting strictly after `cursor`. `limit` bounds the records
+    /// the backend reads, not the records that survive `states`, because a durable range cannot
+    /// filter on a decoded value.
     async fn list_slots_page(
         &self,
         domain: &PlacementDomainId,
         states: &[PlacementSlotState],
-        offset: usize,
+        cursor: Option<&PageCursor>,
         limit: usize,
-    ) -> Result<StorePage<PlacementSlot>, StorageError> {
-        let records = self
-            .list_slots(domain)
-            .await?
-            .into_iter()
-            .filter(|slot| states.is_empty() || states.contains(&slot.state))
-            .collect::<Vec<_>>();
-        bounded_page(&records, offset, limit)
-    }
+    ) -> Result<StorePage<PlacementSlot>, StorageError>;
     async fn list_plans_page(
         &self,
         domain: &PlacementDomainId,
-        offset: usize,
+        cursor: Option<&PageCursor>,
         limit: usize,
-    ) -> Result<StorePage<RebalancePlan>, StorageError> {
-        bounded_page(&self.list_plans(domain).await?, offset, limit)
-    }
+    ) -> Result<StorePage<RebalancePlan>, StorageError>;
     async fn list_claims_page(
         &self,
         domain: &PlacementDomainId,
-        offset: usize,
+        cursor: Option<&PageCursor>,
         limit: usize,
-    ) -> Result<StorePage<LeasedClaim>, StorageError> {
-        bounded_page(&self.list_claims(domain).await?, offset, limit)
-    }
+    ) -> Result<StorePage<LeasedClaim>, StorageError>;
 
     async fn create_plan(
         &self,
@@ -328,6 +316,7 @@ pub trait PlacementDomainStore: CoordinatorLeaseStore {
 #[derive(Debug, Clone)]
 pub struct InMemoryPlacementStore {
     inner: Arc<Mutex<MemoryState>>,
+    counters: Arc<StoreReadCounters>,
     maximum_slots: usize,
     maximum_plans: usize,
     maximum_members: usize,

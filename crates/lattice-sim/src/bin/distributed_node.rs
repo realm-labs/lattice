@@ -147,6 +147,11 @@ struct MultiDomainHostArtifact {
     node_id: String,
     #[serde(with = "lattice_sim::serde_u128")]
     incarnation: u128,
+    /// The release this Coordinator host itself runs. A Coordinator is not a rollout participant,
+    /// so it never appears in the cluster's release state; publishing it is what lets a scenario
+    /// prove which release decided an upgrade it was not part of.
+    #[serde(default)]
+    release_id: u64,
     scopes: BTreeMap<String, ScopedLeadershipArtifact>,
 }
 

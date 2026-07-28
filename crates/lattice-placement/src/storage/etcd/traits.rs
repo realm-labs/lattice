@@ -28,8 +28,9 @@ use crate::{
             ReserveHandoff, ReserveMove, SingletonConfigCommit, SlotCommit, TransitionSlot,
             UpdateDomainMember, UpdateMember, UpdatePlan, UpdatePlanWithOperation,
         },
+        page::{PageCursor, StorePage},
     },
-    types::{PlacementSlot, PlacementSlotKey, Revision},
+    types::{PlacementSlot, PlacementSlotKey, PlacementSlotState, Revision},
 };
 
 #[async_trait]
@@ -81,6 +82,13 @@ impl MembershipStore for EtcdPlacementStore {
     }
     async fn list_members(&self) -> Result<Vec<MemberRecord>, StorageError> {
         EtcdPlacementStore::list_members(self).await
+    }
+    async fn list_members_page(
+        &self,
+        cursor: Option<&PageCursor>,
+        limit: usize,
+    ) -> Result<StorePage<MemberRecord>, StorageError> {
+        self.list_members_page_inner(cursor, limit).await
     }
     async fn create_member(
         &self,
@@ -249,6 +257,32 @@ impl PlacementDomainStore for EtcdPlacementStore {
         domain: &PlacementDomainId,
     ) -> Result<Vec<LeasedClaim>, StorageError> {
         EtcdPlacementStore::list_claims(self, domain).await
+    }
+    async fn list_slots_page(
+        &self,
+        domain: &PlacementDomainId,
+        states: &[PlacementSlotState],
+        cursor: Option<&PageCursor>,
+        limit: usize,
+    ) -> Result<StorePage<PlacementSlot>, StorageError> {
+        self.list_slots_page_inner(domain, states, cursor, limit)
+            .await
+    }
+    async fn list_plans_page(
+        &self,
+        domain: &PlacementDomainId,
+        cursor: Option<&PageCursor>,
+        limit: usize,
+    ) -> Result<StorePage<RebalancePlan>, StorageError> {
+        self.list_plans_page_inner(domain, cursor, limit).await
+    }
+    async fn list_claims_page(
+        &self,
+        domain: &PlacementDomainId,
+        cursor: Option<&PageCursor>,
+        limit: usize,
+    ) -> Result<StorePage<LeasedClaim>, StorageError> {
+        self.list_claims_page_inner(domain, cursor, limit).await
     }
     async fn get_automatic_settings(
         &self,
