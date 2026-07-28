@@ -161,14 +161,17 @@ impl BidirectionalLane {
     {
         let mut target_cache = ExactTargetCache::new(self.config.maximum_cached_exact_targets);
         let mut target_dictionary = ExactTargetDictionary::new();
-        let result = run_bidirectional_lane_inner(
+        // Keep the large lane state behind one allocation boundary so task cancellation cannot
+        // recursively drop the complete endpoint -> connection -> lane future tree on one worker
+        // stack.
+        let result = Box::pin(run_bidirectional_lane_inner(
             &self,
             receiver,
             stream,
             shutdown,
             &mut target_cache,
             &mut target_dictionary,
-        )
+        ))
         .await;
         let (hits, misses) = target_cache.take_metrics();
         self.association.record_exact_target_cache(hits, misses);

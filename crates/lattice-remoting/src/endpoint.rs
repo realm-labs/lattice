@@ -501,11 +501,21 @@ impl RemotingEndpoint {
                 }
             }
         }
-        connections.shutdown().await;
+        // Every connection owns a receiver for the endpoint-wide shutdown watch and can leave
+        // cleanly. Let those tasks observe the fence instead of aborting them immediately:
+        // aborting synchronously drops their nested async state on a Tokio worker stack.
+        while let Some(result) = connections.join_next().await {
+            let connection_result = result.map_err(EndpointError::Join)?;
+            observe_connection_result(&connection_result);
+        }
         Ok(())
     }
 
     async fn accept_connection(self: Arc<Self>, stream: TcpStream) -> Result<(), EndpointError> {
+        let mut shutdown = self.shutdown_tx.subscribe();
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         let validator = HandshakeValidator::new(
             self.local.clone(),
             self.config.max_frame_size,
@@ -514,10 +524,13 @@ impl RemotingEndpoint {
         stream.set_nodelay(true).map_err(WireError::Io)?;
         #[cfg(feature = "tls")]
         let (stream, peer_certificate) = if let Some(security) = &self.security {
-            let stream = tokio_rustls::TlsAcceptor::from(security.server.clone())
-                .accept(stream)
-                .await
-                .map_err(|_| WireError::Tls("server handshake failed"))?;
+            let stream = tokio::select! {
+                biased;
+                () = wait_for_shutdown(&mut shutdown) => return Ok(()),
+                result = tokio_rustls::TlsAcceptor::from(security.server.clone()).accept(stream) => {
+                    result.map_err(|_| WireError::Tls("server handshake failed"))?
+                }
+            };
             let certificate = stream
                 .get_ref()
                 .1
@@ -533,20 +546,27 @@ impl RemotingEndpoint {
         let (stream, peer_certificate) = (EndpointStream::Plain(stream), Option::<Vec<u8>>::None);
         let mut connection =
             FramedConnection::new(stream, FrameCodec::new(self.config.max_frame_size)?);
-        let first_frame = connection.read_frame().await?;
+        let first_frame = tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown) => return Ok(()),
+            result = connection.read_frame() => result?,
+        };
         if first_frame.kind == FrameKind::BootstrapRequest {
             return self
                 .accept_bootstrap(connection, peer_certificate.as_deref(), first_frame)
                 .await;
         }
-        let (handshake, peer_catalogue) = negotiate_inbound_from_frame(
-            &mut connection,
-            first_frame,
-            &validator,
-            &self.catalogue,
-            self.config.max_protocols_per_peer,
-        )
-        .await?;
+        let (handshake, peer_catalogue) = tokio::select! {
+            biased;
+            () = wait_for_shutdown(&mut shutdown) => return Ok(()),
+            result = negotiate_inbound_from_frame(
+                &mut connection,
+                first_frame,
+                &validator,
+                &self.catalogue,
+                self.config.max_protocols_per_peer,
+            ) => result?,
+        };
         #[cfg(feature = "tls")]
         {
             if let Some(certificate) = peer_certificate {
@@ -585,7 +605,6 @@ impl RemotingEndpoint {
                 }
                 error => EndpointError::Association(error),
             })?;
-        let mut shutdown = self.shutdown_tx.subscribe();
         let result = self
             .run_lane_connection(
                 association.clone(),
