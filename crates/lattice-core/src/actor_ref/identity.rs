@@ -172,9 +172,13 @@ impl ActorPath {
     }
 
     pub fn child(&self, segment: impl Into<String>) -> Result<Self, ReferenceError> {
-        let mut segments = self.segments.iter().cloned().collect::<Vec<_>>();
-        segments.push(segment.into());
-        Self::from_segments(segments, self.is_system())
+        Self::from_segments(
+            self.segments
+                .iter()
+                .cloned()
+                .chain(std::iter::once(segment.into())),
+            self.is_system(),
+        )
     }
 
     pub fn segments(&self) -> impl ExactSizeIterator<Item = &str> {
