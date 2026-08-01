@@ -132,6 +132,83 @@ struct FailUntilStore {
     applied: Arc<Semaphore>,
 }
 
+#[derive(Clone)]
+struct FirstFlushGateStore {
+    attempts: Arc<AtomicUsize>,
+    first_entered: Arc<Semaphore>,
+    release_first: Arc<Semaphore>,
+    applied: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct FailOnceThenAcknowledgeStore {
+    attempts: Arc<AtomicUsize>,
+    first_failed: Arc<Semaphore>,
+    applied: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl PreparedWriteStore for FailOnceThenAcknowledgeStore {
+    async fn flush(
+        &self,
+        writes: Vec<PreparedDocumentWrite>,
+    ) -> Result<FlushOutcome, MongoStoreError> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first_failed.add_permits(1);
+            return Err(MongoStoreError::new("transient storage failure"));
+        }
+        self.applied.add_permits(1);
+        Ok(FlushOutcome {
+            documents: writes
+                .into_iter()
+                .map(|write| {
+                    (
+                        write.token,
+                        DocumentWriteOutcome::Applied {
+                            previous_version: write.expected_version,
+                            new_version: write.expected_version + 1,
+                            updated_at_ms: 59,
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
+}
+
+#[async_trait]
+impl PreparedWriteStore for FirstFlushGateStore {
+    async fn flush(
+        &self,
+        writes: Vec<PreparedDocumentWrite>,
+    ) -> Result<FlushOutcome, MongoStoreError> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first_entered.add_permits(1);
+            self.release_first
+                .acquire()
+                .await
+                .expect("first-flush release signal should remain open")
+                .forget();
+        }
+        self.applied.add_permits(1);
+        Ok(FlushOutcome {
+            documents: writes
+                .into_iter()
+                .map(|write| {
+                    (
+                        write.token,
+                        DocumentWriteOutcome::Applied {
+                            previous_version: write.expected_version,
+                            new_version: write.expected_version + 1,
+                            updated_at_ms: 57,
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
+}
+
 #[async_trait]
 impl PreparedWriteStore for FailUntilStore {
     async fn flush(
@@ -162,6 +239,9 @@ impl PreparedWriteStore for FailUntilStore {
 
 #[derive(Debug, lattice_actor::Message)]
 struct Persist;
+
+#[derive(Debug, lattice_actor::Message)]
+struct Mutate(&'static str);
 
 #[derive(Debug, lattice_actor::Message)]
 struct AbortPersist;
@@ -296,11 +376,31 @@ struct SelfSchedulingActor {
     coordinator: MongoPersistenceCoordinator,
     document: Tracked<TestDocument>,
     store: Arc<dyn PreparedWriteStore>,
+    defer_first_scan: bool,
 }
 
 impl Actor for SelfSchedulingActor {
     type Error = ActorError;
     type Behavior = ::lattice_actor::state_machine::Stateless;
+
+    fn started(
+        &mut self,
+        context: &mut ActorContext<Self>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.coordinator.spawn_dirty_wakeup(context, || Persist);
+        async { Ok(()) }
+    }
+}
+
+impl Handler<Mutate> for SelfSchedulingActor {
+    async fn handle(
+        &mut self,
+        _context: &mut HandlerContext<'_, Self>,
+        message: Mutate,
+    ) -> Result<(), Self::Error> {
+        self.document.write().value = message.0.to_owned();
+        Ok(())
+    }
 }
 
 impl Handler<Persist> for SelfSchedulingActor {
@@ -309,9 +409,15 @@ impl Handler<Persist> for SelfSchedulingActor {
         context: &mut HandlerContext<'_, Self>,
         _message: Persist,
     ) -> Result<(), Self::Error> {
+        self.coordinator.begin_dirty_message();
+        let budget = if std::mem::take(&mut self.defer_first_scan) {
+            ScanBudget::new(1, 0, Duration::from_secs(1))
+        } else {
+            ScanBudget::generous()
+        };
         let prepared = self
             .coordinator
-            .prepare(ScanBudget::generous(), |preparation| {
+            .prepare(budget, |preparation| {
                 preparation.scan_tracked(&self.document)
             })
             .map_err(ActorError::from_error)?;
@@ -336,6 +442,13 @@ impl Handler<MongoFlushCompleted> for SelfSchedulingActor {
 }
 
 fn self_scheduling_actor(store: Arc<dyn PreparedWriteStore>) -> SelfSchedulingActor {
+    self_scheduling_actor_with_deferred_first_scan(store, false)
+}
+
+fn self_scheduling_actor_with_deferred_first_scan(
+    store: Arc<dyn PreparedWriteStore>,
+    defer_first_scan: bool,
+) -> SelfSchedulingActor {
     let mut coordinator = MongoPersistenceCoordinator::with_retry_policy(
         5,
         RetryPolicy {
@@ -345,7 +458,7 @@ fn self_scheduling_actor(store: Arc<dyn PreparedWriteStore>) -> SelfSchedulingAc
             jitter_percent: 0,
         },
     );
-    let mut document = coordinator
+    let document = coordinator
         .track_loaded(LoadedDocument {
             version: 2,
             updated_at_ms: 7,
@@ -355,16 +468,16 @@ fn self_scheduling_actor(store: Arc<dyn PreparedWriteStore>) -> SelfSchedulingAc
             },
         })
         .expect("fixture document should attach");
-    document.write().value = "new".to_owned();
     SelfSchedulingActor {
         coordinator,
         document,
         store,
+        defer_first_scan,
     }
 }
 
 #[tokio::test]
-async fn a_failed_flush_retries_itself_without_any_further_external_message() {
+async fn a_mutation_wakes_persistence_and_failed_flushes_retry_without_a_tick() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let applied = Arc::new(Semaphore::new(0));
     let store = Arc::new(FailUntilStore {
@@ -378,9 +491,9 @@ async fn a_failed_flush_retries_itself_without_any_further_external_message() {
     );
 
     handle
-        .tell(Persist)
+        .tell(Mutate("new"))
         .await
-        .expect("the single external persist should enqueue");
+        .expect("the business mutation should enqueue");
 
     tokio::time::timeout(Duration::from_secs(5), applied.acquire())
         .await
@@ -388,6 +501,110 @@ async fn a_failed_flush_retries_itself_without_any_further_external_message() {
         .expect("apply signal should remain open")
         .forget();
     assert_eq!(attempts.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn an_incomplete_clean_scan_schedules_its_next_pass_without_a_tick() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let applied = Arc::new(Semaphore::new(0));
+    let store = Arc::new(FailUntilStore {
+        failures: 0,
+        attempts: attempts.clone(),
+        applied: applied.clone(),
+    });
+    let handle = spawn_actor(
+        self_scheduling_actor_with_deferred_first_scan(store, true),
+        MailboxConfig::bounded(8).with_deferred_capacity(4),
+    );
+
+    handle
+        .tell(Mutate("new"))
+        .await
+        .expect("business mutation should enqueue");
+    tokio::time::timeout(Duration::from_secs(1), applied.acquire())
+        .await
+        .expect("the automatically resumed scan should reach storage")
+        .expect("apply signal should remain open")
+        .forget();
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_mutation_during_an_in_flight_flush_is_released_after_completion() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let first_entered = Arc::new(Semaphore::new(0));
+    let release_first = Arc::new(Semaphore::new(0));
+    let applied = Arc::new(Semaphore::new(0));
+    let store = Arc::new(FirstFlushGateStore {
+        attempts: attempts.clone(),
+        first_entered: first_entered.clone(),
+        release_first: release_first.clone(),
+        applied: applied.clone(),
+    });
+    let handle = spawn_actor(
+        self_scheduling_actor(store),
+        MailboxConfig::bounded(8).with_deferred_capacity(4),
+    );
+
+    handle
+        .tell(Mutate("first"))
+        .await
+        .expect("first mutation should enqueue");
+    tokio::time::timeout(Duration::from_secs(1), first_entered.acquire())
+        .await
+        .expect("first flush should start")
+        .expect("first-flush signal should remain open")
+        .forget();
+
+    handle
+        .tell(Mutate("second"))
+        .await
+        .expect("second mutation should enqueue while the flush is in flight");
+    release_first.add_permits(1);
+
+    tokio::time::timeout(Duration::from_secs(1), applied.acquire_many(2))
+        .await
+        .expect("both mutation epochs should reach storage")
+        .expect("apply signal should remain open")
+        .forget();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_mutation_during_retry_backoff_survives_the_retained_exact_write() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let first_failed = Arc::new(Semaphore::new(0));
+    let applied = Arc::new(Semaphore::new(0));
+    let store = Arc::new(FailOnceThenAcknowledgeStore {
+        attempts: attempts.clone(),
+        first_failed: first_failed.clone(),
+        applied: applied.clone(),
+    });
+    let handle = spawn_actor(
+        self_scheduling_actor(store),
+        MailboxConfig::bounded(8).with_deferred_capacity(4),
+    );
+
+    handle
+        .tell(Mutate("first"))
+        .await
+        .expect("first mutation should enqueue");
+    tokio::time::timeout(Duration::from_secs(1), first_failed.acquire())
+        .await
+        .expect("first flush should fail")
+        .expect("failure signal should remain open")
+        .forget();
+    handle
+        .tell(Mutate("second"))
+        .await
+        .expect("second mutation should enqueue during backoff");
+
+    tokio::time::timeout(Duration::from_secs(1), applied.acquire_many(2))
+        .await
+        .expect("the exact retry and newer mutation should both reach storage")
+        .expect("apply signal should remain open")
+        .forget();
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
 }
 
 struct StoppingDrainActor {

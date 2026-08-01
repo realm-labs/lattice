@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use lattice_actor::context::PipeTaskHandle;
 
+use crate::document::tracked::{Tracked, TrackedMutationSignal};
 use crate::error::MongoStoreError;
 use crate::scan::{ScanBudget, ScanError, ScanWorkMetrics};
 
@@ -139,6 +140,8 @@ pub struct PersistenceReport {
 #[derive(Debug)]
 pub struct MongoPersistenceCoordinator {
     documents: BTreeMap<MongoDocumentKey, DocumentState>,
+    pub(in crate::persistence) mutation_signal: TrackedMutationSignal,
+    pub(in crate::persistence) dirty_message_claimed: bool,
     activation_epoch: u64,
     next_sequence: u64,
     in_flight: Option<InFlightCommit>,
@@ -163,6 +166,8 @@ impl MongoPersistenceCoordinator {
     pub fn with_retry_policy(activation_epoch: u64, retry_policy: RetryPolicy) -> Self {
         Self {
             documents: BTreeMap::new(),
+            mutation_signal: TrackedMutationSignal::new(),
+            dirty_message_claimed: false,
             activation_epoch,
             next_sequence: 1,
             in_flight: None,
@@ -215,6 +220,10 @@ impl MongoPersistenceCoordinator {
         self.documents
             .get(key)
             .map(|state| (state.version, state.updated_at_ms))
+    }
+
+    pub(super) fn tracked<T>(&self, value: T) -> Tracked<T> {
+        Tracked::signaled(value, self.mutation_signal.clone())
     }
 }
 

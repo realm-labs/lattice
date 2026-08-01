@@ -262,6 +262,17 @@
 //! doubles, caps at 2 seconds, and removes up to half of each step at random so
 //! that actors recovering from one outage do not retry in lockstep.
 //!
+//! Periodic persistence ticks are optional for coordinator-created
+//! [`document::tracked::Tracked`] values. An actor may call
+//! [`persistence::coordinator::MongoPersistenceCoordinator::spawn_dirty_wakeup`]
+//! from `Actor::started` to coalesce tracked mutable accesses into one
+//! caller-chosen persistence message. Its handler calls
+//! [`persistence::coordinator::MongoPersistenceCoordinator::begin_dirty_message`]
+//! before preparing and dispatching. The wakeup pump sleeps while state is
+//! clean and waits for mailbox capacity rather than dropping the only dirty
+//! edge. Mutations that arrive during an in-flight write are retained and
+//! released after its completion.
+//!
 //! A retained retry is the actor's only copy of that dirty state, so both
 //! methods also post a caller-chosen message back to the actor when the backoff
 //! expires. Handling it must repeat the same preparation and dispatch. The

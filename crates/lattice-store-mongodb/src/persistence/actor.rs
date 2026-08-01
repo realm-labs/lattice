@@ -47,6 +47,45 @@ pub enum ActorPersistenceError {
 }
 
 impl MongoPersistenceCoordinator {
+    /// Starts one activation-scoped pump that turns coalesced tracked
+    /// mutations into a dedicated Actor message.
+    ///
+    /// The pump consumes no timer ticks while the actor is clean. It waits for
+    /// normal-mailbox capacity rather than dropping the only dirty edge when
+    /// the mailbox is temporarily full. `begin_dirty_message` must be called
+    /// at the start of the message handler.
+    pub fn spawn_dirty_wakeup<A, M, F>(&self, context: &mut ActorContext<A>, mut make_message: F)
+    where
+        A: Actor + Handler<M>,
+        <A as lattice_actor::traits::Actor>::Behavior: lattice_actor::state_machine::Accepts<M>,
+        M: Message,
+        F: FnMut() -> M + Send + 'static,
+    {
+        let signal = self.mutation_signal.clone();
+        if !signal.start_pump() {
+            return;
+        }
+        let handle = context.self_handle();
+        context.spawn_scoped(async move {
+            loop {
+                signal.wait_to_queue().await;
+                if handle.tell(make_message()).await.is_err() {
+                    signal.cancel_queued();
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Acknowledges a dedicated persistence message before it prepares work.
+    /// Retry timers may deliver the same message without a dirty edge, so the
+    /// return value is diagnostic rather than an instruction to skip the pass.
+    pub fn begin_dirty_message(&mut self) -> bool {
+        let claimed = self.mutation_signal.begin_message();
+        self.dirty_message_claimed |= claimed;
+        claimed
+    }
+
     /// Dispatches an already prepared two-phase flush through the actor's
     /// bounded `pipe_to_self` facility.
     pub fn dispatch_prepared<A>(
@@ -103,10 +142,9 @@ impl MongoPersistenceCoordinator {
     /// preparation and dispatch that produced `prepared`.
     ///
     /// One wakeup is outstanding per backoff deadline, so repeated dispatches
-    /// during one backoff window do not accumulate timers. Delivery uses the
-    /// normal mailbox lane and is therefore best effort: a saturated mailbox
-    /// drops the notification, and the next dispatch after the deadline has
-    /// passed arms a replacement.
+    /// during one backoff window do not accumulate timers. Delivery waits for
+    /// normal-mailbox capacity, so transient backpressure cannot strand the
+    /// retained write.
     pub fn dispatch_prepared_with_retry<A, M>(
         &mut self,
         context: &mut ActorContext<A>,
@@ -120,7 +158,32 @@ impl MongoPersistenceCoordinator {
             + lattice_actor::state_machine::Accepts<M>,
         M: Message,
     {
+        let replays_retained_write = self.has_pending_retry();
+        let scan_incomplete = !prepared.scan_complete;
+        let dirty_message_claimed = std::mem::take(&mut self.dirty_message_claimed);
+        if prepared.request.is_some() {
+            self.mutation_signal.suspend();
+        }
+        // A retained exact write predates any mutation claimed by its retry
+        // message. Preserve that edge so its newer epoch is scanned after the
+        // exact operation completes. An incomplete bounded scan likewise
+        // needs another pass even when no further business mutation occurs.
+        if (replays_retained_write && dirty_message_claimed) || scan_incomplete {
+            self.mutation_signal.mark_dirty();
+        }
         let status = self.dispatch_prepared(context, store, prepared);
+        match &status {
+            Ok(PersistenceStatus::InFlight | PersistenceStatus::Backoff(_)) => {
+                self.mutation_signal.suspend();
+            }
+            Ok(PersistenceStatus::Incomplete) => {
+                self.mutation_signal.resume();
+                self.mutation_signal.mark_dirty();
+            }
+            Ok(PersistenceStatus::Clean) => self.mutation_signal.resume(),
+            Err(_) if self.has_pending_retry() => self.mutation_signal.suspend(),
+            Err(_) => self.mutation_signal.resume(),
+        }
         self.schedule_retry_wakeup(context, retry_message);
         status
     }
@@ -140,6 +203,11 @@ impl MongoPersistenceCoordinator {
         M: Message,
     {
         let status = self.apply_completion(completion);
+        if self.has_in_flight() || self.has_pending_retry() || self.has_blocking_conflict() {
+            self.mutation_signal.suspend();
+        } else {
+            self.mutation_signal.resume();
+        }
         self.schedule_retry_wakeup(context, retry_message);
         status
     }
@@ -159,7 +227,11 @@ impl MongoPersistenceCoordinator {
         let Some(delay) = self.arm_retry_wakeup() else {
             return false;
         };
-        context.notify_after(delay, retry_message);
+        let handle = context.self_handle();
+        context.spawn_scoped(async move {
+            tokio::time::sleep(delay).await;
+            let _ = handle.tell(retry_message).await;
+        });
         true
     }
 

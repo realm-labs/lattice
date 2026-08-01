@@ -48,7 +48,7 @@ impl MongoPersistenceCoordinator {
     {
         let (value, meta) = loaded.split();
         self.attach_loaded_tracked(&value, 0, meta)?;
-        Ok(Tracked::clean(value))
+        Ok(self.tracked(value))
     }
 
     #[doc(hidden)]
@@ -85,7 +85,7 @@ impl MongoPersistenceCoordinator {
                 conflict: None,
             },
         );
-        Ok(Tracked::clean(value))
+        Ok(self.tracked(value))
     }
 
     #[doc(hidden)]
@@ -130,7 +130,7 @@ impl MongoPersistenceCoordinator {
         let mut tracked = Vec::with_capacity(pending.len());
         for (key, state, value) in pending {
             self.documents.insert(key, state);
-            tracked.push(Tracked::clean(value));
+            tracked.push(self.tracked(value));
         }
         Ok(tracked)
     }
@@ -175,7 +175,7 @@ impl MongoPersistenceCoordinator {
         let mut tracked = Vec::with_capacity(pending.len());
         for (key, state, value) in pending {
             self.documents.insert(key, state);
-            tracked.push(Tracked::clean(value));
+            tracked.push(self.tracked(value));
         }
         Ok(tracked)
     }
@@ -192,7 +192,9 @@ impl MongoPersistenceCoordinator {
             },
             None,
             DocumentPresence::PendingCreate { mode },
-        )
+        )?;
+        self.mutation_signal.mark_dirty();
+        Ok(())
     }
 
     pub fn track_new<D>(
@@ -204,7 +206,7 @@ impl MongoPersistenceCoordinator {
         D: MongoScan,
     {
         self.attach_new(&value, mode)?;
-        Ok(Tracked::clean(value))
+        Ok(self.tracked(value))
     }
 
     /// Tracks a document known to be absent from storage using its current
@@ -225,7 +227,7 @@ impl MongoPersistenceCoordinator {
                 mode: CreateMode::InsertOnly,
             },
         )?;
-        Ok(Tracked::clean(value))
+        Ok(self.tracked(value))
     }
 
     fn attach<D>(

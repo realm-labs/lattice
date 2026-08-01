@@ -31,6 +31,9 @@ impl MongoPersistenceCoordinator {
         }
         self.documents.remove(&key);
         self.clear_last_error_if_recovered();
+        if !self.has_blocking_conflict() {
+            self.mutation_signal.resume();
+        }
         Ok(())
     }
 
@@ -84,7 +87,10 @@ impl MongoPersistenceCoordinator {
             },
         );
         self.clear_last_error_if_recovered();
-        Ok(Tracked::clean(value))
+        if !self.has_blocking_conflict() {
+            self.mutation_signal.resume();
+        }
+        Ok(self.tracked(value))
     }
 
     /// Clears a definitive document rejection so the current business value is
@@ -104,6 +110,7 @@ impl MongoPersistenceCoordinator {
         if state.rejection.take().is_none() {
             return Err(PersistenceError::DocumentNotRejected(key));
         }
+        self.mutation_signal.mark_dirty();
         self.clear_last_error_if_recovered();
         Ok(())
     }
@@ -168,7 +175,7 @@ impl MongoPersistenceCoordinator {
             },
         );
         self.clear_last_error_if_recovered();
-        Ok(Tracked::clean(value))
+        Ok(self.tracked(value))
     }
 
     /// Stops retrying an exact write whose outcome can no longer be resolved
@@ -254,7 +261,7 @@ impl MongoPersistenceCoordinator {
             .map(|rejection| rejection.error.as_str())
     }
 
-    pub(super) fn has_blocking_conflict(&self) -> bool {
+    pub(in crate::persistence) fn has_blocking_conflict(&self) -> bool {
         self.blocking_conflict().is_some()
     }
 
