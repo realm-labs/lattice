@@ -1,11 +1,11 @@
 use super::{
-    Actor, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc, AskError,
+    Actor, ActorId, ActorLoader, ActorProtocolBinding, ActorRef, ActorRegistry, Arc, AskError,
     AssociationKey, AssociationManager, BTreeMap, Bytes, ClusterRouterError, DomainLogicalRouter,
     EntityConfig, EntityRef, Instant, LOGICAL_RESOLVE_MESSAGE_ID, LogicPlacementState,
     LogicalBufferConfig, LogicalEntityTarget, LogicalRouter, LogicalSingletonTarget, Mutex,
-    NodeKey, OutboundMessaging, PlacementSlotKey, Protocol, ProtocolFingerprint,
-    RemoteMessageError, RouteBuffer, ShardMapper, SingletonConfig, SingletonRef, WatchError,
-    Xxh3V1ShardMapper, async_trait,
+    NodeKey, OutboundMessaging, PlacementSlotKey, PlacementSlotState, Protocol,
+    ProtocolFingerprint, RemoteMessageError, RouteBuffer, ShardMapper, SingletonConfig,
+    SingletonRef, WatchError, Xxh3V1ShardMapper, async_trait,
     entity::{EntityRouteHost, RouteFailureLog},
     peers::PeerReconciler,
     proxy::EntityProxyRoute,
@@ -98,6 +98,33 @@ impl DomainLogicalRouter {
         let domain = config.domain.clone();
         let entity_type = config.entity_type.clone();
         let key = (domain.clone(), entity_type.clone());
+        let authority_state = self.state.clone();
+        let authority_node = self.local_node.clone();
+        let authority_domain = domain.clone();
+        let authority_entity_type = entity_type.clone();
+        let authority_mapper = mapper.clone();
+        let authority_resolver_name =
+            format!("entity:{}:{}", domain.as_str(), entity_type.as_str());
+        registry.install_fencing_token_resolver(authority_resolver_name, move |actor_id| {
+            let ActorId::Bytes(entity_id) = actor_id else {
+                return None;
+            };
+            let entity_id = lattice_core::actor_ref::EntityId::new(entity_id.clone()).ok()?;
+            let shard_id = authority_mapper.shard_for(&entity_id).ok()?;
+            let key = PlacementSlotKey::Shard {
+                domain: authority_domain.clone(),
+                entity_type: authority_entity_type.clone(),
+                shard_id,
+            };
+            let state = authority_state
+                .lock()
+                .expect("logic placement state poisoned");
+            let slot = state.slot(&key)?;
+            (slot.owner.as_ref() == Some(&authority_node)
+                && slot.state == PlacementSlotState::Running
+                && state.admission_open(&key))
+            .then_some(slot.assignment_generation.get())
+        });
         if self
             .entities
             .insert(
@@ -198,6 +225,31 @@ impl DomainLogicalRouter {
         let config_fingerprint = config.fingerprint();
         let protocol_id = config.protocol_id;
         let key = (domain.clone(), kind.clone());
+        let authority_state = self.state.clone();
+        let authority_node = self.local_node.clone();
+        let authority_domain = domain.clone();
+        let authority_kind = kind.clone();
+        let authority_resolver_name = format!("singleton:{}:{}", domain.as_str(), kind.as_str());
+        registry.install_fencing_token_resolver(authority_resolver_name, move |actor_id| {
+            let ActorId::Str(actor_kind) = actor_id else {
+                return None;
+            };
+            if actor_kind != authority_kind.as_str() {
+                return None;
+            }
+            let key = PlacementSlotKey::Singleton {
+                domain: authority_domain.clone(),
+                kind: authority_kind.clone(),
+            };
+            let state = authority_state
+                .lock()
+                .expect("logic placement state poisoned");
+            let slot = state.slot(&key)?;
+            (slot.owner.as_ref() == Some(&authority_node)
+                && slot.state == PlacementSlotState::Running
+                && state.admission_open(&key))
+            .then_some(slot.assignment_generation.get())
+        });
         if self
             .singletons
             .insert(

@@ -5,8 +5,8 @@ use mongodb::bson::Bson;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::{
-    ConflictPolicy, DocumentPresence, MongoPersistenceCoordinator, PersistenceConflictKind,
-    PersistenceError, RetryPolicy,
+    ConflictPolicy, DocumentPresence, MongoPersistenceCoordinator, PLACEMENT_STORAGE_EPOCH_BASE,
+    PersistenceConflictKind, PersistenceError, RetryPolicy, placement_storage_epoch,
 };
 use crate::document::{LoadedDocument, LoadedDocumentMeta};
 use crate::error::MongoStoreError;
@@ -25,6 +25,20 @@ mod registration;
 mod rejection;
 mod retry;
 mod scanning;
+
+#[test]
+fn placement_epochs_dominate_legacy_process_local_epochs_and_preserve_order() {
+    assert_eq!(
+        placement_storage_epoch(1).unwrap(),
+        PLACEMENT_STORAGE_EPOCH_BASE + 1
+    );
+    assert!(placement_storage_epoch(2).unwrap() > placement_storage_epoch(1).unwrap());
+    assert!(placement_storage_epoch(1).unwrap() > 2);
+    assert!(matches!(
+        placement_storage_epoch(i64::MAX as u64),
+        Err(PersistenceError::ActorFencingTokenOutOfRange { .. })
+    ));
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, MongoDocumentDerive, MongoScan)]
 #[mongo(collection = "coordinator_test")]

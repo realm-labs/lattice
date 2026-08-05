@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeSet,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -491,6 +491,7 @@ async fn stale_generation_never_reaches_entity_loader() {
         binding.as_ref(),
     ));
     let loads = Arc::new(AtomicUsize::new(0));
+    let observed_token = Arc::new(AtomicU64::new(0));
     let mut router = DomainLogicalRouter::new(
         local_node.clone(),
         state,
@@ -506,7 +507,10 @@ async fn stale_generation_never_reaches_entity_loader() {
             entity_config.clone(),
             registry,
             binding,
-            CountingLoader(loads.clone()),
+            TokenRecordingLoader {
+                loads: loads.clone(),
+                token: observed_token.clone(),
+            },
         )
         .unwrap();
     let reference = entity_config.entity_ref(cluster_id, entity_id).unwrap();
@@ -547,6 +551,7 @@ async fn stale_generation_never_reaches_entity_loader() {
         Value(42)
     );
     assert_eq!(loads.load(Ordering::SeqCst), 1);
+    assert_eq!(observed_token.load(Ordering::SeqCst), 2);
     shutdown_tx.send(true).unwrap();
     logic_task.await.unwrap().unwrap();
 }

@@ -1,8 +1,10 @@
 use std::{
+    collections::BTreeMap,
     fmt,
     future::Future,
+    num::NonZeroU64,
     sync::{
-        Arc, OnceLock,
+        Arc, OnceLock, RwLock,
         atomic::{AtomicU8, Ordering},
     },
     time::Duration,
@@ -79,8 +81,39 @@ pub struct ActorRegistry<A: Actor> {
     exact_entries: Arc<DashMap<ActivationId, ExactRegistryEntry<A>>>,
     quarantined: Arc<DashMap<LocalActorRef, QuarantinedEntry<A>>>,
     actor_system: Arc<OnceLock<ActorSystem>>,
+    fencing_token_resolvers: Arc<RwLock<BTreeMap<String, ActorFencingTokenResolver>>>,
     observer: ActorObserverHandle,
     spawner: ActorSpawner,
+}
+
+type ActorFencingTokenResolver = Arc<dyn Fn(&ActorId) -> Option<u64> + Send + Sync + 'static>;
+
+/// Monotonic authority generation attached to one placement-managed Actor activation.
+///
+/// The token is produced by the framework authority layer and consumed by storage integrations;
+/// application Actors do not allocate or increment it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ActorFencingToken(NonZeroU64);
+
+impl ActorFencingToken {
+    fn new(value: u64) -> Option<Self> {
+        NonZeroU64::new(value).map(Self)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Proof that one external authority generation was validated by this Registry.
+///
+/// Only framework authority adapters can obtain this proof. Application callers use
+/// [`ActorRegistry::get_or_load`], which resolves authority automatically.
+#[doc(hidden)]
+pub struct ValidatedActorAuthority {
+    actor_id: ActorId,
+    fencing_token: ActorFencingToken,
+    registry_identity: usize,
 }
 
 struct ExactRegistryEntry<A: Actor> {
@@ -104,6 +137,15 @@ pub struct ActorCreateContext {
     pub actor_kind: ActorKind,
     pub actor_id: ActorId,
     pub service: ServiceContext,
+    fencing_token: Option<ActorFencingToken>,
+}
+
+impl ActorCreateContext {
+    /// Returns the placement authority generation for this activation, when it is managed by an
+    /// external authority such as a shard or singleton placement slot.
+    pub const fn fencing_token(&self) -> Option<ActorFencingToken> {
+        self.fencing_token
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +242,7 @@ impl<A: Actor> ActorRegistry<A> {
             exact_entries: Arc::new(DashMap::new()),
             quarantined: Arc::new(DashMap::new()),
             actor_system: Arc::new(OnceLock::new()),
+            fencing_token_resolvers: Arc::new(RwLock::new(BTreeMap::new())),
             observer: ActorObserverHandle::default(),
             spawner: ActorSpawner::task_per_actor(),
         }
@@ -225,6 +268,7 @@ impl<A: Actor> ActorRegistry<A> {
             exact_entries: Arc::new(DashMap::new()),
             quarantined: Arc::new(DashMap::new()),
             actor_system: Arc::new(OnceLock::new()),
+            fencing_token_resolvers: Arc::new(RwLock::new(BTreeMap::new())),
             observer: ActorObserverHandle::default(),
             spawner: ActorSpawner::task_per_actor(),
         }
@@ -242,6 +286,23 @@ impl<A: Actor> ActorRegistry<A> {
 
     pub fn kind(&self) -> &ActorKind {
         &self.kind
+    }
+
+    /// Installs an authority resolver used by direct registry activations.
+    ///
+    /// A Registry may host several placement routes, so differently named resolvers are composed.
+    /// Reinstalling the same name replaces its previous authority view. Returning `None` means
+    /// this resolver does not own the Actor ID; if no installed resolver owns it, a new activation
+    /// is rejected before its loader runs.
+    #[doc(hidden)]
+    pub fn install_fencing_token_resolver<F>(&self, resolver_name: impl Into<String>, resolver: F)
+    where
+        F: Fn(&ActorId) -> Option<u64> + Send + Sync + 'static,
+    {
+        self.fencing_token_resolvers
+            .write()
+            .expect("actor fencing token resolver poisoned")
+            .insert(resolver_name.into(), Arc::new(resolver));
     }
 
     pub fn protocol_id(&self) -> Option<ProtocolId> {
@@ -579,11 +640,10 @@ impl<A: Actor> ActorRegistry<A> {
         Ok(())
     }
 
-    pub async fn get(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
-        self.get_running(actor_id)
-    }
-
     pub fn get_running(&self, actor_id: &ActorId) -> Option<ActorHandle<A>> {
+        if self.resolve_fencing_token(actor_id).is_err() {
+            return None;
+        }
         match self.entries.get(actor_id).as_deref() {
             Some(RegistryEntry::Running(handle))
                 if is_business_admitted(handle.lifecycle_state()) =>
@@ -912,11 +972,7 @@ impl<A: Actor> ActorRegistry<A> {
     where
         F: ActorFactory<A>,
     {
-        let ctx = ActorCreateContext {
-            actor_kind: self.kind.clone(),
-            actor_id: actor_id.clone(),
-            service: self.config.service.clone(),
-        };
+        let ctx = self.create_context(&actor_id)?;
         self.get_or_activate(actor_id, || async move { factory.create(ctx).await })
             .await
     }
@@ -929,13 +985,116 @@ impl<A: Actor> ActorRegistry<A> {
     where
         L: ActorLoader<A>,
     {
-        let ctx = ActorCreateContext {
+        let ctx = self.create_context(&actor_id)?;
+        self.get_or_activate(actor_id, || async move { loader.load(ctx).await })
+            .await
+    }
+
+    /// Validates the exact authority generation carried by a framework routing target.
+    #[doc(hidden)]
+    pub fn validate_actor_authority(
+        &self,
+        actor_id: ActorId,
+        expected_generation: u64,
+    ) -> Result<ValidatedActorAuthority, ActorActivationError> {
+        let fencing_token = self
+            .resolve_fencing_token(&actor_id)?
+            .ok_or_else(|| authority_error("actor registry has no external authority resolver"))?;
+        if fencing_token.get() != expected_generation {
+            return Err(authority_error(
+                "actor routing generation does not match current placement authority",
+            ));
+        }
+        Ok(ValidatedActorAuthority {
+            actor_id,
+            fencing_token,
+            registry_identity: self.registry_identity(),
+        })
+    }
+
+    /// Loads an Actor using an authority proof issued by this Registry.
+    #[doc(hidden)]
+    pub async fn load_with_validated_authority<L>(
+        &self,
+        authority: ValidatedActorAuthority,
+        loader: L,
+    ) -> Result<ActorHandle<A>, ActorActivationError>
+    where
+        L: ActorLoader<A>,
+    {
+        if authority.registry_identity != self.registry_identity() {
+            return Err(authority_error(
+                "actor authority proof belongs to a different registry",
+            ));
+        }
+        let actor_id = authority.actor_id;
+        let ctx = self.create_context_with_token(&actor_id, authority.fencing_token);
+        self.get_or_activate(actor_id, || async move { loader.load(ctx).await })
+            .await
+    }
+
+    fn create_context(
+        &self,
+        actor_id: &ActorId,
+    ) -> Result<ActorCreateContext, ActorActivationError> {
+        let fencing_token = self.resolve_fencing_token(actor_id)?;
+        Ok(self.create_context_optional(actor_id, fencing_token))
+    }
+
+    fn create_context_with_token(
+        &self,
+        actor_id: &ActorId,
+        fencing_token: ActorFencingToken,
+    ) -> ActorCreateContext {
+        self.create_context_optional(actor_id, Some(fencing_token))
+    }
+
+    fn create_context_optional(
+        &self,
+        actor_id: &ActorId,
+        fencing_token: Option<ActorFencingToken>,
+    ) -> ActorCreateContext {
+        ActorCreateContext {
             actor_kind: self.kind.clone(),
             actor_id: actor_id.clone(),
             service: self.config.service.clone(),
-        };
-        self.get_or_activate(actor_id, || async move { loader.load(ctx).await })
-            .await
+            fencing_token,
+        }
+    }
+
+    fn resolve_fencing_token(
+        &self,
+        actor_id: &ActorId,
+    ) -> Result<Option<ActorFencingToken>, ActorActivationError> {
+        let resolvers = self
+            .fencing_token_resolvers
+            .read()
+            .expect("actor fencing token resolver poisoned")
+            .clone();
+        if resolvers.is_empty() {
+            return Ok(None);
+        }
+        let mut generation = None;
+        for resolver in resolvers.into_values() {
+            let Some(candidate) = resolver(actor_id) else {
+                continue;
+            };
+            if generation.is_some_and(|current| current != candidate) {
+                return Err(authority_error(
+                    "actor activation matched conflicting placement authorities",
+                ));
+            }
+            generation = Some(candidate);
+        }
+        let generation = generation
+            .ok_or_else(|| authority_error("actor activation has no live placement authority"))?;
+        ActorFencingToken::new(generation)
+            .map(Some)
+            .ok_or_else(|| authority_error("actor placement authority generation is zero"))
+    }
+
+    fn registry_identity(&self) -> usize {
+        Arc::as_ptr(&self.entries) as usize
     }
 
     async fn wait_for_activation(
@@ -1145,6 +1304,10 @@ fn encode_segment(bytes: &[u8]) -> String {
 
 fn is_terminal(state: ActorLifecycleState) -> bool {
     state == ActorLifecycleState::Stopped
+}
+
+fn authority_error(message: &'static str) -> ActorActivationError {
+    ActorActivationError::ActivationFailed(ActorError::new(message))
 }
 
 fn is_business_admitted(state: ActorLifecycleState) -> bool {

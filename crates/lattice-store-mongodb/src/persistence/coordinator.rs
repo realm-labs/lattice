@@ -12,7 +12,7 @@ mod state;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use lattice_actor::context::PipeTaskHandle;
+use lattice_actor::{context::PipeTaskHandle, registry::ActorCreateContext};
 
 use crate::document::tracked::{Tracked, TrackedMutationSignal};
 use crate::error::MongoStoreError;
@@ -159,6 +159,22 @@ pub struct MongoPersistenceCoordinator {
 }
 
 impl MongoPersistenceCoordinator {
+    /// Creates a coordinator using the placement authority attached to this Actor activation.
+    ///
+    /// Placement-managed application Actors should use this constructor so business code never
+    /// allocates or persists its own fencing epoch.
+    pub fn for_actor(context: &ActorCreateContext) -> Result<Self, PersistenceError> {
+        let fencing_token = context
+            .fencing_token()
+            .ok_or(PersistenceError::MissingActorFencingToken)?;
+        Ok(Self::new(placement_storage_epoch(fencing_token.get())?))
+    }
+
+    /// Creates an unfenced coordinator for tests and Actors outside placement management.
+    pub fn standalone() -> Self {
+        Self::new(1)
+    }
+
     pub fn new(activation_epoch: u64) -> Self {
         Self::with_retry_policy(activation_epoch, RetryPolicy::default())
     }
@@ -245,6 +261,10 @@ pub struct MongoPreparation<'a> {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PersistenceError {
+    #[error("placement-managed persistence requires an Actor fencing token")]
+    MissingActorFencingToken,
+    #[error("Actor fencing token {token} exceeds the MongoDB fencing range")]
+    ActorFencingTokenOutOfRange { token: u64 },
     #[error("required document in collection {collection} with ID {id} was not found")]
     RequiredDocumentMissing {
         collection: &'static str,
@@ -312,6 +332,20 @@ pub enum PersistenceError {
     Scan(#[from] ScanError),
     #[error(transparent)]
     Store(#[from] MongoStoreError),
+}
+
+// Keep placement-owned epochs in a range that dominates epochs written by the former
+// process-local counter. This makes upgrading existing documents safe without a separate
+// migration document; subtracting the base recovers the durable placement generation.
+const PLACEMENT_STORAGE_EPOCH_BASE: u64 = 1_u64 << 62;
+
+fn placement_storage_epoch(token: u64) -> Result<u64, PersistenceError> {
+    let epoch = PLACEMENT_STORAGE_EPOCH_BASE
+        .checked_add(token)
+        .ok_or(PersistenceError::ActorFencingTokenOutOfRange { token })?;
+    (epoch <= i64::MAX as u64)
+        .then_some(epoch)
+        .ok_or(PersistenceError::ActorFencingTokenOutOfRange { token })
 }
 
 #[cfg(test)]

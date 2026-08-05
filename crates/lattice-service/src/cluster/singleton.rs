@@ -231,11 +231,15 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> SingletonRouteHost<A, L, P> {
         target: &LogicalSingletonTarget,
     ) -> Result<ActorHandle<A>, RemoteMessageError> {
         self.validate_local(target)?;
-        self.registry
-            .get_or_load(
+        let authority = self
+            .registry
+            .validate_actor_authority(
                 ActorId::Str(self.kind.as_str().to_owned()),
-                self.loader.clone(),
+                target.assignment_generation,
             )
+            .map_err(|_| RemoteMessageError::StaleAuthority)?;
+        self.registry
+            .load_with_validated_authority(authority, self.loader.clone())
             .await
             .map_err(|_| RemoteMessageError::HandlerFailed)
     }

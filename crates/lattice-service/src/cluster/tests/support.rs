@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -128,6 +128,24 @@ pub(super) struct CountingLoader(pub(super) Arc<AtomicUsize>);
 impl ActorLoader<EntityActor> for CountingLoader {
     async fn load(&self, _ctx: ActorCreateContext) -> Result<EntityActor, ActorError> {
         self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(EntityActor { value: 40 })
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct TokenRecordingLoader {
+    pub(super) loads: Arc<AtomicUsize>,
+    pub(super) token: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl ActorLoader<EntityActor> for TokenRecordingLoader {
+    async fn load(&self, ctx: ActorCreateContext) -> Result<EntityActor, ActorError> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        self.token.store(
+            ctx.fencing_token().map_or(0, |token| token.get()),
+            Ordering::SeqCst,
+        );
         Ok(EntityActor { value: 40 })
     }
 }
