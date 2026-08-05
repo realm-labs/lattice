@@ -285,11 +285,15 @@ impl<A: Actor, L: ActorLoader<A>, P: Protocol> EntityRouteHost<A, L, P> {
         target: &LogicalEntityTarget,
     ) -> Result<ActorHandle<A>, RemoteMessageError> {
         self.validate_local(target)?;
-        self.registry
-            .get_or_load(
+        let authority = self
+            .registry
+            .validate_actor_authority(
                 ActorId::Bytes(target.reference.entity_id().as_bytes().to_vec()),
-                self.loader.clone(),
+                target.assignment_generation,
             )
+            .map_err(|_| RemoteMessageError::StaleAuthority)?;
+        self.registry
+            .load_with_validated_authority(authority, self.loader.clone())
             .await
             .map_err(|_| RemoteMessageError::HandlerFailed)
     }

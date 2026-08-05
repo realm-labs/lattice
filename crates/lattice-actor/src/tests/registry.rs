@@ -3,11 +3,12 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
+use async_trait::async_trait;
 use lattice_core::{actor_kind, id::ActorId, service_context::ServiceContext};
 use tokio::sync::{Mutex, Semaphore};
 
@@ -15,8 +16,131 @@ use super::TestActor;
 use crate::{
     error::{ActorActivationError, ActorError},
     mailbox::MailboxConfig,
-    registry::{ActorRegistry, ActorRegistryConfig},
+    registry::{ActorCreateContext, ActorLoader, ActorRegistry, ActorRegistryConfig},
 };
+
+#[derive(Clone)]
+struct TokenLoader {
+    loads: Arc<AtomicUsize>,
+    token: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl ActorLoader<TestActor> for TokenLoader {
+    async fn load(&self, ctx: ActorCreateContext) -> Result<TestActor, ActorError> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        self.token.store(
+            ctx.fencing_token().map_or(0, |token| token.get()),
+            Ordering::SeqCst,
+        );
+        Ok(TestActor {
+            events: Arc::new(Mutex::new(Vec::new())),
+            start_gate: None,
+            stopped: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn direct_activation_resolves_framework_fencing_token_before_loading() {
+    let registry =
+        ActorRegistry::<TestActor>::new(actor_kind!("Test"), ActorRegistryConfig::default());
+    registry.install_fencing_token_resolver("test", |actor_id| {
+        (actor_id == &ActorId::U64(7)).then_some(11)
+    });
+    let loads = Arc::new(AtomicUsize::new(0));
+    let token = Arc::new(AtomicU64::new(0));
+
+    registry
+        .get_or_load(
+            ActorId::U64(7),
+            TokenLoader {
+                loads: loads.clone(),
+                token: token.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+    assert_eq!(token.load(Ordering::SeqCst), 11);
+}
+
+#[tokio::test]
+async fn direct_activation_without_live_authority_never_runs_loader() {
+    let registry =
+        ActorRegistry::<TestActor>::new(actor_kind!("Test"), ActorRegistryConfig::default());
+    registry.install_fencing_token_resolver("test", |_| None);
+    let loads = Arc::new(AtomicUsize::new(0));
+
+    let result = registry
+        .get_or_load(
+            ActorId::U64(8),
+            TokenLoader {
+                loads: loads.clone(),
+                token: Arc::new(AtomicU64::new(0)),
+            },
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ActorActivationError::ActivationFailed(_))
+    ));
+    assert_eq!(loads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn validated_authority_proof_cannot_be_used_with_another_registry() {
+    let first =
+        ActorRegistry::<TestActor>::new(actor_kind!("Test"), ActorRegistryConfig::default());
+    let second =
+        ActorRegistry::<TestActor>::new(actor_kind!("Test"), ActorRegistryConfig::default());
+    first.install_fencing_token_resolver("test", |_| Some(5));
+    second.install_fencing_token_resolver("test", |_| Some(5));
+    let authority = first.validate_actor_authority(ActorId::U64(10), 5).unwrap();
+    let loads = Arc::new(AtomicUsize::new(0));
+
+    let result = second
+        .load_with_validated_authority(
+            authority,
+            TokenLoader {
+                loads: loads.clone(),
+                token: Arc::new(AtomicU64::new(0)),
+            },
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ActorActivationError::ActivationFailed(_))
+    ));
+    assert_eq!(loads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn running_actor_is_hidden_after_its_external_authority_is_revoked() {
+    let registry =
+        ActorRegistry::<TestActor>::new(actor_kind!("Test"), ActorRegistryConfig::default());
+    registry
+        .start(
+            ActorId::U64(9),
+            TestActor {
+                events: Arc::new(Mutex::new(Vec::new())),
+                start_gate: None,
+                stopped: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(registry.get_running(&ActorId::U64(9)).is_some());
+    registry.install_fencing_token_resolver("test", |_| Some(3));
+    assert!(registry.get_running(&ActorId::U64(9)).is_some());
+
+    registry.install_fencing_token_resolver("test", |_| None);
+
+    assert!(registry.get_running(&ActorId::U64(9)).is_none());
+}
 
 #[tokio::test]
 async fn actor_registry_prevents_duplicate_start() {
