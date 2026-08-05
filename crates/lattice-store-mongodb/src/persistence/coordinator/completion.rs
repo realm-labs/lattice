@@ -8,6 +8,7 @@ use crate::persistence::request::{
     InFlightCommit, PreparedFlush,
 };
 use crate::scan::ScanCursor;
+use tracing::warn;
 
 use super::{
     ConflictPolicy, DocumentPresence, DocumentRejection, MongoPersistenceCoordinator,
@@ -76,7 +77,7 @@ impl MongoPersistenceCoordinator {
         self.clear_in_flight_task(generation);
         let commit = self.in_flight.take().expect("checked in-flight commit");
         let InFlightCommit {
-            generation: _,
+            generation: commit_generation,
             document_commits,
             clean_commits,
             mut writes,
@@ -96,6 +97,7 @@ impl MongoPersistenceCoordinator {
                 .documents
                 .get_mut(&document_commit.key)
                 .ok_or_else(|| PersistenceError::UnknownDocument(document_commit.key.clone()))?;
+            let document_key = document_commit.key.clone();
             match outcome {
                 DocumentWriteOutcome::Applied {
                     new_version,
@@ -128,6 +130,16 @@ impl MongoPersistenceCoordinator {
                         self.counters.applied_documents.saturating_add(1);
                 }
                 DocumentWriteOutcome::VersionConflict { expected_version } => {
+                    warn!(
+                        collection = document_key.collection,
+                        document_id = %document_key.id,
+                        expected_version = *expected_version,
+                        activation_epoch = commit_generation.activation_epoch,
+                        flush_sequence = commit_generation.sequence,
+                        mutation_epoch = ?document_commit.mutation_epoch,
+                        conflict_policy = ?state.conflict_policy,
+                        "mongodb.persistence.version_conflict"
+                    );
                     state.conflict = Some(PersistenceConflict {
                         key: document_commit.key,
                         expected_version: *expected_version,
