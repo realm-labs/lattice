@@ -29,7 +29,9 @@ use crate::{
     },
 };
 
-pub const PLACEMENT_CONTROL_GENERATION: u64 = 7;
+// The payload after the protobuf envelope is postcard-encoded. Bump the generation so a
+// rolling upgrade cannot mistake the old JSON payload for the new wire format.
+pub const PLACEMENT_CONTROL_GENERATION: u64 = 8;
 pub const DEFAULT_MAX_CONTROL_PAYLOAD: usize = 256 * 1024;
 
 pub fn control_stream_id(scope: &CoordinatorScope) -> ControlStreamId {
@@ -224,7 +226,32 @@ fn encode_control_command_inner(
     if maximum_payload == 0 {
         return Err(PlacementControlError::InvalidLimit);
     }
-    let payload = serde_json::to_vec(&ScopedPlacementControlCommand {
+    let encoded = encode_control_command_unbounded(scope, coordinator_term, command)?;
+    if encoded.len() > maximum_payload {
+        return Err(PlacementControlError::PayloadTooLarge);
+    }
+    Ok(Bytes::from(encoded))
+}
+
+/// Returns the final number of bytes sent through the control lane, including the protobuf
+/// envelope. Snapshot construction uses this instead of estimating from the raw Etcd values.
+pub fn encoded_control_command_len(
+    scope: &CoordinatorScope,
+    coordinator_term: Option<u64>,
+    command: &PlacementControlCommand,
+) -> Result<usize, PlacementControlError> {
+    Ok(encode_control_command_unbounded(scope, coordinator_term, command)?.len())
+}
+
+fn encode_control_command_unbounded(
+    scope: &CoordinatorScope,
+    coordinator_term: Option<u64>,
+    command: &PlacementControlCommand,
+) -> Result<Vec<u8>, PlacementControlError> {
+    if coordinator_term == Some(0) {
+        return Err(PlacementControlError::InvalidCoordinatorTerm);
+    }
+    let payload = postcard::to_allocvec(&ScopedPlacementControlCommand {
         scope: scope.clone(),
         coordinator_term,
         command: command.clone(),
@@ -234,11 +261,7 @@ fn encode_control_command_inner(
         generation: PLACEMENT_CONTROL_GENERATION,
         payload,
     };
-    let encoded = wire.encode_to_vec();
-    if encoded.len() > maximum_payload {
-        return Err(PlacementControlError::PayloadTooLarge);
-    }
-    Ok(Bytes::from(encoded))
+    Ok(wire.encode_to_vec())
 }
 
 pub fn decode_control_command(
@@ -255,7 +278,7 @@ pub fn decode_control_command(
     if wire.generation != PLACEMENT_CONTROL_GENERATION {
         return Err(PlacementControlError::GenerationMismatch);
     }
-    serde_json::from_slice(&wire.payload).map_err(|_| PlacementControlError::Codec)
+    postcard::from_bytes(&wire.payload).map_err(|_| PlacementControlError::Codec)
 }
 
 #[derive(Clone, PartialEq, Message)]

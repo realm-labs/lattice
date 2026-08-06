@@ -123,6 +123,9 @@ where
             })
             .collect::<Result<Vec<_>, CoordinatorRuntimeError>>()?;
         let (begin, chunks, end) = build_snapshot(
+            &CoordinatorScope::Membership,
+            version.term.get(),
+            config.placement.maximum_control_payload,
             SnapshotVersion::Membership(version),
             records,
             &config.placement.snapshot_limits,
@@ -352,6 +355,9 @@ mod snapshot_backpressure_tests {
             revision: Revision::new(1).unwrap(),
         };
         let (begin, chunks, end) = build_snapshot(
+            &CoordinatorScope::Membership,
+            version.term.get(),
+            DEFAULT_MAX_CONTROL_PAYLOAD,
             SnapshotVersion::Membership(version),
             (0..24)
                 .map(|index| SnapshotRecord {

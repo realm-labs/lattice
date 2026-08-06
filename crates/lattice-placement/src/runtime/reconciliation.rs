@@ -2,13 +2,17 @@ use lattice_core::failpoint::Failpoint;
 
 use super::{
     AllocationRequest, ClaimGrant, CoordinatorLeaseStore, CoordinatorRuntimeError, GrantSequence,
-    HandoffEvent, Instant, MembershipStore, PlacementDomainLeader, PlacementDomainStore,
-    PlacementSlot, PlacementSlotKey, PlacementSlotState, ScopedElectionStore,
+    HandoffEvent, Instant, MemberRemovalReason, MembershipStore, PlacementDomainLeader,
+    PlacementDomainStore, PlacementSlot, PlacementSlotKey, PlacementSlotState, ScopedElectionStore,
 };
 use crate::{
     allocation::AllocationError,
+    coordinator::MemberStatus,
     plan::MoveProgress,
-    storage::domain::{AdoptAuthority, FenceMissingAuthority, InstallAuthority, LeasedClaim},
+    storage::domain::{
+        AdoptAuthority, FenceMissingAuthority, InstallAuthority, LeasedClaim, RemoveDomainMember,
+    },
+    types::PlacementVersion,
 };
 
 impl<S> PlacementDomainLeader<S>
@@ -18,6 +22,7 @@ where
     pub(super) async fn reconcile_initial_inventory(
         &mut self,
     ) -> Result<(), CoordinatorRuntimeError> {
+        self.reconcile_domain_member_inventory().await?;
         let mut cursor = None;
         loop {
             let page = self
@@ -45,6 +50,40 @@ where
         self.reconciliation.cursor = None;
         self.reconciliation.backlog = 0;
         self.reconciliation.last_success = Some(Instant::now());
+        Ok(())
+    }
+
+    async fn reconcile_domain_member_inventory(&mut self) -> Result<(), CoordinatorRuntimeError> {
+        let members = self.store.list_domain_members(&self.version.domain).await?;
+        for member in members {
+            let global = self.store.get_member(&member.node.node_id).await?;
+            let stale = global.as_ref().is_none_or(|global| {
+                global.node != member.node || global.status != MemberStatus::Up
+            });
+            if !stale {
+                continue;
+            }
+            let node = member.node.clone();
+            self.store
+                .remove_domain_member(&self.leader_guard, RemoveDomainMember { expected: member })
+                .await?;
+            self.version = PlacementVersion::new(
+                self.version.domain.clone(),
+                self.version.term,
+                self.store
+                    .get_placement_revision(&self.version.domain)
+                    .await?,
+            );
+            tracing::info!(
+                target: "lattice.cluster.placement",
+                domain = %self.version.domain.as_str(),
+                node_id = %node.node_id,
+                incarnation = ?node.incarnation,
+                "removed orphaned placement-domain member before inventory recovery"
+            );
+            self.finish_node_removal(node, MemberRemovalReason::FailureDetected)
+                .await?;
+        }
         Ok(())
     }
 
@@ -154,6 +193,7 @@ where
         slot: PlacementSlot,
         claim: Option<LeasedClaim>,
     ) -> Result<(), CoordinatorRuntimeError> {
+        let key = slot.key.clone();
         let active = matches!(
             slot.state,
             PlacementSlotState::Allocating | PlacementSlotState::Running
@@ -162,8 +202,10 @@ where
             (true, Some(claim)) if self.claim_matches_persisted_slot(&claim, &slot) => {
                 if claim.grant.coordinator_term < self.leader.term {
                     self.adopt_authority_record(slot, claim).await?;
+                    self.clear_quarantine(&key);
                 } else if claim.grant.coordinator_term == self.leader.term {
                     self.remember_and_replay_claim(claim)?;
+                    self.clear_quarantine(&key);
                 } else {
                     self.quarantine(&slot.key, "claim term is ahead of the elected leader");
                 }
@@ -174,7 +216,10 @@ where
                     "active slot and claim owner/generation do not match",
                 );
             }
-            (true, None) => self.fence_missing_claim(slot).await?,
+            (true, None) => {
+                self.fence_missing_claim(slot.clone()).await?;
+                self.clear_quarantine(&slot.key);
+            }
             (false, Some(_)) if slot.state == PlacementSlotState::Fenced => {
                 self.quarantine(&slot.key, "Fenced slot still has a claim");
             }
@@ -194,17 +239,24 @@ where
                             generation: handoff.source_generation,
                         })
                         .map_err(CoordinatorRuntimeError::Handoff)?;
-                    Box::pin(self.apply_handoff_effects(slot.key, effects)).await?;
+                    Box::pin(self.apply_handoff_effects(key.clone(), effects)).await?;
                 }
+                self.clear_quarantine(&slot.key);
             }
             (false, None)
                 if slot.state == PlacementSlotState::Fenced && slot.active_move.is_none() =>
             {
-                self.reinstall_fenced_authority(slot).await?;
+                if self.reinstall_fenced_authority(slot.clone()).await? {
+                    self.clear_quarantine(&slot.key);
+                }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    fn clear_quarantine(&mut self, key: &PlacementSlotKey) {
+        self.reconciliation.quarantined.remove(&format!("{key:?}"));
     }
 
     fn claim_matches_persisted_slot(&self, claim: &LeasedClaim, slot: &PlacementSlot) -> bool {

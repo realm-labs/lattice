@@ -1,6 +1,9 @@
-use lattice_core::actor_ref::NodeAddress;
+use lattice_core::{actor_ref::NodeAddress, coordinator::CoordinatorScope};
 
 use super::*;
+use crate::control::{
+    DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, encoded_control_command_len,
+};
 use crate::types::{CoordinatorTerm, Revision};
 
 fn version(term: u64, revision: u64) -> PlacementVersion {
@@ -114,6 +117,9 @@ fn snapshot_staging_timeout_is_renewed_by_chunk_progress() {
         staging_timeout_millis: 10,
     };
     let (begin, chunks, end) = build_snapshot(
+        &CoordinatorScope::Membership,
+        1,
+        1024,
         SnapshotVersion::Placement(version(1, 1)),
         vec![
             SnapshotRecord {
@@ -138,4 +144,45 @@ fn snapshot_staging_timeout_is_renewed_by_chunk_progress() {
         .push(chunks[1].clone(), MonotonicTime::from_millis(18))
         .unwrap();
     stager.finish(end, MonotonicTime::from_millis(19)).unwrap();
+}
+
+#[test]
+fn placement_snapshot_chunks_fit_the_encoded_control_payload_limit() {
+    let scope = CoordinatorScope::Placement(PlacementDomainId::new("player").unwrap());
+    let limits = SnapshotLimits {
+        maximum_records: 1024,
+        maximum_bytes: 1024 * 1024,
+        maximum_chunks: 1024,
+        maximum_chunk_bytes: 192 * 1024,
+        staging_timeout_millis: 1000,
+    };
+    let records = (0..648)
+        .map(|index| SnapshotRecord {
+            key: format!("slot/player/{index}"),
+            value: Bytes::from(vec![0_u8; 497]),
+        })
+        .collect();
+
+    let (begin, chunks, end) = build_snapshot(
+        &scope,
+        119,
+        DEFAULT_MAX_CONTROL_PAYLOAD,
+        SnapshotVersion::Placement(version(119, 7627)),
+        records,
+        &limits,
+    )
+    .unwrap();
+
+    assert!(chunks.len() >= 2);
+    for command in std::iter::once(PlacementControlCommand::SnapshotBegin(begin))
+        .chain(
+            chunks
+                .into_iter()
+                .map(PlacementControlCommand::SnapshotChunk),
+        )
+        .chain(std::iter::once(PlacementControlCommand::SnapshotEnd(end)))
+    {
+        let encoded = encoded_control_command_len(&scope, Some(119), &command).unwrap();
+        assert!(encoded <= DEFAULT_MAX_CONTROL_PAYLOAD);
+    }
 }

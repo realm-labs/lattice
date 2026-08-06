@@ -22,7 +22,8 @@ use crate::{
     authority::{AuthorityEffect, AuthorityError, PlacementAuthority},
     control::{
         DEFAULT_MAX_CONTROL_PAYLOAD, PlacementControlCommand, PlacementControlError,
-        PlacementControlEvent, PlacementResolutionFailure, encode_control_command_for_term,
+        PlacementControlEvent, PlacementControlEventKind, PlacementResolutionFailure,
+        encode_control_command_for_term,
     },
     coordinator::{
         CoordinatorError, MemberEvent, MemberRecord, MembershipStateError, NodeLoadReport,
@@ -382,12 +383,18 @@ impl PlacementDomainSession {
                     let Some(event) = event else {
                         return Err(LogicSessionError::ControlClosed);
                     };
+                    let event_name = event_name(&event.kind);
                     let result = self.handle(event.kind).await;
+                    let stale_generation = matches!(&result, Err(LogicSessionError::StaleGeneration));
                     let acknowledgement = result
                         .as_ref()
                         .map(|_| ())
                         .map_err(session_dispatch_error);
                     let _ = event.completion.send(acknowledgement);
+                    if stale_generation {
+                        self.reconcile_after_stale_control(event_name);
+                        continue;
+                    }
                     result?;
                 }
                 event = self.local_events.recv() => {
@@ -493,6 +500,40 @@ impl PlacementDomainSession {
 
     fn now(&self) -> MonotonicTime {
         monotonic_since(self.origin)
+    }
+
+    fn reconcile_after_stale_control(&mut self, command: &'static str) {
+        self.stager = None;
+        self.state
+            .lock()
+            .expect("logic placement state poisoned")
+            .domain_up = false;
+        if let Err(error) = self.send_hello() {
+            tracing::warn!(
+                target: "lattice.cluster.logic",
+                domain = %self.domain_hello.domain.as_str(),
+                command,
+                coordinator_term = self.coordinator_term,
+                %error,
+                "stale placement control was dropped; fresh snapshot request could not be sent"
+            );
+        } else {
+            tracing::warn!(
+                target: "lattice.cluster.logic",
+                domain = %self.domain_hello.domain.as_str(),
+                command,
+                coordinator_term = self.coordinator_term,
+                "stale placement control was dropped; requested fresh snapshot"
+            );
+        }
+    }
+}
+
+fn event_name(event: &PlacementControlEventKind) -> &'static str {
+    match event {
+        PlacementControlEventKind::Command(inbound) => inbound.command.name(),
+        PlacementControlEventKind::Reconcile { .. } => "Reconcile",
+        PlacementControlEventKind::GlobalMemberRemoved { .. } => "GlobalMemberRemoved",
     }
 }
 

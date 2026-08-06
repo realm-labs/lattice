@@ -5,11 +5,13 @@ use lattice_remoting::{
     association::{LaneAttachment, LaneKind},
     config::RemotingConfig,
     control::decode_control_envelope,
+    control::{CommandId, ControlDispatchError},
     wire::FrameKind,
 };
 
 use super::*;
 use crate::authority::{AuthorityEffect, AuthorityEvent};
+use crate::control::InboundPlacementControl;
 use crate::types::{
     AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, PlacementVersion, Revision,
     ShardId,
@@ -156,6 +158,102 @@ async fn effect_backpressure_waits_for_capacity_without_terminating_the_session(
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn stale_generation_does_not_terminate_the_session() {
+    let cluster_id = ClusterId::new("stale-generation-session").unwrap();
+    let domain = PlacementDomainId::new("stale-generation-session").unwrap();
+    let local = NodeKey {
+        node_id: "logic".to_owned(),
+        address: NodeAddress::new("127.0.0.1", 34090).unwrap(),
+        incarnation: NodeIncarnation::new(1).unwrap(),
+    };
+    let remote_address = NodeAddress::new("127.0.0.1", 34091).unwrap();
+    let remote_incarnation = NodeIncarnation::new(2).unwrap();
+    let associations = Arc::new(
+        AssociationManager::new(
+            local.address.clone(),
+            local.incarnation,
+            RemotingConfig::default(),
+        )
+        .unwrap(),
+    );
+    let association = associations
+        .get_or_create(
+            cluster_id.clone(),
+            remote_address.clone(),
+            remote_incarnation,
+        )
+        .unwrap();
+    let coordinator = AssociationKey {
+        cluster_id,
+        local_incarnation: local.incarnation,
+        remote_address,
+        remote_incarnation,
+    };
+    for (lane, nonce) in [
+        (LaneKind::Control, 1_u128),
+        (LaneKind::Interactive, 2),
+        (LaneKind::Bulk(0), 3),
+    ] {
+        association
+            .attach(LaneAttachment {
+                association_id: association.id(),
+                key: coordinator.clone(),
+                lane,
+                connection_nonce: nonce,
+            })
+            .unwrap();
+    }
+    let (session, _effects) = PlacementDomainSession::new(
+        PlacementDomainHello::builder(local, domain.clone(), 1).build(),
+        coordinator.clone(),
+        associations,
+        LogicCoordinatorConfig::default(),
+        8,
+        1,
+    )
+    .unwrap();
+    let (controls, control_rx) = mpsc::channel(4);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(session.run(control_rx, shutdown_rx));
+    tokio::task::yield_now().await;
+
+    let slot = PlacementSlotKey::Shard {
+        domain: domain.clone(),
+        entity_type: EntityType::new("entity").unwrap(),
+        shard_id: ShardId::new(0),
+    };
+    let (completion, result) = tokio::sync::oneshot::channel();
+    controls
+        .send(PlacementControlEvent {
+            kind: PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
+                association: coordinator,
+                command_id: CommandId::generate(),
+                scope: CoordinatorScope::Placement(domain.clone()),
+                coordinator_term: Some(1),
+                command: PlacementControlCommand::DrainSlot {
+                    slot,
+                    generation: AssignmentGeneration::new(1).unwrap(),
+                    version: PlacementVersion::new(
+                        domain,
+                        CoordinatorTerm::new(1).unwrap(),
+                        Revision::new(1).unwrap(),
+                    ),
+                },
+            })),
+            completion,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        result.await.unwrap(),
+        Err(ControlDispatchError::InvalidCommand)
+    );
+
+    shutdown.send(true).unwrap();
+    assert!(task.await.unwrap().is_ok());
 }
 
 #[tokio::test(start_paused = true)]

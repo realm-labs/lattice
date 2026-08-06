@@ -19,7 +19,7 @@ use crate::{
     storage::{
         CoordinatorLeaseStore, InMemoryPlacementStore, MembershipStore, PlacementDomainStore,
         ScopedElectionStore,
-        domain::{AllocateInitial, CreateDomainMember, CreateMember, LeasedClaim},
+        domain::{AllocateInitial, CreateDomainMember, CreateMember, LeasedClaim, RemoveMember},
     },
     types::{
         AssignmentGeneration, ClaimGrant, CoordinatorTerm, GrantSequence, MembershipVersion,
@@ -257,6 +257,64 @@ async fn legacy_allocating_without_claim_is_deterministically_fenced() {
     assert_eq!(repaired.assignment_generation, legacy.assignment_generation);
     assert!(leader.reconciliation.initial_complete);
     assert!(leader.reconciliation.quarantined.is_empty());
+}
+
+#[tokio::test]
+async fn election_removes_orphaned_domain_members_before_recovery() {
+    let store = Arc::new(InMemoryPlacementStore::new(8, 8).unwrap());
+    store.ensure_schema_generation().await.unwrap();
+    let old_leader = node("old", 20, 32220);
+    let placement_lease = store.grant_lease(Duration::from_secs(10)).await.unwrap();
+    let placement_record = LeaderRecord {
+        scope: CoordinatorScope::Placement(domain()),
+        node: old_leader,
+        protocol_generation: 7,
+        term: CoordinatorTerm::new(1).unwrap(),
+    };
+    assert!(
+        store
+            .campaign_leader(&placement_record, placement_lease)
+            .await
+            .unwrap()
+    );
+    let placement_guard = PlacementLeaderGuard::new(placement_record).unwrap();
+    let owner = node("orphan", 21, 32221);
+    let (global, _domain_member, membership_leader_lease) =
+        persist_authority_records(store.as_ref(), &placement_guard, owner.clone()).await;
+    let membership_record = LeaderRecord {
+        scope: CoordinatorScope::Membership,
+        node: node("membership", 91, 32991),
+        protocol_generation: 7,
+        term: CoordinatorTerm::new(1).unwrap(),
+    };
+    let membership_guard = MembershipLeaderGuard::new(membership_record).unwrap();
+    store
+        .remove_member(&membership_guard, RemoveMember { expected: global })
+        .await
+        .unwrap();
+    store.revoke_lease(membership_leader_lease).await.unwrap();
+    store.revoke_lease(placement_lease).await.unwrap();
+
+    let coordinator = node("new", 22, 32222);
+    let leader = PlacementDomainLeader::elect(
+        store.clone(),
+        associations(&coordinator),
+        coordinator,
+        CoordinatorScope::Placement(domain()),
+        CoordinatorTerm::new(2).unwrap(),
+        PlacementDomainLeaderConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        store
+            .get_domain_member(&domain(), &owner.node_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(leader.reconciliation.initial_complete);
 }
 
 #[tokio::test]

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
+    control::{PlacementControlCommand, encoded_control_command_len},
     region::EntityConfig,
     types::{
         CoordinatorTerm, MembershipVersion, MonotonicTime, NodeKey, PlacementVersion, ShardId,
@@ -541,11 +542,17 @@ pub struct SnapshotInstall {
 }
 
 pub fn build_snapshot(
+    scope: &CoordinatorScope,
+    coordinator_term: u64,
+    maximum_control_payload: usize,
     version: SnapshotVersion,
     mut records: Vec<SnapshotRecord>,
     limits: &SnapshotLimits,
 ) -> Result<(SnapshotBegin, Vec<SnapshotChunk>, SnapshotEnd), CoordinatorError> {
     limits.validate()?;
+    if maximum_control_payload == 0 || coordinator_term == 0 {
+        return Err(CoordinatorError::SnapshotLimit);
+    }
     records.sort();
     if records.len() > limits.maximum_records {
         return Err(CoordinatorError::SnapshotLimit);
@@ -571,16 +578,52 @@ pub fn build_snapshot(
         if bytes > limits.maximum_chunk_bytes {
             return Err(CoordinatorError::SnapshotLimit);
         }
-        if !current.is_empty() && current_bytes.saturating_add(bytes) > limits.maximum_chunk_bytes {
+
+        let mut candidate = current.clone();
+        candidate.push(record.clone());
+        let candidate_bytes = current_bytes.saturating_add(bytes);
+        let candidate_wire_bytes = encoded_control_command_len(
+            scope,
+            Some(coordinator_term),
+            &PlacementControlCommand::SnapshotChunk(SnapshotChunk {
+                snapshot_id,
+                index: chunks.len(),
+                records: candidate.clone(),
+            }),
+        )
+        .map_err(|_| CoordinatorError::SnapshotLimit)?;
+
+        if !current.is_empty()
+            && (candidate_bytes > limits.maximum_chunk_bytes
+                || candidate_wire_bytes > maximum_control_payload)
+        {
             chunks.push(SnapshotChunk {
                 snapshot_id,
                 index: chunks.len(),
                 records: std::mem::take(&mut current),
             });
             current_bytes = 0;
+            candidate = vec![record];
+            let singleton_wire_bytes = encoded_control_command_len(
+                scope,
+                Some(coordinator_term),
+                &PlacementControlCommand::SnapshotChunk(SnapshotChunk {
+                    snapshot_id,
+                    index: chunks.len(),
+                    records: candidate.clone(),
+                }),
+            )
+            .map_err(|_| CoordinatorError::SnapshotLimit)?;
+            if singleton_wire_bytes > maximum_control_payload {
+                return Err(CoordinatorError::SnapshotLimit);
+            }
+        } else if candidate_bytes > limits.maximum_chunk_bytes
+            || candidate_wire_bytes > maximum_control_payload
+        {
+            return Err(CoordinatorError::SnapshotLimit);
         }
-        current_bytes += bytes;
-        current.push(record);
+        current_bytes = current_bytes.saturating_add(bytes);
+        current = candidate;
     }
     if !current.is_empty() {
         chunks.push(SnapshotChunk {
@@ -604,6 +647,17 @@ pub fn build_snapshot(
         snapshot_id,
         version,
     };
+    for command in [
+        PlacementControlCommand::SnapshotBegin(begin.clone()),
+        PlacementControlCommand::SnapshotEnd(end.clone()),
+    ] {
+        if encoded_control_command_len(scope, Some(coordinator_term), &command)
+            .map_err(|_| CoordinatorError::SnapshotLimit)?
+            > maximum_control_payload
+        {
+            return Err(CoordinatorError::SnapshotLimit);
+        }
+    }
     Ok((begin, chunks, end))
 }
 

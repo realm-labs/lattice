@@ -258,7 +258,7 @@ where
     /// operator force removal, and incarnation replacement leave the lease to expire on its own so
     /// that a missing claim record stays an independent fencing proof rather than a leader-authored
     /// one.
-    async fn finish_node_removal(
+    pub(super) async fn finish_node_removal(
         &mut self,
         node: NodeKey,
         reason: MemberRemovalReason,
@@ -505,6 +505,9 @@ where
             }
         }
         let placement = build_snapshot(
+            &CoordinatorScope::Placement(self.version.domain.clone()),
+            self.version.term.get(),
+            self.config.maximum_control_payload,
             SnapshotVersion::Placement(self.version.clone()),
             placement_records,
             &self.config.snapshot_limits,

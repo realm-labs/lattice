@@ -1127,7 +1127,11 @@ async fn install_fixture_snapshot(
         },
         value: serde_json::to_vec(slot)?.into(),
     };
+    let scope = CoordinatorScope::Placement(slot.key.domain().clone());
     let (begin, chunks, end) = build_snapshot(
+        &scope,
+        slot.version.term.get(),
+        DEFAULT_MAX_CONTROL_PAYLOAD,
         SnapshotVersion::Placement(slot.version.clone()),
         vec![record],
         &limits,
@@ -1152,7 +1156,6 @@ async fn install_fixture_snapshot(
         }));
     }
     for command in commands {
-        let scope = CoordinatorScope::Placement(slot.key.domain().clone());
         control
             .apply(
                 coordinator.clone(),
