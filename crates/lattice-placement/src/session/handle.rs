@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 
 use lattice_core::{actor_ref::PlacementDomainId, coordinator::CoordinatorScope};
 use tokio::{sync::Notify, time::Instant};
@@ -100,7 +100,7 @@ impl LogicCoordinatorHandle {
             control_stream_id(&CoordinatorScope::Placement(self.domain.clone())),
             encode_control_command_for_term(
                 &CoordinatorScope::Placement(self.domain.clone()),
-                self.coordinator_term,
+                self.coordinator_term.load(Ordering::Acquire),
                 &PlacementControlCommand::DrainComplete {
                     operation_id,
                     expected_incarnation: incarnation,
@@ -129,7 +129,7 @@ impl LogicCoordinatorHandle {
         association.admit_ephemeral_control(
             encode_control_command_for_term(
                 &CoordinatorScope::Placement(self.domain.clone()),
-                self.coordinator_term,
+                self.coordinator_term.load(Ordering::Acquire),
                 &command,
                 self.maximum_control_payload,
             )
@@ -147,7 +147,7 @@ impl LogicCoordinatorHandle {
             control_stream_id(&CoordinatorScope::Placement(self.domain.clone())),
             encode_control_command_for_term(
                 &CoordinatorScope::Placement(self.domain.clone()),
-                self.coordinator_term,
+                self.coordinator_term.load(Ordering::Acquire),
                 &command,
                 self.maximum_control_payload,
             )
@@ -193,7 +193,7 @@ impl LogicCoordinatorHandle {
             control_stream_id(&CoordinatorScope::Placement(self.domain.clone())),
             encode_control_command_for_term(
                 &CoordinatorScope::Placement(self.domain.clone()),
-                self.coordinator_term,
+                self.coordinator_term.load(Ordering::Acquire),
                 &command,
                 self.maximum_control_payload,
             )

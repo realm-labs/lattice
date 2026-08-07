@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -212,6 +213,7 @@ pub struct PlacementDomainSession {
     origin: Instant,
     heartbeat_sequence: u64,
     coordinator_term: u64,
+    shared_coordinator_term: Arc<AtomicU64>,
     hello_pending: bool,
 }
 
@@ -228,7 +230,7 @@ pub struct LogicCoordinatorHandle {
     maximum_control_payload: usize,
     state: Arc<Mutex<LogicPlacementState>>,
     local_events: mpsc::Sender<LocalAuthorityEvent>,
-    coordinator_term: u64,
+    coordinator_term: Arc<AtomicU64>,
     drain_poll_interval: Duration,
     drain_acknowledgement_timeout: Duration,
 }
@@ -255,6 +257,7 @@ impl PlacementDomainSession {
         let local_node = domain_hello.node.clone();
         let domain = domain_hello.domain.clone();
         let origin = Instant::now();
+        let shared_coordinator_term = Arc::new(AtomicU64::new(coordinator_term));
         Ok((
             Self {
                 domain_hello,
@@ -279,6 +282,7 @@ impl PlacementDomainSession {
                 origin,
                 heartbeat_sequence: 0,
                 coordinator_term,
+                shared_coordinator_term,
                 hello_pending: true,
             },
             receiver,
@@ -297,7 +301,7 @@ impl PlacementDomainSession {
             maximum_control_payload: self.config.maximum_control_payload,
             state: self.state.clone(),
             local_events: self.local_event_sender.clone(),
-            coordinator_term: self.coordinator_term,
+            coordinator_term: self.shared_coordinator_term.clone(),
             drain_poll_interval: self.config.tick_interval,
             drain_acknowledgement_timeout: self.config.drain_acknowledgement_timeout,
         }
@@ -504,6 +508,22 @@ impl PlacementDomainSession {
         } else {
             Err(LogicSessionError::StaleGeneration)
         }
+    }
+
+    fn accept_snapshot_term(&mut self, term: Option<u64>) -> Result<(), LogicSessionError> {
+        let Some(term) = term else {
+            return Err(LogicSessionError::StaleGeneration);
+        };
+        if term < self.coordinator_term {
+            return Err(LogicSessionError::StaleGeneration);
+        }
+        self.coordinator_term = term;
+        self.shared_coordinator_term.store(term, Ordering::Release);
+        self.state
+            .lock()
+            .expect("logic placement state poisoned")
+            .coordinator_term = term;
+        Ok(())
     }
 
     fn now(&self) -> MonotonicTime {

@@ -22,25 +22,42 @@ where
     pub(super) async fn route_control(&mut self, event: PlacementControlEvent) {
         match event.kind {
             PlacementControlEventKind::Command(inbound) => {
-                match (inbound.coordinator_term, self.active_term(&inbound.scope)) {
-                    (Some(received_term), Some(expected_term))
-                        if expected_term == received_term => {}
-                    (Some(_), Some(_)) | (None, _) => {
-                        let _ = event
-                            .completion
-                            .send(Err(ControlDispatchError::InvalidCommand));
-                        return;
-                    }
-                    (Some(_), None) => {
-                        // This host no longer owns the scope. Retrying an old-term command on
-                        // this association can permanently head-of-line block commands for
-                        // other scopes multiplexed over the same control lane. Fence and
-                        // acknowledge it; discovery/session reconciliation will target the
-                        // current leader and send a fresh hello under its term.
-                        let _ = event
-                            .completion
-                            .send(Err(ControlDispatchError::InvalidCommand));
-                        return;
+                // Hello is the re-bootstrap path after a coordinator election. The session may
+                // have discovered this host just before the domain term advanced, so fencing a
+                // stale hello here would leave the member retrying the same stale term forever.
+                // Authentication and association checks still happen in the normal dispatch
+                // path; all steady-state commands remain exact-term fenced below.
+                let is_bootstrap = matches!(
+                    (&inbound.scope, &inbound.command),
+                    (
+                        CoordinatorScope::Membership,
+                        PlacementControlCommand::MemberHello(_)
+                    ) | (
+                        CoordinatorScope::Placement(_),
+                        PlacementControlCommand::PlacementDomainHello(_)
+                    )
+                );
+                if !is_bootstrap {
+                    match (inbound.coordinator_term, self.active_term(&inbound.scope)) {
+                        (Some(received_term), Some(expected_term))
+                            if expected_term == received_term => {}
+                        (Some(_), Some(_)) | (None, _) => {
+                            let _ = event
+                                .completion
+                                .send(Err(ControlDispatchError::InvalidCommand));
+                            return;
+                        }
+                        (Some(_), None) => {
+                            // This host no longer owns the scope. Retrying an old-term command on
+                            // this association can permanently head-of-line block commands for
+                            // other scopes multiplexed over the same control lane. Fence and
+                            // acknowledge it; discovery/session reconciliation will target the
+                            // current leader and send a fresh hello under its term.
+                            let _ = event
+                                .completion
+                                .send(Err(ControlDispatchError::InvalidCommand));
+                            return;
+                        }
                     }
                 }
                 match (&inbound.scope, &inbound.command) {

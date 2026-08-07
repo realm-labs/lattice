@@ -53,7 +53,11 @@ impl PlacementDomainSession {
             }
             PlacementControlEventKind::Command(inbound) => {
                 self.require_coordinator(&inbound.association)?;
-                self.require_coordinator_term(inbound.coordinator_term)?;
+                if matches!(&inbound.command, PlacementControlCommand::SnapshotBegin(_)) {
+                    self.accept_snapshot_term(inbound.coordinator_term)?;
+                } else {
+                    self.require_coordinator_term(inbound.coordinator_term)?;
+                }
                 match inbound.command {
                     PlacementControlCommand::SnapshotBegin(begin) => {
                         self.hello_pending = false;

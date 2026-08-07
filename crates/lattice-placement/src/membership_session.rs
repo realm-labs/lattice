@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -57,6 +58,7 @@ pub struct MembershipSession {
     effects: mpsc::Sender<LogicPlacementEffect>,
     heartbeat_sequence: u64,
     coordinator_term: u64,
+    shared_coordinator_term: Arc<AtomicU64>,
     hello_pending: bool,
 }
 
@@ -66,7 +68,7 @@ pub struct MembershipCoordinatorHandle {
     coordinator: AssociationKey,
     associations: Arc<AssociationManager>,
     maximum_control_payload: usize,
-    coordinator_term: u64,
+    coordinator_term: Arc<AtomicU64>,
 }
 
 impl MembershipCoordinatorHandle {
@@ -79,7 +81,7 @@ impl MembershipCoordinatorHandle {
             control_stream_id(&CoordinatorScope::Membership),
             encode_control_command_for_term(
                 &CoordinatorScope::Membership,
-                self.coordinator_term,
+                self.coordinator_term.load(Ordering::Acquire),
                 &PlacementControlCommand::MembershipDrainComplete {
                     operation_id,
                     expected_incarnation: self.local_incarnation,
@@ -119,12 +121,13 @@ impl MembershipSession {
             return Err(LogicSessionError::InvalidConfig);
         }
         let (effects, receiver) = mpsc::channel(effect_capacity);
+        let shared_coordinator_term = Arc::new(AtomicU64::new(coordinator_term));
         let handle = MembershipCoordinatorHandle {
             local_incarnation: hello.node.incarnation,
             coordinator: coordinator.clone(),
             associations: associations.clone(),
             maximum_control_payload: config.maximum_control_payload,
-            coordinator_term,
+            coordinator_term: shared_coordinator_term.clone(),
         };
         let local_node = hello.node.clone();
         Ok((
@@ -142,6 +145,7 @@ impl MembershipSession {
                 effects,
                 heartbeat_sequence: 0,
                 coordinator_term,
+                shared_coordinator_term,
                 hello_pending: true,
             },
             handle,
@@ -229,7 +233,11 @@ impl MembershipSession {
             }
             PlacementControlEventKind::Command(inbound) => {
                 self.require_coordinator(&inbound.association)?;
-                self.require_coordinator_term(inbound.coordinator_term)?;
+                if matches!(&inbound.command, PlacementControlCommand::SnapshotBegin(_)) {
+                    self.accept_snapshot_term(inbound.coordinator_term)?;
+                } else {
+                    self.require_coordinator_term(inbound.coordinator_term)?;
+                }
                 match inbound.command {
                     PlacementControlCommand::SnapshotBegin(begin) => {
                         if !matches!(begin.version, SnapshotVersion::Membership(_)) {
@@ -354,6 +362,18 @@ impl MembershipSession {
         } else {
             Err(LogicSessionError::StaleGeneration)
         }
+    }
+
+    fn accept_snapshot_term(&mut self, term: Option<u64>) -> Result<(), LogicSessionError> {
+        let Some(term) = term else {
+            return Err(LogicSessionError::StaleGeneration);
+        };
+        if term < self.coordinator_term {
+            return Err(LogicSessionError::StaleGeneration);
+        }
+        self.coordinator_term = term;
+        self.shared_coordinator_term.store(term, Ordering::Release);
+        Ok(())
     }
 }
 
