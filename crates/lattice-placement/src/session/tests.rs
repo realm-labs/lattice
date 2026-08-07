@@ -391,18 +391,76 @@ async fn heartbeat_publishes_a_fresh_baseline_node_load_sample() {
             1,
         )
         .build(),
-        coordinator,
+        coordinator.clone(),
         associations,
         config.clone(),
         8,
         1,
     )
     .unwrap();
-    let (_controls, control_rx) = mpsc::channel(1);
+    let (controls, control_rx) = mpsc::channel(4);
     let (shutdown, shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(session.run(control_rx, shutdown_rx));
 
     tokio::task::yield_now().await;
+    tokio::time::advance(config.heartbeat_interval).await;
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    let mut hello_count = 0;
+    while let Ok(frame) = outbound.try_recv() {
+        let payload = match frame.kind {
+            FrameKind::CoordinatorEvent => frame.payload().to_vec(),
+            FrameKind::ControlEnvelope => decode_control_envelope(&frame).unwrap().payload.to_vec(),
+            _ => continue,
+        };
+        let scoped =
+            crate::control::decode_control_command(&payload, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
+        if matches!(
+            scoped.command,
+            PlacementControlCommand::PlacementDomainHello(_)
+        ) {
+            hello_count += 1;
+        }
+    }
+    assert!(
+        hello_count >= 2,
+        "domain hello should be retried before registration"
+    );
+
+    let (completion, result) = tokio::sync::oneshot::channel();
+    controls
+        .send(PlacementControlEvent {
+            kind: PlacementControlEventKind::Command(Box::new(InboundPlacementControl {
+                association: coordinator,
+                command_id: CommandId::generate(),
+                scope: CoordinatorScope::Placement(
+                    PlacementDomainId::new("automatic-node-load").unwrap(),
+                ),
+                coordinator_term: Some(1),
+                command: PlacementControlCommand::SnapshotBegin(
+                    crate::coordinator::SnapshotBegin {
+                        snapshot_id: 1,
+                        version: crate::coordinator::SnapshotVersion::Placement(
+                            PlacementVersion::new(
+                                PlacementDomainId::new("automatic-node-load").unwrap(),
+                                CoordinatorTerm::new(1).unwrap(),
+                                Revision::new(1).unwrap(),
+                            ),
+                        ),
+                        record_count: 0,
+                        total_bytes: 0,
+                        chunk_count: 0,
+                        digest: [0; 32],
+                    },
+                ),
+            })),
+            completion,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.await.unwrap(), Ok(()));
+
     tokio::time::advance(config.heartbeat_interval).await;
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;

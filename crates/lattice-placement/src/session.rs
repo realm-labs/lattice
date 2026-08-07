@@ -212,6 +212,7 @@ pub struct PlacementDomainSession {
     origin: Instant,
     heartbeat_sequence: u64,
     coordinator_term: u64,
+    hello_pending: bool,
 }
 
 struct LocalAuthorityEvent {
@@ -278,6 +279,7 @@ impl PlacementDomainSession {
                 origin,
                 heartbeat_sequence: 0,
                 coordinator_term,
+                hello_pending: true,
             },
             receiver,
         ))
@@ -407,6 +409,12 @@ impl PlacementDomainSession {
                     self.tick_authorities().await?;
                 }
                 _ = heartbeat.tick() => {
+                    if self.hello_pending {
+                        // Domain registration can race global membership recovery. Retry the
+                        // idempotent hello until the Coordinator starts the placement snapshot.
+                        self.send_hello()?;
+                        continue;
+                    }
                     self.heartbeat_sequence = self
                         .heartbeat_sequence
                         .checked_add(1)
@@ -508,6 +516,7 @@ impl PlacementDomainSession {
             .lock()
             .expect("logic placement state poisoned")
             .domain_up = false;
+        self.hello_pending = true;
         if let Err(error) = self.send_hello() {
             tracing::warn!(
                 target: "lattice.cluster.logic",

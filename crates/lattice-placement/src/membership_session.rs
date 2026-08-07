@@ -57,6 +57,7 @@ pub struct MembershipSession {
     effects: mpsc::Sender<LogicPlacementEffect>,
     heartbeat_sequence: u64,
     coordinator_term: u64,
+    hello_pending: bool,
 }
 
 #[derive(Clone)]
@@ -141,6 +142,7 @@ impl MembershipSession {
                 effects,
                 heartbeat_sequence: 0,
                 coordinator_term,
+                hello_pending: true,
             },
             handle,
             receiver,
@@ -192,6 +194,12 @@ impl MembershipSession {
                     result?;
                 }
                 _ = heartbeat.tick() => {
+                    if self.hello_pending {
+                        // The initial hello may race Coordinator election or membership
+                        // recovery. Retry until a membership snapshot proves it was accepted.
+                        self.send(PlacementControlCommand::MemberHello(self.hello.clone()))?;
+                        continue;
+                    }
                     self.heartbeat_sequence = self
                         .heartbeat_sequence
                         .checked_add(1)
@@ -216,6 +224,7 @@ impl MembershipSession {
                     .lock()
                     .expect("membership session state poisoned")
                     .session = MembershipState::default();
+                self.hello_pending = true;
                 self.send(PlacementControlCommand::MemberHello(self.hello.clone()))
             }
             PlacementControlEventKind::Command(inbound) => {
@@ -226,6 +235,7 @@ impl MembershipSession {
                         if !matches!(begin.version, SnapshotVersion::Membership(_)) {
                             return Err(LogicSessionError::UnauthorizedCommand);
                         }
+                        self.hello_pending = false;
                         self.stager = Some(
                             SnapshotStager::begin(
                                 begin,

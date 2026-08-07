@@ -48,6 +48,7 @@ impl PlacementDomainSession {
                     .lock()
                     .expect("logic placement state poisoned")
                     .domain_up = false;
+                self.hello_pending = true;
                 self.send_hello()
             }
             PlacementControlEventKind::Command(inbound) => {
@@ -55,6 +56,7 @@ impl PlacementDomainSession {
                 self.require_coordinator_term(inbound.coordinator_term)?;
                 match inbound.command {
                     PlacementControlCommand::SnapshotBegin(begin) => {
+                        self.hello_pending = false;
                         self.stager = Some(
                             SnapshotStager::begin(
                                 begin,
