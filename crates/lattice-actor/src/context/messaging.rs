@@ -186,7 +186,7 @@ impl<A: Actor> ActorContext<A> {
             .await
     }
 
-    fn actor_system(&self) -> Result<&ActorSystem, RecipientError> {
+    pub(super) fn actor_system(&self) -> Result<&ActorSystem, RecipientError> {
         self.actor_system
             .as_ref()
             .and_then(|actor_system| actor_system.get())
@@ -208,7 +208,7 @@ mod turn_messaging_tests {
     };
     use lattice_remoting::messaging::error::{AskError, TellError};
     use lattice_remoting::protocol::ProtocolFingerprint;
-    use lattice_remoting::watch::{WatchError, WatchId};
+    use lattice_remoting::watch::{RegisteredWatch, WatchError, WatchId};
 
     use super::ActorTurnMessaging;
     use crate::{
@@ -299,22 +299,25 @@ mod turn_messaging_tests {
             })))
         }
 
-        async fn watch_actor(&self, _target: ActorRef) -> Result<WatchId, WatchError> {
+        async fn watch_actor(&self, _target: ActorRef) -> Result<RegisteredWatch, WatchError> {
             unimplemented!("watching is outside this fixture")
         }
 
-        async fn watch_entity_current(&self, _target: EntityRef) -> Result<WatchId, WatchError> {
+        async fn watch_entity_current(
+            &self,
+            _target: EntityRef,
+        ) -> Result<RegisteredWatch, WatchError> {
             unimplemented!("watching is outside this fixture")
         }
 
         async fn watch_singleton_current(
             &self,
             _target: SingletonRef,
-        ) -> Result<WatchId, WatchError> {
+        ) -> Result<RegisteredWatch, WatchError> {
             unimplemented!("watching is outside this fixture")
         }
 
-        async fn unwatch(&self, _watch_id: WatchId) -> Result<(), WatchError> {
+        fn unwatch(&self, _watch_id: WatchId) -> Result<(), WatchError> {
             unimplemented!("watching is outside this fixture")
         }
     }

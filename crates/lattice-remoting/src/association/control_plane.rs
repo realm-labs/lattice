@@ -88,6 +88,19 @@ impl Association {
         }
     }
 
+    pub async fn admit_control_command_in_wait_configured(
+        &self,
+        stream_id: ControlStreamId,
+        payload: bytes::Bytes,
+    ) -> Result<CommandId, AssociationError> {
+        self.admit_control_command_in_wait(
+            stream_id,
+            payload,
+            self.config.control_apply_retry_timeout,
+        )
+        .await
+    }
+
     pub fn admit_ephemeral_control(&self, payload: bytes::Bytes) -> Result<(), AssociationError> {
         self.try_admit_control(Frame::new(FrameKind::CoordinatorEvent, payload))
     }

@@ -24,7 +24,7 @@ use crate::{
         Actor, ActorLifecycleState, Handler, Message, MessageKind, MessageMetadata, Request,
         Responder, StopReason,
     },
-    watch::{ActorTerminated, LocalActorRef},
+    watch::{ActorTermination, LocalActorRef},
 };
 
 pub(crate) type TerminalHook = Box<dyn FnOnce(LocalActorRef) + Send + 'static>;
@@ -33,7 +33,7 @@ const COOPERATIVE_CAPACITY_WAITER_LIMIT: usize = 2;
 
 pub(crate) struct ActorHandleInit<A: Actor> {
     pub(crate) local_ref: LocalActorRef,
-    pub(crate) terminated_tx: broadcast::Sender<ActorTerminated>,
+    pub(crate) terminated_tx: broadcast::Sender<ActorTermination>,
     pub(crate) lifecycle_tx: watch::Sender<ActorLifecycleState>,
     pub(crate) stop_failure: Arc<Mutex<Option<StopFailureRecord>>>,
     pub(crate) forced_data_loss_tx: broadcast::Sender<ForcedDataLossEvent>,
@@ -46,8 +46,8 @@ pub(crate) struct ActorHandleInit<A: Actor> {
 
 pub struct ActorHandle<A: Actor> {
     local_ref: LocalActorRef,
-    terminated_tx: broadcast::Sender<ActorTerminated>,
-    termination: Arc<Mutex<Option<ActorTerminated>>>,
+    terminated_tx: broadcast::Sender<ActorTermination>,
+    termination: Arc<Mutex<Option<ActorTermination>>>,
     terminal_cleanup_started: Arc<AtomicBool>,
     lifecycle_tx: watch::Sender<ActorLifecycleState>,
     lifecycle_state: Arc<AtomicU8>,
@@ -92,13 +92,13 @@ pub struct ForcedDataLossEvent {
 /// Unlike a bare broadcast receiver, subscriptions created after termination still
 /// observe the terminal event. Each subscription yields the event at most once.
 pub struct ActorTerminationSubscription {
-    retained: Option<ActorTerminated>,
-    receiver: broadcast::Receiver<ActorTerminated>,
+    retained: Option<ActorTermination>,
+    receiver: broadcast::Receiver<ActorTermination>,
     delivered: bool,
 }
 
 impl ActorTerminationSubscription {
-    pub fn try_recv(&mut self) -> Result<ActorTerminated, TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<ActorTermination, TryRecvError> {
         if self.delivered {
             return Err(TryRecvError::Closed);
         }
@@ -111,7 +111,7 @@ impl ActorTerminationSubscription {
         Ok(termination)
     }
 
-    pub async fn recv(&mut self) -> Result<ActorTerminated, RecvError> {
+    pub async fn recv(&mut self) -> Result<ActorTermination, RecvError> {
         if self.delivered {
             return Err(RecvError::Closed);
         }
@@ -506,7 +506,7 @@ impl<A: Actor> ActorHandle<A> {
         self.terminal_cleanup_started.load(Ordering::Acquire)
     }
 
-    pub(crate) fn publish_terminated(&self, notification: ActorTerminated) {
+    pub(crate) fn publish_terminated(&self, notification: ActorTermination) {
         let should_publish = {
             let mut termination = self
                 .termination

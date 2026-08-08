@@ -9,6 +9,7 @@ pub mod kind;
 pub mod release;
 pub mod service_context;
 pub mod trace;
+pub mod watch;
 
 #[cfg(test)]
 mod tests;

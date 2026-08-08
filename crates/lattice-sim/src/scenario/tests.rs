@@ -247,9 +247,10 @@ fn terminal_notifications() -> usize {
     let source = node("source", 1, 28001);
     let actor = actor_ref(&source);
     let mut registry = WatchRegistry::new(4, 4).unwrap();
-    let (watch_id, _) = registry
+    let (registered_watch, _) = registry
         .watch(AssociationId::new(1).unwrap(), &actor)
         .unwrap();
+    let watch_id = registered_watch.id();
     let target = ExactActorTarget::from(&actor);
     registry
         .receive_watch(
@@ -260,7 +261,7 @@ fn terminal_notifications() -> usize {
         )
         .unwrap();
     registry
-        .target_terminated(&target, TerminatedReason::Handoff)
+        .target_terminated(&target, TerminatedReason::Migrated)
         .len()
 }
 

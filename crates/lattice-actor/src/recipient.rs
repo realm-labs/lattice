@@ -11,7 +11,7 @@ use lattice_core::actor_ref::{
 };
 use lattice_remoting::messaging::error::{AskError, TellError};
 use lattice_remoting::protocol::ProtocolFingerprint;
-use lattice_remoting::watch::{WatchError, WatchId};
+use lattice_remoting::watch::{RegisteredWatch, WatchError, WatchId, WatchStatus};
 use thiserror::Error;
 
 use crate::error::ActorError;
@@ -19,6 +19,7 @@ use crate::protocol::{
     ActorProtocol, DispatchError, DispatchMode, Protocol, SupportsAsk, SupportsTell,
 };
 use crate::traits::{Message, Request};
+use crate::watch::{ActorTerminated, TerminatedTarget};
 
 #[doc(hidden)]
 pub struct RecipientTell {
@@ -64,13 +65,112 @@ pub trait RecipientBackend: Send + Sync + 'static {
         deadline: Instant,
     ) -> Result<Bytes, AskError>;
 
-    async fn watch_actor(&self, target: ActorRef) -> Result<WatchId, WatchError>;
+    async fn watch_actor(&self, target: ActorRef) -> Result<RegisteredWatch, WatchError>;
 
-    async fn watch_entity_current(&self, target: EntityRef) -> Result<WatchId, WatchError>;
+    async fn watch_entity_current(&self, target: EntityRef) -> Result<RegisteredWatch, WatchError>;
 
-    async fn watch_singleton_current(&self, target: SingletonRef) -> Result<WatchId, WatchError>;
+    async fn watch_singleton_current(
+        &self,
+        target: SingletonRef,
+    ) -> Result<RegisteredWatch, WatchError>;
 
-    async fn unwatch(&self, watch_id: WatchId) -> Result<(), WatchError>;
+    fn unwatch(&self, watch_id: WatchId) -> Result<(), WatchError>;
+}
+
+pub struct WatchTarget(WatchTargetKind);
+
+enum WatchTargetKind {
+    Exact(ActorRef),
+    EntityCurrent(EntityRef),
+    SingletonCurrent(SingletonRef),
+}
+
+impl<P: ProtocolTag> From<&ActorRef<P>> for WatchTarget {
+    fn from(target: &ActorRef<P>) -> Self {
+        Self(WatchTargetKind::Exact(target.erase()))
+    }
+}
+
+impl<P: ProtocolTag> From<&EntityRef<P>> for WatchTarget {
+    fn from(target: &EntityRef<P>) -> Self {
+        Self(WatchTargetKind::EntityCurrent(target.erase()))
+    }
+}
+
+impl<P: ProtocolTag> From<&SingletonRef<P>> for WatchTarget {
+    fn from(target: &SingletonRef<P>) -> Self {
+        Self(WatchTargetKind::SingletonCurrent(target.erase()))
+    }
+}
+
+/// Event-driven DeathWatch registration for an exact Actor activation.
+///
+/// Dropping an active subscription cancels it. A delivered terminal event completes it.
+pub struct WatchSubscription {
+    registered: RegisteredWatch,
+    backend: Arc<dyn RecipientBackend>,
+    completed: bool,
+}
+
+impl WatchSubscription {
+    fn new(registered: RegisteredWatch, backend: Arc<dyn RecipientBackend>) -> Self {
+        Self {
+            registered,
+            backend,
+            completed: false,
+        }
+    }
+
+    pub const fn id(&self) -> WatchId {
+        self.registered.id()
+    }
+
+    pub fn status(&self) -> WatchStatus {
+        self.registered.status()
+    }
+
+    pub async fn status_changed(&mut self) -> Result<WatchStatus, RecipientError> {
+        self.registered
+            .status_changed()
+            .await
+            .map_err(RecipientError::Watch)
+    }
+
+    pub async fn recv(&mut self) -> Result<ActorTerminated, RecipientError> {
+        let terminated = self
+            .registered
+            .recv()
+            .await
+            .map_err(RecipientError::Watch)?;
+        self.completed = true;
+        let target: ActorRef = terminated
+            .target
+            .actor_ref()
+            .map_err(|_| RecipientError::Watch(WatchError::InvalidCommand))?;
+        Ok(ActorTerminated {
+            watch_id: terminated.watch_id,
+            target: TerminatedTarget::Exact(target),
+            reason: terminated.reason,
+        })
+    }
+
+    pub fn cancel(mut self) -> Result<(), RecipientError> {
+        let result = self
+            .backend
+            .unwatch(self.id())
+            .map_err(RecipientError::Watch);
+        self.completed = true;
+        result
+    }
+}
+
+impl Drop for WatchSubscription {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.backend.unwatch(self.id());
+            self.completed = true;
+        }
+    }
 }
 
 /// Process-level actor messaging capability.
@@ -221,40 +321,26 @@ impl ActorSystem {
             .map_err(RecipientError::Dispatch)
     }
 
-    pub async fn watch<P: ProtocolTag>(
+    pub async fn watch(
         &self,
-        target: &ActorRef<P>,
-    ) -> Result<WatchId, RecipientError> {
-        self.backend
-            .watch_actor(target.erase())
-            .await
-            .map_err(RecipientError::Watch)
+        target: impl Into<WatchTarget>,
+    ) -> Result<WatchSubscription, RecipientError> {
+        let registered = match target.into().0 {
+            WatchTargetKind::Exact(target) => self.backend.watch_actor(target).await,
+            WatchTargetKind::EntityCurrent(target) => {
+                self.backend.watch_entity_current(target).await
+            }
+            WatchTargetKind::SingletonCurrent(target) => {
+                self.backend.watch_singleton_current(target).await
+            }
+        }
+        .map_err(RecipientError::Watch)?;
+        Ok(WatchSubscription::new(registered, self.backend.clone()))
     }
 
-    pub async fn watch_entity_current<P: ProtocolTag>(
-        &self,
-        target: &EntityRef<P>,
-    ) -> Result<WatchId, RecipientError> {
-        self.backend
-            .watch_entity_current(target.erase())
-            .await
-            .map_err(RecipientError::Watch)
-    }
-
-    pub async fn watch_singleton_current<P: ProtocolTag>(
-        &self,
-        target: &SingletonRef<P>,
-    ) -> Result<WatchId, RecipientError> {
-        self.backend
-            .watch_singleton_current(target.erase())
-            .await
-            .map_err(RecipientError::Watch)
-    }
-
-    pub async fn unwatch(&self, watch_id: WatchId) -> Result<(), RecipientError> {
+    pub fn unwatch(&self, watch_id: WatchId) -> Result<(), RecipientError> {
         self.backend
             .unwatch(watch_id)
-            .await
             .map_err(RecipientError::Watch)
     }
 

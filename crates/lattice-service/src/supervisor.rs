@@ -65,6 +65,13 @@ impl TaskSupervisor {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.spawn_abortable(future).map(|_| ())
+    }
+
+    pub(crate) fn spawn_abortable<F>(&self, future: F) -> Result<AbortHandle, ServiceError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let mut tasks = self.tasks.lock().expect("service task supervisor poisoned");
         tasks.retain(|task| !task.monitor.is_finished());
         if tasks.len() == self.maximum {
@@ -93,8 +100,11 @@ impl TaskSupervisor {
                 }
             }
         });
-        tasks.push(SupervisedTask { abort, monitor });
-        Ok(())
+        tasks.push(SupervisedTask {
+            abort: abort.clone(),
+            monitor,
+        });
+        Ok(abort)
     }
 
     /// Stops every supervised task, aborting the ones that miss the graceful deadline.

@@ -74,7 +74,6 @@ use lattice_remoting::{
     config::RemotingConfig,
     control::{CommandId, ControlDispatch},
     handshake::NodeIdentity,
-    watch::WatchStatus,
 };
 use lattice_service::{
     builder::{LatticeService, LatticeServiceBuilder},
@@ -752,18 +751,11 @@ async fn client(reference: PathBuf, expect_failure: bool) -> Result<(), Box<dyn 
     {
         return Err("unexpected distributed child reply".into());
     }
-    let watch_id = service.watch(&child).await?;
+    let mut watch = service.watch(&child).await?;
     service.tell(&child, StopPing).await?;
-    let watch_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if service.watch_status(watch_id) == WatchStatus::Terminated {
-            break;
-        }
-        if Instant::now() >= watch_deadline {
-            return Err("remote child watch did not terminate".into());
-        }
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(10), watch.recv())
+        .await
+        .map_err(|_| "remote child watch did not terminate")??;
     std::fs::write("/artifacts/multiprocess.json", b"{\"reply\":42}\n")?;
     std::fs::write(
         "/artifacts/child-multiprocess.json",

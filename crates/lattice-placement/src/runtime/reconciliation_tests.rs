@@ -78,7 +78,7 @@ async fn persist_authority_records(
     let membership_leader = LeaderRecord {
         scope: CoordinatorScope::Membership,
         node: node("membership", 91, 32991),
-        protocol_generation: 8,
+        protocol_generation: 9,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(
@@ -159,7 +159,7 @@ async fn election_adopts_claim_without_rewriting_the_durable_slot() {
     let record = LeaderRecord {
         scope: CoordinatorScope::Placement(domain()),
         node: old_leader,
-        protocol_generation: 8,
+        protocol_generation: 9,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&record, old_lease).await.unwrap());
@@ -274,7 +274,7 @@ async fn election_removes_orphaned_domain_members_before_recovery() {
     let placement_record = LeaderRecord {
         scope: CoordinatorScope::Placement(domain()),
         node: old_leader,
-        protocol_generation: 8,
+        protocol_generation: 9,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(
@@ -290,7 +290,7 @@ async fn election_removes_orphaned_domain_members_before_recovery() {
     let membership_record = LeaderRecord {
         scope: CoordinatorScope::Membership,
         node: node("membership", 91, 32991),
-        protocol_generation: 8,
+        protocol_generation: 9,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     let membership_guard = MembershipLeaderGuard::new(membership_record).unwrap();

@@ -2,10 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_actor::{
-    handle::ActorTerminationSubscription, host::ProtocolHostRegistry,
-    watch::TerminatedReason as WatchTerminatedReason,
-};
+use lattice_actor::{handle::ActorTerminationSubscription, host::ProtocolHostRegistry};
 use lattice_remoting::{
     association::{Association, AssociationError, AssociationKey, AssociationManager},
     control::{
@@ -14,8 +11,8 @@ use lattice_remoting::{
     },
     messaging::target::ExactActorTarget,
     watch::{
-        TerminatedReason, WatchCommand, WatchError, WatchRegistry, decode_watch_command,
-        encode_watch_command, is_watch_control,
+        WatchCommand, WatchError, WatchRegistry, decode_watch_command, encode_watch_command,
+        is_watch_control,
     },
 };
 
@@ -88,40 +85,66 @@ impl ServiceControlDispatch {
 
     fn supervise_termination(
         &self,
+        association_id: lattice_remoting::association::AssociationId,
+        watch_id: lattice_core::watch::WatchId,
         target: ExactActorTarget,
         mut terminated: ActorTerminationSubscription,
     ) -> Result<(), ControlDispatchError> {
         let watches = self.watches.clone();
         let associations = self.associations.clone();
         let maximum_payload = self.maximum_payload;
-        self.supervisor
-            .spawn(async move {
-                let Ok(terminated) = terminated.recv().await else {
-                    return;
+        let task = match self.supervisor.spawn_abortable(async move {
+            let Ok(terminated) = terminated.recv().await else {
+                return;
+            };
+            let commands = watches
+                .lock()
+                .expect("watch registry poisoned")
+                .target_terminated(&target, terminated.reason);
+            for (association_id, command) in commands {
+                if let WatchCommand::Terminated {
+                    watch_id,
+                    target,
+                    reason,
+                } = &command
+                    && watches
+                        .lock()
+                        .expect("watch registry poisoned")
+                        .contains_desired(*watch_id)
+                {
+                    watches
+                        .lock()
+                        .expect("watch registry poisoned")
+                        .receive_terminated(*watch_id, target, *reason);
+                    continue;
+                }
+                let Some(association) = associations.get_by_id(association_id) else {
+                    continue;
                 };
-                let reason = match terminated.reason {
-                    WatchTerminatedReason::Stopped => TerminatedReason::Stopped,
-                    WatchTerminatedReason::Panicked => TerminatedReason::Panicked,
-                    WatchTerminatedReason::Passivated => TerminatedReason::Passivated,
-                    WatchTerminatedReason::Migrated => TerminatedReason::Handoff,
-                    WatchTerminatedReason::Fenced => TerminatedReason::ClaimLost,
-                    WatchTerminatedReason::NodeDown => TerminatedReason::NodeDown,
+                let Ok(payload) = encode_watch_command(&command, maximum_payload) else {
+                    continue;
                 };
-                let commands = watches
+                let _ = association
+                    .admit_control_command_in_wait_configured(ControlStreamId::WATCH, payload)
+                    .await;
+            }
+        }) {
+            Ok(task) => task,
+            Err(_) => {
+                self.watches
                     .lock()
                     .expect("watch registry poisoned")
-                    .target_terminated(&target, reason);
-                for (association_id, command) in commands {
-                    let Some(association) = associations.get_by_id(association_id) else {
-                        continue;
-                    };
-                    let Ok(payload) = encode_watch_command(&command, maximum_payload) else {
-                        continue;
-                    };
-                    let _ = association.admit_control_command_in(ControlStreamId::WATCH, payload);
-                }
-            })
-            .map_err(|_| ControlDispatchError::RetryLater(ControlRetryReason::ConsumerBusy))
+                    .receive_unwatch(association_id, watch_id);
+                return Err(ControlDispatchError::RetryLater(
+                    ControlRetryReason::ConsumerBusy,
+                ));
+            }
+        };
+        self.watches
+            .lock()
+            .expect("watch registry poisoned")
+            .attach_target_task(association_id, watch_id, task);
+        Ok(())
     }
 
     async fn apply_watch(
@@ -154,7 +177,7 @@ impl ServiceControlDispatch {
                 if matches!(response, WatchCommand::WatchAck { .. })
                     && let Some(terminated) = terminated
                 {
-                    self.supervise_termination(target, terminated)?;
+                    self.supervise_termination(association.id(), watch_id, target, terminated)?;
                 }
                 self.send(&association, &response)
             }
@@ -178,13 +201,15 @@ impl ServiceControlDispatch {
                 Ok(())
             }
             WatchCommand::Terminated {
-                watch_id, target, ..
+                watch_id,
+                target,
+                reason,
             } => {
                 if self
                     .watches
                     .lock()
                     .expect("watch registry poisoned")
-                    .receive_terminated(watch_id, &target)
+                    .receive_terminated(watch_id, &target, reason)
                 {
                     Ok(())
                 } else {
@@ -276,6 +301,12 @@ impl ControlDispatch for ServiceControlDispatch {
             .reconcile_association(target.id());
         for command in commands {
             self.send(&target, &command)?;
+            if let WatchCommand::Unwatch { watch_id } = command {
+                self.watches
+                    .lock()
+                    .expect("watch registry poisoned")
+                    .complete_unwatch(watch_id);
+            }
         }
         Ok(())
     }

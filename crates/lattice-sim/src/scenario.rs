@@ -150,9 +150,10 @@ impl Scenario {
         .map_err(ScenarioError::Handoff)?;
         let actor = actor_ref(&source);
         let mut watches = WatchRegistry::new(16, 16).map_err(ScenarioError::Watch)?;
-        let (watch_id, _) = watches
+        let (registered_watch, _) = watches
             .watch(AssociationId::new(1).unwrap(), &actor)
             .map_err(ScenarioError::Watch)?;
+        let watch_id = registered_watch.id();
         let configuration = serde_json::to_value(&config).map_err(|_| ScenarioError::Codec)?;
         let trace = TraceJournal::new(
             "standard-handoff",
@@ -240,8 +241,8 @@ impl Scenario {
             ScenarioEvent::InstallWatch => self.install_watch()?,
             ScenarioEvent::TargetTerminated => self.terminate_watch_target(),
             ScenarioEvent::NodeDown(session) => {
-                for (watch_id, _) in self.watches.node_down(session) {
-                    if watch_id == self.watch_id {
+                for termination in self.watches.node_down(session) {
+                    if termination.watch_id == self.watch_id {
                         self.state.terminal_watches += 1;
                     }
                 }

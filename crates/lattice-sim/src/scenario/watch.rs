@@ -49,9 +49,11 @@ impl Scenario {
                 self.state.watch_acknowledged = self.watches.receive_ack(watch_id, &target);
             }
             WatchCommand::Terminated {
-                watch_id, target, ..
+                watch_id,
+                target,
+                reason,
             } => {
-                if self.watches.receive_terminated(watch_id, &target) {
+                if self.watches.receive_terminated(watch_id, &target, reason) {
                     self.state.terminal_watches += 1;
                 }
             }
@@ -63,7 +65,7 @@ impl Scenario {
         let target = self.watch_target.clone();
         let commands = self
             .watches
-            .target_terminated(&target, TerminatedReason::Handoff);
+            .target_terminated(&target, TerminatedReason::Migrated);
         let action = self
             .faults
             .take_injection(Failpoint::WatchAfterTerminatedBeforeAck)

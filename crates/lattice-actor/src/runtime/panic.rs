@@ -13,7 +13,7 @@ use crate::{
     mailbox::{ActorCommand, MailboxLane, QueuedRejection, channel::Receiver},
     observation::ActorLifecycleEvent,
     traits::{Actor, ActorLifecycleState, StopReason},
-    watch::{ActorIncarnation, ActorTerminated, TerminatedReason},
+    watch::{ActorTermination, TerminatedReason},
 };
 
 #[derive(Debug)]
@@ -98,9 +98,8 @@ where
     handle
         .observer()
         .lifecycle(handle.observation_metadata(), ActorLifecycleEvent::Panicked);
-    handle.publish_terminated(ActorTerminated {
+    handle.publish_terminated(ActorTermination {
         target: handle.local_ref(),
-        incarnation: ActorIncarnation::new(handle.local_ref().id()),
         reason: TerminatedReason::Panicked,
     });
 }

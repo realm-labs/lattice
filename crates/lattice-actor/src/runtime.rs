@@ -30,7 +30,7 @@ use crate::{
     observation::{ActorLifecycleEvent, ActorObserverHandle},
     recipient::ActorSystem,
     traits::{Actor, ActorLifecycleState, MessageOutcome, StopReason},
-    watch::{ActorIncarnation, ActorTerminated, LocalActorRef, TerminatedReason},
+    watch::{ActorTermination, LocalActorRef, TerminatedReason},
 };
 
 mod panic;
@@ -890,9 +890,8 @@ where
             ActorLifecycleEvent::Stopped(reason)
         },
     );
-    handle.publish_terminated(ActorTerminated {
+    handle.publish_terminated(ActorTermination {
         target: handle.local_ref(),
-        incarnation: ActorIncarnation::new(handle.local_ref().id()),
         reason: TerminatedReason::from(reason),
     });
     if let Some(completion) = terminal_completion {

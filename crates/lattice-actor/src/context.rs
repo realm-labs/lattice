@@ -35,6 +35,8 @@ mod extensions;
 mod messaging;
 mod tasks;
 
+pub use tasks::ContextWatchTarget;
+
 use children::ChildStop;
 
 /// A cancellation handle for work started by [`ActorContext::pipe_to_self`] or
@@ -88,7 +90,6 @@ pub struct ActorContext<A: Actor> {
     deferred_capacity: usize,
     watches: HashMap<WatchId, JoinHandle<()>>,
     children: HashMap<ChildActorKey, Box<dyn ChildStop>>,
-    next_watch_id: u64,
     sender: Option<ActorRef>,
     current_deadline: Option<Instant>,
 }
@@ -118,7 +119,6 @@ impl<A: Actor> fmt::Debug for ActorContext<A> {
             .field("deferred_capacity", &self.deferred_capacity)
             .field("watch_count", &self.watches.len())
             .field("child_count", &self.children.len())
-            .field("next_watch_id", &self.next_watch_id)
             .field("has_sender", &self.sender.is_some())
             .field("current_deadline", &self.current_deadline)
             .finish()
@@ -149,7 +149,6 @@ impl<A: Actor> ActorContext<A> {
             deferred_capacity,
             watches: HashMap::new(),
             children: HashMap::new(),
-            next_watch_id: 0,
             sender: None,
             current_deadline: None,
         }

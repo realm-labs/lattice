@@ -250,7 +250,7 @@ async fn real_etcd_guarded_domain_commits_and_lease_expiry() {
     let membership_leader = LeaderRecord {
         scope: CoordinatorScope::Membership,
         node: node("coordinator", 1, 29001),
-        protocol_generation: 8,
+        protocol_generation: 9,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(
@@ -271,7 +271,7 @@ async fn real_etcd_guarded_domain_commits_and_lease_expiry() {
     let leader = LeaderRecord {
         scope: CoordinatorScope::Placement(domain()),
         node: node("coordinator", 1, 29001),
-        protocol_generation: 8,
+        protocol_generation: 9,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&leader, leader_lease).await.unwrap());
@@ -971,7 +971,7 @@ async fn real_etcd_domain_configuration_is_durable_and_cross_domain_guarded() {
     let leader = LeaderRecord {
         scope: CoordinatorScope::Placement(domain()),
         node: node("config-leader", 61, 29261),
-        protocol_generation: 8,
+        protocol_generation: 9,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&leader, lease).await.unwrap());
@@ -1100,7 +1100,7 @@ async fn real_etcd_plan_capacity_is_exact_and_recovers_after_guarded_delete() {
     let leader = LeaderRecord {
         scope: CoordinatorScope::Placement(domain()),
         node: node("capacity-leader", 50, 29250),
-        protocol_generation: 8,
+        protocol_generation: 9,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&leader, lease).await.unwrap());

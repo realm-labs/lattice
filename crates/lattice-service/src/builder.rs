@@ -19,9 +19,7 @@ use lattice_actor::{
     traits::{Actor, Message, Request},
 };
 use lattice_core::{
-    actor_ref::{
-        ActorRef, EntityRef, PlacementDomainId, ProtocolId, ProtocolTag, RecipientRef, SingletonRef,
-    },
+    actor_ref::{PlacementDomainId, ProtocolId, RecipientRef},
     coordinator::CoordinatorScope,
 };
 use lattice_discovery::provider::CoordinatorDiscovery;

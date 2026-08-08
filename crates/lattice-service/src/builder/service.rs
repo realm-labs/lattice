@@ -1,14 +1,16 @@
 use std::{sync::atomic::Ordering, time::Duration};
 
 use lattice_actor::{
-    registry::ActorCellDiagnostics, traits::ActorLifecycleState, watch::LocalActorRef,
+    recipient::{WatchSubscription, WatchTarget},
+    registry::ActorCellDiagnostics,
+    traits::ActorLifecycleState,
+    watch::{LocalActorRef, WatchId},
 };
 use lattice_core::{
     actor_ref::ClusterId,
     release::{ClusterReleaseState, ReleaseError, ReleaseManifest},
 };
 use lattice_placement::{membership_session::MembershipCoordinatorHandle, types::PlacementSlotKey};
-use lattice_remoting::watch::{WatchId, WatchStatus};
 use tokio::{
     sync::broadcast::{Receiver, error::RecvError},
     time::Instant,
@@ -26,15 +28,15 @@ use crate::{
 };
 
 use super::{
-    ActorRef, ActorSystem, Arc, Association, AssociationManager, AtomicBool, BTreeMap, BTreeSet,
+    ActorSystem, Arc, Association, AssociationManager, AtomicBool, BTreeMap, BTreeSet,
     BootstrapLeader, BootstrapView, ClusterJoinConfig, CoordinatorHandle,
-    CoordinatorHostScopeState, CoordinatorRuntimeAssembly, EntityRef, LatticeServiceBuilder,
+    CoordinatorHostScopeState, CoordinatorRuntimeAssembly, LatticeServiceBuilder,
     LogicCoordinatorHandle, LogicJoinRuntime, LogicRuntimeAssembly, MemberDirectory, MemberEvent,
     MemberSnapshot, MembershipJoinRuntime, Message, Mutex, NodeConfig, NodeIdentity, NodeKey,
     NodeLifecycleState, OutboundMessaging, PeerReconciler, PlacementDomainId, PlacementDomainState,
-    ProductionLifecycleDriver, ProtocolHostRegistry, ProtocolTag, RecipientError, RecipientRef,
+    ProductionLifecycleDriver, ProtocolHostRegistry, RecipientError, RecipientRef,
     RemotingEndpoint, Request, ServiceError, ServiceHealthSnapshot, ServiceLifecycleEvent,
-    SingletonRef, SupportsAsk, SupportsTell, TaskSupervisor, WatchRegistry, watch,
+    SupportsAsk, SupportsTell, TaskSupervisor, WatchRegistry, watch,
 };
 
 pub struct LatticeService {
@@ -191,29 +193,15 @@ impl LatticeService {
         self.actor_system.ask(target, request, timeout).await
     }
 
-    pub async fn watch<P: ProtocolTag>(
+    pub async fn watch(
         &self,
-        target: &ActorRef<P>,
-    ) -> Result<WatchId, RecipientError> {
+        target: impl Into<WatchTarget>,
+    ) -> Result<WatchSubscription, RecipientError> {
         self.actor_system.watch(target).await
     }
 
-    pub async fn watch_entity_current<P: ProtocolTag>(
-        &self,
-        target: &EntityRef<P>,
-    ) -> Result<WatchId, RecipientError> {
-        self.actor_system.watch_entity_current(target).await
-    }
-
-    pub async fn watch_singleton_current<P: ProtocolTag>(
-        &self,
-        target: &SingletonRef<P>,
-    ) -> Result<WatchId, RecipientError> {
-        self.actor_system.watch_singleton_current(target).await
-    }
-
-    pub async fn unwatch(&self, watch_id: WatchId) -> Result<(), RecipientError> {
-        self.actor_system.unwatch(watch_id).await
+    pub fn unwatch(&self, watch_id: WatchId) -> Result<(), RecipientError> {
+        self.actor_system.unwatch(watch_id)
     }
 
     pub fn associations(&self) -> &AssociationManager {
@@ -226,13 +214,6 @@ impl LatticeService {
 
     pub fn supervisor(&self) -> &TaskSupervisor {
         &self.supervisor
-    }
-
-    pub fn watch_status(&self, watch_id: WatchId) -> WatchStatus {
-        self.watches
-            .lock()
-            .expect("watch registry poisoned")
-            .status(watch_id)
     }
 
     pub fn coordinator(&self, domain: &PlacementDomainId) -> Option<CoordinatorHandle> {

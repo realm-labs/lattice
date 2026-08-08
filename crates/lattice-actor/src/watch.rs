@@ -1,13 +1,7 @@
 use crate::traits::{PassivationReason, StopReason};
+use lattice_core::actor_ref::ActorRef;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct WatchId(u64);
-
-impl WatchId {
-    pub(crate) fn new(value: u64) -> Self {
-        Self(value)
-    }
-}
+pub use lattice_core::watch::{TerminatedReason, WatchId, WatchStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocalActorRef {
@@ -24,34 +18,23 @@ impl LocalActorRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ActorIncarnation(u64);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TerminatedTarget {
+    Local(LocalActorRef),
+    Exact(ActorRef),
+}
 
-impl ActorIncarnation {
-    pub(crate) fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub fn value(self) -> u64 {
-        self.0
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorTermination {
+    pub target: LocalActorRef,
+    pub reason: TerminatedReason,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, crate::Message)]
 pub struct ActorTerminated {
-    pub target: LocalActorRef,
-    pub incarnation: ActorIncarnation,
+    pub watch_id: WatchId,
+    pub target: TerminatedTarget,
     pub reason: TerminatedReason,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminatedReason {
-    Stopped,
-    Panicked,
-    Passivated,
-    Migrated,
-    Fenced,
-    NodeDown,
 }
 
 impl From<StopReason> for TerminatedReason {

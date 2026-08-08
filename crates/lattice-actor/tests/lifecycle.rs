@@ -44,7 +44,7 @@ async fn local_actor_watch_sends_typed_termination_notification() {
         type Error = ActorError;
         type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
-            ctx.watch(&self.target)?;
+            ctx.watch(&self.target).await?;
             Ok(())
         }
     }
@@ -98,7 +98,7 @@ async fn watcher_stop_auto_unwatches_local_target() {
         type Error = ActorError;
         type Behavior = ::lattice_actor::state_machine::Stateless;
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
-            ctx.watch(&self.target)?;
+            ctx.watch(&self.target).await?;
             Ok(())
         }
     }
@@ -516,7 +516,7 @@ async fn stopping_failure_retains_actor_state_and_retry_terminates_once() {
         type Behavior = ::lattice_actor::state_machine::Stateless;
 
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
-            ctx.watch(&self.target)?;
+            ctx.watch(&self.target).await?;
             self.ready.add_permits(1);
             Ok(())
         }
@@ -749,7 +749,7 @@ async fn watch_notification_is_delivered_while_the_normal_mailbox_is_full() {
         type Behavior = ::lattice_actor::state_machine::Stateless;
 
         async fn started(&mut self, ctx: &mut ActorContext<Self>) -> Result<(), ActorError> {
-            ctx.watch(&self.target)?;
+            ctx.watch(&self.target).await?;
             self.ready.add_permits(1);
             Ok(())
         }
@@ -958,9 +958,12 @@ async fn watch_capacity_is_bounded_and_reclaimed() {
             reply_to: ReplyTo<usize>,
         ) -> Result<(), ActorError> {
             let target = self.target.clone();
-            let granted = (0..request.0)
-                .filter(|_| ctx.watch(&target).is_ok())
-                .count();
+            let mut granted = 0;
+            for _ in 0..request.0 {
+                if ctx.watch(&target).await.is_ok() {
+                    granted += 1;
+                }
+            }
             reply_to.send(granted)?;
             Ok(())
         }
