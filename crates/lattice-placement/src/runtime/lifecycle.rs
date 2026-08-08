@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use tokio::time::MissedTickBehavior;
 
@@ -6,9 +6,9 @@ use lattice_core::actor_ref::{EntityType, NodeIncarnation, PlacementDomainId};
 
 use super::{
     AllocationError, CoordinatorLeaseStore, CoordinatorRuntimeError, HandoffEvent, HandoffMachine,
-    Instant, MembershipStore, MoveProgress, PlacementControlEvent, PlacementDomainLeader,
-    PlacementDomainStore, PlacementSlotKey, PlacementSlotState, PlanStatus, RebalanceTrigger,
-    ScopedElectionStore, membership::control_dispatch_error, mpsc, watch,
+    Instant, LeaderLeaseKeepalive, MembershipStore, MoveProgress, PlacementControlEvent,
+    PlacementDomainLeader, PlacementDomainStore, PlacementSlotKey, PlacementSlotState, PlanStatus,
+    RebalanceTrigger, ScopedElectionStore, membership::control_dispatch_error, mpsc, watch,
 };
 use crate::{
     control::PlacementControlEventKind,
@@ -304,7 +304,20 @@ where
         controls: mpsc::Receiver<PlacementControlEvent>,
         shutdown: watch::Receiver<bool>,
     ) -> Result<(), CoordinatorRuntimeError> {
-        let result = self.run_loop(controls, shutdown).await;
+        let mut lease_failure = self.leader_lease_keepalive.failure.clone();
+        let result = tokio::select! {
+            result = self.run_loop(controls, shutdown) => result,
+            changed = lease_failure.changed() => {
+                let error = if changed.is_err() {
+                    StorageError::LeadershipLost
+                } else {
+                    lease_failure.borrow().clone().unwrap_or(StorageError::LeadershipLost)
+                };
+                self.leadership_loss_count = self.leadership_loss_count.saturating_add(1);
+                Err(error.into())
+            }
+        };
+        self.leader_lease_keepalive.stop().await;
         let revoke = self.store.revoke_lease(self.leader_lease_id).await;
         match (result, revoke) {
             (Err(error), _) => Err(error),
@@ -413,7 +426,6 @@ where
     }
 
     pub(super) async fn renew(&mut self) -> Result<(), CoordinatorRuntimeError> {
-        self.renew_leader_lease().await?;
         let now = Instant::now();
         let expired = self
             .sessions
@@ -462,51 +474,92 @@ where
         Ok(())
     }
 
-    /// Leader keep-alive is retried only inside the remaining lease budget: a single transport
-    /// deadline must not surrender a domain whose lease is still valid, and an expired budget must
-    /// not pretend the lease survived.
-    async fn renew_leader_lease(&mut self) -> Result<(), CoordinatorRuntimeError> {
-        let mut attempt = 0_u32;
-        loop {
-            let error = match self.store.keep_lease_alive(self.leader_lease_id).await {
-                Ok(()) => {
-                    self.leader_lease_deadline = Instant::now() + self.config.leader_lease_ttl;
-                    return Ok(());
-                }
-                Err(error) => error,
-            };
-            let remaining = self
-                .leader_lease_deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_default();
-            match classify_lease_renewal(&error, remaining, self.config.renewal_interval, attempt) {
-                LeaseRenewal::Retry(backoff) => {
-                    tracing::warn!(
-                        target: "lattice.cluster.placement",
-                        domain = %self.version.domain.as_str(),
-                        %error,
-                        remaining_millis = remaining.as_millis(),
-                        "leader lease keep-alive failed; retrying inside the remaining lease budget"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    attempt = attempt.saturating_add(1);
-                }
-                LeaseRenewal::Surrender => {
-                    if error == StorageError::LeadershipLost {
-                        self.leadership_loss_count = self.leadership_loss_count.saturating_add(1);
-                    }
-                    return Err(error.into());
-                }
-            }
-        }
-    }
-
-    fn focus_reconciliation(&mut self, key: &PlacementSlotKey) {
+    pub(super) fn focus_reconciliation(&mut self, key: &PlacementSlotKey) {
         if self.reconciliation.focus.len() >= self.config.maximum_reconciliation_work_per_pass {
             self.reconciliation.focused = true;
             return;
         }
         self.reconciliation.focus.insert(key.clone());
+    }
+}
+
+impl LeaderLeaseKeepalive {
+    pub(super) fn spawn<S>(
+        store: Arc<S>,
+        domain: PlacementDomainId,
+        lease_id: i64,
+        lease_ttl: Duration,
+        renewal_interval: Duration,
+    ) -> Self
+    where
+        S: CoordinatorLeaseStore,
+    {
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
+        let (failed, failure) = watch::channel(None);
+        let task = tokio::spawn(async move {
+            let mut renewal = tokio::time::interval(renewal_interval);
+            renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut deadline = Instant::now() + lease_ttl;
+            loop {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                    _ = renewal.tick() => {}
+                }
+                let mut attempt = 0_u32;
+                loop {
+                    let error = match store.keep_lease_alive(lease_id).await {
+                        Ok(()) => {
+                            deadline = Instant::now() + lease_ttl;
+                            break;
+                        }
+                        Err(error) => error,
+                    };
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .unwrap_or_default();
+                    match classify_lease_renewal(&error, remaining, renewal_interval, attempt) {
+                        LeaseRenewal::Retry(backoff) => {
+                            tracing::warn!(
+                                target: "lattice.cluster.placement",
+                                domain = %domain.as_str(),
+                                %error,
+                                remaining_millis = remaining.as_millis(),
+                                "leader lease keep-alive failed; retrying inside the remaining lease budget"
+                            );
+                            tokio::select! {
+                                changed = shutdown_rx.changed() => {
+                                    if changed.is_err() || *shutdown_rx.borrow() {
+                                        return;
+                                    }
+                                }
+                                _ = tokio::time::sleep(backoff) => {}
+                            }
+                            attempt = attempt.saturating_add(1);
+                        }
+                        LeaseRenewal::Surrender => {
+                            let _ = failed.send(Some(error));
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            shutdown,
+            failure,
+            task: Some(task),
+        }
+    }
+
+    async fn stop(&mut self) {
+        let _ = self.shutdown.send(true);
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
     }
 }
 
@@ -600,7 +653,60 @@ fn classify_lease_renewal(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    struct CountingLeaseStore {
+        renewals: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl CoordinatorLeaseStore for CountingLeaseStore {
+        async fn ensure_schema_generation(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn grant_lease(&self, _ttl: Duration) -> Result<i64, StorageError> {
+            Ok(1)
+        }
+
+        async fn keep_lease_alive(&self, lease_id: i64) -> Result<(), StorageError> {
+            assert_eq!(lease_id, 7);
+            self.renewals.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn revoke_lease(&self, _lease_id: i64) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn lease_time_to_live(
+            &self,
+            _lease_id: i64,
+        ) -> Result<Option<Duration>, StorageError> {
+            Ok(Some(Duration::from_secs(1)))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leader_lease_keepalive_runs_outside_the_domain_event_loop() {
+        let store = Arc::new(CountingLeaseStore {
+            renewals: AtomicUsize::new(0),
+        });
+        let mut keeper = LeaderLeaseKeepalive::spawn(
+            store.clone(),
+            PlacementDomainId::new("independent-lease").unwrap(),
+            7,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(350)).await;
+        tokio::task::yield_now().await;
+        assert!(store.renewals.load(Ordering::Relaxed) >= 2);
+        keeper.stop().await;
+    }
 
     #[test]
     fn only_transient_lease_failures_are_retried_and_only_inside_the_lease_budget() {

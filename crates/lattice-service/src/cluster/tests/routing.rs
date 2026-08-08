@@ -425,7 +425,11 @@ async fn stale_generation_never_reaches_entity_loader() {
         barrier_sessions: Default::default(),
     };
     let limits = SnapshotLimits::default();
+    let scope = CoordinatorScope::Placement(domain());
     let (begin, chunks, end) = build_snapshot(
+        &scope,
+        slot.version.term.get(),
+        DEFAULT_MAX_CONTROL_PAYLOAD,
         SnapshotVersion::Placement(slot.version.clone()),
         vec![SnapshotRecord {
             key: format!(

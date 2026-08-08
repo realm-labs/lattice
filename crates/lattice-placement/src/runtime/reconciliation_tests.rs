@@ -78,7 +78,7 @@ async fn persist_authority_records(
     let membership_leader = LeaderRecord {
         scope: CoordinatorScope::Membership,
         node: node("membership", 91, 32991),
-        protocol_generation: 7,
+        protocol_generation: 8,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(
@@ -151,7 +151,7 @@ async fn persist_authority_records(
 }
 
 #[tokio::test]
-async fn election_adopts_committed_claim_without_changing_owner_or_generation() {
+async fn election_adopts_claim_without_rewriting_the_durable_slot() {
     let store = Arc::new(InMemoryPlacementStore::new(32, 32).unwrap());
     store.ensure_schema_generation().await.unwrap();
     let old_leader = node("old", 1, 32101);
@@ -159,7 +159,7 @@ async fn election_adopts_committed_claim_without_changing_owner_or_generation() 
     let record = LeaderRecord {
         scope: CoordinatorScope::Placement(domain()),
         node: old_leader,
-        protocol_generation: 7,
+        protocol_generation: 8,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&record, old_lease).await.unwrap());
@@ -197,6 +197,7 @@ async fn election_adopts_committed_claim_without_changing_owner_or_generation() 
         )
         .await
         .unwrap();
+    let durable_revision = store.get_placement_revision(&domain()).await.unwrap();
     store.revoke_lease(membership_leader_lease).await.unwrap();
     store.revoke_lease(old_lease).await.unwrap();
 
@@ -218,7 +219,12 @@ async fn election_adopts_committed_claim_without_changing_owner_or_generation() 
         adopted.assignment_generation,
         persisted.assignment_generation
     );
-    assert_eq!(adopted.version.term, CoordinatorTerm::new(2).unwrap());
+    assert_eq!(adopted.version, persisted.version);
+    assert_eq!(
+        store.get_placement_revision(&domain()).await.unwrap(),
+        durable_revision,
+        "claim adoption must not advance the durable placement revision"
+    );
     assert_eq!(
         claim.grant.coordinator_term,
         CoordinatorTerm::new(2).unwrap()
@@ -268,7 +274,7 @@ async fn election_removes_orphaned_domain_members_before_recovery() {
     let placement_record = LeaderRecord {
         scope: CoordinatorScope::Placement(domain()),
         node: old_leader,
-        protocol_generation: 7,
+        protocol_generation: 8,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(
@@ -284,7 +290,7 @@ async fn election_removes_orphaned_domain_members_before_recovery() {
     let membership_record = LeaderRecord {
         scope: CoordinatorScope::Membership,
         node: node("membership", 91, 32991),
-        protocol_generation: 7,
+        protocol_generation: 8,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     let membership_guard = MembershipLeaderGuard::new(membership_record).unwrap();

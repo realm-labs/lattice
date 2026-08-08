@@ -185,20 +185,16 @@ impl LogicCoordinatorHandle {
                 generation,
             }
         };
-        let association = self
-            .associations
-            .get(&self.coordinator)
-            .ok_or(LogicSessionError::AssociationUnavailable)?;
-        association.admit_control_command_in(
-            control_stream_id(&CoordinatorScope::Placement(self.domain.clone())),
-            encode_control_command_for_term(
-                &CoordinatorScope::Placement(self.domain.clone()),
-                self.coordinator_term.load(Ordering::Acquire),
-                &command,
-                self.maximum_control_payload,
-            )
-            .map_err(LogicSessionError::Control)?,
-        )?;
-        Ok(())
+        if ready {
+            // Readiness is level-triggered and replayed by the session heartbeat. Keeping it out
+            // of reliable control prevents a large first-allocation burst from starving the
+            // association's membership and placement heartbeats.
+            match self.send_ephemeral(command) {
+                Ok(()) | Err(LogicSessionError::Association(_)) => Ok(()),
+                Err(error) => Err(error),
+            }
+        } else {
+            self.send_reliable(command)
+        }
     }
 }

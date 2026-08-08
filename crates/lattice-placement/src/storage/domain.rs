@@ -23,7 +23,6 @@ impl LeasedClaim {
             && self.grant.slot == slot.key
             && slot.owner.as_ref() == Some(&self.grant.owner)
             && self.grant.assignment_generation == slot.assignment_generation
-            && self.grant.coordinator_term == slot.version.term
     }
 }
 
@@ -199,7 +198,6 @@ pub struct AdoptAuthority {
     pub expected_domain_member: DomainMemberRecord,
     pub expected_slot: PlacementSlot,
     pub expected_claim: ClaimGrant,
-    pub slot: PlacementSlot,
     pub claim: LeasedClaim,
 }
 

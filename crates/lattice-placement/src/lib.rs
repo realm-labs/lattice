@@ -141,6 +141,42 @@ mod tests {
     }
 
     #[test]
+    fn a_new_coordinator_term_can_reset_the_runtime_claim_sequence_without_rewriting_the_slot() {
+        let local = node("a", 1, 1001);
+        let slot = running_slot(local.clone());
+        let mut authority = granted_authority(&local, &slot, Duration::from_secs(15));
+        authority
+            .transition(AuthorityEvent::InstallGrant {
+                grant: ClaimGrant {
+                    domain: slot.key.domain().clone(),
+                    slot: slot.key.clone(),
+                    owner: local.clone(),
+                    coordinator_term: slot.version.term.next().unwrap(),
+                    assignment_generation: slot.assignment_generation,
+                    grant_sequence: GrantSequence::new(1).unwrap(),
+                    ttl: Duration::from_secs(15),
+                },
+                now: MonotonicTime::from_millis(500),
+            })
+            .unwrap();
+        assert!(authority.admission_open_at(MonotonicTime::from_millis(501)));
+
+        let stale = authority.transition(AuthorityEvent::InstallGrant {
+            grant: ClaimGrant {
+                domain: slot.key.domain().clone(),
+                slot: slot.key,
+                owner: local,
+                coordinator_term: slot.version.term,
+                assignment_generation: slot.assignment_generation,
+                grant_sequence: GrantSequence::new(2).unwrap(),
+                ttl: Duration::from_secs(15),
+            },
+            now: MonotonicTime::from_millis(600),
+        });
+        assert_eq!(stale, Err(AuthorityError::StaleGrant));
+    }
+
+    #[test]
     fn xxh3_v1_entity_mapping_has_a_fixed_golden_vector() {
         let config = EntityConfig::new(
             PlacementDomainId::new("world").unwrap(),

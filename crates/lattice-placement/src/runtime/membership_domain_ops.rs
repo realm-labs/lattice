@@ -1,7 +1,5 @@
 use std::collections::BTreeSet;
 
-use crate::storage::domain::{AdoptAuthority, AuthorityCommit};
-
 impl<S> PlacementDomainLeader<S>
 where
     S: CoordinatorLeaseStore + ScopedElectionStore + MembershipStore + PlacementDomainStore,
@@ -548,9 +546,9 @@ where
         Ok(())
     }
 
-    /// A member acknowledges every delta, so this full authority sweep runs once per session as it
-    /// first reaches the leader's revision. Later adoption is the periodic reconciliation pass's
-    /// job, and later grants replay from the renewal tick.
+    /// Session acknowledgement is deliberately memory-only. Current claims are replayed from the
+    /// leader mirror; a missing or old-term claim is queued for the bounded reconciliation pass so
+    /// one joining member cannot monopolize the domain loop with an inventory-sized store sweep.
     pub(super) async fn reconcile_claims_for(
         &mut self,
         hello: &PlacementDomainHello,
@@ -559,78 +557,30 @@ where
             .get(&hello.node.incarnation)
             .and_then(|session| self.associations.get(&session.association))
             .ok_or(CoordinatorRuntimeError::AssociationUnavailable)?;
-        for slot in self.store.list_slots(&self.version.domain).await? {
-            if slot.owner.as_ref() != Some(&hello.node)
-                || !matches!(
-                    slot.state,
-                    PlacementSlotState::Allocating | PlacementSlotState::Running
-                )
-            {
-                continue;
-            }
-            let Some(previous) = self.store.get_claim(&slot.key).await? else {
-                continue;
-            };
-            if previous.grant.owner != hello.node
-                || previous.grant.assignment_generation != slot.assignment_generation
-            {
-                return Err(CoordinatorRuntimeError::ClaimNotProven);
-            }
-            let committed = if previous.grant.coordinator_term == self.leader.term {
-                AuthorityCommit {
-                    slot: slot.clone(),
-                    claim: previous,
-                }
-            } else {
-                let lease_id = self.store.grant_lease(self.config.claim_ttl).await?;
-                let mut adopted_slot = slot.clone();
-                adopted_slot.version = self.next_version()?;
-                let grant = ClaimGrant {
-                    domain: slot.key.domain().clone(),
-                    slot: slot.key.clone(),
-                    owner: hello.node.clone(),
-                    coordinator_term: self.leader.term,
-                    assignment_generation: slot.assignment_generation,
-                    grant_sequence: previous
-                        .grant
-                        .grant_sequence
-                        .next()
-                        .map_err(|_| CoordinatorRuntimeError::ClaimSequence)?,
-                    ttl: self.config.claim_ttl,
-                };
-                let (expected_global_member, expected_domain_member) =
-                    self.assignment_members(&hello.node).await?;
-                let result = self
-                    .store
-                    .adopt_authority(
-                        &self.leader_guard,
-                        AdoptAuthority {
-                            expected_global_member,
-                            expected_domain_member,
-                            expected_slot: slot.clone(),
-                            expected_claim: previous.grant.clone(),
-                            slot: adopted_slot,
-                            claim: LeasedClaim { grant, lease_id },
-                        },
+        let owned = self
+            .slots
+            .values()
+            .filter(|slot| {
+                slot.owner.as_ref() == Some(&hello.node)
+                    && matches!(
+                        slot.state,
+                        PlacementSlotState::Allocating | PlacementSlotState::Running
                     )
-                    .await;
-                match result {
-                    Ok(committed) => {
-                        let _ = self.store.revoke_lease(previous.lease_id).await;
-                        self.version = committed.slot.version.clone();
-                        self.publish_slot_delta(&committed.slot).await?;
-                        committed
-                    }
-                    Err(error) => {
-                        let _ = self.store.revoke_lease(lease_id).await;
-                        return Err(error.into());
-                    }
-                }
+            })
+            .map(|slot| slot.key.clone())
+            .collect::<Vec<_>>();
+        for key in owned {
+            let Some(current) = self.claims.get(&key) else {
+                self.focus_reconciliation(&key);
+                continue;
             };
-            let lease_id = committed.claim.lease_id;
-            let grant = committed.claim.grant;
-            self.remember_claim(lease_id, grant.clone());
-            self.grant_authority(&grant)?;
+            if current.grant.owner != hello.node
+                || current.grant.coordinator_term != self.leader.term
+            {
+                self.focus_reconciliation(&key);
+                continue;
+            }
+            self.grant_authority(&current.grant)?;
         }
         if let Some(session) = self.sessions.get_mut(&hello.node.incarnation) {
             session.claims_reconciled = true;

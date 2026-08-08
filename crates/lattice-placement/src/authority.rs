@@ -38,6 +38,7 @@ pub enum AuthorityEffect {
 
 #[derive(Debug, Clone)]
 struct InstalledGrant {
+    coordinator_term: crate::types::CoordinatorTerm,
     sequence: GrantSequence,
     deadline: MonotonicTime,
 }
@@ -180,15 +181,14 @@ impl PlacementAuthority {
             || grant.owner != self.local_node
             || slot.owner.as_ref() != Some(&self.local_node)
             || grant.assignment_generation != slot.assignment_generation
-            || grant.coordinator_term != slot.version.term
         {
             return Err(AuthorityError::StaleGrant);
         }
-        if self
-            .grant
-            .as_ref()
-            .is_some_and(|current| grant.grant_sequence < current.sequence)
-        {
+        if self.grant.as_ref().is_some_and(|current| {
+            grant.coordinator_term < current.coordinator_term
+                || (grant.coordinator_term == current.coordinator_term
+                    && grant.grant_sequence < current.sequence)
+        }) {
             return Err(AuthorityError::StaleGrant);
         }
         let usable_ttl = grant
@@ -200,6 +200,7 @@ impl PlacementAuthority {
             .ok_or(AuthorityError::InvalidClaimDeadline)?;
         let first = self.grant.is_none();
         self.grant = Some(InstalledGrant {
+            coordinator_term: grant.coordinator_term,
             sequence: grant.grant_sequence,
             deadline,
         });

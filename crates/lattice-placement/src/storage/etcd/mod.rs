@@ -36,7 +36,7 @@ mod page;
 mod traits;
 mod transactions;
 
-pub const STORAGE_SCHEMA_GENERATION: u64 = 5;
+pub const STORAGE_SCHEMA_GENERATION: u64 = 6;
 pub const DEFAULT_ETCD_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -878,7 +878,7 @@ impl EtcdPlacementStore {
         &self,
         guard: &PlacementLeaderGuard,
         request: AdoptAuthority,
-    ) -> Result<AuthorityCommit, StorageError> {
+    ) -> Result<LeasedClaim, StorageError> {
         transactions::adopt_authority(self, guard, request).await
     }
 

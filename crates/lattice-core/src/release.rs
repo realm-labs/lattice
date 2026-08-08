@@ -68,8 +68,8 @@ impl ReleaseCompatibility {
     pub const fn development() -> Self {
         Self {
             transport_generation: 1,
-            control_generation: 7,
-            storage_generation: 5,
+            control_generation: 8,
+            storage_generation: 6,
             actor_protocol_fingerprint: [1; 32],
             actor_state_fingerprint: [2; 32],
             placement_fingerprint: [3; 32],

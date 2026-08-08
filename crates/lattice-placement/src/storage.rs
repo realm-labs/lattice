@@ -280,7 +280,7 @@ pub trait PlacementDomainStore: CoordinatorLeaseStore {
         &self,
         guard: &PlacementLeaderGuard,
         request: AdoptAuthority,
-    ) -> Result<AuthorityCommit, StorageError>;
+    ) -> Result<LeasedClaim, StorageError>;
     async fn complete_move(
         &self,
         guard: &PlacementLeaderGuard,
@@ -708,6 +708,7 @@ impl InMemoryPlacementStore {
         validate_claim_lease(&state, &request.claim)?;
         if request.slot.state != PlacementSlotState::Allocating
             || request.slot.active_move.is_some()
+            || request.claim.grant.coordinator_term != guard.term()
             || !request.claim.matches_slot(&request.slot)
             || state.slots.contains_key(&request.slot.key)
             || state.claims.contains_key(&request.slot.key)
@@ -887,6 +888,7 @@ impl InMemoryPlacementStore {
                     .assignment_generation
                     .next()
                     .map_err(|_| StorageError::CounterExhausted)?
+            || request.claim.grant.coordinator_term != guard.term()
             || !request.claim.matches_slot(&request.slot)
             || state.claims.contains_key(&request.slot.key)
         {
@@ -909,7 +911,7 @@ impl InMemoryPlacementStore {
         &self,
         guard: &PlacementLeaderGuard,
         request: AdoptAuthority,
-    ) -> Result<AuthorityCommit, StorageError> {
+    ) -> Result<LeasedClaim, StorageError> {
         let mut state = self.inner.lock().expect("placement memory store poisoned");
         validate_guard(&state, guard)?;
         validate_assignment_members(
@@ -917,36 +919,27 @@ impl InMemoryPlacementStore {
             &request.expected_global_member,
             &request.expected_domain_member,
             request
-                .slot
+                .expected_slot
                 .owner
                 .as_ref()
                 .ok_or(StorageError::InvalidRecord)?,
         )?;
-        validate_slot_common(guard, &state, Some(&request.expected_slot), &request.slot)?;
         validate_claim_lease(&state, &request.claim)?;
         if !claim_matches(&state, &request.expected_claim)
-            || request.expected_slot.owner != request.slot.owner
-            || request.expected_slot.assignment_generation != request.slot.assignment_generation
-            || request.expected_slot.state != request.slot.state
+            || state.slots.get(&request.expected_slot.key) != Some(&request.expected_slot)
             || request.expected_claim.owner != request.claim.grant.owner
             || request.expected_claim.assignment_generation
                 != request.claim.grant.assignment_generation
             || request.expected_claim.coordinator_term >= request.claim.grant.coordinator_term
-            || !request.claim.matches_slot(&request.slot)
+            || request.claim.grant.coordinator_term != guard.term()
+            || !request.claim.matches_slot(&request.expected_slot)
         {
             return Err(StorageError::InvalidTransition);
         }
-        set_revision(&mut state, guard.scope(), request.slot.version.revision);
-        state
-            .slots
-            .insert(request.slot.key.clone(), request.slot.clone());
         state
             .claims
-            .insert(request.slot.key.clone(), request.claim.clone());
-        Ok(AuthorityCommit {
-            slot: request.slot,
-            claim: request.claim,
-        })
+            .insert(request.expected_slot.key, request.claim.clone());
+        Ok(request.claim)
     }
 
     async fn complete_move(

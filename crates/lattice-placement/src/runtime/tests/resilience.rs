@@ -197,6 +197,10 @@ async fn transient_claim_lease_failure_focuses_one_slot_instead_of_ending_leader
 
     fixture.leader.reconcile_bounded_pass().await.unwrap();
     assert!(fixture.leader.reconciliation.focus.is_empty());
+    let fenced = fixture.store.get_slot(&shard_key).await.unwrap().unwrap();
+    assert_eq!(fenced.state, PlacementSlotState::Fenced);
+
+    fixture.leader.reconcile_bounded_pass().await.unwrap();
     let repaired = fixture.store.get_slot(&shard_key).await.unwrap().unwrap();
     assert_eq!(repaired.assignment_generation.get(), 2);
     assert_eq!(repaired.owner.as_ref(), Some(&fixture.host));
@@ -360,7 +364,7 @@ async fn allocating_resolution_publishes_a_slot_delta_without_a_full_snapshot() 
 }
 
 #[tokio::test]
-async fn a_member_reaching_the_leader_revision_reconciles_its_claims_once() {
+async fn a_member_reaching_the_leader_revision_defers_missing_claims_to_bounded_reconciliation() {
     let mut fixture = domain_fixture(
         "claim-reconciliation-once",
         26760,
@@ -419,7 +423,15 @@ async fn a_member_reaching_the_leader_revision_reconciles_its_claims_once() {
         .into_iter()
         .filter(|command| matches!(command, PlacementControlCommand::ClaimGranted(_)))
         .count();
-    assert_eq!(first, 1);
+    assert_eq!(first, 0, "the acknowledgement path must stay memory-only");
+    assert!(fixture.leader.reconciliation.focus.contains(&shard_key));
+
+    fixture.leader.reconcile_bounded_pass().await.unwrap();
+    let reconciled = collected_commands(&mut control)
+        .into_iter()
+        .filter(|command| matches!(command, PlacementControlCommand::ClaimGranted(_)))
+        .count();
+    assert_eq!(reconciled, 1);
 
     fixture.leader.handle_control(applied).await.unwrap();
     let second = collected_commands(&mut control)

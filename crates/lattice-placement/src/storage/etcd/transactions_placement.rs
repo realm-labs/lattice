@@ -130,6 +130,9 @@ pub(super) async fn allocate_initial(
     ensure_guard_live(store, guard).await?;
     validate_slot(guard, None, &request.slot)?;
     validate_claim(&request.claim, &request.slot)?;
+    if request.claim.grant.coordinator_term != guard.term() {
+        return Err(StorageError::InvalidRecord);
+    }
     let assignment = assignment_compares(
         store,
         &request.expected_global_member,
@@ -401,6 +404,9 @@ pub(super) async fn install_authority(
     ensure_guard_live(store, guard).await?;
     validate_slot(guard, Some(&request.expected_slot), &request.slot)?;
     validate_claim(&request.claim, &request.slot)?;
+    if request.claim.grant.coordinator_term != guard.term() {
+        return Err(StorageError::InvalidRecord);
+    }
     let assignment = assignment_compares(
         store,
         &request.expected_global_member,
@@ -459,33 +465,33 @@ pub(super) async fn adopt_authority(
     store: &EtcdPlacementStore,
     guard: &PlacementLeaderGuard,
     request: AdoptAuthority,
-) -> Result<AuthorityCommit, StorageError> {
+) -> Result<LeasedClaim, StorageError> {
     ensure_guard_live(store, guard).await?;
-    validate_slot(guard, Some(&request.expected_slot), &request.slot)?;
-    validate_claim(&request.claim, &request.slot)?;
+    request
+        .expected_slot
+        .validate()
+        .map_err(|_| StorageError::InvalidRecord)?;
+    validate_claim(&request.claim, &request.expected_slot)?;
     let assignment = assignment_compares(
         store,
         &request.expected_global_member,
         &request.expected_domain_member,
         request
-            .slot
+            .expected_slot
             .owner
             .as_ref()
             .ok_or(StorageError::InvalidRecord)?,
     )
     .await?;
-    if request.expected_slot.owner != request.slot.owner
-        || request.expected_slot.assignment_generation != request.slot.assignment_generation
-        || request.expected_slot.state != request.slot.state
-        || request.expected_claim.owner != request.claim.grant.owner
+    if request.expected_claim.owner != request.claim.grant.owner
         || request.expected_claim.assignment_generation != request.claim.grant.assignment_generation
         || request.expected_claim.coordinator_term >= request.claim.grant.coordinator_term
+        || request.claim.grant.coordinator_term != guard.term()
     {
         return Err(StorageError::InvalidTransition);
     }
-    let state = state_counter(store, guard.scope(), request.slot.version.revision).await?;
-    let slot_key = store.slot_key(&request.slot.key);
-    let claim_key = store.claim_key(&request.slot.key);
+    let slot_key = store.slot_key(&request.expected_slot.key);
+    let claim_key = store.claim_key(&request.expected_slot.key);
     let slot_revision = exact_record(store, &slot_key, &request.expected_slot).await?;
     let claim_revision = exact_claim(store, &claim_key, &request.expected_claim).await?;
     commit(
@@ -496,23 +502,15 @@ pub(super) async fn adopt_authority(
             Compare::mod_revision(claim_key.clone(), CompareOp::Equal, claim_revision),
             assignment[0].clone(),
             assignment[1].clone(),
-            state.compare,
         ],
-        vec![
-            TxnOp::put(slot_key, encode(&request.slot)?, None),
-            TxnOp::put(
-                claim_key,
-                encode(&request.claim.grant)?,
-                Some(PutOptions::new().with_lease(request.claim.lease_id)),
-            ),
-            state.put,
-        ],
+        vec![TxnOp::put(
+            claim_key,
+            encode(&request.claim.grant)?,
+            Some(PutOptions::new().with_lease(request.claim.lease_id)),
+        )],
     )
     .await?;
-    Ok(AuthorityCommit {
-        slot: request.slot,
-        claim: request.claim,
-    })
+    Ok(request.claim)
 }
 
 pub(super) async fn complete_move(

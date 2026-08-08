@@ -88,7 +88,7 @@ async fn persist_authority_records(
     let membership_leader = LeaderRecord {
         scope: CoordinatorScope::Membership,
         node: node("membership-leader", 90, 31990),
-        protocol_generation: 7,
+        protocol_generation: 8,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(
@@ -156,7 +156,7 @@ async fn elected_placement(
     let leader = LeaderRecord {
         scope: CoordinatorScope::Placement(domain),
         node: node("leader", 1, 31001),
-        protocol_generation: 7,
+        protocol_generation: 8,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&leader, lease).await.unwrap());
@@ -170,7 +170,7 @@ async fn elected_membership() -> (InMemoryPlacementStore, MembershipLeaderGuard,
     let leader = LeaderRecord {
         scope: CoordinatorScope::Membership,
         node: node("leader", 1, 31001),
-        protocol_generation: 7,
+        protocol_generation: 8,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&leader, lease).await.unwrap());
@@ -786,7 +786,7 @@ async fn domain_configuration_is_durable_revisioned_and_exactly_scoped() {
     let leader = LeaderRecord {
         scope: CoordinatorScope::Placement(domain()),
         node: node("config-leader", 60, 31600),
-        protocol_generation: 7,
+        protocol_generation: 8,
         term: CoordinatorTerm::new(1).unwrap(),
     };
     assert!(store.campaign_leader(&leader, lease).await.unwrap());

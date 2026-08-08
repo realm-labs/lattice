@@ -21,8 +21,8 @@ use crate::{
     storage::{
         StorageError,
         domain::{
-            CreateDomainMember, LeasedClaim, PutEntityConfig, PutSingletonConfig,
-            RemoveDomainMember, UpdateDomainMember,
+            CreateDomainMember, PutEntityConfig, PutSingletonConfig, RemoveDomainMember,
+            UpdateDomainMember,
         },
     },
     types::MonotonicTime,

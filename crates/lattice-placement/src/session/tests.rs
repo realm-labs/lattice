@@ -161,6 +161,110 @@ async fn effect_backpressure_waits_for_capacity_without_terminating_the_session(
 }
 
 #[tokio::test]
+async fn runtime_progress_never_consumes_the_reliable_control_outbox() {
+    let cluster_id = ClusterId::new("runtime-progress-outbox").unwrap();
+    let domain = PlacementDomainId::new("runtime-progress-outbox").unwrap();
+    let local = NodeKey {
+        node_id: "logic".to_owned(),
+        address: NodeAddress::new("127.0.0.1", 34085).unwrap(),
+        incarnation: NodeIncarnation::new(1).unwrap(),
+    };
+    let remote_address = NodeAddress::new("127.0.0.1", 34086).unwrap();
+    let remote_incarnation = NodeIncarnation::new(2).unwrap();
+    let associations = Arc::new(
+        AssociationManager::new(
+            local.address.clone(),
+            local.incarnation,
+            RemotingConfig::default(),
+        )
+        .unwrap(),
+    );
+    let association = associations
+        .get_or_create(
+            cluster_id.clone(),
+            remote_address.clone(),
+            remote_incarnation,
+        )
+        .unwrap();
+    let coordinator = AssociationKey {
+        cluster_id,
+        local_incarnation: local.incarnation,
+        remote_address,
+        remote_incarnation,
+    };
+    for (lane, nonce) in [
+        (LaneKind::Control, 1_u128),
+        (LaneKind::Interactive, 2),
+        (LaneKind::Bulk(0), 3),
+    ] {
+        association
+            .attach(LaneAttachment {
+                association_id: association.id(),
+                key: coordinator.clone(),
+                lane,
+                connection_nonce: nonce,
+            })
+            .unwrap();
+    }
+    let (session, _effects) = PlacementDomainSession::new(
+        PlacementDomainHello::builder(local.clone(), domain.clone(), 1).build(),
+        coordinator,
+        associations,
+        LogicCoordinatorConfig::default(),
+        8,
+        1,
+    )
+    .unwrap();
+    session.send_hello().unwrap();
+
+    let version = PlacementVersion::new(
+        domain.clone(),
+        CoordinatorTerm::new(1).unwrap(),
+        Revision::new(1).unwrap(),
+    );
+    session
+        .send_runtime_progress(PlacementControlCommand::AppliedRevision(version.clone()))
+        .unwrap();
+    let key = PlacementSlotKey::Shard {
+        domain,
+        entity_type: EntityType::new("entity").unwrap(),
+        shard_id: ShardId::new(0),
+    };
+    session
+        .state
+        .lock()
+        .expect("logic placement state poisoned")
+        .slots
+        .insert(
+            key.clone(),
+            PlacementSlot {
+                key: key.clone(),
+                config_fingerprint: ConfigFingerprint::new([7; 32]),
+                owner: Some(local),
+                target: None,
+                assignment_generation: AssignmentGeneration::new(1).unwrap(),
+                version,
+                state: PlacementSlotState::Allocating,
+                active_move: None,
+                barrier_sessions: Default::default(),
+            },
+        );
+    session.control_handle().publish_ready(&key).unwrap();
+
+    let replayed = association
+        .replay_control_frames()
+        .into_iter()
+        .filter_map(|frame| decode_control_envelope(&frame).ok())
+        .filter_map(|envelope| {
+            crate::control::decode_control_command(&envelope.payload, DEFAULT_MAX_CONTROL_PAYLOAD)
+                .ok()
+        })
+        .map(|scoped| scoped.command.name())
+        .collect::<Vec<_>>();
+    assert_eq!(replayed, vec!["PlacementDomainHello"]);
+}
+
+#[tokio::test]
 async fn stale_generation_does_not_terminate_the_session() {
     let cluster_id = ClusterId::new("stale-generation-session").unwrap();
     let domain = PlacementDomainId::new("stale-generation-session").unwrap();

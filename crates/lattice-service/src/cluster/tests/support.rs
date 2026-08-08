@@ -230,13 +230,15 @@ pub(super) async fn stage_logic_runtime(
     let (control, controls) =
         PlacementControlRouter::bounded(64, DEFAULT_MAX_CONTROL_PAYLOAD).unwrap();
     let control = Arc::new(control);
+    let version = slots.iter().map(|slot| slot.version.clone()).max().unwrap();
+    let coordinator_term = version.term.get();
     let (logic, _effects) = PlacementDomainSession::new(
         hello.domain,
         coordinator.clone(),
         associations,
         LogicCoordinatorConfig::default(),
         64,
-        1,
+        coordinator_term,
     )
     .unwrap();
     for slot in &slots {
@@ -249,7 +251,6 @@ pub(super) async fn stage_logic_runtime(
     let state = logic.state();
     let (shutdown, shutdown_rx) = watch::channel(false);
     let task = tokio::spawn(logic.run(controls, shutdown_rx));
-    let version = slots.iter().map(|slot| slot.version.clone()).max().unwrap();
     let records = slots
         .iter()
         .map(|slot| {
@@ -275,8 +276,16 @@ pub(super) async fn stage_logic_runtime(
         })
         .collect();
     let limits = SnapshotLimits::default();
-    let (begin, chunks, end) =
-        build_snapshot(SnapshotVersion::Placement(version), records, &limits).unwrap();
+    let scope = CoordinatorScope::Placement(version.domain.clone());
+    let (begin, chunks, end) = build_snapshot(
+        &scope,
+        version.term.get(),
+        DEFAULT_MAX_CONTROL_PAYLOAD,
+        SnapshotVersion::Placement(version),
+        records,
+        &limits,
+    )
+    .unwrap();
     let mut commands = vec![PlacementControlCommand::SnapshotBegin(begin)];
     commands.extend(
         chunks
@@ -307,7 +316,7 @@ pub(super) async fn stage_logic_runtime(
                 CommandId::generate(),
                 lattice_placement::control::encode_control_command_for_term(
                     &CoordinatorScope::Placement(domain()),
-                    1,
+                    coordinator_term,
                     &command,
                     DEFAULT_MAX_CONTROL_PAYLOAD,
                 )

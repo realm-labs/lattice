@@ -93,6 +93,7 @@ where
             self.reconciliation.focused = false;
         }
         let focus = std::mem::take(&mut self.reconciliation.focus);
+        let focused_keys = focus.clone();
         for key in focus {
             let Some(slot) = self.store.get_slot(&key).await? else {
                 continue;
@@ -117,6 +118,9 @@ where
             .await?;
         let remaining = page.remaining;
         for slot in page.records {
+            if focused_keys.contains(&slot.key) {
+                continue;
+            }
             self.observe_slot(&slot);
             self.validate_slot_move_relationship(&slot);
             let claim = self.store.get_claim(&slot.key).await?;
@@ -246,9 +250,10 @@ where
             (false, None)
                 if slot.state == PlacementSlotState::Fenced && slot.active_move.is_none() =>
             {
-                if self.reinstall_fenced_authority(slot.clone()).await? {
-                    self.clear_quarantine(&slot.key);
+                if !self.reinstall_fenced_authority(slot.clone()).await? {
+                    return Ok(());
                 }
+                self.clear_quarantine(&slot.key);
             }
             _ => {}
         }
@@ -277,8 +282,6 @@ where
             Err(error) => return Err(error),
         };
         let lease_id = self.store.grant_lease(self.config.claim_ttl).await?;
-        let mut adopted = slot.clone();
-        adopted.version = self.next_version()?;
         let grant = ClaimGrant {
             domain: slot.key.domain().clone(),
             slot: slot.key.clone(),
@@ -302,7 +305,6 @@ where
                     expected_domain_member,
                     expected_slot: slot,
                     expected_claim: previous.grant.clone(),
-                    slot: adopted,
                     claim: LeasedClaim {
                         grant: grant.clone(),
                         lease_id,
@@ -314,10 +316,8 @@ where
             Ok(committed) => {
                 super::post_commit_failpoint(Failpoint::ReconciliationAfterCommitBeforeEffect)?;
                 let _ = self.store.revoke_lease(previous.lease_id).await;
-                self.version = committed.slot.version.clone();
-                self.remember_claim(committed.claim.lease_id, committed.claim.grant.clone());
-                self.publish_slot_delta(&committed.slot).await?;
-                self.replay_claim_if_connected(&committed.claim.grant)?;
+                self.remember_claim(committed.lease_id, committed.grant.clone());
+                self.replay_claim_if_connected(&committed.grant)?;
             }
             Err(error) => {
                 let _ = self.store.revoke_lease(lease_id).await;

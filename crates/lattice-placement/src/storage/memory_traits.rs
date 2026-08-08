@@ -505,7 +505,7 @@ impl PlacementDomainStore for InMemoryPlacementStore {
         &self,
         guard: &PlacementLeaderGuard,
         request: AdoptAuthority,
-    ) -> Result<AuthorityCommit, StorageError> {
+    ) -> Result<LeasedClaim, StorageError> {
         InMemoryPlacementStore::adopt_authority(self, guard, request).await
     }
     async fn complete_move(

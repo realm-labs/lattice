@@ -102,7 +102,9 @@ impl PlacementDomainSession {
                                     .session
                                     .install(install)
                                     .map_err(LogicSessionError::PlacementState)?;
-                                self.send(PlacementControlCommand::AppliedRevision(version))
+                                self.send_runtime_progress(
+                                    PlacementControlCommand::AppliedRevision(version),
+                                )
                             }
                         }
                     }
@@ -112,6 +114,9 @@ impl PlacementDomainSession {
                     }
                     PlacementControlCommand::MemberUp(member) => self.apply_member_up(member),
                     PlacementControlCommand::ClaimGranted(grant) => {
+                        if grant.coordinator_term.get() != self.coordinator_term {
+                            return Err(LogicSessionError::StaleGeneration);
+                        }
                         let effects = {
                             let mut state =
                                 self.state.lock().expect("logic placement state poisoned");
@@ -239,7 +244,7 @@ impl PlacementDomainSession {
                 .map_err(LogicSessionError::PlacementState)?;
         }
         self.install_slots(slots).await?;
-        self.send(PlacementControlCommand::AppliedRevision(delta.version))
+        self.send_runtime_progress(PlacementControlCommand::AppliedRevision(delta.version))
     }
 
     fn apply_member_up(&self, member: MemberRecord) -> Result<(), LogicSessionError> {

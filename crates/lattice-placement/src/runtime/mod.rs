@@ -15,6 +15,7 @@ use lattice_remoting::association::{
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot::Sender, watch},
+    task::JoinHandle,
     time::Instant,
 };
 
@@ -307,6 +308,20 @@ struct ClaimLease {
     grant: ClaimGrant,
 }
 
+struct LeaderLeaseKeepalive {
+    shutdown: watch::Sender<bool>,
+    failure: watch::Receiver<Option<StorageError>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl Drop for LeaderLeaseKeepalive {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ManualRelocationRequest {
     pub domain: PlacementDomainId,
@@ -560,7 +575,7 @@ where
     leader: LeaderRecord,
     leader_guard: PlacementLeaderGuard,
     leader_lease_id: i64,
-    leader_lease_deadline: Instant,
+    leader_lease_keepalive: LeaderLeaseKeepalive,
     config: PlacementDomainLeaderConfig,
     membership_version: MembershipVersion,
     version: PlacementVersion,
@@ -658,6 +673,13 @@ where
             let _ = store.revoke_lease(leader_lease_id).await;
             return Err(CoordinatorRuntimeError::NotLeader);
         }
+        let leader_lease_keepalive = LeaderLeaseKeepalive::spawn(
+            store.clone(),
+            domain.clone(),
+            leader_lease_id,
+            config.leader_lease_ttl,
+            config.renewal_interval,
+        );
         let leader_guard = PlacementLeaderGuard::new(leader.clone())
             .map_err(CoordinatorRuntimeError::Coordinator)?;
         let membership_scope = CoordinatorScope::Membership;
@@ -714,14 +736,13 @@ where
             .into_iter()
             .map(|slot| (slot.key.clone(), slot))
             .collect();
-        let leader_lease_deadline = Instant::now() + config.leader_lease_ttl;
         let mut leader = Self {
             store,
             associations,
             leader,
             leader_guard,
             leader_lease_id,
-            leader_lease_deadline,
+            leader_lease_keepalive,
             config,
             membership_version,
             version,

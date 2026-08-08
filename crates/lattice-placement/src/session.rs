@@ -217,6 +217,8 @@ pub struct PlacementDomainSession {
     hello_pending: bool,
 }
 
+const MAX_READY_REPLAYS_PER_HEARTBEAT: usize = 64;
+
 struct LocalAuthorityEvent {
     slot: PlacementSlotKey,
     succeeded: bool,
@@ -427,6 +429,7 @@ impl PlacementDomainSession {
                         incarnation: self.domain_hello.node.incarnation,
                         sequence: self.heartbeat_sequence,
                     })?;
+                    self.replay_runtime_progress()?;
                     if self.config.automatic_node_load_reporting {
                         let report = self
                             .state
@@ -492,6 +495,58 @@ impl PlacementDomainSession {
             )
             .map_err(LogicSessionError::Control)?,
         )?;
+        Ok(())
+    }
+
+    /// Applied revisions and initial-authority readiness are level-triggered runtime state. They
+    /// must never occupy the reliable outbox: a burst of newly allocated shards can otherwise
+    /// fill that outbox and prevent the heartbeats needed to drain it. Transient ephemeral
+    /// admission failure is safe because the current level is replayed on every heartbeat.
+    pub(super) fn send_runtime_progress(
+        &self,
+        command: PlacementControlCommand,
+    ) -> Result<(), LogicSessionError> {
+        match self.send_ephemeral(command) {
+            Ok(()) => Ok(()),
+            Err(LogicSessionError::Association(error)) => {
+                tracing::debug!(
+                    target: "lattice.cluster.logic",
+                    domain = %self.domain_hello.domain.as_str(),
+                    %error,
+                    "runtime progress sample was dropped and will be replayed"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn replay_runtime_progress(&self) -> Result<(), LogicSessionError> {
+        let (version, ready) = {
+            let state = self.state.lock().expect("logic placement state poisoned");
+            let now = state.now();
+            let ready = state
+                .slots
+                .iter()
+                .filter(|(key, slot)| {
+                    slot.state == PlacementSlotState::Allocating
+                        && slot.owner.as_ref() == Some(&state.local_node)
+                        && state
+                            .authorities
+                            .get(*key)
+                            .is_some_and(|authority| authority.admission_open_at(now))
+                })
+                .take(MAX_READY_REPLAYS_PER_HEARTBEAT)
+                .map(|(key, slot)| (key.clone(), slot.assignment_generation))
+                .collect::<Vec<_>>();
+            (state.session.version().cloned(), ready)
+        };
+        if let Some(version) = version {
+            self.send_runtime_progress(PlacementControlCommand::AppliedRevision(version))?;
+        }
+        for (slot, generation) in ready {
+            self.send_runtime_progress(PlacementControlCommand::SlotReady { slot, generation })?;
+        }
         Ok(())
     }
 

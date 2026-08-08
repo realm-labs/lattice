@@ -384,7 +384,7 @@ impl PlacementDomainStore for EtcdPlacementStore {
         &self,
         guard: &PlacementLeaderGuard,
         request: AdoptAuthority,
-    ) -> Result<AuthorityCommit, StorageError> {
+    ) -> Result<LeasedClaim, StorageError> {
         EtcdPlacementStore::adopt_authority(self, guard, request).await
     }
     async fn complete_move(

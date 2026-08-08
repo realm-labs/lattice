@@ -114,7 +114,7 @@ pub enum MigrationError {
     MarkerMismatch,
     #[error("another migration holds the lease-backed migration lock")]
     Locked,
-    #[error("a record cannot be converted to generation 5")]
+    #[error("a record cannot be converted to the current generation")]
     InvalidRecord,
     #[error("every entity type and singleton kind requires an explicit placement-domain mapping")]
     UnmappedType,
