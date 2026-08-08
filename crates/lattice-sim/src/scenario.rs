@@ -8,9 +8,12 @@
 
 use std::collections::BTreeSet;
 
-use lattice_core::actor_ref::{
-    ActivationId, ActorPath, ActorRef, ClusterId, EntityType, NodeAddress, NodeIncarnation,
-    PlacementDomainId, ProtocolId,
+use lattice_core::{
+    actor_ref::{
+        ActivationId, ActorPath, ActorRef, ClusterId, EntityType, NodeAddress, NodeIncarnation,
+        PlacementDomainId, ProtocolId,
+    },
+    watch::{WatchId, WatchStatus},
 };
 use lattice_placement::{
     handoff::{HandoffError, HandoffMachine, HandoffPhase},
@@ -23,7 +26,7 @@ use lattice_remoting::{
     association::AssociationId,
     control::{ReliableControl, ReliableControlError},
     messaging::target::ExactActorTarget,
-    watch::{WatchError, WatchId, WatchRegistry, WatchStatus},
+    watch::{WatchError, WatchRegistry},
     wire::{FrameCodec, WireError},
 };
 use serde::{Deserialize, Serialize};

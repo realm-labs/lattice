@@ -10,9 +10,12 @@ use lattice_actor::{
     host::ProtocolHostRegistry,
     recipient::{ImmediateRecipientTellDispatch, RecipientBackend, RecipientTell},
 };
-use lattice_core::actor_ref::{
-    ActorRef, ClusterId, EntityRef, NodeAddress, NodeIncarnation, PlacementDomainId, RecipientRef,
-    SingletonRef,
+use lattice_core::{
+    actor_ref::{
+        ActorRef, ClusterId, EntityRef, NodeAddress, NodeIncarnation, PlacementDomainId,
+        RecipientRef, SingletonRef,
+    },
+    watch::WatchId,
 };
 use lattice_placement::types::PlacementSlotKey;
 use lattice_remoting::{
@@ -27,9 +30,7 @@ use lattice_remoting::{
         },
     },
     protocol::ProtocolFingerprint,
-    watch::{
-        RegisteredWatch, WatchCommand, WatchError, WatchId, WatchRegistry, encode_watch_command,
-    },
+    watch::{RegisteredWatch, WatchCommand, WatchError, WatchRegistry, encode_watch_command},
 };
 
 use crate::{

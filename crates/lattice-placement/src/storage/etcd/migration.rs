@@ -20,11 +20,14 @@ use crate::{
     types::{CoordinatorTerm, PlacementSlot, PlacementSlotState, PlacementVersion},
 };
 
-const MIGRATING_SCHEMA: &str = "migrating-to-5";
 const MIGRATION_LOCK_TTL_SECONDS: i64 = 300;
 // etcd defaults to 128 operations per transaction. Each target contributes
 // one compare and one put in addition to the common fencing comparisons.
 const MIGRATION_TXN_TARGET_BATCH: usize = 32;
+
+fn migrating_schema() -> String {
+    format!("migrating-to-{STORAGE_SCHEMA_GENERATION}")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationMode {
@@ -148,15 +151,16 @@ pub async fn execute(
     let mut client = Client::connect(&config.endpoints, None).await?;
     let schema_key = key(&config.cluster_prefix, "schema_generation");
     let schema = read_one(&mut client, &schema_key).await?;
+    let migrating_schema = migrating_schema();
     let schema_value = schema
         .as_ref()
         .map(|record| record.value.as_slice())
         .ok_or(MigrationError::WrongGeneration)?;
     let schema_allowed = match mode {
         MigrationMode::Apply => schema_value == b"4",
-        MigrationMode::Resume => schema_value == MIGRATING_SCHEMA.as_bytes(),
+        MigrationMode::Resume => schema_value == migrating_schema.as_bytes(),
         MigrationMode::Inspect | MigrationMode::DryRun => {
-            schema_value == b"4" || schema_value == MIGRATING_SCHEMA.as_bytes()
+            schema_value == b"4" || schema_value == migrating_schema.as_bytes()
         }
     };
     if !schema_allowed {
@@ -276,7 +280,11 @@ pub async fn execute(
         if matches!(mode, MigrationMode::Apply) {
             compares.push(Compare::value(schema_key.clone(), CompareOp::Equal, "4"));
             compares.push(Compare::version(marker_key.clone(), CompareOp::Equal, 0));
-            puts.push(TxnOp::put(schema_key.clone(), MIGRATING_SCHEMA, None));
+            puts.push(TxnOp::put(
+                schema_key.clone(),
+                migrating_schema.as_str(),
+                None,
+            ));
             puts.push(TxnOp::put(
                 marker_key.clone(),
                 serde_json::to_vec(&current_marker)?,
@@ -286,7 +294,7 @@ pub async fn execute(
             compares.push(Compare::value(
                 schema_key.clone(),
                 CompareOp::Equal,
-                MIGRATING_SCHEMA,
+                migrating_schema.as_str(),
             ));
             compares.push(Compare::mod_revision(
                 marker_key.clone(),
@@ -480,7 +488,11 @@ pub async fn execute(
                     serde_json::to_vec(&current_marker)?,
                 ),
                 Compare::version(leader_key.clone(), CompareOp::Equal, 0),
-                Compare::value(schema_key.clone(), CompareOp::Equal, MIGRATING_SCHEMA),
+                Compare::value(
+                    schema_key.clone(),
+                    CompareOp::Equal,
+                    migrating_schema.as_str(),
+                ),
                 term_compare(&term_key, term_record.as_ref(), term),
                 Compare::value(
                     lock_key.clone(),
@@ -859,7 +871,7 @@ async fn finalize(
         .txn(
             Txn::new()
                 .when([
-                    Compare::value(context.schema_key, CompareOp::Equal, MIGRATING_SCHEMA),
+                    Compare::value(context.schema_key, CompareOp::Equal, migrating_schema()),
                     Compare::version(context.leader_key, CompareOp::Equal, 0),
                     term_compare(
                         context.term_key,
@@ -952,13 +964,18 @@ async fn write_bounded_targets(
     context: BoundedWriteContext<'_>,
     targets: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), MigrationError> {
+    let migrating_schema = migrating_schema();
     for chunk in targets
         .iter()
         .collect::<Vec<_>>()
         .chunks(MIGRATION_TXN_TARGET_BATCH)
     {
         let mut compares = vec![
-            Compare::value(context.schema_key, CompareOp::Equal, MIGRATING_SCHEMA),
+            Compare::value(
+                context.schema_key,
+                CompareOp::Equal,
+                migrating_schema.as_str(),
+            ),
             Compare::version(context.leader_key, CompareOp::Equal, 0),
             term_compare(context.term_key, context.term_record, context.term),
             Compare::value(context.lock_key, CompareOp::Equal, context.lock.1.clone()),

@@ -64,7 +64,7 @@ async fn real_etcd_migration_chunks_large_config_and_domain_finalization_sets() 
             .unwrap()
             .kvs()[0]
             .value(),
-        b"5"
+        STORAGE_SCHEMA_GENERATION.to_string().as_bytes()
     );
     let migrated = raw
         .get(

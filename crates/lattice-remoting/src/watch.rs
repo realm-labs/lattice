@@ -11,6 +11,7 @@ use lattice_core::{
         ProtocolId, ProtocolTag, SingletonRef,
     },
     failpoint::{Failpoint, FailpointAction},
+    watch::{TerminatedReason, WatchId, WatchStatus},
 };
 use prost::{Enumeration, Message};
 use thiserror::Error;
@@ -20,8 +21,6 @@ use tokio::{
 };
 
 use crate::{association::AssociationId, messaging::target::ExactActorTarget};
-
-pub use lattice_core::watch::{TerminatedReason, WatchId, WatchStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchCommand {

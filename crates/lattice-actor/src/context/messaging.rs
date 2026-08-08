@@ -202,13 +202,16 @@ mod turn_messaging_tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use lattice_core::actor_ref::{
-        ActivationId, ActorPath, ActorRef, ClusterId, EntityRef, NodeAddress, NodeIncarnation,
-        ProtocolId, SingletonRef,
+    use lattice_core::{
+        actor_ref::{
+            ActivationId, ActorPath, ActorRef, ClusterId, EntityRef, NodeAddress, NodeIncarnation,
+            ProtocolId, SingletonRef,
+        },
+        watch::WatchId,
     };
     use lattice_remoting::messaging::error::{AskError, TellError};
     use lattice_remoting::protocol::ProtocolFingerprint;
-    use lattice_remoting::watch::{RegisteredWatch, WatchError, WatchId};
+    use lattice_remoting::watch::{RegisteredWatch, WatchError};
 
     use super::ActorTurnMessaging;
     use crate::{

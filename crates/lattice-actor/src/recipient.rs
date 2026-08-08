@@ -6,12 +6,13 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lattice_core::actor_ref::{
-    ActorRef, EntityRef, ProtocolId, ProtocolTag, RecipientRef, SingletonRef,
+use lattice_core::{
+    actor_ref::{ActorRef, EntityRef, ProtocolId, ProtocolTag, RecipientRef, SingletonRef},
+    watch::{WatchId, WatchStatus},
 };
 use lattice_remoting::messaging::error::{AskError, TellError};
 use lattice_remoting::protocol::ProtocolFingerprint;
-use lattice_remoting::watch::{RegisteredWatch, WatchError, WatchId, WatchStatus};
+use lattice_remoting::watch::{RegisteredWatch, WatchError};
 use thiserror::Error;
 
 use crate::error::ActorError;

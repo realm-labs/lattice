@@ -5,13 +5,13 @@
 
 use std::collections::BTreeSet;
 
-use lattice_core::failpoint::Failpoint;
+use lattice_core::{failpoint::Failpoint, watch::TerminatedReason};
 use lattice_placement::{
     coordinator::MemberHello,
     runtime::membership_plane::{MembershipLeader, MembershipLeaderConfig},
     storage::InMemoryPlacementStore,
 };
-use lattice_remoting::watch::{TerminatedReason, WatchRegistry};
+use lattice_remoting::watch::WatchRegistry;
 
 use super::*;
 use crate::{

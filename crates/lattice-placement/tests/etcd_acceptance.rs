@@ -35,7 +35,7 @@ use lattice_placement::{
             RemoveMember, TransitionSlot, UpdateMember,
         },
         etcd::{
-            EtcdPlacementConfig, EtcdPlacementStore,
+            EtcdPlacementConfig, EtcdPlacementStore, STORAGE_SCHEMA_GENERATION,
             migration::{
                 CardinalityMode, MigrationConfig, MigrationDomainMapping, MigrationError,
                 MigrationMode, execute as migrate, execute_cardinality,
@@ -63,6 +63,10 @@ fn endpoints() -> Option<Vec<String>> {
     std::env::var("LATTICE_ETCD_ENDPOINTS")
         .ok()
         .map(|value| value.split(',').map(str::to_owned).collect())
+}
+
+fn migrating_storage_schema() -> String {
+    format!("migrating-to-{STORAGE_SCHEMA_GENERATION}")
 }
 
 fn node(id: &str, incarnation: u128, port: u16) -> NodeKey {
@@ -650,7 +654,7 @@ async fn real_etcd_generation_four_migration_dry_run_apply_and_resume() {
             .unwrap()
             .kvs()[0]
             .value(),
-        b"5"
+        STORAGE_SCHEMA_GENERATION.to_string().as_bytes()
     );
     let cardinality = execute_cardinality(
         CardinalityMode::Inspect,
@@ -671,7 +675,7 @@ async fn real_etcd_generation_four_migration_dry_run_apply_and_resume() {
     let resume_prefix = format!("{prefix}-resume");
     raw.put(
         format!("{resume_prefix}/schema_generation"),
-        "migrating-to-5",
+        migrating_storage_schema(),
         None,
     )
     .await
@@ -921,7 +925,7 @@ async fn real_etcd_migration_finalization_compare_failure_is_atomic_and_resumabl
 
     raw.put(
         format!("{prefix}/schema_generation"),
-        "migrating-to-5",
+        migrating_storage_schema(),
         None,
     )
     .await
@@ -946,7 +950,7 @@ async fn real_etcd_migration_finalization_compare_failure_is_atomic_and_resumabl
             .unwrap()
             .kvs()[0]
             .value(),
-        b"5"
+        STORAGE_SCHEMA_GENERATION.to_string().as_bytes()
     );
 }
 
