@@ -21,17 +21,18 @@ use crate::{
     coordinator::{
         CoordinatorDelta, MemberEvent, MemberHello, MemberRecord, MemberRemovalReason,
         NodeLoadReport, PlacementDomainHello, ShardLoadReport, SnapshotBegin, SnapshotChunk,
-        SnapshotEnd,
+        SnapshotEnd, SnapshotRecord, SnapshotVersion,
     },
     types::{
-        AssignmentGeneration, ClaimGrant, MembershipVersion, NodeKey, PlacementSlotKey,
-        PlacementVersion, ShardId,
+        AssignmentGeneration, ClaimGrant, CoordinatorTerm, MembershipVersion, NodeKey,
+        PlacementSlotKey, PlacementVersion, Revision, ShardId,
     },
 };
 
-// The payload after the protobuf envelope is postcard-encoded. Bump the generation so a
-// rolling upgrade cannot mistake the old JSON payload for the new wire format.
-pub const PLACEMENT_CONTROL_GENERATION: u64 = 8;
+// Generation 9 gives snapshots a dedicated protobuf representation. Other commands retain their
+// established JSON representation inside the protobuf envelope, so Serde compatibility fields on
+// domain models never pass through a positional binary codec.
+pub const PLACEMENT_CONTROL_GENERATION: u64 = 9;
 pub const DEFAULT_MAX_CONTROL_PAYLOAD: usize = 256 * 1024;
 
 pub fn control_stream_id(scope: &CoordinatorScope) -> ControlStreamId {
@@ -251,15 +252,11 @@ fn encode_control_command_unbounded(
     if coordinator_term == Some(0) {
         return Err(PlacementControlError::InvalidCoordinatorTerm);
     }
-    let payload = postcard::to_allocvec(&ScopedPlacementControlCommand {
-        scope: scope.clone(),
-        coordinator_term,
-        command: command.clone(),
-    })
-    .map_err(|_| PlacementControlError::Codec)?;
     let wire = PlacementControlWire {
         generation: PLACEMENT_CONTROL_GENERATION,
-        payload,
+        scope: Some(PlacementControlScopeWire::from_scope(scope)),
+        coordinator_term,
+        command: Some(placement_control_wire::Command::from_command(command)?),
     };
     Ok(wire.encode_to_vec())
 }
@@ -278,15 +275,345 @@ pub fn decode_control_command(
     if wire.generation != PLACEMENT_CONTROL_GENERATION {
         return Err(PlacementControlError::GenerationMismatch);
     }
-    postcard::from_bytes(&wire.payload).map_err(|_| PlacementControlError::Codec)
+    let scope = wire
+        .scope
+        .ok_or(PlacementControlError::Codec)?
+        .into_scope()?;
+    if wire.coordinator_term == Some(0) {
+        return Err(PlacementControlError::InvalidCoordinatorTerm);
+    }
+    let command = wire
+        .command
+        .ok_or(PlacementControlError::Codec)?
+        .into_command()?;
+    Ok(ScopedPlacementControlCommand {
+        scope,
+        coordinator_term: wire.coordinator_term,
+        command,
+    })
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct PlacementControlWire {
     #[prost(uint64, tag = "1")]
     generation: u64,
+    #[prost(message, optional, tag = "2")]
+    scope: Option<PlacementControlScopeWire>,
+    #[prost(uint64, optional, tag = "3")]
+    coordinator_term: Option<u64>,
+    #[prost(oneof = "placement_control_wire::Command", tags = "4, 5, 6, 7")]
+    command: Option<placement_control_wire::Command>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+enum PlacementControlScopeKindWire {
+    Unspecified = 0,
+    Membership = 1,
+    Placement = 2,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PlacementControlScopeWire {
+    #[prost(enumeration = "PlacementControlScopeKindWire", tag = "1")]
+    kind: i32,
+    #[prost(string, tag = "2")]
+    placement_domain: String,
+}
+
+impl PlacementControlScopeWire {
+    fn from_scope(scope: &CoordinatorScope) -> Self {
+        match scope {
+            CoordinatorScope::Membership => Self {
+                kind: PlacementControlScopeKindWire::Membership as i32,
+                placement_domain: String::new(),
+            },
+            CoordinatorScope::Placement(domain) => Self {
+                kind: PlacementControlScopeKindWire::Placement as i32,
+                placement_domain: domain.as_str().to_owned(),
+            },
+        }
+    }
+
+    fn into_scope(self) -> Result<CoordinatorScope, PlacementControlError> {
+        match PlacementControlScopeKindWire::try_from(self.kind)
+            .map_err(|_| PlacementControlError::Codec)?
+        {
+            PlacementControlScopeKindWire::Membership if self.placement_domain.is_empty() => {
+                Ok(CoordinatorScope::Membership)
+            }
+            PlacementControlScopeKindWire::Placement => {
+                PlacementDomainId::new(self.placement_domain)
+                    .map(CoordinatorScope::Placement)
+                    .map_err(|_| PlacementControlError::Codec)
+            }
+            _ => Err(PlacementControlError::Codec),
+        }
+    }
+}
+
+mod placement_control_wire {
+    use super::{
+        PlacementControlCommand, PlacementControlError, SnapshotBeginWire, SnapshotChunkWire,
+        SnapshotEndWire,
+    };
+
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub(super) enum Command {
+        #[prost(bytes, tag = "4")]
+        Json(Vec<u8>),
+        #[prost(message, tag = "5")]
+        SnapshotBegin(SnapshotBeginWire),
+        #[prost(message, tag = "6")]
+        SnapshotChunk(SnapshotChunkWire),
+        #[prost(message, tag = "7")]
+        SnapshotEnd(SnapshotEndWire),
+    }
+
+    impl Command {
+        pub(super) fn from_command(
+            command: &PlacementControlCommand,
+        ) -> Result<Self, PlacementControlError> {
+            Ok(match command {
+                PlacementControlCommand::SnapshotBegin(begin) => {
+                    Self::SnapshotBegin(SnapshotBeginWire::from_begin(begin)?)
+                }
+                PlacementControlCommand::SnapshotChunk(chunk) => {
+                    Self::SnapshotChunk(SnapshotChunkWire::from_chunk(chunk)?)
+                }
+                PlacementControlCommand::SnapshotEnd(end) => {
+                    Self::SnapshotEnd(SnapshotEndWire::from_end(end))
+                }
+                command => Self::Json(
+                    serde_json::to_vec(command).map_err(|_| PlacementControlError::Codec)?,
+                ),
+            })
+        }
+
+        pub(super) fn into_command(self) -> Result<PlacementControlCommand, PlacementControlError> {
+            match self {
+                Self::Json(payload) => {
+                    let command: PlacementControlCommand = serde_json::from_slice(&payload)
+                        .map_err(|_| PlacementControlError::Codec)?;
+                    if matches!(
+                        command,
+                        PlacementControlCommand::SnapshotBegin(_)
+                            | PlacementControlCommand::SnapshotChunk(_)
+                            | PlacementControlCommand::SnapshotEnd(_)
+                    ) {
+                        return Err(PlacementControlError::Codec);
+                    }
+                    Ok(command)
+                }
+                Self::SnapshotBegin(begin) => begin
+                    .into_begin()
+                    .map(PlacementControlCommand::SnapshotBegin),
+                Self::SnapshotChunk(chunk) => chunk
+                    .into_chunk()
+                    .map(PlacementControlCommand::SnapshotChunk),
+                Self::SnapshotEnd(end) => end.into_end().map(PlacementControlCommand::SnapshotEnd),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+enum SnapshotVersionKindWire {
+    Unspecified = 0,
+    Membership = 1,
+    Placement = 2,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SnapshotVersionWire {
+    #[prost(enumeration = "SnapshotVersionKindWire", tag = "1")]
+    kind: i32,
+    #[prost(string, tag = "2")]
+    placement_domain: String,
+    #[prost(uint64, tag = "3")]
+    coordinator_term: u64,
+    #[prost(uint64, tag = "4")]
+    revision: u64,
+}
+
+impl SnapshotVersionWire {
+    fn from_version(version: &SnapshotVersion) -> Self {
+        match version {
+            SnapshotVersion::Membership(version) => Self {
+                kind: SnapshotVersionKindWire::Membership as i32,
+                placement_domain: String::new(),
+                coordinator_term: version.term.get(),
+                revision: version.revision.get(),
+            },
+            SnapshotVersion::Placement(version) => Self {
+                kind: SnapshotVersionKindWire::Placement as i32,
+                placement_domain: version.domain.as_str().to_owned(),
+                coordinator_term: version.term.get(),
+                revision: version.revision.get(),
+            },
+        }
+    }
+
+    fn into_version(self) -> Result<SnapshotVersion, PlacementControlError> {
+        let term = CoordinatorTerm::new(self.coordinator_term)
+            .map_err(|_| PlacementControlError::Codec)?;
+        let revision = Revision::new(self.revision).map_err(|_| PlacementControlError::Codec)?;
+        match SnapshotVersionKindWire::try_from(self.kind)
+            .map_err(|_| PlacementControlError::Codec)?
+        {
+            SnapshotVersionKindWire::Membership if self.placement_domain.is_empty() => Ok(
+                SnapshotVersion::Membership(MembershipVersion::new(term, revision)),
+            ),
+            SnapshotVersionKindWire::Placement => {
+                let domain = PlacementDomainId::new(self.placement_domain)
+                    .map_err(|_| PlacementControlError::Codec)?;
+                Ok(SnapshotVersion::Placement(PlacementVersion::new(
+                    domain, term, revision,
+                )))
+            }
+            _ => Err(PlacementControlError::Codec),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SnapshotRecordWire {
+    #[prost(string, tag = "1")]
+    key: String,
     #[prost(bytes = "vec", tag = "2")]
-    payload: Vec<u8>,
+    value: Vec<u8>,
+}
+
+impl From<&SnapshotRecord> for SnapshotRecordWire {
+    fn from(record: &SnapshotRecord) -> Self {
+        Self {
+            key: record.key.clone(),
+            value: record.value.to_vec(),
+        }
+    }
+}
+
+impl From<SnapshotRecordWire> for SnapshotRecord {
+    fn from(record: SnapshotRecordWire) -> Self {
+        Self {
+            key: record.key,
+            value: Bytes::from(record.value),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SnapshotBeginWire {
+    #[prost(bytes = "vec", tag = "1")]
+    snapshot_id: Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    version: Option<SnapshotVersionWire>,
+    #[prost(uint64, tag = "3")]
+    record_count: u64,
+    #[prost(uint64, tag = "4")]
+    total_bytes: u64,
+    #[prost(uint64, tag = "5")]
+    chunk_count: u64,
+    #[prost(bytes = "vec", tag = "6")]
+    digest: Vec<u8>,
+}
+
+impl SnapshotBeginWire {
+    fn from_begin(begin: &SnapshotBegin) -> Result<Self, PlacementControlError> {
+        Ok(Self {
+            snapshot_id: begin.snapshot_id.to_be_bytes().to_vec(),
+            version: Some(SnapshotVersionWire::from_version(&begin.version)),
+            record_count: u64::try_from(begin.record_count)
+                .map_err(|_| PlacementControlError::Codec)?,
+            total_bytes: u64::try_from(begin.total_bytes)
+                .map_err(|_| PlacementControlError::Codec)?,
+            chunk_count: u64::try_from(begin.chunk_count)
+                .map_err(|_| PlacementControlError::Codec)?,
+            digest: begin.digest.to_vec(),
+        })
+    }
+
+    fn into_begin(self) -> Result<SnapshotBegin, PlacementControlError> {
+        Ok(SnapshotBegin {
+            snapshot_id: decode_u128(&self.snapshot_id)?,
+            version: self
+                .version
+                .ok_or(PlacementControlError::Codec)?
+                .into_version()?,
+            record_count: usize::try_from(self.record_count)
+                .map_err(|_| PlacementControlError::Codec)?,
+            total_bytes: usize::try_from(self.total_bytes)
+                .map_err(|_| PlacementControlError::Codec)?,
+            chunk_count: usize::try_from(self.chunk_count)
+                .map_err(|_| PlacementControlError::Codec)?,
+            digest: decode_digest(&self.digest)?,
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SnapshotChunkWire {
+    #[prost(bytes = "vec", tag = "1")]
+    snapshot_id: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    index: u64,
+    #[prost(message, repeated, tag = "3")]
+    records: Vec<SnapshotRecordWire>,
+}
+
+impl SnapshotChunkWire {
+    fn from_chunk(chunk: &SnapshotChunk) -> Result<Self, PlacementControlError> {
+        Ok(Self {
+            snapshot_id: chunk.snapshot_id.to_be_bytes().to_vec(),
+            index: u64::try_from(chunk.index).map_err(|_| PlacementControlError::Codec)?,
+            records: chunk.records.iter().map(SnapshotRecordWire::from).collect(),
+        })
+    }
+
+    fn into_chunk(self) -> Result<SnapshotChunk, PlacementControlError> {
+        Ok(SnapshotChunk {
+            snapshot_id: decode_u128(&self.snapshot_id)?,
+            index: usize::try_from(self.index).map_err(|_| PlacementControlError::Codec)?,
+            records: self.records.into_iter().map(SnapshotRecord::from).collect(),
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SnapshotEndWire {
+    #[prost(bytes = "vec", tag = "1")]
+    snapshot_id: Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    version: Option<SnapshotVersionWire>,
+}
+
+impl SnapshotEndWire {
+    fn from_end(end: &SnapshotEnd) -> Self {
+        Self {
+            snapshot_id: end.snapshot_id.to_be_bytes().to_vec(),
+            version: Some(SnapshotVersionWire::from_version(&end.version)),
+        }
+    }
+
+    fn into_end(self) -> Result<SnapshotEnd, PlacementControlError> {
+        Ok(SnapshotEnd {
+            snapshot_id: decode_u128(&self.snapshot_id)?,
+            version: self
+                .version
+                .ok_or(PlacementControlError::Codec)?
+                .into_version()?,
+        })
+    }
+}
+
+fn decode_u128(bytes: &[u8]) -> Result<u128, PlacementControlError> {
+    let bytes: [u8; 16] = bytes.try_into().map_err(|_| PlacementControlError::Codec)?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
+fn decode_digest(bytes: &[u8]) -> Result<[u8; 32], PlacementControlError> {
+    bytes.try_into().map_err(|_| PlacementControlError::Codec)
 }
 
 #[derive(Debug, Clone)]
@@ -606,7 +933,12 @@ pub enum PlacementControlError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use lattice_core::actor_ref::{NodeAddress, ProtocolId};
+
     use super::*;
+    use crate::region::EntityConfig;
 
     #[test]
     fn control_generation_round_trips_and_rejects_oversize() {
@@ -658,6 +990,73 @@ mod tests {
             )
             .unwrap_err(),
             PlacementControlError::InvalidCoordinatorTerm
+        );
+    }
+
+    #[test]
+    fn configured_placement_domain_hello_round_trips() {
+        let domain = PlacementDomainId::new("player").unwrap();
+        let entity_type = EntityType::new("player").unwrap();
+        let entity_config = EntityConfig::new(
+            domain.clone(),
+            entity_type.clone(),
+            ProtocolId::new(0x1001).unwrap(),
+            1024,
+            "weighted-v1",
+            1,
+            Vec::new(),
+        )
+        .unwrap();
+        let hello = PlacementDomainHello::builder(
+            NodeKey {
+                node_id: "player-1".to_owned(),
+                address: NodeAddress::new("127.0.0.1", 25520).unwrap(),
+                incarnation: NodeIncarnation::new(7).unwrap(),
+            },
+            domain.clone(),
+            8,
+        )
+        .hosted_entity_types(BTreeSet::from([entity_type]))
+        .entity_configs(vec![entity_config])
+        .build();
+        let command = PlacementControlCommand::PlacementDomainHello(hello);
+        let scope = CoordinatorScope::Placement(domain);
+
+        let payload = encode_control_command_for_term(&scope, 29, &command, 16 * 1024).unwrap();
+
+        assert_eq!(
+            decode_control_command(&payload, 16 * 1024).unwrap(),
+            ScopedPlacementControlCommand {
+                scope,
+                coordinator_term: Some(29),
+                command,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_chunks_use_the_dedicated_protobuf_variant() {
+        let scope = CoordinatorScope::Placement(PlacementDomainId::new("player").unwrap());
+        let command = PlacementControlCommand::SnapshotChunk(SnapshotChunk {
+            snapshot_id: 0x0102_0304,
+            index: 3,
+            records: vec![SnapshotRecord {
+                key: "slot/player/3".to_owned(),
+                value: Bytes::from(vec![0xff; 1024]),
+            }],
+        });
+
+        let payload = encode_control_command_for_term(&scope, 29, &command, 2048).unwrap();
+        let wire = PlacementControlWire::decode(payload.as_ref()).unwrap();
+
+        assert!(matches!(
+            wire.command,
+            Some(placement_control_wire::Command::SnapshotChunk(_))
+        ));
+        assert!(payload.len() < 1200);
+        assert_eq!(
+            decode_control_command(&payload, 2048).unwrap().command,
+            command
         );
     }
 
