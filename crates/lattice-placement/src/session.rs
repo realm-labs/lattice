@@ -41,6 +41,8 @@ mod dispatch;
 mod handle;
 mod snapshot;
 
+pub(crate) const CONTROL_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone)]
 pub struct LogicCoordinatorConfig {
     pub snapshot_limits: SnapshotLimits,
@@ -336,9 +338,16 @@ impl PlacementDomainSession {
     }
 
     pub fn send_hello(&self) -> Result<(), LogicSessionError> {
+        self.send_immediate(PlacementControlCommand::PlacementDomainHello(
+            self.domain_hello.clone(),
+        ))
+    }
+
+    async fn send_hello_wait(&self) -> Result<(), LogicSessionError> {
         self.send(PlacementControlCommand::PlacementDomainHello(
             self.domain_hello.clone(),
         ))
+        .await
     }
 
     pub async fn run(
@@ -373,7 +382,7 @@ impl PlacementDomainSession {
         controls: &mut mpsc::Receiver<PlacementControlEvent>,
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<(), LogicSessionError> {
-        self.send_hello()?;
+        self.send_hello_wait().await?;
         let mut tick = tokio::time::interval(self.config.tick_interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
@@ -400,7 +409,7 @@ impl PlacementDomainSession {
                         .map_err(session_dispatch_error);
                     let _ = event.completion.send(acknowledgement);
                     if stale_generation {
-                        self.reconcile_after_stale_control(event_name);
+                        self.reconcile_after_stale_control(event_name).await;
                         continue;
                     }
                     result?;
@@ -418,7 +427,7 @@ impl PlacementDomainSession {
                     if self.hello_pending {
                         // Domain registration can race global membership recovery. Retry the
                         // idempotent hello until the Coordinator starts the placement snapshot.
-                        self.send_hello()?;
+                        self.send_hello_wait().await?;
                         continue;
                     }
                     self.heartbeat_sequence = self
@@ -428,7 +437,7 @@ impl PlacementDomainSession {
                     self.send(PlacementControlCommand::NodeHeartbeat {
                         incarnation: self.domain_hello.node.incarnation,
                         sequence: self.heartbeat_sequence,
-                    })?;
+                    }).await?;
                     self.replay_runtime_progress()?;
                     if self.config.automatic_node_load_reporting {
                         let report = self
@@ -455,7 +464,33 @@ impl PlacementDomainSession {
         }
     }
 
-    fn send(&self, command: PlacementControlCommand) -> Result<(), LogicSessionError> {
+    async fn send(&self, command: PlacementControlCommand) -> Result<(), LogicSessionError> {
+        let association = self
+            .associations
+            .get(&self.coordinator)
+            .ok_or(LogicSessionError::AssociationUnavailable)?;
+        if association.state() == AssociationState::Closed {
+            return Err(LogicSessionError::AssociationUnavailable);
+        }
+        let scope = CoordinatorScope::Placement(self.domain_hello.domain.clone());
+        let payload = encode_control_command_for_term(
+            &scope,
+            self.coordinator_term,
+            &command,
+            self.config.maximum_control_payload,
+        )
+        .map_err(LogicSessionError::Control)?;
+        association
+            .admit_control_command_in_wait(
+                crate::control::control_stream_id(&scope),
+                payload,
+                CONTROL_ADMISSION_TIMEOUT,
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn send_immediate(&self, command: PlacementControlCommand) -> Result<(), LogicSessionError> {
         let association = self
             .associations
             .get(&self.coordinator)
@@ -585,14 +620,14 @@ impl PlacementDomainSession {
         monotonic_since(self.origin)
     }
 
-    fn reconcile_after_stale_control(&mut self, command: &'static str) {
+    async fn reconcile_after_stale_control(&mut self, command: &'static str) {
         self.stager = None;
         self.state
             .lock()
             .expect("logic placement state poisoned")
             .domain_up = false;
         self.hello_pending = true;
-        if let Err(error) = self.send_hello() {
+        if let Err(error) = self.send_hello_wait().await {
             tracing::warn!(
                 target: "lattice.cluster.logic",
                 domain = %self.domain_hello.domain.as_str(),
@@ -680,7 +715,7 @@ pub enum LogicSessionError {
     Authority(#[source] AuthorityError),
     #[error("logic Coordinator control codec failed")]
     Control(#[source] PlacementControlError),
-    #[error("logic Coordinator Association rejected control admission")]
+    #[error("logic Coordinator Association rejected control admission: {0}")]
     Association(#[from] AssociationError),
 }
 

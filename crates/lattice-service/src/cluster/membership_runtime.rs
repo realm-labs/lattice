@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lattice_placement::{
     control::PlacementControlEvent,
@@ -70,6 +70,7 @@ impl MembershipJoinRuntime {
                     let Some(mut receiver) = controls.take() else {
                         continue;
                     };
+                    let mut retry_backoff = Duration::from_millis(100);
                     loop {
                         if association.state()
                             != lattice_remoting::association::AssociationState::Active
@@ -90,6 +91,7 @@ impl MembershipJoinRuntime {
                         };
                         *self.handle.lock().expect("membership handle poisoned") = Some(handle);
                         let state = session.state();
+                        let session_started = Instant::now();
                         let returned = self
                             .run_session(
                                 MembershipSessionRun {
@@ -109,7 +111,19 @@ impl MembershipJoinRuntime {
                             controls = Some(receiver);
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        if session_started.elapsed() >= self.config.heartbeat_interval {
+                            retry_backoff = Duration::from_millis(100);
+                        }
+                        tokio::select! {
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    controls = Some(receiver);
+                                    break;
+                                }
+                            }
+                            () = tokio::time::sleep(retry_backoff) => {}
+                        }
+                        retry_backoff = retry_backoff.saturating_mul(2).min(Duration::from_secs(5));
                     }
                 }
                 JoinEvent::CoordinatorLost { .. } => {

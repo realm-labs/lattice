@@ -174,7 +174,8 @@ impl MembershipSession {
         controls: &mut mpsc::Receiver<PlacementControlEvent>,
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<(), LogicSessionError> {
-        self.send(PlacementControlCommand::MemberHello(self.hello.clone()))?;
+        self.send(PlacementControlCommand::MemberHello(self.hello.clone()))
+            .await?;
         let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         heartbeat.reset();
@@ -201,7 +202,8 @@ impl MembershipSession {
                     if self.hello_pending {
                         // The initial hello may race Coordinator election or membership
                         // recovery. Retry until a membership snapshot proves it was accepted.
-                        self.send(PlacementControlCommand::MemberHello(self.hello.clone()))?;
+                        self.send(PlacementControlCommand::MemberHello(self.hello.clone()))
+                            .await?;
                         continue;
                     }
                     self.heartbeat_sequence = self
@@ -211,7 +213,7 @@ impl MembershipSession {
                     self.send(PlacementControlCommand::NodeHeartbeat {
                         incarnation: self.hello.node.incarnation,
                         sequence: self.heartbeat_sequence,
-                    })?;
+                    }).await?;
                 }
             }
         }
@@ -230,6 +232,7 @@ impl MembershipSession {
                     .session = MembershipState::default();
                 self.hello_pending = true;
                 self.send(PlacementControlCommand::MemberHello(self.hello.clone()))
+                    .await
             }
             PlacementControlEventKind::Command(inbound) => {
                 self.require_coordinator(&inbound.association)?;
@@ -290,6 +293,7 @@ impl MembershipSession {
                         self.send(PlacementControlCommand::JoinReady {
                             snapshot_version: version,
                         })
+                        .await
                     }
                     PlacementControlCommand::MemberDelta(event) => {
                         self.apply_member_event(event).await
@@ -327,7 +331,7 @@ impl MembershipSession {
         Ok(())
     }
 
-    fn send(&self, command: PlacementControlCommand) -> Result<(), LogicSessionError> {
+    async fn send(&self, command: PlacementControlCommand) -> Result<(), LogicSessionError> {
         let association = self
             .associations
             .get(&self.coordinator)
@@ -335,16 +339,20 @@ impl MembershipSession {
         if association.state() == AssociationState::Closed {
             return Err(LogicSessionError::AssociationUnavailable);
         }
-        association.admit_control_command_in(
-            control_stream_id(&CoordinatorScope::Membership),
-            encode_control_command_for_term(
-                &CoordinatorScope::Membership,
-                self.coordinator_term,
-                &command,
-                self.config.maximum_control_payload,
+        let payload = encode_control_command_for_term(
+            &CoordinatorScope::Membership,
+            self.coordinator_term,
+            &command,
+            self.config.maximum_control_payload,
+        )
+        .map_err(LogicSessionError::Control)?;
+        association
+            .admit_control_command_in_wait(
+                control_stream_id(&CoordinatorScope::Membership),
+                payload,
+                super::session::CONTROL_ADMISSION_TIMEOUT,
             )
-            .map_err(LogicSessionError::Control)?,
-        )?;
+            .await?;
         Ok(())
     }
 

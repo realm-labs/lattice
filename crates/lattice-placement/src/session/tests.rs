@@ -6,7 +6,7 @@ use lattice_remoting::{
     config::RemotingConfig,
     control::decode_control_envelope,
     control::{CommandId, ControlDispatchError},
-    wire::FrameKind,
+    wire::{Frame, FrameKind},
 };
 
 use super::*;
@@ -158,6 +158,183 @@ async fn effect_backpressure_waits_for_capacity_without_terminating_the_session(
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn control_queue_backpressure_does_not_terminate_the_session() {
+    let cluster_id = ClusterId::new("control-admission-backpressure").unwrap();
+    let domain = PlacementDomainId::new("control-admission-backpressure").unwrap();
+    let local = NodeKey {
+        node_id: "logic".to_owned(),
+        address: NodeAddress::new("127.0.0.1", 34082).unwrap(),
+        incarnation: NodeIncarnation::new(1).unwrap(),
+    };
+    let remote_address = NodeAddress::new("127.0.0.1", 34083).unwrap();
+    let remote_incarnation = NodeIncarnation::new(2).unwrap();
+    let associations = Arc::new(
+        AssociationManager::new(
+            local.address.clone(),
+            local.incarnation,
+            RemotingConfig {
+                control_queue_frames: 1,
+                ..RemotingConfig::default()
+            },
+        )
+        .unwrap(),
+    );
+    let association = associations
+        .get_or_create(
+            cluster_id.clone(),
+            remote_address.clone(),
+            remote_incarnation,
+        )
+        .unwrap();
+    let coordinator = AssociationKey {
+        cluster_id,
+        local_incarnation: local.incarnation,
+        remote_address,
+        remote_incarnation,
+    };
+    for (lane, nonce) in [
+        (LaneKind::Control, 1_u128),
+        (LaneKind::Interactive, 2),
+        (LaneKind::Bulk(0), 3),
+    ] {
+        association
+            .attach(LaneAttachment {
+                association_id: association.id(),
+                key: coordinator.clone(),
+                lane,
+                connection_nonce: nonce,
+            })
+            .unwrap();
+    }
+    let mut outbound = association.take_lane_receiver(LaneKind::Control).unwrap();
+    association
+        .try_admit_control(Frame::new(FrameKind::Heartbeat, bytes::Bytes::new()))
+        .unwrap();
+    let (session, _effects) = PlacementDomainSession::new(
+        PlacementDomainHello::builder(local, domain, 1).build(),
+        coordinator,
+        associations,
+        LogicCoordinatorConfig::default(),
+        8,
+        1,
+    )
+    .unwrap();
+    let (_controls, control_rx) = mpsc::channel(4);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(session.run(control_rx, shutdown_rx));
+
+    tokio::task::yield_now().await;
+    assert!(
+        !task.is_finished(),
+        "transient control admission backpressure must not terminate the placement session"
+    );
+
+    assert_eq!(outbound.recv().await.unwrap().kind, FrameKind::Heartbeat);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while association.control_outbox_len() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    shutdown.send(true).unwrap();
+    assert!(task.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn reliable_outbox_backpressure_does_not_terminate_the_session() {
+    let cluster_id = ClusterId::new("control-outbox-backpressure").unwrap();
+    let domain = PlacementDomainId::new("control-outbox-backpressure").unwrap();
+    let local = NodeKey {
+        node_id: "logic".to_owned(),
+        address: NodeAddress::new("127.0.0.1", 34084).unwrap(),
+        incarnation: NodeIncarnation::new(1).unwrap(),
+    };
+    let remote_address = NodeAddress::new("127.0.0.1", 34085).unwrap();
+    let remote_incarnation = NodeIncarnation::new(2).unwrap();
+    let associations = Arc::new(
+        AssociationManager::new(
+            local.address.clone(),
+            local.incarnation,
+            RemotingConfig {
+                max_control_outbox_frames: 1,
+                max_control_outbox_frames_per_stream: 1,
+                ..RemotingConfig::default()
+            },
+        )
+        .unwrap(),
+    );
+    let association = associations
+        .get_or_create(
+            cluster_id.clone(),
+            remote_address.clone(),
+            remote_incarnation,
+        )
+        .unwrap();
+    let coordinator = AssociationKey {
+        cluster_id,
+        local_incarnation: local.incarnation,
+        remote_address,
+        remote_incarnation,
+    };
+    for (lane, nonce) in [
+        (LaneKind::Control, 1_u128),
+        (LaneKind::Interactive, 2),
+        (LaneKind::Bulk(0), 3),
+    ] {
+        association
+            .attach(LaneAttachment {
+                association_id: association.id(),
+                key: coordinator.clone(),
+                lane,
+                connection_nonce: nonce,
+            })
+            .unwrap();
+    }
+    let mut outbound = association.take_lane_receiver(LaneKind::Control).unwrap();
+    let pending = association
+        .admit_control_command(bytes::Bytes::from_static(b"pending"))
+        .unwrap();
+    let pending_envelope = decode_control_envelope(&outbound.recv().await.unwrap()).unwrap();
+    let (session, _effects) = PlacementDomainSession::new(
+        PlacementDomainHello::builder(local, domain, 1).build(),
+        coordinator,
+        associations,
+        LogicCoordinatorConfig::default(),
+        8,
+        1,
+    )
+    .unwrap();
+    let (_controls, control_rx) = mpsc::channel(4);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(session.run(control_rx, shutdown_rx));
+
+    tokio::task::yield_now().await;
+    assert!(
+        !task.is_finished(),
+        "transient reliable outbox backpressure must not terminate the placement session"
+    );
+
+    association
+        .acknowledge_control(lattice_remoting::control::ControlAck {
+            association_epoch: association.id(),
+            stream_id: pending_envelope.stream_id,
+            cumulative_sequence: pending_envelope.sequence,
+        })
+        .unwrap();
+    assert!(!association.control_command_pending(pending));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while association.control_outbox_len() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    shutdown.send(true).unwrap();
+    assert!(task.await.unwrap().is_ok());
 }
 
 #[tokio::test]

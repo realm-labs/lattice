@@ -49,7 +49,7 @@ impl PlacementDomainSession {
                     .expect("logic placement state poisoned")
                     .domain_up = false;
                 self.hello_pending = true;
-                self.send_hello()
+                self.send_hello_wait().await
             }
             PlacementControlEventKind::Command(inbound) => {
                 self.require_coordinator(&inbound.association)?;

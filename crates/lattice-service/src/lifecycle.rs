@@ -390,14 +390,25 @@ impl ProductionLifecycleDriver {
                 self.health_events.send_replace(health.clone());
             }
         }
-        tracing::info!(
-            target: "lattice.cluster.lifecycle",
-            component = %self.component,
-            ?event,
-            ?previous,
-            ?next,
-            "production lifecycle driver committed transition"
-        );
+        if previous == next {
+            tracing::debug!(
+                target: "lattice.cluster.lifecycle",
+                component = %self.component,
+                ?event,
+                ?previous,
+                ?next,
+                "production lifecycle driver committed idempotent transition"
+            );
+        } else {
+            tracing::info!(
+                target: "lattice.cluster.lifecycle",
+                component = %self.component,
+                ?event,
+                ?previous,
+                ?next,
+                "production lifecycle driver committed transition"
+            );
+        }
         self.lifecycle_events.send_if_modified(|current| {
             let changed = *current != next;
             *current = next;
